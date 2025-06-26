@@ -28,7 +28,7 @@ class Qwen2VLInputProcessorBase(InputProcessor):
                  trust_remote_code: bool = True):
         self.model_config = model_config
         self.tokenizer = tokenizer
-        # TODO: change to True and also change the acoording test result
+        # TODO: change to True and also change the according test result
         self.use_fast = False
         self.device = 'cuda'
         self.processor = AutoProcessor.from_pretrained(
@@ -277,7 +277,7 @@ class Qwen2VLInputProcessorBase(InputProcessor):
                               **mm_processor_kwargs)
 
     def _postprocess(self, input_ids: torch.IntTensor) -> torch.IntTensor:
-        # NOTE: Qwen2-VL's input processor is doing all the work for fusing input_ids with mm_tokens. 
+        # NOTE: Qwen2-VL's input processor is doing all the work for fusing input_ids with mm_tokens.
         # So, we just replace mm_tokens with expanded out-of-vocab ids
         masks = (input_ids == self.model_config.image_token_id) | (
             input_ids == self.model_config.vision_token_id) | (
@@ -334,7 +334,7 @@ class Qwen2VLInputProcessorBase(InputProcessor):
 
         processed_inputs = self._preprocess(text_prompt, mm_data,
                                             mm_processor_kwargs).to(self.device)
-        
+
         if not mm_data:
             fused_input_ids = processed_inputs['input_ids']
             return fused_input_ids.to(torch.int32).tolist(), {}
@@ -342,14 +342,18 @@ class Qwen2VLInputProcessorBase(InputProcessor):
         pixel_values = processed_inputs.get('pixel_values', None)
         pixel_values_videos = processed_inputs.get('pixel_values_videos', None)
         assert pixel_values is not None or pixel_values_videos is not None, "No multimodal data found"
-        
+
         mm_data = {}
         if pixel_values is not None:
-            mm_data["image"] = {"pixel_values": pixel_values, 
-                                "image_grid_thw": processed_inputs.get('image_grid_thw')}
+            mm_data["image"] = {
+                "pixel_values": pixel_values,
+                "image_grid_thw": processed_inputs.get('image_grid_thw')
+            }
         if pixel_values_videos is not None:
-            mm_data["video"] = {"pixel_values_videos": pixel_values_videos, 
-                                "video_grid_thw": processed_inputs.get('video_grid_thw')}
+            mm_data["video"] = {
+                "pixel_values_videos": pixel_values_videos,
+                "video_grid_thw": processed_inputs.get('video_grid_thw')
+            }
 
         input_ids = processed_inputs['input_ids']
         # TODO: We can move this to the LLM-side.
@@ -366,10 +370,14 @@ class Qwen2VLInputProcessorBase(InputProcessor):
             "mm_data": mm_data,
         }
 
+
 class Qwen2VisionModelBase:
-    def __init__(self, pretrained_config: PretrainedConfig, model_class: type[PreTrainedModel]):
+
+    def __init__(self, pretrained_config: PretrainedConfig,
+                 model_class: type[PreTrainedModel]):
         self.pretrained_config = pretrained_config
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = torch.device(
+            'cuda' if torch.cuda.is_available() else 'cpu')
 
         model_path = self.pretrained_config._name_or_path
         # TODO: Change the model class to TRT-LLM's Qwen2VisionModel
@@ -379,39 +387,53 @@ class Qwen2VisionModelBase:
             torch_dtype=self.pretrained_config.torch_dtype,
             attn_implementation='flash_attention_2').eval()
         self.visual = model.visual.to(self.device)
-    
-    def _parse_and_batch_mm_data(self, mm_data: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dict[str, List[Any]]]:
+
+    def _parse_and_batch_mm_data(
+        self, mm_data: List[Dict[str, Any]]
+    ) -> Tuple[Dict[str, Any], Dict[str, List[Any]]]:
 
         pixel_values_list = []
         pixel_values_videos_list = []
         image_grid_thw_list = []
         video_grid_thw_list = []
-        
+
         for mm_content in mm_data:
             # Process images if present
             if "image" in mm_content and mm_content["image"]:
                 pixel_values_list.append(mm_content["image"]["pixel_values"])
-                image_grid_thw_list.append(mm_content["image"]["image_grid_thw"])
-            
+                image_grid_thw_list.append(
+                    mm_content["image"]["image_grid_thw"])
+
             # Process videos if present
             if "video" in mm_content and mm_content["video"]:
-                pixel_values_videos_list.append(mm_content["video"]["pixel_values_videos"])
-                video_grid_thw_list.append(mm_content["video"]["video_grid_thw"])
-        
+                pixel_values_videos_list.append(
+                    mm_content["video"]["pixel_values_videos"])
+                video_grid_thw_list.append(
+                    mm_content["video"]["video_grid_thw"])
+
         # Concatenate tensors
         mm_content_dict = {}
         if pixel_values_list:
-            mm_content_dict["pixel_values"] = torch.cat(pixel_values_list, dim=0) if len(pixel_values_list) > 1 else pixel_values_list[0]
+            mm_content_dict["pixel_values"] = torch.cat(
+                pixel_values_list,
+                dim=0) if len(pixel_values_list) > 1 else pixel_values_list[0]
         if pixel_values_videos_list:
-            mm_content_dict["pixel_values_videos"] = torch.cat(pixel_values_videos_list, dim=0) if len(pixel_values_videos_list) > 1 else pixel_values_videos_list[0]
-        
+            mm_content_dict["pixel_values_videos"] = torch.cat(
+                pixel_values_videos_list,
+                dim=0) if len(pixel_values_videos_list
+                              ) > 1 else pixel_values_videos_list[0]
+
         # Prepare extra data
         mm_extra_data = {}
         if image_grid_thw_list:
-            mm_extra_data["image_grid_thw"] = torch.cat(image_grid_thw_list, dim=0) if len(image_grid_thw_list) > 1 else image_grid_thw_list[0]
+            mm_extra_data["image_grid_thw"] = torch.cat(
+                image_grid_thw_list, dim=0) if len(
+                    image_grid_thw_list) > 1 else image_grid_thw_list[0]
         if video_grid_thw_list:
-            mm_extra_data["video_grid_thw"] = torch.cat(video_grid_thw_list, dim=0) if len(video_grid_thw_list) > 1 else video_grid_thw_list[0]
-        
+            mm_extra_data["video_grid_thw"] = torch.cat(
+                video_grid_thw_list, dim=0) if len(
+                    video_grid_thw_list) > 1 else video_grid_thw_list[0]
+
         return mm_content_dict, mm_extra_data
 
     @torch.inference_mode()
@@ -420,10 +442,10 @@ class Qwen2VisionModelBase:
         mm_content_data, mm_extra_data = self._parse_and_batch_mm_data(mm_data)
         pixel_values = mm_content_data.get("pixel_values", None)
         pixel_values_videos = mm_content_data.get("pixel_values_videos", None)
-        
+
         image_grid_thw = mm_extra_data.get("image_grid_thw", None)
         video_grid_thw = mm_extra_data.get("video_grid_thw", None)
-        
+
         embeds = []
         if pixel_values is not None:
             pixel_values = pixel_values.to(self.visual.dtype)
@@ -504,18 +526,22 @@ class Qwen2VLModelBase(PreTrainedModel):
         mrope_config = kwargs.get("mrope_config", {})
         if mrope_config:
             if mrope_rotary_cos_sin := mrope_config.get('mrope_rotary_cos_sin'):
-                assert len(mrope_rotary_cos_sin) == num_context_requests, f"Number of mrope_rotary_cos_sin ({len(mrope_rotary_cos_sin)}) should be equal to number of context requests ({num_context_requests}) in the batch."
+                assert len(
+                    mrope_rotary_cos_sin
+                ) == num_context_requests, f"Number of mrope_rotary_cos_sin ({len(mrope_rotary_cos_sin)}) should be equal to number of context requests ({num_context_requests}) in the batch."
                 mrope_config['mrope_rotary_cos_sin'] = torch.cat(
                     mrope_rotary_cos_sin, dim=0)
 
             if mrope_position_deltas := mrope_config.get(
                     'mrope_position_deltas'):
-                assert len(mrope_position_deltas) == num_generation_requests, f"Number of mrope_position_deltas ({len(mrope_position_deltas)}) should be equal to number of generation requests ({num_generation_requests}) in the batch."
+                assert len(
+                    mrope_position_deltas
+                ) == num_generation_requests, f"Number of mrope_position_deltas ({len(mrope_position_deltas)}) should be equal to number of generation requests ({num_generation_requests}) in the batch."
                 mrope_config['mrope_position_deltas'] = torch.cat(
                     mrope_position_deltas, dim=0)
 
         input_ids, input_embeds = fuse_input_embeds(self.llm.model.embed_tokens,
-                                            input_ids, mm_embeds)
+                                                    input_ids, mm_embeds)
         output_prob = self.llm.forward(
             attn_metadata=attn_metadata,
             input_ids=input_ids,
@@ -531,13 +557,20 @@ class Qwen2VLModelBase(PreTrainedModel):
 @register_auto_model("Qwen2VLForConditionalGeneration")
 @register_input_processor(Qwen2VLInputProcessorBase, model_type="qwen2_vl")
 class Qwen2VLModel(Qwen2VLModelBase):
-    def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
-        self.mm_encoder = Qwen2VisionModelBase(model_config.pretrained_config, Qwen2VLForConditionalGeneration)
+
+    def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
+                 **kwargs):
+        self.mm_encoder = Qwen2VisionModelBase(model_config.pretrained_config,
+                                               Qwen2VLForConditionalGeneration)
         super().__init__(model_config, *args, **kwargs)
+
 
 @register_auto_model("Qwen2_5_VLForConditionalGeneration")
 @register_input_processor(Qwen2VLInputProcessorBase, model_type="qwen2_5_vl")
 class Qwen2_5_VLModel(Qwen2VLModelBase):
-    def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
+
+    def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
+                 **kwargs):
         super().__init__(model_config, *args, **kwargs)
-        self.mm_encoder = Qwen2VisionModelBase(model_config.pretrained_config, Qwen2_5_VLForConditionalGeneration)
+        self.mm_encoder = Qwen2VisionModelBase(
+            model_config.pretrained_config, Qwen2_5_VLForConditionalGeneration)

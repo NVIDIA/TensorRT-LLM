@@ -463,6 +463,5 @@ def executor_request_to_llm_request(
         priority=0.5,
         llm_request_type=llm_request_type,
         context_phase_params=executor_request.context_phase_params,
-        py_mm_data=getattr(executor_request, "py_mm_data",
-                                     None))
+        py_mm_data=getattr(executor_request, "py_mm_data", None))
     return llm_request

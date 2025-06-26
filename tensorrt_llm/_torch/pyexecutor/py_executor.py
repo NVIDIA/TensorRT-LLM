@@ -1210,7 +1210,8 @@ class PyExecutor:
                 new_requests, "py_logits_post_processors")
             py_mm_data = self._collect_py_objects_from_requests(
                 new_requests, "py_mm_data")
-            py_request_objects = tuple(filter(None, [py_logits_post_processors, py_mm_data]))
+            py_request_objects = tuple(
+                filter(None, [py_logits_post_processors, py_mm_data]))
         else:
             py_request_objects = None
 
