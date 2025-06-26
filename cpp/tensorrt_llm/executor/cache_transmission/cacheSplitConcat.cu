@@ -645,12 +645,6 @@ __device__ __forceinline__ void getPosId(int const posLayerId, int const* blockN
                 sharedOutputAllLayerOffset = prevOutputLayerOffset + layerInWindowQuotient * layersPerDomainPP
                     + layerInWindowRemainder % layersPerDomainPP;
 
-                // printf(
-                //     " getPosId break , posLayerId:%d, offset:%d, blockNumInWindow:%d, layersInWindow:%d, "
-                //     "inputTensorIdx:%d, layerInInputTensor:%d, sharedOutputPPOffset:%d, sharedInputLayerId: %d\n",
-                //     posLayerId, offset, blockNumInWindow, layersInWindow, inputTensorIdx, layerInInputTensor,
-                //     sharedOutputPPOffset, static_cast<int>(sharedInputLayerId));
-
                 break;
             }
 
@@ -691,11 +685,7 @@ __global__ void splitKVCacheForWindowKernel(T const** __restrict__ inputBlocks, 
         int outputPPOffset;
         getPosId(threadBlockIdx, blockNumPerWindow, layersPerWindow, windowNum, DomainPPSize, inputBlockId,
             inputLayerId, outputAllLayerOffset, outputPPOffset);
-        // if(threadIdx.x==0){
-        //     printf("in kernel splitKVCacheForWindowKernel, thradIdx.x :%d ,threadBlockIdx:%d,
-        //     inputBlockId:%d,nputLayerId:%d, outputAllLayerOffset:%d, outputPPOffset:%d\n ", threadIdx.x,
-        //     threadBlockIdx, inputBlockId, inputLayerId, outputAllLayerOffset, outputPPOffset);
-        // }
+
         T const* inputBlockPtr = inputBlocks[inputBlockId];
         T const* inputLayerPtr = inputBlockPtr + inputLayerId * 2 * headNum * tokensPerBlock * dimsPerHead;
         size_t outputLayerEleOffset = outputAllLayerOffset * 2 * headNumDomainTP * tokensPerBlock * dimsPerHead;
@@ -869,9 +859,6 @@ __global__ void concatKVCacheForWindowKernel(T const** __restrict__ inputCaches,
         int inputPPOffset;
         getPosId(threadBlockIdx, blockNumPerWindow, layersPerWindow, windowNum, DomainPPSize, outputBlockId,
             outputLayerId, inputAllLayerOffset, inputPPOffset);
-        // printf("in kernel concatKVCacheForWindowKernel, thradIdx.x :%d ,threadBlockIdx:%d,
-        // outputBlockId:%d,outputLayerId:%d, inputAllLayerOffset:%d, inputPPOffset:%d\n", threadIdx.x, threadBlockIdx,
-        // outputBlockId, outputLayerId, inputAllLayerOffset, inputPPOffset);
         T* outputBlockPtr = outputBlocks[outputBlockId];
         T* outputLayerPtr = outputBlockPtr + outputLayerId * 2 * headNum * tokensPerBlock * dimsPerHead;
         size_t inputLayerEleOffset = inputAllLayerOffset * 2 * headNumDomainTP * tokensPerBlock * dimsPerHead;
