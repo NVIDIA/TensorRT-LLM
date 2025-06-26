@@ -7,7 +7,6 @@ import torch
 
 from ..._utils import get_sm_version
 from ..attention_backend.trtllm import AttentionBackend, TrtllmAttention
-from ..model_config import TConfig
 
 
 class SpeculativeDecodingMode(IntEnum):
@@ -16,7 +15,7 @@ class SpeculativeDecodingMode(IntEnum):
     EAGLE3 = auto()
     EAGLE3_ONE_MODEL = auto()
     NGRAM = auto()
-    DRAFT_TARGET = auto()
+    DRAFTTARGET = auto()
     NONE = auto()
 
     def is_mtp(self):
@@ -41,7 +40,7 @@ class SpeculativeDecodingMode(IntEnum):
         return self == SpeculativeDecodingMode.NONE
 
     def is_draft_target(self):
-        return self == SpeculativeDecodingMode.DRAFT_TARGET
+        return self == SpeculativeDecodingMode.DRAFTTARGET
 
     def without_logits(self):
         return self.is_mtp() or self.is_eagle3_one_model()
@@ -90,38 +89,6 @@ class SpeculativeDecodingMode(IntEnum):
         if name is None:
             return SpeculativeDecodingMode.NONE
         return SpeculativeDecodingMode[name.upper()]
-
-
-@dataclass
-class SpecConfig:
-    """
-    Configuration for speculative decoding.
-    """
-    # The name of speculative decoding.
-    spec_dec_name = None
-    # The mode of speculative decoding.
-    spec_dec_mode: SpeculativeDecodingMode = SpeculativeDecodingMode.NONE
-    # The max number of draft tokens
-    max_draft_tokens: int = 1024
-    # The path to the draft model
-    draft_model_path: Optional[str] = None
-    # The number of extra kv tokens
-    num_extra_kv_tokens: int = 0
-
-    def __post_init__(self) -> None:
-        self.spec_dec_mode = SpeculativeDecodingMode.from_string(
-            self.spec_dec_name)
-
-    def update_from_model_config(self, model_config: TConfig):
-        pass
-
-    def get_draft_model_prompt(self,
-                               input_tokens: torch.Tensor) -> torch.Tensor:
-        """
-        Override for spec dec modes that need to preprocess prompt
-        tokens before passing them to the draft model.
-        """
-        return input_tokens
 
 
 @dataclass

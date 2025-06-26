@@ -160,7 +160,7 @@ def setup_llm(args):
             )
 
         spec_config = MTPDecodingConfig(
-            num_nextn_predict_layers=args.spec_decode_nextn,
+            max_draft_len=args.spec_decode_nextn,
             use_relaxed_acceptance_for_thinking=args.
             use_relaxed_acceptance_for_thinking,
             relaxed_topk=args.relaxed_topk,
@@ -168,12 +168,12 @@ def setup_llm(args):
     elif spec_decode_algo == "EAGLE3":
         spec_config = EagleDecodingConfig(
             max_draft_len=args.spec_decode_nextn,
-            pytorch_weights_path=args.draft_model_dir,
+            speculative_model=args.draft_model_dir,
             eagle3_one_model=args.use_one_model)
     elif spec_decode_algo == "DRAFT_TARGET":
         spec_config = DraftTargetDecodingConfig(
             max_draft_len=args.spec_decode_nextn,
-            pytorch_weights_path=args.draft_model_dir)
+            speculative_model=args.draft_model_dir)
     elif spec_decode_algo == "NGRAM":
         spec_config = NGramDecodingConfig(
             prompt_lookup_num_tokens=args.spec_decode_nextn,
