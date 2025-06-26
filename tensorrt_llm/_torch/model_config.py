@@ -269,7 +269,6 @@ class ModelConfig(Generic[TConfig]):
                            quant_config=quant_config,
                            quant_config_dict=layer_quant_config,
                            **kwargs)
-
         model_config._frozen = True
         return model_config
 
