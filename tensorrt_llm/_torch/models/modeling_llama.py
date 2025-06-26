@@ -277,11 +277,13 @@ class Llama4MoE(nn.Module):
             apply_router_weight_on_input=True,
             layer_idx=layer_idx)
 
-        self.router = Linear(hidden_size,
-                             num_experts,
-                             bias=False,
-                             dtype=config.torch_dtype,
-                             quant_config=None)
+        self.router = Linear(
+            hidden_size,
+            num_experts,
+            bias=False,
+            dtype=config.torch_dtype,
+            quant_config=None,
+            force_dynamic_quantization=model_config.force_dynamic_quantization)
 
         self.mapping = model_config.mapping
         self.all_reduce = AllReduce(

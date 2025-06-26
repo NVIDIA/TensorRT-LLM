@@ -87,6 +87,8 @@ class ModelConfig(Generic[TConfig]):
     # Allow models to select op according to whether CUDA Graphs are used.
     use_cuda_graph: bool = False
 
+    force_dynamic_quantization: bool = False
+
     extra_attrs: Dict = field(default_factory=dict, repr=False, init=False)
 
     _frozen: bool = field(default=False, init=False, repr=False)
@@ -176,7 +178,6 @@ class ModelConfig(Generic[TConfig]):
     def from_pretrained(cls,
                         checkpoint_dir: str,
                         trust_remote_code=False,
-                        force_dynamic_quantization=False,
                         **kwargs):
         pretrained_config = transformers.AutoConfig.from_pretrained(
             checkpoint_dir,
@@ -264,12 +265,11 @@ class ModelConfig(Generic[TConfig]):
                     128), "FP8_BLOCK_SCALES only supports block_size=(128,128)"
                 quant_config.group_size = block_size[0]
 
-        quant_config.force_dynamic_quantization = force_dynamic_quantization
-
         model_config = cls(pretrained_config=pretrained_config,
                            quant_config=quant_config,
                            quant_config_dict=layer_quant_config,
                            **kwargs)
+
         model_config._frozen = True
         return model_config
 
