@@ -851,16 +851,16 @@ __global__ void applyMLARopeAppendPagedKVAssignQKernel(KVBlockArray kv_cache, T*
                     if constexpr (std::is_same_v<TCache, T>)
                     {
                         reinterpret_cast<VecT*>(kDst)[inBlockIdx] = data;
-                        // copy to latent_cache (for chunked prefill, it will not load kv cache for uncached k_pe)
-                        auto const src_k_global_offset
-                            = static_cast<size_t>(global_token_idx) * (K_DIM + ROPE_DIM) + K_DIM;
-                        *reinterpret_cast<VecT*>(&latent_cache_ptr[src_k_global_offset + head_dim_idx]) = data;
                     }
                     else if constexpr (std::is_same_v<TCache, __nv_fp8_e4m3>)
                     {
                         quantCopy<T, ELTS_PER_VEC>(reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
                             reinterpret_cast<T const*>(&data), quant_scale_kv_val);
                     }
+                    // copy to latent_cache (for chunked prefill, it will not load kv cache for uncached k_pe)
+                    // we only need to copy original value.
+                    auto const src_k_global_offset = static_cast<size_t>(global_token_idx) * (K_DIM + ROPE_DIM) + K_DIM;
+                    *reinterpret_cast<VecT*>(&latent_cache_ptr[src_k_global_offset + head_dim_idx]) = data;
                 }
                 else
                 {
