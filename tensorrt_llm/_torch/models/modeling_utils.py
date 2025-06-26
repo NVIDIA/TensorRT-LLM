@@ -687,13 +687,18 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                     fw = filter_weights('.'.join(names[:-1] + [new_name]),
                                         weights)
                     if new_name in ['k_proj', 'v_proj']:
+                        num_kv_heads_list = [num_kv_heads
+                                             ] * len(fw) if isinstance(
+                                                 num_kv_heads,
+                                                 int) else num_kv_heads
                         fw = {
                             k:
-                            duplicate_kv_weight(weight=v[:],
-                                                num_kv_heads=num_kv_heads,
-                                                tensor_parallel_size=tp_size)
+                            duplicate_kv_weight(
+                                weight=v[:],
+                                num_kv_heads=num_kv_heads_list[i],
+                                tensor_parallel_size=tp_size)
                             if k in ["weight", "bias"] else v
-                            for k, v in fw.items()
+                            for i, (k, v) in enumerate(fw.items())
                         }
 
                     module_weights.append(fw)
