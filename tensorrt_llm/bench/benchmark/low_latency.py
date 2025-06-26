@@ -15,9 +15,9 @@ from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
 from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
 from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
-from tensorrt_llm.bench.tuning.dataclasses import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy
+from tensorrt_llm.bench.tuning.dataclasses import BenchmarkEnvironment
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
 # isort: off

@@ -1,7 +1,7 @@
 import json
 from functools import partial
 from pathlib import Path
-from typing import List, TextIO, Tuple, Union, Optional
+from typing import List, Optional, TextIO, Tuple, Union
 
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
