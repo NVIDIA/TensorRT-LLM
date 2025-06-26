@@ -1409,18 +1409,17 @@ class PyTorchModelEngine(ModelEngine):
                                                   pin_memory=True)
             self.previous_batch_indices_cuda[:previous_batch_tokens].copy_(
                 previous_batch_indices, non_blocking=True)
-            self.input_ids_cuda[num_tokens:num_tokens + previous_batchs].copy_(
-                new_tokens_device[
-                    self.previous_batch_indices_cuda[:previous_batchs]],
-                non_blocking=True)
-            # for beam search
-            batch_and_beam_indices = ( # TODO -- fix this
+            # all beams of a request share the same previous_batch_index, so we need to add the beam id to each beam
+            batch_and_beam_indices = (
                 self.max_beam_width *
                 self.previous_batch_indices_cuda[:previous_batchs])
+            # reshape to expose the beam_width as its own dimension and add the beam id to each beam for each request
             batch_and_beam_indices = batch_and_beam_indices.reshape(
                 -1, self.max_beam_width) + torch.arange(
                     self.max_beam_width, device=batch_and_beam_indices.device)
             batch_and_beam_indices = batch_and_beam_indices.reshape(-1)
+            self.input_ids_cuda[num_tokens:num_tokens + previous_batchs].copy_(
+                new_tokens_device[batch_and_beam_indices], non_blocking=True)
 
         position_ids = torch.tensor(position_ids,
                                     dtype=torch.int,
