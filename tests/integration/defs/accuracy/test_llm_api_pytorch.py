@@ -1065,45 +1065,36 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @parametrize_with_ids("fp8kv,attention_dp,cuda_graph,overlap_scheduler",
-                          [(False, False, False, False),
-                           (False, True, False, False),
-                           (False, False, True, False),
-                           (False, False, False, True),
-                           (False, True, True, True), (True, True, True, True)])
-    @parametrize_with_ids("mtp_nextn", [0])
+    @parametrize_with_ids("fp8kv,overlap_scheduler", [
+        (False, False),
+        (True, False),
+        (False, True),
+        (True, True),
+    ])
     @parametrize_with_ids("kv_cache_reuse", [True, False])
     @parametrize_with_ids(
         "quant_dtype",
         [
             pytest.param("none", marks=skip_pre_blackwell),
             # pytest.param("fp8", marks=skip_pre_hopper),
-            # pytest.param("nvfp4", marks=skip_pre_blackwell)
+            pytest.param("nvfp4", marks=skip_pre_blackwell)
         ])
     # currently, chunked prefill is not supported for fp8 and nvfp4
-    def test_chunked_prefill(self, quant_dtype, mtp_nextn, kv_cache_reuse,
-                             fp8kv, attention_dp, cuda_graph,
+    def test_chunked_prefill(self, quant_dtype, kv_cache_reuse, fp8kv,
                              overlap_scheduler):
-        if quant_dtype == "nvfp4" and mtp_nextn > 0:
-            pytest.skip("MTP is not supported for NVFP4")
-        if fp8kv:
-            pytest.skip("Currently do not support fp8")
-
         model_path = self.MODEL_PATH
         if quant_dtype == "fp8":
             model_path = f"{llm_models_root()}/DeepSeek-V3-Lite/fp8"
         elif quant_dtype == "nvfp4":
             model_path = f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only"
 
+        if quant_dtype == "none" and fp8kv:
+            pytest.skip("only fp8 and nvfp4 support fp8 kv cache")
+
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=kv_cache_reuse)
-        pytorch_config = dict(
-            disable_overlap_scheduler=not overlap_scheduler,
-            use_cuda_graph=cuda_graph,
-        )
+        pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler, )
         mtp_config = None
-        if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
 
         if quant_dtype == "none":
             assert not fp8kv
@@ -1124,7 +1115,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                   max_num_tokens=512,
                   **pytorch_config,
                   quant_config=quant_config,
-                  enable_attention_dp=attention_dp,
+                  enable_attention_dp=True,
                   speculative_config=mtp_config)
 
         if quant_dtype == "fp8":

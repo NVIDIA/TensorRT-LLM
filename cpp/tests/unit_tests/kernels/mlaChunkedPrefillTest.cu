@@ -21,12 +21,13 @@ namespace
 {
 // kv_output {total_tokens, h=1, lora_size}
 // k_pe_output {total_tokens, h=1, rope_size}
-template <typename T>
+template <typename T, typename TCache>
 void loadChunkedKVKernelRef(T* kv_output, T* k_pe_output, tensorrt_llm::kernels::KVBlockArray const& kv_cache,
     int num_contexts, int64_t const* cu_ctx_chunked_len, int const lora_size, int const rope_size, int const chunk_size,
-    int const chunk_idx)
+    int const chunk_idx, float const* kv_scale_quant_orig_ptr)
 {
     int const head_size = lora_size + rope_size;
+    float const kv_scale_quant_orig = kv_scale_quant_orig_ptr ? kv_scale_quant_orig_ptr[0] : 1.0f;
     for (int b = 0; b < num_contexts; b++)
     {
         int const chunked_len = cu_ctx_chunked_len[b + 1] - cu_ctx_chunked_len[b];
@@ -35,19 +36,27 @@ void loadChunkedKVKernelRef(T* kv_output, T* k_pe_output, tensorrt_llm::kernels:
             int const local_token_idx = chunk_idx * chunk_size + s;
             int const ld_token_offset = (cu_ctx_chunked_len[b] + s);
 
-            auto const* kv_src = reinterpret_cast<T const*>(kv_cache.getKBlockPtr(b, local_token_idx));
+            auto const* kv_src = reinterpret_cast<TCache const*>(kv_cache.getKBlockPtr(b, local_token_idx));
             for (int d = 0; d < head_size; d++)
             {
                 auto kv_block_idx = kv_cache.getKVLocalIdx(local_token_idx, 0, head_size, d);
                 auto src_data = kv_src[kv_block_idx];
-
-                if (d < lora_size)
+                T data;
+                if constexpr (std::is_same_v<TCache, __nv_fp8_e4m3>)
                 {
-                    kv_output[ld_token_offset * lora_size + d] = src_data;
+                    data = T(float(src_data) * kv_scale_quant_orig);
                 }
                 else
                 {
-                    k_pe_output[ld_token_offset * rope_size + (d - lora_size)] = src_data;
+                    data = src_data;
+                }
+                if (d < lora_size)
+                {
+                    kv_output[ld_token_offset * lora_size + d] = data;
+                }
+                else
+                {
+                    k_pe_output[ld_token_offset * rope_size + (d - lora_size)] = data;
                 }
             }
         }
@@ -294,12 +303,14 @@ float getTolerance(float scale = 1.f)
 }
 }; // namespace
 
-template <typename _DataType>
+template <typename Typepair>
 class MlaChunkedPrefillTest : public ::testing::Test
 {
 protected:
-    using DataType = _DataType;
-
+    using DataType = typename Typepair::first_type;
+    using TCache = typename Typepair::second_type;
+    static_assert(std::is_same_v<DataType, TCache> || std::is_same_v<TCache, __nv_fp8_e4m3>,
+        "TCache must be either the same type as DataType or __nv_fp8_e4m3");
     std::shared_ptr<tensorrt_llm::runtime::CudaStream> mStream;
 
     tensorrt_llm::runtime::BufferManager::ITensorPtr h_kv_cache_tensor{nullptr}, h_kv_cache_tensor_ref{nullptr},
@@ -311,6 +322,7 @@ protected:
         // for kernel 1
         h_compressed_kv_output{nullptr}, d_compressed_kv_output{nullptr}, h_k_pe_output{nullptr},
         d_k_pe_output{nullptr}, h_compressed_kv_output_ref{nullptr}, h_k_pe_output_ref{nullptr},
+        h_kv_scale_quant_orig{nullptr}, d_kv_scale_quant_orig{nullptr},
 
         // for kernel 2
         h_kv_tensor{nullptr}, d_kv_tensor{nullptr}, h_k_pe_tensor{nullptr}, d_k_pe_tensor{nullptr},
@@ -476,6 +488,20 @@ protected:
         {
             return false;
         }
+        auto cacheType = dtype;
+        if constexpr (std::is_same_v<TCache, __nv_fp8_e4m3>)
+        {
+            cacheType = nvinfer1::DataType::kFP8;
+            this->h_kv_scale_quant_orig
+                = tensorrt_llm::runtime::BufferManager::pinned(ITensor::makeShape({1}), nvinfer1::DataType::kFLOAT);
+            this->d_kv_scale_quant_orig
+                = tensorrt_llm::runtime::BufferManager::gpuSync(ITensor::makeShape({1}), nvinfer1::DataType::kFLOAT);
+            auto* kv_scale_quant_orig_ptr = bufferCast<float>(*(this->h_kv_scale_quant_orig));
+            float kv_scale_orig_quant = 2.0F;
+            kv_scale_quant_orig_ptr[0] = 1.0 / kv_scale_orig_quant;
+            cudaMemcpy(this->d_kv_scale_quant_orig->data(), this->h_kv_scale_quant_orig->data(),
+                this->h_kv_scale_quant_orig->getSizeInBytes(), cudaMemcpyHostToDevice);
+        }
 
         // cu lens
         this->h_cu_kv_seq_lens = tensorrt_llm::runtime::BufferManager::pinned(
@@ -544,18 +570,18 @@ protected:
         this->h_compressed_kv_cache_tensor = tensorrt_llm::runtime::BufferManager::pinned(
             ITensor::makeShape({this->mBatchSize, 2, this->mMaxBlockPerSeq, this->mNumHeads, this->mTokensPerBlock,
                 this->mLoraSize + this->mRopeSize}),
-            dtype);
+            cacheType);
         this->h_compressed_offset_tensor = tensorrt_llm::runtime::BufferManager::pinned(
             ITensor::makeShape({this->mBatchSize, 2, this->mMaxBlockPerSeq + 1}), nvinfer1::DataType::kINT32);
         this->d_kv_cache_tensor
             = tensorrt_llm::runtime::BufferManager::gpuSync(this->h_kv_cache_tensor->getShape(), dtype);
         this->d_compressed_kv_cache_tensor
-            = tensorrt_llm::runtime::BufferManager::gpuSync(this->h_compressed_kv_cache_tensor->getShape(), dtype);
+            = tensorrt_llm::runtime::BufferManager::gpuSync(this->h_compressed_kv_cache_tensor->getShape(), cacheType);
         this->d_compressed_offset_tensor = tensorrt_llm::runtime::BufferManager::gpuSync(
             this->h_compressed_offset_tensor->getShape(), nvinfer1::DataType::kINT32);
 
         {
-            auto* compressed_kv_cache_ptr = bufferCast<DataType>(*(this->h_compressed_kv_cache_tensor));
+            auto* compressed_kv_cache_ptr = bufferCast<TCache>(*(this->h_compressed_kv_cache_tensor));
             auto* offset_ptr = bufferCast<int32_t>(*(this->h_compressed_offset_tensor));
 
             this->memsetZeroHost(this->h_kv_cache_tensor);
@@ -841,17 +867,22 @@ protected:
 
         auto* compressed_kv_output_ptr = bufferCast<DataType>(*(this->h_compressed_kv_output_ref));
         auto* k_pe_output_ptr = bufferCast<DataType>(*(this->h_k_pe_output_ref));
-        auto* compressed_kv_cache_ptr = bufferCast<DataType>(*(this->h_compressed_kv_cache_tensor));
+        auto* compressed_kv_cache_ptr = bufferCast<TCache>(*(this->h_compressed_kv_cache_tensor));
         auto* offset_ptr = bufferCast<int32_t>(*(this->h_compressed_offset_tensor));
         auto* h_cu_chunk_lens_ptr = bufferCast<int64_t>(*(this->h_cu_chunk_lens));
-
+        float* kv_scale_quant_orig_ptr = nullptr;
+        if constexpr (std::is_same_v<TCache, __nv_fp8_e4m3>)
+        {
+            kv_scale_quant_orig_ptr = bufferCast<float>(*(this->h_kv_scale_quant_orig));
+        }
         tensorrt_llm::kernels::KVBlockArray kv_cache(this->mBatchSize, this->mMaxBlockPerSeq, this->mTokensPerBlock,
-            sizeof(DataType) * 1 * (this->mLoraSize + this->mRopeSize), 0, 0, 0, 0, compressed_kv_cache_ptr, nullptr,
+            sizeof(TCache) * 1 * (this->mLoraSize + this->mRopeSize), 0, 0, 0, 0, compressed_kv_cache_ptr, nullptr,
             reinterpret_cast<tensorrt_llm::kernels::KVBlockArrayForContextFMHA::DataType*>(offset_ptr));
         this->PrepareChunkedLen(chunk_idx);
 
-        loadChunkedKVKernelRef(compressed_kv_output_ptr, k_pe_output_ptr, kv_cache, this->mBatchSize,
-            h_cu_chunk_lens_ptr, this->mLoraSize, this->mRopeSize, this->mChunkSize, chunk_idx);
+        loadChunkedKVKernelRef<DataType, TCache>(compressed_kv_output_ptr, k_pe_output_ptr, kv_cache, this->mBatchSize,
+            h_cu_chunk_lens_ptr, this->mLoraSize, this->mRopeSize, this->mChunkSize, chunk_idx,
+            kv_scale_quant_orig_ptr);
     }
 
     void PreformLoadChunkedKV(int chunk_idx)
@@ -860,20 +891,24 @@ protected:
 
         auto* compressed_kv_output_ptr = bufferCast<DataType>(*(this->d_compressed_kv_output));
         auto* k_pe_output_ptr = bufferCast<DataType>(*(this->d_k_pe_output));
-        auto* compressed_kv_cache_ptr = bufferCast<DataType>(*(this->d_compressed_kv_cache_tensor));
+        auto* compressed_kv_cache_ptr = bufferCast<TCache>(*(this->d_compressed_kv_cache_tensor));
         auto* offset_ptr = bufferCast<int32_t>(*(this->d_compressed_offset_tensor));
         auto* d_cu_chunk_lens_ptr = bufferCast<int64_t>(*(this->d_cu_chunk_lens));
-
+        float* kv_scale_quant_orig_ptr = nullptr;
+        if constexpr (std::is_same_v<TCache, __nv_fp8_e4m3>)
+        {
+            kv_scale_quant_orig_ptr = bufferCast<float>(*(this->d_kv_scale_quant_orig));
+        }
         tensorrt_llm::kernels::KVBlockArray kv_cache(this->mBatchSize, this->mMaxBlockPerSeq, this->mTokensPerBlock,
-            sizeof(DataType) * 1 * (this->mLoraSize + this->mRopeSize), 0, 0, 0, 0, compressed_kv_cache_ptr, nullptr,
+            sizeof(TCache) * 1 * (this->mLoraSize + this->mRopeSize), 0, 0, 0, 0, compressed_kv_cache_ptr, nullptr,
             reinterpret_cast<tensorrt_llm::kernels::KVBlockArrayForContextFMHA::DataType*>(offset_ptr));
         this->PrepareChunkedLen(chunk_idx);
         // copy cu chunk lens to device
         cudaMemcpy(this->d_cu_chunk_lens->data(), this->h_cu_chunk_lens->data(),
             this->h_cu_chunk_lens->getSizeInBytes(), cudaMemcpyHostToDevice);
-        tensorrt_llm::kernels::invokeMLALoadChunkedKV<DataType>(compressed_kv_output_ptr, k_pe_output_ptr, kv_cache,
-            this->mBatchSize, d_cu_chunk_lens_ptr, this->mLoraSize, this->mRopeSize, this->mChunkSize, chunk_idx,
-            mStream->get());
+        tensorrt_llm::kernels::invokeMLALoadChunkedKV<DataType, TCache>(compressed_kv_output_ptr, k_pe_output_ptr,
+            kv_cache, this->mBatchSize, d_cu_chunk_lens_ptr, this->mLoraSize, this->mRopeSize, this->mChunkSize,
+            chunk_idx, kv_scale_quant_orig_ptr, mStream->get());
         cudaStreamSynchronize(this->mStream->get());
         // copy result back to host
         cudaMemcpy(this->h_compressed_kv_output->data(), compressed_kv_output_ptr,
@@ -917,7 +952,9 @@ protected:
     }
 };
 
-using MLATypes = ::testing::Types<half, __nv_bfloat16, float>;
+using MLATypes
+    = ::testing::Types<std::pair<half, half>, std::pair<__nv_bfloat16, __nv_bfloat16>, std::pair<float, float>,
+        std::pair<half, __nv_fp8_e4m3>, std::pair<__nv_bfloat16, __nv_fp8_e4m3>, std::pair<float, __nv_fp8_e4m3>>;
 
 TYPED_TEST_SUITE(MlaChunkedPrefillTest, MLATypes);
 
@@ -925,69 +962,77 @@ TYPED_TEST(MlaChunkedPrefillTest, MlaChunkedPrefillDefault)
 {
     using tensorrt_llm::runtime::bufferCast;
     using DataType = typename TestFixture::DataType;
-    this->setDefaultParams();
-    this->allocateBuffers();
-
-    sync_check_cuda_error(this->mStream->get());
-    bool allEqual{true};
-
-    this->PerformNormalAttention();
-    sync_check_cuda_error(this->mStream->get());
-
-    this->PerformMergedAttention();
-    sync_check_cuda_error(this->mStream->get());
-
-    // check result
-    auto* output_ptr = bufferCast<DataType>(*(this->m_h_output_tensor_accum));
-    auto* output_ref_ptr = bufferCast<DataType>(*(this->m_h_output_tensor_ref));
-    for (int i = 0; i < this->m_h_output_tensor->getSize(); i++)
+    using TCache = typename TestFixture::TCache;
+    if constexpr (std::is_same_v<DataType, TCache>)
     {
-        if (std::abs(static_cast<float>(output_ptr[i]) - static_cast<float>(output_ref_ptr[i]))
-            > getTolerance<DataType>(output_ptr[i]))
+        this->setDefaultParams();
+        this->allocateBuffers();
+
+        sync_check_cuda_error(this->mStream->get());
+        bool allEqual{true};
+
+        this->PerformNormalAttention();
+        sync_check_cuda_error(this->mStream->get());
+
+        this->PerformMergedAttention();
+        sync_check_cuda_error(this->mStream->get());
+
+        // check result
+        auto* output_ptr = bufferCast<DataType>(*(this->m_h_output_tensor_accum));
+        auto* output_ref_ptr = bufferCast<DataType>(*(this->m_h_output_tensor_ref));
+        for (int i = 0; i < this->m_h_output_tensor->getSize(); i++)
         {
-            std::cout << "Output mismatch at index " << i << ": "
-                      << "expected " << static_cast<float>(output_ref_ptr[i]) << ", got "
-                      << static_cast<float>(output_ptr[i]) << std::endl;
-            allEqual = false;
-            break;
+            if (std::abs(static_cast<float>(output_ptr[i]) - static_cast<float>(output_ref_ptr[i]))
+                > getTolerance<DataType>(output_ptr[i]))
+            {
+                std::cout << "Output mismatch at index " << i << ": "
+                          << "expected " << static_cast<float>(output_ref_ptr[i]) << ", got "
+                          << static_cast<float>(output_ptr[i]) << std::endl;
+                allEqual = false;
+                break;
+            }
         }
+        ASSERT_TRUE(allEqual);
     }
-    ASSERT_TRUE(allEqual);
 }
 
 TYPED_TEST(MlaChunkedPrefillTest, MlaChunkedPrefillCausalMask)
 {
     using tensorrt_llm::runtime::bufferCast;
     using DataType = typename TestFixture::DataType;
-    this->setDefaultParams();
-    this->mIsCausalMask = true;
-    this->allocateBuffers();
-
-    sync_check_cuda_error(this->mStream->get());
-    bool allEqual{true};
-
-    this->PerformNormalAttention();
-    sync_check_cuda_error(this->mStream->get());
-
-    this->PerformMergedAttention();
-    sync_check_cuda_error(this->mStream->get());
-
-    // check result
-    auto* output_ptr = bufferCast<DataType>(*(this->m_h_output_tensor_accum));
-    auto* output_ref_ptr = bufferCast<DataType>(*(this->m_h_output_tensor_ref));
-    for (int i = 0; i < this->m_h_output_tensor->getSize(); i++)
+    using TCache = typename TestFixture::TCache;
+    if constexpr (std::is_same_v<DataType, TCache>)
     {
-        if (std::abs(static_cast<float>(output_ptr[i]) - static_cast<float>(output_ref_ptr[i]))
-            > getTolerance<DataType>(output_ptr[i]))
+        this->setDefaultParams();
+        this->mIsCausalMask = true;
+        this->allocateBuffers();
+
+        sync_check_cuda_error(this->mStream->get());
+        bool allEqual{true};
+
+        this->PerformNormalAttention();
+        sync_check_cuda_error(this->mStream->get());
+
+        this->PerformMergedAttention();
+        sync_check_cuda_error(this->mStream->get());
+
+        // check result
+        auto* output_ptr = bufferCast<DataType>(*(this->m_h_output_tensor_accum));
+        auto* output_ref_ptr = bufferCast<DataType>(*(this->m_h_output_tensor_ref));
+        for (int i = 0; i < this->m_h_output_tensor->getSize(); i++)
         {
-            std::cout << "Output mismatch at index " << i << ": "
-                      << "expected " << static_cast<float>(output_ref_ptr[i]) << ", got "
-                      << static_cast<float>(output_ptr[i]) << std::endl;
-            allEqual = false;
-            break;
+            if (std::abs(static_cast<float>(output_ptr[i]) - static_cast<float>(output_ref_ptr[i]))
+                > getTolerance<DataType>(output_ptr[i]))
+            {
+                std::cout << "Output mismatch at index " << i << ": "
+                          << "expected " << static_cast<float>(output_ref_ptr[i]) << ", got "
+                          << static_cast<float>(output_ptr[i]) << std::endl;
+                allEqual = false;
+                break;
+            }
         }
+        ASSERT_TRUE(allEqual);
     }
-    ASSERT_TRUE(allEqual);
 }
 
 TYPED_TEST(MlaChunkedPrefillTest, MlaChunkedLoad)
@@ -1048,32 +1093,36 @@ TYPED_TEST(MlaChunkedPrefillTest, MlaChunkedSet)
 {
     using tensorrt_llm::runtime::bufferCast;
     using DataType = typename TestFixture::DataType;
-    this->setDefaultParams();
-    this->allocateBuffers();
-
-    sync_check_cuda_error(this->mStream->get());
-    bool allEqual{true};
-
-    this->PerformSetChunkedKVRef();
-    sync_check_cuda_error(this->mStream->get());
-    this->PerformSetChunkedKV();
-    sync_check_cuda_error(this->mStream->get());
-
-    // check result
-    auto* kv_cache_ptr = bufferCast<DataType>(*(this->h_kv_cache_tensor));
-    auto* kv_cache_ptr_ref = bufferCast<DataType>(*(this->h_kv_cache_tensor_ref));
-
-    for (int i = 0; i < this->h_kv_cache_tensor->getSize(); i++)
+    using TCache = typename TestFixture::TCache;
+    if constexpr (std::is_same_v<DataType, TCache>)
     {
-        if (std::abs(static_cast<float>(kv_cache_ptr[i]) - static_cast<float>(kv_cache_ptr_ref[i]))
-            > getTolerance<DataType>(kv_cache_ptr[i]))
+        this->setDefaultParams();
+        this->allocateBuffers();
+
+        sync_check_cuda_error(this->mStream->get());
+        bool allEqual{true};
+
+        this->PerformSetChunkedKVRef();
+        sync_check_cuda_error(this->mStream->get());
+        this->PerformSetChunkedKV();
+        sync_check_cuda_error(this->mStream->get());
+
+        // check result
+        auto* kv_cache_ptr = bufferCast<DataType>(*(this->h_kv_cache_tensor));
+        auto* kv_cache_ptr_ref = bufferCast<DataType>(*(this->h_kv_cache_tensor_ref));
+
+        for (int i = 0; i < this->h_kv_cache_tensor->getSize(); i++)
         {
-            std::cout << "KV cache mismatch at index " << i << ": "
-                      << "expected " << static_cast<float>(kv_cache_ptr_ref[i]) << ", got "
-                      << static_cast<float>(kv_cache_ptr[i]) << std::endl;
-            allEqual = false;
-            break;
+            if (std::abs(static_cast<float>(kv_cache_ptr[i]) - static_cast<float>(kv_cache_ptr_ref[i]))
+                > getTolerance<DataType>(kv_cache_ptr[i]))
+            {
+                std::cout << "KV cache mismatch at index " << i << ": "
+                          << "expected " << static_cast<float>(kv_cache_ptr_ref[i]) << ", got "
+                          << static_cast<float>(kv_cache_ptr[i]) << std::endl;
+                allEqual = false;
+                break;
+            }
         }
+        ASSERT_TRUE(allEqual);
     }
-    ASSERT_TRUE(allEqual);
 }

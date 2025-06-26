@@ -216,8 +216,7 @@ def create_py_executor(
         cache_reuse=executor_config.kv_cache_config.enable_block_reuse,
         has_speculative_draft_tokens=has_draft_model_engine
         or has_ngram_drafter,
-        chunk_unit_size=executor_config.tokens_per_block,
-        normal_chunk_size=executor_config.max_num_tokens,
+        chunk_size=executor_config.max_num_tokens,
     )
     logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
 
@@ -306,6 +305,15 @@ def create_py_executor(
                 f"disable enable_block_reuse for KV cache quant algorithm: {kv_cache_quant_algo}"
             )
             executor_config.kv_cache_config.enable_block_reuse = False
+        if executor_config.enable_chunked_context and not (get_sm_version()
+                                                           == 100):
+            logger.warning(
+                "Chunked Prefill for MLA can only be enabled on SM100, "
+                f"disable enable_block_reuse for SM{get_sm_version()}")
+            executor_config.enable_chunked_context = False
+            model_engine.attn_runtime_features.chunked_prefill = False
+            if draft_model_engine is not None:
+                draft_model_engine.attn_runtime_features.chunked_prefill = False
 
     if executor_config.enable_chunked_context:
         chunk_unit_size = executor_config.tokens_per_block

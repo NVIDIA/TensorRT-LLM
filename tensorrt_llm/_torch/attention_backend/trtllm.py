@@ -728,7 +728,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         This method is called before the forward pass to prepare the MLA layer for chunked prefill.
         """
         num_contexts = self.num_contexts
-        chunk_size = self.runtime_features.normal_chunk_size
+        chunk_size = self.runtime_features.chunk_size
         cached_kv_lens = torch.tensor(
             self.kv_cache_params.num_cached_tokens_per_seq,
             dtype=torch.int,
@@ -775,7 +775,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # determine the number of loop
             # currently we assume that the chunk size is the same as the max_num_tokens
             if self.runtime_features.chunked_prefill:
-                chunk_size = self.runtime_features.normal_chunk_size
+                chunk_size = self.runtime_features.chunk_size
                 self.chunked_loop_num = (self.max_ctx_cached_token_len +
                                          chunk_size - 1) // chunk_size
                 self.chunked_seq_len = torch.empty(
@@ -1152,11 +1152,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.kv_cache_manager.kv_cache_pool_mapping,
             self.kv_scale_orig_quant,
             self.kv_scale_quant_orig,
-            self.layer_idx,
+            self.get_local_layer_idx(metadata),
             self.mla_params.kv_lora_rank,
             self.mla_params.qk_rope_head_dim,
             metadata.kv_cache_manager.tokens_per_block,
-            metadata.runtime_features.normal_chunk_size,
+            metadata.runtime_features.chunk_size,
             chunked_idx,
             metadata.kv_cache_manager.max_seq_len,
             sink_token_length,
@@ -1224,7 +1224,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if cached:
             # this indptr is the fake.
             cu_seq_len = cu_chunked_seq_len
-            max_seq_len = metadata.runtime_features.normal_chunk_size
+            max_seq_len = metadata.runtime_features.chunk_size
         else:
             cu_seq_len = metadata.ctx_uncached_token_indptr
             max_seq_len = metadata.max_ctx_seq_len
