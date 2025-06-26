@@ -87,7 +87,7 @@ def calc_engine_setting(
         num_conv_state_elements = num_mamba_layers * conv_dim * (
             model_config.mamba_config.d_conv - 1)
         num_ssm_state_elements = num_mamba_layers * model_config.mamba_config.n_heads * model_config.mamba_config.head_dim * model_config.mamba_config.d_state
-        byte_per_state_elem = BYTES_PER_ELEM.get(quant_config.quant_algo, 2)
+        byte_per_state_elem = BYTES_PER_ELEM.get(QuantAlgo.NO_QUANT)
         byte_per_mamba_cache = byte_per_state_elem * (
             num_conv_state_elements + num_ssm_state_elements) / (1024**3)
 
