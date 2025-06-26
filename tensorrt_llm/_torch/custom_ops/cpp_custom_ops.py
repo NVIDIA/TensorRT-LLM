@@ -460,8 +460,8 @@ def _register_fake():
         expanded_source_row_to_expanded_dest_row: torch.Tensor,
         expert_for_source_row: torch.Tensor,
         expert_first_token_offset_tensor: torch.Tensor,
-        num_rows: int,
-        hidden_size: int,
+        num_rows: torch.SymInt,
+        hidden_size: torch.SymInt,
         experts_per_token: int,
         num_experts_per_node: int,
         tp_size: int,
@@ -469,8 +469,9 @@ def _register_fake():
         ep_size: int,
         ep_rank: int,
     ):
-
-        return gemm2_output.new_empty((num_rows, hidden_size),
+        num_rows_val = int(num_rows)
+        hidden_size_val = int(hidden_size)
+        return gemm2_output.new_empty((num_rows_val, hidden_size_val),
                                       dtype=gemm2_output.dtype)
 
 
