@@ -2231,6 +2231,7 @@ class MultimodalModelRunner:
             filepath = hf_hub_download(
                 repo_id="hf-internal-testing/fixtures_docvqa",
                 filename="nougat_paper.png",
+                revision="ec57bf8c8b1653a209c13f6e9ee66b12df0fc2db",
                 repo_type="dataset")
             images = Image.open(filepath)
         elif "fuyu" in self.model_type:
