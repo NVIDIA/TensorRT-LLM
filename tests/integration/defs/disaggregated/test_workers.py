@@ -559,6 +559,7 @@ def test_workers_kv_cache_events(disaggregated_test_root,
 def test_workers_kv_cache_aware_router(disaggregated_test_root,
                                        disaggregated_example_root, llm_venv,
                                        llama_model_root):
+    pytest.skip("https://nvbugspro.nvidia.com/bug/5301492")
     config_file = os.path.join(
         disaggregated_test_root,
         'test_configs/disagg_config_cache_aware_balance.yaml')
