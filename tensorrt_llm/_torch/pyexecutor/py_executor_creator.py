@@ -312,6 +312,9 @@ def create_py_executor(
                 "Chunked Prefill for MLA can only be enabled on SM100, "
                 f"disable enable_block_reuse for SM{get_sm_version()}")
             executor_config.enable_chunked_context = False
+            model_engine.attn_runtime_features.chunked_prefill = False
+            if draft_model_engine is not None:
+                draft_model_engine.attn_runtime_features.chunked_prefill = False
 
     if executor_config.enable_chunked_context:
         chunk_unit_size = executor_config.tokens_per_block
