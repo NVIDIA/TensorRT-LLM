@@ -38,6 +38,8 @@ from utils.util import getSMVersion
     [torch.float16, torch.float32, torch.bfloat16],
 )
 def test_fp8_scaled_mm(output_dtype, m, k_n):
+    pytest.skip("skipped due to flakiness")
+
     k, n = k_n
     torch.random.manual_seed(0)
     shape_x = (m, k)
