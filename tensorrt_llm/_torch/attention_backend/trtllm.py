@@ -519,7 +519,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     # TrtllmAttention needs to know the beam width and access to the cache indirection buffer,
     # when beam search is enabled.
-    # TODO -- put this into the parent class instead?
     beam_width: int = 1
     cache_indirection: Optional[torch.Tensor] = None
 
@@ -739,7 +738,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # kv block offsets
         assert self.request_ids is not None
         if self.kv_cache_manager is not None:
-            # TODO -- skip unnecessary copies
             # Copy blocks for all context requests
             self.kv_cache_manager.impl.copy_batch_block_offsets(
                 self.host_kv_cache_block_offsets,

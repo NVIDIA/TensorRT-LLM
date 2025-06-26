@@ -1230,6 +1230,9 @@ class PyExecutor:
                 break
             else:
                 valid_new_requests.append(req_item)
+        # Check if the beam width of the requests is equal to the max_beam_width
+        for req_item in valid_new_requests:
+            assert req_item.request.sampling_config.beam_width == self.model_engine.max_beam_width, f"Request beam width {req_item.request.sampling_config.beam_width} is not equal to max_beam_width {self.model_engine.max_beam_width}. This is not supported!"
         new_requests = valid_new_requests
 
         if py_request_objects and (self.dist.tp_size > 1

@@ -247,34 +247,23 @@ def main():
 
     for i, output in enumerate(outputs):
         prompt = output.prompt
-        if (args.max_beam_width == 1):
-            generated_text = output.outputs[0].text
+        for beam_idx, beam in enumerate(output.outputs):
+            generated_text = beam.text
+            # Skip printing the beam_idx if no beam search was used
+            beam_id_text = f"[{beam_idx}]" if args.max_beam_width > 1 else ""
             print(
-                f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
+                f"[{i}]{beam_id_text} Prompt: {prompt!r}, Generated text: {generated_text!r}"
+            )
             if args.return_context_logits:
-                print(f"[{i}] Context logits: {output.context_logits}")
+                print(
+                    f"[{i}]{beam_id_text} Context logits: {output.context_logits}"
+                )
             if args.return_generation_logits:
                 print(
-                    f"[{i}] Generation logits: {output.outputs[0].generation_logits}"
+                    f"[{i}]{beam_id_text} Generation logits: {beam.generation_logits}"
                 )
             if args.logprobs:
-                print(f"[{i}] Logprobs: {output.outputs[0].logprobs}")
-        else:
-            for beam_idx, beam in enumerate(output.outputs):
-                generated_text = beam.text
-                print(
-                    f"[{i}][{beam_idx}] Prompt: {prompt!r}, Generated text: {generated_text!r}"
-                )
-                if args.return_context_logits:
-                    print(
-                        f"[{i}][{beam_idx}] Context logits: {output.context_logits}"
-                    )
-                if args.return_generation_logits:
-                    print(
-                        f"[{i}][{beam_idx}] Generation logits: {beam.generation_logits}"
-                    )
-                if args.logprobs:
-                    print(f"[{i}][{beam_idx}] Logprobs: {beam.logprobs}")
+                print(f"[{i}]{beam_id_text} Logprobs: {beam.logprobs}")
 
 
 if __name__ == '__main__':

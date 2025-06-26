@@ -146,7 +146,9 @@ class LogProbStorage:
         log_probs: [beam_width, num_tokens]
         cum_log_probs: [beam_width]
         """
-        self.beam_width = -1
+        # reinitialize the storage to clear the lists
+        self._init(log_probs)
+        # append the new values
         self.append(log_probs, cum_log_probs)
 
 

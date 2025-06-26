@@ -1429,10 +1429,13 @@ class PyTorchModelEngine(ModelEngine):
             batch_and_beam_indices = ( # TODO -- fix this
                 self.max_beam_width *
                 self.previous_batch_indices_cuda[:previous_batchs])
+            # reshape to expose the beam_width as its own dimension and add the beam id to each beam for each request
             batch_and_beam_indices = batch_and_beam_indices.reshape(
                 -1, self.max_beam_width) + torch.arange(
                     self.max_beam_width, device=batch_and_beam_indices.device)
             batch_and_beam_indices = batch_and_beam_indices.reshape(-1)
+            self.input_ids_cuda[num_tokens:num_tokens + previous_batchs].copy_(
+                new_tokens_device[batch_and_beam_indices], non_blocking=True)
 
         position_ids = torch.tensor(position_ids,
                                     dtype=torch.int,

@@ -619,7 +619,7 @@ class TRTLLMSampler(Sampler):
     def sample_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs) -> SampleStateTRTLLM:
         batch_size = scheduled_requests.batch_size
-        all_requests = scheduled_requests.all_requests()
+        all_requests = scheduled_requests.all_requests
         beam_width = self.beam_width(all_requests)
         if (batch_size > 1 and beam_width > 1
                 and any(request.py_return_log_probs
@@ -711,11 +711,9 @@ class TRTLLMSampler(Sampler):
         finished_sum_host = state.host.finished_sum
         sequence_lengths_host_data = state.host.sequence_lengths
 
-        finalize_events = []
+        finalize_events = {}
 
-        
-
-        for request in requests:
+        for request in all_requests:
             if request.is_context_init_state:
                 continue
 
@@ -759,7 +757,7 @@ class TRTLLMSampler(Sampler):
                                                                   beam].item())
 
                 finished_state = FinishedState(
-                    state.host.finish_reasons[seq_slot * beam_width +
+                    state.host.finish_reasons[seq_slot,
                                               beam].item())
                 if finished_state.is_finished:
                     finish_reason = finished_state.to_finish_reason()
@@ -780,18 +778,18 @@ class TRTLLMSampler(Sampler):
             if finished_sum_host[seq_slot] == beam_width:
                 request.state = LlmRequestState.GENERATION_COMPLETE
                 if beam_width > 1:
-                    finalize_events.append(
-                        self._finalize_request(request, False))
+                    finalize_events[
+                        request.request_id] = self._finalize_request(
+                            request, False)
             elif request.streaming and beam_width > 1:
-                finalize_events.append(self._finalize_request(request, True))
+                finalize_events[request.request_id] = self._finalize_request(
+                    request, True)
         # post process all requests if necessary
         if beam_width > 1:
-            for request_position, request in enumerate(requests):
-                if request.is_context_init_state:
-                    continue
-                if request.state == LlmRequestState.GENERATION_COMPLETE or request.streaming:
+            for request in all_requests:
+                if request.request_id in finalize_events:
                     self._post_process_request(
-                        request, finalize_events[request_position])
+                        request, finalize_events[request.request_id])
 
     def _finalize_request(self, request: LlmRequest, streaming: bool):
         """ Finalizes the request. This is necessary for beam search. """

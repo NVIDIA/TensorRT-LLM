@@ -113,25 +113,26 @@ def get_pp_layers(
 class KVCacheManager(BaseResourceManager):
 
     def __init__(
-            self,
-            kv_cache_config: KvCacheConfigCpp,
-            kv_cache_type: CacheTypeCpp,
-            *,
-            num_layers: int,
-            num_kv_heads: Union[int, List[Optional[int]]],
-            head_dim: int,
-            tokens_per_block: int,
-            # Note that max_seq_len is not necessarily equal to kv_cache_config.num_tokens.
-            # It's derived from the model's BuildConfig for consistency with the C++ backend.
-            max_seq_len: int,
-            max_batch_size: int,
-            mapping: Mapping,
-            dtype: DataType = DataType.HALF,
-            spec_config: Optional["SpecConfig"] = None,
-            layer_mask: Optional[List[bool]] = None,
+        self,
+        kv_cache_config: KvCacheConfigCpp,
+        kv_cache_type: CacheTypeCpp,
+        *,
+        num_layers: int,
+        num_kv_heads: Union[int, List[Optional[int]]],
+        head_dim: int,
+        tokens_per_block: int,
+        # Note that max_seq_len is not necessarily equal to kv_cache_config.num_tokens.
+        # It's derived from the model's BuildConfig for consistency with the C++ backend.
+        max_seq_len: int,
+        max_batch_size: int,
+        mapping: Mapping,
+        dtype: DataType = DataType.HALF,
+        spec_config: Optional["SpecConfig"] = None,
+        layer_mask: Optional[List[bool]] = None,
         max_num_tokens: int = 8192,
         model_config: Optional[ModelConfig] = None,
-            max_beam_width: int = 1) -> None:
+        max_beam_width: int = 1,
+    ) -> None:
         self.mapping = mapping
         self.dtype = dtype
         self.kv_cache_type = kv_cache_type
