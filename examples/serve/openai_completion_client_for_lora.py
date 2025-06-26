@@ -1,5 +1,8 @@
 ### OpenAI Completion Client
 
+import os
+from pathlib import Path
+
 from openai import OpenAI
 
 client = OpenAI(
@@ -18,7 +21,9 @@ response = client.completions.create(
             "lora_int_id":
             0,
             "lora_path":
-            "/home/scratch.trt_llm_data/llm-models/llama-models/luotuo-lora-7b-0.1"
+            str(
+                Path(os.environ.get("LLM_MODELS_ROOT")) / "llm-models" /
+                "llama-models" / "luotuo-lora-7b-0.1")
         }
     },
 )
