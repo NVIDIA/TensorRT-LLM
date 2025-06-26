@@ -1219,7 +1219,7 @@ struct Tile_o_epilogue<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
     template <typename Params>
     inline __device__ Tile_o_epilogue(Params const& params)
         : Base(params)
-        , scale_bmm2_(*params.scale_bmm2_d)
+        , scale_bmm2_(scale_bmm2_d == nullptr ? params.scale_bmm_2 : *params.scale_bmm2_d)
     {
     }
 
