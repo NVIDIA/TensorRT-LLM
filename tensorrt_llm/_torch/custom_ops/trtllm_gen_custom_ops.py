@@ -29,8 +29,8 @@ class FP8BlockScaleMoERunner(TunableRunner):
     runner_dict = dict()
     tuning_config = None
 
-    def __init__(self, num_experts: int, top_k: int, n_group: int,
-                 topk_group: int, intermediate_size: int,
+    def __init__(self, num_experts: int, top_k: int, fuse_shared_expert: bool,
+                 n_group: int, topk_group: int, intermediate_size: int,
                  local_expert_offset: int, local_num_experts: int,
                  routed_scaling_factor: float, tile_tokens_dim: int,
                  routing_method_type: int):
@@ -38,6 +38,7 @@ class FP8BlockScaleMoERunner(TunableRunner):
         self.num_experts = num_experts
         self.top_k = top_k
         self.n_group = n_group
+        self.fuse_shared_expert = fuse_shared_expert
         self.topk_group = topk_group
         self.intermediate_size = intermediate_size
         self.local_expert_offset = local_expert_offset
@@ -97,9 +98,10 @@ class FP8BlockScaleMoERunner(TunableRunner):
             args.hidden_states_scale, args.gemm1_weights,
             args.gemm1_weights_scale, args.gemm2_weights,
             args.gemm2_weights_scale, self.num_experts, self.top_k,
-            self.n_group, self.topk_group, self.intermediate_size,
-            self.local_expert_offset, self.local_num_experts,
-            self.routed_scaling_factor, self.routing_method_type, tactic)
+            self.fuse_shared_expert, self.n_group, self.topk_group,
+            self.intermediate_size, self.local_expert_offset,
+            self.local_num_experts, self.routed_scaling_factor,
+            self.routing_method_type, tactic)
 
     def get_valid_tactics(
         self,
@@ -158,7 +160,8 @@ def fp8_block_scale_moe_runner(routing_logits: torch.Tensor,
                                gemm1_weights_scale: torch.Tensor,
                                gemm2_weights: torch.Tensor,
                                gemm2_weights_scale: torch.Tensor,
-                               num_experts: int, top_k: int, n_group: int,
+                               num_experts: int, top_k: int,
+                               fuse_shared_expert: bool, n_group: int,
                                topk_group: int, intermediate_size: int,
                                local_expert_offset: int, local_num_experts: int,
                                routed_scaling_factor: float,
@@ -167,12 +170,10 @@ def fp8_block_scale_moe_runner(routing_logits: torch.Tensor,
 
     tuner = AutoTuner.get()
 
-    kernel_runner = FP8BlockScaleMoERunner(num_experts, top_k, n_group,
-                                           topk_group, intermediate_size,
-                                           local_expert_offset,
-                                           local_num_experts,
-                                           routed_scaling_factor,
-                                           tile_tokens_dim, routing_method_type)
+    kernel_runner = FP8BlockScaleMoERunner(
+        num_experts, top_k, fuse_shared_expert, n_group, topk_group,
+        intermediate_size, local_expert_offset, local_num_experts,
+        routed_scaling_factor, tile_tokens_dim, routing_method_type)
 
     inputs = [
         routing_logits,

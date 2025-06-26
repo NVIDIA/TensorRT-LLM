@@ -726,10 +726,10 @@ struct KernelParams
         // Create the return struct.
         KernelParams params;
 
-        if (options.mNumBatches > KernelParams::MaxBatchSize)
-        {
-            throw std::runtime_error("GEMM batch limit reached.");
-        }
+        // if (options.mNumBatches > KernelParams::MaxBatchSize)
+        // {
+        //     throw std::runtime_error("GEMM batch limit reached.");
+        // }
 
         params.ptrRouteMap = routeMap;
         params.numTokens = options.mNumTokens;
