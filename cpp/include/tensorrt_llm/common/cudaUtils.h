@@ -1339,10 +1339,10 @@ struct ConstExprWrapper
 };
 
 template <int VALUE>
-using Int = ConstExprWrapper<int, VALUE>;
+using ConstInt = ConstExprWrapper<int, VALUE>;
 
 template <bool VALUE>
-using Bool = ConstExprWrapper<bool, VALUE>;
+using ConstBool = ConstExprWrapper<bool, VALUE>;
 
 template <typename T>
 struct TmaDescType;

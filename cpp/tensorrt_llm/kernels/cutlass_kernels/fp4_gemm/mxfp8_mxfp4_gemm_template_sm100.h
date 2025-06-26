@@ -100,7 +100,7 @@ struct DeviceGemmMXFP8xMXFP4GemmSm100
     /* // Input C */
     using ElementC = void;
     using LayoutC = cutlass::layout::RowMajor;
-    static constexpr int AlignmentC = 4;
+    static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<OutElementType>::value;
 
     using SFType = cutlass::float_ue8m0_t;
     using ElementCompute = float;

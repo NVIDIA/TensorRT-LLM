@@ -158,6 +158,21 @@ def _mangle_executor_config(executor_config: ExecutorConfig):
             )
             executor_config.kv_cache_config.enable_block_reuse = False
 
+    spec_config = executor_config.speculative_config
+    if spec_config is not None and spec_config.spec_dec_mode.has_draft_model():
+        # The draft and target models have different KV cache managers to support
+        # different head sizes, dtypes, etc in the generic case.
+        # However, this line will set context_current_position > 0 if there are
+        # cached blocks: https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/pyexecutor/resource_manager.py#L310.
+        # It actually mutates the LLM request! As a result, when we try to allocate KV cache
+        # pages for the draft model, is_first_context_chunk returns False and
+        # no pages are allocated.
+        # We need to refactor LLMRequest to fix this. Disable block reuse for now.
+        logger.warning(
+            f"Disabling block reuse for speculation algorithm {spec_config.spec_dec_mode}"
+        )
+        executor_config.kv_cache_config.enable_block_reuse = False
+
     if pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION" and executor_config.enable_chunked_context:
         logger.warning(
             f"Disabling chunked context for {pytorch_backend_config.attn_backend} backend"
@@ -180,7 +195,6 @@ def _get_mapping(executor_config: ExecutorConfig) -> Mapping:
 def create_py_executor(
         executor_config: ExecutorConfig,
         checkpoint_dir: str = None,
-        engine_dir: str = None,
         lora_config: Optional[LoraConfig] = None,
         garbage_collection_gen0_threshold: Optional[int] = None) -> PyExecutor:
     _mangle_executor_config(executor_config)
@@ -196,11 +210,14 @@ def create_py_executor(
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
     has_ngram_drafter = isinstance(spec_config, NGramConfig)
 
+    # chunk_unit_size may be changed to 64 when using flash mla
     attn_runtime_features = AttentionRuntimeFeatures(
         chunked_prefill=executor_config.enable_chunked_context,
         cache_reuse=executor_config.kv_cache_config.enable_block_reuse,
         has_speculative_draft_tokens=has_draft_model_engine
         or has_ngram_drafter,
+        chunk_unit_size=executor_config.tokens_per_block,
+        normal_chunk_size=executor_config.max_num_tokens,
     )
     logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
 
@@ -265,18 +282,6 @@ def create_py_executor(
     executor_config.max_num_tokens = model_engine.max_num_tokens
     spec_config = model_engine.spec_config
 
-    if executor_config.enable_chunked_context:
-        chunk_unit_size = executor_config.tokens_per_block
-        chunking_policy = (
-            executor_config.scheduler_config.context_chunking_policy
-            if executor_config.scheduler_config.context_chunking_policy
-            is not None else ContextChunkingPolicy.FIRST_COME_FIRST_SERVED)
-        assert chunk_unit_size is not None, "chunk_unit_size must be set"
-        ctx_chunk_config = ContextChunkingConfig(chunking_policy,
-                                                 chunk_unit_size)
-    else:
-        ctx_chunk_config = None
-
     config = model_engine.model.model_config.pretrained_config
     if is_mla(config):
         if model_engine.model.model_config.enable_flash_mla:
@@ -302,7 +307,17 @@ def create_py_executor(
             )
             executor_config.kv_cache_config.enable_block_reuse = False
 
-        executor_config.enable_chunked_context = False
+    if executor_config.enable_chunked_context:
+        chunk_unit_size = executor_config.tokens_per_block
+        chunking_policy = (
+            executor_config.scheduler_config.context_chunking_policy
+            if executor_config.scheduler_config.context_chunking_policy
+            is not None else ContextChunkingPolicy.FIRST_COME_FIRST_SERVED)
+        assert chunk_unit_size is not None, "chunk_unit_size must be set"
+        ctx_chunk_config = ContextChunkingConfig(chunking_policy,
+                                                 chunk_unit_size)
+    else:
+        ctx_chunk_config = None
 
     with mem_monitor.observe_creation_stage(_ExecutorCreationStage.SAMPLER):
         sampler = instantiate_sampler(model_engine, executor_config,
