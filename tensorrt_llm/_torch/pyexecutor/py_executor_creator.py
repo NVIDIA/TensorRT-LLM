@@ -210,11 +210,14 @@ def create_py_executor(
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
     has_ngram_drafter = isinstance(spec_config, NGramConfig)
 
+    # chunk_unit_size may be changed to 64 when using flash mla
     attn_runtime_features = AttentionRuntimeFeatures(
         chunked_prefill=executor_config.enable_chunked_context,
         cache_reuse=executor_config.kv_cache_config.enable_block_reuse,
         has_speculative_draft_tokens=has_draft_model_engine
         or has_ngram_drafter,
+        chunk_unit_size=executor_config.tokens_per_block,
+        normal_chunk_size=executor_config.max_num_tokens,
     )
     logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
 
@@ -279,18 +282,6 @@ def create_py_executor(
     executor_config.max_num_tokens = model_engine.max_num_tokens
     spec_config = model_engine.spec_config
 
-    if executor_config.enable_chunked_context:
-        chunk_unit_size = executor_config.tokens_per_block
-        chunking_policy = (
-            executor_config.scheduler_config.context_chunking_policy
-            if executor_config.scheduler_config.context_chunking_policy
-            is not None else ContextChunkingPolicy.FIRST_COME_FIRST_SERVED)
-        assert chunk_unit_size is not None, "chunk_unit_size must be set"
-        ctx_chunk_config = ContextChunkingConfig(chunking_policy,
-                                                 chunk_unit_size)
-    else:
-        ctx_chunk_config = None
-
     config = model_engine.model.model_config.pretrained_config
     if is_mla(config):
         if model_engine.model.model_config.enable_flash_mla:
@@ -316,7 +307,17 @@ def create_py_executor(
             )
             executor_config.kv_cache_config.enable_block_reuse = False
 
-        executor_config.enable_chunked_context = False
+    if executor_config.enable_chunked_context:
+        chunk_unit_size = executor_config.tokens_per_block
+        chunking_policy = (
+            executor_config.scheduler_config.context_chunking_policy
+            if executor_config.scheduler_config.context_chunking_policy
+            is not None else ContextChunkingPolicy.FIRST_COME_FIRST_SERVED)
+        assert chunk_unit_size is not None, "chunk_unit_size must be set"
+        ctx_chunk_config = ContextChunkingConfig(chunking_policy,
+                                                 chunk_unit_size)
+    else:
+        ctx_chunk_config = None
 
     with mem_monitor.observe_creation_stage(_ExecutorCreationStage.SAMPLER):
         sampler = instantiate_sampler(model_engine, executor_config,

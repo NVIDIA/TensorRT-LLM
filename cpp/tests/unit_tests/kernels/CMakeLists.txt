@@ -30,6 +30,8 @@ add_gtest(mlaPreprocessTest mlaPreprocessTest.cu)
 
 add_gtest(cudaCoreGemmKernelTest cudaCoreGemm/cudaCoreGemmKernelTest.cpp)
 
+add_gtest(mlaChunkedPrefillTest mlaChunkedPrefillTest.cu)
+
 if(NOT ENABLE_MULTI_DEVICE EQUAL 0)
   add_gtest(allReduceKernelTest allReduce/allReduceKernelTest.cu)
   add_gtest(allReduceFusionTest allReduce/allReduceFusionTest.cu)
