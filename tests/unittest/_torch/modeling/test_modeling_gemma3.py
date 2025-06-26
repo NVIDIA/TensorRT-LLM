@@ -1,26 +1,28 @@
 import unittest
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any
 
 import torch
 from parameterized import parameterized
-from transformers import AutoConfig
-from transformers.dynamic_module_utils import get_class_from_dynamic_module
-from transformers.generation.utils import NEED_SETUP_CACHE_CLASSES_MAPPING
-# from utils.llm_data import llm_models_root
+
+from transformers import Gemma3Config
+from transformers import Gemma3ForCausalLM as HFGemma3ForCausalLM
+
+from utils.llm_data import llm_models_root
+
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_gemma3 import \
-    Gemma3ForCausalLM
+from tensorrt_llm._torch.models.modeling_gemma3 import Gemma3ForCausalLM
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
+    DecodingCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
-GEMMA3_CONFIG = {
+GEMMA3_1B_SINGLE_LAYER_CONFIG = {
   "architectures": [
     "Gemma3ForCausalLM"
   ],
@@ -53,6 +55,8 @@ GEMMA3_CONFIG = {
   "sliding_window": 512,
   "sliding_window_pattern": 6,
   "torch_dtype": "bfloat16",
+  "transformers_version": "4.50.0.dev0",
+  "use_cache": True,
   "vocab_size": 262144
 }
 
@@ -60,43 +64,44 @@ GEMMA3_CONFIG = {
 @dataclass(repr=False)
 class Scenario:
     backend: str
+    use_cuda_graph: bool = False
 
     def __repr__(self) -> str:
-        return f"backend:{self.backend.lower()}"
-
-
-def reduce_gemma3_config(config_dict: dict[str, Any]):
-    # num_layers = min(config_dict["num_hidden_layers"], 26)
-    # config_dict["num_hidden_layers"] = num_layers
-    pass
+        return f"backend:{self.backend.lower()}-use_cuda_graph:{self.use_cuda_graph}"
 
 
 class TestGemma3(unittest.TestCase):
 
     def test_gemma3_sanity(self):
-        config_dict = deepcopy(GEMMA3_CONFIG)
-        reduce_gemma3_config(config_dict)
-        if config_dict["num_hidden_layers"] <= 0:
-            self.skipTest("Insufficient memory for a single Gemma3 layer")
-        gemma3_config = AutoConfig.from_pretrained(
-            # llm_models_root() / "gemma3/gemma3-1b-it",
-            "/home/scratch.trt_llm_data/llm-models/gemma/gemma-3-1b-it/",
-            trust_remote_code=True,
-        )
-        gemma3_config = gemma3_config.from_dict(config_dict)
+
+        config_dict = deepcopy(GEMMA3_1B_SINGLE_LAYER_CONFIG)
+        gemma3_config = Gemma3Config.from_dict(config_dict)
 
         dtype = gemma3_config.torch_dtype
         device = torch.device('cuda')
 
         model_config = ModelConfig(pretrained_config=gemma3_config)
-        gemma3 = Gemma3ForCausalLM(model_config).to(dtype).to(device)
+        gemma3 = Gemma3ForCausalLM(model_config).to(device)
 
         input_ids = torch.tensor([100, 200, 300, 100, 200, 100, 400, 500],
                                  dtype=torch.int,
                                  device=device)
 
-        num_blocks = 1000
+        context_sequence_lengths = [3, 2, 1]
+        sequence_lengths = context_sequence_lengths + [1, 1]
+        past_seen_tokens = [0, 0, 0, 62, 75]
+        request_ids = list(range(len(sequence_lengths)))
+        token_nums = (torch.tensor(past_seen_tokens) +
+                      torch.tensor(sequence_lengths)).tolist()
+        prompt_lens = token_nums[:3] + past_seen_tokens[3:]
+
+        num_blocks = 100
         tokens_per_block = 128
+        head_dim = gemma3.config.hidden_size // gemma3.config.num_attention_heads
+        num_layers = gemma3.config.num_hidden_layers
+        num_kv_heads = gemma3.config.num_key_value_heads
+        max_seq_len = num_blocks * tokens_per_block
+        batch_size = len(context_sequence_lengths) + 2
 
         if dtype == torch.half:
             kv_cache_dtype = tensorrt_llm.bindings.DataType.HALF
@@ -108,22 +113,6 @@ class TestGemma3(unittest.TestCase):
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
         kv_cache_config = KvCacheConfig(max_tokens=num_blocks *
                                         tokens_per_block)
-
-        num_layers = gemma3.config.num_hidden_layers
-        num_kv_heads = gemma3.config.num_key_value_heads
-        num_heads = gemma3.config.num_attention_heads
-        head_dim = gemma3.config.hidden_size // num_heads
-        max_seq_len = num_blocks * tokens_per_block
-
-        context_sequence_lengths = [3, 2, 1]
-        sequence_lengths = context_sequence_lengths + [1, 1]
-        batch_size = len(sequence_lengths)
-        past_seen_tokens = [0, 0, 0, 62, 75]
-        request_ids = list(range(len(sequence_lengths)))
-        token_nums = (torch.tensor(past_seen_tokens) +
-                      torch.tensor(sequence_lengths)).tolist()
-        prompt_lens = token_nums[:3] + past_seen_tokens[3:]
-
         kv_cache_manager = KVCacheManager(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
@@ -167,183 +156,186 @@ class TestGemma3(unittest.TestCase):
         with torch.inference_mode():
             attn_metadata.prepare()
             logits = gemma3.forward(input_ids=input_ids,
-                                    position_ids=position_ids,
-                                    attn_metadata=attn_metadata)
+                                     position_ids=position_ids,
+                                     attn_metadata=attn_metadata)
 
         self.assertEqual(len(past_seen_tokens), logits.shape[0])
 
         with torch.inference_mode():
             attn_metadata.prepare()
             logits = gemma3.forward(input_ids=input_ids,
-                                          position_ids=position_ids,
-                                          attn_metadata=attn_metadata,
-                                          return_context_logits=True)
+                                     position_ids=position_ids,
+                                     attn_metadata=attn_metadata,
+                                     return_context_logits=True)
         self.assertEqual(input_ids.shape, logits.shape[:-1])
 
         kv_cache_manager.shutdown()
 
-    # @parameterized.expand([
-    #     Scenario(backend="VANILLA"),
-    #     Scenario(backend="FLASHINFER"),
-    #     Scenario(backend="TRTLLM"),
-    # ], lambda testcase_func, param_num, param:
-    #                       f"{testcase_func.__name__}[{param.args[0]}]")
-    # @torch.no_grad()
-    # def test_gemma3_allclose_to_hf(self, scenario: Scenario) -> None:
-    #     """
-    #     Compare output to HF
-    #     """
-    #     backend = scenario.backend
-    #     metadata_cls = get_attention_backend(backend).Metadata
+    @parameterized.expand([
+        Scenario(backend="TRTLLM"),
+        # Scenario(backend="TRTLLM", use_cuda_graph=True),
+    ], lambda testcase_func, param_num, param:
+                          f"{testcase_func.__name__}[{param.args[0]}]")
+    @torch.no_grad()
+    def test_gemma3_allclose_to_hf(self, scenario: Scenario) -> None:
+        """
+        Compare output to HF.
+        """
+        backend = scenario.backend
+        metadata_cls = get_attention_backend(backend).Metadata
 
-    #     torch.random.manual_seed(0)
-    #     config_dict = deepcopy(GEMMA3_CONFIG)
-    #     reduce_gemma3_config(config_dict)
-    #     if config_dict["num_hidden_layers"] <= 0:
-    #         self.skipTest("Insufficient memory for a single NemotronNAS layer")
+        torch.random.manual_seed(0)
+        config_dict = deepcopy(GEMMA3_1B_SINGLE_LAYER_CONFIG)
+        gemma3_config = Gemma3Config.from_dict(config_dict)
+        dtype = gemma3_config.torch_dtype
+        device = torch.device('cuda')
 
-    #     gemma3_ckpt = llm_models_root(
-    #     ) / "nemotron-nas/Llama-3_1-Nemotron-51B-Instruct"
-    #     gemma3_config = AutoConfig.from_pretrained(
-    #         gemma3_ckpt,
-    #         trust_remote_code=True,
-    #     )
-    #     class_ref = gemma3_config.auto_map["AutoModelForCausalLM"]
-    #     gemma3_config = gemma3_config.from_dict(config_dict)
-    #     dtype = gemma3_config.torch_dtype
-    #     device = torch.device('cuda')
+        hf_gemma3 = HFGemma3ForCausalLM(gemma3_config).to(dtype).to(
+            device).eval()
 
-    #     model_class = get_class_from_dynamic_module(class_ref,
-    #                                                 gemma3_ckpt)
-    #     hf_gemma3 = model_class(gemma3_config).to(dtype).to(
-    #         device).eval()
-    #     # This line populates the "variable" field in the NEED_SETUP_CACHE_CLASSES_MAPPING dict
-    #     hf_gemma3._prepare_generation_config(None)
-    #     # And this line is the only way to access the only concrete Cache class DeciLMForCausalLM accepts
-    #     VariableCache = NEED_SETUP_CACHE_CLASSES_MAPPING["variable"]
+        model_config = ModelConfig(pretrained_config=gemma3_config,
+                                   attn_backend=backend)
+        gemma3 = Gemma3ForCausalLM(model_config).to(dtype).to(device)
+        gemma3.load_weights(hf_gemma3.state_dict())
 
-    #     model_config = ModelConfig(pretrained_config=gemma3_config,
-    #                                attn_backend=backend)
-    #     gemma3 = NemotronNASForCausalLM(model_config).to(dtype).to(device)
-    #     gemma3.load_weights(hf_gemma3.state_dict())
+        num_blocks = 1
+        tokens_per_block = 128
+        head_dim = gemma3.config.hidden_size // gemma3.config.num_attention_heads
+        num_layers = gemma3.config.num_hidden_layers
+        num_kv_heads = gemma3.config.num_key_value_heads
+        max_seq_len = num_blocks * tokens_per_block
+        batch_size = 1
 
-    #     num_blocks = 1
-    #     tokens_per_block = 128
+        if dtype == torch.half:
+            kv_cache_dtype = tensorrt_llm.bindings.DataType.HALF
+        elif dtype == torch.bfloat16:
+            kv_cache_dtype = tensorrt_llm.bindings.DataType.BF16
+        else:
+            raise ValueError("Invalid dtype")
 
-    #     kv_cache_config = KvCacheConfig(max_tokens=num_blocks *
-    #                                     tokens_per_block)
+        mapping = Mapping(world_size=1, tp_size=1, rank=0)
+        kv_cache_config = KvCacheConfig(max_tokens=num_blocks *
+                                        tokens_per_block)
+        kv_cache_manager = KVCacheManager(
+            kv_cache_config,
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=max_seq_len,
+            max_batch_size=batch_size,
+            mapping=mapping,
+            dtype=kv_cache_dtype,
+        )
+        # context
+        input_ids = torch.tensor([100, 200, 300, 100, 200, 100, 400, 500],
+                                 dtype=torch.int32,
+                                 device=device)
 
-    #     num_layers = gemma3.config.num_hidden_layers
-    #     num_kv_heads = gemma3.config.num_key_value_heads
-    #     num_heads = gemma3.config.num_attention_heads
-    #     head_dim = gemma3.config.hidden_size // num_heads
-    #     max_seq_len = num_blocks * tokens_per_block
-    #     batch_size = 1
+        num_cached_tokens_per_seq = [0]
+        request_ids = [1]
+        token_nums = [input_ids.size(-1)]
+        prompt_lens = [input_ids.size(-1)]
+        kv_cache_manager.add_dummy_requests(request_ids, token_nums)
 
-    #     mapping = Mapping(world_size=1, tp_size=1, rank=0)
-    #     if dtype == torch.half:
-    #         kv_cache_dtype = tensorrt_llm.bindings.DataType.HALF
-    #     elif dtype == torch.bfloat16:
-    #         kv_cache_dtype = tensorrt_llm.bindings.DataType.BF16
-    #     else:
-    #         raise ValueError("Invalid dtype")
+        attn_metadata = metadata_cls(
+            seq_lens=torch.tensor([input_ids.size(-1)], dtype=torch.int),
+            num_contexts=1,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=num_cached_tokens_per_seq,
+            ),
+            max_num_requests=1,
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            prompt_lens=prompt_lens,
+        )
+        # Note: no CUDA graphs for prefill, the graph runner is built for
+        # decoding only.
+        position_ids = [torch.arange(0, input_ids.size(-1), dtype=torch.int32)]
+        position_ids = torch.cat(position_ids).unsqueeze(0).cuda()
+        with torch.inference_mode():
+            attn_metadata.prepare()
+            logits = gemma3.forward(input_ids=input_ids,
+                                     position_ids=position_ids,
+                                     attn_metadata=attn_metadata)
+            ref = hf_gemma3.forward(input_ids=input_ids.unsqueeze(0),
+                                     position_ids=position_ids,
+                                     use_cache=True)
+            torch.testing.assert_close(logits,
+                                       ref.logits[:, -1].float(),
+                                       atol=0.1,
+                                       rtol=0.1)
+            print("[test_gemma3_allclose_to_hf] max diff: ", torch.max(torch.abs(logits - ref.logits[:, -1].float())))
+            print("[test_gemma3_allclose_to_hf] mean diff: ", torch.mean(torch.abs(logits - ref.logits[:, -1].float())))
 
-    #     kv_cache_manager = KVCacheManager(
-    #         kv_cache_config,
-    #         tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-    #         num_layers=num_layers,
-    #         num_kv_heads=num_kv_heads,
-    #         head_dim=head_dim,
-    #         tokens_per_block=tokens_per_block,
-    #         max_seq_len=max_seq_len,
-    #         max_batch_size=batch_size,
-    #         mapping=mapping,
-    #         dtype=kv_cache_dtype,
-    #     )
+        # # gen
+        # gen_input_ids = torch.tensor([600], dtype=torch.int32, device=device)
+        # num_cached_tokens_per_seq = [input_ids.size(-1)]
 
-    #     # context
-    #     input_ids = torch.tensor([100, 200, 300, 100, 200, 100, 400, 500],
-    #                              dtype=torch.int,
-    #                              device=device)
+        # attn_metadata = metadata_cls(
+        #     seq_lens=torch.tensor([gen_input_ids.size(-1)], dtype=torch.int),
+        #     num_contexts=0,
+        #     kv_cache_params=KVCacheParams(
+        #         use_cache=True,
+        #         num_cached_tokens_per_seq=num_cached_tokens_per_seq,
+        #     ),
+        #     max_num_requests=1,
+        #     max_num_tokens=8192,
+        #     kv_cache_manager=kv_cache_manager,
+        #     request_ids=request_ids,
+        #     prompt_lens=prompt_lens,
+        # )
 
-    #     num_cached_tokens_per_seq = [0]
-    #     request_ids = [1]
-    #     token_nums = [input_ids.size(-1)]
-    #     prompt_lens = [input_ids.size(-1)]
-    #     kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+        # gen_position_ids = [
+        #     torch.arange(input_ids.size(-1),
+        #                  input_ids.size(-1) + gen_input_ids.size(-1),
+        #                  dtype=torch.int32)
+        # ]
+        # gen_position_ids = torch.cat(gen_position_ids).unsqueeze(0).cuda()
 
-    #     attn_metadata = metadata_cls(
-    #         seq_lens=torch.tensor([input_ids.size(-1)], dtype=torch.int),
-    #         num_contexts=1,
-    #         kv_cache_params=KVCacheParams(
-    #             use_cache=True,
-    #             num_cached_tokens_per_seq=num_cached_tokens_per_seq,
-    #         ),
-    #         kv_cache_manager=kv_cache_manager,
-    #         request_ids=request_ids,
-    #         prompt_lens=prompt_lens,
-    #         max_num_requests=1,
-    #         max_num_tokens=8192,
-    #     )
+        # def run_forward(input_ids, position_ids, attn_metadata):
+        #     attn_metadata.prepare()
+        #     if not scenario.use_cuda_graph:
+        #         return gemma3.forward(input_ids=input_ids,
+        #                                position_ids=position_ids,
+        #                                attn_metadata=attn_metadata)
+        #     else:
+        #         graph_runner = DecodingCUDAGraphRunner(
+        #             attn_metadata.max_num_requests, "cuda", attn_metadata)
+        #         graph_runner.capture(lambda inputs: gemma3.forward(**inputs))
 
-    #     position_ids = [torch.arange(0, input_ids.size(-1))]
-    #     position_ids = torch.cat(position_ids).unsqueeze(0).cuda()
-    #     # And, lastly, this is the simplest way of creating a Cache that `hf_gemma3` will accept
-    #     past_key_values = VariableCache(config=gemma3_config,
-    #                                     dtype=dtype,
-    #                                     batch_size=1)
-    #     with torch.inference_mode():
-    #         attn_metadata.prepare()
-    #         logits = gemma3.forward(input_ids=input_ids,
-    #                                       position_ids=position_ids,
-    #                                       attn_metadata=attn_metadata)
-    #         ref = hf_gemma3.forward(input_ids=input_ids.unsqueeze(0),
-    #                                       position_ids=position_ids,
-    #                                       past_key_values=past_key_values,
-    #                                       use_cache=True)
+        #         for _ in range(2):
+        #             # Run it twice. This helps us catch problems if buffers are accidentally reallocated
+        #             # in prepare().
+        #             attn_metadata.prepare()
+        #             logits = graph_runner.run({
+        #                 "input_ids": input_ids,
+        #                 "position_ids": position_ids,
+        #                 "attn_metadata": attn_metadata,
+        #             })
+        #         return logits
 
-    #     torch.testing.assert_close(logits,
-    #                                ref.logits[:, -1].float(),
-    #                                atol=0.1,
-    #                                rtol=0.1)
+        # if scenario.use_cuda_graph:
+        #     attn_metadata = attn_metadata.create_cuda_graph_metadata(1)
 
-    #     # gen
-    #     gen_input_ids = torch.tensor([600], dtype=torch.int, device=device)
+        # with torch.inference_mode():
+        #     logits = run_forward(input_ids=gen_input_ids,
+        #                          position_ids=gen_position_ids,
+        #                          attn_metadata=attn_metadata)
+        #     ref = hf_gemma3.forward(
+        #         input_ids=gen_input_ids.unsqueeze(0),  #hf_gen_input_ids,
+        #         position_ids=gen_position_ids,
+        #         past_key_values=ref.past_key_values,
+        #         use_cache=True)
 
-    #     num_cached_tokens_per_seq = [input_ids.size(-1)]
+        # #TODO: visit later to adjust atol and rtol
+        # # atol=2, rtol=100000
+        # torch.testing.assert_close(logits,
+        #                            ref.logits[:, -1].float(),
+        #                            atol=2,
+        #                            rtol=100000)
 
-    #     attn_metadata = metadata_cls(
-    #         seq_lens=torch.tensor([gen_input_ids.size(-1)], dtype=torch.int),
-    #         num_contexts=0,
-    #         kv_cache_params=KVCacheParams(
-    #             use_cache=True,
-    #             num_cached_tokens_per_seq=num_cached_tokens_per_seq,
-    #         ),
-    #         kv_cache_manager=kv_cache_manager,
-    #         request_ids=request_ids,
-    #         prompt_lens=prompt_lens,
-    #         max_num_requests=1,
-    #         max_num_tokens=8192,
-    #     )
-
-    #     gen_position_ids = [
-    #         torch.arange(input_ids.size(-1),
-    #                      input_ids.size(-1) + gen_input_ids.size(-1))
-    #     ]
-    #     gen_position_ids = torch.cat(gen_position_ids).unsqueeze(0).cuda()
-    #     with torch.inference_mode():
-    #         attn_metadata.prepare()
-    #         logits = gemma3.forward(input_ids=gen_input_ids,
-    #                                       position_ids=gen_position_ids,
-    #                                       attn_metadata=attn_metadata)
-    #         ref = hf_gemma3.forward(input_ids=gen_input_ids.unsqueeze(0),
-    #                                       position_ids=gen_position_ids,
-    #                                       past_key_values=ref.past_key_values,
-    #                                       use_cache=True)
-
-    #     torch.testing.assert_close(logits,
-    #                                ref.logits[:, -1].float(),
-    #                                atol=0.1,
-    #                                rtol=0.1)
-
-    #     kv_cache_manager.shutdown()
+        kv_cache_manager.shutdown()
