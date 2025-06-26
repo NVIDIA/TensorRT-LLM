@@ -1243,6 +1243,11 @@ public:
         }
     }
 
+    void createFirstScheduledTime()
+    {
+        setFirstScheduledTime(std::chrono::steady_clock::now());
+    }
+
     [[nodiscard]] bool constexpr isStreaming() const noexcept
     {
         return mIsStreaming;

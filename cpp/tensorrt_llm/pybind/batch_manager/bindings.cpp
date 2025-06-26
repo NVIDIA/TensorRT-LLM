@@ -373,7 +373,8 @@ void initBindings(pybind11::module_& m)
             })
         .def("move_prompt_embedding_table_to_gpu", &tb::LlmRequest::movePromptEmbeddingTableToGpu, py::arg("manager"))
         .def("move_lora_weights_to_gpu", &tb::LlmRequest::moveLoraWeightsToGpu, py::arg("manager"))
-        .def("finish_by_reason", &tb::LlmRequest::finishByReason, py::arg("finish_reason"));
+        .def("finish_by_reason", &tb::LlmRequest::finishByReason, py::arg("finish_reason"))
+        .def("create_first_scheduled_time", &tb::LlmRequest::createFirstScheduledTime);
 
     py::classh<tb::SequenceSlotManager>(m, "SequenceSlotManager")
         .def(py::init<tb::SequenceSlotManager::SlotIdType, uint64_t>(), py::arg("max_num_slots"),
