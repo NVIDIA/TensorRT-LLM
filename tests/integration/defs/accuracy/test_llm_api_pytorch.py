@@ -501,6 +501,19 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
 
+    @pytest.fixture(scope="class", autouse=True)
+    @classmethod
+    def setup_task_types(cls, pre_merge: bool):
+        """
+        Limit the number of evaluations performed in pre-merge to reduce test time.
+        """
+        if pre_merge:
+            # run only GSM8K in pre merge to reduce test time
+            # GSM8K is about 2x longer than MMLU, but it tests reasoning so it's preferred
+            cls.task_types = [GSM8K]
+        else:
+            cls.task_types = [MMLU, GSM8K]
+
     @pytest.mark.skip_less_device_memory(60000)
     @parametrize_with_ids(
         "torch_compile",
@@ -536,10 +549,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                   enable_attention_dp=attention_dp,
                   speculative_config=mtp_config)
         with llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+            for task_type in self.task_types:
+                task = task_type(self.MODEL_NAME)
+                task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
     @parametrize_with_ids(
@@ -585,10 +597,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                   enable_attention_dp=attention_dp,
                   speculative_config=mtp_config)
         with llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+            for task_type in self.task_types:
+                task = task_type(self.MODEL_NAME)
+                task.evaluate(llm)
 
     @skip_no_hopper
     @parametrize_with_ids(
@@ -644,12 +655,13 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
         with llm:
-            # No need to run MMLU for fp8kv
-            if not fp8kv:
-                task = MMLU(self.MODEL_NAME)
+            for task_type in self.task_types:
+                # No need to run MMLU for fp8kv
+                if fp8kv and task_type == MMLU:
+                    continue
+
+                task = task_type(self.MODEL_NAME)
                 task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
 
     @pytest.mark.skip_device_not_contain(["H100"])
     @parametrize_with_ids("mtp_nextn", [0, 2])
@@ -768,12 +780,13 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
         with llm:
-            # No need to run MMLU for fp8kv
-            if not fp8kv:
-                task = MMLU(self.MODEL_NAME)
+            for task_type in self.task_types:
+                # No need to run MMLU for fp8kv
+                if fp8kv and task_type == MMLU:
+                    continue
+
+                task = task_type(self.MODEL_NAME)
                 task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_device_not_contain(["H100", "H200"])
@@ -917,12 +930,13 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
         with llm:
-            # No need to run MMLU for fp8kv
-            if not fp8kv:
-                task = MMLU(self.MODEL_NAME)
+            for task_type in self.task_types:
+                # No need to run MMLU for fp8kv
+                if fp8kv and task_type == MMLU:
+                    continue
+
+                task = task_type(self.MODEL_NAME)
                 task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
     @skip_pre_blackwell
@@ -988,12 +1002,13 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
         with llm:
-            # No need to run MMLU for fp8kv
-            if not fp8kv:
-                task = MMLU(self.MODEL_NAME)
+            for task_type in self.task_types:
+                # No need to run MMLU for fp8kv
+                if fp8kv and task_type == MMLU:
+                    continue
+
+                task = task_type(self.MODEL_NAME)
                 task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
 
     @parametrize_with_ids(
         "fp8kv,attention_dp,cuda_graph,overlap_scheduler",
@@ -1058,12 +1073,13 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
         with llm:
-            # No need to run MMLU for fp8kv
-            if not fp8kv:
-                task = MMLU(self.MODEL_NAME)
+            for task_type in self.task_types:
+                # No need to run MMLU for fp8kv
+                if fp8kv and task_type == MMLU:
+                    continue
+
+                task = task_type(self.MODEL_NAME)
                 task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
 
 
 @pytest.mark.timeout(7200)

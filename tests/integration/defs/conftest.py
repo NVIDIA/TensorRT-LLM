@@ -1976,6 +1976,9 @@ def pytest_addoption(parser):
         help=
         "It is useful when using such prefix to mapping waive lists for specific GPU, such as 'GH200'"
     )
+    parser.addoption("--pre-merge",
+                     action="store_true",
+                     help="Shorten some tests for pre-merge CI.")
     parser.addoption("--regexp",
                      "-R",
                      action='store',
@@ -2144,6 +2147,14 @@ def all_pytest_items():
     filtering has been applied.
     """
     return ALL_PYTEST_ITEMS
+
+
+@pytest.fixture(scope="session")
+def pre_merge(request) -> bool:
+    """
+    Is True if `--pre-merge` was passed in pytest cmdline.
+    """
+    return bool(request.config.getoption("--pre-merge"))
 
 
 @pytest.fixture(scope="session")
