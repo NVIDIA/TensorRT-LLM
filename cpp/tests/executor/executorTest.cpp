@@ -3852,7 +3852,7 @@ TEST_P(ParamCancelReqTest, MultipleRequestsMultiGpuCancelRequest)
         auto const requestIds = executor.enqueueRequests(requests);
 
         // Cancel the first and third requests
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
         for (SizeType32 i = 0; i < requests.size(); i++)
         {
             if (cancelRequests.at(i))
@@ -3870,9 +3870,11 @@ TEST_P(ParamCancelReqTest, MultipleRequestsMultiGpuCancelRequest)
             auto requestId = requestIds.at(i);
             isStreaming[requestId] = request.getStreaming();
             expectedNumTokens[requestId] = (request.getStreaming() ? 0 : inputTokens.size()) + maxNewTokens;
-            expectedNumResponses += request.getStreaming()
-                ? expectedNumTokens[requestId]
+            auto const numResponses = request.getStreaming() ? expectedNumTokens[requestId] : 1;
+            auto const numReturnSequences = request.getSamplingConfig().getBeamWidth() > 1
+                ? 1
                 : request.getSamplingConfig().getNumReturnSequences().value_or(1);
+            expectedNumResponses += numResponses * numReturnSequences;
         }
 
         std::unordered_map<IdType, std::unordered_map<SizeType32, VecTokens>> tokens;
