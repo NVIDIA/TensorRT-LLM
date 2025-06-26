@@ -110,9 +110,8 @@ class TrtllmAttentionWrapper:
             self.qk_rope_head_dim = None
             self.v_head_dim = None
 
-        self.is_neox = pos_embd_params.is_neox
         self.rotary_inv_freq, self.rotary_cos_sin = self.rope_params.create_rope_const_params(
-            self.is_neox)
+        )
 
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads or num_heads
@@ -245,7 +244,7 @@ class TrtllmAttentionWrapper:
         if max_sequence_length > self.rope_params.max_positions:
             self.rope_params.max_positions = max_sequence_length
             self.rotary_inv_freq, self.rotary_cos_sin = self.rope_params.create_rope_const_params(
-                self.is_neox)
+            )
 
         self.kwargs.update(kwargs)
 

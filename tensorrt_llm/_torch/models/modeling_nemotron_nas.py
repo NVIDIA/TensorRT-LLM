@@ -70,7 +70,6 @@ class NemotronNASAttention(Attention):
                 type=PositionEmbeddingType.rope_gpt_neox
                 if is_neox else PositionEmbeddingType.rope_gptj,
                 rope=rope,
-                is_neox=is_neox,
             ),
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
