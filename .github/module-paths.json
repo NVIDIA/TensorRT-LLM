@@ -1,0 +1,10 @@
+{
+    "cpp/": "Generic Runtime",
+    "triton_backend/": "Triton Backend",
+    "tensorrt_llm/_torch/peft/": "Lora/P-tuning",
+    "tensorrt_llm/": "LLM API/Workflow",
+    "benchmarks/": "Performance",
+    "examples/disaggregated/": "Disaggregated Serving",
+    "docs/": "Documentation",
+    "docker/": "Installation"
+}
