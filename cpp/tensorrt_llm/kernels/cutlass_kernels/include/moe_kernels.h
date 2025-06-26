@@ -210,6 +210,21 @@ struct QuantParams
         GemmInputs fc2;
     } fp8_mxfp4;
 
+    // MXFP8 MXFP4 quantization params
+    // This mode uses block scaled MXFP8 and MXFP4 weights
+    struct MXFP8MXFP4Inputs
+    {
+        struct GemmInputs
+        {
+            TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const* weight_block_scale
+                = nullptr;                       // (experts, n, k / 32)
+            float const* global_scale = nullptr; // (num_experts_per_node, )
+        };
+
+        GemmInputs fc1;
+        GemmInputs fc2;
+    } mxfp8_mxfp4;
+
     // FP4 quantization params
     struct FP4Inputs
     {
@@ -291,6 +306,16 @@ struct QuantParams
         return qp;
     }
 
+    static QuantParams MXFP8MXFP4(TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const* fc1_weight_block_scale,
+        float const* fc1_global_scale, //
+        TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const* fc2_weight_block_scale, float const* fc2_global_scale)
+    {
+        QuantParams qp;
+        qp.mxfp8_mxfp4.fc1 = {fc1_weight_block_scale, fc1_global_scale};
+        qp.mxfp8_mxfp4.fc2 = {fc2_weight_block_scale, fc2_global_scale};
+        return qp;
+    }
+
     static QuantParams FP4(float const* fc1_act_global_scale,
         TmaWarpSpecializedGroupedGemmInput::NVFP4ElementSF const* fc1_weight_block_scale,
         float const* fc1_global_scale, //
@@ -298,6 +323,7 @@ struct QuantParams
         TmaWarpSpecializedGroupedGemmInput::NVFP4ElementSF const* fc2_weight_block_scale,
         float const* fc2_global_scale, //
         bool fc1_use_per_expert_act_scale = false, bool fc2_use_per_expert_act_scale = false)
+
     {
         QuantParams qp;
         qp.fp4.fc1 = {fc1_use_per_expert_act_scale, fc1_act_global_scale, fc1_weight_block_scale, fc1_global_scale};

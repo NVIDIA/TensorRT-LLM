@@ -445,10 +445,10 @@ __host__ __device__ constexpr int64_t getOffsetActivationSF(int64_t expert_id, i
     switch (scaling_type)
     {
     case cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX:
-        return function(cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::MinNumRowsAlignmentMXFPX,
+        return function(cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX,
             cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize);
     case cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4:
-        return function(cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::MinNumRowsAlignmentNVFP4,
+        return function(cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX,
             cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize);
     case cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE:
         return 0; // No scaling factors, no offset
