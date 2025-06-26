@@ -68,7 +68,6 @@ class TRTLLMGenFusedMoE(MoE):
         )
 
         assert not self.smart_router, "Smart router is not supported in TRTLLMGenFusedMoE."
-        # assert not self.use_dp, "AttentionDP is not supported in TRTLLMGenFusedMoE."
 
         self.num_slots = self.num_experts
         self.expert_size_per_partition = self.num_experts // self.ep_size
