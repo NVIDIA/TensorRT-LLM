@@ -26,13 +26,13 @@ from tensorrt_llm.bench.tuning.dataclasses import (
     BatchingConfiguration, BenchmarkEnvironment, BenchmarkSpecification,
     LlmRuntimeSpecification, ReportingConfiguration, TuningConstraints,
     WorldConfig)
+# isort: on
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
-# isort: on
 
 
 @click.command(name="throughput")
