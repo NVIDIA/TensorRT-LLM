@@ -590,7 +590,7 @@ class MambaCacheManager(BaseResourceManager):
         self.mamba_cache_index: Dict[int, int] = {}
 
         # mamba cache state indices
-        self.state_indices: torch.Tensor = torch.tensor([],
+        self.state_indices: torch.Tensor = torch.arange(max_batch_size,
                                                         device=device,
                                                         dtype=torch.int32)
 
@@ -607,9 +607,8 @@ class MambaCacheManager(BaseResourceManager):
                 block = self.mamba_cache_free_blocks.pop()
                 self.mamba_cache_index[r] = block
                 state_indices.append(block)
-        self.state_indices = torch.as_tensor(state_indices,
-                                             dtype=torch.int32,
-                                             device=self.ssm_states.device)
+        state_indices = torch.tensor(state_indices, dtype=torch.int32, pin_memory=True)
+        self.state_indices[:state_indices.shape[0]].copy_(state_indices, non_blocking=True)
 
     def free_mamba_cache_blocks(self, request_id: int):
         if request_id in self.mamba_cache_index:
