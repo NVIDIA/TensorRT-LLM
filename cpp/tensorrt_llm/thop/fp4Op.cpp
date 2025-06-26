@@ -104,6 +104,7 @@ float e2M1ToFloat(uint8_t value)
     return result;
 }
 
+// Given the rowIdx and colIdx in the unswizzled SFMatrix, compute the 1D offset in the swizzled SFMatrix.
 // colIdx and totalCloumn should be in SFMatrix, not activation Matrix, so no sfVecSize needed.
 int computeSFIndex(int rowIdx, int colIdx, int totalRow, int totalColumn, tensorrt_llm::FP4QuantizationSFLayout layout)
 {
@@ -272,7 +273,9 @@ torch::autograd::variable_list HalfToE2M1AndUFP8SFScale(
     return {valueE2M1, scaleFP8SF};
 }
 
-// Interleave the weights block scaling factor.
+// Interleave (and possibly pad) the weights block scaling factor.
+// blockScale: [num_experts, rows, cols] or [rows, cols]
+// Return: num_experts * pad_up(rows, 128) * pad_up(cols, 4)
 th::Tensor NVFP4BlockScaleInterleave(th::Tensor const& blockScale)
 {
     bool is_cuda = blockScale.device().is_cuda();
@@ -291,31 +294,40 @@ th::Tensor NVFP4BlockScaleInterleave(th::Tensor const& blockScale)
     auto cols = blockScaleShape.size() == 3 ? blockScaleShape[2] : blockScaleShape[1];
 
     auto expert_out_size = tensorrt_llm::computeFP4SwizzledLayoutSFSize(rows, cols);
-    th::Tensor interleavedBlockScale = th::zeros(
+    auto rows_padded = PadUpFn(rows, 128);
+    auto cols_padded = PadUpFn(cols, 4);
+    TORCH_CHECK(
+        expert_out_size == rows_padded * cols_padded, "expert_out_size should be equal to rows_padded * cols_padded.");
+    th::Tensor interleavedBlockScale = th::empty(
         {expert_out_size * num_experts}, th::dtype(SF_DTYPE).device(blockScale.device()).requires_grad(false));
 
     if (is_cuda)
     {
         const thread_local int smCount = tensorrt_llm::common::getMultiProcessorCount();
         auto stream = at::cuda::getCurrentCUDAStream(blockScale.get_device());
-        tensorrt_llm::kernels::invokeNVFP4BlockScaleInterleave(num_experts, rows, cols, blockScale.data_ptr<uint8_t>(),
-            static_cast<uint8_t*>(interleavedBlockScale.data_ptr()), smCount, stream);
+        tensorrt_llm::kernels::invokeNVFP4BlockScaleInterleave(num_experts, rows, rows_padded, cols, cols_padded,
+            blockScale.data_ptr<uint8_t>(), static_cast<uint8_t*>(interleavedBlockScale.data_ptr()), smCount, stream);
     }
     else
     {
-        for (size_t eIdx = 0; eIdx < static_cast<size_t>(num_experts); eIdx++)
+        for (int eIdx = 0; eIdx < static_cast<int>(num_experts); eIdx++)
         {
             uint8_t* interleavedBlockScalePtr
                 = static_cast<uint8_t*>(interleavedBlockScale.data_ptr()) + eIdx * expert_out_size;
-            for (size_t rIdx = 0; rIdx < static_cast<size_t>(rows); ++rIdx)
+            for (int rIdx = 0; rIdx < static_cast<int>(rows_padded); ++rIdx)
             {
                 auto globalRowIdx = eIdx * rows + rIdx;
                 uint8_t* blockScalePtr = blockScale.data_ptr<uint8_t>() + globalRowIdx * cols;
-                for (int cIdx = 0; cIdx < cols; ++cIdx)
+                for (int cIdx = 0; cIdx < static_cast<int>(cols_padded); ++cIdx)
                 {
+                    uint8_t sf_ori = 0;
+                    if (rIdx < static_cast<int>(rows) && cIdx < static_cast<int>(cols))
+                    {
+                        sf_ori = blockScalePtr[cIdx];
+                    }
                     int sf_index
                         = computeSFIndex(rIdx, cIdx, rows, cols, tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED);
-                    interleavedBlockScalePtr[sf_index] = blockScalePtr[cIdx];
+                    interleavedBlockScalePtr[sf_index] = sf_ori;
                 }
             }
         }
@@ -324,41 +336,68 @@ th::Tensor NVFP4BlockScaleInterleave(th::Tensor const& blockScale)
     return interleavedBlockScale;
 }
 
-// Reverse nterleave the weights block scaling factor.
-th::Tensor NVFP4BlockScaleInterleaveReverse(th::Tensor blockScale)
+// Reverse interleave the weights block scaling factor.
+// blockScale: [num_experts, rows, cols] or [rows, cols]
+// Note: rows and cols are the dimensions of the original unswizzled SFMatrix, so reshape input before passing into
+// this function! Return: The same shape as blockScale
+th::Tensor NVFP4BlockScaleInterleaveReverse(th::Tensor const& blockScale)
 {
-    CHECK_CPU_INPUT(blockScale, SF_DTYPE);
+    bool is_cuda = blockScale.device().is_cuda();
+    if (is_cuda)
+    {
+        CHECK_INPUT(blockScale, SF_DTYPE);
+    }
+    else
+    {
+        CHECK_CPU_INPUT(blockScale, SF_DTYPE);
+    }
     auto blockScaleShape = blockScale.sizes();
     TORCH_CHECK(blockScaleShape.size() == 2 || blockScaleShape.size() == 3, "Block Scale should be 2D or 3D tensor.");
     auto num_experts = blockScaleShape.size() == 3 ? blockScaleShape[0] : 1;
     auto rows = blockScaleShape.size() == 3 ? blockScaleShape[1] : blockScaleShape[0];
     auto cols = blockScaleShape.size() == 3 ? blockScaleShape[2] : blockScaleShape[1];
-    auto expert_out_size = tensorrt_llm::computeFP4SwizzledLayoutSFSize(rows, cols);
+    TORCH_CHECK(rows % 128 == 0, "rows of Interleaved block scales should be multiple of 128.");
+    TORCH_CHECK(cols % 4 == 0, "cols of Interleaved block scales should be multiple of 4.");
+    auto expert_out_size = rows * cols;
+    th::Tensor reversedBlockScale
+        = th::empty(blockScaleShape, th::dtype(SF_DTYPE).device(blockScale.device()).requires_grad(false));
 
-    th::Tensor reversedBlockScale = th::zeros(blockScaleShape, th::dtype(SF_DTYPE).requires_grad(false));
-    std::map<int, std::array<int, 3>> identity;
-    for (int eIdx = 0; eIdx < num_experts; eIdx++)
+    if (is_cuda)
     {
-        for (int rIdx = 0; rIdx < rows; ++rIdx)
+        const thread_local int smCount = tensorrt_llm::common::getMultiProcessorCount();
+        auto stream = at::cuda::getCurrentCUDAStream(blockScale.get_device());
+        tensorrt_llm::kernels::invokeNVFP4BlockScaleInterleaveReverse(num_experts, rows, cols,
+            blockScale.data_ptr<uint8_t>(), static_cast<uint8_t*>(reversedBlockScale.data_ptr()), smCount, stream);
+    }
+    else
+    {
+        // index in the swizzled SFMatrix -> (eIdx, rIdx, cIdx) in the unswizzled SFMatrix
+        std::map<int, std::array<int, 3>> identity;
+        for (int eIdx = 0; eIdx < num_experts; eIdx++)
         {
-            for (int cIdx = 0; cIdx < cols; ++cIdx)
+            for (int rIdx = 0; rIdx < rows; ++rIdx)
             {
-                int sf_index = computeSFIndex(rIdx, cIdx, rows, cols, tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED);
-                identity[eIdx * expert_out_size + sf_index] = std::array<int, 3>{eIdx, rIdx, cIdx};
+                for (int cIdx = 0; cIdx < cols; ++cIdx)
+                {
+                    int sf_index
+                        = computeSFIndex(rIdx, cIdx, rows, cols, tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED);
+                    identity[eIdx * expert_out_size + sf_index] = std::array<int, 3>{eIdx, rIdx, cIdx};
+                }
+            }
+        }
+        uint8_t* blockScalePtr = static_cast<uint8_t*>(blockScale.data_ptr());
+        for (int i = 0; i < expert_out_size * num_experts; i++)
+        {
+            auto loc_2d = identity[i];
+            if (loc_2d[1] < rows && loc_2d[2] < cols)
+            {
+                uint8_t* reversedBlockScalePtr
+                    = reversedBlockScale.data_ptr<uint8_t>() + (loc_2d[0] * rows + loc_2d[1]) * cols + loc_2d[2];
+                *reversedBlockScalePtr = blockScalePtr[i];
             }
         }
     }
-    uint8_t* blockScalePtr = static_cast<uint8_t*>(blockScale.data_ptr());
-    for (int i = 0; i < expert_out_size * num_experts; i++)
-    {
-        auto loc_2d = identity[i];
-        if (loc_2d[1] < rows && loc_2d[2] < cols)
-        {
-            uint8_t* reversedBlockScalePtr
-                = reversedBlockScale.data_ptr<uint8_t>() + (loc_2d[0] * rows + loc_2d[1]) * cols + loc_2d[2];
-            *reversedBlockScalePtr = blockScalePtr[i];
-        }
-    }
+
     return reversedBlockScale;
 }
 
