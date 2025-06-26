@@ -357,9 +357,11 @@ class BaseLLM:
                 sampling_params.add_special_tokens = False
 
         query_token_ids = None
+        # NOTE: Multimodal related data
         multimodal_input = None
         multimodal_embedding = None
         mrope_config = None
+        mm_data = None
         if "prompt_token_ids" in inputs:
             # TODO: if specify prompt_token_ids, the mm hashing is not supported yet
             prompt_token_ids = inputs['prompt_token_ids']
@@ -384,11 +386,13 @@ class BaseLLM:
             prompt = inputs['prompt']
             if extra_processed_inputs is not None:
                 query_token_ids = extra_processed_inputs.get('query_token_ids')
+                # NOTE: Multimodal related data
                 multimodal_embedding = extra_processed_inputs.get(
                     'mm_embedding')
                 mrope_config = extra_processed_inputs.get('mrope_config')
                 multimodal_input = extra_processed_inputs.get(
                     'multimodal_input')
+                mm_data = extra_processed_inputs.get('mm_data')
         else:
             raise TypeError(
                 f"The inputs must be type str or list of int, but got {type(inputs)}"
@@ -414,6 +418,7 @@ class BaseLLM:
             kv_cache_retention_config=kv_cache_retention_config,
             disaggregated_params=disaggregated_params,
             postproc_params=_postproc_params,
+            mm_data=mm_data,
         )
 
         return RequestOutput._from_generation_result(result, prompt,

@@ -479,6 +479,10 @@ class GenerationExecutorWorker(GenerationExecutor):
                 context_phase_params=context_phase_params,
                 type=request_type)
 
+            if self._is_pytorch_backend:
+                if request.mm_data is not None:
+                    executor_request.py_mm_data = request.mm_data
+
             if self._is_pytorch_backend and request.sampling_params.logits_processor:
                 # For PyTorch backend, we attach logits processors as a dynamic Python attribute
                 # instead of using the C++ binding, since the latter will cause PyCapsule pickling issues.

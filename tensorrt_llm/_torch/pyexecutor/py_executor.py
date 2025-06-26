@@ -1158,8 +1158,8 @@ class PyExecutor:
     def _broadcast_new_requests(
         self,
         new_requests: List[RequestQueueItem],
-        py_request_objects: Optional[tuple[str, dict]] = None,
-    ) -> tuple[List[RequestQueueItem], Optional[tuple[str, dict]]]:
+        py_request_objects: Optional[dict[str, tuple[str, dict]]] = None,
+    ) -> tuple[List[RequestQueueItem], Optional[dict[str, tuple[str, dict]]]]:
         """Broadcasts new_requests and optional Python-only metadata (`py_request_objects`) across pipeline stages.
            `py_request_objects` is a tuple of (attribute_name, {request_id: object}).
         """
@@ -1206,8 +1206,11 @@ class PyExecutor:
                 total_max_num_active_requests - total_num_active_requests)
 
         if self.dist.rank == 0:
-            py_request_objects = self._collect_py_objects_from_requests(
+            py_logits_post_processors = self._collect_py_objects_from_requests(
                 new_requests, "py_logits_post_processors")
+            py_mm_data = self._collect_py_objects_from_requests(
+                new_requests, "py_mm_data")
+            py_request_objects = tuple(filter(None, [py_logits_post_processors, py_mm_data]))
         else:
             py_request_objects = None
 
@@ -1234,9 +1237,9 @@ class PyExecutor:
 
         if py_request_objects and (self.dist.tp_size > 1
                                    or self.dist.has_pp) and self.dist.rank > 0:
-            attr_name, req_obj_dict = py_request_objects
-            self._attach_py_objects_to_requests(new_requests, attr_name,
-                                                req_obj_dict)
+            for attr_name, req_obj_dict in py_request_objects:
+                self._attach_py_objects_to_requests(new_requests, attr_name,
+                                                    req_obj_dict)
 
         if not self.enable_attention_dp:
             self._update_new_active_requests_queue_latency(new_requests)

@@ -1495,7 +1495,8 @@ class PyTorchModelEngine(ModelEngine):
             self.position_ids_cuda[:total_num_tokens].unsqueeze(0),
             'inputs_embeds': None,
             'multi_modal_data': multi_modal_data,
-            'mrope_config': mrope_config
+            'mrope_config': mrope_config,
+            'mm_data': py_mm_data
         }
 
         if bool(lora_params):

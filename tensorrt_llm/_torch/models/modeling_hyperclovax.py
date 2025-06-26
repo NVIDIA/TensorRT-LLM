@@ -22,9 +22,6 @@ from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_utils import register_auto_model
 
-DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
-
-
 # Copied from HyperCLOVAX-SEED-Vision-Instruct-3B/modeling_hyperclovax.py
 def select_best_resolution(original_size: tuple,
                            possible_resolutions: list) -> tuple:
@@ -423,11 +420,8 @@ class HCXVisionInputProcessor(InputProcessor):
             model_path,
             trust_remote_code=trust_remote_code,
             use_fast=self.use_fast)
-        self.tllm_image_token_id = self.pretrained_config.language_config[
+        self.tllm_multimodal_token_id = self.pretrained_config.language_config[
             "vocab_size"] + 1
-        if DISAGG:
-            self.mm_encoder = HCXVisionModel(self.pretrained_config,
-                                             skip_processor=True)
 
     def _post_process(self,
                       input_ids: torch.Tensor,
@@ -476,7 +470,7 @@ class HCXVisionInputProcessor(InputProcessor):
                     batch_idx,
                     input_start + token_len:input_start + token_len +
                     vision_query_lengths[batch_idx][multi_img_idx],
-                ] = self.tllm_image_token_id
+                ] = self.tllm_multimodal_token_id
 
                 input_start += token_len + vision_query_lengths[batch_idx][
                     multi_img_idx]
@@ -531,49 +525,34 @@ class HCXVisionInputProcessor(InputProcessor):
         if not preprocessed_image:
             return fused_input_ids.to(torch.int32).tolist(), {}
 
-        if DISAGG:
-            mm_embeds = self.mm_encoder.forward(preprocessed_image)
-            mm_embeds = torch.cat(mm_embeds, dim=0)
-        else:
-            # NOTE: For now, I am using "mm_embeding" in tensor format to send the image data to the model.
-            # CASE 1: Sending raw image data
-            if isinstance(images[0], Image.Image):
-                images = [torch.from_numpy(np.array(image)) for image in images]
-            mm_embeds = torch.stack(images, dim=0)
-
-            # NOTE: After refactoring the llmRequest, we can use preprocessed_image['pixel_values'] to send the image data to the model.
-            # CASE 2: Sending preprocessed image data
-            # mm_embeds = torch.cat(preprocessed_image['pixel_values'][0],
-            #                                dim=0)
-
+        mm_data = {}
+        mm_data["image"] = {
+            "pixel_values": torch.stack(preprocessed_image['pixel_values'][0], dim=0), #TODO change the pixel_values into the Shared Tensor
+            "image_sizes": preprocessed_image.get('image_sizes', None),
+            "is_videos": preprocessed_image.get('is_videos', None),
+            "num_queries_vis_abstractors": preprocessed_image.get('num_queries_vis_abstractors', None),
+            "num_queries_vis_abstractors_slow": preprocessed_image.get('num_queries_vis_abstractors_slow', None),
+            "first_last_frames_slows": preprocessed_image.get('first_last_frames_slows', None),
+        }
         return fused_input_ids.to(torch.int32).tolist(), {
-            "mm_embedding": mm_embeds,
+            "mm_data": mm_data
         }
 
 
 class HCXVisionModel:
 
     def __init__(self,
-                 pretrained_config: PretrainedConfig,
-                 skip_processor: bool = False):
-
+                 pretrained_config: PretrainedConfig):
+    
         self.pretrained_config = pretrained_config
         self.vision_config = self.pretrained_config.vision_config
 
         model_path = self.pretrained_config._name_or_path
 
-        # TODO: Remove this when we refactor LlmRequest
-        # NOTE: trust_remote_code can be removed once we refactor LlmRequest
-        self.skip_processor = skip_processor
-        if not self.skip_processor:
-            self.processor = AutoProcessor.from_pretrained(
-                model_path, trust_remote_code=True, use_fast=True)
-
         # NOTE: There is no way of importing mm_projector, HCXVisionCAbstractor from HF. So, can not do the sharded_loading.
         # NOTE: trust_rmemote_code can be removed once we change the model into TRT-LLM's format
         model = transformers.AutoModelForCausalLM.from_pretrained(
-            model_path, trust_remote_code=True)
-        model.eval()
+            model_path, trust_remote_code=True).eval()
         self.device = 'cuda'
 
         # TODO: Convert to TRT-LLM's SIGLIP
@@ -635,25 +614,26 @@ class HCXVisionModel:
             for key in preprocessed_image_list[0].keys()
         }
 
-    def forward(self, mm_data: Union[List[Any], Dict[str, Any]]):
-        if not self.skip_processor:
-            # NOTE: This should be done in the input processor and got the preprocessed_image metadata from request level.
-            # But before refactoring the llmRequest, we are re-doing inputprocessor here.
-            preprocessed_image = self._preprocess(mm_data)
-        else:
-            # NOTE: When we refactor the llmRequest, we will get the extra_mm_data from mm_data, and need to make it as preprocessed_image.
-            preprocessed_image = mm_data
-            preprocessed_image["pixel_values"] = self._to_device(
-                preprocessed_image["pixel_values"])
+    def _parse_and_batch_mm_data(self, mm_data: List[Dict[str, Any]]) -> Tuple[List[torch.Tensor], Dict[str, List[Any]]]:
+        pixel_values = [list(torch.unbind(data["image"]["pixel_values"], dim=0)) for data in mm_data]
+        mm_extra_data = {
+            key: [d["image"][key][0] for d in mm_data]
+            for key in mm_data[0]["image"].keys()
+        }
+        return pixel_values, mm_extra_data
 
-        pixel_values = preprocessed_image.get("pixel_values", None)
-        image_sizes = preprocessed_image.get("image_sizes", None)
-        is_videos = preprocessed_image.get("is_videos", None)
-        num_queries_vis_abstractors = preprocessed_image.get(
+    @torch.inference_mode()
+    def forward(self, mm_data: List[Dict[str, Any]]):
+        
+        pixel_values, mm_extra_data = self._parse_and_batch_mm_data(mm_data)
+        pixel_values = self._to_device(pixel_values)
+        image_sizes = mm_extra_data.get("image_sizes", None)
+        is_videos = mm_extra_data.get("is_videos", None)
+        num_queries_vis_abstractors = mm_extra_data.get(
             "num_queries_vis_abstractors", None)
-        num_queries_vis_abstractors_slow = preprocessed_image.get(
+        num_queries_vis_abstractors_slow = mm_extra_data.get(
             "num_queries_vis_abstractors_slow", None)
-        first_last_frames_slows = preprocessed_image.get(
+        first_last_frames_slows = mm_extra_data.get(
             "first_last_frames_slows", None)
 
         len_pixel_values = [len(pixel_value) for pixel_value in pixel_values]
@@ -791,8 +771,7 @@ class HCXVisionForCausalLM(PreTrainedModel):
         if hasattr(self, "llm"):
             return
 
-        if not DISAGG:
-            self.mm_encoder = HCXVisionModel(model_config.pretrained_config)
+        self.mm_encoder = HCXVisionModel(model_config.pretrained_config)
 
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = PretrainedConfig.from_dict(
@@ -843,17 +822,13 @@ class HCXVisionForCausalLM(PreTrainedModel):
             f"num_context_requests: {num_context_requests}, num_generation_requests: {num_generation_requests}"
         )
 
-        mm_data = kwargs.get("multi_modal_data", [])
+        mm_data = kwargs.get("mm_data", [])
         mm_embeds = []
         if len(mm_data) > 0:
             assert len(
                 mm_data
-            ) == num_context_requests, f"Number of multimodal tensors ({len(mm_data)}) should be equal to number of context requests ({num_context_requests}) in the batch."
-            if DISAGG:
-                # NOTE: In the DISAGG, we are assuming we get the mm_embeds from the llmRequest.
-                mm_embeds = mm_data
-            else:
-                mm_embeds = self.mm_encoder.forward(mm_data)
+            ) == num_context_requests == len(mm_data), f"Number of multimodal tensors ({len(mm_data)}) should be equal to number of context requests ({num_context_requests}) in the batch."
+            mm_embeds = self.mm_encoder.forward(mm_data)
 
         input_ids, input_embeds = fuse_input_embeds(self.llm.model.embed_tokens,
                                                     input_ids, mm_embeds)
