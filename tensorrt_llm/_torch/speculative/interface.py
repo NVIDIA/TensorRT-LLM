@@ -88,6 +88,14 @@ class SpeculativeDecodingMode(IntEnum):
                 and not (isinstance(attention_backend, TrtllmAttention)
                          and get_sm_version() == 100)) or self.is_ngram()
 
+    def attention_need_spec_dec_mode(self, attention_backend):
+        """
+        If true, the attention backend kernel needs to run in spec-dec mode (multi-token query mode).
+        """
+        return (self.is_eagle3_one_model()
+                and issubclass(attention_backend, TrtllmAttention)
+                and get_sm_version() < 100)
+
     @staticmethod
     def from_string(name: Optional[str]) -> "SpeculativeDecodingMode":
         if name is None:
@@ -174,10 +182,8 @@ class SpecMetadata:
     # The number of layers
     num_layers: int = 0
 
-    # some spec-dec method needs a tree-based spec_dec tree
-    has_spec_dec_tree: bool = False
-    # if spec-dec tree is linear, the mask can be computed in an easier way.
-    is_spec_dec_tree_linear: bool = True
+    # if spec-dec tree is not a tree (a chain / linear tree), the mask can be computed in an easier way.
+    is_spec_dec_tree: bool = False
     # if spec-dec tree wouldn't be changed at all, the mask won't be computed every step.
     is_spec_dec_tree_dynamic: bool = False
 

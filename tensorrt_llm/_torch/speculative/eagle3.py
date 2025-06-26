@@ -250,11 +250,10 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         )
 
         # currently Eagle3 only supports linear tree
-        self.has_spec_dec_tree = True
-        self.is_spec_dec_tree_linear = True
+        self.is_spec_dec_tree = False
 
         # currently Eagle3 only supports static tree
-        self.is_spec_dec_tree_dynamic = False
+        self.is_spec_dec_dynamic_tree = False
 
     def is_layer_capture(self, layer_id: int):
         return layer_id in self.layers_to_capture
@@ -511,9 +510,6 @@ class Eagle3OneModelWorker(nn.Module):
 
         # get draft inputs
         input_ids = torch.concat([input_ids_ctx, input_ids_gen], dim=0)
-
-        # set use_spec_decoding = true for the 1st eagle head step
-        attn_metadata.use_spec_decoding = True
 
         return {
             "input_ids": input_ids,
