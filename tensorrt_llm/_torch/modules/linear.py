@@ -16,6 +16,7 @@ from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy)
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import GemmAllReduceRunner
 
 from ...models.modeling_utils import QuantConfig
 from ..utils import Fp4QuantizedTensor
@@ -662,24 +663,49 @@ def get_quant_method(quant_config: Optional[QuantConfig] = None):
 
 # Fuses allreduce and linear method together.
 class DistributedRowLinearMethod(LinearMethodBase):
-    def __init__(self, mapping: Mapping, quant_config: Optional[QuantConfig] = None):
+    def __init__(self, mapping: Mapping, max_num_tokens: int, quant_config: Optional[QuantConfig] = None):
         self.quant_method = get_quant_method(quant_config)
         self.has_nvfp4 = quant_config.layer_quant_mode.has_nvfp4()
-        self.mapping = mapping
+        self.mapping = mapping 
+        self.max_num_tokens = max_num_tokens
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype, *args,
                        **kwargs):
         self.quant_method.create_weights(module, in_features, out_features, bias, dtype, *args, **kwargs)
 
+        # Activation type will be same as weight type for now.
+        # TODO: When we support mixed precision, we need to handle this differently.
+        act_dtype = module.weight.dtype   
+
+        print("in_features", in_features)
+        print("out_features", out_features)
+
+        max_problem_shape = (self.max_num_tokens, out_features, in_features)     
+        print("max_problem_shape", max_problem_shape)
+
+        # Cannot allocate during runtime as it will break with cuda graphs.
+        self.gemm = GemmAllReduceRunner(max_problem_shape, self.mapping.tp_rank, list(self.mapping.tp_group), act_dtype, module.weight.dtype, dtype, self.has_nvfp4, False)
+
+
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor], *args, **kwargs):
         
         act, act_sf = self.quantize_input(module, input)
 
+        num_tokens = input.shape[0]
+        assert num_tokens <= self.max_num_tokens, f"num_tokens {num_tokens} must <= max_num_tokens {self.max_num_tokens} configured in DistributedRowLinear"
+
         print("calling into fused_gemm_allreduce")
-        output = torch.ops.trtllm.fused_gemm_allreduce(
-            act, self.quant_method.weight, act_sf, self.quant_method.weight_scale, self.quant_method.alpha, module.dtype, self.mapping.tp_rank, list(self.mapping.tp_group), self.has_nvfp4)
+        output = self.gemm(inputs=[act, module.weight, act_sf, module.weight_scale, module.alpha])
+
+        # output = torch.ops.trtllm.fused_gemm_allreduce(
+        #     act, module.weight, act_sf, module.weight_scale, module.alpha, module.dtype, self.mapping.tp_rank, list(self.mapping.tp_group), self.has_nvfp4)
+
+        if bias is not None:
+            output = output + bias
+        
+        return output
 
     def quantize_input(self, module: Linear, input: torch.Tensor, *args, **kwargs):
         return self.quant_method.quantize_input(module, input, *args, **kwargs)
@@ -714,7 +740,7 @@ class Linear(nn.Module):
         use_custom_cublas_mm: bool = False,
         lora: Optional[LoraLayer] = None,
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
-        fuse_gemm_allreduce: bool = False,
+        max_num_tokens: int = 8192,
     ):
         from ..distributed import AllReduce
 
@@ -751,15 +777,20 @@ class Linear(nn.Module):
         self.in_features = local_in_features
         self.out_features = local_out_features
 
-        self.all_reduce = AllReduce(
-            mapping=self.mapping,
-            strategy=allreduce_strategy) if reduce_output else None
+        self.fuse_gemm_allreduce = reduce_output and allreduce_strategy == AllReduceStrategy.FUSE_WITH_GEMM
+        if not self.fuse_gemm_allreduce:
+            self.all_reduce = AllReduce(
+                mapping=self.mapping,
+                strategy=allreduce_strategy) if reduce_output else None
         self._weights_created = False
         self.reduce_output = reduce_output
         self.use_custom_cublas_mm = use_custom_cublas_mm
         self.lora = lora
-        self.fuse_gemm_allreduce = fuse_gemm_allreduce and tensor_parallel_mode == TensorParallelMode.ROW
+        self.max_num_tokens = max_num_tokens
 
+        if self.fuse_gemm_allreduce:
+            print("------------- USING FUSE_WITH_GEMM -------------")
+        
         if not skip_create_weights_in_init:
             self.create_weights()
 
@@ -769,7 +800,7 @@ class Linear(nn.Module):
 
         if self.fuse_gemm_allreduce:
             print("Using DistributedRowLinearMethod")
-            self.quant_method = DistributedRowLinearMethod(self.mapping, self.quant_config)
+            self.quant_method = DistributedRowLinearMethod(self.mapping, self.max_num_tokens, self.quant_config)
         else:
             print("Using get_quant_method")
             self.quant_method = get_quant_method(self.quant_config)

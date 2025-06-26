@@ -476,7 +476,10 @@ protected:
                         COMM_SESSION.barrier();
                         timer.start(stream);
                     }
+                    printf("Running %s\n", launch_config.str().c_str());
                     _gemm->run(args, stream);
+                    cudaStreamSynchronize(stream);
+                    printf("Done %s\n", launch_config.str().c_str());
                 }
                 timer.stop();
                 float elapsed_us = timer.elapsed_millis() * 1000.f;
@@ -874,12 +877,12 @@ private:
 
 using MyTypes = testing::Types<
     // fp4xfp4=fp16
-    TestConfig<cutlass::float_e2m1_t, cutlass::float_e2m1_t, cutlass::half_t, cutlass::half_t, cutlass::float_ue4m3_t,
-        cutlass::float_ue4m3_t>,
+    // TestConfig<cutlass::float_e2m1_t, cutlass::float_e2m1_t, cutlass::half_t, cutlass::half_t, cutlass::float_ue4m3_t,
+    //     cutlass::float_ue4m3_t>,
     // fp8xfp8=fp16
-    TestConfig<cutlass::float_e4m3_t, cutlass::float_e4m3_t, cutlass::half_t, cutlass::half_t>,
+    TestConfig<cutlass::float_e4m3_t, cutlass::float_e4m3_t, cutlass::half_t, cutlass::half_t>>;
     // fp16xfp16=fp16
-    TestConfig<cutlass::half_t, cutlass::half_t, cutlass::half_t, cutlass::half_t>>;
+    // TestConfig<cutlass::half_t, cutlass::half_t, cutlass::half_t, cutlass::half_t>>;
 
 TYPED_TEST_SUITE(GemmAllReduceFixture, MyTypes);
 

@@ -43,10 +43,9 @@ __forceinline__ __device__ uint32_t atomicCAS_system_acq(uint32_t* p, uint32_t c
 
 } // namespace detail
 
-template <class Sync, bool SafeBetweenPhases, bool UseMembarGPU>
+template <class Sync, bool SafeBetweenPhases>
 struct MulticastSystemBarrier : public GenericBarrier<Sync>
 {
-
     using T = uint32_t;
 
     struct Params
@@ -57,6 +56,7 @@ struct MulticastSystemBarrier : public GenericBarrier<Sync>
 
 protected:
     /// Reduce into flag, with release pattern (int specialization)
+    template <bool UseMembarGPU>
     CUTLASS_DEVICE
     static void red_release(T* mc_ptr, int val)
     {
@@ -128,6 +128,7 @@ public:
         Sync::sync();
     }
 
+    template <bool UseMembarGPU>
     CUTLASS_DEVICE
     static T arrive_inc_get(T* mc_ptr, T* uc_ptr, int thread_idx, int flag_idx, int rank, int world_size)
     {
@@ -156,11 +157,12 @@ public:
             // can be immediately reused.
             bool master = rank == 0;
             int val = master ? 0x80000000 - (world_size - 1) : 1;
-            red_release(mc_barrier_ptr, val);
+            red_release<UseMembarGPU>(mc_barrier_ptr, val);
         }
         return old_arrive;
     }
 
+    template <bool UseMembarGPU>
     CUTLASS_DEVICE
     static void arrive_inc(Params const& params, int thread_idx, int flag_idx, int rank, int world_size)
     {
@@ -170,10 +172,11 @@ public:
 
         if (thread_idx == 0)
         {
-            red_release(mc_barrier, 1);
+            red_release<UseMembarGPU>(mc_barrier, 1);
         }
     }
 
+    template <bool UseMembarGPU>
     CUTLASS_DEVICE
     static void arrive_and_wait(Params const& params, int thread_idx, int flag_idx, int rank, int world_size)
     {
@@ -181,12 +184,12 @@ public:
         auto uc_ptr = params.uc_barrier_ptr;
         if constexpr (SafeBetweenPhases)
         {
-            auto old_arrive = arrive_inc_get(mc_ptr, uc_ptr, thread_idx, flag_idx, rank, world_size);
+            auto old_arrive = arrive_inc_get<UseMembarGPU>(mc_ptr, uc_ptr, thread_idx, flag_idx, rank, world_size);
             wait(old_arrive, uc_ptr, thread_idx, flag_idx);
         }
         else
         {
-            arrive_inc(params, thread_idx, flag_idx, rank, world_size);
+            arrive_inc<UseMembarGPU>(params, thread_idx, flag_idx, rank, world_size);
             wait_eq_reset(uc_ptr, thread_idx, flag_idx, world_size);
         }
     }
@@ -209,7 +212,7 @@ public:
     }
 };
 
-template <class Sync, bool SafeBetweenPhases, bool UseMembarGPU>
+template <class Sync, bool SafeBetweenPhases>
 struct SystemBarrier : public GenericBarrier<Sync>
 {
     using T = uint32_t;
@@ -221,6 +224,7 @@ struct SystemBarrier : public GenericBarrier<Sync>
 
 protected:
     /// Reduce into flag, with release pattern (int specialization)
+    template <bool UseMembarGPU>
     CUTLASS_DEVICE
     static T red_release(T* ptr, int val)
     {
@@ -267,6 +271,7 @@ public:
         Sync::sync();
     }
 
+    template <bool UseMembarGPU>
     CUTLASS_DEVICE
     static T arrive_inc_get(T** barrier_ptrs, int thread_idx, int flag_idx, int rank, int world_size)
     {
@@ -279,26 +284,28 @@ public:
             bool master = rank == 0;
             int val = master ? 0x80000000 - (world_size - 1) : 1;
             T* barrier_ptr = barrier_ptrs[thread_idx] + flag_idx;
-            old_arrive = red_release(barrier_ptr, val);
+            old_arrive = red_release<UseMembarGPU>(barrier_ptr, val);
         }
         return old_arrive;
     }
 
+    template <bool UseMembarGPU>
     CUTLASS_DEVICE
     static void arrive_and_wait(Params const& params, int thread_idx, int flag_idx, int rank, int world_size)
     {
         if constexpr (SafeBetweenPhases)
         {
-            auto old_arrive = arrive_inc_get(params.barrier_ptrs, thread_idx, flag_idx, rank, world_size);
+            auto old_arrive = arrive_inc_get<UseMembarGPU>(params.barrier_ptrs, thread_idx, flag_idx, rank, world_size);
             wait(old_arrive, params.barrier_ptrs[rank], thread_idx, flag_idx);
         }
         else
         {
-            arrive_inc(params, thread_idx, flag_idx, rank, world_size);
+            arrive_inc<UseMembarGPU>(params, thread_idx, flag_idx, rank, world_size);
             wait_eq_reset(params, thread_idx, flag_idx, rank, world_size);
         }
     }
 
+    template <bool UseMembarGPU>
     CUTLASS_DEVICE
     static void arrive_inc(Params const& params, int thread_idx, int flag_idx, int rank, int world_size)
     {
@@ -307,7 +314,7 @@ public:
         if (thread_idx < world_size)
         {
             T* barrier_ptr = params.barrier_ptrs[thread_idx] + flag_idx;
-            [[maybe_unsed]] T old_arrive = red_release(barrier_ptr, 1);
+            [[maybe_unsed]] T old_arrive = red_release<UseMembarGPU>(barrier_ptr, 1);
         }
     }
 

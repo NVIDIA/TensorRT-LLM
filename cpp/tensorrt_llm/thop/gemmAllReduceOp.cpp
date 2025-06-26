@@ -93,15 +93,27 @@ class GemmAllReduceRunner : public torch::CustomClassHolder
 {
 public:
     // TODO: remove inputIsFP4 & sfUseUE8M0 when supported natively by torch.
-    explicit GemmAllReduceRunner(at::IntArrayRef max_problem_shape, at::ScalarType A_dtype, at::ScalarType B_dtype, at::ScalarType outputDtype, bool inputIsFP4, bool sfUseUE8M0, int64_t rank, at::IntArrayRef tp_group)
+    explicit GemmAllReduceRunner(
+        at::IntArrayRef max_problem_shape,
+        at::ScalarType A_dtype,
+        at::ScalarType B_dtype,
+        at::ScalarType outputDtype,
+        bool inputIsFP4,
+        bool sfUseUE8M0,
+        int64_t rank,
+        at::IntArrayRef tp_group)
         : mRank(static_cast<int>(rank)), mOutputDtype(outputDtype)
     {
         TORCH_CHECK(!sfUseUE8M0, "use UE8M0 for FP4 Block Scale Factors is not supported yet");
 
         // Convert at::IntArrayRef to std::set<int>
-        for (int i = 0; i < tp_group.size(); ++i) {
+        printf("rank: %d\n", mRank);
+        printf("tp_group: ");
+        for (size_t i = 0; i < tp_group.size(); ++i) {
             mTPGroup.insert(tp_group[i]);
+            printf("%d ", int(tp_group[i]));
         }
+        printf("\n");
 
         // allocate gemm
         GemmAllReduceRunnerFactory factory;
@@ -113,6 +125,8 @@ public:
         auto m = static_cast<int>(max_problem_shape[0]);
         auto n = static_cast<int>(max_problem_shape[1]);
         auto k = static_cast<int>(max_problem_shape[2]);
+
+        printf("GemmAllReduceRunner constructor: max_m: %d, n: %d, k: %d\n", m, n, k);
 
         GemmAllReduceImplInterface::ProblemArgs args;
         args.argProblemShape(m, n, k, 1)
@@ -128,10 +142,23 @@ public:
         mOutput.reset(output_bytes, mTPGroup);
 
         printf("allocated mOUTPUT\n");
+
+        // int device_id;
+        // cudaGetDevice(&device_id);
+
+        // mReusableTensor = at::for_blob(
+        //     mOutput.getUnicastPointer(),
+        //     {m, n},
+        //     {n, 1}, // row-major strides
+        //     [](void* ptr) { /* no op */ },
+        //     torch::dtype(mOutputDtype).device(torch::kCUDA, device_id));
+
+        cudaMalloc(&mTmp, output_bytes);
     }
 
     ~GemmAllReduceRunner()
     {
+        printf("torch::GemmAllReduceRunner::~GemmAllReduceRunner\n");
         mOutput.free();
         mWorkspace->free();
     }
@@ -143,57 +170,79 @@ public:
         at::Tensor const& mat2Scale,
         at::Tensor const& globalScale)
     {
+        printf("[DEBUG] runGemm: Starting function\n");
+        
         TORCH_CHECK(mat1.dim() == 2, "mat1 must be of size [M, K]");
         TORCH_CHECK(mat2.dim() == 2, "mat2 must be of size [N, K]");
+        TORCH_CHECK(mat1.get_device() == mat2.get_device(), "mat1 and mat2 must be on the same device");
 
         printf("torch::GemmAllReduceRunner::runGemm\n");
-        cudaStream_t stream = at::cuda::getCurrentCUDAStream(mat1.get_device());
-        int32_t m = mat1.sizes()[0];
-        int32_t n = mat2.sizes()[0];
-        int32_t k = mat1.sizes()[1];
+        // cudaStream_t stream = at::cuda::getCurrentCUDAStream(mat1.get_device());
+        int m = static_cast<int>(mat1.sizes()[0]);
+        int n = static_cast<int>(mat2.sizes()[0]);
+        int k = static_cast<int>(mat1.sizes()[1]);
 
-        printf("gemm_allreduce, m: %d, n: %d, k: %d\n", m, n, k);
+        printf("[DEBUG] runGemm: Dimensions - m=%d, n=%d, k=%d\n", m, n, k);
 
-        at::IntArrayRef output_shape = {m, n};
+        printf("[DEBUG] runGemm: Creating PyTorch tensor with custom allocator\n");
+        
+        // Option 1: Use torch::from_blob with shared_ptr for proper memory management
+        int device_id;
+        cudaGetDevice(&device_id);
 
-        // TODO (xsimmons): use torch_ext::create_multicast_tensor instead of DeviceAllocationNvls for output and workspace.
-
+        // Use the newer API that takes shared_ptr directly
         torch::Tensor output = torch::from_blob(
-            mOutput.getUnicastPointer(),
-            output_shape,
-            [](void* ptr) { /* no op */ },
-            mOutputDtype);
+            mTmp,
+            {m, n}, // shape
+            {n, 1}, // row-major strides
+            [](void* ptr) {
+                // This will be called when the tensor is destroyed
+                // Since we're using pre-allocated memory, we don't free it here
+                printf("[DEBUG] Custom deleter called - not freeing memory\n");
+            }, // torch::Deleter
+            torch::dtype(mOutputDtype).device(torch::kCUDA, mat1.get_device()));
 
-        GemmAllReduceImplInterface::ProblemArgs args;
-        args.argA(mat1.data_ptr())
-            .argB(mat2.data_ptr())
-            .argD(output.data_ptr(), mOutput.getMulticastPointer(), (void**)mOutput.getIpcUnicastPointers())
-            .argAScale(mat1Scale.data_ptr())
-            .argBScale(mat2Scale.data_ptr())
-            .argBeta(0.f) // no bias
-            .argAlphaPtr((float const*)(globalScale.data_ptr()))
-            .argRanks(mRank, mTPGroup)
-            .argWorkspace(mWorkspace.get());
+        // GemmAllReduceImplInterface::ProblemArgs args;
+        // args.argProblemShape(m, n, k, 1)
+        //     .argA(mat1.data_ptr())
+        //     .argB(mat2.data_ptr())
+        //     .argD(output.data_ptr(), mOutput.getMulticastPointer(), (void**)mOutput.getIpcUnicastPointers())
+        //     .argAScale(mat1Scale.data_ptr())
+        //     .argBScale(mat2Scale.data_ptr())
+        //     .argBeta(0.f) // no bias
+        //     .argAlphaPtr((float const*)(globalScale.data_ptr()))
+        //     .argRanks(mRank, mTPGroup)
+        //     .argWorkspace(mWorkspace.get());
 
-        mGemm->run(args, stream);
+        // mGemm->run(args, stream);
+
+        // torch::Tensor output = mReusableTensor.view({m, n});
+        // torch::Tensor output = mReusableTensor.narrow(0, 0, m).narrow(1, 0, n);
+        // auto output = torch::empty({m, n}, torch::dtype(mOutputDtype).device(torch::kCUDA, mat1.get_device()));
 
         return output;
     }
 
     // Overloaded operator() to match Python call pattern
-    at::Tensor operator()(std::vector<at::Tensor> inputs)
+    at::Tensor operator()(
+        at::Tensor const& mat1,
+        at::Tensor const& mat2,
+        at::Tensor const& mat1Scale,
+        at::Tensor const& mat2Scale,
+        at::Tensor const& globalScale)
     {
-        TORCH_CHECK(inputs.size() >= 5, "Expected at least 5 input tensors");
-        return runGemm(inputs[0], inputs[1], inputs[2], inputs[3], inputs[4]);
+        return runGemm(mat1, mat2, mat1Scale, mat2Scale, globalScale);
     }
 
 private:
-    at::ScalarType mOutputDtype;
     int mRank;
+    at::ScalarType mOutputDtype;
     std::set<int> mTPGroup;
     std::shared_ptr<GemmAllReduceImplInterface> mGemm;
     std::shared_ptr<PersistentWorkspaceInterface> mWorkspace;
     tr::DeviceAllocationNvls<char> mOutput;
+    void* mTmp;
+    torch::Tensor mReusableTensor;
 };
 
 } // namespace torch_ext
@@ -202,6 +251,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.class_<torch_ext::GemmAllReduceRunner>("GemmAllReduceRunner")
         .def(torch::init<at::IntArrayRef, at::ScalarType, at::ScalarType, at::ScalarType, bool, bool, int64_t, at::IntArrayRef>())
-        .def("__call__", &torch_ext::GemmAllReduceRunner::operator());
-
+        .def("runGemm", &torch_ext::GemmAllReduceRunner::runGemm);
 }

@@ -1003,6 +1003,7 @@ class PyTorchModelEngine(ModelEngine):
             checkpoint_dir,
             trust_remote_code=True,
             enable_min_latency=self.pytorch_backend_config.enable_min_latency,
+            allreduce_strategy=self.pytorch_backend_config.allreduce_strategy,
             spec_config=self.spec_config,
             max_num_tokens=max_num_tokens,
             moe_max_num_tokens=moe_max_num_tokens,

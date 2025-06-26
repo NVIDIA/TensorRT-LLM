@@ -3881,7 +3881,8 @@ class AllReduceStrategy(IntEnum):
     ONESHOT = 4
     TWOSHOT = 5
     LOWPRECISION = 6
-    MNNVL = 7
+    MNNVL = 7,
+    FUSE_WITH_GEMM = 8,
 
 
 class AllReduceFusionOp(IntEnum):

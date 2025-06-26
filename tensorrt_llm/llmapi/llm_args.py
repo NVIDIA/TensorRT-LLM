@@ -1580,6 +1580,11 @@ class TorchLlmArgs(BaseLlmArgs):
         "If true, enable min-latency mode. Currently only used for Llama4.",
     )
 
+    allreduce_strategy: str = Field(
+        default="AUTO",
+        description="Allreduce strategy to use.",
+    )
+
     @field_validator('load_format', mode='before')
     @classmethod
     def convert_load_format(cls, v):
@@ -1659,7 +1664,8 @@ class TorchLlmArgs(BaseLlmArgs):
             autotuner_enabled=self.autotuner_enabled,
             enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
             load_format=self.load_format,
-            enable_min_latency=self.enable_min_latency)
+            enable_min_latency=self.enable_min_latency,
+            allreduce_strategy=self.allreduce_strategy)
 
     @field_validator('cuda_graph_max_batch_size')
     @classmethod

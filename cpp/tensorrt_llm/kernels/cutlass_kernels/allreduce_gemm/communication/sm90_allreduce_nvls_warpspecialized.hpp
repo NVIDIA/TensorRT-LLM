@@ -118,7 +118,8 @@ public:
             params.ipc_ptr_out[i] = (args.ipc_ptr_out != nullptr) ? args.ipc_ptr_out[i] : nullptr;
         }
         params.stride = args.stride;
-        params.barrier_params = args.barrier_params, params.barrier_params_final_sync = args.barrier_params_final_sync;
+        params.barrier_params = args.barrier_params;
+        params.barrier_params_final_sync = args.barrier_params_final_sync;
         params.rank = args.rank;
         params.world_size = args.world_size;
         params.tile_layout = tile_layout;
@@ -201,7 +202,7 @@ public:
         auto [M, N, K, L] = problem_shape;
         auto [m, n, k, l] = tile_coord;
 
-        if (!tile_valid(m, n) || params_ptr->world_size == 1)
+        if (!tile_valid(m, n) || params_ptr->world_size <= 2)
         {
             return; // nothing to do
         }
@@ -210,9 +211,8 @@ public:
 
         sync_threads();
 
-        // Wait for all multicast writes to be visible to us.
-        // This is safe between phases.
-        SystemBarrier::arrive_and_wait(
+        // Need multicast writes to be visible.
+        SystemBarrier::arrive_and_wait<false>(
             params_ptr->barrier_params_final_sync, thread_idx, tile_index, params_ptr->rank, params_ptr->world_size);
     }
 

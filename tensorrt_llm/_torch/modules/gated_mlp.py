@@ -44,6 +44,9 @@ class GatedMLP(nn.Module):
         self.intermediate_size = intermediate_size
         self.activation = activation
 
+        print("GatedMLP init, config.allreduce_strategy: ", config.allreduce_strategy)
+        print("max_num_tokens: ", config.max_num_tokens)
+
         config = config or ModelConfig()
         self.mapping = config.mapping
         if overridden_tp_size is not None:
@@ -73,7 +76,8 @@ class GatedMLP(nn.Module):
             quant_config=config.get_quant_config(),
             reduce_output=False,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-            allreduce_strategy=config.allreduce_strategy)
+            allreduce_strategy=config.allreduce_strategy,
+            max_num_tokens=config.max_num_tokens)
 
         self.down_lora = LoraLayer([LoraModuleType.MLP_4H_TO_H],
                                    [self.hidden_size])
@@ -89,7 +93,8 @@ class GatedMLP(nn.Module):
             reduce_output=reduce_output,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             lora=self.down_lora,
-            allreduce_strategy=config.allreduce_strategy)
+            allreduce_strategy=config.allreduce_strategy,
+            max_num_tokens=config.max_num_tokens)
 
         # These two modules are mutually exclusive - either splitted_gate_up_lora or fused_gate_up_lora will be used,
         # but never both at the same time. splitted_gate_up_lora handles gate and up separately while fused_gate_up_lora

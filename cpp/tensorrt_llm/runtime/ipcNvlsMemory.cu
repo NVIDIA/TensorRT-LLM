@@ -230,8 +230,37 @@ public:
             ipc_communicator = std::make_shared<IpcSocketCommunicator>(world_rank, group_rank, ranks, new_comm);
         }
 
+        // Initialize multicast object for all ranks.
+        IpcMemHandle ipc_handle = {0};
+        if (group_rank == 0)
+        {
+            CUCHECK(cuMulticastCreate(&nvls_handle->mc_handle, &mcprop));
+            // Export the allocation for the importing process.
+            CUCHECK(cuMemExportToShareableHandle(&ipc_handle, nvls_handle->mc_handle, handle_type, 0 /*flags*/));
+            ipc_communicator->bcastMemHandle(&ipc_handle, 0);
+        }
+        else
+        {
+            ipc_communicator->bcastMemHandle(&ipc_handle, 0);
+            void* os_handle = handle_type == CU_MEM_HANDLE_TYPE_FABRIC ? (void*) &ipc_handle : (void*) ipc_handle.fd;
+            CUCHECK(cuMemImportFromShareableHandle(&nvls_handle->mc_handle, os_handle, handle_type));
+        }
+
+        // Add device to multicast object
+        CUCHECK(cuMulticastAddDevice(nvls_handle->mc_handle, CU_dev));
+        // Bind physical memory to the Multicast group.
+        // Note: It will block until all ranks have been added to the group.
+        CUCHECK(cuMulticastBindMem(nvls_handle->mc_handle, 0, nvls_handle->uc_handle, 0, size, 0));
+        // Reserve multicast virtual address space for the memory.
+        CUCHECK(cuMemAddressReserve(&nvls_handle->mc_va, size, mc_granularity, 0U, 0));
+        // Map the multicast virtual address space to the physical pages.
+        CUCHECK(cuMemMap(nvls_handle->mc_va, size, 0, nvls_handle->mc_handle, 0));
+        // Set the access permissions for the multicast memory.
+        CUCHECK(cuMemSetAccess(nvls_handle->mc_va, size, &access_desc, 1 /* count */));
+        nvls_handle->mc_ptr = reinterpret_cast<uintptr_t>((void*) nvls_handle->mc_va);
+
         // Unicast pointer exchange between ranks.
-        IpcMemHandle ipc_handle;
+        ipc_handle = {0};
         CUCHECK(cuMemExportToShareableHandle((void*) &ipc_handle, nvls_handle->uc_handle, handle_type, 0 /*flags*/));
 
         nvls_handle->ipc_uc_ptrs.resize(ranks.size());
@@ -262,34 +291,6 @@ public:
                 nvls_handle->ipc_uc_handles[i] = nvls_handle->uc_handle;
             }
         }
-
-        // Initialize multicast object for all ranks.
-        if (group_rank == 0)
-        {
-            CUCHECK(cuMulticastCreate(&nvls_handle->mc_handle, &mcprop));
-            // Export the allocation for the importing process.
-            CUCHECK(cuMemExportToShareableHandle(&ipc_handle, nvls_handle->mc_handle, handle_type, 0 /*flags*/));
-            ipc_communicator->bcastMemHandle(&ipc_handle, 0);
-        }
-        else
-        {
-            ipc_communicator->bcastMemHandle(&ipc_handle, 0);
-            void* os_handle = handle_type == CU_MEM_HANDLE_TYPE_FABRIC ? (void*) &ipc_handle : (void*) ipc_handle.fd;
-            CUCHECK(cuMemImportFromShareableHandle(&nvls_handle->mc_handle, os_handle, handle_type));
-        }
-
-        // Add device to multicast object
-        CUCHECK(cuMulticastAddDevice(nvls_handle->mc_handle, CU_dev));
-        // Bind physical memory to the Multicast group.
-        // Note: It will block until all ranks have been added to the group.
-        CUCHECK(cuMulticastBindMem(nvls_handle->mc_handle, 0, nvls_handle->uc_handle, 0, size, 0));
-        // Reserve multicast virtual address space for the memory.
-        CUCHECK(cuMemAddressReserve(&nvls_handle->mc_va, size, mc_granularity, 0U, 0));
-        // Map the multicast virtual address space to the physical pages.
-        CUCHECK(cuMemMap(nvls_handle->mc_va, size, 0, nvls_handle->mc_handle, 0));
-        // Set the access permissions for the multicast memory.
-        CUCHECK(cuMemSetAccess(nvls_handle->mc_va, size, &access_desc, 1 /* count */));
-        nvls_handle->mc_ptr = reinterpret_cast<uintptr_t>((void*) nvls_handle->mc_va);
 
         // Clean up
         MPI_Group_free(&new_group);
