@@ -22,8 +22,8 @@ from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
-from tensorrt_llm.bench.tuning.dataclasses import (
-    BatchingConfiguration, BenchmarkEnvironment, BenchmarkSpecification,
+from tensorrt_llm.bench.dataclasses.scenario import (
+    BatchingConfiguration, BenchmarkEnvironment, ScenarioSpecification,
     LlmRuntimeSpecification, ReportingConfiguration, TuningConstraints,
     WorldConfig)
 # isort: on
@@ -247,7 +247,7 @@ def throughput_command(
 
     logger.info("Preparing to run throughput benchmark...")
     # Populate the benchmark specification with the parameters from the CLI.
-    benchmark_specification = BenchmarkSpecification(
+    benchmark_specification = ScenarioSpecification(
         **params,
         environment=bench_env,
         batching_config=BatchingConfiguration(**params),

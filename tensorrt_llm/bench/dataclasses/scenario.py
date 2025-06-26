@@ -252,7 +252,7 @@ class ReportingConfiguration(BaseModel):
         description="The path to the output to use for benchmarking.")
 
 
-class BenchmarkSpecification(BaseModel):
+class ScenarioSpecification(BaseModel):
     constraints: Optional[TuningConstraints] = Field(
         description="The tuning criteria to use for benchmarking.",
         default=None,
