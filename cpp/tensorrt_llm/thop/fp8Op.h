@@ -28,6 +28,7 @@
 
 namespace torch_ext
 {
+// Given the rowIdx and colIdx in the unswizzled SFMatrix, compute the 1D offset in the swizzled SFMatrix.
 // colIdx and totalCloumn should be in SFMatrix, not activation Matrix, so no sfVecSize needed.
 inline int computeSFIndex(int rowIdx, int colIdx, int totalRow, int totalColumn,
     tensorrt_llm::FP4QuantizationSFLayout layout, bool useUE8M0 = false)
