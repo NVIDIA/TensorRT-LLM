@@ -122,7 +122,8 @@ class GenerationExecutor(ABC):
             mrope_config: Optional[dict] = None,
             kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
             disaggregated_params: Optional[DisaggregatedParams] = None,
-            postproc_params: Optional[PostprocParams] = None
+            postproc_params: Optional[PostprocParams] = None,
+            mm_data: Optional[dict] = None,
     ) -> GenerationResult:
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -148,7 +149,8 @@ class GenerationExecutor(ABC):
                 multimodal_embedding=multimodal_embedding,
                 mrope_config=mrope_config,
                 kv_cache_retention_config=kv_cache_retention_config,
-                disaggregated_params=disaggregated_params))
+                disaggregated_params=disaggregated_params,
+                mm_data=mm_data))
         return result
 
     def generate(

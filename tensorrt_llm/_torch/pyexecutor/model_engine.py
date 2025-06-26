@@ -1152,7 +1152,7 @@ class PyTorchModelEngine(ModelEngine):
         draft_tokens = []
         draft_lens = []
         mrope_config = defaultdict(list)
-
+        py_mm_data = []
         batch_idx = 0
 
         for request in scheduled_requests.context_requests:
@@ -1184,6 +1184,9 @@ class PyTorchModelEngine(ModelEngine):
                 ) if mrope_rotary_cos_sin.device == 'cpu' else mrope_rotary_cos_sin
                 mrope_config['mrope_rotary_cos_sin'].append(
                     mrope_rotary_cos_sin.to('cuda', non_blocking=True))
+            mm_data = request.py_mm_data
+            if mm_data is not None:
+                py_mm_data.append(mm_data)
             request.py_batch_idx = batch_idx
             batch_idx += 1
 
@@ -1455,7 +1458,8 @@ class PyTorchModelEngine(ModelEngine):
             self.position_ids_cuda[:total_num_tokens].unsqueeze(0),
             'inputs_embeds': None,
             'multi_modal_data': multi_modal_data,
-            'mrope_config': mrope_config
+            'mrope_config': mrope_config,
+            'mm_data': py_mm_data
         }
 
         if bool(lora_params):
