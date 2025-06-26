@@ -1042,7 +1042,7 @@ INSTANTIATE_TEST_SUITE_P(GptTests, ParamTest,
                 .useGptAttentionPlugin()
                 .setKVCacheType(KVCacheType::kDISABLED)
                 .usePackedInput()),
-        testing::Values(TrtGptModelType::InflightBatching, TrtGptModelType::InflightFusedBatching),
+        testing::Values(TrtGptModelType::InflightFusedBatching),
         testing::Values(
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(
@@ -1068,7 +1068,7 @@ INSTANTIATE_TEST_SUITE_P(GptRandomEndIdTests, ParamTest,
                 .useGptAttentionPlugin()
                 .setKVCacheType(KVCacheType::kPAGED)
                 .usePackedInput()),
-        testing::Values(TrtGptModelType::InflightBatching, TrtGptModelType::InflightFusedBatching),
+        testing::Values(TrtGptModelType::InflightFusedBatching),
         testing::Values(
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(
@@ -1095,7 +1095,7 @@ INSTANTIATE_TEST_SUITE_P(GptKVOffloadingTest, ParamTest,
                 .setKVCacheType(KVCacheType::kPAGED)
                 .usePackedInput()
                 .setKVCacheReuse(true)),
-        testing::Values(TrtGptModelType::InflightBatching, TrtGptModelType::InflightFusedBatching),
+        testing::Values(TrtGptModelType::InflightFusedBatching),
         testing::Values(
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(BeamConfig{1, {1}}),
@@ -1176,8 +1176,7 @@ INSTANTIATE_TEST_SUITE_P(GptNProfilesTests, ParamTest,
                             .usePackedInput()
                             .setKVCacheType(KVCacheType::kPAGED)
                             .useMultipleProfiles()),
-        testing::Values(TrtGptModelType::InflightBatching, TrtGptModelType::InflightFusedBatching),
-        testing::Values(TrtGptModelIfbTestType::BULK),
+        testing::Values(TrtGptModelType::InflightFusedBatching), testing::Values(TrtGptModelIfbTestType::BULK),
         testing::Values(
             // TODO: enable more tests when mixed beam width is supported
             BeamConfig{1, {1}}, BeamConfig{2, {2}} // , BeamConfig{2, {1, 2}}
@@ -1214,7 +1213,7 @@ INSTANTIATE_TEST_SUITE_P(GptSqTests, ParamTest,
                 .usePackedInput()
                 .setKVCacheType(KVCacheType::kDISABLED)
                 .setQuantMethod(QuantMethod::kSMOOTH_QUANT)),
-        testing::Values(TrtGptModelType::InflightBatching),
+        testing::Values(TrtGptModelType::InflightFusedBatching),
         testing::Values(
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(
@@ -1243,7 +1242,7 @@ INSTANTIATE_TEST_SUITE_P(DISABLED_GptChunkedContextTests, ParamTest,
                 .usePackedInput()
                 .setKVCacheType(KVCacheType::kPAGED)
                 .setMaxInputLength(128)),
-        testing::Values(TrtGptModelType::InflightBatching, TrtGptModelType::InflightFusedBatching),
+        testing::Values(TrtGptModelType::InflightFusedBatching),
         testing::Values(TrtGptModelIfbTestType::BULK), // TrtGptModelIfbTestType
         testing::Values(BeamConfig{1, {1}}),           // beam config
         testing::Values(257),                          // maxTokensInPagedKvCache
@@ -1272,7 +1271,7 @@ INSTANTIATE_TEST_SUITE_P(GptChunkedLongContextTests, ParamTest,
                 .setKVCacheType(KVCacheType::kPAGED)
                 .useDraftTokensExternalDecoding()
                 .setDraftTokens(5)),
-        testing::Values(TrtGptModelType::InflightBatching, TrtGptModelType::InflightFusedBatching),
+        testing::Values(TrtGptModelType::InflightFusedBatching),
         testing::Values(TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT,
             TrtGptModelIfbTestType::RANDOM), // TrtGptModelIfbTestType
         testing::Values(BeamConfig{1, {1}}), // beam config
@@ -1310,7 +1309,7 @@ INSTANTIATE_TEST_SUITE_P(GptDraftTests, ParamTest,
                 .replaceLogits()
                 .collectGenerationLogitsFile()
                 .collectContextLogitsFile()),
-        testing::Values(TrtGptModelType::InflightBatching, TrtGptModelType::InflightFusedBatching),
+        testing::Values(TrtGptModelType::InflightFusedBatching),
         testing::Values(
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(BeamConfig{1, {1}}), // beamConfig
@@ -1391,7 +1390,7 @@ INSTANTIATE_TEST_SUITE_P(GptjTests, ParamTest,
                 .usePackedInput()
 
                 ),
-        testing::Values(TrtGptModelType::InflightBatching, TrtGptModelType::InflightFusedBatching),
+        testing::Values(TrtGptModelType::InflightFusedBatching),
         // WAR: disable wavefront and random tests on because of switched beams
         testing::Values(TrtGptModelIfbTestType::BULK
             /* , TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM */),
@@ -1488,7 +1487,7 @@ INSTANTIATE_TEST_SUITE_P(LlamaTests, ParamTest,
                 .useTensorParallelism(2)
 
                 ),
-        testing::Values(TrtGptModelType::InflightBatching, TrtGptModelType::InflightFusedBatching),
+        testing::Values(TrtGptModelType::InflightFusedBatching),
         testing::Values(
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(
@@ -1665,7 +1664,7 @@ INSTANTIATE_TEST_SUITE_P(GptjFP8Tests, ParamTest,
                 .usePackedInput()
 
                 ),
-        testing::Values(TrtGptModelType::InflightBatching, TrtGptModelType::InflightFusedBatching),
+        testing::Values(TrtGptModelType::InflightFusedBatching),
         testing::Values(
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(
