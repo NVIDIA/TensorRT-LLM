@@ -1057,6 +1057,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                                                     PretrainedConfig]):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
+        # model_config.pretrained_config.num_hidden_layers = 4
         super().__init__(DeepseekV3Model(model_config),
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
