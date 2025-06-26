@@ -163,7 +163,7 @@ std::vector<torch::Tensor> bwd_cuda(int heads,
     return {input_lin_output_grads, matmul2_grads};
 }
 
-NANOBIND_MODULE(TORCH_EXTENSION_NAME, m)
+NB_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.doc() = "CUDA fused Multihead-Attention for BERT"; // optional module docstring
     m.def("fwd", &fwd_cuda, "Forward pass");
