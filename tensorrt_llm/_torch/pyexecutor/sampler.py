@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 
@@ -155,22 +156,35 @@ def greedy_search_sampling_batch(logits):
     return next_tokens, softmax
 
 
-def sample_single_request(request: LlmRequest, logits: torch.Tensor):
-    assert logits.dim(
-    ) == 2 and logits.shape[0] == 1, "logits should have shape [1, vocab_size]"
-    if request.sampling_config.top_p is not None and len(
-            request.sampling_config.top_p) > 0:
-        return top_p_sampling_batch(logits, request.sampling_config.top_p[0])
-    elif request.sampling_config.top_k is not None and len(
+TopK = tuple[Literal["top_k"], int]
+TopP = tuple[Literal["top_p"], float]
+Greedy = tuple[Literal["greedy"], None]
+Strategy = TopK | TopP | Greedy
+
+
+def request_strategy(request: LlmRequest) -> Strategy:
+    if request.sampling_config.top_k is not None and len(
             request.sampling_config.top_k) > 0:
-        return top_k_sampling_batch(logits, request.sampling_config.top_k[0])
+        return ("top_k", request.sampling_config.top_k[0])
+    elif request.sampling_config.top_p is not None and len(
+            request.sampling_config.top_p) > 0:
+        return ("top_p", request.sampling_config.top_p[0])
     else:
-        return greedy_search_sampling_batch(logits)
+        return ("greedy", None)
 
 
-def new_tokens_slice(request: LlmRequest, beam: int, *,
-                     size: int) -> tuple[slice, int, int]:
-    return slice(0, size), request.seq_slot, beam
+def sampling_strategies(requests: Iterable[LlmRequest]) -> list[Strategy]:
+    return [request_strategy(req) for req in requests]
+
+
+def sample(strategy: Strategy, logits: torch.Tensor):
+    match strategy:
+        case ("top_k", top_k):
+            return top_k_sampling_batch(logits, top_k)
+        case ("top_p", top_p):
+            return top_p_sampling_batch(logits, top_p)
+        case ("greedy", None):
+            return greedy_search_sampling_batch(logits)
 
 
 def add_token(request: LlmRequest,
@@ -265,7 +279,7 @@ class TorchSampler(Sampler):
 
     def handle_logits(self, request: LlmRequest, state: SampleState, *,
                       beam: int, count: int):
-        current_slice = new_tokens_slice(request, beam, size=count)
+        current_slice = slice(0, count), request.seq_slot, beam
         if request.py_return_generation_logits:
             assert state.host.logits is not None
             current_logits = state.host.logits[current_slice]
@@ -365,6 +379,12 @@ class TorchSampler(Sampler):
                                                    logits=gen_logits_host),
                            sampler_event=sampler_event)
 
+    @staticmethod
+    def append_eagle3(tokens: torch.Tensor, model_outputs):
+        if "d2t" in model_outputs:
+            d2t = model_outputs["d2t"][tokens]
+            tokens += d2t
+
     def _process_requests(self,
                           requests: list[LlmRequest],
                           model_outputs: dict[str, torch.Tensor],
@@ -372,25 +392,47 @@ class TorchSampler(Sampler):
                           *,
                           gen_logits_host: torch.Tensor | None = None,
                           log_probs_host: torch.Tensor | None = None):
+        beam_width = self.MAX_BEAM_WIDTH
         beam = self.BEAM
-        offset = 0
         raw_logits = model_outputs["logits"]
+        num_steps = [1 + len(req.py_draft_tokens) for req in requests]
+        sum_steps = sum(num_steps)
+        no_draft_tokens = len(requests) == sum_steps
+        fast_path = not self.mixed_sampler and no_draft_tokens and gen_logits_host is None and log_probs_host is None
 
-        for request in requests:
-            steps = 1
-            if len(request.py_draft_tokens) > 0:
-                assert not self.mixed_sampler, "Speculative decoding not supported in mixed sampler"
-                steps += len(request.py_draft_tokens)
-            logits = raw_logits[offset:offset + steps]
-            if self.mixed_sampler:
-                next_tokens, softmax = sample_single_request(request, logits)
+        seq_slots = torch.as_tensor([r.seq_slot for r in requests])
+        seq_slots = seq_slots.to(device="cuda", non_blocking=True)
+
+        if fast_path:
+            logits = raw_logits[:len(requests)]
+            next_tokens = torch.argmax(logits, dim=-1)
+            self.append_eagle3(next_tokens, model_outputs)
+            int_next_tokens = next_tokens.to(torch.int, non_blocking=True)
+            next_tokens = int_next_tokens.view(1, -1, beam_width)
+            new_tokens[:1].index_copy_(1, seq_slots, next_tokens)
+            return
+
+        batched_next_tokens, batched_softmax = None, None
+        strategies = sampling_strategies(requests)
+        if len(set(strategies)) == 1:
+            logits = raw_logits[:sum_steps]
+            strategy = strategies[0]
+            batched_next_tokens, batched_softmax = sample(strategy, logits)
+            self.append_eagle3(batched_next_tokens, model_outputs)
+        else:
+            assert "d2t" not in model_outputs, "eagle3 does not yet support non-uniform sampling"
+
+        offset = 0
+        for strategy, slot, steps in zip(strategies, seq_slots, num_steps):
+            input_slice = slice(offset, offset + steps)
+            logits = raw_logits[input_slice]
+            if batched_next_tokens is None:
+                next_tokens, softmax = sample(strategy, logits)
             else:
-                next_tokens, softmax = greedy_search_sampling_batch(logits)
-            current_slice = new_tokens_slice(request, beam, size=steps)
+                next_tokens = batched_next_tokens[input_slice]
+                softmax = batched_softmax[input_slice]
+            current_slice = slice(0, steps), slot, beam
             new_tokens[current_slice] = next_tokens
-            if "d2t" in model_outputs:  # Eagle3
-                new_tokens[current_slice] += model_outputs["d2t"][
-                    new_tokens[current_slice]]
             if gen_logits_host is not None:
                 gen_logits_host[current_slice].copy_(logits, non_blocking=True)
             if log_probs_host is not None:
@@ -398,8 +440,8 @@ class TorchSampler(Sampler):
                 token_probs = torch.gather(
                     softmax, dim=1, index=next_tokens.unsqueeze(1)).squeeze(-1)
                 log_probs = torch.log(token_probs)
-                log_probs_host[request.seq_slot,
-                               beam, :steps].copy_(log_probs, non_blocking=True)
+                log_probs_host[slot, beam, :steps].copy_(log_probs,
+                                                         non_blocking=True)
             offset += steps
 
 
