@@ -719,8 +719,7 @@ class TRTLLMSampler(Sampler):
 
         scheduled_requests = state.scheduled_requests
         assert scheduled_requests.batch_size > 0
-        all_requests = scheduled_requests.all_requests
-        beam_width = self.beam_width(all_requests)
+        beam_width = self.beam_width(scheduled_requests.all_requests)
         sampler_event = state.sampler_event
 
         if sampler_event:
@@ -732,7 +731,7 @@ class TRTLLMSampler(Sampler):
 
         finalize_events = {}
 
-        for request in all_requests:
+        for request in scheduled_requests.all_requests:
             if request.is_context_init_state:
                 continue
 
@@ -802,7 +801,7 @@ class TRTLLMSampler(Sampler):
                     request, True)
         # post process all requests if necessary
         if beam_width > 1:
-            for request in all_requests:
+            for request in scheduled_requests.all_requests:
                 if request.request_id in finalize_events:
                     self._post_process_request(
                         request, finalize_events[request.request_id])
