@@ -58,18 +58,16 @@ TargetRanksInfo TargetRanksInfoForDP(
     auto const peerTPNum = peerParConfig.mTensorParallelism;
     auto const selfTPNum = selfParConfig.mTensorParallelism;
 
-    for (auto val : {peerPPNum, selfPPNum, peerTPNum, selfTPNum})
-    {
-        TLLM_CHECK(isPowerOfTwo(val));
-    }
-
     auto const selfTPRank = selfRank % selfParConfig.mTensorParallelism;
     auto const selfPPRank = selfRank / selfParConfig.mTensorParallelism;
 
     int peerPPRankStart = 0;
     int mDomainPPSize = 1;
     int peerPPRankEnd = 0;
-
+    for (auto val : {peerPPNum, selfPPNum})
+    {
+        TLLM_CHECK(isPowerOfTwo(val));
+    }
     if (selfPPNum <= peerPPNum)
     {
         mDomainPPSize = peerPPNum / selfPPNum;
@@ -93,7 +91,10 @@ TargetRanksInfo TargetRanksInfoForDP(
     int const selfNbHeadsPerLayer = selfCacheState.getModelConfig().mNbKvHeadsPerLayer[0];
     int const peerNbHeadsPerLayer = peerCacheState.getModelConfig().mNbKvHeadsPerLayer[0];
     int const selfTPrankInDPGroup = selfTPRank % selfTPSizePerDPGroup;
-
+    for (auto val : {peerTPSizePerDPGroup, selfTPSizePerDPGroup})
+    {
+        TLLM_CHECK(isPowerOfTwo(val));
+    }
     if (selfTPSizePerDPGroup <= peerTPSizePerDPGroup)
     {
         mDomainTPSize = peerTPSizePerDPGroup / selfTPSizePerDPGroup;
@@ -951,7 +952,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
         cachePtrs.push_back(static_cast<T*>(outputSplitBlock->data()));
     }
 
-    bool const isWindow = windowSizes.size() > 0;
+    bool const isWindow = windowSizes.size() > 1;
 
     runtime::BufferManager::IBufferPtr PtrsDeviceBuffer
         = bufferManager.gpu(cachePtrs.size(), nvinfer1::DataType::kINT64);
@@ -1283,7 +1284,7 @@ void concatKVCache(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlo
         = bufferManager.gpu(cachePtrs.size(), nvinfer1::DataType::kINT64);
     TLLM_CHECK(PtrsDeviceBuffer->getSizeInBytes() == cachePtrs.size() * sizeof(T*));
     bufferManager.copy(cachePtrs.data(), *PtrsDeviceBuffer, runtime::MemoryType::kCPU);
-    bool const isWindow = windowSizes.size() > 0;
+    bool const isWindow = windowSizes.size() > 1;
     runtime::BufferManager::IBufferPtr windowInfoDeviceBuffer;
     std::vector<SizeType32> windowInfoHostBuffer;
     if (isWindow)
