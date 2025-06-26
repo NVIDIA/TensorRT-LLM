@@ -24,7 +24,7 @@ class SeqSlotManager(BaseResourceManager):
                 llm_req.seq_slot = self.slot_manager.add_slot(
                     llm_req.request_id)
                 if llm_req.return_perf_metrics:
-                    llm_req.create_first_scheduled_time()
+                    llm_req.set_first_scheduled_time()
 
     def free_resources(self, request: LlmRequest) -> None:
         self.slot_manager.remove_slot(request.request_id)

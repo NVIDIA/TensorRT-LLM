@@ -1235,17 +1235,12 @@ public:
         return mPerfMetrics;
     }
 
-    void setFirstScheduledTime(executor::RequestPerfMetrics::TimePoint const& time)
+    void setFirstScheduledTime()
     {
         if (mPerfMetrics.timingMetrics.firstScheduledTime == executor::RequestPerfMetrics::TimePoint{})
         {
-            mPerfMetrics.timingMetrics.firstScheduledTime = time;
+            mPerfMetrics.timingMetrics.firstScheduledTime = std::chrono::steady_clock::now();
         }
-    }
-
-    void createFirstScheduledTime()
-    {
-        setFirstScheduledTime(std::chrono::steady_clock::now());
     }
 
     [[nodiscard]] bool constexpr isStreaming() const noexcept

@@ -840,7 +840,6 @@ void initRequestBindings(pybind11::module_& m)
         .def_readwrite("context_phase_params", &tle::Result::contextPhaseParams)
         .def_readwrite("request_perf_metrics", &tle::Result::requestPerfMetrics)
         .def_readwrite("additional_outputs", &tle::Result::additionalOutputs)
-        .def_readwrite("context_phase_params", &tle::Result::contextPhaseParams)
         .def(py::pickle(resultGetstate, resultSetstate));
 
     m.def("deserialize_result",
