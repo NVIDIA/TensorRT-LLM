@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any, List, Optional, Union
 
 from pydantic import (AliasChoices, BaseModel, Field, computed_field,
@@ -61,4 +60,3 @@ class DatasetMetadata(BaseModel):
     @property
     def avg_sequence_length(self) -> int:
         return int(self.seq_len_stats.average)
-

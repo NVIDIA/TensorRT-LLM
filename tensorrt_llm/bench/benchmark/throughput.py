@@ -11,8 +11,6 @@ from huggingface_hub import snapshot_download
 
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
 from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
-from tensorrt_llm.bench.tuning.heuristics import MaxThroughputScenario
-from tensorrt_llm.bench.tuning.utils import get_model_config
 
 # isort: off
 from tensorrt_llm.bench.benchmark.utils.general import (
@@ -23,22 +21,18 @@ from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
-<<<<<<< HEAD
-=======
-from tensorrt_llm.bench.tuning.dataclasses import BatchingConfiguration, BenchmarkEnvironment, BenchmarkSpecification, LlmRuntimeSpecification, ReportingConfiguration, TuningConstraints, WorldConfig
->>>>>>> e730e9857 (Continued clean up of benchmark.)
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
-from tensorrt_llm.bench.tuning.dataclasses import (BenchmarkEnvironment,
-                                                   BenchmarkSpecification,
-                                                   ScenarioSpecification,
-                                                   TuningConstraints,
-                                                   WorldConfig)
+from tensorrt_llm.bench.tuning.dataclasses import (
+    BatchingConfiguration, BenchmarkEnvironment, BenchmarkSpecification,
+    LlmRuntimeSpecification, ReportingConfiguration, TuningConstraints,
+    WorldConfig)
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
+# isort: on
 
 
 @click.command(name="throughput")
@@ -285,9 +279,11 @@ def throughput_command(
             num_requests=benchmark_specification.num_requests,
             model_type=benchmark_specification.environment.model_type,
             modality=benchmark_specification.modality,
-            max_input_seq_len_for_multimodal=benchmark_specification.batching_config.max_seq_len)
+            max_input_seq_len_for_multimodal=benchmark_specification.
+            batching_config.max_seq_len)
 
-    benchmark_specification.constraints = TuningConstraints.from_dataset_metadata(metadata)
+    benchmark_specification.constraints = TuningConstraints.from_dataset_metadata(
+        metadata)
     benchmark_specification.dataset_metadata = metadata
 
     if benchmark_specification.modality == "text":
@@ -413,7 +409,8 @@ def throughput_command(
             llm._executor._iter_stats_result = None
             logger.info("Warmup done.")
 
-        iteration_writer = IterationWriter(benchmark_specification.reporting_config.iteration_log)
+        iteration_writer = IterationWriter(
+            benchmark_specification.reporting_config.iteration_log)
         with iteration_writer.capture():
             statistics = asyncio.run(
                 async_benchmark(llm,

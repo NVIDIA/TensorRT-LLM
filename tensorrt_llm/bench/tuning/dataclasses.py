@@ -7,11 +7,11 @@ from typing import Any, Dict, Literal, Optional, Self, Union
 import yaml
 from pydantic import (AliasChoices, AliasPath, BaseModel, Field, computed_field,
                       field_validator, model_validator)
-from tensorrt_llm.bench.dataclasses.general import DatasetMetadata
-from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
 from transformers import AutoConfig
 
 from tensorrt_llm.bench.build.utils import get_safetensors_metadata
+from tensorrt_llm.bench.dataclasses.general import DatasetMetadata
+from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
 from tensorrt_llm.bench.tuning.utils import get_model_config
 
 
@@ -21,12 +21,11 @@ class BatchingConfiguration(BaseModel):
         description="The maximum sequence length to use for batch scheduling.")
     max_batch_size: Optional[int] = Field(
         description="The maximum batch size to use for batch scheduling.",
-        default=None
-    )
+        default=None)
     max_num_tokens: Optional[int] = Field(
         description="The maximum number of tokens to use for batch scheduling.",
-        default=None
-    )
+        default=None)
+
 
 class BenchmarkEnvironment(BaseModel):
     model: str = Field(default="",
@@ -39,8 +38,7 @@ class BenchmarkEnvironment(BaseModel):
 
     @computed_field(
         description=
-        "The type of model being used, derived from the model configuration.",
-    )
+        "The type of model being used, derived from the model configuration.", )
     @cached_property
     def model_type(self) -> str:
         return get_model_config(self.model, self.checkpoint_path).model_type
@@ -112,10 +110,14 @@ class LlmRuntimeSpecification(BaseModel):
 
 
 class TuningConstraints(BaseModel):
-    target_input_len: Optional[int] = Field(description="The target input length to use for tuning.")
-    target_output_len: Optional[int] = Field(description="The target output length to use for tuning.")
-    max_input_len: int = Field(description="The maximum input length to use for tuning.")
-    max_output_len: int = Field(description="The maximum output length to use for tuning.")
+    target_input_len: Optional[int] = Field(
+        description="The target input length to use for tuning.")
+    target_output_len: Optional[int] = Field(
+        description="The target output length to use for tuning.")
+    max_input_len: int = Field(
+        description="The maximum input length to use for tuning.")
+    max_output_len: int = Field(
+        description="The maximum output length to use for tuning.")
 
     class Config:
         extra = "ignore"
@@ -128,7 +130,8 @@ class TuningConstraints(BaseModel):
         return self
 
     @classmethod
-    def from_dataset_metadata(cls, metadata: DatasetMetadata) -> "TuningConstraints":
+    def from_dataset_metadata(cls,
+                              metadata: DatasetMetadata) -> "TuningConstraints":
         return cls(
             target_input_len=metadata.avg_isl,
             target_output_len=metadata.avg_osl,
@@ -139,8 +142,7 @@ class TuningConstraints(BaseModel):
 
 class WorldConfig(BaseModel):
     tp: int = Field(
-        default=1,
-        description="The tensor parallelism size to use for tuning.")
+        default=1, description="The tensor parallelism size to use for tuning.")
     pp: int = Field(
         default=1,
         description="The pipeline parallelism size to use for tuning.")
@@ -272,16 +274,14 @@ class BenchmarkSpecification(BaseModel):
         default=None,
         description="The path to the engine to use for benchmarking.")
     environment: BenchmarkEnvironment = Field(
-        description="The environment to use for benchmarking.",
-    )
+        description="The environment to use for benchmarking.", )
     modality: Optional[Literal["text", "image", "video"]] = Field(
-        default="text",
-        description="The modality of the model being used."
-    )
+        default="text", description="The modality of the model being used.")
     mode: Literal["build", "benchmark"] = Field(
         default="benchmark",
         description="The path tuning is being accessed from.")
-    llm_config: LlmRuntimeSpecification = Field(description="The LLM runtime options to use for benchmarking.")
+    llm_config: LlmRuntimeSpecification = Field(
+        description="The LLM runtime options to use for benchmarking.")
     batching_config: BatchingConfiguration = Field(
         description="The batching options to use for benchmarking.",
         default_factory=BatchingConfiguration,
@@ -306,7 +306,8 @@ class BenchmarkSpecification(BaseModel):
 
         if self.mode == "build":
             build_options = [
-                self.dataset_path, self.constraints.max_input_len, self.constraints.target_input_len
+                self.dataset_path, self.constraints.max_input_len,
+                self.constraints.target_input_len
             ]
             if all(opt is None for opt in build_options):
                 raise ValueError(
