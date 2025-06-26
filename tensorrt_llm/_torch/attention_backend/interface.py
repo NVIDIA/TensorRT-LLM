@@ -24,7 +24,7 @@ class AttentionRuntimeFeatures:
     chunked_prefill: bool = False
     cache_reuse: bool = False
     has_speculative_draft_tokens: bool = False
-    chunk_size: int = 0  # this is the real chunk size for MLA chunked prefill, it must be divisible by chunk_unit_size
+    chunk_size: int = 0  # this is the chunk size for MLA chunked prefill, it will split kv cache into chunks to save global memory.
 
 
 # The type of requests in qkv passed to attention
