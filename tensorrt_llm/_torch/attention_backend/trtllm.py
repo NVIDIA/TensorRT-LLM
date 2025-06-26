@@ -6,7 +6,6 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -175,6 +174,7 @@ class TrtllmAttentionWrapper:
         mla_context_paged_kv: Optional[torch.Tensor] = None,
         mla_context_kv_cache_block_offsets: Optional[torch.Tensor] = None,
         softmax_stats_tensor: Optional[torch.Tensor] = None,
+        is_spec_decoding_enabled: bool = False,
         use_spec_decoding: bool = False,
         spec_decoding_position_offsets: Optional[torch.Tensor] = None,
         spec_decoding_packed_mask: Optional[torch.Tensor] = None,
@@ -255,6 +255,7 @@ class TrtllmAttentionWrapper:
             self.rope_params.max_positions = max_sequence_length
             self.rotary_inv_freq, self.rotary_cos_sin = self.rope_params.create_rope_const_params(
             )
+        self.is_spec_decoding_enabled = is_spec_decoding_enabled
         self.use_spec_decoding = use_spec_decoding
         self.spec_decoding_position_offsets = spec_decoding_position_offsets
         self.spec_decoding_packed_mask = spec_decoding_packed_mask
@@ -456,10 +457,12 @@ class TrtllmAttentionWrapper:
             self.mla_context_kv_cache_block_offsets,
             self.attention_chunk_size,
             self.softmax_stats_tensor,
-            self.use_spec_decoding,
-            self.spec_decoding_position_offsets,
-            self.spec_decoding_packed_mask,
-            self.spec_decoding_generation_lengths,
+            [self.is_spec_decoding_enabled, self.use_spec_decoding],
+            [
+                self.spec_decoding_generation_lengths,
+                self.spec_decoding_position_offsets,
+                self.spec_decoding_packed_mask
+            ],
         )
 
         # reset the planned states (especially tensors) to avoid memory leak
@@ -517,16 +520,16 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                                 repr=False)
 
     # Flags to enable spec-dec mode (multi-query mode) in TRTLLM XQA Kernels
-    # spec decoding mode can be enabled for non-TRTLLM-gen kernels (pre-Blackwell kernels)
-    # is_spec_decoding_enabled specifies if spec-dec mode is supported.
+    # spec decoding mode can be enabled for non-TRTLLM-gen kernels (pre-Blackwell XQA kernels)
+    # is_spec_decoding_enabled specifies if spec-dec mode is supported for the entire runtime.
     is_spec_decoding_enabled: bool = False
-    # use_spec_decoding determines if the attention should be run in spec-dec mode at the specific step / layer
+    # use_spec_decoding determines if the attention layer should be run in spec-dec mode at the specific step / layer.
     use_spec_decoding: bool = False
 
-    # if spec-dec tree is linear, the mask can be computed in an easier way.
-    is_spec_dec_tree_linear: bool = True
+    # if spec-dec tree is not a tree (a chain / linear tree), the mask can be computed in an easier way.
+    is_spec_dec_tree: bool = False
     # if spec-dec tree wouldn't be changed at all, the mask won't be computed every step.
-    is_spec_dec_tree_dynamic: bool = False
+    is_spec_dec_dynamic_tree: bool = False
 
     # parameters required for spec-dec mode
     spec_decoding_position_offsets: Optional[torch.Tensor] = None
@@ -887,17 +890,16 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.ctx_kv_indptr[:self.num_contexts + 1].copy_(
             self.host_ctx_kv_indptr[:self.num_contexts + 1], non_blocking=True)
 
-    def update_spec_dec_param(self, has_spec_dec_tree, is_spec_dec_tree_linear,
-                              is_spec_dec_tree_dynamic, max_draft_tokens):
+    def update_spec_dec_param(self, is_spec_decoding_enabled, is_spec_dec_tree,
+                              is_spec_dec_dynamic_tree, max_draft_tokens):
         # spec_dec mode should only be enabled for pre-Blackwell machines and when there's a spec-dec tree.
-        self.is_spec_decoding_enabled = (get_sm_version()
-                                         < 100) and has_spec_dec_tree
+        self.is_spec_decoding_enabled = is_spec_decoding_enabled
 
         # use_spec_decoding is default to true by default, change in runtime by layers / requests
         self.use_spec_decoding = self.is_spec_decoding_enabled
 
-        self.is_spec_dec_tree_linear = is_spec_dec_tree_linear
-        self.is_spec_dec_tree_dynamic = is_spec_dec_tree_dynamic
+        self.is_spec_dec_tree = is_spec_dec_tree
+        self.is_spec_dec_dynamic_tree = is_spec_dec_dynamic_tree
 
         self.spec_decoding_position_offsets = torch.empty(
             [self.max_num_requests, max_draft_tokens + 1],
@@ -921,16 +923,20 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         )
 
         # Parameters can be fixed and not changed during runtime if the
-        if self.is_spec_decoding_enabled and not self.is_spec_dec_tree_dynamic:
-            self.generate_spec_decoding_position_offsets(
-                max_draft_tokens=max_draft_tokens)
-            self.generate_spec_decoding_packed_mask(
-                max_draft_tokens=max_draft_tokens)
-            self.generate_spec_decoding_generation_length(
-                max_draft_tokens=max_draft_tokens)
+        if self.is_spec_decoding_enabled:
+            if self.is_spec_dec_dynamic_tree:
+                assert False, "currently dynamic tree is not supported"
+            else:
+                # Populate the mask that won't change during inference phase.
+                self.generate_spec_decoding_position_offsets(
+                    max_draft_tokens=max_draft_tokens)
+                self.generate_spec_decoding_packed_mask(
+                    max_draft_tokens=max_draft_tokens)
+                self.generate_spec_decoding_generation_length(
+                    max_draft_tokens=max_draft_tokens)
 
     def generate_spec_decoding_position_offsets(self, max_draft_tokens):
-        assert self.is_spec_dec_tree_linear, "only linear tree is supported now"
+        assert not self.is_spec_dec_tree, "only chained/linear tree is supported now"
         position_offset = torch.arange(max_draft_tokens + 1,
                                        dtype=torch.int,
                                        device='cpu',
@@ -941,7 +947,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                                   non_blocking=True)
 
     def generate_spec_decoding_packed_mask(self, max_draft_tokens):
-        assert self.is_spec_dec_tree_linear, "only linear tree is supported now"
+        assert not self.is_spec_dec_tree, "only chained/linear tree is supported now"
         dummy_idx = torch.arange(max_draft_tokens + 1)
         spec_decoding_packed_mask = torch.pow(2, dummy_idx + 1) - 1
         self.spec_decoding_packed_mask[:, :, 0].copy_(spec_decoding_packed_mask,
@@ -1124,6 +1130,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             mla_context_kv_cache_block_offsets=
             mla_context_kv_cache_block_offsets,
             softmax_stats_tensor=softmax_stats_tensor,
+            is_spec_decoding_enabled=metadata.is_spec_decoding_enabled,
             use_spec_decoding=metadata.use_spec_decoding,
             spec_decoding_position_offsets=metadata.
             spec_decoding_position_offsets,

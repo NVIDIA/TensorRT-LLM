@@ -79,9 +79,7 @@ public:
         torch::optional<torch::Tensor> mla_context_paged_kv,
         torch::optional<torch::Tensor> mla_context_kv_cache_block_offsets,
         torch::optional<torch::Tensor> softmax_stats_tensor,
-        torch::optional<torch::Tensor> spec_decoding_position_offsets,
-        torch::optional<torch::Tensor> spec_decoding_packed_mask,
-        torch::optional<torch::Tensor> spec_decoding_generation_lengths) const
+        c10::ArrayRef<std::optional<torch::Tensor>> spec_decoding_tensor_params) const
         = 0;
 };
 
@@ -133,9 +131,7 @@ public:
         torch::optional<torch::Tensor> mla_context_paged_kv,
         torch::optional<torch::Tensor> mla_context_kv_cache_block_offsets,
         torch::optional<torch::Tensor> softmax_stats_tensor,
-        torch::optional<torch::Tensor> spec_decoding_position_offsets,
-        torch::optional<torch::Tensor> spec_decoding_packed_mask,
-        torch::optional<torch::Tensor> spec_decoding_generation_lengths) const override
+        c10::ArrayRef<std::optional<torch::Tensor>> spec_decoding_tensor_params) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv.get_device());
         T* attention_input = static_cast<T*>(qkv.slice(0, token_offset).data_ptr());
@@ -330,16 +326,21 @@ public:
             }
             if (op.mIsSpecDecodingEnabled && op.mUseSpecDecoding)
             {
-                TLLM_CHECK_WITH_INFO(spec_decoding_packed_mask.has_value(), "spec_decoding_packed_mask needs value");
-                TLLM_CHECK_WITH_INFO(
-                    spec_decoding_position_offsets.has_value(), "spec_decoding_packed_mask needs value");
-                TLLM_CHECK_WITH_INFO(
-                    spec_decoding_generation_lengths.has_value(), "spec_decoding_packed_mask needs value");
-                enqueue_params.spec_decoding_packed_mask = spec_decoding_packed_mask.value().data_ptr<int32_t>();
-                enqueue_params.spec_decoding_position_offsets
-                    = spec_decoding_position_offsets.value().data_ptr<int32_t>();
+                TORCH_CHECK(spec_decoding_tensor_params.size() == 3,
+                    "Expecting 3 tensors for spec-dec mode, spec_decoding_generation_lengths, "
+                    "spec_decoding_position_offsets and spec_decoding_packed_mask.");
+                TORCH_CHECK(spec_decoding_tensor_params[0].has_value(),
+                    "Expecting spec_decoding_generation_lengths spec-dec mode.");
+                TORCH_CHECK(spec_decoding_tensor_params[1].has_value(),
+                    "Expecting spec_decoding_position_offsets spec-dec mode.");
+                TORCH_CHECK(
+                    spec_decoding_tensor_params[2].has_value(), "Expecting spec_decoding_packed_mask spec-dec mode.");
+
                 enqueue_params.spec_decoding_generation_lengths
-                    = spec_decoding_generation_lengths.value().data_ptr<int32_t>();
+                    = spec_decoding_tensor_params[0].value().data_ptr<int32_t>();
+                enqueue_params.spec_decoding_position_offsets
+                    = spec_decoding_tensor_params[1].value().data_ptr<int32_t>();
+                enqueue_params.spec_decoding_packed_mask = spec_decoding_tensor_params[2].value().data_ptr<int32_t>();
                 enqueue_params.spec_decoding_is_generation_length_variable = true;
                 enqueue_params.spec_decoding_max_generation_length = input_seq_length + 1;
             }
@@ -406,16 +407,14 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
     int64_t const attention_window_size, int64_t const sink_token_length, int64_t const beam_width,
     int64_t const mask_type, int64_t const quant_mode, double const q_scaling, int64_t const position_embedding_type,
     int64_t const rotary_embedding_dim, double const rotary_embedding_base, int64_t const rotary_embedding_scale_type,
-    std::vector<double> rotary_embedding_scales, std::vector<int64_t> rotary_embedding_max_position_info,
+    c10::ArrayRef<double> rotary_embedding_scales, c10::ArrayRef<int64_t> rotary_embedding_max_position_info,
     bool const use_paged_context_fmha, std::optional<int64_t> attention_input_type, bool is_mla_enable,
     std::optional<int64_t> q_lora_rank, std::optional<int64_t> kv_lora_rank, std::optional<int64_t> qk_nope_head_dim,
     std::optional<int64_t> qk_rope_head_dim, std::optional<int64_t> v_head_dim,
     torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas,
     std::optional<torch::Tensor> mla_context_paged_kv, std::optional<torch::Tensor> mla_context_kv_cache_block_offsets,
     std::optional<int64_t> attention_chunk_size, std::optional<torch::Tensor> softmax_stats_tensor,
-    bool const use_spec_decoding, std::optional<torch::Tensor> spec_decoding_position_offsets,
-    std::optional<torch::Tensor> spec_decoding_packed_mask,
-    std::optional<torch::Tensor> spec_decoding_generation_lengths)
+    c10::List<bool> spec_decoding_bool_params, c10::ArrayRef<std::optional<torch::Tensor>> spec_decoding_tensor_params)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -523,9 +522,11 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
 
     op->mAttentionChunkSize = attention_chunk_size;
 
-    op->mUseSpecDecoding = use_spec_decoding; // true
-    op->mIsSpecDecodingEnabled = spec_decoding_position_offsets.has_value();
-    op->mMultiBlockMode = !(op->mIsSpecDecodingEnabled);
+    TORCH_CHECK(spec_decoding_bool_params.size() == 2,
+        "Expecting 2 bools for spec-dec mode, is_spec_decoding_enabled and use_spec_decoding.");
+    op->mIsSpecDecodingEnabled = spec_decoding_bool_params[0]; // is_spec_decoding_enabled
+    op->mUseSpecDecoding = spec_decoding_bool_params[1];       // use_spec_decoding
+    op->mMultiBlockMode = op->mIsSpecDecodingEnabled ? false : true;
 
     if (is_mla_enable)
     {
@@ -643,8 +644,7 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
             host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, cache_indirection,
             kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
             block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, mla_context_paged_kv,
-            mla_context_kv_cache_block_offsets, softmax_stats_tensor, spec_decoding_position_offsets,
-            spec_decoding_packed_mask, spec_decoding_generation_lengths);
+            mla_context_kv_cache_block_offsets, softmax_stats_tensor, spec_decoding_tensor_params);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -660,8 +660,7 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
             host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, cache_indirection,
             kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
             block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, mla_context_paged_kv,
-            mla_context_kv_cache_block_offsets, softmax_stats_tensor, spec_decoding_position_offsets,
-            spec_decoding_packed_mask, spec_decoding_generation_lengths);
+            mla_context_kv_cache_block_offsets, softmax_stats_tensor, spec_decoding_tensor_params);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);
@@ -766,8 +765,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", int rotary_embedding_dim"
         ", float rotary_embedding_base"
         ", int rotary_embedding_scale_type"
-        ", float[3] rotary_embedding_scales"
-        ", int[2] rotary_embedding_max_position_info"
+        ", float[] rotary_embedding_scales"
+        ", int[] rotary_embedding_max_position_info"
         ", bool use_paged_context_fmha"
         ", int? attention_input_type"
         ", bool is_mla_enable"
@@ -782,10 +781,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", Tensor? mla_context_kv_cache_block_offsets"
         ", int? attention_chunk_size"
         ", Tensor? softmax_stats_tensor"
-        ", bool use_spec_decoding"
-        ", Tensor? spec_decoding_position_offsets"
-        ", Tensor? spec_decoding_packed_mask"
-        ", Tensor? spec_decoding_generation_lengths"
+        ", bool[] spec_decoding_bool_params"
+        ", Tensor?[] spec_decoding_tensor_params"
         ") -> ()");
 
     m.def("attention_supports_nvfp4_output", &torch_ext::attention_supports_nvfp4_output);
