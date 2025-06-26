@@ -100,8 +100,8 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
 
     // create decoder
     auto const vocabSizePadded = modelConfig.getVocabSizePadded(worldConfig.getSize());
-    auto decoder = IGptDecoder::create(decodingMode, modelConfig.getDataType(), batchSize, beamWidth, vocabSize,
-        vocabSizePadded, maxSeqLength, streamPtr);
+    auto decoder = IGptDecoder::create(
+        decodingMode, modelConfig.getDataType(), batchSize, beamWidth, vocabSize, vocabSizePadded, streamPtr);
     ASSERT_TRUE(static_cast<bool>(decoder));
 
     auto batchSlots = getDefaultBatchSlots(batchSize);

@@ -59,6 +59,11 @@ class ResponseWrapper:
         self._response = response
         self.logprobs = logprobs
 
+    @property
+    def _is_llm_response(self):
+        response = object.__getattribute__(self, '_response')
+        return isinstance(response, tllm.Response)
+
     def __getattr__(self, name):
         response = object.__getattribute__(self, '_response')
         return getattr(response, name)
@@ -209,10 +214,6 @@ class GenerationResultBase:
         else:
             output.token_ids.extend(response_tensors.output_token_ids[src_idx])
 
-        # In PD, the first token should be ignored in streaming mode, since it's already been returned by the context server
-        if self.disaggregated_params is not None and self.disaggregated_params.request_type == "generation_only" and self._streaming and self.decoding_iter == 2:
-            output._last_token_ids_len = 1
-
         if response_tensors.cum_log_probs is not None:
             output.cumulative_logprob = response_tensors.cum_log_probs[src_idx]
 
@@ -293,6 +294,9 @@ class GenerationResultBase:
                     handler(response.error_msg)
 
             response_result = response.result
+            if hasattr(response_result, "_result"):
+                response_result.deserialize()
+
             self._done = response_result.is_final
             context_phase_params = response_result.context_phase_params
             self.decoding_iter = response_result.decoding_iter
@@ -616,6 +620,11 @@ def compute_logprobs(
         if logits.dim() == 3:
             # reshape from [1, T, V] to [T, V]
             logits = logits.squeeze(0)
+
+        if tokens is not None and logits.size(0) > len(tokens):
+            # WAR for nvbug 5324291 where TRT backend might return more logits
+            # than output tokens.
+            logits = logits[:len(tokens)]
 
         logprobs = F.log_softmax(logits.to("cuda", dtype=torch.float32), dim=-1)
         topk_vals, topk_indices = torch.topk(logprobs, k=top_k, dim=-1)

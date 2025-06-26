@@ -33,7 +33,7 @@ def _run_ep_shard_job(num_experts: int, rank: int, world_size: int) -> None:
         expected_expert = num_experts_per_rank * hidden_size * intermediate_size * 3
         return n_gate + expected_expert
 
-    op_expected = torch.ops.dist.all_reduce
+    op_expected = torch.ops.auto_deploy.torch_dist_all_reduce
 
     run_test(
         model,

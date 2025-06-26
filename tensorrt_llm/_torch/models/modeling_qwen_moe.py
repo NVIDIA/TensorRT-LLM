@@ -14,7 +14,7 @@ from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import DefaultMoeRoutingMethod, FusedMoE
+from ..modules.fused_moe import DefaultMoeRoutingMethod, MoE, create_moe
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
@@ -29,6 +29,7 @@ class QwenMoE(nn.Module):
         self,
         model_config: ModelConfig[Qwen2MoeConfig],
         aux_stream: torch.cuda.Stream,
+        layer_idx: Optional[int] = None,
     ):
         super().__init__()
         config = model_config.pretrained_config
@@ -49,7 +50,7 @@ class QwenMoE(nn.Module):
 
         reduce_results = True
 
-        self.experts = FusedMoE(
+        self.experts = create_moe(
             num_experts=self.num_experts,
             routing_method=DefaultMoeRoutingMethod(top_k=self.top_k),
             hidden_size=self.hidden_dim,
@@ -57,7 +58,8 @@ class QwenMoE(nn.Module):
             aux_stream=aux_stream,
             dtype=config.torch_dtype,
             reduce_results=reduce_results,
-            model_config=model_config)
+            model_config=model_config,
+            layer_idx=layer_idx)
 
         self.shared_expert = GatedMLP(
             hidden_size=config.hidden_size,
@@ -143,7 +145,7 @@ class QwenMoeDecoderLayer(DecoderLayer):
             layer_idx=layer_idx,
         )
 
-        self.mlp = QwenMoE(model_config, aux_stream)
+        self.mlp = QwenMoE(model_config, aux_stream, layer_idx=layer_idx)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -156,7 +158,7 @@ class QwenMoeDecoderLayer(DecoderLayer):
 
     def forward(
         self,
-        position_ids: torch.LongTensor,
+        position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
@@ -189,7 +191,6 @@ class QwenMoeModel(DecoderModel):
     def __init__(self, model_config: ModelConfig[Qwen2MoeConfig]):
         super().__init__(model_config)
         config = self.model_config
-        self.padding_idx = config.pretrained_config.pad_token_id
         self.aux_stream = torch.cuda.Stream()
 
         self.embed_tokens = Embedding(
@@ -214,8 +215,8 @@ class QwenMoeModel(DecoderModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -289,7 +290,7 @@ class Qwen2MoeForCausalLM(DecoderModelForCausalLM[QwenMoeModel,
                     module.load_weights(weights=module_weights)
                 else:
                     module_weights = filter_weights(name, weights)
-                    if isinstance(module, FusedMoE):
+                    if isinstance(module, MoE):
                         updated_module_weights = {}
                         for weight_name, weight_value in module_weights.items():
                             new_weight_name = weight_name.replace(

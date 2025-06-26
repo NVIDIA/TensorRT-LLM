@@ -80,6 +80,7 @@ struct FusedQKVMaskedAttentionDispatchParams
     PositionEmbeddingType position_embedding_type;
     bool position_shift_enabled;
 
+    int chunked_attention_size;
     int attention_mask_stride;
     int max_attention_window_size;
     int cyclic_attention_window_size;
@@ -203,6 +204,11 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     }
     else if (mKVCacheQuantMode.hasFp8KvCache())
     {
+        // Inputs to MLA is FP8 instead of BF16/FP16 when using FP8 KV cache.
+        if (xqaParams.isMLA())
+        {
+            xqaParams.data_type = DATA_TYPE_E4M3;
+        }
         xqaParams.kv_cache_data_type = DATA_TYPE_E4M3;
     }
     else
@@ -237,6 +243,8 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.beam_width = generationsParams.beam_width;
     // Speculative decoding mode has generation input_length > 1.
     xqaParams.generation_input_length = generationsParams.input_seq_length;
+    xqaParams.chunked_attention_size
+        = mAttentionChunkSize && !tc::getEnvDisableChunkedAttentionInGenPhase() ? *mAttentionChunkSize : INT_MAX;
     xqaParams.max_attention_window_size = generationsParams.max_attention_window_size;
     xqaParams.cyclic_attention_window_size = generationsParams.cyclic_attention_window_size;
     xqaParams.max_blocks_per_sequence = generationsParams.max_blocks_per_sequence;
@@ -562,6 +570,17 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
     params.cache_indir = input_params.cache_indir;
     params.batch_size = input_params.inference_batch_size;
     params.beam_width = input_params.beam_width;
+    params.chunked_attention_size = input_params.chunked_attention_size;
+    if (input_params.chunked_attention_size != INT_MAX && !tc::getEnvDisableChunkedAttentionInGenPhase())
+    {
+        TLLM_CHECK_WITH_INFO((input_params.chunked_attention_size & (input_params.chunked_attention_size - 1)) == 0,
+            "Attention chunk size should be a power of 2.");
+        params.chunked_attention_size_log2 = std::log2(input_params.chunked_attention_size);
+    }
+    else
+    {
+        params.chunked_attention_size_log2 = 0;
+    }
     params.max_attention_window_size = input_params.max_attention_window_size;
     params.cyclic_attention_window_size = input_params.cyclic_attention_window_size;
     params.sink_token_length = input_params.sink_token_length;
@@ -672,6 +691,11 @@ int AttentionOp::getHeadSize(bool checkInit) const
 size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t max_num_seq, int32_t input_seq_length,
     int32_t cross_kv_length, int32_t max_num_tokens) const noexcept
 {
+    if (max_num_tokens == 0)
+    {
+        return 0;
+    }
+
     int const local_hidden_units_qo = mNumAttnHeads * getHeadSize();
     int const local_hidden_units_kv = mNumAttnKVHeads * getHeadSize();
 
@@ -752,10 +776,16 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
 size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32_t max_num_seq,
     int32_t max_attention_window_size, int32_t max_num_tokens) const noexcept
 {
+    if (max_num_tokens == 0)
+    {
+        return 0;
+    }
+
     auto const size = tensorrt_llm::runtime::BufferDataType(type).getSize();
     int const batch_beam = max_num_seq;
 
     // Compute the workspace size for MLA.
+    size_t fmha_v2_mla_workspace_size = 0;
     if (mIsMLAEnabled)
     {
         size_t flash_mla_workspace_size = 0;
@@ -808,7 +838,7 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
         workspaces[8] = sizeof(float) * 256 * mMultiProcessorCount;
         workspaces[9] = flash_mla_workspace_size;
 
-        return tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
+        fmha_v2_mla_workspace_size = tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
     }
 
     size_t generation_workspace_size = 0;
@@ -853,12 +883,13 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
         // Scales used for trtllm-gen kernels.
         xqa_workspaces[4] = sizeof(float) * 2;
         xqa_workspaces[5] = sizeof(float);
-        xqa_workspaces[6] = mXqaDispatcher->getWorkspaceSize(max_num_tokens);
+        xqa_workspaces[6] = mXqaDispatcher->getWorkspaceSize(
+            std::min<uint32_t>(mSpecDecodingMaxGenerationLength * max_num_seq, max_num_tokens));
         xqa_workspace_size
             = tc::calculateTotalWorkspaceSize(xqa_workspaces, XQA_NUM_BUFFERS, mXqaDispatcher->getWorkspaceAlignment());
     }
 
-    return std::max(generation_workspace_size, xqa_workspace_size);
+    return std::max(std::max(generation_workspace_size, xqa_workspace_size), fmha_v2_mla_workspace_size);
 }
 
 int AttentionOp::getMaxNumSeqLenTile(int batch_beam_size) const
@@ -1153,6 +1184,35 @@ int AttentionOp::mlaGeneration(
     }
     else
     {
+        // Try XQA optimization first when CP is not used.
+        if (mCpSize == 1)
+        {
+            // NOTE: input_seq_length = num_medusa_tokens + 1 (new generated one from the original LM head)
+            // self attn
+            XQAParams xqaParams{};
+            this->template convertMMHAParamsToXQAParams<T, decltype(kv_cache_buffer)>(
+                xqaParams, generation_params, /*forConfigurePlugin=*/false);
+            xqaParams.quant_q_buffer_ptr = quant_q_buffer_ptr;
+            xqaParams.q_scaling
+                = 1 / (mQScaling * sqrtf((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)));
+            if (mEnableXQA && mXqaDispatcher->shouldUse(xqaParams))
+            {
+                TLLM_LOG_DEBUG("XQA kernels are selected in the generation phase.");
+                xqaParams.stream = stream;
+                mXqaDispatcher->run(xqaParams, kv_cache_buffer);
+                return 0;
+            }
+            else if (mIsSpecDecodingEnabled && mUseSpecDecoding)
+            {
+                TLLM_CHECK_WITH_INFO(false, "No available XQA kernels are found for speculative decoding mode.");
+            }
+            else if (mFuseFp4Quant)
+            {
+                TLLM_CHECK_WITH_INFO(false, "No available kernels are found for FP4 output.");
+            }
+        }
+
+        // Use FMHA otherwise.
         MHARunnerParams fmhaParams{};
         fmhaParams.b = batch_beam;
         fmhaParams.numGroupedHeads = params.head_num;
@@ -1653,6 +1713,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         fmhaParams.oSfScalePtr = params.attention_output_sf_scale;
         fmhaParams.stream = stream;
         fmhaParams.forceFp32Acc = mFMHAForceFP32Acc;
+        fmhaParams.softmaxStatsPtr = params.softmaxStatsPtr;
 
         if (mAttentionChunkSize)
         {
@@ -1980,7 +2041,7 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
     int const max_distance = mMaxDistance;
     bool const* finished = nullptr;
 
-    auto const quant_option = tc::QuantMode::fromDescription();
+    auto const quant_option = tc::QuantMode{};
     float const* qkv_scale_out = nullptr;
 
     int const* ia3_tasks = nullptr;
@@ -2046,6 +2107,11 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
             mMultiBlockMode = isForceMultiBlockMode;
         }
     }
+
+    // Check that the chunked-attention and sliding-window-attention are not enabled at the same time.
+    TLLM_CHECK_WITH_INFO(
+        !mAttentionChunkSize.has_value() || params.cyclic_attention_window_size >= params.max_past_kv_length,
+        "Chunked-attention and sliding-window-attention should not be enabled at the same time.");
 
     int8_t* workspace_byte_ptr = reinterpret_cast<int8_t*>(params.workspace);
     size_t offset = 0;
@@ -2175,6 +2241,7 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
     dispatch_params.size_per_head = getHeadSize();
     dispatch_params.rotary_embedding_dim = mRotaryEmbeddingDim;
     dispatch_params.position_embedding_type = mPositionEmbeddingType;
+    dispatch_params.chunked_attention_size = mAttentionChunkSize ? *mAttentionChunkSize : INT_MAX;
     dispatch_params.max_attention_window_size = params.max_attention_window_size;
     dispatch_params.cyclic_attention_window_size = params.cyclic_attention_window_size;
     dispatch_params.sink_token_length = isCrossAttention() ? 0 : params.sink_token_length;
@@ -2502,7 +2569,7 @@ int AttentionOp::initialize() noexcept
         // Deepseek-V2 Generation needs a differ fmha with different argumments
         if (mIsMLAEnabled)
         {
-            mEnableXQA = false;
+            mEnableXQA = (mSM == kSM_120);
             if (mUseTllmGen)
             {
                 Data_type qDataType = DATA_TYPE_FP32;
@@ -2612,6 +2679,7 @@ int AttentionOp::initialize() noexcept
         TLLM_LOG_DEBUG("Enabling XQA kernels for GPTAttention.");
 
         XqaFixedParams fixedParams{};
+        fixedParams.isMLA = mIsGenerationMLA;
         // TODO: support more combinations.
         // Update Q and O dtype.
         if (mType == nvinfer1::DataType::kHALF)

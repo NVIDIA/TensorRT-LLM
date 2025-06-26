@@ -53,6 +53,8 @@ Launch build/test pipelines. All previously running jobs will be killed.
 
 `--extra-stage "H100_PCIe-[Post-Merge]-1, xxx"` *(OPTIONAL)* : Run the ordinary L0 pre-merge pipeline and specified test stages. Examples: --extra-stage "H100_PCIe-[Post-Merge]-1, xxx".
 
+For guidance on mapping tests to stage names, see `docs/source/reference/ci-overview.md`.
+
 ### kill
 
 `kill  `

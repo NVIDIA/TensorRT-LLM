@@ -230,22 +230,17 @@ CacheTransBufferManager::CacheTransBufferManager(
     allocateBuffer();
 }
 
-size_t CacheTransBufferManager::preAllocBufferSize(
-    std::optional<size_t> maxNumTokens, std::optional<size_t> kvCacheSizePerToken)
+size_t CacheTransBufferManager::preAllocBufferSize(std::optional<size_t> maxNumTokens)
 {
     bool to_allocate = common::getEnvUseMPIKvCache() || common::getEnvUseUCXKvCache() || common::getEnvUseNixlKvCache();
     if (!to_allocate)
     {
         return 0;
     }
-    if (maxNumTokens.has_value())
-    {
-        TLLM_CHECK(kvCacheSizePerToken.has_value());
-    }
     size_t TransferBufferSize = common::getEnvMemSizeForKVCacheTransferBuffer();
     if (maxNumTokens.has_value())
     {
-        TransferBufferSize = maxNumTokens.value() * kvCacheSizePerToken.value();
+        TransferBufferSize = maxNumTokens.value();
     }
     bool useFabricMemory = FabricMemory::supportFbaricMemory()
         && (!(common::getEnvKVCacheTransferUseSyncBuffer() || common::getEnvKVCacheTransferUseAsyncBuffer()));
@@ -327,7 +322,7 @@ std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> CacheTransBuf
     TLLM_LOG_DEBUG("getOrAllocateBuffers bufferCoverTargetNum:%d", bufferCoverTargetNum);
     if (bufferId.has_value())
     {
-        TLLM_CHECK(static_cast<size_t>(bufferId.value()) < mSendBufferCount);
+        TLLM_CHECK(static_cast<size_t>(bufferId.value()) < concurrenceResource.mBuffers.size());
         TLLM_CHECK(concurrenceResource.mBufferIndexFlag[bufferId.value()] == 1);
 
         for (int i = 0; i < targetNum; i++)

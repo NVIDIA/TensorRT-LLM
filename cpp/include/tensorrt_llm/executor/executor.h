@@ -282,6 +282,27 @@ private:
     std::optional<VecTokenExtraIds> mInputTokenExtraIds;
 };
 
+/// @brief Multimodal input data class
+class MultimodalInput
+{
+public:
+    explicit MultimodalInput(std::vector<std::vector<SizeType32>> multimodalHashes,
+        std::vector<SizeType32> multimodalPositions, std::vector<SizeType32> multimodalLengths);
+
+    [[nodiscard]] std::vector<std::vector<SizeType32>> getMultimodalHashes() const;
+    [[nodiscard]] std::vector<SizeType32> getMultimodalPositions() const;
+    [[nodiscard]] std::vector<SizeType32> getMultimodalLengths() const;
+
+private:
+    friend class Serialization;
+    /// @brief The multimodal hashes
+    std::vector<std::vector<SizeType32>> mMultimodalHashes;
+    /// @brief The multimodal positions
+    std::vector<SizeType32> mMultimodalPositions;
+    /// @brief The multimodal lengths
+    std::vector<SizeType32> mMultimodalLengths;
+};
+
 /// @brief Configuration for mrope
 class MropeConfig
 {
@@ -619,6 +640,7 @@ public:
     /// @param embeddingBias The embedding bias tensor. Expected shape is [vocab_size]
     /// @param externalDraftTokensConfig The speculative decoding with external draft tokens configuration
     /// @param pTuningConfig The prompt tuning configuration
+    /// @param multimodalInput The multimodal input {multimodalHashes, multimodalPositions, multimodalLengths}
     /// @param multimodalEmbedding The multimodal embedding tensor. Expected shape is [num_multimodal_tokens,
     /// hidden_dim]
     /// @param mRopeConfig The mrope configuration
@@ -658,6 +680,7 @@ public:
         std::optional<Tensor> embeddingBias = std::nullopt,
         std::optional<ExternalDraftTokensConfig> externalDraftTokensConfig = std::nullopt,
         std::optional<PromptTuningConfig> pTuningConfig = std::nullopt,
+        std::optional<MultimodalInput> multimodalInput = std::nullopt,
         std::optional<Tensor> multimodalEmbedding = std::nullopt, std::optional<MropeConfig> mRopeConfig = std::nullopt,
         std::optional<LoraConfig> loraConfig = std::nullopt,
         std::optional<LookaheadDecodingConfig> lookaheadConfig = std::nullopt,
@@ -700,6 +723,7 @@ public:
     [[nodiscard]] std::optional<Tensor> getEmbeddingBias() const;
     [[nodiscard]] std::optional<ExternalDraftTokensConfig> getExternalDraftTokensConfig() const;
     [[nodiscard]] std::optional<PromptTuningConfig> getPromptTuningConfig() const;
+    [[nodiscard]] std::optional<MultimodalInput> getMultimodalInput() const;
     [[nodiscard]] std::optional<Tensor> getMultimodalEmbedding() const;
     [[nodiscard]] std::optional<MropeConfig> getMropeConfig() const;
     [[nodiscard]] std::optional<LoraConfig> getLoraConfig() const;
@@ -735,6 +759,7 @@ public:
     void setExternalDraftTokensConfig(ExternalDraftTokensConfig const& externalDraftTokensConfig);
     void setPromptTuningConfig(PromptTuningConfig const& pTuningConfig);
     void setMultimodalEmbedding(Tensor const& multimodalEmbedding);
+    void setMultimodalInput(MultimodalInput const& multimodalInput);
     void setMropeConfig(MropeConfig const& mRopeConfig);
     void setLoraConfig(LoraConfig const& loraConfig);
     void setLookaheadConfig(LookaheadDecodingConfig const& lookaheadConfig);
@@ -966,6 +991,8 @@ private:
 class KvCacheConfig
 {
 public:
+    static constexpr auto kDefaultGpuMemFraction = 0.9F;
+
     explicit KvCacheConfig(bool enableBlockReuse = true, std::optional<SizeType32> const& maxTokens = std::nullopt,
         std::optional<std::vector<SizeType32>> const& maxAttentionWindowVec = std::nullopt,
         std::optional<SizeType32> const& sinkTokenLength = std::nullopt,
@@ -973,8 +1000,8 @@ public:
         std::optional<size_t> const& hostCacheSize = std::nullopt, bool onboardBlocks = true,
         std::optional<FloatType> const& crossKvCacheFraction = std::nullopt,
         std::optional<RetentionPriority> secondaryOffloadMinPriority = std::nullopt, size_t eventBufferMaxSize = 0,
-        std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults = std::nullopt,
-        bool enablePartialReuse = true, bool copyOnPartialReuse = true);
+        bool enablePartialReuse = true, bool copyOnPartialReuse = true, bool useUvm = false,
+        std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults = std::nullopt);
 
     [[nodiscard]] bool getEnableBlockReuse() const;
     [[nodiscard]] bool getEnablePartialReuse() const;
@@ -988,6 +1015,7 @@ public:
     [[nodiscard]] bool getOnboardBlocks() const;
     [[nodiscard]] std::optional<RetentionPriority> getSecondaryOffloadMinPriority() const;
     [[nodiscard]] size_t getEventBufferMaxSize() const;
+    [[nodiscard]] bool getUseUvm() const;
 
     void setEnableBlockReuse(bool enableBlockReuse);
     void setEnablePartialReuse(bool enablePartialReuse);
@@ -1001,7 +1029,9 @@ public:
     void setOnboardBlocks(bool onboardBlocks);
     void setSecondaryOffloadMinPriority(std::optional<RetentionPriority> secondaryOffloadMinPriority);
     void setEventBufferMaxSize(size_t eventBufferMaxSize);
-    void fillEmptyFieldsFromRuntimeDefaults(tensorrt_llm::runtime::RuntimeDefaults runtimeDefaults);
+    void setUseUvm(bool useUvm);
+
+    void fillEmptyFieldsFromRuntimeDefaults(tensorrt_llm::runtime::RuntimeDefaults const& runtimeDefaults);
 
 private:
     friend class Serialization;
@@ -1052,6 +1082,9 @@ private:
 
     /// @brief Whether partially matched blocks that are in use can be reused after copying them
     bool mCopyOnPartialReuse;
+
+    /// @brief Whether to use UVM for the KV cache.
+    bool mUseUvm;
 };
 
 /// @brief Configuration class for the runtime perf knobs
@@ -1326,6 +1359,8 @@ public:
     {
         /// @brief Enable guided decoding with XGrammar backend.
         kXGRAMMAR = 0,
+        /// @brief Enable guided decoding with LLGuidance backend.
+        kLLGUIDANCE = 1,
     };
 
     explicit GuidedDecodingConfig(GuidedDecodingBackend backend,

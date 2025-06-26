@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional, Union
 
 
+# TODO: remove and unify with _AutoDeployLlmArgs
 @dataclass
 class SimpleConfig:
     """Experiment Configuration."""
@@ -25,6 +26,8 @@ class SimpleConfig:
         "AutoModelForCausalLM"
     )
     skip_loading_weights: bool = False  # only load the architecture, not the weights
+    checkpoint_device: Optional[str] = None  # Device on which to load the model checkpoint
+    # (defaults to the same device as the rest of the pipeline)
     customize_tokenizer: bool = False  # True: tokenizer from the model factory, False: from LLM api
 
     ### MODEL EXTRA KWARGS #########################################################################
@@ -55,7 +58,7 @@ class SimpleConfig:
     mla_backend: Literal["MultiHeadLatentAttention"] = "MultiHeadLatentAttention"
     max_seq_len: int = 512  # max sequence length for inference/cache
     max_batch_size: int = 8  # max dimension for statically allocated kv cache
-    page_size: int = 64  # page size for attention
+    attn_page_size: int = 64  # page size for attention
     simple_shard_only: bool = False  # if True, force simple sharding(all_gather) in TP;
     # otherwise auto-detect and use column+row (all_reduce) sharding
 
@@ -94,11 +97,8 @@ class SimpleConfig:
         # check if model was supplied
         assert self.model, "model must be supplied!"
 
-        # we don't want to loose the default values for model_kwargs unless explicitly set by the
-        # user. They are not preserved by the standard initialization process since they whole dict
-        # gets replaced by the user provided one. We don't want that though.
-        f_default = self.__dataclass_fields__["model_kwargs"].default_factory()
-        setattr(self, "model_kwargs", {**f_default, **getattr(self, "model_kwargs")})
+        # NEVER use cache
+        self.model_kwargs["use_cache"] = False
 
         # special handling for torch_dtype in model_kwargs since HF does not correctly update
         # torch_dtype string to an actual torch.dtype object (only with default)
@@ -120,7 +120,7 @@ class SimpleConfig:
 
         # No paging allowed in TritonWithFlattenedInputs
         if self.attn_backend in ["TritonWithFlattenedInputs"]:
-            self.page_size = self.max_seq_len
+            self.attn_page_size = self.max_seq_len
 
         # use min instead of max to avoid OOM for large batch size
         self.model_kwargs["max_position_embeddings"] = min(

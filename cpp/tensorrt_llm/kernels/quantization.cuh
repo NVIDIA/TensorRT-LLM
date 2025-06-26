@@ -275,7 +275,7 @@ __global__ void perTokenQuantization(QuantT* dst, T const* src, int64_t const nu
 // FP4 Quantization
 
 constexpr int CVT_FP4_ELTS_PER_THREAD = 8;
-constexpr int CVT_FP4_SF_VEC_SIZE = 16;
+// constexpr int CVT_FP4_SF_VEC_SIZE = 16;
 constexpr int CVT_FP4_THREADS_PER_WARP = 32;
 constexpr int CVT_FP8_TO_FP4_ELTS_PER_THREAD = 16;
 
@@ -386,16 +386,20 @@ template <class Type>
 struct PackedVec
 {
     typename TypeConverter<Type>::Type elts[4];
+    static_assert(sizeof(elts) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD,
+        "Vector size should match the number of elements per thread.");
 };
 
 template <>
 struct PackedVec<__nv_fp8_e4m3>
 {
     __nv_fp8x2_e4m3 elts[8];
+    static_assert(sizeof(elts) == sizeof(__nv_fp8_e4m3) * CVT_FP8_TO_FP4_ELTS_PER_THREAD,
+        "Vector size should match the number of elements per thread.");
 };
 
 // Quantizes the provided PackedVec into the uint32_t output
-template <class Type, bool UE8M0_SF = false>
+template <class Type, int SF_VEC_SIZE, bool UE8M0_SF>
 __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal, uint8_t* SFout)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -409,8 +413,13 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal,
         localMax = cuda_max(localMax, cuda_abs(vec.elts[i]));
     }
 
-    // Get the absolute maximum among all 16 values (two threads).
+    constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD;
+    // Get the absolute maximum among all 16 values (two threads for 16, four threads for 32).
     localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
+    if constexpr (CVT_NUM_THREADS_PER_SF == 4)
+    {
+        localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 2), localMax);
+    }
     // Get the final absolute maximum values.
     float vecMax = float(cuda_max(localMax.x, localMax.y));
 
@@ -474,7 +483,7 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal,
 #endif
 }
 
-template <class Type, bool UE8M0_SF = false>
+template <class Type, int SF_VEC_SIZE, bool UE8M0_SF>
 __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type>& vec, float SFScaleVal, uint8_t* SFout)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -499,6 +508,13 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type>& vec, float SFScaleVal, 
     for (int i = 1; i < CVT_FP8_TO_FP4_ELTS_PER_THREAD / 2; i++)
     {
         localMax = __hmax2(localMax, __habs2(vec_half2[i]));
+    }
+
+    constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_FP8_TO_FP4_ELTS_PER_THREAD;
+    if constexpr (CVT_NUM_THREADS_PER_SF == 2)
+    {
+        // For block 32, we need to reduce the local max across two threads.
+        localMax = __hmax2(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
     }
 
     // Get the final absolute maximum values.
@@ -556,6 +572,7 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type>& vec, float SFScaleVal, 
 #endif
 }
 
+template <int SF_VEC_SIZE>
 inline __device__ int64_t get_sf_out_offset_128x4(
     std::optional<int> batchIdx, int mIdx, int kIdx, std::optional<int> numRows, int numCols)
 {
@@ -580,7 +597,7 @@ inline __device__ int64_t get_sf_out_offset_128x4(
     int64_t kTileStride = 32 * outerMStride; // 512
 
     // SF vector size 16. We round the "numCols" up to a multiple of 64.
-    int factor = CVT_FP4_SF_VEC_SIZE * 4;
+    int factor = SF_VEC_SIZE * 4;
     int32_t numKTiles = (numCols + factor - 1) / factor;
     int32_t mTileIdx = mIdx / (32 * 4);
     int64_t mTileStride = numKTiles * kTileStride;
@@ -596,12 +613,13 @@ inline __device__ int64_t get_sf_out_offset_128x4(
     return SFOffset;
 }
 
-template <class SFType, int CVT_FP4_NUM_THREADS_PER_SF>
+template <class SFType, int CVT_FP4_NUM_THREADS_PER_SF, int SF_VEC_SIZE>
 __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchIdx, int rowIdx, int colIdx,
     std::optional<int> numRows, int numCols, SFType* SFout, FP4QuantizationSFLayout layout)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-    static_assert(CVT_FP4_NUM_THREADS_PER_SF == 1 || CVT_FP4_NUM_THREADS_PER_SF == 2);
+    static_assert(
+        CVT_FP4_NUM_THREADS_PER_SF == 1 || CVT_FP4_NUM_THREADS_PER_SF == 2 || CVT_FP4_NUM_THREADS_PER_SF == 4);
 
     // One pair of threads write one SF to global memory.
     // TODO: stage through smem for packed STG.32
@@ -615,7 +633,7 @@ __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchI
             int32_t kIdx = colIdx / CVT_FP4_NUM_THREADS_PER_SF;
             int32_t mIdx = rowIdx;
 
-            auto SFOffset = get_sf_out_offset_128x4(batchIdx, mIdx, kIdx, numRows, numCols);
+            auto SFOffset = get_sf_out_offset_128x4<SF_VEC_SIZE>(batchIdx, mIdx, kIdx, numRows, numCols);
             return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
         }
         else if (layout == FP4QuantizationSFLayout::LINEAR)
@@ -623,7 +641,7 @@ __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchI
             // Linear row-major layout, no padding required.
             int32_t KTileIdx = colIdx / CVT_FP4_NUM_THREADS_PER_SF;
 
-            int32_t numKTiles = numCols / CVT_FP4_SF_VEC_SIZE;
+            int32_t numKTiles = numCols / SF_VEC_SIZE;
             int64_t mTileStride = numKTiles;
 
             int64_t BTileStride = numRows.value_or(0) * mTileStride;
@@ -641,7 +659,7 @@ __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchI
 }
 
 // Use UE4M3 by default.
-template <class Type, bool UE8M0_SF = false>
+template <class Type, int SF_VEC_SIZE, bool UE8M0_SF>
 __global__ void
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     __launch_bounds__(512, 4) cvt_fp16_to_fp4_3d(
@@ -654,7 +672,7 @@ cvt_fp16_to_fp4_3d(
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 
     using PackedVec = PackedVec<Type>;
-    static constexpr int CVT_FP4_NUM_THREADS_PER_SF = CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD; // 2
+    static constexpr int CVT_FP4_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD; // 2 or 4
     static_assert(sizeof(PackedVec) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD, "Vec size is not matched.");
 
     // Get the global scaling factor, which will be applied to the SF.
@@ -680,10 +698,10 @@ cvt_fp16_to_fp4_3d(
                 std::optional<int> optionalBatchIdx = batchIdx;
                 std::optional<int> optionalNumRows = numRows;
 
-                auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_NUM_THREADS_PER_SF>(
+                auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_NUM_THREADS_PER_SF, SF_VEC_SIZE>(
                     optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numCols, SFout, layout);
 
-                out_pos = cvt_warp_fp16_to_fp4(in_vec, SFScaleVal, sf_out);
+                out_pos = cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
             }
         }
     }
@@ -692,7 +710,7 @@ cvt_fp16_to_fp4_3d(
 }
 
 // Use UE4M3 by default.
-template <bool UE8M0_SF = false>
+template <int SF_VEC_SIZE, bool UE8M0_SF>
 __global__ void
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     __launch_bounds__(512, 4) cvt_fp8_to_fp4_3d(
@@ -704,7 +722,7 @@ cvt_fp8_to_fp4_3d(
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     using PackedVec = PackedVec<__nv_fp8_e4m3>;
-    static constexpr int CVT_FP4_NUM_THREADS_PER_SF = CVT_FP4_SF_VEC_SIZE / CVT_FP8_TO_FP4_ELTS_PER_THREAD;
+    static constexpr int CVT_FP4_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_FP8_TO_FP4_ELTS_PER_THREAD;
     static_assert(
         sizeof(PackedVec) == sizeof(__nv_fp8_e4m3) * CVT_FP8_TO_FP4_ELTS_PER_THREAD, "Vec size is not matched.");
 
@@ -730,10 +748,10 @@ cvt_fp8_to_fp4_3d(
                 std::optional<int> optionalBatchIdx = batchIdx;
                 std::optional<int> optionalNumRows = numRows;
 
-                auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_NUM_THREADS_PER_SF>(
+                auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_NUM_THREADS_PER_SF, SF_VEC_SIZE>(
                     optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numCols, SFout, layout);
 
-                out_pos = cvt_warp_fp8_to_fp4(in_vec, SFScaleVal, sf_out);
+                out_pos = cvt_warp_fp8_to_fp4<__nv_fp8_e4m3, SF_VEC_SIZE, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
             }
         }
     }
@@ -741,7 +759,7 @@ cvt_fp8_to_fp4_3d(
 }
 
 // Use UE4M3 by default.
-template <class Type, bool UE8M0_SF = false>
+template <class Type, int SF_VEC_SIZE, bool UE8M0_SF>
 __global__ void
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     __launch_bounds__(512, 4) cvt_fp16_to_fp4(
@@ -753,7 +771,7 @@ cvt_fp16_to_fp4(
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     using PackedVec = PackedVec<Type>;
-    static constexpr int CVT_FP4_NUM_THREADS_PER_SF = CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD;
+    static constexpr int CVT_FP4_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD;
     static_assert(sizeof(PackedVec) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD, "Vec size is not matched.");
 
     // Get the global scaling factor, which will be applied to the SF.
@@ -773,10 +791,10 @@ cvt_fp16_to_fp4(
             int64_t outOffset = inOffset;
             auto& out_pos = out[outOffset];
 
-            auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_NUM_THREADS_PER_SF>(
+            auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_NUM_THREADS_PER_SF, SF_VEC_SIZE>(
                 std::nullopt /* batchIdx */, rowIdx, colIdx, std::nullopt /* numRows */, numCols, SFout, layout);
 
-            out_pos = cvt_warp_fp16_to_fp4(in_vec, SFScaleVal, sf_out);
+            out_pos = cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
         }
     }
     asm volatile("griddepcontrol.launch_dependents;");
@@ -784,7 +802,7 @@ cvt_fp16_to_fp4(
 }
 
 // Use UE4M3 by default.
-template <bool UE8M0_SF = false>
+template <int SF_VEC_SIZE, bool UE8M0_SF>
 __global__ void
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     __launch_bounds__(512, 4) cvt_fp8_to_fp4(
@@ -796,7 +814,7 @@ cvt_fp8_to_fp4(
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     using PackedVec = PackedVec<__nv_fp8_e4m3>;
-    static constexpr int CVT_FP4_NUM_THREADS_PER_SF = CVT_FP4_SF_VEC_SIZE / CVT_FP8_TO_FP4_ELTS_PER_THREAD;
+    static constexpr int CVT_FP4_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_FP8_TO_FP4_ELTS_PER_THREAD;
     static_assert(
         sizeof(PackedVec) == sizeof(__nv_fp8_e4m3) * CVT_FP8_TO_FP4_ELTS_PER_THREAD, "Vec size is not matched.");
 
@@ -816,10 +834,10 @@ cvt_fp8_to_fp4(
             int64_t outOffset = inOffset;
             auto& out_pos = out[outOffset];
 
-            auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_NUM_THREADS_PER_SF>(
+            auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_NUM_THREADS_PER_SF, SF_VEC_SIZE>(
                 std::nullopt /* batchIdx */, rowIdx, colIdx, std::nullopt /* numRows */, numCols, SFout, layout);
 
-            out_pos = cvt_warp_fp8_to_fp4(in_vec, SFScaleVal, sf_out);
+            out_pos = cvt_warp_fp8_to_fp4<__nv_fp8_e4m3, SF_VEC_SIZE, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
         }
     }
 #endif

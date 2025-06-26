@@ -27,24 +27,6 @@ namespace tensorrt_llm
 namespace kernels
 {
 
-namespace
-{
-namespace tg = trtllm::gen;
-
-tg::Dtype dtypeToTrtllmDtype(Dtype dtype)
-{
-    switch (dtype)
-    {
-    case Dtype::Bfloat16: return tg::Dtype::Bfloat16;
-    case Dtype::Fp16: return tg::Dtype::Fp16;
-    case Dtype::Fp32: return tg::Dtype::Fp32;
-    case Dtype::E2m1: return tg::Dtype::E2m1;
-    case Dtype::E4m3: return tg::Dtype::E4m3;
-    default: TLLM_CHECK_WITH_INFO(false, "Invalid dtype");
-    }
-}
-} // namespace
-
 TrtllmGenGemmGatedActRunner::TrtllmGenGemmGatedActRunner(TrtllmGenGemmGatedActRunnerOptions const& options_)
     : mOptions(options_)
 {
@@ -59,8 +41,7 @@ TrtllmGenGemmGatedActRunner::TrtllmGenGemmGatedActRunner(TrtllmGenGemmGatedActRu
         auto const options = configs[i].mOptions;
 
         // When we include low-latency kernels we can set transposeMmaOutput via constructor
-        if (options.mDtypeElt == dtypeToTrtllmDtype(mOptions.eltType)
-            && options.mDtypeC == dtypeToTrtllmDtype(mOptions.outputType)
+        if (options.mDtypeElt == mOptions.eltType && options.mDtypeC == mOptions.outputType
             && options.mUseDeepSeekFp8 == mOptions.deepSeekFp8
             && options.mTransposeMmaOutput == mOptions.transposeMmaOutput)
         {

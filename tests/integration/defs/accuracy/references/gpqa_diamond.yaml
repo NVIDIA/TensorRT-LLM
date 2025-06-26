@@ -17,9 +17,22 @@ deepseek-ai/DeepSeek-R1:
 nvidia/Llama-3_3-Nemotron-Super-49B-v1:
   - accuracy: 44.95
   - quant_algo: FP8
-    accuracy: 49.49
+    kv_cache_quant_algo: FP8
+    accuracy: 42.42
+    # GPQA diamond only contains 198 samples, so the score tends to have large variance.
+    # We repeated evaluation 7 times to choose a lower bound score for FP8, 42.42.
+    # random_seed=0: 47.98
+    # random_seed=1: 42.42
+    # random_seed=2: 52.02
+    # random_seed=3: 51.52
+    # random_seed=4: 48.48
+    # random_seed=5: 47.47
+    # random_seed=6: 45.96
 nvidia/Llama-3.1-Nemotron-Nano-8B-v1:
   - accuracy: 40.40
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 39.39
 nvidia/Llama-3_1-Nemotron-Ultra-253B-v1:
   - accuracy: 58.08
   - quant_algo: FP8

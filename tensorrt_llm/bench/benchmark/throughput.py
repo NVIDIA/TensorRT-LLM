@@ -17,7 +17,8 @@ from tensorrt_llm.bench.build.build import get_model_config
 from tensorrt_llm.bench.benchmark.utils.general import (
     get_settings_from_engine, get_settings)
 # isort: on
-from tensorrt_llm._torch.llm import LLM as PyTorchLLM
+from tensorrt_llm import LLM as PyTorchLLM
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
@@ -25,7 +26,7 @@ from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
-from tensorrt_llm.llmapi import LLM, CapacitySchedulerPolicy
+from tensorrt_llm.llmapi import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -43,7 +44,7 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Path to a serialized TRT-LLM engine.",
 )
 @optgroup.option("--backend",
-                 type=click.Choice(["pytorch", "autodeploy"]),
+                 type=click.Choice(["pytorch", "_autodeploy"]),
                  default=None,
                  help="Set to 'pytorch' for pytorch path. Default is cpp path.")
 @optgroup.option(
@@ -292,10 +293,10 @@ def throughput_command(
         logger.info(metadata.get_summary_for_print())
 
     # Engine configuration parsing
-    if backend and backend.lower() in ["pytorch", "autodeploy"]:
+    if backend and backend.lower() in ["pytorch", "_autodeploy"]:
         # If we're dealing with a model name, perform a snapshot download to
         # make sure we have a local copy of the model.
-        if bench_env.checkpoint_path is None:
+        if checkpoint_path is None:
             snapshot_download(model)
 
         exec_settings = get_settings(params, metadata, bench_env.model,
@@ -356,10 +357,14 @@ def throughput_command(
         kwargs = kwargs | runtime_config.get_llm_args()
         kwargs['backend'] = backend
 
-        if backend == "pytorch":
+        if backend == "pytorch" and iteration_log is not None:
             kwargs["enable_iter_perf_stats"] = True
 
         if runtime_config.backend == 'pytorch':
+            if kwargs.pop("extended_runtime_perf_knob_config", None):
+                logger.warning(
+                    "Ignore extended_runtime_perf_knob_config for pytorch backend."
+                )
             llm = PyTorchLLM(**kwargs)
         else:
             llm = LLM(**kwargs)
@@ -368,6 +373,7 @@ def throughput_command(
                                          pad_id=eos_id,
                                          n=beam_width,
                                          use_beam_search=beam_width > 1)
+        post_proc_params = None  # No detokenization
 
         # Perform warmup if requested.
         if warmup > 0:
@@ -377,6 +383,7 @@ def throughput_command(
             asyncio.run(
                 async_benchmark(llm,
                                 sampling_params,
+                                post_proc_params,
                                 warmup_dataset,
                                 False,
                                 concurrency,
@@ -391,6 +398,7 @@ def throughput_command(
             statistics = asyncio.run(
                 async_benchmark(llm,
                                 sampling_params,
+                                post_proc_params,
                                 requests,
                                 streaming,
                                 concurrency,

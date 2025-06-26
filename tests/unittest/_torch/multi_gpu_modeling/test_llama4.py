@@ -1,12 +1,11 @@
-# TODO: Enable this test when the models are checked into the llm repo!!
 from difflib import SequenceMatcher
 
 import pytest
 import torch
 from utils.llm_data import llm_models_root
 
-from tensorrt_llm import SamplingParams
-from tensorrt_llm._torch import LLM
+from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm.llmapi import KvCacheConfig
 
 
 @pytest.mark.parametrize(
@@ -34,22 +33,34 @@ def test_llama4(model_name, backend, tp_size, use_cuda_graph,
                                     and pp_size == 1):
         pytest.skip("Skip this attention DP test case to avoid too many tests")
 
-    prompts = [{
-        "prompt": "The president of the United States is"
-    }, {
-        "prompt": "<|image|>This image is of color",
-        "multi_modal_data": {
-            "image": [torch.ones(3, 1024, 1024)]
-        }
-    }]
+    prompts = [
+        {
+            "prompt": "The president of the United States is"
+        },
+        {
+            # NOTE: Long context accuracy testing (RULER) is not available in CI yet.
+            # This test cannot be removed until long context is covered.
+            "prompt":
+            "This is a very long prompt to exercise long context. Count up to 10000 from 1, 2, 3,"
+            + ", ".join(str(i) for i in range(4, 9000))
+        },
+        {
+            "prompt": "<|image|>This image is of color",
+            "multi_modal_data": {
+                "image": [torch.ones(3, 1024, 1024)]
+            }
+        },
+    ]
 
     expected_outputs = [
-        " the head of state and head of government of the", " solid white"
+        " the head of state and head of government of the", ", 8999, 9000, ",
+        " white. What is the color of the background of"
     ]
 
     pytorch_config = dict(attn_backend=backend, use_cuda_graph=use_cuda_graph)
     model_dir = str(llm_models_root() / "llama4-models" / model_name)
 
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.25, )
     llm = LLM(
         model=model_dir,
         tensor_parallel_size=tp_size,
@@ -58,6 +69,8 @@ def test_llama4(model_name, backend, tp_size, use_cuda_graph,
         **pytorch_config,
         pipeline_parallel_size=pp_size,
         enable_attention_dp=enable_attention_dp,
+        kv_cache_config=kv_cache_config,
+        enable_chunked_prefill=True,
     )
     with llm:
         outputs = llm.generate(

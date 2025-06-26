@@ -2,7 +2,7 @@
 
 # Building from Source Code on Linux
 
-This document provides instructions for building TensorRT-LLM from source code on Linux. Building from source is recommended for achieving optimal performance, enabling debugging capabilities, or when you need a different [GNU CXX11 ABI](https://gcc.gnu.org/onlinedocs/libstdc++/manual/using_dual_abi.html) configuration than what is available in the pre-built TensorRT-LLM wheel on PyPI. Note that the current pre-built TensorRT-LLM wheel on PyPI is linked against PyTorch 2.7.0, which uses the new CXX11 ABI.
+This document provides instructions for building TensorRT-LLM from source code on Linux. Building from source is recommended for achieving optimal performance, enabling debugging capabilities, or when you need a different [GNU CXX11 ABI](https://gcc.gnu.org/onlinedocs/libstdc++/manual/using_dual_abi.html) configuration than what is available in the pre-built TensorRT-LLM wheel on PyPI. Note that the current pre-built TensorRT-LLM wheel on PyPI is linked against PyTorch 2.7.0 and subsequent versions, which uses the new CXX11 ABI.
 
 
 ## Prerequisites

@@ -115,6 +115,21 @@ target_include_directories(
     $<TARGET_PROPERTY:${INTERNAL_CUTLASS_KERNELS_TARGET},INTERFACE_INCLUDE_DIRECTORIES>
   PRIVATE ${TARGET_DIR})
 
+if(USING_OSS_CUTLASS_FP4_GEMM)
+  target_compile_definitions(${PLUGIN_SHARED_TARGET}
+                             PUBLIC USING_OSS_CUTLASS_FP4_GEMM)
+endif()
+
+if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
+  target_compile_definitions(${PLUGIN_SHARED_TARGET}
+                             PUBLIC USING_OSS_CUTLASS_ALLREDUCE_GEMM)
+endif()
+
+if(USING_OSS_CUTLASS_MOE_GEMM)
+  target_compile_definitions(${PLUGIN_SHARED_TARGET}
+                             PUBLIC USING_OSS_CUTLASS_MOE_GEMM)
+endif()
+
 if(ENABLE_MULTI_DEVICE)
   target_include_directories(${PLUGIN_SHARED_TARGET}
                              PUBLIC ${MPI_C_INCLUDE_DIRS})

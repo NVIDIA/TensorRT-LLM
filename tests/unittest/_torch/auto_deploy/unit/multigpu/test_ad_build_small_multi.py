@@ -20,6 +20,8 @@ from simple_config import SimpleConfig
     ],
 )
 def test_build_ad(world_size: int, config: Dict):
+    if world_size > 1:
+        pytest.skip("https://nvbugspro.nvidia.com/bug/5331013")
     config["world_size"] = world_size
     config["runtime"] = "trtllm"  # Default runtime set to trtllm
     simple_config = SimpleConfig(**config)

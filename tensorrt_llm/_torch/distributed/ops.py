@@ -10,7 +10,7 @@ from torch import nn
 from tensorrt_llm._utils import mpi_barrier
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
-                                     AllReduceStrategy)
+                                     AllReduceStrategy, MoEAllReduceParams)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
@@ -307,14 +307,17 @@ class MNNVLAllReduce(nn.Module):
         super().__init__()
         self.mapping = mapping
         self.dtype = dtype
-        self.enable_mnnvl = (os.environ.get("TRTLLM_MNNVL_AR_ENABLED",
-                                            "0") == "1"
-                             and dtype in [torch.bfloat16, torch.float32]
-                             and (not mapping.has_cp()))
+        assert (
+            dtype in MNNVLAllReduce.get_supported_dtypes()
+            and (not mapping.has_cp())
+        ), "MNNVL all reduce only supports dtype {MNNVLAllReduce.get_supported_dtypes()} and without cp."
 
-        if self.enable_mnnvl:
-            self.mcast_buffer_mnnvl, self.buffer_mnnvl, self.buffer_flags_mnnvl, self.max_num_elements_mnnvl = get_allreduce_mnnvl_workspace(
-                self.mapping, dtype)
+        self.mcast_buffer_mnnvl, self.buffer_mnnvl, self.buffer_flags_mnnvl, self.max_num_elements_mnnvl = get_allreduce_mnnvl_workspace(
+            self.mapping, dtype)
+
+    @staticmethod
+    def get_supported_dtypes():
+        return (torch.bfloat16, torch.float32)
 
     def forward(
         self,
@@ -330,7 +333,7 @@ class MNNVLAllReduce(nn.Module):
         Returns:
             Union[torch.Tensor, Tuple[torch.Tensor, ...]]: Reduced tensor(s)
         """
-        if not self.enable_mnnvl or input.numel() > self.max_num_elements_mnnvl:
+        if input.numel() > self.max_num_elements_mnnvl:
             return None
 
         fusion_op = all_reduce_params.fusion_op
@@ -345,8 +348,7 @@ class MNNVLAllReduce(nn.Module):
         buffer_mnnvl = self.buffer_mnnvl.view(3, 2, -1, shape[-1])
 
         if fusion_op == AllReduceFusionOp.NONE:
-            torch.ops.trtllm.mnnvl_twoshot_allreduce(
-                output,
+            output = torch.ops.trtllm.mnnvl_twoshot_allreduce(
                 input,
                 buffer_mnnvl,
                 self.buffer_flags_mnnvl,
@@ -355,19 +357,16 @@ class MNNVLAllReduce(nn.Module):
             return output.view(shape)
         elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
             torch.ops.trtllm.mnnvl_twoshot_allreduce(
-                output,
                 input,
                 buffer_mnnvl,
                 self.buffer_flags_mnnvl,
                 False,
             )
             residual_in = all_reduce_params.residual
-            residual_out = torch.empty_like(input)
 
-            torch.ops.trtllm.mnnvl_twoshot_rmsnorm(
-                residual_out, output, buffer_mnnvl,
-                all_reduce_params.norm_weight, all_reduce_params.eps,
-                residual_in, self.buffer_flags_mnnvl)
+            output, residual_out = torch.ops.trtllm.mnnvl_twoshot_rmsnorm(
+                buffer_mnnvl, all_reduce_params.norm_weight,
+                all_reduce_params.eps, residual_in, self.buffer_flags_mnnvl)
             return output.view(shape), residual_out.view(shape)
         return None
 
@@ -415,27 +414,27 @@ class AllReduce(nn.Module):
             For the reference implementation for each pattern, please refer to the following unit test:
             https://github.com/NVIDIA/TensorRT-LLM/blob/main/tests/unittest/_torch/multi_gpu/test_allreduce.py
 
-            The LOWPRECISION strategy can be selected either by directly specifying it in the constructor
-            or by setting the environment variable FORCE_LOW_PRECISION_ALL_REDUCE_STRATEGY when using
-            the AUTO strategy.
+            The LOWPRECISION strategy can be selected either by directly specifying it in the constructor.
         """
 
         self.mapping = mapping
         self.workspace = None
         self.strategy = strategy
+        self.mnnvl_allreduce = None
 
-        self.force_low_precision_env = os.environ.get(
-            "FORCE_LOW_PRECISION_ALL_REDUCE_STRATEGY")
         if self.mapping.tp_size > 1:
             # When Strategy is UB, it is guaranteed that the workspace is not used.
             if self.strategy != AllReduceStrategy.UB:
-                if self.strategy == AllReduceStrategy.LOWPRECISION or self.force_low_precision_env is not None:
+                if self.strategy == AllReduceStrategy.LOWPRECISION:
                     allocate_low_presicion_allreduce_workspace(self.mapping)
                 self.workspace = get_allreduce_workspace(self.mapping)
 
             # Initialize MNNVL AllReduce if needed
-            self.mnnvl_allreduce = MNNVLAllReduce(mapping,
-                                                  dtype) if dtype else None
+            if self.strategy == AllReduceStrategy.MNNVL and (
+                    dtype and dtype in MNNVLAllReduce.get_supported_dtypes()
+            ) and (not self.mapping.has_cp()):
+                self.mnnvl_allreduce = MNNVLAllReduce(self.mapping,
+                                                      dtype) if dtype else None
 
     def forward(
         self,
@@ -493,6 +492,8 @@ class AllReduce(nn.Module):
             strategy=self.strategy,
             op=all_reduce_params.fusion_op,
             eps=all_reduce_params.eps,
+            trigger_completion_at_end=all_reduce_params.
+            trigger_completion_at_end,
         )
 
         return output if len(output) > 1 else output[0]
@@ -509,6 +510,8 @@ class MoEAllReduce(nn.Module):
             mapping (Mapping):  The parallel mapping config.
 
         Notes:
+            * min latency mode:
+
             Support pattern: MoE Reduction + Add + AR + ADD_RMS, see this torch reference implementation:
             expert_reduction = torch.sum(active_experts_token_input *
                                         scale.unsqueeze(-1),
@@ -516,23 +519,33 @@ class MoEAllReduce(nn.Module):
             output_add = expert_reduction + shared_expert_output
             output_residual = output_add + residual
             output_hidden_states = rms_norm(output_residual, norm_weight, eps)
+
+            * regular mode:
+
+            Support pattern: MoE Reduction + Add + AR + ADD_RMS, see this torch reference implementation:
+            expert_reduction = local_reduction(input, expanded_idx_to_permuted_idx, expert_scale_factor)
+            output_add = expert_reduction + shared_expert_output
+            output_residual = output_add + residual
+            output_hidden_states = rms_norm(output_residual, norm_weight, eps)
         """
         super().__init__()
         self.mapping = mapping
         self.workspace = get_allreduce_workspace(self.mapping)
+        # Pls keep this value in sync with the kOneShotMaxToken in moeAllReduceFusionKernels.h
+        self.max_token = 128
 
     def forward(
         self,
-        residual: torch.Tensor,
-        norm_weight: torch.Tensor,
-        device_num_experts: torch.Tensor,
-        scale_input: torch.Tensor,
-        active_experts_token_input: torch.Tensor,
-        token_input: torch.Tensor,
-        eps: float,
+        input: torch.Tensor,
+        *,
+        all_reduce_params: MoEAllReduceParams,
     ) -> torch.Tensor:
-        """
-        Args:
+
+        assert all_reduce_params.is_valid(), "MoEAllReduceParams is not valid"
+
+        if all_reduce_params.is_cutlass_min_latency:
+            """
+            Args:
             residual: residual tensor
             norm_weight: RMS norm weight
             device_num_experts: number of experts per device
@@ -541,19 +554,37 @@ class MoEAllReduce(nn.Module):
             token_input: per token input, shared expert output
             eps: epsilon for RMSNorm
 
-        Output:
-            hidden_states: hidden_states of the model
-            residual: residual tensor
-        """
-        return torch.ops.trtllm.moe_allreduce(
-            residual=residual,
-            norm_weight=norm_weight,
-            device_num_experts=device_num_experts,
-            scale_input=scale_input,
-            active_experts_token_input=active_experts_token_input,
-            token_input=token_input,
-            workspace=self.workspace,
-            rank=self.mapping.tp_rank,
-            nranks=self.mapping.tp_size,
-            eps=eps,
-        )
+            Output:
+                hidden_states: hidden_states of the model
+                residual: residual tensor
+            """
+
+            return torch.ops.trtllm.moe_allreduce(
+                active_experts_token_input=input,
+                residual=all_reduce_params.residual,
+                norm_weight=all_reduce_params.norm_weight,
+                device_num_experts=all_reduce_params.device_num_experts,
+                scale_input=all_reduce_params.expert_scale_factor,
+                token_input=all_reduce_params.shared_expert_output,
+                workspace=self.workspace,
+                rank=self.mapping.tp_rank,
+                nranks=self.mapping.tp_size,
+                eps=all_reduce_params.eps,
+            )
+        else:
+            assert all_reduce_params.residual.shape[
+                0] <= self.max_token, "Num tokens must be less than or equal to max_token"
+
+            return torch.ops.trtllm.moe_finalize_allreduce(
+                input=input,
+                residual=all_reduce_params.residual,
+                norm_weight=all_reduce_params.norm_weight,
+                expanded_idx_to_permuted_idx=all_reduce_params.
+                expanded_idx_to_permuted_idx,
+                shared_expert_output=all_reduce_params.shared_expert_output,
+                expert_scale_factor=all_reduce_params.expert_scale_factor,
+                workspace=self.workspace,
+                rank=self.mapping.tp_rank,
+                nranks=self.mapping.tp_size,
+                eps=all_reduce_params.eps,
+            )

@@ -169,7 +169,7 @@ def _flattened_context_mha(
     )
 
 
-@torch.library.custom_op("attention::flattened_mha_with_cache", mutates_args=())
+@torch.library.custom_op("auto_deploy::triton_attention_flattened_mha_with_cache", mutates_args=())
 def flattened_mha_with_cache(
     # Q, K, V
     q: torch.Tensor,
@@ -259,7 +259,9 @@ def flattened_mha_fake(
     return q.new_empty(*q.shape[:-1], v.shape[-1]).contiguous()
 
 
-@torch.library.custom_op("attention::prepare_fused_mha_metadata", mutates_args=())
+@torch.library.custom_op(
+    "auto_deploy::triton_attention_prepare_fused_mha_metadata", mutates_args=()
+)
 def prepare_fused_mha_metadata(
     input_ids: torch.Tensor,
     position_ids: torch.Tensor,
@@ -314,15 +316,15 @@ class TritonWithFlattenedInputs(AttentionDescriptor):
 
     @classmethod
     def get_source_attention_op(cls) -> OpOverloadPacket:
-        return torch.ops.attention.bsnd_grouped_sdpa
+        return torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
-        return torch.ops.attention.flattened_mha_with_cache
+        return torch.ops.auto_deploy.triton_attention_flattened_mha_with_cache
 
     @classmethod
     def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
-        return torch.ops.attention.prepare_fused_mha_metadata, 4
+        return torch.ops.auto_deploy.triton_attention_prepare_fused_mha_metadata, 4
 
     @classmethod
     def get_cache_initializers(
@@ -370,7 +372,7 @@ class TritonWithFlattenedInputs(AttentionDescriptor):
             source_attn_node, "attn_mask", "dropout_p", "is_causal"
         )
         if attn_mask is not None or dropout_p != 0.0 or not is_causal:
-            ad_logger.warning(
+            ad_logger.debug(
                 "Unsupported attention arguments for "
                 f"{source_attn_node=}: {attn_mask=}, {dropout_p=}, {is_causal=}"
             )

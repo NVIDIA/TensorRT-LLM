@@ -1,14 +1,17 @@
 import asyncio
 import heapq
 from abc import ABC, abstractmethod
-from typing import Iterable, Optional, Union
+from typing import Dict, Iterable, List, Optional, Union
 
 import aiohttp
 from transformers import AutoTokenizer
 
 from tensorrt_llm.bindings.internal.batch_manager import (BlockKey,
                                                           BlockKeyHasher)
-from tensorrt_llm.llmapi.disagg_utils import RouterConfig
+from tensorrt_llm.llmapi.disagg_utils import (MetadataServerConfig,
+                                              RouterConfig, ServerRole)
+from tensorrt_llm.logger import logger
+from tensorrt_llm.serve.metadata_server import JsonDictionary
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionRequest)
 
@@ -61,6 +64,13 @@ class ServerState:
         async with self._lock:
             self._num_active_requests -= 1
             self._num_active_tokens -= num_tokens
+
+    async def is_healthy(self) -> bool:
+        try:
+            async with self._session.get(self._server + "/health") as response:
+                return response.status == 200
+        except Exception:
+            return False
 
 
 class KvCacheAwareServerState(ServerState):
@@ -135,8 +145,24 @@ class KvCacheAwareServerState(ServerState):
 
 class Router(ABC):
 
-    def __init__(self, servers: list[str] = None):
-        self._servers = servers
+    def __init__(self, server_role: ServerRole, servers: List[str],
+                 metadata_server_cfg: Optional[MetadataServerConfig],
+                 metadata_server: Optional[JsonDictionary]):
+        self._servers = servers or []
+        self._metadata_server = metadata_server
+        self._server_role = server_role
+        self._lock = asyncio.Lock()
+        self._monitor_task = None
+        self._session = None
+        self._health_check_timeout = metadata_server_cfg.health_check_timeout if metadata_server_cfg else None
+
+    @abstractmethod
+    def _on_servers_updated(self, old_servers, new_servers):
+        """Called when the server list changes. Override in subclasses to handle index resets.
+        Args:
+            old_servers: The previous server list
+            new_servers: The new server list
+        """
 
     @abstractmethod
     async def get_next_server(self, request: OpenAIRequest) -> tuple[str, dict]:
@@ -146,16 +172,252 @@ class Router(ABC):
     async def finish_request(self, request: OpenAIRequest):
         pass
 
+    async def start_server_monitoring(self, poll_interval: float = 10.0):
+        """Start monitoring servers update from metadata service"""
+        if not self._metadata_server:
+            raise RuntimeError("Metadata server is not initialized")
+
+        # Create a session for health checks if it doesn't exist
+        if not self._session:
+            self._session = aiohttp.ClientSession()
+
+        logger.info(
+            f"Starting server monitoring for {self._server_role} servers")
+        self._monitor_task = asyncio.create_task(
+            self._monitor_servers(poll_interval))
+
+    async def stop_server_monitoring(self):
+        """Stop monitoring servers update from metadata service"""
+        if self._monitor_task:
+            logger.info(
+                f"Stopping server monitoring for {self._server_role} servers")
+            self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except asyncio.CancelledError:
+                pass
+            self._monitor_task = None
+
+        # Close session when stopping monitoring
+        await self.close_session()
+
+    async def close_session(self):
+        if self._session:
+            try:
+                await self._session.close()
+                self._session = None
+                logger.debug("HTTP session closed")
+            except Exception as e:
+                logger.error(f"Error closing session: {e}")
+                self._session = None
+
+    async def _monitor_servers(self, poll_interval: float = 10.0):
+        while True:
+            try:
+                # Get servers from metadata
+                server_key_map = await self.fetch_live_servers()
+
+                # Check health and get live servers
+                live_servers = await self.check_servers_health(server_key_map)
+
+                # Filter by server role if needed
+                role_specific_servers = self._filter_servers_by_role(
+                    live_servers, server_key_map)
+
+                # Use filtered servers if available
+                final_servers = role_specific_servers
+
+                assert final_servers, f"No {self._server_role} servers available"
+
+                # Update server list
+                async with self._lock:
+                    if final_servers != self._servers:
+                        old_servers = self._servers.copy()
+                        self._servers = final_servers
+
+                        # Call handler for server list changes
+                        self._on_servers_updated(old_servers, self._servers)
+
+                        # Log removed servers
+                        for server in old_servers:
+                            if server not in final_servers:
+                                logger.info(f"Server {server} is removed")
+
+                        # Log added servers
+                        for server in final_servers:
+                            if server not in old_servers:
+                                logger.info(f"Server {server} is added")
+                    else:
+                        logger.debug(
+                            f"No change in {self._server_role} server list: {len(self._servers)} servers"
+                        )
+            except Exception as e:
+                logger.error(f"Error in server monitoring: {e}")
+                raise
+
+            # Wait before next poll
+            await asyncio.sleep(poll_interval)
+
+    def _filter_servers_by_role(self, servers, server_key_map):
+        """Filter servers by role (context or generation)"""
+        if not servers:
+            raise RuntimeError("No servers available")
+
+        filtered_servers = []
+        # Invert to get {url: key} for lookup
+        url_to_key = {url: key for key, url in server_key_map.items()}
+
+        for server_url in servers:
+            key = url_to_key.get(server_url)
+            if key:
+                server_metadata = self._metadata_server.get(key)
+                if server_metadata:
+                    server_type = self._get_server_type(server_metadata)
+
+                    if self._is_matching_role(server_type):
+                        filtered_servers.append(server_url)
+
+        return filtered_servers
+
+    def _get_server_type(self, server_metadata: dict) -> str:
+        return (server_metadata.get('server_type')
+                or server_metadata.get('server_role') or '').lower()
+
+    def _is_matching_role(self, server_type: str) -> bool:
+        return (self._server_role == ServerRole.CONTEXT and server_type == 'context') or \
+            (self._server_role == ServerRole.GENERATION and server_type == 'generation')
+
+    async def fetch_live_servers(self) -> Dict[str, str]:
+        """Fetch all servers from metadata service and return {key: url} mapping"""
+        if not self._metadata_server:
+            raise RuntimeError("Metadata server is not initialized")
+
+        # If metadata server is available, ignore static server list entirely
+        server_key_map = {}
+        try:
+            # Get all keys from the metadata server
+            all_keys = self._metadata_server.keys()
+            logger.debug(f"Found {len(all_keys)} keys in metadata server")
+
+            # Filter keys that start with 'trtllm/' and extract server metadata
+            for key in all_keys:
+                if key.startswith('trtllm/'):
+                    server_metadata = self._metadata_server.get(key)
+                    if server_metadata and isinstance(
+                            server_metadata, dict) and 'url' in server_metadata:
+                        server_key_map[key] = server_metadata['url']
+
+            if server_key_map:
+                logger.debug(
+                    f"Using {len(server_key_map)} servers from metadata service"
+                )
+            else:
+                raise ValueError("No servers found in metadata service")
+
+        except Exception as e:
+            logger.error(f"Error fetching servers from metadata service: {e}")
+            raise
+
+        return server_key_map
+
+    async def check_servers_health(self,
+                                   server_key_map: Dict[str, str]) -> List[str]:
+        """Check health of servers and remove dead ones from metadata service"""
+        live_servers = []
+        dead_servers = []
+
+        # Check health of each server
+        for key, server_url in server_key_map.items():
+            try:
+                is_healthy = await self._check_server_health(server_url)
+
+                # If first attempt failed, try again before declaring server dead
+                if not is_healthy:
+                    # Second attempt - will print errors if it fails
+                    is_healthy = await self._check_server_health(server_url)
+
+                if not is_healthy:
+                    # Only now add to dead servers
+                    dead_servers.append((key, server_url))
+                else:
+                    live_servers.append(server_url)
+            except Exception as e:
+                logger.error(
+                    f"Error checking health for server {server_url} (key: {key}): {e}"
+                )
+                dead_servers.append((key, server_url))
+
+        # Remove dead servers from etcd
+        for key, dead_server in dead_servers:
+            try:
+                logger.info(
+                    f"Removing dead server {dead_server} from metadata server")
+                self._metadata_server.remove(key)
+            except Exception as e:
+                logger.error(
+                    f"Error removing dead server from metadata service: {e}")
+                raise
+
+        return live_servers
+
+    async def _check_server_health(self, server_url) -> bool:
+        """Check if a server is healthy by querying its health endpoint"""
+        if not self._session:
+            self._session = aiohttp.ClientSession()
+
+        assert self._health_check_timeout is not None, "health_check_timeout is not set"
+        try:
+            async with self._session.get(
+                    f"{server_url}/health",
+                    timeout=self._health_check_timeout) as response:
+                if response.status != 200:
+                    logger.warning(
+                        f"Server {server_url} is not healthy (status: {response.status})"
+                    )
+                    return False
+                return True
+        except Exception as e:
+            logger.warning(f"Server {server_url} is not reachable: {e}")
+            return False
+
 
 class RoundRobinRouter(Router):
 
-    def __init__(self, servers: list[str] = None, **kwargs):
-        super().__init__(servers)
+    def __init__(self,
+                 server_role: ServerRole,
+                 servers: List[str] = None,
+                 metadata_server_cfg: MetadataServerConfig = None,
+                 metadata_server: JsonDictionary = None,
+                 **kwargs):
+        super().__init__(server_role, servers, metadata_server_cfg,
+                         metadata_server)
         self._server_idx = 0
 
+    def _on_servers_updated(self, old_servers, new_servers):
+        """Reset the index when servers are removed to prevent index out of bounds errors."""
+        if len(new_servers) < len(old_servers):
+            # Servers were removed, reset the index
+            self._server_idx = 0
+        elif self._server_idx >= len(new_servers):
+            # Safety check: ensure index is always within bounds
+            self._server_idx = 0
+
     async def get_next_server(self, request: OpenAIRequest) -> tuple[str, dict]:
-        server = self._servers[self._server_idx]
-        self._server_idx = (self._server_idx + 1) % len(self._servers)
+        if not self._servers:
+            if self._metadata_server:
+                raise ValueError(
+                    f"No {self._server_role} servers available in metadata service"
+                )
+            else:
+                raise ValueError(f"No {self._server_role} servers available")
+
+        async with self._lock:
+            # Safety check: ensure index is within bounds
+            if self._server_idx >= len(self._servers):
+                self._server_idx = 0
+
+            server = self._servers[self._server_idx]
+            self._server_idx = (self._server_idx + 1) % len(self._servers)
         return server, {}
 
     async def finish_request(self, request: OpenAIRequest):
@@ -165,11 +427,14 @@ class RoundRobinRouter(Router):
 class LoadBalancingRouter(Router):
 
     def __init__(self,
-                 servers: list[str] = None,
+                 server_role: ServerRole,
+                 servers: List[str] = None,
+                 metadata_server_cfg: MetadataServerConfig = None,
+                 metadata_server: JsonDictionary = None,
                  use_tokens: bool = False,
                  **kwargs):
-        super().__init__(servers)
-        self._lock = asyncio.Lock()
+        super().__init__(server_role, servers, metadata_server_cfg,
+                         metadata_server)
         # Load map between servers and their number of tokens processed
         self._server_state = {}
         self._server_load_heap = []
@@ -180,6 +445,25 @@ class LoadBalancingRouter(Router):
         self._use_tokens = use_tokens
         self._init_heap()
 
+    def _on_servers_updated(self, old_servers, new_servers):
+        """Rebuild the heap when the server list changes."""
+        # Keep the state for servers that still exist
+        current_state = {}
+        for server in new_servers:
+            if server in self._server_state:
+                # Keep existing state
+                current_state[server] = self._server_state[server]
+            else:
+                # Initialize new server state
+                current_state[server] = ServerState(server, self._use_tokens)
+
+        # Update state and rebuild heap
+        self._server_state = current_state
+        self._server_load_heap = []
+        for server in new_servers:
+            heapq.heappush(self._server_load_heap,
+                           (self._get_server_load(server), server))
+
     def _init_heap(self):
         for server in self._servers:
             self._server_state[server] = ServerState(server, self._use_tokens)
@@ -187,6 +471,14 @@ class LoadBalancingRouter(Router):
                            (self._get_server_load(server), server))
 
     async def get_next_server(self, request: OpenAIRequest) -> tuple[str, dict]:
+        if not self._servers:
+            if self._metadata_server:
+                raise ValueError(
+                    f"No {self._server_role} servers available in metadata service"
+                )
+            else:
+                raise ValueError(f"No {self._server_role} servers available")
+
         async with self._lock:
             server = heapq.heappop(self._server_load_heap)[1]
             await self._server_state[server].increment_load(request)
@@ -220,18 +512,22 @@ def block_key_hasher(token_ids: list[int],
 class KvCacheAwareRouter(Router):
 
     def __init__(self,
+                 server_role: ServerRole = None,
                  servers: list[str] = None,
+                 metadata_server_cfg: MetadataServerConfig = None,
+                 metadata_server: JsonDictionary = None,
                  use_tokens: bool = False,
                  max_batch_size: int = 64,
                  tokens_per_block: int = 32,
                  **kwargs):
-        super().__init__(servers)
+        super().__init__(server_role, servers, metadata_server_cfg,
+                         metadata_server)
         self._lock = asyncio.Lock()
 
         # Load map between servers and their number of tokens processed
         self._server_state: dict[str, KvCacheAwareServerState] = {
             server: KvCacheAwareServerState(server, use_tokens)
-            for server in servers
+            for server in servers or []
         }
 
         # Routing table to map requests to servers
@@ -311,9 +607,15 @@ class KvCacheAwareRouter(Router):
         await self._server_state[server].decrement_load(request,
                                                         session=session)
 
+    def _on_servers_updated(self, old_servers, new_servers):
+        raise NotImplementedError(
+            "KvCacheAwareRouter does not support server updates")
+
 
 def create_router(router_config: Optional[RouterConfig],
-                  servers: list[str]) -> Router:
+                  servers: Optional[List[str]],
+                  metadata_server_cfg: Optional[MetadataServerConfig] = None,
+                  metadata_server: Optional[JsonDictionary] = None) -> Router:
     """
     Factory function to create different types of router instances.
 
@@ -331,7 +633,8 @@ def create_router(router_config: Optional[RouterConfig],
         ValueError: If an unsupported router type is provided
     """
     if router_config is None:
-        return RoundRobinRouter(servers)
+        # Create a default router without server_role
+        return RoundRobinRouter(None, servers)
 
     router_map = {
         "round_robin": RoundRobinRouter,
@@ -345,4 +648,6 @@ def create_router(router_config: Optional[RouterConfig],
         raise ValueError(f"Unsupported router type: {router_type}. "
                          f"Supported types are: {list(router_map.keys())}")
 
-    return router_class(servers, **router_config.args)
+    # Pass server_role as the first argument
+    return router_class(router_config.server_role, servers, metadata_server_cfg,
+                        metadata_server, **router_config.args)

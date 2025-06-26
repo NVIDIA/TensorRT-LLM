@@ -8,6 +8,7 @@ l0_gb203:
     wildcards:
       gpu:
       - '*gb203*'
+      - '*5080*'
       linux_distribution_name: ubuntu*
     terms:
       stage: pre_merge

@@ -37,7 +37,7 @@ def stop_triton_server():
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
                          ids=["enableDecoupleMode", "disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -170,7 +170,7 @@ def test_llama_v2_7b_ifb(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
                          ids=["enableDecoupleMode", "disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -287,7 +287,7 @@ def test_mistral_v1_7b_ifb(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
                          ids=["enableDecoupleMode", "disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -474,7 +474,7 @@ def test_mistral_v1_7b_python_backend(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
                          ids=["enableDecoupleMode", "disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -592,7 +592,7 @@ def test_llama_v2_70b_ifb(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
                          ids=["enableDecoupleMode", "disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -1043,7 +1043,7 @@ def test_gpt_350m_python_backend(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
                          ids=["enableDecoupleMode", "disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -1445,7 +1445,7 @@ def test_whisper_large_v3_ifb(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", ["0.2"])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["False"],
                          ids=["disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -1569,7 +1569,7 @@ def test_gpt_gather_logits_ifb(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", ["0.2"])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["False"],
                          ids=["disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -1759,7 +1759,7 @@ def test_gpt_350m_speculative_decoding(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", ["0.2"])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["False"],
                          ids=["disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -1950,7 +1950,7 @@ def test_gpt_350m_speculative_decoding_return_logits(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", ["0.2"])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["False"],
                          ids=["disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -2104,7 +2104,7 @@ def test_gpt_speculative_decoding_bls(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", ["0.2"])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["False"],
                          ids=["disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -2278,7 +2278,7 @@ def test_llama_v3_speculative_decoding_bls(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
                          ids=["enableDecoupleMode", "disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -2394,7 +2394,7 @@ def test_gpt_175b_dummyWeights_ifb(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", ["0.7"])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
                          ids=["enableDecoupleMode", "disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])

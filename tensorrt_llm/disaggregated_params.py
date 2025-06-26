@@ -6,8 +6,7 @@ from tensorrt_llm.bindings import executor as tllme
 
 @dataclass(slots=True, kw_only=True)
 class DisaggregatedParams:
-    """
-    Disaggregated seving parameters
+    """Disaggregated seving parameters.
 
     Args:
         request_type (str): The type of request ("context_only" or "generation_only")
@@ -23,10 +22,9 @@ class DisaggregatedParams:
     draft_tokens: Optional[List[int]] = None
 
     def get_context_phase_params(self) -> tllme.ContextPhaseParams:
-
-        return tllme.ContextPhaseParams(self.first_gen_tokens,
-                                        self.ctx_request_id, self.opaque_state,
-                                        self.draft_tokens)
+        return tllme.ContextPhaseParams(
+            self.first_gen_tokens, self.ctx_request_id, self.opaque_state, self.draft_tokens
+        )
 
     def get_request_type(self) -> tllme.RequestType:
         if self.request_type == "context_only":
@@ -37,5 +35,6 @@ class DisaggregatedParams:
             return tllme.RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION
         else:
             raise ValueError(
-                f"Unknown request type: {self.request_type}. Must be context_only, generation_only or context_and_generation"
+                f"Unknown request type: {self.request_type}. Must be context_only, generation_only or "
+                "context_and_generation"
             )

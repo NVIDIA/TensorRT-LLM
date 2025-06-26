@@ -4,7 +4,7 @@ import flashinfer
 import torch
 
 
-@torch.library.custom_op("rope::flashinfer", mutates_args=())
+@torch.library.custom_op("auto_deploy::flashinfer_rope", mutates_args=())
 def apply_rope_with_input_pos_flashinfer(
     q: torch.Tensor,
     k: torch.Tensor,

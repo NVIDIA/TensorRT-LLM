@@ -26,8 +26,8 @@ KvCacheConfig::KvCacheConfig(bool enableBlockReuse, std::optional<SizeType32> co
     std::optional<SizeType32> const& sinkTokenLength, std::optional<FloatType> const& freeGpuMemoryFraction,
     std::optional<size_t> const& hostCacheSize, bool onboardBlocks,
     std::optional<FloatType> const& crossKvCacheFraction, std::optional<RetentionPriority> secondaryOffloadMinPriority,
-    size_t eventBufferMaxSize, std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults,
-    bool enablePartialReuse, bool copyOnPartialReuse)
+    size_t eventBufferMaxSize, bool enablePartialReuse, bool copyOnPartialReuse, bool useUvm,
+    std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults)
     : mEnableBlockReuse(enableBlockReuse)
     , mHostCacheSize(hostCacheSize)
     , mOnboardBlocks(onboardBlocks)
@@ -35,6 +35,7 @@ KvCacheConfig::KvCacheConfig(bool enableBlockReuse, std::optional<SizeType32> co
     , mEventBufferMaxSize{eventBufferMaxSize}
     , mEnablePartialReuse{enablePartialReuse}
     , mCopyOnPartialReuse{copyOnPartialReuse}
+    , mUseUvm{useUvm}
 {
     if (maxTokens)
     {
@@ -122,6 +123,11 @@ size_t KvCacheConfig::getEventBufferMaxSize() const
     return mEventBufferMaxSize;
 }
 
+bool KvCacheConfig::getUseUvm() const
+{
+    return mUseUvm;
+}
+
 void KvCacheConfig::setEnableBlockReuse(bool enableBlockReuse)
 {
     mEnableBlockReuse = enableBlockReuse;
@@ -193,7 +199,12 @@ void KvCacheConfig::setEventBufferMaxSize(size_t eventBufferMaxSize)
     mEventBufferMaxSize = eventBufferMaxSize;
 }
 
-void KvCacheConfig::fillEmptyFieldsFromRuntimeDefaults(tensorrt_llm::runtime::RuntimeDefaults runtimeDefaults)
+void KvCacheConfig::setUseUvm(bool useUvm)
+{
+    mUseUvm = useUvm;
+}
+
+void KvCacheConfig::fillEmptyFieldsFromRuntimeDefaults(tensorrt_llm::runtime::RuntimeDefaults const& runtimeDefaults)
 {
     if (!mMaxAttentionWindowVec && runtimeDefaults.maxAttentionWindowVec)
     {

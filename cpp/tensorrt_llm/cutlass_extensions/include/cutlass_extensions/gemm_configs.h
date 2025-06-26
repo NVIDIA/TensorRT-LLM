@@ -336,7 +336,8 @@ enum class ClusterShape
     ClusterShape_2x4x1,
     ClusterShape_4x4x1,
     ClusterShape_1x8x1,
-    ClusterShape_8x1x1
+    ClusterShape_8x1x1,
+    ClusterShape_4x1x1
 };
 
 static auto get_cluster_shape_name(ClusterShape Shape_MNK)
@@ -356,6 +357,10 @@ static auto get_cluster_shape_name(ClusterShape Shape_MNK)
     else if (Shape_MNK == ClusterShape::ClusterShape_2x2x1)
     {
         return "2x2x1";
+    }
+    else if (Shape_MNK == ClusterShape::ClusterShape_4x1x1)
+    {
+        return "4x1x1";
     }
     else if (Shape_MNK == ClusterShape::ClusterShape_1x8x1)
     {
@@ -387,6 +392,10 @@ constexpr auto get_cluster_shape()
     else if constexpr (Shape_MNK == ClusterShape::ClusterShape_2x2x1)
     {
         return cute::Shape<_2, _2, _1>{};
+    }
+    else if constexpr (Shape_MNK == ClusterShape::ClusterShape_4x1x1)
+    {
+        return cute::Shape<_4, _1, _1>{};
     }
     else if constexpr (Shape_MNK == ClusterShape::ClusterShape_1x8x1)
     {

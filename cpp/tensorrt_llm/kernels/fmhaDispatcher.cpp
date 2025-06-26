@@ -105,6 +105,11 @@ bool FmhaDispatcher::isSupported()
         tllmRunnerParams.mHeadDimV = mFixedParams.headSizeV;
         tllmRunnerParams.mNumTokensPerPage = mFixedParams.numTokensPerBlock;
         tllmRunnerParams.mNumHeadsQPerKv = mFixedParams.numQHeads / mFixedParams.numKvHeads;
+        // Set the chunked attention size and sliding window size to INT_MAX to disable them when checking if
+        // the kernel is supported.
+        tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
+        tllmRunnerParams.mAttentionWindowSize = INT_MAX;
+
         foundKernels = mTllmGenFMHARunner->isSupported(tllmRunnerParams);
     }
     else
@@ -192,6 +197,8 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         // Set it to INT_MAX as the kv cache pageOffsets will ensure that there is no out-of-bounds access.
         tllmRunnerParams.mNumPagesInMemPool = INT_MAX;
         tllmRunnerParams.mSfStartTokenIdx = 0;
+        // For mla chunked prefill
+        tllmRunnerParams.softmaxStatsPtr = reinterpret_cast<float2*>(runnerParams.softmaxStatsPtr);
         tllmRunnerParams.stream = runnerParams.stream;
         mTllmGenFMHARunner->run(tllmRunnerParams);
     }

@@ -11,14 +11,17 @@ import yaml
 from strenum import StrEnum
 from torch.cuda import device_count
 
-from tensorrt_llm._torch.llm import LLM as PyTorchLLM
+from tensorrt_llm import LLM as PyTorchLLM
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
-from tensorrt_llm.llmapi import (LLM, BuildConfig, CapacitySchedulerPolicy,
+from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
                                  DynamicBatchConfig, KvCacheConfig,
                                  SchedulerConfig)
 from tensorrt_llm.llmapi.disagg_utils import (CtxGenServerConfig,
-                                              parse_disagg_config_file)
+                                              MetadataServerConfig, ServerRole,
+                                              parse_disagg_config_file,
+                                              parse_metadata_server_config_file)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_port
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
@@ -119,15 +122,20 @@ def get_llm_args(model: str,
         "max_seq_len": max_seq_len,
         "kv_cache_config": kv_cache_config,
         "backend": backend if backend == "pytorch" else None,
-        "_num_postprocess_workers": num_postprocess_workers,
-        "_postprocess_tokenizer_dir": tokenizer or model,
-        "_reasoning_parser": reasoning_parser,
+        "num_postprocess_workers": num_postprocess_workers,
+        "postprocess_tokenizer_dir": tokenizer or model,
+        "reasoning_parser": reasoning_parser,
     }
 
     return llm_args, llm_args_extra_dict
 
 
-def launch_server(host: str, port: int, llm_args: dict):
+def launch_server(host: str,
+                  port: int,
+                  llm_args: dict,
+                  metadata_server_cfg: Optional[MetadataServerConfig] = None,
+                  server_role: Optional[ServerRole] = None):
+
     backend = llm_args["backend"]
     model = llm_args["model"]
 
@@ -136,7 +144,10 @@ def launch_server(host: str, port: int, llm_args: dict):
     else:
         llm = LLM(**llm_args)
 
-    server = OpenAIServer(llm=llm, model=model)
+    server = OpenAIServer(llm=llm,
+                          model=model,
+                          server_role=server_role,
+                          metadata_server_cfg=metadata_server_cfg)
 
     asyncio.run(server(host, port))
 
@@ -228,6 +239,16 @@ def launch_server(host: str, port: int, llm_args: dict):
     default=None,
     help="[Experimental] Specify the parser for reasoning models.",
 )
+@click.option("--metadata_server_config_file",
+              type=str,
+              default=None,
+              help="Path to metadata server config file")
+@click.option(
+    "--server_role",
+    type=str,
+    default=None,
+    help="Server role. Specify this value only if running in disaggregated mode."
+)
 def serve(model: str, tokenizer: Optional[str], host: str, port: int,
           log_level: str, backend: str, max_beam_width: int,
           max_batch_size: int, max_num_tokens: int, max_seq_len: int,
@@ -235,8 +256,9 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
           cluster_size: Optional[int], gpus_per_node: Optional[int],
           kv_cache_free_gpu_memory_fraction: float,
           num_postprocess_workers: int, trust_remote_code: bool,
-          extra_llm_api_options: Optional[str],
-          reasoning_parser: Optional[str]):
+          extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
+          metadata_server_config_file: Optional[str],
+          server_role: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -267,7 +289,17 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
             llm_args_extra_dict = yaml.safe_load(f)
     llm_args = update_llm_args_with_extra_dict(llm_args, llm_args_extra_dict)
 
-    launch_server(host, port, llm_args)
+    metadata_server_cfg = parse_metadata_server_config_file(
+        metadata_server_config_file)
+
+    if metadata_server_cfg is not None:
+        assert server_role is not None, "server_role is required when metadata_server_cfg is provided"
+        try:
+            server_role = ServerRole[server_role.upper()]
+        except ValueError:
+            raise ValueError(f"Invalid server role: {server_role}. " \
+                             f"Must be one of: {', '.join([role.name for role in ServerRole])}")
+    launch_server(host, port, llm_args, metadata_server_cfg, server_role)
 
 
 def get_ctx_gen_server_urls(
@@ -289,6 +321,11 @@ def get_ctx_gen_server_urls(
               type=str,
               default=None,
               help="Specific option for disaggregated mode.")
+@click.option("-m",
+              "--metadata_server_config_file",
+              type=str,
+              default=None,
+              help="Path to metadata server config file")
 @click.option("-t",
               "--server_start_timeout",
               type=int,
@@ -299,14 +336,26 @@ def get_ctx_gen_server_urls(
               type=int,
               default=180,
               help="Request timeout")
-def disaggregated(config_file: Optional[str], server_start_timeout: int,
-                  request_timeout: int):
+@click.option("-l",
+              '--log_level',
+              type=click.Choice(severity_map.keys()),
+              default='info',
+              help="The logging level.")
+def disaggregated(config_file: Optional[str],
+                  metadata_server_config_file: Optional[str],
+                  server_start_timeout: int, request_timeout: int,
+                  log_level: str):
     """Running server in disaggregated mode"""
+
+    logger.set_level(log_level)
 
     disagg_cfg = parse_disagg_config_file(config_file)
 
     ctx_server_urls, gen_server_urls = get_ctx_gen_server_urls(
         disagg_cfg.server_configs)
+
+    metadata_server_cfg = parse_metadata_server_config_file(
+        metadata_server_config_file)
 
     server = OpenAIDisaggServer(
         ctx_servers=ctx_server_urls,
@@ -315,7 +364,8 @@ def disaggregated(config_file: Optional[str], server_start_timeout: int,
         server_start_timeout_secs=server_start_timeout,
         ctx_router_config=disagg_cfg.ctx_router_config,
         gen_router_config=disagg_cfg.gen_router_config,
-        conditional_disagg_config=disagg_cfg.conditional_disagg_config)
+        conditional_disagg_config=disagg_cfg.conditional_disagg_config,
+        metadata_server_cfg=metadata_server_cfg)
 
     asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port))
 
@@ -370,6 +420,8 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
         llm_args = update_llm_args_with_extra_dict(llm_args,
                                                    llm_args_extra_dict)
 
+        # Ignore the non-LLM args
+        llm_args.pop("router", None)
         _launch_disaggregated_server(config_file, llm_args)
         return
 

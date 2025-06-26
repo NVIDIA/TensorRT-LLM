@@ -724,7 +724,7 @@ class TestMoE(unittest.TestCase):
             if getSMVersion() >= 90 and getSMVersion() < 100:
                 params += [('float32', actfn, False), ('float16', actfn, False),
                            ('bfloat16', actfn, False)]
-            if getSMVersion() >= 100 and getSMVersion() < 120:
+            if getSMVersion() >= 100:
                 params += [('fp4', actfn, True)]
         return params
 
@@ -895,7 +895,7 @@ class TestMoE(unittest.TestCase):
         for actfn in ('gelu', 'geglu'):
             for experts, k in [(8, 2), (10, 3)]:
                 dtypes = ['float16', 'bfloat16', 'fp8']
-                if getSMVersion() >= 100 and getSMVersion() < 120:
+                if getSMVersion() >= 100:
                     dtypes += ['fp4']
                 for dtype in dtypes:
                     params.append((dtype, experts, k, actfn))

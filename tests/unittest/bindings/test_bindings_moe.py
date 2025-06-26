@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import os
 import unittest
 
 import numpy as np
@@ -26,6 +26,7 @@ import tensorrt_llm.bindings.internal.runtime as _tbr
 class TestMoePythonBindings(unittest.TestCase):
 
     def setUp(self):
+        os.environ["TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK"] = "1"
         torch.cuda.set_device(0)
         # Common test parameters
         self.expert_count = 8
@@ -136,6 +137,8 @@ class TestMoePythonBindings(unittest.TestCase):
             ep_size=self.ep_size,
             layer_updates_per_iter=self.layer_updates_per_iter)
 
+        balancer.set_use_gpu_memcpy(True)
+
         # Add a layer
         layer = balancer.add_layer(expert_count=self.expert_count,
                                    top_k=self.top_k,
@@ -205,6 +208,8 @@ class TestMoePythonBindings(unittest.TestCase):
             ep_rank=self.ep_rank,
             ep_size=self.ep_size,
             layer_updates_per_iter=self.layer_updates_per_iter)
+
+        balancer.set_use_gpu_memcpy(True)
 
         # Create initial weight assignments
         initial_assignments = []

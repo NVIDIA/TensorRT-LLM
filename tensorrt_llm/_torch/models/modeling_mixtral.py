@@ -12,7 +12,7 @@ from ..models.modeling_utils import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import FusedMoE, RenormalizeMoeRoutingMethod
+from ..modules.fused_moe import RenormalizeMoeRoutingMethod, create_moe
 from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
@@ -25,6 +25,7 @@ class MixtralMoE(nn.Module):
         self,
         model_config: ModelConfig[PretrainedConfig],
         aux_stream: torch.cuda.Stream,
+        layer_idx: Optional[int] = None,
     ):
         super().__init__()
         config = model_config.pretrained_config
@@ -43,7 +44,7 @@ class MixtralMoE(nn.Module):
 
         reduce_results = True
 
-        self.experts = FusedMoE(
+        self.experts = create_moe(
             num_experts=self.num_experts,
             routing_method=RenormalizeMoeRoutingMethod(top_k=self.top_k),
             hidden_size=self.hidden_dim,
@@ -51,7 +52,8 @@ class MixtralMoE(nn.Module):
             aux_stream=aux_stream,
             dtype=config.torch_dtype,
             reduce_results=reduce_results,
-            model_config=model_config)
+            model_config=model_config,
+            layer_idx=layer_idx)
 
     def forward(
         self,
@@ -108,7 +110,9 @@ class MixtralDecoderLayer(DecoderLayer):
 
         self.self_attn = MixtralAttention(model_config, layer_idx=layer_idx)
 
-        self.block_sparse_moe = MixtralMoE(model_config, aux_stream)
+        self.block_sparse_moe = MixtralMoE(model_config,
+                                           aux_stream,
+                                           layer_idx=layer_idx)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -122,7 +126,7 @@ class MixtralDecoderLayer(DecoderLayer):
 
     def forward(
         self,
-        position_ids: torch.LongTensor,
+        position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
@@ -155,7 +159,6 @@ class MixtralModel(DecoderModel):
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__(model_config)
         config = model_config.pretrained_config
-        self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.aux_stream = torch.cuda.Stream()
 
@@ -176,8 +179,8 @@ class MixtralModel(DecoderModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         **kwargs,
     ) -> torch.Tensor:

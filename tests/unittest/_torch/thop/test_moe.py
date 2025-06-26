@@ -23,6 +23,7 @@ import torch.nn.functional as F
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.util import getSMVersion
 
+from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.modules.fused_moe import RoutingMethodType
 from tensorrt_llm.quantization.utils.fp4_utils import (
     reorder_rows_for_gated_act_gemm, shuffle_matrix_a, shuffle_matrix_sf_a)
@@ -150,26 +151,28 @@ def noaux_tc_ref(logits, bias, n_group, topk_group, top_k,
                  routed_scaling_factor):
     scores = F.sigmoid(logits)
     scores_with_bias = scores + bias
-    scores_shape = list(scores_with_bias.shape)
-    group_scores = torch.sum(torch.topk(
-        scores_with_bias.view(scores_shape[:-1] +
-                              [n_group, scores_shape[-1] // n_group]),
-        k=2,
-        dim=-1,
-        largest=True,
-        sorted=True)[0],
-                             dim=-1)
-    _, group_idx = torch.topk(group_scores,
-                              k=topk_group,
-                              dim=-1,
-                              largest=True,
-                              sorted=True)
-    group_mask = torch.zeros_like(group_scores)
-    group_mask.scatter_(-1, group_idx, 1)
-    score_mask = group_mask.unsqueeze(
-        -1).expand(scores_shape[:-1] +
-                   [n_group, scores_shape[-1] // n_group]).reshape(scores_shape)
-    scores_with_bias = scores_with_bias * score_mask
+    if n_group > 1:
+        scores_shape = list(scores_with_bias.shape)
+        group_scores = torch.sum(torch.topk(
+            scores_with_bias.view(scores_shape[:-1] +
+                                  [n_group, scores_shape[-1] // n_group]),
+            k=2,
+            dim=-1,
+            largest=True,
+            sorted=True)[0],
+                                 dim=-1)
+        _, group_idx = torch.topk(group_scores,
+                                  k=topk_group,
+                                  dim=-1,
+                                  largest=True,
+                                  sorted=True)
+        group_mask = torch.zeros_like(group_scores)
+        group_mask.scatter_(-1, group_idx, 1)
+        score_mask = group_mask.unsqueeze(-1).expand(
+            scores_shape[:-1] +
+            [n_group, scores_shape[-1] // n_group]).reshape(scores_shape)
+        scores_with_bias = scores_with_bias * score_mask
+
     _, topk_idx = torch.topk(scores_with_bias,
                              k=top_k,
                              dim=-1,
@@ -220,7 +223,8 @@ def routing_reference_renormalize(expert_logits, top_k, num_experts, padding):
 
 
 # Softmax->TopK -> Normalize
-def routing_reference_qwen3(expert_logits, top_k, num_experts, padding):
+def routing_reference_renormalize_naive(expert_logits, top_k, num_experts,
+                                        padding):
     norm_topk_prob = True
     scores = torch.nn.functional.softmax(expert_logits.float(), dim=-1)
     topk_values, topk_idx = torch.topk(scores, k=top_k, dim=-1)
@@ -566,30 +570,33 @@ def quant_dequant_per_tensor_fp8(a):
     reason="The kernel only supports Blackwell. Current SM is %d." %
     getSMVersion(),
 )
-@pytest.mark.parametrize("num_tokens", [16, 64, 1024])
-@pytest.mark.parametrize("num_experts", [32, 256])
+@pytest.mark.parametrize("num_tokens", [16, 64, 1024, 4096])
+@pytest.mark.parametrize("expert_info", [(32, 8, 4, 8), (32, 1, 1, 5),
+                                         (72, 1, 1, 6), (256, 8, 4, 8)])
 @pytest.mark.parametrize("hidden_size", [512])
 @pytest.mark.parametrize("intermediate_size", [512])
-def test_moe_fp8(num_tokens, num_experts, hidden_size, intermediate_size):
+@pytest.mark.parametrize("use_autotune", [True, False],
+                         ids=["autotune", "no_autotune"])
+def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size,
+                 use_autotune):
     torch.random.manual_seed(0)
 
     #
     # Data Generation
     #
-    top_k = 8
+    num_experts, n_groups, top_k_groups, top_k = expert_info
     padding = 8
-    n_groups = 8
-    top_k_groups = 4
     routed_scaling = 2.5
+    routing_method_type = RoutingMethodType.DeepSeekV3
+    tile_tokens_dim = 8 if num_tokens < 1024 else 32
 
     assert top_k <= num_experts
-    assert top_k == 8
-    assert top_k_groups == 4
+    assert top_k <= 8
+    assert top_k_groups <= 4
     assert num_experts > n_groups
     assert num_experts % n_groups == 0
+    assert num_experts % 4 == 0
     assert top_k < (top_k_groups * num_experts / n_groups)
-    assert hidden_size % 128 == 0
-    assert intermediate_size % 128 == 0
 
     expert_logits = torch.randn((num_tokens, num_experts),
                                 device='cuda').to(torch.float)
@@ -622,11 +629,12 @@ def test_moe_fp8(num_tokens, num_experts, hidden_size, intermediate_size):
                     scores, gemm1_weights, gemm1_scales, None, gemm2_weights,
                     gemm2_scales, None, permute_info, False)
 
-    output = torch.ops.trtllm.fp8_block_scale_moe_runner(
-        expert_logits, routing_bias, hidden_states, hidden_states_scale,
-        gemm1_weights, gemm1_scales, gemm2_weights, gemm2_scales, num_experts,
-        top_k, n_groups, top_k_groups, intermediate_size, 0, num_experts,
-        routed_scaling)
+    with autotune(use_autotune):
+        output = torch.ops.trtllm.fp8_block_scale_moe_runner(
+            expert_logits, routing_bias, hidden_states, hidden_states_scale,
+            gemm1_weights, gemm1_scales, gemm2_weights, gemm2_scales,
+            num_experts, top_k, n_groups, top_k_groups, intermediate_size, 0,
+            num_experts, routed_scaling, tile_tokens_dim, routing_method_type)
 
     output_dequant_actual = output.to(torch.float)
     #
@@ -663,9 +671,9 @@ def test_moe_fp8(num_tokens, num_experts, hidden_size, intermediate_size):
     reason="The kernel only supports Blackwell. Current SM is %d." %
     getSMVersion(),
 )
-@pytest.mark.parametrize("num_tokens", [1, 2, 16, 64, 1024])
+@pytest.mark.parametrize("num_tokens", [1, 1024, 4096])
 @pytest.mark.parametrize("hidden_size", [1024])
-@pytest.mark.parametrize("intermediate_size", [1024])
+@pytest.mark.parametrize("intermediate_size", [1024, 768, 384, 192])
 @pytest.mark.parametrize(
     "routing_info",
     [
@@ -681,6 +689,18 @@ def test_moe_fp8(num_tokens, num_experts, hidden_size, intermediate_size):
                 "routing_method_type": RoutingMethodType.DeepSeekV3
             },
             id="RoutingDSv3"),
+        pytest.param(
+            {
+                "num_experts": 72,
+                "top_k": 6,
+                "padding": 8,
+                "n_groups": 1,
+                "top_k_groups": 1,
+                "routed_scaling": 2.5,
+                "has_routing_bias": True,
+                "routing_method_type": RoutingMethodType.DeepSeekV3
+            },
+            id="RoutingDSlite"),
         pytest.param(
             {
                 "num_experts": 128,
@@ -702,9 +722,9 @@ def test_moe_fp8(num_tokens, num_experts, hidden_size, intermediate_size):
                 "top_k_groups": None,
                 "routed_scaling": None,
                 "has_routing_bias": False,
-                "routing_method_type": RoutingMethodType.Qwen3
+                "routing_method_type": RoutingMethodType.RenormalizeNaive
             },
-            id="Qwen3"),
+            id="RoutingRenormalizeNaive"),
     ],
 )
 def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
@@ -722,21 +742,21 @@ def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
     routed_scaling = routing_info["routed_scaling"]
     num_experts = routing_info["num_experts"]
     routing_method_type = routing_info["routing_method_type"]
+    tile_tokens_dim = 8
 
     assert top_k <= num_experts
-    assert top_k == 8
-    assert hidden_size % 128 == 0
-    assert intermediate_size % 128 == 0
+    assert top_k <= 8
     if (top_k_groups is not None) and (n_groups is not None):
-        assert top_k_groups == 4
+        assert top_k_groups <= 4
         assert num_experts > n_groups
         assert num_experts % n_groups == 0
+        assert num_experts % 4 == 0
         assert top_k < (top_k_groups * num_experts / n_groups)
 
     if routing_method_type == RoutingMethodType.DeepSeekV3:
         expert_logits = torch.randn((num_tokens, num_experts),
                                     device='cuda').to(torch.float)
-    elif routing_method_type == RoutingMethodType.Qwen3 or routing_method_type == RoutingMethodType.Renormalize:
+    elif routing_method_type == RoutingMethodType.RenormalizeNaive or routing_method_type == RoutingMethodType.Renormalize:
         expert_logits = torch.randn((num_tokens, num_experts),
                                     device='cuda').to(torch.bfloat16)
 
@@ -807,9 +827,9 @@ def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
     elif routing_method_type == RoutingMethodType.Renormalize:
         permute_info, scores = routing_reference_renormalize(
             expert_logits, top_k, num_experts, padding)
-    elif routing_method_type == RoutingMethodType.Qwen3:
-        permute_info, scores = routing_reference_qwen3(expert_logits, top_k,
-                                                       num_experts, padding)
+    elif routing_method_type == RoutingMethodType.RenormalizeNaive:
+        permute_info, scores = routing_reference_renormalize_naive(
+            expert_logits, top_k, num_experts, padding)
 
     args = moe_args(num_tokens, num_experts, hidden_size, intermediate_size,
                     top_k, padding, hidden_states_fp4_bytes,
@@ -897,14 +917,30 @@ def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
                                                       args.gemm2_scales_global)
 
     output = torch.ops.trtllm.fp4_block_scale_moe_runner(
-        expert_logits, routing_bias, hidden_states_fp4,
-        hidden_states_scale_linear_fp4, gemm1_weights_fp4_shuffled,
-        gemm1_scales_fp4_shuffled, gemm2_weights_fp4_shuffled,
-        gemm2_scales_fp4_shuffled, scale_c_fc1, scale_gate_fc1, scale_c_fc2,
-        num_experts, top_k, n_groups, top_k_groups, intermediate_size, 0,
-        num_experts, routed_scaling, routing_method_type)
+        expert_logits,
+        routing_bias,
+        hidden_states_fp4,
+        hidden_states_scale_linear_fp4,
+        gemm1_weights_fp4_shuffled,
+        gemm1_scales_fp4_shuffled,
+        gemm2_weights_fp4_shuffled,
+        gemm2_scales_fp4_shuffled,
+        scale_c_fc1,
+        scale_gate_fc1,
+        scale_c_fc2,
+        num_experts,
+        top_k,
+        n_groups,
+        top_k_groups,
+        intermediate_size,
+        0,
+        num_experts,
+        routed_scaling,
+        tile_tokens_dim,
+        routing_method_type,
+        do_finalize=True)
 
-    output_dequant_actual = output.to(torch.float)
+    output_dequant_actual = output[0].to(torch.float)
 
     #
     # Check the results
@@ -935,33 +971,31 @@ def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
     reason="The kernel only supports Blackwell. Current SM is %d." %
     getSMVersion(),
 )
-@pytest.mark.parametrize("num_tokens", [1, 2, 16, 64, 1024])
-@pytest.mark.parametrize("num_experts", [128])
+@pytest.mark.parametrize("num_tokens", [1, 2, 16, 64, 1024, 4096])
+@pytest.mark.parametrize("expert_info", [(128, 0, 0, 1, True)])
 @pytest.mark.parametrize("hidden_size", [2048])
 @pytest.mark.parametrize("intermediate_size", [2048])
-@pytest.mark.parametrize("use_routing_scales_on_input", [True])
-def test_moe_fp8_per_tensor_scale(num_tokens, num_experts, hidden_size,
-                                  intermediate_size,
-                                  use_routing_scales_on_input):
+def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
+                                  intermediate_size):
     torch.random.manual_seed(0)
 
     #
     # Data Generation
     #
-    top_k = 8 if not use_routing_scales_on_input else 1
+    num_experts, n_groups, top_k_groups, top_k, use_routing_scales_on_input = expert_info
+    # FIXME: set to TileN size
     padding = 8
-    n_groups = 8
-    top_k_groups = 4
     routed_scaling = 2.5
+    routing_method_type = RoutingMethodType.Llama4
+    tile_tokens_dim = 8
 
     assert top_k <= num_experts
-    assert top_k == 8 or top_k == 1
-    assert top_k_groups == 4
+    assert top_k <= 8
+    assert top_k_groups <= 4
     assert num_experts > n_groups
-    assert num_experts % n_groups == 0
-    assert top_k < (top_k_groups * num_experts / n_groups)
-    assert hidden_size % 128 == 0
-    assert intermediate_size % 128 == 0
+    assert n_groups == 0 or num_experts % n_groups == 0
+    assert num_experts % 4 == 0
+    assert n_groups == 0 or top_k < (top_k_groups * num_experts / n_groups)
 
     expert_logits = torch.randn((num_tokens, num_experts),
                                 device='cuda').to(torch.float)
@@ -1048,12 +1082,12 @@ def test_moe_fp8_per_tensor_scale(num_tokens, num_experts, hidden_size,
                                                       args.gemm2_scales_global)
 
     output = torch.ops.trtllm.fp8_per_tensor_scale_moe_runner(
-        expert_logits.to(torch.bfloat16)
-        if use_routing_scales_on_input else expert_logits, routing_bias,
-        hidden_states_quant, gemm1_weights_fp8_shuffled, scale_c_fc1,
-        scale_gate_fc1, gemm2_weights_fp8_shuffled, scale_c_fc2, num_experts,
-        top_k, n_groups, top_k_groups, intermediate_size, 0, num_experts,
-        routed_scaling, use_routing_scales_on_input)
+        expert_logits.to(torch.bfloat16) if use_routing_scales_on_input else
+        expert_logits, routing_bias, hidden_states_quant,
+        gemm1_weights_fp8_shuffled, scale_c_fc1, scale_gate_fc1,
+        gemm2_weights_fp8_shuffled, scale_c_fc2, num_experts, top_k, n_groups,
+        top_k_groups, intermediate_size, 0, num_experts, routed_scaling,
+        use_routing_scales_on_input, tile_tokens_dim, routing_method_type)
 
     output_dequant_actual = output.to(torch.float)
 

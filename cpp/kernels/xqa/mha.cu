@@ -12,9 +12,11 @@
 
 #include "cuda_hint.cuh"
 #include "defines.h"
+#if !(IS_MLA)
 #include "ldgsts.cuh"
 #include "mha.h"
 #include "mhaUtils.cuh"
+#include "mha_components.cuh"
 #include "mma.cuh"
 #include "utils.cuh"
 
@@ -135,12 +137,10 @@ __device__ inline uint32_t gemm1WarpIdxInGrp(uint32_t warpIdxX)
 constexpr uint32_t instM = 16;
 constexpr uint32_t instN = 8;
 // constexpr uint32_t instK = 16;
-constexpr uint32_t quadPerWarp = warp_size / 4;
 
-using QuadRegRowMax
-    = Vec<float, divUp(warpTile.y, warp_size) * 4>;             // data is replicated across 4 threads in a MMA quad.
-using ThrdRegRowMax = Vec<float, divUp(warpTile.y, warp_size)>; // unlike QuadRegRowMax, not replicated.
-using UniformRescaleMask = Vec<uint32_t, divUp(warpTile.y, warp_size)>; // uniform and stored in UR
+using QuadRegRowMax = QuadRegRowMaxT<warpTile.y>;           // data is replicated across 4 threads in a MMA quad.
+using ThrdRegRowMax = ThrdRegRowMaxT<warpTile.y>;           // unlike QuadRegRowMax, not replicated.
+using UniformRescaleMask = UniformRescaleMaskT<warpTile.y>; // uniform and stored in UR
 
 __device__ inline bool any(UniformRescaleMask const& x)
 {
@@ -319,32 +319,6 @@ struct alignas(16) SMemWarpRowMax
     float data[ThrdRegRowMax::size][quadPerWarp][4];
 };
 
-// idxMat8 is the reduced row index in 8-row unit.
-__device__ inline float replicateValForQuad(Warp const& warp, ThrdRegRowMax const& src, uint32_t idxMat8)
-{
-    assertWarpConverged();
-    uint32_t const i = idxMat8 / 4;
-    uint32_t const j = idxMat8 % 4;
-    return __shfl_sync(~0U, src[i], quadPerWarp * j + laneId() / 4);
-}
-
-__device__ inline QuadRegRowMax replicateForQuad(Warp const& warp, ThrdRegRowMax const& src)
-{
-    assertWarpConverged();
-    QuadRegRowMax dst;
-#pragma unroll
-    for (uint32_t i = 0; i < src.size; i++)
-    {
-#pragma unroll
-        for (uint32_t j = 0; j < 4; j++)
-        {
-            dst[i * 4 + j] = __shfl_sync(~0U, src[i], quadPerWarp * j + laneId() / 4);
-            assert(dst[i * 4 + j] == replicateValForQuad(warp, src, i * 4 + j));
-        }
-    }
-    return dst;
-}
-
 // cacheVTileSeqLen may be smaller than x cols, so we need multiple v tiles per X tile.
 constexpr uint32_t nbCacheVTilesPerXTile = exactDiv(warpTile.x, cacheVTileSeqLen);
 
@@ -481,36 +455,7 @@ __device__ inline void smemRotateInplace(Warp const& Warp, Array2D<LdGrain, rows
 }
 #endif
 
-using InstAcc = Array2D<float, 2, 2>;
-using WarpAcc = Array2D<InstAcc, exactDiv(warpTile.y, instM), exactDiv(warpTile.x, instN)>;
-
-__device__ inline void applyMask(Warp const& warp, WarpAcc& acc, uint32_t validColBeg, uint32_t validColEnd)
-{
-    uint32_t const idxInQuad = laneId() % 4;
-    uint32_t const idxQuad = laneId() / 4;
-#pragma unroll
-    for (uint32_t n = 0; n < acc.cols; n++)
-    {
-#pragma unroll
-        for (uint32_t j = 0; j < InstAcc::cols; j++)
-        {
-            uint32_t const col = instN * n + InstAcc::cols * idxInQuad + j;
-            if (col >= validColBeg && col < validColEnd)
-            {
-                continue;
-            }
-#pragma unroll
-            for (uint32_t m = 0; m < acc.rows; m++)
-            {
-#pragma unroll
-                for (uint32_t i = 0; i < InstAcc::rows; i++)
-                {
-                    acc(m, n)(i, j) = mha::numeric_limits<float>::lowest();
-                }
-            }
-        }
-    }
-}
+using WarpAcc = WarpAccT<warpTile.y, warpTile.x>;
 
 #if SPEC_DEC
 #define MMAS_N_PER_MASK 2
@@ -2814,4 +2759,5 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
     checkCuda(cudaPeekAtLastError());
 #endif // USE_INPUT_KV
 }
+#endif
 #endif

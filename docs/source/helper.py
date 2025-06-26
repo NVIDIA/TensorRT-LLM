@@ -149,11 +149,18 @@ def generate_llmapi():
     content = underline("API Reference", "-") + "\n\n"
     for cls_name in public_classes_names:
         cls_name = cls_name.strip()
-        content += (f".. autoclass:: tensorrt_llm.llmapi.{cls_name}\n"
-                    "    :members:\n"
-                    "    :undoc-members:\n"
-                    "    :special-members: __init__\n"
-                    "    :show-inheritance:\n")
+        options = [
+            "    :members:", "    :undoc-members:", "    :show-inheritance:"
+        ]
+
+        if cls_name != 'LLM':  # Conditionally add :special-members: __init__
+            options.append("    :special-members: __init__")
+
+        if cls_name in ['TrtLLM', 'TorchLLM', 'LLM']:
+            options.append("    :inherited-members:")
+
+        content += f".. autoclass:: tensorrt_llm.llmapi.{cls_name}\n"
+        content += "\n".join(options) + "\n\n"
 
     with open(doc_path, "w+") as f:
         f.write(content)

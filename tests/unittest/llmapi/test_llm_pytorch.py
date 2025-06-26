@@ -1,5 +1,6 @@
 import pytest
 
+from tensorrt_llm import LLM
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -9,7 +10,6 @@ from .test_llm import (get_model_path, global_kvcache_config, llama_model_path,
                        llm_get_stats_test_harness, prompts,
                        run_llm_abort_request,
                        run_llm_with_postprocess_parallel_and_result_handler,
-                       tinyllama_guided_decoding_test_harness,
                        tinyllama_logits_processor_test_harness)
 from utils.util import force_ampere, similar, skip_gpu_memory_less_than_40gb, skip_gpu_memory_less_than_80gb, skip_gpu_memory_less_than_138gb
 from utils.llm_data import llm_models_root
@@ -25,12 +25,6 @@ from peft import get_peft_model
 from transformers import AutoModelForCausalLM
 
 # isort: on
-
-
-@force_ampere
-def test_tinyllama_guided_decoding():
-    pytest.skip(reason="https://nvbugs/5240350")
-    tinyllama_guided_decoding_test_harness(backend="pytorch")
 
 
 @force_ampere
@@ -78,9 +72,7 @@ def test_llm_get_stats_async(return_context_logits, use_overlap,
         SamplingParams()  # pytorch only supports n=1
     ])
 def test_llm_abort_request(sampling_params):
-    from tensorrt_llm._torch import LLM as LLM_torch
-    llm = LLM_torch(model=llama_model_path,
-                    kv_cache_config=global_kvcache_config)
+    llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
     run_llm_abort_request(llm=llm, sampling_params=sampling_params)
 
 
@@ -89,10 +81,9 @@ def test_llm_reward_model():
     tokenizer = TransformersTokenizer.from_pretrained(rm_model_path)
     tokenized_input = tokenizer(prompts, return_tensors="pt")["input_ids"]
 
-    from tensorrt_llm._torch import LLM as LLM_torch
-    llm = LLM_torch(model=rm_model_path,
-                    attn_backend="VANILLA",
-                    disable_overlap_scheduler=True)
+    llm = LLM(model=rm_model_path,
+              attn_backend="VANILLA",
+              disable_overlap_scheduler=True)
 
     sampling_params = SamplingParams(return_context_logits=True)
 
@@ -113,8 +104,6 @@ def test_llm_with_postprocess_parallel_and_result_handler(streaming):
 
 
 def llama_v2_13b_lora_test_harness(**llm_kwargs) -> None:
-    from tensorrt_llm._torch.llm import LLM
-
     lora_config = LoraConfig(lora_dir=[
         f"{llm_models_root()}/llama-models-v2/chinese-llama-2-lora-13b"
     ],
@@ -141,8 +130,6 @@ def llama_v2_13b_lora_test_harness(**llm_kwargs) -> None:
 
 
 def llama_7b_multi_lora_test_harness(**llm_kwargs) -> None:
-    from tensorrt_llm._torch.llm import LLM
-
     hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
     hf_lora_dir1 = f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"
     hf_lora_dir2 = f"{llm_models_root()}/llama-models/Japanese-Alpaca-LoRA-7b-v0"
@@ -152,10 +139,7 @@ def llama_7b_multi_lora_test_harness(**llm_kwargs) -> None:
     # (2) provide a lora_dir to infer the lora_target_modules.
     lora_config = LoraConfig(lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
                              max_lora_rank=8)
-    llm = LLM(hf_model_dir,
-              fast_build=True,
-              lora_config=lora_config,
-              **llm_kwargs)
+    llm = LLM(hf_model_dir, lora_config=lora_config, **llm_kwargs)
 
     prompts = [
         "美国的首都在哪里? \n答案:",
@@ -191,8 +175,6 @@ def test_llama_v2_13b_lora():
 
 @skip_gpu_memory_less_than_40gb
 def test_llama_7b_lora_default_modules() -> None:
-    from tensorrt_llm._torch.llm import LLM
-
     lora_config = LoraConfig(max_lora_rank=64)
 
     hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
@@ -224,8 +206,6 @@ def test_llama_7b_multi_lora():
 # https://jirasw.nvidia.com/browse/TRTLLM-5045
 @skip_gpu_memory_less_than_138gb
 def test_nemotron_nas_lora() -> None:
-    from tensorrt_llm._torch.llm import LLM
-
     lora_config = LoraConfig(lora_dir=[
         f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_r64"
     ],
@@ -258,8 +238,6 @@ def test_nemotron_nas_lora() -> None:
 
 @skip_gpu_memory_less_than_80gb
 def test_codellama_fp8_with_bf16_lora() -> None:
-    from tensorrt_llm._torch.llm import LLM
-
     model_dir = f"{llm_models_root()}/codellama/CodeLlama-7b-Instruct-hf/"
     quant_config = QuantConfig(quant_algo=QuantAlgo.FP8,
                                kv_cache_quant_algo=QuantAlgo.FP8)
@@ -297,16 +275,61 @@ def test_codellama_fp8_with_bf16_lora() -> None:
                                  lora_target_modules=target_modules,
                                  max_lora_rank=8)
 
-        llm = LLM(model_dir,
-                  quant_config=quant_config,
-                  fast_build=True,
-                  lora_config=lora_config)
+        llm = LLM(model_dir, quant_config=quant_config, lora_config=lora_config)
 
         prompts = [
             "Write a function that calculates the Fibonacci sequence.",
             "Convert this C++ code to Python: int x = 0; x++;",
         ]
 
+        lora_req1 = LoRARequest("lora-1", 0, lora_paths[0])
+        lora_req2 = LoRARequest("lora-2", 1, lora_paths[1])
+        lora_requests = [lora_req1, lora_req2]
+        sampling_params = SamplingParams(max_tokens=200)
+
+        outputs = llm.generate(prompts,
+                               sampling_params,
+                               lora_request=lora_requests)
+
+        assert len(outputs) == 2
+
+
+@skip_gpu_memory_less_than_80gb
+def test_bielik_11b_v2_2_instruct_multi_lora() -> None:
+    model_dir = f"{llm_models_root()}/Bielik-11B-v2.2-Instruct"
+
+    target_modules = ['attn_q', 'attn_k', 'attn_v']
+
+    # Set up temporary directory for LoRA adapters
+    with tempfile.TemporaryDirectory() as lora_dir:
+        print("Creating dummy LoRAs...")
+
+        model = AutoModelForCausalLM.from_pretrained(model_dir,
+                                                     torch_dtype=torch.bfloat16,
+                                                     device_map="auto")
+        hf_modules = ["q_proj", "k_proj", "v_proj"]
+        peft_lora_config = PeftLoraConfig(r=8,
+                                          target_modules=hf_modules,
+                                          bias="none",
+                                          task_type="CAUSAL_LM")
+        lora_paths = []
+        for i in range(2):
+            lora_model = get_peft_model(model, peft_lora_config)
+            for param in lora_model.parameters():
+                param.data.zero_()
+            lora_path = f"{lora_dir}/lora_{i}"
+            lora_model.save_pretrained(lora_path)
+            lora_paths.append(lora_path)
+
+        trtllm_lora_config = LoraConfig(lora_dir=lora_paths,
+                                        lora_target_modules=target_modules,
+                                        max_lora_rank=8)
+        llm = LLM(model_dir, lora_config=trtllm_lora_config)
+
+        prompts = [
+            "Kim był Mikołaj Kopernik i z czego zasłynął?",
+            "Gdzie znajduje się stolica Polski?",
+        ]
         lora_req1 = LoRARequest("lora-1", 0, lora_paths[0])
         lora_req2 = LoRARequest("lora-2", 1, lora_paths[1])
         lora_requests = [lora_req1, lora_req2]

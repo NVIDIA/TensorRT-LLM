@@ -9,7 +9,7 @@ from tensorrt_llm.functional import PositionEmbeddingType
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..model_config import ModelConfig
-from ..modules.attention import Attention, QkNormType
+from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
@@ -50,18 +50,14 @@ class Qwen3Attention(Attention):
             num_key_value_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
             bias=config.attention_bias,
-            pos_embd_params=pos_embd_params
-            if not self.fuse_qk_norm_rope else None,
-            qk_norm_type=QkNormType.pre_rope,
+            pos_embd_params=pos_embd_params,
+            rope_fusion=not self.
+            fuse_qk_norm_rope,  # If fuse_qk_norm_rope is true, do not apply fused RoPE in attention OP, and self.rotary_emb will be skipped in the overridden apply_rope.
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             dense_bias=config.attention_bias,
             config=model_config,
         )
-
-        # If fuse_qk_norm_rope is true, we pass pos_embd_params=None to super().__init__,
-        # so we need to do assignment to record the actual pos_embd_params.
-        self.pos_embd_params = pos_embd_params
 
         self.q_norm = RMSNorm(hidden_size=self.head_dim,
                               eps=1e-6,
@@ -94,12 +90,6 @@ class Qwen3Attention(Attention):
 
         return q, k
 
-    def apply_rope(self, qkv: torch.Tensor, position_ids: torch.Tensor):
-        if not self.fuse_qk_norm_rope:
-            return super().apply_rope(qkv, position_ids)
-        else:
-            return self.apply_qk_norm_rope(qkv, position_ids)
-
     def apply_qk_norm_rope(self, qkv, position_ids):
         torch.ops.trtllm.fused_qk_norm_rope(
             qkv, self.num_heads, self.num_key_value_heads,
@@ -108,6 +98,18 @@ class Qwen3Attention(Attention):
             self.k_norm.weight, self.pos_embd_params.rope.theta,
             self.pos_embd_params.is_neox, position_ids.view(-1))
         return qkv, None, None
+
+    def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
+                   v: Optional[torch.Tensor], position_ids: torch.Tensor):
+        # Qwen3 applies QK norm before RoPE.
+        if not self.fuse_qk_norm_rope:
+            q, k, v = self.split_qkv(q, k, v)
+            q, k = self.apply_qk_norm(q, k)
+            return super().apply_rope(q, k, v, position_ids)
+
+        assert k is None and v is None, "The input should be a concatenated qkv tensor to apply_qk_norm_rope"
+        qkv = q
+        return self.apply_qk_norm_rope(qkv, position_ids)
 
 
 class Qwen3DecoderLayer(DecoderLayer):
@@ -141,7 +143,7 @@ class Qwen3DecoderLayer(DecoderLayer):
 
     def forward(
         self,
-        position_ids: torch.LongTensor,
+        position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
@@ -177,7 +179,6 @@ class Qwen3Model(DecoderModel):
     def __init__(self, model_config: ModelConfig[Qwen3Config]):
         super().__init__(model_config)
         config = self.model_config
-        self.padding_idx = config.pretrained_config.pad_token_id
 
         self.embed_tokens = Embedding(
             config.pretrained_config.vocab_size,
@@ -202,8 +203,8 @@ class Qwen3Model(DecoderModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         mrope_config: Optional[Tuple[torch.Tensor, int]] = None,
         **kwargs,
@@ -250,8 +251,8 @@ class Qwen3ForCausalLM(DecoderModelForCausalLM[Qwen3Model, Qwen3Config]):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: torch.LongTensor = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: torch.IntTensor = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: bool = False,
         mrope_config: Optional[dict] = None,

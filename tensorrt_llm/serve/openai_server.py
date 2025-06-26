@@ -3,6 +3,7 @@ import asyncio
 import signal
 import traceback
 from contextlib import asynccontextmanager
+from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
 from typing import AsyncGenerator, AsyncIterator, List, Optional, Tuple
@@ -13,17 +14,19 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from transformers import AutoConfig, AutoProcessor
 
+from tensorrt_llm._tensorrt_engine import LLM
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.inputs import prompt_inputs
-from tensorrt_llm.llmapi import LLM
+from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
+from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
+from tensorrt_llm.llmapi.disagg_utils import MetadataServerConfig, ServerRole
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.chat_utils import (ConversationMessage,
-                                           apply_chat_template,
-                                           check_multiple_response,
+from tensorrt_llm.serve.chat_utils import (check_multiple_response,
                                            parse_chat_messages_coroutines)
+from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
                                                 CompletionRequest,
@@ -48,16 +51,25 @@ class OpenAIServer:
 
     def __init__(self,
                  llm: LLM,
-                 model: str):
+                 model: str,
+                 server_role: Optional[ServerRole],
+                 metadata_server_cfg: MetadataServerConfig):
         self.llm = llm
         self.tokenizer = llm.tokenizer
+        self.metadata_server = create_metadata_server(metadata_server_cfg)
+        self.server_role = server_role
+        self.binding_addr = None  # Will be set in __call__
+        hf_tokenizer_path = llm._hf_model_dir or self.tokenizer.tokenizer.name_or_path
+        trust_remote_code = llm.args.trust_remote_code
         try:
-            hf_tokenizer_path = llm._hf_model_dir or self.tokenizer.tokenizer.name_or_path
-            self.processor = AutoProcessor.from_pretrained(hf_tokenizer_path)
-            self.model_config = AutoConfig.from_pretrained(hf_tokenizer_path)
+            self.processor = AutoProcessor.from_pretrained(hf_tokenizer_path, trust_remote_code=trust_remote_code)
         except Exception:
             logger.debug("Failed to load AutoProcessor or AutoConfig for %s", hf_tokenizer_path)
             self.processor = None
+        try:
+            self.model_config = AutoConfig.from_pretrained(hf_tokenizer_path)
+        except Exception:
+            logger.debug("Failed to load AutoConfig for %s", hf_tokenizer_path)
             self.model_config = None
 
         model_dir = Path(model)
@@ -68,8 +80,25 @@ class OpenAIServer:
 
         @asynccontextmanager
         async def lifespan(app: FastAPI):
+            if self.metadata_server is not None:
+                metadata = {
+                    "model": self.model,
+                    "version": VERSION,
+                    "timestamp": datetime.now().isoformat(),
+                    "server_role": server_role.name,
+                    "url": self.binding_addr
+                }
+                # TODO: add more metadata
+                # Register with ETCD using the existing key format
+                self.metadata_server.put(f"trtllm/{self.llm.llm_id}", metadata)
+                logger.info(f"trtllm/{self.llm.llm_id} is registered")
+
             # terminate rank0 worker
             yield
+
+            if self.metadata_server is not None:
+                self.metadata_server.remove(f"trtllm/{self.llm.llm_id}")
+                logger.info(f"trtllm/{self.llm.llm_id} is unregistered")
             self.llm.shutdown()
 
         self.app = FastAPI(lifespan=lifespan)
@@ -204,7 +233,7 @@ class OpenAIServer:
             nvtx_mark("generation ends")
 
         async def create_chat_response(
-                promise: RequestOutput, postproc_params: PostprocParams) -> ChatCompletionResponse:
+                promise: RequestOutput, postproc_params: PostprocParams, disaggregated_params: Optional[LlmDisaggregatedParams] = None) -> ChatCompletionResponse:
             await promise.aresult()
             if self.postproc_worker_enabled:
                 chat_response =promise.outputs[0]._postprocess_result
@@ -213,7 +242,8 @@ class OpenAIServer:
                 chat_response = post_processor(promise, args)
 
             # Add prompt_tokens_ids to the response
-            chat_response.prompt_token_ids = promise.prompt_token_ids
+            if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
+                chat_response.prompt_token_ids = promise.prompt_token_ids
             return chat_response
 
         try:
@@ -226,16 +256,18 @@ class OpenAIServer:
             postproc_args = ChatPostprocArgs.from_request(request)
             disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
 
-            conversation, mm_coroutines = parse_chat_messages_coroutines(request.messages, self.model_config)
+            conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(request.messages, self.model_config)
 
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
                 prompt: str = apply_chat_template(
+                    model_type=self.model_config.model_type,
                     tokenizer=self.tokenizer,
                     processor=self.processor,
                     conversation=conversation,
                     add_generation_prompt=request.add_generation_prompt,
+                    mm_placeholder_counts=mm_placeholder_counts,
                     tools=tool_dicts,
                     documents=request.documents,
                     chat_template=request.chat_template,
@@ -274,7 +306,7 @@ class OpenAIServer:
                 return StreamingResponse(content=response_generator,
                                          media_type="text/event-stream")
             else:
-                response = await create_chat_response(promise, postproc_params)
+                response = await create_chat_response(promise, postproc_params, disaggregated_params)
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
             # If internal executor error is raised, shutdown the server
@@ -322,7 +354,7 @@ class OpenAIServer:
             yield "data: [DONE]\n\n"
 
         async def create_completion_response(
-                generator: AsyncIterator[Tuple[RequestOutput, Optional[PostprocParams]]]) -> CompletionResponse:
+                generator: AsyncIterator[Tuple[RequestOutput, Optional[PostprocParams]]], disaggregated_params: Optional[LlmDisaggregatedParams] = None) -> CompletionResponse:
             all_choices: List[CompletionResponseChoice] = []
             all_prompt_token_ids: List[List[int]] = []
             num_prompt_tokens = num_gen_tokens = 0
@@ -338,7 +370,9 @@ class OpenAIServer:
                 all_choices.extend(choices)
                 num_prompt_tokens += usage.prompt_tokens
                 num_gen_tokens += usage.completion_tokens
-                all_prompt_token_ids.append(request_output.prompt_token_ids)
+                #Include prompt token ids for context-only requests
+                if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
+                    all_prompt_token_ids.append(request_output.prompt_token_ids)
 
             usage_info = UsageInfo(
                 prompt_tokens=num_prompt_tokens,
@@ -397,17 +431,18 @@ class OpenAIServer:
                                             media_type="text/event-stream")
             else:
                 response = await create_completion_response(
-                    generator)
+                    generator, disaggregated_params)
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
             # If internal executor error is raised, shutdown the server
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
-            print(f"Encountered an exception: {str(e)}")
             traceback.print_exc()
             return self.create_error_response(str(e))
 
     async def __call__(self, host, port):
+        # Store the binding address for server registration
+        self.binding_addr = f"http://{host}:{port}"
         config = uvicorn.Config(self.app,
                                 host=host,
                                 port=port,

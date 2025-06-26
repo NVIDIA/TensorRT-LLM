@@ -61,14 +61,19 @@ def merge_report(base_file, extra_file, output_file, is_retry=False):
     base.write(output_file, encoding="UTF-8", xml_declaration=True)
 
 
-def test_unittests_v2(llm_root, llm_venv, case: str, output_dir):
+def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     import pandas as pd
     import pynvml
     pynvml.nvmlInit()
 
     test_root = tests_path()
     dry_run = False
-    passed = True
+
+    my_test_prefix = request.config.getoption("--test-prefix")
+    if my_test_prefix:
+        test_prefix = f"{my_test_prefix}/unittests"
+    else:
+        test_prefix = ""
 
     num_workers = 1
 
@@ -114,16 +119,14 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir):
     if len(case_fn) > 80:
         case_fn = case_fn[:80]
     output_xml = os.path.join(output_dir,
-                              f'sub-results-unittests-{case_fn}.xml')
+                              f'results-sub-unittests-{case_fn}.xml')
 
     command = [
-        '-m',
-        'pytest',
-        ignore_opt,
-        "-v",
-        "--timeout=1600",
-        "--timeout-method=thread",
+        '-m', 'pytest', ignore_opt, "-v", "--timeout=1600",
+        "--timeout-method=thread"
     ]
+    if test_prefix:
+        command += [f"--test-prefix={test_prefix}"]
 
     if dry_run:
         command += ['--collect-only']
@@ -149,8 +152,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir):
             output_dir,
             f'parallel-sub-results-unittests-{case_fn}.xml.intermediate')
         parallel_command = command + [
-            "-n", f"{num_workers}", '--reruns', '3',
-            f"--junitxml={parallel_output_xml}"
+            "-n", f"{num_workers}", f"--junitxml={parallel_output_xml}"
         ]
         passed = run_command(parallel_command)
 
@@ -166,11 +168,10 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir):
                 output_dir,
                 f'retry-sub-results-unittests-{case_fn}.xml.intermediate')
             # Run failed case sequentially.
-            command = [
-                '-m', 'pytest', "-p", "no:xdist", ignore_opt, "-v", '--lf',
-                f"--junitxml={retry_output_xml}"
-            ] + arg_list
-            passed = run_command(command)
+            retry_command = command + [
+                "-p", "no:xdist", '--lf', f"--junitxml={retry_output_xml}"
+            ]
+            passed = run_command(retry_command)
 
             if os.path.exists(retry_output_xml):
                 merge_report(parallel_output_xml, retry_output_xml, output_xml,

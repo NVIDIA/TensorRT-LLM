@@ -1,4 +1,7 @@
-"""Testing build_and_run_ad end2end."""
+"""Testing build_and_run_ad end2end.
+
+NOTE (lucaslie): this test is for local testing only. It is not registered to run as part of CI.
+"""
 
 from typing import Dict, Optional
 
@@ -64,9 +67,6 @@ from utils.llm_data import llm_models_root
                 "attn_backend": "FlashInfer",
                 "compile_backend": "torch-opt",
             },
-            marks_extra=[
-                pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5095416"),
-            ],
         ),
         # 2-layer llama3.1-8B model on 4 GPUs
         param_with_device_count(
@@ -92,9 +92,6 @@ from utils.llm_data import llm_models_root
                 "benchmark": True,
                 "attn_backend": "FlashInfer",
             },
-            marks_extra=[
-                pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5178508"),
-            ],
         ),
         # full NemotronNAS (Llama-3.1-Nemotron-51B) with torch-opt backend + simple runtime
         param_with_device_count(
@@ -105,9 +102,6 @@ from utils.llm_data import llm_models_root
                     "nvidia/Llama-3_1-Nemotron-51B-Instruct",
                 )
             },
-            marks_extra=[
-                pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5121522"),
-            ],
         ),
         # Mixtral 8x7B with torch-simple backend + simple runtime
         param_with_device_count(

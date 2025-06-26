@@ -20,7 +20,7 @@ from ..distributed.communicator import pp_recv, pp_send
 from ..model_config import ModelConfig, TConfig
 from ..modules.attention import Attention
 from ..modules.embedding import Embedding, LMHead
-from ..modules.fused_moe import FusedMoE, VanillaMoE
+from ..modules.fused_moe import MoE, VanillaMoE
 from ..modules.linear import Linear, TensorParallelMode, WeightMode
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
@@ -219,7 +219,6 @@ class PPInitCaller(type):
 
     def __call__(cls, *args, **kwargs):
         obj = type.__call__(cls, *args, **kwargs)
-        obj.__pp_init__()
         return obj
 
 
@@ -235,12 +234,13 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
         self.model_config = model_config
         self.prologue = []
         self.epilogue = []
+        self.keep_embed_tokens = False
 
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: torch.LongTensor = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: torch.IntTensor = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         lora_params: Optional[dict] = None,
         **kwargs,
@@ -278,7 +278,7 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
             )
             return
 
-        if hasattr(self, "embed_tokens"):
+        if hasattr(self, "embed_tokens") and not self.keep_embed_tokens:
             self.prologue.append(self.embed_tokens)
         if hasattr(self, "norm"):
             self.epilogue.append(self.norm)
@@ -394,6 +394,8 @@ class DecoderModelForCausalLM(nn.Module,
             assert self.lm_head.tp_mode == self.model.embed_tokens.tp_mode, (
                 "lm_head and vocab embedding should use the same TP mode")
             self.lm_head.weight = self.model.embed_tokens.weight
+            if config.mapping.is_last_pp_rank():
+                self.model.keep_embed_tokens = True
 
         self.logits_processor = LogitsProcessor()
 
@@ -419,7 +421,7 @@ class DecoderModelForCausalLM(nn.Module,
         quant_config_dict = self.model_config.quant_config_dict
         if quant_config_dict is not None:
             for name, module in self.named_modules():
-                if isinstance(module, (FusedMoE, VanillaMoE)):
+                if isinstance(module, (MoE, VanillaMoE)):
                     for n, q in quant_config_dict.items():
                         # all linear layers inside FusedMoE share the same quant config
                         if name in n:
@@ -494,8 +496,8 @@ class DecoderModelForCausalLM(nn.Module,
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: torch.LongTensor = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: torch.IntTensor = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: bool = False,
         spec_metadata: Optional[SpecMetadata] = None,

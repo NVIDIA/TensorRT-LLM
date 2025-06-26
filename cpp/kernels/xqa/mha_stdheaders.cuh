@@ -91,12 +91,15 @@ DEVICE_FUNC constexpr T const& min(T const& a, T const& b)
 #endif
 
 #ifndef GENERATE_CUBIN
-template <bool B, class T, class F>
-using conditional_t = std::conditional_t<B, T, F>;
+template <bool cond, class T, class F>
+using conditional_t = std::conditional_t<cond, T, F>;
+
+template <bool cond, class T = void>
+using enable_if_t = typename std::enable_if<cond, T>::type;
 #else
 
 // https://en.cppreference.com/w/cpp/types/conditional
-template <bool B, class T, class F>
+template <bool cond, class T, class F>
 struct conditional
 {
     using type = T;
@@ -108,8 +111,22 @@ struct conditional<false, T, F>
     using type = F;
 };
 
-template <bool B, class T, class F>
-using conditional_t = typename conditional<B, T, F>::type;
+template <bool cond, class T, class F>
+using conditional_t = typename conditional<cond, T, F>::type;
+
+template <bool cond, class T = void>
+struct enable_if
+{
+};
+
+template <class T>
+struct enable_if<true, T>
+{
+    typedef T type;
+};
+
+template <bool cond, class T = void>
+using enable_if_t = typename enable_if<cond, T>::type;
 #endif
 
 #ifndef GENERATE_CUBIN

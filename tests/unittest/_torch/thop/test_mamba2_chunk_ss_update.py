@@ -30,21 +30,21 @@ from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 
 
 @pytest.mark.parametrize(
-    "dim, headdim, ngroups, dstate, req_type, dtype, batch_size, max_seq_len, has_z, remove_padding",
+    "dim, headdim, ngroups, dstate, req_type, dtype, batch_size, max_seq_len, has_z, remove_padding, paged_cache",
     # P=8x and H=2x
     list(
         product([160, 320, 640], [80], [1], [128], ['context'], ['float16'],
-                [1, 2, 8, 16], [16, 64, 256], [True], [True])) +
+                [1, 2, 8, 16], [16, 64, 256], [True], [True], [False])) +
     # normal tests
     list(
         product([2048], [64], [1, 4], [128], ['context', 'generation'],
-                ['float32', 'float16', 'bfloat16'], [3], [16], [True, False],
-                [True, False])) +
+                ['float32', 'float16', 'bfloat16'], [3], [16], [False],
+                [True, False], [True, False])) +
     # arbitrary N generation tests
     list(
         product([2048], [64], [1, 4], [16, 32, 48, 64, 80, 96, 128, 256],
                 ['generation'], ['float32', 'float16'], [3], [16], [True],
-                [True])) +
+                [True], [False])) +
     # long sequence tests to cover the int overflow issue
     list(
         map(
@@ -56,16 +56,17 @@ from tensorrt_llm.llmapi.utils import get_total_gpu_memory
                        "The long sequence test needs at least 68GB memory, skipping"
                        )),
             product([5120], [64], [1], [128], ['context'], ['float16'], [2],
-                    [131072], [True, False], [True, False]))) +
+                    [131072], [True, False], [True, False], [False]))) +
     # P=8x and H=2x
     list(
         product([144], [72], [1], [64, 128, 256], ['context', 'generation'],
-                ['float16'], [16], [16384], [True, False], [True, False])),
+                ['float16'], [16], [16384], [True, False], [True, False],
+                [False])),
 )
 def test_mamba2_chunk_scan_selective_state_update(dim, headdim, ngroups, dstate,
                                                   req_type, dtype, batch_size,
                                                   max_seq_len, has_z,
-                                                  remove_padding):
+                                                  remove_padding, paged_cache):
     # configs
     device = "cuda"
     seq_len = max_seq_len if req_type == 'context' else 1
@@ -190,6 +191,19 @@ def test_mamba2_chunk_scan_selective_state_update(dim, headdim, ngroups, dstate,
         outputs = (out, ssm_state)
 
     else:
+        if paged_cache:
+            padded_batch_size = 2 * batch_size
+            state_batch_indices = torch.randperm(padded_batch_size,
+                                                 device=device,
+                                                 dtype=torch.int32)[:batch_size]
+            orig_state = state.detach().clone()
+            state = torch.empty([padded_batch_size, nheads, headdim, dstate],
+                                dtype=torch_dtype,
+                                device=device)
+            state[state_batch_indices] = orig_state
+        else:
+            state_batch_indices = None
+
         y = selective_state_update(
             state,
             x,
@@ -201,8 +215,10 @@ def test_mamba2_chunk_scan_selective_state_update(dim, headdim, ngroups, dstate,
             z=z if has_z else None,
             dt_bias=dt_bias,
             dt_softplus=delta_softplus,
+            state_batch_indices=state_batch_indices,
         )
-        outputs = (y, state)
+        outputs = (y, state[state_batch_indices]
+                   if state_batch_indices is not None else state)
 
     # pytorch run
     if req_type == 'context':

@@ -91,17 +91,18 @@ size_t XqaDispatcher::getWorkspaceSize(int max_num_tokens)
     // output conversion.
     workspace_size = roundUp<size_t>(
         workspace_size + kXQA_OUT_ELEM_SIZE * mFixedParams.headSize * mFixedParams.numQHeads * max_num_tokens, 128);
+    workspace_size = roundUp<size_t>(workspace_size, 128) + xqaMlaCgaXBufSize * max_num_tokens;
     if (mFixedParams.multiBlockMode)
     {
-        int workspaces[4];
-        uint32_t const nbSubSeq = kXQA_MAX_NUM_SUB_SEQ;
-        uint32_t const nbSeq = nbSubSeq / 2;
+        size_t workspaces[4];
+        size_t const nbSubSeq = getXqaMaxNumSubSeq(mFixedParams.isMLA);
+        size_t const nbSeq = nbSubSeq / 2;
         int group_size = mFixedParams.numQHeads / mFixedParams.numKvHeads;
         workspaces[0] = sizeof(uint32_t) * nbSeq;                           // semaphores
         workspaces[1] = sizeof(float) * roundUp(group_size, 32) * nbSubSeq; // rowMax
         workspaces[2] = sizeof(float) * roundUp(group_size, 32) * nbSubSeq; // rowSum
-        int32_t const multi_block_workspace_alignment
-            = roundUp<int32_t>(kXQA_OUT_ELEM_SIZE * kMaxBeamWidth * group_size * mFixedParams.headSize, 128);
+        size_t const multi_block_workspace_alignment
+            = roundUp<size_t>(kXQA_OUT_ELEM_SIZE * kMaxBeamWidth * group_size * mFixedParams.headSize, 128);
         workspaces[3] = multi_block_workspace_alignment * nbSubSeq;
         workspace_size = roundUp<size_t>(workspace_size, multi_block_workspace_alignment)
             + roundUp(workspaces[0], multi_block_workspace_alignment)
@@ -197,6 +198,10 @@ bool XqaDispatcher::isSupported()
         tllmRunnerParams.mNumHeadsKv = mFixedParams.numKvHeads;
         tllmRunnerParams.mNumHeadsQPerKv = mFixedParams.numQHeads / mFixedParams.numKvHeads;
         tllmRunnerParams.mNumTokensPerPage = mFixedParams.numTokensPerBlock;
+        // Set the chunked attention size and sliding window size to INT_MAX to disable them when checking if
+        // the kernel is supported.
+        tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
+        tllmRunnerParams.mAttentionWindowSize = INT_MAX;
 
         // Check if it is supported or not.
         auto [isSupported, info] = mTllmGenFMHARunner->isSupportedWithInfo(tllmRunnerParams);
@@ -407,7 +412,7 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
         tllmRunnerParams.mAttentionWindowSize = params.cyclic_attention_window_size;
         // The chunked attention size.
         // The generation-phase chunked attention is disabled for now.
-        tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
+        tllmRunnerParams.mChunkedAttentionSize = params.chunked_attention_size;
         // Not used in the generation kernels as contiguous_kv or paged_kv layouts are used.
         tllmRunnerParams.mSumOfSeqLensKv = int(params.batch_size * beam_width * tllmRunnerParams.mMaxSeqLenKv);
         tllmRunnerParams.mScaleQ = params.q_scaling;

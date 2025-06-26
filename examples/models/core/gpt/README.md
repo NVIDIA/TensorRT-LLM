@@ -694,7 +694,7 @@ python3 ../../../run.py --engine_dir gpt-next-2B/trt_engines/bf16/1-gpu \
 ### Prompt-tuning
 
 For efficient fine-tuning, the NeMo framework allows you to learn virtual tokens to accomplish a downstream task. For more details, please read the
-NeMo documentation [here](https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/stable/nlp/nemo_megatron/prompt_learning.html).
+NeMo documentation [here](https://docs.nvidia.com/nemo-framework/user-guide/latest/overview.html).
 
 TensorRT-LLM supports inference with those virtual tokens. To enable it, pass the prompt embedding table's maximum size at build time with `--max_prompt_embedding_table_size N`. For example:
 

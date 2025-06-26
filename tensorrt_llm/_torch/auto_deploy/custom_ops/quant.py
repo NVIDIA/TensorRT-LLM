@@ -18,7 +18,7 @@ TRTLLM_FP4_OP_AVAILABLE = True
 TRTLLM_NVFP4_SCALING_VECTOR_SIZE = 16
 
 
-@torch.library.custom_op("quant::quant_fn", mutates_args=())
+@torch.library.custom_op("auto_deploy::torch_quant_fn", mutates_args=())
 def quant_fn(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     scaled_x = x / scale
     rounded_x = torch.round(scaled_x)
@@ -39,7 +39,7 @@ class QuantModule(nn.Module):
         self.register_buffer("scale", torch.tensor(scale))
 
     def forward(self, x: torch.Tensor):
-        return torch.ops.quant.quant_fn(x, self.scale)
+        return torch.ops.auto_deploy.torch_quant_fn(x, self.scale)
 
 
 FP8_MIN = torch.finfo(torch.float8_e4m3fn).min
@@ -52,7 +52,7 @@ def _to_fp8(x, scale):
     return (x / scale).clamp(FP8_MIN, FP8_MAX).to(torch.float8_e4m3fn)
 
 
-@torch.library.custom_op("quant::fp8_linear", mutates_args=())
+@torch.library.custom_op("auto_deploy::torch_quant_fp8_linear", mutates_args=())
 @torch.compile(dynamic=True)
 def fp8_linear(
     input: torch.Tensor,
@@ -107,7 +107,7 @@ def fp8_linear_fake(
     return torch.ops.aten.linear(input, weight_fp8.to(input.dtype), bias)
 
 
-@torch.library.custom_op("quant::fused_fp8_linear_all_reduce", mutates_args=())
+@torch.library.custom_op("auto_deploy::torch_quant_fused_fp8_linear_all_reduce", mutates_args=())
 @torch.compile(dynamic=True)
 def fused_fp8_linear_all_reduce(
     input: torch.Tensor,
@@ -116,7 +116,9 @@ def fused_fp8_linear_all_reduce(
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    out = torch.ops.quant.fp8_linear(input, weight_fp8, bias, input_scale, weight_scale)
+    out = torch.ops.auto_deploy.torch_quant_fp8_linear(
+        input, weight_fp8, bias, input_scale, weight_scale
+    )
     if trtllm_dist.is_trtllm_op_available():
         return trtllm_dist.trtllm_allreduce(out, op=dist.ReduceOp.SUM)
     dist.all_reduce(out, op=dist.ReduceOp.SUM)
@@ -131,7 +133,9 @@ def fused_fp8_linear_all_reduce_fake(
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    return torch.ops.quant.fp8_linear(input, weight_fp8, bias, input_scale, weight_scale)
+    return torch.ops.auto_deploy.torch_quant_fp8_linear(
+        input, weight_fp8, bias, input_scale, weight_scale
+    )
 
 
 class FP8Linear(nn.Linear):
@@ -148,12 +152,12 @@ class FP8Linear(nn.Linear):
             self.bias = nn.Parameter(self.bias.to(torch.half))
 
     def forward(self, x):
-        return torch.ops.quant.fp8_linear(
+        return torch.ops.auto_deploy.torch_quant_fp8_linear(
             x, self.weight, self.bias, self.input_scale, self.weight_scale
         )
 
 
-@torch.library.custom_op("quant::fp4_linear", mutates_args=())
+@torch.library.custom_op("auto_deploy::torch_quant_fp4_linear", mutates_args=())
 @torch.compile(dynamic=True)
 def fp4_linear(
     input: torch.Tensor,
@@ -199,7 +203,7 @@ def fp4_linear(
     )
     with autotune():
         output = torch.ops.trtllm.nvfp4_gemm(
-            x_fp4, weight_fp4, x_sf_block, weight_scale, alpha, False, input.dtype
+            x_fp4, weight_fp4, x_sf_block, weight_scale, alpha, input.dtype
         )
 
     if bias is not None:
@@ -219,11 +223,6 @@ def fp4_linear_fake(
 ) -> torch.Tensor:
     return torch.ops.aten.linear(input, weight_fp4.repeat(1, 2).to(input.dtype), bias)
 
-
-def is_column_major(tensor):
-    rows, _ = tensor.shape[-2:]
-    strides = tensor.stride()
-    return strides[-2] == 1 and strides[-1] == rows
 
 
 @torch.library.custom_op("quant::fp8_bmm", mutates_args=())

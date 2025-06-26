@@ -44,21 +44,25 @@ namespace tensorrt_llm::batch_manager
  */
 enum class LlmRequestState : int32_t
 {
-    kUNKNOWN = 0,                              ///< Unknown state
-    kENCODER_INIT = 1,                         ///< Encoder phase starts (for encoder-decoder models)
-    kCONTEXT_INIT = 2,                         ///< Context phase starts
-    kDISAGG_GENERATION_TRANS_COMPLETE = 3,     ///< For disaggrgated
-    kGENERATION_IN_PROGRESS = 4,               ///< Generation phase is in progress
-    kGENERATION_TO_COMPLETE = 5,               ///< Generation phase is to be completed
-    kGENERATION_COMPLETE = 6,                  ///< Generation phase completed
-    kDISAGG_GENERATION_INIT = 7,               ///< For disaggregated serving only:
-                                               /// new Generation request arrived at generation model
-    kDISAGG_CONTEXT_TRANS_IN_PROGRESS = 8,     ///< For disaggregated serving only:
-                                               /// Waiting context-only request transmitting the kv cache
-    kDISAGG_CONTEXT_COMPLETE = 9,              ///< Context-only request finished kv cache transmission.
-    kDISAGG_GENERATION_TRANS_IN_PROGRESS = 10, ///< For disaggregated serving only: transmitting the kv cache
-    kDISAGG_CONTEXT_INIT_AND_TRANS = 11,       ///< For disaggregated serving only:
-                                               /// Context phase starts and cache transmission is in progress
+    kUNKNOWN = 0,                             ///< Unknown state
+    kENCODER_INIT = 1,                        ///< Encoder phase starts (for encoder-decoder models)
+
+    kDISAGG_GENERATION_INIT = 8,              ///< New Generation request arrived at generation model
+    kDISAGG_GENERATION_TRANS_IN_PROGRESS = 9, ///< Transmitting the kv cache
+
+    // schedulable states starts
+    kCONTEXT_INIT = 10,                     ///< Context phase starts
+    kDISAGG_CONTEXT_INIT_AND_TRANS = 11,    ///< Context phase starts and cache transmission is in progress,
+                                            /// used in layer-wise transmission
+    kDISAGG_GENERATION_TRANS_COMPLETE = 12, ///< Kv cache transmission are finished
+    kGENERATION_IN_PROGRESS = 13,           ///< Generation phase is in progress
+    kGENERATION_TO_COMPLETE = 14,           ///< Generation phase is to be completed
+
+    // schedulable states ends
+    kGENERATION_COMPLETE = 20,              ///< Generation phase completed
+    kDISAGG_CONTEXT_TRANS_IN_PROGRESS = 21, ///< Waiting context-only request transmitting the kv cache,
+                                            /// after computation finished
+    kDISAGG_CONTEXT_COMPLETE = 22,          ///< Context-only request finished kv cache transmission.
 };
 
 enum LlmRequestType
@@ -94,7 +98,7 @@ public:
     using RequestPtr = std::shared_ptr<GenericLlmRequest>;
     using MillisecondsType = std::chrono::milliseconds;
 
-    // 46 parameters, 53 items in initialization list
+    // 49 parameters, 56 items in initialization list
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> const& inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
@@ -102,6 +106,9 @@ public:
         std::optional<std::shared_ptr<std::vector<SizeType32>>> positionIds = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
+        std::optional<std::shared_ptr<std::vector<std::vector<SizeType32>>>> multimodalHashes = std::nullopt,
+        std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalPositions = std::nullopt,
+        std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalLengths = std::nullopt,
         std::optional<TensorPtr> multimodalEmbedding = std::nullopt,
         std::optional<TensorPtr> mropeRotaryCosSin = std::nullopt,
         std::optional<SizeType32> mropePositionDeltas = std::nullopt,
@@ -147,6 +154,9 @@ public:
         , mPositionIds(std::move(positionIds))
         , mPromptEmbeddingTable(std::move(promptEmbeddingTable))
         , mPromptVocabSize(promptVocabSize)
+        , mMultimodalHashes(std::move(multimodalHashes))
+        , mMultimodalPositions(std::move(multimodalPositions))
+        , mMultimodalLengths(std::move(multimodalLengths))
         , mMultimodalEmbedding(std::move(multimodalEmbedding))
         , mMropeRotaryCosSin(std::move(mropeRotaryCosSin))
         , mMropePositionDeltas(mropePositionDeltas)
@@ -849,6 +859,21 @@ public:
     [[nodiscard]] std::optional<SizeType32> getPromptVocabSize() const
     {
         return mPromptVocabSize;
+    }
+
+    [[nodiscard]] std::optional<std::shared_ptr<std::vector<std::vector<SizeType32>>>> getMultimodalHashes() const
+    {
+        return mMultimodalHashes;
+    }
+
+    [[nodiscard]] std::optional<std::shared_ptr<std::vector<SizeType32>>> getMultimodalPositions() const
+    {
+        return mMultimodalPositions;
+    }
+
+    [[nodiscard]] std::optional<std::shared_ptr<std::vector<SizeType32>>> getMultimodalLengths() const
+    {
+        return mMultimodalLengths;
     }
 
     [[nodiscard]] std::optional<TensorPtr> getMultimodalEmbedding() const
@@ -1810,6 +1835,16 @@ public:
         return mRequestedBlockHashes;
     }
 
+    void setIsDummyRequest(bool isDummyRequest)
+    {
+        mIsDummyRequest = isDummyRequest;
+    }
+
+    [[nodiscard]] bool isDummyRequest() const
+    {
+        return mIsDummyRequest;
+    }
+
     RequestIdType mRequestId;
     SizeType32 mPromptLen;
     SizeType32 mMaxNewTokens;
@@ -1864,6 +1899,9 @@ protected:
 
     std::optional<TensorPtr> mPromptEmbeddingTable{std::nullopt};
     std::optional<SizeType32> mPromptVocabSize{std::nullopt};
+    std::optional<std::shared_ptr<std::vector<std::vector<SizeType32>>>> mMultimodalHashes{std::nullopt};
+    std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalPositions{std::nullopt};
+    std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalLengths{std::nullopt};
     std::optional<TensorPtr> mMultimodalEmbedding{std::nullopt};
     std::optional<TensorPtr> mMropeRotaryCosSin{std::nullopt};
     std::optional<SizeType32> mMropePositionDeltas{std::nullopt};
@@ -1978,6 +2016,8 @@ protected:
 
     // Context request only. The hashes of the blocks that are requested by the corresponding generation request.
     std::vector<size_t> mRequestedBlockHashes;
+
+    bool mIsDummyRequest{false};
 
 private:
     void initialize(VecTokens const& inputTokens, bool outputLogProbs)
@@ -2123,7 +2163,7 @@ public:
     using TokenExtraIdType = Base::TokenExtraIdType;
     using VecTokenExtraIds = Base::VecTokenExtraIds;
 
-    // 46 parameters, 46 parameters in Base class constructor
+    // 49 parameters, 49 parameters in Base class constructor
     LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
@@ -2131,6 +2171,9 @@ public:
         std::optional<std::shared_ptr<std::vector<SizeType32>>> positionIds = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
+        std::optional<std::shared_ptr<std::vector<std::vector<SizeType32>>>> multimodalHashes = std::nullopt,
+        std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalPositions = std::nullopt,
+        std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalLengths = std::nullopt,
         std::optional<TensorPtr> multimodalEmbedding = std::nullopt,
         std::optional<TensorPtr> mropeRotaryCosSin = std::nullopt,
         std::optional<SizeType32> mropePositionDeltas = std::nullopt,
@@ -2159,7 +2202,8 @@ public:
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt)
         : Base(requestId, maxNewTokens, std::move(inputTokens), samplingConfig, isStreaming, endId, padId,
             std::move(embeddingBias), std::move(badWordsList), std::move(stopWordsList), std::move(positionIds),
-            std::move(promptEmbeddingTable), promptVocabSize, std::move(multimodalEmbedding),
+            std::move(promptEmbeddingTable), promptVocabSize, std::move(multimodalHashes),
+            std::move(multimodalPositions), std::move(multimodalLengths), std::move(multimodalEmbedding),
             std::move(mropeRotaryCosSin), mropePositionDeltas, loraTaskId, std::move(loraWeights),
             std::move(loraConfig), std::move(lookaheadConfig), std::move(kvCacheRetentionConfig), returnLogProbs,
             returnContextLogits, returnGenerationLogits, std::move(draftTokens), std::move(draftLogits),
@@ -2171,7 +2215,7 @@ public:
     {
     }
 
-    // 46 parameters, 46 parameters in Base class constructor
+    // 49 parameters, 49 parameters in Base class constructor
     LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::vector<TokenIdType> inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
@@ -2179,6 +2223,9 @@ public:
         std::optional<std::vector<SizeType32>> positionIds = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
+        std::optional<std::vector<std::vector<SizeType32>>> multimodalHashes = std::nullopt,
+        std::optional<std::vector<SizeType32>> multimodalPositions = std::nullopt,
+        std::optional<std::vector<SizeType32>> multimodalLengths = std::nullopt,
         std::optional<TensorPtr> multimodalEmbedding = std::nullopt,
         std::optional<TensorPtr> mropeRotaryCosSin = std::nullopt,
         std::optional<SizeType32> mropePositionDeltas = std::nullopt,
@@ -2208,10 +2255,19 @@ public:
             std::move(stopWordsList),
             positionIds.has_value() ? std::make_shared<std::vector<SizeType32>>(std::move(positionIds.value()))
                                     : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
-            std::move(promptEmbeddingTable), promptVocabSize, std::move(multimodalEmbedding),
-            std::move(mropeRotaryCosSin), mropePositionDeltas, loraTaskId, std::move(loraWeights),
-            std::move(loraConfig), lookaheadConfig, std::move(kvCacheRetentionConfig), returnLogProbs,
-            returnContextLogits, returnGenerationLogits,
+            std::move(promptEmbeddingTable), promptVocabSize,
+            multimodalHashes.has_value()
+                ? std::make_shared<std::vector<std::vector<SizeType32>>>(std::move(multimodalHashes.value()))
+                : std::optional<std::shared_ptr<std::vector<std::vector<SizeType32>>>>(std::nullopt),
+            multimodalPositions.has_value()
+                ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalPositions.value()))
+                : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
+            multimodalLengths.has_value()
+                ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalLengths.value()))
+                : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
+            std::move(multimodalEmbedding), std::move(mropeRotaryCosSin), mropePositionDeltas, loraTaskId,
+            std::move(loraWeights), std::move(loraConfig), lookaheadConfig, std::move(kvCacheRetentionConfig),
+            returnLogProbs, returnContextLogits, returnGenerationLogits,
             draftTokens.has_value() ? std::make_shared<VecTokens>(std::move(draftTokens.value()))
                                     : std::make_shared<VecTokens>(),
             std::move(draftLogits), excludeInputFromOutput, std::move(logitsPostProcessor),
@@ -2271,6 +2327,11 @@ public:
     /// @details Note that there is some dependency on the order of operations in this method. Modify with care!
     /// @return An optional Response
     std::optional<executor::Response> createResponse(bool useFastLogits = false, int32_t mpiWorldRank = 0);
+
+    std::optional<executor::Result> createResult(bool useFastLogits = false, int32_t mpiWorldRank = 0);
+
+    void createSerializedResult(
+        std::vector<char>& serializedResult, bool& isFinal, bool useFastLogits = false, int32_t mpiWorldRank = 0);
 
     void validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen, SizeType32 vocabSizePadded,
         std::optional<SizeType32> maxEncoderInputLen = std::nullopt, bool enableKVCacheReuse = false);

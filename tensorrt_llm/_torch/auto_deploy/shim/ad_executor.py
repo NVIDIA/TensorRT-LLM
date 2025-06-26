@@ -9,12 +9,13 @@ from tensorrt_llm._utils import nvtx_range
 from ...._utils import mpi_rank, mpi_world_size
 from ....bindings.executor import ExecutorConfig
 from ....bindings.internal.batch_manager import CacheType
+from ....llmapi.llm_args import _AutoDeployLlmArgs
 from ....mapping import Mapping
 from ...distributed import MPIDist
 from ...pyexecutor.config import PyTorchConfig
 from ...pyexecutor.model_engine import ModelEngine
 from ...pyexecutor.py_executor import PyExecutor
-from ...pyexecutor.resource_manager import KVCacheManager, ResourceManager
+from ...pyexecutor.resource_manager import KVCacheManager, ResourceManager, ResourceManagerType
 from ...pyexecutor.sampler import TorchSampler
 from ...pyexecutor.scheduler import (
     BindCapacityScheduler,
@@ -27,7 +28,7 @@ from ..distributed import common as dist
 from ..models import ModelFactoryRegistry
 from ..transformations.transform import InferenceOptimizer
 from ..utils.logger import ad_logger
-from .interface import AutoDeployConfig, CachedSequenceInterface, GetInferenceModel
+from .interface import CachedSequenceInterface, GetInferenceModel
 
 
 class _CacheManagerWithFakePool(KVCacheManager):
@@ -84,11 +85,11 @@ class ADEngine(ModelEngine):
     def build_from_config(
         cls,
         model: str,
-        ad_config: AutoDeployConfig,
+        ad_config: _AutoDeployLlmArgs,
         seq_info: SequenceInfo,
         device: DeviceLikeType,
     ):
-        """Build the ADEngine using the AutoDeployConfig that gets passed through from the LLM."""
+        """Build the ADEngine using the _AutoDeployLlmArgs that gets passed through from the LLM."""
 
         # update device to contain the current default device if it's in cuda
         device = torch.device(device)
@@ -150,7 +151,9 @@ class ADEngine(ModelEngine):
     ) -> bool:
         """Prepare inputs for AD Model from scheduled requests."""
         # cache manager
-        kv_cache_manager = resource_manager.get_resource_manager("kv_cache_manager")
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
 
         # requests in order of context, extend (generate with draft), generate
         context_requests = scheduled_requests.context_requests
@@ -240,12 +243,10 @@ class ADEngine(ModelEngine):
         return {"logits": logits_flat}
 
 
-def create_autodeploy_executor(
-    executor_config: ExecutorConfig, checkpoint_dir: str = None, engine_dir: str = None
-):
+def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: str = None):
     """Create an AutoDeploy executor from the given configuration and checkpoint directory.
 
-    This is the entrypoint API to the autodeploy backend.
+    This is the entrypoint API to the _autodeploy backend.
     """
     # initialize process groups
     world_size = mpi_world_size()
@@ -258,23 +259,28 @@ def create_autodeploy_executor(
     dist.initialize_or_skip(rank, world_size, port)
 
     # some config
-    if executor_config.pytorch_backend_config is None:
-        executor_config.pytorch_backend_config = AutoDeployConfig(attn_backend="FlashInfer")
+    msg = "pytorch_backend_config must be an _AutoDeployLlmArgs object"
+    assert isinstance(executor_config.pytorch_backend_config, _AutoDeployLlmArgs), msg
+    ad_config: _AutoDeployLlmArgs = executor_config.pytorch_backend_config
 
-    max_batch_size = executor_config.max_batch_size
-    max_seq_len = executor_config.max_seq_len
-    tokens_per_block = executor_config.tokens_per_block
-    max_num_tokens = executor_config.max_num_tokens
-    ad_logger.info(f"{max_seq_len=}, {max_batch_size=}, {tokens_per_block=}, {max_num_tokens=}")
+    max_batch_size = ad_config.max_batch_size
+    max_seq_len = ad_config.max_seq_len
+    attn_page_size = ad_config.attn_page_size
+    max_num_tokens = ad_config.max_num_tokens
+    max_draft_tokens = (
+        0 if ad_config.speculative_config is None else ad_config.speculative_config.max_draft_tokens
+    )
+
+    ad_logger.info(f"{max_seq_len=}, {max_batch_size=}, {attn_page_size=}, {max_num_tokens=}")
 
     # initialize model engine
     engine = ADEngine.build_from_config(
         model=checkpoint_dir,
-        ad_config=executor_config.pytorch_backend_config,
+        ad_config=ad_config,
         seq_info=SequenceInfo(
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
-            page_size=tokens_per_block,
+            page_size=attn_page_size,
             max_num_tokens=max_num_tokens,
         ),
         device="cuda",
@@ -282,14 +288,14 @@ def create_autodeploy_executor(
 
     # resource managers
     kv_cache_manager = _CacheManagerWithFakePool(
-        executor_config.kv_cache_config,
+        ad_config.kv_cache_config,
         num_blocks=engine.cache_seq_interface.info.num_pages,
-        tokens_per_block=tokens_per_block,
+        tokens_per_block=attn_page_size,
         max_seq_len=max_seq_len,
         max_batch_size=max_batch_size,
     )
-    resource_manager = ResourceManager({"kv_cache_manager": kv_cache_manager})
-    resource_manager.resource_managers.move_to_end("kv_cache_manager", last=True)
+    resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+    resource_manager.resource_managers.move_to_end(ResourceManagerType.KV_CACHE_MANAGER, last=True)
 
     # scheduling
     capacitor_scheduler = BindCapacityScheduler(max_batch_size, kv_cache_manager.impl)
@@ -302,18 +308,15 @@ def create_autodeploy_executor(
     sampler = TorchSampler(max_seq_len=max_seq_len)
 
     # creating the executor object
-    py_config: PyTorchConfig = executor_config.pytorch_backend_config
     py_executor = PyExecutor(
         resource_manager,
         scheduler,
         model_engine=engine,
         sampler=sampler,
         dist=mpi_dist,
-        disable_overlap_scheduler=py_config.disable_overlap_scheduler,
-        max_input_len=executor_config.max_input_len,
-        max_batch_size=executor_config.max_batch_size,
-        max_draft_tokens=executor_config.speculative_config.max_draft_tokens
-        if executor_config.speculative_config is not None
-        else 0,
+        disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
+        max_input_len=ad_config.max_input_len,
+        max_batch_size=max_batch_size,
+        max_draft_tokens=max_draft_tokens,
     )
     return py_executor

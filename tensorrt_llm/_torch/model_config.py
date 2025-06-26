@@ -8,6 +8,8 @@ import transformers
 
 from tensorrt_llm import logger
 from tensorrt_llm._utils import torch_dtype_to_binding
+from tensorrt_llm.functional import AllReduceStrategy
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -23,18 +25,13 @@ class MoeLoadBalancerConfig:
                                                                   repr=False)
     layer_updates_per_iter: int = 0
 
-    num_experts: Optional[int] = field(default=None, init=False)
     ep_rank: Optional[int] = field(default=None, init=False)
     ep_size: Optional[int] = field(default=None, init=False)
 
-    def setup(self, num_experts: int, ep_rank: int, ep_size: int) -> None:
-        self.num_experts = num_experts
+    def setup(self, ep_rank: int, ep_size: int) -> None:
         self.ep_rank = ep_rank
         self.ep_size = ep_size
-        if self.num_slots is None:
-            self.num_slots = self.num_experts
-        assert self.num_slots >= self.num_experts
-        assert self.num_slots % self.ep_size == 0
+        assert self.num_slots is not None
 
     @property
     def num_local_slots(self) -> int:
@@ -49,44 +46,89 @@ class MoeLoadBalancerConfig:
         return self.slot_start + self.num_local_slots
 
     def get_layer_initial_global_assignments(self, layer_idx: int) -> List[int]:
-        if self.initial_global_assignments is None:
-            return [(ep_rank * self.num_experts // self.ep_size + i) %
-                    self.num_experts for ep_rank in range(self.ep_size)
-                    for i in range(self.num_local_slots)]
-        else:
+        if self.initial_global_assignments is not None:
             assert layer_idx in self.initial_global_assignments
             assert len(
                 self.initial_global_assignments[layer_idx]) == self.num_slots
-            assert set(self.initial_global_assignments[layer_idx]) == set(
-                range(self.num_experts))
             return self.initial_global_assignments[layer_idx]
+        else:
+            return None
 
 
 @dataclass(kw_only=True)
 class ModelConfig(Generic[TConfig]):
     pretrained_config: Optional[TConfig] = None
     mapping: Mapping = field(default_factory=Mapping)
+
+    # quantization configs
     quant_config: QuantConfig = field(default_factory=QuantConfig)
     # TODO(qijun): support per linear layer quantization
     quant_config_dict: Optional[Dict[str, QuantConfig]] = None
     # Delay weights creation to DecoderModelForCausalLM.__post_init__
     # to support mixed quantization.
     skip_create_weights_in_init: bool = False
+
+    spec_config: Optional["SpecConfig"] = None
+    lora_config: Optional["LoraConfig"] = None
+
     is_generation: bool = True
     max_num_tokens: int = 8192
+
     moe_max_num_tokens: Optional[int] = None
     moe_load_balancer: Optional[MoeLoadBalancerConfig] = None
 
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
+    allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO
+
+    # If true, enable min-latency mode. Currently only used for Llama4.
+    enable_min_latency: bool = False
+
+    # Allow models to select op according to whether CUDA Graphs are used.
+    use_cuda_graph: bool = False
 
     extra_attrs: Dict = field(default_factory=dict, repr=False, init=False)
+
+    _frozen: bool = field(default=False, init=False, repr=False)
+
+    def __setattr__(self, key, value):
+        """
+        Prevent modification of frozen instance attributes.
+        However, we allow modification of 'extra_attrs' attributes for torch.compile
+        and 'pretrained_config' attributes for mutimodal models. All the other
+        attributes are frozen.
+        This can be bypassed by manually setting '_frozen' to False. The design is
+        to discourage modifying the attributes unintentionally.
+        """
+        if self._frozen:
+            if key not in ('_frozen', 'extra_attrs', 'pretrained_config'):
+                raise AttributeError(
+                    f"Cannot modify ModelConfig.'{key}' - instance is frozen")
+        super().__setattr__(key, value)
 
     def __post_init__(self):
         if self.pretrained_config and hasattr(self.pretrained_config,
                                               "architectures"):
             self.is_generation = self.is_generation_model(
                 self.pretrained_config.architectures)
+
+        def get_all_reduce_strategy(strategy: str = "AUTO"):
+            maps = {
+                "AUTO": AllReduceStrategy.AUTO,
+                "NCCL": AllReduceStrategy.NCCL,
+                "UB": AllReduceStrategy.UB,
+                "MINLATENCY": AllReduceStrategy.MIN_LATENCY,
+                "ONESHOT": AllReduceStrategy.ONESHOT,
+                "TWOSHOT": AllReduceStrategy.TWOSHOT,
+                "LOWPRECISION": AllReduceStrategy.LOWPRECISION,
+                "MNNVL": AllReduceStrategy.MNNVL
+            }
+            key = strategy.upper()
+            return maps[key] if key in maps else AllReduceStrategy.AUTO
+
+        if isinstance(self.allreduce_strategy, str):
+            self.allreduce_strategy = get_all_reduce_strategy(
+                self.allreduce_strategy)
 
     @property
     def fuse_pos_embd(self):
@@ -221,10 +263,12 @@ class ModelConfig(Generic[TConfig]):
                     128), "FP8_BLOCK_SCALES only supports block_size=(128,128)"
                 quant_config.group_size = block_size[0]
 
-        return cls(pretrained_config=pretrained_config,
-                   quant_config=quant_config,
-                   quant_config_dict=layer_quant_config,
-                   **kwargs)
+        model_config = cls(pretrained_config=pretrained_config,
+                           quant_config=quant_config,
+                           quant_config_dict=layer_quant_config,
+                           **kwargs)
+        model_config._frozen = True
+        return model_config
 
     def get_bindings_model_config(self) -> "ModelConfigCpp":
         """
@@ -238,6 +282,7 @@ class ModelConfig(Generic[TConfig]):
 
         num_heads = self.pretrained_config.num_attention_heads // (
             self.mapping.tp_size * self.mapping.cp_size)
+        hidden_size = self.pretrained_config.hidden_size // self.mapping.tp_size
 
         model_config_cpp = ModelConfigCpp(
             vocab_size=self.pretrained_config.vocab_size,
@@ -245,7 +290,7 @@ class ModelConfig(Generic[TConfig]):
             num_attention_layers=self.pretrained_config.num_hidden_layers,
             num_rnn_layers=0,
             num_heads=num_heads,
-            hidden_size=self.pretrained_config.hidden_size,
+            hidden_size=hidden_size,
             data_type=torch_dtype_to_binding(
                 self.pretrained_config.torch_dtype))
 
@@ -273,7 +318,7 @@ class ModelConfig(Generic[TConfig]):
         if "head_size" in self.pretrained_config:
             head_size = self.pretrained_config.head_size
         else:
-            head_size = self.pretrained_config.hidden_size // num_heads
+            head_size = hidden_size // num_heads
 
         model_config_cpp.mlp_hidden_size = mlp_hidden_size
         model_config_cpp.size_per_head = head_size

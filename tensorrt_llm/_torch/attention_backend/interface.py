@@ -24,6 +24,7 @@ class AttentionRuntimeFeatures:
     chunked_prefill: bool = False
     cache_reuse: bool = False
     has_speculative_draft_tokens: bool = False
+    chunk_size: int = 0  # this is the chunk size for MLA chunked prefill, it will split kv cache into chunks to save global memory.
 
 
 # The type of requests in qkv passed to attention
@@ -419,7 +420,7 @@ class RopeParams:
                     self.original_max_positions,
                 })
         if rope_inv_freq is not None:
-            rope_inv_freq = torch.torch.tensor(
+            rope_inv_freq = torch.tensor(
                 rope_inv_freq,
                 dtype=torch.float32,
                 device='cuda',
@@ -428,7 +429,7 @@ class RopeParams:
             rope_cos_sin = rope_cos_sin.reshape(
                 self.max_positions, -1,
                 2)[:, :self.dim // 2, :].transpose(0, 2, 1).reshape(1, -1)
-        rope_cos_sin = torch.torch.tensor(
+        rope_cos_sin = torch.tensor(
             rope_cos_sin,
             dtype=torch.float32,
             device='cuda',
@@ -554,6 +555,10 @@ class AttentionBackend(Generic[TMetadata]):
 
     @classmethod
     def support_mla(cls) -> bool:
+        return False
+
+    @classmethod
+    def support_nvfp4_output(cls) -> bool:
         return False
 
 

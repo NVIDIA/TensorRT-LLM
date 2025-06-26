@@ -16,10 +16,8 @@
  */
 
 #include "tensorrt_llm/executor/executorImpl.h"
-#include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/trtEncoderModel.h"
 #include "tensorrt_llm/batch_manager/trtGptModelFactory.h"
-#include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaProfilerUtils.h"
 #include "tensorrt_llm/common/logger.h"
@@ -54,21 +52,37 @@ namespace tensorrt_llm::executor
 namespace
 {
 
-void checkOptionalParams(
-    batch_manager::TrtGptModelOptionalParams& optionalParams, runtime::ModelConfig const& modelConfig)
+[[nodiscard]] bool executorConfigIsValid(ExecutorConfig const& executorConfig, runtime::ModelConfig const& modelConfig)
 {
-    // Disable chunked context when not supported
-    if (optionalParams.enableChunkedContext)
+    // Make sure logic in this function matches fixExecutorConfig
+    if (executorConfig.getEnableChunkedContext())
     {
         if (modelConfig.isRnnBased() || !modelConfig.isKVCacheEnabled() || !modelConfig.getPagedContextFMHA())
         {
-            optionalParams.enableChunkedContext = false;
+            return false;
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] ExecutorConfig fixExecutorConfig(
+    ExecutorConfig const& executorConfig, runtime::ModelConfig const& modelConfig)
+{
+    // Make sure logic in this function matches executorConfigIsValid
+    auto fixedExecutorConfig = executorConfig;
+    // Disable chunked context when not supported
+    if (executorConfig.getEnableChunkedContext())
+    {
+        if (modelConfig.isRnnBased() || !modelConfig.isKVCacheEnabled() || !modelConfig.getPagedContextFMHA())
+        {
+            fixedExecutorConfig.setEnableChunkedContext(false);
             TLLM_LOG_WARNING(
                 "Chunked context is not supported for this configuration and will be disabled. "
                 "Related configs: RNNBased: %d, KVCacheEnabled: %d, PagedContextFMHA: %d",
                 modelConfig.isRnnBased(), modelConfig.isKVCacheEnabled(), modelConfig.getPagedContextFMHA());
         }
     }
+    return fixedExecutorConfig;
 }
 
 SizeType32 getNumChildRequests(Request const& request)
@@ -488,19 +502,22 @@ std::shared_ptr<Model> Executor::Impl::createModel(runtime::RawEngine const& raw
     }();
 
     bool const isLeaderInOrchMode = (mCommMode == CommunicationMode::kORCHESTRATOR) && mIsLeader;
-    auto optionalParams = batch_manager::TrtGptModelOptionalParams(executorConfig, isLeaderInOrchMode);
-    checkOptionalParams(optionalParams, modelConfig);
-    return batch_manager::TrtGptModelFactory::create(rawEngine, modelConfig, worldConfig, gptModelType, optionalParams);
+    auto const& fixedExecutorConfig = executorConfigIsValid(executorConfig, modelConfig)
+        ? executorConfig
+        : fixExecutorConfig(executorConfig, modelConfig);
+
+    return batch_manager::TrtGptModelFactory::create(
+        rawEngine, modelConfig, worldConfig, gptModelType, fixedExecutorConfig, isLeaderInOrchMode);
 }
 
 std::shared_ptr<Model> Executor::Impl::createEncoderModel(runtime::RawEngine const& rawEngine,
     runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
     ExecutorConfig const& executorConfig)
 {
-    auto optionalParams = batch_manager::TrtGptModelOptionalParams{};
-    optionalParams.schedulerConfig = executorConfig.getSchedulerConfig();
+    auto fixedExecutorConfig = ExecutorConfig{};
+    fixedExecutorConfig.setSchedulerConfig(executorConfig.getSchedulerConfig());
     return std::make_shared<batch_manager::TrtEncoderModel>(
-        modelConfig, worldConfig, rawEngine, std::make_shared<runtime::TllmLogger>(), optionalParams);
+        modelConfig, worldConfig, rawEngine, std::make_shared<runtime::TllmLogger>(), fixedExecutorConfig);
 }
 
 void Executor::Impl::setOrchLeaderComm(
@@ -947,30 +964,32 @@ std::vector<Response> Executor::Impl::awaitResponses(std::optional<std::chrono::
 {
     TLLM_CHECK_WITH_INFO(!mShutdownCalled, "Shutdown called");
     checkParallelApiUsage(__func__);
-    std::vector<Response> responses;
     std::unique_lock<std::mutex> lck(mResponsesMtx);
-    auto pred = [&mShutdown = mShutdown, &resp = this->mResponses]() -> bool { return !resp.empty() || mShutdown; };
-    auto storeResponses = [this, &resp = this->mResponses, &responses]()
+    auto pred = [this]() -> bool { return !mResponses.empty() || mShutdown; };
+    auto storeResponses = [this]()
     {
-        for (auto it = resp.cbegin(); it != resp.cend();)
+        std::vector<Response> responses;
+        for (auto it = mResponses.begin(); it != mResponses.end();)
         {
             responses.insert(responses.end(), it->second.begin(), it->second.end());
             addTerminatedReqId(it->second, it->first);
-            resp.erase(it++);
+            it = mResponses.erase(it);
         }
+        return responses;
     };
 
+    std::vector<Response> responses;
     if (timeout)
     {
         if (mResponsesCv.wait_for(lck, timeout.value(), pred))
         {
-            storeResponses();
+            responses = storeResponses();
         }
     }
     else
     {
         mResponsesCv.wait(lck, pred);
-        storeResponses();
+        responses = storeResponses();
     }
     return responses;
 }
@@ -980,15 +999,16 @@ std::vector<Response> Executor::Impl::awaitResponses(
 {
     TLLM_CHECK_WITH_INFO(!mShutdownCalled, "Shutdown called");
     checkParallelApiUsage(__func__);
-    std::vector<Response> responses;
     std::unique_lock<std::mutex> lck(mResponsesMtx);
-    auto pred = [&mShutdown = mShutdown, &resp = this->mResponses, reqId]() -> bool
-    { return (resp.find(reqId) != resp.end() && !resp.at(reqId).empty()) || mShutdown; };
-    auto storeIdResponse = [this, &resp = this->mResponses, &responses, reqId]()
+    auto pred = [this, reqId]() -> bool
+    { return (mResponses.find(reqId) != mResponses.end() && !mResponses.at(reqId).empty()) || mShutdown; };
+    auto storeIdResponse = [this, reqId]()
     {
-        responses.swap(resp.at(reqId));
-        resp.erase(reqId);
+        std::vector<Response> responses;
+        responses.swap(mResponses.at(reqId));
+        mResponses.erase(reqId);
         addTerminatedReqId(responses, reqId);
+        return responses;
     };
 
     // We don't process a terminated request again. Terminated request is defined as a response
@@ -1005,17 +1025,18 @@ std::vector<Response> Executor::Impl::awaitResponses(
         return {Response(reqId, err)};
     }
 
+    std::vector<Response> responses;
     if (timeout)
     {
         if (mResponsesCv.wait_for(lck, timeout.value(), pred))
         {
-            storeIdResponse();
+            responses = storeIdResponse();
         }
     }
     else
     {
         mResponsesCv.wait(lck, pred);
-        storeIdResponse();
+        responses = storeIdResponse();
     }
     return responses;
 }
@@ -1025,26 +1046,27 @@ std::vector<std::vector<Response>> Executor::Impl::awaitResponses(
 {
     TLLM_CHECK_WITH_INFO(!mShutdownCalled, "Shutdown called");
     checkParallelApiUsage(__func__);
-    std::vector<std::vector<Response>> v(requestIds.size());
+    std::vector<std::vector<Response>> responses;
+    responses.reserve(requestIds.size());
     if (timeout)
     {
         auto const start_time = std::chrono::high_resolution_clock::now();
-        for (unsigned i = 0; i < v.size(); ++i)
+        for (auto const requestId : requestIds)
         {
             auto const elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::high_resolution_clock::now() - start_time);
-            v[i] = awaitResponses(requestIds[i],
-                timeout.value() > elapsed_ms ? timeout.value() - elapsed_ms : std::chrono::milliseconds{0});
+            responses.emplace_back(awaitResponses(
+                requestId, timeout.value() > elapsed_ms ? timeout.value() - elapsed_ms : std::chrono::milliseconds{0}));
         }
     }
     else
     {
-        for (unsigned i = 0; i < v.size(); ++i)
+        for (auto const requestId : requestIds)
         {
-            v[i] = awaitResponses(requestIds[i]);
+            responses.emplace_back(awaitResponses(requestId));
         }
     }
-    return v;
+    return responses;
 }
 
 SizeType32 Executor::Impl::getNumResponsesReady(std::optional<IdType> const& optId) const
@@ -1599,6 +1621,9 @@ std::tuple<Executor::Impl::RequestList, double> Executor::Impl::fetchNewRequests
                     TLLM_CHECK_WITH_INFO(mModel->hasGuidedDecoder(),
                         "Request is specified with GuidedDecodingParams, but GuidedDecoder is not setup. Please "
                         "provide a valid GuidedDecodingConfig to setup GuidedDecoder.");
+                    TLLM_CHECK_WITH_INFO(newReq->getGuidedDecodingParams()->getGuideType()
+                            != executor::GuidedDecodingParams::GuideType::kSTRUCTURAL_TAG,
+                        "Structural tag is not supported for guided decoding in C++ Executor.");
                 }
 
                 if (mModel->getWorldConfig().isLastPipelineParallelRank() && newReq->hasAdditionalOutputs())
@@ -1663,7 +1688,7 @@ void Executor::Impl::terminateActiveRequests(RequestList& activeRequests, std::s
         }
 
         // Remove from the requestList
-        activeRequests.erase(it++);
+        it = activeRequests.erase(it);
     }
 }
 

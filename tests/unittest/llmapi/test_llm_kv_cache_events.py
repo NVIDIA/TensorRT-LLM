@@ -2,10 +2,11 @@ import asyncio
 import time
 
 import tensorrt_llm
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import KVCacheEventSerializer
-from tensorrt_llm.llmapi import LLM, KvCacheConfig
+from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
 

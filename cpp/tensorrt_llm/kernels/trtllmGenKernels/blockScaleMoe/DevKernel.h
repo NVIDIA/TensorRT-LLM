@@ -179,7 +179,7 @@ namespace moe::dev
         TLLM_LOG_ERROR("Unsupported dtypeExpW: ");                                                                     \
     }
 
-#define LAUNCH_EXPW_ONLY(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream)                            \
+#define LAUNCH_EXPW_ONLY_QWEN3(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream)                      \
     if (data.mDtypeExpW == tg::Dtype::Fp32)                                                                            \
     {                                                                                                                  \
         LAUNCH_PDL(data, coopLaunch, LAUCNCH_ESC(void, float), kernel, numBlocks, numThreads, smemSize, stream);       \
@@ -187,6 +187,44 @@ namespace moe::dev
     else if (data.mDtypeExpW == tg::Dtype::Bfloat16)                                                                   \
     {                                                                                                                  \
         LAUNCH_PDL(data, coopLaunch, LAUCNCH_ESC(void, cutlass::bfloat16_t), kernel, numBlocks, numThreads, smemSize,  \
+            stream);                                                                                                   \
+    }                                                                                                                  \
+    else                                                                                                               \
+    {                                                                                                                  \
+        TLLM_LOG_ERROR("Unsupported dtypeExpW: ");                                                                     \
+    }
+
+#define LAUNCH_EXPW_ONLY(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream)                            \
+    if (data.mDtypeExpW == tg::Dtype::Fp32)                                                                            \
+    {                                                                                                                  \
+        LAUNCH_PDL(data, coopLaunch, float, kernel, numBlocks, numThreads, smemSize, stream);                          \
+    }                                                                                                                  \
+    else if (data.mDtypeExpW == tg::Dtype::Bfloat16)                                                                   \
+    {                                                                                                                  \
+        LAUNCH_PDL(data, coopLaunch, cutlass::bfloat16_t, kernel, numBlocks, numThreads, smemSize, stream);            \
+    }                                                                                                                  \
+    else                                                                                                               \
+    {                                                                                                                  \
+        TLLM_LOG_ERROR("Unsupported dtypeExpW");                                                                       \
+    }
+
+#define LAUNCH_EXPW_ONLY_GROUPS(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream)                     \
+    if (data.mDtypeExpW == tg::Dtype::Fp32 && data.mNumExpertGroups > 1)                                               \
+    {                                                                                                                  \
+        LAUNCH_PDL(data, coopLaunch, LAUCNCH_ESC(float, true), kernel, numBlocks, numThreads, smemSize, stream);       \
+    }                                                                                                                  \
+    else if (data.mDtypeExpW == tg::Dtype::Fp32)                                                                       \
+    {                                                                                                                  \
+        LAUNCH_PDL(data, coopLaunch, LAUCNCH_ESC(float, false), kernel, numBlocks, numThreads, smemSize, stream);      \
+    }                                                                                                                  \
+    else if (data.mDtypeExpW == tg::Dtype::Bfloat16 && data.mNumExpertGroups > 1)                                      \
+    {                                                                                                                  \
+        LAUNCH_PDL(data, coopLaunch, LAUCNCH_ESC(cutlass::bfloat16_t, true), kernel, numBlocks, numThreads, smemSize,  \
+            stream);                                                                                                   \
+    }                                                                                                                  \
+    else if (data.mDtypeExpW == tg::Dtype::Bfloat16)                                                                   \
+    {                                                                                                                  \
+        LAUNCH_PDL(data, coopLaunch, LAUCNCH_ESC(cutlass::bfloat16_t, false), kernel, numBlocks, numThreads, smemSize, \
             stream);                                                                                                   \
     }                                                                                                                  \
     else                                                                                                               \
@@ -201,7 +239,7 @@ namespace activation
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-namespace tg = trtllm::gen;
+namespace tg = batchedGemm::trtllm::gen;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -272,7 +310,7 @@ namespace convertsf
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-namespace tg = trtllm::gen;
+namespace tg = batchedGemm::trtllm::gen;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -329,7 +367,7 @@ namespace permute
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-namespace tg = trtllm::gen;
+namespace tg = batchedGemm::trtllm::gen;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -399,7 +437,7 @@ namespace finalize
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-namespace tg = trtllm::gen;
+namespace tg = batchedGemm::trtllm::gen;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

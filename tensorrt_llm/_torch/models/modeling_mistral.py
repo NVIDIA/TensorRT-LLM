@@ -82,7 +82,7 @@ class MistralDecoderLayer(DecoderLayer):
 
     def forward(
         self,
-        position_ids: torch.LongTensor,
+        position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = None,
@@ -119,7 +119,6 @@ class MistralModel(DecoderModel):
     def __init__(self, model_config: ModelConfig[MistralConfig]):
         super().__init__(model_config)
         config = self.model_config.pretrained_config
-        self.padding_idx = config.pad_token_id
 
         self.embed_tokens = Embedding(
             config.vocab_size,
@@ -144,8 +143,8 @@ class MistralModel(DecoderModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         spec_metadata: Optional[SpecMetadata] = None,
         lora_params: Optional[Any] = None,

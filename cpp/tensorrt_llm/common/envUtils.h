@@ -27,6 +27,8 @@ std::optional<int32_t> getIntEnv(char const* name);
 
 std::optional<size_t> getUInt64Env(char const* name);
 
+bool getBoolEnv(char const* name);
+
 // XQA kernels (optimized kernels for generation phase).
 bool forceXQAKernels();
 
@@ -58,7 +60,11 @@ bool getEnvUseNixlKvCache();
 
 std::string getEnvUCXInterface();
 
+std::string getEnvNixlInterface();
+
 bool getEnvDisaggLayerwise();
+
+bool getEnvDisableSelectiveCacheTransfer();
 
 bool getEnvParallelCacheSend();
 
@@ -101,5 +107,8 @@ size_t getEnvMemSizeForKVCacheTransferBuffer();
 uint16_t getEnvNixlPort();
 
 bool getEnvDisaggBenchmarkGenOnly();
+
+// Whether to disable the chunked-attention in the generation phase.
+bool getEnvDisableChunkedAttentionInGenPhase();
 
 } // namespace tensorrt_llm::common

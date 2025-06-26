@@ -18,7 +18,12 @@
 #define TRT_MIXTURE_OF_EXPERTS_PLUGIN_H
 
 #include "NvInferPlugin.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/include/cutlass_kernel_selector.h"
+#if defined(USING_OSS_CUTLASS_MOE_GEMM)
+#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
+#else
 #include "moe_kernels.h"
+#endif
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/lora/lora.h"
@@ -26,7 +31,6 @@
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include "tensorrt_llm/plugins/cudaStreamPlugin/cudaStreamPlugin.h"
 #include "tensorrt_llm/plugins/gemmPlugin/gemmPlugin.h"
-#include "tensorrt_llm/plugins/weightOnlyGroupwiseQuantMatmulPlugin/weightOnlyGroupwiseQuantMatmulPlugin.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include <cassert>
 #include <set>
@@ -35,8 +39,15 @@
 
 namespace tensorrt_llm::plugins
 {
+namespace kernels = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE;
+using MoeMinLatencyParams = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::MoeMinLatencyParams;
+using MOEParallelismConfig = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::MOEParallelismConfig;
+using QuantParams = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::QuantParams;
+using ActivationType = CUTLASS_MOE_GEMM_NAMESPACE::ActivationType;
+using TmaWarpSpecializedGroupedGemmInput = CUTLASS_MOE_GEMM_NAMESPACE::TmaWarpSpecializedGroupedGemmInput;
+using CUTLASS_MOE_GEMM_NAMESPACE::isGatedActivation;
+
 class MixtureOfExpertsGemmProfiler;
-using MOEParallelismConfig = tensorrt_llm::kernels::MOEParallelismConfig;
 using MixtureOfExpertsPluginProfilerPtr = std::shared_ptr<MixtureOfExpertsGemmProfiler>;
 using GroupwiseQuantAlgo = tensorrt_llm::common::GroupwiseQuantAlgo;
 
@@ -45,11 +56,11 @@ struct GemmIDMoe
     int gemm_idx;
     int num_experts{};
     int experts_per_token{};
-    MOEParallelismConfig parallelism_config{};
+    kernels::MOEParallelismConfig parallelism_config{};
     int64_t hidden{};
     int64_t inter{};
     int64_t group_size{};
-    tensorrt_llm::ActivationType actfn{};
+    ActivationType actfn{};
     nvinfer1::DataType dtype{};
     nvinfer1::DataType wdtype{};
     tensorrt_llm::common::QuantMode quant_mode;
@@ -103,14 +114,12 @@ struct GemmIDMoeHash
 class MixtureOfExpertsPlugin : public nvinfer1::IPluginV2DynamicExt
 {
 public:
-    using MOEParallelismConfig = tensorrt_llm::kernels::MOEParallelismConfig;
     using LoraPluginProfilerPtr = std::shared_ptr<CublasLtGemmPluginProfiler>;
-    using LoraImplPtr = std::shared_ptr<kernels::LoraImpl>;
-
+    using LoraImplPtr = std::shared_ptr<tensorrt_llm::kernels::LoraImpl>;
     MixtureOfExpertsPlugin() = delete;
     MixtureOfExpertsPlugin(bool remove_input_padding, int number_of_experts, int experts_per_token,
         int expert_hidden_size, int expert_inter_size, int groupwise_quant_algo, int group_size,
-        tensorrt_llm::ActivationType activation_type, nvinfer1::DataType type, nvinfer1::DataType weight_type,
+        ActivationType activation_type, nvinfer1::DataType type, nvinfer1::DataType weight_type,
         nvinfer1::DataType output_type, tensorrt_llm::common::QuantMode quant_mode, bool use_final_scales,
         bool use_bias, int tp_size, int tp_rank, int ep_size, int ep_rank, bool force_determinism, int side_stream_id,
         MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr, bool use_lora, nvinfer1::DataType lora_type,
@@ -166,7 +175,7 @@ private:
     int64_t mExpertInterSize{};
     int64_t mGroupwiseQuantAlgo{};
     int64_t mGroupSize{};
-    tensorrt_llm::ActivationType mActivationType;
+    ActivationType mActivationType;
     nvinfer1::DataType mType{};
     nvinfer1::DataType mWeightType{};
     nvinfer1::DataType mOutputType{};
@@ -225,13 +234,13 @@ private:
     int64_t getNumTokens(nvinfer1::PluginTensorDesc const* input_tensor) const;
     WorkspaceInfo setupWorkspace(void* base_ptr, int64_t num_tokens, int num_reqs = 0) const;
 
-    kernels::MOEParallelismConfig getParallelismConfig() const;
-    kernels::QuantParams getQuantParams(nvinfer1::PluginTensorDesc const* inputDesc, void const* const* inputs,
+    MOEParallelismConfig getParallelismConfig() const;
+    QuantParams getQuantParams(nvinfer1::PluginTensorDesc const* inputDesc, void const* const* inputs,
         int scale_1_idx = -1, int scale_2_idx = -1, int scale_3_idx = -1, int scale_4_idx = -1, int scale_5_idx = -1,
         int scale_6_idx = -1, int scale_7_idx = -1, int scale_8_idx = -1) const;
 
     int getNumLoraRequests(nvinfer1::PluginTensorDesc const* input_tensor) const;
-    kernels::LoraParams getLoraParams(
+    tensorrt_llm::kernels::LoraParams getLoraParams(
         nvinfer1::PluginTensorDesc const* inputDesc, void const* const* inputs, void* workspace);
 
     enum class RequestType : int32_t
@@ -559,7 +568,7 @@ public:
         // NOTE: Do not access mPlugin here, since we are called from the constructor before all fields are init
     }
 
-    void setGemmToProfile(tensorrt_llm::kernels::GemmProfilerBackend::GemmToProfile gemm_to_profile)
+    void setGemmToProfile(kernels::GemmProfilerBackend::GemmToProfile gemm_to_profile)
     {
         // Just set the backend directly. This will just be reused in checkInit().
         backend.mGemmToProfile = gemm_to_profile;
@@ -587,7 +596,7 @@ protected:
     void checkInit();
 
     bool init_backend = false;
-    tensorrt_llm::kernels::GemmProfilerBackend backend{};
+    kernels::GemmProfilerBackend backend{};
 
 private:
     int mMaxProfileM = 0;

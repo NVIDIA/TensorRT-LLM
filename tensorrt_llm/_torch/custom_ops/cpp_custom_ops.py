@@ -21,6 +21,7 @@ def _register_fake():
         strategy,
         op,
         eps,
+        trigger_completion_at_end,
     ):
         from tensorrt_llm.functional import AllReduceFusionOp
         if op == int(AllReduceFusionOp.NONE):
@@ -54,6 +55,18 @@ def _register_fake():
         else:
             return [torch.empty_like(input)]
 
+    #MNNVL Allreduce
+    @torch.library.register_fake("trtllm::mnnvl_twoshot_allreduce")
+    def _(input, buffer, buffer_flags, wait_for_results):
+        output = input.new_empty(input.shape)
+        return output
+
+    @torch.library.register_fake("trtllm::mnnvl_twoshot_rmsnorm")
+    def _(comm_buf, gamma, eps, residual, buffer_flags):
+        output = residual.new_empty(residual.shape)
+        residual_out = residual.new_empty(residual.shape)
+        return [output, residual_out]
+
     @torch.library.register_fake("trtllm::moe_allreduce")
     def _(residual, norm_weight, device_num_experts, scale_input,
           active_experts_token_input, token_input, workspace, rank, nranks,
@@ -86,6 +99,22 @@ def _register_fake():
         return ret
 
     @torch.library.register_fake("trtllm::cublas_mm")
+    def _(mat_a, mat_b, bias, out_dtype):
+        shape = list(mat_a.shape)
+        shape[-1] = mat_b.shape[-1]
+        ret = mat_a.new_empty(
+            shape, dtype=out_dtype if out_dtype is not None else mat_a.dtype)
+        return ret
+
+    @torch.library.register_fake("trtllm::dsv3_router_gemm_op")
+    def _(mat_a, mat_b, bias, out_dtype):
+        shape = list(mat_a.shape)
+        shape[-1] = mat_b.shape[-1]
+        ret = mat_a.new_empty(
+            shape, dtype=out_dtype if out_dtype is not None else mat_a.dtype)
+        return ret
+
+    @torch.library.register_fake("trtllm::dsv3_fused_a_gemm_op")
     def _(mat_a, mat_b, bias, out_dtype):
         shape = list(mat_a.shape)
         shape[-1] = mat_b.shape[-1]
@@ -234,9 +263,22 @@ def _register_fake():
         pass
 
     @torch.library.register_fake("trtllm::moe_load_balance_statistic")
-    def _(single_layer_load_balancer_ptr: int,
-          gathered_raw_expert_ids: torch.Tensor, enabled: torch.Tensor,
-          is_first_stage: bool, is_last_stage: bool):
+    def _(gathered_raw_expert_ids: torch.Tensor, enabled: torch.Tensor,
+          single_layer_load_balancer_ptr: int, is_first_stage: bool,
+          is_last_stage: bool):
+        pass
+
+    @torch.library.register_fake(
+        "trtllm::moe_hierarchical_statistic_local_device")
+    def _(local_raw_expert_ids: torch.Tensor,
+          local_expert_token_count: torch.Tensor, enabled: torch.Tensor,
+          single_layer_load_balancer_ptr: int, is_first_stage: bool,
+          is_last_stage: bool):
+        pass
+
+    @torch.library.register_fake("trtllm::moe_hierarchical_statistic_update")
+    def _(global_expert_token_count: torch.Tensor, enabled: torch.Tensor,
+          single_layer_load_balancer_ptr: int):
         pass
 
     @torch.library.register_fake("trtllm::moe_load_balance_routing")

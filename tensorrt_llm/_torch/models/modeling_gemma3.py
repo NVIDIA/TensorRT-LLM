@@ -8,13 +8,14 @@ from transformers import Gemma3TextConfig
 from transformers.activations import ACT2FN
 
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
                                            PredefinedAttentionMask, RopeParams)
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
-from ..modules.attention import Attention, QkNormType
+from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.linear import Linear, TensorParallelMode
@@ -23,6 +24,31 @@ from ..modules.rms_norm import RMSNorm
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              duplicate_kv_weight, filter_weights,
                              register_auto_model)
+
+
+class Gemma3TextScaledWordEmbedding(Embedding):
+
+    def __init__(
+        self,
+        vocab_size: int,
+        hidden_size: int,
+        dtype: Optional[torch.dtype] = None,
+        mapping: Optional[Mapping] = None,
+        tensor_parallel_mode: Optional[TensorParallelMode] = None,
+        gather_output: bool = False,
+    ):
+        super().__init__(
+            num_embeddings=vocab_size,
+            embedding_dim=hidden_size,
+            dtype=dtype,
+            mapping=mapping,
+            tensor_parallel_mode=tensor_parallel_mode,
+            gather_output=gather_output,
+        )
+        self.embed_scale = torch.sqrt(torch.tensor(hidden_size)).to(self.dtype)
+
+    def forward(self, input_ids):
+        return super().forward(input_ids) * self.embed_scale
 
 
 class Gemma3Attention(Attention):
@@ -53,7 +79,6 @@ class Gemma3Attention(Attention):
             max_position_embeddings=config.max_position_embeddings,
             bias=False,
             pos_embd_params=pos_embd_params,
-            qk_norm_type=QkNormType.pre_rope,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             dense_bias=False,
@@ -71,7 +96,7 @@ class Gemma3Attention(Attention):
 
     def forward(
         self,
-        position_ids: Optional[torch.LongTensor],
+        position_ids: Optional[torch.IntTensor],
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
@@ -112,6 +137,13 @@ class Gemma3Attention(Attention):
         )
 
         return q, k
+
+    def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
+                   v: Optional[torch.Tensor], position_ids: torch.Tensor):
+        # Gemma3 applies QK norm before RoPE.
+        q, k, v = self.split_qkv(q, k, v)
+        q, k = self.apply_qk_norm(q, k)
+        return super().apply_rope(q, k, v, position_ids)
 
 
 class Gemma3MLP(nn.Module):
@@ -177,7 +209,7 @@ class Gemma3DecoderLayer(DecoderLayer):
 
     def forward(
         self,
-        position_ids: torch.LongTensor,
+        position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = None,
@@ -209,9 +241,8 @@ class Gemma3TextModel(DecoderModel):
         super().__init__(model_config)
         config = self.model_config
         self.hidden_size = config.pretrained_config.hidden_size
-        self.padding_idx = config.pretrained_config.pad_token_id
 
-        self.embed_tokens = Embedding(
+        self.embed_tokens = Gemma3TextScaledWordEmbedding(
             config.pretrained_config.vocab_size,
             config.pretrained_config.hidden_size,
             dtype=config.pretrained_config.torch_dtype,
@@ -232,8 +263,8 @@ class Gemma3TextModel(DecoderModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -244,7 +275,6 @@ class Gemma3TextModel(DecoderModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-            inputs_embeds = inputs_embeds * math.sqrt(self.hidden_size)
 
         hidden_states = inputs_embeds.to(self.dtype)
 
@@ -273,8 +303,8 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: torch.LongTensor = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: torch.IntTensor = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: bool = False,
         **kwargs,
