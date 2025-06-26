@@ -2616,6 +2616,7 @@ int AttentionOp::initialize() noexcept
         fmhaParams.attnLogitSoftcappingScale = mAttnLogitSoftcappingScale;
         fmhaParams.hasAlibi = isALiBi();
         fmhaParams.scaleAlibi = isAliBiWithScale();
+	fmhaParams.dataTypeOut = data_type;
 
         // Load kernels from the pre-compiled cubins.
         mFmhaDispatcher.reset(new FmhaDispatcher(fmhaParams));
