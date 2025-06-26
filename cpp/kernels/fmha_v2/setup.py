@@ -3049,8 +3049,9 @@ def get_kernel_traits_code(specs_names):
     return code
 
 
-# For now, only hopper head_size 128 kernel uses cubins, and other kernels use cu files. Unused cubins are removed.
-# If you want to use cu files for these kernels, you can change the condition here.
+# For now, only hopper head_size 128 kernel uses cubins, and other kernels use cu files.
+# You should set the condition `use_cubin_header` to false if you have modified the source code of the FMHA kernels on Hopper (sm90) with head_size 128.
+# This ensures that the kernels will be recompiled using the updated source code rather than relying on precompiled cubins.
 def use_cubin_header(kspec):
     return kspec.sm == 90 and kspec.head_size == 128
 
@@ -3409,6 +3410,9 @@ static const struct TestMetaV2
     return code
 
 
+# This is used to add some kernels running in cubins.
+# The source code of paged context fmha kernels are not in this repo, but we have cubins for them.
+# Other kernels are for passing CI cases.
 def modify_cubin_header(cubin_header):
     # for paged context fmha cases
     target = "#ifndef EXCLUDE_SM_90"
