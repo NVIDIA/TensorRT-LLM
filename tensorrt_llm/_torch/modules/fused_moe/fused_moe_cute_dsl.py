@@ -1,8 +1,11 @@
 import math
+from functools import lru_cache
 from typing import List, Optional, Union
 
 import torch
 import torch.nn.functional as F
+
+from tensorrt_llm._utils import get_sm_version
 
 from ...distributed import allgather
 from ...model_config import ModelConfig
@@ -79,6 +82,79 @@ def cute_dsl_fp8_group_blockwise_gemm_ref(
                                          updated_b[:, :, i])
     ref = ref.to(torch.bfloat16)
     return ref
+
+
+def cute_dsl_fp8_group_blockwise_gemm_ref_blackwell(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_sf: torch.Tensor,
+    b_sf: torch.Tensor,
+    offset_array: torch.Tensor,
+) -> torch.Tensor:
+    m, k = a.shape[0], a.shape[1]
+    l, n, k = b.shape[0], b.shape[1], b.shape[2]
+    num_group, w_n, w_k = b_sf.shape[0], b_sf.shape[1], b_sf.shape[2]
+
+    # Note: view(int8) will cause error.
+    a_tmp = a.as_strided((m, k, 1), (k, 1, m * k))
+    b_tmp = b.permute(1, 2, 0)
+
+    (m + 3) // 4 * 4
+    input_scale_tmp = a_sf.permute(1, 0).as_strided((m, w_k, 1),
+                                                    (1, m, m * w_k))
+
+    weight_scale_tmp = b_sf.permute(1, 2, 0)
+
+    def pad_and_multiply(scale, tensor):
+        cm, ck, _ = scale.shape
+        m, k, _ = tensor.shape
+        IsGroupWise = False
+        IsBlockWise = False
+        if ck == math.ceil(k / 128):
+            IsGroupWise = True
+        if cm == math.ceil(m / 128):
+            IsBlockWise = True
+        if not IsBlockWise and not IsGroupWise:
+            raise ValueError("Only support granularity = 128")
+
+        k_idx = torch.arange(k, device=scale.device)
+        if IsGroupWise:
+            k_idx = k_idx // 128
+        m_idx = torch.arange(m, device=scale.device)
+        if IsBlockWise:
+            m_idx = m_idx // 128
+        expanded_scale = scale[m_idx[:, None], k_idx, :]
+
+        result = expanded_scale * tensor
+
+        return result
+
+    updated_a = pad_and_multiply(input_scale_tmp, a_tmp.to(torch.float32))
+    updated_b = pad_and_multiply(weight_scale_tmp, b_tmp.to(torch.float32))
+
+    ref = torch.zeros((m, n), device="cuda", dtype=torch.float32)
+
+    len_offset_array = offset_array.shape[0]
+    for i in range(len_offset_array - 1):
+        start = offset_array[i]
+        end = offset_array[i + 1]
+        # assert start <= end, f"Invalid group boundaries: start={start} > end={end}"
+        ref[start:end, :] = torch.einsum("mk,nk->mn", updated_a[start:end, :,
+                                                                0],
+                                         updated_b[:, :, i])
+    ref = ref.to(torch.bfloat16)
+    return ref
+
+
+@lru_cache(maxsize=1)
+def select_cute_dsl_fp8_group_blockwise_gemm_ref_by_sm_version():
+    sm_version = get_sm_version()
+    if sm_version >= 100:
+        return cute_dsl_fp8_group_blockwise_gemm_ref_blackwell
+    elif sm_version >= 90:
+        return cute_dsl_fp8_group_blockwise_gemm_ref
+    else:
+        assert False, f"Unsupported SM version for cute_dsl_fp8_group_blockwise_gemm_ref: {sm_version}"
 
 
 class CuteDslFusedMoE(CutlassFusedMoE):
@@ -205,6 +281,9 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 x_sf = reswizzle_sf(x_sf, x_row, x_col,
                                     self.scaling_vector_size)
 
+        group_gemm_ref_func = select_cute_dsl_fp8_group_blockwise_gemm_ref_by_sm_version(
+        )
+
         (
             unpermuted_token_selected_experts_tensor,
             unpermuted_source_token_ids_tensor,
@@ -235,7 +314,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
 
         act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
             permuted_data_tensor)
-        h1 = cute_dsl_fp8_group_blockwise_gemm_ref(
+        h1 = group_gemm_ref_func(
             a=act_input_fp8,
             b=self.w3_w1_weight.view(weight_dtype),
             a_sf=act_input_sf,
@@ -244,7 +323,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         )
         h2 = swiglu_fused_moe(h1)
         act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(h2)
-        h3 = cute_dsl_fp8_group_blockwise_gemm_ref(
+        h3 = group_gemm_ref_func(
             a=act_input_fp8,
             b=self.w2_weight.view(weight_dtype),
             a_sf=act_input_sf,

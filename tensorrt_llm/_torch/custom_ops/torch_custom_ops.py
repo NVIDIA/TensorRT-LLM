@@ -1,4 +1,3 @@
-import sys
 from functools import lru_cache
 from typing import List, Optional, Tuple
 
@@ -17,10 +16,10 @@ from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
 from ..utils import (compute_swizzled_sf_shape, fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2)
-
-sys.path.append(
-    '/home/lmin/scratch/trt-dkg/cutlass_ir/compiler/python/examples/hopper')
-from blockwise_gemm import HopperBlockwiseGemmKernel
+# sys.path.append(
+#     '/home/lmin/scratch/trt-dkg/cutlass_ir/compiler/python/examples/hopper')
+# from blockwise_gemm import HopperBlockwiseGemmKernel
+from .cute_dsl_blackwell_kernel.blockwise_gemm import BlockwiseGemmKernel
 
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
@@ -590,11 +589,30 @@ def pad_up(x: int, y: int) -> int:
     return ((x + y - 1) // y) * y
 
 
+# for hopper linear shape inference
 def cute_dsl_fp8_scale_infer_shape(input_shapes: List[List[int]]):
     """Calculate the dimensions of the fp4 scale tensor.
     """
     m, k = input_shapes[0]
     scale_shape = pad_up(pad_up(m, 4) * div_up(k, 128) * 4, 128) // 4
+    return scale_shape
+
+
+# for blackwell linear shape inference
+def cute_dsl_fp8_linear_scale_infer_shape_blackwell(
+        input_shapes: List[List[int]]):
+    """Calculate the dimensions of the fp4 scale tensor.
+    """
+    m, k = input_shapes[0]
+    scale_shape = m
+    return scale_shape
+
+
+# for blackwell bmm shape inference
+def cute_dsl_fp8_bmm_scale_infer_shape_blackwell(input_shapes: List[List[int]]):
+    l, m, k = input_shapes[0]
+    # scale_shape = [l, k//128, m]
+    scale_shape = pad_up(pad_up(m, 4) * div_up(k * l, 128) * 4, 128) // 4
     return scale_shape
 
 
@@ -729,8 +747,7 @@ class CuteDSLFp8Linear(TunableRunner):
         cache_key = (tile_shape_mnk, cluster_shape_mnk)
         if cache_key not in CuteDSLFp8Linear.kernel_dict:
             gemm = HopperBlockwiseGemmKernel(
-                # acc_dtype,  # acc_dtype,
-                cutlass.Float32,
+                cutlass.Float32,  # acc_dtype,
                 tile_shape_mnk=tile_shape_mnk,
                 cluster_shape_mnk=cluster_shape_mnk,
             )
@@ -765,7 +782,6 @@ class CuteDSLFp8Linear(TunableRunner):
         last_positive_power_of_2), ),
     constraint_specs=(ConstraintSpec(2, 0, cute_dsl_fp8_scale_infer_shape), ),
     configs={
-        # 'acc_dtype': [torch.float],
         'tile_shape_mnk': [(64, 128, 128), (128, 128, 128)],
         'cluster_shape_mnk': [(1, 1, 1), (2, 2, 1), (1, 4, 1), (4, 4, 1)]
     },
@@ -807,6 +823,489 @@ def _(
     # TODO: output is fixed as bf16?
     ret = mat_a.new_empty(shape, dtype=torch.bfloat16)
     return ret
+
+
+class CuteDSLFp8BlackwellLinear(TunableRunner):
+    kernel_dict = dict()
+
+    def __init__(self):
+        super().__init__()
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+        use_2cta_instrs: bool = False,
+        mma_tiler_mn: Tuple[int, int] = (128, 128),
+        cluster_shape_mn: Tuple[int, int] = (1, 1),
+        use_tma_store: bool = True,
+        **kwargs,
+    ) -> List[int]:
+        m = inputs[0].shape[0]
+        n = inputs[1].shape[0]
+        k = inputs[0].shape[1]
+        l = 1
+        # m,k
+        a_major = 'k'
+        # n, k
+        b_major = 'k'
+        # m, n
+        c_major = 'n'
+        is_valid = BlockwiseGemmKernel.can_implement(
+            cutlass.Float8E4M3FN,  #ab_dtype,
+            cutlass.Float32,  #acc_dtype,
+            cutlass.BFloat16,  #c_dtype,
+            use_2cta_instrs,
+            mma_tiler_mn,
+            cluster_shape_mn,
+            use_tma_store,
+            m,
+            n,
+            k,
+            l,
+            a_major,
+            b_major,
+            c_major,
+        )
+        if is_valid:
+            return [0]
+        else:
+            return []
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        use_2cta_instrs: bool = False,
+        mma_tiler_mn: Tuple[int, int] = (128, 128),
+        cluster_shape_mn: Tuple[int, int] = (1, 1),
+        use_tma_store: bool = True,
+        tactic: int = -1,
+    ) -> torch.Tensor:
+        """Performs linear operation using cute-dsl with autotuning.
+
+        :param a: Input tensor of shape (M, K)
+        :type a: torch.Tensor, type: fp8
+        :param b: Weight tensor of shape (N, K)
+        :type b: torch.Tensor, type: fp8
+        :param a_sf: Input scale tensor of shape (P). P is computed by the following formula:
+            P = (div_up(shape_m_4_align * div_up(shape_k, 128) * sizeof(float), 128) * 128)/sizeof(float)
+        :type a_sf: torch.Tensor, type: fp32
+        :param b_sf: Weight scale tensor of shape (w_n, w_k)
+        :type b_sf: torch.Tensor, type: fp32
+
+        :return: Output tensor of shape (M, N)
+        :rtype: torch.Tensor, type: bf16
+        """
+        a, b, a_sf, b_sf = inputs
+        m, n, k = a.shape[0], b.shape[0], a.shape[1]
+        w_n, w_k = b_sf.shape[0], b_sf.shape[1]
+        c = torch.empty(*(m, n), dtype=torch.bfloat16, device="cuda")
+        # print(f"limin: m = {m}, n = {n}, k = {k}, w_n = {w_n}, w_k = {w_k}")
+        # print("limin: a.dtype = ", a.dtype)
+        # print("limin: b.dtype = ", b.dtype)
+        # print("limin: a_sf.dtype = ", a_sf.dtype)
+        # print("limin: b_sf.dtype = ", b_sf.dtype)
+        # print(f"limin: a.shape = {a.shape}, a.stride = {a.stride()}")
+        # print(f"limin: b.shape = {b.shape}, b.stride = {b.stride()}")
+        # print(f"limin: a_sf.shape = {a_sf.shape}, a_sf.stride = {a_sf.stride()}")
+        # print(f"limin: b_sf.shape = {b_sf.shape}, b_sf.stride = {b_sf.stride()}")
+
+        # torch_tensor -> cute.tensor
+        a_tmp = a.as_strided((m, k, 1), (k, 1, m * k)).view(torch.uint8)
+        b_tmp = b.as_strided((n, k, 1), (k, 1, n * k)).view(torch.uint8)
+        c_tmp = c.as_strided((m, n, 1), (n, 1, m * n))
+
+        weight_scale_tmp = b_sf.as_strided((w_n, w_k, 1), (w_k, 1, w_n * w_k))
+
+        # m_padded = pad_up(m, 4)
+        # input_scale_tmp = a_sf[0:m_padded * w_k]
+        # # print(f"limin: 0, input_scale_tmp.shape = {input_scale_tmp.shape}, input_scale_tmp.stride = {input_scale_tmp.stride()}")
+        # input_scale_tmp = input_scale_tmp.reshape(-1, m_padded)
+        # # print(f"limin: 1, input_scale_tmp.shape = {input_scale_tmp.shape}, input_scale_tmp.stride = {input_scale_tmp.stride()}")
+        # input_scale_tmp = input_scale_tmp[:w_k, :m_padded].contiguous().permute(
+        #     1, 0)
+        # # print(f"limin: 2, input_scale_tmp.shape = {input_scale_tmp.shape}, input_scale_tmp.stride = {input_scale_tmp.stride()}")
+        # input_scale_tmp = input_scale_tmp.as_strided(
+        #     (m_padded, w_k, 1), (1, m_padded, m_padded * w_k))
+        # # print(f"limin: 3, input_scale_tmp.shape = {input_scale_tmp.shape}, input_scale_tmp.stride = {input_scale_tmp.stride()}")
+        # [xx, m]
+        input_scale_tmp = a_sf.permute(1, 0).as_strided((m, w_k, 1),
+                                                        (1, m, w_k * m))
+        # print(f"limin: input_scale_tmp.shape = {input_scale_tmp.shape}, input_scale_tmp.stride = {input_scale_tmp.stride()}")
+        # print(f"limin: use_2cta_instrs = {use_2cta_instrs}, mma_tiler_mn = {mma_tiler_mn}, cluster_shape_mn = {cluster_shape_mn}, use_tma_store = {use_tma_store}")
+
+        mA = from_dlpack(a_tmp,
+                         assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        mB = from_dlpack(b_tmp,
+                         assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        mC = from_dlpack(c_tmp,
+                         assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        mA.element_type = cutlass.Float8E4M3FN
+        mB.element_type = cutlass.Float8E4M3FN
+
+        # TODO: mSFA is column major
+        mSFA = from_dlpack(input_scale_tmp,
+                           assumed_align=16).mark_layout_dynamic(leading_dim=0)
+        mSFB = from_dlpack(weight_scale_tmp,
+                           assumed_align=16).mark_layout_dynamic(leading_dim=1)
+
+        # print(f"limin: mA.shape = {mA.shape}, mA.stride = {mA.stride}")
+        # print(f"limin: mB.shape = {mB.shape}, mB.stride = {mB.stride}")
+        # print(f"limin: mC.shape = {mC.shape}, mC.stride = {mC.stride}")
+        # print(f"limin: mSFA.shape = {mSFA.shape}, mSFA.stride = {mSFA.stride}")
+        # print(f"limin: mSFB.shape = {mSFB.shape}, mSFB.stride = {mSFB.stride}")
+        # get stream
+        torch_stream = torch.cuda.current_stream()
+        stream = cuda.CUstream(torch_stream.cuda_stream)
+
+        cache_key = (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn,
+                     use_tma_store)
+        if cache_key not in CuteDSLFp8BlackwellLinear.kernel_dict:
+            # gemm = BlockwiseGemmKernel(
+            #     # acc_dtype,  # acc_dtype,
+            #     cutlass.Float32,
+            #     use_2cta_instrs=False,
+            #     mma_tiler_mn=(128, 128),
+            #     cluster_shape_mn=(1, 1),
+            #     use_tma_store=True,
+            # )
+            gemm = BlockwiseGemmKernel(
+                cutlass.Float32,  # acc_dtype,
+                use_2cta_instrs=use_2cta_instrs,
+                mma_tiler_mn=mma_tiler_mn,
+                cluster_shape_mn=cluster_shape_mn,
+                use_tma_store=use_tma_store,
+            )
+            # Compute max active clusters on current device
+            hardware_info = cutlass.utils.HardwareInfo()
+            max_active_clusters = hardware_info.get_max_active_clusters(
+                cluster_shape_mn[0] * cluster_shape_mn[1])
+            # max_active_clusters = 148
+            compiled_gemm = cute.compile(
+                gemm,
+                mA,
+                mB,
+                mC,
+                mSFA,
+                mSFB,
+                max_active_clusters,
+                stream,
+            )
+            CuteDSLFp8BlackwellLinear.kernel_dict[cache_key] = compiled_gemm
+        else:
+            compiled_gemm = CuteDSLFp8BlackwellLinear.kernel_dict[cache_key]
+
+        # launch gemm kernel
+        compiled_gemm(mA, mB, mC, mSFA, mSFB, stream)
+
+        return c
+
+
+# ### a/b: fp8, scale: fp32 -> bf16
+@torch.library.custom_op("trtllm::cute_dsl_fp8_gemm_blackwell",
+                         mutates_args=(),
+                         device_types="cuda")
+@autotuner.tuning_config(
+    name="trtllm::cute_dsl_fp8_gemm_blackwell::gemm",
+    dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, get_last_power_of_2_num_tokens_buckets,
+        last_positive_power_of_2), ),
+    # constraint_specs=(ConstraintSpec(2, 0, cute_dsl_fp8_scale_infer_shape), ),
+    constraint_specs=(ConstraintSpec(
+        2, 1, cute_dsl_fp8_linear_scale_infer_shape_blackwell), ),
+    configs={
+        'use_2cta_instrs': [False],
+        'mma_tiler_mn': [(128, 128)],
+        'cluster_shape_mn': [(1, 1), (1, 2), (1, 4), (2, 1), (2, 2), (4, 1),
+                             (4, 4)],
+        # 'cluster_shape_mn': [(1, 1)],
+        'use_tma_store': [True],
+    },
+)
+def cute_dsl_fp8_gemm_blackwell(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    tuner = AutoTuner.get()
+
+    # allocate workspace for profiling
+    cute_dsl_fp8_gemm_blackwell_runner = CuteDSLFp8BlackwellLinear()
+
+    _, best_tactic, best_config = tuner.choose_one(
+        "trtllm::cute_dsl_fp8_gemm_blackwell::gemm",
+        [cute_dsl_fp8_gemm_blackwell_runner],
+        [input, weight, input_scale, weight_scale],
+    )
+
+    return cute_dsl_fp8_gemm_blackwell_runner(
+        inputs=[input, weight, input_scale, weight_scale],
+        tactic=best_tactic,
+        **best_config)
+
+    # cute_dsl_fp8_gemm_blackwell_runner = CuteDSLFp8BlackwellLinear()
+    # return cute_dsl_fp8_gemm_blackwell_runner(
+    #     inputs=[input, weight, input_scale, weight_scale],
+    #     tactic=0,
+    #     use_2cta_instrs=False,
+    #     mma_tiler_mn=(128, 128),
+    #     cluster_shape_mn=(1, 1),
+    #     use_tma_store=True,
+    # )
+
+
+@torch.library.register_fake("trtllm::cute_dsl_fp8_gemm_blackwell")
+def _(
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+):
+    # [m, k]
+    shape = [i for i in mat_a.shape]
+    # [n, k]
+    shape[-1] = mat_b.shape[-2]
+    # TODO: output is fixed as bf16?
+    ret = mat_a.new_empty(shape, dtype=torch.bfloat16)
+    return ret
+
+
+class CuteDSLFp8BlackwellBmm(TunableRunner):
+    kernel_dict = dict()
+
+    def __init__(self):
+        super().__init__()
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+        use_2cta_instrs: bool = False,
+        mma_tiler_mn: Tuple[int, int] = (128, 128),
+        cluster_shape_mn: Tuple[int, int] = (1, 1),
+        use_tma_store: bool = True,
+        **kwargs,
+    ) -> List[int]:
+        # [b, m, k]
+        l, m, k = inputs[0].shape[0], inputs[0].shape[1], inputs[0].shape[2]
+        # [b, n, k]
+        n = inputs[1].shape[1]
+        # m,k
+        a_major = 'k'
+        # n, k
+        b_major = 'k'
+        # m, n
+        c_major = 'n'
+        is_valid = BlockwiseGemmKernel.can_implement(
+            cutlass.Float8E4M3FN,  #ab_dtype,
+            cutlass.Float32,  #acc_dtype,
+            cutlass.BFloat16,  #c_dtype,
+            use_2cta_instrs,
+            mma_tiler_mn,
+            cluster_shape_mn,
+            use_tma_store,
+            m,
+            n,
+            k,
+            l,
+            a_major,
+            b_major,
+            c_major,
+        )
+        if is_valid:
+            return [0]
+        else:
+            return []
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        use_2cta_instrs: bool = False,
+        mma_tiler_mn: Tuple[int, int] = (128, 128),
+        cluster_shape_mn: Tuple[int, int] = (1, 1),
+        use_tma_store: bool = True,
+        tactic: int = -1,
+    ) -> None:
+        """Performs linear operation using cute-dsl with autotuning.
+
+        :param a: Input tensor of shape (M, K)
+        :type a: torch.Tensor, type: fp8
+        :param b: Weight tensor of shape (N, K)
+        :type b: torch.Tensor, type: fp8
+        :param a_sf: Input scale tensor of shape (P). P is computed by the following formula:
+            P = (div_up(shape_m_4_align * div_up(shape_k, 128) * sizeof(float), 128) * 128)/sizeof(float)
+        :type a_sf: torch.Tensor, type: fp32
+        :param b_sf: Weight scale tensor of shape (w_n, w_k)
+        :type b_sf: torch.Tensor, type: fp32
+
+        :return: Output tensor of shape (M, N)
+        :rtype: torch.Tensor, type: bf16
+        """
+        a, b, a_sf, b_sf, c = inputs
+        l, m, n, k = a.shape[0], a.shape[1], b.shape[1], b.shape[2]
+        w_n, w_k = b_sf.shape[1], b_sf.shape[2]
+        if c.dtype != torch.bfloat16:
+            assert False, "c.dtype != bf16"
+        if c.shape != (l, m, n):
+            assert False, "c.shape != (l, m, n)"
+        # print(f"limin: a.shape = {a.shape}, a.stride = {a.stride()}")
+        # print(f"limin: b.shape = {b.shape}, b.stride = {b.stride()}")
+        # print(f"limin: a_sf.shape = {a_sf.shape}, a_sf.stride = {a_sf.stride()}")
+        # print(f"limin: b_sf.shape = {b_sf.shape}, b_sf.stride = {b_sf.stride()}")
+        # print(f"limin: c.shape = {c.shape}, c.stride = {c.stride()}")
+
+        # torch_tensor -> cute.tensor
+        # a_tmp = a.as_strided((m, k, 1), (k, 1, m * k)).view(torch.uint8)
+        # b_tmp = b.as_strided((n, k, 1), (k, 1, n * k)).view(torch.uint8)
+        # c_tmp = c.as_strided((m, n, 1), (n, 1, m * n))
+        a_tmp = a.permute(1, 2, 0).view(torch.uint8)
+        b_tmp = b.permute(1, 2, 0).view(torch.uint8)
+        c_tmp = c.permute(1, 2, 0)
+
+        # weight_scale_tmp = b_sf.as_strided((w_n, w_k, 1), (w_k, 1, w_n * w_k))
+        weight_scale_tmp = b_sf.permute(1, 2, 0)
+
+        # input_scale_tmp = a_sf.permute(1, 0).as_strided((m, w_k, 1), (1, m, w_k * m))
+        # NO: [l, w_k, m] -> [m, w_k, l], (2, 1, 0)
+        # div_up(shape_m_4_align * div_up(shape_k, 128) * sizeof(float), 128) * 128/sizeof(float);
+        # // input: [m, b, n]
+        # output: [b, m, n], scales: [b, n/128, padding(m)]
+
+        m_padded = pad_up(m, 4)
+        input_scale_tmp = a_sf[0:m_padded * w_k * l]
+        # print(f"limin: 0, input_scale_tmp.shape = {input_scale_tmp.shape}, input_scale_tmp.stride = {input_scale_tmp.stride()}")
+        input_scale_tmp = input_scale_tmp.reshape(l, -1, m_padded)
+        # print(f"limin: 1, input_scale_tmp.shape = {input_scale_tmp.shape}, input_scale_tmp.stride = {input_scale_tmp.stride()}")
+        input_scale_tmp = input_scale_tmp[:l, :w_k, :m].contiguous().permute(
+            2, 1, 0)
+        # print(f"limin: 2, input_scale_tmp.shape = {input_scale_tmp.shape}, input_scale_tmp.stride = {input_scale_tmp.stride()}")
+
+        mA = from_dlpack(a_tmp,
+                         assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        mB = from_dlpack(b_tmp,
+                         assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        mC = from_dlpack(c_tmp,
+                         assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        mA.element_type = cutlass.Float8E4M3FN
+        mB.element_type = cutlass.Float8E4M3FN
+
+        # TODO: mSFA is column major
+        mSFA = from_dlpack(input_scale_tmp,
+                           assumed_align=16).mark_layout_dynamic(leading_dim=0)
+        mSFB = from_dlpack(weight_scale_tmp,
+                           assumed_align=16).mark_layout_dynamic(leading_dim=1)
+
+        # print(f"limin: mA.shape = {mA.shape}, mA.stride = {mA.stride}")
+        # print(f"limin: mB.shape = {mB.shape}, mB.stride = {mB.stride}")
+        # print(f"limin: mC.shape = {mC.shape}, mC.stride = {mC.stride}")
+        # print(f"limin: mSFA.shape = {mSFA.shape}, mSFA.stride = {mSFA.stride}")
+        # print(f"limin: mSFB.shape = {mSFB.shape}, mSFB.stride = {mSFB.stride}")
+        # get stream
+        torch_stream = torch.cuda.current_stream()
+        stream = cuda.CUstream(torch_stream.cuda_stream)
+
+        cache_key = (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn,
+                     use_tma_store)
+        if cache_key not in CuteDSLFp8BlackwellBmm.kernel_dict:
+            gemm = BlockwiseGemmKernel(
+                cutlass.Float32,  # acc_dtype,
+                use_2cta_instrs=use_2cta_instrs,
+                mma_tiler_mn=mma_tiler_mn,
+                cluster_shape_mn=cluster_shape_mn,
+                use_tma_store=use_tma_store,
+            )
+            # Compute max active clusters on current device
+            hardware_info = cutlass.utils.HardwareInfo()
+            max_active_clusters = hardware_info.get_max_active_clusters(
+                cluster_shape_mn[0] * cluster_shape_mn[1])
+            # max_active_clusters = 148
+            compiled_gemm = cute.compile(
+                gemm,
+                mA,
+                mB,
+                mC,
+                mSFA,
+                mSFB,
+                max_active_clusters,
+                stream,
+            )
+            CuteDSLFp8BlackwellBmm.kernel_dict[cache_key] = compiled_gemm
+        else:
+            compiled_gemm = CuteDSLFp8BlackwellBmm.kernel_dict[cache_key]
+
+        # launch gemm kernel
+        compiled_gemm(mA, mB, mC, mSFA, mSFB, stream)
+
+
+# ### a/b: fp8, scale: fp32 -> bf16
+@torch.library.custom_op("trtllm::cute_dsl_fp8_bmm_blackwell",
+                         mutates_args=(),
+                         device_types="cuda")
+@autotuner.tuning_config(
+    name="trtllm::cute_dsl_fp8_bmm_blackwell::gemm",
+    dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 1, get_last_power_of_2_num_tokens_buckets,
+        last_positive_power_of_2), ),
+    constraint_specs=(ConstraintSpec(
+        2, 0, cute_dsl_fp8_bmm_scale_infer_shape_blackwell), ),
+    configs={
+        'use_2cta_instrs': [False],
+        'mma_tiler_mn': [(128, 128)],
+        'cluster_shape_mn': [(1, 1), (1, 2), (1, 4), (2, 1), (2, 2), (4, 1),
+                             (4, 4)],
+        # 'cluster_shape_mn': [(1, 1)],
+        'use_tma_store': [True],
+    },
+)
+def cute_dsl_fp8_bmm_blackwell(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    tuner = AutoTuner.get()
+
+    # allocate workspace for profiling
+    cute_dsl_fp8_bmm_blackwell_runner = CuteDSLFp8BlackwellBmm()
+
+    _, best_tactic, best_config = tuner.choose_one(
+        "trtllm::cute_dsl_fp8_bmm_blackwell::gemm",
+        [cute_dsl_fp8_bmm_blackwell_runner],
+        [input, weight, input_scale, weight_scale, out],
+    )
+
+    cute_dsl_fp8_bmm_blackwell_runner(
+        inputs=[input, weight, input_scale, weight_scale, out],
+        tactic=best_tactic,
+        **best_config)
+
+    # cute_dsl_fp8_bmm_blackwell_runner = CuteDSLFp8BlackwellBmm()
+    # cute_dsl_fp8_bmm_blackwell_runner(
+    #     inputs=[input, weight, input_scale, weight_scale, out],
+    #     tactic=0,
+    #     use_2cta_instrs=False,
+    #     mma_tiler_mn=(128, 128),
+    #     cluster_shape_mn=(1, 1),
+    #     use_tma_store=True)
+
+
+@torch.library.register_fake("trtllm::cute_dsl_fp8_bmm_blackwell")
+def _(
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    l, m, k = mat_a.shape[0], mat_a.shape[1], mat_a.shape[2]
+    n = mat_b.shape[1]
+    if out.dtype != torch.bfloat16:
+        assert False, "out.dtype != bf16"
+    if out.shape != (l, m, n):
+        assert False, "out.shape != (l, m, n)"
+    # return out
 
 
 @torch.library.custom_op("trtllm::attention", mutates_args=())

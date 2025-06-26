@@ -978,10 +978,14 @@ class MLA(nn.Module):
         elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
             q_nope_fp8, q_nope_scales = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
                 q_nope)
+            # print(f"limin: q_node.shape = {q_nope.shape}, q_nope_fp8.shape = {q_nope_fp8.shape}, q_nope_fp8.stride = {q_nope_fp8.stride()}, q_nope_scales.shape = {q_nope_scales.shape}, q_nope_scales.stride = {q_nope_scales.stride()}")
             # [num_heads, num_tokens, self.kv_lora_rank]
             q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
 
-            torch.ops.trtllm.fp8_block_scaling_bmm_out(
+            # torch.ops.trtllm.fp8_block_scaling_bmm_out(
+            #     q_nope_fp8, self.k_b_proj_trans, q_nope_scales,
+            #     self.k_b_proj_trans_scale, q_nope_out)
+            torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(
                 q_nope_fp8, self.k_b_proj_trans, q_nope_scales,
                 self.k_b_proj_trans_scale, q_nope_out)
             q_nope_scales = None
@@ -1036,7 +1040,10 @@ class MLA(nn.Module):
             attn_out_latent, attn_out_latent_scales = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
                 attn_out_latent)
 
-            torch.ops.trtllm.fp8_block_scaling_bmm_out(
+            # torch.ops.trtllm.fp8_block_scaling_bmm_out(
+            #     attn_out_latent, self.v_b_proj, attn_out_latent_scales,
+            #     self.v_b_proj_scale, attn_output.transpose(0, 1))
+            torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(
                 attn_out_latent, self.v_b_proj, attn_out_latent_scales,
                 self.v_b_proj_scale, attn_output.transpose(0, 1))
             attn_out_latent_scales = None

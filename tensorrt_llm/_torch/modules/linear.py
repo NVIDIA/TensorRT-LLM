@@ -4,6 +4,7 @@ import enum
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Dict, List, Optional, Union
 
 import torch
@@ -13,12 +14,26 @@ from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy)
 from tensorrt_llm.mapping import Mapping
 
 from ...models.modeling_utils import QuantConfig
 from ..utils import Fp4QuantizedTensor
+
+
+@lru_cache(maxsize=1)
+def select_cute_dsl_fp8_gemm_by_sm_version():
+    """Select different GEMM implementations based on SM version"""
+    sm_version = get_sm_version()
+
+    if sm_version >= 100:  # Blackwell (SM100+)
+        return torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell
+    elif sm_version >= 90:  # Hopper (SM90)
+        return torch.ops.trtllm.cute_dsl_fp8_gemm
+    else:  # Other architectures, use default implementation
+        assert False, f"Unsupported SM version for cute_dsl_fp8_gemm: {sm_version}"
 
 
 class WeightMode(str, enum.Enum):
@@ -416,9 +431,15 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
 
         # output = torch.ops.trtllm.fp8_block_scaling_gemm(
         #     act_input_fp8, module.weight, act_input_sf, module.weight_scale)
-        output = torch.ops.trtllm.cute_dsl_fp8_gemm(act_input_fp8,
-                                                    module.weight, act_input_sf,
-                                                    module.weight_scale)
+        # output = torch.ops.trtllm.cute_dsl_fp8_gemm(act_input_fp8,
+        #                                             module.weight, act_input_sf,
+        #                                             module.weight_scale)
+        # output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(act_input_fp8,
+        #                                             module.weight, act_input_sf,
+        #                                             module.weight_scale)
+        cute_dsl_fp8_gemm_func = select_cute_dsl_fp8_gemm_by_sm_version()
+        output = cute_dsl_fp8_gemm_func(act_input_fp8, module.weight,
+                                        act_input_sf, module.weight_scale)
         if bias is not None:
             output = output + bias
         return output
