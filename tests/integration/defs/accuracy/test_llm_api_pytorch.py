@@ -1093,10 +1093,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=kv_cache_reuse)
-        pytorch_config = dict(
-            disable_overlap_scheduler=not overlap_scheduler,
-            use_cuda_graph=False,
-        )
+        pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler, )
         mtp_config = None
 
         if quant_dtype == "none":
@@ -1118,7 +1115,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                   max_num_tokens=512,
                   **pytorch_config,
                   quant_config=quant_config,
-                  enable_attention_dp=False,
+                  enable_attention_dp=True,
                   speculative_config=mtp_config)
 
         if quant_dtype == "fp8":
