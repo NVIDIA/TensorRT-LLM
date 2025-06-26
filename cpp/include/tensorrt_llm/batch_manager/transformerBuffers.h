@@ -17,7 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/common.h"
-#include "tensorrt_llm/batch_manager/kvCacheConfig.h"
+#include "tensorrt_llm/batch_manager/kvCacheType.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
@@ -43,7 +43,6 @@ public:
     using SizeType32 = runtime::SizeType32;
     using TensorPtr = runtime::ITensor::SharedPtr;
     using TensorMap = runtime::StringPtrMap<runtime::ITensor>;
-    using KvCacheType = batch_manager::kv_cache_manager::CacheType;
 
     static constexpr auto kCrossAttentionMaskTensorName = "cross_attention_mask";
     static constexpr auto kCrossAttentionPackedMaskTensorName = "cross_attention_packed_mask";

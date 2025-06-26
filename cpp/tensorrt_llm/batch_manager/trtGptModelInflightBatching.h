@@ -18,7 +18,7 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/common.h"
-#include "tensorrt_llm/batch_manager/kvCacheConfig.h"
+#include "tensorrt_llm/batch_manager/kvCacheType.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
@@ -114,7 +114,7 @@ class TrtGptModelInflightBatching : public TrtGptModel
     using OffsetTableDimensions = kv_cache_manager::OffsetTableDimensions;
     using KVCacheManager = kv_cache_manager::KVCacheManager;
     using KvCacheType = kv_cache_manager::CacheType;
-    using KvCacheConfig = kv_cache_manager::KvCacheConfig;
+    using KvCacheConfig = executor::KvCacheConfig;
     using RnnStateManager = rnn_state_manager::RnnStateManager;
     using LlmRequestPtr = std::shared_ptr<batch_manager::LlmRequest>;
 
