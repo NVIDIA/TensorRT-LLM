@@ -6,6 +6,7 @@ from typing import Optional
 
 import torch
 
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -388,6 +389,23 @@ class TrtllmAttentionWrapper:
             # output is provided, expect output_sf be provided as well if has NVFP4 output.
             assert out_dtype is None or out_dtype != torch.uint8 or output_sf is not None
 
+        # packing parameters to avoid maxing out 64 arguments
+        rotary_embedding_scales = [
+            self.rotary_embedding_scale, self.rotary_embedding_short_m_scale,
+            self.rotary_embedding_long_m_scale
+        ]
+        rotary_embedding_max_position_info = [
+            self.rotary_embedding_max_positions,
+            self.rotary_embedding_original_max_positions
+        ]
+        spec_decoding_bool_params = [
+            self.is_spec_decoding_enabled, self.use_spec_decoding
+        ]
+        spec_decoding_tensor_params = [
+            self.spec_decoding_generation_lengths,
+            self.spec_decoding_position_offsets, self.spec_decoding_packed_mask
+        ]
+
         torch.ops.trtllm.attention_inplace(
             q,
             k,
@@ -434,15 +452,8 @@ class TrtllmAttentionWrapper:
             self.rotary_embedding_dim,
             self.rotary_embedding_base,
             self.rotary_embedding_scale_type,
-            [
-                self.rotary_embedding_scale,
-                self.rotary_embedding_short_m_scale,
-                self.rotary_embedding_long_m_scale
-            ],
-            [
-                self.rotary_embedding_max_positions,
-                self.rotary_embedding_original_max_positions
-            ],
+            rotary_embedding_scales,
+            rotary_embedding_max_position_info,
             self.use_paged_context_fmha,
             self.attention_input_type,
             self.is_mla_enable,
@@ -457,12 +468,8 @@ class TrtllmAttentionWrapper:
             self.mla_context_kv_cache_block_offsets,
             self.attention_chunk_size,
             self.softmax_stats_tensor,
-            [self.is_spec_decoding_enabled, self.use_spec_decoding],
-            [
-                self.spec_decoding_generation_lengths,
-                self.spec_decoding_position_offsets,
-                self.spec_decoding_packed_mask
-            ],
+            spec_decoding_bool_params,
+            spec_decoding_tensor_params,
         )
 
         # reset the planned states (especially tensors) to avoid memory leak
@@ -893,7 +900,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     def update_spec_dec_param(self, is_spec_decoding_enabled, is_spec_dec_tree,
                               is_spec_dec_dynamic_tree, max_draft_tokens):
         # spec_dec mode should only be enabled for pre-Blackwell machines and when there's a spec-dec tree.
-        self.is_spec_decoding_enabled = is_spec_decoding_enabled
+        self.is_spec_decoding_enabled = is_spec_decoding_enabled and get_sm_version(
+        ) < 100
 
         # use_spec_decoding is default to true by default, change in runtime by layers / requests
         self.use_spec_decoding = self.is_spec_decoding_enabled
@@ -901,29 +909,29 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.is_spec_dec_tree = is_spec_dec_tree
         self.is_spec_dec_dynamic_tree = is_spec_dec_dynamic_tree
 
-        self.spec_decoding_position_offsets = torch.empty(
-            [self.max_num_requests, max_draft_tokens + 1],
-            dtype=torch.int,
-            device='cuda',
-        )
-
-        self.spec_decoding_packed_mask = torch.empty(
-            [
-                self.max_num_requests, max_draft_tokens + 1,
-                math.ceil(max_draft_tokens / 32)
-            ],
-            dtype=torch.int,
-            device='cuda',
-        )
-
-        self.spec_decoding_generation_lengths = torch.empty(
-            [self.max_num_requests],
-            dtype=torch.int,
-            device='cuda',
-        )
-
         # Parameters can be fixed and not changed during runtime if the
         if self.is_spec_decoding_enabled:
+            self.spec_decoding_position_offsets = torch.empty(
+                [self.max_num_requests, max_draft_tokens + 1],
+                dtype=torch.int,
+                device='cuda',
+            )
+
+            self.spec_decoding_packed_mask = torch.empty(
+                [
+                    self.max_num_requests, max_draft_tokens + 1,
+                    math.ceil(max_draft_tokens / 32)
+                ],
+                dtype=torch.int,
+                device='cuda',
+            )
+
+            self.spec_decoding_generation_lengths = torch.empty(
+                [self.max_num_requests],
+                dtype=torch.int,
+                device='cuda',
+            )
+
             if self.is_spec_dec_dynamic_tree:
                 assert False, "currently dynamic tree is not supported"
             else:
