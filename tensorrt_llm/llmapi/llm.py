@@ -530,8 +530,6 @@ class BaseLLM:
                     f"PyTorch backend currently only supports `logprobs=1`. Received `logprobs={sampling_params.logprobs}` (Top{sampling_params.logprobs} logprobs). Please set `logprobs=1` in `sampling_params` instead."
                 )
             return
-        elif self.args.backend == "_autodeploy":
-            return
 
         build_config = self.args.build_config
 
