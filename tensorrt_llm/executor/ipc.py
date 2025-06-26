@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import hmac
 import os
@@ -186,6 +187,9 @@ class ZeroMqQueue:
     async def get_async(self) -> Any:
         self.setup_lazily()
         return await self._recv_data_async()
+
+    async def get_async_noblock(self, timeout: float = 0.5) -> Any:
+        return await asyncio.wait_for(self.get_async(), timeout)
 
     def close(self):
         if self.socket:
