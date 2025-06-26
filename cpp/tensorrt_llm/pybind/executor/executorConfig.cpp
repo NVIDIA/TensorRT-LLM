@@ -119,8 +119,8 @@ void initConfigBindings(nanobind::module_& m)
             nb::cast<std::optional<std::vector<SizeType32>>>(state[2]), nb::cast<std::optional<SizeType32>>(state[3]),
             nb::cast<std::optional<float>>(state[4]), nb::cast<std::optional<size_t>>(state[5]),
             nb::cast<bool>(state[6]), nb::cast<std::optional<float>>(state[7]),
-            nb::cast<std::optional<tle::RetentionPriority>>(state[8]), nb::cast<size_t>(state[9]), std::nullopt,
-            nb::cast<bool>(state[10]), nb::cast<bool>(state[11]), state[12].cast<bool>());
+            nb::cast<std::optional<tle::RetentionPriority>>(state[8]), nb::cast<size_t>(state[9]),
+            nb::cast<bool>(state[10]), nb::cast<bool>(state[11]), nb::cast<bool>(state[12]));
     };
     nb::class_<tle::KvCacheConfig>(m, "KvCacheConfig")
         .def(nb::init<bool, std::optional<SizeType32> const&, std::optional<std::vector<SizeType32>> const&,
@@ -132,8 +132,8 @@ void initConfigBindings(nanobind::module_& m)
             nb::arg("free_gpu_memory_fraction") = nb::none(), nb::arg("host_cache_size") = nb::none(),
             nb::arg("onboard_blocks") = true, nb::arg("cross_kv_cache_fraction") = nb::none(),
             nb::arg("secondary_offload_min_priority") = nb::none(), nb::arg("event_buffer_max_size") = 0, nb::kw_only(),
-            nb::arg("runtime_defaults") = nb::none(), nb::arg("enable_partial_reuse") = true
-            nb::arg("copy_on_partial_reuse") = true, nb::arg("use_uvm") = false, nb::arg("runtime_defaults") = nb::none())
+            nb::arg("enable_partial_reuse") = true, nb::arg("copy_on_partial_reuse") = true, nb::arg("use_uvm") = false,
+            nb::arg("runtime_defaults") = nb::none())
         .def_prop_rw(
             "enable_block_reuse", &tle::KvCacheConfig::getEnableBlockReuse, &tle::KvCacheConfig::setEnableBlockReuse)
         .def_prop_rw("max_tokens", &tle::KvCacheConfig::getMaxTokens, &tle::KvCacheConfig::setMaxTokens)
@@ -155,7 +155,7 @@ void initConfigBindings(nanobind::module_& m)
             &tle::KvCacheConfig::setEnablePartialReuse)
         .def_prop_rw("copy_on_partial_reuse", &tle::KvCacheConfig::getCopyOnPartialReuse,
             &tle::KvCacheConfig::setCopyOnPartialReuse)
-        .def_property("use_uvm", &tle::KvCacheConfig::getUseUvm, &tle::KvCacheConfig::setUseUvm)
+        .def_prop_rw("use_uvm", &tle::KvCacheConfig::getUseUvm, &tle::KvCacheConfig::setUseUvm)
         .def("fill_empty_fields_from_runtime_defaults", &tle::KvCacheConfig::fillEmptyFieldsFromRuntimeDefaults)
         .def("__getstate__", kvCacheConfigGetstate)
         .def("__setstate__", kvCacheConfigSetstate);
