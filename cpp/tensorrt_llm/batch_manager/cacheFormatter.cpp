@@ -89,6 +89,29 @@ bool CacheFormatter::needSendCache(
     return selfTpRankInDpGroup % targetInfo.mDupHeadFactor == 0;
 }
 
+void checkAlternateWindow(BaseKVCacheManager* cacheManager, BaseCacheFormatter::CacheState const& selfConfig,
+    BaseCacheFormatter::CacheState const& destConfig)
+{
+    auto numPools = cacheManager->getBlockManager().getNumPools();
+    auto layerNum = cacheManager->getBlockManager().getNumLayers();
+
+    std::vector<SizeType32> poolIdxs(numPools);
+    TLLM_CHECK(layerNum >= numPools);
+    for (int i = 0; i < numPools; i++)
+    {
+        poolIdxs[i] = cacheManager->getBlockManager().getLayerPoolIdx(i);
+        TLLM_LOG_DEBUG("poolIdxs[%d] = %d layerNum:%d", i, poolIdxs[i], layerNum);
+    }
+
+    std::unordered_set<SizeType32> uniquePoolIdxs(poolIdxs.begin(), poolIdxs.end());
+    TLLM_CHECK_WITH_INFO(uniquePoolIdxs.size() == poolIdxs.size(), "poolIdxs must contain unique elements");
+    for (int i = numPools; i < layerNum; i++)
+    {
+        TLLM_CHECK_WITH_INFO(poolIdxs[i % numPools] == cacheManager->getBlockManager().getLayerPoolIdx(i),
+            "only support Alternate Window");
+    }
+}
+
 std::vector<executor::kv_cache::Connection const*> CacheFormatter::pickRecvConnections(
     std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
     SizeType32 selfIdx, CacheState const& destConfig) const
@@ -186,6 +209,15 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
                 blockNum++;
                 inputKvCacheBlocks.at(window).push_back(it);
                 allCacheBlockSize += it->getSize();
+            }
+        }
+
+        if (inputKvCacheBlocks.size() > 1)
+        {
+            if (selfConfig.getParallelConfig().mPipelineParallelism
+                != destConfig.getParallelConfig().mPipelineParallelism)
+            {
+                checkAlternateWindow(mCacheManager, selfConfig, destConfig);
             }
         }
         TLLM_CHECK(!inputKvCacheBlocks.empty());
@@ -393,7 +425,13 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
         }
     }
     TLLM_CHECK(!outputBuffersPerWindow.empty());
-
+    if (outputBuffersPerWindow.size() > 1)
+    {
+        if (selfConfig.getParallelConfig().mPipelineParallelism != destConfig.getParallelConfig().mPipelineParallelism)
+        {
+            checkAlternateWindow(mCacheManager, selfConfig, destConfig);
+        }
+    }
     {
         NVTX3_SCOPED_RANGE(formatInputRecvBuffer);
 
