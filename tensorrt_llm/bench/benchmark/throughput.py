@@ -22,8 +22,8 @@ from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
-from tensorrt_llm.bench.tuning.dataclasses import (
-    BatchingConfiguration, BenchmarkEnvironment, BenchmarkSpecification,
+from tensorrt_llm.bench.dataclasses.scenario import (
+    BatchingConfiguration, BenchmarkEnvironment, ScenarioSpecification,
     LlmRuntimeSpecification, ReportingConfiguration, TuningConstraints,
     WorldConfig)
 # isort: on
@@ -257,8 +257,7 @@ def throughput_command(
 
     logger.info("Preparing to run throughput benchmark...")
     # Populate the benchmark specification with the parameters from the CLI.
-    # TODO: make sure reporting_config includes request timeline.
-    benchmark_specification = BenchmarkSpecification(
+    benchmark_specification = ScenarioSpecification(
         **params,
         environment=bench_env,
         batching_config=BatchingConfiguration(**params),
@@ -293,12 +292,7 @@ def throughput_command(
         logger.info(benchmark_specification.get_dataset_summary())
 
     # Engine configuration parsing
-<<<<<<< HEAD
-    if backend and backend.lower() in ALL_SUPPORTED_BACKENDS and backend.lower(
-    ) != "tensorrt":
-=======
     if benchmark_specification.llm_config.backend != "trt":
->>>>>>> 173d3b211 (Continued clean up of benchmark.)
         # If we're dealing with a model name, perform a snapshot download to
         # make sure we have a local copy of the model.
         if benchmark_specification.environment.checkpoint_path is None:
