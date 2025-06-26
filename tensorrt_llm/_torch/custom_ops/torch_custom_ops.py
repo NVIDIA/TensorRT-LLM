@@ -651,6 +651,7 @@ def attention(
     mla_context_paged_kv: Optional[torch.Tensor],
     mla_context_kv_cache_block_offsets: Optional[torch.Tensor],
     attention_chunk_size: Optional[int],
+    softmax_stats_tensor: Optional[torch.Tensor],
 ) -> List[torch.Tensor]:
     num_tokens = q.size(0)
     attention_input_type = (AttentionInputType(attention_input_type)
@@ -697,7 +698,7 @@ def attention(
         q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim,
         v_head_dim, mrope_rotary_cos_sin, mrope_position_deltas,
         mla_context_paged_kv, mla_context_kv_cache_block_offsets,
-        attention_chunk_size)
+        attention_chunk_size, softmax_stats_tensor)
     return output_act, output_sf
 
 

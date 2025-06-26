@@ -30,6 +30,8 @@ add_gtest(mlaPreprocessTest mlaPreprocessTest.cu)
 
 add_gtest(cudaCoreGemmKernelTest cudaCoreGemm/cudaCoreGemmKernelTest.cpp)
 
+add_gtest(mlaChunkedPrefillTest mlaChunkedPrefillTest.cu)
+
 if(NOT ENABLE_MULTI_DEVICE EQUAL 0)
   add_gtest(allReduceKernelTest allReduce/allReduceKernelTest.cu)
   add_gtest(allReduceFusionTest allReduce/allReduceFusionTest.cu)
@@ -74,3 +76,9 @@ set(SAMPLING_KERNEL_TEST_SRC
     sampling/samplingPenaltyTest.cpp sampling/samplingUtilsTest.cu)
 
 add_gtest(samplingKernelsTest "${SAMPLING_KERNEL_TEST_SRC}")
+
+set(ROUTING_KERNEL_TEST_SRC
+    routing/routingTest.cpp routing/routingLlama4Test.cpp
+    routing/routingRenormalizeTest.cpp routing/routingDeepSeekTest.cpp)
+
+add_gtest(routingKernelsTest "${ROUTING_KERNEL_TEST_SRC}")
