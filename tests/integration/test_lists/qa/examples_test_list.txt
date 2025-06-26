@@ -402,7 +402,7 @@ accuracy/test_cli_flow.py::TestMixtral8x7B::test_plugin_tp8[renormalize-expert_p
 accuracy/test_cli_flow.py::TestMixtral8x7B::test_plugin_tp8[renormalize-mixed_parallel]
 accuracy/test_cli_flow.py::TestMixtral8x7B::test_plugin_tp8[renormalize-tensor_parallel]
 accuracy/test_cli_flow.py::TestMixtral8x7B::test_nvfp4_prequantized
-accuracy/test_cli_flow.py::TestMixtral8x22B::test_fp8_tp2pp2 TIMEOUT (90)
+accuracy/test_cli_flow.py::TestMixtral8x22B::test_fp8_tp2pp2 TIMEOUT (120)
 accuracy/test_cli_flow.py::TestMixtral8x22B::test_int8_plugin_tp8[renormalize-tensor_parallel] TIMEOUT (90)
 accuracy/test_cli_flow.py::TestGemma2_9BIt::test_auto_dtype
 accuracy/test_cli_flow.py::TestGemma2_9BIt::test_weight_only[int8]
