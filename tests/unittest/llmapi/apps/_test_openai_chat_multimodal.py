@@ -1,15 +1,9 @@
-import os
-import tempfile
 from typing import List
 
 import openai
 import pytest
-import yaml
 
 from tensorrt_llm.inputs import encode_base64_content_from_url
-
-from ..test_llm import get_model_path
-from .openai_server import RemoteOpenAIServer
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 
@@ -20,48 +14,26 @@ def model_name():
 
 
 @pytest.fixture(scope="module")
-def temp_extra_llm_api_options_file(request):
-    temp_dir = tempfile.gettempdir()
-    temp_file_path = os.path.join(temp_dir, "extra_llm_api_options.yaml")
-    try:
-        extra_llm_api_options_dict = {
-            "kv_cache_config": {
-                "enable_block_reuse": False,
-                "free_gpu_memory_fraction": 0.6,
-            },
-            "build_config": {
-                "max_num_tokens": 16384,
-            }
+def extra_llm_api_options_dict():
+    return {
+        "kv_cache_config": {
+            "enable_block_reuse": False,
+            "free_gpu_memory_fraction": 0.6,
+        },
+        "build_config": {
+            "max_num_tokens": 16384,
         }
-
-        with open(temp_file_path, 'w') as f:
-            yaml.dump(extra_llm_api_options_dict, f)
-
-        yield temp_file_path
-    finally:
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
+    }
 
 
 @pytest.fixture(scope="module")
-def server(model_name: str, temp_extra_llm_api_options_file: str):
-    model_path = get_model_path(model_name)
-    args = [
-        "--backend", "pytorch", "--extra_llm_api_options",
-        temp_extra_llm_api_options_file
-    ]
-    with RemoteOpenAIServer(model_path, args) as remote_server:
-        yield remote_server
+def backend():
+    return 'pytorch'
 
 
 @pytest.fixture(scope="module")
-def client(server: RemoteOpenAIServer):
-    return server.get_client()
-
-
-@pytest.fixture(scope="module")
-def async_client(server: RemoteOpenAIServer):
-    return server.get_async_client()
+def extra_llm_api_options():
+    return True
 
 
 @pytest.mark.asyncio(loop_scope="module")

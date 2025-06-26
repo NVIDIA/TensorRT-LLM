@@ -5,11 +5,9 @@ import time
 
 import openai
 import pytest
-import torch
 from utils.util import skip_num_gpus_less_than, skip_nvlink_inactive
 
-from ..test_llm import get_model_path, prompts
-from .openai_server import RemoteOpenAIServer
+from ..test_llm import prompts
 
 RANK = os.environ.get("SLURM_PROCID", 0)
 MESSAGES = [{
@@ -41,34 +39,7 @@ def tp_pp_size(request):
     return request.param
 
 
-@pytest.fixture(scope="module")
-def server(model_name: str, backend: str, tp_pp_size: tuple):
-    os.environ["FORCE_DETERMINISTIC"] = "1"
-    model_path = get_model_path(model_name)
-    tp_size, pp_size = tp_pp_size
-    device_count = torch.cuda.device_count()
-    args = [
-        "--tp_size", f"{tp_size}", "--pp_size", f"{pp_size}", "--gpus_per_node",
-        f"{device_count}", "--kv_cache_free_gpu_memory_fraction", "0.95"
-    ]
-    if backend is not None:
-        args.append("--backend")
-        args.append(backend)
-    with RemoteOpenAIServer(model_path, args, llmapi_launch=True,
-                            port=8001) as remote_server:
-        yield remote_server
-
-    os.environ.pop("FORCE_DETERMINISTIC")
-
-
-@pytest.fixture(scope="module")
-def client(server: RemoteOpenAIServer):
-    return server.get_client()
-
-
-@pytest.fixture(scope="module")
-def async_client(server: RemoteOpenAIServer):
-    return server.get_async_client()
+server = multi_node_server
 
 
 @skip_num_gpus_less_than(4)

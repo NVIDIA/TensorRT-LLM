@@ -1,16 +1,10 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/aae6927be06dedbda39c6b0c30f6aa3242b84388/tests/entrypoints/openai/test_chat.py
-import os
-import tempfile
 from typing import List
 
 import numpy as np
 import openai
 import pytest
-import yaml
-
-from ..test_llm import get_model_path
-from .openai_server import RemoteOpenAIServer
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 
@@ -20,73 +14,15 @@ def model_name():
     return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 
-@pytest.fixture(scope="module",
-                params=[None, 'pytorch'],
-                ids=["trt", "pytorch"])
-def backend(request):
-    return request.param
-
-
-@pytest.fixture(scope="module",
-                params=[0, 2],
-                ids=["disable_processpool", "enable_processpool"])
-def num_postprocess_workers(request):
-    return request.param
-
-
-@pytest.fixture(scope="module",
-                params=[True, False],
-                ids=["extra_options", "no_extra_options"])
-def extra_llm_api_options(request):
-    return request.param
-
-
 @pytest.fixture(scope="module")
-def temp_extra_llm_api_options_file(request):
-    temp_dir = tempfile.gettempdir()
-    temp_file_path = os.path.join(temp_dir, "extra_llm_api_options.yaml")
-    try:
-        extra_llm_api_options_dict = {
-            "enable_chunked_prefill": False,
-            "kv_cache_config": {
-                "enable_block_reuse": False,
-                "max_tokens": 40000
-            }
+def extra_llm_api_options_dict():
+    return {
+        "enable_chunked_prefill": False,
+        "kv_cache_config": {
+            "enable_block_reuse": False,
+            "max_tokens": 40000
         }
-
-        with open(temp_file_path, 'w') as f:
-            yaml.dump(extra_llm_api_options_dict, f)
-
-        yield temp_file_path
-    finally:
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
-
-
-@pytest.fixture(scope="module")
-def server(model_name: str, backend: str, extra_llm_api_options: bool,
-           temp_extra_llm_api_options_file: str, num_postprocess_workers: int):
-    model_path = get_model_path(model_name)
-    if backend == "pytorch":
-        args = ["--backend", f"{backend}"]
-    else:
-        args = ["--max_beam_width", "4"]
-    if extra_llm_api_options:
-        args.extend(
-            ["--extra_llm_api_options", temp_extra_llm_api_options_file])
-    args.extend(["--num_postprocess_workers", f"{num_postprocess_workers}"])
-    with RemoteOpenAIServer(model_path, args) as remote_server:
-        yield remote_server
-
-
-@pytest.fixture(scope="module")
-def client(server: RemoteOpenAIServer):
-    return server.get_client()
-
-
-@pytest.fixture(scope="module")
-def async_client(server: RemoteOpenAIServer):
-    return server.get_async_client()
+    }
 
 
 def test_single_chat_session(client: openai.OpenAI, model_name: str):

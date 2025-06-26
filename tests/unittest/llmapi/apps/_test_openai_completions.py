@@ -5,47 +5,10 @@ from typing import List
 import openai
 import pytest
 
-from ..test_llm import get_model_path
-from .openai_server import RemoteOpenAIServer
-
 
 @pytest.fixture(scope="module")
 def model_name():
     return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
-
-
-@pytest.fixture(scope="module", params=[None, 'pytorch'])
-def backend(request):
-    return request.param
-
-
-@pytest.fixture(scope="module",
-                params=[0, 2],
-                ids=["disable_processpool", "enable_processpool"])
-def num_postprocess_workers(request):
-    return request.param
-
-
-@pytest.fixture(scope="module")
-def server(model_name: str, backend: str, num_postprocess_workers: int):
-    model_path = get_model_path(model_name)
-    if backend == "pytorch":
-        args = ["--backend", f"{backend}"]
-    else:
-        args = ["--max_beam_width", "4"]
-    args.extend(["--num_postprocess_workers", f"{num_postprocess_workers}"])
-    with RemoteOpenAIServer(model_path, args) as remote_server:
-        yield remote_server
-
-
-@pytest.fixture(scope="module")
-def client(server: RemoteOpenAIServer):
-    return server.get_client()
-
-
-@pytest.fixture(scope="module")
-def async_client(server: RemoteOpenAIServer):
-    return server.get_async_client()
 
 
 def test_single_completion(client: openai.OpenAI, model_name):

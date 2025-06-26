@@ -3,9 +3,6 @@ from typing import List, Tuple
 import openai
 import pytest
 
-from ..test_llm import get_model_path
-from .openai_server import RemoteOpenAIServer
-
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 
@@ -22,22 +19,13 @@ def backend(request):
 
 
 @pytest.fixture(scope="module")
-def server(model_name: str, backend: str) -> RemoteOpenAIServer:
-    model_path = get_model_path(model_name)
-    args = []
-    if backend == "pytorch":
-        args.extend(["--backend", f"{backend}"])
-    max_beam_width = 1 if backend == "pytorch" else 2
-    args.extend(["--max_beam_width", str(max_beam_width)])
-    args.extend(["--max_batch_size", "2", "--max_seq_len", "1024"])
-    args.extend(["--reasoning_parser", "deepseek-r1"])
-    with RemoteOpenAIServer(model_path, args) as remote_server:
-        yield remote_server
+def max_seq_len():
+    return "1024"
 
 
 @pytest.fixture(scope="module")
-def client(server: RemoteOpenAIServer) -> openai.OpenAI:
-    return server.get_client()
+def reasoning_parser():
+    return "deepseek-r1"
 
 
 def test_reasoning_parser(client: openai.OpenAI, model_name: str, backend: str):
@@ -67,11 +55,6 @@ def test_reasoning_parser(client: openai.OpenAI, model_name: str, backend: str):
             assert len(resp_choice.message.reasoning_content) > 0
 
 
-@pytest.fixture(scope="module")
-def oning_client(server: RemoteOpenAIServer) -> openai.OpenAI:
-    return server.get_async_client()
-
-
 async def process_stream(
         stream: openai.AsyncStream) -> Tuple[List[str], List[str]]:
     content_chunks: List[str] = []
@@ -90,10 +73,10 @@ async def process_stream(
 
 
 @pytest.mark.asyncio(loop_scope="module")
-async def test_reasoning_parser_streaming(oning_client: openai.OpenAI,
+async def test_reasoning_parser_streaming(async_client: openai.AsyncClient,
                                           model_name: str, backend: str):
     messages = [{"role": "user", "content": "hi"}]
-    stream = await oning_client.chat.completions.create(
+    stream = await async_client.chat.completions.create(
         model=model_name,
         messages=messages,
         max_completion_tokens=1000,
@@ -106,7 +89,7 @@ async def test_reasoning_parser_streaming(oning_client: openai.OpenAI,
     assert len(content_chunks) > 0
     assert len(reasoning_content_chunks) > 0
 
-    stream = await oning_client.chat.completions.create(
+    stream = await async_client.chat.completions.create(
         model=model_name,
         messages=messages,
         max_completion_tokens=1,
