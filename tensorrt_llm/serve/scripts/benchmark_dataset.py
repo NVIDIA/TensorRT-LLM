@@ -26,9 +26,10 @@ from typing import Any, Callable, Optional, Union
 
 import numpy as np
 import pandas as pd
-from benchmark_utils import download_and_cache_file
 from datasets import load_dataset
 from transformers import PreTrainedTokenizerBase
+
+from .benchmark_utils import download_and_cache_file
 
 logger = logging.getLogger(__name__)
 
