@@ -62,7 +62,7 @@ methods:
         annotation: Optional[tensorrt_llm.sampling_params.BatchedLogitsProcessor]
         default: null
       guided_decoding_backend:
-        annotation: Optional[str]
+        annotation: Optional[Literal["xgrammar", "llguidance"]]
         default: null
       # Quantization and calibration
       quant_config:

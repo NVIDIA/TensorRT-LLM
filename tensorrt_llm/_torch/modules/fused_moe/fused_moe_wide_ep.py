@@ -87,6 +87,8 @@ class WideEPMoE(MoE):
 
         moe_load_balancer = get_moe_load_balancer()
         self.layer_load_balancer = None
+        self.repeat_idx = 0
+        self.repeat_count = 1
 
         moe_load_balancer_config = model_config.moe_load_balancer
         init_expert_size_per_partition = moe_load_balancer_config.num_local_slots if moe_load_balancer_config else self.num_experts // self.ep_size
@@ -102,6 +104,7 @@ class WideEPMoE(MoE):
             self.expert_size_per_partition = moe_load_balancer_config.num_local_slots
             self.layer_load_balancer = moe_load_balancer.add_layer(
                 self.num_experts, top_k, self.expert_size_per_partition)
+            self.repeat_count = self.layer_load_balancer.get_repeat_count()
             loaded_initial_global_assignments = moe_load_balancer_config.get_layer_initial_global_assignments(
                 self.layer_idx)
             self.num_slots = moe_load_balancer_config.num_slots
@@ -193,7 +196,7 @@ class WideEPMoE(MoE):
                                             hidden_size, self.num_slots)
             else:
                 raise NotImplementedError(
-                    f"Not available alltoall method type: {alltoall_method_type!r}"
+                    f"Not available alltoall method type: {self.alltoall_method_type!r}"
                 )
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
@@ -361,10 +364,12 @@ class WideEPMoE(MoE):
 
         loadbalancer_local_statistic_info = None
         gathered_loadbalancer_local_statistic_info = None
+        token_selected_experts_for_statistic = None
         if self.layer_load_balancer is None:
             token_selected_slots = token_selected_experts
         else:
-            if not self.layer_load_balancer.is_static_routing():
+            if not self.layer_load_balancer.is_static_routing(
+            ) and self.enable_alltoall:
                 self.layer_load_balancer.local_statistic(
                     token_selected_experts,
                     is_first_stage=is_first_call,
@@ -373,9 +378,12 @@ class WideEPMoE(MoE):
                 token_selected_experts, self.use_dp)
             if not self.layer_load_balancer.is_static_routing():
                 # split into two part to get possible overlap with load balancer routing
-                if is_last_call:
-                    loadbalancer_local_statistic_info = self.layer_load_balancer.get_local_statistic_tensor(
-                    )
+                if self.enable_alltoall:
+                    if is_last_call:
+                        loadbalancer_local_statistic_info = self.layer_load_balancer.get_local_statistic_tensor(
+                        )
+                else:
+                    token_selected_experts_for_statistic = token_selected_experts
 
         # If load balancer is disabled, the statistics are collected from expert IDs.
         # If load balancer is enabled, the statistics are collected from expert slot IDs.
@@ -430,10 +438,12 @@ class WideEPMoE(MoE):
                         token_selected_slots, dtype=token_final_scales.dtype)
             else:
                 raise NotImplementedError(
-                    f"Not available alltoall method type: {alltoall_method_type!r}"
+                    f"Not available alltoall method type: {self.alltoall_method_type!r}"
                 )
 
         x_sf = None
+        x_row = x.shape[0]
+        x_col = x.shape[1]
         sf_swizzle = True
         if self.has_any_quant:
             if self.has_fp8_qdq:
@@ -468,31 +478,35 @@ class WideEPMoE(MoE):
 
         if self.use_dp and self.parallel_size > 1 and not disable_fp4_allgather(
         ) and not self.enable_alltoall:
-            x, x_sf, token_selected_slots, token_final_scales = allgather(
+            x, x_sf, token_selected_slots, token_final_scales, gathered_token_selected_experts_for_statistic = allgather(
                 [
                     x,
                     x_sf,
                     token_selected_slots,
                     token_final_scales,
+                    token_selected_experts_for_statistic,
                 ],
                 self.mapping,
                 dim=0,
                 sizes=None if use_dp_padding else all_rank_num_tokens)
-            # use separate allgather since doesn't have sizes, can be optimized but in allgather path it is OK
-            if is_last_call:
-                gathered_loadbalancer_local_statistic_info = allgather(
-                    loadbalancer_local_statistic_info, self.mapping, dim=0)
             # Fp4 gemm has extra scaling factor
             if x_sf is not None:
                 x_sf = reswizzle_sf(x_sf, x_row, x_col,
                                     self.scaling_vector_size)
 
         if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
-        ) and is_last_call:
-            gathered_loadbalancer_local_statistic_info = gathered_loadbalancer_local_statistic_info.view(
-                (self.mapping.moe_ep_size, self.num_experts))
-            self.layer_load_balancer.update_statistic(
-                gathered_loadbalancer_local_statistic_info)
+        ):
+            if self.enable_alltoall:
+                if is_last_call:
+                    gathered_loadbalancer_local_statistic_info = gathered_loadbalancer_local_statistic_info.view(
+                        (self.mapping.moe_ep_size, self.num_experts))
+                    self.layer_load_balancer.update_statistic(
+                        gathered_loadbalancer_local_statistic_info)
+            else:
+                self.layer_load_balancer.statistic(
+                    gathered_token_selected_experts_for_statistic,
+                    is_first_stage=is_first_call,
+                    is_last_stage=is_last_call)
 
         if self.smart_router and not cutlass_min_latency_mode:
             ep_size = self.cluster_size
@@ -547,7 +561,7 @@ class WideEPMoE(MoE):
                 )
             else:
                 raise NotImplementedError(
-                    f"Not available alltoall method type: {alltoall_method_type!r}"
+                    f"Not available alltoall method type: {self.alltoall_method_type!r}"
                 )
 
         if self.enable_alltoall:
@@ -626,7 +640,7 @@ class WideEPMoE(MoE):
                     deep_ep_topk_weights, deep_ep_handle)
             else:
                 raise NotImplementedError(
-                    f"Not available alltoall method type: {alltoall_method_type!r}"
+                    f"Not available alltoall method type: {self.alltoall_method_type!r}"
                 )
 
         if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
@@ -668,13 +682,16 @@ class WideEPMoE(MoE):
         else:
             all_rank_num_tokens_padded = all_rank_num_tokens
         if num_chunks == 1:
+            is_first_call = self.repeat_idx == 0
+            is_last_call = self.repeat_idx == self.repeat_count - 1
             outputs = self.forward_chunk(
                 x,
                 router_logits,
                 cutlass_min_latency_mode,
                 output_dtype,
                 all_rank_num_tokens=all_rank_num_tokens_padded,
-                use_dp_padding=use_dp_padding)
+                use_dp_padding=use_dp_padding,
+                repeating_info=(is_first_call, is_last_call))
             outputs = self.reducescatter_or_allreduce(
                 outputs,
                 all_rank_num_tokens=all_rank_num_tokens_padded,
@@ -717,8 +734,8 @@ class WideEPMoE(MoE):
             # Postpone reduce-scatter/all-reduce to the next iteration to achieve better overlap
             for idx_chunk, (x, router_logits) in enumerate(
                     zip(x_list, router_logits_list)):
-                is_first_call = idx_chunk == 0
-                is_last_call = idx_chunk == num_chunks - 1
+                is_first_call = idx_chunk == 0 and self.repeat_idx == 0
+                is_last_call = idx_chunk == num_chunks - 1 and self.repeat_idx == self.repeat_count - 1
                 if not self.enable_alltoall:
                     if idx_chunk % 2 == 0:
                         with torch.cuda.stream(self.aux_stream):
@@ -777,6 +794,7 @@ class WideEPMoE(MoE):
         if self.use_dp:
             rank = self.mapping.tp_rank
             outputs = outputs[:all_rank_num_tokens[rank]]
+        self.repeat_idx = 0 if self.repeat_idx == self.repeat_count - 1 else self.repeat_idx + 1
         return outputs
 
     def alltoall_prepare_maybe_dispatch(
@@ -886,7 +904,7 @@ class WideEPMoE(MoE):
         ), f'weight {weight_name} should be a is_contiguous, shape={weight_tensor.shape}, strides={weight_tensor.is_contiguous()}'
         assert weight_tensor.numel() * weight_tensor.element_size() == weight_tensor.untyped_storage().size(),\
             f'weight {weight_name} shape={weight_tensor.shape} storage_size = {weight_tensor.untyped_storage().size()}, numel={weight_tensor.numel()}, eltsize={weight_tensor.element_size()}, dtype={weight_tensor.dtype}'
-        self.layer_load_balancer.fix_tensor(weight_tensor)
+        self.layer_load_balancer.make_tensor_host_accessible(weight_tensor)
         param.data = weight_tensor
 
     def register_all_parameter_slot_and_to_fix_weight_fns(
@@ -903,7 +921,7 @@ class WideEPMoE(MoE):
                     self.register_parameter_weight_slot_fn,
                     (weight_name, local_slot_id))
         for weight_name in weight_and_tensor_dict:
-            self.layer_load_balancer.add_to_fix_weight_fn(
+            self.layer_load_balancer.add_to_migrate_weight_fn(
                 self.register_to_fix_weight_fn, (weight_name, ))
 
         local_shared_load_expert_ids = self.layer_load_balancer.get_load_expert_ids(

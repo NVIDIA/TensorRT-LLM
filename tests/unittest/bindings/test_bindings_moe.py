@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import os
 import unittest
 
 import numpy as np
@@ -26,6 +26,7 @@ import tensorrt_llm.bindings.internal.runtime as _tbr
 class TestMoePythonBindings(unittest.TestCase):
 
     def setUp(self):
+        os.environ["TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK"] = "1"
         torch.cuda.set_device(0)
         # Common test parameters
         self.expert_count = 8

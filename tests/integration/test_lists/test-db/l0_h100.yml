@@ -29,7 +29,7 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16[attn_backend=FLASHINFER-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[attn_backend=TRTLLM] TIMEOUT (90)
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[attn_backend=FLASHINFER] TIMEOUT (60)
-  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding[xgrammar]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv=False-attn_backend=TRTLLM-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv=False-attn_backend=TRTLLM-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv=False-attn_backend=FLASHINFER-torch_compile=False]
@@ -52,6 +52,9 @@ l0_h100:
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu_mtp[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tp1_two_mtp[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu[DeepSeek-V3-Lite-fp8]
+  - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[False-False-TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[False-True-TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[True-False-TinyLlama-1.1B-Chat-v1.0]
@@ -182,6 +185,7 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[mtp=vanilla-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_no_kv_cache_reuse[quant_dtype=none-mtp_nextn=2-fp8kv=False-attention_dp=True-cuda_graph=True-overlap_scheduler=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8_block_scales[latency]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding[llguidance]
 - condition:
     ranges:
       system_gpu_count:
@@ -242,7 +246,7 @@ l0_h100:
   - accuracy/test_cli_flow.py::TestGpt2::test_beam_search # 1 min
   - accuracy/test_cli_flow.py::TestGpt2::test_weight_streaming_ootb # 1.5 mins
   - accuracy/test_cli_flow.py::TestGpt2::test_cuda_graph # 1 min
-  - accuracy/test_cli_flow.py::TestGpt2::test_context_fmha_disabled # 1 min
+  - accuracy/test_cli_flow.py::TestGpt2::test_context_fmha_disabled TIMEOUT (60)
   - accuracy/test_cli_flow.py::TestGptNext::test_auto_dtype # 1.5 mins
   - accuracy/test_cli_flow.py::TestSantacoder::test_auto_dtype # 1.5 mins
   - accuracy/test_cli_flow.py::TestMamba130M::test_auto_dtype # 1 min
