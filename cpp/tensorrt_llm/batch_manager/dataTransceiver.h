@@ -34,6 +34,25 @@
 namespace tensorrt_llm::batch_manager
 {
 
+namespace kv_cache_manager
+{
+class BaseCacheFormatter;
+} // namespace kv_cache_manager
+
+// TransceiverTag definition
+struct TransceiverTag
+{
+    enum class Id : uint64_t
+    {
+        REQUEST_SEND = 1,
+        TERMINATION = 2
+    };
+
+    static constexpr int32_t kID_TAG{19};
+    static constexpr int32_t kINFO_SIZE_TAG{22};
+    static constexpr int32_t kINFO_TAG{32};
+};
+
 // Used to store the information that needs to be sent to the context executor to ensure the generation
 // executor smoothly receives the data.
 class RequestInfo
@@ -90,47 +109,86 @@ private:
 };
 
 // Operators required for data transmission in specific communication protocols.
-class DataSender
+class DataSender : public TransceiverTag
 {
 public:
+    using SizeType32 = tensorrt_llm::runtime::SizeType32;
+    using RequestMapInfo
+        = std::vector<std::pair<executor::kv_cache::Connection const*, executor::DataTransceiverState>>;
+
+    DataSender(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
+        SizeType32 selfIndex, std::unique_ptr<kv_cache_manager::BaseCacheFormatter> formatter);
+
     /// @brief Receive the request information.
     /// @return The request information.
-    [[nodiscard]] virtual RequestInfo recvRequestInfo() = 0;
+    [[nodiscard]] RequestInfo recvRequestInfo();
 
     /// @brief Synchronously send data.
     /// @param llmRequest The request object to which the data belongs.
-    virtual void sendSync(LlmRequest const& llmRequest) = 0;
+    void sendSync(LlmRequest const& llmRequest);
 
     /// @brief Return the internal communicator status.
     /// @return The communicator status.
-    [[nodiscard]] virtual executor::kv_cache::CommState const& getCommState() const = 0;
+    [[nodiscard]] executor::kv_cache::CommState const& getCommState() const;
 
     /// @brief Reset the internal communicator status.
     /// @param commState The communicator status.
-    virtual void setCommState(executor::kv_cache::CommState commState) = 0;
+    void setCommState(executor::kv_cache::CommState commState);
 
-    [[nodiscard]] virtual size_t getCounterpartsCount(LlmRequest::RequestIdType requestId) const = 0;
+    [[nodiscard]] size_t getCounterpartsCount(LlmRequest::RequestIdType requestId) const;
 
-    virtual void release(LlmRequest::RequestIdType requestId) = 0;
+    void release(LlmRequest::RequestIdType requestId);
 
-    /// @brief Destructor.
-    virtual ~DataSender() = default;
+    ~DataSender(); // = default;
+
+private:
+    executor::kv_cache::ConnectionManager* mManager;
+    std::map<LlmRequest::RequestIdType, RequestMapInfo> mRequestToComms;
+    executor::DataTransceiverState mSelfState;
+    std::unique_ptr<kv_cache_manager::BaseCacheFormatter> mFormatter;
+    std::mutex mMtxForMap;
+    runtime::BufferManager mBufferManager;
 };
 
 // Operators required for data transmission in specific communication protocols.
-class DataReceiver
+class DataReceiver : public TransceiverTag
 {
 public:
+    using SizeType32 = tensorrt_llm::runtime::SizeType32;
+
+    DataReceiver(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
+        SizeType32 selfIndex, std::unique_ptr<kv_cache_manager::BaseCacheFormatter> formatter);
+
     /// @brief Send the request information.
     /// @param llmRequest The request object to which the information belongs.
-    virtual void sendRequestInfo(LlmRequest const& llmRequest) = 0;
+    void sendRequestInfo(LlmRequest const& llmRequest);
 
     /// @brief Synchronously receive data.
     /// @param llmRequest The request object to which the data belongs.
-    virtual void receiveSync(LlmRequest const& llmRequest) = 0;
+    void receiveSync(LlmRequest const& llmRequest);
 
-    /// @brief Destructor.
-    virtual ~DataReceiver() = default;
+private:
+    struct ReceiveCacheResource
+    {
+        runtime::BufferManager mBufferManager;
+        runtime::CudaEvent mCudaEvent;
+
+        ReceiveCacheResource(runtime::BufferManager&& bufferManager, runtime::CudaEvent&& cudaEvent)
+            : mBufferManager(bufferManager)
+            , mCudaEvent(std::move(cudaEvent))
+        {
+        }
+    };
+
+    static void sendRequestInfo(executor::kv_cache::Connection const* connection, RequestInfo const& info);
+
+    [[nodiscard]] std::unique_ptr<ReceiveCacheResource> const& getReceiveCacheResource(LlmRequest const& llmRequest);
+
+    executor::kv_cache::ConnectionManager* mManager;
+    executor::DataTransceiverState mSelfState;
+    std::unique_ptr<kv_cache_manager::BaseCacheFormatter> mFormatter;
+    std::unordered_map<std::string, std::unique_ptr<ReceiveCacheResource>> mProcessToResources;
+    std::mutex mProcessIoResouceMutex;
 };
 
 class DataResponder
