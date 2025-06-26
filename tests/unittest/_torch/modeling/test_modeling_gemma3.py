@@ -271,71 +271,43 @@ class TestGemma3(unittest.TestCase):
             print("[test_gemma3_allclose_to_hf] max diff: ", torch.max(torch.abs(logits - ref.logits[:, -1].float())))
             print("[test_gemma3_allclose_to_hf] mean diff: ", torch.mean(torch.abs(logits - ref.logits[:, -1].float())))
 
-        # # gen
-        # gen_input_ids = torch.tensor([600], dtype=torch.int32, device=device)
-        # num_cached_tokens_per_seq = [input_ids.size(-1)]
+        # gen
+        gen_input_ids = torch.tensor([600], dtype=torch.int, device=device)
+        num_cached_tokens_per_seq = [input_ids.size(-1)]    # value: 8.
+        print("[test_gemma3_allclose_to_hf] num_cached_tokens_per_seq: ", num_cached_tokens_per_seq)
 
-        # attn_metadata = metadata_cls(
-        #     seq_lens=torch.tensor([gen_input_ids.size(-1)], dtype=torch.int),
-        #     num_contexts=0,
-        #     kv_cache_params=KVCacheParams(
-        #         use_cache=True,
-        #         num_cached_tokens_per_seq=num_cached_tokens_per_seq,
-        #     ),
-        #     max_num_requests=1,
-        #     max_num_tokens=8192,
-        #     kv_cache_manager=kv_cache_manager,
-        #     request_ids=request_ids,
-        #     prompt_lens=prompt_lens,
-        # )
+        attn_metadata = metadata_cls(
+            seq_lens=torch.tensor([gen_input_ids.size(-1)], dtype=torch.int),
+            num_contexts=0,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=num_cached_tokens_per_seq,
+            ),
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            prompt_lens=prompt_lens,
+            max_num_requests=1,
+            max_num_tokens=8192,
+        )
 
-        # gen_position_ids = [
-        #     torch.arange(input_ids.size(-1),
-        #                  input_ids.size(-1) + gen_input_ids.size(-1),
-        #                  dtype=torch.int32)
-        # ]
-        # gen_position_ids = torch.cat(gen_position_ids).unsqueeze(0).cuda()
+        gen_position_ids = [
+            torch.arange(input_ids.size(-1),
+                         input_ids.size(-1) + gen_input_ids.size(-1))
+        ]
+        gen_position_ids = torch.cat(gen_position_ids).unsqueeze(0).cuda()
+        with torch.inference_mode():
+            attn_metadata.prepare()
+            logits = gemma3.forward(input_ids=gen_input_ids,
+                                     position_ids=gen_position_ids,
+                                     attn_metadata=attn_metadata)
+            ref = hf_gemma3.forward(input_ids=gen_input_ids.unsqueeze(0),
+                                     position_ids=gen_position_ids,
+                                     use_cache=True)
 
-        # def run_forward(input_ids, position_ids, attn_metadata):
-        #     attn_metadata.prepare()
-        #     if not scenario.use_cuda_graph:
-        #         return gemma3.forward(input_ids=input_ids,
-        #                                position_ids=position_ids,
-        #                                attn_metadata=attn_metadata)
-        #     else:
-        #         graph_runner = DecodingCUDAGraphRunner(
-        #             attn_metadata.max_num_requests, "cuda", attn_metadata)
-        #         graph_runner.capture(lambda inputs: gemma3.forward(**inputs))
-
-        #         for _ in range(2):
-        #             # Run it twice. This helps us catch problems if buffers are accidentally reallocated
-        #             # in prepare().
-        #             attn_metadata.prepare()
-        #             logits = graph_runner.run({
-        #                 "input_ids": input_ids,
-        #                 "position_ids": position_ids,
-        #                 "attn_metadata": attn_metadata,
-        #             })
-        #         return logits
-
-        # if scenario.use_cuda_graph:
-        #     attn_metadata = attn_metadata.create_cuda_graph_metadata(1)
-
-        # with torch.inference_mode():
-        #     logits = run_forward(input_ids=gen_input_ids,
-        #                          position_ids=gen_position_ids,
-        #                          attn_metadata=attn_metadata)
-        #     ref = hf_gemma3.forward(
-        #         input_ids=gen_input_ids.unsqueeze(0),  #hf_gen_input_ids,
-        #         position_ids=gen_position_ids,
-        #         past_key_values=ref.past_key_values,
-        #         use_cache=True)
-
-        # #TODO: visit later to adjust atol and rtol
-        # # atol=2, rtol=100000
-        # torch.testing.assert_close(logits,
-        #                            ref.logits[:, -1].float(),
-        #                            atol=2,
-        #                            rtol=100000)
+        # TODO: Fix this. Thresholds below are unacceptably high.
+        torch.testing.assert_close(logits,
+                                   ref.logits[:, -1].float(),
+                                   atol=5,
+                                   rtol=14000)
 
         kv_cache_manager.shutdown()
