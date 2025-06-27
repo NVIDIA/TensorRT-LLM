@@ -307,30 +307,30 @@ class TorchSampler(Sampler):
             if request.state != LlmRequestState.GENERATION_COMPLETE:
                 new_token = new_tokens_list[token_idx]
                 num_tokens = request.add_new_token(new_token, beam_idx)
-                if self._handle_stop_criteria(request, new_token, num_tokens,
-                                              beam_idx):
-                    continue
-
-                # Accept draft tokens (if we have any) if and only if they match the new
-                # token exactly.
-                num_accepted = 0
-                new_tokens = [new_token]
-                for draft_token in request.py_draft_tokens:
-                    if draft_token != new_token:
-                        # Reject.
-                        break
-                    num_accepted += 1
-                    new_token = new_tokens_list[token_idx + num_accepted]
-                    num_tokens = request.add_new_token(new_token, beam_idx)
-                    new_tokens.append(num_tokens)  # `num_tokens`->`new_token`
-
-                    if self._handle_stop_criteria(request, new_token,
+                if not self._handle_stop_criteria(request, new_token,
                                                   num_tokens, beam_idx):
-                        break
-                handle_logits(request, new_tokens, num_accepted)
-                request.py_decoding_iter += 1
-                request.py_num_accepted_draft_tokens = num_accepted
-                request.py_rewind_len = request.py_draft_pages_allocated - num_accepted
+
+                    # Accept draft tokens (if we have any) if and only if they match the new
+                    # token exactly.
+                    num_accepted = 0
+                    new_tokens = [new_token]
+                    for draft_token in request.py_draft_tokens:
+                        if draft_token != new_token:
+                            # Reject.
+                            break
+                        num_accepted += 1
+                        new_token = new_tokens_list[token_idx + num_accepted]
+                        num_tokens = request.add_new_token(new_token, beam_idx)
+                        new_tokens.append(
+                            num_tokens)  # `num_tokens`->`new_token`
+
+                        if self._handle_stop_criteria(request, new_token,
+                                                      num_tokens, beam_idx):
+                            break
+                    handle_logits(request, new_tokens, num_accepted)
+                    request.py_decoding_iter += 1
+                    request.py_num_accepted_draft_tokens = num_accepted
+                    request.py_rewind_len = request.py_draft_pages_allocated - num_accepted
             advance_idx(len(request.py_draft_tokens) + 1)
 
         for request in generation_requests:
