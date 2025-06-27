@@ -564,7 +564,7 @@ std::vector<at::Tensor> mha_bwd_noloop(at::Tensor const& d_out, // total x num_h
     return {dqkv, softmax, dkv};
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+NB_MODULE(TORCH_EXTENSION_NAME, m)
 {
 
     m.doc() = "CUDA fused Multihead-Attention for BERT";

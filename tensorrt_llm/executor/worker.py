@@ -55,6 +55,7 @@ class GenerationExecutorWorker(GenerationExecutor):
         engine: Union[Path, Engine],
         executor_config: Optional[tllm.ExecutorConfig] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
+        worker_kwargs: dict = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
@@ -112,7 +113,6 @@ class GenerationExecutorWorker(GenerationExecutor):
                                      tllm.ModelType.DECODER_ONLY,
                                      executor_config=executor_config,
                                      managed_weights=engine.managed_weights)
-
             if not hasattr(executor_config, "backend"):
                 return tllm.Executor(engine, tllm.ModelType.DECODER_ONLY,
                                      executor_config)

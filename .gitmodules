@@ -14,9 +14,9 @@
 [submodule "3rdparty/ucxx"]
 	path = 3rdparty/ucxx
 	url = https://github.com/rapidsai/ucxx.git
-[submodule "3rdparty/pybind11"]
-	path = 3rdparty/pybind11
-	url = https://github.com/pybind/pybind11.git
 [submodule "3rdparty/xgrammar"]
 	path = 3rdparty/xgrammar
 	url = https://github.com/mlc-ai/xgrammar.git
+[submodule "3rdparty/nanobind"]
+	path = 3rdparty/nanobind
+	url = https://github.com/wjakob/nanobind

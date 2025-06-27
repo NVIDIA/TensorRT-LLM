@@ -681,7 +681,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # prepare for kv cache reuse/chunked context in MLA
         if self.enable_paged_context_mla:
             self.prepare_paged_context_mla(cached_token_lens, kv_lens)
-
         # kv block offsets
         assert self.request_ids is not None
         if self.kv_cache_manager is not None:
