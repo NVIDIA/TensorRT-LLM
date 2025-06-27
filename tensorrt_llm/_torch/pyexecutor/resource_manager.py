@@ -175,7 +175,6 @@ class KVCacheManager(BaseResourceManager):
         self.tokens_per_block = tokens_per_block
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
-        self.max_beam_width = max_beam_width
         self.kv_factor = 1 if kv_cache_type == CacheTypeCpp.SELFKONLY else 2
         # Some speculative decoding methods need to use different kv lengths for the
         # draft/target layers. Add extra tokens to handle this issue.
@@ -262,7 +261,7 @@ class KVCacheManager(BaseResourceManager):
             'tokens_per_block': tokens_per_block,
             'blocks_per_window': blocks_per_window,
             'max_num_sequences': max_batch_size,
-            'max_beam_width': self.max_beam_width,
+            'max_beam_width': max_beam_width,
             'max_attention_window_vec': self.max_attention_window_vec,
             'temp_attention_window_inputs': temp_attention_window_inputs,
             'dtype': dtype,

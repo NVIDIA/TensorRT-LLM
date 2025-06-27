@@ -537,6 +537,7 @@ def create_py_executor_instance(
         disable_overlap_scheduler=pytorch_backend_config.
         disable_overlap_scheduler,
         max_batch_size=executor_config.max_batch_size,
+        max_beam_width=executor_config.max_beam_width,
         max_draft_tokens=spec_config.max_draft_tokens
         if spec_config is not None else 0,
         kv_cache_transceiver=kv_cache_transceiver,
