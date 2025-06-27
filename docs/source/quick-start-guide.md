@@ -2,9 +2,20 @@
 
 # Quick Start Guide
 
-This is the starting point to try out TensorRT-LLM. Specifically, this Quick Start Guide enables you to quickly get setup and send HTTP requests using TensorRT-LLM.
+This is the starting point to try out TensorRT-LLM. Specifically, this Quick Start Guide enables you to quickly get set up and send HTTP requests using TensorRT-LLM.
+
+## Installation
+
+There are multiple ways to install and run TensorRT-LLM. For most users, the options below should be ordered from simple to complex. The approaches are equivalent in terms of the supported features.
+
+1. [](installation/containers)
+
+1. Pre-built release wheels on [PyPI](https://pypi.org/project/tensorrt-llm) (see [](installation/linux))
+
+1. [Building from source](installation/build-from-source-linux)
 
 ## LLM API
+
 The LLM API is a Python API designed to facilitate setup and inference with TensorRT-LLM directly within Python. It enables model optimization by simply specifying a HuggingFace repository name or a model checkpoint. The LLM API streamlines the process by managing checkpoint conversion, engine building, engine loading, and model inference, all through a single Python object.
 
 Here is a simple example to show how to use the LLM API with TinyLlama.
@@ -72,8 +83,15 @@ _Example Output_
 }
 ```
 
-For examples and command syntax, refer to the [trtllm-serve](commands/trtllm-serve.rst) section.
+For detailed examples and command syntax, refer to the [trtllm-serve](commands/trtllm-serve.rst) section. If you are running `trtllm-server` inside a Docker container, you have two options for sending API requests:
 
+1. Expose port `8000` to access the server from outside the container.
+
+2. Open a new terminal and use the following command to directly attach to the running container:
+
+```bash
+docker exec -it <container_id> bash
+```
 
 ## Model Definition API
 
@@ -97,7 +115,7 @@ The model definition is a minimal example that shows some of the optimizations a
 
 ```console
 # From the root of the cloned repository, start the TensorRT-LLM container
-make -C docker release_run LOCAL_USER=1
+make -C docker ngc-release_run LOCAL_USER=1 IMAGE_TAG=x.y.z
 
 # Log in to huggingface-cli
 # You can get your token from huggingface.co/settings/token
@@ -114,6 +132,8 @@ trtllm-build --checkpoint_dir llama-3.1-8b-ckpt \
     --gemm_plugin float16 \
     --output_dir ./llama-3.1-8b-engine
 ```
+
+{{container_tag_admonition}}
 
 When you create a model definition with the TensorRT-LLM API, you build a graph of operations from [NVIDIA TensorRT](https://developer.nvidia.com/tensorrt) primitives that form the layers of your neural network. These operations map to specific kernels; prewritten programs for the GPU.
 
