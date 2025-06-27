@@ -82,7 +82,7 @@ class CompletionLogProbs(OpenAIBaseModel):
 
 class CompletionResponseChoice(OpenAIBaseModel):
     index: int
-    text: Union[str, list]
+    text: Union[str, List[int]]
     logprobs: Optional[CompletionLogProbs] = None
     context_logits: Optional[Union[List[float], List[List[
         float]]]] = None  # For reward models, the output is score logits instead of text.
@@ -111,7 +111,7 @@ class CompletionResponse(OpenAIBaseModel):
 
 class CompletionResponseStreamChoice(OpenAIBaseModel):
     index: int
-    text: Union[str, list]
+    text: Union[str, List[int]]
     logprobs: Optional[CompletionLogProbs] = None
     finish_reason: Optional[str] = None
     stop_reason: Optional[Union[int, str]] = Field(
