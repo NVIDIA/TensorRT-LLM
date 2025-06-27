@@ -25,7 +25,7 @@ from utils.llm_data import llm_models_root
                     "meta-llama/Meta-Llama-3.1-8B-Instruct",
                 ),
                 "runtime": "demollm",
-                "attn_backend": "TritonWithFlattenedInputs",
+                "attn_backend": "triton",
                 "compile_backend": "torch-simple",
             },
         ),
@@ -38,11 +38,11 @@ from utils.llm_data import llm_models_root
                     "meta-llama/Meta-Llama-3.1-8B-Instruct",
                 ),
                 "runtime": "demollm",
-                "attn_backend": "TritonWithFlattenedInputs",
+                "attn_backend": "triton",
                 "compile_backend": "torch-opt",
             },
         ),
-        # full llama3.1-8B model with demollm runtime + torch-opt + FlashInfer attn backend
+        # full llama3.1-8B model with demollm runtime + torch-opt + flashinfer attn backend
         (
             2,
             {
@@ -51,7 +51,7 @@ from utils.llm_data import llm_models_root
                     "meta-llama/Meta-Llama-3.1-8B-Instruct",
                 ),
                 "runtime": "demollm",
-                "attn_backend": "FlashInfer",
+                "attn_backend": "flashinfer",
                 "compile_backend": "torch-opt",
             },
         ),
@@ -64,7 +64,7 @@ from utils.llm_data import llm_models_root
                     "meta-llama/Meta-Llama-3.1-8B-Instruct",
                 ),
                 "runtime": "trtllm",
-                "attn_backend": "FlashInfer",
+                "attn_backend": "flashinfer",
                 "compile_backend": "torch-opt",
             },
         ),
@@ -90,7 +90,7 @@ from utils.llm_data import llm_models_root
                     "nvidia/Llama-3.1-8B-Instruct-FP8",
                 ),
                 "benchmark": True,
-                "attn_backend": "FlashInfer",
+                "attn_backend": "flashinfer",
             },
         ),
         # full NemotronNAS (Llama-3.1-Nemotron-51B) with torch-opt backend + simple runtime
@@ -123,7 +123,7 @@ from utils.llm_data import llm_models_root
                     "microsoft/Phi-3-mini-4k-instruct",
                 ),
                 "compile_backend": "torch-opt",
-                "attn_backend": "TritonWithFlattenedInputs",
+                "attn_backend": "triton",
             },
         ),
         # Llama4 Scout Instruct
@@ -136,7 +136,7 @@ from utils.llm_data import llm_models_root
                 ),
                 "model_factory": "AutoModelForImageTextToText",
                 "compile_backend": "torch-simple",
-                "attn_backend": "FlashInfer",
+                "attn_backend": "flashinfer",
             },
         ),
     ],
