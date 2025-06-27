@@ -2027,9 +2027,11 @@ class PyExecutor:
                     f'Send first token response for request {req.py_request_id}'
                 )
                 response = req.create_response(False, self.dist.rank)
-                new_responses.update({req.py_request_id: response})
+                if response:
+                    new_responses.update({req.py_request_id: response})
 
-        self._enqueue_responses(new_responses)
+        if new_responses:
+            self._enqueue_responses(new_responses)
 
     @nvtx_range("_handle_responses")
     def _handle_responses(self):
