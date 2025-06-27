@@ -1359,35 +1359,198 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
 
     def fuse_shared_expert(self, module: torch.nn.Module,
                            shared_experts: GatedMLP, n_shared_experts: int):
-        w3_w1_weight = shared_experts.gate_up_proj.weight.view(
-            n_shared_experts, module.w3_w1_weight.shape[1],
-            module.w3_w1_weight.shape[2])
+
+        def fuse_shared_expert_weight(dst_w3_w1_weight, dst_w2_weight,
+                                      w1_weight, w2_weight, w3_weight):
+            # FIXME: this depends on the kernel internals
+            epilogue_tile_m = 128
+
+            # Keep weights in device buffer
+            dst_w3_weight, dst_w1_weight = dst_w3_w1_weight.split(
+                module.intermediate_size_per_partition, dim=0)
+
+            dst_w3_weight.copy_(w3_weight.view(dst_w3_weight.dtype),
+                                non_blocking=True)
+            dst_w1_weight.copy_(w1_weight.view(dst_w1_weight.dtype),
+                                non_blocking=True)
+
+            # Get permute indices
+            permute_indices = self._maybe_get_cached_w3_w1_permute_indices(
+                dst_w3_w1_weight, epilogue_tile_m)
+
+            # Shuffle the weight according to permute indices
+            processed_w31_weight_shard = torch.ops.trtllm.shuffle_matrix(
+                dst_w3_w1_weight, permute_indices.to(dst_w3_w1_weight.device))
+
+            # Copy the result into device buffer
+            dst_w3_w1_weight.copy_(processed_w31_weight_shard.view(
+                dst_w3_w1_weight.dtype),
+                                   non_blocking=True)
+
+            # Keep weights in device buffer
+            dst_w2_weight.copy_(w2_weight.view(dst_w2_weight.dtype),
+                                non_blocking=True)
+            # Get permuted indices
+            permute_indices = self._maybe_get_cached_w2_permute_indices(
+                dst_w2_weight, epilogue_tile_m)
+
+            # Shuffle the weight according to permute indices
+            processed_w2_weight = torch.ops.trtllm.shuffle_matrix(
+                dst_w2_weight, permute_indices.to(dst_w2_weight.device))
+
+            # Copy the result into device buffer
+            dst_w2_weight.copy_(processed_w2_weight.view(dst_w2_weight.dtype),
+                                non_blocking=True)
+
+        def fuse_shared_expert_weight_scale(dst_w3_w1_weight_scale,
+                                            dst_w2_weight_scale,
+                                            w1_weight_scale, w2_weight_scale,
+                                            w3_weight_scale):
+            # Keep weights in device buffer
+            # w3
+            dst_w3_weight_scale = dst_w3_w1_weight_scale.narrow(
+                dim=0, start=0, length=module.intermediate_size_per_partition)
+            dst_w3_weight_scale.copy_(
+                w3_weight_scale.view(dst_w3_weight_scale.dtype))
+
+            # w1
+            dst_w1_weight_scale = dst_w3_w1_weight_scale.narrow(
+                dim=0,
+                start=module.intermediate_size_per_partition,
+                length=module.intermediate_size_per_partition)
+            dst_w1_weight_scale.copy_(
+                w1_weight_scale.view(dst_w1_weight_scale.dtype))
+
+            orig_shape = dst_w3_w1_weight_scale.shape
+
+            # trtllm-gen specific block scales preprocessing logics
+            epilogue_tile_m = 128  # FIXME
+
+            # Get permute indices
+            permute_indices = self._maybe_get_cached_w3_w1_permute_indices(
+                dst_w3_w1_weight_scale.view(float4_sf_dtype),
+                epilogue_tile_m,
+                num_elts_per_sf=16)
+
+            # Shuffle the weight according to permute indices
+            w3_w1_weight_scale = torch.ops.trtllm.shuffle_matrix(
+                dst_w3_w1_weight_scale.view(float4_sf_dtype), permute_indices)
+
+            # Assert should only be removed during debugging
+            assert w3_w1_weight_scale.is_cuda, "w3_w1_weight_scale.is_cuda should be true or suffer from slow speed"
+            # Interleave the weight.
+            processed_w3_w1_weight_scale = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+                w3_w1_weight_scale.view(float4_sf_dtype).reshape(orig_shape))
+            # Copy the result into device buffer
+            dst_w3_w1_weight_scale.copy_(
+                processed_w3_w1_weight_scale.view(
+                    self.block_scales_dtype).reshape(orig_shape))
+
+            # Keep weights in device buffer
+            dst_w2_weight_scale.copy_(
+                w2_weight_scale.view(dst_w2_weight_scale.dtype))
+
+            orig_shape = dst_w2_weight_scale.shape
+
+            # trtllm-gen specific block scales preprocessing logics
+            epilogue_tile_m = 128  # FIXME: read from kernel
+
+            # Assert should only be removed during debugging
+            assert dst_w2_weight_scale.is_cuda, "dst_w2_weight_scale.is_cuda should be true or suffer from slow speed"
+
+            # Get permute indices
+            permute_indices = self._maybe_get_cached_w2_permute_indices(
+                dst_w2_weight_scale.view(float4_sf_dtype),
+                epilogue_tile_m,
+                num_elts_per_sf=16)
+
+            # Shuffle the weight according to permute indices
+            w_shuffled = torch.ops.trtllm.shuffle_matrix(
+                dst_w2_weight_scale.view(dtype=float4_sf_dtype),
+                permute_indices)
+            # Interleave the weight.
+            processed_w2_weight_scale = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+                w_shuffled)
+            # Copy the result into device buffer
+            dst_w2_weight_scale.copy_(
+                processed_w2_weight_scale.view(
+                    self.block_scales_dtype).reshape(orig_shape))
+
+        w1_weight, w3_weight = shared_experts.gate_up_proj.weight.data.chunk(
+            2, dim=0)
+        w1_weight = w1_weight.view(n_shared_experts,
+                                   module.w3_w1_weight.shape[1] // 2,
+                                   module.w3_w1_weight.shape[2])
+        w3_weight = w3_weight.view(n_shared_experts,
+                                   module.w3_w1_weight.shape[1] // 2,
+                                   module.w3_w1_weight.shape[2])
         w2_weight = shared_experts.down_proj.weight.view(
-            n_shared_experts, module.w2_weight.shape[1],
-            module.w2_weight.shape[2])
-        w3_w1_weight_scale = shared_experts.gate_up_proj.weight_scale.view(
-            n_shared_experts, module.w3_w1_weight_scale.shape[1],
+            module.w2_weight.shape[1], n_shared_experts,
+            module.w2_weight.shape[2]).permute(1, 0, 2).contiguous()
+
+        w1_w3_weight_scale = shared_experts.gate_up_proj.weight_scale.data
+        w1_w3_weight_scale = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave_reverse(
+            w1_w3_weight_scale.cpu().view(
+                -1, module.w3_w1_weight_scale.shape[-1])).view(
+                    torch.float8_e4m3fn).cuda()
+        w1_weight_scale, w3_weight_scale = w1_w3_weight_scale.chunk(2, dim=0)
+        w1_weight_scale = w1_weight_scale.view(
+            n_shared_experts, module.w3_w1_weight_scale.shape[1] // 2,
             module.w3_w1_weight_scale.shape[2])
-        w2_weight_scale = shared_experts.down_proj.weight_scale.view(
-            n_shared_experts, module.w2_weight_scale.shape[1],
-            module.w2_weight_scale.shape[2])
-        # TODO: add relayout logic here
+        w3_weight_scale = w3_weight_scale.view(
+            n_shared_experts, module.w3_w1_weight_scale.shape[1] // 2,
+            module.w3_w1_weight_scale.shape[2])
 
-        module.w3_w1_weight.data[module.expert_size_per_partition:].copy_(
-            w3_w1_weight.data, non_blocking=True)
-        module.w2_weight.data[module.expert_size_per_partition:].copy_(
-            w2_weight.data, non_blocking=True)
-        module.w3_w1_weight_scale.data[module.expert_size_per_partition:].copy_(
-            w3_w1_weight_scale.data, non_blocking=True)
-        module.w2_weight_scale.data[module.expert_size_per_partition:].copy_(
-            w2_weight_scale.data, non_blocking=True)
+        w2_weight_scale = shared_experts.down_proj.weight_scale.data
+        w2_weight_scale = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave_reverse(
+            w2_weight_scale.cpu().view(-1,
+                                       module.w2_weight_scale.shape[-1])).view(
+                                           torch.float8_e4m3fn).cuda()
+        w2_weight_scale = w2_weight_scale.view(
+            module.w2_weight_scale.shape[1], n_shared_experts,
+            module.w2_weight_scale.shape[2]).permute(1, 0, 2).contiguous()
 
-        module.fc31_alpha.data[module.expert_size_per_partition:].copy_(
-            shared_experts.gate_up_proj.alpha.data.expand(n_shared_experts),
-            non_blocking=True)
-        module.fc2_alpha.data[module.expert_size_per_partition:].copy_(
-            shared_experts.down_proj.alpha.data.expand(n_shared_experts),
-            non_blocking=True)
+        for i in range(n_shared_experts):
+            fuse_shared_expert_weight(
+                module.w3_w1_weight[module.expert_size_per_partition + i],
+                module.w2_weight[module.expert_size_per_partition + i],
+                w1_weight[i], w2_weight[i], w3_weight[i])
+            fuse_shared_expert_weight_scale(
+                module.w3_w1_weight_scale[module.expert_size_per_partition + i],
+                module.w2_weight_scale[module.expert_size_per_partition + i],
+                w1_weight_scale[i], w2_weight_scale[i], w3_weight_scale[i])
+
+        # update fc31_alpha and fc31_input_scale
+        fc31_input_scale = shared_experts.gate_up_proj.input_scale.data.view(
+            module.fc31_input_scale.shape)
+        shared_fc31_weight_scale_2 = shared_experts.gate_up_proj.alpha.data * fc31_input_scale
+        expert_fc31_weight_scale_2 = module.fc31_alpha.data * module.fc31_input_scale.data
+        expert_fc31_weight_scale_2[
+            module.expert_size_per_partition:] = shared_fc31_weight_scale_2
+
+        module.fc31_input_scale.data.copy_(torch.minimum(
+            fc31_input_scale, module.fc31_input_scale.data),
+                                           non_blocking=True)
+        module.fc31_alpha.data.copy_(expert_fc31_weight_scale_2 *
+                                     (1.0 / module.fc31_input_scale.data),
+                                     non_blocking=True)
+
+        # update fc2_alpha and fc2_input_scale
+        fc2_input_scale = shared_experts.down_proj.input_scale.data.view(
+            module.fc2_input_scale.shape)
+        shared_fc2_weight_scale_2 = shared_experts.down_proj.alpha.data * fc2_input_scale
+        expert_fc2_weight_scale_2 = module.fc2_alpha.data * module.fc2_input_scale.data
+        expert_fc2_weight_scale_2[
+            module.expert_size_per_partition:] = shared_fc2_weight_scale_2
+
+        module.fc2_input_scale.data.copy_(torch.minimum(
+            fc2_input_scale, module.fc2_input_scale.data),
+                                          non_blocking=True)
+        module.fc2_alpha.data.copy_(expert_fc2_weight_scale_2 *
+                                    (1.0 / module.fc2_input_scale.data),
+                                    non_blocking=True)
         module.fc31_scale_c.data.copy_(module.fc2_input_scale.data *
                                        module.fc31_alpha.data,
                                        non_blocking=True)
+
+        self.setup_quant_scales(module)
