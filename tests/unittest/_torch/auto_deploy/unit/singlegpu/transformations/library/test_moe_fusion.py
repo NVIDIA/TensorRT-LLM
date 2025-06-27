@@ -63,14 +63,14 @@ class BlockSparseTop2MLPFP8(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor):
         x = hidden_states
-        w1_out = torch.ops.quant.fp8_linear(
+        w1_out = torch.ops.auto_deploy.torch_quant_fp8_linear(
             x,
             self.w1_fp8,
             bias=None,
             input_scale=self.inp_scale,
             weight_scale=self.w1_scale,
         )
-        w3_out = torch.ops.quant.fp8_linear(
+        w3_out = torch.ops.auto_deploy.torch_quant_fp8_linear(
             x,
             self.w3_fp8,
             bias=None,
@@ -78,7 +78,7 @@ class BlockSparseTop2MLPFP8(nn.Module):
             weight_scale=self.w3_scale,
         )
         fused = self.act_fn(w1_out) * w3_out
-        out = torch.ops.quant.fp8_linear(
+        out = torch.ops.auto_deploy.torch_quant_fp8_linear(
             fused,
             self.w2_fp8,
             bias=None,
@@ -174,7 +174,7 @@ class MoEPatternModel(nn.Module):
     "use_fp8,expected_op,skip",
     [
         pytest.param(False, torch.ops.auto_deploy.torch_moe, False, id="simple"),
-        pytest.param(True, torch.ops.moe.torch_fp8_moe, not fp8_compatible(), id="fp8"),
+        pytest.param(True, torch.ops.auto_deploy.torch_fp8_moe, not fp8_compatible(), id="fp8"),
     ],
 )
 def test_moe_matching(use_fp8, expected_op, skip):

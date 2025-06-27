@@ -132,7 +132,7 @@ def test_fp8_moe_op_run(dtype):
     ) = setup_moe_test(dtype, num_experts)
 
     with torch.inference_mode():
-        output_torch_moe = torch.ops.moe.torch_moe(
+        output_torch_moe = torch.ops.auto_deploy.torch_moe(
             x,
             selected_experts,
             final_scales,
@@ -163,7 +163,7 @@ def test_fp8_moe_op_run(dtype):
         fused_w2_weight[i] = (fused_w2_weight[i] / w2_weight_scale[i]).to(torch.float8_e4m3fn)
 
     with torch.inference_mode():
-        output_torch_fp8_moe = torch.ops.moe.torch_fp8_moe(
+        output_torch_fp8_moe = torch.ops.auto_deploy.torch_fp8_moe(
             x,
             selected_experts,
             final_scales,
@@ -206,7 +206,7 @@ def test_fp4_moe_op_run(dtype):
     ) = setup_moe_test(dtype, num_experts)
 
     with torch.inference_mode():
-        output_torch_moe = torch.ops.moe.torch_moe(
+        output_torch_moe = torch.ops.auto_deploy.torch_moe(
             x,
             selected_experts,
             final_scales,
@@ -254,7 +254,7 @@ def test_fp4_moe_op_run(dtype):
 
     # run FP4 MoE op
     with torch.inference_mode():
-        output_torch_fp4_moe = torch.ops.moe.torch_fp4_moe(
+        output_torch_fp4_moe = torch.ops.auto_deploy.torch_fp4_moe(
             x,
             selected_experts,
             final_scales,

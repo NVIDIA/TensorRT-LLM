@@ -306,11 +306,15 @@ class FP4QuantizationImpl(QuantizationImpl):
     def shard_load_hook(
         state_dict, prefix, *args, weight_name, weight_shape, dim, rank, world_size
     ):
-        if weight_name + "_scale" in state_dict:
-            weight_scale = state_dict[weight_name + "_scale"]
-            state_dict[weight_name + "_scale"] = _shard_fp4_weight_scale(
-                weight_scale, weight_shape, dim, rank, world_size
-            )
+        try:
+            if weight_name + "_scale" in state_dict:
+                weight_scale = state_dict[weight_name + "_scale"]
+                state_dict[weight_name + "_scale"] = _shard_fp4_weight_scale(
+                    weight_scale, weight_shape, dim, rank, world_size
+                )
+        except Exception as e:
+            print(f"[shard_load_hook] Skipped due to exception: {e}", flush=True)
+
 
     @staticmethod
     def fuse_linear_weights(

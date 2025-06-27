@@ -71,7 +71,7 @@ def match_moe_pattern(gm: GraphModule) -> GraphModule:
 
             if weight_type == "fp8":
                 fused_moe_node = graph.call_function(
-                    torch.ops.moe.torch_fp8_moe,
+                    torch.ops.auto_deploy.torch_fp8_moe,
                     args=(
                         hidden_states,
                         selected_experts,
@@ -89,7 +89,7 @@ def match_moe_pattern(gm: GraphModule) -> GraphModule:
                 )
             elif weight_type == "fp4":
                 fused_moe_node = graph.call_function(
-                    torch.ops.moe.torch_fp4_moe,
+                    torch.ops.auto_deploy.torch_fp4_moe,
                     args=(
                         hidden_states,
                         selected_experts,
@@ -139,7 +139,7 @@ def match_moe_pattern(gm: GraphModule) -> GraphModule:
 
 def fuse_moe(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
     """
-    Scan the FX graph and replace all calls to torch.ops.moe.torch_moe with
+    Scan the FX graph and replace all calls to torch.ops.auto_deploy.torch_moe with
     torch.ops.auto_deploy.trtllm_moe_fused.
     """
     ad_logger.debug("Before MoE fusion: " + str(gm))
@@ -187,7 +187,7 @@ def _insert_fused_moe_ops(gm: GraphModule) -> int:
 
         with graph.inserting_before(node):
             new_node = graph.call_function(
-                # TODO: torch.ops.moe.trtllm_fused_moe for unquantized models,
+                # TODO: torch.ops.auto_deploy.trtllm_fused_moe for unquantized models,
                 torch.ops.auto_deploy.trtllm_moe_fused,
                 args=(
                     hidden_states,
@@ -274,14 +274,16 @@ def _extract_linear_parameters(linear_node: Node) -> tuple[Node, torch.Tensor, O
     Given a linear op node, extract the input tensor node, weight tensor,
     any quantization scales (if the op is quantized), and return a weight type.
 
-    For a torch.ops.linear.simple.default op:
+    For a torch.ops.auto_deploy.torch_linear_simple.default op:
       - Returns (input_node, weight, None, "simple")
 
-    For a torch.ops.quant.fp8_linear op:
+    For a torch.ops.auto_deploy.torch_quant_fp8_linear op:
       - Returns (input_node, weight, {"input_scale": input_scale, "weight_scale": weight_scale}, "fp8")
+       For a torch.ops.auto_deploy.torch_quant_fp4_linear op:
+      - Returns (input_node, weight, {"input_scale": input_scale, "weight_scale": weight_scale, "alpha": alpha}, "fp4")
     """
     input_node = linear_node.args[0]
-    if is_op(linear_node, torch.ops.quant.fp8_linear):
+    if is_op(linear_node, torch.ops.auto_deploy.torch_quant_fp8_linear):
         weight = linear_node.args[1]
         input_scale = linear_node.kwargs.get("input_scale", None)
         weight_scale = linear_node.kwargs.get("weight_scale", None)
@@ -293,7 +295,7 @@ def _extract_linear_parameters(linear_node: Node) -> tuple[Node, torch.Tensor, O
         if weight_scale is None and len(linear_node.args) >= 5:
             weight_scale = linear_node.args[4]
         return input_node, weight, {"input_scale": input_scale, "weight_scale": weight_scale}, "fp8"
-    elif is_op(linear_node, torch.ops.quant.fp4_linear):
+    elif is_op(linear_node, torch.ops.auto_deploy.torch_quant_fp4_linear):
         weight = linear_node.args[1]
         input_scale = linear_node.kwargs.get("input_scale", None)
         weight_scale = linear_node.kwargs.get("weight_scale", None)
@@ -312,7 +314,7 @@ def _extract_linear_parameters(linear_node: Node) -> tuple[Node, torch.Tensor, O
             {"input_scale": input_scale, "weight_scale": weight_scale, "alpha": alpha},
             "fp4",
         )
-    elif is_op(linear_node, torch.ops.linear.simple):
+    elif is_op(linear_node, torch.ops.auto_deploy.torch_linear_simple):
         weight = linear_node.args[1]
         return input_node, weight, None, "simple"
     else:
@@ -331,8 +333,9 @@ def _match_expert_compute_pattern(start_boundary: Node, end_boundary: Node):
     collects the weight parameters from three linear ops (w1, w3, and w2 branches).
 
     This function supports both:
-      - torch.ops.linear.simple.default ops, and
-      - torch.ops.quant.fp8_linear ops (in which case it also extracts quantization scales).
+      - torch.ops.auto_deploy.torch_linear_simple.default ops, and
+      - torch.ops.auto_deploy.torch_quant_fp8_linear ops (also extracts quantization scales).
+      - torch.ops.auto_deploy.torch_quant_fp4_linear ops (also extracts quantization scales).
 
     Returns:
         A tuple:

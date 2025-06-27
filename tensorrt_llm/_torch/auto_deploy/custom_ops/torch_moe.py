@@ -143,7 +143,7 @@ def torch_fused_moe(
     return torch.empty_like(x)
 
 
-@torch.library.custom_op("moe::torch_fp8_moe", mutates_args=())
+@torch.library.custom_op("auto_deploy::torch_fp8_moe", mutates_args=())
 def torch_fp8_moe(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
@@ -161,7 +161,7 @@ def torch_fp8_moe(
     """
     FP8 MoE op using quantized linear operations.
 
-    Computes a Mixture-of-Experts layer similar to the reference moe::torch_moe op, but uses the
+    Computes a Mixture-of-Experts layer similar to the reference auto_deploy::torch_moe op, but uses the
     quantized FP8 linear op for expert computations.
 
     Args:
@@ -188,14 +188,14 @@ def torch_fp8_moe(
         idx, top_x = torch.where(expert_mask[expert_idx])
         tokens_for_expert = x[None, top_x].reshape(-1, hidden_dim)
 
-        gate_out = torch.ops.quant.fp8_linear(
+        gate_out = torch.ops.auto_deploy.torch_quant_fp8_linear(
             tokens_for_expert,
             w1_weight[expert_idx],
             bias=None,
             input_scale=w1_input_scale[expert_idx],
             weight_scale=w1_weight_scale[expert_idx],
         )
-        up_out = torch.ops.quant.fp8_linear(
+        up_out = torch.ops.auto_deploy.torch_quant_fp8_linear(
             tokens_for_expert,
             w3_weight[expert_idx],
             bias=None,
@@ -204,7 +204,7 @@ def torch_fp8_moe(
         )
         activated = F.silu(gate_out)
         prod = activated * up_out
-        expert_out = torch.ops.quant.fp8_linear(
+        expert_out = torch.ops.auto_deploy.torch_quant_fp8_linear(
             prod,
             w2_weight[expert_idx],
             bias=None,
@@ -236,7 +236,7 @@ def torch_fp8_moe(
     return torch.empty_like(x)
 
 
-@torch.library.custom_op("moe::torch_fp4_moe", mutates_args=())
+@torch.library.custom_op("auto_deploy::torch_fp4_moe", mutates_args=())
 def torch_fp4_moe(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
@@ -257,7 +257,7 @@ def torch_fp4_moe(
     """
     FP4 MoE op using quantized linear operations.
 
-    Computes a Mixture-of-Experts layer similar to the reference moe::torch_moe op,
+    Computes a Mixture-of-Experts layer similar to the reference auto_deploy::torch_moe op,
     but uses the NVFP4 quantized linear op for expert computations.
 
     Args:
@@ -286,7 +286,7 @@ def torch_fp4_moe(
 
         if not tokens_for_expert.shape[0]:
             continue  # input of shape [0, hidden_dim] breaks fp4 kernel
-        gate_out = torch.ops.quant.fp4_linear(
+        gate_out = torch.ops.auto_deploy.torch_quant_fp4_linear(
             tokens_for_expert,
             w1_weight[expert_idx],
             bias=None,
@@ -294,7 +294,7 @@ def torch_fp4_moe(
             weight_scale=w1_weight_scale[expert_idx],
             alpha=w1_alpha[expert_idx],
         )
-        up_out = torch.ops.quant.fp4_linear(
+        up_out = torch.ops.auto_deploy.torch_quant_fp4_linear(
             tokens_for_expert,
             w3_weight[expert_idx],
             bias=None,
@@ -304,7 +304,7 @@ def torch_fp4_moe(
         )
         activated = F.silu(gate_out)
         prod = activated * up_out
-        expert_out = torch.ops.quant.fp4_linear(
+        expert_out = torch.ops.auto_deploy.torch_quant_fp4_linear(
             prod,
             w2_weight[expert_idx],
             bias=None,

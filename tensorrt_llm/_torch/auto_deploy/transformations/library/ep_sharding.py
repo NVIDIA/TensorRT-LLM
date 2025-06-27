@@ -40,7 +40,7 @@ def ep_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
     for node in list(gm.graph.nodes):
         if not is_op(
             node,
-            (torch.ops.auto_deploy.torch_moe, torch.ops.moe.torch_fp8_moe, torch.ops.moe.torch_fp4_moe),
+            (torch.ops.auto_deploy.torch_moe, torch.ops.auto_deploy.torch_fp8_moe, torch.ops.auto_deploy.torch_fp4_moe),
         ):
             continue
         _insert_sharded_moe(gm, node, rank, world_size)
@@ -63,8 +63,8 @@ def _insert_sharded_moe(
     sharded `selected_experts` and `final_scales(router_logics)`.
     Add an all_reduce node after the moe node.
     """
-    is_fp8 = is_op(node, torch.ops.moe.torch_fp8_moe)
-    is_fp4 = is_op(node, torch.ops.moe.torch_fp4_moe)
+    is_fp8 = is_op(node, torch.ops.auto_deploy.torch_fp8_moe)
+    is_fp4 = is_op(node, torch.ops.auto_deploy.torch_fp4_moe)
     num_experts = len(node.args[3])
     args = list(node.args)
 
