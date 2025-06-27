@@ -1,18 +1,20 @@
 from __future__ import annotations
 
-from functools import cached_property
 from pathlib import Path
-from typing import Any, Dict, Literal, Optional, Self, Union
+from typing import Any, Dict, Literal, Optional
 
 import yaml
+from huggingface_hub import snapshot_download
 from pydantic import (AliasChoices, AliasPath, BaseModel, Field, computed_field,
                       field_validator, model_validator)
 from transformers import AutoConfig
 
+# isort: off
+from tensorrt_llm.bench.benchmark.tuning.utils import get_model_config
 from tensorrt_llm.bench.build.utils import get_safetensors_metadata
 from tensorrt_llm.bench.dataclasses.general import DatasetMetadata
 from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
-from tensorrt_llm.bench.tuning.utils import get_model_config
+# isort: on
 
 
 class BatchingConfiguration(BaseModel):
@@ -25,23 +27,6 @@ class BatchingConfiguration(BaseModel):
     max_num_tokens: Optional[int] = Field(
         description="The maximum number of tokens to use for batch scheduling.",
         default=None)
-
-
-class BenchmarkEnvironment(BaseModel):
-    model: str = Field(default="",
-                       description="The HF model name to use for benchmarking.")
-    checkpoint_path: Optional[Path] = Field(
-        default=None,
-        description="The path to the checkpoint to use for benchmarking.")
-    workspace: Path = Field(
-        default="/tmp", description="The workspace to use for engine building.")
-
-    @computed_field(
-        description=
-        "The type of model being used, derived from the model configuration.", )
-    @cached_property
-    def model_type(self) -> str:
-        return get_model_config(self.model, self.checkpoint_path).model_type
 
 
 class LlmRuntimeSpecification(BaseModel):
@@ -368,3 +353,37 @@ class ScenarioSpecification(BaseModel):
             f"P95:  {form(isl_stats.p95)}          {form(osl_stats.p95)}          {form(seq_len_stats.p95)}\n"
             f"P99:  {form(isl_stats.p99)}          {form(osl_stats.p99)}          {form(seq_len_stats.p99)}\n"
             "===========================================================\n")
+
+
+class BenchmarkEnvironment(BaseModel):
+    model: str = Field(default="",
+                       description="The HF model name to use for benchmarking.")
+    checkpoint_path: Optional[Path] = Field(
+        default=None,
+        description="The path to the checkpoint to use for benchmarking.")
+    workspace: Path = Field(
+        default="/tmp", description="The workspace to use for engine building.")
+
+    @computed_field(
+        description=
+        "The type of model being used, derived from the model configuration.")
+    def model_type(self) -> str:
+        return get_model_config(self.model, self.checkpoint_path).model_type
+
+
+class BenchmarkSpecification(BaseModel):
+    environment: BenchmarkEnvironment
+    engine_dir: Optional[Path] = Field(
+        default=None,
+        description="The path to the engine to use for benchmarking.")
+    scenario: Optional[ScenarioSpecification] = Field(
+        default=None, description="The scenario to use for benchmarking.")
+    world: Optional[WorldConfig] = Field(
+        default=None, description="The world to use for benchmarking.")
+    constraints: Optional[TuningConstraints] = Field(
+        default=None,
+        description="The tuning criteria to use for benchmarking.")
+
+    def __post_init__(self) -> None:
+        if self.checkpoint_path is None and self.scenario.backend != "tensorrt":
+            self.checkpoint_path = snapshot_download(self.model)
