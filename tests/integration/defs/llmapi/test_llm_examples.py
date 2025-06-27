@@ -77,6 +77,10 @@ def _run_llmapi_example(llm_root, engine_dir, llm_venv, script_name: str,
     venv_check_call(llm_venv, run_command)
 
 
+def test_llmapi_quickstart(llm_root, engine_dir, llm_venv):
+    _run_llmapi_example(llm_root, engine_dir, llm_venv, "quickstart_example.py")
+
+
 def test_llmapi_example_inference(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv, "llm_inference.py")
 
@@ -105,11 +109,6 @@ def test_llmapi_example_guided_decoding(llm_root, engine_dir, llm_venv):
 def test_llmapi_example_distributed_tp2(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv,
                         "llm_inference_distributed.py")
-
-
-### Quickstart examples
-def test_llmapi_quickstart(llm_root, engine_dir, llm_venv):
-    _run_llmapi_example(llm_root, engine_dir, llm_venv, "quickstart_example.py")
 
 
 def test_llmapi_quickstart_atexit(llm_root, engine_dir, llm_venv):
