@@ -415,14 +415,10 @@ def main(*,
         build_pybind = "OFF"
         build_deep_ep = "OFF"
     else:
-        targets.extend(["bindings", "th_common"])
+        targets.extend(["th_common", "bindings", "deep_ep"])
         build_pyt = "ON"
         build_pybind = "ON"
-        if on_windows:
-            build_deep_ep = "OFF"
-        else:
-            build_deep_ep = "ON"
-            targets.append("deep_ep")
+        build_deep_ep = "ON"
 
     if benchmarks:
         targets.append("benchmarks")
@@ -631,7 +627,11 @@ def main(*,
             return pybind_lib[0]
 
         install_file(get_pybind_lib("pybind", "bindings"), pkg_dir)
-        if build_deep_ep == "ON":
+
+        with (build_dir / "tensorrt_llm" / "deep_ep" /
+              "cuda_architectures.txt").open() as f:
+            deep_ep_cuda_architectures = f.read().strip().split(";")
+        if deep_ep_cuda_architectures:
             install_file(get_pybind_lib("deep_ep", "deep_ep_cpp_tllm"), pkg_dir)
             install_tree(build_dir / "tensorrt_llm" / "deep_ep" / "python" /
                          "deep_ep",
@@ -639,7 +639,7 @@ def main(*,
                          dirs_exist_ok=True)
             (lib_dir / "nvshmem").mkdir(exist_ok=True)
             install_file(
-                build_dir / "tensorrt_llm/deep_ep/nvshmem-src/License.txt",
+                build_dir / "tensorrt_llm/deep_ep/nvshmem-build/License.txt",
                 lib_dir / "nvshmem")
             install_file(
                 build_dir /
@@ -685,7 +685,7 @@ def main(*,
                     build_run(
                         f"\"{venv_python}\" -m pybind11_stubgen -o . bindings --exit-code",
                         env=env_ld)
-                    if build_deep_ep == "ON":
+                    if deep_ep_cuda_architectures:
                         build_run(
                             f"\"{venv_python}\" -m pybind11_stubgen -o . deep_ep_cpp_tllm --exit-code",
                             env=env_ld)
