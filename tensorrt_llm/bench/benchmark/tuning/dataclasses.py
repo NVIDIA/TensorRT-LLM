@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, Dict, Literal, Optional
 
 import yaml
+from huggingface_hub import snapshot_download
 from pydantic import (AliasChoices, AliasPath, BaseModel, Field, computed_field,
                       field_validator, model_validator)
 from transformers import AutoConfig
@@ -24,6 +25,10 @@ class BenchmarkSpecification(BaseModel):
     constraints: Optional[TuningConstraints] = Field(
         default=None,
         description="The tuning criteria to use for benchmarking.")
+
+    def __post_init__(self) -> None:
+        if self.checkpoint_path is None and self.scenario.backend != "tensorrt":
+            self.checkpoint_path = snapshot_download(self.model)
 
 
 class BenchmarkEnvironment(BaseModel):
