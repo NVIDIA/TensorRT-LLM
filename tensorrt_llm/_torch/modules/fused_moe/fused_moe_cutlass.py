@@ -269,7 +269,9 @@ class CutlassFusedMoE(MoE):
             token_selected_experts,
             token_final_scales,
             self.w3_w1_weight.view(weight_dtype),
+            None,  # fc1_expert_biases
             self.w2_weight.view(weight_dtype),
+            None,  # fc2_expert_biases
             output_dtype,
             quant_scales=self.quant_scales,
             input_sf=x_sf,
