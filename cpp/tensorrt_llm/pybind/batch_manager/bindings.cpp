@@ -250,7 +250,8 @@ void initBindings(pybind11::module_& m)
                     self.setDraftTokens(std::make_shared<GenLlmReq::VecTokens>(draftTokens.value()));
                 }
             })
-        .def_property("is_dummy_request", &GenLlmReq::isDummyRequest, &GenLlmReq::setIsDummyRequest);
+        .def_property("is_dummy_request", &GenLlmReq::isDummyRequest, &GenLlmReq::setIsDummyRequest)
+        .def_property_readonly("return_perf_metrics", &GenLlmReq::getReturnPerfMetrics);
 
     py::classh<tb::LlmRequest, GenLlmReq>(m, "LlmRequest", pybind11::dynamic_attr())
         .def(py::init(
@@ -373,7 +374,9 @@ void initBindings(pybind11::module_& m)
             })
         .def("move_prompt_embedding_table_to_gpu", &tb::LlmRequest::movePromptEmbeddingTableToGpu, py::arg("manager"))
         .def("move_lora_weights_to_gpu", &tb::LlmRequest::moveLoraWeightsToGpu, py::arg("manager"))
-        .def("finish_by_reason", &tb::LlmRequest::finishByReason, py::arg("finish_reason"));
+        .def("finish_by_reason", &tb::LlmRequest::finishByReason, py::arg("finish_reason"))
+        .def("set_first_scheduled_time", &tb::LlmRequest::setFirstScheduledTime)
+        .def("update_perf_metrics", &tb::LlmRequest::updatePerfMetrics, py::arg("iter_counter"));
 
     py::classh<tb::SequenceSlotManager>(m, "SequenceSlotManager")
         .def(py::init<tb::SequenceSlotManager::SlotIdType, uint64_t>(), py::arg("max_num_slots"),

@@ -1764,6 +1764,7 @@ class PyExecutor:
                         max_new_tokens=request.py_max_new_tokens,
                         input_tokens=input_tokens,
                         sampling_config=request.sampling_config,
+                        return_perf_metrics=request.return_perf_metrics,
                         is_streaming=False)
 
                     draft_batch.context_requests.append(new_request)
@@ -1773,6 +1774,7 @@ class PyExecutor:
                         max_new_tokens=request.py_max_new_tokens,
                         input_tokens=input_tokens[:-1],
                         sampling_config=request.sampling_config,
+                        return_perf_metrics=request.return_perf_metrics,
                         is_streaming=False)
                     # Explicitly add the last token so get_last_tokens() returns
                     # the right value
@@ -1785,6 +1787,7 @@ class PyExecutor:
                         max_new_tokens=request.py_max_new_tokens,
                         input_tokens=input_tokens,
                         sampling_config=request.sampling_config,
+                        return_perf_metrics=request.return_perf_metrics,
                         is_streaming=False)
                     new_request.context_chunk_size = num_accepted_tokens + 1
                     new_request.context_current_position = len(
@@ -2013,6 +2016,9 @@ class PyExecutor:
 
             request.draft_tokens = request.py_draft_tokens
             request.decoding_iter = request.py_decoding_iter
+
+            if request.return_perf_metrics:
+                request.update_perf_metrics(self.model_engine.iter_counter)
 
             request_done = False
             if self.model_engine.iter_counter % self.stream_interval == 0 or request.is_finished:
