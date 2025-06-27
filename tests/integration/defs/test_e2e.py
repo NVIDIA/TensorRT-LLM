@@ -550,6 +550,8 @@ class BenchRunner:
 
         if self.use_pytorch_backend:
             benchmark_cmd += " --backend pytorch"
+        else:
+            benchmark_cmd += " --backend trt"
 
         if self.extra_llm_api_options:
             benchmark_cmd += f" --extra_llm_api_options {self.extra_llm_api_options}"
@@ -737,6 +739,7 @@ def test_trtllm_bench_sanity(llm_root, llm_venv, engine_dir, model_subdir,
     benchmark_cmd = \
         f"trtllm-bench --model {model_name} --model_path {model_path} " \
         f"throughput --engine_dir {engine_path} " \
+        f"--backend tensorrt " \
         f"--dataset {dataset_path} {streaming}"
 
     assert not pytorch_backend_config
@@ -784,7 +787,7 @@ def test_trtllm_bench_pytorch_backend_sanity(llm_root, llm_venv,
     benchmark_cmd = \
         f"trtllm-bench --model {model_name} --model_path {model_path} " \
         f"throughput " \
-        f"--dataset {dataset_path} --backend 'pytorch'"
+        f"--dataset {dataset_path} --backend pytorch"
 
     mapping = {
         "Meta-Llama-3.1-8B": 19.4,
@@ -942,7 +945,8 @@ def test_trtllm_bench_request_rate_and_concurrency(llm_root, llm_venv,
 )
 @pytest.mark.parametrize("streaming", [True, False],
                          ids=["non-streaming", "streaming"])
-@pytest.mark.parametrize("backend", [None, "pytorch"], ids=["TRT", "PyTorch"])
+@pytest.mark.parametrize("backend", ["tensorrt", "pytorch"],
+                         ids=["TRT", "PyTorch"])
 def test_trtllm_bench_iteration_log(llm_root, llm_venv, model_name,
                                     model_subdir, streaming, backend):
     '''
@@ -952,7 +956,7 @@ def test_trtllm_bench_iteration_log(llm_root, llm_venv, model_name,
     engine_dir = None
 
     try:
-        skip_engine_build = backend is not None
+        skip_engine_build = backend != "tensorrt"
         iteration_log = tempfile.mkstemp(dir="/tmp", suffix=".txt")[1]
         if not skip_engine_build:
             engine_dir = tempfile.mkdtemp(dir="/tmp")
@@ -974,9 +978,9 @@ def test_trtllm_bench_iteration_log(llm_root, llm_venv, model_name,
         if streaming:
             benchmark_cmd += " --streaming"
 
+        benchmark_cmd += f" --backend {backend}"
         if skip_engine_build:
             assert engine_path is None, "Engine path should be None"
-            benchmark_cmd += f" --backend {backend}"
         else:
             assert engine_path is not None, "Engine path should not be None"
             benchmark_cmd += f" --engine_dir {engine_path}"
