@@ -2,8 +2,6 @@ name: Auto assign reviewers
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-permissions:
-  pull-requests: write
 jobs:
   assign:
     runs-on: ubuntu-latest
