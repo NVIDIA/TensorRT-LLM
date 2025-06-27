@@ -12,10 +12,11 @@ from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
                                            PredefinedAttentionMask, RopeParams)
 from ..model_config import ModelConfig
-from ..modules.attention import Attention, QkNormType
+from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import FusedMoE, RenormalizeMoeRoutingMethod
+from ..modules.fused_moe import (CutlassFusedMoE, RenormalizeMoeRoutingMethod,
+                                 VanillaMoE, create_moe)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
@@ -51,7 +52,7 @@ class HunyuanMoE(nn.Module):
 
         reduce_results = True
 
-        self.experts = FusedMoE(
+        self.experts = create_moe(
             num_experts=self.num_experts,
             routing_method=RenormalizeMoeRoutingMethod(top_k=self.top_k),
             hidden_size=self.hidden_dim,
@@ -110,6 +111,7 @@ class HunYuanAttention(Attention):
             rope=RopeParams.from_config(config),
             is_neox=True,
         ) if self.use_rope else None
+        self.use_qk_norm = use_qk_norm
 
         super().__init__(
             hidden_size=config.hidden_size,
@@ -118,8 +120,6 @@ class HunYuanAttention(Attention):
             max_position_embeddings=config.max_position_embeddings,
             bias=config.attention_bias,
             pos_embd_params=pos_embd_params,
-            qk_norm_type=QkNormType.post_rope
-            if use_qk_norm else QkNormType.none,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
@@ -134,6 +134,17 @@ class HunYuanAttention(Attention):
                                      dtype=config.torch_dtype)
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+
+    def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
+                   v: Optional[torch.Tensor], position_ids: torch.Tensor):
+        q, k, v = self.split_qkv(q, k, v)
+        if position_ids is not None:
+            q, k, v = super().apply_rope(q, k, v, position_ids)
+        # Llama4 applies QK norm after RoPE.
+        if self.use_qk_norm:
+            q, k = self.apply_qk_norm(q, k)
+
+        return q, k, v
 
     def apply_qk_norm(self, q, k):
 
@@ -375,7 +386,8 @@ class HunYuanMoEV1ForCausalLM(DecoderModelForCausalLM[HunYuanModel,
                 else:
                     name = name.replace('gate', 'gate.wg')
                     module_weights = filter_weights(name, weights)
-                    if isinstance(module, FusedMoE):
+                    if isinstance(module, CutlassFusedMoE) or isinstance(
+                            module, VanillaMoE):
                         # model.layers.{idx}.mlp.experts
                         updated_module_weights = {}
                         for weight_name, weight_value in module_weights.items():
