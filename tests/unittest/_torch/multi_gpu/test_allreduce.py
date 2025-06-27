@@ -40,6 +40,9 @@ MPI.pickle.__init__(
     pickle.HIGHEST_PROTOCOL,
 )
 
+# needed since we reuse the mpi executor pool, first test running will leak a thread
+pytestmark = pytest.mark.threadleak(enabled=False)
+
 
 def fp8_quant(input, scale):
     finfo = torch.finfo(torch.float8_e4m3fn)
