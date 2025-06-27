@@ -2061,13 +2061,15 @@ def test_llm_chunked_prefill():
     success_path()
 
 
-def _test_llm_capture_request_error(tp_size: int = 1):
+def _test_llm_capture_request_error(backend: Optional[str], tp_size: int = 1):
     build_config = BuildConfig()
     build_config.max_num_tokens = 64
 
     llm = LLM(
         model=llama_model_path,
         build_config=build_config,
+        tensor_parallel_size=tp_size,
+        backend=backend,
         fast_build=True,
     )
 
@@ -2077,8 +2079,9 @@ def _test_llm_capture_request_error(tp_size: int = 1):
         llm.generate(prompt)
 
 
-def test_llm_capture_request_error():
-    _test_llm_capture_request_error(tp_size=1)
+@pytest.mark.parametrize('backend', [None, 'pytorch'])
+def test_llm_capture_request_error(backend: Optional[str]):
+    _test_llm_capture_request_error(backend=backend, tp_size=1)
 
 
 def test_llm_api_jupyter_scenario():

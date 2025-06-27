@@ -451,8 +451,9 @@ def test_llm_get_stats_async_tp2(pytorch_backend):
     llm_get_stats_async_test_harness(tp_size=2, pytorch_backend=pytorch_backend)
 
 
-def test_llm_capture_request_error():
-    _test_llm_capture_request_error(tp_size=2)
+@pytest.mark.parametrize('backend', [None, 'pytorch'])
+def test_llm_capture_request_error(backend: Optional[str]):
+    _test_llm_capture_request_error(backend=backend, tp_size=2)
 
 
 def test_llm_with_postprocess_parallel_tp2():
