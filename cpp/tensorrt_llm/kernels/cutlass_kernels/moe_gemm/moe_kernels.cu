@@ -847,6 +847,31 @@ void mergeExpertPrefixSum(int const* blocked_expert_counts, int const* blocked_e
         unpermuted_row_to_permuted_row, num_tokens);
 }
 
+// threeStepBuildExpertMapsSortFirstToken uses three kernels to achieve the sort of token_selected_experts
+
+// 1. blockExpertPrefixSumKernel launches [num_experts_per_node, num_blocks_per_seq] CTAs; each CTA has
+// num_tokens_per_block threads. blocked_row_to_unpermuted_row points to a 2D buffer of size [num_experts_per_node,
+// num_tokens], which can be viewed as [num_experts_per_node, num_blocks_per_seq] blocks, and each block has
+// num_tokens_per_block tokens. Note that each CTA corresponds to a block in blocked_row_to_unpermuted_row. Within each
+// CTA, the threads leverage cub::BlockScan to compute the offsets of tokens that activate the target expert. If a
+// thread's token activates the target expert, the thread stores its unpermuted_row to the buffer block with the offset.
+// In addition, the kernel also stores the expert counts for each block to another 2D buffer blocked_expert_counts of
+// size [num_experts_per_node, num_blocks_per_seq].
+
+// 2. globalExpertPrefixSumKernel launches 1 CTA; that CTA has num_experts_per_node * num_blocks_per_seq threads.
+// The kernel views blocked_expert_counts as a 1D buffer, and leverages cub::BlockScan to compute the prefix sum of the
+// expert counts for each block. The prefix sum is stored to blocked_expert_counts_cumsum.
+
+// 3. mergeExpertPrefixSumKernel launches [num_experts_per_node, num_blocks_per_seq] CTAs; each CTA has
+// num_tokens_per_block threads. Each CTA obtains the block-level offset from blocked_expert_counts_cumsum, and thus
+// compacts blocked_row_to_unpermuted_row to permuted_row_to_unpermuted_row. In addition, with the block-level offsets,
+// the kernel fills permuted_token_selected_experts.
+
+// computeNumTokensPerBlock decides num_tokens_per_block. Note that both blockExpertPrefixSumKernel and
+// globalExpertPrefixSumKernel leverage cub::BlockScan, and their CTA sizes are num_tokens_per_block and
+// num_experts_per_node * num_blocks_per_seq, respectively. computeNumTokensPerBlock tries to find a minimum CTA size
+// for both kernels, so that the block-leval cub::BlockScan can be efficient.
+
 void threeStepBuildExpertMapsSortFirstToken(int const* token_selected_experts, int* permuted_token_selected_experts,
     int* permuted_row_to_unpermuted_row, int* unpermuted_row_to_permuted_row, int64_t* expert_first_token_offset,
     int* blocked_expert_counts, int* blocked_expert_counts_cumsum, int* blocked_row_to_unpermuted_row,
