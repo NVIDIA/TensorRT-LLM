@@ -9,7 +9,9 @@ from .interface import MoE
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            FP8QDQFusedMoEMethod, MoEWeightLoadingMode,
                            NVFP4CutlassFusedMoEMethod,
-                           UnquantizedFusedMoEMethod, WInt4AFP8FusedMoEMethod)
+                           UnquantizedFusedMoEMethod,
+                           W4A8MXFP4FP8CutlassFusedMoEMethod,
+                           WInt4AFP8FusedMoEMethod)
 from .routing import BaseMoeRoutingMethod
 
 
@@ -133,7 +135,8 @@ class CutlassFusedMoE(MoE):
                     | self.quant_config.quant_mode.has_fp8_block_scales()
                     | self.quant_config.quant_mode.has_fp8_qdq()
                     | self.quant_config.quant_mode.
-                    is_int4_weight_only_per_group()):
+                    is_int4_weight_only_per_group()
+                    | self.quant_config.quant_mode.has_w4a8_mxfp4_fp8()):
                 raise ValueError(
                     f"unsupported quantization mode: {self.quant_config.quant_mode}"
                 )
@@ -156,6 +159,8 @@ class CutlassFusedMoE(MoE):
             elif self.quant_config.layer_quant_mode.is_int4_weight_only_per_group(
             ):
                 return WInt4AFP8FusedMoEMethod()
+            elif self.quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8():
+                return W4A8MXFP4FP8CutlassFusedMoEMethod()
             else:
                 raise ValueError(
                     f"Unsupported quantization mode: {self.quant_config.quant_mode}"
@@ -228,7 +233,7 @@ class CutlassFusedMoE(MoE):
         weight_dtype = self.w3_w1_weight.dtype
         x_sf = None
         if self.has_any_quant:
-            if self.has_fp8_qdq:
+            if self.has_fp8_qdq or self.has_w4a8_mxfp4_fp8:
                 x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
                     x, self.fc31_input_dequant)
             elif self.has_deepseek_fp8_block_scales:

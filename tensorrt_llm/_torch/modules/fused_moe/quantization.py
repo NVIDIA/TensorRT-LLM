@@ -59,6 +59,14 @@ class FusedMoEQuantScalesW4A8(NamedTuple):
     alpha_2: torch.Tensor
 
 
+class FusedMoEQuantScalesW4A8MXFP4FP8(NamedTuple):
+    fc31_weight_block_scale: torch.Tensor
+    fc31_dequant_scale: torch.Tensor
+    fc2_input_scale: torch.Tensor
+    fc2_weight_block_scale: torch.Tensor
+    fc2_dequant_scale: torch.Tensor
+
+
 class FusedMoEMethodBase(ABC):
     """
     Base class for all fused MoE methods.
@@ -1237,6 +1245,264 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
         torch.cuda.synchronize()
 
         dst_w2_weight_scale.copy_(dst_w2_weight_scale_interleaved)
+
+
+class W4A8MXFP4FP8FusedMoEMethod(FusedMoEMethodBase):
+    """
+    Base class for W4A8MXFP4FP8 fused MoE methods for all backends.
+    """
+
+    def create_weights(self, module: torch.nn.Module, weight_dtype,
+                       weight_vec_size, block_scales_dtype,
+                       block_scales_vec_size):
+
+        module.scaling_vector_size = 32
+        # Divide by 32 because we use int64 to pack 16 fp4 values
+        w3_w1_weight_shape = (module.expert_size_per_partition,
+                              module.intermediate_size_per_partition * 2,
+                              module.hidden_size // weight_vec_size)
+        w2_weight_shape = (module.expert_size_per_partition, module.hidden_size,
+                           module.intermediate_size_per_partition //
+                           weight_vec_size)
+
+        # Divide by 4 because we use int32 to pack 4 fp8 values
+        # column parallel
+        assert module.hidden_size % (module.scaling_vector_size *
+                                     block_scales_vec_size) == 0
+        w3_w1_weight_scale = nn.Parameter(
+            torch.ones(module.expert_size_per_partition,
+                       module.intermediate_size_per_partition * 2,
+                       module.hidden_size // module.scaling_vector_size //
+                       block_scales_vec_size,
+                       dtype=block_scales_dtype),
+            requires_grad=False)
+        module.register_parameter("w3_w1_weight_scale", w3_w1_weight_scale)
+
+        # row parallel
+        assert module.intermediate_size_per_partition % (
+            module.scaling_vector_size * block_scales_vec_size) == 0
+        w2_weight_scale = nn.Parameter(
+            torch.ones(module.expert_size_per_partition,
+                       module.hidden_size,
+                       module.intermediate_size_per_partition //
+                       module.scaling_vector_size // block_scales_vec_size,
+                       dtype=block_scales_dtype),
+            requires_grad=False)
+        module.register_parameter("w2_weight_scale", w2_weight_scale)
+
+        fc31_input_scale = nn.Parameter(torch.tensor(1., dtype=torch.float32),
+                                        requires_grad=False)
+        module.register_parameter("fc31_input_scale", fc31_input_scale)
+
+        fc31_input_dequant = nn.Parameter(torch.empty(
+            module.expert_size_per_partition, dtype=torch.float32),
+                                          requires_grad=False)
+        module.register_parameter("fc31_input_dequant", fc31_input_dequant)
+
+        fc2_input_scale = nn.Parameter(torch.tensor(1., dtype=torch.float32),
+                                       requires_grad=False)
+        module.register_parameter("fc2_input_scale", fc2_input_scale)
+
+        fc2_input_dequant = nn.Parameter(torch.empty(
+            module.expert_size_per_partition, dtype=torch.float32),
+                                         requires_grad=False)
+        module.register_parameter("fc2_input_dequant", fc2_input_dequant)
+
+        super().create_weights(module, weight_dtype, w3_w1_weight_shape,
+                               w2_weight_shape)
+
+        self.setup_quant_scales(module)
+
+    def load_expert_w3_w1_weight_scale_w4a8_mxfp4_fp8(
+            self, module: torch.nn.Module, w1_weight_scale: torch.Tensor,
+            w3_weight_scale: torch.Tensor,
+            dst_w3_w1_weight_scale: torch.Tensor):
+        w1_weight_scale = load_weight_shard(w1_weight_scale, module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.COLUMN)
+        w3_weight_scale = load_weight_shard(w3_weight_scale, module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.COLUMN)
+        # Keep weights in device buffer
+        # w3
+        dst_w3_weight_scale = dst_w3_w1_weight_scale.narrow(
+            dim=0, start=0, length=module.intermediate_size_per_partition)
+        dst_w3_weight_scale.copy_(
+            w3_weight_scale.view(dst_w3_weight_scale.dtype))
+
+        # w1
+        dst_w1_weight_scale = dst_w3_w1_weight_scale.narrow(
+            dim=0,
+            start=module.intermediate_size_per_partition,
+            length=module.intermediate_size_per_partition)
+        dst_w1_weight_scale.copy_(
+            w1_weight_scale.view(dst_w1_weight_scale.dtype))
+
+        orig_shape = dst_w3_w1_weight_scale.shape
+
+        dst_w3_w1_weight_scale.copy_(
+            torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+                dst_w3_w1_weight_scale.view(float4_sf_dtype)).view(
+                    self.block_scales_dtype).reshape(orig_shape))
+
+    def load_expert_w2_weight_scale_w4a8_mxfp4_fp8(
+            self, module: torch.nn.Module, w2_weight_scale: torch.Tensor,
+            dst_w2_weight_scale: torch.Tensor):
+        w2_weight_scale = load_weight_shard(w2_weight_scale, module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.ROW)
+        # Keep weights in device buffer
+        dst_w2_weight_scale.copy_(
+            w2_weight_scale.view(dst_w2_weight_scale.dtype))
+
+        orig_shape = dst_w2_weight_scale.shape
+
+        dst_w2_weight_scale.copy_(
+            torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+                dst_w2_weight_scale.view(float4_sf_dtype)).view(
+                    self.block_scales_dtype).reshape(orig_shape))
+
+    def load_expert_fc31_input_scale_w4a8_mxfp4_fp8(
+            self, w1_input_scale, w3_input_scale,
+            dst_fc31_input_scale: torch.Tensor):
+        w1_input_scale = w1_input_scale[...].reshape([])
+        assert torch.allclose(
+            w1_input_scale, w3_input_scale), "w1_input_scale != w3_input_scale"
+        dst_fc31_input_scale.copy_(w1_input_scale)
+
+    def load_expert_fc2_input_scale_w4a8_mxfp4_fp8(
+            self, w2_input_scale, dst_fc2_input_scale: torch.Tensor):
+        dst_fc2_input_scale.copy_(w2_input_scale[...].reshape([]))
+
+    def load_all_w4a8_mxfp4_fp8_weight_scales(
+            self, module: torch.nn.Module, weights: Dict,
+            load_expert_ids: List[int], dst_w3_w1_weight_scale: torch.Tensor,
+            dst_w2_weight_scale: torch.Tensor):
+        for local_slot_id, expert_id in enumerate(load_expert_ids):
+            if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+                w1_weight_scale = weights[f"{expert_id}.w1.weight_scale"]
+                w3_weight_scale = weights[f"{expert_id}.w3.weight_scale"]
+                w2_weight_scale = weights[f"{expert_id}.w2.weight_scale"]
+            elif module.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+                w1_w3_weight_scale = weights["gate_up_proj_weight_scale"][
+                    expert_id].transpose(0, 1).contiguous()
+                w1_weight_scale, w3_weight_scale = w1_w3_weight_scale.chunk(
+                    2, dim=0)
+                w2_weight_scale = weights["down_proj_weight_scale"][
+                    expert_id].transpose(0, 1).contiguous()
+            else:
+                raise NotImplementedError(
+                    f"Unknown weight loading mode in MoE: {module.weight_loading_mode}"
+                )
+
+            expert_idx = local_slot_id
+
+            self.load_expert_w3_w1_weight_scale_w4a8_mxfp4_fp8(
+                module, w1_weight_scale, w3_weight_scale,
+                dst_w3_w1_weight_scale[expert_idx])
+            self.load_expert_w2_weight_scale_w4a8_mxfp4_fp8(
+                module, w2_weight_scale, dst_w2_weight_scale[expert_idx])
+
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+        # Step1: Load input scales.
+        tmp_fc31_input_scale = torch.empty(module.num_experts,
+                                           dtype=torch.float32)
+        tmp_fc2_input_scale = torch.empty(module.num_experts,
+                                          dtype=torch.float32)
+
+        for expert_id in range(module.num_experts):
+            if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+                w1_input_scale = weights[f"{expert_id}.w1.input_scale"]
+                w3_input_scale = weights[f"{expert_id}.w3.input_scale"]
+                w2_input_scale = weights[f"{expert_id}.w2.input_scale"]
+            elif module.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+                w1_input_scale = weights["gate_up_proj_input_scale"]
+                w3_input_scale = weights["gate_up_proj_input_scale"]
+                w2_input_scale = weights["down_proj_input_scale"]
+            else:
+                raise NotImplementedError(
+                    f"Unknown weight loading mode in MoE: {module.weight_loading_mode}"
+                )
+
+            self.load_expert_fc31_input_scale_w4a8_mxfp4_fp8(
+                w1_input_scale, w3_input_scale, tmp_fc31_input_scale[expert_id])
+            self.load_expert_fc2_input_scale_w4a8_mxfp4_fp8(
+                w2_input_scale, tmp_fc2_input_scale[expert_id])
+
+        # fc31_input_scale is the reciprocal of the maximum of all w1 input scales and w3 input scales.
+        module.fc31_input_scale.data.copy_(
+            tmp_fc31_input_scale.max().reciprocal())
+        module.fc31_input_dequant.data.copy_(tmp_fc31_input_scale.max())
+        # fc2_input_scale is the reciprocal of the maximum of all w2 input scales.
+        module.fc2_input_scale.data.copy_(
+            tmp_fc2_input_scale.max().reciprocal())
+        module.fc2_input_dequant.data.copy_(tmp_fc2_input_scale.max())
+
+        # Step2: Load weight block scales.
+        self.load_all_w4a8_mxfp4_fp8_weight_scales(
+            module, weights, module.initial_local_expert_ids,
+            module.w3_w1_weight_scale.data, module.w2_weight_scale.data)
+
+        # Step 3: if need load into shared
+        if self.need_load_shared_weights(module):
+            local_shared_load_expert_ids = module.layer_load_balancer.get_load_expert_ids(
+            )
+            local_shared_w3_w1_scale_tensors = torch.empty(
+                (len(local_shared_load_expert_ids), ) +
+                module.w3_w1_weight_scale.data.shape[1:],
+                dtype=module.w3_w1_weight_scale.data.dtype,
+                device='cpu')
+            local_shared_w2_scale_tensors = torch.empty(
+                (len(local_shared_load_expert_ids), ) +
+                module.w2_weight_scale.data.shape[1:],
+                dtype=module.w2_weight_scale.data.dtype,
+                device='cpu')
+            self.load_all_w4a8_mxfp4_fp8_weight_scales(
+                module, weights, local_shared_load_expert_ids,
+                local_shared_w3_w1_scale_tensors, local_shared_w2_scale_tensors)
+
+            module.register_all_parameter_slot_and_to_fix_weight_fns({
+                'w3_w1_weight_scale':
+                local_shared_w3_w1_scale_tensors,
+                'w2_weight_scale':
+                local_shared_w2_scale_tensors,
+            })
+
+    def setup_quant_scales(self, module: torch.nn.Module):
+        module.quant_scales = FusedMoEQuantScalesW4A8MXFP4FP8(
+            fc31_weight_block_scale=module.w3_w1_weight_scale,
+            fc31_dequant_scale=module.fc31_input_dequant,
+            fc2_input_scale=module.fc2_input_scale,
+            fc2_weight_block_scale=module.w2_weight_scale,
+            fc2_dequant_scale=module.fc2_input_dequant,
+        )
+
+    def get_quant_scales(self, module: torch.nn.Module, slot_start,
+                         slot_end) -> tuple[torch.Tensor, ...]:
+        assert module.smart_router
+        return FusedMoEQuantScalesW4A8MXFP4FP8(
+            fc31_weight_block_scale=module.w3_w1_weight_scale.narrow(
+                0, slot_start, slot_end - slot_start),
+            fc31_dequant_scale=module.fc31_input_dequant.narrow(
+                0, slot_start, slot_end - slot_start),
+            fc2_input_scale=module.fc2_input_scale,
+            fc2_weight_block_scale=module.w2_weight_scale.narrow(
+                0, slot_start, slot_end - slot_start),
+            fc2_dequant_scale=module.fc2_input_dequant.narrow(
+                0, slot_start, slot_end - slot_start),
+        )
+
+
+class W4A8MXFP4FP8CutlassFusedMoEMethod(W4A8MXFP4FP8FusedMoEMethod):
+    weight_dtype = FUSED_MOE_NVFP4_WEIGHT_DTYPE
+    block_scales_dtype = FUSED_MOE_NVFP4_WEIGHT_BLOCK_SCALE_DTYPE
+
+    def create_weights(self, module: torch.nn.Module):
+        weight_vec_size = torch.iinfo(self.weight_dtype).bits // 4
+        block_scales_vec_size = torch.iinfo(self.block_scales_dtype).bits // 8
+
+        super().create_weights(module, self.weight_dtype, weight_vec_size,
+                               self.block_scales_dtype, block_scales_vec_size)
 
 
 class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):

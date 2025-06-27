@@ -1536,6 +1536,8 @@ class Linear(nn.Module):
             return FP8BlockScalesLinearMethod()
         if quant_config.layer_quant_mode.has_nvfp4():
             return NVFP4LinearMethod()
+        if quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8():
+            return W4A8MXFP4FP8LinearMethod()
         raise ValueError(f'unsupported quant mode: {quant_config.quant_mode}')
 
     def create_weights(self):
@@ -1596,6 +1598,12 @@ class Linear(nn.Module):
         assert self._weights_created
         return self.quant_config is not None and self.quant_config.layer_quant_mode.is_int4_weight_only_per_group(
         ) and self.quant_config.quant_algo == QuantAlgo.W4A8_AWQ
+
+    @property
+    def has_w4a8_mxfp4_fp8(self):
+        assert self._weights_created
+        return self.quant_config is not None and self.quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8(
+        )
 
     def apply_linear(self,
                      input,

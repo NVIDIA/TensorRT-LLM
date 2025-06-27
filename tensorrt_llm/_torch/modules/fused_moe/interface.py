@@ -129,3 +129,9 @@ class MoE(nn.Module):
         """ enable_alltoall (bool): whether to enable alltoall instead of allgather/reducescatter
         """
         return False
+
+    @property
+    def has_w4a8_mxfp4_fp8(self):
+        assert self._weights_created
+        return self.quant_config is not None and self.quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8(
+        )
