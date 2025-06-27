@@ -42,7 +42,7 @@ GEMMA3_1B_SINGLE_LAYER_CONFIG = {
   "max_position_embeddings": 32768,
   "model_type": "gemma3_text",
   "num_attention_heads": 4,
-  "num_hidden_layers": 26,
+  "num_hidden_layers": 1,
   "num_key_value_heads": 1,
   "pad_token_id": 0,
   "query_pre_attn_scalar": 256,
@@ -312,14 +312,14 @@ class TestGemma3(unittest.TestCase):
                                      attn_metadata=attn_metadata)
             ref = hf_gemma3.forward(input_ids=gen_input_ids.unsqueeze(0),
                                      position_ids=gen_position_ids,
+                                     past_key_values=ref.past_key_values,
                                      use_cache=True)
             print("[test_gemma3_allclose_to_hf] max gen diff: ", torch.max(torch.abs(logits - ref.logits[:, -1].float())))
             print("[test_gemma3_allclose_to_hf] mean gen diff: ", torch.mean(torch.abs(logits - ref.logits[:, -1].float())))
 
-            # TODO: Fix this. Thresholds below are unacceptably high.
             torch.testing.assert_close(logits,
                                     ref.logits[:, -1].float(),
-                                    atol=5,
-                                    rtol=14000)
+                                    atol=0.5,
+                                    rtol=0.5)
 
         kv_cache_manager.shutdown()
