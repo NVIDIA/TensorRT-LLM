@@ -878,13 +878,6 @@ class PyExecutor:
                 scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
                 )
 
-                if self.draft_model_engine is not None or is_ngram:
-                    # REVIEW: This might need to be changed. The reason we call prepare_draft_requests
-                    # on all active requests before scheduling is to make the scheduler aware of KV pages used
-                    # by draft tokens.
-                    self._prepare_draft_requests(
-                        fitting_disagg_gen_init_requests)
-
                 if self.kv_cache_transceiver:
                     # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
                     self._prepare_disagg_gen_init(
@@ -981,7 +974,6 @@ class PyExecutor:
             # Set draft tokens here to make the KV cache manager
             # and scheduler aware of them.
             for req in requests:
-                # TODO: enable draft tokens in context phase
                 if req.state not in (LlmRequestState.GENERATION_IN_PROGRESS,
                                      LlmRequestState.DISAGG_GENERATION_INIT):
                     continue
@@ -1551,7 +1543,8 @@ class PyExecutor:
                     ResourceManagerType.SEQ_SLOT_MANAGER,
                     ResourceManagerType.SPEC_RESOURCE_MANAGER,
                     ResourceManagerType.DRAFT_KV_CACHE_MANAGER):
-                if resource_mgr_type in self.resource_manager.resource_managers:
+                if resource_mgr_type in self.resource_manager.resource_managers and self.resource_manager.resource_managers[
+                        resource_mgr_type] is not None:
                     self.resource_manager.resource_managers[
                         resource_mgr_type].prepare_resources(
                             disagg_gen_init_to_prepare)

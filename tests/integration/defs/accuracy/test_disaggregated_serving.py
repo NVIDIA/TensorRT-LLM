@@ -211,9 +211,56 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.parametrize("disable_overlap_scheduler", [True])
+    @pytest.mark.skip(reason="nvbugs/5337601")
+    def test_eagle3(self, disable_overlap_scheduler):
+        sepculative_decoding_config = {
+            "decoding_type": "Eagle",
+            "max_draft_len": 4,
+            "pytorch_weights_path":
+            f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
+            "eagle3_one_model": False
+        }
+        kv_cache_config = {
+            "free_gpu_memory_fraction": 0.5,
+            "enable_block_reuse": False
+        }
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "speculative_config": sepculative_decoding_config,
+            "kv_cache_config": kv_cache_config
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": disable_overlap_scheduler,
+            "speculative_config": sepculative_decoding_config,
+            "kv_cache_config": kv_cache_config
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      self.MODEL_PATH,
+                                      tensor_parallel_size=4) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
-@pytest.mark.timeout(3600)
+
 @pytest.mark.skip_less_device_memory(140000)
+@pytest.mark.timeout(3600)
 class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama4-models/Llama-4-Scout-17B-16E-Instruct"
