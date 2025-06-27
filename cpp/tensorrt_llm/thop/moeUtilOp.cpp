@@ -62,9 +62,10 @@ void runPermute(void const* input_activations_void, void const* input_sf_void, i
     int start_expert = num_experts_per_node * parallelism_config.ep_rank;
     int end_expert = start_expert + num_experts_per_node;
 
-    bool const needs_num_valid = parallelism_config.ep_size > 1;
-    // Note: expert_first_token_offset_[num_experts_per_node] stores the total number of expanded tokens
-    int64_t const* num_valid_tokens_ptr = needs_num_valid ? expert_first_token_offset_ + num_experts_per_node : nullptr;
+    // bool const needs_num_valid = parallelism_config.ep_size > 1;
+    // // Note: expert_first_token_offset_[num_experts_per_node] stores the total number of expanded tokens
+    // int64_t const* num_valid_tokens_ptr = needs_num_valid ? expert_first_token_offset_ + num_experts_per_node :
+    // nullptr;
 
     bool use_w4afp8 = false;
     bool fused_prologue_result = false;
