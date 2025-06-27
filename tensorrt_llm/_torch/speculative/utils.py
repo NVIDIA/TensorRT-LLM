@@ -98,10 +98,10 @@ def get_num_spec_layers(spec_config):
 
 
 def get_spec_worker(spec_config, mapping):
-    if spec_config.spec_dec_mode.is_mtp():
-        return MTPWorker(spec_config)
-    elif spec_config.spec_dec_mode.is_mtp_eagle():
+    if spec_config.spec_dec_mode.is_mtp_eagle():
         return MTPEagleWorker(spec_config)
+    elif spec_config.spec_dec_mode.is_mtp():
+        return MTPWorker(spec_config)
     elif spec_config.spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelWorker(spec_config, mapping)
     else:
