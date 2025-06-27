@@ -199,9 +199,8 @@ class DeepseekV3Linear(Linear):
                      lora_params: Optional[dict] | None = None,
                      layer_idx: Optional[int] | None = None):
         num_tokens = input.shape[0]
-        if (
-                not self.has_any_quant
-        ) and num_tokens >= 1 and num_tokens <= 16 and get_sm_version() != 120:
+        if (not self.has_any_quant and 1 <= num_tokens <= 16
+                and get_sm_version() != 120):
             output = torch.ops.trtllm.dsv3_fused_a_gemm_op(
                 input, self.weight.t(), bias, None)
         else:
