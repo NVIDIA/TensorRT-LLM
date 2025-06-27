@@ -1,13 +1,16 @@
 import copy
 import math
+from functools import partial
 from itertools import chain
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-import transformers
-from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
-                          PreTrainedModel)
+from einops import rearrange
+from transformers import (AutoConfig, AutoModel, AutoProcessor, AutoTokenizer,
+                          PretrainedConfig, PreTrainedModel)
+from transformers.modeling_utils import load_sharded_checkpoint
+from transformers.models.auto import CONFIG_MAPPING
 
 from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
                        register_input_processor)
@@ -17,6 +20,7 @@ from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import fuse_input_embeds
+from .modeling_siglip import SiglipVisionModel
 from .modeling_utils import register_auto_model
 
 
@@ -398,6 +402,169 @@ def determine_non_vision_query_lengths(input_ids: torch.LongTensor, pad_id: int,
     return non_vision_query_lengths
 
 
+# Copied from HyperCLOVAX-SEED-Vision-Instruct-3B/modeling_hyperclovax.py
+class HCXVisionCAbstractor(nn.Module):
+    """
+    This module is based on C-Abstractor, whose license is under apache-2.0.
+    You can check the original code at https://github.com/khanrc/honeybee/blob/main/honeybee/projectors/projectors.py
+    and we made necessary modifications.
+    """
+
+    def __init__(
+        self,
+        num_queries: int,
+        num_input_tokens: int,
+        encoder_hidden_size: int,
+        hidden_size: int,
+        output_hidden_size: int,
+        pos_emb: bool = True,
+        prenorm: bool = False,
+    ):
+        super().__init__()
+        self.num_input_tokens = num_input_tokens
+        self.output_hidden_size = output_hidden_size
+
+        # Positional embedding
+        if pos_emb:
+            self.pos_emb = torch.nn.Parameter(
+                torch.zeros(1, num_input_tokens, encoder_hidden_size))
+            self.pos_emb.data.normal_(mean=0.0, std=0.02)
+        else:
+            self.pos_emb = None
+
+        # (Optional) Pre-normalization layer
+        from timm.layers import LayerNorm
+        if prenorm:
+            self.prenorm = LayerNorm(encoder_hidden_size)
+        else:
+            self.prenorm = None
+
+        self.build_net(num_queries, encoder_hidden_size, hidden_size,
+                       output_hidden_size)
+        self.dtype = next(self.parameters()).dtype
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        num_queries_vis_abstractors: Optional[List[List[int]]] = None,
+        num_grids: Optional[List[int]] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: (B, L, encoder_hidden_size) tensor from the visual backbone (e.g. CLIP visual encoder), including cls token.
+        """
+        if self.prenorm is not None:
+            x = self.prenorm(x)
+
+        if self.pos_emb is not None:
+            x = x + self.pos_emb
+
+        x = self._forward(
+            x,
+            num_queries_vis_abstractors=num_queries_vis_abstractors,
+            num_grids=num_grids,
+        )  # (B, L, output_hidden_size)
+
+        return x
+
+    def _forward(
+        self,
+        x: torch.Tensor,
+        num_queries_vis_abstractors: Optional[List[List[int]]] = None,
+        num_grids: Optional[List[int]] = None,
+    ) -> torch.Tensor:
+
+        # x: [B, L, dim]
+        B, L, dim = x.shape
+        hw = int(L**0.5)
+        x = rearrange(x, "b (h w) d -> b d h w", h=hw, w=hw)
+
+        if num_queries_vis_abstractors is not None:
+            assert num_grids is not None
+            return self._forward_adaptive_num_query(
+                x, num_queries_vis_abstractors, num_grids)
+
+        x = self.net(x)
+        x = rearrange(x, "b d h w -> b (h w) d")
+        x = self.readout(x)
+        return x
+
+    def _forward_adaptive_num_query(
+        self,
+        x: torch.Tensor,
+        num_queries_vis_abstractors: Optional[List[List[int]]] = None,
+        num_grids: Optional[List[int]] = None,
+    ) -> List[torch.Tensor]:
+        # self.net is consisted by 3 layers (s1, sampler, s2)
+        assert len(self.net) == 3
+
+        x = self.net[0](x)  # s1
+        new_x = []
+        for i, num_queries in enumerate(num_queries_vis_abstractors):
+            hw = int(num_queries**0.5)
+            sampler = nn.AdaptiveAvgPool2d((hw, hw))
+            out = sampler(x[num_grids[i]:num_grids[i + 1], :])
+            out = self.net[2](out)  # s2
+
+            out = rearrange(out, "b d h w -> b (h w) d")
+            out = self.readout(out)
+
+            new_x.append(out)
+        return new_x
+
+    def build_net(
+        self,
+        n_queries: int,
+        encoder_hidden_size: int,
+        hidden_size: int,
+        output_hidden_size: int,
+        depth: int = 3,
+        mlp_depth: int = 2,
+    ):
+        assert (n_queries**0.5).is_integer(
+        ), f"n_queries must be square number. n_queries: {n_queries}"
+        hw = int(n_queries**0.5)
+        from timm.layers import LayerNorm2d
+        from timm.models.regnet import RegStage
+
+        # RegBlock = ResBlock + SE
+        RegBlock = partial(
+            RegStage,
+            stride=1,
+            dilation=1,
+            act_layer=nn.SiLU,
+            norm_layer=LayerNorm2d,
+        )
+
+        s1 = RegBlock(
+            depth,
+            encoder_hidden_size,
+            hidden_size,
+        )
+        sampler = nn.AdaptiveAvgPool2d((hw, hw))
+        s2 = RegBlock(
+            depth,
+            hidden_size,
+            hidden_size,
+        )
+
+        self.net = nn.Sequential(s1, sampler, s2)
+        self.readout = self.build_mlp(mlp_depth, hidden_size,
+                                      output_hidden_size)
+
+    def build_mlp(
+        self,
+        depth: int,
+        hidden_size: int,
+        output_hidden_size: int,
+    ):
+        layers = [nn.Linear(hidden_size, output_hidden_size)]
+        for _ in range(1, depth):
+            layers.append(nn.SiLU())
+            layers.append(nn.Linear(output_hidden_size, output_hidden_size))
+        return nn.Sequential(*layers)
+
+
 class HCXVisionInputProcessor(InputProcessor):
 
     def __init__(self,
@@ -526,9 +693,9 @@ class HCXVisionInputProcessor(InputProcessor):
         mm_data = {}
         mm_data["image"] = {
             "pixel_values":
-            torch.stack(
-                preprocessed_image['pixel_values'][0],
-                dim=0),  #TODO change the pixel_values into the Shared Tensor
+            torch.stack(preprocessed_image['pixel_values'][0], dim=0).to(
+                torch.bfloat16
+            ),  #TODO change the pixel_values into the Shared Tensor
             "image_sizes":
             preprocessed_image.get('image_sizes', None),
             "is_videos":
@@ -545,23 +712,62 @@ class HCXVisionInputProcessor(InputProcessor):
 
 class HCXVisionModel:
 
-    def __init__(self, pretrained_config: PretrainedConfig):
+    def __init__(self, model_config: ModelConfig[PretrainedConfig]):
 
-        self.pretrained_config = pretrained_config
+        self.pretrained_config = model_config.pretrained_config
         self.vision_config = self.pretrained_config.vision_config
 
         model_path = self.pretrained_config._name_or_path
+        self.device = f"cuda:{model_config.mapping.rank}"
 
-        # NOTE: There is no way of importing mm_projector, HCXVisionCAbstractor from HF. So, can not do the sharded_loading.
-        # NOTE: trust_rmemote_code can be removed once we change the model into TRT-LLM's format
-        model = transformers.AutoModelForCausalLM.from_pretrained(
-            model_path, trust_remote_code=True).eval()
-        self.device = 'cuda'
+        hf_model_config = AutoConfig.from_pretrained(model_path,
+                                                     trust_remote_code=True)
+        vision_model_type = hf_model_config.vision_config["model_type"]
+        vision_config = CONFIG_MAPPING[vision_model_type](
+            **hf_model_config.vision_config)
+        self.dtype = vision_config.torch_dtype
+        module_dict = nn.ModuleDict({
+            "vision_model":
+            AutoModel.from_config(vision_config, trust_remote_code=True),
+            "mm_projector":
+            HCXVisionCAbstractor(
+                num_queries=hf_model_config.num_queries_vis_abstractor,
+                num_input_tokens=(vision_config.image_size //
+                                  vision_config.patch_size)**2,
+                encoder_hidden_size=vision_config.hidden_size,
+                hidden_size=vision_config.hidden_size,
+                output_hidden_size=hf_model_config.
+                language_config["hidden_size"],
+                pos_emb=hf_model_config.proj_pos_emb,
+                prenorm=hf_model_config.proj_prenorm,
+            ),
+        })
 
-        # TODO: Convert to TRT-LLM's SIGLIP
-        self.vision_model = model.vision_model.to(self.device)
-        self.mm_projector = model.mm_projector.to(self.device)
-        self.image_newline = model.image_newline.to(self.device)
+        module_dict.register_parameter(
+            "image_newline",
+            nn.Parameter(
+                torch.empty(hf_model_config.language_config["hidden_size"])))
+
+        missing_keys, _ = load_sharded_checkpoint(module_dict,
+                                                  model_path,
+                                                  strict=False)
+        assert len(missing_keys) == 0, f"Missing keys: {missing_keys}"
+        hf_vision_model = module_dict["vision_model"].to(self.dtype)
+        hf_mm_projector = module_dict["mm_projector"].to(self.dtype).to(
+            self.device)
+        hf_image_newline = module_dict.image_newline.to(self.dtype).to(
+            self.device)
+
+        vision_model_config = ModelConfig(pretrained_config=vision_config,
+                                          attn_backend="TRTLLM")
+
+        # Model related lines
+        self.vision_model = SiglipVisionModel(vision_model_config).to(
+            self.device).to(self.dtype)
+        self.vision_model.load_weights(hf_vision_model.state_dict())
+        print(model_config.mapping.rank, self.vision_model)
+        self.mm_projector = hf_mm_projector.eval()
+        self.image_newline = hf_image_newline
 
         self.unpad = self.pretrained_config.unpad
         self.use_nth_layer = self.pretrained_config.use_nth_layer
@@ -587,9 +793,11 @@ class HCXVisionModel:
         return possible_resolutions
 
     def _to_device(
-            self, input_tensor: Union[torch.Tensor,
-                                      List]) -> Union[torch.Tensor, List]:
-        if isinstance(input_tensor, list):
+        self, input_tensor: Union[torch.Tensor, List, None]
+    ) -> Union[torch.Tensor, List, None]:
+        if input_tensor is None:
+            return None
+        elif isinstance(input_tensor, list):
             return [self._to_device(item) for item in input_tensor]
         elif isinstance(input_tensor, torch.Tensor):
             return input_tensor.to(self.device)
@@ -634,7 +842,8 @@ class HCXVisionModel:
     def forward(self, mm_data: List[Dict[str, Any]]):
 
         pixel_values, mm_extra_data = self._parse_and_batch_mm_data(mm_data)
-        pixel_values = self._to_device(pixel_values)
+        pixel_values = self._to_device(
+            pixel_values)  # TODO: remove this once we have the shared tensor
         image_sizes = mm_extra_data.get("image_sizes", None)
         is_videos = mm_extra_data.get("is_videos", None)
         num_queries_vis_abstractors = mm_extra_data.get(
@@ -669,15 +878,15 @@ class HCXVisionModel:
                     device=concat_pixel_values.device,
                 )
                 chunk = torch.cat([chunk, dummy], dim=0)
-
+            attn_metadata = self.vision_model.prepare_attn_metadata(
+                chunk.shape[0])
             if self.use_nth_layer == -1:
                 self.vision_model.vision_model.post_layernorm = nn.Identity()
-                outs = self.vision_model(chunk)
-                outs = outs.last_hidden_state[:, visual_token_idx:]
+                outs = self.vision_model(chunk, attn_metadata=attn_metadata)
+                outs = outs[:, visual_token_idx:]
             else:
-                outs = self.vision_model(chunk, output_hidden_states=True)
-                outs = outs.hidden_states[self.use_nth_layer][:,
-                                                              visual_token_idx:]
+                outs = self.vision_model(chunk, attn_metadata=attn_metadata)
+                outs = outs[self.use_nth_layer][:, visual_token_idx:]
             image_forward_outs_chunks.append(outs)
 
         image_forward_outs = torch.cat(image_forward_outs_chunks, dim=0).to(
@@ -689,8 +898,6 @@ class HCXVisionModel:
             if is_videos is not None:
                 is_videos = list(chain(*is_videos))
             group_ids = None
-            image_forward_outs = image_forward_outs.to(
-                dtype=self.mm_projector.dtype)
             image_forward_outs = self.mm_projector(image_forward_outs)
         else:
             (
@@ -707,9 +914,6 @@ class HCXVisionModel:
                 is_videos,
                 first_last_frames_slows,
             )
-
-            image_forward_outs = image_forward_outs.to(
-                dtype=self.mm_projector.dtype)
             image_forward_outs = self.mm_projector(
                 image_forward_outs,
                 num_queries_vis_abstractors=num_queries_vis_abstractors,
@@ -779,14 +983,13 @@ class HCXVisionForCausalLM(PreTrainedModel):
         if hasattr(self, "llm"):
             return
 
-        self.mm_encoder = HCXVisionModel(model_config.pretrained_config)
-
+        self.mm_encoder = HCXVisionModel(model_config)
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = PretrainedConfig.from_dict(
             llm_model_config.pretrained_config.language_config)
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
-        self.model_dtype = getattr(config, "torch_dtype", torch.float16)
+        self.model_dtype = getattr(config, "torch_dtype", torch.bfloat16)
         logger.info(f"{self.dtype=} {self.model_dtype=}")
         self.post_config()
         self.is_loaded = True
