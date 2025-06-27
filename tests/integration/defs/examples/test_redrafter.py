@@ -28,18 +28,30 @@ from defs.trt_test_alternative import check_call
                          ids=["use_cpp_session", "use_py_session"])
 def test_llm_redrafter_1gpu(batch_size, data_type, redrafter_model_roots,
                             redrafter_num_beams, redrafter_draft_len_per_beam,
-                            redrafter_example_root, llm_datasets_root,
-                            llm_rouge_root, llm_venv, cmodel_dir, engine_dir,
+                            redrafter_example_root, llama_example_root,
+                            llm_datasets_root, llm_rouge_root, llm_venv,
+                            cmodel_dir, cmodel_base_dir, engine_dir,
                             use_py_session):
     print("Build engines...")
     model_name = "redrafter"
+    base_model_name = "llama"
+    base_example_root = llama_example_root
+
+    base_model_dir = convert_weights(llm_venv=llm_venv,
+                                     example_root=base_example_root,
+                                     cmodel_dir=cmodel_base_dir,
+                                     model=base_model_name,
+                                     model_path=redrafter_model_roots[0],
+                                     data_type=data_type)
+
+    redrafter_convert_roots = (base_model_dir, redrafter_model_roots[1])
 
     model_dir = convert_weights(
         llm_venv=llm_venv,
         example_root=redrafter_example_root,
         cmodel_dir=cmodel_dir,
         model=model_name,
-        model_path=redrafter_model_roots,
+        model_path=redrafter_convert_roots,
         data_type=data_type,
         redrafter_num_beams=redrafter_num_beams,
         redrafter_draft_len_per_beam=redrafter_draft_len_per_beam)
