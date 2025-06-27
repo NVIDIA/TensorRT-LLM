@@ -107,7 +107,7 @@ def test_fp8_quantize_blackwell(dtype, m, k):
                             [1024, 512, torch.half, False]]),
                       name_func=unittest_name_func)
 @skip_pre_blackwell_unittest
-def test_mxfp8_quantize_torch(m, k, dtype, is_sf_swizzled_layout):
+def test_mxfp8_quantize_torch_host(m, k, dtype, is_sf_swizzled_layout):
     a = 16 * torch.randn([m, k], dtype=dtype).float().cpu().contiguous()
 
     a_fp8, a_sf = torch.ops.tensorrt_llm.quantize_mxe4m3_host(
@@ -133,3 +133,42 @@ def test_mxfp8_quantize_torch(m, k, dtype, is_sf_swizzled_layout):
                             (mismatch_percent, rtol))
 
     check_accuracy(a_pt, a, 8, 0, 0.999)
+
+
+@parameterized.expand(list([[1, 1024, torch.half, True],
+                            [2, 512, torch.bfloat16, True],
+                            [16, 512, torch.half, True],
+                            [16, 512, torch.half, False],
+                            [1024, 512, torch.half, False],
+                            [1024, 512, torch.half, False]]),
+                      name_func=unittest_name_func)
+@skip_pre_blackwell_unittest
+def test_mxfp8_quantize_torch_device(m, k, dtype, is_sf_swizzled_layout):
+    a = 16 * torch.randn([m, k], dtype=dtype).cuda().contiguous()
+
+    # Quantize it on device.
+    a_fp8, a_sf = torch.ops.trtllm.mxfp8_quantize(a, is_sf_swizzled_layout)
+
+    # Dequantize it on host.
+    a_pt = torch.ops.tensorrt_llm.dequantize_mxe4m3_host(
+        a_fp8.cpu().view(torch.uint8),
+        a_sf.cpu().view(torch.uint8), is_sf_swizzled_layout)
+
+    torch.cuda.synchronize()
+
+    def check_accuracy(a, b, atol, rtol, percent):
+        if torch.any(torch.isnan(a)):
+            raise Exception("NaN in a")
+        if torch.any(torch.isnan(b)):
+            raise Exception("NaN in b")
+        assert a.shape == b.shape
+        left = torch.abs(a - b)
+        right = atol + rtol * torch.abs(b)
+        count = torch.sum(left > right)
+        mismatch_percent = count / a.numel()
+        if mismatch_percent > 1 - percent:
+            raise Exception("Mismatch percentage is %f for rtol %f" %
+                            (mismatch_percent, rtol))
+
+    check_accuracy(a_pt.cpu().to(torch.float32),
+                   a.cpu().to(torch.float32), 8, 0, 0.999)

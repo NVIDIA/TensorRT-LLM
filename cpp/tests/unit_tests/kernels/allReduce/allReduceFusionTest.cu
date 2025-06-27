@@ -421,7 +421,7 @@ public:
             // computation order, atol is set to 0.
             invokeFP4Quantization(token_num, hidden_dim, m_norm_out.device_data<DType>(),
                 m_scale_factor.device_data<float>(), ref_output.device_data<int64_t>(),
-                ref_scale.device_data<int32_t>(), false, tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED, 128, 0);
+                ref_scale.device_data<int32_t>(), false, tensorrt_llm::QuantizationSFLayout::SWIZZLED, 128, 0);
             TLLM_CHECK(compare<int8_t>(
                 m_rank, m_quant_out.host_data(), ref_output.host_data(), message_size / 2, "fp4 quant out", 0));
             TLLM_CHECK(compare<int8_t>(
@@ -462,7 +462,7 @@ public:
     {
         invokeFP4Quantization(token_num, hidden_dim, m_norm_out.device_data<DType>(),
             m_scale_factor.device_data<float>(), m_quant_out.device_data<int64_t>(), m_scale_out.device_data<int32_t>(),
-            false, tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED, 128, m_stream->get());
+            false, tensorrt_llm::QuantizationSFLayout::SWIZZLED, 128, m_stream->get());
     }
 
     void run_kernel(int token_num, int hidden_dim)

@@ -1682,7 +1682,7 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         # Assert should only be removed during debugging
         assert w3_w1_weight_scale.is_cuda, "w3_w1_weight_scale.is_cuda should be true or suffer from slow speed"
         # Interleave the weight.
-        processed_w3_w1_weight_scale = torch.ops.trtllm.nvfp4_block_scale_interleave(
+        processed_w3_w1_weight_scale = torch.ops.trtllm.block_scale_interleave(
             w3_w1_weight_scale.view(float4_sf_dtype).reshape(orig_shape))
         # Copy the result into device buffer
         dst_w3_w1_weight_scale.copy_(
@@ -1717,7 +1717,7 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         w_shuffled = torch.ops.trtllm.shuffle_matrix(
             dst_w2_weight_scale.view(dtype=float4_sf_dtype), permute_indices)
         # Interleave the weight.
-        processed_w2_weight_scale = torch.ops.trtllm.nvfp4_block_scale_interleave(
+        processed_w2_weight_scale = torch.ops.trtllm.block_scale_interleave(
             w_shuffled)
         # Copy the result into device buffer
         dst_w2_weight_scale.copy_(

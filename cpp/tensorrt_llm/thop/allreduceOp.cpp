@@ -487,7 +487,7 @@ private:
             output_shape[r - 1] = k / 2;
 
             quant_out = at::detail::empty_cuda(output_shape, FLOAT4_E2M1X2, input.device(), std::nullopt);
-            scale_out = at::detail::empty_cuda({tensorrt_llm::computeFP4SwizzledLayoutSFSize(m, k / sf_vec_size)},
+            scale_out = at::detail::empty_cuda({tensorrt_llm::computeSwizzledLayoutSFSize(m, k / sf_vec_size)},
                 SF_DTYPE, input.device(), std::nullopt);
             residual_out = torch::empty_like(residual.value());
 

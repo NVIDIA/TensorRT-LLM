@@ -34,7 +34,7 @@ namespace torch_ext
 // mxfp4: sfVecSize = 32, sfUseUE8M0 = true
 // alignment: sfVecSize
 // isSfSwizzledLayout: bool, if true, the scale factors are stored in swizzled layout, otherwise in linear layout.
-// See FP4QuantizationSFLayout enum for more details about the two layouts.
+// See QuantizationSFLayout enum for more details about the two layouts.
 // returns self_fp4, self_block_scale_factors
 // self_fp4: [M, K / 2], FLOAT4_E2M1X2
 // self_block_scale_factors: ceil(M / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE (UE4M3 or UE8M0)
@@ -77,19 +77,19 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self, std::opt
 
     at::Tensor valueE2M1 = at::detail::empty_cuda(outputShape, FLOAT4_E2M1X2, self.device(), /* stride */ std::nullopt);
 
-    int64_t SFSize = isSfSwizzledLayout ? tensorrt_llm::computeFP4SwizzledLayoutSFSize(m, k / sfVecSize)
-                                        : tensorrt_llm::computeFP4LinearLayoutSFSize(m, k / sfVecSize);
+    int64_t SFSize = isSfSwizzledLayout ? tensorrt_llm::computeSwizzledLayoutSFSize(m, k / sfVecSize)
+                                        : tensorrt_llm::computeLinearLayoutSFSize(m, k / sfVecSize);
 
     at::Tensor scaleFP8SF
         = at::detail::empty_cuda({SFSize}, SF_DTYPE, self.device(), /* stride */ std::nullopt); // 1D tensor
 
     const thread_local int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
 
-    auto const layout = isSfSwizzledLayout ? tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED
-                                           : tensorrt_llm::FP4QuantizationSFLayout::LINEAR;
+    auto const layout = isSfSwizzledLayout ? tensorrt_llm::QuantizationSFLayout::SWIZZLED
+                                           : tensorrt_llm::QuantizationSFLayout::LINEAR;
 
 #define LAUNCH_FP4_QUANTIZE_KERNEL(T, SF_VEC_SIZE)                                                                     \
-    tensorrt_llm::kernels::invokeFP4Quantization<T, SF_VEC_SIZE>(m, k, reinterpret_cast<T*>(self.data_ptr()),          \
+    tensorrt_llm::kernels::invokeFP4Quantization<T, SF_VEC_SIZE>(1, m, k, reinterpret_cast<T*>(self.data_ptr()),       \
         globalScalePtr, reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                                              \
         reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), sfUseUE8M0, layout, mMultiProcessorCount,                   \
         at::cuda::getCurrentCUDAStream(self.get_device()));

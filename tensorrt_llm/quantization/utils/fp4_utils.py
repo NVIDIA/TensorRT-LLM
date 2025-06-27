@@ -207,4 +207,4 @@ def shuffle_matrix_sf_a(
         input_tensor, row_indices.to(input_tensor.device))
 
     # 128x4
-    return torch.ops.trtllm.nvfp4_block_scale_interleave(w_shuffled)
+    return torch.ops.trtllm.block_scale_interleave(w_shuffled)
