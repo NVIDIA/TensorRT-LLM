@@ -99,6 +99,8 @@ struct RequestData
     std::shared_ptr<std::set<executor::IdType>> pendingBatchedRequestIds;
     executor::RequestType requestType;
     bool returnPerfMetrics;
+    bool returnNumInputTokens;
+    bool returnNumOutputTokens;
 };
 
 //

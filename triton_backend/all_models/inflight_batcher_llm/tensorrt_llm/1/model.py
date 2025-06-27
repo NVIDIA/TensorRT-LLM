@@ -62,6 +62,8 @@ class RequestData:
     num_input_tokens: int
     num_output_tokens: int
     response_sender: Any
+    return_num_input_tokens: bool = False
+    return_num_output_tokens: bool = False
 
 
 def mpi_comm():
@@ -657,7 +659,10 @@ def convert_response(response,
                      batch_index,
                      batch_size,
                      num_return_sequences,
-                     expected_logits_dtype=torch.float32):
+                     expected_logits_dtype=torch.float32,
+                     input_token_count=None,
+                     return_num_input_tokens=False,
+                     return_num_output_tokens=False):
 
     if response.has_error():
         return pb_utils.InferenceResponse(output_tensors=[],
@@ -722,6 +727,18 @@ def convert_response(response,
             pb_utils.Tensor(
                 "sequence_index",
                 np.expand_dims(np.array([result.sequence_index], np.int32), 0)))
+
+    # Add token count outputs if requested
+    if return_num_input_tokens and input_token_count is not None:
+        triton_output_tensor = pb_utils.Tensor(
+            "num_input_tokens",
+            np.expand_dims(np.array([input_token_count], np.int32), 0))
+        output_tensors.append(triton_output_tensor)
+    if return_num_output_tokens:
+        triton_output_tensor = pb_utils.Tensor(
+            "num_output_tokens",
+            np.expand_dims(np.array([output_lengths], np.int32), 0))
+        output_tensors.append(triton_output_tensor)
 
     if result.request_perf_metrics is not None:
         kv_cache_metrics = result.request_perf_metrics.kv_cache_metrics
@@ -1420,7 +1437,13 @@ class TritonPythonModel:
                     triton_req_id, triton_user_id, batch_index,
                     len(batch_indices),
                     executor_request.sampling_config.num_return_sequences, 0, 0,
-                    triton_request.get_response_sender())
+                    triton_request.get_response_sender(),
+                    get_input_scalar_by_name(triton_request,
+                                             'return_num_input_tokens',
+                                             batch_index=batch_index),
+                    get_input_scalar_by_name(triton_request,
+                                             'return_num_output_tokens',
+                                             batch_index=batch_index))
                 self.triton_req_id_to_req_ids[triton_req_id].add(req_id)
                 input_len = len(
                     executor_request.input_token_ids
@@ -1451,7 +1474,10 @@ class TritonPythonModel:
 
                 triton_response, is_final, output_length = convert_response(
                     response, request_data.batch_index, request_data.batch_size,
-                    request_data.num_return_sequences, self.logits_dtype)
+                    request_data.num_return_sequences, self.logits_dtype,
+                    request_data.num_input_tokens,
+                    request_data.return_num_input_tokens,
+                    request_data.return_num_output_tokens)
                 with self.lock:
                     self.req_id_to_request_data[
                         req_id].num_output_tokens += output_length

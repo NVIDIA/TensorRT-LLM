@@ -28,9 +28,18 @@ from tensorrt_llm.bindings.internal.testing import ModelSpec
 def build_engine(base_model_dir: _pl.Path, drafter_model_dir: _pl.Path,
                  engine_dir: _pl.Path, *args):
 
+    base_ckpt_dir = f'{base_model_dir}-ckpt'
+    covert_cmd_base = [
+        _sys.executable, "examples/models/core/llama/convert_checkpoint.py"
+    ] + (['--model_dir', str(base_model_dir)] if base_model_dir else []) + [
+        '--output_dir', str(base_ckpt_dir), '--dtype=float16'
+    ] + list(args)
+
+    run_command(covert_cmd_base)
+
     covert_cmd = [
         _sys.executable, "examples/redrafter/convert_checkpoint.py"] + (
-        ['--model_dir', str(base_model_dir)] if base_model_dir else []) + [
+        ['--base_model_checkpoint_dir', str(base_ckpt_dir)] if base_model_dir else []) + [
             '--drafter_model_dir', str(drafter_model_dir), \
             '--output_dir', str(engine_dir), '--dtype=float16',
             '--redrafter_num_beams=5', '--redrafter_draft_len_per_beam=5'
