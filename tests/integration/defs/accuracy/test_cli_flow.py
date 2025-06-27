@@ -201,6 +201,7 @@ class TestNemotronMini4BInstruct(CliFlowAccuracyTestHarness):
 
 
 # TODO: Remove the CLI tests once NIMs use PyTorch backend
+@pytest.mark.timeout(5400)
 class TestLlama3_3NemotronSuper49Bv1(CliFlowAccuracyTestHarness):
     MODEL_NAME = "nvidia/Llama-3_3-Nemotron-Super-49B-v1"
     MODEL_PATH = f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1"
@@ -244,6 +245,7 @@ class TestLlama3_1NemotronNano8Bv1(CliFlowAccuracyTestHarness):
                  kv_cache_quant_algo=QuantAlgo.FP8)
 
 
+@pytest.mark.timeout(10800)
 class TestNemotronUltra(CliFlowAccuracyTestHarness):
     MODEL_NAME = "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1"
     MODEL_PATH = f"{llm_models_root()}/nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1"

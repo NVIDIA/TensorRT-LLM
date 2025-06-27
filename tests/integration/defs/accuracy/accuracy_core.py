@@ -23,10 +23,11 @@ import scipy
 import yaml
 
 import tensorrt_llm.evaluate
-from tensorrt_llm._torch import LLM as PyTorchLLM
+from tensorrt_llm import LLM as PyTorchLLM
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.speculative import SpecConfig
 from tensorrt_llm.builder import BuildConfig
-from tensorrt_llm.llmapi import LLM, SamplingParams
+from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -147,7 +148,8 @@ class AccuracyTask:
                  llm: Union[LLM, PyTorchLLM],
                  extra_acc_spec: Optional[str] = None,
                  extra_evaluator_kwargs: Optional[dict] = None,
-                 sampling_params: Optional[SamplingParams] = None):
+                 sampling_params: Optional[SamplingParams] = None,
+                 streaming: bool = False):
         assert self.EVALUATOR_CLS is not None
 
         if llm.args.speculative_config is None:
@@ -193,7 +195,7 @@ class AccuracyTask:
             evaluator_kwargs.update(extra_evaluator_kwargs)
         evaluator = self.EVALUATOR_CLS(num_samples=num_samples,
                                        **evaluator_kwargs)
-        accuracy = evaluator.evaluate(llm, sampling_params)
+        accuracy = evaluator.evaluate(llm, sampling_params, streaming)
         if self.HIGHER_IS_BETTER:
             assert accuracy >= threshold, f"Expected accuracy >= {threshold}, but got {accuracy}."
         else:

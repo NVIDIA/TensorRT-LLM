@@ -3,7 +3,7 @@ from typing import List, Optional
 
 import torch
 
-from tensorrt_llm import LLM
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
                                           LogitsProcessor, SamplingParams)
 

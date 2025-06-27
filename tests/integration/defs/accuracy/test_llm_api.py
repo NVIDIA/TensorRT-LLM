@@ -14,7 +14,8 @@
 # limitations under the License.
 import pytest
 
-from tensorrt_llm.llmapi import LLM, EagleDecodingConfig, KvCacheConfig
+from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm.llmapi import EagleDecodingConfig, KvCacheConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -57,16 +58,18 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    def test_guided_decoding(self):
-        llm = LLM(self.MODEL_PATH, guided_decoding_backend="xgrammar")
+    @pytest.mark.parametrize("backend", ["xgrammar"])
+    def test_guided_decoding(self, backend: str):
+        llm = LLM(self.MODEL_PATH, guided_decoding_backend=backend)
         with llm:
             task = JsonModeEval(self.MODEL_NAME)
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
-    def test_guided_decoding_4gpus(self):
+    @pytest.mark.parametrize("backend", ["xgrammar"])
+    def test_guided_decoding_4gpus(self, backend: str):
         llm = LLM(self.MODEL_PATH,
-                  guided_decoding_backend="xgrammar",
+                  guided_decoding_backend=backend,
                   tensor_parallel_size=2,
                   pipeline_parallel_size=2)
         with llm:

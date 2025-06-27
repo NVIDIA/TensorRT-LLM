@@ -105,6 +105,8 @@ class SpecConfig:
     max_draft_tokens: int = 1024
     # The path to the draft model
     draft_model_path: Optional[str] = None
+    # The number of extra kv tokens
+    num_extra_kv_tokens: int = 0
 
     def __post_init__(self) -> None:
         self.spec_dec_mode = SpeculativeDecodingMode.from_string(

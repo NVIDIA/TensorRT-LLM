@@ -298,6 +298,7 @@ class MTPDecodingConfig(DecodingBaseConfig):
     use_relaxed_acceptance_for_thinking: Optional[bool] = False
     relaxed_topk: Optional[int] = 1
     relaxed_delta: Optional[float] = 0.
+    use_mtp_vanilla: Optional[bool] = False
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -878,8 +879,11 @@ class BaseLlmArgs(BaseModel):
     enable_chunked_prefill: bool = Field(default=False,
                                          description="Enable chunked prefill.")
 
-    guided_decoding_backend: Optional[str] = Field(
-        default=None, description="Guided decoding backend.")
+    guided_decoding_backend: Optional[Literal["xgrammar", "llguidance"]] = Field(
+        default=None,
+        description=
+        "Guided decoding backend. llguidance is supported in PyTorch backend only."
+    )
 
     batched_logits_processor: Optional[object] = Field(
         default=None,
@@ -952,12 +956,6 @@ class BaseLlmArgs(BaseModel):
     reasoning_parser: Optional[str] = Field(
         default=None,
         description="The parser to separate reasoning content from output.")
-
-    garbage_collection_gen0_threshold: int = Field(
-        default=20000,
-        description=
-        "Threshold for Python garbage collection of generation 0 objects."
-        "Lower values trigger more frequent garbage collection.")
 
     # TODO[Superjomn]: To deprecate this config.
     decoding_config: Optional[object] = Field(
@@ -1351,7 +1349,8 @@ class BaseLlmArgs(BaseModel):
                     use_relaxed_acceptance_for_thinking=self.speculative_config.
                     use_relaxed_acceptance_for_thinking,
                     relaxed_topk=self.speculative_config.relaxed_topk,
-                    relaxed_delta=self.speculative_config.relaxed_delta)
+                    relaxed_delta=self.speculative_config.relaxed_delta,
+                    use_mtp_vanilla=self.speculative_config.use_mtp_vanilla)
             else:
                 raise ValueError(
                     f"Speculative config type not recognized: {self.speculative_config}"
@@ -1591,9 +1590,6 @@ class TrtLlmArgs(BaseLlmArgs):
         return self
 
 
-LlmArgs = TrtLlmArgs
-
-
 class LoadFormat(Enum):
     AUTO = 0
     # Initialize all weights randomly.
@@ -1604,25 +1600,24 @@ class TorchCompileConfig(BaseModel):
     """
     Configuration for torch.compile.
     """
-    torch_compile_fullgraph: bool = Field(
+    enable_fullgraph: bool = Field(
         default=True,
         description="Enable full graph compilation in torch.compile.")
 
-    torch_compile_inductor_enabled: bool = Field(
+    enable_inductor: bool = Field(
         default=False, description="Enable inductor backend in torch.compile.")
 
-    torch_compile_piecewise_cuda_graph: bool = Field(
+    enable_piecewise_cuda_graph: bool = Field(
         default=False,
         description="Enable piecewise CUDA graph in torch.compile.")
 
-    torch_compile_enable_userbuffers: bool = Field(
+    enable_userbuffers: bool = Field(
         default=True,
         description=
         "When torch compile is enabled, userbuffers is enabled by default.")
 
 
 class TorchLlmArgs(BaseLlmArgs):
-
     # Just a dummy BuildConfig to allow code reuse with the TrtLlmArgs
     build_config: Optional[object] = Field(
         default=None,
@@ -1631,6 +1626,12 @@ class TorchLlmArgs(BaseLlmArgs):
         json_schema_extra={"type": f"Optional[{get_type_repr(BuildConfig)}]"})
 
     # PyTorch backend specific configurations
+
+    garbage_collection_gen0_threshold: int = Field(
+        default=20000,
+        description=
+        "Threshold for Python garbage collection of generation 0 objects."
+        "Lower values trigger more frequent garbage collection.")
 
     use_cuda_graph: bool = Field(
         default=False,
@@ -1663,7 +1664,10 @@ class TorchLlmArgs(BaseLlmArgs):
     moe_load_balancer: Optional[Union[object, str]] = Field(
         default=None,
         description="Configuration for MoE load balancing.",
-        json_schema_extra={"type": "Union[MoeLoadBalancerConfig, str]"})
+        json_schema_extra={
+            "type":
+            "Union[tensorrt_llm._torch.model_config.MoeLoadBalancerConfig, str, None]"
+        })
 
     attn_backend: str = Field(default='TRTLLM',
                               description="Attention backend to use.")
@@ -1720,6 +1724,14 @@ class TorchLlmArgs(BaseLlmArgs):
         "If true, enable min-latency mode. Currently only used for Llama4.",
     )
 
+    # TODO: make this a per-request parameter
+    stream_interval: int = Field(
+        default=1,
+        description=
+        "The iteration interval to create responses under the streaming mode. "
+        "Set this to a larger value when the batch size is large, which helps reduce the streaming overhead.",
+    )
+
     # TODO: remove backend later
     @field_validator('backend', mode='before')
     def init_backend(cls, v):
@@ -1772,6 +1784,13 @@ class TorchLlmArgs(BaseLlmArgs):
                 ) from e
         return self
 
+    @model_validator(mode="after")
+    def validate_stream_interval(self):
+        if self.stream_interval <= 0:
+            raise ValueError(
+                f"stream_interval must be positive, got {self.stream_interval}")
+        return self
+
     # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
     def get_pytorch_backend_config(self) -> "PyTorchConfig":
         from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
@@ -1794,22 +1813,21 @@ class TorchLlmArgs(BaseLlmArgs):
             enable_iter_req_stats=self.enable_iter_req_stats,
             print_iter_log=self.print_iter_log,
             torch_compile_enabled=bool(self.torch_compile_config is not None),
-            torch_compile_fullgraph=self.torch_compile_config.
-            torch_compile_fullgraph
+            torch_compile_fullgraph=self.torch_compile_config.enable_fullgraph
             if self.torch_compile_config is not None else True,
             torch_compile_inductor_enabled=self.torch_compile_config.
-            torch_compile_inductor_enabled
-            if self.torch_compile_config is not None else False,
+            enable_inductor if self.torch_compile_config is not None else False,
             torch_compile_piecewise_cuda_graph=self.torch_compile_config.
-            torch_compile_piecewise_cuda_graph
+            enable_piecewise_cuda_graph
             if self.torch_compile_config is not None else False,
             torch_compile_enable_userbuffers=self.torch_compile_config.
-            torch_compile_enable_userbuffers
+            enable_userbuffers
             if self.torch_compile_config is not None else True,
             autotuner_enabled=self.autotuner_enabled,
             enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
             load_format=self.load_format,
-            enable_min_latency=self.enable_min_latency)
+            enable_min_latency=self.enable_min_latency,
+            stream_interval=self.stream_interval)
 
     @field_validator('cuda_graph_max_batch_size')
     @classmethod
@@ -2066,6 +2084,8 @@ def get_model_format(model_dir: str) -> _ModelFormatKind:
     else:
         return model_format
 
+
+LlmArgs = TorchLlmArgs
 
 TRT_LLMARGS_EXPLICIT_DOCSTRING = generate_api_docs_as_docstring(TrtLlmArgs,
                                                                 indent=' ' * 4)

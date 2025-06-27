@@ -119,7 +119,6 @@ class GenerationExecutorWorker(GenerationExecutor):
             args = {
                 "executor_config": executor_config,
                 "checkpoint_dir": executor_config.hf_model_dir,
-                "engine_dir": executor_config.trt_engine_dir,
             }
             if executor_config.backend == "pytorch":
                 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
@@ -135,7 +134,6 @@ class GenerationExecutorWorker(GenerationExecutor):
             else:
                 raise ValueError(
                     f"Unsupported backend config: {executor_config.backend}")
-
             return create_executor(**args)
 
         self.engine = _create_engine()

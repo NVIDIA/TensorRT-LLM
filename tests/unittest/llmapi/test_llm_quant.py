@@ -1,6 +1,7 @@
 import pytest
 
-from tensorrt_llm.llmapi import LLM, KvCacheConfig, SamplingParams
+from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.llm_utils import CalibConfig, QuantAlgo, QuantConfig
 
 # isort: off

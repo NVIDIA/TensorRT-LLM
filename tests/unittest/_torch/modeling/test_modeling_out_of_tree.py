@@ -2,7 +2,7 @@ import unittest
 
 from parameterized import parameterized
 
-from tensorrt_llm._torch import LLM
+from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.sampling_params import SamplingParams
 

@@ -158,6 +158,21 @@ def _mangle_executor_config(executor_config: ExecutorConfig):
             )
             executor_config.kv_cache_config.enable_block_reuse = False
 
+    spec_config = executor_config.speculative_config
+    if spec_config is not None and spec_config.spec_dec_mode.has_draft_model():
+        # The draft and target models have different KV cache managers to support
+        # different head sizes, dtypes, etc in the generic case.
+        # However, this line will set context_current_position > 0 if there are
+        # cached blocks: https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/pyexecutor/resource_manager.py#L310.
+        # It actually mutates the LLM request! As a result, when we try to allocate KV cache
+        # pages for the draft model, is_first_context_chunk returns False and
+        # no pages are allocated.
+        # We need to refactor LLMRequest to fix this. Disable block reuse for now.
+        logger.warning(
+            f"Disabling block reuse for speculation algorithm {spec_config.spec_dec_mode}"
+        )
+        executor_config.kv_cache_config.enable_block_reuse = False
+
     if pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION" and executor_config.enable_chunked_context:
         logger.warning(
             f"Disabling chunked context for {pytorch_backend_config.attn_backend} backend"
@@ -180,7 +195,6 @@ def _get_mapping(executor_config: ExecutorConfig) -> Mapping:
 def create_py_executor(
         executor_config: ExecutorConfig,
         checkpoint_dir: str = None,
-        engine_dir: str = None,
         lora_config: Optional[LoraConfig] = None,
         garbage_collection_gen0_threshold: Optional[int] = None) -> PyExecutor:
     _mangle_executor_config(executor_config)

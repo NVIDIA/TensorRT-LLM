@@ -19,8 +19,8 @@ from tensorrt_llm._torch.modules.fused_moe import (BaseMoeRoutingMethod,
                                                    CutlassFusedMoE,
                                                    DefaultMoeRoutingMethod,
                                                    RenormalizeMoeRoutingMethod,
-                                                   VanillaMoE)
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import \
+                                                   VanillaMoE, WideEPMoE)
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_wide_ep import \
     AlltoallMethodType
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._utils import mpi_rank
@@ -167,10 +167,10 @@ def test_fused_moe_alltoall(alltoall_method_type):
             weights[f"{expert_id}.w1.weight"] = w1_weight
             weights[f"{expert_id}.w2.weight"] = w2_weight
             weights[f"{expert_id}.w3.weight"] = w3_weight
-        with mock.patch.object(CutlassFusedMoE,
+        with mock.patch.object(WideEPMoE,
                                "select_alltoall_method_type",
                                return_value=alltoall_method_type):
-            alltoall_model = CutlassFusedMoE(
+            alltoall_model = WideEPMoE(
                 num_experts=NUM_EXPERTS,
                 routing_method=routing_method,
                 hidden_size=HIDDEN_SIZE,
@@ -182,19 +182,17 @@ def test_fused_moe_alltoall(alltoall_method_type):
             )
         alltoall_model.to("cuda")
         alltoall_model.load_weights([weights])
-        with mock.patch.object(CutlassFusedMoE,
-                               "select_alltoall_method_type",
-                               return_value=AlltoallMethodType.NotEnabled):
-            ref_model = CutlassFusedMoE(
-                num_experts=NUM_EXPERTS,
-                routing_method=routing_method,
-                hidden_size=HIDDEN_SIZE,
-                intermediate_size=INTERMEDIATE_SIZE,
-                dtype=dtype,
-                reduce_results=True,
-                model_config=ModelConfig(mapping=mapping,
-                                         max_num_tokens=MAX_NUM_TOKENS),
-            )
+
+        ref_model = CutlassFusedMoE(
+            num_experts=NUM_EXPERTS,
+            routing_method=routing_method,
+            hidden_size=HIDDEN_SIZE,
+            intermediate_size=INTERMEDIATE_SIZE,
+            dtype=dtype,
+            reduce_results=True,
+            model_config=ModelConfig(mapping=mapping,
+                                     max_num_tokens=MAX_NUM_TOKENS),
+        )
         ref_model.to("cuda")
         ref_model.load_weights([weights])
 

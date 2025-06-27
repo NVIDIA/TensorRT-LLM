@@ -253,6 +253,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             return_logits_device_memory: bool = True,
             exclude_last_generation_logits: bool = False,
             stop_words_list: list[list[int]] | None = None,
+            is_draft: bool = False,
             **kwargs):
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
                                                     None)
@@ -282,12 +283,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.is_cuda_graph_dummy = False
         self.py_lora_task_layer_module_configs = None
 
-        self.py_tokens = super().get_tokens()
-
         self.py_return_log_probs = return_log_probs
         self.py_return_context_logits = return_context_logits
         self.py_return_generation_logits = return_generation_logits
         self.py_return_logits_device_memory = return_logits_device_memory
+        self.py_is_draft = is_draft
 
         # TODO: remove this when use DynamicDecodeOp in pytorch flow.
         # currently, keep py_stop_words_list as python list, rather than tensor.
