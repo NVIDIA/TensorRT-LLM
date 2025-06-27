@@ -6,9 +6,13 @@ import subprocess
 from pathlib import Path
 
 
-def run_git_diff(base: str, head: str) -> list[str]:
+def get_pr_changed_files(pr_number: str) -> list[str]:
+    """Get files changed in PR using GitHub CLI (more reliable than git diff)"""
     result = subprocess.run(
-        ["git", "diff", "--name-only", base, head],
+        [
+            "gh", "pr", "view", pr_number, "--json", "files", "--jq",
+            ".files[].path"
+        ],
         capture_output=True,
         text=True,
         check=True,
@@ -54,13 +58,11 @@ def main() -> None:
                         help="Print the gh command instead of executing")
     args = parser.parse_args()
 
-    base_sha = os.environ["BASE_SHA"]
-    head_sha = os.environ["HEAD_SHA"]
     pr_number = os.environ["PR_NUMBER"]
     reviewer_limit = int(os.environ.get("REVIEWER_LIMIT", "0"))
     pr_author = os.environ.get("PR_AUTHOR")
 
-    changed_files = run_git_diff(base_sha, head_sha)
+    changed_files = get_pr_changed_files(pr_number)
     module_paths = load_json(Path(".github") / "module-paths.json")
     module_owners = load_json(Path(".github/workflows") / "module-owners.json")
 
