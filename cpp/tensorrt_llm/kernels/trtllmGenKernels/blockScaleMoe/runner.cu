@@ -96,7 +96,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         // routingData.mPtrIn = args.mInputActs;
         routingData.mNumTokens = numTokens;
         // routingData.mHiddenDim = args.mHiddenDim;
-        routingData.mFuseSharedExpert = numFusedSharedExpert > 0;
+        routingData.mNumFusedSharedExperts = numFusedSharedExpert;
         routingData.mNumExperts = numExperts;
         routingData.mNumExpertGroups = nGroup;
         routingData.mNumLimitedGroups = topkGroup;

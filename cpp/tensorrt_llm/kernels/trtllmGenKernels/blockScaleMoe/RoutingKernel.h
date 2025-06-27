@@ -91,8 +91,8 @@ struct Data
 
     // The number of routed experts
     int32_t mNumExperts;
-    // Will the shared expert be fused into batched gemms?
-    bool mFuseSharedExpert;
+    // The number of shared experts to fuse into batched gemm
+    int32_t mNumFusedSharedExperts;
     // The number of routed experts on this device
     int32_t mNumLocalExperts;
     // The starting index of this devices local experts
@@ -154,7 +154,7 @@ struct KernelParams
     int32_t mHiddenDim;
 
     int32_t mNumExperts;
-    bool mFuseSharedExpert;
+    int32_t mNumFusedSharedExperts;
     int32_t mNumLocalExperts;
     int32_t mLocalExpertsStartIdx;
     int32_t mLocalExpertsStrideLog2;
@@ -195,7 +195,7 @@ struct KernelParams
         params.mNumTokens = data.mNumTokens;
 
         params.mNumExperts = data.mNumExperts;
-        params.mFuseSharedExpert = data.mFuseSharedExpert;
+        params.mNumFusedSharedExperts = data.mNumFusedSharedExperts;
         params.mNumLocalExperts = data.mNumLocalExperts;
         params.mLocalExpertsStartIdx = data.mLocalExpertsStartIdx;
         params.mLocalExpertsStrideLog2 = data.mLocalExpertsStrideLog2;

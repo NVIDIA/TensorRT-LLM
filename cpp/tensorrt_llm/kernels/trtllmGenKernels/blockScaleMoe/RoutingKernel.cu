@@ -439,10 +439,9 @@ __global__ void routingMainKernel(KernelParams params)
             params.mPtrExpertWeightsFull[idxWeightsFull] = finalScore;
         }
         // Write score of 1.0 for shared expert if enabled
-        // TODO maybe have this written by laneIdx == params.mTopK?
-        if (params.mFuseSharedExpert && (laneIdx == 0) && (params.mPtrExpertWeights != nullptr))
+        if (laneIdx < params.mNumFusedSharedExperts && (params.mPtrExpertWeights != nullptr))
         {
-            auto idxShared = blockIdx.x * params.mTotalExpertsPerToken + params.mTopK;
+            auto idxShared = blockIdx.x * params.mTotalExpertsPerToken + params.mTopK + laneIdx;
             params.mPtrExpertWeights[idxShared] = static_cast<TypeExpW>(1.0F);
         }
     }
@@ -600,11 +599,11 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
     //  Compute shared expert offset before number of non-exiting CTAs is updated
     int32_t const sharedExpertOffset = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
     // Write routing info for shared expert
-    if (params.mFuseSharedExpert)
+    for (int32_t sharedExpertIdx = 0; sharedExpertIdx < params.mNumFusedSharedExperts; ++sharedExpertIdx)
     {
         int32_t const numSharedExpertCtas = divUpLog2<int32_t>(params.mSharedExpertNumTokens, params.mPaddingLog2);
         int32_t const tokensPerTile = params.mAllToAllRouteAct ? params.mNumTokens : params.mSharedExpertNumTokens;
-        int32_t const sharedExpertIndex = params.mNumLocalExperts;
+        int32_t const sharedExpertIndex = params.mNumLocalExperts + sharedExpertIdx;
         // All threads across cluster can work on this
         for (int32_t cta = clusterThreadIdx; cta < numSharedExpertCtas; cta += NumThreadsPerCluster)
         {
@@ -679,15 +678,18 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
         }
     }
 
-    if (params.mFuseSharedExpert)
+    for (int32_t sharedExpertIdx = 0; sharedExpertIdx < params.mNumFusedSharedExperts; ++sharedExpertIdx)
     {
         // All threads will collaboratively write map for the shared example.
         for (int32_t tokenIdx = clusterThreadIdx; tokenIdx < params.mNumTokens; tokenIdx += NumThreadsPerCluster)
         {
-            int32_t const expandedIdx = tokenIdx * params.mTotalExpertsPerToken + params.mTopK;
-            bool const isTokenLocal = (tokenIdx >= params.mSharedExpertTokenOffset)
-                && (tokenIdx < (params.mSharedExpertTokenOffset + params.mSharedExpertNumTokens));
-            int32_t const permutedIdx = isTokenLocal ? (sharedExpertOffset + tokenIdx) : int32_t{-1};
+            int32_t const expandedIdx = tokenIdx * params.mTotalExpertsPerToken + params.mTopK + sharedExpertIdx;
+            int32_t const localTokenIdx = tokenIdx - params.mSharedExpertTokenOffset;
+            bool const isTokenLocal = (localTokenIdx >= 0) && (localTokenIdx < params.mSharedExpertNumTokens);
+            int32_t const sharedExpertPermuteSize = divUpMulLog2(params.mSharedExpertNumTokens, params.mPaddingLog2);
+            int32_t const permutedIdx = isTokenLocal
+                ? (sharedExpertOffset + sharedExpertIdx * sharedExpertPermuteSize + localTokenIdx)
+                : int32_t{-1};
             if (params.mPtrExpandedIdxToPermutedIdx != nullptr)
             {
                 params.mPtrExpandedIdxToPermutedIdx[expandedIdx] = permutedIdx;
@@ -842,11 +844,11 @@ __global__ void __launch_bounds__(NumThreads) routingIndicesCoopKernel(KernelPar
     //  Compute shared expert offset before number of non-exiting CTAs is updated
     int32_t const sharedExpertOffset = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
     // Write routing info for shared expert
-    if (params.mFuseSharedExpert)
+    for (int32_t sharedExpertIdx = 0; sharedExpertIdx < params.mNumFusedSharedExperts; ++sharedExpertIdx)
     {
         int32_t const numSharedExpertCtas = divUpLog2<int32_t>(params.mSharedExpertNumTokens, params.mPaddingLog2);
         int32_t const tokensPerTile = params.mAllToAllRouteAct ? params.mNumTokens : params.mSharedExpertNumTokens;
-        int32_t const sharedExpertIndex = params.mNumLocalExperts;
+        int32_t const sharedExpertIndex = params.mNumLocalExperts + sharedExpertIdx;
         // All threads will work on this
         for (int32_t cta = gridThreadIdx; cta < numSharedExpertCtas; cta += numThreadsPerGrid)
         {
@@ -914,15 +916,18 @@ __global__ void __launch_bounds__(NumThreads) routingIndicesCoopKernel(KernelPar
         }
     }
 
-    if (params.mFuseSharedExpert)
+    for (int32_t sharedExpertIdx = 0; sharedExpertIdx < params.mNumFusedSharedExperts; ++sharedExpertIdx)
     {
         // All threads will collaboratively write map for the shared example.
         for (int32_t tokenIdx = gridThreadIdx; tokenIdx < params.mNumTokens; tokenIdx += numThreadsPerGrid)
         {
-            int32_t const expandedIdx = tokenIdx * params.mTotalExpertsPerToken + params.mTopK;
-            bool const isTokenLocal = (tokenIdx >= params.mSharedExpertTokenOffset)
-                && (tokenIdx < (params.mSharedExpertTokenOffset + params.mSharedExpertNumTokens));
-            int32_t const permutedIdx = isTokenLocal ? (sharedExpertOffset + tokenIdx) : int32_t{-1};
+            int32_t const expandedIdx = tokenIdx * params.mTotalExpertsPerToken + params.mTopK + sharedExpertIdx;
+            int32_t const localTokenIdx = tokenIdx - params.mSharedExpertTokenOffset;
+            bool const isTokenLocal = (localTokenIdx >= 0) && (localTokenIdx < params.mSharedExpertNumTokens);
+            int32_t const sharedExpertPermuteSize = divUpMulLog2(params.mSharedExpertNumTokens, params.mPaddingLog2);
+            int32_t const permutedIdx = isTokenLocal
+                ? (sharedExpertOffset + sharedExpertIdx * sharedExpertPermuteSize + localTokenIdx)
+                : int32_t{-1};
             if (params.mPtrExpandedIdxToPermutedIdx != nullptr)
             {
                 params.mPtrExpandedIdxToPermutedIdx[expandedIdx] = permutedIdx;
@@ -1084,11 +1089,11 @@ __global__ void __launch_bounds__(NumThreads) routingIndicesOffsetsKernel(Kernel
     //  Compute shared expert offset before number of non-exiting CTAs is updated
     int32_t const sharedExpertOffset = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
     // Write routing info for shared expert
-    if (params.mFuseSharedExpert)
+    for (int32_t sharedExpertIdx = 0; sharedExpertIdx < params.mNumFusedSharedExperts; ++sharedExpertIdx)
     {
         int32_t const numSharedExpertCtas = divUpLog2<int32_t>(params.mSharedExpertNumTokens, params.mPaddingLog2);
         int32_t const tokensPerTile = params.mAllToAllRouteAct ? params.mNumTokens : params.mSharedExpertNumTokens;
-        int32_t const sharedExpertIndex = params.mNumLocalExperts;
+        int32_t const sharedExpertIndex = params.mNumLocalExperts + sharedExpertIdx;
         // All threads will work on this
         for (int32_t cta = threadIdx.x + blockIdx.x * NumThreads; cta < numSharedExpertCtas;
              cta += NumThreads * gridDim.x)
@@ -1272,16 +1277,19 @@ __global__ void __launch_bounds__(NumThreads) routingIndicesOffsetsKernel(Kernel
         }
     }
 
-    if (params.mFuseSharedExpert)
+    for (int32_t sharedExpertIdx = 0; sharedExpertIdx < params.mNumFusedSharedExperts; ++sharedExpertIdx)
     {
         // All threads will collaboratively write map for the shared example.
         for (int32_t tokenIdx = threadIdx.x + NumThreads * blockIdx.x; tokenIdx < params.mNumTokens;
              tokenIdx += NumThreads * gridDim.x)
         {
-            int32_t const expandedIdx = tokenIdx * params.mTotalExpertsPerToken + params.mTopK;
-            bool const isTokenLocal = (tokenIdx >= params.mSharedExpertTokenOffset)
-                && (tokenIdx < (params.mSharedExpertTokenOffset + params.mSharedExpertNumTokens));
-            int32_t const permutedIdx = isTokenLocal ? (sharedExpertOffset + tokenIdx) : int32_t{-1};
+            int32_t const expandedIdx = tokenIdx * params.mTotalExpertsPerToken + params.mTopK + sharedExpertIdx;
+            int32_t const localTokenIdx = tokenIdx - params.mSharedExpertTokenOffset;
+            bool const isTokenLocal = (localTokenIdx >= 0) && (localTokenIdx < params.mSharedExpertNumTokens);
+            int32_t const sharedExpertPermuteSize = divUpMulLog2(params.mSharedExpertNumTokens, params.mPaddingLog2);
+            int32_t const permutedIdx = isTokenLocal
+                ? (sharedExpertOffset + sharedExpertIdx * sharedExpertPermuteSize + localTokenIdx)
+                : int32_t{-1};
             if (params.mPtrExpandedIdxToPermutedIdx != nullptr)
             {
                 params.mPtrExpandedIdxToPermutedIdx[expandedIdx] = permutedIdx;
@@ -1352,7 +1360,10 @@ void run(Data const& data, void* stream)
         data.mNumExperts % 4 == 0, "Routing kernel expects #experts %d to be a multiple of 4.", data.mNumExperts);
     TLLM_CHECK_WITH_INFO(data.mPaddingLog2 < 8, "Routing kernel expects padding log2 < 8, got %d", data.mPaddingLog2);
 
-    if (data.mFuseSharedExpert)
+    TLLM_CHECK_WITH_INFO(data.mNumFusedSharedExperts <= WarpSize,
+        "Number of fused shared experts (%d must be less than warp size.", WarpSize);
+
+    if (data.mNumFusedSharedExperts > 0)
     {
         // Disabling due to lack of testing
         TLLM_CHECK_WITH_INFO(
