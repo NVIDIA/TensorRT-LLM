@@ -218,6 +218,7 @@ struct RoutingKernelTestParam
     bool usePdl{true};
     bool getExpWeights{true};
 
+    int requiredComputeCapability{9};
     // Special for renormalize routing method
     bool doSoftmaxBeforeTopK{false};
     bool normTopkProb{true};
@@ -242,7 +243,7 @@ struct RoutingKernelTestParam
     RoutingKernelTestParam(RoutingMethodType routingMethod, int32_t numTokens, int32_t numExperts, uint32_t topK,
         int32_t expertParallelization = 1, int32_t expertParallelizationId = 0, int32_t paddingLog2 = 3,
         int32_t localExpertsStrideLog2 = 0, bool usePdl = true, bool getExpWeights = true, int32_t nGroup = 1,
-        int32_t topkGroup = 1, float routedScalingFactor = 1.0f)
+        int32_t topkGroup = 1, float routedScalingFactor = 1.0f, int requiredComputeCapability = 9)
         : routingMethod(routingMethod)
         , numTokens(numTokens)
         , numExperts(numExperts)
@@ -254,6 +255,7 @@ struct RoutingKernelTestParam
         , nGroup(nGroup)
         , topkGroup(topkGroup)
         , routedScalingFactor(routedScalingFactor)
+        , requiredComputeCapability(requiredComputeCapability)
     {
         // Check the routing method
         if (routingMethod != RoutingMethodType::Renormalize && routingMethod != RoutingMethodType::RenormalizeNaive

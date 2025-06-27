@@ -332,6 +332,11 @@ void RoutingKernelTest<T>::verifyResult(RoutingKernelTestParam const& param)
 template <typename T>
 void RoutingKernelTest<T>::runTest(RoutingKernelTestParam const& param)
 {
+    if (mDeviceProp.major < param.requiredComputeCapability)
+    {
+        GTEST_SKIP() << "Skip test due to compute capability requirement.";
+    }
+
     // Allocate buffers
     allocateBuffers(param);
     // Setup buffers

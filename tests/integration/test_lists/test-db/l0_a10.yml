@@ -28,6 +28,7 @@ l0_a10:
   - test_e2e.py::test_openai_reasoning[pytorch]
   - test_e2e.py::test_openai_completions_example[pytorch]
   - test_e2e.py::test_openai_chat_example[pytorch]
+  - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency-]
 - condition:
     ranges:
       system_gpu_count:
@@ -84,7 +85,6 @@ l0_a10:
   - test_e2e.py::test_openai_reasoning[trt]
   - test_e2e.py::test_trtllm_bench_sanity[--non-streaming-FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
   - test_e2e.py::test_trtllm_bench_latency_sanity[FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
-  - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency-]
   - unittest/trt/quantization TIMEOUT (60)
   - accuracy/test_cli_flow.py::TestLlama7B::test_streamingllm # 2 mins
   - unittest/trt/functional # 37 mins

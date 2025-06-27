@@ -29,7 +29,7 @@ execute_process(
   COMMAND ${Python3_EXECUTABLE} setup_library.py develop --user
   RESULT_VARIABLE _CUTLASS_LIBRARY_SUCCESS)
 
-if(NOT _CUTLASS_LIBRARY_SUCCESS MATCHES 0)
+if(NOT _CUTLASS_LIBRARY_SUCCESS EQUAL 0)
   message(
     FATAL_ERROR
       "Failed to set up the CUTLASS library due to ${_CUTLASS_LIBRARY_SUCCESS}."
@@ -53,7 +53,7 @@ execute_process(
   OUTPUT_VARIABLE _KERNEL_GEN_OUTPUT
   RESULT_VARIABLE _KERNEL_GEN_SUCCESS)
 
-if(NOT _KERNEL_GEN_SUCCESS MATCHES 0)
+if(NOT _KERNEL_GEN_SUCCESS EQUAL 0)
   message(
     FATAL_ERROR
       "Failed to generate internal CUTLASS kernel instantiations due to ${_KERNEL_GEN_SUCCESS}."
@@ -211,6 +211,12 @@ function(process_target target_name enable_hopper enable_blackwell)
                                  PUBLIC COMPILE_BLACKWELL_TMA_GEMMS)
       target_compile_definitions(${target_name}
                                  PUBLIC COMPILE_BLACKWELL_TMA_GROUPED_GEMMS)
+    endif()
+    if("120" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
+      target_compile_definitions(${target_name}
+                                 PRIVATE COMPILE_BLACKWELL_SM120_TMA_GEMMS)
+      target_compile_definitions(
+        ${target_name} PRIVATE COMPILE_BLACKWELL_SM120_TMA_GROUPED_GEMMS)
     endif()
   endif()
 
