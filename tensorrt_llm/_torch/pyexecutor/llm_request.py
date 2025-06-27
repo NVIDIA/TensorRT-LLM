@@ -256,6 +256,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             **kwargs):
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
                                                     None)
+        # Multimodal data
+        self.py_mm_data = kwargs.pop("py_mm_data", None)
         super().__init__(
             *args,
             client_id=client_id,
@@ -426,6 +428,6 @@ def executor_request_to_llm_request(
         if executor_request.client_id is not None else req_id,
         priority=0.5,
         llm_request_type=llm_request_type,
-        context_phase_params=executor_request.context_phase_params)
-
+        context_phase_params=executor_request.context_phase_params,
+        py_mm_data=getattr(executor_request, "py_mm_data", None))
     return llm_request
