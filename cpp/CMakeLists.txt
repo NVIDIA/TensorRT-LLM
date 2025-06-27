@@ -363,8 +363,19 @@ if(BUILD_PYT)
     )
   endif()
   unset(ENV{TORCH_CUDA_ARCH_LIST})
-  # Placeholder.
-  message(STATUS "Set TORCH_CUDA_ARCH_LIST to placeholder value \"8.0\".")
+  # Torch maintains custom logic to add CUDA architecture flags into
+  # CMAKE_CUDA_FLAGS based on TORCH_CUDA_ARCH_LIST variable, instead of using
+  # the native support introduced in newer CMake versions. And it always tries
+  # to add some flags, even given empty TORCH_CUDA_ARCH_LIST.
+
+  # We prefer CMake's native support to be able to easily customize the CUDA
+  # architectures to be compiled for, for each kernel individually. So we set
+  # TORCH_CUDA_ARCH_LIST to a placeholder value and remove the generated flags
+  # then to effectively prevent Torch from adding CUDA architecture flags.
+  message(
+    STATUS
+      "Set TORCH_CUDA_ARCH_LIST to placeholder value \"8.0\" to make Torch happy. "
+      "This is NOT the list of architectures that will be compiled for.")
   set(TORCH_CUDA_ARCH_LIST "8.0")
 
   find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
@@ -398,8 +409,18 @@ print(os.path.dirname(torch.__file__),end='');"
   set(CMAKE_CUDA_ARCHITECTURES_BACKUP ${CMAKE_CUDA_ARCHITECTURES})
   find_package(Torch REQUIRED)
   set(CMAKE_CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES_BACKUP})
-  string(REPLACE "-gencode arch=compute_80,code=sm_80 " "" CMAKE_CUDA_FLAGS
+  message(
+    STATUS
+      "Removing Torch generated placeholder CUDA architecture flags: -gencode arch=compute_80,code=sm_80."
+  )
+  string(REPLACE "-gencode arch=compute_80,code=sm_80 " "" CMAKE_CUDA_FLAGS_NEW
                  "${CMAKE_CUDA_FLAGS}")
+  if("${CMAKE_CUDA_FLAGS_NEW}" STREQUAL "${CMAKE_CUDA_FLAGS}")
+    message(
+      FATAL_ERROR
+        "Torch didn't generate expected placeholder CUDA architecture flags.")
+  endif()
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS_NEW}")
 
   add_compile_definitions(TORCH_CUDA=1)
 
