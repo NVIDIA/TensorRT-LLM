@@ -83,6 +83,7 @@ class CompletionLogProbs(OpenAIBaseModel):
 class CompletionResponseChoice(OpenAIBaseModel):
     index: int
     text: str
+    token_ids: Optional[List[int]] = []
     logprobs: Optional[CompletionLogProbs] = None
     context_logits: Optional[Union[List[float], List[List[
         float]]]] = None  # For reward models, the output is score logits instead of text.
@@ -112,6 +113,7 @@ class CompletionResponse(OpenAIBaseModel):
 class CompletionResponseStreamChoice(OpenAIBaseModel):
     index: int
     text: str
+    token_ids: Optional[List[int]] = []
     logprobs: Optional[CompletionLogProbs] = None
     finish_reason: Optional[str] = None
     stop_reason: Optional[Union[int, str]] = Field(
@@ -243,7 +245,6 @@ class CompletionRequest(OpenAIBaseModel):
             guided_decoding=_response_format_to_guided_decoding_params(
                 self.response_format),
             detokenize=self.detokenize,
-
 
             # completion-extra-params
             add_special_tokens=self.add_special_tokens,

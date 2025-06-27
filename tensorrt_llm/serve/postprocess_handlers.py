@@ -259,6 +259,7 @@ class CompletionPostprocArgs(PostprocArgs):
     prompt_idx: int = 0
     prompt: Optional[str] = None
     stream_options: Optional[StreamOptions] = None
+    detokenize: Optional[bool] = True
 
     @classmethod
     def from_request(cls, request: CompletionRequest):
@@ -267,6 +268,7 @@ class CompletionPostprocArgs(PostprocArgs):
             model=request.model,
             num_choices=request.n if request.n else 1,
             stream_options=request.stream_options,
+            detokenize=request.detokenize,
         )
 
 
@@ -285,12 +287,21 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase, args:
         delta_text = output.text_diff
         if args.echo and args.first_iteration:
             delta_text = args.prompt + delta_text
-        choice = CompletionResponseStreamChoice(
-            index=args.prompt_idx * args.num_choices + output.index,
-            text=delta_text,
-            finish_reason = output.finish_reason,
-            stop_reason = output.stop_reason,
-        )
+        if args.detokenize:
+            choice = CompletionResponseStreamChoice(
+                index=args.prompt_idx * args.num_choices + output.index,
+                text=delta_text,
+                finish_reason = output.finish_reason,
+                stop_reason = output.stop_reason,
+            )
+        else:
+            choice = CompletionResponseStreamChoice(
+                index=args.prompt_idx * args.num_choices + output.index,
+                text="",
+                token_ids=output.token_ids_diff,
+                finish_reason = output.finish_reason,
+                stop_reason = output.stop_reason,
+            )
         chunk = CompletionStreamResponse(model=args.model, choices=[choice])
         if include_continuous_usage:
             chunk.usage = UsageInfo(prompt_tokens=prompt_tokens,
@@ -326,14 +337,25 @@ def completion_response_post_processor(rsp: GenerationResult, args: CompletionPo
         if args.echo:
             text = args.prompt + text
         disaggregated_params = to_disaggregated_params(output.disaggregated_params)
-        choice = CompletionResponseChoice(
-            text=text,
-            index=args.prompt_idx * args.num_choices + output.index,
-            disaggregated_params=disaggregated_params,
-            context_logits=None if rsp.context_logits is None else rsp.context_logits.tolist(),
-            stop_reason=output.stop_reason,
-            finish_reason=output.finish_reason,
-        )
+        if args.detokenize:
+            choice = CompletionResponseChoice(
+                text=text,
+                index=args.prompt_idx * args.num_choices + output.index,
+                disaggregated_params=disaggregated_params,
+                context_logits=None if rsp.context_logits is None else rsp.context_logits.tolist(),
+                stop_reason=output.stop_reason,
+                finish_reason=output.finish_reason,
+            )
+        else:
+            choice = CompletionResponseChoice(
+                text="",
+                token_ids=output.token_ids,
+                index=args.prompt_idx * args.num_choices + output.index,
+                disaggregated_params=disaggregated_params,
+                context_logits=None if rsp.context_logits is None else rsp.context_logits.tolist(),
+                stop_reason=output.stop_reason,
+                finish_reason=output.finish_reason,
+            )
 
         completion_tokens += output.length
         choices.append(choice)

@@ -388,15 +388,6 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                 else:
                     beam_output.text = self.tokenizer.decode(
                         beam_output.token_ids, **kwargs)
-        else:
-            for beam_output in self.outputs:
-                beam_output._last_text_len = len(beam_output.text)
-
-                if self._streaming:
-                    beam_output._last_text_len = 0
-                    beam_output.text = str(beam_output.token_ids_diff)
-                else:
-                    beam_output.text = str(beam_output.token_ids)
 
 
 # alias
