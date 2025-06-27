@@ -757,8 +757,7 @@ class TRTLLMSampler(Sampler):
                                                                   beam].item())
 
                 finished_state = FinishedState(
-                    state.host.finish_reasons[seq_slot,
-                                              beam].item())
+                    state.host.finish_reasons[seq_slot, beam].item())
                 if finished_state.is_finished:
                     finish_reason = finished_state.to_finish_reason()
                     request.set_finished_reason(finish_reason, beam)
