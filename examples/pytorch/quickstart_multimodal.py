@@ -25,6 +25,28 @@ example_video_prompts = [
     "Tell me what you see in the video briefly.",
     "Describe the scene in the video briefly.",
 ]
+example_audios = [
+    "https://huggingface.co/microsoft/Phi-4-multimodal-instruct/resolve/main/examples/what_is_the_traffic_sign_in_the_image.wav",
+    "https://huggingface.co/microsoft/Phi-4-multimodal-instruct/resolve/main/examples/what_is_shown_in_this_image.wav",
+]
+example_audio_prompts = [
+    "Transcribe the audio clip into text, please don't add other text.",
+    "Transcribe the audio clip into text, please don't add other text.",
+]
+example_image_audios = [
+    [
+        "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png",
+        "https://huggingface.co/microsoft/Phi-4-multimodal-instruct/resolve/main/examples/what_is_shown_in_this_image.wav",
+    ],
+    [
+        "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png",
+        "https://huggingface.co/microsoft/Phi-4-multimodal-instruct/resolve/main/examples/what_is_shown_in_this_image.wav",
+    ],
+]
+example_image_audio_prompts = [
+    "Describe the scene in the image briefly.",
+    "",
+]
 
 
 def add_multimodal_args(parser):
@@ -34,7 +56,7 @@ def add_multimodal_args(parser):
                         help="Model type.")
     parser.add_argument("--modality",
                         type=str,
-                        choices=["image", "video"],
+                        choices=["image", "video", "audio", "image_audio"],
                         default="image",
                         help="Media type.")
     parser.add_argument("--media",
@@ -53,11 +75,24 @@ def add_multimodal_args(parser):
     return parser
 
 
+def add_lora_args(parser):
+    parser.add_argument("--load_lora",
+                        default=False,
+                        action='store_true',
+                        help="Whether to load the LoRA model.")
+    parser.add_argument("--auto_model_name",
+                        type=str,
+                        default=None,
+                        help="The auto model name in TRTLLM repo.")
+    return parser
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser(
         description="Multimodal models with the PyTorch workflow.")
     parser = add_llm_args(parser)
     parser = add_multimodal_args(parser)
+    parser = add_lora_args(parser)
     args = parser.parse_args()
 
     args.disable_kv_cache_reuse = True  # kv cache reuse does not work for multimodal, force overwrite
@@ -71,11 +106,33 @@ def main():
     args = parse_arguments()
     # set prompts and media to example prompts and images if they are not provided
     if args.prompt is None:
-        args.prompt = example_image_prompts if args.modality == "image" else example_video_prompts
+        if args.modality == "image":
+            args.prompt = example_image_prompts
+        elif args.modality == "video":
+            args.prompt = example_video_prompts
+        elif args.modality == "audio":
+            args.prompt = example_audio_prompts
+        elif args.modality == "image_audio":
+            args.prompt = example_image_audio_prompts
     if args.media is None:
-        args.media = example_images if args.modality == "image" else example_videos
+        if args.modality == "image":
+            args.media = example_images
+        elif args.modality == "video":
+            args.media = example_videos
+        elif args.modality == "audio":
+            args.media = example_audios
+        elif args.modality == "image_audio":
+            args.media = example_image_audios
 
-    llm, sampling_params = setup_llm(args)
+    lora_config = None
+    if args.load_lora:
+        assert args.auto_model_name is not None, "Please provide the auto model name to load LoRA config."
+        import importlib
+        models_module = importlib.import_module('tensorrt_llm._torch.models')
+        model_class = getattr(models_module, args.auto_model_name)
+        lora_config = model_class.lora_config(args.model_dir)
+
+    llm, sampling_params = setup_llm(args, lora_config=lora_config)
 
     image_format = args.image_format
     if args.model_type is not None:
@@ -96,7 +153,16 @@ def main():
                                              num_frames=args.num_frames,
                                              device=device)
 
-    outputs = llm.generate(inputs, sampling_params)
+    lora_request = None
+    if args.load_lora:
+        lora_request = model_class.lora_request(len(inputs), args.modality,
+                                                llm._hf_model_dir)
+
+    outputs = llm.generate(
+        inputs,
+        sampling_params,
+        lora_request=lora_request,
+    )
 
     for i, output in enumerate(outputs):
         prompt = args.prompt[i]
