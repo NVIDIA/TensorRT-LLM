@@ -254,7 +254,8 @@ struct TmaWarpSpecializedGroupedGemmInput
 
 constexpr bool isGatedActivation(ActivationType activation_type)
 {
-    return activation_type == ActivationType::Swiglu || activation_type == ActivationType::Geglu;
+    return activation_type == ActivationType::Swiglu || activation_type == ActivationType::Geglu
+        || activation_type == ActivationType::SwigluBias;
 }
 
 template <typename T,                   /*The type used for activations/scales/compute*/
@@ -306,9 +307,9 @@ public:
 
     [[nodiscard]] bool isTmaWarpSpecialized(cutlass_extensions::CutlassGemmConfig gemm_config) const;
     [[nodiscard]] bool supportsTmaWarpSpecialized() const;
-    [[nodiscard]] bool isFusedGatedActivation(
-        cutlass_extensions::CutlassGemmConfig gemm_config, bool is_gated_activation, int gemm_n, int gemm_k) const;
-    [[nodiscard]] bool supportsFusedGatedActivation(bool is_gated_activation, int gemm_n, int gemm_k) const;
+    [[nodiscard]] bool isFusedGatedActivation(cutlass_extensions::CutlassGemmConfig gemm_config,
+        ActivationType activation_type, int gemm_n, int gemm_k) const;
+    [[nodiscard]] bool supportsFusedGatedActivation(ActivationType activation_type, int gemm_n, int gemm_k) const;
 
     size_t getMaxWorkspaceSize(int num_experts) const;
 

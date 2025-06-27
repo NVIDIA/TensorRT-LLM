@@ -580,18 +580,19 @@ int MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getSM() const
 // currently support sm80 bf16/fp16 gate activation, only set predication tensor for m direction
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::supportsFusedGatedActivation(
-    bool is_gated_activation, int gemm_n, int gemm_k) const
+    ActivationType activation_type, int gemm_n, int gemm_k) const
 {
     constexpr bool ENABLE_FUSED_GATED_ACTIVATION = true;
-    return is_gated_activation && std::is_same_v<T, WeightType> && !std::is_same_v<T, float> && !use_fp8
-        && (this->getSM() >= 80) && (gemm_k % 64 == 0) && (gemm_n % 64 == 0) && ENABLE_FUSED_GATED_ACTIVATION;
+    return (activation_type == ActivationType::Swiglu || activation_type == ActivationType::Geglu)
+        && std::is_same_v<T, WeightType> && !std::is_same_v<T, float> && !use_fp8 && (this->getSM() >= 80)
+        && (gemm_k % 64 == 0) && (gemm_n % 64 == 0) && ENABLE_FUSED_GATED_ACTIVATION;
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::isFusedGatedActivation(
-    cutlass_extensions::CutlassGemmConfig gemm_config, bool is_gated_activation, int gemm_n, int gemm_k) const
+    cutlass_extensions::CutlassGemmConfig gemm_config, ActivationType activation_type, int gemm_n, int gemm_k) const
 {
-    return supportsFusedGatedActivation(is_gated_activation, gemm_n, gemm_k) && !gemm_config.is_tma_warp_specialized;
+    return supportsFusedGatedActivation(activation_type, gemm_n, gemm_k) && !gemm_config.is_tma_warp_specialized;
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
