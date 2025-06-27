@@ -226,6 +226,7 @@ class ADEngine(ModelEngine):
         resource_manager: ResourceManager,
         new_tokens_device: Optional[torch.Tensor] = None,
         gather_context_logits: bool = False,
+        cache_indirection_buffer: Optional[torch.Tensor] = None,
     ):
         """Run forward from scheduled requests; main entrypoint that gets called by the executor."""
         # convert requests and store in sequence info object
@@ -264,6 +265,7 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
     ad_config: _AutoDeployLlmArgs = executor_config.pytorch_backend_config
 
     max_batch_size = ad_config.max_batch_size
+    max_beam_width = ad_config.max_beam_width
     max_seq_len = ad_config.max_seq_len
     attn_page_size = ad_config.attn_page_size
     max_num_tokens = ad_config.max_num_tokens
@@ -273,6 +275,7 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
 
     ad_logger.info(f"{max_seq_len=}, {max_batch_size=}, {attn_page_size=}, {max_num_tokens=}")
 
+    assert max_beam_width <= 1, "_autodeploy + beam_search is not supported"
     # initialize model engine
     engine = ADEngine.build_from_config(
         model=checkpoint_dir,
@@ -317,6 +320,7 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
         disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
         max_input_len=ad_config.max_input_len,
         max_batch_size=max_batch_size,
+        max_beam_width=max_beam_width,
         max_draft_tokens=max_draft_tokens,
     )
     return py_executor
