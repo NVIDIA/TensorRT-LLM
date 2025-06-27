@@ -252,10 +252,17 @@ void DataReceiver::sendRequestInfo(LlmRequest const& llmRequest)
         auto const* connection = connections.at(index);
         counterPartConnections.emplace_back(connection);
     }
-    auto pickUpConnections = mFormatter->pickRecvConnections(counterPartConnections, mSelfState.getCacheState().value(),
+    auto pickUpIdx = mFormatter->pickRecvConnections(counterPartConnections.size(), mSelfState.getCacheState().value(),
         mSelfState.getCommState().value().getSelfIdx(), destCacheState);
-    for (auto connection : counterPartConnections)
+    std::vector<Connection const*> pickUpConnections;
+    for (auto idx : pickUpIdx)
     {
+        auto const* connection = counterPartConnections.at(idx);
+        pickUpConnections.emplace_back(connection);
+    }
+    for (size_t i = 0; i < counterParts.size(); i++)
+    {
+        auto const* connection = connections.at(counterParts[i]);
         // if Manager is agentConnectionManager, then send request info to agent
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
         if (agentConnectionManager != nullptr)
