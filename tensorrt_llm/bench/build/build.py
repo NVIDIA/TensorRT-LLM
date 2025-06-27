@@ -5,8 +5,7 @@ from typing import Tuple, get_args
 import click
 from click_option_group import AllOptionGroup, optgroup
 
-
-from tensorrt_llm.bench.tuning.dataclasses import BenchmarkEnvironment
+from tensorrt_llm.bench.dataclasses.scenario import BenchmarkEnvironment
 from tensorrt_llm.bench.utils.data import create_dataset_from_stream, initialize_tokenizer
 from tensorrt_llm.bench.utils import VALID_QUANT_ALGOS
 from tensorrt_llm.builder import BuildConfig
