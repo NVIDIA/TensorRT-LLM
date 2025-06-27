@@ -86,7 +86,7 @@ def test_fp8_bmm(input_dtype, mat2_dtype):
         weight_scale=mat2_scale,
     )
 
-    output_fp8_bmm_unquantized_inputs = torch.ops.quant.fp8_bmm(
+    output_fp8_bmm_unquantized_inputs = torch.ops.auto_deploy.torch_quant_fp8_bmm(
         input,
         mat2,
         input_scale=input_scale,
