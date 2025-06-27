@@ -79,7 +79,7 @@ def test_fp8_bmm(input_dtype, mat2_dtype):
     mat2_fp8 = (mat2 / mat2_scale).to(torch.float8_e4m3fn)
 
     # Test fp8_bmm operation
-    output_fp8_bmm = torch.ops.quant.fp8_bmm(
+    output_fp8_bmm = torch.ops.auto_deploy.torch_quant_fp8_bmm(
         input,
         mat2_fp8,
         input_scale=input_scale,
