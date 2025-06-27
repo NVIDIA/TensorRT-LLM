@@ -28,10 +28,14 @@ UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifac
 // Container configuration
 // available tags can be found in: https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm/
 // [base_image_name]-[arch]-[os](-[python_version])-[trt_version]-[torch_install_type]-[stage]-[date]-[mr_id]
-LLM_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.05-py3-x86_64-ubuntu24.04-trt10.11.0.33-skip-tritondevel-202506051650-4885"
-LLM_SBSA_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.05-py3-aarch64-ubuntu24.04-trt10.11.0.33-skip-tritondevel-202506051650-4885"
-LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.0-devel-rocky8-x86_64-rocky8-py310-trt10.11.0.33-skip-tritondevel-202506051650-4885"
-LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.0-devel-rocky8-x86_64-rocky8-py312-trt10.11.0.33-skip-tritondevel-202506051650-4885"
+def tag_props = readProperties file: "current_image_tag.properties"
+LLM_DOCKER_IMAGE_URI = tag_props["LLM_DOCKER_IMAGE_URI"]
+LLM_DOCKER_IMAGE_TAG_SUFFIX = tag_props["LLM_DOCKER_IMAGE_TAG_SUFFIX"]
+LLM_DOCKER_IMAGE_X86_TAG_SUFFIX = tag_props["LLM_DOCKER_IMAGE_X86_TAG_SUFFIX"]
+LLM_DOCKER_IMAGE = "${LLM_DOCKER_IMAGE_URI}:${LLM_DOCKER_IMAGE_X86_TAG_SUFFIX}${LLM_DOCKER_IMAGE_TAG_SUFFIX}"
+LLM_SBSA_DOCKER_IMAGE = "${LLM_DOCKER_IMAGE_URI}:pytorch-25.05-py3-aarch64-ubuntu24.04${LLM_DOCKER_IMAGE_TAG_SUFFIX}"
+LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = "${LLM_DOCKER_IMAGE_URI}:cuda-12.9.0-devel-rocky8-x86_64-rocky8-py310${LLM_DOCKER_IMAGE_TAG_SUFFIX}"
+LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = "${LLM_DOCKER_IMAGE_URI}:cuda-12.9.0-devel-rocky8-x86_64-rocky8-py312${LLM_DOCKER_IMAGE_TAG_SUFFIX}"
 
 // TODO: Move common variables to an unified location
 BUILD_CORES_REQUEST = "8"
