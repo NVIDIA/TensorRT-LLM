@@ -5,11 +5,18 @@ BASE_TAG           ?= $(shell grep '^ARG BASE_TAG=' Dockerfile.multi | grep -o '
 IMAGE_NAME         ?= tensorrt_llm
 IMAGE_TAG          ?= latest
 
+# Used to share .cache when LOCAL_USER=1. Possibility of override is
+# helpful, e.g., for use with Docker rootless mode.
+HOME_DIR           ?= $(HOME)
+
 # Local user information
 USER_ID            ?= $(shell id --user)
 USER_NAME          ?= $(shell id --user --name)
 GROUP_ID           ?= $(shell id --group)
 GROUP_NAME         ?= $(shell id --group --name)
+
+# Try to detect Docker rootless mode
+IS_ROOTLESS        ?= $(shell if [ "$$(docker context inspect --format '{{.Endpoints.docker.Host}}' "$$(docker context show)")" = "unix:///run/user/$(USER_ID)/docker.sock" ]; then echo 1; else echo 0; fi)
 
 # Set this to 1 to add the current user to the docker image and run the container with the user
 LOCAL_USER         ?= 0
@@ -108,7 +115,7 @@ endef
 	@echo "Pulling docker image: $(IMAGE_WITH_TAG)"
 	docker pull $(IMAGE_WITH_TAG)
 
-DOCKER_RUN_OPTS   ?= --rm -it --ipc=host --ulimit memlock=-1 --ulimit stack=67108864
+DOCKER_RUN_OPTS ?= --rm -it --ipc=host --ulimit stack=67108864 $(if $(filter 0,$(IS_ROOTLESS)),--ulimit memlock=-1)
 DOCKER_RUN_ARGS   ?=
 # Check if NVIDIA_VISIBLE_DEVICES is set and not empty
 NVIDIA_VISIBLE_DEVICES_VAL = $(shell echo $$NVIDIA_VISIBLE_DEVICES)
@@ -129,6 +136,9 @@ WORK_DIR          ?= $(CODE_DIR)
 DOCKER_PULL       ?= 0
 
 %_run:
+ifeq ($(IS_ROOTLESS),1)
+	@echo "Assuming Docker rootless mode."
+endif
 ifeq ($(DOCKER_PULL),1)
 	@$(MAKE) --no-print-directory $*_pull
 endif
@@ -138,7 +148,7 @@ endif
 	docker run $(DOCKER_RUN_OPTS) $(DOCKER_RUN_ARGS) \
     		$(GPU_OPTS) \
     		--volume $(SOURCE_DIR):$(CODE_DIR) \
-    		$(if $(filter 1,$(LOCAL_USER)),--volume ${HOME}/.cache:/home/${USER_NAME}/.cache:rw) \
+    		$(if $(filter 1,$(LOCAL_USER)),--volume ${HOME_DIR}/.cache:/home/${USER_NAME}/.cache:rw) \
     		--env "CCACHE_DIR=${CCACHE_DIR}" \
     		--env "CCACHE_BASEDIR=${CODE_DIR}" \
     	    --env "CONAN_HOME=${CONAN_DIR}" \
@@ -215,7 +225,7 @@ ngc-release_%: IMAGE_TAG = $(TRT_LLM_VERSION)-$(PLATFORM)
 
 ngc-release_run:  WORK_DIR = /app/tensorrt_llm
 ngc-release_run:  IMAGE_NAME = $(NGC_AUTO_REPO)
-ngc-release_run:  IMAGE_TAG = $(TRT_LLM_VERSION)
+ngc-release_run: IMAGE_TAG = $(TRT_LLM_VERSION)
 ngc-release_pull: IMAGE_NAME = $(NGC_AUTO_REPO)
 ngc-release_pull: IMAGE_TAG = $(TRT_LLM_VERSION)
 
