@@ -89,3 +89,48 @@ def test_metrics(client):
     assert "pinnedMemUsage" in response_dict
     assert "staticBatchingStats" in response_dict
     assert "timestamp" in response_dict
+
+
+def test_metrics_size():
+    build_config = BuildConfig()
+    build_config.max_batch_size = 8
+    build_config.max_seq_len = 512
+    iter_perf_latest_stats_size = 3
+    hf_tokenizer = AutoTokenizer.from_pretrained(llama_model_path)
+    llm = PyTorchLLM(
+        model=llama_model_path,
+        tokenizer=hf_tokenizer,
+        build_config=build_config,
+        kv_cache_config=KvCacheConfig(),
+        backend="pytorch",
+        pytorch_backend_config=PyTorchConfig(
+            enable_overlap_scheduler=True,
+            enable_iter_perf_stats=True,
+            iter_perf_latest_stats_size=iter_perf_latest_stats_size,
+        ))
+
+    app_instance = OpenAIServer(llm, model=llama_model_path)
+    client = TestClient(app_instance.app)
+
+    response = client.get("/metrics")
+    assert response.status_code == 200
+    assert len(response.json()) == 0
+
+    response = client.post("/v1/completions",
+                           json={
+                               "prompt": "A B C",
+                               "model": llama_model_path,
+                               "max_tokens": 100
+                           })
+    assert response.status_code == 200
+
+    response = client.get("/metrics")
+    assert response.status_code == 200
+    assert len(response.json()) == iter_perf_latest_stats_size
+    response_dict = response.json()[0]
+    assert "cpuMemUsage" in response_dict
+    assert "gpuMemUsage" in response_dict
+
+    response = client.get("/metrics")
+    assert response.status_code == 200
+    assert len(response.json()) == 0

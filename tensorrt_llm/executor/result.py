@@ -598,6 +598,20 @@ class IterationResult:
             self._done = True
             raise StopAsyncIteration
 
+    def get_latest(self, exp_size: Optional[int] = None) -> List[dict]:
+        results = []
+        cur_size = len(self.queue)
+        if cur_size == 0:
+            return results
+        if exp_size is None:
+            exp_size = cur_size
+        while cur_size > 0:
+            data = self.queue.get()
+            if cur_size <= exp_size:
+                results.append(json.loads(data))
+            cur_size -= 1
+        return results
+
 
 def compute_logprobs(
     k_prompt_logprobs: int,
