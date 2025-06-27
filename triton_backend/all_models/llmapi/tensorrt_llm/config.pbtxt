@@ -192,5 +192,40 @@ output [
     name: "per_request_kv_hit_rate"
     data_type: TYPE_FP32
     dims: [-1]
+  },
+  {
+    name: "arrival_time_ns"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+  },
+  {
+    name: "first_scheduled_time_ns"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+  },
+  {
+    name: "first_token_time_ns"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+  },
+  {
+    name: "last_token_time_ns"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+  },
+  {
+    name: "acceptance_rate"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+  },
+  {
+    name: "total_accepted_draft_tokens"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+  },
+  {
+    name: "total_draft_tokens"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
   }
 ]
