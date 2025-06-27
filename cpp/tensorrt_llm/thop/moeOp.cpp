@@ -632,22 +632,28 @@ private:
             auto const fc2_dequant = quant_scales.value()[2];
             auto const fc1_input_dequant = quant_scales.value()[3];
 
+            // Check types
             CHECK_INPUT(fc1_dequant, c10::ScalarType::Float);
             CHECK_INPUT(fc2_quant, c10::ScalarType::Float);
             CHECK_INPUT(fc2_dequant, c10::ScalarType::Float);
             CHECK_INPUT(fc1_input_dequant, c10::ScalarType::Float);
+            // Check ranks
             TORCH_CHECK(fc1_dequant.dim() == 1, "fc1 dequant must be 1D");
-            TORCH_CHECK(fc2_quant.dim() == 0, "fc2 quant must be a scalar tensor");
+            TORCH_CHECK(fc2_quant.dim() == 0 || fc2_quant.dim() == 1, "fc2 quant must be a scalar or 1-D tensor");
             TORCH_CHECK(fc2_dequant.dim() == 1, "fc2 quant must be 1D");
             TORCH_CHECK(fc1_input_dequant.dim() == 0, "fc1 input dequant must be a scalar tensor");
+            // Check shapes
             TORCH_CHECK(
                 fc1_dequant.sizes()[0] == num_experts_on_rank, "fc1 dequant size must be (num_experts_on_rank,)");
+            TORCH_CHECK(fc2_quant.dim() == 0 || fc2_quant.sizes()[0] == num_experts_on_rank,
+                "fc2 quant must be scalar or (num_experts_on_rank,)");
             TORCH_CHECK(
                 fc2_dequant.sizes()[0] == num_experts_on_rank, "fc2 dequant size must be (num_experts_on_rank,)");
 
             return kernels::QuantParams::FP8(static_cast<float const*>(fc1_dequant.data_ptr()),
                 static_cast<float const*>(fc2_quant.data_ptr()), static_cast<float const*>(fc2_dequant.data_ptr()),
-                /* fp8 output quant scale */ nullptr, static_cast<float const*>(fc1_input_dequant.data_ptr()));
+                /* fp8 output quant scale */ nullptr, static_cast<float const*>(fc1_input_dequant.data_ptr()),
+                fc2_quant.dim() == 1);
         }
 
         else if (isWFp4AFp8Quant())
@@ -663,16 +669,20 @@ private:
 
             // The input for scale fc1_weight_block / fc2_weight_block is packed into INT32
             constexpr int FP8_PER_INT32 = 4;
+            // Check types
             CHECK_INPUT(fc1_weight_block, c10::ScalarType::Int);
             CHECK_INPUT(fc1_global, c10::ScalarType::Float);
             CHECK_INPUT(fc2_act_global, c10::ScalarType::Float);
             CHECK_INPUT(fc2_weight_block, c10::ScalarType::Int);
             CHECK_INPUT(fc2_global, c10::ScalarType::Float);
+            // Check ranks
             TORCH_CHECK(fc1_weight_block.dim() == 3, "fc1 weight block must be #D");
             TORCH_CHECK(fc1_global.dim() == 1, "fc1 global must be 1D");
-            TORCH_CHECK(fc2_act_global.dim() == 0, "fc2 act global must be a scalar tensor");
+            TORCH_CHECK(fc2_act_global.dim() == 0 || fc2_act_global.dim() == 1,
+                "fc2 act global must be a scalar or 1-D tensor");
             TORCH_CHECK(fc2_weight_block.dim() == 3, "fc2 weight block must be 3D");
             TORCH_CHECK(fc2_global.dim() == 1, "fc2 global must be 1D");
+            // Check shapes
             TORCH_CHECK(fc1_weight_block.sizes()[0] == num_experts_on_rank
                     && fc1_weight_block.sizes()[1] == inter_size * 2
                     && fc1_weight_block.sizes()[2] * FP8_PER_INT32
@@ -681,6 +691,8 @@ private:
                 "fc1 weight block size must be (num_experts_on_rank, inter_size * 2, hidden_size // 4 // "
                 "block_scale_vector_size)");
             TORCH_CHECK(fc1_global.sizes()[0] == num_experts_on_rank, "fc1 global size must be (num_experts_on_rank,)");
+            TORCH_CHECK(fc2_act_global.dim() == 0 || fc2_act_global.sizes()[0] == num_experts_on_rank,
+                "fc2 act global must be scalar or (num_experts_on_rank,)");
             TORCH_CHECK(fc2_weight_block.sizes()[0] == num_experts_on_rank && fc2_weight_block.sizes()[1] == hidden_size
                     && fc2_weight_block.sizes()[2] * FP8_PER_INT32
                             * TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize
@@ -693,7 +705,7 @@ private:
                 static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc1_weight_block.data_ptr()),
                 static_cast<float const*>(fc1_global.data_ptr()), static_cast<float const*>(fc2_act_global.data_ptr()),
                 static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc2_weight_block.data_ptr()),
-                static_cast<float const*>(fc2_global.data_ptr()));
+                static_cast<float const*>(fc2_global.data_ptr()), false, fc2_act_global.dim() == 1);
         }
         else if (isNvfp4Quant())
         {
@@ -709,18 +721,25 @@ private:
 
             // The input for scale fc1_weight_block / fc2_weight_block is packed into INT32
             constexpr int FP8_PER_INT32 = 4;
+            // Check types
             CHECK_INPUT(fc1_act_global, c10::ScalarType::Float);
             CHECK_INPUT(fc1_weight_block, c10::ScalarType::Int);
             CHECK_INPUT(fc1_global, c10::ScalarType::Float);
             CHECK_INPUT(fc2_act_global, c10::ScalarType::Float);
             CHECK_INPUT(fc2_weight_block, c10::ScalarType::Int);
             CHECK_INPUT(fc2_global, c10::ScalarType::Float);
-            TORCH_CHECK(fc1_act_global.dim() == 0, "fc1 act global must be a scalar tensor");
+            // Check ranks
+            TORCH_CHECK(fc1_act_global.dim() == 0 || fc1_act_global.dim() == 1,
+                "fc1 act global must be a scalar or 1-D tensor");
             TORCH_CHECK(fc1_weight_block.dim() == 3, "fc1 weight block must be #D");
             TORCH_CHECK(fc1_global.dim() == 1, "fc1 global must be 1D");
-            TORCH_CHECK(fc2_act_global.dim() == 0, "fc2 act global must be a scalar tensor");
+            TORCH_CHECK(fc2_act_global.dim() == 0 || fc2_act_global.dim() == 1,
+                "fc2 act global must be a scalar or 1-D tensor");
             TORCH_CHECK(fc2_weight_block.dim() == 3, "fc2 weight block must be 3D");
             TORCH_CHECK(fc2_global.dim() == 1, "fc2 global must be 1D");
+            // Check shapes
+            TORCH_CHECK(fc1_act_global.dim() == 0 || fc1_act_global.sizes()[0] == num_experts_on_rank,
+                "fc1 act global must be scalar or (num_experts_on_rank,)");
             TORCH_CHECK(fc1_weight_block.sizes()[0] == num_experts_on_rank
                     && fc1_weight_block.sizes()[1] == inter_size * 2
                     && fc1_weight_block.sizes()[2] * FP8_PER_INT32
@@ -729,6 +748,8 @@ private:
                 "fc1 weight block size must be (num_experts_on_rank, inter_size * 2, hidden_size // 4 // "
                 "block_scale_vector_size)");
             TORCH_CHECK(fc1_global.sizes()[0] == num_experts_on_rank, "fc1 global size must be (num_experts_on_rank,)");
+            TORCH_CHECK(fc2_act_global.dim() == 0 || fc2_act_global.sizes()[0] == num_experts_on_rank,
+                "fc2 act global must be scalar or (num_experts_on_rank,)");
             TORCH_CHECK(fc2_weight_block.sizes()[0] == num_experts_on_rank && fc2_weight_block.sizes()[1] == hidden_size
                     && fc2_weight_block.sizes()[2] * FP8_PER_INT32
                             * TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize
@@ -741,7 +762,7 @@ private:
                 static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc1_weight_block.data_ptr()),
                 static_cast<float const*>(fc1_global.data_ptr()), static_cast<float const*>(fc2_act_global.data_ptr()),
                 static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc2_weight_block.data_ptr()),
-                static_cast<float const*>(fc2_global.data_ptr()));
+                static_cast<float const*>(fc2_global.data_ptr()), fc1_act_global.dim() == 1, fc2_act_global.dim() == 1);
         }
         else if (mUseDeepSeekFP8BlockScaling)
         {
