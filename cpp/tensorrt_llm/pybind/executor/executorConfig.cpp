@@ -489,18 +489,17 @@ void initConfigBindings(nanobind::module_& m)
             nb::cast<bool>(cpp_states[14]),                                          // UseGpuDirectStorage
             nb::cast<float>(cpp_states[15]),                                         // GpuWeightsPercent
             nb::cast<std::optional<SizeType32>>(cpp_states[16]),                     // MaxQueueSize
-            nb::cast<tle::ExtendedRuntimePerfKnobConfig>(cpp_states[17]), // ExtendedRuntimePerfKnobConfig
-            nb::cast<std::optional<tle::DebugConfig>>(cpp_states[18]),    // DebugConfig
-            nb::cast<SizeType32>(cpp_states[19]),                         // RecvPollPeriodMs
-            nb::cast<uint64_t>(cpp_states[20]),                           // MaxSeqIdleMicroseconds
+            nb::cast<tle::ExtendedRuntimePerfKnobConfig>(cpp_states[17]),            // ExtendedRuntimePerfKnobConfig
+            nb::cast<std::optional<tle::DebugConfig>>(cpp_states[18]),               // DebugConfig
+            nb::cast<SizeType32>(cpp_states[19]),                                    // RecvPollPeriodMs
+            nb::cast<uint64_t>(cpp_states[20]),                                      // MaxSeqIdleMicroseconds
             nb::cast<std::optional<tle::SpeculativeDecodingConfig>>(cpp_states[21]), // SpecDecConfig
             nb::cast<std::optional<tle::GuidedDecodingConfig>>(cpp_states[22]),      // GuidedDecodingConfig
-            nb::cast<std::optional<std::vector<tle::AdditionalModelOutput>>>(
-                cpp_states[23]),                                                     // AdditionalModelOutputs
-            nb::cast<std::optional<tle::CacheTransceiverConfig>>(cpp_states[24]),    // CacheTransceiverConfig
-            nb::cast<bool>(cpp_states[25]),                                          // GatherGenerationLogits
-            nb::cast<bool>(cpp_states[26]),                                          // PromptTableOffloading
-            nb::cast<bool>(cpp_states[27])                                           // EnableTrtOverlap
+            nb::cast<std::optional<std::vector<tle::AdditionalModelOutput>>>(cpp_states[23]), // AdditionalModelOutputs
+            nb::cast<std::optional<tle::CacheTransceiverConfig>>(cpp_states[24]),             // CacheTransceiverConfig
+            nb::cast<bool>(cpp_states[25]),                                                   // GatherGenerationLogits
+            nb::cast<bool>(cpp_states[26]),                                                   // PromptTableOffloading
+            nb::cast<bool>(cpp_states[27])                                                    // EnableTrtOverlap
         );
 
         auto py_state = nb::cast<nb::dict>(state[1]);
