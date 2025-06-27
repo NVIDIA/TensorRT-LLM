@@ -169,27 +169,27 @@ output [
     dims: [-1]
   },
   {
-    name: "kv_reused_block"
+    name: "kv_cache_reused_block"
     data_type: TYPE_INT32
     dims: [-1]
   },
   {
-    name: "kv_missed_block"
+    name: "kv_cache_missed_block"
     data_type: TYPE_INT32
     dims: [-1]
   },
   {
-    name: "alloc_new_blocks_per_request"
+    name: "kv_cache_alloc_new_blocks"
     data_type: TYPE_INT32
     dims: [-1]
   },
   {
-    name: "alloc_total_blocks_per_request"
+    name: "kv_cache_alloc_total_blocks"
     data_type: TYPE_INT32
     dims: [-1]
   },
   {
-    name: "per_request_kv_hit_rate"
+    name: "kv_cache_hit_rate"
     data_type: TYPE_FP32
     dims: [-1]
   },
