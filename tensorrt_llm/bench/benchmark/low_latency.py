@@ -20,7 +20,7 @@ from tensorrt_llm.bench.build.build import get_model_config
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy
-from tensorrt_llm.bench.tuning.dataclasses import BenchmarkEnvironment
+from tensorrt_llm.bench.dataclasses.scenario import BenchmarkEnvironment
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
 # isort: off
