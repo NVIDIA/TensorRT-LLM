@@ -479,43 +479,71 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
                 0, slot_start, slot_end - slot_start),
         )
 
+    def load_expert_all_weight_scale_fp8_block_scale(
+            self, module: torch.nn.Module, weights: Dict,
+            load_expert_ids: List[int], dst_w3_w1_weight_scale: torch.Tensor,
+            dst_w2_weight_scale: torch.Tensor, device):
+        for local_slot_id, expert_id in enumerate(load_expert_ids):
+            w3_scale = load_weight_shard(
+                weights[f"{expert_id}.w3.weight_scale_inv"],
+                module.tp_size,
+                module.tp_rank,
+                TensorParallelMode.COLUMN,
+                device=device)
+            dst_w3_w1_weight_scale[local_slot_id][:dst_w3_w1_weight_scale.
+                                                  shape[-2] //
+                                                  2].copy_(w3_scale)
+            w1_scale = load_weight_shard(
+                weights[f"{expert_id}.w1.weight_scale_inv"],
+                module.tp_size,
+                module.tp_rank,
+                TensorParallelMode.COLUMN,
+                device=device)
+            dst_w3_w1_weight_scale[local_slot_id][dst_w3_w1_weight_scale.
+                                                  shape[-2] //
+                                                  2:].copy_(w1_scale)
+            w2_scale = load_weight_shard(
+                weights[f"{expert_id}.w2.weight_scale_inv"],
+                module.tp_size,
+                module.tp_rank,
+                TensorParallelMode.ROW,
+                device=device)
+            dst_w2_weight_scale[local_slot_id].copy_(w2_scale)
+
     def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
-        device = torch.device("cuda")
-
-        all_w3_scales = [
-            load_weight_shard(weights[f"{expert_id}.w3.weight_scale_inv"],
-                              module.tp_size,
-                              module.tp_rank,
-                              TensorParallelMode.COLUMN,
-                              device=device)
-            for expert_id in module.initial_local_expert_ids
-        ]
-
-        all_w1_scales = [
-            load_weight_shard(weights[f"{expert_id}.w1.weight_scale_inv"],
-                              module.tp_size,
-                              module.tp_rank,
-                              TensorParallelMode.COLUMN,
-                              device=device)
-            for expert_id in module.initial_local_expert_ids
-        ]
-
-        w3_w1_scales = torch.cat(
-            [torch.stack(all_w3_scales),
-             torch.stack(all_w1_scales)], dim=-2)
-        module.w3_w1_weight_scaling_factor.data.copy_(w3_w1_scales)
-
-        all_w2_scales = [
-            load_weight_shard(weights[f"{expert_id}.w2.weight_scale_inv"],
-                              module.tp_size,
-                              module.tp_rank,
-                              TensorParallelMode.ROW,
-                              device=device)
-            for expert_id in module.initial_local_expert_ids
-        ]
-
-        w2_scales = torch.stack(all_w2_scales)
-        module.w2_weight_scaling_factor.data.copy_(w2_scales)
+        self.load_expert_all_weight_scale_fp8_block_scale(
+            module,
+            weights,
+            module.initial_local_expert_ids,
+            module.w3_w1_weight_scaling_factor.data,
+            module.w2_weight_scaling_factor.data,
+            device=torch.device("cuda"))
+        if self.need_load_shared_weights(module):
+            local_shared_load_expert_ids = module.layer_load_balancer.get_load_expert_ids(
+            )
+            local_shared_w3_w1_scale_tensors = torch.empty(
+                (len(local_shared_load_expert_ids), ) +
+                module.w3_w1_weight_scaling_factor.data.shape[1:],
+                dtype=module.w3_w1_weight_scaling_factor.data.dtype,
+                device='cpu')
+            local_shared_w2_scale_tensors = torch.empty(
+                (len(local_shared_load_expert_ids), ) +
+                module.w2_weight_scaling_factor.data.shape[1:],
+                dtype=module.w2_weight_scaling_factor.data.dtype,
+                device='cpu')
+            self.load_expert_all_weight_scale_fp8_block_scale(
+                module,
+                weights,
+                local_shared_load_expert_ids,
+                local_shared_w3_w1_scale_tensors,
+                local_shared_w2_scale_tensors,
+                device=torch.device("cpu"))
+            module.register_all_parameter_slot_and_to_fix_weight_fns({
+                'w3_w1_weight_scaling_factor':
+                local_shared_w3_w1_scale_tensors,
+                'w2_weight_scaling_factor':
+                local_shared_w2_scale_tensors,
+            })
 
 
 class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):

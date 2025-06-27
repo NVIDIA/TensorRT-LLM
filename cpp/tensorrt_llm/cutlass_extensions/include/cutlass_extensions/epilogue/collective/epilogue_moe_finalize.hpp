@@ -218,7 +218,8 @@ public:
 
         // Function to scatter output rows
         auto& num_rows = params.num_rows_in_final_output;
-        auto read_scatter_map = IndexedGather(make_gmem_ptr(params.scatter_index + params.group_offset[l_coord]));
+        auto read_scatter_map = tensorrt_llm::cutlass_extensions::IndexedGather(
+            make_gmem_ptr(params.scatter_index + params.group_offset[l_coord]));
         auto get_scatter_idx = [&](auto i)
         {
             auto scatter = read_scatter_map(i);
@@ -231,7 +232,7 @@ public:
         ElementC const* ptr_C = epilogue_op.is_source_needed() ? params.ptr_C[l_coord] : nullptr;
         auto dC = epilogue_op.is_source_needed() ? params.dC[l_coord] : InternalStrideC{};
         Tensor mC_mnl = make_tensor(make_gmem_ptr(ptr_C), make_shape(M, N, mock_L), dC);        // (m,n,l)
-        Tensor mD_mnl = make_gather_tensor(
+        Tensor mD_mnl = tensorrt_llm::cutlass_extensions::make_gather_tensor(
             make_gmem_ptr(params.ptr_D), make_shape(M, N, mock_L), params.dD, get_scatter_idx); // (m,n,l)
 
         // Use fake shape for bias, it doesn't matter

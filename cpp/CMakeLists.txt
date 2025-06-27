@@ -43,6 +43,7 @@ option(ENABLE_MULTI_DEVICE
        "Enable building with multi device support (requires NCCL, MPI,...)" ON)
 option(ENABLE_UCX "Enable building with UCX (Uniform Communication X) support"
        ON)
+option(NVRTC_DYNAMIC_LINKING "Link against the dynamic NVRTC libraries" OFF)
 option(USING_OSS_CUTLASS_LOW_LATENCY_GEMM
        "Using open sourced Cutlass low latency gemm kernel" ON)
 option(USING_OSS_CUTLASS_FP4_GEMM "Using open sourced Cutlass fp4 gemm kernel"
@@ -147,9 +148,16 @@ set(CURAND_LIB CUDA::curand)
 set(CUDA_DRV_LIB CUDA::cuda_driver)
 set(CUDA_NVML_LIB CUDA::nvml)
 set(CUDA_RT_LIB CUDA::cudart_static)
-set(NVRTC_LIB CUDA::nvrtc_static)
-set(NVRTC_BUILTINS_LIB CUDA::nvrtc_builtins_static)
+set(NVPTX_LIB CUDA::nvptxcompiler_static)
 set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
+
+if(NVRTC_DYNAMIC_LINKING)
+  set(NVRTC_LIB CUDA::nvrtc)
+  set(NVRTC_BUILTINS_LIB CUDA::nvrtc_builtins)
+else()
+  set(NVRTC_LIB CUDA::nvrtc_static)
+  set(NVRTC_BUILTINS_LIB CUDA::nvrtc_builtins_static)
+endif()
 
 resolve_dirs(CUDAToolkit_INCLUDE_DIRS "${CUDAToolkit_INCLUDE_DIRS}")
 

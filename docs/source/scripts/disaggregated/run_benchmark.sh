@@ -70,13 +70,19 @@ for concurrency in ${concurrency_list}; do
     mkdir -p ${log_path}/concurrency_${concurrency}
     max_count=$((${concurrency} * ${multi_round}))
     echo "Running benchmark with concurrency: ${concurrency}, max_count: ${max_count}"
-    # run your benchmark here
-    python run_benchmark.py --model_name ${model_name} \
-            --isl ${isl} \
-            --osl ${osl} \
-            --concurrency ${concurrency} \
-            --max_count ${max_count} \
-            --log_path ${log_path}/concurrency_${concurrency}
+    python -m tensorrt_llm.serve.scripts.benchmark_serving \
+        --model ${model_name} \
+        --tokenizer ${model_name} \
+        --dataset-name random \
+        --random-ids \
+        --random-input-len ${isl} \
+        --random-output-len ${osl} \
+        --random-prefix-len 0 \
+        --num-prompts ${max_count} \
+        --max-concurrency ${concurrency} \
+        --host ${hostname} \
+        --port ${port} \
+        --ignore-eos
     echo "done for ${concurrency} in folder ${log_path}/concurrency_${concurrency}"
 done
 

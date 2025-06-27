@@ -43,6 +43,8 @@ set(SRCS
     ipcNvlsMemory.cpp
     mcastDeviceMemory.cpp
     memoryCounters.cpp
+    moeLoadBalancer/gdrwrap.cpp
+    moeLoadBalancer/hostAccessibleDeviceAllocator.cpp
     moeLoadBalancer/moeLoadBalancer.cpp
     moeLoadBalancer/topologyDetector.cpp
     ncclCommunicator.cpp
