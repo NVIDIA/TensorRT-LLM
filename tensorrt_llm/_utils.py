@@ -24,6 +24,7 @@ import trace
 import weakref
 from contextlib import contextmanager
 from dataclasses import asdict
+from cuda import cuda, nvrtc
 from enum import EnumMeta
 from functools import lru_cache, partial, wraps
 from pathlib import Path
@@ -1063,3 +1064,34 @@ class KVCacheEventSerializer:
             "token_id": data.token_id,
             "token_extra_id": data.token_extra_id
         }
+
+def ASSERT_DRV(err):
+    if isinstance(err, cuda.CUresult):
+        if err != cuda.CUresult.CUDA_SUCCESS:
+            raise RuntimeError('Cuda Error: {}'.format(err))
+    elif isinstance(err, nvrtc.nvrtcResult):
+        if err != nvrtc.nvrtcResult.NVRTC_SUCCESS:
+            raise RuntimeError('Nvrtc Error: {}'.format(err))
+    else:
+        raise RuntimeError('Unknown error type: {}'.format(err))
+
+def getSMVersion():
+    # Init
+    err, = cuda.cuInit(0)
+    ASSERT_DRV(err)
+
+    # Device
+    err, cuDevice = cuda.cuDeviceGet(0)
+    ASSERT_DRV(err)
+
+    # Get target architecture
+    err, sm_major = cuda.cuDeviceGetAttribute(
+        cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+        cuDevice)
+    ASSERT_DRV(err)
+    err, sm_minor = cuda.cuDeviceGetAttribute(
+        cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+        cuDevice)
+    ASSERT_DRV(err)
+
+    return sm_major * 10 + sm_minor
