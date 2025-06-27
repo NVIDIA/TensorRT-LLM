@@ -134,10 +134,13 @@ def GITHUB_PR_API_URL = "github_pr_api_url"
 def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
 @Field
 def ACTION_INFO = "action_info"
+@Field
+def TARGET_BRANCH = "target_branch"
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): gitlabParamsFromBot.get('action_info', null),
+    (TARGET_BRANCH): gitlabParamsFromBot.get('target_branch', null),
 ]
 
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
@@ -334,7 +337,136 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
         testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         testFilter[(ONLY_PYTORCH_FILE_CHANGED)] = getOnlyPytorchFileChanged(pipeline, testFilter, globalVars)
         testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
+        mergeWaiveList(pipeline, globalVars)
     })
+}
+
+def getMergeRequestOneFileChangesGitlab(pipeline, filePath) {
+    withCredentials([
+        usernamePassword(
+            credentialsId: 'svc_tensorrt_gitlab_read_api_token',
+            usernameVariable: 'GITLAB_API_USER',
+            passwordVariable: 'GITLAB_API_TOKEN'
+        ),
+        string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')
+    ]) {
+        def diff = ""
+        def pageId = 0
+        while(true) {
+            pageId += 1
+            def rawDataJson = pipeline.sh(
+                script: """
+                    curl --header "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+                         --url "https://${DEFAULT_GIT_URL}/api/v4/projects/${env.gitlabMergeRequestTargetProjectId}/merge_requests/${env.gitlabMergeRequestIid}/diffs?page=${pageId}&per_page=20"
+                """,
+                returnStdout: true
+            )
+            def rawDataList = readJSON text: rawDataJson, returnPojo: true
+            rawDataList.each { rawData ->
+                if (rawData.get("new_path") == filePath || rawData.get("old_path") == filePath) {
+                    diff = rawData.get("diff")
+                    return true  // This will break the each loop
+                }
+            }
+            if (!rawDataList || diff != "") { break }
+        }
+        pipeline.echo("The change of ${filePath} is: ${diff}")
+        return diff
+    }
+}
+
+def getMergeRequestOneFileChangesGithub(pipeline, githubPrApiUrl, filePath) {
+    def diff = ""
+    def pageId = 0
+    withCredentials([
+        string(
+            credentialsId: 'github-token-trtllm-ci',
+            variable: 'GITHUB_API_TOKEN'
+        ),
+    ]) {
+        while(true) {
+            pageId += 1
+            def rawDataJson = pipeline.sh(
+                script: """
+                    curl --header "Authorization: Bearer $GITHUB_API_TOKEN" \
+                         --url "${githubPrApiUrl}/files?page=${pageId}&per_page=20"
+                """,
+                returnStdout: true
+            )
+            echo "rawDataJson: ${rawDataJson}"
+            def rawDataList = readJSON text: rawDataJson, returnPojo: true
+            rawDataList.each { rawData ->
+                try {
+                    if (rawData.get("filename") == filePath || rawData.get("previous_filename") == filePath) {
+                        diff = rawData.get("patch")
+                        return true  // This will break the each loop
+                    }
+                } catch (Exception e) {
+                    echo "Error processing rawData: ${e.message}"
+                }
+            }
+            if (!rawDataList || diff != "") { break }
+        }
+    }
+    pipeline.echo("The change of ${filePath} is: ${diff}")
+    return diff
+}
+
+def getMergeRequestOneFileChanges(pipeline, globalVars, filePath) {
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (env.alternativeTRT || isOfficialPostMergeJob) {
+        pipeline.echo("Force set waive list diff to empty.")
+        return ""
+    }
+
+    def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
+    def diff = ""
+
+    try {
+        if (githubPrApiUrl != null) {
+            diff = getMergeRequestOneFileChangesGithub(pipeline, githubPrApiUrl, filePath)
+        } else {
+            diff = getMergeRequestOneFileChangesGitlab(pipeline, filePath)
+        }
+        return diff
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo("Get merge request one changed file diff failed. Error: ${e.toString()}")
+        return ""
+    }
+}
+
+def mergeWaiveList(pipeline, globalVars)
+{
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (env.alternativeTRT || isOfficialPostMergeJob) {
+        return
+    }
+
+    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabMergeRequestLastCommit, LLM_ROOT, true, true)
+    sh "cp ${LLM_ROOT}/tests/integration/test_lists/waives.txt ./waives_CUR_${env.gitlabMergeRequestLastCommit}.txt"
+    sh "cp ${LLM_ROOT}/jenkins/mergeWaiveList.py ./"
+
+    targetBranch = env.gitlabTargetBranch ? env.gitlabTargetBranch : globalVars[TARGET_BRANCH]
+    echo "Target branch: ${targetBranch}"
+    trtllm_utils.checkoutSource(LLM_REPO, targetBranch, LLM_ROOT, true, true)
+    targetBranchTOTCommit = sh (script: "cd ${LLM_ROOT} && git rev-parse HEAD", returnStdout: true).trim()
+    echo "Target branch TOT commit: ${targetBranchTOTCommit}"
+    sh "cp ${LLM_ROOT}/tests/integration/test_lists/waives.txt ./waives_TOT_${targetBranchTOTCommit}.txt"
+    // sh "cp ${LLM_ROOT}/jenkins/mergeWaiveList.py ./"
+
+    def diff = getMergeRequestOneFileChanges(pipeline, globalVars, "tests/integration/test_lists/waives.txt")
+
+    sh """
+        python3 mergeWaiveList.py \
+        --cur-waive-list=waives_CUR_${env.gitlabMergeRequestLastCommit}.txt \
+        --latest-waive-list=waives_TOT_${targetBranchTOTCommit}.txt \
+        --diff='${diff}' \
+        --output-file=waives.txt
+    """
+    trtllm_utils.uploadArtifacts("waives*.txt", "${UPLOAD_PATH}/waive_list/")
+    echo "Waive list: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/waive_list/"
 }
 
 def launchReleaseCheck(pipeline)
