@@ -248,11 +248,9 @@ class WideEPMoE(MoE):
         if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
             return AlltoallMethodType.NotEnabled
 
+        # Notes: hack
         if mapping.moe_ep_size < top_k:
             return AlltoallMethodType.NotEnabled
-
-        if MnnvlMemory.supports_mnnvl():
-            return AlltoallMethodType.MNNVL
 
         if os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "0") == "1":
             if deep_ep_installed and dtype == torch.bfloat16:
@@ -262,6 +260,9 @@ class WideEPMoE(MoE):
                 else:
                     # Here we can choose DeepEP or DeepEPLowLatency if both are available. Now DeepEP is faster.
                     return AlltoallMethodType.DeepEP
+
+        if MnnvlMemory.supports_mnnvl():
+            return AlltoallMethodType.MNNVL
 
         return AlltoallMethodType.NotEnabled
 
