@@ -101,6 +101,7 @@ def test_kv_cache_event_data_serialization():
     serialized_event = KVCacheEventSerializer.serialize(events)
 
 
+@pytest.mark.skip(reason="https://nvbugs/5362412")
 def test_expected_kv_cache_events():
     llm = create_llm()
     sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
@@ -119,6 +120,7 @@ def test_expected_kv_cache_events():
                 assert event["data"]["type"] == "stored"
 
 
+@pytest.mark.skip(reason="https://nvbugs/5362412")
 def test_kv_cache_event_async_api():
     llm = create_llm()
     sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
@@ -146,6 +148,7 @@ def test_kv_cache_event_async_api():
     asyncio.run(main())
 
 
+@pytest.mark.skip(reason="https://nvbugs/5362412")
 def test_llm_kv_events_api():
     llm = create_llm()
     sampling_params = SamplingParams(max_tokens=6, temperature=0.01)

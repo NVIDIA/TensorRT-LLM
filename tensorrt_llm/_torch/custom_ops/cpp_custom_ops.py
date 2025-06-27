@@ -473,7 +473,3 @@ def _register_fake():
         hidden_size_val = int(hidden_size)
         return gemm2_output.new_empty((num_rows_val, hidden_size_val),
                                       dtype=gemm2_output.dtype)
-
-
-def fp8_quantize_1x128(input: torch.Tensor):
-    return torch.ops.trtllm.fp8_quantize_1x128(input)

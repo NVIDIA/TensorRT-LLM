@@ -59,6 +59,9 @@ class BaseResourceManager(ABC):
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
         raise NotImplementedError
 
+    def add_dummy_requests(self, request_ids: List[int]):
+        pass
+
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         pass
 

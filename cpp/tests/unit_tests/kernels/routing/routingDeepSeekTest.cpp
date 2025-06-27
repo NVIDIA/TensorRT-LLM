@@ -246,7 +246,6 @@ private:
 
 TYPED_TEST_SUITE(RoutingDeepSeekKernelTest, Bf16Types);
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelization)
 {
     RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/10,
@@ -254,7 +253,7 @@ TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelization)
         /*expertParallelization=*/1, /*expertParallelizationId=*/0,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true,
-        /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f);
+        /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
     this->runTest(param);
 };
 
@@ -265,20 +264,19 @@ TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelizationWithExpertParal
         /*expertParallelization=*/2, /*expertParallelizationId=*/1,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true,
-        /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f);
+        /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
     this->runTest(param);
 };
 
-TYPED_TEST(RoutingDeepSeekKernelTest, DeviceLevelParallelization)
+TYPED_TEST(RoutingDeepSeekKernelTest, CooperativeLevelParallelization)
 {
     RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/1030,
-        /*numExperts=*/128, /*topK=*/1,
+        /*numExperts=*/128, /*topK=*/8,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true,
-        /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f);
+        /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 10);
     this->runTest(param);
 };
-#endif
 
 } // namespace

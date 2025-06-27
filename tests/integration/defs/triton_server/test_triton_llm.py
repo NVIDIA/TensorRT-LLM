@@ -519,8 +519,7 @@ def test_llama_v2_70b_ifb(
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
 
-    llm_backend_repo_root = os.path.join(os.environ["LLM_ROOT"],
-                                         "triton_backend")
+    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
     # Build Engine
     ENGINE_PATH = prepare_llama_v2_70b_engine("ifb",
                                               tensorrt_llm_llama_example_root,
@@ -3708,3 +3707,165 @@ def test_llmapi_backend(E2E_MODEL_NAME, DECOUPLED_MODE, TRITON_MAX_BATCH_SIZE,
 
             print_info("DEBUG:: run_cmd: python3 " + " ".join(run_cmd))
             venv_check_call(llm_backend_venv, run_cmd)
+
+
+@pytest.mark.parametrize("E2E_MODEL_NAME", ["ensemble", "tensorrt_llm_bls"])
+@pytest.mark.parametrize("ACCUMULATE_TOKEN", ["False"])
+@pytest.mark.parametrize("BLS_INSTANCE_COUNT", ["1"])
+@pytest.mark.parametrize("PREPROCESSING_INSTANCE_COUNT", ["1"])
+@pytest.mark.parametrize("POSTPROCESSING_INSTANCE_COUNT", ["1"])
+@pytest.mark.parametrize("MAX_TOKENS_IN_KV_CACHE", [""])
+@pytest.mark.parametrize("MAX_ATTENTION_WINDOW_SIZE", [""])
+@pytest.mark.parametrize("BATCH_SCHEDULER_POLICY", ["guaranteed_no_evict"])
+@pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
+@pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
+                         ids=["disableTrtOverlap"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
+@pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
+                         ids=["enableDecoupleMode", "disableDecoupleMode"])
+@pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
+@pytest.mark.parametrize("MAX_QUEUE_DELAY_MICROSECONDS", ["0"])
+@pytest.mark.parametrize("ENABLE_KV_CACHE_REUSE", ["False"])
+@pytest.mark.parametrize("NORMALIZE_LOG_PROBS", ["True"])
+@pytest.mark.parametrize("ENABLE_CHUNKED_CONTEXT", ["False"])
+@pytest.mark.parametrize("GPU_DEVICE_IDS", [""])
+@pytest.mark.parametrize("DECODING_MODE", [""])
+@pytest.mark.parametrize("MAX_BEAM_WIDTH", ["1"])
+@pytest.mark.parametrize("EXCLUDE_INPUT_IN_OUTPUT", ["False"])
+@pytest.mark.parametrize("TOKEN_COUNT_TEST",
+                         ["input_only", "output_only", "both"])
+@pytest.mark.parametrize("BACKEND", ["tensorrtllm", "python"])
+def test_tiny_llama_ifb_token_counts(
+    E2E_MODEL_NAME,
+    MAX_TOKENS_IN_KV_CACHE,
+    MAX_ATTENTION_WINDOW_SIZE,
+    BATCH_SCHEDULER_POLICY,
+    KV_CACHE_FREE_GPU_MEM_FRACTION,
+    ENABLE_TRT_OVERLAP,
+    BATCHING_STRATEGY,
+    DECOUPLED_MODE,
+    TRITON_MAX_BATCH_SIZE,
+    MAX_QUEUE_DELAY_MICROSECONDS,
+    MAX_BEAM_WIDTH,
+    ENABLE_KV_CACHE_REUSE,
+    NORMALIZE_LOG_PROBS,
+    ENABLE_CHUNKED_CONTEXT,
+    GPU_DEVICE_IDS,
+    DECODING_MODE,
+    PREPROCESSING_INSTANCE_COUNT,
+    POSTPROCESSING_INSTANCE_COUNT,
+    ACCUMULATE_TOKEN,
+    BLS_INSTANCE_COUNT,
+    EXCLUDE_INPUT_IN_OUTPUT,
+    TOKEN_COUNT_TEST,
+    BACKEND,
+    inflight_batcher_llm_client_root,
+    tensorrt_llm_llama_example_root,
+    tiny_llama_model_root,
+    llm_backend_venv,
+):
+    """Test that the TRT-LLM inflight batcher backend can return input and output token counts."""
+    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
+        pytest.skip("Skipping. V1 doesn't support max_utilization.")
+
+    if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
+        pytest.skip("Skipping.")
+
+    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+    # Build engine
+    ENGINE_PATH, _ = prepare_tiny_llama_1b_engine(
+        type="ifb",
+        tensorrt_llm_llama_example_root=tensorrt_llm_llama_example_root,
+        tiny_llama_model_root=tiny_llama_model_root,
+        tensorrt_llm_example_root=None,
+    )
+    # Prepare model repo
+    new_model_repo = os.path.join(llm_backend_repo_root, "triton_repo")
+    prepare_ib_model_repo(llm_backend_repo_root, new_model_repo)
+
+    # Modify config.pbtxt
+    TOKENIZER_PATH = tiny_llama_model_root
+    modify_ib_config_pbtxt(new_model_repo,
+                           ENGINE_PATH,
+                           TOKENIZER_PATH,
+                           llm_backend_repo_root,
+                           DECOUPLED_MODE,
+                           MAX_TOKENS_IN_KV_CACHE,
+                           MAX_ATTENTION_WINDOW_SIZE,
+                           BATCH_SCHEDULER_POLICY,
+                           BATCHING_STRATEGY,
+                           KV_CACHE_FREE_GPU_MEM_FRACTION,
+                           EXCLUDE_INPUT_IN_OUTPUT,
+                           ENABLE_TRT_OVERLAP,
+                           TRITON_MAX_BATCH_SIZE,
+                           MAX_QUEUE_DELAY_MICROSECONDS,
+                           MAX_BEAM_WIDTH,
+                           ENABLE_KV_CACHE_REUSE,
+                           NORMALIZE_LOG_PROBS,
+                           ENABLE_CHUNKED_CONTEXT,
+                           GPU_DEVICE_IDS,
+                           DECODING_MODE,
+                           PREPROCESSING_INSTANCE_COUNT,
+                           POSTPROCESSING_INSTANCE_COUNT,
+                           ACCUMULATE_TOKEN,
+                           BLS_INSTANCE_COUNT,
+                           TENSORRT_LLM_TARGET_MODEL_NAME="tensorrt_llm",
+                           TENSORRT_LLM_DRAFT_MODEL_NAME="",
+                           BACKEND=BACKEND)
+
+    # Launch Triton Server
+    launch_server_py = os.path.join(llm_backend_repo_root, "scripts",
+                                    "launch_triton_server.py")
+    check_call(
+        f"python3 {launch_server_py} --world_size=1 --model_repo={new_model_repo}",
+        shell=True)
+    check_server_ready()
+
+    # Test token count functionality based on the test type
+    tokenizer_dir = f"{tiny_llama_model_root}"
+
+    # Prepare different test commands based on token count test type
+    if TOKEN_COUNT_TEST == "input_only":
+        test_args = ["--return-num-input-tokens"]
+    elif TOKEN_COUNT_TEST == "output_only":
+        test_args = ["--return-num-output-tokens"]
+    elif TOKEN_COUNT_TEST == "both":
+        test_args = ["--return-num-input-tokens", "--return-num-output-tokens"]
+
+    if DECOUPLED_MODE == "False":
+        run_cmd = [
+            f"{inflight_batcher_llm_client_root}/inflight_batcher_llm_client.py",
+            f"--tokenizer-dir={tokenizer_dir}",
+            "--tokenizer-type=auto",
+            "--request-output-len=20",
+        ] + test_args
+
+        output = venv_check_output(llm_backend_venv, run_cmd)
+    else:
+        run_cmd = [
+            f"{inflight_batcher_llm_client_root}/inflight_batcher_llm_client.py",
+            f"--tokenizer-dir={tokenizer_dir}",
+            "--tokenizer-type=auto",
+            "--request-output-len=20",
+            "--streaming",
+        ] + test_args
+
+        output = venv_check_output(llm_backend_venv, run_cmd)
+
+    print(output)
+    if TOKEN_COUNT_TEST == "input_only":
+        assert "Input token count: [[13]]" in output
+    elif TOKEN_COUNT_TEST == "output_only":
+        if DECOUPLED_MODE == "False":
+            assert "Output token count: [[33]]" in output
+        else:
+            assert "Output token count: [[1]]" in output and not "Output token count: [[20]]" in output
+    elif TOKEN_COUNT_TEST == "both":
+        assert "Input token count: [[13]]" in output
+        if DECOUPLED_MODE == "False":
+            assert "Output token count: [[33]]" in output
+        else:
+            assert "Output token count: [[1]]" in output and not "Output token count: [[20]]" in output
+    print_info(
+        f"Successfully tested token count functionality for {TOKEN_COUNT_TEST} mode"
+    )
