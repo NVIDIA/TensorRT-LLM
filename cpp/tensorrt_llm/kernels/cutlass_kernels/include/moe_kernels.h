@@ -396,7 +396,7 @@ public:
         float const* const fc2_fp8_dequant, TmaWarpSpecializedGroupedGemmInput::ElementSF const* fc2_fp4_act_flat,
         QuantParams quant_params, float const* const token_topk_unpermuted_scales,
         float const* const token_topk_permuted_scales, int const* const unpermuted_row_to_permuted_row,
-        int const* permuted_row_to_unpermuted_row, int const* const expert_for_source_row,
+        int const* permuted_row_to_unpermuted_row, int const* const token_selected_experts,
         int64_t const* const num_valid_tokens_ptr, int64_t const num_rows, int64_t const expanded_num_rows,
         int64_t const hidden_size, int64_t const inter_size, int const num_experts_per_node,
         int64_t const experts_per_token, float const** alpha_scale_ptr_array, bool use_lora, void* fc2_lora,
@@ -549,7 +549,7 @@ public:
         float const* const fc2_fp8_dequant, TmaWarpSpecializedGroupedGemmInput::ElementSF const* fc2_fp4_act_flat,
         QuantParams quant_params, float const* const token_topk_unpermuted_scales,
         float const* const token_topk_permuted_scales, int const* const unpermuted_row_to_permuted_row,
-        int const* permuted_row_to_unpermuted_row, int const* const expert_for_source_row,
+        int const* permuted_row_to_unpermuted_row, int const* const token_selected_experts,
         int64_t const* const num_valid_tokens_ptr, int64_t const num_rows, int64_t const expanded_num_rows,
         int64_t const hidden_size, int64_t const inter_size, int const num_experts_per_node,
         int64_t const experts_per_token, float const** alpha_scale_ptr_array, bool use_lora, void* fc2_lora,
@@ -586,7 +586,7 @@ public:
         float const* const fc2_fp8_dequant, TmaWarpSpecializedGroupedGemmInput::ElementSF const* fc2_fp4_act_flat,
         QuantParams quant_params, float const* const token_topk_unpermuted_scales,
         float const* const token_topk_permuted_scales, int const* const unpermuted_row_to_permuted_row,
-        int const* permuted_row_to_unpermuted_row, int const* const expert_for_source_row,
+        int const* permuted_row_to_unpermuted_row, int const* const token_selected_experts,
         int64_t const* const num_valid_tokens_ptr, int64_t const num_rows, int64_t const expanded_num_rows,
         int64_t const hidden_size, int64_t const inter_size, int const num_experts_per_node,
         int64_t const experts_per_token, float const** alpha_scale_ptr_array, bool use_lora, void* fc2_lora,
@@ -600,7 +600,7 @@ public:
             static_cast<WeightType const*>(fc2_expert_weights), static_cast<ScaleBiasType const*>(fc2_expert_biases),
             static_cast<ScaleBiasType const*>(fc2_int_scales), fc2_fp8_dequant, fc2_fp4_act_flat, quant_params,
             token_topk_unpermuted_scales, token_topk_permuted_scales, unpermuted_row_to_permuted_row,
-            permuted_row_to_unpermuted_row, expert_for_source_row, num_valid_tokens_ptr, num_rows, expanded_num_rows,
+            permuted_row_to_unpermuted_row, token_selected_experts, num_valid_tokens_ptr, num_rows, expanded_num_rows,
             hidden_size, inter_size, num_experts_per_node, experts_per_token, alpha_scale_ptr_array, use_lora, fc2_lora,
             stream, parallelism_config, enable_alltoall, config, min_latency_mode, num_active_experts_per,
             active_expert_global_ids);
@@ -738,7 +738,7 @@ private:
         OutputType* const final_output, int64_t const* const expert_first_token_offset,
         WeightType const* const fc2_expert_weights, ScaleBiasType const* const fc2_expert_biases,
         float const* const token_topk_unpermuted_scales, int const* const unpermuted_row_to_permuted_row,
-        int const* const permuted_row_to_unpermuted_row, int const* const expert_for_source_row,
+        int const* const permuted_row_to_unpermuted_row, int const* const token_selected_experts,
         int64_t const* const num_valid_tokens_ptr, int64_t const num_rows, int64_t const expanded_num_rows,
         int64_t const hidden_size, int64_t const inter_size, int64_t const num_experts_per_node, int64_t const k,
         MOEParallelismConfig parallelism_config, bool const enable_alltoall, QuantParams& quant_params,
@@ -755,7 +755,7 @@ private:
     std::optional<cutlass_extensions::CutlassGemmConfig> gemm2_config_;
 
     // Pointers
-    int* permuted_source_token_ids_{};
+    int* permuted_row_to_unpermuted_row_{};
     int* permuted_token_selected_experts_{};
     int* blocked_expert_counts_{};
     int* blocked_expert_counts_cumsum_{};
