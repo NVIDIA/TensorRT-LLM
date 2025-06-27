@@ -1,18 +1,23 @@
 #!/usr/bin/env python
 import asyncio
+import logging
 import signal
 import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime
+from functools import wraps
 from http import HTTPStatus
 from pathlib import Path
-from typing import AsyncGenerator, AsyncIterator, List, Optional, Tuple
+from typing import (AsyncGenerator, AsyncIterator, List, Optional, Tuple,
+                    TypedDict, Callable, Awaitable, Any, Type)
 
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.exceptions import RequestValidationError
+from fastapi.exceptions import RequestValidationError, HTTPException
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from transformers import AutoConfig, AutoProcessor
+from openai.types.chat import ChatCompletionMessageParam
+from pydantic import BaseModel
 
 from tensorrt_llm._tensorrt_engine import LLM
 # yapf: disable
@@ -45,6 +50,73 @@ from .._utils import nvtx_mark
 
 # yapf: enale
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
+
+
+async def disconnect_poller(request: Request, result: Any):
+    """
+    Poll for a disconnect.
+    If the request disconnects, stop polling and return.
+    """
+    try:
+        while True:
+            message = await request.receive()
+            if message["type"] == "http.disconnect":
+                break
+
+        print("Request disconnected")
+
+        return result
+    except asyncio.CancelledError:
+        print("Stopping polling loop")
+
+
+def cancel_on_disconnect(model_type: Type[BaseModel]):
+    """
+    Decorator that will check if the client disconnects,
+    and cancel the task if required.
+    """
+
+    def cancel_on_disconnect_inner(handler: Callable):
+
+        @wraps(handler)
+        async def cancel_on_disconnect_decorator(self, request: model_type, raw_request: Request):
+            sentinel = object()
+
+            # Create two tasks, one to poll the request and check if the
+            # client disconnected, and another which is the request handler
+            poller_task = asyncio.ensure_future(disconnect_poller(raw_request, sentinel))
+            handler_task = asyncio.ensure_future(handler(self, request=request, raw_request=raw_request))
+
+            done, pending = await asyncio.wait(
+                [poller_task, handler_task], return_when=asyncio.FIRST_COMPLETED
+            )
+
+            # Cancel any outstanding tasks
+            for t in pending:
+                t.cancel()
+
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    print(f"{t} was cancelled")
+                except Exception as exc:
+                    print(f"{t} raised {exc} when being cancelled")
+
+            # Return the result if the handler finished first
+            if handler_task in done:
+                return await handler_task
+
+            # Otherwise, raise an exception
+            # This is not exactly needed, but it will prevent
+            # validation errors if your request handler is supposed
+            # to return something.
+            print("Raising an HTTP error because I was disconnected!!")
+
+            raise HTTPException(503)
+
+        return cancel_on_disconnect_decorator
+
+    return cancel_on_disconnect_inner
 
 
 class OpenAIServer:
@@ -212,7 +284,10 @@ class OpenAIServer:
             pass
         return JSONResponse(content=events)
 
+    @cancel_on_disconnect(ChatCompletionRequest)
     async def openai_chat(self, request: ChatCompletionRequest, raw_request: Request) -> Response:
+
+        did_complete = False
 
         def get_role() -> str:
             if request.add_generation_prompt:
@@ -223,14 +298,24 @@ class OpenAIServer:
 
         async def chat_stream_generator(
                 promise: RequestOutput, postproc_params: PostprocParams) -> AsyncGenerator[str, None]:
+            nonlocal did_complete
             if not self.postproc_worker_enabled:
                 post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
-            async for res in promise:
-                pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
-                for pp_res in pp_results:
-                    yield pp_res
-            yield "data: [DONE]\n\n"
-            nvtx_mark("generation ends")
+            try:
+                async for res in promise:
+                    pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
+                    for pp_res in pp_results:
+                        for choice in pp_res.choices:
+                            if choice.finish_reason is not None:
+                                did_complete = True
+
+                        pp_res_json = pp_res.model_dump_json(exclude_unset=True)
+                        yield f"data: {pp_res_json}\n\n"
+                yield f"data: [DONE]\n\n"
+                nvtx_mark("generation ends")
+            finally:
+                if not did_complete:
+                    promise.abort()
 
         async def create_chat_response(
                 promise: RequestOutput, postproc_params: PostprocParams, disaggregated_params: Optional[LlmDisaggregatedParams] = None) -> ChatCompletionResponse:
@@ -246,6 +331,7 @@ class OpenAIServer:
                 chat_response.prompt_token_ids = promise.prompt_token_ids
             return chat_response
 
+        promise: Optional[RequestOutput] = None
         try:
             check_multiple_response(request.n, self.llm.args.backend)
             conversation: List[ConversationMessage] = []
@@ -297,7 +383,6 @@ class OpenAIServer:
                 lora_request=request.lora_request,
                 disaggregated_params=disaggregated_params
             )
-            asyncio.create_task(self.await_disconnected(raw_request, promise))
             if not self.postproc_worker_enabled:
                 postproc_args.tokenizer = self.tokenizer
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
@@ -312,9 +397,14 @@ class OpenAIServer:
         except CppExecutorError:
             # If internal executor error is raised, shutdown the server
             signal.raise_signal(signal.SIGINT)
+        except asyncio.CancelledError:
+            if promise is not None:
+                promise.abort()
+            return self.create_error_response("cancelled")
         except Exception as e:
             return self.create_error_response(str(e))
 
+    @cancel_on_disconnect(CompletionRequest)
     async def openai_completion(self, request: CompletionRequest, raw_request: Request) -> Response:
 
         def merge_promises(
@@ -343,16 +433,27 @@ class OpenAIServer:
             return consumer()
 
         async def create_completion_generator(
-                generator: AsyncIterator[Tuple[RequestOutput, Optional[PostprocParams]]]):
-            async for request_output, postproc_params in generator:
-                if not self.postproc_worker_enabled:
-                    post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
-                    pp_result = post_processor(request_output, args)
-                else:
-                    pp_result = request_output.outputs[0]._postprocess_result
-                for pp_res in pp_result:
-                    yield pp_res
-            yield "data: [DONE]\n\n"
+                generator: AsyncIterator[Tuple[RequestOutput, Optional[PostprocParams]]],
+                promises: List[RequestOutput]):
+            did_complete = False
+            try:
+                async for request_output, postproc_params in generator:
+                    if not self.postproc_worker_enabled:
+                        post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
+                        pp_result = post_processor(request_output, args)
+                    else:
+                        pp_result = request_output.outputs[0]._postprocess_result
+                    for pp_res in pp_result:
+                        for choice in pp_res.choices:
+                            if choice.finish_reason is not None:
+                                did_complete = True
+                        pp_res_json = pp_res.model_dump_json(exclude_unset=False)
+                        yield f"data: {pp_res_json}\n\n"
+                yield f"data: [DONE]\n\n"
+            finally:
+                if not did_complete:
+                    for promise in promises:
+                        promise.abort()
 
         async def create_completion_response(
                 generator: AsyncIterator[Tuple[RequestOutput, Optional[PostprocParams]]], disaggregated_params: Optional[LlmDisaggregatedParams] = None) -> CompletionResponse:
@@ -418,7 +519,6 @@ class OpenAIServer:
                     lora_request=request.lora_request,
                     disaggregated_params=disaggregated_params
                 )
-                asyncio.create_task(self.await_disconnected(raw_request, promise))
                 if not self.postproc_worker_enabled:
                     postproc_args.tokenizer = self.tokenizer
                     postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
@@ -427,8 +527,7 @@ class OpenAIServer:
 
             generator = merge_promises(promises, postproc_params_collection)
             if request.stream:
-                response_generator = create_completion_generator(
-                    generator)
+                response_generator = create_completion_generator(generator, promises)
                 return StreamingResponse(content=response_generator,
                                             media_type="text/event-stream")
             else:
@@ -438,6 +537,10 @@ class OpenAIServer:
         except CppExecutorError:
             # If internal executor error is raised, shutdown the server
             signal.raise_signal(signal.SIGINT)
+        except asyncio.CancelledError:
+            for promise in promises:
+                promise.abort()
+            return self.create_error_response("cancelled")
         except Exception as e:
             traceback.print_exc()
             return self.create_error_response(str(e))
