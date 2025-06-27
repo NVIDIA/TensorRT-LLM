@@ -1,5 +1,5 @@
 import copy
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
@@ -373,20 +373,30 @@ class Qwen2VLInputProcessorBase(InputProcessor):
 
 class Qwen2VisionModelBase:
 
-    def __init__(self, pretrained_config: PretrainedConfig,
+    def __init__(self, model_config: ModelConfig[PretrainedConfig],
                  model_class: type[PreTrainedModel]):
-        self.pretrained_config = pretrained_config
-        self.device = torch.device(
-            'cuda' if torch.cuda.is_available() else 'cpu')
+        self.pretrained_config = model_config.pretrained_config
+        self.device = f"cuda:{model_config.mapping.rank}"
 
         model_path = self.pretrained_config._name_or_path
         # TODO: Change the model class to TRT-LLM's Qwen2VisionModel
+        # Currently, copying vision encoder on all devices.
         # NOTE: Using attn_implementation='flash_attention_2' to avoid the issue of vision model's GPU OOM.
         model = model_class.from_pretrained(
             model_path,
             torch_dtype=self.pretrained_config.torch_dtype,
             attn_implementation='flash_attention_2').eval()
         self.visual = model.visual.to(self.device)
+
+    def _to_device(
+        self, input_tensor: Union[torch.Tensor, List, None]
+    ) -> Union[torch.Tensor, List, None]:
+        if input_tensor is None:
+            return None
+        elif isinstance(input_tensor, list):
+            return [self._to_device(item) for item in input_tensor]
+        elif isinstance(input_tensor, torch.Tensor):
+            return input_tensor.to(self.device)
 
     def _parse_and_batch_mm_data(
         self, mm_data: List[Dict[str, Any]]
@@ -448,10 +458,16 @@ class Qwen2VisionModelBase:
 
         embeds = []
         if pixel_values is not None:
+            pixel_values = self._to_device(
+                pixel_values
+            )  # TODO: remove this once we have the shared tensor
+            image_grid_thw = self._to_device(image_grid_thw)
             pixel_values = pixel_values.to(self.visual.dtype)
             embeds.append(self.visual(pixel_values, grid_thw=image_grid_thw))
 
         if pixel_values_videos is not None:
+            pixel_values_videos = self._to_device(pixel_values_videos)
+            video_grid_thw = self._to_device(video_grid_thw)
             pixel_values_videos = pixel_values_videos.to(self.visual.dtype)
             embeds.append(
                 self.visual(pixel_values_videos, grid_thw=video_grid_thw))
@@ -560,7 +576,7 @@ class Qwen2VLModel(Qwen2VLModelBase):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):
-        self.mm_encoder = Qwen2VisionModelBase(model_config.pretrained_config,
+        self.mm_encoder = Qwen2VisionModelBase(model_config,
                                                Qwen2VLForConditionalGeneration)
         super().__init__(model_config, *args, **kwargs)
 
@@ -571,6 +587,6 @@ class Qwen2_5_VLModel(Qwen2VLModelBase):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):
-        super().__init__(model_config, *args, **kwargs)
         self.mm_encoder = Qwen2VisionModelBase(
-            model_config.pretrained_config, Qwen2_5_VLForConditionalGeneration)
+            model_config, Qwen2_5_VLForConditionalGeneration)
+        super().__init__(model_config, *args, **kwargs)
