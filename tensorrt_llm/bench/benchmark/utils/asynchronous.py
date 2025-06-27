@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from itertools import chain
 from typing import List, Optional, Set, Tuple
 
+import tqdm
 from zmq import PUSH
 from zmq.asyncio import Context
 
@@ -238,12 +239,14 @@ async def async_benchmark(
                              post_proc_params, submit_finished))
 
         logger.info("Starting benchmark...")
+        pbar = tqdm.tqdm(total=len(requests), desc="Benchmarking")
         while not submit_finished.is_set() or backend.busy or not outbox.empty(
         ):
             try:
                 item: PerfItemTuple = await asyncio.wait_for(outbox.get(),
                                                              timeout=1.0)
                 statistics.register_request_perf_item(item)
+                pbar.update(1)
             except asyncio.TimeoutError:
                 logger.debug("No items in queue. Continuing.")
 

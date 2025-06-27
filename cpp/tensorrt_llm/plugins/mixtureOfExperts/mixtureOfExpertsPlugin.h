@@ -18,6 +18,7 @@
 #define TRT_MIXTURE_OF_EXPERTS_PLUGIN_H
 
 #include "NvInferPlugin.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/include/cutlass_kernel_selector.h"
 #if defined(USING_OSS_CUTLASS_MOE_GEMM)
 #include "tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
 #else
@@ -38,26 +39,13 @@
 
 namespace tensorrt_llm::plugins
 {
-#if defined(USING_OSS_CUTLASS_MOE_GEMM)
-namespace kernels = tensorrt_llm::kernels::cutlass_kernels;
-using MoeMinLatencyParams = tensorrt_llm::kernels::cutlass_kernels::MoeMinLatencyParams;
-using MOEParallelismConfig = tensorrt_llm::kernels::cutlass_kernels::MOEParallelismConfig;
-using QuantParams = tensorrt_llm::kernels::cutlass_kernels::QuantParams;
-using ActivationType = tensorrt_llm::kernels::cutlass_kernels::ActivationType;
-using TmaWarpSpecializedGroupedGemmInput = tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
-using tensorrt_llm::kernels::cutlass_kernels::isGatedActivation;
-constexpr auto BlockScaleVectorSize
-    = ::tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::BlockScaleVectorSize;
-#else
-namespace kernels = tensorrt_llm::kernels;
-using MoeMinLatencyParams = tensorrt_llm::kernels::MoeMinLatencyParams;
-using MOEParallelismConfig = tensorrt_llm::kernels::MOEParallelismConfig;
-using QuantParams = tensorrt_llm::kernels::QuantParams;
-using ActivationType = tensorrt_llm::ActivationType;
-using TmaWarpSpecializedGroupedGemmInput = tensorrt_llm::TmaWarpSpecializedGroupedGemmInput;
-using tensorrt_llm::isGatedActivation;
-constexpr auto BlockScaleVectorSize = ::tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize;
-#endif
+namespace kernels = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE;
+using MoeMinLatencyParams = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::MoeMinLatencyParams;
+using MOEParallelismConfig = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::MOEParallelismConfig;
+using QuantParams = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::QuantParams;
+using ActivationType = CUTLASS_MOE_GEMM_NAMESPACE::ActivationType;
+using TmaWarpSpecializedGroupedGemmInput = CUTLASS_MOE_GEMM_NAMESPACE::TmaWarpSpecializedGroupedGemmInput;
+using CUTLASS_MOE_GEMM_NAMESPACE::isGatedActivation;
 
 class MixtureOfExpertsGemmProfiler;
 using MixtureOfExpertsPluginProfilerPtr = std::shared_ptr<MixtureOfExpertsGemmProfiler>;
