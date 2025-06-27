@@ -180,7 +180,7 @@ class SpecMetadata:
     # The number of layers
     num_layers: int = 0
 
-    # if spec-dec tree is not a tree (a chain / linear tree), the mask can be computed in an easier way.
+    # if spec-dec tree is a tree or a chain (linear tree)
     is_spec_dec_tree: bool = False
     # if spec-dec tree wouldn't be changed at all, the mask won't be computed every step.
     is_spec_dec_dynamic_tree: bool = False

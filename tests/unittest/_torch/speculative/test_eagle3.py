@@ -14,25 +14,35 @@ from utils.llm_data import llm_models_root
 
 
 @pytest.mark.skip(reason="https://nvbugs/5363158")
-@pytest.mark.parametrize("use_cuda_graph,attn_backend",
-                         [[True, "TRTLLM"], [False, "TRTLLM"],
-                          [True, "FLASHINFER"], [False, "FLASHINFER"]])
-def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str):
+@pytest.mark.parametrize(
+    "use_cuda_graph,attn_backend,use_eagle3_one_model",
+    [[True, "TRTLLM", False], [False, "TRTLLM", False],
+     [True, "FLASHINFER", False], [False, "FLASHINFER", False],
+     [False, "TRTLLM", True], [True, "TRTLLM", True]])
+def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
+                      use_eagle3_one_model: bool):
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
         pytest.skip("Not enough memory to load target + draft model")
 
     models_path = llm_models_root()
 
+    # overlap scheduler is not compatible to 2-engine eagle3
+    disable_overlap_scheduler = not use_eagle3_one_model
+
+    # enable_block_reuse is not compatible to 2-engine eagle3
+    enable_block_reuse = use_eagle3_one_model
+
     pytorch_config = dict(
-        disable_overlap_scheduler=True,
+        disable_overlap_scheduler=disable_overlap_scheduler,
+        use_cuda_graph=use_cuda_graph,
         # Only create a single CUDA graph to prevent OOM in CI
         attn_backend=attn_backend,
     )
     cuda_graph_config = CudaGraphConfig(
         cuda_graph_batch_sizes=[1]) if use_cuda_graph else None
 
-    kv_cache_config = KvCacheConfig(enable_block_reuse=False, )
+    kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse, )
 
     eagle_model_dir = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
     target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
@@ -42,7 +52,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str):
         max_draft_len=draft_len,
         pytorch_weights_path=eagle_model_dir,
         # Llama 3 does not support one model eagle.
-        eagle3_one_model=False)
+        eagle3_one_model=use_eagle3_one_model)
 
     llm_spec = LLM(
         model=target_model_dir,
@@ -102,6 +112,10 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str):
     for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
         # The spec decode algorithm currently guarantees identical results
         assert text_spec == text_ref
+
+    # FIXME (jhaotingc): on Hopper, 2-engine Eagle3 has slight difference in output token:
+    #  a city of romance, art, fashion, and history. Paris is a must-visit destination for anyone who loves culture, architecture, and cuisine. From the
+    #  a city of romance, art, fashion, and cuisine. Paris is a must-visit destination for anyone who loves history, architecture, and culture. From the
 
 
 if __name__ == "__main__":
