@@ -597,7 +597,9 @@ class WideEPMoE(MoE):
             token_selected_slots,
             token_final_scales,
             w3_w1_weight.view(weight_dtype),
+            None,  # w3_w1_bias
             w2_weight.view(weight_dtype),
+            None,  # w2_bias
             output_dtype,
             quant_scales=quant_scales,
             input_sf=x_sf,
