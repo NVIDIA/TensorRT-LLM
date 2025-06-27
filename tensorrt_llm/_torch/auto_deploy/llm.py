@@ -3,14 +3,14 @@ from typing import List, Optional
 
 from ...executor.result import CompletionOutput
 from ...inputs.registry import create_input_processor
-from ...llmapi.llm import BaseLLM, RequestOutput
+from ...llmapi.llm import RequestOutput, _TorchLLM
 from ...llmapi.tokenizer import TokenizerBase, tokenizer_factory
 from .distributed import common as dist_ad
 from .llm_args import LlmArgs
 from .shim.demollm import DemoGenerationExecutor
 
 
-class LLM(BaseLLM):
+class LLM(_TorchLLM):
     """LLM class is the main class for running an LLM model using AutoDeploy backend."""
 
     args: LlmArgs
@@ -26,15 +26,9 @@ class LLM(BaseLLM):
         factory = self.args.create_factory()
         return tokenizer_factory(factory.init_tokenizer())
 
-    @classmethod
-    def from_args(cls, args: LlmArgs) -> "LLM":
-        """Initialize an AutoDeploy LLM from an AutoDeploy LlmArgs object directly.
-
-        We temporarily patch from_kwargs to correctly return the correct args object.
-        """
-        # TODO: finish this
-        model = args.model
-        return cls(model)
+    def _validate_args_for_torch_backend(self, kwargs: dict) -> None:
+        """We don't need to validate args for AutoDeploy backend for now."""
+        pass
 
     def _prefetch_model(self):
         """Prefetch the model for the LLM."""

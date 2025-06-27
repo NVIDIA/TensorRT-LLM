@@ -162,6 +162,7 @@ class LlmArgs(BaseLlmArgs):
         description="The number of GPUs per node.",
         frozen=True,
     )
+    garbage_collection_gen0_threshold: int = Field(default=20000, description="See TorchLlmArgs.")
 
     ### VALIDATION #################################################################################
     @field_validator("build_config", mode="before")

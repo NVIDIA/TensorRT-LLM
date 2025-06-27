@@ -4,9 +4,8 @@ from typing import Any, Dict, List, Optional, Union
 
 import torch
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, CliImplicitFlag
+from pydantic_settings import BaseSettings, CliApp, CliImplicitFlag
 
-from tensorrt_llm import LLM
 from tensorrt_llm._torch.auto_deploy import LLM, DemoLLM, LlmArgs
 from tensorrt_llm._torch.auto_deploy.llm_args import _try_decode_dict_with_str_values
 from tensorrt_llm._torch.auto_deploy.utils.benchmark import benchmark, store_benchmark_results
@@ -79,7 +78,6 @@ class ExperimentConfig(BaseSettings):
 
     model_config = ConfigDict(
         extra="forbid",
-        cli_parse_args=True,
         cli_kebab_case=True,
     )
 
@@ -171,7 +169,7 @@ def print_outputs(outs: Union[RequestOutput, List[RequestOutput]]) -> List[List[
 
 def main(config: Optional[ExperimentConfig] = None):
     if config is None:
-        config = ExperimentConfig()
+        config = CliApp.run(ExperimentConfig)
     ad_logger.info(f"{config=}")
 
     if config.dry_run:
