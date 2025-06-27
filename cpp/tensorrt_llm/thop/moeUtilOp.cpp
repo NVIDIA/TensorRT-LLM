@@ -106,7 +106,7 @@ void runPermute(void const* input_activations_void, void const* input_sf_void, i
     kernels::expandInputRowsKernelLauncher(input_activations,
         reinterpret_cast<ExpandedActivationsType*>(permuted_data_), token_topk_unpermuted_scales,
         permuted_token_final_scales_, permuted_source_token_ids_, expanded_source_row_to_expanded_dest_row, num_rows,
-        num_valid_tokens_ptr, hidden_size, experts_per_token, num_experts_per_node,
+        /*num_valid_tokens_ptr,*/ hidden_size, experts_per_token, num_experts_per_node,
         quant_params.fp4.fc1.act_global_scale, expert_first_token_offset_,
         /* fc1_fp4_act_scale_ */ nullptr, input_sf, stream);
     sync_check_cuda_error(stream);
@@ -294,7 +294,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_moe_expand_op(torch:
             reinterpret_cast<float*>(permuted_data_tensor.data_ptr()), token_topk_unpermuted_scales,
             static_cast<float*>(permuted_token_final_scales_tensor.data_ptr()),
             static_cast<int const*>(permuted_source_token_ids.const_data_ptr()),
-            static_cast<int*>(expanded_source_row_to_expanded_dest_row.data_ptr()), num_rows, num_valid_tokens_ptr,
+            static_cast<int*>(expanded_source_row_to_expanded_dest_row.data_ptr()), num_rows, /*num_valid_tokens_ptr,*/
             hidden_size, experts_per_token, num_experts_per_node, quant_params.fp4.fc1.act_global_scale,
             static_cast<int64_t*>(expert_first_token_offset_tensor.data_ptr()),
             /* fc1_fp4_act_scale_ */ nullptr, /*input_sf*/ nullptr, stream);
@@ -305,7 +305,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_moe_expand_op(torch:
             reinterpret_cast<__nv_bfloat16*>(permuted_data_tensor.data_ptr()), token_topk_unpermuted_scales,
             static_cast<float*>(permuted_token_final_scales_tensor.data_ptr()),
             static_cast<int const*>(permuted_source_token_ids.const_data_ptr()),
-            static_cast<int*>(expanded_source_row_to_expanded_dest_row.data_ptr()), num_rows, num_valid_tokens_ptr,
+            static_cast<int*>(expanded_source_row_to_expanded_dest_row.data_ptr()), num_rows, /*num_valid_tokens_ptr,*/
             hidden_size, experts_per_token, num_experts_per_node, quant_params.fp4.fc1.act_global_scale,
             static_cast<int64_t*>(expert_first_token_offset_tensor.data_ptr()),
             /* fc1_fp4_act_scale_ */ nullptr, /*input_sf*/ nullptr, stream);
@@ -315,7 +315,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_moe_expand_op(torch:
             reinterpret_cast<half*>(permuted_data_tensor.data_ptr()), token_topk_unpermuted_scales,
             static_cast<float*>(permuted_token_final_scales_tensor.data_ptr()),
             static_cast<int const*>(permuted_source_token_ids.const_data_ptr()),
-            static_cast<int*>(expanded_source_row_to_expanded_dest_row.data_ptr()), num_rows, num_valid_tokens_ptr,
+            static_cast<int*>(expanded_source_row_to_expanded_dest_row.data_ptr()), num_rows, /*num_valid_tokens_ptr,*/
             hidden_size, experts_per_token, num_experts_per_node, quant_params.fp4.fc1.act_global_scale,
             static_cast<int64_t*>(expert_first_token_offset_tensor.data_ptr()),
             /* fc1_fp4_act_scale_ */ nullptr, /*input_sf*/ nullptr, stream);
@@ -329,19 +329,24 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_moe_expand_op(torch:
         permuted_data_tensor, permuted_token_final_scales_tensor, expanded_source_row_to_expanded_dest_row);
 }
 
+// TODO: extend the api interface (expanded_dest_row_to_expanded_source_row, expert_first_token_offset_tensor,
+// enable_alltoall)
+// ok: remove num_valid_tokens_ptr
 template <class UnfusedGemmOutputType, class ScaleBiasType, class OutputType>
 void runMoEFinalizeScaleOp(UnfusedGemmOutputType const* const gemm2_output,
     ScaleBiasType const* const fc2_expert_biases, float const* const unpermuted_final_scales,
     int const* const expanded_source_row_to_expanded_dest_row, int const* const expert_for_source_row,
-    int64_t const* const num_valid_tokens_ptr, int64_t const num_rows, /*int64_t const expanded_num_rows,*/
+    /*int64_t const* const num_valid_tokens_ptr,*/ int64_t const num_rows, /*int64_t const expanded_num_rows,*/
     int64_t const hidden_size, /*int64_t const inter_size, int const num_experts_per_node,*/
-    int64_t const experts_per_token, cutlass_kernels::MOEParallelismConfig parallelism_config, cudaStream_t stream,
-    OutputType* const final_output)
+    int64_t const experts_per_token, int const num_experts_per_node,
+    cutlass_kernels::MOEParallelismConfig parallelism_config, cudaStream_t stream, OutputType* const final_output)
 {
     kernels::finalizeMoeRoutingKernelLauncher<OutputType, UnfusedGemmOutputType>(
         static_cast<UnfusedGemmOutputType const*>(gemm2_output), final_output, fc2_expert_biases,
-        unpermuted_final_scales, expanded_source_row_to_expanded_dest_row, expert_for_source_row, num_rows, hidden_size,
-        experts_per_token, num_valid_tokens_ptr, parallelism_config, stream);
+        unpermuted_final_scales, expanded_source_row_to_expanded_dest_row,
+        /* expanded_dest_row_to_expanded_source_row */ nullptr, expert_for_source_row,
+        /* expert_first_token_offset_tensor */ nullptr, num_rows, hidden_size, experts_per_token, num_experts_per_node,
+        parallelism_config, /* enable_alltoall */ false, stream);
 }
 
 torch::Tensor run_moe_finalize_scale_op(torch::Tensor const& gemm2_output, torch::Tensor const& fc2_expert_biases,
@@ -373,10 +378,10 @@ torch::Tensor run_moe_finalize_scale_op(torch::Tensor const& gemm2_output, torch
 
     auto parallelism_config = cutlass_kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank);
 
-    bool const needs_num_valid = parallelism_config.ep_size > 1;
-    int64_t const* num_valid_tokens_ptr = needs_num_valid
-        ? static_cast<int64_t const*>(expert_first_token_offset_tensor.const_data_ptr()) + num_experts_per_node
-        : nullptr;
+    // bool const needs_num_valid = parallelism_config.ep_size > 1;
+    // int64_t const* num_valid_tokens_ptr = needs_num_valid
+    //     ? static_cast<int64_t const*>(expert_first_token_offset_tensor.const_data_ptr()) + num_experts_per_node
+    //     : nullptr;
 
     auto final_output = torch::empty({num_rows, hidden_size}, gemm2_output.options());
 
@@ -389,8 +394,9 @@ torch::Tensor run_moe_finalize_scale_op(torch::Tensor const& gemm2_output, torch
             // static_cast<float const*>(fc2_expert_biases.const_data_ptr()),
             nullptr, static_cast<float const*>(unpermuted_final_scales.const_data_ptr()),
             static_cast<int const*>(expanded_source_row_to_expanded_dest_row.const_data_ptr()),
-            static_cast<int const*>(expert_for_source_row.const_data_ptr()), num_valid_tokens_ptr, num_rows,
-            hidden_size, experts_per_token, parallelism_config, stream, static_cast<float*>(final_output.data_ptr()));
+            static_cast<int const*>(expert_for_source_row.const_data_ptr()), /*num_valid_tokens_ptr,*/ num_rows,
+            hidden_size, experts_per_token, num_experts_per_node, parallelism_config, stream,
+            static_cast<float*>(final_output.data_ptr()));
         break;
     case torch::kBFloat16:
         runMoEFinalizeScaleOp<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16>(
@@ -398,8 +404,8 @@ torch::Tensor run_moe_finalize_scale_op(torch::Tensor const& gemm2_output, torch
             // static_cast<__nv_bfloat16 const*>(fc2_expert_biases.const_data_ptr()),
             nullptr, static_cast<float const*>(unpermuted_final_scales.const_data_ptr()),
             static_cast<int const*>(expanded_source_row_to_expanded_dest_row.const_data_ptr()),
-            static_cast<int const*>(expert_for_source_row.const_data_ptr()), num_valid_tokens_ptr, num_rows,
-            hidden_size, experts_per_token, parallelism_config, stream,
+            static_cast<int const*>(expert_for_source_row.const_data_ptr()), /*num_valid_tokens_ptr,*/ num_rows,
+            hidden_size, experts_per_token, num_experts_per_node, parallelism_config, stream,
             static_cast<__nv_bfloat16*>(final_output.data_ptr()));
         break;
     case torch::kHalf:
@@ -407,8 +413,9 @@ torch::Tensor run_moe_finalize_scale_op(torch::Tensor const& gemm2_output, torch
             // static_cast<half const*>(fc2_expert_biases.const_data_ptr()),
             nullptr, static_cast<float const*>(unpermuted_final_scales.const_data_ptr()),
             static_cast<int const*>(expanded_source_row_to_expanded_dest_row.const_data_ptr()),
-            static_cast<int const*>(expert_for_source_row.const_data_ptr()), num_valid_tokens_ptr, num_rows,
-            hidden_size, experts_per_token, parallelism_config, stream, static_cast<half*>(final_output.data_ptr()));
+            static_cast<int const*>(expert_for_source_row.const_data_ptr()), /*num_valid_tokens_ptr,*/ num_rows,
+            hidden_size, experts_per_token, num_experts_per_node, parallelism_config, stream,
+            static_cast<half*>(final_output.data_ptr()));
         break;
     default:
         throw std::invalid_argument(

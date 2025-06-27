@@ -559,6 +559,186 @@ __host__ __device__ constexpr static U arrayConvert(T const& input)
     return u;
 }
 
+// // Duplicated and permutes rows for MoE. In addition, reverse the permutation map to help with finalizing routing.
+
+// // "expanded_x_row" simply means that the number of values is num_rows x k. It is "expanded" since we will have to
+// // duplicate some rows in the input matrix to match the dimensions. Duplicates will always get routed to separate
+// // experts in the end.
+
+// // Note that the expanded_dest_row_to_expanded_source_row map referred to here has indices in the range (0,
+// // k*rows_in_input - 1). However, it is set up so that index 0, rows_in_input, 2*rows_in_input ...
+// (k-1)*rows_in_input
+// // all map to row 0 in the original matrix. Thus, to know where to read in the source matrix, we simply take the
+// modulus
+// // of the expanded index.
+
+// constexpr static int EXPAND_THREADS_PER_BLOCK = 256;
+
+// template <class InputActivationsType, class ExpandedActivationsType, bool CHECK_SKIPPED>
+// __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_input,
+//     ExpandedActivationsType* permuted_output, float const* unpermuted_scales, float* permuted_scales,
+//     int const* expanded_dest_row_to_expanded_source_row, int* expanded_source_row_to_expanded_dest_row,
+//     int64_t const num_rows, int64_t const* num_dest_rows, int64_t const cols, int64_t k,
+//     float const* fc1_act_global_scale, int64_t* expert_first_token_offset,
+//     cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
+//     cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, int64_t num_experts_per_node)
+// {
+// #ifdef ENABLE_FP4
+//     constexpr bool is_fp4 = std::is_same_v<ExpandedActivationsType, __nv_fp4_e2m1>;
+//     constexpr bool is_fp4_input = is_fp4 && std::is_same_v<InputActivationsType, __nv_fp4_e2m1>;
+//     constexpr bool need_fp4_quant = is_fp4 && !std::is_same_v<InputActivationsType, __nv_fp4_e2m1>;
+// #else
+//     constexpr bool is_fp4 = false;
+//     constexpr bool is_fp4_input = false;
+//     constexpr bool need_fp4_quant = false;
+// #endif
+
+//     static_assert(need_fp4_quant || std::is_same_v<InputActivationsType, ExpandedActivationsType>,
+//         "Only FP4 quantization supports outputting a different format as part of the expansion");
+
+//     // Reverse permutation map.
+//     // I do this so that later, we can use the source -> dest map to do the k-way reduction and unpermuting. I need
+//     the
+//     // reverse map for that reduction to allow each threadblock to do 1 k-way reduce without atomics later in MoE. 1
+//     // thread block will be responsible for all k summations.
+//     int64_t const expanded_dest_row = blockIdx.x;
+// #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+//     asm volatile("griddepcontrol.wait;");
+// #endif
+//     int64_t const expanded_source_row = expanded_dest_row_to_expanded_source_row[expanded_dest_row];
+//     if (threadIdx.x == 0)
+//     {
+//         assert(expanded_dest_row <= INT32_MAX);
+//         expanded_source_row_to_expanded_dest_row[expanded_source_row] = static_cast<int>(expanded_dest_row);
+//     }
+
+//     if (!CHECK_SKIPPED || blockIdx.x < *num_dest_rows)
+//     {
+//         // Load 128-bits per thread
+//         constexpr int64_t ELEM_PER_THREAD
+//             = is_fp4 ? CVT_FP4_ELTS_PER_THREAD : (128 / sizeof_bits<InputActivationsType>::value);
+//         constexpr int64_t ELEM_PER_BYTE = is_fp4_input ? 2 : 1;
+//         using DataElem
+//             = std::conditional_t<is_fp4_input, uint32_t, cutlass::Array<InputActivationsType, ELEM_PER_THREAD>>;
+//         using OutputElem = std::conditional_t<is_fp4, uint32_t, DataElem>;
+
+//         // Duplicate and permute rows
+//         int64_t const source_k_rank = expanded_source_row / num_rows;
+//         int64_t const source_row = expanded_source_row % num_rows;
+
+//         auto const* source_row_ptr
+//             = reinterpret_cast<DataElem const*>(unpermuted_input + source_row * cols / ELEM_PER_BYTE);
+//         // Cast first to handle when this is FP4
+//         auto* dest_row_ptr
+//             = reinterpret_cast<OutputElem*>(permuted_output) + expanded_dest_row * cols / ELEM_PER_THREAD;
+
+//         int64_t const start_offset = threadIdx.x;
+//         int64_t const stride = EXPAND_THREADS_PER_BLOCK;
+//         int64_t const num_elems_in_col = cols / ELEM_PER_THREAD;
+//         assert(cols % ELEM_PER_THREAD == 0);
+
+//         if constexpr (is_fp4)
+//         {
+//             int64_t expert = findTotalEltsLessThanTarget(
+//                                  expert_first_token_offset, num_experts_per_node, (int64_t) expanded_dest_row + 1)
+//                 - 1;
+//             float global_scale_val = fc1_act_global_scale ? *fc1_act_global_scale : 1.0f;
+//             int64_t num_tokens_before_expert = expert_first_token_offset[expert];
+
+//             for (int elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride)
+//             {
+//                 auto in_vec = source_row_ptr[elem_index];
+//                 if constexpr (need_fp4_quant)
+//                 {
+//                     // auto res = quantizePackedFP4Value<InputActivationsType, DataElem>(in_vec, global_scale_val,
+//                     //     num_tokens_before_expert, expert, expanded_dest_row, elem_index, cols, num_rows,
+//                     //     fc1_act_sf_flat);
+//                     auto res = quantizePackedFP4Value<InputActivationsType, DataElem>(in_vec, global_scale_val,
+//                         num_tokens_before_expert, expert, expanded_dest_row, elem_index, cols, num_rows,
+//                         fc1_act_sf_flat,
+//                         cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4);
+//                     dest_row_ptr[elem_index] = res;
+//                 }
+//                 else
+//                 {
+//                     writeSF(num_tokens_before_expert, expert, source_row, expanded_dest_row, elem_index, cols,
+//                     num_rows,
+//                         fc1_act_sf_flat, input_sf);
+//                     dest_row_ptr[elem_index] = in_vec;
+//                 }
+//             }
+//         }
+//         else
+//         {
+//             for (int elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride)
+//             {
+//                 dest_row_ptr[elem_index] = source_row_ptr[elem_index];
+//             }
+//         }
+
+//         if (permuted_scales && threadIdx.x == 0)
+//         {
+//             int64_t const source_k_idx = source_row * k + source_k_rank;
+//             permuted_scales[expanded_dest_row] = unpermuted_scales ? unpermuted_scales[source_k_idx] : 1.0f;
+//         }
+//     }
+// #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+//     asm volatile("griddepcontrol.launch_dependents;");
+// #endif
+// }
+
+// template <class InputActivationsType, class ExpandedActivationsType>
+// void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
+//     ExpandedActivationsType* permuted_output, float const* unpermuted_scales, float* permuted_scales,
+//     int const* expanded_dest_row_to_expanded_source_row, int* expanded_source_row_to_expanded_dest_row,
+//     int64_t const num_rows, int64_t const* num_valid_tokens_ptr, int64_t const cols, int const k,
+//     int const num_experts_per_node, float const* fc1_act_global_scale, int64_t* expert_first_token_offset,
+//     cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
+//     cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, cudaStream_t stream)
+// {
+//     if (fc1_act_sf_flat)
+//     {
+//         assert(false && "Not supported, we need to keep the same as moe_kerenls.cu in the future (TODO).");
+//     }
+
+//     int64_t const blocks = num_rows * k;
+//     int64_t const threads = EXPAND_THREADS_PER_BLOCK;
+//     auto func = (num_valid_tokens_ptr != nullptr)
+//         ? expandInputRowsKernel<InputActivationsType, ExpandedActivationsType, true>
+//         : expandInputRowsKernel<InputActivationsType, ExpandedActivationsType, false>;
+
+//     cudaLaunchConfig_t config;
+//     config.gridDim = blocks;
+//     config.blockDim = threads;
+//     config.dynamicSmemBytes = 0;
+//     config.stream = stream;
+//     cudaLaunchAttribute attrs[1];
+//     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+//     attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+//     config.numAttrs = 1;
+//     config.attrs = attrs;
+//     cudaLaunchKernelEx(&config, func, unpermuted_input, permuted_output, unpermuted_scales, permuted_scales,
+//         expanded_dest_row_to_expanded_source_row, expanded_source_row_to_expanded_dest_row, num_rows,
+//         num_valid_tokens_ptr, cols, k, fc1_act_global_scale, expert_first_token_offset, fc1_act_sf_flat, input_sf,
+//         num_experts_per_node);
+// }
+
+// #define INSTANTIATE_EXPAND_INPUT_ROWS(InputActivationsType, ExpandedActivationsType)                                   \
+//     template void expandInputRowsKernelLauncher<InputActivationsType, ExpandedActivationsType>(                        \
+//         InputActivationsType const* unpermuted_input, ExpandedActivationsType* permuted_output,                        \
+//         float const* unpermuted_scales, float* permuted_scales, int const* expanded_dest_row_to_expanded_source_row,   \
+//         int* expanded_source_row_to_expanded_dest_row, int64_t const num_rows, int64_t const* num_valid_tokens_ptr,    \
+//         int64_t const cols, int const k, int const num_experts_per_node, float const* fc1_act_global_scale,            \
+//         int64_t* expert_first_token_offset,                                                                            \
+//         cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,                               \
+//         cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, cudaStream_t stream);
+
+// INSTANTIATE_EXPAND_INPUT_ROWS(half, half);
+// INSTANTIATE_EXPAND_INPUT_ROWS(float, float);
+// #ifdef ENABLE_BF16
+// INSTANTIATE_EXPAND_INPUT_ROWS(__nv_bfloat16, __nv_bfloat16);
+// #endif
+
 // Duplicated and permutes rows for MoE. In addition, reverse the permutation map to help with finalizing routing.
 
 // "expanded_x_row" simply means that the number of values is num_rows x k. It is "expanded" since we will have to
@@ -572,14 +752,14 @@ __host__ __device__ constexpr static U arrayConvert(T const& input)
 
 constexpr static int EXPAND_THREADS_PER_BLOCK = 256;
 
-template <class InputActivationsType, class ExpandedActivationsType, bool CHECK_SKIPPED>
+template <class InputActivationsType, class ExpandedActivationsType>
 __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_input,
     ExpandedActivationsType* permuted_output, float const* unpermuted_scales, float* permuted_scales,
     int const* expanded_dest_row_to_expanded_source_row, int* expanded_source_row_to_expanded_dest_row,
-    int64_t const num_rows, int64_t const* num_dest_rows, int64_t const cols, int64_t k,
-    float const* fc1_act_global_scale, int64_t* expert_first_token_offset,
+    int64_t const num_rows, int64_t const cols, int64_t const k, float const* fc1_act_global_scale,
+    int64_t const* expert_first_token_offset,
     cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
-    cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, int64_t num_experts_per_node)
+    cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, int64_t const num_experts_per_node)
 {
 #ifdef ENABLE_FP4
     constexpr bool is_fp4 = std::is_same_v<ExpandedActivationsType, __nv_fp4_e2m1>;
@@ -594,23 +774,25 @@ __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_inp
     static_assert(need_fp4_quant || std::is_same_v<InputActivationsType, ExpandedActivationsType>,
         "Only FP4 quantization supports outputting a different format as part of the expansion");
 
-    // Reverse permutation map.
-    // I do this so that later, we can use the source -> dest map to do the k-way reduction and unpermuting. I need the
-    // reverse map for that reduction to allow each threadblock to do 1 k-way reduce without atomics later in MoE. 1
-    // thread block will be responsible for all k summations.
-    int64_t const expanded_dest_row = blockIdx.x;
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     asm volatile("griddepcontrol.wait;");
 #endif
-    int64_t const expanded_source_row = expanded_dest_row_to_expanded_source_row[expanded_dest_row];
-    if (threadIdx.x == 0)
-    {
-        assert(expanded_dest_row <= INT32_MAX);
-        expanded_source_row_to_expanded_dest_row[expanded_source_row] = static_cast<int>(expanded_dest_row);
-    }
 
-    if (!CHECK_SKIPPED || blockIdx.x < *num_dest_rows)
+    int64_t const num_valid_tokens = expert_first_token_offset[num_experts_per_node];
+
+    for (int64_t expanded_dest_row = blockIdx.x; expanded_dest_row < num_valid_tokens; expanded_dest_row += gridDim.x)
     {
+        // Reverse permutation map.
+        // I do this so that later, we can use the source -> dest map to do the k-way reduction and unpermuting. I need
+        // the reverse map for that reduction to allow each threadblock to do 1 k-way reduce without atomics later in
+        // MoE. 1 thread block will be responsible for all k summations.
+        int64_t const expanded_source_row = expanded_dest_row_to_expanded_source_row[expanded_dest_row];
+        if (threadIdx.x == 0)
+        {
+            assert(expanded_dest_row <= INT32_MAX);
+            expanded_source_row_to_expanded_dest_row[expanded_source_row] = static_cast<int>(expanded_dest_row);
+        }
+
         // Load 128-bits per thread
         constexpr int64_t ELEM_PER_THREAD
             = is_fp4 ? CVT_FP4_ELTS_PER_THREAD : (128 / sizeof_bits<InputActivationsType>::value);
@@ -647,9 +829,6 @@ __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_inp
                 auto in_vec = source_row_ptr[elem_index];
                 if constexpr (need_fp4_quant)
                 {
-                    // auto res = quantizePackedFP4Value<InputActivationsType, DataElem>(in_vec, global_scale_val,
-                    //     num_tokens_before_expert, expert, expanded_dest_row, elem_index, cols, num_rows,
-                    //     fc1_act_sf_flat);
                     auto res = quantizePackedFP4Value<InputActivationsType, DataElem>(in_vec, global_scale_val,
                         num_tokens_before_expert, expert, expanded_dest_row, elem_index, cols, num_rows,
                         fc1_act_sf_flat,
@@ -687,21 +866,29 @@ template <class InputActivationsType, class ExpandedActivationsType>
 void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
     ExpandedActivationsType* permuted_output, float const* unpermuted_scales, float* permuted_scales,
     int const* expanded_dest_row_to_expanded_source_row, int* expanded_source_row_to_expanded_dest_row,
-    int64_t const num_rows, int64_t const* num_valid_tokens_ptr, int64_t const cols, int const k,
-    int const num_experts_per_node, float const* fc1_act_global_scale, int64_t* expert_first_token_offset,
+    int64_t const num_rows, int64_t const cols, int const k, int const num_experts_per_node,
+    float const* fc1_act_global_scale, int64_t* expert_first_token_offset,
     cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
     cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, cudaStream_t stream)
 {
-    if (fc1_act_sf_flat)
+#ifdef ENABLE_FP4
+    // TODO Currently this is a bit hacky because we assume we are in FP8_MXFP4 mode if activations are FP8.
+    //   This code is still needed if we add MXFP8_MXFP4 mode.
+    // TODO This is also wasteful, we should solve this properly by properly writing the padding in the kernel
+    if (fc1_act_sf_flat && std::is_same_v<ExpandedActivationsType, __nv_fp4_e2m1>)
     {
-        assert(false && "Not supported, we need to keep the same as moe_kerenls.cu in the future (TODO).");
+        size_t num_elems = getOffsetActivationSF(num_experts_per_node, num_rows * std::min(k, num_experts_per_node),
+            cols, cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4);
+        check_cuda_error(cudaMemsetAsync(fc1_act_sf_flat, 0x0,
+            num_elems * sizeof(cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::NVFP4ElementSF), stream));
     }
+#endif
 
-    int64_t const blocks = num_rows * k;
+    static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
+    // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
+    int64_t const blocks = smCount * 8;
     int64_t const threads = EXPAND_THREADS_PER_BLOCK;
-    auto func = (num_valid_tokens_ptr != nullptr)
-        ? expandInputRowsKernel<InputActivationsType, ExpandedActivationsType, true>
-        : expandInputRowsKernel<InputActivationsType, ExpandedActivationsType, false>;
+    auto func = expandInputRowsKernel<InputActivationsType, ExpandedActivationsType>;
 
     cudaLaunchConfig_t config;
     config.gridDim = blocks;
@@ -714,18 +901,16 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
     config.numAttrs = 1;
     config.attrs = attrs;
     cudaLaunchKernelEx(&config, func, unpermuted_input, permuted_output, unpermuted_scales, permuted_scales,
-        expanded_dest_row_to_expanded_source_row, expanded_source_row_to_expanded_dest_row, num_rows,
-        num_valid_tokens_ptr, cols, k, fc1_act_global_scale, expert_first_token_offset, fc1_act_sf_flat, input_sf,
-        num_experts_per_node);
+        expanded_dest_row_to_expanded_source_row, expanded_source_row_to_expanded_dest_row, num_rows, cols, k,
+        fc1_act_global_scale, expert_first_token_offset, fc1_act_sf_flat, input_sf, num_experts_per_node);
 }
 
 #define INSTANTIATE_EXPAND_INPUT_ROWS(InputActivationsType, ExpandedActivationsType)                                   \
     template void expandInputRowsKernelLauncher<InputActivationsType, ExpandedActivationsType>(                        \
         InputActivationsType const* unpermuted_input, ExpandedActivationsType* permuted_output,                        \
         float const* unpermuted_scales, float* permuted_scales, int const* expanded_dest_row_to_expanded_source_row,   \
-        int* expanded_source_row_to_expanded_dest_row, int64_t const num_rows, int64_t const* num_valid_tokens_ptr,    \
-        int64_t const cols, int const k, int const num_experts_per_node, float const* fc1_act_global_scale,            \
-        int64_t* expert_first_token_offset,                                                                            \
+        int* expanded_source_row_to_expanded_dest_row, int64_t const num_rows, int64_t const cols, int const k,        \
+        int const num_experts_per_node, float const* fc1_act_global_scale, int64_t* expert_first_token_offset,         \
         cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,                               \
         cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, cudaStream_t stream);
 
@@ -735,6 +920,149 @@ INSTANTIATE_EXPAND_INPUT_ROWS(float, float);
 INSTANTIATE_EXPAND_INPUT_ROWS(__nv_bfloat16, __nv_bfloat16);
 #endif
 
+// enum class ScaleMode : int
+// {
+//     NO_SCALE = 0,
+//     DEFAULT = 1,
+// };
+
+// constexpr static int FINALIZE_THREADS_PER_BLOCK = 256;
+
+// template <class T>
+// using sizeof_bits = cutlass::sizeof_bits<typename
+// cutlass_kernels::TllmToCutlassTypeAdapter<std::remove_cv_t<T>>::type>;
+
+// // Final kernel to unpermute and scale
+// // This kernel unpermutes the original data, does the k-way reduction and performs the final skip connection.
+// template <typename OutputType, class GemmOutputType, class ScaleBiasType, ScaleMode SCALE_MODE, bool CHECK_SKIPPED>
+// __global__ void finalizeMoeRoutingKernel(GemmOutputType const* expanded_permuted_rows,
+//     OutputType* reduced_unpermuted_output, ScaleBiasType const* bias, float const* scales,
+//     int const* expanded_source_row_to_expanded_dest_row, int const* expert_for_source_row, int64_t const orig_cols,
+//     int64_t const experts_per_token, int64_t const* num_valid_ptr)
+// {
+//     assert(orig_cols % 4 == 0);
+//     int64_t const original_row = blockIdx.x;
+//     int64_t const num_rows = gridDim.x;
+//     auto const offset = original_row * orig_cols;
+//     OutputType* reduced_row_ptr = reduced_unpermuted_output + offset;
+
+//     // Load 128-bits per thread, according to the smallest data type we read/write
+//     constexpr int64_t FINALIZE_ELEM_PER_THREAD
+//         = 128 / std::min(sizeof_bits<OutputType>::value, sizeof_bits<GemmOutputType>::value);
+
+//     int64_t const start_offset = threadIdx.x;
+//     int64_t const stride = FINALIZE_THREADS_PER_BLOCK;
+//     int64_t const num_elems_in_col = orig_cols / FINALIZE_ELEM_PER_THREAD;
+
+//     using BiasElem = cutlass::Array<ScaleBiasType, FINALIZE_ELEM_PER_THREAD>;
+//     using InputElem = cutlass::Array<GemmOutputType, FINALIZE_ELEM_PER_THREAD>;
+//     using OutputElem = cutlass::Array<OutputType, FINALIZE_ELEM_PER_THREAD>;
+//     using ComputeElem = cutlass::Array<float, FINALIZE_ELEM_PER_THREAD>;
+//     auto const* bias_v = reinterpret_cast<BiasElem const*>(bias);
+//     auto const* expanded_permuted_rows_v = reinterpret_cast<InputElem const*>(expanded_permuted_rows);
+//     auto* reduced_row_ptr_v = reinterpret_cast<OutputElem*>(reduced_row_ptr);
+
+// #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+//     asm volatile("griddepcontrol.wait;");
+// #endif
+//     int64_t const num_valid = *num_valid_ptr;
+
+// #pragma unroll
+//     for (int elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride)
+//     {
+//         bool has_valid = false;
+//         ComputeElem thread_output;
+//         thread_output.fill(0);
+//         for (int k_idx = 0; k_idx < experts_per_token; ++k_idx)
+//         {
+//             int64_t const expanded_original_row = original_row + k_idx * num_rows;
+//             int64_t const expanded_permuted_row = expanded_source_row_to_expanded_dest_row[expanded_original_row];
+
+//             int64_t const k_offset = original_row * experts_per_token + k_idx;
+//             float const row_scale = (SCALE_MODE == ScaleMode::NO_SCALE) ? 1.f : scales[k_offset];
+
+//             // Check after row_rescale has accumulated
+//             if (CHECK_SKIPPED && expanded_permuted_row >= num_valid)
+//             {
+//                 continue;
+//             }
+
+//             auto const* expanded_permuted_rows_row_ptr
+//                 = expanded_permuted_rows_v + expanded_permuted_row * num_elems_in_col;
+
+//             int64_t const expert_idx = expert_for_source_row[k_offset];
+
+//             auto const* bias_ptr = bias_v + expert_idx * num_elems_in_col;
+//             ComputeElem bias_value;
+//             if (bias)
+//             {
+//                 bias_value = arrayConvert<BiasElem, ComputeElem>(bias_ptr[elem_index]);
+//             }
+//             else
+//             {
+//                 bias_value.fill(0);
+//             }
+
+//             ComputeElem expert_result
+//                 = arrayConvert<InputElem, ComputeElem>(expanded_permuted_rows_row_ptr[elem_index]);
+//             thread_output = thread_output + row_scale * (expert_result + bias_value);
+//             has_valid = true;
+//         }
+
+//         OutputElem output_elem = arrayConvert<ComputeElem, OutputElem>(thread_output);
+//         reduced_row_ptr_v[elem_index] = output_elem;
+//     }
+// #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+//     asm volatile("griddepcontrol.launch_dependents;");
+// #endif
+// }
+
+// template <class OutputType, class GemmOutputType, class ScaleBiasType>
+// void finalizeMoeRoutingKernelLauncher(GemmOutputType const* expanded_permuted_rows,
+//     OutputType* reduced_unpermuted_output, ScaleBiasType const* bias, float const* final_scales,
+//     int const* expanded_source_row_to_expanded_dest_row, int const* expert_for_source_row, int64_t const num_rows,
+//     int64_t const cols, int64_t const experts_per_token, int64_t const* num_valid_ptr,
+//     cutlass_kernels::MOEParallelismConfig parallelism_config, cudaStream_t stream)
+// {
+//     int64_t const blocks = num_rows;
+//     int64_t const threads = FINALIZE_THREADS_PER_BLOCK;
+
+//     // Only add bias on rank 0 for tensor parallelism
+//     bool const is_rank_0 = parallelism_config.tp_rank == 0;
+//     ScaleBiasType const* bias_ptr = is_rank_0 ? bias : nullptr;
+
+//     bool const check_skipped = num_valid_ptr != nullptr;
+
+//     ScaleMode scale_mode = final_scales ? ScaleMode::DEFAULT : ScaleMode::NO_SCALE;
+
+//     using FuncPtr
+//         = decltype(&finalizeMoeRoutingKernel<OutputType, GemmOutputType, ScaleBiasType, ScaleMode::DEFAULT, false>);
+//     FuncPtr func_map[2][3] = {
+//         {
+//             &finalizeMoeRoutingKernel<OutputType, GemmOutputType, ScaleBiasType, ScaleMode::NO_SCALE, false>,
+//             &finalizeMoeRoutingKernel<OutputType, GemmOutputType, ScaleBiasType, ScaleMode::DEFAULT, false>,
+//         },
+//         {
+//             &finalizeMoeRoutingKernel<OutputType, GemmOutputType, ScaleBiasType, ScaleMode::NO_SCALE, true>,
+//             &finalizeMoeRoutingKernel<OutputType, GemmOutputType, ScaleBiasType, ScaleMode::DEFAULT, true>,
+//         },
+//     };
+//     auto* const func = func_map[check_skipped][int(scale_mode)];
+
+//     cudaLaunchConfig_t config;
+//     config.gridDim = blocks;
+//     config.blockDim = threads;
+//     config.dynamicSmemBytes = 0;
+//     config.stream = stream;
+//     cudaLaunchAttribute attrs[1];
+//     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+//     attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+//     config.numAttrs = 1;
+//     config.attrs = attrs;
+//     cudaLaunchKernelEx(&config, func, expanded_permuted_rows, reduced_unpermuted_output, bias_ptr, final_scales,
+//         expanded_source_row_to_expanded_dest_row, expert_for_source_row, cols, experts_per_token, num_valid_ptr);
+// }
+
 enum class ScaleMode : int
 {
     NO_SCALE = 0,
@@ -743,16 +1071,13 @@ enum class ScaleMode : int
 
 constexpr static int FINALIZE_THREADS_PER_BLOCK = 256;
 
-template <class T>
-using sizeof_bits = cutlass::sizeof_bits<typename cutlass_kernels::TllmToCutlassTypeAdapter<std::remove_cv_t<T>>::type>;
-
 // Final kernel to unpermute and scale
 // This kernel unpermutes the original data, does the k-way reduction and performs the final skip connection.
-template <typename OutputType, class GemmOutputType, class ScaleBiasType, ScaleMode SCALE_MODE, bool CHECK_SKIPPED>
+template <typename OutputType, class GemmOutputType, class ScaleBiasType, ScaleMode SCALE_MODE>
 __global__ void finalizeMoeRoutingKernel(GemmOutputType const* expanded_permuted_rows,
     OutputType* reduced_unpermuted_output, ScaleBiasType const* bias, float const* scales,
     int const* expanded_source_row_to_expanded_dest_row, int const* expert_for_source_row, int64_t const orig_cols,
-    int64_t const experts_per_token, int64_t const* num_valid_ptr)
+    int64_t const experts_per_token, int const num_experts_per_node)
 {
     assert(orig_cols % 4 == 0);
     int64_t const original_row = blockIdx.x;
@@ -779,48 +1104,39 @@ __global__ void finalizeMoeRoutingKernel(GemmOutputType const* expanded_permuted
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     asm volatile("griddepcontrol.wait;");
 #endif
-    int64_t const num_valid = *num_valid_ptr;
 
 #pragma unroll
     for (int elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride)
     {
-        bool has_valid = false;
         ComputeElem thread_output;
         thread_output.fill(0);
         for (int k_idx = 0; k_idx < experts_per_token; ++k_idx)
         {
-            int64_t const expanded_original_row = original_row + k_idx * num_rows;
-            int64_t const expanded_permuted_row = expanded_source_row_to_expanded_dest_row[expanded_original_row];
-
             int64_t const k_offset = original_row * experts_per_token + k_idx;
-            float const row_scale = (SCALE_MODE == ScaleMode::NO_SCALE) ? 1.f : scales[k_offset];
-
-            // Check after row_rescale has accumulated
-            if (CHECK_SKIPPED && expanded_permuted_row >= num_valid)
+            int64_t const expert_idx = expert_for_source_row[k_offset];
+            if (expert_idx >= num_experts_per_node)
             {
                 continue;
             }
 
+            int64_t const expanded_original_row = original_row + k_idx * num_rows;
+            int64_t const expanded_permuted_row = expanded_source_row_to_expanded_dest_row[expanded_original_row];
+
+            float const row_scale = (SCALE_MODE == ScaleMode::NO_SCALE) ? 1.f : scales[k_offset];
+
             auto const* expanded_permuted_rows_row_ptr
                 = expanded_permuted_rows_v + expanded_permuted_row * num_elems_in_col;
 
-            int64_t const expert_idx = expert_for_source_row[k_offset];
-
-            auto const* bias_ptr = bias_v + expert_idx * num_elems_in_col;
-            ComputeElem bias_value;
-            if (bias)
-            {
-                bias_value = arrayConvert<BiasElem, ComputeElem>(bias_ptr[elem_index]);
-            }
-            else
-            {
-                bias_value.fill(0);
-            }
-
             ComputeElem expert_result
                 = arrayConvert<InputElem, ComputeElem>(expanded_permuted_rows_row_ptr[elem_index]);
-            thread_output = thread_output + row_scale * (expert_result + bias_value);
-            has_valid = true;
+
+            if (bias)
+            {
+                auto const* bias_ptr = bias_v + expert_idx * num_elems_in_col;
+                expert_result = expert_result + arrayConvert<BiasElem, ComputeElem>(bias_ptr[elem_index]);
+            }
+
+            thread_output = thread_output + row_scale * expert_result;
         }
 
         OutputElem output_elem = arrayConvert<ComputeElem, OutputElem>(thread_output);
@@ -831,41 +1147,119 @@ __global__ void finalizeMoeRoutingKernel(GemmOutputType const* expanded_permuted
 #endif
 }
 
+// Final kernel to unpermute and scale
+// This kernel unpermutes the original data, does the k-way reduction and performs the final skip connection.
+template <typename OutputType, class GemmOutputType, class ScaleBiasType, ScaleMode SCALE_MODE>
+__global__ void finalizeMoeRoutingNoFillingKernel(GemmOutputType const* expanded_permuted_rows,
+    OutputType* reduced_unpermuted_output, ScaleBiasType const* bias, float const* scales,
+    int const* const expanded_source_row_to_expanded_dest_row, int const* expanded_dest_row_to_expanded_source_row,
+    int const* expert_for_source_row, int64_t const* expert_first_token_offset, int64_t const num_rows,
+    int64_t const orig_cols, int64_t const experts_per_token, int const num_experts_per_node)
+{
+    assert(orig_cols % 4 == 0);
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.wait;");
+#endif
+
+    int64_t const num_valid_tokens = expert_first_token_offset[num_experts_per_node];
+    for (int64_t expanded_permuted_row = blockIdx.x; expanded_permuted_row < num_valid_tokens;
+         expanded_permuted_row += gridDim.x)
+    {
+        int64_t expanded_source_row = expanded_dest_row_to_expanded_source_row[expanded_permuted_row];
+
+        // Duplicate and permute rows
+        int64_t const source_k_rank = expanded_source_row / num_rows;
+        int64_t const source_row = expanded_source_row % num_rows;
+
+        // If the expert is the first selected (valid) one of the corresponding token on the current EP rank, do
+        // reduction; otherwise, skip.
+        bool is_first_selected_expert = true;
+        for (int k_idx = 0; k_idx < source_k_rank; ++k_idx)
+        {
+            if (expert_for_source_row[source_row * experts_per_token + k_idx] < num_experts_per_node)
+            {
+                is_first_selected_expert = false;
+                break;
+            }
+        }
+        if (!is_first_selected_expert)
+        {
+            continue;
+        }
+
+        OutputType* reduced_row_ptr = reduced_unpermuted_output + source_row * orig_cols;
+
+        // Load 128-bits per thread, according to the smallest data type we read/write
+        constexpr int64_t FINALIZE_ELEM_PER_THREAD
+            = 128 / std::min(sizeof_bits<OutputType>::value, sizeof_bits<GemmOutputType>::value);
+
+        int64_t const start_offset = threadIdx.x;
+        int64_t const stride = FINALIZE_THREADS_PER_BLOCK;
+        int64_t const num_elems_in_col = orig_cols / FINALIZE_ELEM_PER_THREAD;
+
+        using BiasElem = cutlass::Array<ScaleBiasType, FINALIZE_ELEM_PER_THREAD>;
+        using InputElem = cutlass::Array<GemmOutputType, FINALIZE_ELEM_PER_THREAD>;
+        using OutputElem = cutlass::Array<OutputType, FINALIZE_ELEM_PER_THREAD>;
+        using ComputeElem = cutlass::Array<float, FINALIZE_ELEM_PER_THREAD>;
+        auto const* bias_v = reinterpret_cast<BiasElem const*>(bias);
+        auto const* expanded_permuted_rows_v = reinterpret_cast<InputElem const*>(expanded_permuted_rows);
+        auto* reduced_row_ptr_v = reinterpret_cast<OutputElem*>(reduced_row_ptr);
+
+        for (int elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride)
+        {
+            ComputeElem thread_output;
+            thread_output.fill(0);
+            for (int k_idx = 0; k_idx < experts_per_token; ++k_idx)
+            {
+                int64_t const k_offset = source_row * experts_per_token + k_idx;
+                int64_t const expert_idx = expert_for_source_row[k_offset];
+                if (expert_idx >= num_experts_per_node)
+                {
+                    continue;
+                }
+
+                int64_t const expanded_permuted_row_from_k_idx
+                    = expanded_source_row_to_expanded_dest_row[source_row + k_idx * num_rows];
+
+                float const row_scale = (SCALE_MODE == ScaleMode::NO_SCALE) ? 1.f : scales[k_offset];
+
+                auto const* expanded_permuted_rows_row_ptr
+                    = expanded_permuted_rows_v + expanded_permuted_row_from_k_idx * num_elems_in_col;
+
+                ComputeElem expert_result
+                    = arrayConvert<InputElem, ComputeElem>(expanded_permuted_rows_row_ptr[elem_index]);
+
+                if (bias)
+                {
+                    auto const* bias_ptr = bias_v + expert_idx * num_elems_in_col;
+                    expert_result = expert_result + arrayConvert<BiasElem, ComputeElem>(bias_ptr[elem_index]);
+                }
+
+                thread_output = thread_output + row_scale * expert_result;
+            }
+            OutputElem output_elem = arrayConvert<ComputeElem, OutputElem>(thread_output);
+            reduced_row_ptr_v[elem_index] = output_elem;
+        }
+    }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
 template <class OutputType, class GemmOutputType, class ScaleBiasType>
 void finalizeMoeRoutingKernelLauncher(GemmOutputType const* expanded_permuted_rows,
     OutputType* reduced_unpermuted_output, ScaleBiasType const* bias, float const* final_scales,
-    int const* expanded_source_row_to_expanded_dest_row, int const* expert_for_source_row, int64_t const num_rows,
-    int64_t const cols, int64_t const experts_per_token, int64_t const* num_valid_ptr,
-    cutlass_kernels::MOEParallelismConfig parallelism_config, cudaStream_t stream)
+    int const* expanded_source_row_to_expanded_dest_row, int const* expanded_dest_row_to_expanded_source_row,
+    int const* expert_for_source_row, int64_t const* expert_first_token_offset, int64_t const num_rows,
+    int64_t const cols, int64_t const experts_per_token, int const num_experts_per_node,
+    cutlass_kernels::MOEParallelismConfig parallelism_config, bool const enable_alltoall, cudaStream_t stream)
 {
-    int64_t const blocks = num_rows;
-    int64_t const threads = FINALIZE_THREADS_PER_BLOCK;
-
     // Only add bias on rank 0 for tensor parallelism
     bool const is_rank_0 = parallelism_config.tp_rank == 0;
     ScaleBiasType const* bias_ptr = is_rank_0 ? bias : nullptr;
 
-    bool const check_skipped = num_valid_ptr != nullptr;
-
-    ScaleMode scale_mode = final_scales ? ScaleMode::DEFAULT : ScaleMode::NO_SCALE;
-
-    using FuncPtr
-        = decltype(&finalizeMoeRoutingKernel<OutputType, GemmOutputType, ScaleBiasType, ScaleMode::DEFAULT, false>);
-    FuncPtr func_map[2][3] = {
-        {
-            &finalizeMoeRoutingKernel<OutputType, GemmOutputType, ScaleBiasType, ScaleMode::NO_SCALE, false>,
-            &finalizeMoeRoutingKernel<OutputType, GemmOutputType, ScaleBiasType, ScaleMode::DEFAULT, false>,
-        },
-        {
-            &finalizeMoeRoutingKernel<OutputType, GemmOutputType, ScaleBiasType, ScaleMode::NO_SCALE, true>,
-            &finalizeMoeRoutingKernel<OutputType, GemmOutputType, ScaleBiasType, ScaleMode::DEFAULT, true>,
-        },
-    };
-    auto* const func = func_map[check_skipped][int(scale_mode)];
-
     cudaLaunchConfig_t config;
-    config.gridDim = blocks;
-    config.blockDim = threads;
     config.dynamicSmemBytes = 0;
     config.stream = stream;
     cudaLaunchAttribute attrs[1];
@@ -873,16 +1267,47 @@ void finalizeMoeRoutingKernelLauncher(GemmOutputType const* expanded_permuted_ro
     attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
     config.numAttrs = 1;
     config.attrs = attrs;
-    cudaLaunchKernelEx(&config, func, expanded_permuted_rows, reduced_unpermuted_output, bias_ptr, final_scales,
-        expanded_source_row_to_expanded_dest_row, expert_for_source_row, cols, experts_per_token, num_valid_ptr);
+
+    if (parallelism_config.ep_size > 1 && enable_alltoall)
+    {
+        // If all-to-all comm is enabled, finalizeMoeRouting doesn't need to fill the invalid output tokens with zeros.
+        static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
+        // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
+        int64_t const blocks = smCount * 8;
+        int64_t const threads = FINALIZE_THREADS_PER_BLOCK;
+        config.gridDim = blocks;
+        config.blockDim = threads;
+        auto func = final_scales
+            ? &finalizeMoeRoutingNoFillingKernel<OutputType, GemmOutputType, ScaleBiasType, ScaleMode::DEFAULT>
+            : &finalizeMoeRoutingNoFillingKernel<OutputType, GemmOutputType, ScaleBiasType, ScaleMode::NO_SCALE>;
+        cudaLaunchKernelEx(&config, func, expanded_permuted_rows, reduced_unpermuted_output, bias_ptr, final_scales,
+            expanded_source_row_to_expanded_dest_row, expanded_dest_row_to_expanded_source_row, expert_for_source_row,
+            expert_first_token_offset, num_rows, cols, experts_per_token, num_experts_per_node);
+    }
+    else
+    {
+        // If all-gather reduce-scatter is used, finalizeMoeRouting must fill invalid output tokens with zeros.
+        int64_t const blocks = num_rows;
+        int64_t const threads = FINALIZE_THREADS_PER_BLOCK;
+        config.gridDim = blocks;
+        config.blockDim = threads;
+        auto func = final_scales
+            ? &finalizeMoeRoutingKernel<OutputType, GemmOutputType, ScaleBiasType, ScaleMode::DEFAULT>
+            : &finalizeMoeRoutingKernel<OutputType, GemmOutputType, ScaleBiasType, ScaleMode::NO_SCALE>;
+        cudaLaunchKernelEx(&config, func, expanded_permuted_rows, reduced_unpermuted_output, bias_ptr, final_scales,
+            expanded_source_row_to_expanded_dest_row, expert_for_source_row, cols, experts_per_token,
+            num_experts_per_node);
+    }
 }
 
 #define INSTANTIATE_FINALIZE_MOE_ROUTING(OutputT, GemmOutputT, ScaleBiasT)                                             \
     template void finalizeMoeRoutingKernelLauncher<OutputT, GemmOutputT, ScaleBiasT>(                                  \
         GemmOutputT const* expanded_permuted_rows, OutputT* reduced_unpermuted_output, ScaleBiasT const* bias,         \
         float const* final_scales, int const* expanded_source_row_to_expanded_dest_row,                                \
-        int const* expert_for_source_row, int64_t const num_rows, int64_t const cols, int64_t const experts_per_token, \
-        int64_t const* num_valid_ptr, cutlass_kernels::MOEParallelismConfig parallelism_config, cudaStream_t stream);
+        int const* expanded_dest_row_to_expanded_source_row, int const* expert_for_source_row,                         \
+        int64_t const* expert_first_token_offset, int64_t const num_rows, int64_t const cols,                          \
+        int64_t const experts_per_token, int const num_experts_per_node,                                               \
+        cutlass_kernels::MOEParallelismConfig parallelism_config, bool const enable_alltoall, cudaStream_t stream);
 
 INSTANTIATE_FINALIZE_MOE_ROUTING(half, half, half);
 INSTANTIATE_FINALIZE_MOE_ROUTING(float, float, float);

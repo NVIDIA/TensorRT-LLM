@@ -37,20 +37,38 @@ void generateTokenPermutation(int const* unpermuted_token_selected_experts, int 
     int64_t num_rows, int64_t num_experts_per_node, int64_t k, cutlass_kernels::CubKeyValueSorter& sorter,
     void* sorter_ws, cudaStream_t stream);
 
+// TODO: remove num_valid_tokens_ptr
+// template <class InputActivationsType, class ExpandedActivationsType>
+// void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
+//     ExpandedActivationsType* permuted_output, float const* unpermuted_scales, float* permuted_scales,
+//     int const* expanded_dest_row_to_expanded_source_row, int* expanded_source_row_to_expanded_dest_row,
+//     int64_t const num_rows, int64_t const* num_valid_tokens_ptr, int64_t const cols, int const k,
+//     int const num_experts_per_node, float const* fc1_act_global_scale, int64_t* expert_first_token_offset,
+//     cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
+//     cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, cudaStream_t stream);
 template <class InputActivationsType, class ExpandedActivationsType>
 void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
     ExpandedActivationsType* permuted_output, float const* unpermuted_scales, float* permuted_scales,
     int const* expanded_dest_row_to_expanded_source_row, int* expanded_source_row_to_expanded_dest_row,
-    int64_t const num_rows, int64_t const* num_valid_tokens_ptr, int64_t const cols, int const k,
-    int const num_experts_per_node, float const* fc1_act_global_scale, int64_t* expert_first_token_offset,
+    int64_t const num_rows, int64_t const cols, int const k, int const num_experts_per_node,
+    float const* fc1_act_global_scale, int64_t* expert_first_token_offset,
     cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
     cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, cudaStream_t stream);
 
+// template <class OutputType, class GemmOutputType, class ScaleBiasType>
+// void finalizeMoeRoutingKernelLauncher(GemmOutputType const* expanded_permuted_rows,
+//     OutputType* reduced_unpermuted_output, ScaleBiasType const* bias, float const* final_scales,
+//     int const* expanded_source_row_to_expanded_dest_row, int const* expert_for_source_row, int64_t const
+//     num_rows, int64_t const cols, int64_t const experts_per_token, int64_t const* num_valid_ptr,
+//     cutlass_kernels::MOEParallelismConfig parallelism_config, cudaStream_t stream);
+// added: expanded_dest_row_to_expanded_source_row, expert_first_token_offset, enable_alltoall
+// remove: num_valid_ptr,
 template <class OutputType, class GemmOutputType, class ScaleBiasType>
 void finalizeMoeRoutingKernelLauncher(GemmOutputType const* expanded_permuted_rows,
     OutputType* reduced_unpermuted_output, ScaleBiasType const* bias, float const* final_scales,
-    int const* expanded_source_row_to_expanded_dest_row, int const* expert_for_source_row, int64_t const num_rows,
-    int64_t const cols, int64_t const experts_per_token, int64_t const* num_valid_ptr,
-    cutlass_kernels::MOEParallelismConfig parallelism_config, cudaStream_t stream);
+    int const* expanded_source_row_to_expanded_dest_row, int const* expanded_dest_row_to_expanded_source_row,
+    int const* expert_for_source_row, int64_t const* expert_first_token_offset, int64_t const num_rows,
+    int64_t const cols, int64_t const experts_per_token, int const num_experts_per_node,
+    cutlass_kernels::MOEParallelismConfig parallelism_config, bool const enable_alltoall, cudaStream_t stream);
 
 } // namespace tensorrt_llm::kernels
