@@ -4,6 +4,8 @@ from typing import List, Optional, Union
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._utils import get_sm_version
+
 from ...distributed import allgather
 from ...model_config import ModelConfig
 from ...utils import Fp4QuantizedTensor, disable_fp4_allgather, reswizzle_sf
@@ -32,11 +34,17 @@ def cute_dsl_fp8_group_blockwise_gemm_ref(
     a_tmp = a.as_strided((m, k, 1), (k, 1, m * k))
     b_tmp = b.permute(1, 2, 0)
 
-    m_padded = (m + 3) // 4 * 4
-    input_scale_tmp = a_sf[0:m_padded * w_k]
-    input_scale_tmp = input_scale_tmp.reshape(-1, m_padded)
-    input_scale_tmp = input_scale_tmp[:w_k, :m].contiguous().permute(1, 0)
-    input_scale_tmp = input_scale_tmp.as_strided((m, w_k, 1), (1, m, m * w_k))
+    # Note: we have different output scale shape for fp8_quantize_1x128, so we need to handle it differently for sm100 and other archs.
+    if get_sm_version() == 100:
+        input_scale_tmp = a_sf.permute(1, 0).as_strided((m, w_k, 1),
+                                                        (1, m, m * w_k))
+    else:
+        m_padded = (m + 3) // 4 * 4
+        input_scale_tmp = a_sf[0:m_padded * w_k]
+        input_scale_tmp = input_scale_tmp.reshape(-1, m_padded)
+        input_scale_tmp = input_scale_tmp[:w_k, :m].contiguous().permute(1, 0)
+        input_scale_tmp = input_scale_tmp.as_strided((m, w_k, 1),
+                                                     (1, m, m * w_k))
 
     weight_scale_tmp = b_sf.permute(1, 2, 0)
 
@@ -168,28 +176,11 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         weight_dtype = self.w3_w1_weight.dtype
         x_sf = None
         if self.has_any_quant:
-            if self.has_fp8_qdq:
-                x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
-                    x, self.fc31_input_dequant)
-            elif self.has_deepseek_fp8_block_scales:
+            if self.has_deepseek_fp8_block_scales:
                 use_deepseek_fp8_block_scale = True
-            elif self.has_w4afp8:
-                weight_dtype = torch.quint4x2
-            elif self.has_nvfp4 and not disable_fp4_allgather():
-                if isinstance(x, Fp4QuantizedTensor):
-                    x_row = x.shape[0]
-                    # note: we use uint8 to store 2 fp4 values
-                    x_col = x.shape[1] * 2
-                    x, x_sf = x.fp4_tensor, x.scaling_factor
-                else:
-                    x_row = x.shape[0]
-                    x_col = x.shape[1]
-                    x, x_sf = torch.ops.trtllm.fp4_quantize(
-                        x, self.fc31_input_scale, self.scaling_vector_size,
-                        False)
             else:
                 raise ValueError(
-                    f"unsupported quantization mode: {self.quant_config.quant_mode}"
+                    f"unsupported quantization mode for CUTEDSL backend: {self.quant_config.quant_mode}"
                 )
 
         # gather inputs for attention dp
