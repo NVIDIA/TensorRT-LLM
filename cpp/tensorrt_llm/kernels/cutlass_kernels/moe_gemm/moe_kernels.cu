@@ -801,7 +801,6 @@ void globalExpertPrefixSum(int const* blocked_expert_counts, int* blocked_expert
         num_experts_per_node, num_blocks_per_seq);
 }
 
-template <int kNumTokensPerBlock>
 __global__ void mergeExpertPrefixSumKernel(int const* blocked_expert_counts, int const* blocked_expert_counts_cumsum,
     int const* blocked_row_to_unpermuted_row, int* permuted_token_selected_experts, int* permuted_row_to_unpermuted_row,
     int* unpermuted_row_to_permuted_row, int const num_tokens)
@@ -809,7 +808,7 @@ __global__ void mergeExpertPrefixSumKernel(int const* blocked_expert_counts, int
     int const target_expert_id = blockIdx.x;
     int const block_id = blockIdx.y;
     int const num_blocks_per_seq = gridDim.y;
-    int const token_id = block_id * kNumTokensPerBlock + threadIdx.x;
+    int const token_id = block_id * blockDim.x + threadIdx.x;
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     asm volatile("griddepcontrol.wait;");
@@ -850,28 +849,7 @@ void mergeExpertPrefixSum(int const* blocked_expert_counts, int const* blocked_e
     config.numAttrs = 1;
     config.attrs = attrs;
 
-    auto func = mergeExpertPrefixSumKernel<1024>;
-    if (num_tokens_per_block <= 32)
-    {
-        func = mergeExpertPrefixSumKernel<32>;
-    }
-    else if (num_tokens_per_block <= 64)
-    {
-        func = mergeExpertPrefixSumKernel<64>;
-    }
-    else if (num_tokens_per_block <= 128)
-    {
-        func = mergeExpertPrefixSumKernel<128>;
-    }
-    else if (num_tokens_per_block <= 256)
-    {
-        func = mergeExpertPrefixSumKernel<256>;
-    }
-    else if (num_tokens_per_block <= 512)
-    {
-        func = mergeExpertPrefixSumKernel<512>;
-    }
-    cudaLaunchKernelEx(&config, func, blocked_expert_counts, blocked_expert_counts_cumsum,
+    cudaLaunchKernelEx(&config, mergeExpertPrefixSumKernel, blocked_expert_counts, blocked_expert_counts_cumsum,
         blocked_row_to_unpermuted_row, permuted_token_selected_experts, permuted_row_to_unpermuted_row,
         unpermuted_row_to_permuted_row, num_tokens);
 }
