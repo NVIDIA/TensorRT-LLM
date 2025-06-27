@@ -17,7 +17,6 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/common.h"
-#include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/runtime/eagleBuffers.h"
@@ -237,7 +236,7 @@ public:
     TensorPtr seqSlots;
     TensorPtr seqSlotsDevice;
     TensorPtr sortedSeqSlots;
-    //! TODO: move into decoderBuffers.DraftBuffers
+    //! For KV cache rewind
     TensorPtr seqSlotRemappingHost;   // [numSequences]
     TensorPtr seqSlotRemappingDevice; // [numSequences]
 

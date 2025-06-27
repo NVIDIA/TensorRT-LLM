@@ -141,11 +141,11 @@ TYPED_TEST(RoutingLlama4KernelTest, WarpLevelParallelization)
         /*numExperts=*/128, /*topK=*/1,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 0.0f);
+        /*usePdl=*/true, /*getExpWeights=*/true, /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 0.0f,
+        /*requiredComputeCapability*/ 8);
     this->runTest(param);
 };
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 TYPED_TEST(RoutingLlama4KernelTest, ClusterLevelParallelization)
 {
     RoutingKernelTestParam param(RoutingMethodType::Llama4, /*numTokens=*/100,
@@ -153,10 +153,9 @@ TYPED_TEST(RoutingLlama4KernelTest, ClusterLevelParallelization)
         /*expertParallelization=*/1, /*expertParallelizationId=*/0,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true,
-        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f);
+        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
     this->runTest(param);
 };
-#endif
 
 TYPED_TEST(RoutingLlama4KernelTest, DeviceLevelParallelization)
 {
@@ -165,7 +164,7 @@ TYPED_TEST(RoutingLlama4KernelTest, DeviceLevelParallelization)
         /*expertParallelization=*/1, /*expertParallelizationId=*/0,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true,
-        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f);
+        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 8);
     this->runTest(param);
 };
 
