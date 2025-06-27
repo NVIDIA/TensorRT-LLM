@@ -870,7 +870,7 @@ class PyExecutor:
                     self.resource_manager.prepare_resources(scheduled_batch)
                     if self.drafter is not None:
                         self.drafter.prepare_draft_tokens(
-                            scheduled_batch, self.resource_manager)
+                            scheduled_batch, self.resource_manager, iter_stats)
 
                     batch_outputs = self._forward_step(scheduled_batch)
 

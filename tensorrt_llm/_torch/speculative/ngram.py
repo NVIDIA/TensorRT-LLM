@@ -1,7 +1,10 @@
+import time
 from itertools import chain
+from typing import Dict, Tuple
 
 from ordered_set import OrderedSet
 
+from tensorrt_llm.bindings.executor import IterationStats
 from tensorrt_llm.logger import logger
 
 from ..pyexecutor.llm_request import *
@@ -174,6 +177,21 @@ class NGramDrafter(Drafter):
         self,
         scheduled_requests: ScheduledRequests,
         resource_manager: Optional[ResourceManager] = None,
+        iter_stats: IterationStats = None,
+    ) -> None:
+
+        if iter_stats is not None:
+            start_time = time.time()
+
+        self._prepare_draft_tokens(scheduled_requests)
+
+        if iter_stats is not None:
+            self._update_ngram_iter_stats(scheduled_requests, iter_stats,
+                                          start_time)
+
+    def _prepare_draft_tokens(
+        self,
+        scheduled_requests: ScheduledRequests,
     ) -> None:
         # Sort by request_id when py_batch_idx is None as a fallback.
         # This happens in the disagg case: for a set of new requests, we draft
@@ -195,6 +213,48 @@ class NGramDrafter(Drafter):
             )
             # Pad length to `self.max_draft_len`
             if len(draft_tokens) > 0:
-                pad_length = self.max_draft_len - len(draft_tokens)
+                draft_length = len(draft_tokens)
+                pad_length = self.max_draft_len - draft_length
                 draft_tokens.extend([request.py_end_id] * pad_length)
+            else:
+                draft_length = 0
             request.py_draft_tokens = draft_tokens
+            request.py_draft_length = draft_length
+
+    def _update_ngram_iter_stats(
+        self,
+        scheduled_requests: ScheduledRequests,
+        iter_stats: IterationStats,
+        start_time: float,
+    ) -> Tuple[ScheduledRequests, Dict[int, LlmRequest]]:
+        """
+        Get statistic information from the draft tokens in NGram drafter
+        """
+        now_time = time.time()
+
+        total_num_draft_tokens = 0
+        total_num_accepted_tokens = 0
+        num_requests_with_draft_tokens = 0
+        for request in scheduled_requests.generation_requests:
+            if request.py_last_draft_tokens is not None:
+                total_num_draft_tokens += request.py_draft_length
+                total_num_accepted_tokens += request.py_num_accepted_draft_tokens
+                num_requests_with_draft_tokens += 1
+
+        if num_requests_with_draft_tokens > 0:
+            iter_stats.specdec_stats.iter_latency_ms = (now_time -
+                                                        start_time) * 1e3
+            iter_stats.specdec_stats.num_draft_tokens = total_num_draft_tokens
+            iter_stats.specdec_stats.num_accepted_tokens = total_num_accepted_tokens
+            iter_stats.specdec_stats.num_requests_with_draft_tokens = num_requests_with_draft_tokens
+            iter_stats.specdec_stats.acceptance_length = (
+                total_num_accepted_tokens +
+                num_requests_with_draft_tokens) / num_requests_with_draft_tokens
+        else:
+            iter_stats.specdec_stats.iter_latency_ms = 0.0
+            iter_stats.specdec_stats.num_draft_tokens = 0
+            iter_stats.specdec_stats.num_accepted_tokens = 0
+            iter_stats.specdec_stats.num_requests_with_draft_tokens = 0
+            iter_stats.specdec_stats.acceptance_length = 1.0
+
+        return
