@@ -110,7 +110,7 @@ def generate_outputs(num_beams, only_multi_gpu=False):
         print(
             f'Generating outputs for Llama FP16 with TP={tp_size}, PP={pp_size} and CP={cp_size}'
         )
-        if pp_size == 1:
+        if tp_size == 4 and pp_size == 1:
             output_logits = True
             output_log_probs = True
             output_cum_log_probs = True
