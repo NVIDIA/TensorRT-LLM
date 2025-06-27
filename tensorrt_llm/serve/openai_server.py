@@ -52,6 +52,7 @@ class OpenAIServer:
     def __init__(self,
                  llm: LLM,
                  model: str,
+                 served_model_name: str | None,
                  server_role: Optional[ServerRole],
                  metadata_server_cfg: MetadataServerConfig):
         self.llm = llm
@@ -73,7 +74,9 @@ class OpenAIServer:
             self.model_config = None
 
         model_dir = Path(model)
-        if model_dir.exists() and model_dir.is_dir():
+        if served_model_name is not None:
+            self.model = served_model_name
+        elif model_dir.exists() and model_dir.is_dir():
             self.model = model_dir.name
         else:
             self.model = model

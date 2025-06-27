@@ -17,7 +17,7 @@ from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
                                  DynamicBatchConfig, KvCacheConfig,
-                                 SchedulerConfig)
+                                 SchedulerConfig, CudaGraphConfig)
 from tensorrt_llm.llmapi.disagg_utils import (CtxGenServerConfig,
                                               MetadataServerConfig, ServerRole,
                                               parse_disagg_config_file,
@@ -70,6 +70,7 @@ def _signal_handler_cleanup_child(signum, frame):
 
 
 def get_llm_args(model: str,
+                 served_model_name: str,
                  tokenizer: Optional[str] = None,
                  backend: Optional[str] = None,
                  max_beam_width: int = BuildConfig.max_beam_width,
@@ -81,6 +82,11 @@ def get_llm_args(model: str,
                  moe_expert_parallel_size: Optional[int] = None,
                  gpus_per_node: Optional[int] = None,
                  free_gpu_memory_fraction: Optional[float] = None,
+                 host_cache_size: int = 0,
+                 kv_cache_dtype: str = "auto",
+                 enable_chunked_prefill: bool = True,
+                 guided_decoding_backend: Optional[str] = None,
+                 disable_overlap_scheduler: bool = False,
                  num_postprocess_workers: int = 0,
                  trust_remote_code: bool = False,
                  reasoning_parser: Optional[str] = None,
@@ -95,7 +101,9 @@ def get_llm_args(model: str,
                                max_beam_width=max_beam_width,
                                max_seq_len=max_seq_len)
     kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=free_gpu_memory_fraction)
+        free_gpu_memory_fraction=free_gpu_memory_fraction,
+        host_cache_size=host_cache_size,
+    )
 
     dynamic_batch_config = DynamicBatchConfig(
         enable_batch_size_tuning=True,
@@ -108,6 +116,7 @@ def get_llm_args(model: str,
 
     llm_args = {
         "model": model,
+        "served_model_name": served_model_name,
         "scheduler_config": scheduler_config,
         "tokenizer": tokenizer,
         "tensor_parallel_size": tensor_parallel_size,
@@ -121,10 +130,16 @@ def get_llm_args(model: str,
         "max_beam_width": max_beam_width,
         "max_seq_len": max_seq_len,
         "kv_cache_config": kv_cache_config,
+        "enable_chunked_prefill": enable_chunked_prefill,
+        "guided_decoding_backend": guided_decoding_backend,
+        "disable_overlap_scheduler": disable_overlap_scheduler,
         "backend": backend if backend == "pytorch" else None,
         "num_postprocess_workers": num_postprocess_workers,
         "postprocess_tokenizer_dir": tokenizer or model,
         "reasoning_parser": reasoning_parser,
+        "cuda_graph_config": CudaGraphConfig(batch_sizes=list(range(1, max_batch_size + 1))),
+        "enable_trtllm_sampler": True,
+        "kv_cache_dtype": kv_cache_dtype,
     }
 
     return llm_args, llm_args_extra_dict
@@ -138,6 +153,7 @@ def launch_server(host: str,
 
     backend = llm_args["backend"]
     model = llm_args["model"]
+    served_model_name = llm_args.pop("served_model_name")
 
     if backend == 'pytorch':
         llm = PyTorchLLM(**llm_args)
@@ -146,6 +162,7 @@ def launch_server(host: str,
 
     server = OpenAIServer(llm=llm,
                           model=model,
+                          served_model_name=served_model_name,
                           server_role=server_role,
                           metadata_server_cfg=metadata_server_cfg)
 
@@ -154,6 +171,11 @@ def launch_server(host: str,
 
 @click.command("serve")
 @click.argument("model", type=str)
+@click.option("--served_model_name",
+              type=str,
+              default=None,
+              help="HF model name."
+              "Model name to use. Defaults to model_path.")
 @click.option("--tokenizer",
               type=str,
               default=None,
@@ -216,6 +238,27 @@ def launch_server(host: str,
               default=0.9,
               help="Free GPU memory fraction reserved for KV Cache, "
               "after allocating model weights and buffers.")
+@click.option("--host_cache_size",
+                type=int,
+                default=0,
+                help="Size of the host cache in bytes. "
+                "Set to 0 to disable host cache. ")
+@click.option("--kv_cache_dtype",
+              type=str,
+              default="auto",
+              help="Data type for KV cache")
+@click.option("--enable_chunked_prefill",
+              type=bool,
+              default=True,
+              help="Flag to control chunked prefill. ")
+@click.option("--guided_decoding_backend",
+              type=str,
+              default=None,
+              help="Backend for guided decoding.")
+@click.option("--disable_overlap_scheduler",
+              type=bool,
+              default=False,
+              help="Disable overlap scheduler. ")
 @click.option(
     "--num_postprocess_workers",
     type=int,
@@ -249,14 +292,22 @@ def launch_server(host: str,
     default=None,
     help="Server role. Specify this value only if running in disaggregated mode."
 )
-def serve(model: str, tokenizer: Optional[str], host: str, port: int,
+def serve(model: str,
+          served_model_name: Optional[str],
+          tokenizer: Optional[str], host: str, port: int,
           log_level: str, backend: str, max_beam_width: int,
           max_batch_size: int, max_num_tokens: int, max_seq_len: int,
           tp_size: int, pp_size: int, ep_size: Optional[int],
           cluster_size: Optional[int], gpus_per_node: Optional[int],
           kv_cache_free_gpu_memory_fraction: float,
+          host_cache_size: int,
+          kv_cache_dtype: str,
+          enable_chunked_prefill: bool,
+          guided_decoding_backend: Optional[str],
+          disable_overlap_scheduler: bool,
           num_postprocess_workers: int, trust_remote_code: bool,
-          extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
+          extra_llm_api_options: Optional[str],
+          reasoning_parser: Optional[str],
           metadata_server_config_file: Optional[str],
           server_role: Optional[str]):
     """Running an OpenAI API compatible server
@@ -265,8 +316,11 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
     """
     logger.set_level(log_level)
 
+    assert max_seq_len is not None, "max_seq_len must be specified"
+
     llm_args, _ = get_llm_args(
         model=model,
+        served_model_name=served_model_name,
         tokenizer=tokenizer,
         backend=backend,
         max_beam_width=max_beam_width,
@@ -279,6 +333,11 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
         moe_cluster_parallel_size=cluster_size,
         gpus_per_node=gpus_per_node,
         free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
+        host_cache_size=host_cache_size,
+        kv_cache_dtype=kv_cache_dtype,
+        enable_chunked_prefill=enable_chunked_prefill,
+        guided_decoding_backend=guided_decoding_backend,
+        disable_overlap_scheduler=disable_overlap_scheduler,
         num_postprocess_workers=num_postprocess_workers,
         trust_remote_code=trust_remote_code,
         reasoning_parser=reasoning_parser)
