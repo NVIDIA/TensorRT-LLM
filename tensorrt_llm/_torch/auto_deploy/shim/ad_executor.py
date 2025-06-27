@@ -264,6 +264,7 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
     ad_config: _AutoDeployLlmArgs = executor_config.pytorch_backend_config
 
     max_batch_size = ad_config.max_batch_size
+    max_beam_width = ad_config.max_beam_width
     max_seq_len = ad_config.max_seq_len
     attn_page_size = ad_config.attn_page_size
     max_num_tokens = ad_config.max_num_tokens
@@ -272,7 +273,8 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
     )
 
     ad_logger.info(f"{max_seq_len=}, {max_batch_size=}, {attn_page_size=}, {max_num_tokens=}")
-
+    if max_beam_width is not None:
+        assert max_beam_width <= 1, "_autodeploy + beam_search is not supported"
     # initialize model engine
     engine = ADEngine.build_from_config(
         model=checkpoint_dir,
