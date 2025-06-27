@@ -271,6 +271,9 @@ class GenerationExecutor(ABC):
             # We can catch some exceptions here.
             raise e
 
+    def is_shutdown(self) -> bool:
+        return self.doing_shutdown
+
     @abstractmethod
     def shutdown(self):
         pass

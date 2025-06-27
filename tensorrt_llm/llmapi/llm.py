@@ -321,6 +321,11 @@ class BaseLLM:
         Returns:
             tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.
         """
+
+        # Check if the worker is shutting down
+        if self._executor is None or self._executor.is_shutdown():
+            raise RuntimeError("LLM is shutting down")
+
         sampling_params = self._prepare_sampling_params(sampling_params)
 
         # With pytorch backend, py_executor has logic to handle max_tokens of 1,
