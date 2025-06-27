@@ -72,7 +72,7 @@ tr::SamplingConfig makeSamplingConfig(std::vector<tr::SamplingConfig> const& con
 }
 } // namespace
 
-NB_MODULE(bindings, m)
+NB_MODULE(TRTLLM_NB_MODULE, m)
 {
     nb::set_leak_warnings(false); // todo
     m.doc() = "TensorRT-LLM Python bindings for C++ runtime";
