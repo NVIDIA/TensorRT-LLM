@@ -654,14 +654,15 @@ void blockExpertPrefixSum(int const* token_selected_experts, int* blocked_expert
         num_tokens, num_experts_per_token, start_expert_id);
 }
 
-template <int kNumThreadsPerBlock, int kNumElemPerThread>
-__global__ void globalExpertPrefixSumKernel(int const* blocked_expert_counts, int* blocked_expert_counts_cumsum,
-    int64_t* expert_first_token_offset, int64_t const num_experts_per_node, int64_t const num_blocks_per_seq)
+template <int kNumThreadsPerBlock>
+__global__ void globalExpertPrefixSumLargeKernel(int const* blocked_expert_counts, int* blocked_expert_counts_cumsum,
+    int64_t* expert_first_token_offset, int64_t const num_experts_per_node, int64_t const num_blocks_per_seq,
+    int64_t const num_elem_per_thread)
 {
     using BlockScan = cub::BlockScan<int, kNumThreadsPerBlock>;
     __shared__ typename BlockScan::TempStorage temp_storage;
 
-    int offset = threadIdx.x * kNumElemPerThread;
+    int offset = threadIdx.x * num_elem_per_thread;
     int cnt = 0;
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -669,7 +670,7 @@ __global__ void globalExpertPrefixSumKernel(int const* blocked_expert_counts, in
 #endif
 
     // Note: Because of limited registers, cannot store thread-level prefix sum or enable #pragma unroll
-    for (int i = 0; i < kNumElemPerThread; i++)
+    for (int i = 0; i < num_elem_per_thread; i++)
     {
         // TODO(enweiz): Fix uncoalesced access with shared memory.
         if (offset + i < num_experts_per_node * num_blocks_per_seq)
@@ -681,7 +682,7 @@ __global__ void globalExpertPrefixSumKernel(int const* blocked_expert_counts, in
     int cumsum;
     BlockScan(temp_storage).ExclusiveSum(cnt, cumsum);
 
-    for (int i = 0; i < kNumElemPerThread; i++)
+    for (int i = 0; i < num_elem_per_thread; i++)
     {
         if (offset + i < num_experts_per_node * num_blocks_per_seq)
         {
@@ -753,52 +754,44 @@ void globalExpertPrefixSum(int const* blocked_expert_counts, int* blocked_expert
     config.numAttrs = 1;
     config.attrs = attrs;
 
-    // This allows accommodating 256 experts x 64k tokens; reasonable workload should not exceed this.
-    assert(num_elements <= 1024 * 16);
-    auto func = globalExpertPrefixSumKernel<1024, 16>;
-    if (num_elements <= 32)
+    if (num_elements <= 1024)
     {
-        func = globalExpertPrefixSumKernel<32>;
-        config.blockDim = 32;
+        auto func = globalExpertPrefixSumKernel<1024>;
+        if (num_elements <= 32)
+        {
+            func = globalExpertPrefixSumKernel<32>;
+            config.blockDim = 32;
+        }
+        else if (num_elements <= 64)
+        {
+            func = globalExpertPrefixSumKernel<64>;
+            config.blockDim = 64;
+        }
+        else if (num_elements <= 128)
+        {
+            func = globalExpertPrefixSumKernel<128>;
+            config.blockDim = 128;
+        }
+        else if (num_elements <= 256)
+        {
+            func = globalExpertPrefixSumKernel<256>;
+            config.blockDim = 256;
+        }
+        else if (num_elements <= 512)
+        {
+            func = globalExpertPrefixSumKernel<512>;
+            config.blockDim = 512;
+        }
+        cudaLaunchKernelEx(&config, func, blocked_expert_counts, blocked_expert_counts_cumsum,
+            expert_first_token_offset, num_experts_per_node, num_blocks_per_seq);
     }
-    else if (num_elements <= 64)
+    else
     {
-        func = globalExpertPrefixSumKernel<64>;
-        config.blockDim = 64;
+        auto func = globalExpertPrefixSumLargeKernel<1024>;
+        int64_t const num_elem_per_thread = tensorrt_llm::common::ceilDiv(num_elements, 1024);
+        cudaLaunchKernelEx(&config, func, blocked_expert_counts, blocked_expert_counts_cumsum,
+            expert_first_token_offset, num_experts_per_node, num_blocks_per_seq, num_elem_per_thread);
     }
-    else if (num_elements <= 128)
-    {
-        func = globalExpertPrefixSumKernel<128>;
-        config.blockDim = 128;
-    }
-    else if (num_elements <= 256)
-    {
-        func = globalExpertPrefixSumKernel<256>;
-        config.blockDim = 256;
-    }
-    else if (num_elements <= 512)
-    {
-        func = globalExpertPrefixSumKernel<512>;
-        config.blockDim = 512;
-    }
-    else if (num_elements <= 1024)
-    {
-        func = globalExpertPrefixSumKernel<1024>;
-    }
-    else if (num_elements <= 1024 * 2)
-    {
-        func = globalExpertPrefixSumKernel<1024, 2>;
-    }
-    else if (num_elements <= 1024 * 4)
-    {
-        func = globalExpertPrefixSumKernel<1024, 4>;
-    }
-    else if (num_elements <= 1024 * 8)
-    {
-        func = globalExpertPrefixSumKernel<1024, 8>;
-    }
-    cudaLaunchKernelEx(&config, func, blocked_expert_counts, blocked_expert_counts_cumsum, expert_first_token_offset,
-        num_experts_per_node, num_blocks_per_seq);
 }
 
 __global__ void mergeExpertPrefixSumKernel(int const* blocked_expert_counts, int const* blocked_expert_counts_cumsum,
