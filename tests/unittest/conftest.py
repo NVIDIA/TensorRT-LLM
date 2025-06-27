@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # # Force resource release after test
+
 import pytest
 import torch
 import tqdm
@@ -92,13 +93,7 @@ def torch_empty_cache() -> None:
         torch.cuda.empty_cache()
 
 
-@pytest.fixture(scope="module")
-def mpi_pool_executor() -> MPIPoolExecutor:
-    if torch.cuda.is_available():
-        max_workers = torch.cuda.device_count()
-    else:
-        # should be enough for our tests
-        max_workers = 8
-
-    with MPIPoolExecutor(max_workers=max_workers) as executor:
+@pytest.fixture(scope="module", params=[2, 4, 8])
+def mpi_pool_executor(request):
+    with MPIPoolExecutor(request.param) as executor:
         yield executor

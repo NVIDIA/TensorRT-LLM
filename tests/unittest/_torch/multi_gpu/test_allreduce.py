@@ -281,6 +281,7 @@ def run_allreduce_op(x: torch.Tensor, residual: torch.Tensor, hidden_size: int,
                      marks=skip_pre_blackwell),
     ],
 )
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
 def test_allreduce_fusion_patterns(seq_len, hidden_size, fusion_op,
                                    mpi_pool_executor):
     torch.manual_seed(0)
