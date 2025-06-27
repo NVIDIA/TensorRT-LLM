@@ -45,6 +45,21 @@ from tensorrt_llm.serve.postprocess_handlers import (
     chat_stream_post_processor, completion_response_post_processor,
     completion_stream_post_processor)
 from tensorrt_llm.version import __version__ as VERSION
+from tensorrt_llm._torch.pyexecutor.py_executor import PROM_METRICS_FILENAME
+
+from collections import defaultdict
+import array
+import json
+import os
+import traceback
+
+prom_metrics_file = None
+prom_metrics = defaultdict(float, {
+    "num_requests_running": 0,
+    "num_requests_waiting": 0,
+    "prompt_tokens_total": 0,
+    "generation_tokens_total": 0,
+})
 
 from .._utils import nvtx_mark
 
@@ -212,8 +227,9 @@ class OpenAIServer:
         self.app.add_api_route("/health_generate", self.health_generate, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
         self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
-        # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now
-        self.app.add_api_route("/metrics", self.get_iteration_stats, methods=["GET"])
+        # TODO: the metrics endpoint only reports runtime stats, not iteration stats
+        self.app.add_api_route("/metrics", self.metrics, methods=["GET"])
+        self.app.add_api_route("/metrics/", self.metrics, methods=["GET"])
         # TODO: workaround before ETCD support
         self.app.add_api_route("/kv_cache_events", self.get_kv_cache_events, methods=["POST"])
         self.app.add_api_route("/v1/completions",
@@ -264,10 +280,49 @@ class OpenAIServer:
         ver = {"version": VERSION}
         return JSONResponse(content=ver)
 
+    async def metrics(self) -> Response:
+        global prom_metrics_file
+        bufs = None
+        try:
+            if prom_metrics_file is None:
+                prom_metrics_file = os.open(PROM_METRICS_FILENAME,
+                                            os.O_RDWR|os.O_CREAT|os.O_TRUNC)
+            bufs = os.pread(prom_metrics_file, 65536, 0).split(b'\0', 1)
+            if len(bufs) >= 2:
+                keybuf, valbuf = bufs
+                key_list = json.loads(keybuf.decode('UTF-8'))
+                value_list = array.array('d')
+                value_list.frombytes(valbuf)
+                for key, value in zip(key_list, value_list):
+                    prom_metrics[key] = value
+        except:
+            print(bufs)
+            traceback.print_exc()
+
+        all_requests_done = (
+                prom_metrics["request_completed_total"] +
+                prom_metrics["request_cancelled_total"] +
+                prom_metrics["request_failed_total"])
+        # NOTE: metrics do not update if the other thread is not running any requests.
+        # Make sure to zero out running and waiting in this case.
+        if prom_metrics["request_started_total"] == all_requests_done:
+            prom_metrics["num_requests_running"] = 0
+
+        # Detect number of requests not being processed by the TensorRT-LLM engine.
+        prom_metrics["num_requests_waiting"] = max(0, prom_metrics["request_started_total"] - (
+                prom_metrics["num_requests_running"] + all_requests_done))
+
+        resp = ''
+        for metric_key, metric_val in prom_metrics.items():
+            separator = ',' if '{' in metric_key else '{'
+            resp += f'pytrtllm:{metric_key}{separator}model_name="{self.model}"}} {float(metric_val)}\n'
+        return Response(status_code=200, content=resp)
+
     async def get_model(self) -> JSONResponse:
         model_list = ModelList(data=[ModelCard(id=self.model)])
         return JSONResponse(content=model_list.model_dump())
 
+    # FIXME: Currently unused
     async def get_iteration_stats(self) -> JSONResponse:
         stats = []
         async for stat in self.llm.get_stats_async(2):
@@ -308,6 +363,8 @@ class OpenAIServer:
                         for choice in pp_res.choices:
                             if choice.finish_reason is not None:
                                 did_complete = True
+                                prom_metrics["request_completed_total"] += 1
+                                prom_metrics[f"request_success_total{{finished_reason=\"{choice.finish_reason}\""] += 1
 
                         pp_res_json = pp_res.model_dump_json(exclude_unset=True)
                         yield f"data: {pp_res_json}\n\n"
@@ -315,6 +372,7 @@ class OpenAIServer:
                 nvtx_mark("generation ends")
             finally:
                 if not did_complete:
+                    prom_metrics["request_cancelled_total"] += 1
                     promise.abort()
 
         async def create_chat_response(
@@ -326,11 +384,17 @@ class OpenAIServer:
                 post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
                 chat_response = post_processor(promise, args)
 
+            for choice in chat_response.choices:
+                if choice.finish_reason is not None:
+                    prom_metrics["request_completed_total"] += 1
+                    prom_metrics[f"request_success_total{{finished_reason=\"{choice.finish_reason}\""] += 1
+
             # Add prompt_tokens_ids to the response
             if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
                 chat_response.prompt_token_ids = promise.prompt_token_ids
             return chat_response
 
+        prom_metrics["request_started_total"] += 1
         promise: Optional[RequestOutput] = None
         try:
             check_multiple_response(request.n, self.llm.args.backend)
@@ -398,10 +462,12 @@ class OpenAIServer:
             # If internal executor error is raised, shutdown the server
             signal.raise_signal(signal.SIGINT)
         except asyncio.CancelledError:
+            prom_metrics["request_cancelled_total"] += 1
             if promise is not None:
                 promise.abort()
             return self.create_error_response("cancelled")
         except Exception as e:
+            prom_metrics["request_failed_total"] += 1
             return self.create_error_response(str(e))
 
     @cancel_on_disconnect(CompletionRequest)
@@ -447,11 +513,14 @@ class OpenAIServer:
                         for choice in pp_res.choices:
                             if choice.finish_reason is not None:
                                 did_complete = True
+                                prom_metrics["request_completed_total"] += 1
+                                prom_metrics[f"request_success_total{{finished_reason=\"{choice.finish_reason}\""] += 1
                         pp_res_json = pp_res.model_dump_json(exclude_unset=False)
                         yield f"data: {pp_res_json}\n\n"
                 yield f"data: [DONE]\n\n"
             finally:
                 if not did_complete:
+                    prom_metrics["request_cancelled_total"] += 1
                     for promise in promises:
                         promise.abort()
 
@@ -467,6 +536,11 @@ class OpenAIServer:
                     pp_result = post_processor(request_output, args)
                 else:
                     pp_result = request_output.outputs[0]._postprocess_result
+
+                for choice in pp_result.choices:
+                    if choice.finish_reason is not None:
+                        prom_metrics["request_completed_total"] += 1
+                        prom_metrics[f"request_success_total{{finished_reason=\"{choice.finish_reason}\""] += 1
 
                 choices, usage = pp_result.choices, pp_result.usage
                 all_choices.extend(choices)
@@ -489,6 +563,7 @@ class OpenAIServer:
             )
             return response
 
+        prom_metrics["request_started_total"] += 1
         try:
             check_multiple_response(request.n, self.llm.args.backend)
             if isinstance(request.prompt, str) or \
@@ -538,11 +613,13 @@ class OpenAIServer:
             # If internal executor error is raised, shutdown the server
             signal.raise_signal(signal.SIGINT)
         except asyncio.CancelledError:
+            prom_metrics["request_cancelled_total"] += 1
             for promise in promises:
                 promise.abort()
             return self.create_error_response("cancelled")
         except Exception as e:
             traceback.print_exc()
+            prom_metrics["request_failed_total"] += 1
             return self.create_error_response(str(e))
 
     async def __call__(self, host, port):
