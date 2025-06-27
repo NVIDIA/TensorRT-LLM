@@ -7,15 +7,18 @@ from pathlib import Path
 import click
 from click_option_group import (MutuallyExclusiveOptionGroup, OptionGroup,
                                 optgroup)
-from huggingface_hub import snapshot_download
 
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
 from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
 
 # isort: off
 from tensorrt_llm.bench.benchmark.utils.general import (
+<<<<<<< HEAD
     get_settings_from_engine, get_settings, ALL_SUPPORTED_BACKENDS)
 # isort: on
+=======
+    get_settings_from_engine, get_settings)
+>>>>>>> c1880441d (Move snapshot download.)
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
@@ -23,8 +26,8 @@ from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
 from tensorrt_llm.bench.dataclasses.scenario import (
-    BatchingConfiguration, BenchmarkEnvironment, ScenarioSpecification,
-    LlmRuntimeSpecification, ReportingConfiguration, TuningConstraints,
+    BatchingConfiguration, BenchmarkEnvironment, LlmRuntimeSpecification,
+    ReportingConfiguration, ScenarioSpecification, TuningConstraints,
     WorldConfig)
 # isort: on
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
@@ -293,11 +296,6 @@ def throughput_command(
 
     # Engine configuration parsing
     if benchmark_specification.llm_config.backend != "trt":
-        # If we're dealing with a model name, perform a snapshot download to
-        # make sure we have a local copy of the model.
-        if benchmark_specification.environment.checkpoint_path is None:
-            snapshot_download(benchmark_specification.environment.model)
-
         exec_settings = get_settings(params, metadata, bench_env.model,
                                      bench_env.checkpoint_path)
         kwargs_max_sql = max_seq_len or metadata.max_sequence_length
