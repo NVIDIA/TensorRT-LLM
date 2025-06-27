@@ -1383,6 +1383,21 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
         fc1_act_global_scale, expert_first_token_offset, fc1_act_sf_flat, input_sf, num_experts_per_node);
 }
 
+#define INSTANTIATE_EXPAND_INPUT_ROWS(InputActivationsType, ExpandedActivationsType)                                   \
+    template void expandInputRowsKernelLauncher<InputActivationsType, ExpandedActivationsType>(                        \
+        InputActivationsType const* unpermuted_input, ExpandedActivationsType* permuted_output,                        \
+        float const* unpermuted_scales, float* permuted_scales, int const* expanded_dest_row_to_expanded_source_row,   \
+        int* expanded_source_row_to_expanded_dest_row, int64_t const num_rows, int64_t const cols, int const k,        \
+        int const num_experts_per_node, float const* fc1_act_global_scale, int64_t* expert_first_token_offset,         \
+        TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,                                                \
+        TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, cudaStream_t stream);
+
+INSTANTIATE_EXPAND_INPUT_ROWS(half, half);
+INSTANTIATE_EXPAND_INPUT_ROWS(float, float);
+#ifdef ENABLE_BF16
+INSTANTIATE_EXPAND_INPUT_ROWS(__nv_bfloat16, __nv_bfloat16);
+#endif
+
 enum class ScaleMode : int
 {
     NO_SCALE = 0,
@@ -1619,6 +1634,21 @@ void finalizeMoeRoutingKernelLauncher(GemmOutputType const* expanded_permuted_ro
             num_experts_per_node);
     }
 }
+
+#define INSTANTIATE_FINALIZE_MOE_ROUTING(OutputT, GemmOutputT, ScaleBiasT)                                             \
+    template void finalizeMoeRoutingKernelLauncher<OutputT, GemmOutputT, ScaleBiasT>(                                  \
+        GemmOutputT const* expanded_permuted_rows, OutputT* reduced_unpermuted_output, ScaleBiasT const* bias,         \
+        float const* final_scales, int const* expanded_source_row_to_expanded_dest_row,                                \
+        int const* expanded_dest_row_to_expanded_source_row, int const* expert_for_source_row,                         \
+        int64_t const* expert_first_token_offset, int64_t const num_rows, int64_t const cols,                          \
+        int64_t const experts_per_token, int const num_experts_per_node, MOEParallelismConfig parallelism_config,      \
+        bool const enable_alltoall, cudaStream_t stream);
+
+INSTANTIATE_FINALIZE_MOE_ROUTING(half, half, half);
+INSTANTIATE_FINALIZE_MOE_ROUTING(float, float, float);
+#ifdef ENABLE_BF16
+INSTANTIATE_FINALIZE_MOE_ROUTING(__nv_bfloat16, __nv_bfloat16, __nv_bfloat16);
+#endif
 
 // ============================== Gated Activation =================================
 constexpr static int ACTIVATION_THREADS_PER_BLOCK = 256;
