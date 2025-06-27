@@ -55,8 +55,6 @@ def get_spec_metadata(spec_config,
         )
     return None
 
-        return None
-
 
 def get_spec_resource_manager(spec_config,
                               model_engine,
