@@ -315,7 +315,6 @@ class FP4QuantizationImpl(QuantizationImpl):
         except Exception as e:
             print(f"[shard_load_hook] Skipped due to exception: {e}", flush=True)
 
-
     @staticmethod
     def fuse_linear_weights(
         weights, weight_scale, alpha, input_scale

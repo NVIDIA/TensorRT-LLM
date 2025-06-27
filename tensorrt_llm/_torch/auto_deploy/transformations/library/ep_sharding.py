@@ -40,7 +40,11 @@ def ep_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
     for node in list(gm.graph.nodes):
         if not is_op(
             node,
-            (torch.ops.auto_deploy.torch_moe, torch.ops.auto_deploy.torch_fp8_moe, torch.ops.auto_deploy.torch_fp4_moe),
+            (
+                torch.ops.auto_deploy.torch_moe,
+                torch.ops.auto_deploy.torch_fp8_moe,
+                torch.ops.auto_deploy.torch_fp4_moe,
+            ),
         ):
             continue
         _insert_sharded_moe(gm, node, rank, world_size)
