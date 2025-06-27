@@ -513,8 +513,6 @@ class TRTLLMSampler(Sampler):
         self.max_num_sequences = mapping.pp_size * self.executor_config.max_batch_size
         self.max_seq_idle_microseconds = 180 * 1000 * 1000
         self.is_trt_overlap = not disable_overlap_scheduler
-        self.update_requests_time = []
-        self.minimal_update_requests_time = []
 
         self.world_config = WorldConfig.mpi(mapping.gpus_per_node,
                                             mapping.tp_size, mapping.pp_size)
@@ -788,7 +786,7 @@ class TRTLLMSampler(Sampler):
         ]
 
         for request in reqs:
-            seq_slot = request.seq_slot
+            seq_slot = request.py_seq_slot
             num_generated_tokens = request.num_draft_tokens + 1
             current_num_of_tokens = request.max_beam_num_tokens
             num_new_tokens = [0] * beam_width
