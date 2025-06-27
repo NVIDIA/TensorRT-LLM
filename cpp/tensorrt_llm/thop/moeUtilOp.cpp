@@ -62,11 +62,6 @@ void runPermute(void const* input_activations_void, void const* input_sf_void, i
     int start_expert = num_experts_per_node * parallelism_config.ep_rank;
     int end_expert = start_expert + num_experts_per_node;
 
-    // bool const needs_num_valid = parallelism_config.ep_size > 1;
-    // // Note: expert_first_token_offset_[num_experts_per_node] stores the total number of expanded tokens
-    // int64_t const* num_valid_tokens_ptr = needs_num_valid ? expert_first_token_offset_ + num_experts_per_node :
-    // nullptr;
-
     bool use_w4afp8 = false;
     bool fused_prologue_result = false;
     if (!use_w4afp8)
@@ -260,79 +255,6 @@ moe_permute_op(torch::Tensor const& input, torch::Tensor const& token_selected_e
         expert_first_token_offset_tensor, permuted_token_final_scales_tensor, src_to_dest_map_tensor);
 }
 
-// std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_moe_expand_op(torch::Tensor const& input,
-//     torch::optional<torch::Tensor> token_final_scales, torch::Tensor const& permuted_source_token_ids,
-//     int64_t const num_rows, torch::Tensor& expert_first_token_offset_tensor, int64_t const hidden_size,
-//     int64_t const experts_per_token, int64_t const num_experts_per_node, int64_t const tp_size, int64_t const
-//     tp_rank, int64_t const ep_size, int64_t const ep_rank, bool use_fp8_block_scaling)
-// {
-//     auto parallelism_config = cutlass_kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank);
-
-//     bool const needs_num_valid = parallelism_config.ep_size > 1;
-//     int64_t const* num_valid_tokens_ptr = needs_num_valid
-//         ? static_cast<int64_t*>(expert_first_token_offset_tensor.data_ptr()) + num_experts_per_node
-//         : nullptr;
-
-//     int64_t num_moe_inputs = static_cast<int64_t>(experts_per_token * num_rows);
-//     auto permuted_data_tensor = torch::empty({num_moe_inputs, hidden_size}, input.options().requires_grad(false));
-//     auto permuted_token_final_scales_tensor
-//         = torch::empty({num_moe_inputs}, torch::dtype(torch::kFloat32).device(torch::kCUDA).requires_grad(false));
-//     auto expanded_source_row_to_expanded_dest_row
-//         = torch::empty({num_moe_inputs}, torch::dtype(torch::kInt32).device(torch::kCUDA).requires_grad(false));
-
-//     auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
-//     cutlass_kernels::QuantParams quant_params{};
-
-//     float const* token_topk_unpermuted_scales = token_final_scales.has_value()
-//         ? reinterpret_cast<float const*>(token_final_scales.value().const_data_ptr())
-//         : nullptr;
-//     auto data_type = input.scalar_type();
-//     switch (data_type)
-//     {
-//     case torch::kFloat32:
-//         cutlass_kernels::expandInputRowsKernelLauncher<float, float>(static_cast<float
-//         const*>(input.const_data_ptr()),
-//             reinterpret_cast<float*>(permuted_data_tensor.data_ptr()), token_topk_unpermuted_scales,
-//             static_cast<float*>(permuted_token_final_scales_tensor.data_ptr()),
-//             static_cast<int const*>(permuted_source_token_ids.const_data_ptr()),
-//             static_cast<int*>(expanded_source_row_to_expanded_dest_row.data_ptr()), num_rows,
-//             /*num_valid_tokens_ptr,*/ hidden_size, experts_per_token, num_experts_per_node,
-//             quant_params.fp4.fc1.act_global_scale,
-//             static_cast<int64_t*>(expert_first_token_offset_tensor.data_ptr()),
-//             /* fc1_fp4_act_scale_ */ nullptr, /*input_sf*/ nullptr, stream);
-//         break;
-//     case torch::kBFloat16:
-//         cutlass_kernels::expandInputRowsKernelLauncher<__nv_bfloat16, __nv_bfloat16>(
-//             static_cast<__nv_bfloat16 const*>(input.const_data_ptr()),
-//             reinterpret_cast<__nv_bfloat16*>(permuted_data_tensor.data_ptr()), token_topk_unpermuted_scales,
-//             static_cast<float*>(permuted_token_final_scales_tensor.data_ptr()),
-//             static_cast<int const*>(permuted_source_token_ids.const_data_ptr()),
-//             static_cast<int*>(expanded_source_row_to_expanded_dest_row.data_ptr()), num_rows,
-//             /*num_valid_tokens_ptr,*/ hidden_size, experts_per_token, num_experts_per_node,
-//             quant_params.fp4.fc1.act_global_scale,
-//             static_cast<int64_t*>(expert_first_token_offset_tensor.data_ptr()),
-//             /* fc1_fp4_act_scale_ */ nullptr, /*input_sf*/ nullptr, stream);
-//         break;
-//     case torch::kHalf:
-//         cutlass_kernels::expandInputRowsKernelLauncher<half, half>(static_cast<half const*>(input.const_data_ptr()),
-//             reinterpret_cast<half*>(permuted_data_tensor.data_ptr()), token_topk_unpermuted_scales,
-//             static_cast<float*>(permuted_token_final_scales_tensor.data_ptr()),
-//             static_cast<int const*>(permuted_source_token_ids.const_data_ptr()),
-//             static_cast<int*>(expanded_source_row_to_expanded_dest_row.data_ptr()), num_rows,
-//             /*num_valid_tokens_ptr,*/ hidden_size, experts_per_token, num_experts_per_node,
-//             quant_params.fp4.fc1.act_global_scale,
-//             static_cast<int64_t*>(expert_first_token_offset_tensor.data_ptr()),
-//             /* fc1_fp4_act_scale_ */ nullptr, /*input_sf*/ nullptr, stream);
-//         break;
-//     default:
-//         throw std::invalid_argument(
-//             "Invalid dtype, only supports input tensor with float32, float16 and bfloat16 dtype");
-//         break;
-//     }
-//     return std::make_tuple(
-//         permuted_data_tensor, permuted_token_final_scales_tensor, expanded_source_row_to_expanded_dest_row);
-// }
-
 // TODO: extend the api interface (expanded_dest_row_to_expanded_source_row, expert_first_token_offset_tensor,
 // enable_alltoall)
 // ok: remove num_valid_tokens_ptr
@@ -382,10 +304,6 @@ torch::Tensor run_moe_finalize_scale_op(torch::Tensor const& gemm2_output, torch
 
     auto parallelism_config = cutlass_kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank);
 
-    // bool const needs_num_valid = parallelism_config.ep_size > 1;
-    // int64_t const* num_valid_tokens_ptr = needs_num_valid
-    //     ? static_cast<int64_t const*>(expert_first_token_offset_tensor.const_data_ptr()) + num_experts_per_node
-    //     : nullptr;
     auto final_output = torch::empty({num_rows, hidden_size}, gemm2_output.options());
 
     auto stream = at::cuda::getCurrentCUDAStream(gemm2_output.get_device());
@@ -444,16 +362,10 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "expert_first_token_offset_tensor, SymInt num_rows, SymInt hidden_size, int experts_per_token, int "
         "num_experts_per_node, int tp_size, int tp_rank, int ep_size, int ep_rank)"
         "-> (Tensor)");
-    // m.def(
-    //     "moe_expand_op(Tensor input, Tensor? token_final_scales, Tensor permuted_source_token_ids, int num_rows, "
-    //     "Tensor expert_first_token_offset_tensor, int hidden_size, int experts_per_token, int num_experts_per_node, "
-    //     "int tp_size, int tp_rank, int ep_size, int ep_rank, bool use_fp8_block_scaling)"
-    //     "-> (Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("moe_permute_op", &torch_ext::moe_permute_op);
     m.impl("moe_finalize_scale_op", &torch_ext::run_moe_finalize_scale_op);
-    // m.impl("moe_expand_op", &torch_ext::run_moe_expand_op);
 }
