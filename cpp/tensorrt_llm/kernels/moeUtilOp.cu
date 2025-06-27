@@ -376,22 +376,30 @@ __host__ __device__ constexpr T* safe_inc_ptr(T* ptr, size_t offset)
     return ptr + offset / adjustment;
 }
 
-__host__ __device__ constexpr int64_t getOffsetFlatSFArray(int64_t expert_id, int64_t gemm_n, int64_t gemm_k)
+__host__ __device__ constexpr int64_t getOffsetActivationSF(int64_t expert_id, int64_t token_offset, int64_t gemm_k,
+    cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType scaling_type)
 {
-    auto min_alignment = cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::MinNumRowsAlignmentFP4;
-    int64_t rounded_gemm_n = cute::ceil_div(gemm_n, min_alignment) * min_alignment;
-    assert(gemm_k % cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::BlockScaleVectorSize == 0);
-    return expert_id * rounded_gemm_n * gemm_k
-        / cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::BlockScaleVectorSize;
-}
+    auto function = [=](int64_t min_alignment, int64_t block_size)
+    {
+        // This formulation ensures that sf_offset[i + 1] - sf_offset[i] >= token_offset[i + 1] - token_offset[i].
+        int64_t sf_offset = (token_offset + expert_id * (min_alignment - 1)) / min_alignment * min_alignment;
+        assert(gemm_k % block_size == 0);
+        return sf_offset * gemm_k / block_size;
+    };
+    switch (scaling_type)
+    {
+    case cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX:
+        return function(cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::MinNumRowsAlignmentMXFPX,
+            cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize);
+    case cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4:
+        return function(cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::MinNumRowsAlignmentNVFP4,
+            cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize);
+    case cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE:
+        return 0; // No scaling factors, no offset
+    }
 
-__host__ __device__ constexpr int64_t getOffsetActivationSF(int64_t expert_id, int64_t token_offset, int64_t gemm_k)
-{
-    auto min_alignment = cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::MinNumRowsAlignmentFP4;
-    // This formulation ensures that sf_offset[i + 1] - sf_offset[i] >= token_offset[i + 1] - token_offset[i].
-    int64_t sf_offset = (token_offset + expert_id * (min_alignment - 1)) / min_alignment * min_alignment;
-    assert(gemm_k % cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::BlockScaleVectorSize == 0);
-    return sf_offset * gemm_k / cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::BlockScaleVectorSize;
+    assert(false && "Unrecognized scaling type");
+    return 0;
 }
 
 constexpr static int NVFP4_VEC_SIZE = 16;
@@ -399,9 +407,10 @@ constexpr static int NVFP4_VEC_SIZE = 16;
 template <class GemmOutputType, class ComputeElem>
 __device__ uint32_t quantizePackedFP4Value(ComputeElem& post_act_val, float global_scale_val,
     int64_t num_tokens_before_expert, int64_t expert_id, int64_t token_id, int64_t elem_idx, int64_t num_cols,
-    int64_t max_tokens_per_expert, cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF* act_sf_flat)
+    int64_t max_tokens_per_expert, cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF* act_sf_flat,
+    cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType scaling_type)
 {
-    static constexpr int CVT_FP4_NUM_THREADS_PER_SF = CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD;
+    static constexpr int CVT_FP4_NUM_THREADS_PER_SF = NVFP4_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD;
     // Quantize the input to FP4
     static_assert(std::is_same_v<GemmOutputType, __nv_bfloat16> || std::is_same_v<GemmOutputType, half>);
     static_assert(ComputeElem::kElements == CVT_FP4_ELTS_PER_THREAD);
@@ -413,21 +422,19 @@ __device__ uint32_t quantizePackedFP4Value(ComputeElem& post_act_val, float glob
     }
 
     // We need to offset into the scaling factors for just this expert
-    auto act_sf_expert = act_sf_flat + getOffsetFlatSFArray(expert_id, max_tokens_per_expert, num_cols);
+    auto act_sf_expert
+        = act_sf_flat + getOffsetActivationSF(expert_id, num_tokens_before_expert, num_cols, scaling_type);
 
     // Use `token - num_tokens_before_expert` because we want this to be relative to the start of this expert
-    // auto sf_out
-    //     = cvt_quant_to_fp4_get_sf_out_offset<cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF,
-    //     CVT_FP4_NUM_THREADS_PER_SF>(
-    //         std::nullopt /* batchIdx */, token_id - num_tokens_before_expert, elem_idx, std::nullopt /* numRows */,
-    //         num_cols, act_sf_expert, FP4QuantizationSFLayout::SWIZZLED);
     auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF,
         CVT_FP4_NUM_THREADS_PER_SF, NVFP4_VEC_SIZE>(std::nullopt /* batchIdx */, token_id - num_tokens_before_expert,
         elem_idx, std::nullopt /* numRows */, num_cols, act_sf_expert, FP4QuantizationSFLayout::SWIZZLED);
 
     // Do the conversion and set the output and scaling factor
-    constexpr bool UE8M0 = false;
-    auto res = cvt_warp_fp16_to_fp4<GemmOutputType, UE8M0>(packed_vec, global_scale_val, sf_out);
+    auto func = (scaling_type == cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4)
+        ? &cvt_warp_fp16_to_fp4<GemmOutputType, NVFP4_VEC_SIZE, false>
+        : &cvt_warp_fp16_to_fp4<GemmOutputType, NVFP4_VEC_SIZE, true>;
+    auto res = func(packed_vec, global_scale_val, sf_out);
     return res;
 }
 
@@ -439,7 +446,9 @@ __device__ void writeSF(int64_t num_tokens_before_expert, int64_t expert_id, int
     static constexpr int CVT_FP4_NUM_THREADS_PER_SF = NVFP4_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD;
 
     // We need to offset into the scaling factors for just this expert
-    auto act_sf_expert = act_sf_flat + getOffsetActivationSF(expert_id, num_tokens_before_expert, num_cols);
+    auto act_sf_expert = act_sf_flat
+        + getOffsetActivationSF(expert_id, num_tokens_before_expert, num_cols,
+            cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4);
 
     // Use `token - num_tokens_before_expert` because we want this to be relative to the start of this expert
     auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF,
@@ -638,9 +647,13 @@ __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_inp
                 auto in_vec = source_row_ptr[elem_index];
                 if constexpr (need_fp4_quant)
                 {
+                    // auto res = quantizePackedFP4Value<InputActivationsType, DataElem>(in_vec, global_scale_val,
+                    //     num_tokens_before_expert, expert, expanded_dest_row, elem_index, cols, num_rows,
+                    //     fc1_act_sf_flat);
                     auto res = quantizePackedFP4Value<InputActivationsType, DataElem>(in_vec, global_scale_val,
                         num_tokens_before_expert, expert, expanded_dest_row, elem_index, cols, num_rows,
-                        fc1_act_sf_flat);
+                        fc1_act_sf_flat,
+                        cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4);
                     dest_row_ptr[elem_index] = res;
                 }
                 else
@@ -681,8 +694,7 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
 {
     if (fc1_act_sf_flat)
     {
-        check_cuda_error(
-            cudaMemsetAsync(fc1_act_sf_flat, 0x0, getOffsetFlatSFArray(num_experts_per_node, num_rows, cols), stream));
+        assert(false && "Not supported, we need to keep the same as moe_kerenls.cu in the future (TODO).");
     }
 
     int64_t const blocks = num_rows * k;
