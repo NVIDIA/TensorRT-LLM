@@ -118,6 +118,12 @@ input [
     dims: [ 1 ]
     optional: true
   },
+  {
+    name: "sampling_param_return_perf_metrics"
+    data_type: TYPE_BOOL
+    dims: [ 1 ]
+    optional: true
+  },
   ## Arguments for Controlling Response Output Fields ##
   {
     name: "return_finish_reason"
@@ -159,6 +165,31 @@ output [
   },
   {
     name: "cumulative_logprob"
+    data_type: TYPE_FP32
+    dims: [-1]
+  },
+  {
+    name: "kv_reused_block"
+    data_type: TYPE_INT32
+    dims: [-1]
+  },
+  {
+    name: "kv_missed_block"
+    data_type: TYPE_INT32
+    dims: [-1]
+  },
+  {
+    name: "alloc_new_blocks_per_request"
+    data_type: TYPE_INT32
+    dims: [-1]
+  },
+  {
+    name: "alloc_total_blocks_per_request"
+    data_type: TYPE_INT32
+    dims: [-1]
+  },
+  {
+    name: "per_request_kv_hit_rate"
     data_type: TYPE_FP32
     dims: [-1]
   }

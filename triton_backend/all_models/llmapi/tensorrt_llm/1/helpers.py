@@ -25,7 +25,8 @@ def get_sampling_params_from_request(request, batch_size=1, batch_index=0):
     """
     sampling_params_args = [
         'best_of', 'temperature', 'top_k', 'top_p', 'frequency_penalty',
-        'presence_penalty', 'max_tokens', 'seed', 'exclude_input_from_output'
+        'presence_penalty', 'max_tokens', 'seed', 'exclude_input_from_output',
+        'return_perf_metrics', 
     ]
     param_mappings = {}
     for arg in sampling_params_args:
@@ -33,6 +34,7 @@ def get_sampling_params_from_request(request, batch_size=1, batch_index=0):
     default_values = {
         'sampling_param_best_of': 1,
         'sampling_param_exclude_input_from_output': False,
+        'sampling_param_return_perf_metrics': False,
     }
     kwargs = convert_request_input_to_dict(request, param_mappings,
                                            default_values, batch_size,

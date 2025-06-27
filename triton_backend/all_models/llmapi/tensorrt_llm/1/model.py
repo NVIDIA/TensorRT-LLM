@@ -449,6 +449,74 @@ class TritonPythonModel:
                 response.append(
                     pb_utils.Tensor(output_name,
                                     np.asarray(tensor_data, dtype=np.object_)))
+        
+        if hasattr(request_output.outputs[0], 'request_perf_metrics') and request_output.outputs[0].request_perf_metrics:
+
+            perf_metrics = request_output.outputs[0].request_perf_metrics
+
+            # kv cache perf metrics per request
+            kv_metrics = perf_metrics.kv_cache_metrics
+
+            response.append(
+                pb_utils.Tensor("kv_reused_block",
+                            np.asarray([kv_metrics.num_reused_blocks], dtype=self.output_dtype))
+            )
+            response.append(
+                pb_utils.Tensor("per_request_kv_hit_rate",
+                            np.asarray([kv_metrics.kv_cache_hit_rate], dtype=self.output_dtype))
+            )
+            response.append(
+                pb_utils.Tensor("alloc_new_blocks_per_request",
+                            np.asarray([kv_metrics.num_new_allocated_blocks], dtype=self.output_dtype))
+            )
+            response.append(
+                pb_utils.Tensor("alloc_total_blocks_per_request",
+                            np.asarray([kv_metrics.num_total_allocated_blocks], dtype=self.output_dtype))
+            )
+            response.append(
+                pb_utils.Tensor("kv_missed_block",
+                            np.asarray([kv_metrics.num_missed_blocks], dtype=self.output_dtype))
+            )
+
+            # timing perf metrics per request
+            timing_metrics = perf_metrics.timing_metrics
+            response.append(
+                pb_utils.Tensor("arrival_time_ns",
+                            np.asarray([timing_metrics.arrival_time], dtype=self.output_dtype))
+            )
+
+            response.append(
+                pb_utils.Tensor("first_scheduled_time_ns",
+                            np.asarray([timing_metrics.first_scheduled_time], dtype=self.output_dtype))
+            )
+
+            response.append(
+                pb_utils.Tensor("first_token_time_ns",
+                            np.asarray([timing_metrics.first_token_time], dtype=self.output_dtype))
+            )
+
+            response.append(
+                pb_utils.Tensor("last_token_time_ns",
+                            np.asarray([timing_metrics.last_token_time], dtype=self.output_dtype))
+            )
+
+            #spec dec perf metrics per request
+            spec_dec_metrics = perf_metrics.speculative_decoding
+
+            response.append(
+                pb_utils.Tensor("acceptance_rate",
+                            np.asarray([spec_dec_metrics.acceptance_rate], dtype=self.output_dtype))
+            )
+
+            response.append(
+                pb_utils.Tensor("total_accepted_draft_tokens",
+                            np.asarray([spec_dec_metrics.total_accepted_draft_tokens], dtype=self.output_dtype))
+            )
+
+            response.append(
+                pb_utils.Tensor("total_draft_tokens",
+                            np.asarray([spec_dec_metrics.total_draft_tokens], dtype=self.output_dtype))
+            )
 
         return pb_utils.InferenceResponse(output_tensors=response)
 
