@@ -16,6 +16,7 @@
 import pytest
 import torch
 import tqdm
+from mpi4py.futures import MPIPoolExecutor
 
 
 def pytest_configure(config):
@@ -89,3 +90,15 @@ def torch_empty_cache() -> None:
     """
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+@pytest.fixture(scope="module")
+def mpi_pool_executor() -> MPIPoolExecutor:
+    if torch.cuda.is_available():
+        max_workers = torch.cuda.device_count()
+    else:
+        # should be enough for our tests
+        max_workers = 8
+
+    with MPIPoolExecutor(max_workers=max_workers) as executor:
+        yield executor

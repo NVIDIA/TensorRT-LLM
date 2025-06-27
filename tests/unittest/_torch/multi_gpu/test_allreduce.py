@@ -278,22 +278,22 @@ def run_allreduce_op(x: torch.Tensor, residual: torch.Tensor, hidden_size: int,
                      marks=skip_pre_blackwell),
     ],
 )
-def test_allreduce_fusion_patterns(seq_len, hidden_size, fusion_op):
+def test_allreduce_fusion_patterns(seq_len, hidden_size, fusion_op,
+                                   mpi_pool_executor):
     torch.manual_seed(0)
     dtype = torch.bfloat16
     tensor_parallel_size = 2
     x = torch.randn((seq_len, hidden_size), dtype=dtype)
     residual = torch.randn_like(x)
     linear_weight = torch.randn((hidden_size, hidden_size), dtype=dtype)
-    with MPIPoolExecutor(max_workers=tensor_parallel_size) as executor:
-        results = executor.map(
-            run_single_rank,
-            *zip(*[(tensor_parallel_size, run_allreduce_op, x, residual,
-                    [linear_weight], hidden_size, dtype, fusion_op)] *
-                 tensor_parallel_size),
-        )
-        for r in results:
-            assert r is True
+    results = mpi_pool_executor.map(
+        run_single_rank,
+        *zip(*[(tensor_parallel_size, run_allreduce_op, x, residual,
+                [linear_weight], hidden_size, dtype, fusion_op)] *
+             tensor_parallel_size),
+    )
+    for r in results:
+        assert r is True
 
 
 @torch.inference_mode()
