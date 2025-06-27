@@ -356,9 +356,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         child_request.py_orig_prompt_len = child_request.orig_prompt_len
         child_request.py_max_new_tokens = child_request.max_new_tokens
 
-        # input_toknes are already cloned in create_child_request.
-        child_request.py_tokens = child_request.get_tokens()
-
         # Copy Python-specific configuration from parent
         child_request.py_return_log_probs = self.py_return_log_probs
         child_request.py_return_context_logits = self.py_return_context_logits
