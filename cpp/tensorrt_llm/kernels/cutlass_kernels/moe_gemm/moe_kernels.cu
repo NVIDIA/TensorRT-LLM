@@ -593,17 +593,17 @@ __global__ void blockExpertPrefixSumKernel(int const* token_selected_experts, in
     }
 
     int const has_matched = expanded_token_id >= 0 ? 1 : 0;
-    int indice;
-    BlockScan(temp_storage).ExclusiveSum(has_matched, indice);
+    int index;
+    BlockScan(temp_storage).ExclusiveSum(has_matched, index);
 
     if (has_matched)
     {
-        block_source_token_ids[target_expert_id * num_tokens + block_id * kNumTokensPerBlock + indice]
+        block_source_token_ids[target_expert_id * num_tokens + block_id * kNumTokensPerBlock + index]
             = expanded_token_id;
     }
     if (threadIdx.x == kNumTokensPerBlock - 1)
     {
-        block_expert_counts[target_expert_id * num_blocks_per_seq + block_id] = indice + has_matched;
+        block_expert_counts[target_expert_id * num_blocks_per_seq + block_id] = index + has_matched;
     }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
