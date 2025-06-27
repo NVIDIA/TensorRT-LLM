@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import random
 import subprocess
 from pathlib import Path
 
@@ -66,8 +67,8 @@ def main() -> None:
     modules = map_modules(changed_files, module_paths)
     reviewers = gather_reviewers(modules, module_owners, pr_author=pr_author)
 
-    if reviewer_limit:
-        reviewers = reviewers[:reviewer_limit]
+    if reviewer_limit and len(reviewers) > reviewer_limit:
+        reviewers = random.sample(reviewers, reviewer_limit)
 
     if reviewers:
         cmd = ["gh", "pr", "edit", pr_number]
