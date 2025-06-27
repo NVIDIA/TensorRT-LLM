@@ -95,5 +95,8 @@ def torch_empty_cache() -> None:
 
 @pytest.fixture(scope="module", params=[2, 4, 8])
 def mpi_pool_executor(request):
+    """
+    Start an MPIPoolExecutor with `request.param` workers.
+    """
     with MPIPoolExecutor(request.param) as executor:
         yield executor

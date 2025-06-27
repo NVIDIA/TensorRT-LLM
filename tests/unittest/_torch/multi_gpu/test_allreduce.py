@@ -21,7 +21,6 @@ import cloudpickle
 import pytest
 import torch
 from mpi4py import MPI
-from mpi4py.futures import MPIPoolExecutor
 from utils.util import skip_pre_blackwell
 
 import tensorrt_llm
@@ -430,7 +429,8 @@ def run_moe_allreduce_op(token_input: torch.Tensor, residual: torch.Tensor,
 
 
 @torch.inference_mode()
-def test_moe_allreduce_patterns():
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_moe_allreduce_patterns(mpi_pool_executor):
     torch.manual_seed(42)
 
     seq_len = 16
@@ -452,15 +452,14 @@ def test_moe_allreduce_patterns():
     residual = torch.randn_like(token_input)
 
     l0_weight = torch.randn((hidden_size, hidden_size), dtype=dtype)
-    with MPIPoolExecutor(max_workers=tensor_parallel_size) as executor:
-        results = executor.map(
-            run_moe_single_rank,
-            *zip(*[(tensor_parallel_size, run_moe_allreduce_op, token_input,
-                    residual, active_experts_token_input, scale, l0_weight)] *
-                 tensor_parallel_size),
-        )
-        for r in results:
-            assert r is True
+    results = mpi_pool_executor.map(
+        run_moe_single_rank,
+        *zip(*[(tensor_parallel_size, run_moe_allreduce_op, token_input,
+                residual, active_experts_token_input, scale, l0_weight)] *
+             tensor_parallel_size),
+    )
+    for r in results:
+        assert r is True
 
 
 def run_moe_finalize_single_rank(tensor_parallel_size, single_rank_forward_func,
@@ -548,7 +547,8 @@ def run_moe_finalize_allreduce_op(
 
 
 @torch.inference_mode()
-def test_moe_finalize_allreduce_patterns():
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_moe_finalize_allreduce_patterns(mpi_pool_executor):
     torch.manual_seed(42)
 
     seq_len = 16
@@ -566,13 +566,11 @@ def test_moe_finalize_allreduce_patterns():
                                                  dtype=torch.int32)
     residual = torch.randn_like(shared_expert_output)
 
-    with MPIPoolExecutor(max_workers=tensor_parallel_size) as executor:
-        results = executor.map(
-            run_moe_finalize_single_rank,
-            *zip(*[(tensor_parallel_size, run_moe_finalize_allreduce_op,
-                    fc2_output, residual, shared_expert_output,
-                    expanded_idx_to_permuted_idx, scale)] *
-                 tensor_parallel_size),
-        )
-        for r in results:
-            assert r is True
+    results = mpi_pool_executor.map(
+        run_moe_finalize_single_rank,
+        *zip(*[(tensor_parallel_size, run_moe_finalize_allreduce_op, fc2_output,
+                residual, shared_expert_output, expanded_idx_to_permuted_idx,
+                scale)] * tensor_parallel_size),
+    )
+    for r in results:
+        assert r is True
