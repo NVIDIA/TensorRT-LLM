@@ -103,6 +103,7 @@ def add_llm_args(parser):
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top_k", type=int, default=None)
     parser.add_argument("--top_p", type=float, default=None)
+    parser.add_argument("--n", type=int, default=1)
     parser.add_argument('--load_format', type=str, default='auto')
 
     # Speculative decoding
@@ -185,6 +186,12 @@ def setup_llm(args):
     else:
         spec_config = None
 
+    # TorchSampler needs to set mixed_sampler to True for non-greedy decoding.
+    greedy_decoding = ((args.temperature == 0.0)
+                       or (args.top_k == 1 and
+                           (args.top_p == 0.0 or args.top_p is None)))
+    mixed_sampler = not greedy_decoding and not args.enable_trtllm_sampler
+
     llm = LLM(
         model=args.model_dir,
         backend='pytorch',
@@ -206,6 +213,7 @@ def setup_llm(args):
         if args.use_torch_compile else None,
         moe_backend=args.moe_backend,
         enable_trtllm_sampler=args.enable_trtllm_sampler,
+        mixed_sampler=mixed_sampler,
         max_seq_len=args.max_seq_len,
         max_batch_size=args.max_batch_size,
         max_num_tokens=args.max_num_tokens,
@@ -227,6 +235,7 @@ def setup_llm(args):
         top_p=args.top_p,
         return_context_logits=args.return_context_logits,
         return_generation_logits=args.return_generation_logits,
+        n=args.n,
         logprobs=args.logprobs)
     return llm, sampling_params
 
@@ -240,17 +249,22 @@ def main():
 
     for i, output in enumerate(outputs):
         prompt = output.prompt
-        generated_text = output.outputs[0].text
-        print(f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
 
-        if args.return_context_logits:
-            print(f"[{i}] Context logits: {output.context_logits}")
-        if args.return_generation_logits:
+        for seq_idx, seq_output in enumerate(output.outputs):
+            prefix = f"{i}-{seq_idx}" if len(output.outputs) > 1 else f"{i}"
+            generated_text = seq_output.text
             print(
-                f"[{i}] Generation logits: {output.outputs[0].generation_logits}"
+                f"[{prefix}] Prompt: {prompt!r}, Generated text: {generated_text!r}"
             )
-        if args.logprobs:
-            print(f"[{i}] Logprobs: {output.outputs[0].logprobs}")
+
+            if args.return_context_logits:
+                print(f"[{prefix}] Context logits: {output.context_logits}")
+            if args.return_generation_logits:
+                print(
+                    f"[{prefix}] Generation logits: {seq_output.generation_logits}"
+                )
+            if args.logprobs:
+                print(f"[{prefix}] Logprobs: {seq_output.logprobs}")
 
 
 if __name__ == '__main__':
