@@ -708,10 +708,7 @@ class TRTLLMSampler(Sampler):
         beam_width = self.beam_width(state.scheduled_requests.all_requests)
 
         if beam_width == 1 and self.MAX_DECODING_TOKENS == 1:
-            start_time = time.perf_counter()
             self.update_requests_single_beam_single_step(state)
-            end_time = time.perf_counter()
-            self.update_requests_time.append((end_time - start_time) * 1000)
         else:
             self.update_requests_multiple_beams_or_drafting(state, beam_width)
 
