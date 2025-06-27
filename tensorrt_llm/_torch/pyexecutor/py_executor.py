@@ -1952,6 +1952,8 @@ class PyExecutor:
         for request in self.active_requests:
             req_id = request.py_request_id
             if req_id in self.canceled_req_ids:
+                # Mark requests as finished, then, we reuse all existing code
+                # to clean up the KV cache resources.
                 request.finish_by_reason(FinishReason.CANCELLED)
                 request.decoding_iter = request.py_decoding_iter
                 self.canceled_req_ids.erase(req_id)
