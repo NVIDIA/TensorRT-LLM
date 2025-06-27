@@ -80,7 +80,7 @@ class TestGemma3(unittest.TestCase):
         model_config = ModelConfig(pretrained_config=gemma3_config)
         gemma3 = Gemma3ForCausalLM(model_config).to(device)
 
-        input_ids = torch.tensor([100, 200, 300, 100, 200, 100, 400, 500],
+        input_ids = torch.tensor([100, 200, 300, 400, 500, 600, 700, 800],
                                  dtype=torch.int,
                                  device=device)
 
@@ -238,7 +238,7 @@ class TestGemma3(unittest.TestCase):
             dtype=kv_cache_dtype,
         )
         # context
-        input_ids = torch.tensor([100, 200, 300, 100, 200, 100, 400, 500],
+        input_ids = torch.tensor([100, 200, 300, 400, 500, 600, 700, 800],
                                  dtype=torch.int32,
                                  device=device)
 
@@ -282,7 +282,7 @@ class TestGemma3(unittest.TestCase):
             print("[test_gemma3_allclose_to_hf] mean prefill diff: ", torch.mean(torch.abs(logits - ref.logits[:, -1].float())))
 
         # gen
-        gen_input_ids = torch.tensor([600], dtype=torch.int, device=device)
+        gen_input_ids = torch.tensor([900], dtype=torch.int, device=device)
         num_cached_tokens_per_seq = [input_ids.size(-1)]    # value: 8.
         print("[test_gemma3_allclose_to_hf] num_cached_tokens_per_seq: ", num_cached_tokens_per_seq)
 
