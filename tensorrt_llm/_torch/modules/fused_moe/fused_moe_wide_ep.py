@@ -247,9 +247,6 @@ class WideEPMoE(MoE):
         if mapping.moe_ep_size <= top_k:
             return AlltoallMethodType.NotEnabled
 
-        if MnnvlMemory.supports_mnnvl():
-            return AlltoallMethodType.MNNVL
-
         if os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "0") == "1":
             if deep_ep_installed and dtype == torch.bfloat16:
                 if use_cuda_graph:
@@ -258,6 +255,9 @@ class WideEPMoE(MoE):
                 else:
                     # Here we can choose DeepEP or DeepEPLowLatency if both are available. Now DeepEP is faster.
                     return AlltoallMethodType.DeepEP
+
+        if MnnvlMemory.supports_mnnvl():
+            return AlltoallMethodType.MNNVL
 
         return AlltoallMethodType.NotEnabled
 
