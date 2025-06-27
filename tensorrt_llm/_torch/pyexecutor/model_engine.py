@@ -73,12 +73,14 @@ class ModelEngine(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def forward(self,
-                scheduled_requests: ScheduledRequests,
-                resource_manager: ResourceManager,
-                new_tensors_device: Optional[SampleStateTensors],
-                gather_context_logits: bool = False,
-                cache_indirection_buffer: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        scheduled_requests: ScheduledRequests,
+        resource_manager: ResourceManager,
+        new_tensors_device: Optional[SampleStateTensors],
+        gather_context_logits: bool = False,
+        cache_indirection_buffer: Optional[torch.Tensor] = None,
+    ):
         raise NotImplementedError
 
     def warmup(self, resource_manager: ResourceManager) -> None:
@@ -2031,12 +2033,14 @@ class PyTorchModelEngine(ModelEngine):
 
     @torch.inference_mode()
     @with_model_extra_attrs(lambda self: self.model.extra_attrs)
-    def forward(self,
-                scheduled_requests: ScheduledRequests,
-                resource_manager: ResourceManager,
-                new_tensors_device: Optional[SampleStateTensors] = None,
-                gather_context_logits: bool = False,
-                cache_indirection_buffer: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        scheduled_requests: ScheduledRequests,
+        resource_manager: ResourceManager,
+        new_tensors_device: Optional[SampleStateTensors] = None,
+        gather_context_logits: bool = False,
+        cache_indirection_buffer: Optional[torch.Tensor] = None,
+    ):
 
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)

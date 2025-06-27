@@ -220,6 +220,7 @@ class ADEngine(ModelEngine):
         resource_manager: ResourceManager,
         new_tokens_device: Optional[torch.Tensor] = None,
         gather_context_logits: bool = False,
+        cache_indirection_buffer: Optional[torch.Tensor] = None,
     ):
         """Run forward from scheduled requests; main entrypoint that gets called by the executor."""
         # convert requests and store in sequence info object
