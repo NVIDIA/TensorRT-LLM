@@ -408,7 +408,7 @@ class FP8BMMQuantizationImpl(QuantizationImpl):
 
     @staticmethod
     def target_op():
-        return torch.ops.quant.fp8_bmm
+        return torch.ops.auto_deploy.torch_quant_fp8_bmm
 
     @staticmethod
     def quantize_weight(original_weight: torch.Tensor) -> torch.Tensor:

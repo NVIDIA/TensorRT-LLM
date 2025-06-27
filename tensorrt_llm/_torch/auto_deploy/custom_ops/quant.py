@@ -230,7 +230,7 @@ def is_column_major(tensor):
     return strides[-2] == 1 and strides[-1] == rows
 
 
-@torch.library.custom_op("quant::fp8_bmm", mutates_args=())
+@torch.library.custom_op("auto_deploy::torch_quant_fp8_bmm", mutates_args=())
 def fp8_bmm(
     input: torch.Tensor,
     mat2: torch.Tensor,
@@ -302,12 +302,12 @@ def fp8_bmm_fake(
 
 
 QUANT_LINEAR_OPS = [
-    torch.ops.quant.fp8_linear,
-    torch.ops.quant.fp4_linear,
+    torch.ops.auto_deploy.torch_quant_fp8_linear,
+    torch.ops.auto_deploy.torch_quant_fp4_linear,
 ]
 
 QUANT_BMM_OPS = [
-    torch.ops.quant.fp8_bmm,
+    torch.ops.auto_deploy.torch_quant_fp8_bmm,
 ]
 
 QUANT_OPS = QUANT_LINEAR_OPS + QUANT_BMM_OPS
