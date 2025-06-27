@@ -3627,8 +3627,7 @@ def test_benchmark_core_model(
                          ids=["disableDecoupleMode", "enableDecoupleMode"])
 # TODO: [JIRA-4496] Add batch support in llmapi backend and add tests here.
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["0"])
-# TODO: [JIRA-4040] Add more tensor parallel size
-@pytest.mark.parametrize("TENSOR_PARALLEL_SIZE", ["1"])
+@pytest.mark.parametrize("TENSOR_PARALLEL_SIZE", ["1", "4"])
 def test_llmapi_backend(E2E_MODEL_NAME, DECOUPLED_MODE, TRITON_MAX_BATCH_SIZE,
                         TENSOR_PARALLEL_SIZE,
                         llm_backend_inflight_batcher_llm_root, llm_backend_venv,
@@ -3644,6 +3643,8 @@ def test_llmapi_backend(E2E_MODEL_NAME, DECOUPLED_MODE, TRITON_MAX_BATCH_SIZE,
         model_config = yaml.safe_load(f)
     model_config["triton_config"]["decoupled"] = DECOUPLED_MODE
     model_config["triton_config"]["max_batch_size"] = int(TRITON_MAX_BATCH_SIZE)
+    model_config["tensor_parallel_size"] = int(TENSOR_PARALLEL_SIZE)
+    model_config["kv_cache_config"] = {"free_gpu_memory_fraction": 0.8}
     with open(model_config_path, "w") as f:
         yaml.dump(model_config, f)
 
@@ -3653,12 +3654,14 @@ def test_llmapi_backend(E2E_MODEL_NAME, DECOUPLED_MODE, TRITON_MAX_BATCH_SIZE,
     # Launch Triton Server
     launch_server_py = os.path.join(llm_backend_repo_root, "scripts",
                                     "launch_triton_server.py")
-    print_info(
-        f"DEBUG:: launch_server with args: python3 {launch_server_py} --world_size={TENSOR_PARALLEL_SIZE} --model_repo={new_model_repo} --no-mpi"
-    )
-    check_call(
-        f"python3 {launch_server_py} --world_size={TENSOR_PARALLEL_SIZE} --model_repo={new_model_repo} --no-mpi",
-        shell=True)
+    cmd = f"python3 {launch_server_py} --world_size={TENSOR_PARALLEL_SIZE} --model_repo={new_model_repo}"
+    if TENSOR_PARALLEL_SIZE == "4":
+        cmd += " --trtllm_llmapi_launch"
+        cmd += " --oversubscribe"
+    else:
+        cmd += " --no-mpi"
+    print_info(f"DEBUG:: launch_server with args: {cmd}")
+    check_call(cmd, shell=True)
     check_server_ready()
 
     # Speed up the test by running multiple tests with different configurations sharing the same triton server.
