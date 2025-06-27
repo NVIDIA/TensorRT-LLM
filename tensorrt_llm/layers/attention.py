@@ -20,8 +20,8 @@ import tensorrt as trt
 import torch
 
 from .._common import default_net, precision
-from .._utils import (fp32_array, get_sm_version, int32_array, is_same_dtype,
-                      set_obj_attrs, trt_dtype_to_np, trt_dtype_to_str)
+from .._utils import (fp32_array, int32_array, is_same_dtype, set_obj_attrs,
+                      trt_dtype_to_np, trt_dtype_to_str)
 
 # isort: off
 from ..functional import (
