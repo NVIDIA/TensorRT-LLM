@@ -859,13 +859,11 @@ if __name__ == "__main__":
         for i, op_sub_group in enumerate(value):
             out_file = os.path.join(
                 output_dir, GemmKindNames[gemm_kind], str(arch),
-                f"cutlass_kernel_file_{gemm_kind}_M{m}_BS{block_scale}_Mixed{is_mixed}_group{i}.generated.cu"
+                f"cutlass_kernel_file_{GemmKindNames[gemm_kind]}_sm{arch}_M{m}{'_BS' if block_scale else ''}{'_Mixed' if is_mixed else ''}_group{i}.generated.cu"
             )
             inl_file = [moe_mixed_gemm_inl] if is_mixed else inl_map[key[:2]]
             write_file(inl_file, op_sub_group, out_file)
             file_list.append(out_file)
-
-    print(";".join(file_list))
 
     # Clean up any leftover files from previous runs
     clean_leftover_files(output_dir, set(file_list))

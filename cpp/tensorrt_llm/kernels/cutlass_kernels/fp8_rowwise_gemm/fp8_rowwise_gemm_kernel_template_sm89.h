@@ -112,7 +112,7 @@ struct DeviceGemmFp8RowwiseSm89
             }
             else
             {
-                printf("ERROR : This kernel shall only run on SM90 devices.\n");
+                printf("ERROR : This kernel shall only run on SM89 or SM12x devices.\n");
             }
         }
     };
