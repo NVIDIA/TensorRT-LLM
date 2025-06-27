@@ -1949,14 +1949,11 @@ class PyExecutor:
         if len(self.canceled_req_ids) == 0:
             return
 
-        # Tracks canceled requests for proper handling in overlap mode during `sampler.update_requests`.
-        self.canceled_requests = []
         for request in self.active_requests:
             req_id = request.py_request_id
             if req_id in self.canceled_req_ids:
                 request.finish_by_reason(FinishReason.CANCELLED)
                 request.decoding_iter = request.py_decoding_iter
-                self.canceled_requests.append(request)
                 self.canceled_req_ids.erase(req_id)
 
         # When enable attention dp, each rank does not have full copy of requests
