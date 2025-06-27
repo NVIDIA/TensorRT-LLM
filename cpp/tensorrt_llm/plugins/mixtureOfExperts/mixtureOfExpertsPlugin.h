@@ -44,6 +44,7 @@ using MoeMinLatencyParams = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::MoeMinLatencyPar
 using MOEParallelismConfig = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::MOEParallelismConfig;
 using QuantParams = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::QuantParams;
 using ActivationType = CUTLASS_MOE_GEMM_NAMESPACE::ActivationType;
+using ActivationParams = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::ActivationParams;
 using TmaWarpSpecializedGroupedGemmInput = CUTLASS_MOE_GEMM_NAMESPACE::TmaWarpSpecializedGroupedGemmInput;
 using CUTLASS_MOE_GEMM_NAMESPACE::isGatedActivation;
 
