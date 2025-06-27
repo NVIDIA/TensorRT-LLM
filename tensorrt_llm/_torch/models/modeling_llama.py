@@ -201,9 +201,12 @@ class Llama4Attention(Attention):
                 **kwargs,
             )
         else:
-            return self._forward_nope(position_ids, hidden_states,
-                                      attn_metadata, attention_mask,
-                                      mrope_config, all_reduce_params)
+            return self._forward_nope(position_ids=position_ids,
+                                      hidden_states=hidden_states,
+                                      attn_metadata=attn_metadata,
+                                      attention_mask=attention_mask,
+                                      mrope_config=mrope_config,
+                                      all_reduce_params=all_reduce_params)
 
 
 class LlamaAttention(Attention):

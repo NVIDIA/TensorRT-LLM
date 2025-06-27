@@ -269,6 +269,12 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
             device='cuda',
         )
 
+        # currently Eagle3 only supports linear tree
+        self.is_spec_dec_tree = False
+
+        # currently Eagle3 only supports static tree
+        self.is_spec_dec_dynamic_tree = False
+
     def is_layer_capture(self, layer_id: int):
         return layer_id in self.layers_to_capture
 
@@ -370,6 +376,7 @@ class Eagle3OneModelWorker(nn.Module):
         next_draft_tokens = []
         for i in range(self.max_draft_tokens):
             hidden_states, hidden_states_to_save = draft_model.model(**inputs)
+            attn_metadata.use_spec_decoding = False
             if i == 0:
                 start_ids_gen = (spec_metadata.batch_indices_cuda[:num_gens] *
                                  (self.max_draft_tokens + 1)).long()
@@ -432,6 +439,8 @@ class Eagle3OneModelWorker(nn.Module):
         next_new_tokens = torch.concat([next_new_tokens, next_draft_tokens],
                                        dim=1)
 
+        attn_metadata.use_spec_decoding = True
+
         return {
             'logits': raw_logits,
             'new_tokens': accepted_tokens,
@@ -463,7 +472,6 @@ class Eagle3OneModelWorker(nn.Module):
 
         # Do greedy sampling for the input logits
         target_tokens = torch.argmax(logits, dim=-1)
-
         # context
         accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
 
@@ -476,7 +484,6 @@ class Eagle3OneModelWorker(nn.Module):
         num_accepted_tokens[num_contexts:] += torch.cumprod((
             draft_tokens == gen_target_tokens[:, :self.max_draft_tokens]).int(),
                                                             dim=-1).sum(1)
-
         return accepted_tokens, num_accepted_tokens
 
     def draft_decoder(
