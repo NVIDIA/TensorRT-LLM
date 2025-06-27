@@ -16,8 +16,7 @@ from tensorrt_llm.bindings import (CudaStream, DataType, ModelConfig,
 from tensorrt_llm.bindings.executor import (DecodingConfig, DecodingMode,
                                             ExecutorConfig, FinishReason)
 from tensorrt_llm.bindings.internal.algorithms import CreateNewDecoderRequests
-from tensorrt_llm.bindings.internal.batch_manager import (DecoderBuffers,
-                                                          DecoderInputBuffers)
+from tensorrt_llm.bindings.internal.batch_manager import DecoderInputBuffers
 from tensorrt_llm.bindings.internal.runtime import (BufferManager, DecoderState,
                                                     GptDecoderBatched)
 from tensorrt_llm.executor.result import Logprob
@@ -524,10 +523,6 @@ class TRTLLMSampler(Sampler):
             cuda_stream,
             "buffer_manager":
             buffer_manager,
-            "decoder_buffers":
-            DecoderBuffers(self.max_num_sequences, self.MAX_DECODING_TOKENS,
-                           buffer_manager, self.model_config,
-                           self.world_config),
             "decoder_input_buffers":
             DecoderInputBuffers(self.max_num_sequences,
                                 self.executor_config.max_batch_size,
@@ -616,22 +611,21 @@ class TRTLLMSampler(Sampler):
             num_context_logits[
                 batch_index] = request.context_chunk_size if request.py_return_context_logits else 1
 
-        decoder_buffer_logits, logits_index = self.algs.handle_context_logits(
+        decoder_logits, logits_index = self.algs.handle_context_logits(
             scheduled_requests.context_requests, model_outputs["logits"],
             num_context_logits, self.max_num_sequences)
 
-        decoder_buffer_logits = self.algs.handle_generation_logits(
-            decoder_buffer_logits, scheduled_requests.generation_requests,
+        decoder_logits = self.algs.handle_generation_logits(
+            decoder_logits, scheduled_requests.generation_requests,
             model_outputs["logits"], logits_index)
 
-        self.store["decoder_input_buffers"].logits = decoder_buffer_logits
+        self.store["decoder_input_buffers"].logits = decoder_logits
 
         decoding_input = self.algs.make_decoding_batch_input_output(
             scheduled_requests.context_requests,
             scheduled_requests.generation_requests,
-            self.store["decoder_buffers"], self.store["decoder_input_buffers"],
-            self.store["decoder_state"], self.model_config,
-            self.max_num_sequences)
+            self.store["decoder_input_buffers"], self.store["decoder_state"],
+            self.model_config, self.max_num_sequences)
 
         self.algs.decoder.forward_async(self.store["decoder_state"],
                                         decoding_input)
