@@ -377,10 +377,10 @@ __global__ void fusedBuildExpertMapsSortFirstTokenKernel(int const* const token_
 #pragma unroll
         for (int i = 0; i < EXPERTS_PER_TOKEN; i++)
         {
-            int const source_token_id = i * num_tokens + token;
-            int const dest_token_id = local_token_permuted_indices[i];
-            permuted_row_to_unpermuted_row[dest_token_id] = source_token_id;
-            unpermuted_row_to_permuted_row[source_token_id] = dest_token_id;
+            int const unpermuted_row = i * num_tokens + token;
+            int const permuted_row = local_token_permuted_indices[i];
+            permuted_row_to_unpermuted_row[permuted_row] = unpermuted_row;
+            unpermuted_row_to_permuted_row[unpermuted_row] = permuted_row;
         }
     }
 
@@ -819,11 +819,11 @@ __global__ void mergeExpertPrefixSumKernel(int const* blocked_expert_counts, int
     int const offset = blocked_expert_counts_cumsum[target_expert_id * num_blocks_per_seq + block_id];
     if (threadIdx.x < cnt)
     {
-        int const source_token_id = blocked_row_to_unpermuted_row[target_expert_id * num_tokens + token_id];
-        int const dest_token_id = offset + threadIdx.x;
-        permuted_row_to_unpermuted_row[dest_token_id] = source_token_id;
-        permuted_token_selected_experts[dest_token_id] = target_expert_id;
-        unpermuted_row_to_permuted_row[source_token_id] = dest_token_id;
+        int const unpermuted_row = blocked_row_to_unpermuted_row[target_expert_id * num_tokens + token_id];
+        int const permuted_row = offset + threadIdx.x;
+        permuted_row_to_unpermuted_row[permuted_row] = unpermuted_row;
+        permuted_token_selected_experts[permuted_row] = target_expert_id;
+        unpermuted_row_to_permuted_row[unpermuted_row] = permuted_row;
     }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -1453,9 +1453,9 @@ __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_inp
 
     int64_t const num_valid_tokens = expert_first_token_offset[num_experts_per_node];
 
-    for (int64_t expanded_dest_row = blockIdx.x; expanded_dest_row < num_valid_tokens; expanded_dest_row += gridDim.x)
+    for (int64_t permuted_row = blockIdx.x; permuted_row < num_valid_tokens; permuted_row += gridDim.x)
     {
-        int64_t const expanded_source_row = permuted_row_to_unpermuted_row[expanded_dest_row];
+        int64_t const unpermuted_row = permuted_row_to_unpermuted_row[permuted_row];
 
         // Load 128-bits per thread
         constexpr int64_t ELEM_PER_THREAD
@@ -1466,14 +1466,13 @@ __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_inp
         using OutputElem = std::conditional_t<is_fp4, uint32_t, DataElem>;
 
         // Duplicate and permute rows
-        int64_t const source_k_rank = expanded_source_row / num_rows;
-        int64_t const source_row = expanded_source_row % num_rows;
+        int64_t const source_k_rank = unpermuted_row / num_rows;
+        int64_t const source_row = unpermuted_row % num_rows;
 
         auto const* source_row_ptr
             = reinterpret_cast<DataElem const*>(unpermuted_input + source_row * cols / ELEM_PER_BYTE);
         // Cast first to handle when this is FP4
-        auto* dest_row_ptr
-            = reinterpret_cast<OutputElem*>(permuted_output) + expanded_dest_row * cols / ELEM_PER_THREAD;
+        auto* dest_row_ptr = reinterpret_cast<OutputElem*>(permuted_output) + permuted_row * cols / ELEM_PER_THREAD;
 
         int64_t const start_offset = threadIdx.x;
         int64_t const stride = EXPAND_THREADS_PER_BLOCK;
@@ -1483,7 +1482,7 @@ __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_inp
         if constexpr (is_fp4)
         {
             int64_t expert = findTotalEltsLessThanTarget(
-                                 expert_first_token_offset, num_experts_per_node, (int64_t) expanded_dest_row + 1)
+                                 expert_first_token_offset, num_experts_per_node, (int64_t) permuted_row + 1)
                 - 1;
             size_t act_scale_idx = use_per_expert_act_scale ? expert : 0;
             float global_scale_val = fc1_act_global_scale ? fc1_act_global_scale[act_scale_idx] : 1.0f;
@@ -1495,14 +1494,14 @@ __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_inp
                 if constexpr (need_fp4_quant)
                 {
                     auto res = quantizePackedFP4Value<InputActivationsType, DataElem>(in_vec, global_scale_val,
-                        num_tokens_before_expert, expert, expanded_dest_row, elem_index, cols, num_rows,
-                        fc1_act_sf_flat, TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4);
+                        num_tokens_before_expert, expert, permuted_row, elem_index, cols, num_rows, fc1_act_sf_flat,
+                        TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4);
                     dest_row_ptr[elem_index] = res;
                 }
                 else
                 {
                     assert(act_scale_idx == 0 && "Cannot use per-expert act scale for pre-quantized activations");
-                    writeSF(num_tokens_before_expert, expert, source_row, expanded_dest_row, elem_index, cols, num_rows,
+                    writeSF(num_tokens_before_expert, expert, source_row, permuted_row, elem_index, cols, num_rows,
                         fc1_act_sf_flat, input_sf);
                     dest_row_ptr[elem_index] = in_vec;
                 }
@@ -1519,7 +1518,7 @@ __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_inp
         if (permuted_scales && threadIdx.x == 0)
         {
             int64_t const source_k_idx = source_row * k + source_k_rank;
-            permuted_scales[expanded_dest_row] = unpermuted_scales ? unpermuted_scales[source_k_idx] : 1.0f;
+            permuted_scales[permuted_row] = unpermuted_scales ? unpermuted_scales[source_k_idx] : 1.0f;
         }
     }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -1677,11 +1676,11 @@ __global__ void finalizeMoeRoutingNoFillingKernel(GemmOutputType const* expanded
     for (int64_t expanded_permuted_row = blockIdx.x; expanded_permuted_row < num_valid_tokens;
          expanded_permuted_row += gridDim.x)
     {
-        int64_t expanded_source_row = permuted_row_to_unpermuted_row[expanded_permuted_row];
+        int64_t unpermuted_row = permuted_row_to_unpermuted_row[expanded_permuted_row];
 
         // Duplicate and permute rows
-        int64_t const source_k_rank = expanded_source_row / num_rows;
-        int64_t const source_row = expanded_source_row % num_rows;
+        int64_t const source_k_rank = unpermuted_row / num_rows;
+        int64_t const source_row = unpermuted_row % num_rows;
 
         // If the expert is the first selected (valid) one of the corresponding token on the current EP rank, do
         // reduction; otherwise, skip.

@@ -2225,12 +2225,12 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
                         if (expert_idx < num_experts)
 #endif
                         {
-                            int64_t source_location = k_idx * num_tokens + token_idx;
-                            int64_t dest_location = host_expert_first_token_offset_size[expert_idx]
+                            int64_t unpermuted_row = k_idx * num_tokens + token_idx;
+                            int64_t permuted_row = host_expert_first_token_offset_size[expert_idx]
                                 + calculated_routing_values[expert_idx];
 
-                            ASSERT_EQ(host_unpermuted_row_to_permuted_row_map[source_location], dest_location);
-                            ASSERT_EQ(host_permuted_row_to_unpermuted_row_map[dest_location], source_location);
+                            ASSERT_EQ(host_unpermuted_row_to_permuted_row_map[unpermuted_row], permuted_row);
+                            ASSERT_EQ(host_permuted_row_to_unpermuted_row_map[permuted_row], unpermuted_row);
 
                             calculated_routing_values[expert_idx]++;
                         }
