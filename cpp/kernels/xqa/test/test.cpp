@@ -678,7 +678,6 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
     }
     if (isTracing)
     {
-        runKernel();
         printf("Tracing is enabled\n");
     }
     checkCuda(cudaEventRecord(tic, stream));

@@ -16,6 +16,7 @@
  */
 
 #include "moeBindings.h"
+#include "tensorrt_llm/runtime/moeLoadBalancer/hostAccessibleDeviceAllocator.h"
 #include "tensorrt_llm/runtime/moeLoadBalancer/moeLoadBalancer.h"
 #include <pybind11/functional.h>
 #include <pybind11/numpy.h>
@@ -110,6 +111,9 @@ void initMoeBindings(pybind11::module_& m)
             py::arg("enable_update_weights"), "Start a new iteration with the given ID and settings")
         .def("end_iter", &tr::MoeLoadBalancer::endIter, py::arg("iter_id"), "End the iteration with the given ID")
         .def("shutdown", &tr::MoeLoadBalancer::shutdown, "Shutdown the load balancer and clean up resources");
+
+    m.def("is_host_accessible_device_memory_supported", &tr::HostAccessibleDeviceAllocator::isSupported,
+        "If current system support host accessible device memory");
 
     // Bind do_replication function for testing
     m.def("do_replication", &pyDoReplication, py::arg("meta_info"), py::arg("expert_load_factor"),
