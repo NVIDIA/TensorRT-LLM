@@ -256,9 +256,9 @@ public:
             constexpr int SF_VEC_SIZE = 16;
             using PackedVec = PackedVec<DType>;
             PackedVec pack_val = *reinterpret_cast<PackedVec const*>(&val);
-            auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2, SF_VEC_SIZE>(std::nullopt, token_id,
-                m_access_id_in_token, std::nullopt, m_params.hidden_dim,
-                reinterpret_cast<uint32_t*>(m_params.scale_out), m_params.layout);
+            auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, 2>(std::nullopt, token_id, m_access_id_in_token,
+                std::nullopt, m_params.hidden_dim / SF_VEC_SIZE, reinterpret_cast<uint32_t*>(m_params.scale_out),
+                m_params.layout);
             reinterpret_cast<uint32_t*>(m_params.quant_out)[m_access_id]
                 = cvt_warp_fp16_to_fp4<DType, SF_VEC_SIZE, false>(pack_val, m_scale_factor, sf_out);
         }

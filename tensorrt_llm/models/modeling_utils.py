@@ -1817,7 +1817,7 @@ def preprocess_perlayer_weights(weights,
                 weights[new_name] = weights[name]
                 weights[
                     new_name +
-                    "_interleaved"] = torch.ops.trtllm.nvfp4_block_scale_interleave(
+                    "_interleaved"] = torch.ops.trtllm.block_scale_interleave(
                         weights[name].view(fp4_utils.float4_sf_dtype).cpu(
                         ).contiguous()).reshape(nrows, ncols).view(
                             fp4_utils.float4_sf_dtype)

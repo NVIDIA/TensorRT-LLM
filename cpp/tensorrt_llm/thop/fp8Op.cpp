@@ -239,13 +239,12 @@ std::tuple<Tensor, Tensor> quantize_mxe4m3_host(Tensor x_fp32, bool is_sf_swizzl
     Tensor fp8_tensor = at::detail::empty_cpu(
         {num_tokens, hidden_dim}, at::ScalarType::Byte, /* pinned */ true, at::MemoryFormat::Contiguous);
     int64_t sf_size = is_sf_swizzled_layout
-        ? tensorrt_llm::computeFP4SwizzledLayoutSFSize(num_tokens, hidden_dim / sf_vec_size)
-        : tensorrt_llm::computeFP4LinearLayoutSFSize(num_tokens, hidden_dim / sf_vec_size);
+        ? tensorrt_llm::computeSwizzledLayoutSFSize(num_tokens, hidden_dim / sf_vec_size)
+        : tensorrt_llm::computeLinearLayoutSFSize(num_tokens, hidden_dim / sf_vec_size);
     Tensor scale_tensor = at::detail::empty_cpu({sf_size}, SF_DTYPE, /* pinned */ true, at::MemoryFormat::Contiguous);
 
-    tensorrt_llm::FP4QuantizationSFLayout layout = is_sf_swizzled_layout
-        ? tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED
-        : tensorrt_llm::FP4QuantizationSFLayout::LINEAR;
+    tensorrt_llm::QuantizationSFLayout layout = is_sf_swizzled_layout ? tensorrt_llm::QuantizationSFLayout::SWIZZLED
+                                                                      : tensorrt_llm::QuantizationSFLayout::LINEAR;
 
     for (size_t ti = 0; ti < static_cast<size_t>(data_shape[0]); ++ti)
     {
@@ -296,9 +295,8 @@ Tensor dequantize_mxe4m3_host(Tensor value_e4m3, Tensor scale_ue8m08sf, bool is_
     int hidden_dim = data_shape[1];
     int groups_per_hidden_dim = hidden_dim / sf_vec_size;
 
-    tensorrt_llm::FP4QuantizationSFLayout layout = is_sf_swizzled_layout
-        ? tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED
-        : tensorrt_llm::FP4QuantizationSFLayout::LINEAR;
+    tensorrt_llm::QuantizationSFLayout layout = is_sf_swizzled_layout ? tensorrt_llm::QuantizationSFLayout::SWIZZLED
+                                                                      : tensorrt_llm::QuantizationSFLayout::LINEAR;
     for (size_t ti = 0; ti < static_cast<size_t>(data_shape[0]); ++ti)
     {
         for (int group = 0; group < groups_per_hidden_dim; ++group)

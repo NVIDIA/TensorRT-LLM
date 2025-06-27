@@ -172,8 +172,8 @@ def test_fp4_sf_interleave(b, m, k):
     w_cuda = w.cuda()
 
     # The cpu and cuda kernels are different
-    w_out_cpu = torch.ops.trtllm.nvfp4_block_scale_interleave(w)
-    w_out_cuda = torch.ops.trtllm.nvfp4_block_scale_interleave(w_cuda)
+    w_out_cpu = torch.ops.trtllm.block_scale_interleave(w)
+    w_out_cuda = torch.ops.trtllm.block_scale_interleave(w_cuda)
     torch.cuda.synchronize()
 
     torch.testing.assert_allclose(w_out_cpu.cuda(), w_out_cuda)

@@ -70,8 +70,8 @@ class TestFunctional(unittest.TestCase):
         mat_b[0][0] = 36
         mat_b_ref[0][0] = 2.0
 
-        a_block_sf = torch.ops.trtllm.nvfp4_block_scale_interleave(a_block_sf)
-        b_block_sf = torch.ops.trtllm.nvfp4_block_scale_interleave(b_block_sf)
+        a_block_sf = torch.ops.trtllm.block_scale_interleave(a_block_sf)
+        b_block_sf = torch.ops.trtllm.block_scale_interleave(b_block_sf)
 
         c = (torch.ops.trtllm.w4a8_mxfp4_fp8_gemm(mat_a, mat_b, a_block_sf,
                                                   b_block_sf, a_sf,

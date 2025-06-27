@@ -977,7 +977,7 @@ def run_single_rank_ub_pass_fp4(
 
         def block_scale_unswizzled(scale):
             sz = fp4_utils.pad_up(hidden_size, 128)
-            return torch.ops.trtllm.nvfp4_block_scale_interleave_reverse(
+            return torch.ops.trtllm.block_scale_interleave_reverse(
                 scale.cpu().view(sz, -1))[0:hidden_size]
 
         l0_weight_scale_block_unswizzled = block_scale_unswizzled(

@@ -137,7 +137,7 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::Tensor const& routing_l
 
     int32_t const sf_block_size = 32;
     int64_t sf_size
-        = tensorrt_llm::computeFP4SwizzledLayoutSFSize(max_num_padded_tokens, intermediate_size / sf_block_size);
+        = tensorrt_llm::computeSwizzledLayoutSFSize(max_num_padded_tokens, intermediate_size / sf_block_size);
     // allocate workspace for activation/gemm/finalize kernels
     auto const gemm1_output_type
         = dtype == btg::Dtype::MxE4m3 ? at::ScalarType::Float8_e4m3fn : at::ScalarType::BFloat16;
@@ -169,7 +169,7 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::Tensor const& routing_l
         TORCH_CHECK(!hidden_states_scale.has_value(), "hidden_states_scale must not be provided for Bfloat16.");
     }
     auto const hidden_states_scale_linear_size
-        = tensorrt_llm::computeFP4LinearLayoutSFSize(args.num_tokens, args.hidden_size / sf_block_size);
+        = tensorrt_llm::computeLinearLayoutSFSize(args.num_tokens, args.hidden_size / sf_block_size);
     at::Tensor hidden_states_scale_linear
         = at::detail::empty_cuda(hidden_states_scale_linear_size, SF_DTYPE, hidden_states.device(), std::nullopt);
 
@@ -209,7 +209,7 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::Tensor const& routing_l
 
         TORCH_CHECK(hidden_states_scale->dim() == 1, "hidden_states_scale must be 1D.");
         TORCH_CHECK(hidden_states_scale->sizes()[0]
-                == tensorrt_llm::computeFP4LinearLayoutSFSize(args.num_tokens, args.hidden_size / sf_block_size),
+                == tensorrt_llm::computeLinearLayoutSFSize(args.num_tokens, args.hidden_size / sf_block_size),
             "hidden_states_scale has incorrect size");
     }
 

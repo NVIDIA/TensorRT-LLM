@@ -120,9 +120,8 @@ struct FP4Converter<TIn, UE8M0_SF, std::enable_if_t<std::is_same_v<TIn, half> ||
             SFValue = static_cast<float>(tmp);
         }
 
-        auto SFOffset
-            = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, NUM_THREADS_PER_SF, SF_VEC_SIZE>(std::nullopt /* batchIdx */,
-                rowIdx, colIdx, std::nullopt /* numRows */, numCols, SFout, FP4QuantizationSFLayout::SWIZZLED);
+        auto SFOffset = cvt_quant_get_sf_out_offset<uint32_t, NUM_THREADS_PER_SF>(std::nullopt /* batchIdx */, rowIdx,
+            colIdx, std::nullopt /* numRows */, numCols / SF_VEC_SIZE, SFout, QuantizationSFLayout::SWIZZLED);
         *SFOffset = fp8SFVal;
         // Get the output scale.
         // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal))) * reciprocal(SFScaleVal))
@@ -234,9 +233,8 @@ struct FP4Converter<float, UE8M0_SF>
             SFValue = static_cast<float>(tmp);
         }
 
-        auto SFOffset
-            = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, NUM_THREADS_PER_SF, SF_VEC_SIZE>(std::nullopt /* batchIdx */,
-                rowIdx, colIdx, std::nullopt /* numRows */, numCols, SFout, FP4QuantizationSFLayout::SWIZZLED);
+        auto SFOffset = cvt_quant_get_sf_out_offset<uint32_t, NUM_THREADS_PER_SF>(std::nullopt /* batchIdx */, rowIdx,
+            colIdx, std::nullopt /* numRows */, numCols / SF_VEC_SIZE, SFout, QuantizationSFLayout::SWIZZLED);
         float outputScale = reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal));
 
         // Convert the input to float.

@@ -762,7 +762,7 @@ class NVFP4LinearMethod(LinearMethodBase):
         assert len(weights) == 1
         weight_scale = weight_scale[0]
         # Swizzle weight scale
-        weight_scale = torch.ops.trtllm.nvfp4_block_scale_interleave(
+        weight_scale = torch.ops.trtllm.block_scale_interleave(
             weight_scale)
 
         copy_weight(module.input_scale, input_scale)
@@ -783,7 +783,7 @@ class NVFP4LinearMethod(LinearMethodBase):
             tp_mode=module.tp_mode)
         # Swizzle weight scales after concatenation
         weight_scale = torch.cat(weight_scales, 0)
-        weight_scale = torch.ops.trtllm.nvfp4_block_scale_interleave(
+        weight_scale = torch.ops.trtllm.block_scale_interleave(
             weight_scale)
         copy_weight(module.input_scale, input_scale)
         copy_weight(module.weight_scale, weight_scale)
@@ -806,7 +806,7 @@ class NVFP4LinearMethod(LinearMethodBase):
             tp_mode=module.tp_mode)
         # Swizzle weight scales after concatenation
         weight_scale = torch.cat(weight_scales, 0)
-        weight_scale = torch.ops.trtllm.nvfp4_block_scale_interleave(
+        weight_scale = torch.ops.trtllm.block_scale_interleave(
             weight_scale)
         copy_weight(module.input_scale, input_scale)
         copy_weight(module.weight_scale, weight_scale)
@@ -890,7 +890,7 @@ class W4A8MXFP4FP8LinearMethod(LinearMethodBase):
         assert len(weights) == 1
         weight_scale = weight_scale[0]
         # Swizzle weight scale
-        weight_scale = torch.ops.trtllm.nvfp4_block_scale_interleave(
+        weight_scale = torch.ops.trtllm.block_scale_interleave(
             weight_scale)
         copy_weight(module.weight_scale, weight_scale)
 
@@ -906,7 +906,7 @@ class W4A8MXFP4FP8LinearMethod(LinearMethodBase):
                                                tp_rank=module.tp_rank,
                                                tp_mode=module.tp_mode)
         weight_scale = torch.cat(weight_scale, 0)
-        weight_scale = torch.ops.trtllm.nvfp4_block_scale_interleave(
+        weight_scale = torch.ops.trtllm.block_scale_interleave(
             weight_scale)
         copy_weight(module.weight_scale, weight_scale)
 
@@ -923,7 +923,7 @@ class W4A8MXFP4FP8LinearMethod(LinearMethodBase):
                                                tp_mode=module.tp_mode)
         # Swizzle weight scales after concatenation
         weight_scale = torch.cat(weight_scale, 0)
-        weight_scale = torch.ops.trtllm.nvfp4_block_scale_interleave(
+        weight_scale = torch.ops.trtllm.block_scale_interleave(
             weight_scale)
         copy_weight(module.weight_scale, weight_scale)
 

@@ -39,7 +39,7 @@ def test_fp4_linear(dtype):
     assert l_fp4.weight_scale.dtype == fp4_utils.float4_sf_dtype
 
     w_sf_block_unswizzled = (
-        torch.ops.trtllm.nvfp4_block_scale_interleave_reverse(
+        torch.ops.trtllm.block_scale_interleave_reverse(
             w_sf_block.cpu().view(HIDDEN_SIZE, -1)))
 
     l_fp4.load_weights([{
