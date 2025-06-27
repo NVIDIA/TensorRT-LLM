@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
 from typing import Optional
 
+from tensorrt_llm.bindings.executor import IterationStats
+
 from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.scheduler import ScheduledRequests
 
@@ -17,6 +19,7 @@ class Drafter(ABC):
     def prepare_draft_tokens(
         self,
         scheduled_requests: ScheduledRequests,
+        iter_stats: IterationStats = None,
     ) -> None:
         """
         Prepare the drafter tokens for the forward computation this step.
