@@ -224,6 +224,11 @@ def fp4_linear_fake(
     return torch.ops.aten.linear(input, weight_fp4.repeat(1, 2).to(input.dtype), bias)
 
 
+def is_column_major(tensor):
+    rows, _ = tensor.shape[-2:]
+    strides = tensor.stride()
+    return strides[-2] == 1 and strides[-1] == rows
+
 
 @torch.library.custom_op("quant::fp8_bmm", mutates_args=())
 def fp8_bmm(
