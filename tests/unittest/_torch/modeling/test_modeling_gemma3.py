@@ -16,8 +16,6 @@ from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_gemma3 import Gemma3ForCausalLM
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
-    DecodingCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -64,10 +62,9 @@ GEMMA3_1B_SINGLE_LAYER_CONFIG = {
 @dataclass(repr=False)
 class Scenario:
     backend: str
-    use_cuda_graph: bool = False
 
     def __repr__(self) -> str:
-        return f"backend:{self.backend.lower()}-use_cuda_graph:{self.use_cuda_graph}"
+        return f"backend:{self.backend.lower()}"
 
 
 class TestGemma3(unittest.TestCase):
@@ -111,8 +108,11 @@ class TestGemma3(unittest.TestCase):
             raise ValueError("Invalid dtype")
 
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
-        kv_cache_config = KvCacheConfig(max_tokens=num_blocks *
-                                        tokens_per_block)
+        # @B: Should we mention max_attention_window in the config?
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        enable_partial_reuse=False,
+                                        copy_on_partial_reuse=False,
+                                        max_tokens=num_blocks * tokens_per_block)
         kv_cache_manager = KVCacheManager(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
@@ -173,7 +173,7 @@ class TestGemma3(unittest.TestCase):
 
     @parameterized.expand([
         Scenario(backend="TRTLLM"),
-        # Scenario(backend="TRTLLM", use_cuda_graph=True),
+        Scenario(backend="VANILLA"),
     ], lambda testcase_func, param_num, param:
                           f"{testcase_func.__name__}[{param.args[0]}]")
     @torch.no_grad()
@@ -200,11 +200,17 @@ class TestGemma3(unittest.TestCase):
 
         num_blocks = 1
         tokens_per_block = 128
-        head_dim = gemma3.config.hidden_size // gemma3.config.num_attention_heads
+        head_dim = gemma3.config.head_dim
         num_layers = gemma3.config.num_hidden_layers
         num_kv_heads = gemma3.config.num_key_value_heads
         max_seq_len = num_blocks * tokens_per_block
         batch_size = 1
+
+        # #############################################################################
+        # assert head_dim == 256, "Expected head_dim to be 256 for gemma3-1b-it, got {}".format(head_dim)
+        # assert num_kv_heads == 1, "Expected num_kv_heads to be 1 for gemma3-1b-it, got {}".format(num_kv_heads)
+        # assert num_layers == 26, "Expected num_layers to be 26 for gemma3-1b-it, got {}".format(num_layers)
+        # #############################################################################
 
         if dtype == torch.half:
             kv_cache_dtype = tensorrt_llm.bindings.DataType.HALF
@@ -214,8 +220,11 @@ class TestGemma3(unittest.TestCase):
             raise ValueError("Invalid dtype")
 
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
-        kv_cache_config = KvCacheConfig(max_tokens=num_blocks *
-                                        tokens_per_block)
+        # @B: Should we mention max_attention_window in the config?
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        enable_partial_reuse=False,
+                                        copy_on_partial_reuse=False,
+                                        max_tokens=num_blocks * tokens_per_block)
         kv_cache_manager = KVCacheManager(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
@@ -256,6 +265,7 @@ class TestGemma3(unittest.TestCase):
         # decoding only.
         position_ids = [torch.arange(0, input_ids.size(-1), dtype=torch.int32)]
         position_ids = torch.cat(position_ids).unsqueeze(0).cuda()
+
         with torch.inference_mode():
             attn_metadata.prepare()
             logits = gemma3.forward(input_ids=input_ids,

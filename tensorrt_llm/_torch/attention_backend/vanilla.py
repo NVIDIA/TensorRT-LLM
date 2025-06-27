@@ -1,4 +1,5 @@
 from typing import Optional
+import math
 
 import torch
 import torch.nn.functional as F
@@ -66,11 +67,13 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         head_dim: int,
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
+        q_scaling: Optional[float] = None,
         **kwargs,
     ):
-        super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
-                         quant_config, **kwargs)
+        super().__init__(layer_idx, num_heads, head_dim, num_kv_heads=num_kv_heads,
+                         quant_config=quant_config, **kwargs)
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
+        self.q_scaling = q_scaling
 
     def _single_request_update_kv_cache(self, k, v, kv_cache_tensor, seq_len,
                                         cache_idx, cache_position):
@@ -140,12 +143,16 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         else:
             raise ValueError("Unexpected attention mask type")
 
+        qk_scale = None
+        if self.q_scaling is not None:
+            qk_scale = 1 / (math.sqrt(self.head_dim) * self.q_scaling)
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             q,
             key_states,
             value_states,
             is_causal=is_causal,
             attn_mask=attn_mask,
+            scale=qk_scale,
         )
 
         attn_output = attn_output.squeeze(0)
