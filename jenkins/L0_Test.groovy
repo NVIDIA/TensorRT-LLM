@@ -2241,6 +2241,10 @@ pipeline {
             steps
             {
                 script {
+                    if (env.JOB_NAME ==~ /.*Multi-GPU.*/) {
+                        echo "This check is not needed for multi-GPU tests."
+                        return
+                    }
                     launchTestListCheck(this)
                 }
             }
@@ -2254,10 +2258,32 @@ pipeline {
                     dgxJobs = [:]
 
                     def testPhase2StageName = env.testPhase2StageName
-                    if (testPhase2StageName) {
+                    if (testPhase2StageName || env.JOB_NAME ==~ /.*Multi-GPU.*/ || env.JOB_NAME ==~ /.*Single-GPU.*/) {
                         def dgxSigns = ["DGX_H100", "DGX_H200", "GB200", "DGX_B200"]
                         singleGpuJobs = parallelJobs.findAll{!dgxSigns.any{sign -> it.key.contains(sign)}}
                         dgxJobs = parallelJobs.findAll{dgxSigns.any{sign -> it.key.contains(sign)}}
+                    }
+
+                    if (env.JOB_NAME ==~ /.*Single-GPU.*/) {
+                        echo "Only run single-GPU tests."
+                        singleGpuJobs.failFast = params.enableFailFast
+                        parallel singleGpuJobs
+                        if (dgxJobs.size() == 0) {
+                            echo "Skip multi-GPU testing. No test to run."
+                            return
+                        }
+                        if (globalVars[ACTION_INFO]['parents'].size() == 0) {
+                            error "No parent job to run multi-GPU tests."
+                        }
+                        def parentJob = globalVars[ACTION_INFO]['parents'][-2]
+                        trtllm_utils.appendBuildDescription(this, parentJob['name'], parentJob['build_number'], "Will run multi-GPU tests:")
+                        return
+                    }
+                    if (env.JOB_NAME ==~ /.*Multi-GPU.*/) {
+                        echo "Only run multi-GPU tests."
+                        dgxJobs.failFast = params.enableFailFast
+                        parallel dgxJobs
+                        return
                     }
 
                     if (singleGpuJobs.size() > 0) {
