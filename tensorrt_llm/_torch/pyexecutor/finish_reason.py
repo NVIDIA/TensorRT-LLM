@@ -1,13 +1,6 @@
 from tensorrt_llm.bindings.executor import FinishReason
 
 
-class PyFinishReason:
-    END_ID = 0
-    STOP_WORDS = 1
-    LENGTH = 2
-    NOT_FINISHED = 3
-
-
 class FinishedState:
     # State flags
     FINISHED_EOS = 1 << 0
@@ -86,15 +79,6 @@ class FinishedState:
         if self.is_finished_max_length:
             return FinishReason.LENGTH
         return FinishReason.NOT_FINISHED
-
-    def to_py_finish_reason(self):
-        if self.is_finished_eos:
-            return PyFinishReason.END_ID
-        if self.is_finished_stop_words:
-            return PyFinishReason.STOP_WORDS
-        if self.is_finished_max_length:
-            return PyFinishReason.LENGTH
-        return PyFinishReason.NOT_FINISHED
 
     def to_underlying(self):
         return self._state
