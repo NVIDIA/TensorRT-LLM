@@ -285,7 +285,7 @@ def test_allreduce_fusion_patterns(seq_len, hidden_size, fusion_op,
                                    mpi_pool_executor):
     torch.manual_seed(0)
     dtype = torch.bfloat16
-    tensor_parallel_size = 2
+    tensor_parallel_size = mpi_pool_executor.num_workers
     x = torch.randn((seq_len, hidden_size), dtype=dtype)
     residual = torch.randn_like(x)
     linear_weight = torch.randn((hidden_size, hidden_size), dtype=dtype)
@@ -436,7 +436,7 @@ def test_moe_allreduce_patterns(mpi_pool_executor):
     seq_len = 16
     hidden_size = 7168
     dtype = torch.bfloat16
-    tensor_parallel_size = 2
+    tensor_parallel_size = mpi_pool_executor.num_workers
     num_global_experts = 4
 
     # [num_token, 7168]
@@ -554,7 +554,7 @@ def test_moe_finalize_allreduce_patterns(mpi_pool_executor):
     seq_len = 16
     hidden_size = 7168
     dtype = torch.bfloat16
-    tensor_parallel_size = 2
+    tensor_parallel_size = mpi_pool_executor.num_workers
     top_k = 8
 
     shared_expert_output = torch.randn((seq_len, hidden_size), dtype=dtype)
