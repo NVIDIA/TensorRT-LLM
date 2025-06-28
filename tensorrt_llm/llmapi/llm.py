@@ -1,9 +1,11 @@
 import atexit
+import concurrent
 import json
 import os
 import shutil
 import socket
 import tempfile
+import threading
 import time
 import weakref
 from pathlib import Path
@@ -117,6 +119,7 @@ class BaseLLM:
                  tokenizer_revision: Optional[str] = None,
                  **kwargs: Any) -> None:
 
+        self.lock = threading.Lock()
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
         self._llm_id = None
 
@@ -271,18 +274,48 @@ class BaseLLM:
             else:
                 return maybe_batched
 
-        futures = []
-        for i, request_inputs in enumerate(inputs):
-            future = self.generate_async(
-                request_inputs,
-                sampling_params=_item_at(sampling_params, i),
-                lora_request=_item_at(lora_request, i),
-                prompt_adapter_request=_item_at(prompt_adapter_request, i),
-                kv_cache_retention_config=_item_at(kv_cache_retention_config,
-                                                   i),
-                disaggregated_params=_item_at(disaggregated_params, i),
-                streaming=False)
-            futures.append(future)
+        futures = [None] * len(inputs)
+        tasks_data = [{
+            "request_inputs":
+            request_inputs,
+            "sampling_params":
+            _item_at(sampling_params, i),
+            "lora_request":
+            _item_at(lora_request, i),
+            "prompt_adapter_request":
+            _item_at(prompt_adapter_request, i),
+            "streaming":
+            False,
+            "kv_cache_retention_config":
+            _item_at(kv_cache_retention_config, i),
+            "disaggregated_params":
+            _item_at(disaggregated_params, i),
+            "_postproc_params":
+            None
+        } for i, request_inputs in enumerate(inputs)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            futures_preprocess = {}
+            for task_id, task_data in enumerate(tasks_data):
+                task = executor.submit(
+                    self.generate_async,
+                    task_data["request_inputs"],
+                    task_data["sampling_params"],
+                    task_data["lora_request"],
+                    task_data["prompt_adapter_request"],
+                    task_data["streaming"],
+                    task_data["kv_cache_retention_config"],
+                    task_data["disaggregated_params"],
+                    task_data["_postproc_params"],
+                )
+                futures_preprocess[task] = task_id
+
+            for future_preprocess in concurrent.futures.as_completed(
+                    futures_preprocess):
+                try:
+                    futures[futures_preprocess[
+                        future_preprocess]] = future_preprocess.result()
+                except Exception as e:
+                    print(f"concurrent Task generated an exception: {e}")
 
         for future in tqdm(futures,
                            desc="Processed requests",
@@ -396,20 +429,21 @@ class BaseLLM:
         if _postproc_params:
             _postproc_params.postproc_args.num_prompt_tokens = len(
                 prompt_token_ids)
-        result = self._executor.generate_async(
-            prompt_token_ids,
-            query_token_ids=query_token_ids,
-            sampling_params=sampling_params,
-            lora_request=lora_request,
-            prompt_adapter_request=prompt_adapter_request,
-            streaming=streaming,
-            multimodal_input=multimodal_input,
-            multimodal_embedding=multimodal_embedding,
-            mrope_config=mrope_config,
-            kv_cache_retention_config=kv_cache_retention_config,
-            disaggregated_params=disaggregated_params,
-            postproc_params=_postproc_params,
-        )
+        with self.lock:
+            result = self._executor.generate_async(
+                prompt_token_ids,
+                query_token_ids=query_token_ids,
+                sampling_params=sampling_params,
+                lora_request=lora_request,
+                prompt_adapter_request=prompt_adapter_request,
+                streaming=streaming,
+                multimodal_input=multimodal_input,
+                multimodal_embedding=multimodal_embedding,
+                mrope_config=mrope_config,
+                kv_cache_retention_config=kv_cache_retention_config,
+                disaggregated_params=disaggregated_params,
+                postproc_params=_postproc_params,
+            )
 
         return RequestOutput._from_generation_result(result, prompt,
                                                      self.tokenizer)
