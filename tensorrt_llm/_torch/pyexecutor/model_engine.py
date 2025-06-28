@@ -593,9 +593,7 @@ class PyTorchModelEngine(ModelEngine):
                 result.generation_requests = requests
                 if spec_resource_manager is not None:
                     spec_resource_manager.add_dummy_requests(
-                        request_ids=list(range(batch_size)),
-                        use_mrope=use_mrope,
-                    )
+                        request_ids=list(range(batch_size)))
             else:
                 result = None
             return result
@@ -889,7 +887,8 @@ class PyTorchModelEngine(ModelEngine):
             self.cuda_graph_dummy_request = kv_cache_manager.add_dummy_requests(
                 [MAX_UINT64 - 1],
                 is_gen=True,
-                max_num_draft_tokens=self.max_draft_len)[0]
+                max_num_draft_tokens=self.max_draft_len,
+                use_mrope=self.use_mrope)[0]
             self.cuda_graph_dummy_request.is_cuda_graph_dummy = True
 
         scheduled_requests.generation_requests.extend(
