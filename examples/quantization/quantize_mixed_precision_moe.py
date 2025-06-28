@@ -259,7 +259,12 @@ def main(args):
         ]
         for name in names:
             shutil.copy(os.path.join(model_dir, name), output_dir)
-        shutil.copy(args.act_scales, output_dir)
+
+        if os.path.isdir(args.act_scales):
+            for _file in os.listdir(args.act_scales):
+                shutil.copy(os.path.join(args.act_scales, _file), output_dir)
+        else:
+            shutil.copy(args.act_scales, output_dir)
 
         # config.json
         del config['quantization_config']
