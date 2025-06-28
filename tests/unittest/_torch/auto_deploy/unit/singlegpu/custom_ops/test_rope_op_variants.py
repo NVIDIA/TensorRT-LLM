@@ -143,7 +143,7 @@ def test_flashinfer_custom_op_and_complex_impl(dtype, atol, rtol, head_dim):
     torch.testing.assert_close(out_k_v2, custom_k, rtol=rtol, atol=atol)
 
 
-# Copy of TritonWithFlattenedInputs._precompute_freqs_cis
+# Copy of TritonAttention._precompute_freqs_cis
 def precompute_freqs_cis_interleaved(
     seq_len: int, head_dim: int, dtype: torch.dtype, device: torch.device
 ) -> torch.Tensor:
