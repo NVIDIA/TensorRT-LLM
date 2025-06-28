@@ -7,9 +7,9 @@ from parameterized import parameterized
 
 from transformers import Gemma3Config
 from transformers import Gemma3ForCausalLM as HFGemma3ForCausalLM
+from transformers.cache_utils import HybridCache
 
 from utils.llm_data import llm_models_root
-
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
@@ -190,21 +190,22 @@ class TestGemma3(unittest.TestCase):
         dtype = gemma3_config.torch_dtype
         device = torch.device('cuda')
 
+        num_blocks = 1
+        tokens_per_block = 128
+        head_dim = gemma3_config.head_dim
+        num_layers = gemma3_config.num_hidden_layers
+        num_kv_heads = gemma3_config.num_key_value_heads
+        max_seq_len = num_blocks * tokens_per_block
+        batch_size = 1
+
         hf_gemma3 = HFGemma3ForCausalLM(gemma3_config).to(dtype).to(
             device).eval()
+        hf_cache = HybridCache(config=gemma3_config, max_batch_size=batch_size, max_cache_len=max_seq_len, device=device, dtype=dtype)
 
         model_config = ModelConfig(pretrained_config=gemma3_config,
                                    attn_backend=backend)
         gemma3 = Gemma3ForCausalLM(model_config).to(dtype).to(device)
         gemma3.load_weights(hf_gemma3.state_dict())
-
-        num_blocks = 1
-        tokens_per_block = 128
-        head_dim = gemma3.config.head_dim
-        num_layers = gemma3.config.num_hidden_layers
-        num_kv_heads = gemma3.config.num_key_value_heads
-        max_seq_len = num_blocks * tokens_per_block
-        batch_size = 1
 
         # #############################################################################
         # assert head_dim == 256, "Expected head_dim to be 256 for gemma3-1b-it, got {}".format(head_dim)
@@ -273,6 +274,7 @@ class TestGemma3(unittest.TestCase):
                                      attn_metadata=attn_metadata)
             ref = hf_gemma3.forward(input_ids=input_ids.unsqueeze(0),
                                      position_ids=position_ids,
+                                     past_key_values=hf_cache,
                                      use_cache=True)
             torch.testing.assert_close(logits,
                                        ref.logits[:, -1].float(),
@@ -312,7 +314,7 @@ class TestGemma3(unittest.TestCase):
                                      attn_metadata=attn_metadata)
             ref = hf_gemma3.forward(input_ids=gen_input_ids.unsqueeze(0),
                                      position_ids=gen_position_ids,
-                                     past_key_values=ref.past_key_values,
+                                     past_key_values=hf_cache,
                                      use_cache=True)
             print("[test_gemma3_allclose_to_hf] max gen diff: ", torch.max(torch.abs(logits - ref.logits[:, -1].float())))
             print("[test_gemma3_allclose_to_hf] mean gen diff: ", torch.mean(torch.abs(logits - ref.logits[:, -1].float())))
