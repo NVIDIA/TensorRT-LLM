@@ -128,13 +128,13 @@ class Gemma3Attention(Attention):
             return self.k_norm(k.reshape(-1, self.head_dim)).reshape(
                 -1, self.kv_size)
 
-        # q, k = maybe_execute_in_parallel(
-        #     q_l2norm,
-        #     k_l2norm,
-        #     self.ln_events[0],
-        #     self.ln_events[1],
-        #     self.aux_stream,
-        # )
+        q, k = maybe_execute_in_parallel(
+            q_l2norm,
+            k_l2norm,
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+        )
 
         return q, k
 
