@@ -17,7 +17,8 @@ from tensorrt_llm.bindings import (CudaStream, DataType, ModelConfig,
 from tensorrt_llm.bindings.executor import (DecodingConfig, DecodingMode,
                                             ExecutorConfig, FinishReason)
 from tensorrt_llm.bindings.internal.algorithms import CreateNewDecoderRequests
-from tensorrt_llm.bindings.internal.batch_manager import DecoderInputBuffers
+from tensorrt_llm.bindings.internal.batch_manager import (
+    DecoderInputBuffers, add_new_tokens_to_requests)
 from tensorrt_llm.bindings.internal.runtime import (BufferManager, CudaEvent,
                                                     DecoderState,
                                                     GptDecoderBatched)
@@ -717,7 +718,6 @@ class TRTLLMSampler(Sampler):
         sequence_lengths_host_data = state.host.sequence_lengths.flatten(
         ).tolist()
         finish_reasons = state.host.finish_reasons.flatten().tolist()
-        finished_sum_host = state.host.finished_sum.tolist()
         log_probs_host = state.host.log_probs.tolist()
         cum_log_probs_host = state.host.cum_log_probs.tolist()
 
@@ -732,9 +732,10 @@ class TRTLLMSampler(Sampler):
         ]
 
         # Add new tokens
-        for request in reqs_with_new_tokens:
-            new_token = new_tokens_host[request.py_seq_slot]
-            request.add_new_token(new_token, 0)
+        new_tokens = [
+            new_tokens_host[r.py_seq_slot] for r in reqs_with_new_tokens
+        ]
+        add_new_tokens_to_requests(reqs_with_new_tokens, new_tokens, 0)
 
         # Log probs
         for request in reqs_with_new_tokens:
@@ -753,18 +754,14 @@ class TRTLLMSampler(Sampler):
                 request.py_result.append_log_probs([log_probs], cum_log_probs)
 
         for request in reqs:
-            # Check finish reasons
-            finished_state = FinishedState(finish_reasons[request.py_seq_slot])
-            if finished_state.is_finished:
-                finish_reason = finished_state.to_finish_reason()
-                request.set_finished_reason(finish_reason, 0)
-
-            # Increment the decoding iteration counter
             if request.state != LlmRequestState.GENERATION_COMPLETE:
                 request.py_decoding_iter += 1
-
-            if finished_sum_host[request.py_seq_slot] == 1:
-                request.state = LlmRequestState.GENERATION_COMPLETE
+                finished_state = FinishedState(
+                    finish_reasons[request.py_seq_slot])
+                if finished_state.is_finished:
+                    request.state = LlmRequestState.GENERATION_COMPLETE
+                    finish_reason = finished_state.to_finish_reason()
+                    request.set_finished_reason(finish_reason, 0)
 
     @torch.inference_mode()
     @nvtx_range("update_requests_multiple_beams_or_drafting")

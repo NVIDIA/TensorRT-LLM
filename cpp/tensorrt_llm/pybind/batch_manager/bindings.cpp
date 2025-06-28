@@ -428,6 +428,22 @@ void initBindings(pybind11::module_& m)
                  runtime::TllmRuntime const&>(),
             py::arg("max_beam_width"), py::arg("max_seq_len"), py::arg("buffer_manager"), py::arg("model_config"),
             py::arg("world_config"), py::arg("decoding_config"), py::arg("runtime"));
+
+    m.def(
+        "add_new_tokens_to_requests",
+        [](std::vector<std::shared_ptr<tb::LlmRequest>>& requests,
+            std::vector<tb::LlmRequest::TokenIdType> const& tokens, int beam_idx)
+        {
+            TLLM_CHECK_WITH_INFO(requests.size() == tokens.size(), "Expected the same number of requests and tokens.");
+
+            for (int i = 0; i < requests.size(); ++i)
+            {
+                requests[i]->addNewToken(tokens[i], beam_idx);
+            }
+        },
+        py::arg("requests"), py::arg("tokens"), py::arg("beam_idx"),
+        "Add new tokens to multiple LLM requests. The tokens vector should contain tokens for beam beam_idx of all "
+        "requests in order.");
 }
 
 } // namespace tensorrt_llm::pybind::batch_manager
