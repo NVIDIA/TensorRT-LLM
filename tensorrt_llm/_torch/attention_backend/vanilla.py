@@ -146,6 +146,14 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         qk_scale = None
         if self.q_scaling is not None:
             qk_scale = 1 / (math.sqrt(self.head_dim) * self.q_scaling)
+
+        print(f"[VanillaAttention] q: {q.shape} \n {q}")
+        print(f"[VanillaAttention] key_states: {key_states.shape} \n {key_states}")
+        print(f"[VanillaAttention] value_states: {value_states.shape} \n {value_states}")
+        print(f"[VanillaAttention] is_causal: {is_causal}")
+        print(f"[VanillaAttention] attn_mask: {attn_mask}")
+        print(f"[VanillaAttention] qk_scale: {qk_scale}")
+
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             q,
             key_states,
@@ -154,6 +162,8 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             attn_mask=attn_mask,
             scale=qk_scale,
         )
+
+        print(f"[VanillaAttention] attn_output: {attn_output.shape} \n {attn_output}")
 
         attn_output = attn_output.squeeze(0)
         return attn_output

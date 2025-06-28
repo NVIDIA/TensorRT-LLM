@@ -107,7 +107,7 @@ class Gemma3Attention(Attention):
         **kwargs,
     ) -> torch.Tensor:
 
-        attention_window_size = self.attention_window_size or attn_metadata.max_seq_len
+        attention_window_size = self.attention_window_size # or attn_metadata.max_seq_len
         return super().forward(position_ids=position_ids,
                                hidden_states=hidden_states,
                                attn_metadata=attn_metadata,
@@ -128,13 +128,13 @@ class Gemma3Attention(Attention):
             return self.k_norm(k.reshape(-1, self.head_dim)).reshape(
                 -1, self.kv_size)
 
-        q, k = maybe_execute_in_parallel(
-            q_l2norm,
-            k_l2norm,
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
+        # q, k = maybe_execute_in_parallel(
+        #     q_l2norm,
+        #     k_l2norm,
+        #     self.ln_events[0],
+        #     self.ln_events[1],
+        #     self.aux_stream,
+        # )
 
         return q, k
 
@@ -216,21 +216,21 @@ class Gemma3DecoderLayer(DecoderLayer):
         **kwargs,
     ) -> torch.Tensor:
 
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        # residual = hidden_states
+        # hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             **kwargs,
         )
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
-        residual = hidden_states
-        hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = self.post_feedforward_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
+        # hidden_states = self.post_attention_layernorm(hidden_states)
+        # hidden_states = residual + hidden_states
+        # residual = hidden_states
+        # hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        # hidden_states = self.mlp(hidden_states)
+        # hidden_states = self.post_feedforward_layernorm(hidden_states)
+        # hidden_states = residual + hidden_states
 
         return hidden_states
 

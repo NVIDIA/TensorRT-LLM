@@ -305,7 +305,7 @@ class Attention(nn.Module):
         """
         q, k, v = self.split_qkv(q, k, v)
         # If RoPE is fused into the attention OP, do not apply RoPE here.
-        if not self.rope_fusion and position_ids is not None:
+        if False: # not self.rope_fusion and position_ids is not None:
             q, k = self.rotary_emb(position_ids, [q, k])
         return q, k, v
 
