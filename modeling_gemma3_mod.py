@@ -407,9 +407,9 @@ class Gemma3DecoderLayer(nn.Module):
                 offset = max(0, offset)
                 attention_mask = attention_mask[:, :, :, offset : offset + effective_seq_len]
 
-        # residual = hidden_states
+        residual = hidden_states
 
-        # hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.input_layernorm(hidden_states)
 
         # apply global RoPE to non-sliding layer only
         if self.self_attn.is_sliding:
@@ -428,14 +428,14 @@ class Gemma3DecoderLayer(nn.Module):
             cache_position=cache_position,
             **kwargs,
         )
-        # hidden_states = self.post_attention_layernorm(hidden_states)
-        # hidden_states = residual + hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = residual + hidden_states
 
-        # residual = hidden_states
-        # hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        # hidden_states = self.mlp(hidden_states)
-        # hidden_states = self.post_feedforward_layernorm(hidden_states)
-        # hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.post_feedforward_layernorm(hidden_states)
+        hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
 

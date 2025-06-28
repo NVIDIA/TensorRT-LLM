@@ -216,21 +216,21 @@ class Gemma3DecoderLayer(DecoderLayer):
         **kwargs,
     ) -> torch.Tensor:
 
-        # residual = hidden_states
-        # hidden_states = self.input_layernorm(hidden_states)
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             **kwargs,
         )
-        # hidden_states = self.post_attention_layernorm(hidden_states)
-        # hidden_states = residual + hidden_states
-        # residual = hidden_states
-        # hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        # hidden_states = self.mlp(hidden_states)
-        # hidden_states = self.post_feedforward_layernorm(hidden_states)
-        # hidden_states = residual + hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.post_feedforward_layernorm(hidden_states)
+        hidden_states = residual + hidden_states
 
         return hidden_states
 
