@@ -1,17 +1,41 @@
 from typing import Any, Dict
 
-from tensorrt_llm.bench.dataclasses.scenario import (ScenarioSpecification,
-                                                     TuningConstraints,
-                                                     WorldConfig)
-from tensorrt_llm.bench.tuning.heuristics import DefaultScenario
+from tensorrt_llm.bench.dataclasses.scenario import ScenarioSpecification
+from tensorrt_llm.bench.tuning import HueristicProtocol
 
 
-class TrtMaxThroughputScenario(DefaultScenario):
-
+class DefaultTrtHeuristic(HueristicProtocol):
+    """Default settings for the TensorRT backend."""
     @classmethod
-    def get_settings(cls, scenario: ScenarioSpecification, world: WorldConfig,
-                     tuning: TuningConstraints) -> Dict[str, Any]:
-        llm_args = super().get_settings(scenario, world, tuning)
+    def get_settings(cls, scenario: ScenarioSpecification) -> Dict[str, Any]:
+        world = scenario.world
+        return {
+            "model":
+            scenario.environment.model,
+            "pipeline_parallel_size":
+            world.pp_size,
+            "tensor_parallel_size":
+            world.tp_size,
+            "gpus_per_node":
+            world.gpus_per_node,
+            "moe_expert_parallel_size":
+            world.ep_size,
+            "moe_cluster_parallel_size":
+            world.cluster_size,
+            "trust_remote_code":
+            True,
+            "batching_type":
+            "INFLIGHT",
+            "kv_cache_config":
+            dict(kv_cache_free_gpu_mem_fraction=scenario.
+                 kv_cache_free_gpu_mem_fraction, ),
+        }
+
+class TrtMaxThroughputScenario(DefaultTrtHeuristic):
+    """Maximum throughput heuristic tuning for the TensorRT backend."""
+    @classmethod
+    def get_settings(cls, scenario: ScenarioSpecification) -> Dict[str, Any]:
+        llm_args = super().get_settings(scenario)
         llm_args |= {
             "scheduler_config":
             dict(

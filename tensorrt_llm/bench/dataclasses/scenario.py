@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, Literal, Optional, Self, Union
 
 import yaml
 from huggingface_hub import snapshot_download
@@ -278,11 +279,42 @@ class ScenarioSpecification(BaseModel):
 
     @model_validator(mode="after")
     def validate_engine_dir(self) -> Self:
-        if self.engine_dir is None and self.llm_config.backend == "trt" and self.mode == "benchmark":
+        engine_dir = bool(self.engine_dir is not None)
+        trt_backend = bool(self.llm_config.backend == "tensorrt")
+        engine_dir_exists = bool(self.engine_dir is not None and self.engine_dir.exists())
+
+        # We aren't dealing with tensorrt engine for this instance. Return.
+        if not engine_dir and not trt_backend:
+            return self
+
+        # We are dealing with tensorrt engine for this instance but backend is not tensorrt.
+        if engine_dir and not trt_backend:
             raise RuntimeError(
                 "Specifying an engine directory ('engine_dir')is required for running the TRT workflow."
             )
+
+        # Engine directory does not exist.
+        if not engine_dir_exists:
+            raise ValueError(
+                f"Engine directory ('engine_dir') does not exist: {self.engine_dir}"
+            )
+
+        # Now that we know we're dealing with tensorrt engine, we need to validate the engine directory.
+        with open(self.engine_dir / "config.json", "r") as f:
+            engine_config = json.load(f)
+
+        # Validate the engine directory against the engine config.
+        engine_world_map = engine_config["pretrained_config"]["mapping"]
+        engine_build_cfg = engine_config["build_config"]
+        engine_parallel_map = engine_build_cfg["auto_parallel_config"]
+
+        # Validate the world config.
+
+
+
         return self
+
+
 
     @model_validator(mode="after")
     def validate_heuristic_constraints(self) -> Self:
