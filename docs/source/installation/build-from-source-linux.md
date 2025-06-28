@@ -9,6 +9,8 @@ This document provides instructions for building TensorRT-LLM from source code o
 
 Use [Docker](https://www.docker.com) to build and run TensorRT-LLM. Instructions to install an environment to run Docker containers for the NVIDIA platform can be found [here](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html).
 
+If you intend to build any TensortRT-LLM artifacts, such as any of the container images (note that there exist pre-built [develop](#build-from-source-tip-develop-container) and [release](#build-from-source-tip-release-container) container images in NGC), or the TensorRT-LLM Python wheel, you first need to clone the TensorRT-LLM repository:
+
 ```bash
 # TensorRT-LLM uses git-lfs, which needs to be installed in advance.
 apt-get update && apt-get -y install git git-lfs
@@ -25,6 +27,11 @@ git lfs pull
 There are two options to create a TensorRT-LLM Docker image. The approximate disk space required to build the image is 63 GB.
 
 ### Option 1: Build TensorRT-LLM in One Step
+
+```{tip}
+:name: build-from-source-tip-release-container
+If you just want to run TensorRT-LLM, you can instead [use the pre-built TensorRT-LLM Release container images](containers).
+```
 
 TensorRT-LLM contains a simple command to create a Docker image. Note that if you plan to develop on TensorRT-LLM, we recommend using [Option 2: Build TensorRT-LLM Step-By-Step](#option-2-build-tensorrt-llm-step-by-step).
 
@@ -49,11 +56,16 @@ The `make` command supports the `LOCAL_USER=1` argument to switch to the local u
 
 Since TensorRT-LLM has been built and installed, you can skip the remaining steps.
 
-### Option 2: Build TensorRT-LLM Step-by-Step
+### Option 2: Container for building TensorRT-LLM Step-by-Step
 
 If you are looking for more flexibility, TensorRT-LLM has commands to create and run a development container in which TensorRT-LLM can be built.
 
-#### Create the Container
+```{tip}
+:name: build-from-source-tip-develop-container
+As an alternative to building the container image following the instructions below,
+you can pull a pre-built [TensorRT-LLM Develop container image](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/devel) from NGC (see [here](containers) for information on container tags).
+Follow the linked catalog entry to enter a new container based on the pre-built container image, with the TensorRT source repository mounted into it. You can then skip this section and continue straight to [building TensorRT-LLM](#build-tensorrt-llm).
+```
 
 **On systems with GNU `make`**
 
@@ -99,6 +111,11 @@ If you are looking for more flexibility, TensorRT-LLM has commands to create and
     Note: please make sure to set `--ipc=host` as a docker run argument to avoid `Bus error (core dumped)`.
 
 Once inside the container, follow the next steps to build TensorRT-LLM from source.
+
+### Advanced topics
+
+For more information on building and running various TensorRT-LLM container images,
+check <https://github.com/NVIDIA/TensorRT-LLM/tree/main/docker>.
 
 ## Build TensorRT-LLM
 
@@ -207,7 +224,7 @@ Alternatively, you can use editable installation for convenience during Python d
 TRTLLM_USE_PRECOMPILED=1 pip install -e .
 ```
 
-Setting `TRTLLM_USE_PRECOMPILED=1` enables downloading a prebuilt wheel of the version specified in `tensorrt_llm/version.py`, extracting compiled libraries into your current directory, thus skipping C++ compilation.
+Setting `TRTLLM_USE_PRECOMPILED=1` enables downloading a prebuilt wheel of the version specified in `tensorrt_llm/version.py`, extracting compiled libraries into your current directory, thus skipping C++ compilation. This version can be overridden by specifying `TRTLLM_USE_PRECOMPILED=x.y.z`.
 
 You can specify a custom URL or local path for downloading using `TRTLLM_PRECOMPILED_LOCATION`. For example, to use version 0.16.0 from PyPI:
 

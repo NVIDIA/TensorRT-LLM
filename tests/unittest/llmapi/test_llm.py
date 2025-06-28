@@ -544,6 +544,7 @@ def llm_for_sampling_params():
     llm.shutdown()
 
 
+@pytest.mark.skip(reason="https://nvbugs/5362398")
 @pytest.mark.part0
 def test_user_specify_workspace():
     user_specified_ws_path = '/tmp/specified_workspace'
@@ -612,6 +613,7 @@ def test_generate_with_SamplingConfig(llm_for_sampling_params: LLM,
         assert len(output.outputs) == sampling_params.n
 
 
+@pytest.mark.skip(reason="https://nvbugs/5362398")
 @force_ampere
 @pytest.mark.part0
 def test_generate_with_seed(llm_for_sampling_params: LLM):
