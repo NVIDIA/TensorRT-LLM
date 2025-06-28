@@ -48,7 +48,7 @@ void runPermute(void const* input_activations_void, void const* input_sf_void, i
     int* unpermuted_token_selected_experts_, int* unpermuted_source_token_ids_, int* permuted_source_token_ids_,
     int* permuted_token_selected_experts_, T* permuted_data_, char* sorter_ws_, int64_t* expert_first_token_offset_,
     float* permuted_token_final_scales_, int* expanded_source_row_to_expanded_dest_row,
-    cutlass_kernels::MOEParallelismConfig parallelism_config, cutlass_kernels::CubKeyValueSorter sorter_, bool use_lora,
+    cutlass_kernels::MOEParallelismConfig parallelism_config, kernels::CubKeyValueSorter sorter_, bool use_lora,
     kernels::LoraParams& lora_params, bool use_fp8_block_scaling, bool min_latency_mode,
     cutlass_kernels::MoeMinLatencyParams& min_latency_params, cudaStream_t stream)
 {
@@ -121,7 +121,7 @@ moe_permute_op(torch::Tensor const& input, torch::Tensor const& token_selected_e
     int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size,
     int64_t const cluster_rank, bool min_latency_mode, bool use_fp8_block_scaling)
 {
-    cutlass_kernels::CubKeyValueSorter sorter_;
+    kernels::CubKeyValueSorter sorter_;
 
     TORCH_CHECK(cluster_size == 1 && cluster_rank == 0, "smart_router is supported in min_latency mode");
     TORCH_CHECK(min_latency_mode == false, "min_latency_mode is not supported now");
@@ -179,7 +179,7 @@ moe_permute_op(torch::Tensor const& input, torch::Tensor const& token_selected_e
 
     size_t const sorter_size = min_latency_mode
         ? 0
-        : cutlass_kernels::CubKeyValueSorter::getWorkspaceSize(num_rows * experts_per_token, num_experts_per_node);
+        : kernels::CubKeyValueSorter::getWorkspaceSize(num_rows * experts_per_token, num_experts_per_node);
     auto sorter_ws_tensor = torch::empty(
         {static_cast<int64_t>(sorter_size)}, torch::dtype(torch::kChar).device(torch::kCUDA).requires_grad(false));
 

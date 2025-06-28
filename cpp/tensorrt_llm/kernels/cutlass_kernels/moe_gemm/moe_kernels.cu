@@ -1526,8 +1526,8 @@ template <class InputActivationsType, class ExpandedActivationsType>
 void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
     ExpandedActivationsType* permuted_output, float const* unpermuted_scales, float* permuted_scales,
     int const* permuted_row_to_unpermuted_row, int64_t const num_rows, int64_t const cols, int const k,
-    int const num_experts_per_node, float const* fc1_act_global_scale, bool use_per_expert_act_scale, int64_t* expert_first_token_offset,
-    TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
+    int const num_experts_per_node, float const* fc1_act_global_scale, bool use_per_expert_act_scale,
+    int64_t* expert_first_token_offset, TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
     TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, cudaStream_t stream)
 {
 #ifdef ENABLE_FP4
@@ -1565,8 +1565,8 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
     config.numAttrs = 1;
     config.attrs = attrs;
     cudaLaunchKernelEx(&config, func, unpermuted_input, permuted_output, unpermuted_scales, permuted_scales,
-        permuted_row_to_unpermuted_row, num_rows, cols, k, fc1_act_global_scale, use_per_expert_act_scale, expert_first_token_offset,
-        fc1_act_sf_flat, input_sf, num_experts_per_node);
+        permuted_row_to_unpermuted_row, num_rows, cols, k, fc1_act_global_scale, use_per_expert_act_scale,
+        expert_first_token_offset, fc1_act_sf_flat, input_sf, num_experts_per_node);
 }
 
 enum class ScaleMode : int
