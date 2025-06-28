@@ -5,6 +5,7 @@ from typing import Optional, Union, cast
 import torch
 from torch import nn
 
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -344,6 +345,47 @@ def mla_custom_op_inplace(
 ) -> None:
     metadata, mla_layer = extract_extra_attrs(layer_idx)
     mla_layer.forward_impl(position_ids, hidden_states, metadata, output=output)
+
+
+def fp8_block_scaling_bmm_out(
+    mat1: torch.Tensor,
+    mat2_fp8: torch.Tensor,
+    mat2_scale: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    sm_version = get_sm_version()
+    if sm_version == 90:
+        mat1_fp8, mat1_scale = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
+            mat1)
+        torch.ops.trtllm.fp8_block_scaling_bmm_out(mat1_fp8, mat2_fp8,
+                                                   mat1_scale, mat2_scale, out)
+    elif sm_version == 100:
+        low_latency = True
+        use_deep_seek_fp8 = True
+        tile_size = 8
+        epilogue_tile_m = 64 if use_deep_seek_fp8 else 128
+        m_size = mat1.shape[0]
+        if m_size % tile_size != 0:
+            tiled_shape = ((m_size + tile_size - 1) // tile_size) * tile_size
+            mat1 = torch.nn.functional.pad(
+                mat1, (0, 0, 0, 0, 0, tiled_shape - m_size), "constant", 0)
+
+        mat1_fp8, mat1_scale = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
+            mat1)
+        output, output_sf = torch.ops.trtllm.fp8_batched_gemm_trtllmgen(
+            mat1_fp8,
+            mat2_fp8,
+            tile_size=tile_size,
+            epilogue_tile_m=epilogue_tile_m,
+            use_deep_seek_fp8=use_deep_seek_fp8,
+            low_latency=low_latency,
+            dq_sfs_a=mat1_scale.reshape(mat1.shape[-1] // 128, -1),
+            dq_sfs_b=mat2_scale,
+            out_dtype=out.dtype,
+        )
+        out.copy_(output[:, :m_size])
+    else:
+        raise NotImplementedError(f"SM{sm_version} is not supported")
 
 
 class MLA(nn.Module):
@@ -922,6 +964,166 @@ class MLA(nn.Module):
 
         return attn_output
 
+    def forward_context_with_chunked_prefill(
+        self,
+        q: torch.Tensor,
+        compressed_kv: torch.Tensor,
+        latent_cache: torch.
+        Tensor,  # compressed_kv + k_pe [context_tokens, 1, lora_size + rope_size]
+        attn_metadata: TrtllmAttentionMetadata,
+        output: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        trtllm_attention = cast(TrtllmAttention, self.mha)
+        # apply RoPE, append compressed_kv + k_pe to paged kv cache and assign q_pe to q
+        trtllm_attention.mla_rope_append_paged_kv_assign_q(
+            q, latent_cache, attn_metadata)
+
+        # determine the number of loop
+        # currently we assume that the chunk size is the same as the max_num_tokens
+        chunk_size = attn_metadata.runtime_features.chunk_size
+        chunked_loop_num = attn_metadata.chunked_loop_num
+
+        # [toal_token_q, num_heads, 2] -> [toal_token_q, num_heads] float2
+        self.softmax_stats_tensor = torch.empty(
+            (attn_metadata.num_ctx_tokens, self.num_heads, 2),
+            dtype=torch.float,
+            device='cuda',
+        )
+        self.temp_softmax_stats_tensor = torch.empty(
+            (attn_metadata.num_ctx_tokens, self.num_heads, 2),
+            dtype=torch.float,
+            device='cuda',
+        )
+        if output is None:
+            attn_output = q.new_empty(
+                (q.size(0), self.num_heads * self.v_head_dim), dtype=q.dtype)
+        else:
+            attn_output = output
+        temp_attn_output = q.new_empty(
+            (q.size(0), self.num_heads * self.v_head_dim), dtype=q.dtype)
+
+        # use fake cached_cu_seq_len for chunked loop
+        origin_kv_lens_cuda_runtime = attn_metadata.kv_lens_cuda_runtime
+        origin_kv_lens_runtime = attn_metadata.kv_lens_runtime
+
+        for loop_idx in range(chunked_loop_num):
+            # {b, chunked_unit_size, h, kv_lora_rank + qk_rope_head_dim} zero padded
+            # fetch `loop_idx` chunk from kv cache
+            temp_cu_chunked_seq_len = attn_metadata.cu_chunked_seq_len[loop_idx]
+            total_ctx_chunked_tokens = attn_metadata.host_cu_chunked_seq_len[
+                loop_idx, attn_metadata.num_contexts]
+            chunked_compressed_kv, chunked_k_pe = trtllm_attention.load_chunked_kv_cache_for_mla(
+                metadata=attn_metadata,
+                chunked_idx=loop_idx,
+                num_ctx_cached_tokens=total_ctx_chunked_tokens,
+                cu_chunked_seq_len=temp_cu_chunked_seq_len,
+                out_dtype=q.dtype)
+
+            # up proj to uncompressed kv
+            # [tokens, 2, h, kv_dim], without rope_dim
+            chunked_kv = self.kv_b_proj(chunked_compressed_kv)
+
+            # build full_kv
+            # full_kv {B, 2, chunk_size / tokens_per_block, h, tokens_per_block, kv_dim + rope_dim}
+            tokens_per_block = attn_metadata.kv_cache_manager.tokens_per_block
+            full_kv = torch.zeros([
+                attn_metadata.num_contexts, 2,
+                (chunk_size + tokens_per_block - 1) // tokens_per_block,
+                self.num_heads, tokens_per_block,
+                max(self.qk_nope_head_dim + self.qk_rope_head_dim,
+                    self.v_head_dim)
+            ],
+                                  dtype=q.dtype,
+                                  device=q.device)
+            mla_kv_cache_block_offsets = trtllm_attention.set_chunked_kv_cache_for_mla(
+                full_kv,
+                chunked_kv,
+                chunked_k_pe,
+                cu_chunked_seq_len=temp_cu_chunked_seq_len,
+                cached=True,
+                metadata=attn_metadata)
+
+            # copy chunked_seq_len to replace kv_lens_runtime
+            attn_metadata.kv_lens_runtime = attn_metadata.host_chunked_seq_len[
+                loop_idx]
+            attn_metadata.kv_lens_cuda_runtime = attn_metadata.chunked_seq_len[
+                loop_idx]
+            out_scale = None
+            # do not apply mask for attention within loop
+            temp_attn_output = self.mha.forward(
+                q,
+                None,
+                None,
+                attn_metadata,
+                attention_input_type=AttentionInputType.context_only,
+                latent_cache=None,
+                out_scale=out_scale,
+                attention_mask=PredefinedAttentionMask.FULL,
+                mla_context_paged_kv=full_kv,
+                mla_context_kv_cache_block_offsets=mla_kv_cache_block_offsets,
+                softmax_stats_tensor=self.temp_softmax_stats_tensor,
+                output=temp_attn_output,
+            )
+            # merge attn result
+            temp_merge_op = attn_metadata.merge_op_tensor[loop_idx]
+            trtllm_attention.merge_attention_for_mla(
+                attn_output, temp_attn_output, self.softmax_stats_tensor,
+                self.temp_softmax_stats_tensor, temp_merge_op, attn_metadata)
+
+        # deal with the uncached kv
+        kv = self.kv_b_proj(compressed_kv)
+        _, k_pe = latent_cache.view([
+            -1, self.kv_lora_rank + self.qk_rope_head_dim
+        ]).split([self.kv_lora_rank, self.qk_rope_head_dim], -1)
+        k_pe = k_pe.contiguous()
+        # final round of attention
+
+        # out_scale = getattr(self.o_proj, "inv_input_scale", None)
+        out_scale = None  # Currently we use BF16 MHA for context phase
+
+        tokens_per_block = attn_metadata.kv_cache_manager.tokens_per_block
+        full_kv = torch.zeros([
+            attn_metadata.num_contexts, 2,
+            (attn_metadata.max_ctx_seq_len + tokens_per_block - 1) //
+            tokens_per_block, self.num_heads, tokens_per_block,
+            max(self.qk_nope_head_dim + self.qk_rope_head_dim, self.v_head_dim)
+        ],
+                              dtype=q.dtype,
+                              device=q.device)
+        mla_kv_cache_block_offsets = trtllm_attention.set_chunked_kv_cache_for_mla(
+            full_kv,
+            kv,
+            k_pe,
+            cu_chunked_seq_len=None,
+            cached=False,
+            metadata=attn_metadata)
+        # copy q_lens to replace kv_lens_runtime
+        attn_metadata.kv_lens_runtime = attn_metadata.prompt_lens_cpu_runtime
+        attn_metadata.kv_lens_cuda_runtime = attn_metadata.prompt_lens_cuda_runtime
+        temp_attn_output = self.mha.forward(
+            q,
+            None,
+            None,
+            attn_metadata,
+            attention_input_type=AttentionInputType.context_only,
+            latent_cache=None,
+            out_scale=out_scale,
+            mla_context_paged_kv=full_kv,
+            mla_context_kv_cache_block_offsets=mla_kv_cache_block_offsets,
+            softmax_stats_tensor=self.temp_softmax_stats_tensor,
+            output=temp_attn_output,
+        )
+        temp_merge_op = attn_metadata.merge_op_tensor[chunked_loop_num]
+        trtllm_attention.merge_attention_for_mla(attn_output, temp_attn_output,
+                                                 self.softmax_stats_tensor,
+                                                 self.temp_softmax_stats_tensor,
+                                                 temp_merge_op, attn_metadata)
+        # copy back kv_lens_runtime and kv_lens_cuda_runtime
+        attn_metadata.kv_lens_runtime = origin_kv_lens_runtime
+        attn_metadata.kv_lens_cuda_runtime = origin_kv_lens_cuda_runtime
+
+        return attn_output
+
     def forward_context(
         self,
         q: torch.Tensor,
@@ -934,7 +1136,11 @@ class MLA(nn.Module):
         if isinstance(self.mha, TrtllmAttention):
             assert isinstance(attn_metadata, TrtllmAttentionMetadata)
             trtllm_attention = cast(TrtllmAttention, self.mha)
-            if trtllm_attention.has_cached_kv_for_mla_context(attn_metadata):
+            if trtllm_attention.is_chunked_prefill_for_mla_context(
+                    attn_metadata):
+                return self.forward_context_with_chunked_prefill(
+                    q, compressed_kv, latent_cache, attn_metadata, output)
+            elif trtllm_attention.has_cached_kv_for_mla_context(attn_metadata):
                 return self.forward_context_with_cached_kv(
                     q, latent_cache, attn_metadata, output)
         return self.forward_context_default(q, compressed_kv, k_pe,
@@ -976,15 +1182,11 @@ class MLA(nn.Module):
                                      self.k_b_proj_trans.transpose(1, 2),
                                      q_nope_out)
         elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
-            q_nope_fp8, q_nope_scales = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
-                q_nope)
             # [num_heads, num_tokens, self.kv_lora_rank]
             q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
 
-            torch.ops.trtllm.fp8_block_scaling_bmm_out(
-                q_nope_fp8, self.k_b_proj_trans, q_nope_scales,
-                self.k_b_proj_trans_scale, q_nope_out)
-            q_nope_scales = None
+            fp8_block_scaling_bmm_out(q_nope, self.k_b_proj_trans,
+                                      self.k_b_proj_trans_scale, q_nope_out)
         else:
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}.")
@@ -1033,13 +1235,9 @@ class MLA(nn.Module):
                                      self.v_b_proj.transpose(1, 2),
                                      attn_output.transpose(0, 1))
         elif self.v_b_proj.dtype == torch.float8_e4m3fn:
-            attn_out_latent, attn_out_latent_scales = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
-                attn_out_latent)
-
-            torch.ops.trtllm.fp8_block_scaling_bmm_out(
-                attn_out_latent, self.v_b_proj, attn_out_latent_scales,
-                self.v_b_proj_scale, attn_output.transpose(0, 1))
-            attn_out_latent_scales = None
+            fp8_block_scaling_bmm_out(attn_out_latent, self.v_b_proj,
+                                      self.v_b_proj_scale,
+                                      attn_output.transpose(0, 1))
         else:
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")

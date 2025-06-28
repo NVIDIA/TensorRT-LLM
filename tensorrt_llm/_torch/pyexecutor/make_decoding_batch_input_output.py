@@ -88,7 +88,6 @@ class MakeDecodingBatchInputOutput:
         self,
         context_requests: List[LlmRequest],
         generation_requests: List[LlmRequest],
-        decoder_buffers,
         decoder_input_buffers,
         decoder_state,
         model_config,
@@ -99,7 +98,6 @@ class MakeDecodingBatchInputOutput:
         Args:
             context_requests: List of context requests
             generation_requests: List of generation requests
-            decoder_buffers: Decoder buffers
             decoder_input_buffers: Decoder input buffers
             decoder_state: Current decoder state
             model_config: Model configuration
@@ -135,11 +133,9 @@ class MakeDecodingBatchInputOutput:
         )
         decoding_input.generation_steps = generation_steps
 
-        # Handle speculative decoding modes
-        if model_config.speculative_decoding_mode.has_draft_logits:
-            decoding_input.predicted_draft_logits = decoder_buffers.draft_buffers.predicted_draft_logits
+        # TODO: Handle speculative decoding modes.
+        # fused_runtime_buffers is not created in the pytorch framework.
 
-        # TODO: fused_runtime_buffers is not created in the pytorch framework.
         # if model_config.speculative_decoding_mode.is_explicit_draft_tokens:
         #     if fused_runtime_buffers is None:
         #         raise RuntimeError("Fused runtime buffers required for explicit draft tokens")

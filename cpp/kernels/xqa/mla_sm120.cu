@@ -79,9 +79,9 @@ struct KVTilePartLoader
     // if greater than 1, then we need unrolling for the loading loop. Seems 1 is fine for latency.
     static inline constexpr uint32_t nbPageBuffers = 1;
 #if USE_PAGED_KV_CACHE
-    uint32_t const nbPages; // for bound check
+    uint32_t const nbPages;    // for bound check
     Vec<KVCachePageIndex, nbPagesPerTile> pageBuffers[nbPageBuffers];
-    uint32_t idxTileRef;    // idxTile used to load the pages
+    uint32_t idxTileRef = ~0U; // idxTile used to load the pages
 #endif
     uint32_t const baseOffset;
 
@@ -117,6 +117,11 @@ __device__ inline KVTilePartLoader::KVTilePartLoader(
     , baseOffset{(idxReq * beamWidth) * 2}
 #endif
 {
+#pragma unroll
+    for (auto& pageBuffer : pageBuffers)
+    {
+        pageBuffer.fill(kBAD_PAGE_INDEX);
+    }
 }
 
 // tensorMap is for one whole page ([nbKHeads*tokensPerPage][headElems]) or whole cache
@@ -240,6 +245,7 @@ struct CgaXBuffer
 {
     XBuffer x;
     Vec<float, headGrpSize> rowSum;
+    Vec<float, headGrpSize> rowMaxLog2e;
 };
 
 struct PingPongMutex
@@ -247,6 +253,7 @@ struct PingPongMutex
     using ShmStorage = CtaBarrier[2];
     ShmStorage& barriers;
     uint32_t const idxGrp;
+    bool skipWait = false;
 
     static __device__ inline void initStorage(ShmStorage& barriers, uint32_t thrdsPerGrp)
     {
@@ -261,14 +268,23 @@ struct PingPongMutex
     {
     }
 
+    __device__ inline void test_lock(uint32_t iter)
+    {
+        skipWait = barriers[idxGrp].test_wait_parity(toParity<1>(iter));
+    }
+
     __device__ inline void lock(uint32_t iter)
     {
-        barriers[idxGrp].wait_parity(toParity<1>(iter));
+        if (!skipWait)
+        {
+            barriers[idxGrp].wait_parity(toParity<1>(iter));
+        }
     }
 
     __device__ inline void unlock()
     {
         barriers[idxGrp ^ 1U].arrive();
+        skipWait = false;
     }
 };
 
@@ -299,10 +315,9 @@ constexpr bool useRegQ = USE_REG_Q;
 
 struct SharedMemA
 {
-    static inline constexpr uint32_t nbKBufs = 4;
-    static inline constexpr uint32_t nbXBufs = 1;
+    static inline constexpr uint32_t nbKBufs = 12;
 
-    static inline constexpr uint32_t regQParts = (useRegQ ? 1 : 0);
+    static inline constexpr uint32_t regQParts = (useRegQ ? 4 : 0);
     static inline constexpr uint32_t shmQParts = nbQParts - regQParts;
 
     using ShmQPart = Array2D<LdGrain, headGrpSize, grainsPerPartK>;
@@ -310,10 +325,9 @@ struct SharedMemA
 
     Vec<ShmQPart, shmQParts> q;
     ShmKPart k[nbKBufs];
-    XBuffer x[nbXBufs];
-    Vec<float, headGrpSize> rowSum[nbXBufs];
 
-    Vec<uint32_t, warp_size> drain; // data does not matter. Used to help avoid fence.
+    // single buffer reused by two groups. sendX() warp will arbitrate the order of x buffer access via two xBars.
+    CgaXBuffer x;
 
     // scaled by log2e. Write by last CGA iteration (from the other producer CTA) and read by current producer CTA.
     Vec<float, headGrpSize> rowMaxLog2e;
@@ -324,21 +338,19 @@ struct SharedMemA
     PingPongMutex::ShmStorage tensorCoreMutex;
 
     CtaBarrierPair kBars[nbKBufs];
-    CtaBarrierPair xBars[nbXBufs];
+    static inline constexpr uint32_t nbXBars = nbMathGrpsA;
+    CtaBarrierPair xBars[nbXBars];
 #if USE_REG_Q
     CtaBarrierPair regQBar;
 #endif
     CtaBarrier shmQBar;
-    CgaBarrier cgaXBufConsumed;                    // for X
-
-    PingPongMutex::ShmStorage rowMaxTransferMutex; // protect the order of rowMax transfer to consumers
-    CgaBarrier consumerRowMaxConsumedBar;          // arrive by consumer CTAs.
+    CgaBarrier cgaXBufConsumed; // for X
 
     CtaBarrierPair multiBlockBars[nbMultiBlockBufs];
 
     __device__ inline void invalidateBarriers(uint32_t thrdIdx)
     {
-        constexpr uint32_t nbBars = (useRegQ ? 15 : 13) + 2 * (nbKBufs + nbXBufs);
+        constexpr uint32_t nbBars = (useRegQ ? 12 : 10) + 2 * (nbKBufs + nbXBars);
 #ifndef __CUDACC_RTC__
         constexpr uint32_t nbBarsRef
             = exactDiv(offsetof(SharedMemA, qkScaleLog2e) - offsetof(SharedMemA, rowMaxLog2eBar), 8);
@@ -375,16 +387,16 @@ struct SharedMemB
     // in the future.
     struct XVBuffer
     {
-        XBuffer x;
         VBuffer v;
-        XBuffer pad; // for output swizzling
+        CgaXBuffer x;
+        uint8_t pad[headGrpSize * 128 * 2 - sizeof(VBuffer) - sizeof(CgaXBuffer)]; // for output swizzling
     };
 
     XVBuffer xv[nbXVBufs];
 
     __device__ inline XBuffer& x(uint32_t idx)
     {
-        return xv[idx].x;
+        return xv[idx].x.x;
     }
 
     __device__ inline VBuffer& v(uint32_t idx)
@@ -392,14 +404,19 @@ struct SharedMemB
         return xv[idx].v;
     }
 
-    Vec<float, headGrpSize> xRowSum[nbXBufs];
+    __device__ inline Vec<float, headGrpSize>& xRowSum(uint32_t idx)
+    {
+        return xv[idx].x.rowSum;
+    }
+
+    __device__ inline Vec<float, headGrpSize>& xRowMaxLog2e(uint32_t idx)
+    {
+        return xv[idx].x.rowMaxLog2e;
+    }
 
     static inline constexpr uint32_t nbAccRowMaxSumCopies = 2;
     Vec<float, headGrpSize> accRowMaxLog2e[nbAccRowMaxSumCopies];
     Vec<float, headGrpSize> accRowSum[nbAccRowMaxSumCopies];
-
-    Vec<float, headGrpSize> xRowMaxLog2e[nbProducerCtasPerCga];
-    CgaBarrier xRowMaxLog2eProducedBar[nbProducerCtasPerCga];
 
     CtaBarrierPair xBars[nbXBufs];
     CtaBarrierPair vBars[nbVBufs];
@@ -411,23 +428,21 @@ struct SharedMemB
 
     __device__ inline void invalidateBarriers(uint32_t thrdIdx)
     {
-        constexpr uint32_t nbBars = 17;
+        constexpr uint32_t nbBars = 15;
 #ifndef __CUDACC_RTC__
-        constexpr uint32_t nbBarsRef
-            = exactDiv(offsetof(SharedMemB, isLastSubSeq) - offsetof(SharedMemB, xRowMaxLog2eProducedBar), 8);
+        constexpr uint32_t nbBarsRef = exactDiv(offsetof(SharedMemB, isLastSubSeq) - offsetof(SharedMemB, xBars), 8);
         static_assert(nbBars == nbBarsRef);
 #endif
         if (thrdIdx < nbBars)
         {
-            reinterpret_cast<CtaBarrier*>(&xRowMaxLog2eProducedBar[0])[thrdIdx].~CtaBarrier();
+            reinterpret_cast<CtaBarrier*>(&xBars[0])[thrdIdx].~CtaBarrier();
         }
     }
 
     __device__ inline Vec<PartialResult::Chunk, nbMultiBlockBufs>& getMultiBlockBufs()
     {
 #ifndef __CUDACC_RTC__
-        static_assert(
-            sizeof(Vec<PartialResult::Chunk, nbMultiBlockBufs>) < offsetof(SharedMemB, xRowMaxLog2eProducedBar));
+        static_assert(sizeof(Vec<PartialResult::Chunk, nbMultiBlockBufs>) < offsetof(SharedMemB, xBars));
 #endif
         return *reinterpret_cast<Vec<PartialResult::Chunk, nbMultiBlockBufs>*>(this);
     }
@@ -518,11 +533,10 @@ struct Producer
                 b.initialize(1, thrdsPerGrp);
                 b.consumed.arrive<Scope::CTA, ArriveOrder::RELAXED>(thrdsPerGrp);
             }
-            if (warpRank < SharedMemA::nbXBufs)
+            if (warpRank < SharedMemA::nbXBars)
             {
                 auto& b = smem.xBars[warpRank];
                 b.initialize(thrdsPerGrp, 1);
-                b.consumed.arrive<Scope::CTA, ArriveOrder::RELAXED>(1);
             }
 #if USE_REG_Q
             if (warpRank == 0)
@@ -546,10 +560,6 @@ struct Producer
                 init(&smem.cgaXBufConsumed, 1 * nbVSplit);
                 smem.cgaXBufConsumed.arrive<Scope::CTA, ArriveOrder::RELAXED>(1 * nbVSplit);
                 PingPongMutex::initStorage(smem.tensorCoreMutex, thrdsPerGrp);
-                PingPongMutex::initStorage(smem.rowMaxTransferMutex, thrdsPerGrp);
-                init(&smem.consumerRowMaxConsumedBar, warp_size * nbComputeWarpsB * nbVSplit);
-                smem.consumerRowMaxConsumedBar.arrive<Scope::CTA, ArriveOrder::RELAXED>(
-                    warp_size * nbComputeWarpsB * nbVSplit);
             }
             if (nbSubSeq > 1 && warpRank < nbMultiBlockBufs)
             {
@@ -674,7 +684,6 @@ private:
         uint32_t const grpIdx = warpIdx.y;
         uint32_t const tileBaseRow = warpTile.y * warpIdx.x;
         PingPongMutex tensorCoreMutex{smem.tensorCoreMutex, grpIdx};
-        PingPongMutex rowMaxTransferMutex{smem.rowMaxTransferMutex, grpIdx};
 
         constexpr uint32_t partNbInstK = exactDiv(partElemsK, qmmaShape.k);
         using AtomA = Vec<uint32_t, 4>; // for 16x32 data, working as mat A of QMMA.16832
@@ -726,7 +735,6 @@ private:
         }
         smem.regQBar.consumed.arrive();
 #endif
-        smem.shmQBar.wait_parity(false);
 // main loop
 #pragma unroll 1
         for (uint32_t grpIter = 0; true; grpIter++)
@@ -824,6 +832,10 @@ private:
                 }
             }
 #endif
+            if (ctaIter == 0)
+            {
+                smem.shmQBar.wait_parity(false);
+            }
 #pragma unroll
             for (uint32_t idxPart = SharedMemA::regQParts; idxPart < nbQParts; idxPart++)
             {
@@ -891,7 +903,11 @@ private:
             {
                 applyMask(this_warp(), acc, 0, validTokens);
             }
-            WarpAcc const xF32 = scaleAndSoftmax(acc, grpIdx, grpIter, tileBaseRow, rowMaxTransferMutex);
+            ThrdRegRowMax rowMaxLog2e;
+            WarpAcc const xF32 = scaleAndSoftmax(rowMaxLog2e, acc, grpIdx, grpIter, tileBaseRow);
+
+            auto& xBar = smem.xBars[grpIdx];
+            bool const skipXBarWait = xBar.consumed.test_wait_parity(toParity<1>(grpIter));
             // convert to fp8
             WarpAcc const xF32Quant = xF32 * rcpXScale;
             // 0, 1, 8, 9,  2, 3, 10, 11,  4, 5, 12, 13,  6, 7, 14, 15
@@ -917,17 +933,19 @@ private:
                 : computeRowSumF32<warpTile.y, warpTile.x>(this_warp(), xF32);
 
             // store xF8 and rowSum into L2 scratch buffer
-            uint32_t const idxXBuf = ctaIter % SharedMemA::nbXBufs;
-            auto& xBar = smem.xBars[idxXBuf];
-            xBar.consumed.wait_parity(toParity<SharedMemA::nbXBufs>(ctaIter));
-            storeRowMax<warpTile.y>(smem.rowSum[idxXBuf], rowSum, tileBaseRow, lane);
-            storeOrderedXToShm(smem.x[idxXBuf], xF8, tileBaseRow, lane);
+            if (!skipXBarWait)
+            {
+                xBar.consumed.wait_parity(toParity<1>(grpIter));
+            }
+            storeRowMax<warpTile.y>(smem.x.rowMaxLog2e, rowMaxLog2e, tileBaseRow, lane);
+            storeRowMax<warpTile.y>(smem.x.rowSum, rowSum, tileBaseRow, lane);
+            storeOrderedXToShm(smem.x.x, xF8, tileBaseRow, lane);
             xBar.produced.arrive();
         }
     }
 
-    __device__ inline WarpAcc scaleAndSoftmax(WarpAcc const& acc, uint32_t grpIdx, uint32_t grpIter,
-        uint32_t tileBaseRow, PingPongMutex& rowMaxTransferMutex);
+    __device__ inline WarpAcc scaleAndSoftmax(
+        ThrdRegRowMax& rowMaxLog2e, WarpAcc const& acc, uint32_t grpIdx, uint32_t grpIter, uint32_t tileBaseRow);
 
     __device__ inline void storeOrderedXToShm(XBuffer& dst,
         Array2D<Array2D<uint32_t, 2, 1>, WarpAcc::rows, exactDiv(WarpAcc::cols, 2)> const& src,
@@ -973,6 +991,11 @@ __device__ inline void Producer::loadK()
 
 __device__ inline void Producer::sendX()
 {
+    // let group 0 to produce first.
+    if (warpElectSync())
+    {
+        smem.xBars[0].consumed.arrive();
+    }
     for (uint32_t iter = 0; true; iter++)
     {
         uint32_t const idxTile = idxTileBeg() + iterStride() * iter;
@@ -980,18 +1003,20 @@ __device__ inline void Producer::sendX()
         {
             break;
         }
-        uint32_t const idxBuf = iter % SharedMemA::nbXBufs;
-        auto& xBar = smem.xBars[idxBuf];
-        xBar.produced.wait_parity(toParity<SharedMemA::nbXBufs>(iter));
+        uint32_t const idxBar = iter % SharedMemA::nbXBars;
+        auto& xBar = smem.xBars[idxBar];
+        xBar.produced.wait_parity(toParity<SharedMemA::nbXBars>(iter));
         smem.cgaXBufConsumed.wait_parity(toParity<1>(iter));
         if (warpElectSync())
         {
             auto& dst = args.cgaXBuf[nbSubSeq * idxInputTokenGlobal + idxSubSeq][ctaRank];
-            tma::store1DAsync(&dst.x, &smem.x[idxBuf], sizeof(XBuffer));
-            tma::store1DAsync(&dst.rowSum, &smem.rowSum[idxBuf], sizeof(smem.rowSum[0]));
+            tma::store1DAsync(&dst, &smem.x, sizeof(CgaXBuffer));
             tma::commitGroup();
             tma::waitGroup<0>();
-            xBar.consumed.arrive();
+            // it's turn for the other math group to produce.
+            uint32_t const idxBarNext = (iter + 1) % SharedMemA::nbXBars;
+            auto& xBarNext = smem.xBars[idxBarNext];
+            xBarNext.consumed.arrive();
             asm volatile("fence.release.cluster;\n");
 #pragma unroll
             for (uint32_t i = 0; i < nbVSplit; i++)
@@ -1004,7 +1029,7 @@ __device__ inline void Producer::sendX()
 }
 
 __device__ inline Producer::WarpAcc Producer::scaleAndSoftmax(
-    WarpAcc const& acc, uint32_t grpIdx, uint32_t grpIter, uint32_t tileBaseRow, PingPongMutex& rowMaxTransferMutex)
+    ThrdRegRowMax& rowMaxLog2e, WarpAcc const& acc, uint32_t grpIdx, uint32_t grpIter, uint32_t tileBaseRow)
 {
     uint32_t const ctaIter = grpIdx + grpIter * nbMathGrps;
     uint32_t const cgaIter = ctaRank + ctaIter * nbProducerCtasPerCga;
@@ -1013,9 +1038,9 @@ __device__ inline Producer::WarpAcc Producer::scaleAndSoftmax(
     uint32_t const idxProducer = ctaRank;
     assert(ctaRank < nbProducerCtasPerCga);
 
-    auto const accLog2e = acc * smem.qkScaleLog2e;
+    float const qkScaleLog2e = smem.qkScaleLog2e;
     bool const skipWaitLastShmRowMax = smem.rowMaxLog2eBar[grpIdx].test_wait_parity(toParity<1>(grpIter));
-    QuadRegRowMax const tileRowMaxLog2e = computeRowMax<warpTile.y, warpTile.x>(accLog2e);
+    QuadRegRowMax const tileRowMaxLog2e = computeRowMax<warpTile.y, warpTile.x>(acc) * qkScaleLog2e;
     // get max with previous CTA's rowMax
     if (!skipWaitLastShmRowMax)
     {
@@ -1029,21 +1054,9 @@ __device__ inline Producer::WarpAcc Producer::scaleAndSoftmax(
     SharedMemA& smemNext = mapa(smem, ctaRank ^ 1U);
     CgaBarrier& nextRowMaxLog2eBar
         = smemNext.rowMaxLog2eBar[(cgaIter + 1) % (nbMathGrps * nbProducerCtasPerCga) / nbMathGrps];
-    ThrdRegRowMax const rowMaxLog2e = dedupFromQuad(warp, quadRowMaxLog2e);
+    rowMaxLog2e = dedupFromQuad(warp, quadRowMaxLog2e);
     storeRowMaxAsync<warpTile.y>(nextRowMaxLog2eBar, smemNext.rowMaxLog2e, rowMaxLog2e, tileBaseRow, lane);
     nextRowMaxLog2eBar.arrive_tx_relaxed(sizeof(rowMaxLog2e)); // notify that the next CTA can read rowMax now.
-
-    // transfer rowMax to consumers.
-    rowMaxTransferMutex.lock(grpIter); // @fixme: use test_wait_parity() early to avoid latency.
-    smem.consumerRowMaxConsumedBar.wait_parity(checkedVal<bool>(grpIdx, toParity<1>(ctaIter)));
-    for (uint32_t idxConsumer = 0; idxConsumer < nbVSplit; idxConsumer++)
-    {
-        auto& smemB = getConsumerShm(idxConsumer);
-        storeRowMaxAsync<warpTile.y>(smemB.xRowMaxLog2eProducedBar[idxProducer], smemB.xRowMaxLog2e[idxProducer],
-            rowMaxLog2e, tileBaseRow, lane);
-        smemB.xRowMaxLog2eProducedBar[idxProducer].arrive_tx_relaxed(sizeof(rowMaxLog2e));
-    }
-    rowMaxTransferMutex.unlock();
 
     WarpAcc x;
 // apply softmax
@@ -1060,9 +1073,9 @@ __device__ inline Producer::WarpAcc Producer::scaleAndSoftmax(
 #pragma unroll
                 for (uint32_t j = 0; j < InstAcc::cols; j++)
                 {
-                    float elem = accLog2e(m, n)(i, j);
-                    assert(maxVal >= elem);
-                    x(m, n)(i, j) = exp2f(elem - maxVal);
+                    float elem = acc(m, n)(i, j);
+                    assert(maxVal >= elem * qkScaleLog2e);
+                    x(m, n)(i, j) = exp2f(elem * qkScaleLog2e - maxVal);
                 }
             }
         }
@@ -1194,7 +1207,6 @@ struct Consumer
         {
             if (warpRank < nbProducerCtasPerCga)
             {
-                init(&smem.xRowMaxLog2eProducedBar[warpRank], Producer::thrdsPerGrp);
                 init(&smem.cgaXBufProduced[warpRank], 1);
             }
             if (warpRank < SharedMemB::nbXBufs)
@@ -1297,8 +1309,7 @@ __device__ inline void Consumer::compute()
     uint32_t const cB = 0;
 
     WarpAcc acc{};
-    uint32_t idxXVBufLast;
-    bool skipWait_xRowMaxLog2eProducedBar = false;
+    uint32_t idxXVBufLast{};
     for (uint32_t iter = 0; true; iter++)
     {
         uint32_t const idxTile = iterToTile(iter);
@@ -1310,20 +1321,19 @@ __device__ inline void Consumer::compute()
         ThrdRegRowMax accRowMaxLog2e = loadShmRowMax<warpTile.y>(smem.accRowMaxLog2e[tileIdx.x], tileBase.y, lane);
         ThrdRegRowMax accRowSum = loadShmRowMax<warpTile.y>(smem.accRowSum[tileIdx.x], tileBase.y, lane);
 
-        uint32_t const idxProducer = iter % nbProducerCtasPerCga;
-        if (!skipWait_xRowMaxLog2eProducedBar)
-        {
-            smem.xRowMaxLog2eProducedBar[idxProducer].wait_parity(toParity<nbProducerCtasPerCga>(iter));
-        }
-        ThrdRegRowMax const xRowMaxLog2e = loadShmRowMax<warpTile.y>(smem.xRowMaxLog2e[idxProducer], tileBase.y, lane);
-        auto& prodSmem = getProducerShm(idxProducer);
-        uint32_t const drainData = hashRegData(xRowMaxLog2e);
-        tma::storeAsync(&prodSmem.drain[lane], drainData, prodSmem.consumerRowMaxConsumedBar);
-        prodSmem.consumerRowMaxConsumedBar.template arrive_tx<Scope::CGA, ArriveOrder::RELAXED>(sizeof(drainData));
+        uint32_t const idxXBuf = iter % SharedMemB::nbXBufs;
+        uint32_t const idxVBuf = iter % SharedMemB::nbVBufs;
+        auto& xBar = smem.xBars[idxXBuf];
+        auto& vBar = smem.vBars[idxVBuf];
+        // @fixme: merge these two barriers and use test_wait_parity() early to avoid latency.
+        bool const skipVBarWait = vBar.produced.test_wait_parity(toParity<SharedMemB::nbVBufs>(iter));
+        xBar.produced.wait_parity(toParity<SharedMemB::nbXBufs>(iter));
+
+        ThrdRegRowMax const xRowMaxLog2e = loadShmRowMax<warpTile.y>(smem.xRowMaxLog2e(idxXBuf), tileBase.y, lane);
         assert(all(accRowMaxLog2e <= xRowMaxLog2e));
 
         auto const needRescaleVec = (xRowMaxLog2e > accRowMaxLog2e);
-        UniformNeedRescaleMask rescaleMask;
+        UniformNeedRescaleMask rescaleMask{};
 #pragma unroll
         for (uint32_t i = 0; i < rescaleMask.size; i++)
         {
@@ -1360,17 +1370,13 @@ __device__ inline void Consumer::compute()
         }
         accRowMaxLog2e = xRowMaxLog2e;
         storeRowMax<warpTile.y>(smem.accRowMaxLog2e[tileIdx.x], accRowMaxLog2e, tileBase.y, lane);
-
-        uint32_t const idxXBuf = iter % SharedMemB::nbXBufs;
-        uint32_t const idxVBuf = iter % SharedMemB::nbVBufs;
-        auto& xBar = smem.xBars[idxXBuf];
-        auto& vBar = smem.vBars[idxVBuf];
-        // @fixme: merge these two barriers and use test_wait_parity() early to avoid latency.
-        vBar.produced.wait_parity(toParity<SharedMemB::nbVBufs>(iter));
-        xBar.produced.wait_parity(toParity<SharedMemB::nbXBufs>(iter));
+        if (!skipVBarWait)
+        {
+            vBar.produced.wait_parity(toParity<SharedMemB::nbVBufs>(iter));
+        }
         auto const& xBuf = smem.x(idxXBuf);
         auto const& vBuf = smem.v(idxVBuf)[tileIdx.x];
-        auto const xRowSum = loadShmRowMax<warpTile.y>(smem.xRowSum[idxXBuf], tileBase.y, lane);
+        auto const xRowSum = loadShmRowMax<warpTile.y>(smem.xRowSum(idxXBuf), tileBase.y, lane);
         accRowSum = accRowSum + xRowSum;
         storeRowMax<warpTile.y>(smem.accRowSum[tileIdx.x], accRowSum, tileBase.y, lane);
 
@@ -1386,13 +1392,6 @@ __device__ inline void Consumer::compute()
                 auto const data
                     = ldmatrix_16x16_trans<2>(&vBuf.template at<true>(qmmaShape.k * idxInstK + rB, idxAtomBx2 + cB));
                 AtomB const v[2] = {data[0], data[2], data[1], data[3]};
-                if (idxInstK == tileNbInstK - 1 && idxAtomBx2 == warpTileNbAtomBx2 - 2)
-                {
-                    uint32_t const iterNext = iter + 1;
-                    skipWait_xRowMaxLog2eProducedBar
-                        = smem.xRowMaxLog2eProducedBar[iterNext % nbProducerCtasPerCga].test_wait_parity(
-                            toParity<nbProducerCtasPerCga>(iterNext));
-                }
 #pragma unroll
                 for (uint32_t i = 0; i < WarpAcc::rows; i++)
                 {
@@ -1479,11 +1478,9 @@ __device__ inline void Consumer::loadX()
         if (warpElectSync())
         {
             auto& src = args.cgaXBuf[nbSubSeq * idxInputTokenGlobal + idxSubSeq][idxScratchXBuf];
-            auto& dstX = smem.x(idxXBuf);
-            auto& dstRowSum = smem.xRowSum[idxXBuf];
-            tma::load1DAsync(&dstX, &src.x, sizeof(smem.x(0)), xBar.produced);
-            tma::load1DAsync(&dstRowSum, &src.rowSum, sizeof(smem.xRowSum[0]), xBar.produced);
-            xBar.produced.arrive_tx(sizeof(smem.x(0)) + sizeof(smem.xRowSum[0]));
+            auto& dst = smem.xv[idxXBuf].x;
+            tma::loadLinearAsync(&dst, &src.x, sizeof(CgaXBuffer), xBar.produced);
+            xBar.produced.arrive_tx(sizeof(CgaXBuffer));
             xBar.produced.wait_parity(toParity<SharedMemB::nbXBufs>(iter));
             uint32_t const idxProducer = idxScratchXBuf;
             // @fixme: check if this works. If it doesn't, randomly pick some data from dstX and dstRowSum and use
@@ -1663,7 +1660,7 @@ __device__ inline void mergePartialOutputs(uint32_t& semaphore, Vec<OutputHead, 
                 bar.consumed.wait_parity(toParity<nbShmBufs>(idxSubSeq));
                 if (warpElectSync())
                 {
-                    tma::load1DAsync(&shmBufs[idxBuf], &reqPartialResults[idxSubSeq].chunks[ctaRank],
+                    tma::loadLinearAsync(&shmBufs[idxBuf], &reqPartialResults[idxSubSeq].chunks[ctaRank],
                         sizeof(PartialResult::Chunk), bar.produced);
                     bar.produced.arrive_tx(sizeof(PartialResult::Chunk));
                 }

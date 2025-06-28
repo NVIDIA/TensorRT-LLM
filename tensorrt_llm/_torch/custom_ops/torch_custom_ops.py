@@ -22,12 +22,9 @@ def bmm_out(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
 class MoERunner(TunableRunner):
     # avoid overhead of creating a new runner in forward pass
     runner_dict = dict()
-    # TODO: only profile for min_latency_mode = False due to the error in the moe_kernels
     tuning_config = TuningConfig(dynamic_tensor_specs=(
         DynamicTensorSpec(0, 0, get_last_power_of_2_num_tokens_buckets(8192),
-                          lambda x: min(last_positive_power_of_2(x), 8192)),
-        DynamicTensorSpec(3, 0, (0, ), lambda x: x),
-    ))
+                          lambda x: min(last_positive_power_of_2(x), 8192)), ))
 
     def __init__(
         self,
@@ -44,6 +41,7 @@ class MoERunner(TunableRunner):
         enable_alltoall: bool,
         use_deepseek_fp8_block_scale: bool,
         use_w4a8_group_scaling: bool,
+        min_latency_mode: bool,
     ):
         self.x_dtype = x_dtype
         self.weight_dtype = weight_dtype
@@ -58,7 +56,7 @@ class MoERunner(TunableRunner):
         self.enable_alltoall = enable_alltoall
         self.use_deepseek_fp8_block_scale = use_deepseek_fp8_block_scale
         self.use_w4a8_group_scaling = use_w4a8_group_scaling
-
+        self.min_latency_mode = min_latency_mode
         instance_key = (x_dtype, weight_dtype, output_dtype,
                         use_deepseek_fp8_block_scale, use_w4a8_group_scaling)
 
@@ -74,22 +72,7 @@ class MoERunner(TunableRunner):
         inputs: List[torch.Tensor],
         profile: OptimizationProfile,
     ) -> List[int]:
-        x, _, _, min_latency_mode_tensor = inputs
-        min_latency_mode = min_latency_mode_tensor.size(0) == 1
-        m = x.shape[0]
-
-        # Only profile m <= 128 for min latency mode = True
-        # Profile all valid buckets for min latency mode = False
-        # TODO: min_latency_mode = True will cause the following error:
-        # Cannot profile configuration 4: Cutlass GEMM Tactic
-        # [TensorRT-LLM][ERROR] Assertion failed: Failed to initialize cutlass TMA WS grouped gemm.
-        # Should be fixed in the moe_kernels in the future.
-        invalid = (m > 128 and
-                   min_latency_mode) or (m <= 128 and min_latency_mode and
-                                         (not self.weight_dtype == torch.int64))
-
-        return [] if invalid else list(
-            range(self.fused_moe_runner.get_tactic_num()))
+        return range(self.fused_moe_runner.get_tactic_num())
 
     def forward(
         self,
@@ -98,13 +81,13 @@ class MoERunner(TunableRunner):
         tactic: int = -1,
         do_preparation: bool = False,
     ):
-        x, fc1_expert_weights, fc2_expert_weights, min_latency_mode_tensor = inputs
-        min_latency_mode = min_latency_mode_tensor.size(0) == 1
-        # determine if we should use min latency mode according to the profiled seq len
+        x, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights, fc2_expert_biases = inputs
         self.fused_moe_runner.run_gemm_profile(
             x,
             fc1_expert_weights,
+            fc1_expert_biases,
             fc2_expert_weights,
+            fc2_expert_biases,
             self.top_k,
             self.tp_size,
             self.tp_rank,
@@ -113,7 +96,7 @@ class MoERunner(TunableRunner):
             self.cluster_size,
             self.cluster_rank,
             self.enable_alltoall,
-            min_latency_mode,
+            self.min_latency_mode,
             gemm_idx,
             tactic,
             do_preparation,
@@ -122,13 +105,11 @@ class MoERunner(TunableRunner):
     @classmethod
     @lru_cache(maxsize=None)
     def refine_tuning_config(cls, tune_max_num_tokens: int):
-        cls.tuning_config = TuningConfig(dynamic_tensor_specs=(
-            DynamicTensorSpec(
+        cls.tuning_config = TuningConfig(
+            dynamic_tensor_specs=(DynamicTensorSpec(
                 0, 0, get_last_power_of_2_num_tokens_buckets(
                     tune_max_num_tokens), lambda x: min(
-                        last_positive_power_of_2(x), tune_max_num_tokens)),
-            DynamicTensorSpec(3, 0, (0, ), lambda x: x),
-        ))
+                        last_positive_power_of_2(x), tune_max_num_tokens)), ))
 
 
 @torch.library.custom_op("trtllm::fused_moe", mutates_args=())
@@ -137,7 +118,9 @@ def fused_moe(
     token_selected_experts: torch.Tensor,
     token_final_scales: torch.Tensor,
     fc1_expert_weights: torch.Tensor,
+    fc1_expert_biases: Optional[torch.Tensor],
     fc2_expert_weights: torch.Tensor,
+    fc2_expert_biases: Optional[torch.Tensor],
     output_dtype: torch.dtype,
     quant_scales: List[torch.Tensor],
     input_sf: Optional[torch.Tensor] = None,
@@ -157,9 +140,6 @@ def fused_moe(
     tuner = AutoTuner.get()
     MoERunner.refine_tuning_config(tune_max_num_tokens)
 
-    # TODO: set min_latency_mode always to False due to the error in the moe_kernels
-    min_latency_tensor = torch.empty(0)
-
     # allocate workspace for profiling
     moe_runner = MoERunner(
         x_dtype=input.dtype,
@@ -175,13 +155,17 @@ def fused_moe(
         enable_alltoall=enable_alltoall,
         use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
         use_w4a8_group_scaling=use_w4a8_group_scaling,
+        min_latency_mode=min_latency_mode,
     )
 
     _, gemm_tactic_1 = tuner.choose_one(
         "trtllm::fused_moe::gemm1",
         [moe_runner],
         MoERunner.tuning_config,
-        [input, fc1_expert_weights, fc2_expert_weights, min_latency_tensor],
+        [
+            input, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
+            fc2_expert_biases
+        ],
         gemm_idx=1,
     )
 
@@ -189,7 +173,10 @@ def fused_moe(
         "trtllm::fused_moe::gemm2",
         [moe_runner],
         MoERunner.tuning_config,
-        [input, fc1_expert_weights, fc2_expert_weights, min_latency_tensor],
+        [
+            input, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
+            fc2_expert_biases
+        ],
         gemm_idx=2,
     )
 
@@ -199,7 +186,9 @@ def fused_moe(
         token_selected_experts,
         token_final_scales,
         fc1_expert_weights,
+        fc1_expert_biases,
         fc2_expert_weights,
+        fc2_expert_biases,
         quant_scales,
         input_sf,
         tp_size,
@@ -222,7 +211,9 @@ def _(
     token_selected_experts: torch.Tensor,
     token_final_scales: torch.Tensor,
     fc1_expert_weights: torch.Tensor,
+    fc1_expert_biases: Optional[torch.Tensor],
     fc2_expert_weights: torch.Tensor,
+    fc2_expert_biases: Optional[torch.Tensor],
     output_dtype: torch.dtype,
     quant_scales: List[torch.Tensor],
     input_sf: Optional[torch.Tensor] = None,
@@ -651,6 +642,7 @@ def attention(
     mla_context_paged_kv: Optional[torch.Tensor],
     mla_context_kv_cache_block_offsets: Optional[torch.Tensor],
     attention_chunk_size: Optional[int],
+    softmax_stats_tensor: Optional[torch.Tensor],
 ) -> List[torch.Tensor]:
     num_tokens = q.size(0)
     attention_input_type = (AttentionInputType(attention_input_type)
@@ -697,7 +689,7 @@ def attention(
         q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim,
         v_head_dim, mrope_rotary_cos_sin, mrope_position_deltas,
         mla_context_paged_kv, mla_context_kv_cache_block_offsets,
-        attention_chunk_size)
+        attention_chunk_size, softmax_stats_tensor)
     return output_act, output_sf
 
 

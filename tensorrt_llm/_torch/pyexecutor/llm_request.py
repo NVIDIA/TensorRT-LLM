@@ -252,8 +252,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             return_generation_logits: bool = False,
             return_logits_device_memory: bool = True,
             exclude_last_generation_logits: bool = False,
+            return_perf_metrics: bool = False,
             stop_words_list: list[list[int]] | None = None,
-            is_draft: bool = False,
             **kwargs):
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
                                                     None)
@@ -263,6 +263,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             return_log_probs=return_log_probs,
             return_context_logits=False,
             return_generation_logits=False,
+            return_perf_metrics=return_perf_metrics,
             stop_words_list=torch.tensor(stop_words_list, dtype=torch.int32)
             if stop_words_list else None,
             **kwargs)
@@ -287,7 +288,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_return_context_logits = return_context_logits
         self.py_return_generation_logits = return_generation_logits
         self.py_return_logits_device_memory = return_logits_device_memory
-        self.py_is_draft = is_draft
 
         # TODO: remove this when use DynamicDecodeOp in pytorch flow.
         # currently, keep py_stop_words_list as python list, rather than tensor.
@@ -410,6 +410,7 @@ def executor_request_to_llm_request(
         return_log_probs=executor_request.output_config.return_log_probs,
         return_context_logits=executor_request.output_config.
         return_context_logits,
+        return_perf_metrics=executor_request.output_config.return_perf_metrics,
         return_generation_logits=executor_request.output_config.
         return_generation_logits,
         exclude_last_generation_logits=exclude_last_generation_logits,

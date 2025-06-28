@@ -44,6 +44,7 @@
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/gemm/kernel/sm100_tile_scheduler.hpp"
+#include "cutlass/gemm/kernel/tile_scheduler.hpp"
 #include "cutlass/kernel_hardware_info.hpp"
 #include "cutlass/pipeline/pipeline.hpp"
 #include "cutlass/workspace.h"

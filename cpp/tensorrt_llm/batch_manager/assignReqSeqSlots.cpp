@@ -34,7 +34,7 @@ void tensorrt_llm::batch_manager::AssignReqSeqSlots::operator()(SequenceSlotMana
                 || (llmReq->isDisaggGenerationTransmissionComplete());
             if (isReqNew && llmReq->getReturnPerfMetrics())
             {
-                llmReq->setFirstScheduledTime(std::chrono::steady_clock::now());
+                llmReq->setFirstScheduledTime();
             }
             auto const reqSeqSlot = seqSlotManager.getSequenceSlot(isReqNew, llmReq->mRequestId);
             TLLM_CHECK_WITH_INFO(reqSeqSlot, "Unable to get batch slot for reqId");

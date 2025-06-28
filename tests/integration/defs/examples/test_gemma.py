@@ -208,6 +208,7 @@ def test_llm_gemma_1gpu_summary_vswa(batch_size, data_type, gemma_model_root,
                        max_attention_window)
 
 
+@pytest.mark.timeout(5400)
 @pytest.mark.parametrize("batch_size", [8])
 @pytest.mark.parametrize("data_type", ['float16', 'bfloat16'])
 @pytest.mark.parametrize("test_case", [

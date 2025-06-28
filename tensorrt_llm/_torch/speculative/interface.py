@@ -47,7 +47,7 @@ class SpeculativeDecodingMode(IntEnum):
         return self.is_mtp() or self.is_eagle3_one_model()
 
     def needs_kv_cache_rewind(self):
-        return self.is_mtp() or self.is_eagle3_one_model()
+        return self.is_mtp() or self.is_eagle3_one_model() or self.is_ngram()
 
     def support_overlap_scheduler(self):
         return self.is_mtp() or self.is_eagle3_one_model()
@@ -72,6 +72,9 @@ class SpeculativeDecodingMode(IntEnum):
 
     def has_spec_decoder(self):
         return self.is_mtp() or self.is_eagle3() or self.is_eagle3_one_model()
+
+    def has_spec_drafter(self):
+        return self.is_ngram()
 
     def extend_ctx(self, attention_backend: Type[AttentionBackend]):
         """

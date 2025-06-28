@@ -43,6 +43,7 @@ Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/
       - [Activation calibration](#activation-calibration)
       - [Weight quantization and assembling](#weight-quantization-and-assembling)
     - [KV Cache Reuse](#kv-cache-reuse)
+    - [Chunked Prefill](#chunked-prefill)
   - [Notes and Troubleshooting](#notes-and-troubleshooting)
   - [Known Issues](#known-issues)
 
@@ -786,6 +787,16 @@ The converted checkpoint could be used as `<YOUR_MODEL_DIR>` and consumed by oth
 
 ### KV Cache Reuse
 KV cache reuse is supported for MLA on SM90 and SM100. It is enabled by default. Due to extra operations like memcpy and GEMMs, GPU memory consumption may be higher and the E2E performance may have regression in some cases. Users could pass `KvCacheConfig(enable_block_reuse=False)` to LLM API to disable it.
+
+### Chunked Prefill
+Chunked Prefill is supported for MLA only on SM100 currently. You should add `--enable_chunked_prefill` to enable it. The GPU memory consumption is highly correlated with `max_num_tokens` and `max_batch_size`. If encountering out-of-memory errors, you may make these values smaller. (`max_num_tokens` must be divisible by kv cache's `tokens_per_block`)
+
+More specifically, we can imitate what we did in the [Quick Start](#quick-start):
+
+``` bash
+cd examples/pytorch
+python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --enable_chunked_prefill
+```
 
 ## Notes and Troubleshooting
 

@@ -327,6 +327,7 @@ __global__ void routingMainKernel(KernelParams params)
     // note that with invalid values, because sigmoid is < 1 and bias is -1,
     // we must get a negative value, which is smaller than any valid value
     auto scoreBias = float{scoreSigmoid + float{biasVal}};
+
     if (expertSelected)
     {
         smemScoreBias[threadExpert] = scoreBias;
@@ -859,7 +860,6 @@ __global__ void routingIndicesCoopKernel(KernelParams params)
 // inefficient if we have one CTA per token doing a single global atomic.
 
 template <typename KernelParams>
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 __global__ void __launch_bounds__(NumThreads) routingIndicesHistogramKernel(KernelParams params)
 {
     // number of experts is bounded by number of threads
@@ -872,12 +872,14 @@ __global__ void __launch_bounds__(NumThreads) routingIndicesHistogramKernel(Kern
     smemExpertCount[threadIdx.x] = 0;
     __syncthreads();
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // Wait on primary grid and trigger secondary kernel.
     if constexpr (KernelParams::UsePdl)
     {
         cudaGridDependencySynchronize();
         cudaTriggerProgrammaticLaunchCompletion();
     }
+#endif
 
     int32_t const expandedIdxSize = params.mNumTokens * params.mTopK;
     int32_t const localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
@@ -932,17 +934,10 @@ __global__ void __launch_bounds__(NumThreads) routingIndicesHistogramKernel(Kern
     int32_t const localExpertCount = smemExpertCount[threadIdx.x];
     atomicAdd(&params.mPtrExpertCounts[threadIdx.x], localExpertCount);
 }
-#else
-__global__ void routingIndicesHistogramKernel(KernelParams params)
-{
-    assert(false && "routingIndicesHistogramKernel is only supported on SM90+ architectures");
-}
-#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename KernelParams>
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 __global__ void __launch_bounds__(NumThreads) routingIndicesOffsetsKernel(KernelParams params)
 {
     // number of experts is bounded by number of threads
@@ -960,11 +955,13 @@ __global__ void __launch_bounds__(NumThreads) routingIndicesOffsetsKernel(Kernel
     int32_t const expandedIdxSize = params.mNumTokens * params.mTopK;
     int32_t const numTiles = (expandedIdxSize + MaxExpandedIdxPerBlock - 1) / (MaxExpandedIdxPerBlock);
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // Wait on primary grid.
     if constexpr (KernelParams::UsePdl)
     {
         cudaGridDependencySynchronize();
     }
+#endif
 
     // The expert offsets are common to all tiles of all blocks.
     // Load the histogram, scan it and write offsets to shared memory.
@@ -1163,17 +1160,13 @@ __global__ void __launch_bounds__(NumThreads) routingIndicesOffsetsKernel(Kernel
     // Trigger secondary kernel.
     // Note: this does not guarantee the visibility of prior writes unless the consumer executes a
     // dependency sync.
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     if constexpr (KernelParams::UsePdl)
     {
         cudaTriggerProgrammaticLaunchCompletion();
     }
-}
-#else
-__global__ void routingIndicesOffsetsKernel(KernelParams params)
-{
-    assert(false && "routingIndicesOffsetsKernel is only supported on SM90+ architectures");
-}
 #endif
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -1251,6 +1244,8 @@ void run(Data const& data, void* stream)
     {
         // Reset the global histograms (not used in single-cluster code path).
         // Cover both for the cooperative and two-kernel code paths.
+        TLLM_CHECK_WITH_INFO(
+            data.mPtrExpertCounts != nullptr, "When #tokens is large, `mPtrExpertCounts` is a required input.");
         TLLM_CUDA_CHECK(cudaMemsetAsync(
             data.mPtrExpertCounts, 0, static_cast<size_t>(2 * NumThreads) * sizeof(int32_t), (cudaStream_t) stream));
     }
@@ -1577,7 +1572,6 @@ __host__ __device__ constexpr void setBits(int32_t& value, int32_t newBits, int 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename KernelParams>
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParams params)
 {
     // types used in this kernel
@@ -1614,11 +1608,13 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     }
     __syncwarp();
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // then wait on primary grid
     if constexpr (KernelParams::UsePdl)
     {
         cudaGridDependencySynchronize();
     }
+#endif
 
     if (params.mPtrScores != nullptr)
     {
@@ -1744,12 +1740,14 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
         params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
     }
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 #if !defined(PDL_PROFILE) || PDL_PROFILE == 0
     // we can trigger the next kernel at this point
     if constexpr (KernelParams::UsePdl)
     {
         cudaTriggerProgrammaticLaunchCompletion();
     }
+#endif
 #endif
 
     // at this point, all values for offsets are ready, except the final offsets
@@ -1806,13 +1804,6 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
         }
     }
 }
-#else
-__global__ void routingIndicesWarpKernel(KernelParams params)
-{
-    assert(false && "routingIndicesWarpKernel is only supported on SM90+ architectures");
-}
-#endif
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename KernelParams>
@@ -2076,7 +2067,6 @@ __global__ void routingIndicesClusterKernel(KernelParams params)
 
 // this kernel is needed in case we have scores as input for the histogram kernel
 template <typename KernelParams>
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramScoresKernel(KernelParams params)
 {
     using TypeExpW = typename KernelParams::TypeExpW;
@@ -2094,12 +2084,14 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramScoresK
     auto block = cg::this_thread_block();
     auto warp = cg::tiled_partition<WarpSize>(block);
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // Wait on primary grid and trigger secondary kernel.
     if constexpr (KernelParams::UsePdl)
     {
         cudaGridDependencySynchronize();
         cudaTriggerProgrammaticLaunchCompletion();
     }
+#endif
 
     // in this case, each warp represents a token, and we use a grid-stride loop
     // over all warps/tokens
@@ -2132,12 +2124,6 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramScoresK
         }
     }
 }
-#else
-__global__ void routingIndicesHistogramScoresKernel(KernelParams params)
-{
-    assert(false && "routingIndicesHistogramScoresKernel is only supported on SM90+ architectures");
-}
-#endif
 
 // Two-step approach (if number of tokens exceed limits of what cluster / cooperative launch
 // variants can handle): in order to minimize the amount of data to exchange through global memory,
@@ -2148,7 +2134,6 @@ __global__ void routingIndicesHistogramScoresKernel(KernelParams params)
 // Note: the histogram calculation could also be fused with routingMainKernel, but this might be
 // inefficient if we have one CTA per token doing a single global atomic.
 template <typename KernelParams>
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramKernel(KernelParams params)
 {
     using TypeExpW = typename KernelParams::TypeExpW;
@@ -2166,12 +2151,14 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramKernel(
     }
     __syncthreads();
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // Wait on primary grid and trigger secondary kernel.
     if constexpr (KernelParams::UsePdl)
     {
         cudaGridDependencySynchronize();
         cudaTriggerProgrammaticLaunchCompletion();
     }
+#endif
 
     uint32_t const expandedIdxSize = params.mNumTokens * NumTopExperts;
     uint32_t const localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
@@ -2234,17 +2221,10 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramKernel(
         atomicAdd(&params.mPtrExpertCounts[threadIdx.x], localExpertCount);
     }
 }
-#else
-__global__ void routingIndicesHistogramKernel(KernelParams params)
-{
-    assert(false && "routingIndicesHistogramKernel is only supported on SM90+ architectures");
-}
-#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename KernelParams>
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 __global__ void __launch_bounds__(NumThreadsHist) routingIndicesOffsetsKernel(KernelParams params)
 {
     using TypeExpW = typename KernelParams::TypeExpW;
@@ -2264,11 +2244,13 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesOffsetsKernel(Ke
     uint32_t const expandedIdxSize = params.mNumTokens * NumTopExperts;
     uint32_t const numTiles = (expandedIdxSize + MaxExpandedIdxPerBlock - 1) / (MaxExpandedIdxPerBlock);
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // Wait on primary grid.
     if constexpr (KernelParams::UsePdl)
     {
         cudaGridDependencySynchronize();
     }
+#endif
 
     // The expert offsets are common to all tiles of all blocks.
     // Load the histogram, scan it and write offsets to shared memory.
@@ -2484,6 +2466,7 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesOffsetsKernel(Ke
         }
     }
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 // Trigger secondary kernel.
 // Note: this does not guarantee the visibility of prior writes unless the consumer executes a
 // dependency sync.
@@ -2493,13 +2476,8 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesOffsetsKernel(Ke
         cudaTriggerProgrammaticLaunchCompletion();
     }
 #endif
-}
-#else
-__global__ void routingIndicesOffsetsKernel(KernelParams params)
-{
-    assert(false && "routingIndicesOffsetsKernel is only supported on SM90+ architectures");
-}
 #endif
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -2599,7 +2577,7 @@ void run(Data const& data, void* stream)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-namespace routingQwen3
+namespace routingRenormalize
 {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -3230,13 +3208,13 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramScoresK
     auto block = cg::this_thread_block();
     auto warp = cg::tiled_partition<WarpSize>(block);
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // Wait on primary grid.
     if constexpr (KernelParams::UsePdl)
     {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         cudaGridDependencySynchronize();
-#endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     }
+#endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 
     // initialize the mPtrPermutedIdxToTokenIdx
     int32_t globalThreadIdx = globalWarpIdx * WarpSize + laneIdx;
@@ -3261,13 +3239,13 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramScoresK
         }
     }
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // Trigger secondary kernel.
     if constexpr (KernelParams::UsePdl)
     {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         cudaTriggerProgrammaticLaunchCompletion();
-#endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     }
+#endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 
     // in this case, each warp represents a token, and we use a grid-stride loop
     // over all warps/tokens
@@ -3360,14 +3338,14 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramKernel(
     }
     __syncthreads();
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // Wait on primary grid and trigger secondary kernel.
     if constexpr (KernelParams::UsePdl)
     {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         cudaGridDependencySynchronize();
         cudaTriggerProgrammaticLaunchCompletion();
-#endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     }
+#endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 
     uint32_t const expandedIdxSize = params.mNumTokens * NumTopExperts;
     uint32_t const localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
@@ -3454,13 +3432,13 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesOffsetsKernel(Ke
     uint32_t const expandedIdxSize = params.mNumTokens * NumTopExperts;
     uint32_t const numTiles = (expandedIdxSize + MaxExpandedIdxPerBlock - 1) / (MaxExpandedIdxPerBlock);
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // Wait on primary grid.
     if constexpr (KernelParams::UsePdl)
     {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         cudaGridDependencySynchronize();
-#endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     }
+#endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 
     // The expert offsets are common to all tiles of all blocks.
     // Load the histogram, scan it and write offsets to shared memory.
@@ -3676,17 +3654,17 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesOffsetsKernel(Ke
         }
     }
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 // Trigger secondary kernel.
 // Note: this does not guarantee the visibility of prior writes unless the consumer executes a
 // dependency sync.
 #if !defined(PDL_PROFILE) || PDL_PROFILE == 0
     if constexpr (KernelParams::UsePdl)
     {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         cudaTriggerProgrammaticLaunchCompletion();
-#endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     }
 #endif
+#endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -3756,7 +3734,7 @@ void run(Data const& data, void* stream)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-} // namespace routingQwen3
+} // namespace routingRenormalize
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

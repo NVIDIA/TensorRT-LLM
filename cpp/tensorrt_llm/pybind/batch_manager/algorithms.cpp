@@ -103,15 +103,14 @@ void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::mod
             [](HandleContextLogits const& self, DecoderInputBuffers& inputBuffers, RequestVector const& contextRequests,
                 at::Tensor const& logits, std::vector<tr::SizeType32> const& numContextLogitsVec,
                 tr::ModelConfig const& modelConfig, tr::BufferManager const& manager,
-                OptionalRef<MedusaBuffers> medusaBuffers = std::nullopt,
-                OptionalRef<DraftBuffers> draftBuffers = std::nullopt)
+                OptionalRef<MedusaBuffers> medusaBuffers = std::nullopt)
             {
                 return self(inputBuffers, contextRequests, tr::TorchView::of(logits), numContextLogitsVec, modelConfig,
-                    manager, draftBuffers, medusaBuffers);
+                    manager, medusaBuffers);
             },
             py::arg("decoder_input_buffers"), py::arg("context_requests"), py::arg("logits"),
             py::arg("num_context_logits"), py::arg("model_config"), py::arg("buffer_manager"),
-            py::arg("draft_buffers") = std::nullopt, py::arg("medusa_buffers") = std::nullopt)
+            py::arg("medusa_buffers") = std::nullopt)
         .def("name", [](HandleContextLogits const&) { return HandleContextLogits::name; });
 
     py::class_<HandleGenerationLogits>(m, HandleGenerationLogits::name)
@@ -122,22 +121,21 @@ void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::mod
                 RequestVector const& generationRequests, at::Tensor const& logits, tr::SizeType32 logitsIndex,
                 tr::ModelConfig const& modelConfig, tr::BufferManager const& manager,
                 OptionalRef<RuntimeBuffers> genRuntimeBuffers = std::nullopt,
-                OptionalRef<DraftBuffers> draftBuffers = std::nullopt)
+                OptionalRef<MedusaBuffers> medusaBuffers = std::nullopt)
             {
                 self(inputBuffers, generationRequests, tr::TorchView::of(logits), logitsIndex, modelConfig, manager,
-                    genRuntimeBuffers, draftBuffers);
+                    genRuntimeBuffers, medusaBuffers);
             },
             py::arg("decoder_input_buffers"), py::arg("generation_requests"), py::arg("logits"),
             py::arg("logits_index"), py::arg("model_config"), py::arg("buffer_manager"),
-            py::arg("gen_runtime_buffers") = std::nullopt, py::arg("draft_buffers") = std::nullopt)
+            py::arg("gen_runtime_buffers") = std::nullopt, py::arg("medusa_buffers") = std::nullopt)
         .def("name", [](HandleGenerationLogits const&) { return HandleGenerationLogits::name; });
 
     py::class_<MakeDecodingBatchInputOutput>(m, MakeDecodingBatchInputOutput::name)
         .def(py::init())
         .def("__call__", &MakeDecodingBatchInputOutput::operator(), py::arg("context_requests"),
-            py::arg("generation_requests"), py::arg("decoder_buffers"), py::arg("decoder_input_buffers"),
-            py::arg("decoder_state"), py::arg("model_config"), py::arg("max_num_sequences"),
-            py::arg("fused_runtime_buffers") = std::nullopt)
+            py::arg("generation_requests"), py::arg("decoder_input_buffers"), py::arg("decoder_state"),
+            py::arg("model_config"), py::arg("max_num_sequences"), py::arg("fused_runtime_buffers") = std::nullopt)
         .def("name", [](MakeDecodingBatchInputOutput const&) { return MakeDecodingBatchInputOutput::name; });
 
     py::class_<LogitsPostProcessor>(m, LogitsPostProcessor::name)
@@ -175,8 +173,8 @@ void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::mod
 
     py::class_<UpdateDecoderBuffers>(m, UpdateDecoderBuffers::name)
         .def(py::init())
-        .def("__call__", &UpdateDecoderBuffers::operator(), py::arg("model_config"), py::arg("decoder_buffers"),
-            py::arg("decoder_output_buffers"), py::arg("copy_buffer_manager"), py::arg("decoder_state"),
-            py::arg("return_log_probs"), py::arg("decoder_finish_event"))
+        .def("__call__", &UpdateDecoderBuffers::operator(), py::arg("model_config"), py::arg("decoder_output_buffers"),
+            py::arg("copy_buffer_manager"), py::arg("decoder_state"), py::arg("return_log_probs"),
+            py::arg("decoder_finish_event"))
         .def("name", [](UpdateDecoderBuffers const&) { return UpdateDecoderBuffers::name; });
 }

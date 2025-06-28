@@ -20,7 +20,7 @@ import tensorrt as trt
 from tensorrt_llm._common import default_net
 from tensorrt_llm.bindings import KVCacheType
 from tensorrt_llm.functional import Tensor, cast, categorical_sample
-from tensorrt_llm.models import LLaMAForCausalLM
+from tensorrt_llm.models import LLaMAForCausalLM, QWenForCausalLM
 from tensorrt_llm.models.generation_mixin import GenerationMixin
 
 from ..._utils import pad_vocab_size, str_dtype_to_trt
@@ -29,7 +29,7 @@ from .redrafter_helper import (_beam_search_candidates, _beams2tree,
                                _process_logits_and_hidden_states)
 
 
-class ReDrafterForCausalLM(LLaMAForCausalLM):
+class ReDrafterMixin:
 
     def __init__(self, config):
 
@@ -297,3 +297,21 @@ class ReDrafterForCausalLM(LLaMAForCausalLM):
         inputs['rand_data_sample'] = rand_data_sample
         inputs['position_ids_base'] = position_ids_base
         return inputs
+
+
+class ReDrafterForQWenLM(ReDrafterMixin, QWenForCausalLM):
+    """ReDrafter implementation for QWen models.
+
+    Combines:
+    - Base QWen model functionality from QWenForCausalLM
+    - Drafting/speculative decoding logic from ReDrafterMixin
+    """
+
+
+class ReDrafterForLLaMALM(ReDrafterMixin, LLaMAForCausalLM):
+    """ReDrafter implementation for LLaMA models.
+
+    Combines:
+    - Base LLaMA model functionality from LLaMAForCausalLM
+    - Drafting/speculative decoding logic from ReDrafterMixin
+    """

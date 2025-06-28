@@ -473,10 +473,13 @@ TEST(SerializeUtilsTest, VectorResponses)
 
 TEST(SerializeUtilsTest, KvCacheConfig)
 {
-    texec::KvCacheConfig kvCacheConfig(true, 10, std::vector(1, 100), 2, 0.1, 10000, false, 0.5, 50, 1024);
+    texec::KvCacheConfig kvCacheConfig(
+        true, 10, std::vector(1, 100), 2, 0.1, 10000, false, 0.5, 50, 1024, false, false, true);
     auto kvCacheConfig2 = serializeDeserialize(kvCacheConfig);
 
     EXPECT_EQ(kvCacheConfig.getEnableBlockReuse(), kvCacheConfig2.getEnableBlockReuse());
+    EXPECT_EQ(kvCacheConfig.getEnablePartialReuse(), kvCacheConfig2.getEnablePartialReuse());
+    EXPECT_EQ(kvCacheConfig.getCopyOnPartialReuse(), kvCacheConfig2.getCopyOnPartialReuse());
     EXPECT_EQ(kvCacheConfig.getMaxTokens(), kvCacheConfig2.getMaxTokens());
     EXPECT_EQ(kvCacheConfig.getMaxAttentionWindowVec(), kvCacheConfig2.getMaxAttentionWindowVec());
     EXPECT_EQ(kvCacheConfig.getSinkTokenLength(), kvCacheConfig2.getSinkTokenLength());
@@ -486,6 +489,7 @@ TEST(SerializeUtilsTest, KvCacheConfig)
     EXPECT_EQ(kvCacheConfig.getCrossKvCacheFraction(), kvCacheConfig2.getCrossKvCacheFraction());
     EXPECT_EQ(kvCacheConfig.getSecondaryOffloadMinPriority(), kvCacheConfig2.getSecondaryOffloadMinPriority());
     EXPECT_EQ(kvCacheConfig.getEventBufferMaxSize(), kvCacheConfig2.getEventBufferMaxSize());
+    EXPECT_EQ(kvCacheConfig.getUseUvm(), kvCacheConfig2.getUseUvm());
 }
 
 TEST(SerializeUtilsTest, SchedulerConfig)

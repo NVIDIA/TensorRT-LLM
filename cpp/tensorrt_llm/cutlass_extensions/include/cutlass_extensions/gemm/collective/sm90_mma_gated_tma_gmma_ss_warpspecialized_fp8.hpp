@@ -25,7 +25,6 @@
 #include "cute/algorithm/gemm.hpp"
 #include "cute/atom/mma_atom.hpp"
 #include "cute/numeric/arithmetic_tuple.hpp"
-#include "cute/tensor_predicate.hpp"
 #include "cutlass/epilogue/thread/activation.h"
 #include "cutlass/gemm/collective/fp8_accumulation.hpp"
 #include "cutlass/trace.h"

@@ -78,8 +78,11 @@ Note:
 ```bash
 # NGram drafter
 python3 examples/pytorch/quickstart_advanced.py \
+    --model_dir meta-llama/Llama-3.1-8B-Instruct \
+    --spec_decode_algo NGRAM \
     --max_matching_ngram_size=2 \
-    --spec_decode_nextn=4
+    --spec_decode_nextn=4 \
+    --disable_overlap_scheduler
 ```
 
 ```bash
@@ -90,4 +93,5 @@ python3 examples/pytorch/quickstart_advanced.py \
     --spec_decode_nextn 5 \
     --draft_model_dir meta-llama/Llama-3.2-1B-Instruct \
     --disable_overlap_scheduler
+    --disable_kv_cache_reuse
 ```

@@ -502,16 +502,21 @@ class LoraManager(object):
         runtime_mapping: Optional[Mapping] = None,
         uids: Optional[List[str]] = None,
         ckpt_source: str = "hf",
-    ):
+    ) -> List[str]:
+        """Returns the adapter UIDs that were loaded by this call.
+
+        Note that when an adapter was already loaded before this call, it would not be
+        included in the returned list of UIDs.
+        """
         if ckpt_source == "hf":
-            self.load_from_hf(
+            return self.load_from_hf(
                 model_dirs=model_dirs_or_files,
                 model_config=model_config,
                 runtime_mapping=runtime_mapping,
                 uids=uids,
             )
         elif ckpt_source == "nemo":
-            self.load_from_nemo(
+            return self.load_from_nemo(
                 model_files=model_dirs_or_files,
                 model_config=model_config,
                 runtime_mapping=runtime_mapping,
@@ -526,7 +531,12 @@ class LoraManager(object):
         model_config: Union["ModelConfig", LoraModelConfig],
         runtime_mapping: Optional[Mapping] = None,
         uids: Optional[List[str]] = None,
-    ):
+    ) -> List[str]:
+        """Returns the adapter UIDs that were loaded by this call.
+
+        Note that when an adapter was already loaded before this call, it would not be
+        included in the returned list of UIDs.
+        """
         if runtime_mapping is None:
             runtime_mapping = Mapping()
         tp_size = runtime_mapping.tp_size
@@ -544,7 +554,7 @@ class LoraManager(object):
             new_model_files.append(model_file)
 
         if len(new_uids) == 0:
-            return
+            return new_uids
 
         self.lora_target_modules = model_config.lora_target_modules
 
@@ -616,6 +626,8 @@ class LoraManager(object):
             load_from_model_file(uid, model_file)
             release_gc()
 
+        return new_uids
+
     def load_from_hf(
         self,
         model_dirs: List[str],
@@ -623,8 +635,13 @@ class LoraManager(object):
         runtime_mapping: Optional[Mapping] = None,
         uids: Optional[List[str]] = None,
         component: Optional[str] = None,
-    ):
-        """Lora config of https://huggingface.co/hfl/chinese-alpaca-2-lora-7b.
+    ) -> List[str]:
+        """Returns the adapter UIDs that were loaded by this call.
+
+        Note that when an adapter was already loaded before this call, it would not be
+        included in the returned list of UIDs.
+
+        Lora config of https://huggingface.co/hfl/chinese-alpaca-2-lora-7b.
 
         {
             "base_model_name_or_path": "/Llama-2-7b-hf",
@@ -689,7 +706,7 @@ class LoraManager(object):
             new_model_dirs.append(model_dir)
 
         if len(new_uids) == 0:
-            return
+            return new_uids
 
         lora_hf_configs = []
         for model_dir in new_model_dirs:
@@ -864,6 +881,8 @@ class LoraManager(object):
         for uid, model_dir, hf_config in zip(new_uids, new_model_dirs, lora_hf_configs):
             load_from_model_dir(uid, model_dir, hf_config)
             release_gc()
+
+        return new_uids
 
     @property
     def lora_weights(self):

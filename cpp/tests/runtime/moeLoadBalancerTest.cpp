@@ -16,6 +16,8 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdlib>
+
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/moeLoadBalance/moeLoadBalanceKernels.h"
 #include "tensorrt_llm/runtime/moeLoadBalancer/moeLoadBalancer.h"
@@ -314,6 +316,7 @@ class MoeLoadBalancerTest : public ::testing::TestWithParam<MoeLoadBalancerTestP
 protected:
     void SetUp() override
     {
+        setenv("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK", "1", 1);
         auto param = GetParam();
         TLLM_CUDA_CHECK(cudaSetDevice(0));
         mLoadBalancer = std::make_unique<MoeLoadBalancer>(param.epRank, param.epSize, param.layerUpdatesPerIter);

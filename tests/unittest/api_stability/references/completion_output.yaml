@@ -7,6 +7,9 @@ methods:
       disaggregated_params:
         annotation: Optional[tensorrt_llm.disaggregated_params.DisaggregatedParams]
         default: null
+      request_perf_metrics:
+        annotation: Optional[tensorrt_llm.bindings.executor.RequestPerfMetrics]
+        default: null
     return_annotation: None
 properties:
   length:
