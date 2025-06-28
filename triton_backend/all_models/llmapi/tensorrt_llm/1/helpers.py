@@ -24,9 +24,16 @@ def get_sampling_params_from_request(request, batch_size=1, batch_index=0):
     Used in llmapi/tensorrt_llm
     """
     sampling_params_args = [
-        'best_of', 'temperature', 'top_k', 'top_p', 'frequency_penalty',
-        'presence_penalty', 'max_tokens', 'seed', 'exclude_input_from_output',
-        'return_perf_metrics', 
+        'best_of',
+        'temperature',
+        'top_k',
+        'top_p',
+        'frequency_penalty',
+        'presence_penalty',
+        'max_tokens',
+        'seed',
+        'exclude_input_from_output',
+        'return_perf_metrics',
     ]
     param_mappings = {}
     for arg in sampling_params_args:
