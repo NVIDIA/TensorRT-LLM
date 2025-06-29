@@ -359,11 +359,11 @@ public:
         auto const jointOutputIdsShape = ITensor::makeShape({batchSize, beamWidth, maxSeqLen});
 
         { // prevent reusing these vars after std::move
-            auto dummyLogits = mBufferManager->emptyTensor(MemoryType::kGPU, nvFloatType);
             auto endIds = mBufferManager->emptyTensor(MemoryType::kGPU, nvTokenIdType);
             auto batchSlots = mBufferManager->emptyTensor(MemoryType::kPINNED, nvSizeType);
-            decodingInput = std::make_unique<DecodingInput>(
-                0, 0, 0, 0, std::move(dummyLogits), std::move(endIds), std::move(batchSlots));
+            decodingInput = std::make_unique<DecodingInput>();
+            decodingInput->endIds = std::move(endIds);
+            decodingInput->batchSlots = std::move(batchSlots);
         }
         auto& dInput = *decodingInput;
 
