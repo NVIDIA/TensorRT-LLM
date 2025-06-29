@@ -478,12 +478,7 @@ def test_enc_dec(build_google_tests, multi_gpu_model, build_dir):
 
 @pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
                          indirect=True)
-@pytest.mark.parametrize("mode", [
-    "orchestrator",
-    pytest.param(
-        "leader",
-        marks=pytest.mark.skip("https://nvbugspro.nvidia.com/bug/5026255"))
-])
+@pytest.mark.parametrize("mode", ["orchestrator", "leader"])
 @pytest.mark.parametrize("multi_gpu_model", ["llama"], indirect=True)
 def test_llama_executor(build_google_tests, multi_gpu_model, mode, lora_setup,
                         build_dir):
