@@ -13,6 +13,8 @@ context_servers:
   tensor_parallel_size: 2
   pipeline_parallel_size: 1
   enable_attention_dp: true
+  cache_transceiver_config:
+    enable_cache_transceiver: True
   urls:
       - "localhost:8001"
 generation_servers:
@@ -20,5 +22,8 @@ generation_servers:
   tensor_parallel_size: 2
   pipeline_parallel_size: 1
   enable_attention_dp: false
+  cache_transceiver_config:
+    enable_cache_transceiver: True
+
   urls:
       - "localhost:8002"

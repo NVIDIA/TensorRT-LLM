@@ -1258,18 +1258,24 @@ size_t Serialization::serializedSize(SchedulerConfig const& schedulerConfig)
 // CacheTransceiverConfig
 CacheTransceiverConfig Serialization::deserializeCacheTransceiverConfig(std::istream& is)
 {
+    auto enableCacheTransceiver = su::deserialize<bool>(is);
+    auto commType = su::deserialize<std::optional<CacheTransceiverConfig::CommType>>(is);
     auto maxNumTokens = su::deserialize<std::optional<size_t>>(is);
-    return CacheTransceiverConfig{maxNumTokens};
+    return CacheTransceiverConfig{enableCacheTransceiver, commType, maxNumTokens};
 }
 
 void Serialization::serialize(CacheTransceiverConfig const& cacheTransceiverConfig, std::ostream& os)
 {
+    su::serialize(cacheTransceiverConfig.getEnableCacheTransceiver(), os);
+    su::serialize(cacheTransceiverConfig.getCommType(), os);
     su::serialize(cacheTransceiverConfig.getMaxNumTokens(), os);
 }
 
 size_t Serialization::serializedSize(CacheTransceiverConfig const& cacheTransceiverConfig)
 {
     size_t totalSize = 0;
+    totalSize += su::serializedSize(cacheTransceiverConfig.getEnableCacheTransceiver());
+    totalSize += su::serializedSize(cacheTransceiverConfig.getCommType());
     totalSize += su::serializedSize(cacheTransceiverConfig.getMaxNumTokens());
     return totalSize;
 }

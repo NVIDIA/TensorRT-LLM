@@ -62,41 +62,49 @@ std::unique_ptr<BaseCacheTransceiver> CacheTransceiverFactory::createCacheTransc
     runtime::WorldConfig const& worldConfig, executor::kv_cache::CacheState::AttentionType attentionType,
     std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig)
 {
+    if (!cacheTransceiverConfig.has_value() || !cacheTransceiverConfig.value().getEnableCacheTransceiver())
+    {
+        TLLM_LOG_INFO("CacheTransceiver is disabled.");
+        return nullptr;
+    }
+    auto commType = cacheTransceiverConfig.value().getCommType();
+    if (!commType.has_value())
+    {
+        if (common::getEnvUseUCXKvCache())
+        {
+            commType = executor::CacheTransceiverConfig::CommType::UCX;
+            TLLM_LOG_INFO("Enable UCX KV cache transport.");
+        }
+        else if (common::getEnvUseNixlKvCache())
+        {
+            commType = executor::CacheTransceiverConfig::CommType::NIXL;
+            TLLM_LOG_INFO("Enable NIXL KV cache transport.");
+        }
+        else if (common::getEnvUseMPIKvCache())
+        {
+            commType = executor::CacheTransceiverConfig::CommType::MPI;
+            TLLM_LOG_INFO("Enable MPI KV cache transport.");
+            TLLM_LOG_WARNING("MPI KV cache transport is deprecated, please use UCX or NIXL instead.");
+        }
+        else
+        {
+            commType = executor::CacheTransceiverConfig::CommType::UCX;
+        }
+    }
+    cacheTransceiverConfig.value().setCommType(commType);
 
-    std::optional<CacheTransceiver::CommType> commType;
-    if (common::getEnvUseUCXKvCache())
-    {
-        commType = CacheTransceiver::CommType::UCX;
-        TLLM_LOG_INFO("Enable UCX KV cache transport.");
-    }
-    else if (common::getEnvUseNixlKvCache())
-    {
-        commType = CacheTransceiver::CommType::NIXL;
-        TLLM_LOG_INFO("Enable NIXL KV cache transport.");
-    }
-    else if (common::getEnvUseMPIKvCache())
-    {
-        commType = CacheTransceiver::CommType::MPI;
-        TLLM_LOG_INFO("Enable MPI KV cache transport.");
-    }
+    executor::kv_cache::CacheState::ModelConfig cacheStateCfg{
+        modelConfig.getNumKvHeadsPerLayer(), modelConfig.getSizePerHead(), modelConfig.getTokensPerBlock()};
 
-    if (commType)
-    {
-        executor::kv_cache::CacheState::ModelConfig cacheStateCfg{
-            modelConfig.getNumKvHeadsPerLayer(), modelConfig.getSizePerHead(), modelConfig.getTokensPerBlock()};
-
-        return std::make_unique<CacheTransceiver>(cacheManager, commType.value(), cacheStateCfg, worldConfig,
-            modelConfig.getKvDataType(), attentionType, cacheTransceiverConfig);
-    }
-    return nullptr;
+    return std::make_unique<CacheTransceiver>(
+        cacheManager, cacheStateCfg, worldConfig, modelConfig.getKvDataType(), attentionType, cacheTransceiverConfig);
 }
 
-CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager, CommType commType,
+CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager,
     executor::kv_cache::CacheState::ModelConfig const& cacheStateModelCfg, runtime::WorldConfig const& worldConfig,
     nvinfer1::DataType dataType, executor::kv_cache::CacheState::AttentionType attentionType,
     std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig)
-    : mCommType{commType}
-    , mMpiGroupComm(std::addressof(tensorrt_llm::mpi::MpiComm::session()))
+    : mMpiGroupComm(std::addressof(tensorrt_llm::mpi::MpiComm::session()))
     , mCacheTransceiverConfig{cacheTransceiverConfig}
 {
     using tensorrt_llm::batch_manager::kv_cache_manager::CacheFormatter;
@@ -138,59 +146,60 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         }
     }
     bool isMLA = attentionType == executor::kv_cache::CacheState::AttentionType::kMLA;
-    if (mCommType == CommType::MPI || mCommType == CommType::UCX || mCommType == CommType::NIXL)
+    TLLM_CHECK_WITH_INFO(mCacheTransceiverConfig.has_value(), "CacheTransceiverConfig is not set.");
+    auto commType = mCacheTransceiverConfig.value().getCommType();
+    TLLM_CHECK_WITH_INFO(commType.has_value(), " CacheTransceiverConfig::CommType is not set.");
+
+    std::optional<size_t> maxNumTokens = std::nullopt;
+    if (mCacheTransceiverConfig.has_value())
     {
-        std::optional<size_t> maxNumTokens = std::nullopt;
-        if (mCacheTransceiverConfig.has_value())
+        maxNumTokens = mCacheTransceiverConfig.value().getMaxNumTokens();
+    }
+    mCacheTransBufferManager = std::make_unique<kv_cache_manager::CacheTransBufferManager>(cacheManager, maxNumTokens);
+    if (commType.value() == executor::CacheTransceiverConfig::CommType::UCX)
+    {
+        std::lock_guard<std::mutex> lock(mDllMutex);
+        mWrapperLibHandle = dllOpen(UCX_WRAPPER_LIB_NAME);
+        TLLM_CHECK_WITH_INFO(mWrapperLibHandle != nullptr, "UCX wrapper library is not open correctly.");
+        auto load_sym = [](void* handle, char const* name)
         {
-            maxNumTokens = mCacheTransceiverConfig.value().getMaxNumTokens();
-        }
-        mCacheTransBufferManager
-            = std::make_unique<kv_cache_manager::CacheTransBufferManager>(cacheManager, maxNumTokens);
-        if (mCommType == CommType::UCX)
-        {
-            std::lock_guard<std::mutex> lock(mDllMutex);
-            mWrapperLibHandle = dllOpen(UCX_WRAPPER_LIB_NAME);
-            TLLM_CHECK_WITH_INFO(mWrapperLibHandle != nullptr, "UCX wrapper library is not open correctly.");
-            auto load_sym = [](void* handle, char const* name)
-            {
-                void* ret = dllGetSym(handle, name);
-                TLLM_CHECK_WITH_INFO(ret != nullptr,
-                    "Unable to load UCX wrapper library symbol, possible cause is that TensorRT-LLM library is not "
-                    "built with UCX support, please rebuild in UCX-enabled environment.");
-                return ret;
-            };
-            std::unique_ptr<tensorrt_llm::executor::kv_cache::ConnectionManager> (*makeUcxConnectionManager)();
-            *(void**) (&makeUcxConnectionManager) = load_sym(mWrapperLibHandle, "makeUcxConnectionManager");
-            mManager = makeUcxConnectionManager();
-            TLLM_LOG_INFO("UCX Connection Manager created");
-        }
-        else if (mCommType == CommType::NIXL)
-        {
-            mManager = std::make_unique<tensorrt_llm::executor::kv_cache::AgentConnectionManager>(
-                mCacheTransBufferManager.get());
-            TLLM_LOG_INFO("NIXL Connection Manager created");
-        }
-        else
-        {
-            mMpiWorldComm = std::addressof(tensorrt_llm::mpi::MpiComm::world());
-            mManager = std::make_unique<executor::kv_cache::MpiConnectionManager>(mMpiWorldComm);
-            TLLM_LOG_INFO("MPI Connection Manager created");
-        }
-
-        using tensorrt_llm::batch_manager::kv_cache_manager::MLACacheFormatter;
-        auto makeFormatter = [cacheManager, isMLA, this]()
-        { return createCacheFormatter(cacheManager, mCacheTransBufferManager.get(), isMLA); };
-
-        mDataResponder = std::make_unique<DataResponder>(
-            std::make_unique<DataSenderImpl>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter()));
-        mDataRequester = std::make_unique<DataRequester>(
-            std::make_unique<DataReceiverImpl>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter()));
+            void* ret = dllGetSym(handle, name);
+            TLLM_CHECK_WITH_INFO(ret != nullptr,
+                "Unable to load UCX wrapper library symbol, possible cause is that TensorRT-LLM library is not "
+                "built with UCX support, please rebuild in UCX-enabled environment.");
+            return ret;
+        };
+        std::unique_ptr<tensorrt_llm::executor::kv_cache::ConnectionManager> (*makeUcxConnectionManager)();
+        *(void**) (&makeUcxConnectionManager) = load_sym(mWrapperLibHandle, "makeUcxConnectionManager");
+        mManager = makeUcxConnectionManager();
+        TLLM_LOG_INFO("UCX Connection Manager created");
+    }
+    else if (commType.value() == executor::CacheTransceiverConfig::CommType::NIXL)
+    {
+        mManager = std::make_unique<tensorrt_llm::executor::kv_cache::AgentConnectionManager>(
+            mCacheTransBufferManager.get());
+        TLLM_LOG_INFO("NIXL Connection Manager created");
+    }
+    else if (commType.value() == executor::CacheTransceiverConfig::CommType::MPI)
+    {
+        mMpiWorldComm = std::addressof(tensorrt_llm::mpi::MpiComm::world());
+        mManager = std::make_unique<executor::kv_cache::MpiConnectionManager>(mMpiWorldComm);
+        TLLM_LOG_INFO("MPI Connection Manager created");
     }
     else
     {
-        TLLM_THROW("Unsupported communication type.");
+        TLLM_THROW("Unsupported cache transceiver comm type ");
     }
+
+    using tensorrt_llm::batch_manager::kv_cache_manager::MLACacheFormatter;
+    auto makeFormatter = [cacheManager, isMLA, this]()
+    { return createCacheFormatter(cacheManager, mCacheTransBufferManager.get(), isMLA); };
+
+    mDataResponder = std::make_unique<DataResponder>(
+        std::make_unique<DataSenderImpl>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter()));
+    mDataRequester = std::make_unique<DataRequester>(
+        std::make_unique<DataReceiverImpl>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter()));
+
     initializeCommState();
 }
 
