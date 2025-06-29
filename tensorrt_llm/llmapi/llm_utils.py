@@ -625,6 +625,9 @@ class CachedModelLoader:
         if self.llm_args.model_format is _ModelFormatKind.TLLM_ENGINE:
             return Path(self.llm_args.model), None
 
+        if self.llm_args.backend == "_autodeploy":
+            return None, ""
+
         self.engine_cache_stage: Optional[CachedStage] = None
 
         self._hf_model_dir = None

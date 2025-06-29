@@ -109,7 +109,8 @@ at::Tensor run_fp8_block_scale_moe(at::Tensor const& routing_logits, at::Tensor 
         {args.num_tokens, args.top_k}, routing_bias.scalar_type(), routing_logits.device(), std::nullopt);
     at::Tensor expert_indexes = at::detail::empty_cuda(
         {args.num_tokens, args.top_k}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
-    at::Tensor expert_count_histogram = at::detail::empty_cuda({2 * 256},
+    int64_t const size_of_expert_count_histogram = std::max(num_experts * 2, int64_t(256 * 2));
+    at::Tensor expert_count_histogram = at::detail::empty_cuda({size_of_expert_count_histogram},
         at::ScalarType::Int, // 256 is the max number of threads per block and max number of experts
         routing_logits.device(), std::nullopt);
 

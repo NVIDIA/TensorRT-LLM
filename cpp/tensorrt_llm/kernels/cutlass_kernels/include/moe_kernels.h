@@ -210,8 +210,9 @@ struct QuantParams
     // FP8 quantization params
     struct
     {
+        bool fc2_use_per_expert_act_scale = false;
         float const* dequant_fc1 = nullptr;   // (num_experts_per_node, )
-        float const* quant_fc2 = nullptr;     // (1, )
+        float const* quant_fc2 = nullptr;     // (1, ) or (num_experts_per_node, ) based on fc2_use_per_expert_act_scale
         float const* dequant_fc2 = nullptr;   // (num_experts_per_node, )
         float const* quant_final = nullptr;   // (1, )
         float const* dequant_input = nullptr; // (1, )
@@ -223,10 +224,12 @@ struct QuantParams
     {
         struct GemmInputs
         {
-            float const* act_global_scale = nullptr; // (1, )
+            bool use_per_expert_act_scale = false;
+            float const* act_global_scale
+                = nullptr;                       // (1, ) or (num_experts_per_node, ) based on use_per_expert_act_scale
             TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const* weight_block_scale
-                = nullptr;                           // (experts, n, k / 32)
-            float const* global_scale = nullptr;     // (num_experts_per_node, )
+                = nullptr;                       // (experts, n, k / 32)
+            float const* global_scale = nullptr; // (num_experts_per_node, )
         };
 
         GemmInputs fc1;
@@ -238,10 +241,13 @@ struct QuantParams
     {
         struct GemmInputs
         {
-            float const* act_global_scale = nullptr; // (1, )
+            bool use_per_expert_act_scale = false;
+
+            float const* act_global_scale
+                = nullptr;                       // (1, ) or (num_experts_per_node, ) based on use_per_expert_act_scale
             TmaWarpSpecializedGroupedGemmInput::NVFP4ElementSF const* weight_block_scale
-                = nullptr;                           // (experts, n, k / 16)
-            float const* global_scale = nullptr;     // (num_experts_per_node, )
+                = nullptr;                       // (experts, n, k / 16)
+            float const* global_scale = nullptr; // (num_experts_per_node, )
         };
 
         GemmInputs fc1;
@@ -287,10 +293,11 @@ struct QuantParams
     }
 
     static QuantParams FP8(float const* dequant_fc1, float const* quant_fc2, float const* dequant_fc2,
-        float const* quant_final = nullptr, float const* dequant_input = nullptr)
+        float const* quant_final = nullptr, float const* dequant_input = nullptr,
+        bool fc2_use_per_expert_act_scale = false)
     {
         QuantParams qp;
-        qp.fp8 = {dequant_fc1, quant_fc2, dequant_fc2, quant_final, dequant_input};
+        qp.fp8 = {fc2_use_per_expert_act_scale, dequant_fc1, quant_fc2, dequant_fc2, quant_final, dequant_input};
         return qp;
     }
 
@@ -299,12 +306,14 @@ struct QuantParams
         float const* fc1_global_scale, //
         float const* fc2_act_global_scale,
         TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const* fc2_weight_block_scale,
-        float const* fc2_global_scale //
-    )
+        float const* fc2_global_scale, //
+        bool fc1_use_per_expert_act_scale = false, bool fc2_use_per_expert_act_scale = false)
     {
         QuantParams qp;
-        qp.fp8_mxfp4.fc1 = {fc1_act_global_scale, fc1_weight_block_scale, fc1_global_scale};
-        qp.fp8_mxfp4.fc2 = {fc2_act_global_scale, fc2_weight_block_scale, fc2_global_scale};
+        qp.fp8_mxfp4.fc1
+            = {fc1_use_per_expert_act_scale, fc1_act_global_scale, fc1_weight_block_scale, fc1_global_scale};
+        qp.fp8_mxfp4.fc2
+            = {fc2_use_per_expert_act_scale, fc2_act_global_scale, fc2_weight_block_scale, fc2_global_scale};
         return qp;
     }
 
@@ -313,12 +322,12 @@ struct QuantParams
         float const* fc1_global_scale, //
         float const* fc2_act_global_scale,
         TmaWarpSpecializedGroupedGemmInput::NVFP4ElementSF const* fc2_weight_block_scale,
-        float const* fc2_global_scale //
-    )
+        float const* fc2_global_scale, //
+        bool fc1_use_per_expert_act_scale = false, bool fc2_use_per_expert_act_scale = false)
     {
         QuantParams qp;
-        qp.fp4.fc1 = {fc1_act_global_scale, fc1_weight_block_scale, fc1_global_scale};
-        qp.fp4.fc2 = {fc2_act_global_scale, fc2_weight_block_scale, fc2_global_scale};
+        qp.fp4.fc1 = {fc1_use_per_expert_act_scale, fc1_act_global_scale, fc1_weight_block_scale, fc1_global_scale};
+        qp.fp4.fc2 = {fc2_use_per_expert_act_scale, fc2_act_global_scale, fc2_weight_block_scale, fc2_global_scale};
         return qp;
     }
 
