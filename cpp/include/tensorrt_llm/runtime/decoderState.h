@@ -66,7 +66,7 @@ public:
         WorldConfig const& worldConfig, BufferManager const& bufferManager);
 
     //! @brief Disable lookahead decoding.
-    void disableLookahead(RequestVector const& genRequests);
+    void disableLookahead();
 
     //! @returns [batchSize], number of finished sequences per request, on gpu
     [[nodiscard]] TensorPtr getFinishedSum() const;
