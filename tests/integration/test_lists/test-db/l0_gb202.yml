@@ -8,6 +8,7 @@ l0_gb202:
     wildcards:
       gpu:
       - '*gb202*'
+      - '*5090*'
       linux_distribution_name: ubuntu*
     terms:
       stage: pre_merge
@@ -20,3 +21,4 @@ l0_gb202:
   - unittest/_torch/test_attention_mla.py
   - test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
   - test_e2e.py::test_ptp_quickstart_bert[TRTLLM-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_bf16[latency]

@@ -935,13 +935,17 @@ class ModelRunnerCpp(ModelRunnerMixin):
         output_ids = [[[] for _ in range(num_sequences)]
                       for _ in range(len(request_ids))]
 
-        multi_responses = self.session.await_responses(request_ids)
-        responses = [
-            response for responses in multi_responses for response in responses
-        ]
+        all_responses = []
+        finished_request_ids = set()
+        while finished_request_ids != set(request_ids):
+            responses = self.session.await_responses()
+            for response in responses:
+                if response.result.is_final:
+                    finished_request_ids.add(response.request_id)
+            all_responses.extend(responses)
 
         return self._fill_output(
-            responses=responses,
+            responses=all_responses,
             output_ids=output_ids,
             end_id=end_id,
             return_dict=return_dict,

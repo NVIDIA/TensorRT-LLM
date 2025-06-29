@@ -8,8 +8,9 @@ from typing import Optional
 import pytest
 from parameterized import parameterized
 
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.executor import GenerationExecutorProxy
-from tensorrt_llm.llmapi import LLM, BuildConfig, KvCacheConfig, SamplingParams
+from tensorrt_llm.llmapi import BuildConfig, KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import PretrainedConfig
@@ -266,6 +267,7 @@ def test_llama_7b_multi_lora_tp2():
                                      kv_cache_config=global_kv_cache_config)
 
 
+@pytest.mark.skip(reason="https://nvbugs/5362426")
 @pytest.mark.gpu2
 @pytest.mark.part3
 def test_llama_v2_7b_prompt_adapter_tp2():

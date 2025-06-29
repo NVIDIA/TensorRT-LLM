@@ -263,9 +263,22 @@ def _register_fake():
         pass
 
     @torch.library.register_fake("trtllm::moe_load_balance_statistic")
-    def _(single_layer_load_balancer_ptr: int,
-          gathered_raw_expert_ids: torch.Tensor, enabled: torch.Tensor,
-          is_first_stage: bool, is_last_stage: bool):
+    def _(gathered_raw_expert_ids: torch.Tensor, enabled: torch.Tensor,
+          single_layer_load_balancer_ptr: int, is_first_stage: bool,
+          is_last_stage: bool):
+        pass
+
+    @torch.library.register_fake(
+        "trtllm::moe_hierarchical_statistic_local_device")
+    def _(local_raw_expert_ids: torch.Tensor,
+          local_expert_token_count: torch.Tensor, enabled: torch.Tensor,
+          single_layer_load_balancer_ptr: int, is_first_stage: bool,
+          is_last_stage: bool):
+        pass
+
+    @torch.library.register_fake("trtllm::moe_hierarchical_statistic_update")
+    def _(global_expert_token_count: torch.Tensor, enabled: torch.Tensor,
+          single_layer_load_balancer_ptr: int):
         pass
 
     @torch.library.register_fake("trtllm::moe_load_balance_routing")
@@ -384,3 +397,79 @@ def _register_fake():
         pad_slot_id: int,
     ) -> None:
         pass
+
+    @torch.library.register_fake("trtllm::moe_permute_op")
+    def _(
+        input: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        fc1_expert_weights: torch.Tensor,
+        fc2_expert_weights: torch.Tensor,
+        quant_scales: List[torch.Tensor],
+        input_sf: Optional[torch.Tensor],
+        num_experts_per_node: int,
+        tp_size: int,
+        tp_rank: int,
+        ep_size: int,
+        ep_rank: int,
+        cluster_size: int,
+        cluster_rank: int,
+        min_latency_mode: bool,
+        use_fp8_block_scaling: bool,
+    ):
+
+        experts_per_token = token_selected_experts.shape[1]
+        num_rows = input.shape[0]
+        hidden_size = input.shape[1]
+
+        num_moe_inputs = experts_per_token * num_rows
+
+        unpermuted_token_selected_experts_tensor = token_selected_experts.new_empty(
+            (num_moe_inputs, ), dtype=torch.int32)
+        unpermuted_source_token_ids_tensor = token_selected_experts.new_empty(
+            (num_moe_inputs, ), dtype=torch.int32)
+        permuted_source_token_ids_tensor = token_selected_experts.new_empty(
+            (num_moe_inputs, ), dtype=torch.int32)
+        permuted_token_selected_experts_tensor = token_selected_experts.new_empty(
+            (num_moe_inputs, ), dtype=torch.int32)
+        permuted_data_tensor = input.new_empty((num_moe_inputs, hidden_size),
+                                               dtype=torch.float32)
+        expert_first_token_offset_tensor = token_selected_experts.new_empty(
+            (num_experts_per_node + 1, ), dtype=torch.int64)
+        permuted_token_final_scales_tensor = token_selected_experts.new_empty(
+            (num_moe_inputs, ), dtype=torch.float32)
+        src_to_dest_map_tensor = token_selected_experts.new_empty(
+            (num_moe_inputs, ), dtype=torch.int32)
+
+        return (
+            unpermuted_token_selected_experts_tensor,
+            unpermuted_source_token_ids_tensor,
+            permuted_source_token_ids_tensor,
+            permuted_token_selected_experts_tensor,
+            permuted_data_tensor,
+            expert_first_token_offset_tensor,
+            permuted_token_final_scales_tensor,
+            src_to_dest_map_tensor,
+        )
+
+    @torch.library.register_fake("trtllm::moe_finalize_scale_op")
+    def _(
+        gemm2_output: torch.Tensor,
+        fc2_expert_biases: torch.Tensor,
+        unpermuted_final_scales: torch.Tensor,
+        expanded_source_row_to_expanded_dest_row: torch.Tensor,
+        expert_for_source_row: torch.Tensor,
+        expert_first_token_offset_tensor: torch.Tensor,
+        num_rows: torch.SymInt,
+        hidden_size: torch.SymInt,
+        experts_per_token: int,
+        num_experts_per_node: int,
+        tp_size: int,
+        tp_rank: int,
+        ep_size: int,
+        ep_rank: int,
+    ):
+        num_rows_val = int(num_rows)
+        hidden_size_val = int(hidden_size)
+        return gemm2_output.new_empty((num_rows_val, hidden_size_val),
+                                      dtype=gemm2_output.dtype)

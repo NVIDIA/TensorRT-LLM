@@ -1,3 +1,4 @@
+import enum
 import math
 from abc import ABC, abstractmethod
 from collections import OrderedDict
@@ -25,7 +26,7 @@ if TYPE_CHECKING:
     from ..speculative.interface import SpecConfig
 
 KVCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.KVCacheManager
-KvCacheConfigCpp = tensorrt_llm.bindings.KvCacheConfig
+KvCacheConfigCpp = tensorrt_llm.bindings.executor.KvCacheConfig
 CacheTypeCpp = tensorrt_llm.bindings.internal.batch_manager.CacheType
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 DataType = tensorrt_llm.bindings.DataType
@@ -34,6 +35,14 @@ RequestList = list[LlmRequest]
 PeftCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.PeftCacheManager
 PeftCacheConfig = tensorrt_llm.bindings.executor.PeftCacheConfig
 WorldConfig = tensorrt_llm.bindings.WorldConfig
+
+
+class ResourceManagerType(enum.Enum):
+    KV_CACHE_MANAGER = "KV_CACHE_MANAGER"
+    DRAFT_KV_CACHE_MANAGER = "DRAFT_KV_CACHE_MANAGER"
+    PEFT_CACHE_MANAGER = "PEFT_CACHE_MANAGER"
+    SEQ_SLOT_MANAGER = "SEQ_SLOT_MANAGER"
+    SPEC_RESOURCE_MANAGER = "SPEC_RESOURCE_MANAGER"
 
 
 def compute_page_count(token_count: int, tokens_per_page: int) -> int:
@@ -49,6 +58,9 @@ class BaseResourceManager(ABC):
     @abstractmethod
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
         raise NotImplementedError
+
+    def add_dummy_requests(self, request_ids: List[int]):
+        pass
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         pass
@@ -706,40 +718,6 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
     def free_resources(self, request: LlmRequest):
         self.free_mamba_resources(request)
         super().free_resources(request)
-
-
-class BaseDraftTokenManager(BaseResourceManager):
-
-    @abstractmethod
-    def get_draft_tokens(self,
-                         input_token_ids: List[List[int]]) -> List[List[int]]:
-        """
-        This method is intended to take a sequence of token ids (prompt + decoded so far)
-        and produce draft tokens for each request. We should have
-        len(get_draft_tokens(tokens)) == len(tokens), but each request's list of draft tokens
-        may be arbitrarily long.
-
-        You can produce the draft tokens in any manner that you want.
-        """
-
-    def prepare_resources(self, scheduled_batch: ScheduledRequests) -> None:
-        input_tokens = []
-        for request in scheduled_batch.generation_requests:
-            input_tokens.append(request.get_tokens(0))
-
-        if not input_tokens:
-            return
-
-        results = self.get_draft_tokens(input_tokens)
-        for request, output in zip(scheduled_batch.generation_requests,
-                                   results):
-            request.py_draft_tokens = output
-
-    def get_max_resource_count(self) -> int:
-        return 0
-
-    def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
-        return 0
 
 
 class SlotManager:

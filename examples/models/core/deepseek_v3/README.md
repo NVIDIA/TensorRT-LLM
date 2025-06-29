@@ -30,7 +30,7 @@ Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/
     - [trtllm-serve](#trtllm-serve)
     - [Disaggregated Serving](#disaggregated-serving)
     - [Dynamo](#dynamo)
-    - [tensorrtllm_backend for triton inference server (Experimental)](#tensorrtllm_backend-for-triton-inference-server-experimental)
+    - [tensorrtllm\_backend for triton inference server (Experimental)](#tensorrtllm_backend-for-triton-inference-server-experimental)
   - [Advanced Usages](#advanced-usages)
     - [Multi-node](#multi-node)
       - [mpirun](#mpirun)
@@ -40,7 +40,10 @@ Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/
     - [FlashMLA](#flashmla)
     - [FP8 KV Cache and MLA](#fp8-kv-cache-and-mla)
     - [W4AFP8](#w4afp8)
+      - [Activation calibration](#activation-calibration)
+      - [Weight quantization and assembling](#weight-quantization-and-assembling)
     - [KV Cache Reuse](#kv-cache-reuse)
+    - [Chunked Prefill](#chunked-prefill)
   - [Notes and Troubleshooting](#notes-and-troubleshooting)
   - [Known Issues](#known-issues)
 
@@ -227,6 +230,8 @@ trtllm-eval --model  <YOUR_MODEL_DIR> \
 ## Serving
 ### trtllm-serve
 
+Take max-throughput scenario on B200 as an example, the settings are extracted from the [blog](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md#b200-max-throughput). **For users' own models and cases, the specific settings could be different to get best performance.**
+
 To serve the model using `trtllm-serve`:
 
 ```bash
@@ -253,12 +258,12 @@ trtllm-serve \
   --host localhost \
   --port 8000 \
   --backend pytorch \
-  --max_batch_size 161 \
-  --max_num_tokens 1160 \
+  --max_batch_size 384 \
+  --max_num_tokens 1536 \
   --tp_size 8 \
   --ep_size 8 \
   --pp_size 1 \
-  --kv_cache_free_gpu_memory_fraction 0.95 \
+  --kv_cache_free_gpu_memory_fraction 0.85 \
   --extra_llm_api_options ./extra-llm-api-config.yml
 ```
 
@@ -783,13 +788,19 @@ The converted checkpoint could be used as `<YOUR_MODEL_DIR>` and consumed by oth
 ### KV Cache Reuse
 KV cache reuse is supported for MLA on SM90 and SM100. It is enabled by default. Due to extra operations like memcpy and GEMMs, GPU memory consumption may be higher and the E2E performance may have regression in some cases. Users could pass `KvCacheConfig(enable_block_reuse=False)` to LLM API to disable it.
 
+### Chunked Prefill
+Chunked Prefill is supported for MLA only on SM100 currently. You should add `--enable_chunked_prefill` to enable it. The GPU memory consumption is highly correlated with `max_num_tokens` and `max_batch_size`. If encountering out-of-memory errors, you may make these values smaller. (`max_num_tokens` must be divisible by kv cache's `tokens_per_block`)
+
+More specifically, we can imitate what we did in the [Quick Start](#quick-start):
+
+``` bash
+cd examples/pytorch
+python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --enable_chunked_prefill
+```
+
 ## Notes and Troubleshooting
 
 - **Model Directory:** Update `<YOUR_MODEL_DIR>` with the actual path where the model weights reside.
 - **GPU Memory:** Adjust `--max_batch_size` and `--max_num_tokens` if you encounter out-of-memory errors.
 - **Logs:** Check `/workspace/trt_bench.log` for detailed performance information and troubleshooting messages.
 - **Configuration Files:** Verify that the configuration files are correctly formatted to avoid runtime issues.
-
-## Known Issues
-
-- MTP + attention DP + CUDA graph + overlap scheduler might have accuracy issues. We'll fix it later.

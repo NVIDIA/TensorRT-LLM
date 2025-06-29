@@ -468,7 +468,7 @@ def stress_test(config,
             capacity_scheduler_policy,
             wait_interval=test_server_config.wait_interval,
             max_wait_seconds=
-            14400,  # DeepSeek-V3 or DeepSeek-R1 specific wait time (4 hours)
+            28800,  # DeepSeek-V3 or DeepSeek-R1 specific wait time (8 hours)
             health_check_timeout=test_server_config.health_check_timeout)
 
     # Create a StressTestConfig with customized time parameters if provided

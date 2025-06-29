@@ -84,6 +84,7 @@ class CompletionOutput:
         stop_reason (int, str, optional): The stop string or token id that caused the completion to stop, None if the completion finished for some other reason. Defaults to None.
         generation_logits (torch.Tensor, optional): The logits on the generated output token ids. Defaults to None.
         disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Parameters needed for disaggregated serving. Includes the type of request, the first generated tokens, the context request id and the any additional state needing to be transferred from context and generation instances. Defaults to None.
+        request_perf_metrics (tensorrt_llm.bindings.executor.RequestPerfMetrics, optional): Performance metrics for the request. Defaults to None.
 
     Attributes:
         length (int): The number of generated tokens.
@@ -102,6 +103,7 @@ class CompletionOutput:
     stop_reason: Optional[Union[int, str]] = None
     generation_logits: Optional[torch.Tensor] = None
     disaggregated_params: Optional[DisaggregatedParams] = None
+    request_perf_metrics: Optional[tllm.RequestPerfMetrics] = None
 
     # hidden fields for tracking the diffs
     _last_text_len: int = field(default=0, init=False, repr=False)
@@ -237,6 +239,9 @@ class GenerationResultBase:
                 src_idx] == tllm.FinishReason.CANCELLED:
             output.finish_reason = 'cancelled'
 
+        if response_tensors.request_perf_metrics is not None:
+            output.request_perf_metrics = response_tensors.request_perf_metrics
+
         if self._done:
             if finish_reasons[src_idx] == tllm.FinishReason.END_ID:
                 output.finish_reason = 'stop'
@@ -294,6 +299,9 @@ class GenerationResultBase:
                     handler(response.error_msg)
 
             response_result = response.result
+            if hasattr(response_result, "_result"):
+                response_result.deserialize()
+
             self._done = response_result.is_final
             context_phase_params = response_result.context_phase_params
             self.decoding_iter = response_result.decoding_iter
@@ -617,6 +625,11 @@ def compute_logprobs(
         if logits.dim() == 3:
             # reshape from [1, T, V] to [T, V]
             logits = logits.squeeze(0)
+
+        if tokens is not None and logits.size(0) > len(tokens):
+            # WAR for nvbug 5324291 where TRT backend might return more logits
+            # than output tokens.
+            logits = logits[:len(tokens)]
 
         logprobs = F.log_softmax(logits.to("cuda", dtype=torch.float32), dim=-1)
         topk_vals, topk_indices = torch.topk(logprobs, k=top_k, dim=-1)

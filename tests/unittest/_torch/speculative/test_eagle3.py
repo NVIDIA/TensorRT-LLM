@@ -5,14 +5,14 @@ import unittest
 import pytest
 import torch
 
-from tensorrt_llm import SamplingParams
-from tensorrt_llm._torch import LLM
+from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import EagleDecodingConfig, KvCacheConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
 
 
+@pytest.mark.skip(reason="https://nvbugs/5363158")
 @pytest.mark.parametrize("use_cuda_graph,attn_backend",
                          [[True, "TRTLLM"], [False, "TRTLLM"],
                           [True, "FLASHINFER"], [False, "FLASHINFER"]])

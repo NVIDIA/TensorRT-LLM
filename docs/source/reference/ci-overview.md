@@ -43,8 +43,8 @@ Unit tests live under `tests/unittest/` and run during the merge-request pipelin
 `jenkins/L0_Test.groovy` maps stage names to these YAML files.  For A100 the mapping includes:
 
 ```groovy
-    "A100X-Triton-Python-[Post-Merge]-1": ["a100x", "l0_a100", 1, 2],
-    "A100X-Triton-Python-[Post-Merge]-2": ["a100x", "l0_a100", 2, 2],
+    "A100X-Triton-[Post-Merge]-1": ["a100x", "l0_a100", 1, 2],
+    "A100X-Triton-[Post-Merge]-2": ["a100x", "l0_a100", 2, 2],
 ```
 
 The array elements are: GPU type, YAML file (without extension), shard index, and total number of shards. Only tests with `stage: post_merge` from that YAML file are selected when a `Post-Merge` stage runs.
@@ -57,12 +57,12 @@ The array elements are: GPU type, YAML file (without extension), shard index, an
 
 ### Example
 
-`triton_server/test_triton.py::test_gpt_ib_ptuning[gpt-ib-ptuning]` appears in `l0_a100.yml` under `stage: post_merge` and `backend: triton`.  The corresponding Jenkins stages are `A100X-Triton-Python-[Post-Merge]-1` and `A100X-Triton-Python-[Post-Merge]-2` (two shards).
+`triton_server/test_triton.py::test_gpt_ib_ptuning[gpt-ib-ptuning]` appears in `l0_a100.yml` under `stage: post_merge` and `backend: triton`.  The corresponding Jenkins stages are `A100X-Triton-[Post-Merge]-1` and `A100X-Triton-[Post-Merge]-2` (two shards).
 
 To run the same tests on your pull request, comment:
 
 ```bash
-/bot run --stage-list "A100X-Triton-Python-[Post-Merge]-1,A100X-Triton-Python-[Post-Merge]-2"
+/bot run --stage-list "A100X-Triton-[Post-Merge]-1,A100X-Triton-[Post-Merge]-2"
 ```
 
 This executes the same tests that run post-merge for this hardware/backend.

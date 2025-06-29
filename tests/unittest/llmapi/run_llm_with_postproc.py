@@ -6,9 +6,10 @@ from typing import Optional
 
 import click
 
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.executor import GenerationResultBase
 from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
-from tensorrt_llm.llmapi import LLM, KvCacheConfig, SamplingParams
+from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.utils import print_colored
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionResponseStreamChoice, ChatCompletionStreamResponse,

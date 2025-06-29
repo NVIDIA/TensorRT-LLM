@@ -78,7 +78,8 @@ class Evaluator(ABC):
 
     def evaluate(self,
                  llm: Any,
-                 sampling_params: Optional[SamplingParams] = None) -> float:
+                 sampling_params: Optional[SamplingParams] = None,
+                 streaming: bool = False) -> float:
         profiler.start("trtllm exec")
         outputs, references, auxiliaries = [], [], []
         for prompt, sampling_args, reference, *aux in tqdm(
@@ -87,7 +88,11 @@ class Evaluator(ABC):
                 prompt = self.do_apply_chat_template(llm, prompt)
             sampling_params = self._get_sampline_params(sampling_params,
                                                         sampling_args)
-            output = llm.generate_async(prompt, sampling_params)
+            output = llm.generate_async(
+                prompt,
+                sampling_params,
+                streaming=streaming,
+            )
             outputs.append(output)
             references.append(reference)
             auxiliaries.append(aux)

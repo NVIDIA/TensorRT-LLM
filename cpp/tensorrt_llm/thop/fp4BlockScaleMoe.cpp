@@ -123,7 +123,8 @@ std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routi
         {args.num_tokens, args.top_k}, routing_bias_dtype, routing_logits.device(), std::nullopt);
     at::Tensor expert_indexes = at::detail::empty_cuda(
         {args.num_tokens, args.top_k}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
-    at::Tensor expert_count_histogram = at::detail::empty_cuda({((num_experts * 2 + 255) / 256) * 256},
+    int64_t const size_of_expert_count_histogram = std::max(num_experts * 2, int64_t(256 * 2));
+    at::Tensor expert_count_histogram = at::detail::empty_cuda({size_of_expert_count_histogram},
         at::ScalarType::Int, // 256 is the max number of threads per block and max number of experts
         routing_logits.device(), std::nullopt);
 
@@ -262,7 +263,12 @@ std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routi
 
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner moe_runner(
         args.mDtypeElt, args.mUseDeepSeekFp8, tile_tokens_dim);
-    auto workspace_sizes = moe_runner.getWorkspaceSizeInBytes(args);
+
+    auto const moeConfigIndex = moe_runner.getDefaultValidConfigIndex(
+        args.top_k, args.hidden_size, args.intermediate_size, args.local_num_experts, args.num_tokens);
+
+    auto workspace_sizes = moe_runner.getWorkspaceSizeInBytes(args, moeConfigIndex);
+
     at::Tensor workspace_fc1 = at::detail::empty_cuda(
         {std::get<0>(workspace_sizes)}, at::ScalarType::Char, hidden_states.device(), std::nullopt);
     at::Tensor workspace_fc2 = at::detail::empty_cuda(
@@ -270,12 +276,13 @@ std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routi
     workspace.bmm1_workspace = workspace_fc1.data_ptr();
     workspace.bmm2_workspace = workspace_fc2.data_ptr();
     auto const& moe_stream = at::cuda::getCurrentCUDAStream(hidden_states.get_device());
-    moe_runner.run(args, workspace, hidden_states.get_device(), moe_stream);
+    moe_runner.run(args, workspace, hidden_states.get_device(), moe_stream, moeConfigIndex);
 
     if (!do_finalize)
     {
         return {gemm2_output, expert_weights, expanded_idx_to_permuted_idx};
     }
+
     return {output};
 }
 

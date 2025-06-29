@@ -6,10 +6,12 @@ from contextlib import asynccontextmanager
 from itertools import chain
 from typing import List, Optional, Set, Tuple
 
+import tqdm
 from zmq import PUSH
 from zmq.asyncio import Context
 
-from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm import SamplingParams
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.bench.dataclasses.general import InferenceRequest
 from tensorrt_llm.bench.dataclasses.reporting import PerfItemTuple, StatsKeeper
 from tensorrt_llm.executor.postproc_worker import PostprocParams
@@ -125,6 +127,10 @@ class LlmManager:
             while not self._stop.is_set():
                 async for stats in self.llm.get_stats_async(2):
                     await socket.send_json(stats)
+                # NOTE: This is a WAR to force this loop to relinquish control
+                # that was preventing other async tasks from holding the event
+                # loop. If we don't
+                await asyncio.sleep(0)
 
             # Wrap up by sending any remaining statistics data
             logger.debug("Iteration log worker wrapping up...")
@@ -233,12 +239,14 @@ async def async_benchmark(
                              post_proc_params, submit_finished))
 
         logger.info("Starting benchmark...")
+        pbar = tqdm.tqdm(total=len(requests), desc="Benchmarking")
         while not submit_finished.is_set() or backend.busy or not outbox.empty(
         ):
             try:
                 item: PerfItemTuple = await asyncio.wait_for(outbox.get(),
                                                              timeout=1.0)
                 statistics.register_request_perf_item(item)
+                pbar.update(1)
             except asyncio.TimeoutError:
                 logger.debug("No items in queue. Continuing.")
 

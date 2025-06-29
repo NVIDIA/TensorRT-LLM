@@ -1235,11 +1235,11 @@ public:
         return mPerfMetrics;
     }
 
-    void setFirstScheduledTime(executor::RequestPerfMetrics::TimePoint const& time)
+    void setFirstScheduledTime()
     {
         if (mPerfMetrics.timingMetrics.firstScheduledTime == executor::RequestPerfMetrics::TimePoint{})
         {
-            mPerfMetrics.timingMetrics.firstScheduledTime = time;
+            mPerfMetrics.timingMetrics.firstScheduledTime = std::chrono::steady_clock::now();
         }
     }
 
@@ -2327,6 +2327,11 @@ public:
     /// @details Note that there is some dependency on the order of operations in this method. Modify with care!
     /// @return An optional Response
     std::optional<executor::Response> createResponse(bool useFastLogits = false, int32_t mpiWorldRank = 0);
+
+    std::optional<executor::Result> createResult(bool useFastLogits = false, int32_t mpiWorldRank = 0);
+
+    void createSerializedResult(
+        std::vector<char>& serializedResult, bool& isFinal, bool useFastLogits = false, int32_t mpiWorldRank = 0);
 
     void validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen, SizeType32 vocabSizePadded,
         std::optional<SizeType32> maxEncoderInputLen = std::nullopt, bool enableKVCacheReuse = false);

@@ -47,7 +47,7 @@ class SpeculativeDecodingMode(IntEnum):
         return self.is_mtp() or self.is_eagle3_one_model()
 
     def needs_kv_cache_rewind(self):
-        return self.is_mtp() or self.is_eagle3_one_model()
+        return self.is_mtp() or self.is_eagle3_one_model() or self.is_ngram()
 
     def support_overlap_scheduler(self):
         return self.is_mtp() or self.is_eagle3_one_model()
@@ -72,6 +72,9 @@ class SpeculativeDecodingMode(IntEnum):
 
     def has_spec_decoder(self):
         return self.is_mtp() or self.is_eagle3() or self.is_eagle3_one_model()
+
+    def has_spec_drafter(self):
+        return self.is_ngram()
 
     def extend_ctx(self, attention_backend: Type[AttentionBackend]):
         """
@@ -105,6 +108,8 @@ class SpecConfig:
     max_draft_tokens: int = 1024
     # The path to the draft model
     draft_model_path: Optional[str] = None
+    # The number of extra kv tokens
+    num_extra_kv_tokens: int = 0
 
     def __post_init__(self) -> None:
         self.spec_dec_mode = SpeculativeDecodingMode.from_string(

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from enum import Enum, EnumMeta
 from pathlib import Path
 from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Literal, Optional,
-                    Union)
+                    TypeAlias, Union)
 
 import torch
 import yaml
@@ -54,8 +54,7 @@ from ..models.modeling_utils import (PretrainedConfig, QuantAlgo, QuantConfig,
 from ..sampling_params import BatchedLogitsProcessor
 from .build_cache import BuildCacheConfig
 from .tokenizer import TokenizerBase, tokenizer_factory
-from .utils import (generate_api_docs_as_docstring, get_type_repr,
-                    print_traceback_on_error)
+from .utils import generate_api_docs_as_docstring, get_type_repr
 
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 
@@ -298,6 +297,7 @@ class MTPDecodingConfig(DecodingBaseConfig):
     use_relaxed_acceptance_for_thinking: Optional[bool] = False
     relaxed_topk: Optional[int] = 1
     relaxed_delta: Optional[float] = 0.
+    use_mtp_vanilla: Optional[bool] = False
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -598,6 +598,16 @@ class LookaheadDecodingConfig(DecodingBaseConfig, PybindMirror):
     decoding_type: ClassVar[str] = "Lookahead"
 
 
+SpeculativeConfig: TypeAlias = Optional[Union[
+    DraftTargetDecodingConfig,
+    EagleDecodingConfig,
+    LookaheadDecodingConfig,
+    MedusaDecodingConfig,
+    MTPDecodingConfig,
+    NGramDecodingConfig,
+]]
+
+
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(BaseModel, PybindMirror):
     """
@@ -657,6 +667,8 @@ class KvCacheConfig(BaseModel, PybindMirror):
         description=
         "Whether partially matched blocks that are in use can be reused after copying them."
     )
+    use_uvm: bool = Field(default=False,
+                          description="Whether to use UVM for the KV cache.")
 
     def _to_pybind(self):
         return _KvCacheConfig(
@@ -671,7 +683,8 @@ class KvCacheConfig(BaseModel, PybindMirror):
             secondary_offload_min_priority=self.secondary_offload_min_priority,
             event_buffer_max_size=self.event_buffer_max_size,
             enable_partial_reuse=self.enable_partial_reuse,
-            copy_on_partial_reuse=self.copy_on_partial_reuse)
+            copy_on_partial_reuse=self.copy_on_partial_reuse,
+            use_uvm=self.use_uvm)
 
 
 @PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)
@@ -878,8 +891,11 @@ class BaseLlmArgs(BaseModel):
     enable_chunked_prefill: bool = Field(default=False,
                                          description="Enable chunked prefill.")
 
-    guided_decoding_backend: Optional[str] = Field(
-        default=None, description="Guided decoding backend.")
+    guided_decoding_backend: Optional[Literal["xgrammar", "llguidance"]] = Field(
+        default=None,
+        description=
+        "Guided decoding backend. llguidance is supported in PyTorch backend only."
+    )
 
     batched_logits_processor: Optional[object] = Field(
         default=None,
@@ -907,11 +923,8 @@ class BaseLlmArgs(BaseModel):
         default=None, description="Cache transceiver config.")
 
     # Speculative decoding parameters
-    speculative_config: Optional[
-        Union[LookaheadDecodingConfig, MedusaDecodingConfig,
-              EagleDecodingConfig, MTPDecodingConfig, NGramDecodingConfig,
-              DraftTargetDecodingConfig]] = Field(
-                  default=None, description="Speculative decoding config.")
+    speculative_config: SpeculativeConfig = Field(
+        default=None, description="Speculative decoding config.")
 
     batching_type: Optional[BatchingType] = Field(default=None,
                                                   description="Batching type.")
@@ -952,12 +965,6 @@ class BaseLlmArgs(BaseModel):
     reasoning_parser: Optional[str] = Field(
         default=None,
         description="The parser to separate reasoning content from output.")
-
-    garbage_collection_gen0_threshold: int = Field(
-        default=20000,
-        description=
-        "Threshold for Python garbage collection of generation 0 objects."
-        "Lower values trigger more frequent garbage collection.")
 
     # TODO[Superjomn]: To deprecate this config.
     decoding_config: Optional[object] = Field(
@@ -1351,7 +1358,8 @@ class BaseLlmArgs(BaseModel):
                     use_relaxed_acceptance_for_thinking=self.speculative_config.
                     use_relaxed_acceptance_for_thinking,
                     relaxed_topk=self.speculative_config.relaxed_topk,
-                    relaxed_delta=self.speculative_config.relaxed_delta)
+                    relaxed_delta=self.speculative_config.relaxed_delta,
+                    use_mtp_vanilla=self.speculative_config.use_mtp_vanilla)
             else:
                 raise ValueError(
                     f"Speculative config type not recognized: {self.speculative_config}"
@@ -1591,12 +1599,6 @@ class TrtLlmArgs(BaseLlmArgs):
         return self
 
 
-LlmArgs = TrtLlmArgs
-
-LLMARGS_EXPLICIT_DOCSTRING = generate_api_docs_as_docstring(LlmArgs,
-                                                            indent=' ' * 4)
-
-
 class LoadFormat(Enum):
     AUTO = 0
     # Initialize all weights randomly.
@@ -1607,25 +1609,24 @@ class TorchCompileConfig(BaseModel):
     """
     Configuration for torch.compile.
     """
-    torch_compile_fullgraph: bool = Field(
+    enable_fullgraph: bool = Field(
         default=True,
         description="Enable full graph compilation in torch.compile.")
 
-    torch_compile_inductor_enabled: bool = Field(
+    enable_inductor: bool = Field(
         default=False, description="Enable inductor backend in torch.compile.")
 
-    torch_compile_piecewise_cuda_graph: bool = Field(
+    enable_piecewise_cuda_graph: bool = Field(
         default=False,
         description="Enable piecewise CUDA graph in torch.compile.")
 
-    torch_compile_enable_userbuffers: bool = Field(
+    enable_userbuffers: bool = Field(
         default=True,
         description=
         "When torch compile is enabled, userbuffers is enabled by default.")
 
 
 class TorchLlmArgs(BaseLlmArgs):
-
     # Just a dummy BuildConfig to allow code reuse with the TrtLlmArgs
     build_config: Optional[object] = Field(
         default=None,
@@ -1634,6 +1635,12 @@ class TorchLlmArgs(BaseLlmArgs):
         json_schema_extra={"type": f"Optional[{get_type_repr(BuildConfig)}]"})
 
     # PyTorch backend specific configurations
+
+    garbage_collection_gen0_threshold: int = Field(
+        default=20000,
+        description=
+        "Threshold for Python garbage collection of generation 0 objects."
+        "Lower values trigger more frequent garbage collection.")
 
     use_cuda_graph: bool = Field(
         default=False,
@@ -1666,7 +1673,10 @@ class TorchLlmArgs(BaseLlmArgs):
     moe_load_balancer: Optional[Union[object, str]] = Field(
         default=None,
         description="Configuration for MoE load balancing.",
-        json_schema_extra={"type": "Union[MoeLoadBalancerConfig, str]"})
+        json_schema_extra={
+            "type":
+            "Union[tensorrt_llm._torch.model_config.MoeLoadBalancerConfig, str, None]"
+        })
 
     attn_backend: str = Field(default='TRTLLM',
                               description="Attention backend to use.")
@@ -1723,6 +1733,14 @@ class TorchLlmArgs(BaseLlmArgs):
         "If true, enable min-latency mode. Currently only used for Llama4.",
     )
 
+    # TODO: make this a per-request parameter
+    stream_interval: int = Field(
+        default=1,
+        description=
+        "The iteration interval to create responses under the streaming mode. "
+        "Set this to a larger value when the batch size is large, which helps reduce the streaming overhead.",
+    )
+
     # TODO: remove backend later
     @field_validator('backend', mode='before')
     def init_backend(cls, v):
@@ -1775,6 +1793,13 @@ class TorchLlmArgs(BaseLlmArgs):
                 ) from e
         return self
 
+    @model_validator(mode="after")
+    def validate_stream_interval(self):
+        if self.stream_interval <= 0:
+            raise ValueError(
+                f"stream_interval must be positive, got {self.stream_interval}")
+        return self
+
     # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
     def get_pytorch_backend_config(self) -> "PyTorchConfig":
         from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
@@ -1797,22 +1822,21 @@ class TorchLlmArgs(BaseLlmArgs):
             enable_iter_req_stats=self.enable_iter_req_stats,
             print_iter_log=self.print_iter_log,
             torch_compile_enabled=bool(self.torch_compile_config is not None),
-            torch_compile_fullgraph=self.torch_compile_config.
-            torch_compile_fullgraph
+            torch_compile_fullgraph=self.torch_compile_config.enable_fullgraph
             if self.torch_compile_config is not None else True,
             torch_compile_inductor_enabled=self.torch_compile_config.
-            torch_compile_inductor_enabled
-            if self.torch_compile_config is not None else False,
+            enable_inductor if self.torch_compile_config is not None else False,
             torch_compile_piecewise_cuda_graph=self.torch_compile_config.
-            torch_compile_piecewise_cuda_graph
+            enable_piecewise_cuda_graph
             if self.torch_compile_config is not None else False,
             torch_compile_enable_userbuffers=self.torch_compile_config.
-            torch_compile_enable_userbuffers
+            enable_userbuffers
             if self.torch_compile_config is not None else True,
             autotuner_enabled=self.autotuner_enabled,
             enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
             load_format=self.load_format,
-            enable_min_latency=self.enable_min_latency)
+            enable_min_latency=self.enable_min_latency,
+            stream_interval=self.stream_interval)
 
     @field_validator('cuda_graph_max_batch_size')
     @classmethod
@@ -1888,115 +1912,6 @@ class TorchLlmArgs(BaseLlmArgs):
         return batch_sizes
 
 
-class _AutoDeployLlmArgs(TorchLlmArgs):
-    """LLM arguments specifically for AutoDeploy backend.
-
-    This class extends TorchLlmArgs with AutoDeploy-specific configuration options.
-    AutoDeploy provides automatic deployment and optimization of language models
-    with various attention backends and optimization strategies.
-    """
-
-    model_factory: Literal[
-        "AutoModelForCausalLM", "AutoModelForImageTextToText"] = Field(
-            default="AutoModelForCausalLM",
-            description="The model factory to use for loading the model.",
-        )
-
-    model_kwargs: Dict[str, Any] = Field(
-        default_factory=dict,
-        description=
-        "Extra kwargs for the model config class to customize the model config. "
-        "These arguments take precedence over default values or config values in the model config "
-        "file. Arguments are resolved in order: 1) Default values in model config class, 2) Values "
-        "in model config file, 3) Values in model_kwargs. Note: if a kwarg doesn't exist in the "
-        "model config class, it will be ignored.",
-    )
-
-    mla_backend: Literal["MultiHeadLatentAttention"] = Field(
-        default="MultiHeadLatentAttention",
-        description="The Multi-Head Latent Attention backend to use.",
-    )
-
-    skip_loading_weights: bool = Field(
-        default=False,
-        description=
-        "Whether to skip loading model weights during initialization. "
-        "If True, only the model architecture is loaded.",
-    )
-
-    free_mem_ratio: float = Field(
-        default=0.8,
-        description="The fraction of available memory to allocate for cache. "
-        "Must be between 0.0 and 1.0.",
-    )
-
-    simple_shard_only: bool = Field(
-        default=False,
-        description=
-        "If True, force simple sharding (all_gather) in tensor parallelism. "
-        "If False, auto-detect and use column+row (all_reduce) sharding when possible.",
-    )
-
-    # TODO: Remove this field once tokens_per_block is properly passed through
-    attn_page_size: int = Field(
-        default=64,
-        description=
-        "Page size for attention (tokens_per_block). For TritonWithFlattenedInputs "
-        "backend, this should equal max_seq_len. Temporary field until tokens_per_block gets "
-        "properly passed through.",
-    )
-
-    checkpoint_device: Optional[str] = Field(
-        default=None,
-        description="Device on which to load the model checkpoint. "
-        "Defaults to the same device as the rest of the pipeline.",
-    )
-
-    @field_validator("free_mem_ratio")
-    @classmethod
-    def validate_free_mem_ratio(cls, v):
-        """Validate that free_mem_ratio is between 0.0 and 1.0."""
-        if not 0.0 <= v <= 1.0:
-            raise ValueError(
-                f"free_mem_ratio must be between 0.0 and 1.0, got {v}")
-        return v
-
-    @print_traceback_on_error
-    def model_post_init(self, __context):
-        # Modify default values that differ from TorchLlmArgs
-        new_defaults = {
-            "max_batch_size": 8,
-            "max_seq_len": 512,
-            "attn_backend": "FlashInfer",
-            # TODO: Remove this when overlap scheduler is supported (https://github.com/NVIDIA/TensorRT-LLM/issues/4364)
-            "disable_overlap_scheduler": True,
-        }
-        for k, v_default in new_defaults.items():
-            if k not in self.__pydantic_fields_set__:
-                setattr(self, k, v_default)
-
-        # NOTE: Only call super() after setting the default values since default values should be
-        # set first.
-        super().model_post_init(__context)
-
-        # Handle attn_page_size for TritonWithFlattenedInputs backend
-        if self.attn_backend == "TritonWithFlattenedInputs":
-            self.attn_page_size = self.max_seq_len
-
-        # Add max_position_embeddings to model_kwargs
-        # TODO (lucaslie): this is more HF specific than a generic model_kwargs. Ideally, we can
-        # move this to the HF model factory but we don't have access to max_seq_len there right now.
-        self.model_kwargs["max_position_embeddings"] = min(
-            self.max_seq_len,
-            self.model_kwargs.get("max_position_embeddings", self.max_seq_len),
-        )
-
-    # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
-    def get_pytorch_backend_config(self) -> "_AutoDeployLlmArgs":
-        """Return the _AutoDeployLlmArgs (self) object."""
-        return self
-
-
 def update_llm_args_with_extra_dict(
         llm_args: Dict,
         llm_args_dict: Dict,
@@ -2068,3 +1983,12 @@ def get_model_format(model_dir: str) -> _ModelFormatKind:
         )
     else:
         return model_format
+
+
+LlmArgs = TorchLlmArgs
+
+TRT_LLMARGS_EXPLICIT_DOCSTRING = generate_api_docs_as_docstring(TrtLlmArgs,
+                                                                indent=' ' * 4)
+TORCH_LLMARGS_EXPLICIT_DOCSTRING = generate_api_docs_as_docstring(TorchLlmArgs,
+                                                                  indent=' ' *
+                                                                  4)

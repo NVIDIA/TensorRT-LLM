@@ -60,7 +60,7 @@ from .cuda_graph_runner import DecodingCUDAGraphRunner
 from .guided_decoder import GuidedDecoder
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .resource_manager import (BaseResourceManager, KVCacheManager,
-                               ResourceManager)
+                               ResourceManager, ResourceManagerType)
 from .scheduler import ScheduledRequests
 
 MAX_UINT64 = (1 << 64) - 1
@@ -270,10 +270,6 @@ def initialize_dummy_weights(
         # constants and not weights.
         elif torch.is_floating_point(param):
             param.uniform_(low, high, generator=generator)
-
-
-KV_CACHE_MANAGER_KEY = 'kv_cache_manager'
-DRAFT_KV_CACHE_MANAGER_KEY = 'draft_kv_cache_manager'
 
 
 def get_rank_model_storage(model):
@@ -497,7 +493,7 @@ class PyTorchModelEngine(ModelEngine):
         # We look up this key in resource_manager during forward to find the
         # kv cache manager. Can be changed to support multiple model engines
         # with different KV cache managers.
-        self.kv_cache_manager_key = KV_CACHE_MANAGER_KEY
+        self.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
         self.lora_model_config: Optional[LoraModelConfig] = None
         self.cuda_graph_dummy_request = None
 
@@ -541,7 +537,7 @@ class PyTorchModelEngine(ModelEngine):
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         spec_resource_manager = resource_manager.get_resource_manager(
-            'spec_resource_manager')
+            ResourceManagerType.SPEC_RESOURCE_MANAGER)
         if kv_cache_manager is None:
             logger.info("Skipping warm up as no KV Cache manager allocated.")
             return
@@ -597,8 +593,8 @@ class PyTorchModelEngine(ModelEngine):
                 is_gen = num_tokens_per_request == 1
 
                 requests = kv_cache_manager.add_dummy_requests(
-                    list(range(batch_size)),
-                    [num_tokens_per_request] * batch_size,
+                    list(range(batch_size)), [num_tokens_per_request] *
+                    batch_size if not is_gen else None,
                     is_gen=is_gen,
                     max_num_draft_tokens=self.max_draft_len)
 
@@ -765,7 +761,7 @@ class PyTorchModelEngine(ModelEngine):
                                  resource_manager=resource_manager)
                     torch.cuda.synchronize()
 
-                if self._torch_compile_piecewise_cuda_graph:
+                if self._torch_compile_piecewise_cuda_graph and self._torch_compile_enabled:
                     with self.no_cuda_graph():
                         with release_batch(
                                 get_torch_compile_warmup_request(1,
@@ -787,8 +783,9 @@ class PyTorchModelEngine(ModelEngine):
 
     def _set_up_attn_metadata(self, kv_cache_manager: KVCacheManager):
         enable_paged_context_mla = is_mla(
-            self.model.model_config.pretrained_config
-        ) and self.attn_runtime_features.cache_reuse
+            self.model.model_config.pretrained_config) and (
+                self.attn_runtime_features.cache_reuse
+                or self.attn_runtime_features.chunked_prefill)
         if kv_cache_manager is None:
             return self.attn_backend.Metadata(
                 max_num_requests=self.batch_size,
@@ -1172,7 +1169,7 @@ class PyTorchModelEngine(ModelEngine):
             gather_ids.append(len(input_ids) - 1)
             sequence_lengths.append(len(prompt_tokens))
             prompt_lengths.append(len(prompt_tokens))
-            past_seen_token_num = request.context_current_position
+            past_seen_token_num = begin_compute
             num_cached_tokens_per_seq.append(past_seen_token_num)
             multimodal_embedding = request.multimodal_embedding
             if multimodal_embedding is not None:
@@ -2010,7 +2007,7 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata = self._set_up_attn_metadata(kv_cache_manager)
         if self.is_spec_decode:
             spec_resource_manager = resource_manager.get_resource_manager(
-                'spec_resource_manager')
+                ResourceManagerType.SPEC_RESOURCE_MANAGER)
             spec_metadata = self._set_up_spec_metadata(spec_resource_manager,
                                                        no_cache=kv_cache_manager
                                                        is None)
@@ -2089,7 +2086,7 @@ class PyTorchModelEngine(ModelEngine):
             if self.mapping.is_last_pp_rank(
             ) and self.guided_decoder is not None:
                 seq_slot_manager = resource_manager.get_resource_manager(
-                    "seq_slot_manager")
+                    ResourceManagerType.SEQ_SLOT_MANAGER)
                 self.guided_decoder.build(scheduled_requests, seq_slot_manager)
                 self.guided_decoder.execute(scheduled_requests,
                                             outputs['logits'], seq_slot_manager)

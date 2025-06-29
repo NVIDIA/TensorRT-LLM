@@ -19,7 +19,8 @@
 #include "cute/tensor.hpp"
 #include "cute/util/print.hpp"
 
-using namespace cute;
+namespace tensorrt_llm::cutlass_extensions
+{
 
 /// Function object that applies an index to its argument
 template <class Iter>
@@ -39,8 +40,8 @@ struct IndexedGather
     CUTE_HOST_DEVICE friend void print(IndexedGather const& s)
     {
         cute::print("Indexed{");
-        print(s.indices_);
-        print("}");
+        cute::print(s.indices_);
+        cute::print("}");
     }
 
     Iter indices_;
@@ -71,9 +72,9 @@ struct CustomStride
     CUTE_HOST_DEVICE friend void print(CustomStride const& s)
     {
         cute::print("Custom{");
-        print(s.func_);
+        cute::print(s.func_);
         cute::print(",");
-        print(s.stride_);
+        cute::print(s.stride_);
         cute::print("}");
     }
 
@@ -87,7 +88,7 @@ struct CustomStride
     template <class Shape>
     CUTE_HOST_DEVICE constexpr friend auto make_layout(Shape const& shape, CustomStride const& stride)
     {
-        return Layout<Shape, CustomStride>(shape, stride);
+        return cute::Layout<Shape, CustomStride>(shape, stride);
     }
 
     Func func_;
@@ -97,6 +98,7 @@ struct CustomStride
 template <class Stride, class Func>
 CUTLASS_HOST_DEVICE auto make_custom_stride_layout(Stride const& stride, Func&& func)
 {
+    using namespace cute;
     // Use a dummy shape and replace the first non-unit and non-zero stride with a custom gather stride
     auto idx = find_if(stride, [](auto x) { return !is_constant<1, decltype(x)>{} && !is_constant<0, decltype(x)>{}; });
     constexpr int I = decltype(idx)::value;
@@ -108,11 +110,13 @@ CUTLASS_HOST_DEVICE auto make_custom_stride_layout(Stride const& stride, Func&& 
 template <class Iterator, class Shape, class Stride, class Func>
 CUTLASS_HOST_DEVICE auto make_gather_tensor(Iterator iter, Shape const& shape, Stride const& stride, Func&& func)
 {
+    using namespace cute;
     Layout matrix_layout = make_identity_layout(shape);
     auto offset = as_arithmetic_tuple(repeat_like(shape, _0{}));
     Layout gather_layout = make_custom_stride_layout(stride, static_cast<Func&&>(func));
     return make_tensor(iter, ComposedLayout{gather_layout, offset, matrix_layout});
 }
+} // namespace tensorrt_llm::cutlass_extensions
 
 namespace cute
 {

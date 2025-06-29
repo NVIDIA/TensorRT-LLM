@@ -2,17 +2,16 @@
 
 set -ex
 
-TRT_VER="10.10.0.31"
+TRT_VER="10.11.0.33"
 # Align with the pre-installed cuDNN / cuBLAS / NCCL versions from
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-04.html#rel-25-04
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-05.html#rel-25-05
 CUDA_VER="12.9" # 12.9.0
 # Keep the installation for cuDNN if users want to install PyTorch with source codes.
 # PyTorch 2.x can compile with cuDNN v9.
-CUDNN_VER="9.9.0.52-1"
-# NCCL version 2.26.3 used in the NGC PyTorch 25.04 image but not existing in public.
-# Use NCCL version 2.26.5 instead.
-NCCL_VER="2.26.5-1+cuda12.9"
-# cuBLAS version 12.9.0.2 used in the NGC PyTorch 25.04 image but not existing in public.
+CUDNN_VER="9.10.1.4-1"
+# NCCL version 2.26.x used in the NGC PyTorch 25.05 image but has a performance regression issue.
+# Use NCCL version 2.25.1 instead.
+NCCL_VER="2.25.1-1+cuda12.8"
 # Use cuBLAS version 12.9.0.13 instead.
 CUBLAS_VER="12.9.0.13-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
@@ -68,6 +67,7 @@ install_ubuntu_requirements() {
     apt-get install -y --no-install-recommends \
         libcudnn9-cuda-12=${CUDNN_VER} \
         libcudnn9-dev-cuda-12=${CUDNN_VER} \
+	libcudnn9-headers-cuda-12=${CUDNN_VER} \
         libnccl2=${NCCL_VER} \
         libnccl-dev=${NCCL_VER} \
         libcublas-${CUBLAS_CUDA_VERSION}=${CUBLAS_VER} \

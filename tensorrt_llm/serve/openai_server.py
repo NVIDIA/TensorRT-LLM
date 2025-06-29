@@ -14,12 +14,12 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from transformers import AutoConfig, AutoProcessor
 
+from tensorrt_llm._tensorrt_engine import LLM
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
-from tensorrt_llm.llmapi import LLM
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi.disagg_utils import MetadataServerConfig, ServerRole
 from tensorrt_llm.llmapi.llm import RequestOutput
@@ -294,6 +294,7 @@ class OpenAIServer:
                 sampling_params=sampling_params,
                 _postproc_params=postproc_params if self.postproc_worker_enabled else None,
                 streaming=request.stream,
+                lora_request=request.lora_request,
                 disaggregated_params=disaggregated_params
             )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
@@ -414,6 +415,7 @@ class OpenAIServer:
                     sampling_params=sampling_params,
                     _postproc_params=postproc_params,
                     streaming=request.stream,
+                    lora_request=request.lora_request,
                     disaggregated_params=disaggregated_params
                 )
                 asyncio.create_task(self.await_disconnected(raw_request, promise))

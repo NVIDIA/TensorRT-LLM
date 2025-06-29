@@ -184,7 +184,7 @@ class MoEOpModel(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: Tensor of shape (batch, hidden_size)
-        Computes router logits via a gate, and then calls the MoE op via torch.moe.torch_moe.
+        Computes router logits via a gate, and then calls the MoE op via torch.ops.auto_deploy.torch_moe.
         """
 
         router_logits = self.gate(x)
@@ -197,7 +197,7 @@ class MoEOpModel(nn.Module):
         w2_list = [expert.w2 for expert in self.experts]
         w3_list = [expert.w3 for expert in self.experts]
 
-        out = torch.ops.moe.torch_moe(
+        out = torch.ops.auto_deploy.torch_moe(
             x, selected_experts, routing_weights, w1_list, w2_list, w3_list
         )
         return out
@@ -325,7 +325,6 @@ _SMALL_MODEL_CONFIGS = {
             "meta-llama/Llama-4-Scout-17B-16E-Instruct",
         ),
         "model_factory": "AutoModelForImageTextToText",
-        "customize_tokenizer": True,
         "model_kwargs": {
             "text_config": {
                 "num_hidden_layers": 1,
@@ -370,7 +369,7 @@ _SMALL_MODEL_CONFIGS = {
 }
 
 
-def get_small_model_config(model_hub_id: str, **config_kwargs) -> Dict[str, Any]:
+def get_small_model_config(model_hub_id: str, **llm_args_kwargs) -> Dict[str, Any]:
     """
     Get the small model configuration for a given HuggingFace model hub ID.
 
@@ -387,18 +386,25 @@ def get_small_model_config(model_hub_id: str, **config_kwargs) -> Dict[str, Any]
         available_models = list(_SMALL_MODEL_CONFIGS.keys())
         raise KeyError(f"Model '{model_hub_id}' not found. Available models: {available_models}")
 
-    config = copy.deepcopy(_SMALL_MODEL_CONFIGS[model_hub_id])
+    llm_args = copy.deepcopy(_SMALL_MODEL_CONFIGS[model_hub_id])
 
-    # add default values for small model config
-    config["skip_loading_weights"] = True  # No weight loading to speed up things
-    config["free_mem_ratio"] = 0.00  # we don't need the cache and it may cause OOM issues
-    config["benchmark"] = False  # No benchmark to speed up things
-    config["max_tokens"] = 8  # Don't produce too many tokens to speed up things
-    config["attn_page_size"] = 4  # Make sure paging is activated despite small max_tokens
-    config["max_batch_size"] = 2  # Minimum batching to speed up things
-    config["prompt"] = "Hello World"
+    # add some defaults to llm_args
+    llm_args["skip_loading_weights"] = True  # No weight loading to speed up things
+    llm_args["free_mem_ratio"] = 0.00  # we don't need the cache and it may cause OOM issues
+    llm_args["attn_page_size"] = 4  # Make sure paging is activated despite small max_tokens
+    llm_args["max_batch_size"] = 2  # Minimum batching to speed up things
 
-    # add custom config kwargs
-    config.update(config_kwargs)
+    # update with custom llm_args kwargs
+    llm_args.update(llm_args_kwargs)
 
-    return config
+    # add a couple of other defaults to the experiment config
+    experiment_config = {
+        "args": llm_args,
+        "benchmark": {"enabled": False},
+        "prompt": {
+            "queries": "Hello World",
+            "sp_kwargs": {"max_tokens": 8},
+        },
+    }
+
+    return experiment_config

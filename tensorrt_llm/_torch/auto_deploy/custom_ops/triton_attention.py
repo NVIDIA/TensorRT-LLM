@@ -169,7 +169,7 @@ def _flattened_context_mha(
     )
 
 
-@torch.library.custom_op("attention::flattened_mha_with_cache", mutates_args=())
+@torch.library.custom_op("auto_deploy::triton_attention_flattened_mha_with_cache", mutates_args=())
 def flattened_mha_with_cache(
     # Q, K, V
     q: torch.Tensor,
@@ -259,7 +259,9 @@ def flattened_mha_fake(
     return q.new_empty(*q.shape[:-1], v.shape[-1]).contiguous()
 
 
-@torch.library.custom_op("attention::prepare_fused_mha_metadata", mutates_args=())
+@torch.library.custom_op(
+    "auto_deploy::triton_attention_prepare_fused_mha_metadata", mutates_args=()
+)
 def prepare_fused_mha_metadata(
     input_ids: torch.Tensor,
     position_ids: torch.Tensor,
@@ -295,8 +297,8 @@ def prepare_fused_mha_metadata_fake(
     )
 
 
-@AttentionRegistry.register("TritonWithFlattenedInputs")
-class TritonWithFlattenedInputs(AttentionDescriptor):
+@AttentionRegistry.register("triton")
+class TritonAttention(AttentionDescriptor):
     @classmethod
     def is_paged(cls) -> bool:
         """Return if the attention op is paged or not."""
@@ -314,15 +316,15 @@ class TritonWithFlattenedInputs(AttentionDescriptor):
 
     @classmethod
     def get_source_attention_op(cls) -> OpOverloadPacket:
-        return torch.ops.attention.bsnd_grouped_sdpa
+        return torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
-        return torch.ops.attention.flattened_mha_with_cache
+        return torch.ops.auto_deploy.triton_attention_flattened_mha_with_cache
 
     @classmethod
     def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
-        return torch.ops.attention.prepare_fused_mha_metadata, 4
+        return torch.ops.auto_deploy.triton_attention_prepare_fused_mha_metadata, 4
 
     @classmethod
     def get_cache_initializers(
@@ -336,7 +338,7 @@ class TritonWithFlattenedInputs(AttentionDescriptor):
         v_head_dim = v_fake.shape[3]
 
         def _get_k_cache(si: SequenceInfo):
-            assert not si.is_paged, "Paged cache not supported for TritonWithFlattenedInputs"
+            assert not si.is_paged, "Paged cache not supported for triton"
             return torch.empty(
                 si.num_pages,
                 si.page_size,
@@ -347,7 +349,7 @@ class TritonWithFlattenedInputs(AttentionDescriptor):
             )
 
         def _get_v_cache(si: SequenceInfo):
-            assert not si.is_paged, "Paged cache not supported for TritonWithFlattenedInputs"
+            assert not si.is_paged, "Paged cache not supported for triton"
             return torch.empty(
                 si.num_pages,
                 si.page_size,

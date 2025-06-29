@@ -1,7 +1,6 @@
 import argparse
 
-from tensorrt_llm import SamplingParams
-from tensorrt_llm._torch import LLM
+from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import (DraftTargetDecodingConfig, EagleDecodingConfig,
                                  KvCacheConfig, MTPDecodingConfig,
                                  NGramDecodingConfig, TorchCompileConfig)
@@ -200,9 +199,10 @@ def setup_llm(args):
         print_iter_log=args.print_iter_log,
         enable_iter_perf_stats=args.print_iter_log,
         torch_compile_config=TorchCompileConfig(
-            torch_compile_fullgraph=args.use_torch_compile,
-            torch_compile_inductor_enabled=args.use_torch_compile,
-            torch_compile_piecewise_cuda_graph=args.use_piecewise_cuda_graph)
+            enable_fullgraph=args.use_torch_compile,
+            enable_inductor=args.use_torch_compile,
+            enable_piecewise_cuda_graph= \
+                args.use_piecewise_cuda_graph)
         if args.use_torch_compile else None,
         moe_backend=args.moe_backend,
         enable_trtllm_sampler=args.enable_trtllm_sampler,

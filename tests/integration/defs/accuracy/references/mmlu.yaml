@@ -115,6 +115,9 @@ deepseek-ai/DeepSeek-V3-Lite:
   - accuracy: 71.40
   - quant_algo: NVFP4
     accuracy: 70.60
+  - quant_algo: NVFP4
+    spec_dec_algo: MTP
+    accuracy: 70.60
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 71.27
   - spec_dec_algo: MTP
@@ -139,6 +142,7 @@ deepseek-ai/DeepSeek-R1:
 Qwen3/Qwen3-8B:
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 76.12
+  - accuracy: 76.12
 Qwen3/Qwen3-30B-A3B:
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 79.53
@@ -179,3 +183,8 @@ nvidia/Llama-3_1-Nemotron-Ultra-253B-v1:
     accuracy: 83.36
 kanana-1.5-2.1b-instruct-2505:
   - accuracy: 56.89
+speakleash/Bielik-11B-v2.2-Instruct:
+  - accuracy: 64.47
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 64.36

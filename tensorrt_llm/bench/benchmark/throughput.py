@@ -17,7 +17,8 @@ from tensorrt_llm.bench.build.build import get_model_config
 from tensorrt_llm.bench.benchmark.utils.general import (
     get_settings_from_engine, get_settings)
 # isort: on
-from tensorrt_llm._torch.llm import LLM as PyTorchLLM
+from tensorrt_llm import LLM as PyTorchLLM
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
@@ -25,7 +26,7 @@ from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
-from tensorrt_llm.llmapi import LLM, CapacitySchedulerPolicy
+from tensorrt_llm.llmapi import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -43,9 +44,9 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Path to a serialized TRT-LLM engine.",
 )
 @optgroup.option("--backend",
-                 type=click.Choice(["pytorch", "_autodeploy"]),
-                 default=None,
-                 help="Set to 'pytorch' for pytorch path. Default is cpp path.")
+                 type=click.Choice(["pytorch", "tensorrt", "_autodeploy"]),
+                 default="pytorch",
+                 help="The backend to use when running benchmarking.")
 @optgroup.option(
     "--extra_llm_api_options",
     type=str,
@@ -303,7 +304,7 @@ def throughput_command(
         kwargs_max_sql = max_seq_len or metadata.max_sequence_length
         logger.info(f"Setting PyTorch max sequence length to {kwargs_max_sql}")
         kwargs["max_seq_len"] = kwargs_max_sql
-    else:
+    elif backend.lower() == "tensorrt":
         assert max_seq_len is None, (
             "max_seq_len is not a runtime parameter for C++ backend")
         exec_settings, build_cfg = get_settings_from_engine(engine_dir)
@@ -316,6 +317,10 @@ def throughput_command(
                 "Provided dataset contains a maximum sequence of "
                 f"{metadata.max_sequence_length}. Please rebuild a new engine "
                 "to support this dataset.")
+    else:
+        raise RuntimeError(
+            f"Invalid backend: {backend}, please use one of the following: "
+            "pytorch, tensorrt, _autodeploy.")
 
     exec_settings["model"] = model
     engine_bs = exec_settings["settings_config"]["max_batch_size"]

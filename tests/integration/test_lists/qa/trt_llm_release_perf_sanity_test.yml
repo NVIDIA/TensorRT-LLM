@@ -99,7 +99,7 @@ trt_llm_release_perf_sanity_test:
   - perf/test_perf.py::test_perf[t5-bench-float16-maxbs:1-input_output_len:128,20-gpus:2]
   - perf/test_perf.py::test_perf[flan_t5_large-bench-float16-maxbs:1-input_output_len:128,20-gpus:2]
   - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-bfloat16-input_output_len:128,128-quant:int8-gpus:2]
-  - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-bfloat16-maxbs:256-input_output_len:128,128-gpu:2]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-bfloat16-maxbs:256-input_output_len:128,128-gpus:2]
   - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-streaming-bfloat16-input_output_len:128,128-gpus:2]
   - perf/test_perf.py::test_perf[llama_v3.2_1b-bench-bfloat16-maxbs:1-input_output_len:128,128-reqs:10-gpus:2]
   - perf/test_perf.py::test_perf[llama_v3.2_1b-bench-pytorch-bfloat16-input_output_len:128,128-gpus:2]

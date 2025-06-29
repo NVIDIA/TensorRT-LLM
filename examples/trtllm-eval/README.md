@@ -10,8 +10,7 @@ We provide a CLI tool `trtllm-eval` for evaluating model accuracy. It shares the
 pip install -r requirements.txt
 
 # Evaluate Llama-3.1-8B-Instruct on MMLU
-wget https://people.eecs.berkeley.edu/~hendrycks/data.tar && tar -xf data.tar
-trtllm-eval --model meta-llama/Llama-3.1-8B-Instruct mmlu --dataset_path data
+trtllm-eval --model meta-llama/Llama-3.1-8B-Instruct mmlu
 
 # Evaluate Llama-3.1-8B-Instruct on GSM8K
 trtllm-eval --model meta-llama/Llama-3.1-8B-Instruct gsm8k

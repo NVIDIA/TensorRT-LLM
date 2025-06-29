@@ -283,6 +283,20 @@ input [
     optional: true
   },
   {
+    name: "return_num_input_tokens"
+    data_type: TYPE_BOOL
+    dims: [ 1 ]
+    reshape: { shape: [ ] }
+    optional: true
+  },
+  {
+    name: "return_num_output_tokens"
+    data_type: TYPE_BOOL
+    dims: [ 1 ]
+    reshape: { shape: [ ] }
+    optional: true
+  },
+  {
     name: "exclude_input_in_output"
     data_type: TYPE_BOOL
     dims: [ 1 ]
@@ -573,6 +587,16 @@ output [
   },
   {
     name: "total_draft_tokens"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+  },
+  {
+    name: "num_input_tokens"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+  },
+  {
+    name: "num_output_tokens"
     data_type: TYPE_INT32
     dims: [ 1 ]
   }
