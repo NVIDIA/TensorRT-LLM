@@ -2115,7 +2115,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockWithDependentTest)
     EXPECT_THAT(cacheBlockIds0, ::testing::ElementsAreArray({0, 1, 2}));
 
     // Lower priority of middle block to prevent offloading
-    auto const blockManager = kvCacheManager.getBlockManager();
+    auto const& blockManager = kvCacheManager.getBlockManager();
     auto middleBlock = blockManager.getBlockById(cacheBlockIds0[1], maxAttentionWindow);
     middleBlock->setPriority(0);
 
@@ -2215,7 +2215,7 @@ TEST_P(KVCacheManagerTest, DISABLED_KVCacheManagerAllocationTest)
             std::nullopt, nvinfer1::DataType::kHALF, sinkTokenLength, stream, std::nullopt, enableBlockReuse,
             onboardBlocks);
 
-    auto const blockManager = kvCacheManager.getBlockManager();
+    auto const& blockManager = kvCacheManager.getBlockManager();
     auto const& bufferManager = blockManager.getBufferManager(theOnlyWindowSize(kvCacheManager));
     auto const memoryPoolUsedBefore = bufferManager.memoryPoolUsed();
     kvCacheManager.allocatePools(useUvm);
