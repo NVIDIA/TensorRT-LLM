@@ -758,7 +758,8 @@ class W4A8MXFP4FP8LinearMethod(LinearMethodBase):
 class W4A16_AWQ_LinearMethod(LinearMethodBase):
 
     def create_weights(self, module: Linear, in_features: int,
-                       out_features: int, bias: bool, dtype: torch.dtype):
+                       out_features: int, bias: bool,
+                       dtype: torch.dtype) -> None:
         # Quantized weights
         module.weight = Parameter(torch.empty(
             (in_features, out_features // 2),
@@ -786,7 +787,7 @@ class W4A16_AWQ_LinearMethod(LinearMethodBase):
             module.register_parameter("bias", None)
 
     def apply(self, module: Linear, input: torch.Tensor,
-              bias: Optional[torch.Tensor]):
+              bias: Optional[torch.Tensor]) -> torch.Tensor:
 
         if module.pre_quant_scale is not None:
             pre_quant_scale = module.pre_quant_scale.repeat(input.shape[0], 1)
@@ -804,11 +805,12 @@ class W4A16_AWQ_LinearMethod(LinearMethodBase):
                                              zeros=None)
         return output
 
-    def load_weight_scales(self,
-                           weights: List[Dict],
-                           tp_size: int = 1,
-                           tp_rank: int = 0,
-                           tp_mode: Optional[TensorParallelMode] = None):
+    def load_weight_scales(
+            self,
+            weights: List[Dict],
+            tp_size: int = 1,
+            tp_rank: int = 0,
+            tp_mode: Optional[TensorParallelMode] = None) -> List[torch.Tensor]:
         device = torch.device("cuda")
         q_weight_scale = load_weight_shard(weights[0]['weight_scale'],
                                            tp_size,
