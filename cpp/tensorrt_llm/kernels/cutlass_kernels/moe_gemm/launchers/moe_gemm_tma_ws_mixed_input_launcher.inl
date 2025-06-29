@@ -61,17 +61,16 @@
 
 #include "moe_gemm_tma_ws_mixed_input_launcher.h"
 
-namespace tk = tensorrt_llm::common;
-namespace tkc = tensorrt_llm::cutlass_extensions;
-
-using namespace cute;
-
 namespace tensorrt_llm
 {
 namespace kernels
 {
 namespace cutlass_kernels
 {
+namespace tk = tensorrt_llm::common;
+namespace tkc = tensorrt_llm::cutlass_extensions;
+
+using namespace cute;
 
 template <typename T, typename WeightType, typename GemmOutputType, typename EpilogueTag, typename CTAShape,
     typename ClusterShape, typename MainloopScheduleType, typename EpilogueScheduleType,

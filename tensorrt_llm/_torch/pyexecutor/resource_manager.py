@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from ..speculative.interface import SpecConfig
 
 KVCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.KVCacheManager
-KvCacheConfigCpp = tensorrt_llm.bindings.KvCacheConfig
+KvCacheConfigCpp = tensorrt_llm.bindings.executor.KvCacheConfig
 CacheTypeCpp = tensorrt_llm.bindings.internal.batch_manager.CacheType
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 DataType = tensorrt_llm.bindings.DataType
@@ -58,6 +58,9 @@ class BaseResourceManager(ABC):
     @abstractmethod
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
         raise NotImplementedError
+
+    def add_dummy_requests(self, request_ids: List[int]):
+        pass
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         pass

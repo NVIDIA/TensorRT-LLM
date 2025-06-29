@@ -14,7 +14,7 @@ from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
 
 
-@dataclass(kw_only=True)
+@dataclass(frozen=True, kw_only=True)
 class SampleStateTensorsMTP(SampleStateTensors):
     new_tokens_lens: torch.Tensor
     next_draft_tokens: torch.Tensor
@@ -248,10 +248,12 @@ class MTPSampler(TorchSampler):
 
     SampleState = SampleStateMTP
 
-    def __init__(self, args: TorchSampler.Args, *, nextn: int):
-        super().__init__(args)
+    def __init__(self, max_seq_len: int, config: MTPConfig):
+        super().__init__(max_seq_len, False)
         self.mapping = None
-        self.draft_len = nextn
+        self.draft_len = 0
+        if config is not None:
+            self.draft_len = config.num_nextn_predict_layers
 
     def _draft_meet_max_token_stop_criteria(self, request: LlmRequest,
                                             num_tokens: int, beam_idx: int):
@@ -281,9 +283,8 @@ class MTPSampler(TorchSampler):
             if request.state != LlmRequestState.GENERATION_COMPLETE:
                 new_token = new_tokens_list[idx][0]
                 num_tokens = request.add_new_token(new_token, beam_idx)
-                should_stop = self._handle_stop_criteria(request,
-                                                         new_token,
-                                                         beam=beam_idx)
+                should_stop = self._handle_stop_criteria(
+                    request, new_token, num_tokens, beam_idx)
                 if self._draft_meet_max_token_stop_criteria(
                         request, num_tokens, beam_idx):
                     should_stop = True
@@ -302,9 +303,8 @@ class MTPSampler(TorchSampler):
                 for i in range(num_new_tokens):
                     new_token = new_tokens[i]
                     num_tokens = request.add_new_token(new_token, beam_idx)
-                    should_stop = self._handle_stop_criteria(request,
-                                                             new_token,
-                                                             beam=beam_idx)
+                    should_stop = self._handle_stop_criteria(
+                        request, new_token, num_tokens, beam_idx)
                     if should_stop:
                         break
                 if self._draft_meet_max_token_stop_criteria(
@@ -344,6 +344,7 @@ class MTPSampler(TorchSampler):
         for request in scheduled_requests.context_requests:
             request.py_draft_tokens = [1] * self.draft_len
         return SampleStateMTP(scheduled_requests=scheduled_requests,
+                              logits=model_outputs['logits'],
                               device=device,
                               host=host,
                               sampler_event=sampler_event)
