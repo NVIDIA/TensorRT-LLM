@@ -9,6 +9,7 @@ from weakref import WeakMethod
 
 import torch
 import torch.nn.functional as F
+from tokenizers.decoders import DecodeStream
 
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
@@ -146,6 +147,7 @@ class GenerationResultBase:
         self.disaggregated_params = None
         self.decoding_iter = 0
         self._done = False
+        self.stream = DecodeStream(skip_special_tokens=False)
 
         if has_event_loop():
             self.aqueue = AsyncQueue()
@@ -381,12 +383,17 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                 beam_output._last_text_len = len(beam_output.text)
                 if hasattr(self.tokenizer, 'decode_incrementally'):
                     if self._streaming and not self.sampling_params.use_beam_search:
-                        beam_output.text, beam_output._incremental_states = self.tokenizer.decode_incrementally(
-                            beam_output.token_ids_diff,
-                            prev_text=beam_output.text,
-                            states=beam_output._incremental_states,
-                            flush=self._done,
-                            **kwargs)
+                        # beam_output.text, beam_output._incremental_states = self.tokenizer.decode_incrementally(
+                        #     beam_output.token_ids_diff,
+                        #     prev_text=beam_output.text,
+                        #     states=beam_output._incremental_states,
+                        #     flush=self._done,
+                        #     **kwargs)
+                        beam_output.text += "".join([
+                            self.stream.step(
+                                self.tokenizer.tokenizer._tokenizer, token_id)
+                            for token_id in beam_output.token_ids_diff
+                        ])
                     else:
                         beam_output.text, _ = self.tokenizer.decode_incrementally(
                             beam_output.token_ids, flush=self._done, **kwargs)
