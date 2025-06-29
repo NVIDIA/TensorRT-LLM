@@ -1865,7 +1865,7 @@ void TrtGptModelInflightBatching::setupDecoderStep(
     {
         auto const logitsType = mRuntime->getEngine().getTensorDataType("logits");
 
-        auto [batchSlots, samplingConfigs, lookaheadPrompt, lookaheadAlgoConfigs]
+        auto [batchSlots, samplingConfig, lookaheadPrompt, lookaheadAlgoConfigs]
             = (*mCreateNewDecoderRequests)(mModelConfig, mWorldConfig, mDecodingConfig, contextRequests, logitsType,
                 inputBuffers, *mDecoderState, mRuntime->getStream(), *mDecoder->getDecoderStream(), getMaxSequenceLen(),
                 mOperatingBeamWidth, buffers.mMedusaBuffers);
@@ -1873,14 +1873,13 @@ void TrtGptModelInflightBatching::setupDecoderStep(
         auto const localBatchSize = batchSlots->getSize();
         if (localBatchSize > 0)
         {
-            auto samplingConfig = SamplingConfig(samplingConfigs);
-            mDecoder->getUnderlyingDecoder().setup(samplingConfig, localBatchSize, batchSlots,
+            mDecoder->getUnderlyingDecoder().setup(samplingConfig.value(), localBatchSize, batchSlots,
                 {mDecoderState->getJointDecodingOutput()}, mModelConfig.getDataType(), lookaheadPrompt,
                 lookaheadAlgoConfigs);
 
-            auto const& stream = mDecoder->getDecoderStream();
+            auto const& decoderStream = mDecoder->getDecoderStream();
             CudaEvent event{};
-            stream->record(event);
+            decoderStream->record(event);
             mRuntime->getStreamPtr()->wait(event);
         }
     }
@@ -2520,28 +2519,10 @@ void TrtGptModelInflightBatching::disableLookaheadDecoder(
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto& batchSlots = inputBuffers.setupBatchSlots;
+    auto batchSlots = CreateNewDecoderRequests::fillBatchSlots(genRequests, inputBuffers);
+    auto samplingConfig = CreateNewDecoderRequests::fuseSamplingConfigs(genRequests);
 
-    std::vector<SamplingConfig> samplingConfigs;
-    samplingConfigs.reserve(genRequests.size());
-    auto batchSlotsRange = BufferRange<SizeType32>(*batchSlots);
-
-    SizeType32 batchIdx = 0;
-    for (auto const& llmReq : genRequests)
-    {
-        samplingConfigs.push_back(llmReq->mSamplingConfig);
-        batchSlotsRange[batchIdx] = llmReq->mSeqSlot.value();
-        batchIdx += 1;
-    }
-    auto const batchSize = batchIdx;
-    std::optional<SamplingConfig> samplingConfig;
-    if (batchSize > 0)
-    {
-        samplingConfig = SamplingConfig(samplingConfigs);
-    }
-    TensorPtr batchSlotsView = ITensor::slice(batchSlots, 0, batchSize);
-
-    mDecoder->getUnderlyingDecoder().disableLookahead(samplingConfig, batchSize, batchSlots);
+    mDecoder->getUnderlyingDecoder().disableLookahead(samplingConfig, batchSlots->getSize(), batchSlots);
 
     auto const& decoderStream = mDecoder->getDecoderStream();
     CudaEvent event{};
