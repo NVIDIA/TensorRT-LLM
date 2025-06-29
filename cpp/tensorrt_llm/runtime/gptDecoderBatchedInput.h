@@ -16,13 +16,30 @@
 
 #pragma once
 
+#include "tensorrt_llm/runtime/cudaEvent.h"
+#include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/eagleBuffers.h"
 #include "tensorrt_llm/runtime/explicitDraftTokensBuffers.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
+#include <memory>
 #include <vector>
 
-namespace tensorrt_llm::runtime::decoder_batch
+namespace tensorrt_llm::batch_manager
+{
+class LlmRequest;
+}
+
+namespace tensorrt_llm::runtime
+{
+class SamplingConfig;
+
+namespace decoder
+{
+class DecoderState;
+}
+
+namespace decoder_batch
 {
 
 class Input
@@ -76,4 +93,6 @@ public:
     std::optional<EagleBuffers::Inputs> eagleLastInputs;
 };
 
-} // namespace tensorrt_llm::runtime::decoder_batch
+} // namespace decoder_batch
+
+} // namespace tensorrt_llm::runtime
