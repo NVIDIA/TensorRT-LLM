@@ -3401,6 +3401,62 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamBlocking)
     EXPECT_TRUE(std::holds_alternative<tle::KVCacheStoredData>(events.front().data));
 }
 
+TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamWindowSize)
+{
+    auto constexpr numLayers = 2;
+    auto constexpr numHeads = 6;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr maxBlocksPerSeq = 4;
+    auto constexpr maxNumSequences = 8;
+    auto blocksInPool = std::vector<SizeType32>{8, 2};
+    auto blocksInSlidingWindowPool = std::vector<SizeType32>{4, 2};
+    auto constexpr onboardBlocks = true;
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
+    auto const stream = std::make_shared<tr::CudaStream>();
+
+    auto constexpr beamWidth = 1;
+    SizeType32 constexpr maxNewTokens{0};
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+
+    auto const maxAttentionWindow = tokensPerBlock * maxBlocksPerSeq;
+    auto const slidingWindow = tokensPerBlock * (maxBlocksPerSeq - 1);
+
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPool[0], blocksInPool[1]}},
+        {slidingWindow, {blocksInSlidingWindowPool[0], blocksInSlidingWindowPool[1]}}};
+
+    KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow, slidingWindow}, std::nullopt, dtype, 0,
+        stream, std::nullopt, true, onboardBlocks, CacheType::kSELF, std::nullopt,
+        std::make_unique<tlk::KVCacheEventManager>(1024));
+    kvCacheManager.allocatePools(false);
+
+    auto events = getEvents(kvCacheManager);
+
+    EXPECT_EQ(events.size(), 2);
+
+    EXPECT_EQ(events.front().windowSize, slidingWindow);
+    EXPECT_EQ(std::get<tle::KVCacheCreatedData>(events.front().data).numBlocksPerCacheLevel, blocksInSlidingWindowPool);
+
+    EXPECT_EQ(events.back().windowSize, maxAttentionWindow);
+    EXPECT_EQ(std::get<tle::KVCacheCreatedData>(events.back().data).numBlocksPerCacheLevel, blocksInPool);
+
+    auto inputTokens0 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7});
+    auto llmRequest0 = std::make_shared<LlmRequest>(0, 0, inputTokens0, samplingConfig, true);
+    kvCacheManager.addSequence(0, inputTokens0->size(), beamWidth, llmRequest0);
+    kvCacheManager.storeContextBlocks(*llmRequest0);
+
+    events = getEvents(kvCacheManager);
+
+    EXPECT_EQ(events.size(), 2);
+    EXPECT_EQ(events.front().windowSize, slidingWindow);
+    EXPECT_TRUE(std::holds_alternative<tle::KVCacheStoredData>(events.front().data));
+
+    EXPECT_EQ(events.back().windowSize, maxAttentionWindow);
+    EXPECT_TRUE(std::holds_alternative<tle::KVCacheStoredData>(events.back().data));
+}
+
 TEST_F(KVCacheManagerTest, KVCacheTransferManagerConcurrencyTest)
 {
     auto const blockSize = 16384;
