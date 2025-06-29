@@ -239,7 +239,8 @@ void initBindings(pybind11::module_& m)
 
     py::class_<tle::KVCacheEvent>(executor_kv_cache, "KVCacheEvent")
         .def_readonly("event_id", &tle::KVCacheEvent::eventId)
-        .def_readonly("data", &tle::KVCacheEvent::data);
+        .def_readonly("data", &tle::KVCacheEvent::data)
+        .def_readonly("window_size", &tle::KVCacheEvent::windowSize);
 
     py::class_<tle::KVCacheEventManager, std::shared_ptr<tle::KVCacheEventManager>>(
         executor_kv_cache, "KVCacheEventManager")
