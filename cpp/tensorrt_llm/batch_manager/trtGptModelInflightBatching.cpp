@@ -2604,9 +2604,15 @@ void TrtGptModelInflightBatching::changeSpecDecMode(ScheduledRequests const& sch
         mDecoderOutputBuffers.at(getFusedBufferId()).disableLookaheadDecoding(getMaxNumSequences());
         mDecoder->disableLookahead(
             scheduledRequests.generationRequests, mDecoderInputBuffers.at(getFusedBufferId()).setupBatchSlots);
-        mDecoderState->disableLookahead(scheduledRequests.generationRequests);
+        mDecoderState->disableLookahead();
+
         for (auto const& llmReq : scheduledRequests.generationRequests)
         {
+            if (llmReq->mSeqSlot)
+            {
+                mDecoderState->setNumDecodingEngineTokens(llmReq->mSeqSlot.value(), 1);
+            }
+
             if (llmReq->getNumDraftTokens() > 0)
             {
                 llmReq->discardDraftTokens(llmReq->getNumDraftTokens());
