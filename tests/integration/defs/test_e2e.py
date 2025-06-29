@@ -1375,6 +1375,18 @@ def test_trtllm_serve_multimodal_example(llm_root, llm_venv):
     ])
 
 
+def test_trtllm_serve_lora_example(llm_root, llm_venv):
+    example_root = Path(os.path.join(llm_root, "examples", "serve"))
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pip", "install", "-r",
+        os.path.join(example_root, "requirements.txt")
+    ])
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_trtllm_serve_lora.py")])
+
+
 @pytest.mark.parametrize("backend", ["pytorch", "trt"])
 def test_openai_misc_example(llm_root, llm_venv, backend: str):
     test_root = unittest_path() / "llmapi" / "apps"
@@ -1415,6 +1427,11 @@ def test_openai_reasoning(llm_root, llm_venv, backend: str):
         "-m", "pytest",
         str(test_root / "_test_openai_reasoning.py"), "-k", backend
     ])
+
+
+def test_openai_lora(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd(["-m", "pytest", str(test_root / "_test_openai_lora.py")])
 
 
 def test_openai_chat_multimodal_example(llm_root, llm_venv):
@@ -1667,34 +1684,6 @@ def test_ptp_quickstart_advanced_bs1(llm_root, llm_venv):
     ])
 
 
-@pytest.mark.parametrize("model_name,model_path", [
-    ("Llama-3.1-8B-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct"),
-])
-def test_ptp_quickstart_advanced_ngram(llm_root, llm_venv, model_name,
-                                       model_path):
-    print(f"Testing {model_name}.")
-    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
-    with tempfile.NamedTemporaryFile(mode='w+t',
-                                     suffix=f".{model_name}.log",
-                                     dir="./",
-                                     delete=True,
-                                     delete_on_close=True) as running_log:
-        llm_venv.run_cmd([
-            str(example_root / "quickstart_advanced.py"),
-            "--disable_overlap_scheduler",
-            "--spec_decode_nextn",
-            "4",
-            "--max_matching_ngram_size",
-            "2",
-            "--spec_decode_algo",
-            "NGRAM",
-            "--model_dir",
-            f"{llm_models_root()}/{model_path}",
-        ],
-                         stdout=running_log)
-        _check_mem_usage(running_log, [4.60, 0, 0, 0])
-
-
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_device(8)
 @skip_pre_hopper
@@ -1751,6 +1740,36 @@ def test_ptp_quickstart_advanced_eagle3(llm_root, llm_venv, model_name,
         ],
                          stdout=running_log)
         _check_mem_usage(running_log, [25.2, 0, 0, 0])
+
+
+@pytest.mark.parametrize("model_name,model_path", [
+    ("Llama-3.1-8B-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct"),
+])
+def test_ptp_quickstart_advanced_ngram(llm_root, llm_venv, model_name,
+                                       model_path):
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    with tempfile.NamedTemporaryFile(mode='w+t',
+                                     suffix=f".{model_name}.log",
+                                     dir="./",
+                                     delete=True,
+                                     delete_on_close=True) as running_log:
+        llm_venv.run_cmd([
+            str(example_root / "quickstart_advanced.py"),
+            "--model_dir",
+            f"{llm_models_root()}/{model_path}",
+            "--spec_decode_algo",
+            "NGRAM",
+            "--spec_decode_nextn",
+            "4",
+            "--max_matching_ngram_size",
+            "2",
+            "--use_cuda_graph",
+            "--disable_kv_cache_reuse",
+            "--disable_overlap_scheduler",
+        ],
+                         stdout=running_log)
+        _check_mem_usage(running_log, [27.0, 0, 0, 0])
 
 
 @skip_post_blackwell

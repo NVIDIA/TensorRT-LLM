@@ -17,7 +17,6 @@
 #pragma once
 
 #include "IntFastDiv.h"
-
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 
 #include <cuda.h>
@@ -31,7 +30,6 @@ namespace moe::dev
 
 namespace routing
 {
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace tg = batchedGemm::trtllm::gen;

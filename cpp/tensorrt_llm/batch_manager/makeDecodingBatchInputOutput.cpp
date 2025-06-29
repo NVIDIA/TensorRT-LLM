@@ -121,7 +121,7 @@ std::pair<std::vector<SizeType32>, std::vector<SizeType32>> getActiveSlots(
 } // namespace
 
 std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::operator()(RequestVector const& contextRequests,
-    RequestVector const& generationRequests, DecoderBuffers& decoderBuffers, DecoderInputBuffers const& inputBuffers,
+    RequestVector const& generationRequests, DecoderInputBuffers const& inputBuffers,
     runtime::decoder::DecoderState& decoderState, runtime::ModelConfig const& modelConfig, SizeType32 maxNumSequences,
     OptionalRef<RuntimeBuffers> fusedRuntimeBuffers) const
 {
@@ -135,7 +135,7 @@ std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::operator
 
     if (modelConfig.getSpeculativeDecodingMode().hasDraftLogits())
     {
-        decodingInput->predictedDraftLogits = decoderBuffers.draftBuffers.predictedDraftLogits;
+        decodingInput->predictedDraftLogits = inputBuffers.predictedDraftLogits;
     }
 
     if (modelConfig.getSpeculativeDecodingMode().isExplicitDraftTokens())

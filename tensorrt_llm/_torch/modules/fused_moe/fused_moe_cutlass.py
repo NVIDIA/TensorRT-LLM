@@ -4,8 +4,8 @@ import torch
 
 from ...distributed import allgather, reducescatter
 from ...model_config import ModelConfig
-from ...utils import (EventType, Fp4QuantizedTensor, disable_fp4_allgather,
-                      reswizzle_sf)
+from ...utils import (EventType, Fp4QuantizedTensor, ceil_div,
+                      disable_fp4_allgather, swizzle_sf)
 from .interface import MoE
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            FP8QDQFusedMoEMethod, MoEWeightLoadingMode,
@@ -220,6 +220,9 @@ class CutlassFusedMoE(MoE):
             # TODO: remove this once we have correct fusedmoe kernel ready
             token_final_scales = None
 
+        use_allgather = self.use_dp and self.parallel_size > 1 and not disable_fp4_allgather(
+        )
+
         # quantize inputs
         use_deepseek_fp8_block_scale = False
         use_w4a8_group_scaling = False
@@ -234,42 +237,58 @@ class CutlassFusedMoE(MoE):
             elif self.has_w4afp8:
                 use_w4a8_group_scaling = True
                 weight_dtype = torch.quint4x2
-            elif self.has_nvfp4 and not disable_fp4_allgather():
-                if isinstance(x, Fp4QuantizedTensor):
-                    x_row = x.shape[0]
-                    # note: we use uint8 to store 2 fp4 values
-                    x_col = x.shape[1] * 2
-                    x, x_sf = x.fp4_tensor, x.scaling_factor
+            elif self.has_nvfp4:
+                if use_allgather:
+                    if isinstance(x, Fp4QuantizedTensor):
+                        assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before communication"
+                        x_row = x.shape[0]
+                        # note: we use uint8 to store 2 fp4 values
+                        x_col = x.shape[1] * 2
+                        x, x_sf = x.fp4_tensor, x.scaling_factor
+                    else:
+                        x_row = x.shape[0]
+                        x_col = x.shape[1]
+                        x, x_sf = torch.ops.trtllm.fp4_quantize(
+                            x,
+                            self.fc31_input_scale,
+                            self.scaling_vector_size,
+                            sfUseUE8M0=False,
+                            swizzedLayout=False)
+                        x_sf = x_sf.view(
+                            x_row, ceil_div(x_col, self.scaling_vector_size))
                 else:
-                    x_row = x.shape[0]
-                    x_col = x.shape[1]
-                    x, x_sf = torch.ops.trtllm.fp4_quantize(
-                        x, self.fc31_input_scale, self.scaling_vector_size,
-                        False)
+                    if not isinstance(x, Fp4QuantizedTensor):
+                        x, x_sf = torch.ops.trtllm.fp4_quantize(
+                            x,
+                            self.fc31_input_scale,
+                            self.scaling_vector_size,
+                            sfUseUE8M0=False,
+                            swizzedLayout=True)
             else:
                 raise ValueError(
                     f"unsupported quantization mode: {self.quant_config.quant_mode}"
                 )
 
         # gather inputs for attention dp
-        if self.use_dp and self.parallel_size > 1 and not disable_fp4_allgather(
-        ):
+        if use_allgather:
             x, x_sf, token_selected_experts, token_final_scales = allgather(
                 [x, x_sf, token_selected_experts, token_final_scales],
                 self.mapping,
                 dim=0,
                 sizes=None if use_dp_padding else all_rank_num_tokens)
+            x_row = x.shape[0]
             # Fp4 gemm has extra scaling factor
             if x_sf is not None:
-                x_sf = reswizzle_sf(x_sf, x_row, x_col,
-                                    self.scaling_vector_size)
+                x_sf = swizzle_sf(x_sf, x_row, x_col, self.scaling_vector_size)
 
         final_hidden_states = torch.ops.trtllm.fused_moe(
             x,
             token_selected_experts,
             token_final_scales,
             self.w3_w1_weight.view(weight_dtype),
+            None,  # fc1_expert_biases
             self.w2_weight.view(weight_dtype),
+            None,  # fc2_expert_biases
             output_dtype,
             quant_scales=self.quant_scales,
             input_sf=x_sf,

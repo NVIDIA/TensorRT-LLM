@@ -110,7 +110,7 @@ class TrtllmAttentionWrapper:
             self.qk_rope_head_dim = None
             self.v_head_dim = None
 
-        self.rotary_inv_freq, self.rotary_cos_sin = rope_params.create_rope_const_params(
+        self.rotary_inv_freq, self.rotary_cos_sin = self.rope_params.create_rope_const_params(
         )
 
         self.num_heads = num_heads
