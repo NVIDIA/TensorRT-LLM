@@ -384,7 +384,9 @@ public:
             auto gatheredIds = mBufferManager->gpu(jointOutputIdsShape, nvTokenIdType);
             mBufferManager->setZero(*gatheredIds);
 
-            decodingOutput = std::make_unique<DecodingOutput>(std::move(ids), std::move(gatheredIds));
+            decodingOutput = std::make_unique<DecodingOutput>();
+            decodingOutput->ids = std::move(ids);
+            decodingOutput->gatheredIds = std::move(gatheredIds);
         }
         auto& dOutput = *decodingOutput;
 
