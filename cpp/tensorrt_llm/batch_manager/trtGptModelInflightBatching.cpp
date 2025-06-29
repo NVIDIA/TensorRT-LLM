@@ -2515,6 +2515,42 @@ void TrtGptModelInflightBatching::changeBeamWidth(SizeType32 beamWidth)
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
+void TrtGptModelInflightBatching::disableLookaheadDecoder(
+    RequestVector const& genRequests, DecoderInputBuffers& inputBuffers)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    auto& batchSlots = inputBuffers.setupBatchSlots;
+
+    std::vector<SamplingConfig> samplingConfigs;
+    samplingConfigs.reserve(genRequests.size());
+    auto batchSlotsRange = BufferRange<SizeType32>(*batchSlots);
+
+    SizeType32 batchIdx = 0;
+    for (auto const& llmReq : genRequests)
+    {
+        samplingConfigs.push_back(llmReq->mSamplingConfig);
+        batchSlotsRange[batchIdx] = llmReq->mSeqSlot.value();
+        batchIdx += 1;
+    }
+    auto const batchSize = batchIdx;
+    std::optional<SamplingConfig> samplingConfig;
+    if (batchSize > 0)
+    {
+        samplingConfig = SamplingConfig(samplingConfigs);
+    }
+    TensorPtr batchSlotsView = ITensor::slice(batchSlots, 0, batchSize);
+
+    mDecoder->getUnderlyingDecoder().disableLookahead(samplingConfig, batchSize, batchSlots);
+
+    auto const& decoderStream = mDecoder->getDecoderStream();
+    CudaEvent event{};
+    decoderStream->record(event);
+    mRuntime->getStreamPtr()->wait(event);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
 void TrtGptModelInflightBatching::changeSpecDecMode(ScheduledRequests const& scheduledRequests)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -2602,8 +2638,7 @@ void TrtGptModelInflightBatching::changeSpecDecMode(ScheduledRequests const& sch
         mDecodingConfig.setDecodingMode(executor::DecodingMode::Auto());
         mBuffers.at(bufferId)->mLookaheadBuffers->disableLookaheadDecoding();
         mDecoderOutputBuffers.at(getFusedBufferId()).disableLookaheadDecoding(getMaxNumSequences());
-        mDecoder->disableLookahead(
-            scheduledRequests.generationRequests, mDecoderInputBuffers.at(getFusedBufferId()).setupBatchSlots);
+        disableLookaheadDecoder(scheduledRequests.generationRequests, mDecoderInputBuffers.at(getFusedBufferId()));
         mDecoderState->disableLookahead();
 
         for (auto const& llmReq : scheduledRequests.generationRequests)
