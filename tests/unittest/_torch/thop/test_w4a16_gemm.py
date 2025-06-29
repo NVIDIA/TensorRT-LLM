@@ -1,3 +1,9 @@
+import os
+import sys
+
+sys.path.insert(0,
+                os.path.join(os.path.dirname(__file__), '..', '..', '..', '..'))
+
 import pytest
 import torch
 
@@ -35,10 +41,8 @@ from tests.unittest.trt.quantization import _utils
         (384, 2048, 384, 128, torch.float16, True, True, True),
         (512, 2048, 1024, 128, torch.float16, True, True, False),
     ])
-def test_matmul_bf16_or_fp16_activation_int4_input(m, n, k, group_size,
-                                                   activation_dtype,
-                                                   has_pre_quant, has_zero,
-                                                   has_bias):
+def test_matmul_activation_int4_input(m, n, k, group_size, activation_dtype,
+                                      has_pre_quant, has_zero, has_bias):
     torch.manual_seed(0)
     device = "cuda"
 
