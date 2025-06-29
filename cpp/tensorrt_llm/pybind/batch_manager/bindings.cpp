@@ -170,6 +170,7 @@ void initBindings(pybind11::module_& m)
         .def_property_readonly("context_phase_params", &GenLlmReq::getContextPhaseParams)
         .def_property_readonly("is_context_only_request", &GenLlmReq::isContextOnlyRequest)
         .def_property_readonly("is_generation_only_request", &GenLlmReq::isGenerationOnlyRequest)
+        .def_property_readonly("is_generation_complete_state", &GenLlmReq::isGenerationCompleteState)
         .def_property_readonly("is_context_finished", &GenLlmReq::isContextFinished)
         .def_property_readonly("is_disagg_generation_init_state", &GenLlmReq::isDisaggGenerationInitState)
         .def_property_readonly(

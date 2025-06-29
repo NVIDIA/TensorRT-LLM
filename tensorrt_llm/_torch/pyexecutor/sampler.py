@@ -723,7 +723,7 @@ class TRTLLMSampler(Sampler):
 
         reqs = [
             r for r in state.scheduled_requests.all_requests
-            if not r.is_context_init_state
+            if not r.is_generation_complete_state
         ]
         reqs_with_new_tokens = [
             r for r in reqs
@@ -754,14 +754,12 @@ class TRTLLMSampler(Sampler):
                 request.py_result.append_log_probs([log_probs], cum_log_probs)
 
         for request in reqs:
-            if request.state != LlmRequestState.GENERATION_COMPLETE:
-                request.py_decoding_iter += 1
-                finished_state = FinishedState(
-                    finish_reasons[request.py_seq_slot])
-                if finished_state.is_finished:
-                    request.state = LlmRequestState.GENERATION_COMPLETE
-                    finish_reason = finished_state.to_finish_reason()
-                    request.set_finished_reason(finish_reason, 0)
+            request.py_decoding_iter += 1
+            finished_state = FinishedState(finish_reasons[request.py_seq_slot])
+            if finished_state.is_finished:
+                request.state = LlmRequestState.GENERATION_COMPLETE
+                finish_reason = finished_state.to_finish_reason()
+                request.set_finished_reason(finish_reason, 0)
 
     @torch.inference_mode()
     @nvtx_range("update_requests_multiple_beams_or_drafting")
