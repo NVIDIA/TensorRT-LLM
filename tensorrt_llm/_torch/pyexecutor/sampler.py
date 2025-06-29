@@ -10,13 +10,14 @@ from tensorrt_llm._torch.pyexecutor.handle_generation_logits import \
     HandleGenerationLogits
 from tensorrt_llm._torch.pyexecutor.make_decoding_batch_input_output import \
     MakeDecodingBatchInputOutput
-from tensorrt_llm._utils import torch_dtype_to_binding
+from tensorrt_llm._utils import nvtx_range, torch_dtype_to_binding
 from tensorrt_llm.bindings import (CudaStream, DataType, ModelConfig,
                                    WorldConfig, make_sampling_config)
 from tensorrt_llm.bindings.executor import (DecodingConfig, DecodingMode,
                                             ExecutorConfig, FinishReason)
 from tensorrt_llm.bindings.internal.algorithms import CreateNewDecoderRequests
-from tensorrt_llm.bindings.internal.batch_manager import DecoderInputBuffers
+from tensorrt_llm.bindings.internal.batch_manager import (
+    DecoderInputBuffers, add_new_tokens_to_requests)
 from tensorrt_llm.bindings.internal.runtime import (BufferManager, DecoderState,
                                                     GptDecoderBatched)
 from tensorrt_llm.executor.result import Logprob
@@ -637,7 +638,7 @@ class TRTLLMSampler(Sampler):
         new_tokens_device_tensor = self.store[
             "new_tokens_device_tensor"][:batch_size, :beam_width]
         seq_slots = [
-            request.seq_slot for request in scheduled_requests.all_requests
+            request.py_seq_slot for request in scheduled_requests.all_requests
         ]
         new_tokens_device_tensor.copy_(
             self.store["decoder_state"].all_new_tokens[0][seq_slots],
@@ -683,24 +684,89 @@ class TRTLLMSampler(Sampler):
     @torch.inference_mode()
     def update_requests(self, state: SampleStateTRTLLM):
         assert isinstance(state, SampleStateTRTLLM)
+        assert state.scheduled_requests.batch_size > 0
 
-        scheduled_requests = state.scheduled_requests
-        assert scheduled_requests.batch_size > 0
-        beam_width = self.beam_width(scheduled_requests.all_requests)
-        sampler_event = state.sampler_event
+        if state.sampler_event:
+            state.sampler_event.synchronize()
 
-        if sampler_event:
-            sampler_event.synchronize()
+        beam_width = self.beam_width(state.scheduled_requests.all_requests)
 
-        new_tokens_host = state.host.new_tokens
-        finished_sum_host = state.host.finished_sum
-        sequence_lengths_host_data = state.host.sequence_lengths
+        if beam_width == 1 and self.MAX_DECODING_TOKENS == 1:
+            self.update_requests_single_beam_single_step(state)
+        else:
+            self.update_requests_multiple_beams_or_drafting(state, beam_width)
 
-        for request in scheduled_requests.all_requests:
-            if request.is_context_init_state:
-                continue
+    @torch.inference_mode()
+    @nvtx_range("update_requests_single_beam_single_step")
+    def update_requests_single_beam_single_step(self, state: SampleStateTRTLLM):
+        """Specialization of update_requests for single beam and single step"""
+        new_tokens_host = state.host.new_tokens.flatten().tolist()
+        sequence_lengths_host_data = state.host.sequence_lengths.flatten(
+        ).tolist()
+        finish_reasons = state.host.finish_reasons.flatten().tolist()
+        log_probs_host = state.host.log_probs.tolist()
+        cum_log_probs_host = state.host.cum_log_probs.tolist()
 
-            seq_slot = request.seq_slot
+        reqs = [
+            r for r in state.scheduled_requests.all_requests
+            if not r.is_generation_complete_state
+        ]
+        reqs_with_new_tokens = [
+            r for r in reqs
+            if (sequence_lengths_host_data[r.py_seq_slot] > r.get_num_tokens(0)
+                or self.is_trt_overlap)
+        ]
+
+        # Add new tokens
+        new_tokens = [
+            new_tokens_host[r.py_seq_slot] for r in reqs_with_new_tokens
+        ]
+        add_new_tokens_to_requests(reqs_with_new_tokens, new_tokens, 0)
+
+        # Log probs
+        for request in reqs_with_new_tokens:
+            if request.py_return_log_probs:
+                seq_slot = request.py_seq_slot
+                seq_len = sequence_lengths_host_data[seq_slot]
+                begin_log_probs_offset = request.prompt_len
+                current_token = seq_len - request.prompt_len - 1
+                log_probs = [{
+                    new_tokens_host[seq_slot]:
+                    Logprob(logprob=log_probs_host[seq_slot][0][
+                        begin_log_probs_offset + current_token],
+                            rank=1)
+                }]
+                cum_log_probs = [cum_log_probs_host[seq_slot]]
+                request.py_result.append_log_probs([log_probs], cum_log_probs)
+
+        for request in reqs:
+            request.py_decoding_iter += 1
+            finished_state = FinishedState(finish_reasons[request.py_seq_slot])
+            if finished_state.is_finished:
+                request.state = LlmRequestState.GENERATION_COMPLETE
+                finish_reason = finished_state.to_finish_reason()
+                request.set_finished_reason(finish_reason, 0)
+
+    @torch.inference_mode()
+    @nvtx_range("update_requests_multiple_beams_or_drafting")
+    def update_requests_multiple_beams_or_drafting(self,
+                                                   state: SampleStateTRTLLM,
+                                                   beam_width: int):
+        new_tokens_host = state.host.new_tokens.tolist()
+        finished_sum_host = state.host.finished_sum.tolist()
+        finish_reasons = state.host.finish_reasons.flatten().tolist()
+        sequence_lengths_host_data = state.host.sequence_lengths.flatten(
+        ).tolist()
+        cum_log_probs_host = state.host.cum_log_probs.tolist()
+        log_probs_host = state.host.log_probs.tolist()
+
+        reqs = [
+            r for r in state.scheduled_requests.all_requests
+            if not r.is_context_init_state
+        ]
+
+        for request in reqs:
+            seq_slot = request.py_seq_slot
             num_generated_tokens = request.num_draft_tokens + 1
             current_num_of_tokens = request.max_beam_num_tokens
             num_new_tokens = [0] * beam_width
@@ -710,7 +776,7 @@ class TRTLLMSampler(Sampler):
 
             for beam in range(beam_width):
                 seq_len = sequence_lengths_host_data[seq_slot * beam_width +
-                                                     beam].item()
+                                                     beam]
                 seq_len = seq_len + 1 if self.is_trt_overlap else seq_len
                 num_new_tokens[beam] = min(
                     num_generated_tokens,
@@ -727,21 +793,18 @@ class TRTLLMSampler(Sampler):
                             beam] + step
 
                         log_probs.append({
-                            new_token.item():
-                            Logprob(logprob=state.host.log_probs[seq_slot][beam]
-                                    [begin_log_probs_offset +
-                                     current_token].item(),
+                            new_token:
+                            Logprob(logprob=log_probs_host[seq_slot][beam][
+                                begin_log_probs_offset + current_token],
                                     rank=1)
                         })
 
                 if request.py_return_log_probs:
                     cum_log_probs.append(
-                        state.host.cum_log_probs[seq_slot * beam_width +
-                                                 beam].item())
+                        cum_log_probs_host[seq_slot * beam_width + beam])
 
                 finished_state = FinishedState(
-                    state.host.finish_reasons[seq_slot * beam_width +
-                                              beam].item())
+                    finish_reasons[seq_slot * beam_width + beam])
                 if finished_state.is_finished:
                     finish_reason = finished_state.to_finish_reason()
                     request.set_finished_reason(finish_reason, beam)
