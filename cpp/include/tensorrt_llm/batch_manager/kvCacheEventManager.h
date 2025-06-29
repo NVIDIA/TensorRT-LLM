@@ -44,13 +44,13 @@ public:
     KVCacheEventManager(KVCacheEventManager&& other) = delete;
     KVCacheEventManager& operator=(KVCacheEventManager&& other) = delete;
 
-    void enqueueCreatedEvent(std::vector<SizeType32> const& numBlocksPerCacheLevel);
+    void enqueueCreatedEvent(std::vector<SizeType32> const& numBlocksPerCacheLevel, SizeType32 windowSize);
 
-    void enqueueStoredEvent(std::vector<BlockPtr> const& blocks);
+    void enqueueStoredEvent(std::vector<BlockPtr> const& blocks, SizeType32 windowSize);
 
-    void enqueueRemovedEvent(BlockPtr const& block);
+    void enqueueRemovedEvent(BlockPtr const& block, SizeType32 windowSize);
 
-    void enqueueUpdatedEvent(executor::KVCacheUpdatedData const& data);
+    void enqueueUpdatedEvent(executor::KVCacheUpdatedData const& data, SizeType32 windowSize);
 
     // Get events in mEvents. If there are no events, wait for a maximum of `timeout` milliseconds.
     std::deque<executor::KVCacheEvent> getEvents(std::optional<std::chrono::milliseconds> timeout);
