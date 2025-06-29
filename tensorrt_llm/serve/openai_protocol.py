@@ -106,7 +106,7 @@ class CompletionResponse(OpenAIBaseModel):
     usage: UsageInfo
     # Add prompt_tokens_ids to the response to remove the tokenization
     # in the generation server in disaggreated serving
-    prompt_token_ids: Optional[List[List[int]]] = None
+    prompt_token_ids: Optional[Union[List[List[int]], List[int]]] = None
 
 
 class CompletionResponseStreamChoice(OpenAIBaseModel):
