@@ -22,7 +22,7 @@ def commit_message_has_signoff(message):
 
 def main():
     if len(sys.argv) != 2:
-        print("Usage: python commit-msg.py <commit message filename>")
+        print("Usage: python dco_check.py <commit message filename>")
         sys.exit(1)
 
     # Read the commit message from the file passed as an argument by Git
