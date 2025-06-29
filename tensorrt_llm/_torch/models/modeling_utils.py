@@ -521,8 +521,11 @@ class DecoderModelForCausalLM(nn.Module,
             return_context_logits,
         )
 
-    def load_weights(self, weights: Dict, skip_modules: List[str] = []):
-        _load_weights_impl(self, weights, skip_modules)
+    def load_weights(self,
+                     weights: Dict,
+                     weight_mapper: "WeightMapperInterface",
+                     skip_modules: List[str] = []):
+        _load_weights_impl(self, weights, weight_mapper, skip_modules)
 
     def infer_max_seq_len(self) -> int:
         # Modified from tensorrt_llm/builder.py _init_max_seq_len
@@ -551,6 +554,11 @@ class DecoderModelForCausalLM(nn.Module,
 
 
 MODEL_CLASS_MAPPING = {}
+# TODO smor- ask Roi for a nicer imp
+# TODO smor- might need to relocate following logic and/or decorators and/or helper methods.
+MODEL_CLASS_MAPPER_MAPPING = {}
+MODEL_CLASS_CHECKPOINT_LOADER_DEFAULT_MAPPING = {}
+MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING = {}
 
 
 def register_auto_model(name: str):
@@ -560,6 +568,50 @@ def register_auto_model(name: str):
         return cls
 
     return decorator
+
+
+def register_auto_mapper(format: str, name: Optional[str] = None):
+
+    def decorator(cls):
+        if name is not None:
+            # set cls for model name and format pair
+            MODEL_CLASS_MAPPER_MAPPING[name][format] = cls
+        else:
+            # resort to the default per format
+            MODEL_CLASS_MAPPER_MAPPING[format] = cls
+        return cls
+
+    return decorator
+
+
+def register_auto_checkpoint_loader(name: str):
+
+    def decorator(cls):
+        MODEL_CLASS_CHECKPOINT_LOADER_DEFAULT_MAPPING[name] = cls
+        return cls
+
+    return decorator
+
+
+def register_auto_config_loader(name: str):
+
+    def decorator(cls):
+        MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING[name] = cls
+        return cls
+
+    return decorator
+
+
+def get_checkpoint_loader(name: str) -> "WeightLoaderInterface":
+    if name not in MODEL_CLASS_CHECKPOINT_LOADER_DEFAULT_MAPPING:
+        raise ValueError(f"Default checkpoint loader {name} not found.")
+    return MODEL_CLASS_CHECKPOINT_LOADER_DEFAULT_MAPPING[name]
+
+
+def get_config_loader(name: str) -> "ConfigLoaderInterface":
+    if name not in MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING:
+        raise ValueError(f"Default config loader {name} not found.")
+    return MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING[name]
 
 
 def get_model_architecture(
@@ -635,71 +687,35 @@ def filter_weights(prefix, weights: Dict):
 
 def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                        weights: Dict,
+                       weight_mapper: "WeightMapperInterface",
                        skip_modules: List[str] = [],
                        params_map: Optional[Dict[str, str]] = None):
-    if not hasattr(model, 'model_config') or not isinstance(
-            model.model_config, ModelConfig):
-        raise ValueError("model must have a model_config attribute")
-    if not hasattr(model, 'config'):
-        raise ValueError("model must have a config attribute")
 
+    # TODO smor- need to move to weights mapper.
+    # TODO smor- have no idea where this is used.
     if params_map is not None:
         weights = rename_weights_with_regex(params_map, weights)
         logger.info(f"Renamed weights with params_map: {params_map}")
 
-    tp_size = 1 if model.model_config.mapping.enable_attention_dp else model.model_config.mapping.tp_size
-    head_dim = getattr(
-        model.config, "head_dim",
-        model.config.hidden_size // model.config.num_attention_heads)
-
-    params_map = {
-        'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
-        'gate_up_proj': ['gate_proj', 'up_proj']
-    }
-
     for name, module in tqdm(list(model.named_modules()),
                              desc="Loading weights"):
         if len(module._parameters) > 0:
-            # skip load weights if module is in skip_modules
-            if any(skip_module in name for skip_module in skip_modules):
-                continue
-
-            # skip load weights if tie word embeddings is enabled and layer is lm_head
-            if model.config.tie_word_embeddings and name.startswith("lm_head"):
-                continue
-
-            # Skip loading weights for embedding and lm_head if LoRA is enabled and has custom values
-            if hasattr(model, "model") and hasattr(
-                    model.model, 'has_custom_embed_tokens'
-            ) and model.model.has_custom_embed_tokens and name == "model.embed_tokens":
-                continue
-            if hasattr(model, 'has_custom_lm_head'
-                       ) and model.has_custom_lm_head and name == "lm_head":
+            if weight_mapper.should_skip_module(name):
                 continue
 
             names = name.split('.')
+            module_names_breakdown, module_name = names[:-1], names[-1]
+            # TODO smor- customize llama skip clause here!
             # WAR: better solution is that llama has its own load_weights function.
-            if names[-1] == 'next_layer_layernorm':
+            if module_name == 'next_layer_layernorm':
                 continue
-            if names[-1] in params_map:
-                module_weights = []
-                for new_name in params_map[names[-1]]:
-                    fw = filter_weights('.'.join(names[:-1] + [new_name]),
-                                        weights)
-                    if new_name in ['k_proj', 'v_proj']:
-                        fw = {
-                            k:
-                            duplicate_kv_weight(weight=v[:],
-                                                head_dim=head_dim,
-                                                tensor_parallel_size=tp_size)
-                            if k in ["weight", "bias"] else v
-                            for k, v in fw.items()
-                        }
 
-                    module_weights.append(fw)
+            if weight_mapper.should_apply_to_module(module_name):
+                module_weights = weight_mapper.apply_callbacks(
+                    module_name, module_names_breakdown, weights)
                 module.load_weights(weights=module_weights)
             else:
-                module_weights = filter_weights(name, weights)
+                module_weights = weight_mapper.filter_weights(name, weights)
                 if hasattr(module, 'load_weights'):
                     module.load_weights(weights=[module_weights])
                 else:

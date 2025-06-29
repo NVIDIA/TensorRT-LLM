@@ -2,29 +2,26 @@ import bisect
 import contextlib
 import functools
 import gc
-import glob
 import inspect
 import itertools
 import math
-import multiprocessing
 import os
 import traceback
 import weakref
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
-import psutil
-import safetensors
 import torch
 import torch._dynamo.config
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
+from tensorrt_llm._torch.models.checkpoints.checkpoint_loader import \
+    CheckpointLoader
 from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
 from tensorrt_llm._torch.speculative.mtp import SampleStateTensorsMTP
-from tensorrt_llm._utils import (is_trace_enabled, local_mpi_rank,
-                                 local_mpi_size, nvtx_range, release_gc,
+from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
                                  torch_dtype_to_str, trace_func)
 from tensorrt_llm.bindings.executor import GuidedDecodingConfig
 from tensorrt_llm.logger import logger
@@ -135,81 +132,6 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     # We have an open ended KV cache in the checkpoint
     # and we have a specified override.
     model_config.quant_config.kv_cache_quant_algo = mapped_pyt_quant
-
-
-def _prefetch_one_file(file_name):
-    if os.path.exists(file_name):
-        logger.info(f"Prefetching {file_name} to memory...")
-        with open(file_name, 'rb') as f:
-            f.read()
-        logger.info(f"Finished prefetching {file_name}.")
-
-
-def prefetch_files(file_names: List[str]):
-    """
-    Prefetch safetensors files to memory so that the weight loading will be much faster.
-    When multiple ranks run in parallel, each rank will prefetch some files.
-    """
-
-    # Find out the files to prefetch for the current rank.
-    # Each rank loads files with indices local_rank, local_rank + local_mpi_size, local_rank + 2*local_mpi_size, etc.
-    local_file_names = file_names[local_mpi_rank()::local_mpi_size()]
-    if len(local_file_names) == 0:
-        return
-
-    max_processes = min(multiprocessing.cpu_count() * 2, 16,
-                        len(local_file_names))
-    with multiprocessing.Pool(processes=max_processes) as pool:
-        pool.map(_prefetch_one_file, local_file_names)
-
-
-def load_weights(checkpoint_dir: str):
-    weights = {}
-    weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
-    if weight_files:
-        # Prefetch the weight files to CPU memory if the size is less than 90% of the available memory.
-        # This is a heuristic to avoid prefetching files that are too large and causing file cache thrashing.
-        prefetch_size = sum(os.path.getsize(file) for file in weight_files)
-        # If the layer number is overridden, it indicates that only a subset of layers are loaded.
-        # Prefetching all layers is unnecessary.
-        num_layers = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0"))
-        enable_prefetch = prefetch_size < psutil.virtual_memory(
-        ).available * 0.9 and num_layers == 0
-        if enable_prefetch:
-            logger.info(
-                f"Prefetching {prefetch_size / (1024**3):.2f}GB checkpoint files."
-            )
-            prefetch_files(weight_files)
-        for file in weight_files:
-            logger.info(f"Loading {file}")
-            part_weights = safetensors.torch.load_file(file)
-            weights.update(part_weights)
-        return weights
-
-    weight_files = glob.glob(f"{checkpoint_dir}/*.bin")
-    if not weight_files:
-        weight_files = glob.glob(f"{checkpoint_dir}/*.pth")
-
-    if weight_files:
-        for file in weight_files:
-            # try mmap first, if failed, turn off mmap
-            try:
-                part_weights = torch.load(file,
-                                          weights_only=True,
-                                          map_location='cpu',
-                                          mmap=True)
-            except Exception:
-                logger.warning(
-                    f"Failed to load {file} with mmap=True, fallback to mmap=False"
-                )
-                part_weights = torch.load(file,
-                                          weights_only=True,
-                                          map_location='cpu',
-                                          mmap=False)
-            weights.update(part_weights)
-        return weights
-
-    raise RuntimeError(f"No weight files found in {checkpoint_dir}.")
 
 
 def initialize_dummy_weights(
@@ -324,6 +246,7 @@ class PyTorchModelEngine(ModelEngine):
         self,
         model_path: str,
         pytorch_backend_config: PyTorchConfig,
+        checkpoint_loader: CheckpointLoader,
         batch_size: int = 8,
         max_num_tokens: int = 8192,
         max_seq_len: Optional[int] = None,
@@ -360,6 +283,7 @@ class PyTorchModelEngine(ModelEngine):
         self.model = self._load_model(
             model_path,
             mapping=self.mapping,
+            checkpoint_loader=checkpoint_loader,
             attn_backend=attn_backend,
             moe_backend=pytorch_backend_config.moe_backend,
             load_format=pytorch_backend_config.load_format,
@@ -969,13 +893,15 @@ class PyTorchModelEngine(ModelEngine):
 
     def _load_model(self,
                     checkpoint_dir: str,
+                    checkpoint_loader: CheckpointLoader,
                     load_format: LoadFormat,
                     max_num_tokens: int,
                     moe_max_num_tokens: Optional[int] = None,
                     moe_load_balancer: Optional[MoeLoadBalancerConfig] = None,
                     lora_config: Optional[LoraConfig] = None,
                     **kwargs):
-        config = ModelConfig.from_pretrained(
+
+        config = checkpoint_loader.config_loader.load(
             checkpoint_dir,
             trust_remote_code=True,
             enable_min_latency=self.pytorch_backend_config.enable_min_latency,
@@ -1025,18 +951,30 @@ class PyTorchModelEngine(ModelEngine):
             logger.info(
                 f"Use {rank_model_storage / (1024**3):.2f} GB for model weights."
             )
-
             if load_format == LoadFormat.AUTO:
                 if hasattr(model, 'llm_checkpoint_dir'):
-                    weights = load_weights(model.llm_checkpoint_dir)
+                    # TODO smor- this hasn't been tested yet.
+                    print("SMOR, hasn't been tested yet")
+                    from IPython import embed
+                    embed()
+                    weights = checkpoint_loader.weight_loader.load_weights(
+                        model.llm_checkpoint_dir)
                 else:
-                    weights = load_weights(checkpoint_dir)
+                    weights = checkpoint_loader.weight_loader.load_weights(
+                        checkpoint_dir)
 
-                model.load_weights(weights)
+                weight_mapper = checkpoint_loader.get_weight_mapper(
+                    model, config)
+                model.load_weights(weights, weight_mapper=weight_mapper)
 
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
-                    weights = load_weights(self.spec_config.draft_model_path)
+                    # TODO smor- not verified yet
+                    print("SMOR, hasn't been tested yet")
+                    from IPython import embed
+                    embed()
+                    weights = checkpoint_loader.weight_loader.load_weights(
+                        self.spec_config.draft_model_path)
                     model.load_draft_weights(weights)
 
             elif load_format == LoadFormat.DUMMY:

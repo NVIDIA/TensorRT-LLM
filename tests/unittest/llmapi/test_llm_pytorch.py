@@ -365,3 +365,29 @@ def test_bielik_11b_v2_2_instruct_multi_lora() -> None:
                                lora_request=lora_requests)
 
         assert len(outputs) == 2
+
+
+def test_debug():
+    pass
+
+    model_path = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
+
+    # intermediate
+    # llm = LLM(
+    #     model=model_path,
+    #     checkpoint_loader=CheckpointLoader(
+    #         checkpoint_format="HF",
+    #         weight_loader=HfWeightLoader(),
+    #         weight_mapper=HfWeightMapper(),
+    #         config_loader=HfConfigLoader()))
+
+    # default
+    llm = LLM(model=model_path, checkpoint_format="HF")
+
+    # implicit
+    # llm = LLM(model=model_path) # assumes HF format
+
+    prompts = ["Hello, how are you?"]
+    outputs = llm.generate(prompts)
+    print(f"Model Output is: {outputs[0].outputs[0].text}")
+    assert 1 == 1
