@@ -28,6 +28,7 @@
 #include "tensorrt_llm/batch_manager/pauseRequests.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/runtime/decoderState.h"
+#include "tensorrt_llm/runtime/gptDecoderBatched.h"
 #include "tensorrt_llm/runtime/torch.h"
 #include "tensorrt_llm/runtime/torchView.h"
 

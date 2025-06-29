@@ -22,7 +22,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/runtime/decoderState.h"
-#include "tensorrt_llm/runtime/iGptDecoderBatched.h"
+#include "tensorrt_llm/runtime/gptDecoderBatched.h"
 
 namespace tr = tensorrt_llm::runtime;
 

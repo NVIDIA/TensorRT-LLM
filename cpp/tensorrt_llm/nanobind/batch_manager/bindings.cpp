@@ -25,6 +25,7 @@
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
 #include "tensorrt_llm/nanobind/common/bindTypes.h"
+#include "tensorrt_llm/runtime/decoderState.h"
 #include "tensorrt_llm/runtime/gptDecoderBatched.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/torch.h"

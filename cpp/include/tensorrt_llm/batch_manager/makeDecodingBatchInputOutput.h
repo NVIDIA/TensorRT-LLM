@@ -21,13 +21,20 @@
 #include "tensorrt_llm/common/algorithm.h"
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/runtime/common.h"
-#include "tensorrt_llm/runtime/iGptDecoderBatched.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 
-namespace tensorrt_llm::runtime::decoder
+namespace tensorrt_llm::runtime
+{
+namespace decoder
 {
 class DecoderState;
-} // namespace tensorrt_llm::runtime::decoder
+} // namespace decoder
+
+namespace decoder_batch
+{
+class Input;
+} // namespace decoder_batch
+} // namespace tensorrt_llm::runtime
 
 namespace tensorrt_llm::batch_manager
 {
@@ -40,7 +47,7 @@ public:
     constexpr static auto name{"MakeDecodingBatchInputOutput"};
 
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
-    using TensorPtr = runtime::decoder_batch::Input::TensorPtr;
+    using TensorPtr = runtime::ITensor::SharedPtr;
     template <typename T>
     using OptionalRef = tensorrt_llm::common::OptionalRef<T>;
 
