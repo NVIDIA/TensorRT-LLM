@@ -21,7 +21,7 @@
 #include "tensorrt_llm/common/algorithm.h"
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/runtime/common.h"
-#include "tensorrt_llm/runtime/iGptDecoderBatched.h"
+#include "tensorrt_llm/runtime/gptDecoderBatchedInput.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 
 namespace tensorrt_llm::runtime::decoder

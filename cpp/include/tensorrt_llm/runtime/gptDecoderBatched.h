@@ -21,7 +21,7 @@
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/decoderState.h"
 #include "tensorrt_llm/runtime/gptDecoder.h"
-#include "tensorrt_llm/runtime/iGptDecoderBatched.h"
+#include "tensorrt_llm/runtime/gptDecoderBatchedInput.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
@@ -37,7 +37,7 @@ namespace tensorrt_llm::runtime
 {
 
 //! GPT decoder class with support for in-flight batching
-class GptDecoderBatched : public IGptDecoderBatched
+class GptDecoderBatched
 {
 public:
     using CudaStreamPtr = std::shared_ptr<CudaStream>;
@@ -48,24 +48,24 @@ public:
     explicit GptDecoderBatched(CudaStreamPtr stream);
 
     void setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
-        nvinfer1::DataType dtype, ModelConfig const& modelConfig, WorldConfig const& worldConfig) override;
+        nvinfer1::DataType dtype, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
-    void disableLookahead(RequestVector const& genRequests, TensorPtr const& batchSlots) override;
+    void disableLookahead(RequestVector const& genRequests, TensorPtr const& batchSlots);
 
-    CudaEvent forwardAsync(decoder::DecoderState const& decoderState, decoder_batch::Input const& input) override;
-    void forward(decoder::DecoderState const& decoderState, decoder_batch::Input const& input) override;
+    CudaEvent forwardAsync(decoder::DecoderState const& decoderState, decoder_batch::Input const& input);
+    void forward(decoder::DecoderState const& decoderState, decoder_batch::Input const& input);
 
     //! @brief Gather final beam search results for request `batchSlot`.
     //! Result will only be available after event returned.
     [[nodiscard]] CudaEvent finalize(decoder::DecoderState const& decoderState, SizeType32 batchSlot,
-        SamplingConfig const& samplingConfig, bool streaming) const override;
+        SamplingConfig const& samplingConfig, bool streaming) const;
 
-    CudaStreamPtr getDecoderStream() const
+    [[nodiscard]] CudaStreamPtr getDecoderStream() const
     {
         return mDecoderStream;
     }
 
-    IGptDecoder& getUnderlyingDecoder() const
+    [[nodiscard]] IGptDecoder& getUnderlyingDecoder() const
     {
         return *mDecoder.get();
     }
