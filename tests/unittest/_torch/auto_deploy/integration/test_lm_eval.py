@@ -65,7 +65,7 @@ def _cli_evaluate_with_mocks(args):
                     f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct",
                     "meta-llama/Meta-Llama-3.1-8B-Instruct",
                 ),
-                "attn_backend": "FlashInfer",
+                "attn_backend": "flashinfer",
                 "max_batch_size": 32,
             },
             ["gsm8k", "mmlu"],

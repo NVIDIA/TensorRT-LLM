@@ -75,6 +75,8 @@ struct InputFieldsNames
     static constexpr char const* returnContextLogits = "return_context_logits";
     static constexpr char const* excludeInputFromOutput = "exclude_input_in_output";
     static constexpr char const* returnPerfMetrics = "return_perf_metrics";
+    static constexpr char const* returnNumInputTokens = "return_num_input_tokens";
+    static constexpr char const* returnNumOutputTokens = "return_num_output_tokens";
 
     // Deprecated
     static constexpr char const* returnKvCacheReuseStats = "return_kv_cache_reuse_stats";
@@ -159,6 +161,8 @@ struct OutputFieldsNames
     static constexpr char const* acceptanceRate = "acceptance_rate";
     static constexpr char const* totalAcceptedDraftTokens = "total_accepted_draft_tokens";
     static constexpr char const* totalDraftTokens = "total_draft_tokens";
+    static constexpr char const* numInputTokens = "num_input_tokens";
+    static constexpr char const* numOutputTokens = "num_output_tokens";
 };
 
 inline static std::string const kStopInputTensorName = "stop";
