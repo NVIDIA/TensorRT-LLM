@@ -22,7 +22,9 @@ from tqdm import tqdm
 
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.generation_mixin import GenerationMixin
-from tensorrt_llm.models.llama.model import LLaMAForCausalLM, LLaMAModel
+from tensorrt_llm.models.qwen.model import QWenModel as TRTModel
+from tensorrt_llm.models.qwen.model import QWenForCausalLM as TRTModelForCausalLM
+
 from tensorrt_llm.models.model_weights_loader import ModelWeightsLoader
 
 from ..._common import default_net, default_trtnet
@@ -531,7 +533,7 @@ class EagleNet(Module):
 
     def __init__(self, config, logits_dtype):
         super().__init__()
-        self.drafter = LLaMAModel(config)
+        self.drafter = TRTModel(config)
         self.config = config
         self.logits_dtype = logits_dtype
 
@@ -575,7 +577,7 @@ class EagleNet(Module):
         return None, hidden_states, cache
 
 
-class EagleForCausalLM(LLaMAForCausalLM):
+class EagleForCausalLM(TRTModelForCausalLM):
     config_class = EagleConfig
 
     def __init__(self, config: EagleConfig):
