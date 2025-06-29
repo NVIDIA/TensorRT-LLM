@@ -913,7 +913,6 @@ TEST_F(TrtGptModelTest, KVCacheReuseChunked)
 
     for (int const numBlocksExpectedReused : {1, 2})
     {
-<<<<<<< HEAD
         auto trtGptModelIfb = std::make_shared<TrtGptModelIfbHelper>(
             mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, executorConfig, false);
         auto const cacheManager = trtGptModelIfb->getKVCacheManager();
@@ -931,9 +930,7 @@ TEST_F(TrtGptModelTest, KVCacheReuseChunked)
             tokens->begin(), tokens->begin() + numBlocksExpectedReused * tokensPerBlock);
         // Add new token to "start" a new block.
         subTokens->push_back(0);
-=======
         for (int const maxNumIterations : {2, 6})
->>>>>>> 63f51da91 (enable kvcache to be reused during request generation)
         {
             auto trtGptModelIfb = std::make_shared<TrtGptModelIfbHelper>(
                 mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, optionalParams);
