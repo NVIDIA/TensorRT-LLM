@@ -55,6 +55,62 @@ using namespace tensorrt_llm::common;
 namespace tensorrt_llm::kernels
 {
 
+// ========================== CUB Sorting things ====================================
+CubKeyValueSorter::CubKeyValueSorter()
+    : num_experts_(0)
+    , num_bits_(sizeof(int) * 8)
+{
+}
+
+int CubKeyValueSorter::expertsToBits(int num_experts)
+{
+    // Max value we represent is V = num_experts + (num_experts - 1) = 2 * num_experts - 1
+    // The maximum number of bits is therefore floor(log2(V)) + 1
+    return static_cast<int>(log2(2 * num_experts - 1)) + 1;
+}
+
+CubKeyValueSorter::CubKeyValueSorter(int const num_experts)
+    : num_experts_(num_experts)
+    , num_bits_(expertsToBits(num_experts))
+{
+}
+
+void CubKeyValueSorter::updateNumExperts(int const num_experts)
+{
+    num_experts_ = num_experts;
+    num_bits_ = expertsToBits(num_experts);
+}
+
+size_t CubKeyValueSorter::getWorkspaceSize(size_t const num_key_value_pairs, int const num_experts)
+{
+    int num_bits = expertsToBits(num_experts);
+    size_t required_storage = 0;
+    int* null_int = nullptr;
+    cub::DeviceRadixSort::SortPairs(
+        nullptr, required_storage, null_int, null_int, null_int, null_int, num_key_value_pairs, 0, num_bits);
+
+    // TODO: fix DeviceRadixSort
+    //   when num_key_value_pairs, num_experts, num_bits, required_storage = 64, 4, 3, 0
+    //   The required_storage seems to vary between 0 and 1 for the same inputs
+    if (required_storage == 0)
+    {
+        required_storage = 1;
+    }
+    return required_storage;
+}
+
+void CubKeyValueSorter::run(void* workspace, size_t const workspace_size, int const* keys_in, int* keys_out,
+    int const* values_in, int* values_out, size_t const num_key_value_pairs, cudaStream_t stream)
+{
+    size_t expected_ws_size = getWorkspaceSize(num_key_value_pairs, num_experts_);
+    size_t actual_ws_size = workspace_size;
+
+    TLLM_CHECK_WITH_INFO(expected_ws_size <= workspace_size,
+        "[CubKeyValueSorter::run] The allocated workspace is too small to run this problem.");
+    cub::DeviceRadixSort::SortPairs(
+        workspace, actual_ws_size, keys_in, keys_out, values_in, values_out, num_key_value_pairs, 0, num_bits_, stream);
+}
+
 // TODO: These kernel implementations are duplicated in moe_kernels.cu. They will be refactored later (tracked by
 // https://jirasw.nvidia.com/browse/TRTLLM-708)
 template <int BLOCK_SIZE, int EXPERTS_PER_TOKEN, int LOG2_NUM_EXPERTS>
@@ -468,13 +524,13 @@ __device__ void writeSF(int64_t num_tokens_before_expert, int64_t expert_id, int
 
 void generateTokenPermutation(int const* unpermuted_token_selected_experts, int const* unpermuted_source_token_ids,
     int* permuted_token_selected_experts, int* permuted_source_token_ids, int64_t* expert_first_token_offset,
-    int64_t num_rows, int64_t num_experts_per_node, int64_t k, cutlass_kernels::CubKeyValueSorter& sorter,
-    void* sorter_ws, cudaStream_t stream)
+    int64_t num_rows, int64_t num_experts_per_node, int64_t k, CubKeyValueSorter& sorter, void* sorter_ws,
+    cudaStream_t stream)
 {
     int64_t const expanded_num_rows = k * num_rows;
     sorter.updateNumExperts(num_experts_per_node);
     size_t const sorter_ws_size_bytes
-        = cutlass_kernels::pad_to_multiple_of_16(sorter.getWorkspaceSize(expanded_num_rows, num_experts_per_node));
+        = pad_to_multiple_of_16(sorter.getWorkspaceSize(expanded_num_rows, num_experts_per_node));
     sorter.run((void*) sorter_ws, sorter_ws_size_bytes, unpermuted_token_selected_experts,
         permuted_token_selected_experts, unpermuted_source_token_ids, permuted_source_token_ids, expanded_num_rows,
         stream);

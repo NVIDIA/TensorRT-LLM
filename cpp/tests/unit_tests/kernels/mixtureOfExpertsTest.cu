@@ -2118,7 +2118,7 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
             backend.init(this->mMoERunner, GemmProfilerBackend::GemmToProfile::GEMM_1, nvinfer1::DataType::kHALF,
                 nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF, num_experts, k, 1024, 4096, mGroupSize, {}, false,
-                mUseLora, /*min_latency_mode=*/false, /*need_weights=*/true, MOEParallelismConfig{1, 0, ep, ep - 1},
+                mUseLora, /*min_latency_mode=*/false, /*need_weights=*/true, MOEParallelismConfig{1, 0, ep, 0},
                 /*enable_alltoall=*/false);
 #else
             backend.init(this->mMoERunner, GemmProfilerBackend::GemmToProfile::GEMM_1, nvinfer1::DataType::kHALF,
@@ -2136,33 +2136,46 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
 #define GET_WS_PTR(type, name) auto* name = reinterpret_cast<type>(workspace + workspaces.at(#name).second)
 
             GET_WS_PTR(int64_t*, expert_first_token_offset);
-            GET_WS_PTR(int*, source_to_dest);
-            GET_WS_PTR(int*, dest_to_source);
+            GET_WS_PTR(int*, unpermuted_row_to_permuted_row);
+            GET_WS_PTR(int*, permuted_row_to_unpermuted_row);
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
+            GET_WS_PTR(int*, token_selected_experts);
+#else
             GET_WS_PTR(int*, unpermuted_selected_experts);
-
+#endif
 #undef GET_WS_PTR
 
             for (int sample = 0; sample < backend.NUM_ROUTING_SAMPLES; sample++)
             {
                 auto host_expert_first_token_offset_size = getDataFromDevice(
                     expert_first_token_offset + sample * (num_experts_per_node + 1), num_experts_per_node + 1);
-                auto host_source_to_dest_map
-                    = getDataFromDevice(source_to_dest + sample * expanded_num_tokens, expanded_num_tokens);
-                auto host_dest_to_source_map
-                    = getDataFromDevice(dest_to_source + sample * expanded_num_tokens, expanded_num_tokens);
+                auto host_unpermuted_row_to_permuted_row_map = getDataFromDevice(
+                    unpermuted_row_to_permuted_row + sample * expanded_num_tokens, expanded_num_tokens);
+                auto host_permuted_row_to_unpermuted_row_map = getDataFromDevice(
+                    permuted_row_to_unpermuted_row + sample * expanded_num_tokens, expanded_num_tokens);
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
+                auto host_token_selected_experts
+                    = getDataFromDevice(token_selected_experts + sample * expanded_num_tokens, expanded_num_tokens);
+#else
                 auto host_token_selected_experts = getDataFromDevice(
                     unpermuted_selected_experts + sample * expanded_num_tokens, expanded_num_tokens);
+#endif
 
                 std::vector<int64_t> calculated_routing_values(num_experts_per_node + 1, 0);
                 int skipped = 0;
                 for (auto v : host_token_selected_experts)
                 {
+#ifndef USING_OSS_CUTLASS_MOE_GEMM
                     ASSERT_TRUE(v < num_experts_per_node || (v == num_experts_per_node && ep > 1))
                         << "v " << v << " num_experts_per_node " << num_experts_per_node << " ep " << ep;
-                    skipped += (v == num_experts_per_node);
+#endif
                     if (v < num_experts_per_node)
                     {
                         calculated_routing_values[v]++;
+                    }
+                    else
+                    {
+                        skipped++;
                     }
                 }
 
@@ -2206,14 +2219,18 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
                         int64_t idx = token_idx * k + k_idx;
                         int64_t expert_idx = host_token_selected_experts[idx];
 
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
+                        if (expert_idx < num_experts_per_node)
+#else
                         if (expert_idx < num_experts)
+#endif
                         {
-                            int64_t source_location = k_idx * num_tokens + token_idx;
-                            int64_t dest_location = host_expert_first_token_offset_size[expert_idx]
+                            int64_t unpermuted_row = k_idx * num_tokens + token_idx;
+                            int64_t permuted_row = host_expert_first_token_offset_size[expert_idx]
                                 + calculated_routing_values[expert_idx];
 
-                            ASSERT_EQ(host_source_to_dest_map[source_location], dest_location);
-                            ASSERT_EQ(host_dest_to_source_map[dest_location], source_location);
+                            ASSERT_EQ(host_unpermuted_row_to_permuted_row_map[unpermuted_row], permuted_row);
+                            ASSERT_EQ(host_permuted_row_to_unpermuted_row_map[permuted_row], unpermuted_row);
 
                             calculated_routing_values[expert_idx]++;
                         }
