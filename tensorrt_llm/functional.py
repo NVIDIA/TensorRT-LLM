@@ -4707,6 +4707,7 @@ class RopeEmbeddingUtils:
                                     dim: int,
                                     theta: float = 10000.0,
                                     dtype=np.float32):
+        assert False
         inv_freq = 1.0 / (theta**(np.arange(0, dim, 2) / dim)).astype(dtype)
         sinusoid_inp = np.einsum("i , j -> i j",
                                  np.arange(num_pos, dtype=dtype),
@@ -4726,27 +4727,45 @@ class RopeEmbeddingUtils:
             # Other scaling configs that only used by certain scaling types.
             rope_scaling_config: dict = None,
             dtype=np.float32):
+        print(f"[create_sinusoidal_positions_for_attention_plugin] scale_type: {scale_type} theta: {theta} dim: {dim} scale: {scale} num_pos: {num_pos} rope_scaling_config: {rope_scaling_config} dtype: {dtype}")
         if scale_type == RotaryScalingType.linear:
             scale = 1.0 / scale
-        if scale_type == RotaryScalingType.llama3:
-            assert rope_scaling_config is not None, "rotary_scaling config must be provided."
-            inv_freq = 1.0 / (theta**(np.arange(0, dim, 2) / dim)).astype(dtype)
-            inv_freq = RopeEmbeddingUtils.apply_llama3_scaling(
-                inv_freq, rope_scaling_config)
-        else:
-            inv_freq = scale / (theta
-                                **(np.arange(0, dim, 2) / dim)).astype(dtype)
-        sinusoid_inp = np.expand_dims(np.einsum("i , j -> i j",
-                                                np.arange(num_pos, dtype=dtype),
-                                                inv_freq,
-                                                dtype=dtype),
-                                      axis=-1)
-        # fuse cos/sin into float2 (cos, sin).
-        concat = np.concatenate(
-            (np.cos(sinusoid_inp), np.sin(sinusoid_inp)),
-            axis=-1)  #np.cos(sinusoid_inp).shape = (32768, 64, 1)
+        # if scale_type == RotaryScalingType.llama3:
+        #     assert rope_scaling_config is not None, "rotary_scaling config must be provided."
+        #     inv_freq = 1.0 / (theta**(np.arange(0, dim, 2) / dim)).astype(dtype)
+        #     inv_freq = RopeEmbeddingUtils.apply_llama3_scaling(
+        #         inv_freq, rope_scaling_config)
+        # else:
+        #     inv_freq = scale / (theta
+        #                         **(np.arange(0, dim, 2) / dim)).astype(dtype)   # @B: (128,)
+        # sinusoid_inp = np.expand_dims(np.einsum("i , j -> i j",
+        #                                         np.arange(num_pos, dtype=dtype),
+        #                                         inv_freq,
+        #                                         dtype=dtype),
+        #                               axis=-1)                                  # @B: (32768, 128, 1)
+        # # fuse cos/sin into float2 (cos, sin).
+        # concat = np.concatenate(
+        #     (np.cos(sinusoid_inp), np.sin(sinusoid_inp)),
+        #     axis=-1)                                                            # @B: (32768, 128, 2)
 
-        return inv_freq, concat.reshape(1, -1).astype(dtype)
+        # return inv_freq, concat.reshape(1, -1).astype(dtype)                    # @B: (128,), (1, 8388608)
+
+        assert dtype == np.float32
+        dtype = torch.float32
+
+        position_ids = torch.arange(num_pos, dtype=torch.int64)
+        inv_freq = scale / (theta ** (torch.arange(0, dim, 2, dtype=torch.int64).float() / dim))
+        inv_freq_expanded = inv_freq[None, :, None].float().expand(num_pos, -1, 1)
+        position_ids_expanded = position_ids[:, None, None].float()
+
+        with torch.autocast(device_type='cpu', enabled=False):  # Force float32
+            sinusoid_inp = (inv_freq_expanded.float() @ position_ids_expanded.float())
+            concat = torch.cat((sinusoid_inp.cos(), sinusoid_inp.sin()), dim=-1)
+
+        assert concat.shape == (num_pos, dim//2, 2)
+        assert inv_freq.shape == (dim//2,)
+
+        return inv_freq.numpy(), concat.reshape(1, -1).float().numpy()
 
     @staticmethod
     def create_sinusoidal_positions_for_cogvlm_attention_plugin(
@@ -4758,6 +4777,7 @@ class RopeEmbeddingUtils:
             vision_start: int = 1,
             vision_length: int = 1225,
             dtype=np.float32):
+        assert False
         if scale_type == RotaryScalingType.linear:
             scale = 1.0 / scale
         inv_freq = scale / (theta**(np.arange(0, dim, 2) / dim)).astype(dtype)
@@ -4789,7 +4809,7 @@ class RopeEmbeddingUtils:
             short_mscale=None,
             long_mscale=None,
             dtype=np.float32):
-
+        assert False
         def _calc_mscale(scale):
             if scale <= 1.0:
                 return 1.0
@@ -4853,6 +4873,7 @@ class RopeEmbeddingUtils:
             duplicate_data: bool = True,
             dtype=torch.float32):
 
+        assert False
         # Copy from https://huggingface.co/deepseek-ai/DeepSeek-V2/blob/main/modeling_deepseek.py
         # Inverse dim formula to find dim based on number of rotations
         def yarn_find_correction_dim(num_rotations, dim, base,
