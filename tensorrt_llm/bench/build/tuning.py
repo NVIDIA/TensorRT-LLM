@@ -1,5 +1,6 @@
 from typing import Tuple
 
+from tensorrt_llm._torch.pyexecutor.config_utils import is_nemotron_hybrid
 from tensorrt_llm.llmapi.llm_utils import QuantConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -55,7 +56,15 @@ def calc_engine_setting(
 
     # Each GPU in TP group has at least 1 kv head
     adjusted_num_kv_heads = max(tp_size, model_config.num_key_value_heads)
-    byte_per_token = 2 * model_config.num_hidden_layers * adjusted_num_kv_heads \
+
+    is_mamba_attn_hybrid = is_nemotron_hybrid(model_config)
+    if is_mamba_attn_hybrid:
+        num_attention_layers = model_config.hybrid_override_pattern.count("*")
+    else:
+        num_attention_layers = model_config.num_hidden_layers
+    logger.info(f"Number of attention layers: {num_attention_layers}")
+
+    byte_per_token = 2 * num_attention_layers * adjusted_num_kv_heads \
         * model_config.head_size * byte_per_kv_elem / (1024 ** 3)
 
     # Number of GPU used for this run.
@@ -70,19 +79,48 @@ def calc_engine_setting(
                 f"{available_memory:.2f} GB")
 
     # Calculate max requests in KV cache based on target ISL and OSL.
-    kv_cache_memory = available_memory * kv_cache_gpu_mem_fraction
-    kv_cache_max_tokens = kv_cache_memory / byte_per_token
-    kv_cache_max_requests = kv_cache_max_tokens / (target_input_len +
-                                                   target_output_len)
-    logger.info(f"Estimated total KV cache memory: {kv_cache_memory:.2f} GB")
+    target_seq_len = target_input_len + target_output_len
+
+    if is_mamba_attn_hybrid:
+        num_mamba_layers = model_config.hybrid_override_pattern.count("M")
+        conv_dim = model_config.mamba_config.d_inner + 2 * model_config.mamba_config.n_groups * model_config.mamba_config.d_state
+        num_conv_state_elements = num_mamba_layers * conv_dim * (
+            model_config.mamba_config.d_conv - 1)
+        num_ssm_state_elements = num_mamba_layers * model_config.mamba_config.n_heads * model_config.mamba_config.head_dim * model_config.mamba_config.d_state
+        byte_per_state_elem = BYTES_PER_ELEM.get(QuantAlgo.NO_QUANT)
+        byte_per_mamba_cache = byte_per_state_elem * (
+            num_conv_state_elements + num_ssm_state_elements) / (1024**3)
+
+        # Each mamba cache entry is pretty large (~50MB), so we are more conservative when estimating the max batch size
+        kv_cache_gpu_mem_fraction *= kv_cache_gpu_mem_fraction
+    else:
+        byte_per_mamba_cache = 0
+
+    cache_memory = available_memory * kv_cache_gpu_mem_fraction
+    kv_cache_max_requests = cache_memory / (byte_per_token * target_seq_len +
+                                            byte_per_mamba_cache)
+    mamba_cache_memory = byte_per_mamba_cache * kv_cache_max_requests
+    kv_cache_max_tokens = (cache_memory - mamba_cache_memory) / byte_per_token
+
+    if is_mamba_attn_hybrid:
+        kv_cache_memory = kv_cache_max_tokens * byte_per_token
+        logger.info(
+            f"Estimated total cache memory: {cache_memory:.2f} GB. KV cache: {kv_cache_memory:.2f} GB, Mamba cache: {mamba_cache_memory:.2f} GB"
+        )
+    else:
+        logger.info(f"Estimated total KV cache memory: {cache_memory:.2f} GB")
+    logger.info(f"Estimated kv cache max tokens: {kv_cache_max_tokens:.2f}")
     logger.info("Estimated max number of requests in KV cache memory: "
                 f"{kv_cache_max_requests:.2f}")
 
     # Fine-tune the max batch size and num token setting for performance.
-    max_batch_size, max_num_tokens = finetune_setting(kv_cache_max_requests,
-                                                      target_input_len,
-                                                      target_output_len,
-                                                      pp_size)
+    # For mamba-attn hybrid models, we disable optimistic tuning because the mamba cache leaves less memory for the KV cache
+    max_batch_size, max_num_tokens = finetune_setting(
+        kv_cache_max_requests,
+        target_input_len,
+        target_output_len,
+        pp_size,
+        enable_optimistic_tuning=not is_mamba_attn_hybrid)
 
     # Functional and performance
     if total_gpu_memory < engine_size:
@@ -107,7 +145,7 @@ def calc_engine_setting(
     if kv_cache_max_requests < 1:
         raise RuntimeError("The amount of KV cache memory is insufficient to "
                            "run this model. Please try with more GPUs.")
-    if kv_cache_memory / n_gpus < 10.0:
+    if cache_memory / n_gpus < 10.0:
         logger.warning(
             f"The KV cache memory per GPU is less than 10 GB. "
             "Performance may be undesirable. Please consider using a different "
@@ -121,12 +159,11 @@ def calc_engine_setting(
     return max_batch_size, max_num_tokens
 
 
-def finetune_setting(
-    kv_cache_max_requests: float,
-    input_len: int,
-    output_len: int,
-    pp_size: int,
-) -> Tuple[int, int]:
+def finetune_setting(kv_cache_max_requests: float,
+                     input_len: int,
+                     output_len: int,
+                     pp_size: int,
+                     enable_optimistic_tuning: bool = True) -> Tuple[int, int]:
     """ Calculate and fine-tune the engine build settings (max batch size and
         max num tokens). Both max batch size and max num tokens are fine-tuned
         to be slightly optimistic.
@@ -137,6 +174,7 @@ def finetune_setting(
         input_len (int): Input sequence length to compile the engine.
         output_len (int): Output sequence length to compile the engine.
         pp_size (int): Number of pipeline parallel stages.
+        enable_optimistic_tuning (bool): Whether to enable optimistic tuning.
 
     Returns:
         Tuple[int, int]: Tuple containing fine-tuned values for engine
@@ -148,13 +186,16 @@ def finetune_setting(
     raw_token = min(raw_bs * (1 + input_len / output_len), 32768)
 
     # Fine-tune the max batch size.
-    # Set min BS to be 64.
-    if raw_bs < 256:
-        max_bs = max(64, 32 * math.ceil(raw_bs / 32))
-    elif raw_bs < 1024:
-        max_bs = 128 * math.ceil(raw_bs / 128)
+    if enable_optimistic_tuning:
+        # Set min BS to be 64.
+        if raw_bs < 256:
+            max_bs = max(64, 32 * math.ceil(raw_bs / 32))
+        elif raw_bs < 1024:
+            max_bs = 128 * math.ceil(raw_bs / 128)
+        else:
+            max_bs = 256 * math.ceil(raw_bs / 256)
     else:
-        max_bs = 256 * math.ceil(raw_bs / 256)
+        max_bs = 2 * math.floor(raw_bs / 2)
 
     # Fine-tune the max num tokens.
     # Set min to 2048 to ensure Ctx/Gen overlap efficiency
