@@ -65,7 +65,7 @@ class Gemma3Attention(Attention):
         self.attention_window_size = None
         if is_sliding:
             rope_params.theta = 10000
-            self.attention_window_size = config.sliding_window
+            self.attention_window_size = config.sliding_window - 1  # Gemma3 sliding window isn't inclusive.
         pos_embd_params = PositionalEmbeddingParams(
             type=PositionEmbeddingType.rope_gpt_neox,
             rope=rope_params,
@@ -107,7 +107,7 @@ class Gemma3Attention(Attention):
         **kwargs,
     ) -> torch.Tensor:
 
-        attention_window_size = self.attention_window_size # or attn_metadata.max_seq_len
+        attention_window_size = self.attention_window_size or attn_metadata.max_seq_len
         return super().forward(position_ids=position_ids,
                                hidden_states=hidden_states,
                                attn_metadata=attn_metadata,
