@@ -473,6 +473,13 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface
         = tensorrt_llm::kernels::fp8_blockscale_gemm::CutlassFp8BlockScaleGemmRunnerInterface;
     using ScaleBiasType = BackBoneType;
     using Self = CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType>;
+
+#if defined(ENABLE_BF16)
+    static constexpr bool use_wfp4a16
+        = std::is_same_v<WeightType, __nv_fp4_e2m1> && (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>);
+#else
+    static constexpr bool use_wfp4a16 = std::is_same_v<WeightType, __nv_fp4_e2m1> && std::is_same_v<T, half>;
+#endif
 #if defined(ENABLE_FP8)
     static constexpr bool use_fp8 = (std::is_same_v<T, __nv_fp8_e4m3>
         || std::is_same_v<T, __nv_fp8_e5m2>) &&!std::is_same_v<WeightType, cutlass::uint4b_t>;
@@ -725,7 +732,7 @@ private:
     bool mayHaveFinalizeFused() const
     {
         return moe_gemm_runner_.supportsTmaWarpSpecialized() && moe_gemm_runner_.getSM() == 90
-            && !use_deterministic_hopper_reduce_ && !use_w4afp8;
+            && !use_deterministic_hopper_reduce_ && !use_w4afp8 && !use_wfp4a16;
     }
 
     // TODO: This should eventually take the quant params to give more flexibility

@@ -548,7 +548,13 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
 
 class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
 
+    isW4A16MXFP4 = False
+
     def create_weights(self, module: torch.nn.Module):
+
+        self.isW4A16MXFP4 = module.quant_config.quant_mode.has_w4a16_mxfp4()
+        group_size = 32 if self.isW4A16MXFP4 else 128
+
         module.sm_version = get_sm_version()
         if module.sm_version == 89:
             module.interleave = [1, 1]
@@ -557,12 +563,14 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
             for k_shape in [
                     module.hidden_size, module.intermediate_size_per_partition
             ]:
-                if k_shape % 512 == 0:
-                    module.interleave.append(4)
+                if self.isW4A16MXFP4:
+                    module.interleave.append(128 // group_size)
+                elif k_shape % 512 == 0:
+                    module.interleave.append(512 // group_size)
                 elif k_shape % 256 == 0:
-                    module.interleave.append(2)
+                    module.interleave.append(256 // group_size)
                 elif k_shape % 128 == 0:
-                    module.interleave.append(1)
+                    module.interleave.append(128 // group_size)
                 else:
                     raise NotImplementedError(
                         f"K shape is required to be multiple of 128, received {k_shape}."
@@ -570,7 +578,7 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
         else:
             raise NotImplementedError(
                 f"W4AFP8 MoE is unsupported on SM{module.sm_version}.")
-        weight_dtype = torch.int8
+        weight_dtype = torch.uint8 if self.isW4A16MXFP4 else torch.int8
         w3_w1_weight_shape = (module.expert_size_per_partition,
                               module.intermediate_size_per_partition * 2,
                               module.hidden_size // 2)
@@ -589,11 +597,12 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
         module.register_parameter("fc2_act_scale", fc2_act_scale)
 
         # col parallel
+        scale_dtype = torch.uint8 if self.isW4A16MXFP4 else module.dtype
         fc31_weight_scale = nn.Parameter(torch.empty(
             module.expert_size_per_partition,
-            module.hidden_size // (128 * module.interleave[0]),
+            module.hidden_size // (group_size * module.interleave[0]),
             module.intermediate_size_per_partition * 2 * module.interleave[0],
-            dtype=module.dtype),
+            dtype=scale_dtype),
                                          requires_grad=False)
         module.register_parameter("fc31_weight_scale", fc31_weight_scale)
 
@@ -601,9 +610,9 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
         fc2_weight_scale = nn.Parameter(
             torch.empty(module.expert_size_per_partition,
                         module.intermediate_size_per_partition //
-                        (128 * module.interleave[1]),
+                        (group_size * module.interleave[1]),
                         module.hidden_size * module.interleave[1],
-                        dtype=module.dtype),
+                        dtype=scale_dtype),
             requires_grad=False)
         module.register_parameter("fc2_weight_scale", fc2_weight_scale)
 
