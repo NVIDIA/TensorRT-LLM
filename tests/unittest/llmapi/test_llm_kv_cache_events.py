@@ -1,6 +1,8 @@
 import asyncio
 import time
 
+import pytest
+
 import tensorrt_llm
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
