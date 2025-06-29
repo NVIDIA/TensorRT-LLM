@@ -220,6 +220,9 @@ class CutlassFusedMoE(MoE):
             # TODO: remove this once we have correct fusedmoe kernel ready
             token_final_scales = None
 
+        use_allgather = self.use_dp and self.parallel_size > 1 and not disable_fp4_allgather(
+        )
+
         # quantize inputs
         use_deepseek_fp8_block_scale = False
         use_w4a8_group_scaling = False
@@ -234,32 +237,40 @@ class CutlassFusedMoE(MoE):
             elif self.has_w4afp8:
                 use_w4a8_group_scaling = True
                 weight_dtype = torch.quint4x2
-            elif self.has_nvfp4 and not disable_fp4_allgather():
-                if isinstance(x, Fp4QuantizedTensor):
-                    assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before communication"
-                    x_row = x.shape[0]
-                    # note: we use uint8 to store 2 fp4 values
-                    x_col = x.shape[1] * 2
-                    x, x_sf = x.fp4_tensor, x.scaling_factor
+            elif self.has_nvfp4:
+                if use_allgather:
+                    if isinstance(x, Fp4QuantizedTensor):
+                        assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before communication"
+                        x_row = x.shape[0]
+                        # note: we use uint8 to store 2 fp4 values
+                        x_col = x.shape[1] * 2
+                        x, x_sf = x.fp4_tensor, x.scaling_factor
+                    else:
+                        x_row = x.shape[0]
+                        x_col = x.shape[1]
+                        x, x_sf = torch.ops.trtllm.fp4_quantize(
+                            x,
+                            self.fc31_input_scale,
+                            self.scaling_vector_size,
+                            sfUseUE8M0=False,
+                            swizzedLayout=False)
+                        x_sf = x_sf.view(
+                            x_row, ceil_div(x_col, self.scaling_vector_size))
                 else:
-                    x_row = x.shape[0]
-                    x_col = x.shape[1]
-                    x, x_sf = torch.ops.trtllm.fp4_quantize(
-                        x,
-                        self.fc31_input_scale,
-                        self.scaling_vector_size,
-                        sfUseUE8M0=False,
-                        swizzedLayout=False)
-                    x_sf = x_sf.view(x_row,
-                                     ceil_div(x_col, self.scaling_vector_size))
+                    if not isinstance(x, Fp4QuantizedTensor):
+                        x, x_sf = torch.ops.trtllm.fp4_quantize(
+                            x,
+                            self.fc31_input_scale,
+                            self.scaling_vector_size,
+                            sfUseUE8M0=False,
+                            swizzedLayout=True)
             else:
                 raise ValueError(
                     f"unsupported quantization mode: {self.quant_config.quant_mode}"
                 )
 
         # gather inputs for attention dp
-        if self.use_dp and self.parallel_size > 1 and not disable_fp4_allgather(
-        ):
+        if use_allgather:
             x, x_sf, token_selected_experts, token_final_scales = allgather(
                 [x, x_sf, token_selected_experts, token_final_scales],
                 self.mapping,
