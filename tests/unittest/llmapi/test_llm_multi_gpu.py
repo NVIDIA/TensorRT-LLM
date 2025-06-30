@@ -72,7 +72,6 @@ def engine_from_checkpoint() -> tempfile.TemporaryDirectory:
     return tmpdir
 
 
-@pytest.mark.skip(reason="https://nvbugs/5266240")
 @pytest.mark.gpu2
 @pytest.mark.part0
 def test_llm_loading_from_ckpt_for_tp2(

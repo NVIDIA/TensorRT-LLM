@@ -1220,7 +1220,9 @@ class TestNemotronUltra(LlmapiAccuracyTestHarness):
                  tensor_parallel_size=tp_size,
                  pipeline_parallel_size=pp_size,
                  moe_expert_parallel_size=ep_size,
-                 use_cuda_graph=cuda_graph) as llm:
+                 use_cuda_graph=cuda_graph,
+                 kv_cache_config=KvCacheConfig(
+                     free_gpu_memory_fraction=0.85)) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
             task = MMLU(self.MODEL_NAME)
