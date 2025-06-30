@@ -1491,6 +1491,7 @@ void WindowBlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<
         return;
     }
 
+    auto lastBlock = mAllBlocksById.at(cacheBlockIds[beamIdx][blockKeys.size() - 1]);
     auto prevBlock = mAllBlocksById.at(cacheBlockIds[beamIdx][blockKeys.size() - 2]);
 
     // If the previous block is not in the radix tree, we need to store all blocks
@@ -1501,14 +1502,21 @@ void WindowBlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<
         return;
     }
 
-    TLLM_LOG_DEBUG("%s::storeNewBlock - store the last block", mLogPrefix.c_str());
-    auto storedBlocks = storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
-    assert(storedBlocks.size() < 2);
-    if (storedBlocks.size() == 1)
+    if (lastBlock->getPrevBlock() != nullptr)
     {
-        assert(storedBlocks[0]->getBlockKey() == blockKeys.back());
-        TLLM_LOG_DEBUG("%s::storeNewBlock - stored block %d", mLogPrefix.c_str(), storedBlocks[0]->getBlockId());
+        // If the last block is not in the radix tree, we need to store all blocks
+        TLLM_LOG_DEBUG("%s::storeNewBlock - no need to store", mLogPrefix.c_str());
+        return;
     }
+    TLLM_LOG_DEBUG("%s::storeNewBlock - store the last block", mLogPrefix.c_str());
+    storeBlock(blockKeys.back(), lastBlock, prevBlock);
+    // auto storedBlocks = storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
+    // assert(storedBlocks.size() < 2);
+    // if (storedBlocks.size() == 1)
+    // {
+    //     assert(storedBlocks[0]->getBlockKey() == blockKeys.back());
+    //     TLLM_LOG_DEBUG("%s::storeNewBlock - stored block %d", mLogPrefix.c_str(), storedBlocks[0]->getBlockId());
+    // }
 }
 
 void WindowBlockManager::storeBlocksForReuse(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest)
