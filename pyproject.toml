@@ -30,6 +30,7 @@ extend_skip_glob = [
     "tensorrt_llm/python_plugin.py",
     "tensorrt_llm/sampling_params.py",
     "tensorrt_llm/top_model_mixin.py",
+    "tests/unittest/_torch/modeling/test_modeling_mistral.py",
 ]
 
 [tool.yapf]
@@ -57,6 +58,7 @@ ignore_patterns = [
     "tensorrt_llm/python_plugin.py",
     "tensorrt_llm/sampling_params.py",
     "tensorrt_llm/top_model_mixin.py",
+    "tests/unittest/_torch/modeling/test_modeling_mistral.py",
 ]
 
 [tool.codespell]
@@ -88,6 +90,7 @@ exclude = [
     "tensorrt_llm/python_plugin.py",
     "tensorrt_llm/sampling_params.py",
     "tensorrt_llm/top_model_mixin.py",
+    "tests/unittest/_torch/modeling/test_modeling_mistral.py",
 ]
 
 
@@ -128,6 +131,7 @@ include = [
     "tensorrt_llm/python_plugin.py",
     "tensorrt_llm/sampling_params.py",
     "tensorrt_llm/top_model_mixin.py",
+    "tests/unittest/_torch/modeling/test_modeling_mistral.py",
 ]
 exclude = [
     "**3rdparty/**",
