@@ -12,6 +12,8 @@ from transformers import (AutoConfig, AutoModel, AutoProcessor, AutoTokenizer,
 from transformers.modeling_utils import load_sharded_checkpoint
 from transformers.models.auto import CONFIG_MAPPING
 
+from tensorrt_llm.inputs.multimodal import MultimodalParams
+
 from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
                        register_input_processor)
 from ...logger import logger
@@ -690,8 +692,8 @@ class HCXVisionInputProcessor(InputProcessor):
         if not preprocessed_image:
             return fused_input_ids.to(torch.int32).tolist(), {}
 
-        mm_data = {}
-        mm_data["image"] = {
+        multimodal_data = {}
+        multimodal_data["image"] = {
             "pixel_values":
             torch.stack(preprocessed_image['pixel_values'][0], dim=0).to(
                 torch.bfloat16
@@ -707,7 +709,9 @@ class HCXVisionInputProcessor(InputProcessor):
             "first_last_frames_slows":
             preprocessed_image.get('first_last_frames_slows', None),
         }
-        return fused_input_ids.to(torch.int32).tolist(), {"mm_data": mm_data}
+        return fused_input_ids.to(torch.int32).tolist(), {
+            "multimodal_data": multimodal_data
+        }
 
 
 class HCXVisionModel:
@@ -765,7 +769,6 @@ class HCXVisionModel:
         self.vision_model = SiglipVisionModel(vision_model_config).to(
             self.device).to(self.dtype)
         self.vision_model.load_weights(hf_vision_model.state_dict())
-        print(model_config.mapping.rank, self.vision_model)
         self.mm_projector = hf_mm_projector.eval()
         self.image_newline = hf_image_newline
 
@@ -802,46 +805,30 @@ class HCXVisionModel:
         elif isinstance(input_tensor, torch.Tensor):
             return input_tensor.to(self.device)
 
-    # TODO: Remove this when we refactor LlmRequuest
-    def _preprocess(self, mm_data: List[Any]) -> Dict[str, List[Any]]:
-        preprocessed_image_list = []
-
-        for images in mm_data:
-            images = torch.unbind(images, dim=0)
-            preprocessed_image = self.processor(
-                images=images,
-                is_video_list=[False] * len(images),
-            )
-
-            # NOTE: The HCXVisionInputProcessor makes pixel_vlues to CPU values even though use_fast = True.
-            # So, we need to transfer them to GPU.
-            preprocessed_image["pixel_values"] = self._to_device(
-                preprocessed_image["pixel_values"])
-
-            preprocessed_image_list.append(preprocessed_image)
-
-        return {
-            key: [d[key][0] for d in preprocessed_image_list]
-            for key in preprocessed_image_list[0].keys()
-        }
-
-    def _parse_and_batch_mm_data(
-        self, mm_data: List[Dict[str, Any]]
+    def _parse_and_batch_multimodal_data(
+        self, multimodal_params: List[MultimodalParams]
     ) -> Tuple[List[torch.Tensor], Dict[str, List[Any]]]:
+        """Parse and batch multimodal data from MultimodalParams objects."""
         pixel_values = [
-            list(torch.unbind(data["image"]["pixel_values"], dim=0))
-            for data in mm_data
+            list(
+                torch.unbind(
+                    multimodal_param.multimodal_data["image"]["pixel_values"],
+                    dim=0)) for multimodal_param in multimodal_params
         ]
         mm_extra_data = {
-            key: [d["image"][key][0] for d in mm_data]
-            for key in mm_data[0]["image"].keys()
+            key: [
+                multimodal_param.multimodal_data["image"][key][0]
+                for multimodal_param in multimodal_params
+            ]
+            for key in multimodal_params[0].multimodal_data["image"].keys()
         }
         return pixel_values, mm_extra_data
 
     @torch.inference_mode()
-    def forward(self, mm_data: List[Dict[str, Any]]):
+    def forward(self, multimodal_params: List[MultimodalParams]):
 
-        pixel_values, mm_extra_data = self._parse_and_batch_mm_data(mm_data)
+        pixel_values, mm_extra_data = self._parse_and_batch_multimodal_data(
+            multimodal_params)
         pixel_values = self._to_device(
             pixel_values)  # TODO: remove this once we have the shared tensor
         image_sizes = mm_extra_data.get("image_sizes", None)
@@ -1033,13 +1020,13 @@ class HCXVisionForCausalLM(PreTrainedModel):
             f"num_context_requests: {num_context_requests}, num_generation_requests: {num_generation_requests}"
         )
 
-        mm_data = kwargs.get("mm_data", [])
+        multimodal_params = kwargs.get("multimodal_params", [])
         mm_embeds = []
-        if len(mm_data) > 0:
-            assert len(mm_data) == num_context_requests == len(
-                mm_data
-            ), f"Number of multimodal tensors ({len(mm_data)}) should be equal to number of context requests ({num_context_requests}) in the batch."
-            mm_embeds = self.mm_encoder.forward(mm_data)
+        if len(multimodal_params) > 0:
+            assert len(multimodal_params) == num_context_requests == len(
+                multimodal_params
+            ), f"Number of multimodal tensors ({len(multimodal_params)}) should be equal to number of context requests ({num_context_requests}) in the batch."
+            mm_embeds = self.mm_encoder.forward(multimodal_params)
 
         input_ids, input_embeds = fuse_input_embeds(self.llm.model.embed_tokens,
                                                     input_ids, mm_embeds)

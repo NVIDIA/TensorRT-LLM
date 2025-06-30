@@ -376,11 +376,6 @@ class GenerationExecutorWorker(GenerationExecutor):
 
         prompt_token_ids = copy.deepcopy(request.prompt_token_ids)
         prompt_tuning_config = None
-        multimodal_embedding = None
-        mrope_config = None
-        multimodal_input = None
-        if request.multimodal_embedding is not None:
-            multimodal_embedding = request.multimodal_embedding
         if request.prompt_adapter_request is not None:
             self._load_prompt_adapter(request.prompt_adapter_request)
             uid = str(request.prompt_adapter_request.adapter_id)
@@ -391,15 +386,35 @@ class GenerationExecutorWorker(GenerationExecutor):
             prompt_token_ids = list(range(
                 vocab_size, vocab_size + pa_length)) + prompt_token_ids
 
-        if request.mrope_config is not None:
-            mrope_config = tllm.MropeConfig(**request.mrope_config)
+        # Multimodal related fields - simplified handling
+        if request.multimodal_params is not None and request.multimodal_params.has_content(
+        ):
+            # Create mrope_config if needed
+            mrope_config = None
+            if request.multimodal_params.mrope_config:
+                mrope_config = tllm.MropeConfig(
+                    mrope_rotary_cos_sin=request.multimodal_params.mrope_config.
+                    get('mrope_rotary_cos_sin'),
+                    mrope_position_deltas=request.multimodal_params.
+                    mrope_config.get('mrope_position_deltas'))
 
-        if request.multimodal_input is not None:
-            multimodal_input = tllm.MultimodalInput(
-                multimodal_hashes=request.multimodal_input.multimodal_hashes,
-                multimodal_positions=request.multimodal_input.
-                multimodal_positions,
-                multimodal_lengths=request.multimodal_input.multimodal_lengths)
+            # Create multimodal_input for C++ if needed
+            multimodal_input = None
+            if request.multimodal_params.multimodal_input is not None:
+                multimodal_input = tllm.MultimodalInput(
+                    multimodal_hashes=request.multimodal_params.
+                    multimodal_input.multimodal_hashes,
+                    multimodal_positions=request.multimodal_params.
+                    multimodal_input.multimodal_positions,
+                    multimodal_lengths=request.multimodal_params.
+                    multimodal_input.multimodal_lengths)
+            multimodal_embedding = None
+            if request.multimodal_params.multimodal_embedding is not None:
+                multimodal_embedding = request.multimodal_params.multimodal_embedding
+        else:
+            multimodal_embedding = None
+            mrope_config = None
+            multimodal_input = None
 
         context_phase_params = None
         request_type = tllm.RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION
@@ -480,8 +495,9 @@ class GenerationExecutorWorker(GenerationExecutor):
                 type=request_type)
 
             if self._is_pytorch_backend:
-                if request.mm_data is not None:
-                    executor_request.py_mm_data = request.mm_data
+                # For PyTorch backend, attach the raw multimodal data
+                if request.multimodal_params is not None and request.multimodal_params.multimodal_data:
+                    executor_request.py_multimodal_data = request.multimodal_params.multimodal_data
 
             if self._is_pytorch_backend and request.sampling_params.logits_processor:
                 # For PyTorch backend, we attach logits processors as a dynamic Python attribute

@@ -5,7 +5,7 @@ from typing import List, Optional, Union
 import numpy as np
 import torch
 
-from tensorrt_llm.inputs.multimodal import MultimodalInput
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.llm_utils import KvCacheRetentionConfig
@@ -82,13 +82,10 @@ class GenerationRequest:
         lora_request: Optional[LoRARequest] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         streaming: bool = False,
-        multimodal_input: Optional[MultimodalInput] = None,
-        multimodal_embedding: Optional[list] = None,
-        mrope_config: Optional[dict] = None,
         kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
         postproc_params: Optional[PostprocParams] = None,
-        mm_data: Optional[dict] = None,
+        multimodal_params: Optional[MultimodalParams] = None,
     ):
         if isinstance(prompt_token_ids, list):
             self.prompt_token_ids = prompt_token_ids
@@ -107,13 +104,10 @@ class GenerationRequest:
         self.lora_request = lora_request
         self.prompt_adapter_request = prompt_adapter_request
         self.streaming = streaming
-        self.multimodal_input = multimodal_input
-        self.multimodal_embedding = multimodal_embedding
-        self.mrope_config = mrope_config
+        self.multimodal_params = multimodal_params
         self.kv_cache_retention_config = kv_cache_retention_config
         self.id: Optional[int] = None
         self.disaggregated_params = disaggregated_params
-        self.mm_data = mm_data
 
     def set_id(self, id):
         assert self.id is None, f"Request ID is already set: {self.id}"

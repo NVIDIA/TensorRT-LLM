@@ -1,7 +1,7 @@
 """Multimodal utilities for handling images and other media types in TensorRT-LLM."""
 
-from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple, Union
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import PIL
@@ -80,6 +80,45 @@ class MultimodalInput:
             torch.tensor(self.multimodal_hashes, dtype=torch.int32),
             torch.tensor(self.multimodal_positions, dtype=torch.int32),
             torch.tensor(self.multimodal_lengths, dtype=torch.int32))
+
+
+@dataclass
+class MultimodalParams:
+    """Unified container for multimodal parameters.
+
+    This class encapsulates all multimodal-related data that flows through the system,
+    providing a clean interface for handling multimodal inputs across different models.
+    """
+
+    # Core multimodal data
+    multimodal_input: Optional[MultimodalInput] = None
+    """Multimodal input data with hashing information for caching and deduplication."""
+
+    multimodal_embedding: Optional[torch.Tensor] = None
+    """Pre-computed multimodal embeddings from vision encoder."""
+
+    multimodal_data: Optional[Dict[str, Dict[str,
+                                             Union[torch.Tensor,
+                                                   List[Any]]]]] = field(
+                                                       default_factory=dict)
+    """Raw multimodal data by modality (e.g., image pixels, video frames)."""
+
+    # Model-specific configurations
+    mrope_config: Optional[Dict[str, Any]] = None
+    """Multimodal rotary position embedding config (used by Qwen2-VL)."""
+
+    def __post_init__(self):
+        """Ensure default values are properly set."""
+        if self.multimodal_data is None:
+            self.multimodal_data = {}
+        if self.mrope_config is None:
+            self.mrope_config = {}
+
+    def has_content(self) -> bool:
+        """Check if this object contains any multimodal data."""
+        return bool(self.multimodal_input
+                    or self.multimodal_embedding is not None
+                    or self.multimodal_data or self.mrope_config)
 
 
 # adopt from vllm : https://github.com/vllm-project/vllm/blob/main/vllm/vllm/multimodal/hash.py
