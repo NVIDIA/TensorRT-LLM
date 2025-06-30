@@ -1943,8 +1943,24 @@ def get_device_memory():
             "nvidia-smi" + suffix, "--query-gpu=memory.total",
             "--format=csv,noheader"
         ])
-        output = check_output(cmd, shell=True, cwd=temp_dirname)
-        memory = int(output.strip().split()[0])
+        try:
+            output = check_output(cmd, shell=True, cwd=temp_dirname)
+            memory_str = output.strip().split()[0]
+            # Check if nvidia-smi returned a valid numeric value
+            if "N/A" in memory_str:
+                raise ValueError("nvidia-smi returned invalid memory info")
+            memory = int(memory_str)
+        except (sp.CalledProcessError, ValueError, IndexError):
+            # Fallback to system memory from /proc/meminfo (in kB, convert to MiB)
+            try:
+                with open('/proc/meminfo', 'r') as f:
+                    for line in f:
+                        if line.startswith('MemTotal:'):
+                            memory = int(
+                                line.split()[1]) // 1024  # Convert kB to MiB
+                            break
+            except:
+                memory = 8192  # Default 8GB if all else fails
 
     return memory
 
