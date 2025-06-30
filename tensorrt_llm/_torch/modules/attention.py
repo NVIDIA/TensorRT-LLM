@@ -835,7 +835,7 @@ class MLA(nn.Module):
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
         self.rope_fusion = self.mha.support_fused_rope()
-        self.support_fused_qkv = self.mha.support_fused_qkv()
+        self.need_contiguous_qkv = self.mha.need_contiguous_qkv()
         self.rotary_emb = None
         self.apply_rotary_emb = not self.rope_fusion
         if self.apply_rotary_emb:
@@ -1054,10 +1054,11 @@ class MLA(nn.Module):
         attn_output_gen = None
         return output
 
-    def _maybe_concat_qkv(self, q, k, v):
-        if k is not None and v is not None and self.support_fused_qkv:
-            qkv = torch.concat([q, k, v], dim=-1)
-            q, k, v = qkv, None, None
+    def _maybe_contiguous(self, q, k, v):
+        if self.need_contiguous_qkv:
+            q, k, v = [
+                x.contiguous() if x is not None else None for x in (q, k, v)
+            ]
         return q, k, v
 
     def forward_context_default(
@@ -1068,6 +1069,7 @@ class MLA(nn.Module):
             attn_metadata: AttentionMetadata,
             latent_cache: Optional[torch.Tensor] = None,
             output: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # print(f"=========forward_context_default layer_idx: {self.layer_idx}, q: {q.shape}, compressed_kv: {compressed_kv.shape}, k_pe: {k_pe.shape}, latent_cache: {latent_cache.shape}")
         kv = self.kv_b_proj(compressed_kv)
         k_nope, v = kv.split(
             [
@@ -1085,8 +1087,8 @@ class MLA(nn.Module):
                                                        self.qk_rope_head_dim)
         k = k.view(-1, self.num_heads * self.qk_head_dim)
 
-        # May concat q(including q_pe), k + k_pe, v together
-        q, k, v = self._maybe_concat_qkv(q, k, v)
+        # q, k and v may should be contiguous
+        q, k, v = self._maybe_contiguous(q, k, v)
 
         # out_scale = getattr(self.o_proj, "inv_input_scale", None)
         out_scale = None  # Currently we use BF16 MHA for context phase
@@ -1101,6 +1103,11 @@ class MLA(nn.Module):
             out_scale=out_scale,
             output=output,
         )
+        # if self.layer_idx == 0:
+        #     print(f"======= q shape: {q.shape}, value:\n{q}")
+        #     print(f"======= k shape: {k.shape}, value:\n{k}")
+        #     print(f"======= v shape: {v.shape}, value:\n{v}")
+        #     print(f"======= attn_output shape: {attn_output.shape}, value:\n{attn_output}")
 
         return attn_output
 
@@ -1111,6 +1118,7 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # print(f"=========forward_context_with_cached_kv layer_idx: {self.layer_idx}, q: {q.shape}, latent_cache: {latent_cache.shape}")
         assert latent_cache is not None
         trtllm_attention = cast(TrtllmAttention, self.mha)
 
@@ -1139,50 +1147,39 @@ class MLA(nn.Module):
             ],
             -1,
         )
-        full_k_nope = full_k_nope.view(-1, self.num_heads,
-                                       self.qk_nope_head_dim)
-        full_v = full_v.view(-1, self.num_heads, self.v_head_dim)
 
-        # build paged_full_kv
-        tokens_per_block = attn_metadata.kv_cache_manager.tokens_per_block
-        # paged_full_kv will be initialized to 0 in the kernel to avoid NaN
-        paged_full_kv = torch.empty([
-            attn_metadata.num_contexts, 2,
-            (attn_metadata.max_ctx_kv_len + tokens_per_block - 1) //
-            tokens_per_block, self.num_heads, tokens_per_block,
-            max(self.qk_nope_head_dim + self.qk_rope_head_dim, self.v_head_dim)
-        ],
-                                    dtype=q.dtype,
-                                    device=q.device)
-        mla_context_kv_cache_block_offsets = trtllm_attention.set_paged_kv_cache_for_mla(
-            paged_full_kv,
-            full_k_nope,
-            full_v,
-            full_k_pe,
-            attn_metadata,
-        )
+        full_k = torch.empty(
+            (full_k_nope.shape[0], self.num_heads, self.qk_head_dim),
+            dtype=full_k_nope.dtype,
+            device=full_k_nope.device)
+        full_k[..., :self.qk_nope_head_dim] = full_k_nope.view(
+            -1, self.num_heads, self.qk_nope_head_dim)
+        full_k[...,
+               self.qk_nope_head_dim:] = full_k_pe.view(-1, 1,
+                                                        self.qk_rope_head_dim)
+        full_k = full_k.view(-1, self.num_heads * self.qk_head_dim)
+
+        # q, full_k and full_v may should be contiguous
+        q, full_k, full_v = self._maybe_contiguous(q, full_k, full_v)
 
         # release pytorch activation memory
         full_compressed_kv = None
         full_k_pe = None
         full_kv = None
         full_k_nope = None
-        full_v = None
 
         # out_scale = getattr(self.o_proj, "inv_input_scale", None)
         out_scale = None  # Currently we use BF16 MHA for context phase
 
         attn_output = self.mha.forward(
             q,
-            None,
-            None,
+            full_k,
+            full_v,
             attn_metadata,
             attention_input_type=AttentionInputType.context_only,
-            latent_cache=None,
+            latent_cache=
+            None,  # need to be None to differentiate from normal context phase
             out_scale=out_scale,
-            mla_context_paged_kv=paged_full_kv,
-            mla_context_kv_cache_block_offsets=
-            mla_context_kv_cache_block_offsets,
             output=output,
         )
 
@@ -1204,7 +1201,7 @@ class MLA(nn.Module):
 
         # determine the number of loop
         # currently we assume that the chunk size is the same as the max_num_tokens
-        chunk_size = attn_metadata.runtime_features.chunk_size
+        attn_metadata.runtime_features.chunk_size
         chunked_loop_num = attn_metadata.chunked_loop_num
 
         # [toal_token_q, num_heads, 2] -> [toal_token_q, num_heads] float2
@@ -1229,6 +1226,7 @@ class MLA(nn.Module):
         # use fake cached_cu_seq_len for chunked loop
         origin_kv_lens_cuda_runtime = attn_metadata.kv_lens_cuda_runtime
         origin_kv_lens_runtime = attn_metadata.kv_lens_runtime
+        origin_ctx_total_kv_lens = attn_metadata.total_kv_lens[0]
 
         for loop_idx in range(chunked_loop_num):
             # {b, chunked_unit_size, h, kv_lora_rank + qk_rope_head_dim} zero padded
@@ -1246,45 +1244,50 @@ class MLA(nn.Module):
             # up proj to uncompressed kv
             # [tokens, 2, h, kv_dim], without rope_dim
             chunked_kv = self.kv_b_proj(chunked_compressed_kv)
+            chunked_k_nope, chunked_v = chunked_kv.split(
+                [
+                    self.num_heads * self.qk_nope_head_dim,
+                    self.num_heads * self.v_head_dim
+                ],
+                -1,
+            )
+            chunked_k = torch.empty(
+                (chunked_k_nope.shape[0], self.num_heads, self.qk_head_dim),
+                dtype=chunked_k_nope.dtype,
+                device=chunked_k_nope.device)
+            chunked_k[..., :self.qk_nope_head_dim] = chunked_k_nope.view(
+                -1, self.num_heads, self.qk_nope_head_dim)
+            chunked_k[..., self.qk_nope_head_dim:] = chunked_k_pe.view(
+                -1, 1, self.qk_rope_head_dim)
+            chunked_k = chunked_k.view(-1, self.num_heads * self.qk_head_dim)
 
-            # build full_kv
-            # full_kv {B, 2, chunk_size / tokens_per_block, h, tokens_per_block, kv_dim + rope_dim}
-            tokens_per_block = attn_metadata.kv_cache_manager.tokens_per_block
-            full_kv = torch.zeros([
-                attn_metadata.num_contexts, 2,
-                (chunk_size + tokens_per_block - 1) // tokens_per_block,
-                self.num_heads, tokens_per_block,
-                max(self.qk_nope_head_dim + self.qk_rope_head_dim,
-                    self.v_head_dim)
-            ],
-                                  dtype=q.dtype,
-                                  device=q.device)
-            mla_kv_cache_block_offsets = trtllm_attention.set_chunked_kv_cache_for_mla(
-                full_kv,
-                chunked_kv,
-                chunked_k_pe,
-                cu_chunked_seq_len=temp_cu_chunked_seq_len,
-                cached=True,
-                metadata=attn_metadata)
+            q, chunked_k, chunked_v = self._maybe_contiguous(
+                q, chunked_k, chunked_v)
+
+            # release pytorch activation memory
+            chunked_compressed_kv = None
+            chunked_k_pe = None
+            chunked_kv = None
+            chunked_k_nope = None
 
             # copy chunked_seq_len to replace kv_lens_runtime
             attn_metadata.kv_lens_runtime = attn_metadata.host_chunked_seq_len[
                 loop_idx]
             attn_metadata.kv_lens_cuda_runtime = attn_metadata.chunked_seq_len[
                 loop_idx]
+            attn_metadata.total_kv_lens[0] = total_ctx_chunked_tokens
+
             out_scale = None
             # do not apply mask for attention within loop
             temp_attn_output = self.mha.forward(
                 q,
-                None,
-                None,
+                chunked_k,
+                chunked_v,
                 attn_metadata,
                 attention_input_type=AttentionInputType.context_only,
                 latent_cache=None,
                 out_scale=out_scale,
                 attention_mask=PredefinedAttentionMask.FULL,
-                mla_context_paged_kv=full_kv,
-                mla_context_kv_cache_block_offsets=mla_kv_cache_block_offsets,
                 softmax_stats_tensor=self.temp_softmax_stats_tensor,
                 output=temp_attn_output,
             )
@@ -1299,41 +1302,41 @@ class MLA(nn.Module):
         _, k_pe = latent_cache.view([
             -1, self.kv_lora_rank + self.qk_rope_head_dim
         ]).split([self.kv_lora_rank, self.qk_rope_head_dim], -1)
-        k_pe = k_pe.contiguous()
         # final round of attention
 
-        # out_scale = getattr(self.o_proj, "inv_input_scale", None)
-        out_scale = None  # Currently we use BF16 MHA for context phase
+        k_nope, v = kv.split(
+            [
+                self.num_heads * self.qk_nope_head_dim,
+                self.num_heads * self.v_head_dim
+            ],
+            -1,
+        )
+        k = torch.empty_like(q).view(-1, self.num_heads, self.qk_head_dim)
+        k[..., :self.qk_nope_head_dim] = k_nope.view(-1, self.num_heads,
+                                                     self.qk_nope_head_dim)
+        k[..., self.qk_nope_head_dim:] = k_pe.view(-1, 1, self.qk_rope_head_dim)
+        k = k.view(-1, self.num_heads * self.qk_head_dim)
 
-        tokens_per_block = attn_metadata.kv_cache_manager.tokens_per_block
-        full_kv = torch.zeros([
-            attn_metadata.num_contexts, 2,
-            (attn_metadata.max_ctx_seq_len + tokens_per_block - 1) //
-            tokens_per_block, self.num_heads, tokens_per_block,
-            max(self.qk_nope_head_dim + self.qk_rope_head_dim, self.v_head_dim)
-        ],
-                              dtype=q.dtype,
-                              device=q.device)
-        mla_kv_cache_block_offsets = trtllm_attention.set_chunked_kv_cache_for_mla(
-            full_kv,
-            kv,
-            k_pe,
-            cu_chunked_seq_len=None,
-            cached=False,
-            metadata=attn_metadata)
+        q, k, v = self._maybe_contiguous(q, k, v)
+
         # copy q_lens to replace kv_lens_runtime
         attn_metadata.kv_lens_runtime = attn_metadata.prompt_lens_cpu_runtime
         attn_metadata.kv_lens_cuda_runtime = attn_metadata.prompt_lens_cuda_runtime
+        attn_metadata.total_kv_lens[
+            0] = attn_metadata.prompt_lens_cpu_runtime[:attn_metadata.
+                                                       num_contexts].sum().item(
+                                                       )
+
+        # out_scale = getattr(self.o_proj, "inv_input_scale", None)
+        out_scale = None  # Currently we use BF16 MHA for context phase
         temp_attn_output = self.mha.forward(
             q,
-            None,
-            None,
+            k,
+            v,
             attn_metadata,
             attention_input_type=AttentionInputType.context_only,
             latent_cache=None,
             out_scale=out_scale,
-            mla_context_paged_kv=full_kv,
-            mla_context_kv_cache_block_offsets=mla_kv_cache_block_offsets,
             softmax_stats_tensor=self.temp_softmax_stats_tensor,
             output=temp_attn_output,
         )
@@ -1345,6 +1348,7 @@ class MLA(nn.Module):
         # copy back kv_lens_runtime and kv_lens_cuda_runtime
         attn_metadata.kv_lens_runtime = origin_kv_lens_runtime
         attn_metadata.kv_lens_cuda_runtime = origin_kv_lens_cuda_runtime
+        attn_metadata.total_kv_lens[0] = origin_ctx_total_kv_lens
 
         return attn_output
 
@@ -1484,7 +1488,7 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
     ) -> torch.Tensor:
-
+        # print(f"=========forward layer_idx: {self.layer_idx}, position_ids: {position_ids.shape}, hidden_states: {hidden_states.shape}")
         attn_output = self.create_output(hidden_states)
         if self.register_to_config:
             torch.ops.trtllm.mla_custom_op_inplace(hidden_states, position_ids,

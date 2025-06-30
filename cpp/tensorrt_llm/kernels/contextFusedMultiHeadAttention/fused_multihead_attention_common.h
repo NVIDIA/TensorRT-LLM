@@ -81,7 +81,10 @@ enum class AttentionInputLayout
     // Q has contiguous [B, S, H, D] layout, while paged KV has [B, 2, Max_blocks_per_seq] layout
     // that contains paged block indices. The indices indicate the block offset to the pool ptr in
     // global memory
-    Q_PAGED_KV
+    Q_PAGED_KV,
+    // Q has contiguous [B, S, H, D] layout, while K has contiguous [B, S, H_kv, D] layout, and V has
+    // contiguous [B, S, H_kv, D_v] layout. Only used for context MLA now.
+    SEPARATE_QKV,
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -166,6 +169,7 @@ struct MHARunnerFixedParams
         case AttentionInputLayout::PACKED_QKV: output += "packed_qkv"; break;
         case AttentionInputLayout::Q_CONTIGUOUS_KV: output += "q_contiguous_kv"; break;
         case AttentionInputLayout::Q_PAGED_KV: output += "q_paged_kv"; break;
+        case AttentionInputLayout::SEPARATE_QKV: output += "separate_qkv"; break;
         default: output += std::to_string(static_cast<int>(attentionInputLayout)) + " (unknown)"; break;
         }
 
@@ -255,6 +259,10 @@ struct MHARunnerParams
     void const* qPtr;
     // The contiguous Kv buffer ptr;
     void const* kvPtr;
+    // The K buffer ptr (for separate K input).
+    void const* kPtr;
+    // The V buffer ptr (for separate V input).
+    void const* vPtr;
     // The paged kv cache array.
     KVBlockArray pagedKvCache;
     // The output buffer ptr.

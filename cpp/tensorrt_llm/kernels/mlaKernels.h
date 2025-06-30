@@ -52,8 +52,12 @@ template <typename T>
 struct MlaParams
 {
     T const* latent_cache;  // cKV + k_pe
-    T* attention_input_buf; // [b, s, 3, h, d_h + r]
-    void* quant_attention_input_buf;
+    T* q_buf;
+    T* k_buf = nullptr;          // [total_kv_lens, h, d_nope + d_rope], for context MLA, contiguous
+    T* v_buf = nullptr;          // [total_kv_lens, h, d_v], for context MLA, not contiguous
+    void* quant_q_buf = nullptr;
+    void* quant_k_buf = nullptr; // [total_kv_lens, h, d_nope + d_rope], for fp8 context MLA, contiguous
+    void* quant_v_buf = nullptr; // [total_kv_lens, h, d_v], for fp8 context MLA, contiguous
     T* context_buf;
     T* q_pe;                     // [b, h, d_r], strided
 
@@ -83,16 +87,15 @@ struct MlaParams
     float const* dequant_scale_kv;
     float host_bmm1_scale;
 
-    // for kv cache reuse/chunked context
-    void* context_paged_kv_ptr = nullptr;
-    void* context_kv_cache_block_offsets_ptr = nullptr;
-    int32_t context_paged_kv_max_blocks_per_seq = 0;
     // for FP8 context qkv quantization
     float const* quant_scale_qkv = nullptr;
 };
 
 template <typename T, typename KVCacheBuffer>
 void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream);
+
+template <typename T>
+void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStream_t stream);
 
 template <typename T, typename KVCacheBuffer>
 void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream);
@@ -112,10 +115,5 @@ void invokeMLARopeAppendPagedKVAssignQ(KVBlockArray& kv_cache, T* q_ptr, T* late
     int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens, int const max_input_uncached_seq_len,
     float2 const* cos_sin_cache, size_t head_num, int nope_size, int rope_size, int lora_size,
     float const* kv_scale_orig_quant_ptr, cudaStream_t stream);
-
-template <typename T_IN>
-__global__ void QuantizeCopyInputToFp8Kernel(
-    T_IN const* input_buffer, __nv_fp8_e4m3* output_fp8_buffer, int num_total_elements, float const* device_scale_ptr);
-
 } // namespace kernels
 } // namespace tensorrt_llm
