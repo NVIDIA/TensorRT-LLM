@@ -158,16 +158,17 @@ def greedy_search_sampling_batch(logits):
 TopK = tuple[Literal["top_k"], int]
 TopP = tuple[Literal["top_p"], float]
 Greedy = tuple[Literal["greedy"], None]
+GREEDY: Greedy = ("greedy", None)
 Strategy = TopK | TopP | Greedy
 
 
 def request_strategy(request: LlmRequest) -> Strategy:
-    if request.sampling_config.top_k is not None and len(
-            request.sampling_config.top_k) > 0:
-        return ("top_k", request.sampling_config.top_k[0])
-    elif request.sampling_config.top_p is not None and len(
+    if request.sampling_config.top_p is not None and len(
             request.sampling_config.top_p) > 0:
         return ("top_p", request.sampling_config.top_p[0])
+    elif request.sampling_config.top_k is not None and len(
+            request.sampling_config.top_k) > 0:
+        return ("top_k", request.sampling_config.top_k[0])
     else:
         return ("greedy", None)
 
@@ -412,14 +413,20 @@ class TorchSampler(Sampler):
             return
 
         batched_next_tokens, batched_softmax = None, None
-        strategies = sampling_strategies(requests)
-        if len(set(strategies)) == 1:
+        batched_strategy: Strategy | None = GREEDY
+        if self.mixed_sampler:
+            strategies = sampling_strategies(requests)
+            assert "d2t" not in model_outputs, "eagle3 does not yet support non-greedy sampling"
+            if len(set(strategies)) == 1:
+                batched_strategy = strategies[0]
+            else:
+                batched_strategy = None
+
+        if batched_strategy is not None:
             logits = raw_logits[:sum_steps]
-            strategy = strategies[0]
-            batched_next_tokens, batched_softmax = sample(strategy, logits)
+            batched_next_tokens, batched_softmax = sample(
+                batched_strategy, logits)
             self.append_eagle3(batched_next_tokens, model_outputs)
-        else:
-            assert "d2t" not in model_outputs, "eagle3 does not yet support non-uniform sampling"
 
         offset = 0
         for strategy, slot, steps in zip(strategies, seq_slots, num_steps):
