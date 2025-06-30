@@ -1644,7 +1644,7 @@ def checkStageNameSet(stageNames, jobKeys, paramName) {
 }
 
 def checkStageName(stageNames) {
-    invalidStageName = stageNames.findAll { !(it ==~ /[-\+\w\[\]]+/) }
+    invalidStageName = stageNames.findAll { !(it ==~ /[-\+\w\[\]\(\)]+/) }
     if (invalidStageName) {
         throw new Exception("Invalid stage name: [${invalidStageName}], we only support chars '-+_[]0-9a-zA-Z' .")
     }
