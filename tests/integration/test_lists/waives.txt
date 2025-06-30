@@ -438,3 +438,5 @@ examples/test_phi.py::test_llm_phi_quantization_1gpu[Phi-3.5-mini-instruct-fp8-f
 accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_fp8 SKIP (https://nvbugs/5355054)
 accuracy/test_cli_flow.py::TestLlama3_1_8BInstruct::test_fp8_prequantized SKIP (https://nvbugs/5355054)
 accuracy/test_cli_flow.py::TestLlama3_1_8BInstruct::test_medusa_fp8_prequantized SKIP (https://nvbugs/5355054)
+examples/test_gpt.py::test_starcoder_fp8_quantization_2gpu[starcoder] SKIP (https://nvbugs/5355128)
+examples/test_gpt.py::test_starcoder_fp8_quantization_2gpu[starcoderplus] SKIP (https://nvbugs/5355128)
