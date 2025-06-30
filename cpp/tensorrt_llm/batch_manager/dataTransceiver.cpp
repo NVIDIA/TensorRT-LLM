@@ -16,6 +16,7 @@
  */
 
 #include "dataTransceiver.h"
+
 #include "cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
@@ -24,6 +25,7 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/utils.h"
 #include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
+#include "tensorrt_llm/executor/serializeUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <future>
 #include <map>
@@ -89,6 +91,12 @@ std::size_t RequestInfo::serializedSize(RequestInfo const& requestInfo)
     totalSize += su::serializedSize(requestInfo.mBlockHashes);
     totalSize += su::serializedSize(requestInfo.mTransState);
     return totalSize;
+}
+
+static int32_t tagFromRequestId(LlmRequest::RequestIdType requestId)
+{
+    constexpr int32_t kDATA_TAG{43};
+    return ((requestId & 0xFFF) << 8) | (kDATA_TAG & 0xFF);
 }
 
 using BaseCacheFormatter = kv_cache_manager::BaseCacheFormatter;
@@ -169,18 +177,14 @@ void DataSender::sendSync(LlmRequest const& llmRequest)
         connections.emplace_back(connection);
     }
     auto&& dataTransceiverState = reqToComm.at(0).second;
-    mFormatter->formatOutput(llmRequest, std::move(connections), mSelfState.getCacheState().value(),
-        mSelfState.getCommState().value().getSelfIdx(), dataTransceiverState.getCacheState().value(), mBufferManager);
+    TransferSession session(connections, DataContext{tagFromRequestId(llmRequest.mRequestId)}, mSelfState,
+        dataTransceiverState, mBufferManager);
+    mFormatter->format(session, llmRequest);
 }
 
 [[nodiscard]] executor::kv_cache::CommState const& DataSender::getCommState() const
 {
     return mSelfState.getCommState().value();
-}
-
-void DataSender::setCommState(executor::kv_cache::CommState commState)
-{
-    mSelfState.setCommState(std::move(commState));
 }
 
 [[nodiscard]] size_t DataSender::getCounterpartsCount(LlmRequest::RequestIdType requestId) const
@@ -285,8 +289,9 @@ void DataReceiver::receiveSync(LlmRequest const& llmRequest)
         connections.emplace_back(connection);
     }
     auto const& resource = getReceiveCacheResource(llmRequest);
-    mFormatter->formatInput(llmRequest, std::move(connections), mSelfState.getCacheState().value(),
-        mSelfState.getCommState().value().getSelfIdx(), destCacheState, resource->mBufferManager);
+    TransferSession session(connections, DataContext{tagFromRequestId(llmRequest.mRequestId)}, mSelfState, contextState,
+        resource->mBufferManager);
+    mFormatter->unformat(session, llmRequest);
 }
 
 void DataReceiver::sendRequestInfo(executor::kv_cache::Connection const* connection, RequestInfo const& info)
@@ -355,11 +360,6 @@ public:
     [[nodiscard]] executor::kv_cache::CommState const& getCommState() const
     {
         return mSender->getCommState();
-    }
-
-    void setCommState(executor::kv_cache::CommState commState)
-    {
-        mSender->setCommState(std::move(commState));
     }
 
     ~Impl()
@@ -720,11 +720,6 @@ std::future<void> DataResponder::respondAndSendAsync(LlmRequest& llmRequest) con
 executor::kv_cache::CommState const& DataResponder::getCommState() const
 {
     return mImpl->getCommState();
-}
-
-void DataResponder::setCommState(executor::kv_cache::CommState commState)
-{
-    mImpl->setCommState(std::move(commState));
 }
 
 DataResponder::~DataResponder() = default;

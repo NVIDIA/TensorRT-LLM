@@ -16,20 +16,16 @@
  */
 
 #pragma once
-#include <fstream>
-#include <future>
-#include <map>
-#include <string>
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
-#include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/envUtils.h"
-#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/cacheCommunicator.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/serializeUtils.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include <future>
+#include <map>
+#include <string>
 
 namespace tensorrt_llm::batch_manager
 {
@@ -39,7 +35,6 @@ namespace kv_cache_manager
 class BaseCacheFormatter;
 } // namespace kv_cache_manager
 
-// TransceiverTag definition
 struct TransceiverTag
 {
     enum class Id : uint64_t
@@ -52,6 +47,11 @@ struct TransceiverTag
     static constexpr int32_t kINFO_SIZE_TAG{22};
     static constexpr int32_t kINFO_TAG{32};
 };
+
+// TODO: unify the following class into namespace tensorrt_llm::transmission
+using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
+using Connection = tensorrt_llm::executor::kv_cache::Connection;
+using ConnectionManager = tensorrt_llm::executor::kv_cache::ConnectionManager;
 
 // Used to store the information that needs to be sent to the context executor to ensure the generation
 // executor smoothly receives the data.
@@ -108,6 +108,69 @@ private:
     executor::DataTransceiverState mTransState;
 };
 
+class TransferSession
+{
+public:
+    TransferSession(std::vector<executor::kv_cache::Connection const*> connections,
+        executor::kv_cache::DataContext dataContext, executor::DataTransceiverState const& selfState,
+        executor::DataTransceiverState const& otherState, runtime::BufferManager& bufferManager)
+        : mConnections(std::move(connections))
+        , mDataContext(dataContext)
+        , mSelfState(&selfState)
+        , mOtherState(&otherState)
+        , mBufferManager(&bufferManager)
+    {
+        TLLM_CHECK(!mConnections.empty());
+    }
+
+    [[nodiscard]] size_t getNumConnections() const
+    {
+        return mConnections.size();
+    }
+
+    [[nodiscard]] std::vector<executor::kv_cache::Connection const*> const& getConnections() const
+    {
+        return mConnections;
+    }
+
+    [[nodiscard]] executor::kv_cache::DataContext const& getDataContext() const
+    {
+        return mDataContext;
+    }
+
+    [[nodiscard]] executor::DataTransceiverState const& getSelfState() const
+    {
+        return *mSelfState;
+    }
+
+    [[nodiscard]] executor::DataTransceiverState const& getOtherState() const
+    {
+        return *mOtherState;
+    }
+
+    [[nodiscard]] runtime::BufferManager& getBufferManager()
+    {
+        return *mBufferManager;
+    }
+
+    void send(size_t connIdx, void const* data, size_t size)
+    {
+        mConnections[connIdx]->send(mDataContext, data, size);
+    }
+
+    void recv(size_t connIdx, void* data, size_t size)
+    {
+        mConnections[connIdx]->recv(mDataContext, data, size);
+    }
+
+private:
+    std::vector<executor::kv_cache::Connection const*> mConnections;
+    executor::kv_cache::DataContext mDataContext;
+    executor::DataTransceiverState const* mSelfState;
+    executor::DataTransceiverState const* mOtherState;
+    runtime::BufferManager* mBufferManager;
+};
+
 // Operators required for data transmission in specific communication protocols.
 class DataSender : public TransceiverTag
 {
@@ -130,10 +193,6 @@ public:
     /// @brief Return the internal communicator status.
     /// @return The communicator status.
     [[nodiscard]] executor::kv_cache::CommState const& getCommState() const;
-
-    /// @brief Reset the internal communicator status.
-    /// @param commState The communicator status.
-    void setCommState(executor::kv_cache::CommState commState);
 
     [[nodiscard]] size_t getCounterpartsCount(LlmRequest::RequestIdType requestId) const;
 
@@ -207,10 +266,6 @@ public:
     /// @brief Return the internal communicator status.
     /// @return The communicator status.
     [[nodiscard]] executor::kv_cache::CommState const& getCommState() const;
-
-    /// @brief Reset the internal communicator status.
-    /// @param commState The communicator status.
-    void setCommState(executor::kv_cache::CommState commState);
 
     /// @brief Destructor.
     ~DataResponder();
