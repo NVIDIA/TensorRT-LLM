@@ -21,7 +21,7 @@ import torch
 from tqdm import tqdm
 
 from ..._utils import pad_vocab_size
-from ...functional import Tensor, recv, send
+from ...functional import Tensor, recv, send,LayerNormType
 from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, GatedMLP, RmsNorm, SharedMoE)
 from ...layers.moe import MOEWeightWrapper
@@ -53,6 +53,9 @@ class QWenDecoderLayer(Module):
         self.input_layernorm = RmsNorm(normalized_shape=config.hidden_size,
                                        eps=config.norm_epsilon,
                                        dtype=dtype)
+	
+        layernorm_type = LayerNormType.RmsNorm
+        qk_layernorm = True if config.qwen_type == "qwen3" else False
 
         layers_range = config.mapping.pp_layers(config.num_hidden_layers)
         local_layer_idx = layer_idx - layers_range[0]
@@ -78,7 +81,10 @@ class QWenDecoderLayer(Module):
             cp_group=config.mapping.cp_group,
             quant_mode=config.quant_mode,
             use_logn_scaling=config.use_logn_attn,
-            dense_bias=False)
+            dense_bias=False,
+            qk_layernorm=qk_layernorm,
+            layernorm_type=layernorm_type,
+            eps = config.norm_epsilon)
 
         if config.moe.has_moe():
             mlp_kwargs = {'moe_config': config.moe, 'mapping': config.mapping}
@@ -336,7 +342,7 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                     "mlp.shared_expert_gate": "mlp.shared_expert_gate",
                     "fc": ["up_proj", "gate_proj"],
                 }
-            elif config.qwen_type in {"qwen2", "qwen2_vl"
+            elif config.qwen_type in {"qwen2", "qwen2_vl","qwen3"
                                       } and config.tie_word_embeddings:
                 custom_dict = {"lm_head": "model.embed_tokens"}
             elif config.architecture == "Qwen2ForSequenceClassification":
@@ -353,6 +359,17 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                     "transformer": "language_model.model",
                     "lm_head": "language_model.lm_head",
                 }
+                
+            if config.tie_word_embeddings:
+                config.share_embedding_table = True
+                config.use_parallel_embedding = True
+            # q k layernorm is required in qwen3 dense model
+            if config.qwen_type == "qwen3":
+                custom_dict.update({
+                    "q_layernorm":"q_norm",
+                    "k_layernorm":"k_norm"
+                })
+
             loader = ModelWeightsLoader(hf_model_dir, custom_dict)
             model = cls(config)
             if config.qwen_type == "qwen" and model.config.mapping.has_tp():
