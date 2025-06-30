@@ -239,7 +239,7 @@ class OPTForCausalLM(DecoderModelForCausalLM[OPTModel, OPTConfig]):
 
     def load_weights(self, weights: dict):
         tp_size = self.model_config.mapping.tp_size
-        num_kv_heads = self.config.num_key_value_heads
+        num_kv_heads = self.model_config.pretrained_config.num_attention_heads
 
         def filter_weights(prefix: str, weights: dict):
             result = {}

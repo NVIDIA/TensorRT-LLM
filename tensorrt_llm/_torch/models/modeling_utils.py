@@ -650,7 +650,9 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
         logger.info(f"Renamed weights with params_map: {params_map}")
 
     tp_size = 1 if model.model_config.mapping.enable_attention_dp else model.model_config.mapping.tp_size
-    num_kv_heads = model.config.num_key_value_heads
+    num_kv_heads = model.config.num_key_value_heads if hasattr(
+        model.config, 'num_key_value_heads'
+    ) and model.config.num_key_value_heads is not None else model.config.num_attention_heads
 
     params_map = {
         'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
