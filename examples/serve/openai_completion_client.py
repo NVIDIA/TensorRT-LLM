@@ -1,4 +1,4 @@
-### OpenAI Completion Client
+### :title OpenAI Completion Client
 
 from openai import OpenAI
 

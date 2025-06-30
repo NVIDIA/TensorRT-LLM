@@ -1,14 +1,18 @@
-### Generate text with guided decoding
-from tensorrt_llm import SamplingParams
-from tensorrt_llm._tensorrt_engine import LLM
+### :section Customization
+### :title Generate text with guided decoding
+### :order 0
+from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import GuidedDecodingParams
 
 
 def main():
 
     # Specify the guided decoding backend; xgrammar is supported currently.
-    llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-              guided_decoding_backend='xgrammar')
+    llm = LLM(
+        model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        guided_decoding_backend='xgrammar',
+        disable_overlap_scheduler=True  # Not supported by xgrammar mode
+    )
 
     # An example from json-mode-eval
     schema = '{"title": "WirelessAccessPoint", "type": "object", "properties": {"ssid": {"title": "SSID", "type": "string"}, "securityProtocol": {"title": "SecurityProtocol", "type": "string"}, "bandwidth": {"title": "Bandwidth", "type": "string"}}, "required": ["ssid", "securityProtocol", "bandwidth"]}'
