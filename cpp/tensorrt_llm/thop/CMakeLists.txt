@@ -82,6 +82,7 @@ add_library(
   selectiveScanOp.cpp
   userbuffersFinalizeOp.cpp
   userbuffersTensor.cpp
+  virtualMemoryAllocator.cpp
   weightOnlyQuantOp.cpp
   mtpOp.cpp
   loraOp.cpp)
