@@ -394,9 +394,7 @@ class Qwen3MoeForCausalLM(SpecDecOneEngineForCausalLM[Qwen3MoEModel,
         tp_size = self.model_config.mapping.tp_size
         enable_attention_dp = self.model_config.mapping.enable_attention_dp
 
-        head_dim = getattr(
-            self.config, "head_dim",
-            self.config.hidden_size // self.config.num_attention_heads)
+        num_kv_heads = self.config.num_key_value_heads
 
         params_map = {
             "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -419,11 +417,14 @@ class Qwen3MoeForCausalLM(SpecDecOneEngineForCausalLM[Qwen3MoEModel,
                         tensors_need_duplication = ["weight", "bias"]
                         if module.quant_config.quant_mode.has_nvfp4():
                             tensors_need_duplication.append("weight_scale")
+                        if module.quant_config.quant_mode.has_fp8_block_scales(
+                        ):
+                            tensors_need_duplication.append("weight_scale_inv")
                         if new_name in ["k_proj", "v_proj"]:
                             fw = {
                                 k: (duplicate_kv_weight(
                                     weight=v[:],
-                                    head_dim=head_dim,
+                                    num_kv_heads=num_kv_heads,
                                     tensor_parallel_size=tp_size
                                     if not enable_attention_dp else 1)
                                     if k in tensors_need_duplication else v)

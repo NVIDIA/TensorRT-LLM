@@ -328,9 +328,7 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
     # minor change for Gemma3 RMSNorm.
     def load_weights(self, weights: Dict):
         tp_size = self.model_config.mapping.tp_size
-        head_dim = getattr(
-            self.config, "head_dim",
-            self.config.hidden_size // self.config.num_attention_heads)
+        num_kv_heads = self.config.num_key_value_heads
 
         params_map = {
             'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
@@ -364,7 +362,7 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
                                 k:
                                 duplicate_kv_weight(
                                     weight=v[:],
-                                    head_dim=head_dim,
+                                    num_kv_heads=num_kv_heads,
                                     tensor_parallel_size=tp_size)
                                 if k in ["weight", "bias"] else v
                                 for k, v in fw.items()
