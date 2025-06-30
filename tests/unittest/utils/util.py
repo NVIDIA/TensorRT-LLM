@@ -1,5 +1,6 @@
 import os
 import unittest
+from contextlib import contextmanager
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -368,3 +369,11 @@ def similar(a, b, threshold=0.8):
 def get_project_root(test_file: str) -> Path:
     return next(p for p in Path(test_file).resolve().parents
                 if (p / 'tests').is_dir() and (p / "tensorrt_llm").is_dir())
+
+
+@contextmanager
+def default_dtype(dtype: torch.dtype):
+    cur_default = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    yield
+    torch.set_default_dtype(cur_default)
