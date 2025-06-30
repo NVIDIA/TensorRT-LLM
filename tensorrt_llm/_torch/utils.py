@@ -93,6 +93,7 @@ def make_weak_ref(x):
 class Fp4QuantizedTensor:
     fp4_tensor: torch.Tensor
     scaling_factor: torch.Tensor
+    is_sf_swizzled: bool = True
 
     @property
     def shape(self):

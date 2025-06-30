@@ -24,8 +24,7 @@ class AttentionRuntimeFeatures:
     chunked_prefill: bool = False
     cache_reuse: bool = False
     has_speculative_draft_tokens: bool = False
-    chunk_unit_size: int = 0
-    normal_chunk_size: int = 0
+    chunk_size: int = 0  # this is the chunk size for MLA chunked prefill, it will split kv cache into chunks to save global memory.
 
 
 # The type of requests in qkv passed to attention
@@ -392,8 +391,7 @@ class RopeParams:
                 )
 
         if self.scale_type == RotaryScalingType.yarn:
-            rope_inv_freq = None
-            _, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
+            rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
                 self.max_positions,
                 self.dim,
                 self.theta,

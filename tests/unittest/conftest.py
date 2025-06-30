@@ -13,9 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # # Force resource release after test
+
 import pytest
 import torch
 import tqdm
+from mpi4py.futures import MPIPoolExecutor
 
 
 def pytest_configure(config):
@@ -89,3 +91,15 @@ def torch_empty_cache() -> None:
     """
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+@pytest.fixture(scope="module", params=[2, 4, 8])
+def mpi_pool_executor(request):
+    """
+    Start an MPIPoolExecutor with `request.param` workers.
+    """
+    num_workers = request.param
+    with MPIPoolExecutor(num_workers) as executor:
+        # make the number of workers visible to tests
+        setattr(executor, "num_workers", num_workers)
+        yield executor

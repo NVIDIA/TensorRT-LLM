@@ -125,7 +125,8 @@ def prepare_inputs(input_ids_data, input_lengths_data, request_output_len_data,
                    return_generation_logits_data, decoder_input_ids_data,
                    prompt_table_extra_id_data, exclude_input_in_output,
                    num_return_sequences_data, return_perf_metrics_data,
-                   lookahead_config_data):
+                   lookahead_config_data, return_num_input_tokens_data,
+                   return_num_output_tokens_data):
     inputs = [
         prepare_tensor("input_ids", input_ids_data),
         prepare_tensor("input_lengths", input_lengths_data),
@@ -138,6 +139,16 @@ def prepare_inputs(input_ids_data, input_lengths_data, request_output_len_data,
         prepare_tensor("runtime_top_k", top_k_data),
         prepare_tensor("runtime_top_p", top_p_data),
     ]
+    if return_num_input_tokens_data is not None:
+        inputs += [
+            prepare_tensor("return_num_input_tokens",
+                           return_num_input_tokens_data),
+        ]
+    if return_num_output_tokens_data is not None:
+        inputs += [
+            prepare_tensor("return_num_output_tokens",
+                           return_num_output_tokens_data),
+        ]
     if num_return_sequences_data is not None:
         inputs += [
             prepare_tensor("num_return_sequences", num_return_sequences_data)
@@ -600,6 +611,20 @@ if __name__ == "__main__":
         'Lookahead parameters in format [window_size,ngram_size,verification_set_size]. Example: [7,7,7]',
         default=None,
         required=False)
+    parser.add_argument(
+        "--return-num-input-tokens",
+        action="store_true",
+        required=False,
+        default=False,
+        help="Return the number of input tokens",
+    )
+    parser.add_argument(
+        "--return-num-output-tokens",
+        action="store_true",
+        required=False,
+        default=False,
+        help="Return the number of output tokens",
+    )
 
     FLAGS = parser.parse_args()
 
@@ -770,6 +795,16 @@ if __name__ == "__main__":
     if FLAGS.lookahead_config is not None:
         lookahead_config_data = np.array(FLAGS.lookahead_config, dtype=np.int32)
 
+    return_num_input_tokens_data = None
+    if FLAGS.return_num_input_tokens:
+        return_num_input_tokens_data = np.array(
+            [[FLAGS.return_num_input_tokens]], dtype=bool)
+
+    return_num_output_tokens_data = None
+    if FLAGS.return_num_output_tokens:
+        return_num_output_tokens_data = np.array(
+            [[FLAGS.return_num_output_tokens]], dtype=bool)
+
     inputs = prepare_inputs(
         input_ids_data, input_lengths_data, request_output_len_data,
         beam_width_data, temperature_data, repetition_penalty_data,
@@ -781,7 +816,8 @@ if __name__ == "__main__":
         return_generation_logits_data, decoder_input_ids_data,
         prompt_table_extra_id_data, exclude_input_in_output,
         num_return_sequences_data, return_perf_metrics_data,
-        lookahead_config_data)
+        lookahead_config_data, return_num_input_tokens_data,
+        return_num_output_tokens_data)
 
     if FLAGS.requested_outputs:
         # Must have at least output_ids in requested outputs
@@ -846,6 +882,8 @@ if __name__ == "__main__":
     context_logits = None
     generation_logits = [None] * num_generations
     returned_perf_metrics = {}
+    input_token_count = [None] * num_generations
+    output_token_count = [None] * num_generations
 
     def set_output(outputs: list, data, seq_idx=None):
         if FLAGS.beam_width > 1:
@@ -933,6 +971,12 @@ if __name__ == "__main__":
                                     generation_logits,
                                     result.as_numpy('generation_logits')[0],
                                     seq_idx)
+                            if FLAGS.return_num_input_tokens:
+                                input_token_count[seq_idx] = result.as_numpy(
+                                    'num_input_tokens')
+                            if FLAGS.return_num_output_tokens:
+                                output_token_count[seq_idx] = result.as_numpy(
+                                    'num_output_tokens')
                             if FLAGS.return_perf_metrics:
                                 returned_perf_metrics[
                                     'kv_cache_alloc_new_blocks'] = result.as_numpy(
@@ -1043,6 +1087,12 @@ if __name__ == "__main__":
                             set_output(generation_logits,
                                        result.as_numpy('generation_logits')[0],
                                        seq_idx)
+                        if FLAGS.return_num_input_tokens:
+                            input_token_count[seq_idx] = result.as_numpy(
+                                'num_input_tokens')
+                        if FLAGS.return_num_output_tokens:
+                            output_token_count[seq_idx] = result.as_numpy(
+                                'num_output_tokens')
                         if FLAGS.return_perf_metrics:
                             returned_perf_metrics[
                                 'kv_cache_alloc_new_blocks'] = result.as_numpy(
@@ -1120,8 +1170,10 @@ if __name__ == "__main__":
                 output_text = tokenizer.decode(output_ids_wo_prompt)
                 print(f'Input: {FLAGS.text}')
                 print(f'Output beam {seq_idx}: {output_text}')
-                print(f'Output beam {seq_idx}: {output_text}')
-
+            if FLAGS.return_num_input_tokens:
+                print(f'Input token count: {input_token_count[seq_idx]}')
+            if FLAGS.return_num_output_tokens:
+                print(f'Output token count: {output_token_count[seq_idx]}')
             # If cancelled, the number of output tokens should be less than request output length.
             if FLAGS.stop_after_ms > 0 and len(
                     output_ids_wo_prompt) >= FLAGS.request_output_len:
@@ -1173,6 +1225,11 @@ if __name__ == "__main__":
             generation_logits = expand_and_vstack(generation_logits)
             print(f"generation_logits.shape: {generation_logits.shape}")
             print(f"generation_logits: {generation_logits}")
+
+        if FLAGS.return_num_input_tokens:
+            print(f'Input token count: {input_token_count[0]}')
+        if FLAGS.return_num_output_tokens:
+            print(f'Output token count: {output_token_count[0]}')
 
         if FLAGS.return_perf_metrics:
             for key, value in returned_perf_metrics.items():

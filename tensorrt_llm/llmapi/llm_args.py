@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from enum import Enum, EnumMeta
 from pathlib import Path
 from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Literal, Optional,
-                    Union)
+                    TypeAlias, Union)
 
 import torch
 import yaml
@@ -54,8 +54,7 @@ from ..models.modeling_utils import (PretrainedConfig, QuantAlgo, QuantConfig,
 from ..sampling_params import BatchedLogitsProcessor
 from .build_cache import BuildCacheConfig
 from .tokenizer import TokenizerBase, tokenizer_factory
-from .utils import (generate_api_docs_as_docstring, get_type_repr,
-                    print_traceback_on_error)
+from .utils import generate_api_docs_as_docstring, get_type_repr
 
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 
@@ -599,6 +598,16 @@ class LookaheadDecodingConfig(DecodingBaseConfig, PybindMirror):
     decoding_type: ClassVar[str] = "Lookahead"
 
 
+SpeculativeConfig: TypeAlias = Optional[Union[
+    DraftTargetDecodingConfig,
+    EagleDecodingConfig,
+    LookaheadDecodingConfig,
+    MedusaDecodingConfig,
+    MTPDecodingConfig,
+    NGramDecodingConfig,
+]]
+
+
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(BaseModel, PybindMirror):
     """
@@ -914,11 +923,8 @@ class BaseLlmArgs(BaseModel):
         default=None, description="Cache transceiver config.")
 
     # Speculative decoding parameters
-    speculative_config: Optional[
-        Union[LookaheadDecodingConfig, MedusaDecodingConfig,
-              EagleDecodingConfig, MTPDecodingConfig, NGramDecodingConfig,
-              DraftTargetDecodingConfig]] = Field(
-                  default=None, description="Speculative decoding config.")
+    speculative_config: SpeculativeConfig = Field(
+        default=None, description="Speculative decoding config.")
 
     batching_type: Optional[BatchingType] = Field(default=None,
                                                   description="Batching type.")
@@ -1904,115 +1910,6 @@ class TorchLlmArgs(BaseLlmArgs):
             batch_sizes.append(max_batch_size)
 
         return batch_sizes
-
-
-class _AutoDeployLlmArgs(TorchLlmArgs):
-    """LLM arguments specifically for AutoDeploy backend.
-
-    This class extends TorchLlmArgs with AutoDeploy-specific configuration options.
-    AutoDeploy provides automatic deployment and optimization of language models
-    with various attention backends and optimization strategies.
-    """
-
-    model_factory: Literal[
-        "AutoModelForCausalLM", "AutoModelForImageTextToText"] = Field(
-            default="AutoModelForCausalLM",
-            description="The model factory to use for loading the model.",
-        )
-
-    model_kwargs: Dict[str, Any] = Field(
-        default_factory=dict,
-        description=
-        "Extra kwargs for the model config class to customize the model config. "
-        "These arguments take precedence over default values or config values in the model config "
-        "file. Arguments are resolved in order: 1) Default values in model config class, 2) Values "
-        "in model config file, 3) Values in model_kwargs. Note: if a kwarg doesn't exist in the "
-        "model config class, it will be ignored.",
-    )
-
-    mla_backend: Literal["MultiHeadLatentAttention"] = Field(
-        default="MultiHeadLatentAttention",
-        description="The Multi-Head Latent Attention backend to use.",
-    )
-
-    skip_loading_weights: bool = Field(
-        default=False,
-        description=
-        "Whether to skip loading model weights during initialization. "
-        "If True, only the model architecture is loaded.",
-    )
-
-    free_mem_ratio: float = Field(
-        default=0.8,
-        description="The fraction of available memory to allocate for cache. "
-        "Must be between 0.0 and 1.0.",
-    )
-
-    simple_shard_only: bool = Field(
-        default=False,
-        description=
-        "If True, force simple sharding (all_gather) in tensor parallelism. "
-        "If False, auto-detect and use column+row (all_reduce) sharding when possible.",
-    )
-
-    # TODO: Remove this field once tokens_per_block is properly passed through
-    attn_page_size: int = Field(
-        default=64,
-        description=
-        "Page size for attention (tokens_per_block). For TritonWithFlattenedInputs "
-        "backend, this should equal max_seq_len. Temporary field until tokens_per_block gets "
-        "properly passed through.",
-    )
-
-    checkpoint_device: Optional[str] = Field(
-        default=None,
-        description="Device on which to load the model checkpoint. "
-        "Defaults to the same device as the rest of the pipeline.",
-    )
-
-    @field_validator("free_mem_ratio")
-    @classmethod
-    def validate_free_mem_ratio(cls, v):
-        """Validate that free_mem_ratio is between 0.0 and 1.0."""
-        if not 0.0 <= v <= 1.0:
-            raise ValueError(
-                f"free_mem_ratio must be between 0.0 and 1.0, got {v}")
-        return v
-
-    @print_traceback_on_error
-    def model_post_init(self, __context):
-        # Modify default values that differ from TorchLlmArgs
-        new_defaults = {
-            "max_batch_size": 8,
-            "max_seq_len": 512,
-            "attn_backend": "FlashInfer",
-            # TODO: Remove this when overlap scheduler is supported (https://github.com/NVIDIA/TensorRT-LLM/issues/4364)
-            "disable_overlap_scheduler": True,
-        }
-        for k, v_default in new_defaults.items():
-            if k not in self.__pydantic_fields_set__:
-                setattr(self, k, v_default)
-
-        # NOTE: Only call super() after setting the default values since default values should be
-        # set first.
-        super().model_post_init(__context)
-
-        # Handle attn_page_size for TritonWithFlattenedInputs backend
-        if self.attn_backend == "TritonWithFlattenedInputs":
-            self.attn_page_size = self.max_seq_len
-
-        # Add max_position_embeddings to model_kwargs
-        # TODO (lucaslie): this is more HF specific than a generic model_kwargs. Ideally, we can
-        # move this to the HF model factory but we don't have access to max_seq_len there right now.
-        self.model_kwargs["max_position_embeddings"] = min(
-            self.max_seq_len,
-            self.model_kwargs.get("max_position_embeddings", self.max_seq_len),
-        )
-
-    # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
-    def get_pytorch_backend_config(self) -> "_AutoDeployLlmArgs":
-        """Return the _AutoDeployLlmArgs (self) object."""
-        return self
 
 
 def update_llm_args_with_extra_dict(

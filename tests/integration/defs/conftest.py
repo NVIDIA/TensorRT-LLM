@@ -1714,6 +1714,17 @@ def cmodel_dir(llm_venv):
         shutil.rmtree(model_dir)
 
 
+@pytest.fixture(scope="function")
+def cmodel_base_dir(llm_venv):
+    "converted base model dir for redrafter"
+    model_dir = os.path.join(llm_venv.get_working_directory(), "cmodels_base")
+
+    yield model_dir
+
+    if exists(model_dir):
+        shutil.rmtree(model_dir)
+
+
 @pytest.fixture(scope="module")
 def qcache_dir(llm_venv, llm_root):
     "get quantization cache dir"
