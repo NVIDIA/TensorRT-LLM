@@ -58,6 +58,22 @@ size_t genericFp4GemmKernelLauncherSm120(void* D, void const* A, void const* B, 
     return 0;
 };
 
+#ifdef PLACEHOLDER_KERNELS
+
+#define INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER_SM120(T, CTA_M_, CTA_N_, CTA_K_, CGA_M_, CGA_N_, CGA_K_)                  \
+    template <>                                                                                                        \
+    size_t genericFp4GemmKernelLauncherSm120<T, cute::Int<CTA_M_>, cute::Int<CTA_N_>, cute::Int<CTA_K_>,               \
+        cute::Int<CGA_M_>, cute::Int<CGA_N_>, cute::Int<CGA_K_>>(void* D, void const* A, void const* B,                \
+        void const* input_sf, void const* weight_sf, float const* global_sf, int m, int n, int k, int batch_count,     \
+        tkc::CutlassGemmConfig gemmConfig, char* workspace, const size_t workspaceBytes, cudaStream_t stream,          \
+        int* occupancy)                                                                                                \
+    {                                                                                                                  \
+        throw std::runtime_error(                                                                                      \
+            "[TensorRT-LLM Error][FP4 gemm Runner] TensorRT-LLM is not compiled with support for this Architecture."); \
+    }
+
+#else
+
 #define INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER_SM120(T, CTA_M_, CTA_N_, CTA_K_, CGA_M_, CGA_N_, CGA_K_)                  \
     struct DeviceGemmFp4GemmSm120_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##_##CGA_M_##_##CGA_N_##_##CGA_K_                \
     {                                                                                                                  \
@@ -97,8 +113,25 @@ size_t genericFp4GemmKernelLauncherSm120(void* D, void const* A, void const* B, 
                 sizeof(typename CollectiveEpilogue::SharedStorage))>,                                                  \
             cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;                                         \
         using TileSchedulerTag = cutlass::gemm::StaticPersistentScheduler;                                             \
-        using GemmKernel = cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>, CollectiveMainloop,   \
-            CollectiveEpilogue, TileSchedulerTag>;                                                                     \
+        template <typename Base>                                                                                       \
+        struct Sm12xOnly : Base                                                                                        \
+        {                                                                                                              \
+            using typename Base::Params;                                                                               \
+            CUTLASS_DEVICE                                                                                             \
+            void operator()(Params const& params, char* smem_buf)                                                      \
+            {                                                                                                          \
+                if constexpr (tensorrt_llm::kernels::arch::is_major_v<12>)                                             \
+                {                                                                                                      \
+                    this->Base::operator()(params, smem_buf);                                                          \
+                }                                                                                                      \
+                else                                                                                                   \
+                {                                                                                                      \
+                    printf("ERROR : This kernel shall only run on SM12x devices.\n");                                  \
+                }                                                                                                      \
+            }                                                                                                          \
+        };                                                                                                             \
+        using GemmKernel = Sm12xOnly<cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>,             \
+            CollectiveMainloop, CollectiveEpilogue, TileSchedulerTag>>;                                                \
                                                                                                                        \
         using Gemm = typename cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;                                 \
     };                                                                                                                 \
@@ -217,6 +250,8 @@ size_t genericFp4GemmKernelLauncherSm120(void* D, void const* A, void const* B, 
         }                                                                                                              \
         return gemm.get_workspace_size(args);                                                                          \
     }
+
+#endif
 
 } // namespace cutlass_kernels
 } // namespace kernels
