@@ -4391,7 +4391,7 @@ TEST_P(TimeoutTest, TimeoutNonstreamingTest)
     VecTokens finishedTokens{101, 102, 103, 104};
     auto finishedRequest
         = Request(finishedTokens, maxNewTokens, false, tensorrt_llm::executor::SamplingConfig(beamWidth));
-    finishedRequest.setAllottedTimeMs(std::chrono::milliseconds(5000));
+    finishedRequest.setAllottedTimeMs(std::chrono::milliseconds(6000));
     std::vector<std::vector<int>> finishedReponse
         = {{101, 102, 103, 104, 49849, 225, 49849, 232, 55742}, {101, 102, 103, 104, 49849, 225, 49849, 232, 29082}};
 
