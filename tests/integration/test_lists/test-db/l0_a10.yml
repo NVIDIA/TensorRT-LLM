@@ -19,9 +19,16 @@ l0_a10:
   - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
-  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-pytorch-stress-test]
-  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-GUARANTEED_NO_EVICT-pytorch-stress-test]
   - test_e2e.py::test_openai_chat_structural_tag_example
+  - test_e2e.py::test_openai_chat_multimodal_example
+  - test_e2e.py::test_openai_lora
+  - test_e2e.py::test_trtllm_serve_multimodal_example
+  - test_e2e.py::test_trtllm_serve_lora_example
+  - test_e2e.py::test_openai_misc_example[pytorch]
+  - test_e2e.py::test_openai_reasoning[pytorch]
+  - test_e2e.py::test_openai_completions_example[pytorch]
+  - test_e2e.py::test_openai_chat_example[pytorch]
+  - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency-]
 - condition:
     ranges:
       system_gpu_count:
@@ -72,15 +79,12 @@ l0_a10:
   - llmapi/test_llm_e2e.py::test_llmapi_exit
   - llmapi/test_llm_examples.py::test_llmapi_server_example
   - test_e2e.py::test_trtllm_serve_example
-  - test_e2e.py::test_trtllm_serve_multimodal_example
-  - test_e2e.py::test_openai_misc_example
-  - test_e2e.py::test_openai_completions_example
-  - test_e2e.py::test_openai_chat_example
-  - test_e2e.py::test_openai_reasoning
-  - test_e2e.py::test_openai_chat_multimodal_example
+  - test_e2e.py::test_openai_misc_example[trt]
+  - test_e2e.py::test_openai_completions_example[trt]
+  - test_e2e.py::test_openai_chat_example[trt]
+  - test_e2e.py::test_openai_reasoning[trt]
   - test_e2e.py::test_trtllm_bench_sanity[--non-streaming-FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
   - test_e2e.py::test_trtllm_bench_latency_sanity[FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
-  - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency-]
   - unittest/trt/quantization TIMEOUT (60)
   - accuracy/test_cli_flow.py::TestLlama7B::test_streamingllm # 2 mins
   - unittest/trt/functional # 37 mins
@@ -101,12 +105,6 @@ l0_a10:
   - accuracy/test_cli_flow.py::TestMamba130M::test_auto_dtype # 1 min
   - accuracy/test_cli_flow.py::TestLongAlpaca7B::test_multiblock_aggressive # 6 mins
   - accuracy/test_cli_flow.py::TestVicuna7B::test_lookahead # 5 mins
-  - accuracy/test_cli_flow.py::TestVicuna7B::test_medusa[cuda_graph=False] # 5 mins
-  - accuracy/test_cli_flow.py::TestVicuna7B::test_medusa[cuda_graph=True] # 5 mins
-  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph=False-chunked_context=False-typical_acceptance=False] # 5 mins
-  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph=True-chunked_context=False-typical_acceptance=False] # 5 mins
-  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph=True-chunked_context=True-typical_acceptance=False] # 5 mins
-  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph=True-chunked_context=False-typical_acceptance=True] # 5 mins
   - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle_2[cuda_graph=False-chunked_context=False] # 5 mins
   - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle_2[cuda_graph=True-chunked_context=False] # 5 mins
   - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle_2[cuda_graph=True-chunked_context=True] # 5 mins
@@ -118,8 +116,6 @@ l0_a10:
   - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_cpp_runtime]
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba2-130m-float16-enable_gemm_plugin]
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba-codestral-7B-v0.1-float16-enable_gemm_plugin] # 3 mins
-  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-trt-stress-test] TIMEOUT (60)
-  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-GUARANTEED_NO_EVICT-trt-stress-test] TIMEOUT (60)
 - condition:
     ranges:
       system_gpu_count:
@@ -168,5 +164,28 @@ l0_a10:
   - test_e2e.py::test_build_time_benchmark_sanity
   - examples/test_whisper.py::test_llm_whisper_general[large-v3-enable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime]
   - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime] # 4 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_medusa[cuda_graph=False] # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_medusa[cuda_graph=True] # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph=False-chunked_context=False-typical_acceptance=False] # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph=True-chunked_context=False-typical_acceptance=False] # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph=True-chunked_context=True-typical_acceptance=False] # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph=True-chunked_context=False-typical_acceptance=True] # 5 mins
   - accuracy/test_llm_api.py::TestEagleVicuna_7B_v1_3::test_auto_dtype
   - accuracy/test_llm_api.py::TestEagle2Vicuna_7B_v1_3::test_auto_dtype
+  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-trt-stress-test]
+  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-GUARANTEED_NO_EVICT-trt-stress-test]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*a10*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+      backend: pytorch
+  tests:
+  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-pytorch-stress-test]
+  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-GUARANTEED_NO_EVICT-pytorch-stress-test]

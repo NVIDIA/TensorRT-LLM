@@ -17,7 +17,6 @@
 
 #include "tensorrt_llm/batch_manager/transformerBuffers.h"
 
-#include "tensorrt_llm/batch_manager/kvCacheConfig.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
@@ -221,7 +220,7 @@ void TransformerBuffers::reshapeKvTensors(SizeType32 maxBatchSize, SizeType32 ma
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     // allocate with max shape during init
-    if (kvCacheType == KvCacheType::kSELF)
+    if (kvCacheType == kv_cache_manager::CacheType::kSELF)
     {
         auto const cacheBlockOffsetsShape
             = ITensor::makeShape({numPools, maxBatchSize * maxBeamWidth, 2, maxBlocksPerSeq});
@@ -232,7 +231,7 @@ void TransformerBuffers::reshapeKvTensors(SizeType32 maxBatchSize, SizeType32 ma
         kvCacheBlockOffsetsDevice->reshape(cacheBlockOffsetsShape);
         manager.setZero(*kvCacheBlockOffsetsDevice);
     }
-    else if (kvCacheType == KvCacheType::kCROSS)
+    else if (kvCacheType == kv_cache_manager::CacheType::kCROSS)
     {
         auto const crossCacheBlockOffsetsShape
             = ITensor::makeShape({numPools, maxBatchSize * maxBeamWidth, 2, maxBlocksPerSeq});

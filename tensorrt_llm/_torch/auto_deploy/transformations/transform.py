@@ -5,10 +5,10 @@ import gc
 import torch
 from torch.fx import GraphModule
 
-from ....llmapi.llm_args import _AutoDeployLlmArgs
 from ..compile import compile_and_capture
 from ..custom_ops.attention_interface import AttentionRegistry
 from ..distributed import common as dist_ad
+from ..llm_args import LlmArgs
 from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
 from ..utils.logger import ad_logger
@@ -38,27 +38,9 @@ from .library import (
 
 
 class InferenceOptimizer:
-    def __init__(
-        self,
-        factory: ModelFactory,
-        *,  # TODO: temporary until we have a better config system
-        ad_config: _AutoDeployLlmArgs,
-        visualize: bool = False,
-    ):
+    def __init__(self, factory: ModelFactory, ad_config: LlmArgs):
         self.factory = factory
-
         self.ad_config = ad_config
-        # Map Pytorch config to AutoDeploy compile backends.
-        if ad_config.use_cuda_graph and ad_config.torch_compile_config:
-            compile_backend = "torch-opt"
-        elif ad_config.use_cuda_graph:
-            compile_backend = "torch-cudagraph"
-        elif ad_config.torch_compile_config:
-            compile_backend = "torch-compile"
-        else:
-            compile_backend = "torch-simple"
-        self.compile_backend = compile_backend
-        self.visualize = visualize
 
     def __call__(self, cm: CachedSequenceInterface) -> GraphModule:
         """Transform a model into an optimized inference model.
@@ -177,7 +159,7 @@ class InferenceOptimizer:
         egm = fuse_collectives(egm)
 
         # visualize the final graph
-        if self.visualize:
+        if self.ad_config.visualize:
             try:
                 from .library import visualize_namespace
 
@@ -212,12 +194,15 @@ class InferenceOptimizer:
 
         cm.info.set_generate_only_batch()
         compiler_kwargs = {
-            "cuda_graph_batch_sizes": self.ad_config.cuda_graph_batch_sizes,
+            "cuda_graph_batch_sizes": self.ad_config.cuda_graph_config.cuda_graph_batch_sizes
+            if hasattr(self.ad_config, "cuda_graph_config")
+            and self.ad_config.cuda_graph_config is not None
+            else None,
             "num_batched_inputs": 2,  # TODO (lucaslie): improve once we have a config system...
         }
         egm_compiled = compile_and_capture(
             egm,
-            self.compile_backend,
+            self.ad_config.compile_backend,
             args=cm.args,
             dynamic_shapes=cm.dynamic_shapes,
             compiler_kwargs=compiler_kwargs,

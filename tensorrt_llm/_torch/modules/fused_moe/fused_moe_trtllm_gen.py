@@ -68,7 +68,6 @@ class TRTLLMGenFusedMoE(MoE):
         )
 
         assert not self.smart_router, "Smart router is not supported in TRTLLMGenFusedMoE."
-        assert not self.use_dp, "AttentionDP is not supported in TRTLLMGenFusedMoE."
 
         self.num_slots = self.num_experts
         self.expert_size_per_partition = self.num_experts // self.ep_size
@@ -128,7 +127,8 @@ class TRTLLMGenFusedMoE(MoE):
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
         do_finalize: bool = True,
-        *args,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        use_dp_padding: Optional[bool] = None,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -231,4 +231,8 @@ class TRTLLMGenFusedMoE(MoE):
         if self.reduce_results and self.parallel_size > 1:
             final_hidden_states = self.all_reduce(final_hidden_states)
 
+        if use_dp_padding:
+            rank = self.mapping.tp_rank
+            final_hidden_states = final_hidden_states[:
+                                                      all_rank_num_tokens[rank]]
         return final_hidden_states

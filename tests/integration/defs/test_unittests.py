@@ -71,9 +71,9 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
 
     my_test_prefix = request.config.getoption("--test-prefix")
     if my_test_prefix:
-        test_prefix = f"{my_test_prefix}/unittests"
+        test_prefix = f"{my_test_prefix}/unittest"
     else:
-        test_prefix = ""
+        test_prefix = "unittest"
 
     num_workers = 1
 
