@@ -95,8 +95,7 @@ std::size_t RequestInfo::serializedSize(RequestInfo const& requestInfo)
 
 static int32_t tagFromRequestId(LlmRequest::RequestIdType requestId)
 {
-    constexpr int32_t kDATA_TAG{43};
-    return ((requestId & 0xFFF) << 8) | (kDATA_TAG & 0xFF);
+    return ((requestId & 0xFFF) << 8) | (TransceiverTag::kDATA_TAG & 0xFF);
 }
 
 using BaseCacheFormatter = kv_cache_manager::BaseCacheFormatter;
@@ -114,27 +113,20 @@ DataSender::DataSender(executor::kv_cache::ConnectionManager* manager, executor:
 
 [[nodiscard]] RequestInfo DataSender::recvRequestInfo()
 {
-    using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
     auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
-    bool isAgent = agentConnectionManager != nullptr;
-
-    auto agentRecvFun = [&](RequestInfo& requestInfo)
-    {
-        auto const* connection = agentConnectionManager->recvConnectionAndRequestInfo(requestInfo);
-        return connection;
-    };
-    Id id;
     RequestInfo info;
-    auto const* connection
-        = isAgent ? agentRecvFun(info) : mManager->recvConnect(DataContext{kID_TAG}, &id, sizeof(id));
-    if (!isAgent)
+    std::uint64_t infoSize{0};
+    Connection const* connection{nullptr};
+    if (agentConnectionManager != nullptr)
     {
-        TLLM_CHECK(id == Id::REQUEST_SEND);
-        std::uint64_t infoSize{0};
-        connection->recv(executor::kv_cache::DataContext{kINFO_SIZE_TAG}, &infoSize, sizeof(infoSize));
+        connection = agentConnectionManager->recvConnectionAndRequestInfo(info);
+    }
+    else
+    {
+        connection = mManager->recvConnect(DataContext{TransceiverTag::kID_TAG}, &infoSize, sizeof(infoSize));
         std::string serializedInfo;
         serializedInfo.resize(infoSize);
-        connection->recv(executor::kv_cache::DataContext{kINFO_TAG}, serializedInfo.data(), infoSize);
+        connection->recv(DataContext{TransceiverTag::kDATA_TAG}, serializedInfo.data(), infoSize);
         std::istringstream iss(serializedInfo);
         info = RequestInfo::deserialize(iss);
     }
@@ -147,38 +139,31 @@ DataSender::DataSender(executor::kv_cache::ConnectionManager* manager, executor:
     auto peerRelativeRanks = executor::kv_cache::targetIRanks(info.getTransState().getCacheState().value(),
         mSelfState.getCacheState().value(), mSelfState.getCommState().value().getSelfIdx())
                                  .mIRanks;
-    int peerIdx = std::distance(peerRelativeRanks.begin(),
+    auto peerIdx = std::distance(peerRelativeRanks.begin(),
         std::find(
             peerRelativeRanks.begin(), peerRelativeRanks.end(), info.getTransState().getCommState()->getSelfIdx()));
     {
         std::unique_lock<std::mutex> lk(mMtxForMap);
-        auto it = mRequestToComms.find(requestId);
-        if (it == mRequestToComms.end())
+        auto it = mRequestToSession.find(requestId);
+        if (it == mRequestToSession.end())
         {
-            int recvExpectCount = peerRelativeRanks.size();
-            {
-                it = mRequestToComms.emplace(requestId, RequestMapInfo{}).first;
-                it->second.resize(recvExpectCount);
-            }
+            it = mRequestToSession
+                     .emplace(requestId,
+                         TransferSession{std::vector<Connection const*>(peerRelativeRanks.size()),
+                             DataContext{tagFromRequestId(requestId)}, mSelfState, info.getTransState(),
+                             mBufferManager})
+                     .first;
         }
-        it->second[peerIdx] = {connection, info.getTransState()};
+        it->second.getConnectionsMutable()[peerIdx] = connection;
     }
     return info;
 }
 
 void DataSender::sendSync(LlmRequest const& llmRequest)
 {
-    std::vector<executor::kv_cache::Connection const*> connections;
-    auto it = mRequestToComms.find(llmRequest.mRequestId);
-    TLLM_CHECK(it != mRequestToComms.end());
-    auto const& reqToComm = it->second;
-    for (auto&& [connection, dataTransceiverState] : reqToComm)
-    {
-        connections.emplace_back(connection);
-    }
-    auto&& dataTransceiverState = reqToComm.at(0).second;
-    TransferSession session(connections, DataContext{tagFromRequestId(llmRequest.mRequestId)}, mSelfState,
-        dataTransceiverState, mBufferManager);
+    auto it = mRequestToSession.find(llmRequest.mRequestId);
+    TLLM_CHECK(it != mRequestToSession.end());
+    auto& session = it->second;
     mFormatter->format(session, llmRequest);
 }
 
@@ -189,17 +174,17 @@ void DataSender::sendSync(LlmRequest const& llmRequest)
 
 [[nodiscard]] size_t DataSender::getCounterpartsCount(LlmRequest::RequestIdType requestId) const
 {
-    auto it = mRequestToComms.find(requestId);
-    TLLM_CHECK(it != mRequestToComms.end());
-    return it->second.size();
+    auto it = mRequestToSession.find(requestId);
+    TLLM_CHECK(it != mRequestToSession.end());
+    return it->second.getConnections().size();
 }
 
 void DataSender::release(LlmRequest::RequestIdType requestId)
 {
-    auto it = mRequestToComms.find(requestId);
-    TLLM_CHECK(it != mRequestToComms.end());
+    auto it = mRequestToSession.find(requestId);
+    TLLM_CHECK(it != mRequestToSession.end());
     std::unique_lock<std::mutex> lk(mMtxForMap);
-    mRequestToComms.erase(it);
+    mRequestToSession.erase(it);
 }
 
 DataSender::~DataSender() = default;
@@ -242,24 +227,12 @@ void DataReceiver::sendRequestInfo(LlmRequest const& llmRequest)
         TLLM_CHECK(cacheBufferId.has_value());
         // memory Desp , validSegmentIdx send
     }
+    auto connections = mManager->getConnections(commState);
     auto counterParts = mFormatter->getCounterparts(
         mSelfState.getCacheState().value(), mSelfState.getCommState().value().getSelfIdx(), destCacheState);
-
-    auto connections = mManager->getConnections(commState);
-    std::vector<executor::kv_cache::Connection const*> counterPartConnections;
-    for (auto index : counterParts)
-    {
-        auto const* connection = connections.at(index);
-        counterPartConnections.emplace_back(connection);
-    }
-    auto pickUpIdx = mFormatter->pickRecvConnections(counterPartConnections.size(), mSelfState.getCacheState().value(),
+    auto pickUpIdx = mFormatter->pickRecvConnections(counterParts.size(), mSelfState.getCacheState().value(),
         mSelfState.getCommState().value().getSelfIdx(), destCacheState);
-    std::vector<Connection const*> pickUpConnections;
-    for (auto idx : pickUpIdx)
-    {
-        auto const* connection = counterPartConnections.at(idx);
-        pickUpConnections.emplace_back(connection);
-    }
+
     for (size_t i = 0; i < counterParts.size(); i++)
     {
         auto const* connection = connections.at(counterParts[i]);
@@ -268,8 +241,7 @@ void DataReceiver::sendRequestInfo(LlmRequest const& llmRequest)
         if (agentConnectionManager != nullptr)
         {
             // TODO: index -> validConnectionIdx conversion
-            auto valideConnectionIdx
-                = std::find(pickUpConnections.begin(), pickUpConnections.end(), connection) - pickUpConnections.begin();
+            auto valideConnectionIdx = std::find(pickUpIdx.begin(), pickUpIdx.end(), i) - pickUpIdx.begin();
             auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connection);
             TLLM_CHECK(agentConnection != nullptr);
             TLLM_CHECK(cacheBufferId.has_value());
@@ -307,10 +279,8 @@ void DataReceiver::sendRequestInfo(executor::kv_cache::Connection const* connect
     RequestInfo::serialize(info, oss);
     auto const& serializedInfo = oss.str();
     std::size_t const infoSize = serializedInfo.size();
-    Id id{Id::REQUEST_SEND};
-    connection->send(executor::kv_cache::DataContext{kID_TAG}, &id, sizeof(id));
-    connection->send(executor::kv_cache::DataContext{kINFO_SIZE_TAG}, &infoSize, sizeof(infoSize));
-    connection->send(executor::kv_cache::DataContext{kINFO_TAG}, serializedInfo.data(), infoSize);
+    connection->send(DataContext{TransceiverTag::kID_TAG}, &infoSize, sizeof(infoSize));
+    connection->send(DataContext{TransceiverTag::kDATA_TAG}, serializedInfo.data(), infoSize);
 }
 
 std::unique_ptr<DataReceiver::ReceiveCacheResource> const& DataReceiver::getReceiveCacheResource(

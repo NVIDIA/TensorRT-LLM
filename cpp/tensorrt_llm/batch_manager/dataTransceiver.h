@@ -37,15 +37,8 @@ class BaseCacheFormatter;
 
 struct TransceiverTag
 {
-    enum class Id : uint64_t
-    {
-        REQUEST_SEND = 1,
-        TERMINATION = 2
-    };
-
     static constexpr int32_t kID_TAG{19};
-    static constexpr int32_t kINFO_SIZE_TAG{22};
-    static constexpr int32_t kINFO_TAG{32};
+    static constexpr int32_t kDATA_TAG{43};
 };
 
 // TODO: unify the following class into namespace tensorrt_llm::transmission
@@ -111,44 +104,45 @@ private:
 class TransferSession
 {
 public:
-    TransferSession(std::vector<executor::kv_cache::Connection const*> connections,
-        executor::kv_cache::DataContext dataContext, executor::DataTransceiverState const& selfState,
-        executor::DataTransceiverState const& otherState, runtime::BufferManager& bufferManager)
+    TransferSession(std::vector<Connection const*> connections, DataContext dataContext,
+        executor::DataTransceiverState const& selfState, executor::DataTransceiverState otherState,
+        runtime::BufferManager& bufferManager)
         : mConnections(std::move(connections))
         , mDataContext(dataContext)
         , mSelfState(&selfState)
-        , mOtherState(&otherState)
+        , mOtherState(std::move(otherState))
         , mBufferManager(&bufferManager)
     {
         TLLM_CHECK(!mConnections.empty());
     }
 
-    [[nodiscard]] size_t getNumConnections() const
-    {
-        return mConnections.size();
-    }
-
-    [[nodiscard]] std::vector<executor::kv_cache::Connection const*> const& getConnections() const
+    [[nodiscard]] std::vector<Connection const*> const& getConnections() const noexcept
     {
         return mConnections;
     }
 
-    [[nodiscard]] executor::kv_cache::DataContext const& getDataContext() const
+    // TODO: set up connections at session creation
+    [[nodiscard]] std::vector<Connection const*>& getConnectionsMutable() noexcept
+    {
+        return mConnections;
+    }
+
+    [[nodiscard]] DataContext const& getDataContext() const noexcept
     {
         return mDataContext;
     }
 
-    [[nodiscard]] executor::DataTransceiverState const& getSelfState() const
+    [[nodiscard]] executor::DataTransceiverState const& getSelfState() const noexcept
     {
         return *mSelfState;
     }
 
-    [[nodiscard]] executor::DataTransceiverState const& getOtherState() const
+    [[nodiscard]] executor::DataTransceiverState const& getOtherState() const noexcept
     {
-        return *mOtherState;
+        return mOtherState;
     }
 
-    [[nodiscard]] runtime::BufferManager& getBufferManager()
+    [[nodiscard]] runtime::BufferManager& getBufferManager() noexcept
     {
         return *mBufferManager;
     }
@@ -164,23 +158,23 @@ public:
     }
 
 private:
-    std::vector<executor::kv_cache::Connection const*> mConnections;
-    executor::kv_cache::DataContext mDataContext;
+    std::vector<Connection const*> mConnections;
+    DataContext mDataContext;
+    // self state is stored in DataSender/Receiver and is always valid
     executor::DataTransceiverState const* mSelfState;
-    executor::DataTransceiverState const* mOtherState;
+    // the other state is temporary and should be copied from the ContextPhaseParams/RequestInfo
+    executor::DataTransceiverState mOtherState;
     runtime::BufferManager* mBufferManager;
 };
 
 // Operators required for data transmission in specific communication protocols.
-class DataSender : public TransceiverTag
+class DataSender
 {
 public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
-    using RequestMapInfo
-        = std::vector<std::pair<executor::kv_cache::Connection const*, executor::DataTransceiverState>>;
 
-    DataSender(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
-        SizeType32 selfIndex, std::unique_ptr<kv_cache_manager::BaseCacheFormatter> formatter);
+    DataSender(ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState, SizeType32 selfIndex,
+        std::unique_ptr<kv_cache_manager::BaseCacheFormatter> formatter);
 
     /// @brief Receive the request information.
     /// @return The request information.
@@ -201,8 +195,8 @@ public:
     ~DataSender(); // = default;
 
 private:
-    executor::kv_cache::ConnectionManager* mManager;
-    std::map<LlmRequest::RequestIdType, RequestMapInfo> mRequestToComms;
+    ConnectionManager* mManager;
+    std::map<LlmRequest::RequestIdType, TransferSession> mRequestToSession;
     executor::DataTransceiverState mSelfState;
     std::unique_ptr<kv_cache_manager::BaseCacheFormatter> mFormatter;
     std::mutex mMtxForMap;
@@ -210,7 +204,7 @@ private:
 };
 
 // Operators required for data transmission in specific communication protocols.
-class DataReceiver : public TransceiverTag
+class DataReceiver
 {
 public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
