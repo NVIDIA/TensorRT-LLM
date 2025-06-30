@@ -319,6 +319,13 @@ def create_py_executor(
 
     if executor_config.enable_chunked_context:
         chunk_unit_size = executor_config.tokens_per_block
+        if (max_seq_len
+                > min(executor_config.kv_cache_config.max_attention_window)):
+            # maxKvStepSizeInFmha = 256
+            chunk_unit_size = max(256, chunk_unit_size)
+            logger.info(
+                f"ChunkUnitSize is set to {chunk_unit_size} as sliding window attention is used."
+            )
         chunking_policy = (
             executor_config.scheduler_config.context_chunking_policy
             if executor_config.scheduler_config.context_chunking_policy
