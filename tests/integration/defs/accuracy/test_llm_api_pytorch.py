@@ -95,9 +95,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             enable_fullgraph=True) if torch_compile else None
         pytorch_config = dict(
             torch_compile_config=torch_compile_config,
-            cuda_graph_config=CudaGraphConfig(
-                cuda_graph_padding_enabled=torch_compile,
-                cuda_graph_batch_sizes=[4]),
+            cuda_graph_config=CudaGraphConfig(padding_enabled=torch_compile,
+                                              batch_sizes=[4]),
             attn_backend=attn_backend,
             disable_overlap_scheduler=torch_compile,
         )
@@ -123,9 +122,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             enable_fullgraph=True) if torch_compile else None
         pytorch_config = dict(
             torch_compile_config=torch_compile_config,
-            cuda_graph_config=CudaGraphConfig(
-                cuda_graph_padding_enabled=torch_compile,
-                cuda_graph_batch_sizes=[4]),
+            cuda_graph_config=CudaGraphConfig(padding_enabled=torch_compile,
+                                              batch_sizes=[4]),
             attn_backend=attn_backend,
             disable_overlap_scheduler=torch_compile,
         )
@@ -149,9 +147,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             enable_fullgraph=True) if torch_compile else None
         pytorch_config = dict(
             torch_compile_config=torch_compile_config,
-            cuda_graph_config=CudaGraphConfig(
-                cuda_graph_padding_enabled=torch_compile,
-                cuda_graph_batch_sizes=[4]),
+            cuda_graph_config=CudaGraphConfig(padding_enabled=torch_compile,
+                                              batch_sizes=[4]),
             attn_backend=attn_backend,
             disable_overlap_scheduler=torch_compile,
         )
@@ -189,9 +186,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             enable_fullgraph=True) if torch_compile else None
         pytorch_config = dict(
             torch_compile_config=torch_compile_config,
-            cuda_graph_config=CudaGraphConfig(
-                cuda_graph_padding_enabled=torch_compile,
-                cuda_graph_batch_sizes=[4]),
+            cuda_graph_config=CudaGraphConfig(padding_enabled=torch_compile,
+                                              batch_sizes=[4]),
             attn_backend=attn_backend,
             disable_overlap_scheduler=torch_compile,
         )
@@ -231,7 +227,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     def test_eagle3(self):
         pytorch_config = dict(
             disable_overlap_scheduler=True,
-            cuda_graph_config=CudaGraphConfig(cuda_graph_batch_sizes=[1]),
+            cuda_graph_config=CudaGraphConfig(batch_sizes=[1]),
         )
         kv_cache_config = KvCacheConfig(enable_block_reuse=False)
 
@@ -709,8 +705,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         pytorch_config = dict(
             disable_overlap_scheduler=False,
             cuda_graph_config=CudaGraphConfig(
-                cuda_graph_max_batch_size=512,
-                cuda_graph_padding_enabled=True,
+                max_batch_size=512,
+                padding_enabled=True,
             ),
         )
         llm = LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
@@ -734,8 +730,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
         pytorch_config = dict(
             disable_overlap_scheduler=False,
-            cuda_graph_config=CudaGraphConfig(
-                cuda_graph_padding_enabled=True, ),
+            cuda_graph_config=CudaGraphConfig(padding_enabled=True),
         )
         quant_config = QuantConfig()
         quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
@@ -1609,7 +1604,6 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                   overlap_scheduler):
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
-            #   cuda_graph_config=CudaGraphConfig() if cuda_graph else None
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
         llm = LLM(f"{llm_models_root()}/Qwen3/Qwen3-8B",
@@ -1829,7 +1823,7 @@ class TestKanana_Instruct(LlmapiAccuracyTestHarness):
     def test_auto_dtype(self):
         "RCCA: https://nvbugspro.nvidia.com/bug/5310520"
         pytorch_config = dict(cuda_graph_config=CudaGraphConfig(
-            cuda_graph_padding_enabled=True, cuda_graph_max_batch_size=384))
+            padding_enabled=True, max_batch_size=384))
         with LLM(self.MODEL_PATH, **pytorch_config,
                  enable_attention_dp=True) as llm:
             task = MMLU(self.MODEL_NAME)

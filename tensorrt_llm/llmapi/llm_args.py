@@ -64,25 +64,26 @@ class CudaGraphConfig(BaseModel):
     Configuration for CUDA graphs.
     """
     # List of batch sizes to create CUDA graphs for.
-    cuda_graph_batch_sizes: Optional[List[int]] = Field(
+    batch_sizes: Optional[List[int]] = Field(
         default=None,
         description="List of batch sizes to create CUDA graphs for.")
 
-    cuda_graph_max_batch_size: int = Field(
+    max_batch_size: int = Field(
         default=0, description="Maximum batch size for CUDA graphs.")
 
-    cuda_graph_padding_enabled: bool = Field(
+    padding_enabled: bool = Field(
         default=False,
         description=
         "If true, batches are rounded up to the nearest cuda_graph_batch_size. This is usually a net win for performance."
     )
 
-    @field_validator('cuda_graph_max_batch_size')
+    @field_validator('max_batch_size')
     @classmethod
     def validate_cuda_graph_max_batch_size(cls, v):
-        """Validate cuda_graph_max_batch_size is non-negative."""
+        """Validate cuda_graph_config.max_batch_size is non-negative."""
         if v < 0:
-            raise ValueError("cuda_graph_max_batch_size must be non-negative")
+            raise ValueError(
+                "cuda_graph_config.max_batch_size must be non-negative")
         return v
 
 
@@ -1672,7 +1673,7 @@ class TorchLlmArgs(BaseLlmArgs):
     cuda_graph_config: Optional[CudaGraphConfig] = Field(
         default=None,
         description="CUDA graph config.If true, use CUDA graphs for decoding. \
-        CUDA graphs are only created for the batch sizes in cuda_graph_batch_sizes, \
+        CUDA graphs are only created for the batch sizes in cuda_graph_config.batch_sizes, \
         and are enabled for batches that consist of decoding requests *only* \
         (the reason is that it's hard to capture a single graph with prefill requests \
         since the input shapes are a function of the sequence lengths).\
@@ -1854,37 +1855,34 @@ class TorchLlmArgs(BaseLlmArgs):
         """Validate CUDA graph configuration.
 
         Ensures that:
-        1. If cuda_graph_batch_sizes is provided, cuda_graph_max_batch_size must be 0
-        2. If cuda_graph_batch_sizes is not provided, it is generated based on cuda_graph_max_batch_size
-        3. If both are provided, cuda_graph_batch_sizes must match the generated values
+        1. If cuda_graph_config.batch_sizes is provided, cuda_graph_config.max_batch_size must be 0
+        2. If cuda_graph_config.batch_sizes is not provided, it is generated based on cuda_graph_config.max_batch_size
+        3. If both are provided, cuda_graph_config.batch_sizes must match the generated values
         """
         if self.cuda_graph_config is None:
             return self
 
         config = self.cuda_graph_config
 
-        if config.cuda_graph_batch_sizes:
-            config.cuda_graph_batch_sizes = sorted(
-                config.cuda_graph_batch_sizes)
-            if config.cuda_graph_max_batch_size != 0:
-                if config.cuda_graph_batch_sizes != self._generate_cuda_graph_batch_sizes(
-                        config.cuda_graph_max_batch_size,
-                        config.cuda_graph_padding_enabled):
+        if config.batch_sizes:
+            config.batch_sizes = sorted(config.batch_sizes)
+            if config.max_batch_size != 0:
+                if config.batch_sizes != self._generate_cuda_graph_batch_sizes(
+                        config.max_batch_size, config.padding_enabled):
                     raise ValueError(
-                        "Please don't set both cuda_graph_batch_sizes "
-                        "and cuda_graph_max_batch_size.\n"
-                        f"cuda_graph_batch_sizes: {self.cuda_graph_batch_sizes}, "
-                        f"cuda_graph_max_batch_size: {self.cuda_graph_max_batch_size}"
+                        "Please don't set both cuda_graph_config.batch_sizes "
+                        "and cuda_graph_config.max_batch_size.\n"
+                        f"cuda_graph_config.batch_sizes: {self.cuda_graph_config.batch_sizes}, "
+                        f"cuda_graph_config.max_batch_size: {self.cuda_graph_config.max_batch_size}"
                     )
             else:
-                config.cuda_graph_max_batch_size = max(
-                    config.cuda_graph_batch_sizes)
+                config.max_batch_size = max(config.batch_sizes)
         else:
-            max_batch_size = config.cuda_graph_max_batch_size or 128
+            max_batch_size = config.max_batch_size or 128
             generated_sizes = self._generate_cuda_graph_batch_sizes(
-                max_batch_size, config.cuda_graph_padding_enabled)
-            config.cuda_graph_batch_sizes = generated_sizes
-            config.cuda_graph_max_batch_size = max_batch_size
+                max_batch_size, config.padding_enabled)
+            config.batch_sizes = generated_sizes
+            config.max_batch_size = max_batch_size
 
         return self
 
@@ -1895,12 +1893,12 @@ class TorchLlmArgs(BaseLlmArgs):
         return PyTorchConfig(
             extra_resource_managers=self.extra_resource_managers,
             use_cuda_graph=bool(self.cuda_graph_config is not None),
-            cuda_graph_batch_sizes=self.cuda_graph_config.cuda_graph_batch_sizes
+            cuda_graph_batch_sizes=self.cuda_graph_config.batch_sizes
             if self.cuda_graph_config else None,
-            cuda_graph_max_batch_size=self.cuda_graph_config.
-            cuda_graph_max_batch_size if self.cuda_graph_config else 0,
-            cuda_graph_padding_enabled=self.cuda_graph_config.
-            cuda_graph_padding_enabled if self.cuda_graph_config else False,
+            cuda_graph_max_batch_size=self.cuda_graph_config.max_batch_size
+            if self.cuda_graph_config else 0,
+            cuda_graph_padding_enabled=self.cuda_graph_config.padding_enabled
+            if self.cuda_graph_config else False,
             disable_overlap_scheduler=self.disable_overlap_scheduler,
             moe_max_num_tokens=self.moe_max_num_tokens,
             moe_load_balancer=self.moe_load_balancer,

@@ -194,10 +194,7 @@ class InferenceOptimizer:
 
         cm.info.set_generate_only_batch()
         compiler_kwargs = {
-            "cuda_graph_batch_sizes": self.ad_config.cuda_graph_config.cuda_graph_batch_sizes
-            if hasattr(self.ad_config, "cuda_graph_config")
-            and self.ad_config.cuda_graph_config is not None
-            else None,
+            "cuda_graph_batch_sizes": self.ad_config.cuda_graph_batch_sizes,
             "num_batched_inputs": 2,  # TODO (lucaslie): improve once we have a config system...
         }
         egm_compiled = compile_and_capture(

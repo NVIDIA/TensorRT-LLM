@@ -149,9 +149,9 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
 
     pyt_options = {
         "cuda_graph_config": {
-            "cuda_graph_padding_enabled":
+            "padding_enabled":
             True,
-            "cuda_graph_max_batch_size":
+            "max_batch_size":
             max_batch_size if cuda_graph_batch_sizes is None else 0,
         },
         "kv_cache_dtype": kv_cache_dtype,
