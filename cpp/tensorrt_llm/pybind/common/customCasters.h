@@ -27,7 +27,6 @@
 #include "tensorrt_llm/runtime/torchView.h"
 
 #include <ATen/DLConvertor.h>
-#include <dlpack/dlpack.h>
 #include <filesystem>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/filesystem.h>

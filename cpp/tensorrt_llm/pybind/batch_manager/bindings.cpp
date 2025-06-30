@@ -469,8 +469,6 @@ void initBindings(nanobind::module_& m)
         .def_rw("log_probs_host", &tb::DecoderOutputBuffers::logProbsHost)
         .def_rw("finish_reasons_host", &tb::DecoderOutputBuffers::finishReasonsHost);
 
-
-
     nb::class_<tb::SlotDecoderBuffers>(m, "SlotDecoderBuffers")
         .def(nb::init<runtime::SizeType32, runtime::SizeType32, runtime::BufferManager const&>(),
             nb::arg("max_beam_width"), nb::arg("max_seq_len"), nb::arg("buffer_manager"))

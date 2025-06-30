@@ -723,19 +723,22 @@ void initRequestBindings(nanobind::module_& m)
 
     auto timingMetricsGetstate = [](tle::RequestPerfMetrics::TimingMetrics const& self)
     {
-        return py::make_tuple(self.arrivalTime, self.firstScheduledTime, self.firstTokenTime, self.lastTokenTime,
+        return nb::make_tuple(self.arrivalTime, self.firstScheduledTime, self.firstTokenTime, self.lastTokenTime,
             self.kvCacheTransferStart, self.kvCacheTransferEnd, self.kvCacheSize);
     };
-    auto timingMetricsSetstate = [](py::tuple const& state)
+    auto timingMetricsSetstate = [](tle::RequestPerfMetrics::TimingMetrics& timingMetrics, nb::tuple const& state)
     {
         if (state.size() != 7)
         {
             throw std::runtime_error("Invalid TimingMetrics state!");
         }
-        return tle::RequestPerfMetrics::TimingMetrics{nb::cast<tle::RequestPerfMetrics::TimePoint>(state[0]),
-            nb::cast<tle::RequestPerfMetrics::TimePoint>(state[1]), nb::cast<tle::RequestPerfMetrics::TimePoint>(state[2]),
-            nb::cast<tle::RequestPerfMetrics::TimePoint>(state[3]), nb::cast<tle::RequestPerfMetrics::TimePoint>(state[4]),
-            nb::cast<tle::RequestPerfMetrics::TimePoint>(state[5]), nb::cast<size_t>(state[6])};
+        new (&timingMetrics)
+            tle::RequestPerfMetrics::TimingMetrics{nb::cast<tle::RequestPerfMetrics::TimePoint>(state[0]),
+                nb::cast<tle::RequestPerfMetrics::TimePoint>(state[1]),
+                nb::cast<tle::RequestPerfMetrics::TimePoint>(state[2]),
+                nb::cast<tle::RequestPerfMetrics::TimePoint>(state[3]),
+                nb::cast<tle::RequestPerfMetrics::TimePoint>(state[4]),
+                nb::cast<tle::RequestPerfMetrics::TimePoint>(state[5]), nb::cast<size_t>(state[6])};
     };
     nb::class_<tle::RequestPerfMetrics::TimingMetrics>(m, "TimingMetrics")
         .def(nb::init<>())
@@ -751,17 +754,18 @@ void initRequestBindings(nanobind::module_& m)
 
     auto kvCacheMetricsGetstate = [](tle::RequestPerfMetrics::KvCacheMetrics const& self)
     {
-        return py::make_tuple(self.numTotalAllocatedBlocks, self.numNewAllocatedBlocks, self.numReusedBlocks,
+        return nb::make_tuple(self.numTotalAllocatedBlocks, self.numNewAllocatedBlocks, self.numReusedBlocks,
             self.numMissedBlocks, self.kvCacheHitRate);
     };
-    auto kvCacheMetricsSetstate = [](py::tuple const& state)
+    auto kvCacheMetricsSetstate = [](tle::RequestPerfMetrics::KvCacheMetrics& kvCacheMetrics, nb::tuple const& state)
     {
         if (state.size() != 5)
         {
             throw std::runtime_error("Invalid KvCacheMetrics state!");
         }
-        return tle::RequestPerfMetrics::KvCacheMetrics{state[0].cast<SizeType32>(), state[1].cast<SizeType32>(),
-            state[2].cast<SizeType32>(), state[3].cast<SizeType32>(), state[4].cast<float>()};
+        new (&kvCacheMetrics)
+            tle::RequestPerfMetrics::KvCacheMetrics{nb::cast<SizeType32>(state[0]), nb::cast<SizeType32>(state[1]),
+                nb::cast<SizeType32>(state[2]), nb::cast<SizeType32>(state[3]), nb::cast<float>(state[4])};
     };
     nb::class_<tle::RequestPerfMetrics::KvCacheMetrics>(m, "KvCacheMetrics")
         .def(nb::init<>())
@@ -770,18 +774,20 @@ void initRequestBindings(nanobind::module_& m)
         .def_rw("num_reused_blocks", &tle::RequestPerfMetrics::KvCacheMetrics::numReusedBlocks)
         .def_rw("num_missed_blocks", &tle::RequestPerfMetrics::KvCacheMetrics::numMissedBlocks)
         .def_rw("kv_cache_hit_rate", &tle::RequestPerfMetrics::KvCacheMetrics::kvCacheHitRate)
-        .def(py::pickle(kvCacheMetricsGetstate, kvCacheMetricsSetstate));
+        .def("__getstate__", kvCacheMetricsGetstate)
+        .def("__setstate__", kvCacheMetricsSetstate);
 
     auto speculativeDecodingMetricsGetstate = [](tle::RequestPerfMetrics::SpeculativeDecodingMetrics const& self)
-    { return py::make_tuple(self.acceptanceRate, self.totalAcceptedDraftTokens, self.totalDraftTokens); };
-    auto speculativeDecodingMetricsSetstate = [](py::tuple const& state)
+    { return nb::make_tuple(self.acceptanceRate, self.totalAcceptedDraftTokens, self.totalDraftTokens); };
+    auto speculativeDecodingMetricsSetstate
+        = [](tle::RequestPerfMetrics::SpeculativeDecodingMetrics& speculativeDecodingMetrics, nb::tuple const& state)
     {
         if (state.size() != 3)
         {
             throw std::runtime_error("Invalid SpeculativeDecodingMetrics state!");
         }
-        return tle::RequestPerfMetrics::SpeculativeDecodingMetrics{
-            state[0].cast<float>(), state[1].cast<SizeType32>(), state[2].cast<SizeType32>()};
+        new (&speculativeDecodingMetrics) tle::RequestPerfMetrics::SpeculativeDecodingMetrics{
+            nb::cast<float>(state[0]), nb::cast<SizeType32>(state[1]), nb::cast<SizeType32>(state[2])};
     };
 
     nb::class_<tle::RequestPerfMetrics::SpeculativeDecodingMetrics>(m, "SpeculativeDecodingMetrics")
@@ -795,20 +801,21 @@ void initRequestBindings(nanobind::module_& m)
 
     auto requestPerfMetricsGetstate = [](tle::RequestPerfMetrics const& self)
     {
-        return py::make_tuple(self.timingMetrics, self.kvCacheMetrics, self.speculativeDecoding, self.firstIter,
+        return nb::make_tuple(self.timingMetrics, self.kvCacheMetrics, self.speculativeDecoding, self.firstIter,
             self.lastIter, self.iter);
     };
-    auto requestPerfMetricsSetstate = [](py::tuple const& state)
+    auto requestPerfMetricsSetstate = [](tle::RequestPerfMetrics& requestPerfMetrics, nb::tuple const& state)
     {
         if (state.size() != 6)
         {
             throw std::runtime_error("Invalid RequestPerfMetrics state!");
         }
-        return tle::RequestPerfMetrics{state[0].cast<tle::RequestPerfMetrics::TimingMetrics>(),
-            state[1].cast<tle::RequestPerfMetrics::KvCacheMetrics>(),
-            state[2].cast<tle::RequestPerfMetrics::SpeculativeDecodingMetrics>(),
-            state[3].cast<std::optional<tle::IterationType>>(), state[4].cast<std::optional<tle::IterationType>>(),
-            state[5].cast<std::optional<tle::IterationType>>()};
+        new (&requestPerfMetrics) tle::RequestPerfMetrics{nb::cast<tle::RequestPerfMetrics::TimingMetrics>(state[0]),
+            nb::cast<tle::RequestPerfMetrics::KvCacheMetrics>(state[1]),
+            nb::cast<tle::RequestPerfMetrics::SpeculativeDecodingMetrics>(state[2]),
+            nb::cast<std::optional<tle::IterationType>>(state[3]),
+            nb::cast<std::optional<tle::IterationType>>(state[4]),
+            nb::cast<std::optional<tle::IterationType>>(state[5])};
     };
 
     // There's a circular dependency between the declaration of the TimingMetrics and RequestPerfMetrics bindings.
@@ -885,6 +892,14 @@ void initRequestBindings(nanobind::module_& m)
         [](std::string& x)
         {
             std::istringstream is(x);
+            return tle::serialize_utils::deserialize<tle::Result>(is);
+        });
+
+    m.def("deserialize_result",
+        [](nb::bytes& x)
+        {
+            std::string str(x.c_str(), x.size());
+            std::istringstream is(str);
             return tle::serialize_utils::deserialize<tle::Result>(is);
         });
 
