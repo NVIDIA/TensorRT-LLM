@@ -255,9 +255,8 @@ moe_permute_op(torch::Tensor const& input, torch::Tensor const& token_selected_e
         expert_first_token_offset_tensor, permuted_token_final_scales_tensor, src_to_dest_map_tensor);
 }
 
-// TODO: extend the api interface (expanded_dest_row_to_expanded_source_row, expert_first_token_offset_tensor,
-// enable_alltoall)
-// ok: remove num_valid_tokens_ptr
+// TODO: we could add the following parameters to support enable_alltoall feature:
+// expanded_dest_row_to_expanded_source_row, expert_first_token_offset_tensor, enable_alltoall
 template <class UnfusedGemmOutputType, class ScaleBiasType, class OutputType>
 void runMoEFinalizeScaleOp(UnfusedGemmOutputType const* const gemm2_output,
     ScaleBiasType const* const fc2_expert_biases, float const* const unpermuted_final_scales,
