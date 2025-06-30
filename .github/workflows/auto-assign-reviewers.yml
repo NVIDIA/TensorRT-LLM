@@ -12,7 +12,7 @@ on:
         description: 'Run in dry-run mode (just print commands)'
         required: false
         type: boolean
-        default: true
+        default: false
       force_assign:
         description: 'Force assign even if reviewers already exist'
         required: false
@@ -21,6 +21,9 @@ on:
 jobs:
   assign:
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
