@@ -204,11 +204,18 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
             TLLM_CHECK_WITH_INFO(inputKvCacheBlocks.find(window) == inputKvCacheBlocks.end(),
                 "window size already exists, which is not supported");
             inputKvCacheBlocks.emplace(window, std::vector<runtime::ITensor::SharedPtr>());
+            auto maxBlockThisWindow = window / selfConfig.getModelConfig().mTokensPerBlock;
+            size_t blockNumThisWindow = 0;
             for (auto it = blockRange.begin(); it != blockRange.end(); ++it)
             {
                 blockNum++;
                 inputKvCacheBlocks.at(window).push_back(it);
                 allCacheBlockSize += it->getSize();
+                blockNumThisWindow++;
+                if (blockNumThisWindow >= maxBlockThisWindow)
+                {
+                    break;
+                }
             }
         }
 
@@ -417,11 +424,18 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
         TLLM_CHECK_WITH_INFO(outputBuffersPerWindow.find(window) == outputBuffersPerWindow.end(),
             "window size already exists, which is not supported");
         outputBuffersPerWindow.emplace(window, std::vector<runtime::ITensor::SharedPtr>());
+        auto maxBlockThisWindow = window / selfConfig.getModelConfig().mTokensPerBlock;
+        size_t blockNumThisWindow = 0;
         for (auto it = blockRange.begin(); it != blockRange.end(); ++it)
         {
             blockNum++;
+            blockNumThisWindow++;
             outputBuffersPerWindow.at(window).push_back(it);
             cacheBlockSizeSum += it->getSize();
+            if (blockNumThisWindow >= maxBlockThisWindow)
+            {
+                break;
+            }
         }
     }
     TLLM_CHECK(!outputBuffersPerWindow.empty());
