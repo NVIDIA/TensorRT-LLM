@@ -1515,12 +1515,12 @@ class PyExecutor:
             )
             for llm_request in llm_request_list:
                 llm_request.is_attention_dp_dummy = True
-            self.active_requests += llm_request_list
             spec_resource_manager = self.resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
             if spec_resource_manager is not None:
                 spec_resource_manager.add_dummy_requests(
                     list(range(num_dummy_request)))
+            self.active_requests += llm_request_list
 
     @nvtx_range("_prepare_disagg_gen_init")
     def _prepare_disagg_gen_init(self, fitting_disagg_gen_init_requests):
