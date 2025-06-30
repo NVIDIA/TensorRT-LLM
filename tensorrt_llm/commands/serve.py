@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import signal  # Added import
 import subprocess  # nosec B404
@@ -274,7 +275,7 @@ def launch_server(host: str,
     type=str,
     default=None,
     help=
-    "Path to a YAML file that overwrites the parameters specified by trtllm-serve."
+    "JSON that overwrites the parameters specified by trtllm-serve."
 )
 @click.option(
     "--reasoning_parser",
@@ -344,8 +345,7 @@ def serve(model: str,
 
     llm_args_extra_dict = {}
     if extra_llm_api_options is not None:
-        with open(extra_llm_api_options, 'r') as f:
-            llm_args_extra_dict = yaml.safe_load(f)
+        llm_args_extra_dict = json.loads(extra_llm_api_options)
     llm_args = update_llm_args_with_extra_dict(llm_args, llm_args_extra_dict)
 
     metadata_server_cfg = parse_metadata_server_config_file(
