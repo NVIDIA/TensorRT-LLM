@@ -1572,10 +1572,10 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
 #define INSTANTIATE_EXPAND_INPUT_ROWS(InputActivationsType, ExpandedActivationsType)                                   \
     template void expandInputRowsKernelLauncher<InputActivationsType, ExpandedActivationsType>(                        \
         InputActivationsType const* unpermuted_input, ExpandedActivationsType* permuted_output,                        \
-        float const* unpermuted_scales, float* permuted_scales, int const* expanded_dest_row_to_expanded_source_row,   \
-        int* expanded_source_row_to_expanded_dest_row, int64_t const num_rows, int64_t const cols, int const k,        \
-        int const num_experts_per_node, float const* fc1_act_global_scale, bool use_per_expert_act_scale,              \
-        int64_t* expert_first_token_offset, TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,            \
+        float const* unpermuted_scales, float* permuted_scales, int const* permuted_row_to_unpermuted_row,             \
+        int64_t const num_rows, int64_t const cols, int const k, int const num_experts_per_node,                       \
+        float const* fc1_act_global_scale, bool use_per_expert_act_scale, int64_t* expert_first_token_offset,          \
+        TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,                                                \
         TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, cudaStream_t stream);
 
 INSTANTIATE_EXPAND_INPUT_ROWS(half, half);
@@ -1829,7 +1829,7 @@ void finalizeMoeRoutingKernelLauncher(GemmOutputType const* expanded_permuted_ro
         float const* final_scales, int const* expanded_source_row_to_expanded_dest_row,                                \
         int const* expanded_dest_row_to_expanded_source_row, int const* expert_for_source_row,                         \
         int64_t const* expert_first_token_offset, int64_t const num_rows, int64_t const cols,                          \
-        int64_t const experts_per_token, int const num_experts_per_node, MOEParallelismConfig parallelism_config,      \
+        int64_t const experts_per_token, int64_t const num_experts_per_node, MOEParallelismConfig parallelism_config,  \
         bool const enable_alltoall, cudaStream_t stream);
 
 INSTANTIATE_FINALIZE_MOE_ROUTING(half, half, half);
