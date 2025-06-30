@@ -13,78 +13,35 @@ Welcome to TensorRT-LLM's Documentation!
 
    overview.md
    quick-start-guide.md
-   key-features.md
-   torch.md
-   release-notes.md
-
+   installation/index
 
 .. toctree::
    :maxdepth: 2
-   :caption: Installation
-   :name: Installation
-
-   .. installation/overview.md
-
-   installation/containers.md
-   installation/linux.md
-   installation/build-from-source-linux.md
-
-
-.. toctree::
-   :maxdepth: 2
-   :caption: LLM API
+   :caption: Developer Guide
    :hidden:
-   :glob:
 
+.. toctree::
+   :maxdepth: 2
+   :caption: CLI Reference
+   :hidden:
+   commands/trtllm-serve
+
+.. toctree::
+   :maxdepth: 2
+   :caption: API Reference
+   :hidden:
    llm-api/*
-
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Examples
-   :hidden:
-
    examples/index.rst
    examples/customization.md
    examples/llm_api_examples
    examples/trtllm_serve_examples
 
 
-.. toctree::
-   :maxdepth: 2
-   :caption: Model Definition API
-   :hidden:
-
-   python-api/tensorrt_llm.layers.rst
-   python-api/tensorrt_llm.functional.rst
-   python-api/tensorrt_llm.models.rst
-   python-api/tensorrt_llm.plugin.rst
-   python-api/tensorrt_llm.quantization.rst
-   python-api/tensorrt_llm.runtime.rst
-
 
 .. toctree::
    :maxdepth: 2
-   :caption: C++ API
-   :hidden:
-
-   _cpp_gen/executor.rst
-   _cpp_gen/runtime.rst
-
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Command-Line Reference
-   :hidden:
-
-   commands/trtllm-build
-   commands/trtllm-serve
-
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Architecture
-   :name: Architecture
+   :caption: Software Architecture
+   :name: Software Architecture
 
    architecture/overview.md
    architecture/core-concepts.md
@@ -94,8 +51,8 @@ Welcome to TensorRT-LLM's Documentation!
 
 .. toctree::
    :maxdepth: 2
-   :caption: Advanced
-   :name: Advanced
+   :caption: Features
+   :name: Features
 
    advanced/gpt-attention.md
    advanced/gpt-runtime.md
@@ -109,45 +66,13 @@ Welcome to TensorRT-LLM's Documentation!
    advanced/speculative-decoding.md
    advanced/disaggregated-service.md
 
-.. toctree::
-   :maxdepth: 2
-   :caption: Performance
-   :name: Performance
-
-   performance/perf-overview.md
-   Benchmarking <performance/perf-benchmarking.md>
-   performance/performance-tuning-guide/index
-   performance/perf-analysis.md
-
 
 .. toctree::
    :maxdepth: 2
-   :caption: Reference
-   :name: Reference
-
-   reference/troubleshooting.md
-   reference/support-matrix.md
-
-   .. reference/upgrading.md
-
-   reference/precision.md
-   reference/memory.md
-   reference/ci-overview.md
-
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Blogs
+   :caption: Links
    :hidden:
 
-   blogs/H100vsA100.md
-   blogs/H200launch.md
-   blogs/Falcon180B-H200.md
-   blogs/quantization-in-TRT-LLM.md
-   blogs/XQA-kernel.md
-   blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md
-   blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.md
-
+   blogs/index.rst
 
 Indices and tables
 ==================
