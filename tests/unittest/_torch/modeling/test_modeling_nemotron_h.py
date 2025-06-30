@@ -44,7 +44,7 @@ def test_nemotron_h_correctness():
     nemotron_h = LLM(
         model=model_dir,
         max_batch_size=num_prompts,
-        use_cuda_graph=False,
+        use_cuda_graph=True,
         kv_cache_config=KvCacheConfig(enable_block_reuse=False),
         enable_trtllm_sampler=True,
     )
