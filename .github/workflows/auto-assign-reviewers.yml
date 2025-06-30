@@ -14,6 +14,6 @@ jobs:
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.REVIEW_ASSIGNING_TOKEN }}
           REVIEWER_LIMIT: '3'
         run: python3 .github/scripts/assign_reviewers.py
