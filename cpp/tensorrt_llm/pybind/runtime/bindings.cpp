@@ -404,13 +404,13 @@ void initBindings(nanobind::module_& m)
             nb::arg("explicit_draft_tokens_d_type") = std::nullopt, nb::arg("lookahead_prompt") = std::nullopt,
             nb::arg("lookahead_algo_configs") = std::nullopt);
 
-    py::class_<tr::decoder::DecoderState>(m, "DecoderState")
+    nb::class_<tr::decoder::DecoderState>(m, "DecoderState")
         .def(nb::init<>())
         .def("setup", &tr::decoder::DecoderState::setup, nb::arg("max_batch_size"), nb::arg("max_beam_width"),
             nb::arg("max_attention_window"), nb::arg("sink_token_length"), nb::arg("max_sequence_length"),
             nb::arg("dtype"), nb::arg("model_config"), nb::arg("world_config"), nb::arg("buffer_manager"))
         .def("setup_cache_indirection", &tr::decoder::DecoderState::setupCacheIndirection, nb::arg("max_batch_size"),
-            py::arg("max_beam_width"), py::arg("max_attention_window"), py::arg("buffer_manager"))
+            nb::arg("max_beam_width"), nb::arg("max_attention_window"), nb::arg("buffer_manager"))
         .def("setup_speculative_decoding", &tr::decoder::DecoderState::setupSpeculativeDecoding,
             nb::arg("speculative_decoding_mode"), nb::arg("max_tokens_per_engine_step"), nb::arg("dtype"),
             nb::arg("model_config"), nb::arg("world_config"), nb::arg("buffer_manager"))
