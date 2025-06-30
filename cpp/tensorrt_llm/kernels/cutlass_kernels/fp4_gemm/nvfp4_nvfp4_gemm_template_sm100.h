@@ -169,7 +169,11 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
                 }                                                                                                      \
                 else                                                                                                   \
                 {                                                                                                      \
-                    printf("ERROR : This kernel shall only run on SM10x devices.\n");                                  \
+                    if (cute::thread0())                                                                               \
+                    {                                                                                                  \
+                        printf(__FILE__ " : This kernel shall only run on SM10x devices.\n");                          \
+                        __trap();                                                                                      \
+                    }                                                                                                  \
                 }                                                                                                      \
             }                                                                                                          \
         };                                                                                                             \

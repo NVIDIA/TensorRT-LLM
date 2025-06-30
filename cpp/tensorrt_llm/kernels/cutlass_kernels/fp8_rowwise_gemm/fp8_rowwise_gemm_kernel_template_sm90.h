@@ -178,7 +178,11 @@ struct DeviceGemmFp8RowwiseSm90
             }
             else
             {
-                printf("ERROR : This kernel shall only run on SM90 devices.\n");
+                if (cute::thread0())
+                {
+                    printf(__FILE__ " : This kernel shall only run on SM90 devices.\n");
+                    __trap();
+                }
             }
         }
     };

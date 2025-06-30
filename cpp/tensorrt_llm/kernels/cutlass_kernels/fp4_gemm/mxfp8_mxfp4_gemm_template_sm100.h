@@ -153,7 +153,11 @@ struct DeviceGemmMXFP8xMXFP4GemmSm100
             }
             else
             {
-                printf("ERROR : This kernel shall only run on SM10x devices.\n");
+                if (cute::thread0())
+                {
+                    printf(__FILE__ " : This kernel shall only run on SM10x devices.\n");
+                    __trap();
+                }
             }
         }
     };
