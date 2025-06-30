@@ -21,8 +21,8 @@ class TransformersTokenizer(TokenizerBase):
         self.tokenizer = tokenizer
         self._all_special_tokens_set = set(self.tokenizer.all_special_tokens)
         self.hf_decode_stream = None
-        self.STREAM_INTERVAL_THRESHOLD = int(
-            os.getenv("TRTLLM_STREAM_INTERVAL_THRESHOLD", "64"))
+        self.stream_interval_threshold = int(
+            os.getenv("TLLM_STREAM_INTERVAL_THRESHOLD", "64"))
 
     def __call__(self, text: str, *args, **kwargs) -> Any:
         return self.tokenizer(text, *args, **kwargs)
@@ -153,7 +153,7 @@ class TransformersTokenizer(TokenizerBase):
 
         # HF incremental detokenization implementation is faster than TRTLLM
         # when stream_interval is smaller.
-        if len(token_ids) < self.STREAM_INTERVAL_THRESHOLD:
+        if len(token_ids) < self.stream_interval_threshold:
             return self.hf_decode_incrementally(token_ids, prev_text,
                                                 skip_special_tokens)
 
