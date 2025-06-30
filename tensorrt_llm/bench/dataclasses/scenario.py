@@ -6,8 +6,8 @@ from typing import Any, Dict, Literal, Optional, Self, Union
 
 import yaml
 from huggingface_hub import snapshot_download
-from pydantic import (AliasChoices, AliasPath, BaseModel, Field, computed_field,
-                      field_validator, model_validator)
+from pydantic import (AliasChoices, AliasPath, BaseModel, Field, PrivateAttr,
+                      computed_field, field_validator, model_validator)
 from transformers import AutoConfig
 
 # isort: off
@@ -128,15 +128,19 @@ class TuningConstraints(BaseModel):
 
 class WorldConfig(BaseModel):
     tp: int = Field(
-        default=1, description="The tensor parallelism size to use for tuning.")
+        default=None,
+        description="The tensor parallelism size to use for tuning.")
     pp: int = Field(
-        default=1,
+        default=None,
         description="The pipeline parallelism size to use for tuning.")
     ep: Optional[int] = Field(
         default=None,
         description="The expert parallelism size to use for tuning.")
     cluster_size: Optional[int] = Field(
         default=None, description="The expert cluster size to use for tuning.")
+    gpus_per_node: Optional[int] = Field(
+        default=None,
+        description="The number of GPUs per node to use for tuning.")
 
     @computed_field
     def world_size(self) -> int:
@@ -239,6 +243,9 @@ class ReportingConfiguration(BaseModel):
 
 
 class ScenarioSpecification(BaseModel):
+    target_scenario: Optional[str] = Field(
+        default="throughput",
+        description="The target scenario to use for benchmarking.")
     constraints: Optional[TuningConstraints] = Field(
         description="The tuning criteria to use for benchmarking.",
         default=None,
@@ -274,14 +281,17 @@ class ScenarioSpecification(BaseModel):
     )
     world: WorldConfig = Field(description="The world to use for benchmarking.")
 
+    _engine_config: Dict[str, Any] = PrivateAttr(init=False)
+
     class Config:
         validate_assignment = True
 
     @model_validator(mode="after")
-    def validate_engine_dir(self) -> Self:
+    def validate_engine_dir(self, v: Optional[Path]) -> Optional[Path]:
         engine_dir = bool(self.engine_dir is not None)
         trt_backend = bool(self.llm_config.backend == "tensorrt")
-        engine_dir_exists = bool(self.engine_dir is not None and self.engine_dir.exists())
+        engine_dir_exists = bool(self.engine_dir is not None
+                                 and self.engine_dir.exists())
 
         # We aren't dealing with tensorrt engine for this instance. Return.
         if not engine_dir and not trt_backend:
@@ -299,22 +309,41 @@ class ScenarioSpecification(BaseModel):
                 f"Engine directory ('engine_dir') does not exist: {self.engine_dir}"
             )
 
-        # Now that we know we're dealing with tensorrt engine, we need to validate the engine directory.
+    @model_validator(mode="after")
+    def validate_engine_config(self) -> Self:
+        if self.engine_dir is None:
+            return self
+
         with open(self.engine_dir / "config.json", "r") as f:
-            engine_config = json.load(f)
+            self._engine_config = json.load(f)
 
-        # Validate the engine directory against the engine config.
-        engine_world_map = engine_config["pretrained_config"]["mapping"]
-        engine_build_cfg = engine_config["build_config"]
-        engine_parallel_map = engine_build_cfg["auto_parallel_config"]
+        # Validate/update settings in relation to the engine config.
+        engine_mapping = self._engine_config["pretrained_config"]["mapping"]
+        engine_to_config_map = {
+            "gpus_per_node": "gpus_per_node",
+            "tp": "tp",
+            "pp": "pp",
+            "ep": "ep",
+            "cluster_size": "cluster_size",
+        }
+        invalid_values = []
+        for engine_key, config_key in engine_to_config_map.items():
+            if engine_key in engine_mapping:
+                cfg_value = self.world.model_getattr(config_key)
+                engine_value = engine_mapping[engine_key]
+                value = cfg_value or engine_value
+                self.world.model_setattr(config_key, value)
 
-        # Validate the world config.
+                if value != engine_value:
+                    invalid_values.append(
+                        f"{config_key}: Config: {cfg_value} -> Engine: {engine_value}"
+                    )
 
-
+        if invalid_values:
+            raise ValueError("Invalid values detected in the engine config: \n"
+                             f"{invalid_values.join('\n')}")
 
         return self
-
-
 
     @model_validator(mode="after")
     def validate_heuristic_constraints(self) -> Self:
@@ -405,10 +434,7 @@ class BenchmarkEnvironment(BaseModel):
 
 class BenchmarkSpecification(BaseModel):
     environment: BenchmarkEnvironment
-    engine_dir: Optional[Path] = Field(
-        default=None,
-        description="The path to the engine to use for benchmarking.")
-    scenario: Optional[ScenarioSpecification] = Field(
+    scenario: ScenarioSpecification = Field(
         default=None, description="The scenario to use for benchmarking.")
     world: Optional[WorldConfig] = Field(
         default=None, description="The world to use for benchmarking.")
