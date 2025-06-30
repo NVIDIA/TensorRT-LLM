@@ -15,8 +15,4 @@ l0_gb200_multi_nodes:
   tests:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_8gpus[latency] TIMEOUT (180)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_8gpus[throughput_tp8] TIMEOUT (180)
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_8gpus[latency_trtllmgen] TIMEOUT (180)
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_fp8[throughput_latency] TIMEOUT (180)
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_fp8[latency] TIMEOUT (180)
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4[throughput_latency] TIMEOUT (180)
   - accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4[latency] TIMEOUT (180)
