@@ -328,103 +328,152 @@ class WideEPMoE(MoE):
     def forward_mnnvl(self, x, token_selected_slots, token_final_scales,
                       all_rank_num_tokens, loadbalancer_local_statistic_info,
                       is_last_call, output_dtype):
+
+        def dispatch(chunk_idx, x, token_selected_slots, token_final_scales):
+            chunk_expert_mask = (token_selected_slots %
+                                 self.expert_size_per_partition
+                                 ) // self.chunk_expert_size != chunk_idx
+            token_selected_slots[chunk_expert_mask] = self.ep_size
+            token_final_scales[chunk_expert_mask] = 0
+
+            alltoall_info = None
+            x, token_selected_slots, token_final_scales, gathered_loadbalancer_local_statistic_info, alltoall_info = \
+                self.alltoall_prepare_maybe_dispatch(all_rank_num_tokens,
+                                                        x,
+                                                        token_selected_slots,
+                                                        token_final_scales,
+                                                        loadbalancer_local_statistic_info)
+
+            x_sf = None
+            x_row = x.shape[0]
+            x_col = x.shape[1]
+            sf_swizzle = True
+            self.w3_w1_weight.dtype
+
+            if self.has_any_quant:
+                if self.has_fp8_qdq:
+                    x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                        x, self.fc31_input_dequant)
+                elif self.has_nvfp4:
+                    if not disable_fp4_allgather(
+                    ) or self.use_postquant_alltoall:
+                        if isinstance(x, Fp4QuantizedTensor):
+                            x, x_sf = x.fp4_tensor, x.scaling_factor
+                            x_row = x.shape[0]
+                            # note: we use uint8 to store 2 fp4 values
+                            x_col = x.shape[1] * 2
+                        else:
+                            sf_swizzle = not self.use_postquant_alltoall
+                            x_row = x.shape[0]
+                            x_col = x.shape[1]
+                            x, x_sf = torch.ops.trtllm.fp4_quantize(
+                                x, self.fc31_input_scale,
+                                self.scaling_vector_size, False, sf_swizzle)
+                            if self.use_postquant_alltoall:
+                                x_sf = x_sf.view((x_row, -1))
+
+                elif self.has_deepseek_fp8_block_scales:
+                    pass
+                elif self.has_w4afp8:
+                    torch.quint4x2
+                else:
+                    raise ValueError(
+                        f"unsupported quantization mode: {self.quant_config.quant_mode}"
+                    )
+
+            if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
+            ):
+                if is_last_call:
+                    gathered_loadbalancer_local_statistic_info = gathered_loadbalancer_local_statistic_info.view(
+                        (self.mapping.moe_ep_size, self.num_experts))
+                    self.layer_load_balancer.update_statistic(
+                        gathered_loadbalancer_local_statistic_info)
+
+            if self.use_postquant_alltoall:
+                x, x_sf = self.alltoall_postquant_dispatch(
+                    x,
+                    x_sf,
+                    x_row,
+                    x_col,
+                    alltoall_info,
+                    is_sf_swizzle=sf_swizzle)
+            return x, x_sf, token_selected_slots, token_final_scales, alltoall_info
+
+        def compute_and_combine(x, x_sf, token_selected_slots,
+                                token_final_scales, token_count, alltoall_info):
+            final_hidden_states = torch.ops.trtllm.fused_moe(
+                x,
+                token_selected_slots,
+                token_final_scales,
+                self.w3_w1_weight,
+                self.w2_weight,
+                output_dtype,
+                quant_scales=self.quant_scales,
+                input_sf=x_sf,
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
+                ep_size=self.ep_size,
+                ep_rank=self.ep_rank,
+                cluster_size=self.cluster_size,
+                cluster_rank=self.cluster_rank,
+                enable_alltoall=self.enable_alltoall,
+                use_deepseek_fp8_block_scale=False,
+                use_w4a8_group_scaling=False,
+                min_latency_mode=False,
+                tune_max_num_tokens=self.tune_max_num_tokens,
+            )
+
+            if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
+            ) and is_last_call:
+                self.layer_load_balancer.set_cpu_stage()
+
+            # Custom op requires all inputs are in the same type.
+            # Only in cutlass_min_latency_mode, the output is a list of tensors.
+            # Otherwise, the output should be unpacked as a single tensor.
+            final_hidden_states = final_hidden_states[0]
+
+            final_hidden_states = self.alltoall_combine(final_hidden_states,
+                                                        alltoall_info,
+                                                        token_count)
+            return final_hidden_states
+
         token_count = x.shape[0]
-        alltoall_info = None
-        x, token_selected_slots, token_final_scales, gathered_loadbalancer_local_statistic_info, alltoall_info = \
-            self.alltoall_prepare_maybe_dispatch(all_rank_num_tokens,
-                                                    x,
-                                                    token_selected_slots,
-                                                    token_final_scales,
-                                                    loadbalancer_local_statistic_info)
+        final_hidden_states = []
 
-        x_sf = None
-        x_row = x.shape[0]
-        x_col = x.shape[1]
-        sf_swizzle = True
-        use_deepseek_fp8_block_scale = False
-        use_w4a8_group_scaling = False
-        weight_dtype = self.w3_w1_weight.dtype
+        x_chunked, x_sf_chunked, token_selected_slots_chunked, token_final_scales_chunked, alltoall_info_chunked = dispatch(
+            0, x.clone(), token_selected_slots.clone(),
+            token_final_scales.clone())
+        self.event_dict[EventType.Main].record()
 
-        if self.has_any_quant:
-            if self.has_fp8_qdq:
-                x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
-                    x, self.fc31_input_dequant)
-            elif self.has_nvfp4:
-                if not disable_fp4_allgather() or self.use_postquant_alltoall:
-                    if isinstance(x, Fp4QuantizedTensor):
-                        x, x_sf = x.fp4_tensor, x.scaling_factor
-                        x_row = x.shape[0]
-                        # note: we use uint8 to store 2 fp4 values
-                        x_col = x.shape[1] * 2
-                    else:
-                        sf_swizzle = not self.use_postquant_alltoall
-                        x_row = x.shape[0]
-                        x_col = x.shape[1]
-                        x, x_sf = torch.ops.trtllm.fp4_quantize(
-                            x, self.fc31_input_scale, self.scaling_vector_size,
-                            False, sf_swizzle)
-                        if self.use_postquant_alltoall:
-                            x_sf = x_sf.view((x_row, -1))
-
-            elif self.has_deepseek_fp8_block_scales:
-                use_deepseek_fp8_block_scale = True
-            elif self.has_w4afp8:
-                use_w4a8_group_scaling = True
-                weight_dtype = torch.quint4x2
+        for chunk_idx in range(self.num_chunk_experts):
+            if chunk_idx % 2 == 0:
+                if chunk_idx > 0:
+                    x_chunked, x_sf_chunked, token_selected_slots_chunked, token_final_scales_chunked, alltoall_info_chunked = dispatch(
+                        chunk_idx, x.clone(), token_selected_slots.clone(),
+                        token_final_scales.clone())
+                chunked_final_hidden_states = compute_and_combine(
+                    x_chunked, x_sf_chunked, token_selected_slots_chunked,
+                    token_final_scales_chunked, token_count,
+                    alltoall_info_chunked)
+                final_hidden_states.append(chunked_final_hidden_states)
             else:
-                raise ValueError(
-                    f"unsupported quantization mode: {self.quant_config.quant_mode}"
-                )
+                if chunk_idx == 1:
+                    with torch.cuda.stream(self.aux_stream):
+                        self.event_dict[EventType.Main].wait()
+                with torch.cuda.stream(self.aux_stream):
+                    x_chunked, x_sf_chunked, token_selected_slots_chunked, token_final_scales_chunked, alltoall_info_chunked = dispatch(
+                        chunk_idx, x.clone(), token_selected_slots.clone(),
+                        token_final_scales.clone())
+                    chunked_final_hidden_states = compute_and_combine(
+                        x_chunked, x_sf_chunked, token_selected_slots_chunked,
+                        token_final_scales_chunked, token_count,
+                        alltoall_info_chunked)
+                    final_hidden_states.append(chunked_final_hidden_states)
+                    if chunk_idx == self.num_chunk_experts - 1:
+                        self.event_dict[EventType.MoeChunkingOverlap].record()
 
-        if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
-        ):
-            if is_last_call:
-                gathered_loadbalancer_local_statistic_info = gathered_loadbalancer_local_statistic_info.view(
-                    (self.mapping.moe_ep_size, self.num_experts))
-                self.layer_load_balancer.update_statistic(
-                    gathered_loadbalancer_local_statistic_info)
-
-        if self.use_postquant_alltoall:
-            x, x_sf = self.alltoall_postquant_dispatch(x,
-                                                       x_sf,
-                                                       x_row,
-                                                       x_col,
-                                                       alltoall_info,
-                                                       is_sf_swizzle=sf_swizzle)
-
-        final_hidden_states = torch.ops.trtllm.fused_moe(
-            x,
-            token_selected_slots,
-            token_final_scales,
-            self.w3_w1_weight.view(weight_dtype),
-            self.w2_weight.view(weight_dtype),
-            output_dtype,
-            quant_scales=self.quant_scales,
-            input_sf=x_sf,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            ep_size=self.ep_size,
-            ep_rank=self.ep_rank,
-            cluster_size=self.cluster_size,
-            cluster_rank=self.cluster_rank,
-            enable_alltoall=self.enable_alltoall,
-            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
-            use_w4a8_group_scaling=use_w4a8_group_scaling,
-            min_latency_mode=False,
-            tune_max_num_tokens=self.tune_max_num_tokens,
-        )
-
-        if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
-        ) and is_last_call:
-            self.layer_load_balancer.set_cpu_stage()
-
-        # Custom op requires all inputs are in the same type.
-        # Only in cutlass_min_latency_mode, the output is a list of tensors.
-        # Otherwise, the output should be unpacked as a single tensor.
-        final_hidden_states = final_hidden_states[0]
-
-        final_hidden_states = self.alltoall_combine(final_hidden_states,
-                                                    alltoall_info, token_count)
+        self.event_dict[EventType.MoeChunkingOverlap].wait()
+        final_hidden_states = torch.stack(final_hidden_states, dim=0).sum(dim=0)
 
         if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
         ) and is_last_call:
