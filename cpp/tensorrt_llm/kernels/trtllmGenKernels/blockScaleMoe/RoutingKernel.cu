@@ -1239,6 +1239,8 @@ void run(Data const& data, void* stream)
     {
         // Reset the global histograms (not used in single-cluster code path).
         // Cover both for the cooperative and two-kernel code paths.
+        TLLM_CHECK_WITH_INFO(
+            data.mPtrExpertCounts != nullptr, "When #tokens is large, `mPtrExpertCounts` is a required input.");
         TLLM_CUDA_CHECK(cudaMemsetAsync(
             data.mPtrExpertCounts, 0, static_cast<size_t>(2 * NumThreads) * sizeof(int32_t), (cudaStream_t) stream));
     }

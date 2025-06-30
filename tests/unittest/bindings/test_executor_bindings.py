@@ -1124,6 +1124,9 @@ def test_result():
     result.finish_reasons = [trtllm.FinishReason.LENGTH]
     result.sequence_index = 1
     result.is_sequence_final = True
+    result.decoding_iter = 1
+    result.request_perf_metrics = trtllm.RequestPerfMetrics()
+    result.request_perf_metrics.last_iter = 33
     result.additional_outputs = [
         trtllm.AdditionalOutput("topKLogits", torch.ones(1, 4, 100))
     ]
@@ -1137,10 +1140,44 @@ def test_result():
     assert result.finish_reasons == [trtllm.FinishReason.LENGTH]
     assert result.sequence_index == 1
     assert result.is_sequence_final is True
+    assert result.decoding_iter == 1
+    assert result.request_perf_metrics is not None
+    assert result.request_perf_metrics.last_iter == 33
     assert len(result.additional_outputs) == 1
     additional_output = result.additional_outputs[0]
     assert additional_output.name == "topKLogits"
     assert (additional_output.output == torch.ones(1, 4, 100)).all()
+
+
+def test_result_pickle():
+    result = trtllm.Result()
+    result.is_final = True
+    result.output_token_ids = [[1, 2, 3]]
+    result.cum_log_probs = [1.0, 2.0, 3.0]
+    result.log_probs = [[1.0, 2.0, 3.0]]
+    result.context_logits = torch.ones(3, 100)
+    result.generation_logits = torch.ones(1, 3, 100)
+    result.encoder_output = torch.ones(1, 1)
+    result.finish_reasons = [trtllm.FinishReason.LENGTH]
+    result.sequence_index = 1
+    result.is_sequence_final = True
+    result.decoding_iter = 1
+    result.request_perf_metrics = trtllm.RequestPerfMetrics()
+    result.request_perf_metrics.last_iter = 33
+    result_str = pickle.dumps(result)
+    result_copy = pickle.loads(result_str)
+    assert result.is_final == result_copy.is_final
+    assert result.output_token_ids == result_copy.output_token_ids
+    assert result.cum_log_probs == result_copy.cum_log_probs
+    assert result.log_probs == result_copy.log_probs
+    assert (result.context_logits == result_copy.context_logits).all()
+    assert (result.generation_logits == result_copy.generation_logits).all()
+    assert (result.encoder_output == result_copy.encoder_output).all()
+    assert result.finish_reasons == result_copy.finish_reasons
+    assert result.sequence_index == result_copy.sequence_index
+    assert result.is_sequence_final == result_copy.is_sequence_final
+    assert result.decoding_iter == result_copy.decoding_iter
+    assert result.request_perf_metrics.last_iter == result_copy.request_perf_metrics.last_iter
 
 
 def test_response():
@@ -2189,6 +2226,50 @@ def test_kv_event_stream_timeout(model_path):
     # Make sure that it actually waited
     assert abs(end - start) > datetime.timedelta(milliseconds=900)
     assert len(events) == 0
+
+
+def test_request_perf_metrics_pickle():
+    metrics = trtllm.RequestPerfMetrics()
+    random_delta = datetime.timedelta(seconds=42, milliseconds=123)
+
+    metrics.timing_metrics.arrival_time = random_delta
+    metrics.timing_metrics.first_scheduled_time = 2 * random_delta
+    metrics.timing_metrics.first_token_time = 3 * random_delta
+    metrics.timing_metrics.last_token_time = 4 * random_delta
+    metrics.timing_metrics.kv_cache_transfer_start = 5 * random_delta
+    metrics.timing_metrics.kv_cache_transfer_end = 6 * random_delta
+    metrics.timing_metrics.kv_cache_size = 1024
+    metrics.kv_cache_metrics.num_total_allocated_blocks = 1
+    metrics.kv_cache_metrics.num_new_allocated_blocks = 1
+    metrics.kv_cache_metrics.num_reused_blocks = 0
+    metrics.kv_cache_metrics.num_missed_blocks = 1
+    metrics.kv_cache_metrics.kv_cache_hit_rate = 0
+    metrics.speculative_decoding.acceptance_rate = 0.5
+    metrics.speculative_decoding.total_accepted_draft_tokens = 2
+    metrics.speculative_decoding.total_draft_tokens = 4
+    metrics.first_iter = 0
+    metrics.iter = 40
+    metrics.last_iter = 50
+    metrics_str = pickle.dumps(metrics)
+    metrics_copy = pickle.loads(metrics_str)
+    assert metrics.timing_metrics.arrival_time == metrics_copy.timing_metrics.arrival_time
+    assert metrics.timing_metrics.first_scheduled_time == metrics_copy.timing_metrics.first_scheduled_time
+    assert metrics.timing_metrics.first_token_time == metrics_copy.timing_metrics.first_token_time
+    assert metrics.timing_metrics.last_token_time == metrics_copy.timing_metrics.last_token_time
+    assert metrics.timing_metrics.kv_cache_transfer_start == metrics_copy.timing_metrics.kv_cache_transfer_start
+    assert metrics.timing_metrics.kv_cache_transfer_end == metrics_copy.timing_metrics.kv_cache_transfer_end
+    assert metrics.timing_metrics.kv_cache_size == metrics_copy.timing_metrics.kv_cache_size
+    assert metrics.kv_cache_metrics.num_total_allocated_blocks == metrics_copy.kv_cache_metrics.num_total_allocated_blocks
+    assert metrics.kv_cache_metrics.num_new_allocated_blocks == metrics_copy.kv_cache_metrics.num_new_allocated_blocks
+    assert metrics.kv_cache_metrics.num_reused_blocks == metrics_copy.kv_cache_metrics.num_reused_blocks
+    assert metrics.kv_cache_metrics.num_missed_blocks == metrics_copy.kv_cache_metrics.num_missed_blocks
+    assert metrics.kv_cache_metrics.kv_cache_hit_rate == metrics_copy.kv_cache_metrics.kv_cache_hit_rate
+    assert metrics.speculative_decoding.acceptance_rate == metrics_copy.speculative_decoding.acceptance_rate
+    assert metrics.speculative_decoding.total_accepted_draft_tokens == metrics_copy.speculative_decoding.total_accepted_draft_tokens
+    assert metrics.speculative_decoding.total_draft_tokens == metrics_copy.speculative_decoding.total_draft_tokens
+    assert metrics.first_iter == metrics_copy.first_iter
+    assert metrics.iter == metrics_copy.iter
+    assert metrics.last_iter == metrics_copy.last_iter
 
 
 def test_iteration_stats():
