@@ -16,6 +16,7 @@
 
 import argparse as _arg
 import os
+import time
 from pathlib import Path
 
 from mpi4py.MPI import COMM_WORLD
@@ -105,8 +106,9 @@ def generate_outputs(num_beams, only_multi_gpu=False):
 
     for tp_size, pp_size, cp_size in tp_pp_cp_sizes:
         print(
-            f'Generating outputs for Llama FP16 with TP={tp_size}, PP={pp_size} and CP={cp_size}'
+            f'Generating outputs for Llama FP16 with TP={tp_size}, PP={pp_size}, CP={cp_size}, BW={num_beams}'
         )
+        start_time = time.time()
 
         output_logits = False
         output_log_probs = False
@@ -128,6 +130,11 @@ def generate_outputs(num_beams, only_multi_gpu=False):
                         output_logits=output_logits,
                         output_log_probs=output_log_probs,
                         output_cum_log_probs=output_cum_log_probs)
+
+        duration = time.time() - start_time
+        print(
+            f"Generating outputs for Llama FP16 with TP={tp_size}, PP={pp_size}, CP={cp_size}, BW={num_beams} took {duration} seconds"
+        )
 
 
 if __name__ == '__main__':
