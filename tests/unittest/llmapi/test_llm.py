@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import gc
 import json
 import os
 import sys
@@ -547,7 +548,6 @@ def llm_for_sampling_params():
     llm.shutdown()
 
 
-@pytest.mark.skip(reason="https://nvbugs/5362398")
 @pytest.mark.part0
 def test_user_specify_workspace():
     user_specified_ws_path = '/tmp/specified_workspace'
