@@ -35,13 +35,9 @@ public:
         TLLM_CHECK(mCacheTransBufferManager);
     }
 
-    void formatOutput(LlmRequest const& llmRequest,
-        std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
-        SizeType32 selfIdx, CacheState const& destConfig, runtime::BufferManager const& bufferManager) override;
+    void format(TransferSession& session, LlmRequest const& llmRequest) override;
 
-    void formatInput(LlmRequest const& llmRequest,
-        std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
-        SizeType32 selfIdx, CacheState const& destConfig, runtime::BufferManager const& bufferManager) override;
+    void unformat(TransferSession& session, LlmRequest const& llmRequest) override;
 
     [[nodiscard]] bool inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const override;
 

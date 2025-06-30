@@ -141,16 +141,18 @@ std::vector<executor::kv_cache::Connection const*> CacheFormatter::pickRecvConne
     return ret;
 }
 
-void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
-    std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
-    SizeType32 selfIdx, CacheState const& destConfig, runtime::BufferManager const& bufferManager)
+void CacheFormatter::format(TransferSession& session, LlmRequest const& llmRequest)
 {
-    NVTX3_SCOPED_RANGE(formatOutput);
+    NVTX3_SCOPED_RANGE(CacheFormatter_format);
     TLLM_LOG_DEBUG(
         mpi::MpiComm::world().getRank(), "Start sending KV cache for request ID: %ld.", llmRequest.mRequestId);
 
     TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently, only beam width 1 is supported.");
-    TLLM_CHECK(!connections.empty());
+    auto const& connections = session.getConnections();
+    auto const& selfConfig = session.getSelfState().getCacheState().value();
+    auto const& destConfig = session.getOtherState().getCacheState().value();
+    auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
+    auto& bufferManager = session.getBufferManager();
     if (!needSendCache(selfConfig, destConfig, selfIdx))
     {
         return;
@@ -401,15 +403,17 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
         mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID:%ld ", llmRequest.mRequestId);
 }
 
-void CacheFormatter::formatInput(LlmRequest const& llmRequest,
-    std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
-    SizeType32 selfIdx, CacheState const& destConfig, runtime::BufferManager const& bufferManager)
+void CacheFormatter::unformat(TransferSession& session, LlmRequest const& llmRequest)
 {
-    NVTX3_SCOPED_RANGE(formatInput);
+    NVTX3_SCOPED_RANGE(CacheFormatter_unformat);
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "Start receiving KV cache for request ID: %ld, context request ID: %ld.", llmRequest.mRequestId,
         llmRequest.getContextPhaseParams().value().getReqId());
-    TLLM_CHECK(!connections.empty());
+    auto const& connections = session.getConnections();
+    auto const& selfConfig = session.getSelfState().getCacheState().value();
+    auto const& destConfig = session.getOtherState().getCacheState().value();
+    auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
+    auto& bufferManager = session.getBufferManager();
     auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest);
 
     auto pickUpConnections = pickRecvConnections(connections, selfConfig, selfIdx, destConfig);

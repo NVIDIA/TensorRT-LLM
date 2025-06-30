@@ -24,6 +24,12 @@
 namespace tensorrt_llm::batch_manager
 {
 
+static int32_t tagFromRequestId(LlmRequest::RequestIdType requestId)
+{
+    constexpr int32_t kDATA_TAG{43};
+    return ((requestId & 0xFFF) << 8) | (kDATA_TAG & 0xFF);
+}
+
 DataSenderImpl::DataSenderImpl(executor::kv_cache::ConnectionManager* manager,
     executor::kv_cache::CacheState selfCacheState, SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter)
     : mManager{manager}
@@ -100,8 +106,9 @@ void DataSenderImpl::sendSync(LlmRequest const& llmRequest)
         connections.emplace_back(connection);
     }
     auto&& dataTransceiverState = reqToComm.at(0).second;
-    mFormatter->formatOutput(llmRequest, std::move(connections), mSelfState.getCacheState().value(),
-        mSelfState.getCommState().value().getSelfIdx(), dataTransceiverState.getCacheState().value(), mBufferManager);
+    TransferSession session(connections, DataContext{tagFromRequestId(llmRequest.mRequestId)}, mSelfState,
+        dataTransceiverState, mBufferManager);
+    mFormatter->format(session, llmRequest);
 }
 
 [[nodiscard]] executor::kv_cache::CommState const& DataSenderImpl::getCommState() const
@@ -216,8 +223,9 @@ void DataReceiverImpl::receiveSync(LlmRequest const& llmRequest)
         connections.emplace_back(connection);
     }
     auto const& resource = getReceiveCacheResource(llmRequest);
-    mFormatter->formatInput(llmRequest, std::move(connections), mSelfState.getCacheState().value(),
-        mSelfState.getCommState().value().getSelfIdx(), destCacheState, resource->mBufferManager);
+    TransferSession session(connections, DataContext{tagFromRequestId(llmRequest.mRequestId)}, mSelfState, contextState,
+        resource->mBufferManager);
+    mFormatter->unformat(session, llmRequest);
 }
 
 void DataReceiverImpl::sendRequestInfo(executor::kv_cache::Connection const* connection, RequestInfo const& info)
