@@ -43,8 +43,10 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
     size_t requestBlockNum = llmRequest.getRequestedBlockHashes().size();
     constexpr SizeType32 beam{0};
     auto blockRange = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId, beam);
-    if (common::getEnvDisableSelectiveCacheTransfer())
+    auto poolNum = cacheManager->getBlockManager().getNumPools();
+    if (poolNum > 1 || common::getEnvDisableSelectiveCacheTransfer())
     {
+        // disable selective cache transfer for poolNum > 1
         return blockRange;
     }
     if (requestBlockNum < blockRange.size() && requestBlockNum > 0)
@@ -59,7 +61,9 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
 
 BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest)
 {
-    if (common::getEnvDisableSelectiveCacheTransfer())
+
+    auto poolNum = cacheManager->getBlockManager().getNumPools();
+    if (poolNum > 1 || common::getEnvDisableSelectiveCacheTransfer())
     {
         constexpr SizeType32 beam{0};
         return BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId, beam);
@@ -205,7 +209,7 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
                 "window size already exists, which is not supported");
             inputKvCacheBlocks.emplace(window, std::vector<runtime::ITensor::SharedPtr>());
             auto maxBlockThisWindow = window / selfConfig.getModelConfig().mTokensPerBlock;
-            size_t blockNumThisWindow = 0;
+            SizeType32 blockNumThisWindow = 0;
             for (auto it = blockRange.begin(); it != blockRange.end(); ++it)
             {
                 blockNum++;
@@ -425,7 +429,7 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
             "window size already exists, which is not supported");
         outputBuffersPerWindow.emplace(window, std::vector<runtime::ITensor::SharedPtr>());
         auto maxBlockThisWindow = window / selfConfig.getModelConfig().mTokensPerBlock;
-        size_t blockNumThisWindow = 0;
+        SizeType32 blockNumThisWindow = 0;
         for (auto it = blockRange.begin(); it != blockRange.end(); ++it)
         {
             blockNum++;
@@ -762,8 +766,6 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
         TLLM_LOG_WARNING("CacheFormatter::inquireSupport: selfConfig.getDataType() != destConfig.getDataType()");
         return false;
     }
-
-    // TODO: getEnvDisableSelectiveCacheTransfer
 
     std::unordered_set<SizeType32> setVecSelf{
         selfConfig.getModelConfig().mNbKvHeadsPerLayer.begin(), selfConfig.getModelConfig().mNbKvHeadsPerLayer.end()};
