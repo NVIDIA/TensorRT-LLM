@@ -297,4 +297,8 @@ if(BUILD_PYBIND)
   add_subdirectory(pybind)
 endif()
 
+if(BUILD_DEEP_EP)
+  add_subdirectory(deep_ep)
+endif()
+
 add_subdirectory(plugins)

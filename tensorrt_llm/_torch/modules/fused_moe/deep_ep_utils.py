@@ -9,7 +9,7 @@ from tensorrt_llm._utils import local_mpi_size, mpi_comm
 from tensorrt_llm.mapping import Mapping
 
 try:
-    from deep_ep import Buffer
+    from tensorrt_llm.deep_ep import Buffer
     deep_ep_installed = True
 except ModuleNotFoundError:
     deep_ep_installed = False
@@ -127,6 +127,7 @@ class VariableLengthLowLatencyBuffer:
                                  num_rdma_bytes,
                                  low_latency_mode=True,
                                  num_qps_per_rank=num_experts // world_size,
+                                 allow_nvlink_for_low_latency_mode=False,
                                  comm=self.comm)
 
     def low_latency_dispatch(self, hidden_states: torch.Tensor,

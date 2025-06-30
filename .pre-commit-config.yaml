@@ -88,3 +88,4 @@ repos:
         entry: ./scripts/dco_check.py
         language: script
         stages: [commit-msg]
+exclude: '\.patch$'
