@@ -76,6 +76,7 @@ void GptDecoderBatched::setup(executor::DecodingMode const& mode, SizeType32 max
     nvinfer1::DataType dtype, ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     TLLM_CHECK(maxBatchSize > 0);
     TLLM_CHECK(maxBeamWidth > 0);
 
