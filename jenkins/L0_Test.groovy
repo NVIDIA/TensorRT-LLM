@@ -2006,11 +2006,18 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "[ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true")
                         }
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
-                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install python3-pip git rsync curl")
+                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install python3-pip git rsync curl wget")
                         trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install requests")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y tensorrt")
+
+                        // Install CUDA 12.9.0 for WAR flashinfer requiring CUDA Toolkit issue
+                        if (values[5] != DLFW_IMAGE) {
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv https://developer.download.nvidia.com/compute/cuda/12.9.0/local_installers/cuda_12.9.0_575.51.03_linux.run")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "sh cuda_12.9.0_575.51.03_linux.run --silent --override --toolkit")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "rm -f cuda_12.9.0_575.51.03_linux.run")
+                        }
 
                         // Extra PyTorch CUDA 12.8 install
                         if (values[6]) {
