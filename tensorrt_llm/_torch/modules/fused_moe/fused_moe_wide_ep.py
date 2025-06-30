@@ -170,10 +170,22 @@ class WideEPMoE(MoE):
             self.use_postquant_alltoall = (os.environ.get(
                 "TRTLLM_MOE_POST_QUANT_ALLTOALLV", "1")
                                            == "1") and qm.has_nvfp4()
+            self.num_chunk_experts = 2
+            assert self.expert_size_per_partition % self.num_chunk_experts == 0
+            self.chunk_expert_size = self.expert_size_per_partition // self.num_chunk_experts
+            assert (
+                self.moe_max_num_tokens >= max_num_tokens
+            ), "moe_max_num_tokens should be greater than max_num_tokens"
+
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
                 MnnvlMemory.initialize()
                 self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
                     model_config.mapping)
+                if self.num_chunk_experts > 1:
+                    self.alltoall_aux_workspace = MnnvlMoe.get_moe_aux_workspace(
+                        model_config.mapping)
+                else:
+                    self.alltoall_aux_workspace = None
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
                 self.deep_ep_buffer = buffer_pool.get_buffer(
                     model_config.mapping)
@@ -189,12 +201,6 @@ class WideEPMoE(MoE):
                 raise NotImplementedError(
                     f"Not available alltoall method type: {self.alltoall_method_type!r}"
                 )
-            self.num_chunk_experts = 2
-            assert self.expert_size_per_partition % self.num_chunk_experts == 0
-            self.chunk_expert_size = self.expert_size_per_partition // self.num_chunk_experts
-            assert (
-                self.moe_max_num_tokens >= max_num_tokens
-            ), "moe_max_num_tokens should be greater than max_num_tokens"
 
         # The auxiliary CUDA stream and CUDA events are only used when MoE chunking is applied
         if self.moe_max_num_tokens < max_num_tokens or self.num_chunk_experts > 1:
@@ -329,7 +335,8 @@ class WideEPMoE(MoE):
                       all_rank_num_tokens, loadbalancer_local_statistic_info,
                       is_last_call, output_dtype):
 
-        def dispatch(chunk_idx, x, token_selected_slots, token_final_scales):
+        def dispatch(chunk_idx, x, token_selected_slots, token_final_scales,
+                     workspace):
             chunk_expert_mask = (token_selected_slots %
                                  self.expert_size_per_partition
                                  ) // self.chunk_expert_size != chunk_idx
@@ -337,11 +344,13 @@ class WideEPMoE(MoE):
             token_final_scales[chunk_expert_mask] = 0
 
             alltoall_info = None
+
             x, token_selected_slots, token_final_scales, gathered_loadbalancer_local_statistic_info, alltoall_info = \
                 self.alltoall_prepare_maybe_dispatch(all_rank_num_tokens,
                                                         x,
                                                         token_selected_slots,
                                                         token_final_scales,
+                                                        workspace,
                                                         loadbalancer_local_statistic_info)
 
             x_sf = None
@@ -393,6 +402,7 @@ class WideEPMoE(MoE):
                 x, x_sf = self.alltoall_postquant_dispatch(
                     x,
                     x_sf,
+                    workspace,
                     x_row,
                     x_col,
                     alltoall_info,
@@ -400,7 +410,8 @@ class WideEPMoE(MoE):
             return x, x_sf, token_selected_slots, token_final_scales, alltoall_info
 
         def compute_and_combine(x, x_sf, token_selected_slots,
-                                token_final_scales, token_count, alltoall_info):
+                                token_final_scales, workspace, token_count,
+                                alltoall_info):
             final_hidden_states = torch.ops.trtllm.fused_moe(
                 x,
                 token_selected_slots,
@@ -433,16 +444,27 @@ class WideEPMoE(MoE):
             final_hidden_states = final_hidden_states[0]
 
             final_hidden_states = self.alltoall_combine(final_hidden_states,
+                                                        workspace,
                                                         alltoall_info,
                                                         token_count)
             return final_hidden_states
 
         token_count = x.shape[0]
+        if self.num_chunk_experts == 1:
+            x_chunked, x_sf_chunked, token_selected_slots_chunked, token_final_scales_chunked, alltoall_info_chunked = dispatch(
+                0, x, token_selected_slots, token_final_scales,
+                self.alltoall_workspace)
+            chunked_final_hidden_states = compute_and_combine(
+                x_chunked, x_sf_chunked, token_selected_slots_chunked,
+                token_final_scales_chunked, self.alltoall_workspace,
+                token_count, alltoall_info_chunked)
+            return chunked_final_hidden_states
+
         final_hidden_states = []
 
         x_chunked, x_sf_chunked, token_selected_slots_chunked, token_final_scales_chunked, alltoall_info_chunked = dispatch(
             0, x.clone(), token_selected_slots.clone(),
-            token_final_scales.clone())
+            token_final_scales.clone(), self.alltoall_workspace)
         self.event_dict[EventType.Main].record()
 
         for chunk_idx in range(self.num_chunk_experts):
@@ -453,23 +475,21 @@ class WideEPMoE(MoE):
                         token_final_scales.clone())
                 chunked_final_hidden_states = compute_and_combine(
                     x_chunked, x_sf_chunked, token_selected_slots_chunked,
-                    token_final_scales_chunked, token_count,
-                    alltoall_info_chunked)
+                    token_final_scales_chunked, self.alltoall_workspace,
+                    token_count, alltoall_info_chunked)
                 final_hidden_states.append(chunked_final_hidden_states)
             else:
                 if chunk_idx == 1:
                     with torch.cuda.stream(self.aux_stream):
                         self.event_dict[EventType.Main].wait()
                 with torch.cuda.stream(self.aux_stream):
-                    # Note: this is a workaround to avoid the hang issue
-                    torch.cuda.synchronize()
                     x_chunked, x_sf_chunked, token_selected_slots_chunked, token_final_scales_chunked, alltoall_info_chunked = dispatch(
                         chunk_idx, x.clone(), token_selected_slots.clone(),
-                        token_final_scales.clone())
+                        token_final_scales.clone(), self.alltoall_aux_workspace)
                     chunked_final_hidden_states = compute_and_combine(
                         x_chunked, x_sf_chunked, token_selected_slots_chunked,
-                        token_final_scales_chunked, token_count,
-                        alltoall_info_chunked)
+                        token_final_scales_chunked, self.alltoall_aux_workspace,
+                        token_count, alltoall_info_chunked)
                     final_hidden_states.append(chunked_final_hidden_states)
                     if chunk_idx == self.num_chunk_experts - 1:
                         self.event_dict[EventType.MoeChunkingOverlap].record()
@@ -1037,10 +1057,14 @@ class WideEPMoE(MoE):
         return outputs
 
     def alltoall_prepare_maybe_dispatch(
-            self, all_rank_num_tokens: list, x: torch.Tensor,
-            token_selected_slots: torch.Tensor,
-            token_final_scales: torch.Tensor,
-            local_statistic_tensor: Optional[torch.Tensor]):
+        self,
+        all_rank_num_tokens: list,
+        x: torch.Tensor,
+        token_selected_slots: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        workspace: torch.Tensor,
+        local_statistic_tensor: Optional[torch.Tensor],
+    ):
         top_k = self.routing_method.experts_per_token
         # gather router info
         max_num_token = max(all_rank_num_tokens)
@@ -1072,8 +1096,7 @@ class WideEPMoE(MoE):
             assert not isinstance(
                 x, Fp4QuantizedTensor
             ), "pre-quant alltoall doesn't support fp4 tensor"
-            x = MnnvlMoe.mnnvl_moe_alltoallv(x, alltoall_info,
-                                             self.alltoall_workspace,
+            x = MnnvlMoe.mnnvl_moe_alltoallv(x, alltoall_info, workspace,
                                              self.ep_rank, self.ep_size)
 
         return x, token_selected_slots, token_final_scales, gathered_local_statistic_tensor, alltoall_info
@@ -1081,21 +1104,20 @@ class WideEPMoE(MoE):
     def alltoall_postquant_dispatch(self,
                                     x: torch.Tensor,
                                     x_sf: torch.Tensor,
+                                    workspace: torch.Tensor,
                                     x_row: int,
                                     x_col: int,
                                     alltoall_info: MoEAlltoallInfo,
                                     is_sf_swizzle: bool = True):
-        x = MnnvlMoe.mnnvl_moe_alltoallv(x, alltoall_info,
-                                         self.alltoall_workspace, self.ep_rank,
-                                         self.ep_size)
+        x = MnnvlMoe.mnnvl_moe_alltoallv(x, alltoall_info, workspace,
+                                         self.ep_rank, self.ep_size)
 
         if x_sf is not None:
             if self.has_nvfp4 and is_sf_swizzle:
                 x_sf = unswizzle_sf(x_sf, x_row, x_col,
                                     self.scaling_vector_size)
 
-            x_sf = MnnvlMoe.mnnvl_moe_alltoallv(x_sf, alltoall_info,
-                                                self.alltoall_workspace,
+            x_sf = MnnvlMoe.mnnvl_moe_alltoallv(x_sf, alltoall_info, workspace,
                                                 self.ep_rank, self.ep_size)
 
             if self.has_nvfp4:
@@ -1105,6 +1127,7 @@ class WideEPMoE(MoE):
         return x, x_sf
 
     def alltoall_combine(self, final_hidden_states: torch.Tensor,
+                         workspace: torch.Tensor,
                          alltoall_info: MoEAlltoallInfo, token_count: int):
         top_k = self.routing_method.experts_per_token
         if isinstance(final_hidden_states, list):
@@ -1112,7 +1135,7 @@ class WideEPMoE(MoE):
         final_hidden_states = MnnvlMoe.mnnvl_moe_alltoallv_combine(
             final_hidden_states,
             alltoall_info,
-            self.alltoall_workspace,
+            workspace,
             ep_rank=self.ep_rank,
             ep_size=self.ep_size,
             top_k=top_k,
