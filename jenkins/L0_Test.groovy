@@ -2013,10 +2013,15 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y tensorrt")
 
                         // Install CUDA 12.9.0 for WAR flashinfer requiring CUDA Toolkit issue
-                        if (values[5] != DLFW_IMAGE) {
+                        if (values[5] != DLFW_IMAGE && cpu_arch == X86_64_TRIPLE) {
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv https://developer.download.nvidia.com/compute/cuda/12.9.0/local_installers/cuda_12.9.0_575.51.03_linux.run")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "sh cuda_12.9.0_575.51.03_linux.run --silent --override --toolkit")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "rm -f cuda_12.9.0_575.51.03_linux.run")
+                        }
+                        else if (values[5] != DLFW_IMAGE && cpu_arch == AARCH64_TRIPLE) {
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv https://developer.download.nvidia.com/compute/cuda/12.9.1/local_installers/cuda_12.9.1_575.57.08_linux_sbsa.run")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "sh cuda_12.9.1_575.57.08_linux_sbsa.run --silent --override --toolkit")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "rm -f cuda_12.9.1_575.57.08_linux_sbsa.run")
                         }
 
                         // Extra PyTorch CUDA 12.8 install
