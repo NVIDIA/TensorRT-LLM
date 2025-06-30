@@ -945,7 +945,7 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
     ExpandedActivationsType* permuted_output, float const* unpermuted_scales, float* permuted_scales,
     int const* expanded_dest_row_to_expanded_source_row, int* expanded_source_row_to_expanded_dest_row,
     int64_t const num_rows, int64_t const cols, int const k, int const num_experts_per_node,
-    float const* fc1_act_global_scale, int64_t* expert_first_token_offset,
+    float const* fc1_act_global_scale, bool use_per_expert_act_scale, int64_t* expert_first_token_offset,
     TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
     TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, cudaStream_t stream);
 

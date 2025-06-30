@@ -102,7 +102,7 @@ void runPermute(void const* input_activations_void, void const* input_sf_void, i
         reinterpret_cast<ExpandedActivationsType*>(permuted_data_), token_topk_unpermuted_scales,
         permuted_token_final_scales_, permuted_source_token_ids_, expanded_source_row_to_expanded_dest_row, num_rows,
         /*num_valid_tokens_ptr,*/ hidden_size, experts_per_token, num_experts_per_node,
-        quant_params.fp4.fc1.act_global_scale, expert_first_token_offset_,
+        quant_params.fp4.fc1.act_global_scale, /*use_per_expert_act_scale*/ false, expert_first_token_offset_,
         /* fc1_fp4_act_scale_ */ nullptr, input_sf, stream);
     sync_check_cuda_error(stream);
 }
