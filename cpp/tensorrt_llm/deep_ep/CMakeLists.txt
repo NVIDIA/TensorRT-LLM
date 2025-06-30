@@ -74,7 +74,12 @@ set(NVSHMEM_STAMP_FILE ${CMAKE_CURRENT_BINARY_DIR}/nvshmem_stamp.txt)
 file(COPY ${DEEP_EP_SOURCE_DIR}/third-party/nvshmem.patch
      DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
 file(SHA256 ${CMAKE_CURRENT_BINARY_DIR}/nvshmem.patch NVSHMEM_PATCH_HASH)
-set(NVSHMEM_STAMP_CONTENT "${NVSHMEM_URL_HASH} patch ${NVSHMEM_PATCH_HASH}")
+file(SHA256 ${CMAKE_CURRENT_SOURCE_DIR}/nvshmem_fast_build.patch
+     NVSHMEM_FAST_BUILD_PATCH_HASH)
+set(NVSHMEM_STAMP_CONTENT "${NVSHMEM_URL_HASH}")
+string(APPEND NVSHMEM_STAMP_CONTENT " patch ${NVSHMEM_PATCH_HASH}")
+string(APPEND NVSHMEM_STAMP_CONTENT " TRANSPORT_VERSION_MAJOR 103")
+string(APPEND NVSHMEM_STAMP_CONTENT " patch ${NVSHMEM_FAST_BUILD_PATCH_HASH}")
 set(OLD_NVSHMEM_STAMP_CONTENT "")
 if(EXISTS ${NVSHMEM_STAMP_FILE})
   file(READ ${NVSHMEM_STAMP_FILE} OLD_NVSHMEM_STAMP_CONTENT)
@@ -109,6 +114,7 @@ ExternalProject_Add(
   PATCH_COMMAND patch -p1 -i ${CMAKE_CURRENT_BINARY_DIR}/nvshmem.patch
   COMMAND sed "s/TRANSPORT_VERSION_MAJOR 3/TRANSPORT_VERSION_MAJOR 103/" -i
           src/CMakeLists.txt
+  COMMAND patch -p1 -i ${CMAKE_CURRENT_SOURCE_DIR}/nvshmem_fast_build.patch
   CMAKE_ARGS -DNVSHMEM_IBGDA_SUPPORT=1
              -DNVSHMEM_IBRC_SUPPORT=0
              -DNVSHMEM_MPI_SUPPORT=0
@@ -143,9 +149,9 @@ set_target_properties(
 string(REGEX REPLACE "-gencode arch=[^ ]+ " "" CMAKE_CUDA_FLAGS
                      "${CMAKE_CUDA_FLAGS}")
 
-# Let CMake generate `fatbinData` for -rdc. Set to FALSE and TRUE are both OK,
-# but it generates `code=lto_90a` rather than `code=sm_90a` for
-# CUDA_ARCHITECTURES 90a-real if set to TRUE.
+# Let CMake generate `fatbinData` for CUDA separable compilation. Set to FALSE
+# or TRUE are both OK, but it generates `code=lto_90a` rather than `code=sm_90a`
+# for arch `90a-real` if set to TRUE.
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION FALSE)
 
 # Find torch_python

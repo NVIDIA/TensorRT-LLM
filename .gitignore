@@ -58,6 +58,7 @@ llm-test-workspace/
 *.safetensors
 */tllm_debug/**
 *.patch
+!cpp/tensorrt_llm/deep_ep/nvshmem_fast_build.patch
 
 # Generated files
 cpp/include/tensorrt_llm/executor/version.h
