@@ -34,8 +34,9 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
 from ..attention_backend.interface import (AttentionMetadata,
-                                           AttentionRuntimeFeatures)
-from ..attention_backend.trtllm import TrtllmAttentionMetadata
+                                           AttentionRuntimeFeatures,
+                                           PredefinedAttentionMask)
+from ..attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from ..attention_backend.utils import get_attention_backend
 from ..attention_backend.vanilla import VanillaAttentionMetadata
 from ..autotuner import AutoTuner, autotune
@@ -2099,6 +2100,34 @@ class PyTorchModelEngine(ModelEngine):
         attrs = get_model_extra_attrs()
         assert attrs is not None, "Model extra attrs is not set"
         attrs["attention_metadata"] = weakref.ref(kwargs['attn_metadata'])
+        if 'mrope_config' in kwargs:
+            attrs["mrope_config"] = kwargs['mrope_config']
+        if self.pytorch_backend_config.attn_backend == "TRTLLM":
+            # Ugly hack to support trtllm attention backend nvfp4 output
+            for attn_layer in self.model.model_config.extra_attrs[
+                    'attn_layers'].values():
+                if isinstance(attn_layer, weakref.ReferenceType):
+                    attn_layer = attn_layer()
+                attn_backend = attn_layer.attn
+                assert isinstance(
+                    attn_backend,
+                    TrtllmAttention), "attn_backend is not a TrtllmAttention"
+                metadata = kwargs['attn_metadata']
+                assert isinstance(metadata, TrtllmAttentionMetadata
+                                  ), "metadata is not a TrtllmAttentionMetadata"
+
+                attn_backend.use_nvfp4_output = False
+                if attn_backend.has_nvfp4 and attn_backend.support_nvfp4_output(
+                ):
+                    attn_backend.use_nvfp4_output = attn_backend.wrapper.is_nvfp4_output_kernel_available(
+                        tokens_per_block=metadata.tokens_per_block,
+                        attention_mask=kwargs.get(
+                            'attention_mask', PredefinedAttentionMask.CAUSAL),
+                        use_paged_context_fmha=attn_backend.
+                        use_paged_context_fmha(metadata),
+                        is_mla_enable=attn_backend.is_mla_enable,
+                    )
+
         attrs.update(self.model.model_config.extra_attrs)
 
         if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):

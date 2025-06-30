@@ -560,6 +560,9 @@ class AttentionBackend(Generic[TMetadata]):
     def support_nvfp4_output(cls) -> bool:
         return False
 
+    def create_output(self, *args, **kwargs):
+        raise NotImplementedError
+
 
 @dataclass(kw_only=True, unsafe_hash=True)
 class MLAParams:

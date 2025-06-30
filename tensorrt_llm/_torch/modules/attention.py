@@ -24,6 +24,33 @@ from .rms_norm import RMSNorm
 from .rotary_embedding import RotaryEmbedding
 
 
+@torch.library.custom_op("trtllm::attn_custom_op_inplace",
+                         mutates_args=("output", "output_sf"))
+def attn_custom_op_inplace(
+    qkv: torch.Tensor,
+    position_ids: Optional[torch.Tensor],
+    layer_idx: str,
+    attention_mask: str,
+    out_scale: Optional[torch.Tensor] = None,
+    out_scale_sf: Optional[torch.Tensor] = None,
+    output: Optional[torch.Tensor] = None,
+    output_sf: Optional[torch.Tensor] = None,
+    attention_window_size: Optional[int] = None,
+) -> None:
+    metadata, mrope_config, attn_layer = extract_extra_attrs(
+        layer_idx, "attention")
+    attn_layer.forward_impl(qkv,
+                            position_ids,
+                            metadata,
+                            PredefinedAttentionMask(attention_mask),
+                            mrope_config,
+                            attention_window_size,
+                            out_scale,
+                            out_scale_sf,
+                            output=output,
+                            output_sf=output_sf)
+
+
 class Attention(nn.Module):
 
     def __init__(
@@ -63,6 +90,7 @@ class Attention(nn.Module):
         """
         super().__init__()
         self.layer_idx = layer_idx
+        self.layer_idx_str = str(layer_idx)
 
         config = config or ModelConfig()
         self.hidden_size = hidden_size
@@ -91,6 +119,14 @@ class Attention(nn.Module):
         # 0 0 0 1 1 0
         # 0 0 0 1 1 1
         self.attention_chunk_size = attention_chunk_size
+
+        self.register_to_config = False
+        if config is not None:
+            if "attn_layers" not in config.extra_attrs:
+                config.extra_attrs["attn_layers"] = {}
+            config.extra_attrs["attn_layers"][self.layer_idx_str] = weakref.ref(
+                self)
+            self.register_to_config = True
 
         if dense_bias is None:
             self.dense_bias = bias
@@ -218,6 +254,40 @@ class Attention(nn.Module):
             q, k, v = qkv, None, None
         return q, k, v
 
+    def forward_impl(
+            self,
+            q: torch.Tensor,
+            position_ids: Optional[torch.IntTensor],
+            attn_metadata: AttentionMetadata,
+            attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
+        CAUSAL,
+            mrope_config: Optional[dict] = None,
+            attention_window_size: Optional[int] = None,
+            out_scale: Optional[torch.Tensor] = None,
+            out_scale_sf: Optional[torch.Tensor] = None,
+            output: Optional[torch.Tensor] = None,
+            output_sf: Optional[torch.Tensor] = None,
+            **kwargs):
+
+        q, k, v = q, None, None
+
+        q, k, v = self.apply_rope(q, k, v, position_ids)
+
+        q, k, v = self.convert_qkv(q, k, v)
+        self.attn.forward(
+            q,
+            k,
+            v,
+            attn_metadata,
+            out_scale=out_scale,
+            out_scale_sf=out_scale_sf,
+            attention_mask=attention_mask,
+            mrope_config=mrope_config,
+            attention_window_size=attention_window_size,
+            output=output,
+            output_sf=output_sf,
+        )
+
     def forward(
         self,
         position_ids: Optional[torch.IntTensor],
@@ -260,10 +330,6 @@ class Attention(nn.Module):
             if qkv_lora is not None:
                 qkv = qkv + qkv_lora
 
-        q, k, v = qkv, None, None
-
-        q, k, v = self.apply_rope(q, k, v, position_ids)
-
         out_scale = None
         out_scale_sf = None
         if self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4 or self.o_proj.has_fp8_block_scales:
@@ -271,18 +337,30 @@ class Attention(nn.Module):
         if self.o_proj.has_nvfp4 and self.support_nvfp4_output:
             out_scale_sf = self.o_proj.input_scale
 
-        q, k, v = self.convert_qkv(q, k, v)
-        attn_output = self.attn.forward(
-            q,
-            k,
-            v,
-            attn_metadata,
-            out_scale=out_scale,
-            out_scale_sf=out_scale_sf,
-            attention_mask=attention_mask,
-            mrope_config=mrope_config,
-            attention_window_size=attention_window_size)
-        hidden_states = attn_output
+        output, output_sf = self.attn.create_output(q=qkv, out_scale=out_scale)
+
+        if self.register_to_config:
+            torch.ops.trtllm.attn_custom_op_inplace(
+                qkv,
+                position_ids,
+                self.layer_idx_str,
+                attention_mask.value,
+                out_scale,
+                out_scale_sf,
+                output,
+                output_sf,
+                attention_window_size,
+            )
+        else:
+            self.forward_impl(qkv, position_ids, attn_metadata, attention_mask,
+                              mrope_config, attention_window_size, out_scale,
+                              out_scale_sf)
+
+        if output_sf is not None:
+            attn_output = Fp4QuantizedTensor(output, output_sf)
+        else:
+            attn_output = output
+
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params,
                                   lora_params=lora_params,
@@ -311,28 +389,43 @@ class Attention(nn.Module):
         return q, k, v
 
 
-def extract_extra_attrs(layer_idx: str):
+def extract_extra_attrs(layer_idx: str, type: str):
     extra_attrs = get_model_extra_attrs()
     assert extra_attrs is not None, "Model extra attrs is not set"
 
     metadata_ref = extra_attrs.get("attention_metadata", None)
     assert metadata_ref is not None, "Attention metadata is not set"
     metadata = metadata_ref()
+    mrope_config = extra_attrs.get("mrope_config", None)
     assert isinstance(
         metadata,
         TrtllmAttentionMetadata,
     )
 
-    mla_layers = extra_attrs.get("mla_layers", None)
-    assert mla_layers is not None, "MLA layers is not registered"
-    mla_layer_ref = mla_layers.get(layer_idx, None)
-    assert mla_layer_ref is not None, f"Cannot find MLA layer for layer {layer_idx}"
-    mla_layer = mla_layer_ref()
-    assert isinstance(
-        mla_layer,
-        MLA), "MLA layer must be a subclass of MLA or an instance of MLA"
+    layer = None
 
-    return metadata, mla_layer
+    if type == "attention":
+        attn_layers = extra_attrs.get("attn_layers", None)
+        assert attn_layers is not None, "Attention layers is not set"
+        attn_layer_ref = attn_layers.get(layer_idx, None)
+        assert attn_layer_ref is not None, f"Cannot find Attention layer for layer {layer_idx}"
+        layer = attn_layer_ref()
+        assert isinstance(
+            layer, Attention
+        ), "Attention layer must be a subclass of Attention or an instance of Attention"
+    elif type == "mla":
+        mla_layers = extra_attrs.get("mla_layers", None)
+        assert mla_layers is not None, "MLA layers is not set"
+        mla_layer_ref = mla_layers.get(layer_idx, None)
+        assert mla_layer_ref is not None, f"Cannot find MLA layer for layer {layer_idx}"
+        layer = mla_layer_ref()
+        assert isinstance(
+            layer,
+            MLA), "MLA layer must be a subclass of MLA or an instance of MLA"
+    else:
+        raise ValueError(f"Invalid type: {type}")
+
+    return metadata, mrope_config, layer
 
 
 @torch.library.custom_op("trtllm::mla_custom_op_inplace",
@@ -343,7 +436,7 @@ def mla_custom_op_inplace(
     layer_idx: str,
     output: torch.Tensor,
 ) -> None:
-    metadata, mla_layer = extract_extra_attrs(layer_idx)
+    metadata, mla_layer = extract_extra_attrs(layer_idx, "mla")
     mla_layer.forward_impl(position_ids, hidden_states, metadata, output=output)
 
 
