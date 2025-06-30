@@ -6,13 +6,19 @@
 #include "tensorrt_llm/runtime/utils/mpiTags.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <map>
+#if ENABLE_MULTI_DEVICE
 #include <nccl.h>
+#endif // ENABLE_MULTI_DEVICE
+
 #include <nvml.h>
 
 using namespace tensorrt_llm::mpi;
 
 namespace tensorrt_llm::common
 {
+
+#if ENABLE_MULTI_DEVICE
+
 std::set<int> getLocalGroup(std::set<int> const& group)
 {
     auto const myRank = COMM_SESSION.getRank();
@@ -190,8 +196,12 @@ std::tuple<bool, bool> setGroupTopology(std::set<int> group)
     return {is_NVLINK_supported, is_P2P_supported};
 }
 
+#endif // ENABLE_MULTI_DEVICE
+
 std::vector<bool> initGroupTopology(std::set<int> group)
 {
+
+#if ENABLE_MULTI_DEVICE
     static std::map<std::set<int>, std::tuple<bool, bool>> cache;
     if (cache.find(group) != cache.end())
     {
@@ -201,6 +211,9 @@ std::vector<bool> initGroupTopology(std::set<int> group)
     auto link_supported = setGroupTopology(group);
     cache[group] = link_supported;
     return {std::get<0>(link_supported), std::get<1>(link_supported)};
+#else
+    return {false};
+#endif // ENABLE_MULTI_DEVICE
 }
 
 } // namespace tensorrt_llm::common
