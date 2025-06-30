@@ -643,7 +643,7 @@ class TRTLLMSampler(Sampler):
             decoder_logits, scheduled_requests.generation_requests,
             model_outputs["logits"], logits_index)
 
-        self.store["decoder_input_buffers"].logits = decoder_buffer_logits
+        self.store["decoder_input_buffers"].logits = decoder_logits
 
         # For beam search, cache indirection needs to be updated
         if (beam_width > 1):

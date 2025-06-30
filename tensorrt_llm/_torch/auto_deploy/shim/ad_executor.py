@@ -257,6 +257,7 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
     msg = "pytorch_backend_config must be an AD LlmArgs object"
     assert isinstance(executor_config.pytorch_backend_config, LlmArgs), msg
     ad_config: LlmArgs = executor_config.pytorch_backend_config
+    assert ad_config.max_beam_width <= 1, "_autodeploy + beam_search is not supported"
 
     max_num_sequences = ad_config.max_batch_size * dist_mapping.pp_size
     # some derivative properties
@@ -317,5 +318,6 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
         max_input_len=ad_config.max_input_len,
         max_batch_size=ad_config.max_batch_size,
         max_draft_tokens=max_draft_tokens,
+        max_beam_width=ad_config.max_beam_width,
     )
     return py_executor
