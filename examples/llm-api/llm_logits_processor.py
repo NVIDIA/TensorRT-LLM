@@ -1,4 +1,6 @@
-### Control generated text using logits processor
+### :title Control generated text using logits processor
+### :section Customization
+### :order 1
 from typing import List, Optional
 
 import torch
@@ -29,7 +31,7 @@ def text_to_token(tokenizer: PreTrainedTokenizer, text: str, last: bool):
 # The recommended way to create a customized logits processor:
 #     * Subclass LogitsProcessor and implement the processing logics in the __call__ method.
 #     * Create an instance and pass to SamplingParams.
-# More LogitsProcessors refereces can be found at https://github.com/NVIDIA/logits-processor-zoo.
+# More LogitsProcessors references can be found at https://github.com/NVIDIA/logits-processor-zoo.
 class GenLengthLogitsProcessor(LogitsProcessor):
     """
     A logits processor that adjusts the likelihood of the end-of-sequence (EOS) token
