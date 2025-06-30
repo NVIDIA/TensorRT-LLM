@@ -15,7 +15,6 @@
  */
 
 #include "tensorrt_llm/runtime/decoderState.h"
-#include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 
@@ -400,7 +399,7 @@ void DecoderState::setupSpeculativeDecoding(SpeculativeDecodingMode const& specu
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void DecoderState::disableLookahead(RequestVector const& genRequests)
+void DecoderState::disableLookahead()
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -413,14 +412,6 @@ void DecoderState::disableLookahead(RequestVector const& genRequests)
     auto const maxNewTokensShape = ITensor::makeShape({mMaxDecodingEngineTokens, mMaxBatchSize, mMaxBeamWidth});
     mJointDecodingOutput->newTokensSteps->reshape(maxNewTokensShape);
     mFinishedSteps->reshape(maxNewTokensShape);
-
-    for (auto const& llmReq : genRequests)
-    {
-        if (llmReq->mSeqSlot)
-        {
-            setNumDecodingEngineTokens(llmReq->mSeqSlot.value(), 1);
-        }
-    }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
