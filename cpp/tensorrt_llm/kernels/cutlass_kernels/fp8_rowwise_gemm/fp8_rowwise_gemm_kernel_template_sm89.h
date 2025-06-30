@@ -114,7 +114,7 @@ struct DeviceGemmFp8RowwiseSm89
             {
                 if (cute::thread0())
                 {
-                    printf(__FILE__ " : This kernel shall only run on SM89 or SM12x devices.\n");
+                    printf("%s : This kernel shall only run on SM89 or SM12x devices.\n", __PRETTY_FUNCTION__);
                     __trap();
                 }
             }
