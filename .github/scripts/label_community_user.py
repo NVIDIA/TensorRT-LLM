@@ -3,13 +3,13 @@ import os
 import requests
 
 GITHUB_API_URL = "https://api.github.com"
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-assert GITHUB_TOKEN, "GITHUB_TOKEN environment variable not set"
+AUTO_LABEL_COMMUNITY_TOKEN = os.environ.get("AUTO_LABEL_COMMUNITY_TOKEN")
+assert AUTO_LABEL_COMMUNITY_TOKEN, "AUTO_LABEL_COMMUNITY_TOKEN environment variable not set"
 
 HEADERS = {
     "Accept": "application/vnd.github.v3+json",
     "User-Agent": "PythonGitHubAction-Labeler/1.0",
-    "Authorization": f"token {GITHUB_TOKEN}",
+    "Authorization": f"token {AUTO_LABEL_COMMUNITY_TOKEN}",
 }
 
 

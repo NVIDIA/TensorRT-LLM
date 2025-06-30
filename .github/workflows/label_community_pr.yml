@@ -23,7 +23,7 @@ jobs:
 
       - name: Run labeling script
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AUTO_LABEL_COMMUNITY_TOKEN: ${{ secrets.AUTO_LABEL_COMMUNITY_TOKEN }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO_OWNER: ${{ github.event.repository.owner.login }}
