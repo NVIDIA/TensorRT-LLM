@@ -640,10 +640,12 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         mtp_config = None
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
-        pytorch_config = dict(disable_overlap_scheduler=False,
-                              use_cuda_graph=True,
-                              cuda_graph_max_batch_size=512,
-                              cuda_graph_padding_enabled=True)
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            use_cuda_graph=True,
+            cuda_graph_max_batch_size=512,
+            cuda_graph_padding_enabled=True,
+        )
         llm = LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
                   kv_cache_config=kv_cache_config,
                   **pytorch_config,
@@ -656,7 +658,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.skip_device_not_contain(["H100", "H200"])
+    @skip_no_hopper
     @parametrize_with_ids("mtp_nextn", [0, 2])
     @parametrize_with_ids("attention_dp", [False, True])
     def test_fp8_block_scales_cuda_graph_padding_4gpus(self, mtp_nextn,
