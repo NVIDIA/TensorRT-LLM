@@ -530,8 +530,7 @@ class TRTLLMSampler(Sampler):
             ),
                         dtype=torch.int),
             "decoder_state":
-            DecoderState(dtype=self.logits_datatype,
-                         buffer_manager=buffer_manager)
+            DecoderState()
         }
 
         self.store["decoder_state"].setup(
@@ -540,9 +539,11 @@ class TRTLLMSampler(Sampler):
             max_attention_window=self.max_attention_window,
             sink_token_length=0,
             max_sequence_length=self.executor_config.max_seq_len,
+            dtype=self.logits_datatype,
             model_config=self.model_config,
             world_config=self.world_config,
-            buffer_manager=buffer_manager)
+            buffer_manager=buffer_manager,
+        )
 
     def _instantiate_algorithms(self):
         self.algs = Algorithms()

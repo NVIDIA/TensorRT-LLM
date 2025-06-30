@@ -18,19 +18,19 @@ In this blog, we share the configurations and procedures about how to reproduce 
   - [Reproducing steps](#reproducing-steps)
     - [B200 min-latency](#b200-min-latency)
       - [Expected Results](#expected-results)
-    - [B200 max-throughput with FP8 KV](#b200-max-throughput-for-r1-0528-with-fp8-kv-cache)
+    - [B200 max-throughput for R1-0528 with FP8 KV cache](#b200-max-throughput-for-r1-0528-with-fp8-kv-cache)
       - [Benchmark](#benchmark)
       - [Expected Result Format](#expected-result-format)
-    - [B200 max-throughput with FP16 KV](#b200-max-throughput-for-r1-with-fp16-kv-cache)
-      - [Benchmark](#benchmark)
-      - [Expected Result Format](#expected-result-format)
-    - [H200 min-latency](#h200-min-latency)
+    - [B200 max-throughput for R1 with FP16 KV cache](#b200-max-throughput-for-r1-with-fp16-kv-cache)
+      - [Benchmark](#benchmark-1)
       - [Expected Result Format](#expected-result-format-1)
-    - [H200 max-throughput](#h200-max-throughput)
+    - [H200 min-latency](#h200-min-latency)
       - [Expected Result Format](#expected-result-format-2)
+    - [H200 max-throughput](#h200-max-throughput)
+      - [Expected Result Format](#expected-result-format-3)
   - [Exploring more ISL/OSL combinations](#exploring-more-islosl-combinations)
     - [WIP: Enable more features by default](#wip-enable-more-features-by-default)
-    - [WIP: Chunked context support on DeepSeek models](#wip-chunked-context-support-on-deepseek-models)
+    - [Not supported: MLA chunked context support on Hopper](#not-supported-mla-chunked-context-support-on-hopper)
     - [Out of memory issues](#out-of-memory-issues)
 
 
@@ -421,9 +421,9 @@ Generally, you should make sure that `max_batch_size` is not too low to bottlene
 
 For more details on `max_batch_size` and `max_num_tokens`, refer to [Tuning Max Batch Size and Max Num Tokens](../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md).
 
-### WIP: Chunked context support on DeepSeek models
+### Not supported: MLA chunked context support on Hopper
 
-TensorRT-LLM team is actively working on chunked context support for DeepSeek models. Because of that missing feature, there is currently a limitation that `max_num_tokens` has to be at least larger than the max input sequence length of the samples in dataset.
+MLA chunked context support has been added on Blackwell GPUs, while it's not supported on Hopper yet. On Hopper, note that `max_num_tokens` has to be at least larger than the max input sequence length of the samples in dataset.
 For more details on `max_num_tokens`, refer to [Tuning Max Batch Size and Max Num Tokens](../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md).
 
 ### Out of memory issues
