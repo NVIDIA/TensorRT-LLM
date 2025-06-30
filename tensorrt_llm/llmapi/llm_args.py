@@ -873,13 +873,6 @@ class BaseLlmArgs(BaseModel):
     lora_config: Optional[LoraConfig] = Field(
         default=None, description="LoRA configuration for the model.")
 
-    # Prompt adapter arguments
-    enable_prompt_adapter: bool = Field(default=False,
-                                        description="Enable prompt adapter.")
-
-    max_prompt_adapter_token: int = Field(
-        default=0, description="The maximum number of prompt adapter tokens.")
-
     # Quantization and calibration configurations
     quant_config: Optional[QuantConfig] = Field(
         default=None, description="Quantization config.", validate_default=True)
@@ -1265,7 +1258,8 @@ class BaseLlmArgs(BaseModel):
             if self.max_lora_rank is not None:
                 self.build_config.lora_config.max_lora_rank = self.max_lora_rank
 
-        if self.enable_prompt_adapter:
+        if hasattr(self,
+                   'enable_prompt_adapter') and self.enable_prompt_adapter:
             self.build_config.max_prompt_embedding_table_size = self.max_prompt_adapter_token * self.build_config.max_batch_size
 
         if self.max_beam_width is None:
@@ -1535,6 +1529,13 @@ class TrtLlmArgs(BaseLlmArgs):
         default=None,
         description="Build config.",
         json_schema_extra={"type": f"Optional[{get_type_repr(BuildConfig)}]"})
+
+    # Prompt adapter arguments
+    enable_prompt_adapter: bool = Field(default=False,
+                                        description="Enable prompt adapter.")
+
+    max_prompt_adapter_token: int = Field(
+        default=0, description="The maximum number of prompt adapter tokens.")
 
     # Private attributes
     _auto_parallel_config: Optional[AutoParallelConfig] = PrivateAttr(
