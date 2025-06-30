@@ -609,7 +609,6 @@ class Llama4Model(DecoderModel):
     def __init__(self, model_config: ModelConfig[LlamaConfig]):
         super().__init__(model_config)
         config = self.model_config.pretrained_config
-        self.padding_idx = config.pad_token_id
         self.num_hidden_layers = config.num_hidden_layers
         self.aux_stream = torch.cuda.Stream()
         self.mapping = model_config.mapping
@@ -687,7 +686,6 @@ class LlamaModel(DecoderModel):
     def __init__(self, model_config: ModelConfig[LlamaConfig]):
         super().__init__(model_config)
         config = self.model_config.pretrained_config
-        self.padding_idx = config.pad_token_id
         self.num_hidden_layers = config.num_hidden_layers
 
         vocab_size = config.vocab_size

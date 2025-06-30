@@ -999,7 +999,6 @@ class DeepseekV3Model(DecoderModel):
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__(model_config)
         config = model_config.pretrained_config
-        self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
         aux_stream_list = [torch.cuda.Stream() for _ in range(2)]

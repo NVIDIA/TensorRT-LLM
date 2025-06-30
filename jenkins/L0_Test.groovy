@@ -184,7 +184,7 @@ def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
             sh """
                 ls -all ${stageName}/
                 if ! grep -q '<testcase' ${stageName}/results.xml; then
-                    rm ${stageName}/results.xml
+                    rm ${stageName}/results.xml || true
                 fi
             """
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()

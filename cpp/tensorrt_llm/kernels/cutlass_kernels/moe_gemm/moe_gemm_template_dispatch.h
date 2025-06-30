@@ -60,12 +60,12 @@
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 
 #include "../include/moe_gemm_kernels.h"
-#include "launchers/fused_moe_gemm_launcher_sm80.h"
-#include "launchers/moe_gemm_tma_ws_launcher.h"
-#include "launchers/moe_gemm_tma_ws_mixed_input_launcher.h"
-#include "moe_gemm_template_dispatch_tma_ws.h"
-#include "moe_gemm_template_dispatch_tma_ws_mixed_dtype.h"
-#include "moe_tma_warp_specialized_traits.h"
+#include "./launchers/fused_moe_gemm_launcher_sm80.h"
+#include "./launchers/moe_gemm_tma_ws_launcher.h"
+#include "./launchers/moe_gemm_tma_ws_mixed_input_launcher.h"
+#include "./moe_gemm_template_dispatch_tma_ws.h"
+#include "./moe_gemm_template_dispatch_tma_ws_mixed_dtype.h"
+#include "./moe_tma_warp_specialized_traits.h"
 
 #include <cuda.h>
 #include <cuda_fp16.h>
@@ -73,9 +73,7 @@
 #include <sstream>
 #include <type_traits>
 
-namespace tensorrt_llm
-{
-namespace kernels::cutlass_kernels
+namespace tensorrt_llm::kernels::cutlass_kernels
 {
 
 // ============================= Variable batched Gemm things ===========================
@@ -529,21 +527,26 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedCo
     int const enable_blackwell = sm >= 100 ? CutlassGemmConfig::BLACKWELL : CutlassGemmConfig::NONE;
     int const enable_hopper = sm == 90 ? CutlassGemmConfig::HOPPER : CutlassGemmConfig::NONE;
     static constexpr auto fp8_only_flag = use_fp8 ? CutlassGemmConfig::FP8_ONLY : CutlassGemmConfig::NONE;
-    static constexpr auto fp4_only_flag = use_fp4 ? CutlassGemmConfig::FP4_ONLY : CutlassGemmConfig::NONE;
+    static constexpr auto fp4_only_flag
+        = (use_fp4 || use_wfp4afp4) ? CutlassGemmConfig::FP4_ONLY : CutlassGemmConfig::NONE;
     auto config_type_param = static_cast<CutlassGemmConfig::CandidateConfigTypeParam>(weight_only_flag | simt_only_flag
         | grouped_gemm_flag | enable_blackwell | enable_hopper | fp8_only_flag | fp4_only_flag);
     TLLM_CHECK_WITH_INFO(!(enable_blackwell && enable_hopper), "Blackwell and hopper flags are mutually exclusive");
 
     if (sm >= 100 && sm < 120 && !kernels::cutlass_kernels::isValidBlackwellMOESpecialisation<T, WeightType>())
     {
+        TLLM_LOG_TRACE("Blackwell is not supported for this configuration, not selecting any TMA WS implementations");
         return {};
     }
     if (sm == 120 && !kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType>())
     {
+        TLLM_LOG_TRACE(
+            "Blackwell SM120 is not supported for this configuration, not selecting any TMA WS implementations");
         return {};
     }
     if (enable_hopper && !kernels::cutlass_kernels::isValidHopperMOESpecialisation<T, WeightType>())
     {
+        TLLM_LOG_TRACE("Hopper is not supported for this configuration, not selecting any TMA WS implementations");
         return {};
     }
 
@@ -788,6 +791,15 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspace
     if constexpr (kernels::cutlass_kernels::isValidTmaWarpSpecializedMOESpecialisation<T, WeightType>() && !use_w4afp8)
     {
         auto configs = getTmaWarpSpecializedConfigs(sm_);
+        auto fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
+        if constexpr (use_wfp4afp4)
+        {
+            fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
+        }
+        else if (use_fp4)
+        {
+            fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
+        }
         size_t max_size = 0;
         bool has_config = false;
         for (auto conf : configs)
@@ -798,7 +810,7 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspace
         try                                                                                                            \
         {                                                                                                              \
             size_t size = calcMaxWorkspaceSizeTmaWarpSpecialized<T, WeightType, OutputType, FUSION>(                   \
-                num_experts, conf, multi_processor_count_);                                                            \
+                num_experts, conf, multi_processor_count_, fpX_block_scaling_type);                                    \
             max_size = std::max(max_size, size);                                                                       \
             has_config = true;                                                                                         \
         }                                                                                                              \
@@ -858,5 +870,4 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::moeGemm(
     runGemm<cutlass_extensions::EpilogueOpDefault>(inputs, hopper_inputs);
 }
 
-} // namespace kernels::cutlass_kernels
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::kernels::cutlass_kernels

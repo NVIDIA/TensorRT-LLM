@@ -4,7 +4,6 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch._prims_common import DeviceLikeType
 
-from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._utils import nvtx_range
 
 from ...._utils import mpi_rank, mpi_world_size
@@ -13,7 +12,6 @@ from ....bindings.internal.batch_manager import CacheType
 from ....llmapi.llm_args import _AutoDeployLlmArgs
 from ....mapping import Mapping
 from ...distributed import MPIDist
-from ...pyexecutor._util import create_torch_sampler_args
 from ...pyexecutor.config import PyTorchConfig
 from ...pyexecutor.model_engine import ModelEngine
 from ...pyexecutor.py_executor import PyExecutor
@@ -269,6 +267,10 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
     max_seq_len = ad_config.max_seq_len
     attn_page_size = ad_config.attn_page_size
     max_num_tokens = ad_config.max_num_tokens
+    max_draft_tokens = (
+        0 if ad_config.speculative_config is None else ad_config.speculative_config.max_draft_tokens
+    )
+
     ad_logger.info(f"{max_seq_len=}, {max_batch_size=}, {attn_page_size=}, {max_num_tokens=}")
 
     # initialize model engine
@@ -292,13 +294,7 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
         max_seq_len=max_seq_len,
         max_batch_size=max_batch_size,
     )
-    seq_slot_manager = SeqSlotManager(max_num_sequences=max_batch_size * dist_mapping.pp_size)
-    resource_manager = ResourceManager(
-        {
-            ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager,
-            ResourceManagerType.SEQ_SLOT_MANAGER: seq_slot_manager,
-        }
-    )
+    resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
     resource_manager.resource_managers.move_to_end(ResourceManagerType.KV_CACHE_MANAGER, last=True)
 
     # scheduling
@@ -309,22 +305,18 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
     scheduler = SimpleScheduler(capacitor_scheduler, mb_scheduler)
 
     # search sampler with speculative decoding
-    sampler_args = create_torch_sampler_args(
-        executor_config, dist_mapping, mixed_sampler=False, max_seq_len=max_seq_len
-    )
-    sampler = TorchSampler(sampler_args)
+    sampler = TorchSampler(max_seq_len=max_seq_len)
+
+    # creating the executor object
     py_executor = PyExecutor(
         resource_manager,
         scheduler,
         model_engine=engine,
         sampler=sampler,
         dist=mpi_dist,
-        max_num_sequences=ad_config.max_batch_size * dist_mapping.pp_size,
         disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
         max_input_len=ad_config.max_input_len,
-        max_batch_size=ad_config.max_batch_size,
-        max_draft_tokens=ad_config.speculative_config.max_draft_tokens
-        if ad_config.speculative_config is not None
-        else 0,
+        max_batch_size=max_batch_size,
+        max_draft_tokens=max_draft_tokens,
     )
     return py_executor
