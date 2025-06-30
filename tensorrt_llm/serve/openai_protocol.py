@@ -12,6 +12,7 @@ from openai.types.chat import \
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing_extensions import Annotated, Required, TypedDict
 
+from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import GuidedDecodingParams, SamplingParams
 
@@ -170,6 +171,7 @@ class CompletionRequest(OpenAIBaseModel):
     temperature: Optional[float] = 1.0
     top_p: Optional[float] = 1.0
     user: Optional[str] = None
+    lora_request: Optional[LoRARequest] = None
 
     # doc: begin-completion-sampling-params
     use_beam_search: bool = False
@@ -447,6 +449,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     skip_special_tokens: bool = True
     spaces_between_special_tokens: bool = True
     truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
+    lora_request: Optional[LoRARequest] = None
     # doc: end-chat-completion-sampling-params
 
     # doc: begin-chat-completion-extra-params

@@ -275,7 +275,7 @@ __global__ void perTokenQuantization(QuantT* dst, T const* src, int64_t const nu
 // FP4 Quantization
 
 constexpr int CVT_FP4_ELTS_PER_THREAD = 8;
-// constexpr int CVT_FP4_SF_VEC_SIZE = 16;
+constexpr int CVT_FP4_SF_VEC_SIZE = 16;
 constexpr int CVT_FP4_THREADS_PER_WARP = 32;
 constexpr int CVT_FP8_TO_FP4_ELTS_PER_THREAD = 16;
 

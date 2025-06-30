@@ -148,14 +148,13 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
             max_num_tokens = dataset_metadata.max_isl + max_batch_size
 
     pyt_options = {
-        "use_cuda_graph":
-        True,
-        "cuda_graph_padding_enabled":
-        True,
-        "kv_cache_dtype":
-        kv_cache_dtype,
-        "cuda_graph_max_batch_size":
-        max_batch_size if cuda_graph_batch_sizes is None else 0,
+        "cuda_graph_config": {
+            "cuda_graph_padding_enabled":
+            True,
+            "cuda_graph_max_batch_size":
+            max_batch_size if cuda_graph_batch_sizes is None else 0,
+        },
+        "kv_cache_dtype": kv_cache_dtype,
     }
     backend = params.get("backend", "pytorch")
 

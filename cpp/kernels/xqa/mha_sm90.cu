@@ -1639,7 +1639,7 @@ CUBIN_EXPORT __global__
                 {
                     if (warpElectSync())
                     {
-                        tma::load1DAsync(&smem.tokens[idxBuf], &scratchMem.tokens()[idxChunk],
+                        tma::loadLinearAsync(&smem.tokens[idxBuf], &scratchMem.tokens()[idxChunk],
                             sizeof(smem.tokens[idxBuf]), bar.produced);
                         arrive_tx(bar.produced, sizeof(smem.tokens[idxBuf]), 1);
                     }

@@ -68,7 +68,6 @@ def test_deepseek_trtllmgen(model_name):
 
     pytorch_config = dict(
         disable_overlap_scheduler=True,
-        use_cuda_graph=False,
         kv_cache_dtype="auto",
         attn_backend="TRTLLM",
         load_format="dummy",
