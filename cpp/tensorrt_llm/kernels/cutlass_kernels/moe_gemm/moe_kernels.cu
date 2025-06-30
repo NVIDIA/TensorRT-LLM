@@ -1425,19 +1425,11 @@ constexpr static int EXPAND_THREADS_PER_BLOCK = 256;
 template <class InputActivationsType, class ExpandedActivationsType, bool PRE_QUANT_AWQ>
 __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_input,
     ExpandedActivationsType* permuted_output, float const* unpermuted_scales, float* permuted_scales,
-// <<<<<<< HEAD
     int const* permuted_row_to_unpermuted_row, int64_t const num_rows, int64_t const cols, int64_t const k,
     float const* fc1_act_global_scale, bool use_per_expert_act_scale, int64_t const* expert_first_token_offset,
     TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
     TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, int64_t const num_experts_per_node,
     InputActivationsType const* prequant_scales = nullptr)
-// =======
-//     int const* expanded_dest_row_to_expanded_source_row, int* expanded_source_row_to_expanded_dest_row,
-//     int64_t const num_rows, int64_t const cols, int64_t const k, float const* fc1_act_global_scale,
-//     int64_t const* expert_first_token_offset, TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
-//     TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, int64_t const num_experts_per_node,
-//     InputActivationsType const* prequant_scales = nullptr)
-// >>>>>>> 1fba972df (Fuse w4a8 moe pre-quant scale)
 {
 #ifdef ENABLE_FP4
     constexpr bool is_fp4 = std::is_same_v<ExpandedActivationsType, __nv_fp4_e2m1>;
@@ -1471,9 +1463,6 @@ __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_inp
         using DataElem
             = std::conditional_t<is_fp4_input, uint32_t, cutlass::Array<InputActivationsType, ELEM_PER_THREAD>>;
         using OutputElem = std::conditional_t<is_fp4, uint32_t, DataElem>;
-        // using InputElem = cutlass::Array<InputActivationsType, ELEM_PER_THREAD>;
-        // using OutputElem_ = cutlass::Array<ExpandedActivationsType, ELEM_PER_THREAD>;
-        // using OutputElem = std::conditional_t<is_fp4, uint32_t, OutputElem_>;
 
         // Duplicate and permute rows
         int64_t const source_k_rank = unpermuted_row / num_rows;
@@ -1568,7 +1557,6 @@ __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_inp
 template <class InputActivationsType, class ExpandedActivationsType, bool PRE_QUANT_AWQ = false>
 void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
     ExpandedActivationsType* permuted_output, float const* unpermuted_scales, float* permuted_scales,
-// <<<<<<< HEAD
     int const* permuted_row_to_unpermuted_row, int64_t const num_rows, int64_t const cols, int const k,
     int const num_experts_per_node, float const* fc1_act_global_scale, bool use_per_expert_act_scale,
     int64_t* expert_first_token_offset, TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
@@ -1580,17 +1568,6 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
     //   This code is still needed if we add MXFP8_MXFP4 mode.
     // TODO This is also wasteful, we should solve this properly by properly writing the padding in the kernel
     if (fc1_act_sf_flat && std::is_same_v<ExpandedActivationsType, __nv_fp4_e2m1>)
-// =======
-//     int const* expanded_dest_row_to_expanded_source_row, int* expanded_source_row_to_expanded_dest_row,
-//     int64_t const num_rows, int64_t const cols, int const k, int const num_experts_per_node,
-//     float const* fc1_act_global_scale, int64_t* expert_first_token_offset,
-//     TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
-//     TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, cudaStream_t stream,
-//     void const* prequant_scales = nullptr)
-// {
-//     // if (fc1_act_sf_flat)
-//     if (std::is_same_v<ExpandedActivationsType, __nv_fp4_e2m1>)
-// >>>>>>> 1fba972df (Fuse w4a8 moe pre-quant scale)
     {
         size_t num_elems = getOffsetActivationSF(num_experts_per_node, num_rows * std::min(k, num_experts_per_node),
             cols, TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4);
@@ -1621,15 +1598,9 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
     config.numAttrs = 1;
     config.attrs = attrs;
     cudaLaunchKernelEx(&config, func, unpermuted_input, permuted_output, unpermuted_scales, permuted_scales,
-// <<<<<<< HEAD
         permuted_row_to_unpermuted_row, num_rows, cols, k, fc1_act_global_scale, use_per_expert_act_scale,
         expert_first_token_offset, fc1_act_sf_flat, input_sf, num_experts_per_node,
         reinterpret_cast<InputActivationsType const*>(prequant_scales));
-// =======
-//         expanded_dest_row_to_expanded_source_row, expanded_source_row_to_expanded_dest_row, num_rows, cols, k,
-//         fc1_act_global_scale, expert_first_token_offset, fc1_act_sf_flat, input_sf, num_experts_per_node,
-//         reinterpret_cast<InputActivationsType const*>(prequant_scales));
-// >>>>>>> 1fba972df (Fuse w4a8 moe pre-quant scale)
 }
 
 #define INSTANTIATE_EXPAND_INPUT_ROWS(InputActivationsType, ExpandedActivationsType)                                   \
@@ -3404,18 +3375,6 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         using ExpandedActivationsType = std::conditional_t<use_w4afp8, BackBoneType, T>;
         // Only NVFP4xNVFP4 supports FC1 per-expert act scale
         bool use_per_expert_act_scale = use_fp4 ? quant_params.fp4.fc1.use_per_expert_act_scale : false;
-// <<<<<<< HEAD
-//         // Only NVFP4xNVFP4 supports FC1 per-expert act scale
-//         bool use_per_expert_act_scale = use_fp4 ? quant_params.fp4.fc1.use_per_expert_act_scale : false;
-//         expandInputRowsKernelLauncher(input_activations, reinterpret_cast<ExpandedActivationsType*>(permuted_data_),
-//             token_topk_unpermuted_scales, permuted_token_final_scales_, permuted_row_to_unpermuted_row_, num_rows,
-//             hidden_size, experts_per_token, num_experts_per_node, quant_params.fp4.fc1.act_global_scale,
-//             use_per_expert_act_scale, expert_first_token_offset_, fc1_fp4_act_scale_, input_sf, stream);
-// =======
-        // expandInputRowsKernelLauncher(input_activations, reinterpret_cast<ExpandedActivationsType*>(permuted_data_),
-        //     token_topk_unpermuted_scales, permuted_token_final_scales_, permuted_source_token_ids_,
-        //     expanded_source_row_to_expanded_dest_row, num_rows, hidden_size, experts_per_token, num_experts_per_node,
-        //     quant_params.fp4.fc1.act_global_scale, expert_first_token_offset_, fc1_fp4_act_scale_, input_sf, stream);
         T const* gemm1_input;
         if constexpr (use_w4afp8)
         {
@@ -3423,7 +3382,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
             expandInputRowsKernelLauncher<InputType, T, true>(input_activations, reinterpret_cast<T*>(smoothed_act_),
                 token_topk_unpermuted_scales, permuted_token_final_scales_, permuted_row_to_unpermuted_row_, num_rows,
                 hidden_size, experts_per_token, num_experts_per_node, quant_params.fp4.fc1.act_global_scale,
-                use_per_expert_act_scale, expert_first_token_offset_, fc1_fp4_act_scale_, input_sf, stream, quant_params.groupwise.fc1.act_scales);
+                use_per_expert_act_scale, expert_first_token_offset_, fc1_fp4_act_scale_, input_sf, stream,
+                quant_params.groupwise.fc1.act_scales);
 
             gemm1_input = reinterpret_cast<T const*>(smoothed_act_);
         }
@@ -3435,8 +3395,6 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
                 use_per_expert_act_scale, expert_first_token_offset_, fc1_fp4_act_scale_, input_sf, stream);
             gemm1_input = reinterpret_cast<T const*>(permuted_data_);
         }
-        /////////////////////////////////////////////////////////////////////////////
-// >>>>>>> 1fba972df (Fuse w4a8 moe pre-quant scale)
 
         sync_check_cuda_error(stream);
 
