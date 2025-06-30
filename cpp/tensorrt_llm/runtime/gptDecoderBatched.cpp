@@ -26,6 +26,7 @@
 #include "tensorrt_llm/kernels/decodingKernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
+#include "tensorrt_llm/runtime/gptDecoder.h"
 
 #include <algorithm>
 #include <cassert>

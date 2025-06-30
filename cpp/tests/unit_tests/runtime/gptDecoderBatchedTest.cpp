@@ -24,10 +24,11 @@
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/decoderState.h"
+#include "tensorrt_llm/runtime/gptDecoder.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
-#include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <gmock/gmock-matchers.h>
