@@ -91,6 +91,8 @@ class PyTorchConfig:
     # TODO: make this a per-request parameter
     stream_interval: int = 1
 
+    force_dynamic_quantization: bool = False
+
 
 EXETENDED_EXECUTOR_CONFIG_FIELDS = [
     'backend',

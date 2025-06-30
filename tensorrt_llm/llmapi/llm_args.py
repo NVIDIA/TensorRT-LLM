@@ -1741,6 +1741,11 @@ class TorchLlmArgs(BaseLlmArgs):
         "Set this to a larger value when the batch size is large, which helps reduce the streaming overhead.",
     )
 
+    force_dynamic_quantization: bool = Field(
+        default=False,
+        description="If true, force dynamic quantization. Defaults to False.",
+    )
+
     # TODO: remove backend later
     @field_validator('backend', mode='before')
     def init_backend(cls, v):
@@ -1836,7 +1841,8 @@ class TorchLlmArgs(BaseLlmArgs):
             enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
             load_format=self.load_format,
             enable_min_latency=self.enable_min_latency,
-            stream_interval=self.stream_interval)
+            stream_interval=self.stream_interval,
+            force_dynamic_quantization=self.force_dynamic_quantization)
 
     @field_validator('cuda_graph_max_batch_size')
     @classmethod
