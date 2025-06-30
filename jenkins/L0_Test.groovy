@@ -1992,6 +1992,30 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         */
     ]
 
+    if (env.targetArch == AARCH64_TRIPLE) {
+        sanityCheckConfigs = [
+            /* Clear unnecessary configs for feat/orangina
+            "PY312-UB2404": [
+                LLM_DOCKER_IMAGE,
+                "GH200",
+                AARCH64_TRIPLE,
+                false,
+                "",
+                UBUNTU_24_04_IMAGE,
+                true, // Extra PyTorch CUDA 12.8 install
+            ],
+            */
+            "PY312-DLFW": [
+                LLM_DOCKER_IMAGE,
+                "GH200",
+                AARCH64_TRIPLE,
+                false,
+                "dlfw/",
+                DLFW_IMAGE,
+                false,
+            ],
+        ]
+    }
     aarch64SanityCheckConfigs = [
         /*"PY312-UB2404": [
             LLM_DOCKER_IMAGE,
@@ -2001,7 +2025,8 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             "",
             UBUNTU_24_04_IMAGE,
             true, // Extra PyTorch CUDA 12.8 install
-        ],*/
+        ],
+        */
         "PY312-DLFW": [
             LLM_DOCKER_IMAGE,
             "GH200",
