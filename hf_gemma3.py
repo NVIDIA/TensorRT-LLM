@@ -1,0 +1,19 @@
+from transformers import AutoTokenizer, Gemma3ForCausalLM
+import torch
+import numpy as np
+
+# Seeding for deterministic sampling.
+torch.manual_seed(42)
+np.random.seed(42)
+
+model_path = "/home/scratch.trt_llm_data/llm-models/gemma/gemma-3-1b-it/"
+
+tokenizer = AutoTokenizer.from_pretrained(model_path)
+input_text = "It was a beautiful summer day when Jack first boarded the train to head home from a business trip. He had been traveling for weeks, and all he wanted was to relax and enjoy the peaceful ride. As he found his seat, he noticed a woman sitting across from him, reading a book. She had long, curly brown hair and bright green eyes that sparkled every time she turned a page. Jack could not help but glance at her occasionally, feeling a little shy but also curious. The train started moving, and they both settled into their seats, enjoying the gentle rocking motion. After a while, the woman looked up and caught Jack staring at her. She smiled kindly, and Jack felt his face flush with embarrassment. He apologized and introduced himself, and they started talking. Her name was Emily, and she was on her way to visit her family for the summer. They talked about everything from books to music to their favorite foods. Jack was surprised by how easy it was to talk to her; it felt like they had known each other for years. As the hours passed, they discovered they had a lot in common, including a love for adventure and trying new things. The train ride was supposed to be long, but with Emily by his side, time flew by. They laughed together, shared stories, and even played games to pass the time. At one point, they decided to grab some snacks from the cafeteria car, and as they walked down the aisle, Jack realized he was having the time of his life. When they returned to their seats, Emily pulled out a small notebook and began to draw. Jack was amazed by her talent, and they spent the next hour sketching together, enjoying the scenery outside the window. As the sun began to set, casting a golden glow over the landscape, Jack felt a deep connection to Emily that he could not explain. He knew he did not want the train ride to end, not just because he was having so much fun, but because he felt like he had found someone special. Eventually, the train pulled into the station where Emily should disembark, and she had to leave. Jack walked her to the door, feeling a pang of sadness. They exchanged numbers, and Jack promised to call her soon. As he watched her step off the train, he could not help but smile. He felt hopeful and excited for what the future might hold. Over the next few weeks, Jack and Emily talked every day, sharing stories and laughter. They decided to meet again, and their first date was like a dream come true. They went on long walks, had picnics in the park, and explored the city together. Jack knew he had found his soulmate in Emily, and he was grateful for that chance encounter on the train. A year later, Jack proposed to Emily on another train ride, this time with a beautiful view of the mountains. She said yes, and they got married surrounded by friends and family. They always looked back on that first train ride as the moment that changed their lives forever, bringing them together in a way they never could have imagined. Years later, they would tell their children the story of how they met, and how that train ride led them to a lifetime of love and happiness."
+input_tokens = tokenizer("Hi there, how are you?", return_tensors="pt")
+
+model = Gemma3ForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16).eval()
+
+output_tokens = model.generate(input_tokens["input_ids"], max_length=656, do_sample=False, num_beams=1, top_p=None, top_k=None, temperature=None)
+output_text = tokenizer.decode(output_tokens[0], skip_special_tokens=True)
+print(output_text)

@@ -65,7 +65,7 @@ class Gemma3Attention(Attention):
         self.attention_window_size = None
         if is_sliding:
             rope_params.theta = 10000
-            self.attention_window_size = config.sliding_window
+            self.attention_window_size = config.sliding_window - 1  # Gemma3 sliding window isn't inclusive.
         pos_embd_params = PositionalEmbeddingParams(
             type=PositionEmbeddingType.rope_gpt_neox,
             rope=rope_params,
