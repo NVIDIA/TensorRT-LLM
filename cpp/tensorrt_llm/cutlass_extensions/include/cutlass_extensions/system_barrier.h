@@ -22,6 +22,8 @@
 
 #include "cutlass/barrier.h"
 
+#include <cuda/atomic>
+
 namespace cutlass
 {
 
@@ -43,7 +45,7 @@ __forceinline__ __device__ uint32_t atomicCAS_system_acq(uint32_t* p, uint32_t c
 
 } // namespace detail
 
-template <class Sync, bool SafeBetweenPhases, bool UseMembarGPU>
+template <class Sync, bool SafeBetweenPhases>
 struct MulticastSystemBarrier : public GenericBarrier<Sync>
 {
 
@@ -57,8 +59,8 @@ struct MulticastSystemBarrier : public GenericBarrier<Sync>
 
 protected:
     /// Reduce into flag, with release pattern (int specialization)
-    CUTLASS_DEVICE
-    static void red_release(T* mc_ptr, int val)
+    template <cuda::thread_scope Scope>
+    CUTLASS_DEVICE static void red_release(T* mc_ptr, int val)
     {
 #if defined(CUTE_ARCH_MULTIMEM_SM90_ENABLED)
         // atomic reduction to all replicas
@@ -66,13 +68,17 @@ protected:
         // See
         // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-multimem-ld-reduce-multimem-st-multimem-red
         // for multimem PTX doc
-        if constexpr (UseMembarGPU)
+        if constexpr (Scope == cuda::thread_scope::thread_scope_device)
         {
             asm volatile("multimem.red.release.gpu.global.add.u32 [%0], %1;" ::"l"(mc_ptr), "r"(val) : "memory");
         }
-        else
+        else if constexpr (Scope == cuda::thread_scope::thread_scope_system)
         {
             asm volatile("multimem.red.release.sys.global.add.u32 [%0], %1;" ::"l"(mc_ptr), "r"(val) : "memory");
+        }
+        else
+        {
+            CUTE_INVALID_CONTROL_PATH("Invalid thread scope for MulticastSystemBarrier.");
         }
 
         // Need a fence between MC and UC access to the same memory:
@@ -128,8 +134,8 @@ public:
         Sync::sync();
     }
 
-    CUTLASS_DEVICE
-    static T arrive_inc_get(T* mc_ptr, T* uc_ptr, int thread_idx, int flag_idx, int rank, int world_size)
+    template <cuda::thread_scope Scope>
+    CUTLASS_DEVICE static T arrive_inc_get(T* mc_ptr, T* uc_ptr, int thread_idx, int flag_idx, int rank, int world_size)
     {
         T* mc_barrier_ptr = mc_ptr + flag_idx;
         T* uc_barrier_ptr = uc_ptr + flag_idx;
@@ -156,13 +162,13 @@ public:
             // can be immediately reused.
             bool master = rank == 0;
             int val = master ? 0x80000000 - (world_size - 1) : 1;
-            red_release(mc_barrier_ptr, val);
+            red_release<Scope>(mc_barrier_ptr, val);
         }
         return old_arrive;
     }
 
-    CUTLASS_DEVICE
-    static void arrive_inc(Params const& params, int thread_idx, int flag_idx, int rank, int world_size)
+    template <cuda::thread_scope Scope = cuda::thread_scope::thread_scope_system>
+    CUTLASS_DEVICE static void arrive_inc(Params const& params, int thread_idx, int flag_idx, int rank, int world_size)
     {
         T* mc_barrier = params.mc_barrier_ptr + flag_idx;
 
@@ -170,23 +176,24 @@ public:
 
         if (thread_idx == 0)
         {
-            red_release(mc_barrier, 1);
+            red_release<Scope>(mc_barrier, 1);
         }
     }
 
-    CUTLASS_DEVICE
-    static void arrive_and_wait(Params const& params, int thread_idx, int flag_idx, int rank, int world_size)
+    template <cuda::thread_scope Scope = cuda::thread_scope::thread_scope_system>
+    CUTLASS_DEVICE static void arrive_and_wait(
+        Params const& params, int thread_idx, int flag_idx, int rank, int world_size)
     {
         auto mc_ptr = params.mc_barrier_ptr;
         auto uc_ptr = params.uc_barrier_ptr;
         if constexpr (SafeBetweenPhases)
         {
-            auto old_arrive = arrive_inc_get(mc_ptr, uc_ptr, thread_idx, flag_idx, rank, world_size);
+            auto old_arrive = arrive_inc_get<Scope>(mc_ptr, uc_ptr, thread_idx, flag_idx, rank, world_size);
             wait(old_arrive, uc_ptr, thread_idx, flag_idx);
         }
         else
         {
-            arrive_inc(params, thread_idx, flag_idx, rank, world_size);
+            arrive_inc<Scope>(params, thread_idx, flag_idx, rank, world_size);
             wait_eq_reset(uc_ptr, thread_idx, flag_idx, world_size);
         }
     }
