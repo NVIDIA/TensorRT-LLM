@@ -10,7 +10,7 @@ add_custom_target(deep_ep)
 # Filter CUDA arch >= 9.0
 set(DEEP_EP_CUDA_ARCHITECTURES "")
 foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES_NORMALIZED)
-  string(REGEX MATCHALL "^([1-9][0-9]*)[0-9]a?(-real|-virtual)?$" MATCHES
+  string(REGEX MATCHALL "^([1-9][0-9]*)[0-9][af]?(-real|-virtual)?$" MATCHES
                ${CUDA_ARCH})
   if(NOT CMAKE_MATCH_0)
     message(FATAL_ERROR "Invalid CUDA arch format: \"${CUDA_ARCH}\"")
@@ -74,26 +74,32 @@ set(NVSHMEM_STAMP_FILE ${CMAKE_CURRENT_BINARY_DIR}/nvshmem_stamp.txt)
 file(COPY ${DEEP_EP_SOURCE_DIR}/third-party/nvshmem.patch
      DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
 file(SHA256 ${CMAKE_CURRENT_BINARY_DIR}/nvshmem.patch NVSHMEM_PATCH_HASH)
-file(SHA256 ${CMAKE_CURRENT_SOURCE_DIR}/nvshmem_fix_clang_aarch64_build.patch
-     NVSHMEM_PATCH_2_HASH)
 file(SHA256 ${CMAKE_CURRENT_SOURCE_DIR}/nvshmem_fast_build.patch
-     NVSHMEM_PATCH_3_HASH)
+     NVSHMEM_PATCH_2_HASH)
 set(NVSHMEM_STAMP_CONTENT "${NVSHMEM_URL_HASH}")
 string(APPEND NVSHMEM_STAMP_CONTENT " patch ${NVSHMEM_PATCH_HASH}")
 string(APPEND NVSHMEM_STAMP_CONTENT " TRANSPORT_VERSION_MAJOR 103")
 string(APPEND NVSHMEM_STAMP_CONTENT " patch ${NVSHMEM_PATCH_2_HASH}")
-string(APPEND NVSHMEM_STAMP_CONTENT " patch ${NVSHMEM_PATCH_3_HASH}")
 set(OLD_NVSHMEM_STAMP_CONTENT "")
 if(EXISTS ${NVSHMEM_STAMP_FILE})
   file(READ ${NVSHMEM_STAMP_FILE} OLD_NVSHMEM_STAMP_CONTENT)
 endif()
-if(NOT "${OLD_NVSHMEM_STAMP_CONTENT}" STREQUAL "${NVSHMEM_STAMP_CONTENT}")
+if(NOT OLD_NVSHMEM_STAMP_CONTENT STREQUAL NVSHMEM_STAMP_CONTENT)
   file(REMOVE_RECURSE ${CMAKE_CURRENT_BINARY_DIR}/nvshmem_project-prefix)
   file(WRITE ${NVSHMEM_STAMP_FILE} "${NVSHMEM_STAMP_CONTENT}")
 endif()
 
 # Add NVSHMEM
 # ===========
+
+# NVSHMEM only works with GCC. Building NVSHMEM with Clang results in
+# compilation errors. Using NVSHMEM with Clang results in slow builds and device
+# link issues.
+if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  set(CMAKE_C_COMPILER gcc)
+  set(CMAKE_CXX_COMPILER g++)
+  set(CMAKE_CUDA_HOST_COMPILER g++)
+endif()
 
 # Find libmlx5.so.1
 execute_process(
@@ -113,12 +119,9 @@ ExternalProject_Add(
   nvshmem_project
   URL https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/source/nvshmem_src_3.2.5-1.txz
   URL_HASH ${NVSHMEM_URL_HASH}
-  BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/nvshmem-build
   PATCH_COMMAND patch -p1 -i ${CMAKE_CURRENT_BINARY_DIR}/nvshmem.patch
   COMMAND sed "s/TRANSPORT_VERSION_MAJOR 3/TRANSPORT_VERSION_MAJOR 103/" -i
           src/CMakeLists.txt
-  COMMAND patch -p1 -i
-          ${CMAKE_CURRENT_SOURCE_DIR}/nvshmem_fix_clang_aarch64_build.patch
   COMMAND patch -p1 -i ${CMAKE_CURRENT_SOURCE_DIR}/nvshmem_fast_build.patch
   CMAKE_ARGS -DNVSHMEM_IBGDA_SUPPORT=1
              -DNVSHMEM_IBRC_SUPPORT=0
@@ -135,8 +138,15 @@ ExternalProject_Add(
              -DNVSHMEM_BUILD_EXAMPLES=0
              -DNVSHMEM_BUILD_TESTS=0
   CMAKE_CACHE_ARGS
+    -DCMAKE_C_COMPILER:STRING=${CMAKE_C_COMPILER}
+    -DCMAKE_CXX_COMPILER:STRING=${CMAKE_CXX_COMPILER}
+    -DCMAKE_CUDA_HOST_COMPILER:STRING=${CMAKE_CUDA_HOST_COMPILER}
+    -DCMAKE_C_COMPILER_LAUNCHER:STRING=${CMAKE_C_COMPILER_LAUNCHER}
+    -DCMAKE_CXX_COMPILER_LAUNCHER:STRING=${CMAKE_CXX_COMPILER_LAUNCHER}
+    -DCMAKE_CUDA_COMPILER_LAUNCHER:STRING=${CMAKE_CUDA_COMPILER_LAUNCHER}
     -DCMAKE_CUDA_ARCHITECTURES:STRING=${DEEP_EP_CUDA_ARCHITECTURES}
-  INSTALL_COMMAND "")
+  INSTALL_COMMAND ""
+  BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/nvshmem-build)
 add_library(nvshmem_project::nvshmem STATIC IMPORTED)
 add_dependencies(nvshmem_project::nvshmem nvshmem_project)
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/nvshmem-build/src/include)
