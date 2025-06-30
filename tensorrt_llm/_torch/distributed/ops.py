@@ -6,8 +6,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from tensorrt_llm._utils import getSMVersion
-from tensorrt_llm._utils import mpi_barrier
+from tensorrt_llm._utils import getSMVersion, mpi_barrier
 from tensorrt_llm.bindings.allreduceUtil import check_nvlink_p2p_supported
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
@@ -296,9 +295,11 @@ NVLINK_P2P_SUPPORTED = {}
 MNNVL_BUFFER_SHAPE = {}
 SM_VERSION = getSMVersion()
 
+
 def is_FP8_enabled():
     global SM_VERSION
     return (SM_VERSION >= 90) and (SM_VERSION < 100)
+
 
 def get_mnnvl_supported_dtypes():
     return (torch.bfloat16, torch.float32)
@@ -308,8 +309,9 @@ def get_UB_supported_dtype():
     return (torch.half, torch.bfloat16)
 
 
-def _strategy_supports(strategy, input, fusion_op, nvlink_supported, p2p_supported, buffer_mnnvl_shape):
-    # If UB is 
+def _strategy_supports(strategy, input, fusion_op, nvlink_supported,
+                       p2p_supported, buffer_mnnvl_shape):
+    # If UB is
     if strategy == AllReduceStrategy.NCCL:
         return True
 
@@ -318,7 +320,7 @@ def _strategy_supports(strategy, input, fusion_op, nvlink_supported, p2p_support
         return True
 
     override_strategy = os.getenv("OVERRIDE_HEURISTIC_ALLREDUCE_STRATEGY",
-                                    False)
+                                  False)
     if override_strategy and strategy != AllReduceStrategy.AUTO:
         return True
 
@@ -339,7 +341,8 @@ def _strategy_supports(strategy, input, fusion_op, nvlink_supported, p2p_support
     return False
 
 
-def _fallback_nccl(message_size_bytes, max_workspace_size, is_auto, nvlink_supported, p2p_supported):
+def _fallback_nccl(message_size_bytes, max_workspace_size, is_auto,
+                   nvlink_supported, p2p_supported):
     # If messageSize is less than maxWorkspaceSize, use NCCL, regardless of the fusion type.
     if message_size_bytes > max_workspace_size:
         if not is_auto:
@@ -374,7 +377,7 @@ def _get_max_required_workspace_size(world_size):
     if forceDeterministic:
         workspaceSize = int(
             os.environ.get("FORCE_ALLREDUCE_KERNEL_WORKSPACE_SIZE",
-                            1000 * 1000 * 1000))
+                           1000 * 1000 * 1000))
         return workspaceSize
 
     if world_size <= 2:
@@ -389,13 +392,14 @@ def _match_min_latency_msg_size(world_size, message_size_bytes):
 
 
 def _infer_strategy(input, fusion_op: AllReduceFusionOp,
-                    stratey: AllReduceStrategy, tp_group, nvlink_supported, p2p_supported) -> AllReduceStrategy:
+                    stratey: AllReduceStrategy, tp_group, nvlink_supported,
+                    p2p_supported) -> AllReduceStrategy:
     is_auto = stratey == AllReduceStrategy.AUTO
     message_size_bytes = input.numel() * input.element_size()
-    max_workspace_size = _get_max_required_workspace_size(
-        len(tp_group))
+    max_workspace_size = _get_max_required_workspace_size(len(tp_group))
 
-    if _fallback_nccl(message_size_bytes, max_workspace_size, is_auto, nvlink_supported, p2p_supported):
+    if _fallback_nccl(message_size_bytes, max_workspace_size, is_auto,
+                      nvlink_supported, p2p_supported):
         return AllReduceStrategy.NCCL
 
     if fusion_op in [
@@ -412,21 +416,19 @@ def _infer_strategy(input, fusion_op: AllReduceFusionOp,
         return AllReduceStrategy.NCCL
 
     if not is_auto:
-        if stratey in [
-                AllReduceStrategy.ONESHOT, AllReduceStrategy.TWOSHOT
-        ]:
+        if stratey in [AllReduceStrategy.ONESHOT, AllReduceStrategy.TWOSHOT]:
             return AllReduceStrategy.MIN_LATENCY
         return stratey
     else:
-        if _match_min_latency_msg_size(len(tp_group),
-                                    message_size_bytes):
+        if _match_min_latency_msg_size(len(tp_group), message_size_bytes):
             stratey = AllReduceStrategy.MIN_LATENCY
         else:
             stratey = AllReduceStrategy.NCCL
     return stratey
 
 
-def _prepare_for_strategy(strategy, input, workspace, mnnvl_buffer, mnnvl_buff_flags):
+def _prepare_for_strategy(strategy, input, workspace, mnnvl_buffer,
+                          mnnvl_buff_flags):
     if strategy == AllReduceStrategy.MNNVL:
         workspace = mnnvl_buffer.view(3, 2, -1, input.shape[-1])
         mnnvl_buff_flags = mnnvl_buff_flags
@@ -436,31 +438,41 @@ def _prepare_for_strategy(strategy, input, workspace, mnnvl_buffer, mnnvl_buff_f
     return workspace, mnnvl_buff_flags
 
 
-def get_runtime_strategy(input, fusion_op, origin_strategy, tp_group, buffer_mnnvl_shape):
+def get_runtime_strategy(input, fusion_op, origin_strategy, tp_group,
+                         buffer_mnnvl_shape):
     strategy = origin_strategy
 
     tp_group_set = tuple(tp_group)
     global NVLINK_P2P_SUPPORTED
-    nvlink_supported, p2p_supported = NVLINK_P2P_SUPPORTED[
-        tp_group_set]
+    nvlink_supported, p2p_supported = NVLINK_P2P_SUPPORTED[tp_group_set]
 
     if strategy != AllReduceStrategy.AUTO:
-        if _strategy_supports(strategy, input,
-                                    fusion_op, nvlink_supported, p2p_supported, buffer_mnnvl_shape):
+        if _strategy_supports(strategy, input, fusion_op, nvlink_supported,
+                              p2p_supported, buffer_mnnvl_shape):
             return strategy
         elif strategy == AllReduceStrategy.LOWPRECISION or strategy == AllReduceStrategy.MNNVL or strategy == AllReduceStrategy.UB:
             strategy = AllReduceStrategy.AUTO
-    return _infer_strategy(input, fusion_op, strategy, tp_group, nvlink_supported, p2p_supported)
+    return _infer_strategy(input, fusion_op, strategy, tp_group,
+                           nvlink_supported, p2p_supported)
 
 
 @torch.library.custom_op("trtllm::all_reduce", mutates_args=())
-def all_reduce_forward(input: torch.Tensor, residual: Optional[torch.Tensor], norm_weight: Optional[torch.Tensor],
-                        scale: Optional[torch.Tensor], bias: Optional[torch.Tensor], tp_group: list[int],
-                        strategy: int, fusion_op: int, eps: float, trigger_completion_at_end: bool,
-                        buffer_mnnvl_shape: Optional[list[int]], workspace: Optional[torch.Tensor],
-                        mnnvl_buffer: Optional[torch.Tensor], mnnvl_buff_flags: Optional[torch.Tensor]) -> List[torch.Tensor]:
-    strategy = get_runtime_strategy(input, fusion_op, strategy, tp_group, buffer_mnnvl_shape)
-    workspace, buffer_flags_mnnvl = _prepare_for_strategy(strategy, input, workspace, mnnvl_buffer, mnnvl_buff_flags)
+def all_reduce_forward(
+        input: torch.Tensor, residual: Optional[torch.Tensor],
+        norm_weight: Optional[torch.Tensor], scale: Optional[torch.Tensor],
+        bias: Optional[torch.Tensor], tp_group: list[int], strategy: int,
+        fusion_op: int, eps: float, trigger_completion_at_end: bool,
+        buffer_mnnvl_shape: Optional[list[int]],
+        workspace: Optional[torch.Tensor], mnnvl_buffer: Optional[torch.Tensor],
+        mnnvl_buff_flags: Optional[torch.Tensor]) -> List[torch.Tensor]:
+    strategy = get_runtime_strategy(input, fusion_op, strategy, tp_group,
+                                    buffer_mnnvl_shape)
+    workspace, buffer_flags_mnnvl = _prepare_for_strategy(
+        strategy, input, workspace, mnnvl_buffer, mnnvl_buff_flags)
+
+    print(
+        f"================================== strategy: {strategy}, op {fusion_op}, input  {input.shape}, norm_weight: {norm_weight.shape if norm_weight is not None else None},  scale: {scale.shape if scale is not None else None},  bias:  {bias.shape if bias is not None else None}"
+    )
 
     output = torch.ops.trtllm.allreduce(
         input=input,
@@ -474,31 +486,38 @@ def all_reduce_forward(input: torch.Tensor, residual: Optional[torch.Tensor], no
         strategy=strategy,
         op=fusion_op,
         eps=eps,
-        trigger_completion_at_end=
-        trigger_completion_at_end,
-        )
+        trigger_completion_at_end=trigger_completion_at_end,
+    )
 
+    for o in output:
+        print(f"===================================output: {o.shape}")
     return output
 
+
 @all_reduce_forward.register_fake
-def _(
-    input: torch.Tensor, residual: Optional[torch.Tensor], norm_weight: Optional[torch.Tensor],
-    scale: Optional[torch.Tensor], bias: Optional[torch.Tensor], tp_group: list[int],
-    strategy: int, fusion_op: int, eps: float, trigger_completion_at_end: bool,
-    buffer_mnnvl_shape: Optional[list[int]], workspace: Optional[torch.Tensor],
-    mnnvl_buffer: Optional[torch.Tensor], mnnvl_buff_flags: Optional[torch.Tensor]
-) -> List[torch.Tensor]:
+def _(input: torch.Tensor, residual: Optional[torch.Tensor],
+      norm_weight: Optional[torch.Tensor], scale: Optional[torch.Tensor],
+      bias: Optional[torch.Tensor], tp_group: list[int], strategy: int,
+      fusion_op: int, eps: float, trigger_completion_at_end: bool,
+      buffer_mnnvl_shape: Optional[list[int]],
+      workspace: Optional[torch.Tensor], mnnvl_buffer: Optional[torch.Tensor],
+      mnnvl_buff_flags: Optional[torch.Tensor]) -> List[torch.Tensor]:
     if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
         return [torch.empty_like(input), torch.empty_like(residual)]
     elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8:
-        return [norm_quant, torch.empty_like(residual)]
+        return [torch.empty_like(input), torch.empty_like(residual)]
     elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8:
-        return [norm, norm_quant, torch.empty_like(residual)]
+        return [
+            torch.empty_like(input),
+            torch.empty_like(input),
+            torch.empty_like(residual)
+        ]
     elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
         return [norm_quant_fp4, scale_factor, torch.empty_like(residual)]
     elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4:
         return [norm, norm_quant_fp4, scale_factor, torch.empty_like(residual)]
     return torch.empty_like(input)
+
 
 class AllReduce(nn.Module):
 
@@ -553,7 +572,9 @@ class AllReduce(nn.Module):
         self.dtype = dtype
 
         if self.strategy == AllReduceStrategy.MNNVL:
-            if (not is_FP8_enabled()) or (dtype is None or dtype not in get_mnnvl_supported_dtypes()) or (mapping.has_cp()):
+            if (not is_FP8_enabled()) or (
+                    dtype is None or dtype
+                    not in get_mnnvl_supported_dtypes()) or (mapping.has_cp()):
                 logger.warn(
                     f"MNNVL doesn't support cp and only support datatype {get_mnnvl_supported_dtypes()}: required cp {mapping.has_cp()} dtype {dtype}. Failback to auto."
                 )
@@ -573,16 +594,23 @@ class AllReduce(nn.Module):
                 self.nvlink_supported, self.p2p_supported
             ]
 
-        if self.strategy == AllReduceStrategy.MNNVL:
-            assert dtype is not None, "dtype shall be set with MNNVL."
-            if dtype in MNNVL_BUFFER_SHAPE:
-                self.buffer_mnnvl_shape = MNNVL_BUFFER_SHAPE(dtype)
-            else:
-                self.buffer_mnnvl_shape = get_all_reduce_mnnvl_max_workspace_elements(
-                    dtype)[2]
-                MNNVL_BUFFER_SHAPE[dtype] = self.buffer_mnnvl_shape
-            mcast_buffer_mnnvl, self.mnnvl_buffer, self.mnnvl_buff_flags, max_num_elements_mnnvl = get_allreduce_mnnvl_workspace(
-                self.mapping, dtype)
+        if self.mapping.tp_size > 1:
+            # When Strategy is UB, it is guaranteed that the workspace is not used.
+            if self.strategy != AllReduceStrategy.UB:
+                if self.strategy == AllReduceStrategy.LOWPRECISION:
+                    allocate_low_presicion_allreduce_workspace(self.mapping)
+                self.workspace = get_allreduce_workspace(self.mapping)
+
+            if self.strategy == AllReduceStrategy.MNNVL:
+                assert dtype is not None, "dtype shall be set with MNNVL."
+                if dtype in MNNVL_BUFFER_SHAPE:
+                    self.buffer_mnnvl_shape = MNNVL_BUFFER_SHAPE(dtype)
+                else:
+                    self.buffer_mnnvl_shape = get_all_reduce_mnnvl_max_workspace_elements(
+                        dtype)[2]
+                    MNNVL_BUFFER_SHAPE[dtype] = self.buffer_mnnvl_shape
+                mcast_buffer_mnnvl, self.mnnvl_buffer, self.mnnvl_buff_flags, max_num_elements_mnnvl = get_allreduce_mnnvl_workspace(
+                    self.mapping, dtype)
 
     def forward(
         self,
@@ -621,9 +649,13 @@ class AllReduce(nn.Module):
         if all_reduce_params is None:
             all_reduce_params = AllReduceParams()
 
-        output = torch.ops.trtllm.all_reduce(input, all_reduce_params.residual, all_reduce_params.norm_weight, all_reduce_params.scale, all_reduce_params.bias, self.mapping.tp_group, self.strategy,
-                                    all_reduce_params.fusion_op, all_reduce_params.eps, all_reduce_params.trigger_completion_at_end, self.buffer_mnnvl_shape, self.workspace,
-                        self.mnnvl_buffer, self.mnnvl_buff_flags)
+        output = torch.ops.trtllm.all_reduce(
+            input, all_reduce_params.residual, all_reduce_params.norm_weight,
+            all_reduce_params.scale, all_reduce_params.bias,
+            self.mapping.tp_group, self.strategy, all_reduce_params.fusion_op,
+            all_reduce_params.eps, all_reduce_params.trigger_completion_at_end,
+            self.buffer_mnnvl_shape, self.workspace, self.mnnvl_buffer,
+            self.mnnvl_buff_flags)
 
         return output if len(output) > 1 else output[0]
 

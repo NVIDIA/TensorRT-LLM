@@ -24,7 +24,6 @@ import trace
 import weakref
 from contextlib import contextmanager
 from dataclasses import asdict
-from cuda import cuda, nvrtc
 from enum import EnumMeta
 from functools import lru_cache, partial, wraps
 from pathlib import Path
@@ -32,6 +31,7 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 import nvtx
+from cuda import cuda, nvrtc
 from mpi4py import MPI
 from packaging import version
 
@@ -1065,6 +1065,7 @@ class KVCacheEventSerializer:
             "token_extra_id": data.token_extra_id
         }
 
+
 def ASSERT_DRV(err):
     if isinstance(err, cuda.CUresult):
         if err != cuda.CUresult.CUDA_SUCCESS:
@@ -1074,6 +1075,7 @@ def ASSERT_DRV(err):
             raise RuntimeError('Nvrtc Error: {}'.format(err))
     else:
         raise RuntimeError('Unknown error type: {}'.format(err))
+
 
 def getSMVersion():
     # Init
