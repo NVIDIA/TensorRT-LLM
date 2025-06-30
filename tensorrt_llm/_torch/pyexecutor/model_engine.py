@@ -1197,13 +1197,18 @@ class PyTorchModelEngine(ModelEngine):
                 new_tokens_lens_device = new_tensors_device.new_tokens_lens  # [batch]
                 next_draft_tokens_device = new_tensors_device.next_draft_tokens  # [batch, draft_len]
 
-        # Requests with draft tokens are treated like extend requests.
+        # Requests with draft tokens are treated like extend requests. CUDA graph dummy extend
+        # requests should be at the end of extend_requests.
         extend_requests = []
+        extend_cuda_graph_dummy_requests = []
         generation_requests = []
         for request in scheduled_requests.generation_requests:
             if len(request.py_draft_tokens
                    ) > 0 or next_draft_tokens_device is not None:
-                extend_requests.append(request)
+                if request.is_cuda_graph_dummy:
+                    extend_cuda_graph_dummy_requests.append(request)
+                else:
+                    extend_requests.append(request)
             else:
                 generation_requests.append(request)
 
@@ -1217,6 +1222,7 @@ class PyTorchModelEngine(ModelEngine):
                                  dtype=torch.int32).to('cuda',
                                                        non_blocking=True))
 
+        extend_requests = extend_cuda_graph_dummy_requests + extend_requests
         if not self._disable_overlap_scheduler and self.is_spec_decode:
             spec_dec_mode = self.spec_config.spec_dec_mode
             assert spec_dec_mode.support_overlap_scheduler(

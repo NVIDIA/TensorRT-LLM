@@ -633,17 +633,53 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_device_not_contain(["H100"])
-    def test_fp8_block_scales_cuda_graph_padding(self):
+    @parametrize_with_ids("mtp_nextn", [0, 2])
+    def test_fp8_block_scales_cuda_graph_padding(self, mtp_nextn):
+        # OOM on H100 with default free_gpu_memory_fraction=0.9
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+        pytorch_config = dict(disable_overlap_scheduler=False,
+                              use_cuda_graph=True,
+                              cuda_graph_max_batch_size=512,
+                              cuda_graph_padding_enabled=True)
+        llm = LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
+                  kv_cache_config=kv_cache_config,
+                  **pytorch_config,
+                  speculative_config=mtp_config)
+        assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+        with llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_device_not_contain(["H100", "H200"])
+    @parametrize_with_ids("mtp_nextn", [0, 2])
+    @parametrize_with_ids("attention_dp", [False, True])
+    def test_fp8_block_scales_cuda_graph_padding_4gpus(self, mtp_nextn,
+                                                       attention_dp):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
         pytorch_config = dict(
             disable_overlap_scheduler=False,
             use_cuda_graph=True,
-            cuda_graph_max_batch_size=512,
             cuda_graph_padding_enabled=True,
         )
+        quant_config = QuantConfig()
+        quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+
         llm = LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
+                  tensor_parallel_size=4,
                   kv_cache_config=kv_cache_config,
-                  **pytorch_config)
+                  **pytorch_config,
+                  quant_config=quant_config,
+                  enable_attention_dp=attention_dp,
+                  speculative_config=mtp_config)
         assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
         with llm:
             task = MMLU(self.MODEL_NAME)
