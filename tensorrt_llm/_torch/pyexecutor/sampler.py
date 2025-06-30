@@ -11,8 +11,7 @@ from tensorrt_llm._torch.pyexecutor.handle_generation_logits import \
 from tensorrt_llm._torch.pyexecutor.make_decoding_batch_input_output import \
     MakeDecodingBatchInputOutput
 from tensorrt_llm._utils import torch_dtype_to_binding
-from tensorrt_llm.bindings import (CudaStream, DataType, ModelConfig,
-                                   WorldConfig, make_sampling_config)
+from tensorrt_llm.bindings import CudaStream, DataType, ModelConfig, WorldConfig
 from tensorrt_llm.bindings.executor import (DecodingConfig, DecodingMode,
                                             ExecutorConfig, FinishReason)
 from tensorrt_llm.bindings.internal.algorithms import CreateNewDecoderRequests
@@ -575,7 +574,7 @@ class TRTLLMSampler(Sampler):
         )
 
     def setup_sampler_step(self, requests):
-        batch_slots, sampling_configs, lookahead_prompt, lookahead_algo_configs = self.algs.create_new_decoder_requests(
+        batch_slots, sampling_config, lookahead_prompt, lookahead_algo_configs = self.algs.create_new_decoder_requests(
             self.model_config, self.world_config, self.decoding_config,
             requests, self.store["buffer_manager"], self.logits_datatype,
             self.store["decoder_input_buffers"], self.store["decoder_state"],
@@ -584,7 +583,6 @@ class TRTLLMSampler(Sampler):
 
         local_batch_size = len(batch_slots)
         if local_batch_size > 0:
-            sampling_config = make_sampling_config(sampling_configs)
             self.algs.decoder.underlying_decoder().setup(
                 sampling_config, local_batch_size, batch_slots,
                 self.store["decoder_state"].joint_decoding_output,
