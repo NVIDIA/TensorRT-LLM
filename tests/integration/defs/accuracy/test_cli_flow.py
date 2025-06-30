@@ -408,7 +408,7 @@ class TestVicuna7B(CliFlowAccuracyTestHarness):
     EAGLE_MODEL_PATH = f"{llm_models_root()}/EAGLE-Vicuna-7B-v1.3"
 
     def test_lookahead(self, mocker):
-        mocker.patch.object(CnnDailymail, "MAX_BATCH_SIZE", 8)
+        mocker.patch.object(CnnDailymail, "MAX_BATCH_SIZE", 16)
 
         self.run(spec_dec_algo=LookaheadDecodingConfig.decoding_type,
                  extra_build_args=[
@@ -420,7 +420,7 @@ class TestVicuna7B(CliFlowAccuracyTestHarness):
     @parametrize_with_ids("cuda_graph", [False, True])
     def test_medusa(self, cuda_graph, mocker):
         mocker.patch.object(self.__class__, "EXAMPLE_FOLDER", "medusa")
-        mocker.patch.object(CnnDailymail, "MAX_BATCH_SIZE", 8)
+        mocker.patch.object(CnnDailymail, "MAX_BATCH_SIZE", 16)
 
         extra_summarize_args = [
             "--medusa_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], [0, 0, 0, 0], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]"
@@ -444,7 +444,7 @@ class TestVicuna7B(CliFlowAccuracyTestHarness):
     def test_eagle(self, cuda_graph, chunked_context, typical_acceptance,
                    mocker):
         mocker.patch.object(self.__class__, "EXAMPLE_FOLDER", "eagle")
-        mocker.patch.object(CnnDailymail, "MAX_BATCH_SIZE", 8)
+        mocker.patch.object(CnnDailymail, "MAX_BATCH_SIZE", 16)
 
         extra_summarize_args = [
             "--eagle_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], [0, 0, 0, 0], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]"
@@ -474,7 +474,7 @@ class TestVicuna7B(CliFlowAccuracyTestHarness):
                                                          (True, False)])
     def test_eagle_2(self, cuda_graph, chunked_context, mocker):
         mocker.patch.object(self.__class__, "EXAMPLE_FOLDER", "eagle")
-        mocker.patch.object(CnnDailymail, "MAX_BATCH_SIZE", 8)
+        mocker.patch.object(CnnDailymail, "MAX_BATCH_SIZE", 16)
 
         extra_summarize_args = [
             "--eagle_use_dynamic_tree", "--eagle_dynamic_tree_max_top_k=10"
