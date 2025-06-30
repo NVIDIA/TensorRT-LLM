@@ -318,23 +318,26 @@ def echoNodeAndGpuInfo(pipeline, stageName)
 
 def setupPipelineEnvironment(pipeline, testFilter, globalVars)
 {
-    sh "env | sort"
-    updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: 'running'
-    echo "Using GitLab repo: ${LLM_REPO}."
-    sh "git config --global --add safe.directory \"*\""
-    if (env.gitlabMergeRequestLastCommit) {
-        env.gitlabCommit = env.gitlabMergeRequestLastCommit
-    } else {
-        branch = env.gitlabBranch ? env.gitlabBranch : "main"
-        trtllm_utils.checkoutSource(LLM_REPO, branch, LLM_ROOT, true, true)
-        checkoutCommit = sh (script: "cd ${LLM_ROOT} && git rev-parse HEAD",returnStdout: true).trim()
-        env.gitlabCommit = checkoutCommit
-    }
-    echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
-    echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
-    testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
-    testFilter[(ONLY_PYTORCH_FILE_CHANGED)] = getOnlyPytorchFileChanged(pipeline, testFilter, globalVars)
-    testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
+    setupPipelineSpec = createKubernetesPodConfig(LLM_DOCKER_IMAGE, "build")
+    trtllm_utils.launchKubernetesPod(pipeline, setupPipelineSpec, "trt-llm", {
+        sh "env | sort"
+        updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: 'running'
+        echo "Using GitLab repo: ${LLM_REPO}."
+        sh "git config --global --add safe.directory \"*\""
+        if (env.gitlabMergeRequestLastCommit) {
+            env.gitlabCommit = env.gitlabMergeRequestLastCommit
+        } else {
+            branch = env.gitlabBranch ? env.gitlabBranch : "main"
+            trtllm_utils.checkoutSource(LLM_REPO, branch, LLM_ROOT, true, true)
+            checkoutCommit = sh (script: "cd ${LLM_ROOT} && git rev-parse HEAD",returnStdout: true).trim()
+            env.gitlabCommit = checkoutCommit
+        }
+        echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
+        echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
+        testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
+        testFilter[(ONLY_PYTORCH_FILE_CHANGED)] = getOnlyPytorchFileChanged(pipeline, testFilter, globalVars)
+        testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
+    })
 }
 
 def getMergeRequestOneFileChangesGitlab(pipeline, filePath) {
@@ -440,29 +443,33 @@ def mergeWaiveList(pipeline, globalVars)
         return
     }
 
-    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabMergeRequestLastCommit, LLM_ROOT, true, true)
-    sh "cp ${LLM_ROOT}/tests/integration/test_lists/waives.txt ./waives_CUR_${env.gitlabMergeRequestLastCommit}.txt"
-    sh "cp ${LLM_ROOT}/jenkins/mergeWaiveList.py ./"
+    setupPipelineSpec = createKubernetesPodConfig(LLM_DOCKER_IMAGE, "build")
+    trtllm_utils.launchKubernetesPod(pipeline, setupPipelineSpec, "trt-llm", {
+        sh "git config --global --add safe.directory \"*\""
+        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabMergeRequestLastCommit, LLM_ROOT, true, true)
+        sh "cp ${LLM_ROOT}/tests/integration/test_lists/waives.txt ./waives_CUR_${env.gitlabMergeRequestLastCommit}.txt"
+        sh "cp ${LLM_ROOT}/jenkins/mergeWaiveList.py ./"
 
-    targetBranch = env.gitlabTargetBranch ? env.gitlabTargetBranch : globalVars[TARGET_BRANCH]
-    echo "Target branch: ${targetBranch}"
-    trtllm_utils.checkoutSource(LLM_REPO, targetBranch, LLM_ROOT, true, true)
-    targetBranchTOTCommit = sh (script: "cd ${LLM_ROOT} && git rev-parse HEAD", returnStdout: true).trim()
-    echo "Target branch TOT commit: ${targetBranchTOTCommit}"
-    sh "cp ${LLM_ROOT}/tests/integration/test_lists/waives.txt ./waives_TOT_${targetBranchTOTCommit}.txt"
-    // sh "cp ${LLM_ROOT}/jenkins/mergeWaiveList.py ./"
+        targetBranch = env.gitlabTargetBranch ? env.gitlabTargetBranch : globalVars[TARGET_BRANCH]
+        echo "Target branch: ${targetBranch}"
+        trtllm_utils.checkoutSource(LLM_REPO, targetBranch, LLM_ROOT, true, true)
+        targetBranchTOTCommit = sh (script: "cd ${LLM_ROOT} && git rev-parse HEAD", returnStdout: true).trim()
+        echo "Target branch TOT commit: ${targetBranchTOTCommit}"
+        sh "cp ${LLM_ROOT}/tests/integration/test_lists/waives.txt ./waives_TOT_${targetBranchTOTCommit}.txt"
+        // sh "cp ${LLM_ROOT}/jenkins/mergeWaiveList.py ./"
 
-    def diff = getMergeRequestOneFileChanges(pipeline, globalVars, "tests/integration/test_lists/waives.txt")
+        def diff = getMergeRequestOneFileChanges(pipeline, globalVars, "tests/integration/test_lists/waives.txt")
 
-    sh """
-        python3 mergeWaiveList.py \
-        --cur-waive-list=waives_CUR_${env.gitlabMergeRequestLastCommit}.txt \
-        --latest-waive-list=waives_TOT_${targetBranchTOTCommit}.txt \
-        --diff='${diff}' \
-        --output-file=waives.txt
-    """
-    trtllm_utils.uploadArtifacts("waives*.txt", "${UPLOAD_PATH}/waive_list/")
-    echo "Waive list: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/waive_list/"
+        sh """
+            python3 mergeWaiveList.py \
+            --cur-waive-list=waives_CUR_${env.gitlabMergeRequestLastCommit}.txt \
+            --latest-waive-list=waives_TOT_${targetBranchTOTCommit}.txt \
+            --diff='${diff}' \
+            --output-file=waives.txt
+        """
+        trtllm_utils.uploadArtifacts("waives*.txt", "${UPLOAD_PATH}/waive_list/")
+        echo "Waive list: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/waive_list/"
+    })
 }
 
 def launchReleaseCheck(pipeline)
@@ -1272,21 +1279,20 @@ pipeline {
             steps
             {
                 script {
-                    setupPipelineSpec = createKubernetesPodConfig(LLM_DOCKER_IMAGE, "build")
-                    trtllm_utils.launchKubernetesPod(this, setupPipelineSpec, "trt-llm", {
-                        stage("Setup environment") {
-                            setupPipelineEnvironment(this, testFilter, globalVars)
-                            println globalVars
-                            globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
-                            echo "enableFailFast is: ${enableFailFast}"
-                            echo "env.gitlabTriggerPhrase is: ${env.gitlabTriggerPhrase}"
-                            println testFilter
-                            echo "Check the passed GitLab bot testFilter parameters."
-                        }
-                        stage("Merge Waive List") {
-                            mergeWaiveList(this, globalVars)
-                        }
-                    })
+                    setupPipelineEnvironment(this, testFilter, globalVars)
+                    println globalVars
+                    globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
+                    echo "enableFailFast is: ${enableFailFast}"
+                    echo "env.gitlabTriggerPhrase is: ${env.gitlabTriggerPhrase}"
+                    println testFilter
+                    echo "Check the passed GitLab bot testFilter parameters."
+                }
+            }
+        }
+        stage("Merge Waive List") {
+            steps {
+                script {
+                    mergeWaiveList(this, globalVars)
                 }
             }
         }
