@@ -611,6 +611,10 @@ class AttentionBackend(Generic[TMetadata]):
         return False
 
     @classmethod
+    def need_contiguous_qkv(cls) -> bool:
+        return False
+
+    @classmethod
     def support_mla(cls) -> bool:
         return False
 

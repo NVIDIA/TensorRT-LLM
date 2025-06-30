@@ -95,6 +95,7 @@ public:
         void* host_primary_pool_pointer = nullptr;
         void* host_secondary_pool_pointer = nullptr;
         int32_t num_tokens = 0;
+        int32_t total_kv_len = 0;
         int32_t max_blocks_per_sequence = 0;
         int32_t const* sequence_lengths = nullptr;
         int32_t const* context_lengths = nullptr;
@@ -128,6 +129,9 @@ public:
 
         // For MLA chunked prefill
         void* softmaxStatsPtr = nullptr;
+        // optional for separate QKV input, currently only used for context MLA
+        T const* k_ptr = nullptr;
+        T const* v_ptr = nullptr;
 
         std::string enqueueContextParamsToString() const
         {
@@ -179,6 +183,8 @@ public:
             ss << "encoder_input_lengths: " << this->encoder_input_lengths << std::endl;
             ss << "num_encoder_tokens: " << this->num_encoder_tokens << std::endl;
             ss << "softmaxStatsPtr: " << this->softmaxStatsPtr << std::endl;
+            ss << "k_ptr: " << this->k_ptr << std::endl;
+            ss << "v_ptr: " << this->v_ptr << std::endl;
             return ss.str();
         }
     };
