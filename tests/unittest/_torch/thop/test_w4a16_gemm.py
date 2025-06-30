@@ -1,6 +1,6 @@
 import pytest
 import torch
-from utils import woq_assert_near_eq, woq_groupwise_gt_matmul
+from utils.util import woq_assert_near_eq, woq_groupwise_gt_matmul
 
 import tensorrt_llm
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import W4A16GemmRunner
