@@ -1594,41 +1594,14 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                 "Found invalid number (NaN or Inf) in " + beforeRopeStr);
         }
 
-        KVBlockArray mla_context_paged_kv_cache_buffer;
         if (mIsMLAEnabled)
         {
             params.mla_param->cache_type = cache_type;
             params.mla_param->cu_q_seqlens = cu_q_seqlens;
             params.mla_param->quant_scale_kv = params.kv_scale_orig_quant;
-            if (mPagedContextFMHA && mPagedKVCache)
+            if (params.mla_param->latent_cache != nullptr)
             {
-                TLLM_CHECK_WITH_INFO(params.mla_param->context_paged_kv_ptr != nullptr,
-                    "Paged kv cache is not set for MLA context kernel");
-                TLLM_CHECK_WITH_INFO(params.mla_param->context_kv_cache_block_offsets_ptr != nullptr,
-                    "Paged kv cache block offsets is not set for MLA context kernel");
-                // build another KVBlockArray for MLA context kernel to read paged kv cache, which is built by the
-                // PyTorch backend assume the dtype of paged kv cache is the same as the T
-                auto const elemSize = sizeof(T);
-                auto const headSize = params.mla_param->meta.qk_nope_head_dim + params.mla_param->meta.qk_rope_head_dim;
-                // mNumKVHeads is 1 for writing, we use mNumHeads for reading paged kv cache
-                auto sizePerToken = mNumHeads * headSize * elemSize;
-                auto maxBlocksPerSeq = params.mla_param->context_paged_kv_max_blocks_per_seq;
-                TLLM_LOG_DEBUG(
-                    "AttentionOp building KVBlockArray for MLA context kernel, elemSize: %d, headSize: %d, mNumHeads: "
-                    "%d, sizePerToken: %d, batchSize: %d, maxBlocksPerSeq: %d, tokensPerBlock: %d, maxAttentionWindow: "
-                    "%d, "
-                    "sinkTokenLen: %d, canUseOneMoreBlock: %d",
-                    elemSize, headSize, mNumHeads, sizePerToken, params.batch_size, maxBlocksPerSeq, mTokensPerBlock,
-                    params.cyclic_attention_window_size, params.sink_token_length, params.can_use_one_more_block);
-                mla_context_paged_kv_cache_buffer = KVBlockArray(params.batch_size, maxBlocksPerSeq, mTokensPerBlock,
-                    sizePerToken, params.cyclic_attention_window_size, params.max_cyclic_attention_window_size,
-                    params.sink_token_length, params.can_use_one_more_block, params.mla_param->context_paged_kv_ptr,
-                    nullptr,
-                    static_cast<KVBlockArray::DataType*>(params.mla_param->context_kv_cache_block_offsets_ptr));
-            }
-            else
-            {
-                // compute RoPE and set compressed_kv + k_pe by invokeMLARopeContext if not using paged context FMHA
+                // compute RoPE and set compressed_kv + k_pe by invokeMLARopeContext if latent_cache is not nullptr
                 invokeMLARopeContext<T, KVCacheBuffer>(*params.mla_param, kv_cache_buffer, stream);
             }
         }
@@ -1653,7 +1626,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             mFMHAForceFP32Acc = mFMHAForceFP32Acc || enable_context_fmha_fp32_acc_val == 1;
         }
 
-        // Unified FMHA runner interface for both packed QKV FMHA, contiguous Q_KV and paged KV FMHA.
+        // Unified FMHA runner interface for both packed QKV FMHA, contiguous Q_KV, paged KV FMHA, and separate QKV
+        // FMHA.
         // Page KV input layout:
         //    - q_ptr: [B, S, H, D], which supports variable sequence length
         //    - paged_kv_cache: paged kv buffer
@@ -1663,6 +1637,13 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         // Contiguous KV input layout:
         //    - q_ptr: [B, S, H, D], which supports variable sequence length
         //    - kv_ptr: [B, S, 2, H, D], which supports variable sequence length
+        //    - cu_q_seqlens: the cumulative query sequence lengths, needed for variable sequence length.
+        //    - cu_kv_seqlens: the cumulative kv sequence lengths, needed for variable sequence length.
+        //
+        // Separate QKV input layout (only for context MLA now):
+        //    - q_ptr: [B, S, H, D], which supports variable sequence length
+        //    - k_ptr: [B, S, H_kv, D], which supports variable sequence length
+        //    - v_ptr: [B, S, H_kv, D_v], which supports variable sequence length
         //    - cu_q_seqlens: the cumulative query sequence lengths, needed for variable sequence length.
         //    - cu_kv_seqlens: the cumulative kv sequence lengths, needed for variable sequence length.
 
@@ -1676,11 +1657,21 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             = (mDenseContextFMHA || isCrossAttention()) ? max_kv_seq_len : params.cyclic_attention_window_size;
         fmhaParams.totalQSeqLen = params.num_tokens;
         // TODO: set it correctly for contiguous kv buffer (cross-attention).
-        fmhaParams.totalKvSeqLen = isCrossAttention() ? params.num_encoder_tokens : params.num_tokens;
+        fmhaParams.totalKvSeqLen = isCrossAttention() ? params.num_encoder_tokens : params.total_kv_len;
         // Device buffer pointers.
-        fmhaParams.qkvPtr = mFP8ContextFMHA ? reinterpret_cast<void const*>(fp8_qkv_buffer)
-                                            : reinterpret_cast<void const*>(attention_input);
-        fmhaParams.qPtr = reinterpret_cast<void const*>(q_buf_2_);
+        if (mIsMLAEnabled)
+        {
+            // separate QKV input for context MLA
+            fmhaParams.qPtr = attention_input;
+            fmhaParams.kPtr = params.k_ptr;
+            fmhaParams.vPtr = params.v_ptr;
+        }
+        else
+        {
+            fmhaParams.qkvPtr = mFP8ContextFMHA ? reinterpret_cast<void const*>(fp8_qkv_buffer)
+                                                : reinterpret_cast<void const*>(attention_input);
+            fmhaParams.qPtr = reinterpret_cast<void const*>(q_buf_2_);
+        }
         // TODO: add contiguous kv buffer (cross-attention).
         fmhaParams.kvPtr = nullptr;
         if (isCrossAttention() && !useKVCache())
@@ -1693,15 +1684,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         fmhaParams.packedMaskPtr = params.attention_packed_mask;
         if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
         {
-            if (mIsMLAEnabled && mPagedContextFMHA && mPagedKVCache)
-            {
-                fmhaParams.pagedKvCache = mla_context_paged_kv_cache_buffer;
-                fmhaParams.qPtr = reinterpret_cast<void const*>(attention_input);
-            }
-            else
-            {
-                fmhaParams.pagedKvCache = kv_cache_buffer;
-            }
+            fmhaParams.pagedKvCache = kv_cache_buffer;
         }
         fmhaParams.cuQSeqLenPtr = cu_q_seqlens;
         fmhaParams.kvSeqLenPtr = decoder_params.seqKVLengths;
@@ -2546,6 +2529,8 @@ int AttentionOp::initialize() noexcept
         // the wrong kernel, no matter mIsGenerationMLA is true or false
         if (mIsMLAEnabled)
         {
+            // context MLA always use separate_qkv layout
+            fmhaParams.attentionInputLayout = AttentionInputLayout::SEPARATE_QKV;
             // Context attention of MLA is different
             fmhaParams.numKvHeads = mNumHeads;
             fmhaParams.headSize = mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim;

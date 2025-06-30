@@ -52,7 +52,9 @@ template <typename T>
 struct MlaParams
 {
     T const* latent_cache;  // cKV + k_pe
-    T* attention_input_buf; // [b, s, 3, h, d_h + r]
+    T* attention_input_buf; // [b, s, h, d_h + r]
+    T* k_buf;               // [b, s, h, d_h + r], for context MLA
+    T* v_buf;               // [b, s, h, d_h], for context MLA
     void* quant_attention_input_buf;
     T* context_buf;
     T* q_pe;                     // [b, h, d_r], strided
@@ -82,11 +84,6 @@ struct MlaParams
     float const* dequant_scale_q;
     float const* dequant_scale_kv;
     float host_bmm1_scale;
-
-    // for kv cache reuse/chunked context
-    void* context_paged_kv_ptr = nullptr;
-    void* context_kv_cache_block_offsets_ptr = nullptr;
-    int32_t context_paged_kv_max_blocks_per_seq = 0;
 };
 
 template <typename T, typename KVCacheBuffer>
