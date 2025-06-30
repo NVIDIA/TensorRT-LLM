@@ -41,8 +41,6 @@ target_compile_definitions(
 if(NOT WIN32)
   set_target_properties(
     ${TRTLLM_PYBIND_MODULE}
-    PROPERTIES
-      LINK_FLAGS
-      "-Wl,-rpath,'$ORIGIN/libs' -Wl,-rpath,'$ORIGIN/../nvidia/nccl/lib' ${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}"
-  )
+    PROPERTIES LINK_FLAGS
+               "-Wl,-rpath,'$ORIGIN/libs' ${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
 endif()
