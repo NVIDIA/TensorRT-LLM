@@ -22,7 +22,7 @@ class TransformersTokenizer(TokenizerBase):
         self._all_special_tokens_set = set(self.tokenizer.all_special_tokens)
         self.hf_decode_stream = None
         self.stream_interval_threshold = int(
-            os.getenv("TLLM_STREAM_INTERVAL_THRESHOLD", "64"))
+            os.getenv("TLLM_STREAM_INTERVAL_THRESHOLD", "32"))
 
     def __call__(self, text: str, *args, **kwargs) -> Any:
         return self.tokenizer(text, *args, **kwargs)
