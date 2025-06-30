@@ -402,14 +402,24 @@ class TorchSampler(Sampler):
 
         seq_slots = torch.as_tensor([r.seq_slot for r in requests])
         seq_slots = seq_slots.to(device="cuda", non_blocking=True)
+        fast_path = not self.mixed_sampler and gen_logits_host is None and log_probs_host is None
 
         if fast_path:
             logits = raw_logits[:len(requests)]
             next_tokens = torch.argmax(logits, dim=-1)
             self.append_eagle3(next_tokens, model_outputs)
             int_next_tokens = next_tokens.to(torch.int, non_blocking=True)
-            next_tokens = int_next_tokens.view(1, -1, beam_width)
-            new_tokens[:1].index_copy_(1, seq_slots, next_tokens)
+            first_draft = 0 if num_steps[0] > 1 else len(
+                num_steps) - num_steps[::-1].index(1)
+            if first_draft > 0:  # Non-draft requests
+                tokens = int_next_tokens[:first_draft].view(1, -1, beam_width)
+                slots = seq_slots[:first_draft]
+                new_tokens[:1].index_copy_(1, slots, tokens)
+            if sum_steps > first_draft:  # Draft requests
+                tokens = int_next_tokens[first_draft:].view(-1, self.max_tokens)
+                slots = seq_slots[first_draft:]
+                new_tokens = new_tokens.squeeze(-1).transpose(0, 1)
+                new_tokens.index_copy_(0, slots, tokens)
             return
 
         strategies = sampling_strategies(requests)
