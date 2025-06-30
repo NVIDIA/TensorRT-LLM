@@ -111,6 +111,11 @@ def test_llmapi_example_distributed_tp2(llm_root, engine_dir, llm_venv):
                         "llm_inference_distributed.py")
 
 
+def test_llmapi_example_logits_processor(llm_root, engine_dir, llm_venv):
+    _run_llmapi_example(llm_root, engine_dir, llm_venv,
+                        "llm_logits_processor.py")
+
+
 def test_llmapi_quickstart_atexit(llm_root, engine_dir, llm_venv):
     script_path = Path(
         llm_root
