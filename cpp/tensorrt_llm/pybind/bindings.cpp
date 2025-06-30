@@ -24,8 +24,6 @@
 #include <vector>
 
 #include "tensorrt_llm/batch_manager/peftCacheManagerConfig.h"
-#include "tensorrt_llm/batch_manager/kvCacheConfig.h"
-#include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
 #include "tensorrt_llm/common/linkSupportUtil.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/pybind/batch_manager/algorithms.h"
