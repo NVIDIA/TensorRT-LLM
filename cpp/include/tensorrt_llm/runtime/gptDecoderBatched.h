@@ -21,11 +21,11 @@
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/eagleBuffers.h"
 #include "tensorrt_llm/runtime/explicitDraftTokensBuffers.h"
-#include "tensorrt_llm/runtime/gptDecoder.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager
@@ -36,6 +36,7 @@ class LlmRequest;
 namespace tensorrt_llm::runtime
 {
 class SamplingConfig;
+class IGptDecoder;
 
 namespace decoder
 {
