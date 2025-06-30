@@ -31,7 +31,7 @@ from ..logger import logger
 from ..sampling_params import SamplingParams
 from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
                        TRT_LLMARGS_EXPLICIT_DOCSTRING, PybindMirror,
-                       TorchLlmArgs, TrtLlmArgs, _AutoDeployLlmArgs)
+                       TorchLlmArgs, TrtLlmArgs)
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader, _ModelRuntimeContext)
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
@@ -125,7 +125,9 @@ class BaseLLM:
             if backend == 'pytorch':
                 llm_args_cls = TorchLlmArgs
             elif backend == '_autodeploy':
-                llm_args_cls = _AutoDeployLlmArgs
+                from .._torch.auto_deploy.llm_args import \
+                    LlmArgs as AutoDeployLlmArgs
+                llm_args_cls = AutoDeployLlmArgs
             else:
                 llm_args_cls = TrtLlmArgs
 
@@ -528,8 +530,6 @@ class BaseLLM:
                 raise ValueError(
                     f"PyTorch backend currently only supports `logprobs=1`. Received `logprobs={sampling_params.logprobs}` (Top{sampling_params.logprobs} logprobs). Please set `logprobs=1` in `sampling_params` instead."
                 )
-            return
-        elif self.args.backend == "_autodeploy":
             return
 
         build_config = self.args.build_config

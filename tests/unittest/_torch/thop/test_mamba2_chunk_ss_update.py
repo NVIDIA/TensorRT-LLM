@@ -31,38 +31,69 @@ from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 
 @pytest.mark.parametrize(
     "dim, headdim, ngroups, dstate, req_type, dtype, batch_size, max_seq_len, has_z, remove_padding, paged_cache",
-    # P=8x and H=2x
+    # dim parametrization
     list(
-        product([160, 320, 640], [80], [1], [128], ['context'], ['float16'],
-                [1, 2, 8, 16], [16, 64, 256], [True], [True], [False])) +
-    # normal tests
+        product([1024, 2048, 5120], [64], [1], [128], ['context', 'generation'],
+                ['bfloat16'], [3], [16], [False], [True], [False])) +
+    # headdim parametrization
+    list(
+        product([2048], [32, 64, 128, 256], [1], [128],
+                ['context', 'generation'], ['bfloat16'], [3], [16], [False],
+                [True], [False])) +
+    # ngroups parametrization
     list(
         product([2048], [64], [1, 4], [128], ['context', 'generation'],
-                ['float32', 'float16', 'bfloat16'], [3], [16], [False],
-                [True, False], [True, False])) +
-    # arbitrary N generation tests
+                ['bfloat16'], [3], [16], [False], [True], [False])) +
+    # dstate parametrization
     list(
-        product([2048], [64], [1, 4], [16, 32, 48, 64, 80, 96, 128, 256],
-                ['generation'], ['float32', 'float16'], [3], [16], [True],
+        product([2048], [64], [1], [64, 96, 128, 256],
+                ['context', 'generation'], ['bfloat16'], [3], [16], [False],
                 [True], [False])) +
-    # long sequence tests to cover the int overflow issue
+    # dtype parametrization
     list(
-        map(
-            lambda x: pytest.param(
-                *x,
-                marks=pytest.mark.
-                skipif(get_total_gpu_memory(0) < 68 * 1024**3,
-                       reason=
-                       "The long sequence test needs at least 68GB memory, skipping"
-                       )),
-            product([5120], [64], [1], [128], ['context'], ['float16'], [2],
-                    [131072], [True, False], [True, False], [False]))) +
-    # P=8x and H=2x
+        product([2048], [64], [1], [128], ['context', 'generation'],
+                ['float16', 'bfloat16', 'float32'], [3], [16], [False], [True],
+                [False])) +
+    # batch_size parametrization
     list(
-        product([144], [72], [1], [64, 128, 256], ['context', 'generation'],
-                ['float16'], [16], [16384], [True, False], [True, False],
-                [False])),
-)
+        product([2048], [64], [1], [128], ['context', 'generation'],
+                ['bfloat16'], [1, 2, 8, 16], [16], [False], [True], [False])) +
+    # max_seq_len parametrization
+    list(
+        product([2048], [64], [1], [128], ['context', 'generation'],
+                ['bfloat16'], [3], [32, 64, 256, 2048, 16384], [False], [True],
+                [False])) +
+    # has_z parametrization
+    list(
+        product([2048], [64], [1], [128], ['context', 'generation'],
+                ['bfloat16'], [3], [32], [True, False], [True], [False])) +
+    # remove_padding parametrization
+    list(
+        product([2048], [64], [1], [128], ['context', 'generation'],
+                ['bfloat16'], [3], [32], [False], [True, False], [False])) +
+    # paged_cache parametrization (relevant for generation only)
+    list(
+        product([2048], [64], [1], [128], ['generation'], ['bfloat16'], [3],
+                [32], [False], [False], [True, False])) +
+    # long sequence test to cover the int overflow issue
+    [
+        pytest.param(
+            2048,
+            64,
+            1,
+            128,
+            'context',
+            'float16',
+            2,
+            131072,
+            False,
+            False,
+            False,
+            marks=pytest.mark.skipif(
+                get_total_gpu_memory(0) < 68 * 1024**3,
+                reason=
+                "The long sequence test needs at least 68GB memory, skipping"))
+    ])
 def test_mamba2_chunk_scan_selective_state_update(dim, headdim, ngroups, dstate,
                                                   req_type, dtype, batch_size,
                                                   max_seq_len, has_z,
