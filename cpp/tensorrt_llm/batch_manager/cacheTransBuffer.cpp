@@ -235,12 +235,11 @@ size_t CacheTransBufferManager::preAllocBufferSize(
     {
         return 0;
     }
-    if (!cacheTransceiverConfig->getEnableCacheTransceiver())
+    if (!cacheTransceiverConfig->getBackendType().has_value())
     {
         return 0;
     }
-    auto maxNumTokens = cacheTransceiverConfig->getMaxNumTokens();
-
+    auto maxNumTokens = cacheTransceiverConfig->getMaxTokensInBuffer();
     size_t TransferBufferSize = common::getEnvMemSizeForKVCacheTransferBuffer();
     if (maxNumTokens.has_value())
     {

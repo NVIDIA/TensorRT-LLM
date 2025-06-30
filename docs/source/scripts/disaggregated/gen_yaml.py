@@ -176,7 +176,8 @@ def gen_config_file(config_path: str,
             'disable_overlap_scheduler': True,
             'kv_cache_dtype': 'fp8',
             'cache_transceiver_config': {
-                'max_num_tokens': 8320,
+                'backend': 'default',
+                'max_tokens_in_buffer': 8320,
             },
         },
         'generation_servers': {
@@ -196,7 +197,8 @@ def gen_config_file(config_path: str,
             'kv_cache_dtype': 'fp8',
             'moe_backend': 'TRTLLM',
             'cache_transceiver_config': {
-                'max_num_tokens': 8320,
+                'backend': 'default',
+                'max_tokens_in_buffer': 8320,
             },
         }
     }

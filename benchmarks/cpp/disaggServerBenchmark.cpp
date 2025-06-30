@@ -636,7 +636,8 @@ public:
                                                                                 : texec::DecodingMode::Auto(),
                     benchmarkParams.executorLookaheadConfig, benchmarkParams.medusaChoices));
             executorConfig.setExtendedRuntimePerfKnobConfig(extendedRuntimePerfKnobConfig);
-            executorConfig.setCacheTransceiverConfig(texec::CacheTransceiverConfig(true));
+            executorConfig.setCacheTransceiverConfig(
+                texec::CacheTransceiverConfig(texec::CacheTransceiverConfig::BackendType::DEFAULT));
             constexpr int maxIterationsForRequestStats = 1000;
             if (mEnableCollectKvCacheTransferTime)
             {

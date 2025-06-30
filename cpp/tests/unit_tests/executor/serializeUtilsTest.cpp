@@ -786,7 +786,7 @@ TEST(SerializeUtilsTest, ExecutorConfig)
         texec::GuidedDecodingConfig(
             texec::GuidedDecodingConfig::GuidedDecodingBackend::kXGRAMMAR, std::initializer_list<std::string>{"eos"}),
         std::vector{tensorrt_llm::executor::AdditionalModelOutput{"output_name"}},
-        texec::CacheTransceiverConfig(true, std::nullopt, 1024), true, true, true);
+        texec::CacheTransceiverConfig(std::nullopt, 1024), true, true, true);
     auto executorConfig2 = serializeDeserialize(executorConfig);
 
     EXPECT_EQ(executorConfig.getMaxBeamWidth(), executorConfig2.getMaxBeamWidth());
@@ -863,9 +863,8 @@ TEST(SerializeUtilsTest, MethodReturnType)
 TEST(SerializeUtilsTest, CacheTransceiverConfig)
 {
     texec::CacheTransceiverConfig cacheTransceiverConfig(
-        true, tensorrt_llm::executor::CacheTransceiverConfig::CommType::UCX, 1024);
+        tensorrt_llm::executor::CacheTransceiverConfig::BackendType::UCX, 1024);
     auto cacheTransceiverConfig2 = serializeDeserialize(cacheTransceiverConfig);
-    EXPECT_EQ(cacheTransceiverConfig.getEnableCacheTransceiver(), cacheTransceiverConfig2.getEnableCacheTransceiver());
-    EXPECT_EQ(cacheTransceiverConfig.getCommType(), cacheTransceiverConfig2.getCommType());
-    EXPECT_EQ(cacheTransceiverConfig.getMaxNumTokens(), cacheTransceiverConfig2.getMaxNumTokens());
+    EXPECT_EQ(cacheTransceiverConfig.getBackendType(), cacheTransceiverConfig2.getBackendType());
+    EXPECT_EQ(cacheTransceiverConfig.getMaxTokensInBuffer(), cacheTransceiverConfig2.getMaxTokensInBuffer());
 }

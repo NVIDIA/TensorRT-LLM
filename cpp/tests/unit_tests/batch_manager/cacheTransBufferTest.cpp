@@ -112,7 +112,7 @@ TEST_F(CacheTransBufferTest, TestPreAllocBufferSize)
             : 1;
         size_t cacheSizeBytesPerToken = kvCacheSizePerToken(4, 2, 64, CacheType::kSELFKONLY);
         tensorrt_llm::executor::CacheTransceiverConfig cacheTransceiverConfig{
-            true, tensorrt_llm::executor::CacheTransceiverConfig::CommType::UCX, maxNumTokens};
+            tensorrt_llm::executor::CacheTransceiverConfig::BackendType::UCX, maxNumTokens};
         size_t bufferSizeBytes
             = CacheTransBufferManager::preAllocBufferSize(cacheSizeBytesPerToken, cacheTransceiverConfig);
         auto bufferId = mTransBufferManager->assignBufferIndexForSend();
@@ -152,7 +152,7 @@ TEST_F(CacheTransBufferTest, TestPreAllocBufferSize2)
             : 1;
         size_t cacheSizeBytesPerToken = kvCacheSizePerToken(4, 2, 64, CacheType::kSELFKONLY);
         tensorrt_llm::executor::CacheTransceiverConfig cacheTransceiverConfig{
-            true, tensorrt_llm::executor::CacheTransceiverConfig::CommType::UCX, maxNumTokens};
+            tensorrt_llm::executor::CacheTransceiverConfig::BackendType::UCX, maxNumTokens};
         size_t bufferSizeBytes
             = CacheTransBufferManager::preAllocBufferSize(cacheSizeBytesPerToken, cacheTransceiverConfig);
         auto bufferId = mTransBufferManager->assignBufferIndexForSend();

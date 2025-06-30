@@ -28,23 +28,22 @@ The TRT-LLM executor can execute three types of requests: `REQUEST_TYPE_CONTEXT_
 
 The TRT-LLM executor requires the configuration of CacheTransceiverConfig to enable disaggregated service. The constructor signature is defined as follows:
 ```cpp
-CacheTransceiverConfig(bool enableCacheTransceiver,
-        std::optional<CommType> commType, std::optional<size_t> maxNumTokens);
+CacheTransceiverConfig(
+        std::optional<BackendType> backendType, std::optional<size_t> maxTokensInBuffer);
 ```
 The configuration parameters serve the following purposes:
 
-The `enableCacheTransceiver` parameter must be set to `True` to enable kvCache transfer functionality.
 
-The `commType` parameter determines the communication backend for kvCache transfer. Valid options include `CommType::UCX`, `CommType::NIXL`, and `CommType::MPI`, with `UCX` serving as the default backend.
+The `backendType` parameter determines the communication backend for kvCache transfer. Valid options include `BackendType::UCX`, `BackendType::NIXL`, `BackendType::MPI` and `BackendType::DEFAULT` with `UCX` serving as the default backend.
 
-The `maxNumTokens` parameter specifies the buffer size for kvCache transfers. For optimal performance, this value should be set to match or exceed the maximum Input Sequence Length (ISL) of all requests.
+The `maxTokensInBuffer` parameter specifies the buffer size for kvCache transfers. For optimal performance, this value should be set to match or exceed the maximum Input Sequence Length (ISL) of all requests.
 
 
 Here are some key APIs to use disaggregated service:
 ```cpp
 ExecutorConfig executorConfig{...};
 
-executorConfig.setCacheTransceiverConfig(texec::CacheTransceiverConfig(true));
+executorConfig.setCacheTransceiverConfig(texec::CacheTransceiverConfig(BackendType::UCX));
 
 Request request{...};
 
@@ -88,7 +87,7 @@ Please refer to `benchmarks/cpp/disaggServerBenchmark.cpp` and `benchmarks/cpp/R
 
 TRT-LLM uses some environment variables to control the behavior of disaggregated service.
 
-The `enableCacheTransceiver` parameter in `CacheTransceiverConfig` must be set to `true` for disaggregated service. If the `commType` parameter is not explicitly specified, TRT-LLM automatically determines the appropriate communication backend based on available environment variables.
+The `backendType` parameter in `CacheTransceiverConfig` must be set for disaggregated service. If the `backendType` parameter is `BackendType::DEFAULT`, TRT-LLM automatically determines the appropriate communication backend based on available environment variables.
 
 * `TRTLLM_USE_MPI_KVCACHE`: Whether to use MPI to transfer KV cache. Currently, the default value is `0`.
 
@@ -149,11 +148,11 @@ A. TRT-LLM requires `UCX`-backend `CUDA-aware MPI` currently, TRT-LLM implements
 
 *Q. How to handle error `Disaggregated serving is not enabled, please check the configuration?`*
 
-A. please set `enableCacheTransceiver` of `CacheTransceiverConfig` as `true`.
+A. please set `backendType` of `CacheTransceiverConfig`.
 ```cpp
 ExecutorConfig executorConfig{...};
 
-executorConfig.setCacheTransceiverConfig(texec::CacheTransceiverConfig(true));
+executorConfig.setCacheTransceiverConfig(texec::CacheTransceiverConfig(BackendType::DEFAULT));
 ```
 
 When the environment variable `TRTLLM_USE_MPI_KVCACHE=1` is set, TRT-LLM will transfer the KV cache using `CUDA-aware MPI`. All executor processes involved must share the same MPI world communicator. Consequently, with `TRTLLM_USE_MPI_KVCACHE=1`, TRT-LLM only supports launching multiple executors via `MPI`. Additionally, the `CommunicationMode` for the executors must be set to `kLEADER` or `kORCHESTRATOR` with `SpawnProcesses=false` for the `disaggregated-service`. These restrictions do not apply when `TRTLLM_USE_UCX_KVCACHE=1` is set.

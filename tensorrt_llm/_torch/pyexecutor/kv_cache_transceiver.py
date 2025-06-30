@@ -13,7 +13,7 @@ from .resource_manager import KVCacheManager
 CacheTransceiverCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransceiver
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 CacheTransBufferManagerCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransBufferManager
-CommTypeCpp = tensorrt_llm.bindings.executor.CacheTransceiverCommType
+BackendTypeCpp = tensorrt_llm.bindings.executor.CacheTransceiverBackendType
 
 
 def mapping_to_world_config(mapping: Mapping) -> WorldConfig:
@@ -31,22 +31,22 @@ def create_kv_cache_transceiver(
         mapping: Mapping, kv_cache_manager: KVCacheManager,
         attention_type: AttentionTypeCpp,
         cache_transceiver_config: CacheTransceiverConfig):
-    if cache_transceiver_config is None or (
-            not cache_transceiver_config.enable_cache_transceiver):
+    if cache_transceiver_config is None or (cache_transceiver_config.backend
+                                            is None):
         logger.info("cache_transceiver is disabled")
         return None
-    if (cache_transceiver_config.comm_type is None):
+    if (cache_transceiver_config.backend == BackendTypeCpp.DEFAULT):
 
-        comm_type = CommTypeCpp.UCX
+        backend_type = BackendTypeCpp.UCX
         if getenv("TRTLLM_USE_UCX_KVCACHE"):
-            comm_type = CommTypeCpp.UCX
+            backend_type = BackendTypeCpp.UCX
         elif getenv("TRTLLM_USE_NIXL_KVCACHE"):
-            comm_type = CommTypeCpp.NIXL
+            backend_type = BackendTypeCpp.NIXL
         elif getenv("TRTLLM_USE_MPI_KVCACHE"):
-            comm_type = CommTypeCpp.MPI
-        cache_transceiver_config.comm_type = comm_type
+            backend_type = BackendTypeCpp.MPI
+        cache_transceiver_config.backend = backend_type
 
-    if (cache_transceiver_config.comm_type == CommTypeCpp.MPI):
+    if (cache_transceiver_config.backend == BackendTypeCpp.MPI):
         logger.warning(
             "MPI CacheTransceiver is deprecated, UCX or NIXL is recommended")
     cache_transceiver = BindKvCacheTransceiver(mapping, kv_cache_manager,

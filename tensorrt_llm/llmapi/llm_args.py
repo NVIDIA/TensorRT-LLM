@@ -751,21 +751,18 @@ class CacheTransceiverConfig(BaseModel, PybindMirror):
     """
     Configuration for the cache transceiver.
     """
-    enable_cache_transceiver: bool = Field(
-        default=False, description="Whether to enable the cache transceiver.")
-    comm_type: Optional[str] = Field(
+    backend: Optional[str] = Field(
         default=None,
         description=
         "The communication backend type to use for the cache transceiver.")
-    max_num_tokens: Optional[int] = Field(
+    max_tokens_in_buffer: Optional[int] = Field(
         default=None,
         description="The max number of tokens the transfer buffer can fit.")
 
     def _to_pybind(self):
         return _CacheTransceiverConfig(
-            enable_cache_transceiver=self.enable_cache_transceiver,
-            comm_type=self.comm_type,
-            max_num_tokens=self.max_num_tokens)
+            backend=self.backend,
+            max_tokens_in_buffer=self.max_tokens_in_buffer)
 
 
 @dataclass

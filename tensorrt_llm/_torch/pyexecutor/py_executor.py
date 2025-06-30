@@ -1302,7 +1302,7 @@ class PyExecutor:
                 RequestType.REQUEST_TYPE_GENERATION_ONLY
                 for req_item in new_requests_cur_rank)
             if has_disagg_request:
-                assert self.kv_cache_transceiver is not None, "kv_cache_transceiver is disabled, please set 'cache_transceiver_config: enable_cache_transceiver=True` in config file for disaggregated serving"
+                assert self.kv_cache_transceiver is not None, "kv_cache_transceiver is disabled, please set 'cache_transceiver_config: backend` in config file for disaggregated serving"
 
             if self.kv_cache_transceiver:
                 for req_item in new_requests_cur_rank:

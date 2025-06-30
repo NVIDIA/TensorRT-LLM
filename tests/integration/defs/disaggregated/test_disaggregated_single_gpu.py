@@ -11,8 +11,8 @@ from mpi4py.futures import MPIPoolExecutor
 
 from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams
 from tensorrt_llm._utils import set_mpi_comm
-from tensorrt_llm.llmapi import (CudaGraphConfig, KvCacheConfig,
-                                 MpiCommSession, CacheTransceiverConfig)
+from tensorrt_llm.llmapi import (CacheTransceiverConfig, CudaGraphConfig,
+                                 KvCacheConfig, MpiCommSession)
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(
@@ -127,7 +127,7 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
 
     kv_cache_configs = [KvCacheConfig(max_tokens=2048 * 8) for _ in range(2)]
     cache_transceiver_configs = [
-        CacheTransceiverConfig(enable_cache_transceiver=True) for _ in range(2)
+        CacheTransceiverConfig(backend="default") for _ in range(2)
     ]
     model_names = [model_path(model) for _ in range(2)]
     ranks = [0, 1]
@@ -256,7 +256,7 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
         for _ in range(2)
     ]
     cache_transceiver_configs = [
-        CacheTransceiverConfig(enable_cache_transceiver=True) for _ in range(2)
+        CacheTransceiverConfig(backend="default") for _ in range(2)
     ]
     model_names = [model_path(model) for _ in range(2)]
     ranks = [0, 1]

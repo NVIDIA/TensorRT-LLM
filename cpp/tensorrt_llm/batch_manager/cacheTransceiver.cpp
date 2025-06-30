@@ -62,36 +62,36 @@ std::unique_ptr<BaseCacheTransceiver> CacheTransceiverFactory::createCacheTransc
     runtime::WorldConfig const& worldConfig, executor::kv_cache::CacheState::AttentionType attentionType,
     std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig)
 {
-    if (!cacheTransceiverConfig.has_value() || !cacheTransceiverConfig.value().getEnableCacheTransceiver())
+    if (!cacheTransceiverConfig.has_value() || !cacheTransceiverConfig.value().getBackendType().has_value())
     {
         TLLM_LOG_INFO("CacheTransceiver is disabled.");
         return nullptr;
     }
-    auto commType = cacheTransceiverConfig.value().getCommType();
-    if (!commType.has_value())
+    auto backendType = cacheTransceiverConfig.value().getBackendType();
+    if (backendType.value() == executor::CacheTransceiverConfig::BackendType::DEFAULT)
     {
         if (common::getEnvUseUCXKvCache())
         {
-            commType = executor::CacheTransceiverConfig::CommType::UCX;
+            backendType = executor::CacheTransceiverConfig::BackendType::UCX;
             TLLM_LOG_INFO("Enable UCX KV cache transport.");
         }
         else if (common::getEnvUseNixlKvCache())
         {
-            commType = executor::CacheTransceiverConfig::CommType::NIXL;
+            backendType = executor::CacheTransceiverConfig::BackendType::NIXL;
             TLLM_LOG_INFO("Enable NIXL KV cache transport.");
         }
         else if (common::getEnvUseMPIKvCache())
         {
-            commType = executor::CacheTransceiverConfig::CommType::MPI;
+            backendType = executor::CacheTransceiverConfig::BackendType::MPI;
             TLLM_LOG_INFO("Enable MPI KV cache transport.");
             TLLM_LOG_WARNING("MPI KV cache transport is deprecated, please use UCX or NIXL instead.");
         }
         else
         {
-            commType = executor::CacheTransceiverConfig::CommType::UCX;
+            backendType = executor::CacheTransceiverConfig::BackendType::UCX;
         }
     }
-    cacheTransceiverConfig.value().setCommType(commType);
+    cacheTransceiverConfig.value().setBackendType(backendType);
 
     executor::kv_cache::CacheState::ModelConfig cacheStateCfg{
         modelConfig.getNumKvHeadsPerLayer(), modelConfig.getSizePerHead(), modelConfig.getTokensPerBlock()};
@@ -147,16 +147,15 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     }
     bool isMLA = attentionType == executor::kv_cache::CacheState::AttentionType::kMLA;
     TLLM_CHECK_WITH_INFO(mCacheTransceiverConfig.has_value(), "CacheTransceiverConfig is not set.");
-    auto commType = mCacheTransceiverConfig.value().getCommType();
-    TLLM_CHECK_WITH_INFO(commType.has_value(), " CacheTransceiverConfig::CommType is not set.");
+    auto backendType = mCacheTransceiverConfig.value().getBackendType();
+    TLLM_CHECK_WITH_INFO(
+        backendType.has_value() && (backendType.value() != executor::CacheTransceiverConfig::BackendType::DEFAULT),
+        " CacheTransceiverConfig::BackendType is not set.");
 
-    std::optional<size_t> maxNumTokens = std::nullopt;
-    if (mCacheTransceiverConfig.has_value())
-    {
-        maxNumTokens = mCacheTransceiverConfig.value().getMaxNumTokens();
-    }
+    std::optional<size_t> maxNumTokens = mCacheTransceiverConfig.value().getMaxTokensInBuffer();
+
     mCacheTransBufferManager = std::make_unique<kv_cache_manager::CacheTransBufferManager>(cacheManager, maxNumTokens);
-    if (commType.value() == executor::CacheTransceiverConfig::CommType::UCX)
+    if (backendType.value() == executor::CacheTransceiverConfig::BackendType::UCX)
     {
         std::lock_guard<std::mutex> lock(mDllMutex);
         mWrapperLibHandle = dllOpen(UCX_WRAPPER_LIB_NAME);
@@ -174,13 +173,13 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         mManager = makeUcxConnectionManager();
         TLLM_LOG_INFO("UCX Connection Manager created");
     }
-    else if (commType.value() == executor::CacheTransceiverConfig::CommType::NIXL)
+    else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::NIXL)
     {
         mManager = std::make_unique<tensorrt_llm::executor::kv_cache::AgentConnectionManager>(
             mCacheTransBufferManager.get());
         TLLM_LOG_INFO("NIXL Connection Manager created");
     }
-    else if (commType.value() == executor::CacheTransceiverConfig::CommType::MPI)
+    else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::MPI)
     {
         mMpiWorldComm = std::addressof(tensorrt_llm::mpi::MpiComm::world());
         mManager = std::make_unique<executor::kv_cache::MpiConnectionManager>(mMpiWorldComm);
@@ -188,7 +187,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     }
     else
     {
-        TLLM_THROW("Unsupported cache transceiver comm type ");
+        TLLM_THROW("Unsupported cache transceiver backend type ");
     }
 
     using tensorrt_llm::batch_manager::kv_cache_manager::MLACacheFormatter;

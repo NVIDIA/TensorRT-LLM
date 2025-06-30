@@ -9,23 +9,20 @@ We use the `cache_transceiver_config` configuration to set up disaggregated serv
 
 ```
 cache_transceiver_config:
-  enable_cache_transceiver: <bool>
-  comm_type: <str>
-  max_num_tokens: <int>
+  backend: <str>
+  max_tokens_in_buffer: <int>
 ```
 
-Setting `enable_cache_transceiver` to `True` is required for disaggregated serving.
+`backend` specifies the communication backend for transferring the kvCache, valid options include `DEFAULT`,`UCX`, `NIXL`, and `MPI`, the default backend is UCX.
 
-`comm_type` specifies the communication backend for transferring the kvCache, valid options include `UCX`, `NIXL`, and `MPI`, the default option is `UCX`.
-
-`max_num_tokens` defines the buffer size for kvCache transfers, it is recommended to set this value greater than or equal to the maximum ISL (Input Sequence Length) of all requests for optimal performance.
+`max_tokens_in_buffer` defines the buffer size for kvCache transfers, it is recommended to set this value greater than or equal to the maximum ISL (Input Sequence Length) of all requests for optimal performance.
 
 You can use multiple `trtllm-serve` commands to launch the context and generation servers that will be used
 for disaggregated serving. For example, you could launch two context servers and one generation servers as follows:
 
 ```
-echo -e "disable_overlap_scheduler: True\ncache_transceiver_config:\n  enable_cache_transceiver: True\n  comm_type: UCX\n  max_num_tokens: 2048" > context_extra-llm-api-config.yml
-echo -e "cache_transceiver_config:\n  enable_cache_transceiver: True\n  comm_type: UCX\n  max_num_tokens: 2048" > gen_extra-llm-api-config.yml
+echo -e "disable_overlap_scheduler: True\ncache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048" > context_extra-llm-api-config.yml
+echo -e "cache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048" > gen_extra-llm-api-config.yml
 
 #Context servers
 CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001 --backend pytorch --extra_llm_api_options ./context_extra-llm-api-config.yml &> log_ctx_0 &
@@ -83,7 +80,7 @@ context_servers:
   tensor_parallel_size: 1
   pipeline_parallel_size: 1
   cache_transceiver_config:
-    enable_cache_transceiver: True
+    backend: ucx
   kv_cache_config:
     free_gpu_memory_fraction: 0.9
   urls:
@@ -94,7 +91,7 @@ generation_servers:
   tensor_parallel_size: 1
   pipeline_parallel_size: 1
   cache_transceiver_config:
-    enable_cache_transceiver: True
+    backend: ucx
   urls:
       - "localhost:8003"
 ```
