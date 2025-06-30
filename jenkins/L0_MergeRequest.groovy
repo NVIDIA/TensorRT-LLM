@@ -318,27 +318,23 @@ def echoNodeAndGpuInfo(pipeline, stageName)
 
 def setupPipelineEnvironment(pipeline, testFilter, globalVars)
 {
-    setupPipelineSpec = createKubernetesPodConfig(LLM_DOCKER_IMAGE, "build")
-    trtllm_utils.launchKubernetesPod(pipeline, setupPipelineSpec, "trt-llm", {
-        sh "env | sort"
-        updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: 'running'
-        echo "Using GitLab repo: ${LLM_REPO}."
-        sh "git config --global --add safe.directory \"*\""
-        if (env.gitlabMergeRequestLastCommit) {
-            env.gitlabCommit = env.gitlabMergeRequestLastCommit
-        } else {
-            branch = env.gitlabBranch ? env.gitlabBranch : "main"
-            trtllm_utils.checkoutSource(LLM_REPO, branch, LLM_ROOT, true, true)
-            checkoutCommit = sh (script: "cd ${LLM_ROOT} && git rev-parse HEAD",returnStdout: true).trim()
-            env.gitlabCommit = checkoutCommit
-        }
-        echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
-        echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
-        testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
-        testFilter[(ONLY_PYTORCH_FILE_CHANGED)] = getOnlyPytorchFileChanged(pipeline, testFilter, globalVars)
-        testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
-        mergeWaiveList(pipeline, globalVars)
-    })
+    sh "env | sort"
+    updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: 'running'
+    echo "Using GitLab repo: ${LLM_REPO}."
+    sh "git config --global --add safe.directory \"*\""
+    if (env.gitlabMergeRequestLastCommit) {
+        env.gitlabCommit = env.gitlabMergeRequestLastCommit
+    } else {
+        branch = env.gitlabBranch ? env.gitlabBranch : "main"
+        trtllm_utils.checkoutSource(LLM_REPO, branch, LLM_ROOT, true, true)
+        checkoutCommit = sh (script: "cd ${LLM_ROOT} && git rev-parse HEAD",returnStdout: true).trim()
+        env.gitlabCommit = checkoutCommit
+    }
+    echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
+    echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
+    testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
+    testFilter[(ONLY_PYTORCH_FILE_CHANGED)] = getOnlyPytorchFileChanged(pipeline, testFilter, globalVars)
+    testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
 }
 
 def getMergeRequestOneFileChangesGitlab(pipeline, filePath) {
@@ -1276,13 +1272,21 @@ pipeline {
             steps
             {
                 script {
-                    setupPipelineEnvironment(this, testFilter, globalVars)
-                    println globalVars
-                    globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
-                    echo "enableFailFast is: ${enableFailFast}"
-                    echo "env.gitlabTriggerPhrase is: ${env.gitlabTriggerPhrase}"
-                    println testFilter
-                    echo "Check the passed GitLab bot testFilter parameters."
+                    setupPipelineSpec = createKubernetesPodConfig(LLM_DOCKER_IMAGE, "build")
+                    trtllm_utils.launchKubernetesPod(this, setupPipelineSpec, "trt-llm", {
+                        stage("Setup environment") {
+                            setupPipelineEnvironment(this, testFilter, globalVars)
+                            println globalVars
+                            globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
+                            echo "enableFailFast is: ${enableFailFast}"
+                            echo "env.gitlabTriggerPhrase is: ${env.gitlabTriggerPhrase}"
+                            println testFilter
+                            echo "Check the passed GitLab bot testFilter parameters."
+                        }
+                        stage("Merge Waive List") {
+                            mergeWaiveList(this, globalVars)
+                        }
+                    })
                 }
             }
         }
