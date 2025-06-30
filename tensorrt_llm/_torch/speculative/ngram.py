@@ -219,18 +219,17 @@ class NGramDrafter(Drafter):
         iter_stats: IterationStats = None,
     ) -> None:
 
-        if state is None:  # Skip the first step
+        if state is None:  # Skip this process in the first iteration.
             return
 
         if iter_stats is not None:
-            before = time.time()
+            start_time = time.time()
 
         self._prepare_draft_tokens(scheduled_requests, state)
 
         if iter_stats is not None:
-            self._insert_ngram_iter_stats(scheduled_requests, iter_stats)
-            iter_stats.specdec_stats.iter_latency_ms = (time.time() -
-                                                        before) * 1e3
+            self._update_ngram_iter_stats(scheduled_requests, iter_stats,
+                                          start_time)
 
     def _prepare_draft_tokens(
         self,
@@ -255,36 +254,38 @@ class NGramDrafter(Drafter):
                 draft_tokens.extend([request.py_end_id] * pad_length)
             request.py_draft_tokens = draft_tokens
 
-    def _insert_ngram_iter_stats(
-        self, scheduled_requests: ScheduledRequests, iter_stats: IterationStats
+    def _update_ngram_iter_stats(
+        self,
+        scheduled_requests: ScheduledRequests,
+        iter_stats: IterationStats,
+        start_time: float,
     ) -> Tuple[ScheduledRequests, Dict[int, LlmRequest]]:
         """
         Get statistic information from the draft tokens in NGram drafter
         """
-        assert iter_stats is not None
+        now_time = time.time()
 
         total_num_draft_tokens = 0
         total_num_accepted_tokens = 0
         num_requests_with_draft_tokens = 0
-        for request in chain(scheduled_requests.context_requests,
-                             scheduled_requests.generation_requests):
+        for request in scheduled_requests.generation_requests:
             num_draft_tokens = 0 if request.py_last_draft_tokens is None else len(
                 request.py_last_draft_tokens)
-            num_accepted_tokens = getattr(request,
-                                          "py_num_accepted_draft_tokens", 0)
+            num_accepted_tokens = request.py_num_accepted_draft_tokens
             if num_draft_tokens > 0:
-                total_num_draft_tokens = total_num_draft_tokens + num_draft_tokens
-                total_num_accepted_tokens = total_num_accepted_tokens + num_accepted_tokens
-                num_requests_with_draft_tokens = num_requests_with_draft_tokens + 1
+                total_num_draft_tokens += num_draft_tokens
+                total_num_accepted_tokens += num_accepted_tokens
+                num_requests_with_draft_tokens += 1
 
         if num_requests_with_draft_tokens > 0:
-            iter_stats.specdec_stats.iter_latency_ms = 0.0  # We do not coutn time in this method
+            iter_stats.specdec_stats.iter_latency_ms = (now_time -
+                                                        start_time) * 1e3
             iter_stats.specdec_stats.num_draft_tokens = total_num_draft_tokens
             iter_stats.specdec_stats.num_accepted_tokens = total_num_accepted_tokens
             iter_stats.specdec_stats.num_requests_with_draft_tokens = num_requests_with_draft_tokens
-            iter_stats.specdec_stats.acceptance_length = float(
-                (total_num_accepted_tokens + num_requests_with_draft_tokens
-                 )) / float(num_requests_with_draft_tokens)
+            iter_stats.specdec_stats.acceptance_length = (
+                total_num_accepted_tokens +
+                num_requests_with_draft_tokens) / num_requests_with_draft_tokens
         else:
             iter_stats.specdec_stats.iter_latency_ms = 0.0
             iter_stats.specdec_stats.num_draft_tokens = 0
