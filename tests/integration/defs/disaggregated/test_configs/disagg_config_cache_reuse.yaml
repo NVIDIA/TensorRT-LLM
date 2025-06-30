@@ -3,7 +3,6 @@ port: 8000
 model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
 free_gpu_memory_fraction: 0.15
 backend: "pytorch"
-use_cuda_graph: False
 disable_overlap_scheduler: True
 autotuner_enabled: False
 context_servers:

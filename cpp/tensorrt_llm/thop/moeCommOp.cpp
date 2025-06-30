@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/kernels/moeCommKernels.h"
+#include "tensorrt_llm/kernels/moePrepareKernels.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
@@ -196,6 +197,89 @@ void setMaxUsableSmCount(int64_t maxSmCount)
     tensorrt_llm::kernels::setMaxUsableSmCount(maxSmCount);
 }
 
+int64_t getPrepareWorkspaceSizePerRank(int64_t epSize)
+{
+    int epSize32 = static_cast<int>(epSize);
+    return tensorrt_llm::kernels::moe_prepare::getMoePrepareWorkspaceSize(epSize32);
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    c10::optional<torch::Tensor>>
+moePrepareOp(torch::Tensor expertsIds, torch::Tensor scales, c10::optional<torch::Tensor> expertsStatics,
+    torch::Tensor allWorkspaces, int64_t maxTokenCountPerRank, int64_t epRank, int64_t epSize, int64_t expertCount,
+    int64_t slotCount, int64_t topK)
+{
+    CHECK_INPUT(expertsIds, torch::kInt32);
+    CHECK_INPUT(scales, torch::kFloat32);
+    TORCH_CHECK(expertCount % 4 == 0, "expertCount must be divisible by 4");
+    TORCH_CHECK(slotCount % 4 == 0, "slotCount must be divisible by 4");
+
+    int64_t maxSendRanksPerToken = std::max(epSize, topK);
+    int64_t tokenCount = expertsIds.size(0);
+
+    torch::Tensor preparedLocalExpertIds
+        = torch::empty({maxTokenCountPerRank * epSize, topK}, expertsIds.options().dtype(torch::kInt32));
+    torch::Tensor preparedLocalScales
+        = torch::empty({maxTokenCountPerRank * epSize, topK}, expertsIds.options().dtype(torch::kFloat32));
+
+    torch::Tensor sendRankCountCumSum = torch::empty({epSize}, expertsIds.options().dtype(torch::kInt32));
+    torch::Tensor RecvRankCountCumSum = torch::empty({epSize}, expertsIds.options().dtype(torch::kInt32));
+
+    torch::Tensor gatherRecvRankIndices
+        = torch::empty({maxTokenCountPerRank * epSize}, expertsIds.options().dtype(torch::kInt32));
+    torch::Tensor recvRankIndices
+        = torch::empty({maxTokenCountPerRank * epSize}, expertsIds.options().dtype(torch::kInt32));
+
+    torch::Tensor gatherBackwardRecvRankIndices
+        = torch::empty({maxTokenCountPerRank * maxSendRanksPerToken}, expertsIds.options().dtype(torch::kInt32));
+    torch::Tensor backwardRecvRankIndices
+        = torch::empty({maxTokenCountPerRank * maxSendRanksPerToken}, expertsIds.options().dtype(torch::kInt32));
+
+    torch::Tensor gatherSendRankIndices
+        = torch::empty({maxTokenCountPerRank * maxSendRanksPerToken}, expertsIds.options().dtype(torch::kInt32));
+    torch::Tensor sendRankIndices
+        = torch::empty({maxTokenCountPerRank * maxSendRanksPerToken}, expertsIds.options().dtype(torch::kInt32));
+
+    int* localExpertStaticsPtr = nullptr;
+    int* gatheredExpertStaticsPtr = nullptr;
+    c10::optional<torch::Tensor> gatheredExpertStatics;
+    if (expertsStatics.has_value())
+    {
+        localExpertStaticsPtr = expertsStatics.value().data_ptr<int>();
+        gatheredExpertStatics = torch::empty({epSize, expertCount}, expertsIds.options().dtype(torch::kInt32));
+        gatheredExpertStaticsPtr = gatheredExpertStatics.value().data_ptr<int>();
+    }
+
+    tensorrt_llm::kernels::moe_prepare::MoeCommWorkspace workspace;
+    workspace.workspacePtr = allWorkspaces.data_ptr<uint64_t>();
+    workspace.rankStrideInU64 = allWorkspaces.stride(0);
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    tensorrt_llm::kernels::moe_prepare::computeCountAndIndice(expertsIds.data_ptr<int>(),
+        sendRankCountCumSum.data_ptr<int>(), RecvRankCountCumSum.data_ptr<int>(), sendRankIndices.data_ptr<int>(),
+        backwardRecvRankIndices.data_ptr<int>(), recvRankIndices.data_ptr<int>(), workspace, tokenCount,
+        maxTokenCountPerRank, topK, slotCount, epRank, epSize, stream);
+
+    tensorrt_llm::kernels::moe_prepare::computeCumsum(
+        sendRankCountCumSum.data_ptr<int>(), RecvRankCountCumSum.data_ptr<int>(), epRank, epSize, stream);
+
+    tensorrt_llm::kernels::moe_prepare::moveIndice(sendRankCountCumSum.data_ptr<int>(),
+        RecvRankCountCumSum.data_ptr<int>(), sendRankIndices.data_ptr<int>(), gatherSendRankIndices.data_ptr<int>(),
+        backwardRecvRankIndices.data_ptr<int>(), gatherBackwardRecvRankIndices.data_ptr<int>(),
+        recvRankIndices.data_ptr<int>(), gatherRecvRankIndices.data_ptr<int>(), epRank, epSize, maxTokenCountPerRank,
+        stream);
+
+    tensorrt_llm::kernels::moe_prepare::allToAllMetadata(expertsIds.data_ptr<int>(),
+        preparedLocalExpertIds.data_ptr<int>(), scales.data_ptr<float>(), preparedLocalScales.data_ptr<float>(),
+        localExpertStaticsPtr, gatheredExpertStaticsPtr, workspace, sendRankCountCumSum.data_ptr<int>(),
+        sendRankIndices.data_ptr<int>(), RecvRankCountCumSum.data_ptr<int>(), recvRankIndices.data_ptr<int>(),
+        tokenCount, maxTokenCountPerRank, topK, expertCount, slotCount, epRank, epSize, stream);
+
+    return std::make_tuple(preparedLocalExpertIds, preparedLocalScales, sendRankCountCumSum, gatherSendRankIndices,
+        RecvRankCountCumSum, gatherRecvRankIndices, gatherBackwardRecvRankIndices, gatheredExpertStatics);
+}
+
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -257,4 +341,30 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
 {
     m.impl("set_moe_max_usable_sm_count", &torch_ext::setMaxUsableSmCount);
+}
+
+TORCH_LIBRARY_FRAGMENT(trtllm, m)
+{
+    m.def(
+        "mnnvl_moe_alltoallv_prepare_without_allgather(Tensor experts_ids, Tensor scales, Tensor? experts_statics, "
+        "Tensor allWorkspace, int "
+        "max_token_count_per_rank, int ep_rank, int ep_size, int expert_count, int slot_count, int top_k) -> (Tensor, "
+        "Tensor, Tensor, "
+        "Tensor, "
+        "Tensor, Tensor, Tensor, Tensor?)");
+}
+
+TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
+{
+    m.impl("mnnvl_moe_alltoallv_prepare_without_allgather", &torch_ext::moePrepareOp);
+}
+
+TORCH_LIBRARY_FRAGMENT(trtllm, m)
+{
+    m.def("get_moe_prepare_workspace_size_per_rank(int ep_size) -> int");
+}
+
+TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
+{
+    m.impl("get_moe_prepare_workspace_size_per_rank", &torch_ext::getPrepareWorkspaceSizePerRank);
 }

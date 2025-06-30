@@ -59,6 +59,33 @@ from .utils import generate_api_docs_as_docstring, get_type_repr
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 
 
+class CudaGraphConfig(BaseModel):
+    """
+    Configuration for CUDA graphs.
+    """
+    # List of batch sizes to create CUDA graphs for.
+    cuda_graph_batch_sizes: Optional[List[int]] = Field(
+        default=None,
+        description="List of batch sizes to create CUDA graphs for.")
+
+    cuda_graph_max_batch_size: int = Field(
+        default=0, description="Maximum batch size for CUDA graphs.")
+
+    cuda_graph_padding_enabled: bool = Field(
+        default=False,
+        description=
+        "If true, batches are rounded up to the nearest cuda_graph_batch_size. This is usually a net win for performance."
+    )
+
+    @field_validator('cuda_graph_max_batch_size')
+    @classmethod
+    def validate_cuda_graph_max_batch_size(cls, v):
+        """Validate cuda_graph_max_batch_size is non-negative."""
+        if v < 0:
+            raise ValueError("cuda_graph_max_batch_size must be non-negative")
+        return v
+
+
 @dataclass
 class _ParallelConfig:
     ''' The model distribution configs for LLM.  '''
@@ -1635,31 +1662,20 @@ class TorchLlmArgs(BaseLlmArgs):
         json_schema_extra={"type": f"Optional[{get_type_repr(BuildConfig)}]"})
 
     # PyTorch backend specific configurations
-
     garbage_collection_gen0_threshold: int = Field(
         default=20000,
         description=
         "Threshold for Python garbage collection of generation 0 objects."
         "Lower values trigger more frequent garbage collection.")
 
-    use_cuda_graph: bool = Field(
-        default=False,
-        description=
-        "If true, use CUDA graphs for decoding. CUDA graphs are only created for the batch sizes in cuda_graph_batch_sizes, and are enabled for batches that consist of decoding requests *only* (the reason is that it's hard to capture a single graph with prefill requests since the input shapes are a function of the sequence lengths). Note that each CUDA graph can use up to 200 MB of extra memory."
-    )
-
-    cuda_graph_batch_sizes: Optional[List[int]] = Field(
+    cuda_graph_config: Optional[CudaGraphConfig] = Field(
         default=None,
-        description="List of batch sizes to create CUDA graphs for.")
-
-    cuda_graph_max_batch_size: int = Field(
-        default=0, description="Maximum batch size for CUDA graphs.")
-
-    cuda_graph_padding_enabled: bool = Field(
-        default=False,
-        description=
-        "If true, batches are rounded up to the nearest cuda_graph_batch_size. This is usually a net win for performance."
-    )
+        description="CUDA graph config.If true, use CUDA graphs for decoding. \
+        CUDA graphs are only created for the batch sizes in cuda_graph_batch_sizes, \
+        and are enabled for batches that consist of decoding requests *only* \
+        (the reason is that it's hard to capture a single graph with prefill requests \
+        since the input shapes are a function of the sequence lengths).\
+         Note that each CUDA graph can use up to 200 MB of extra memory.")
 
     disable_overlap_scheduler: bool = Field(
         default=False, description="Disable the overlap scheduler.")
@@ -1800,85 +1816,6 @@ class TorchLlmArgs(BaseLlmArgs):
                 f"stream_interval must be positive, got {self.stream_interval}")
         return self
 
-    # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
-    def get_pytorch_backend_config(self) -> "PyTorchConfig":
-        from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-
-        return PyTorchConfig(
-            extra_resource_managers=self.extra_resource_managers,
-            use_cuda_graph=self.use_cuda_graph,
-            cuda_graph_batch_sizes=self.cuda_graph_batch_sizes,
-            cuda_graph_max_batch_size=self.cuda_graph_max_batch_size,
-            cuda_graph_padding_enabled=self.cuda_graph_padding_enabled,
-            disable_overlap_scheduler=self.disable_overlap_scheduler,
-            moe_max_num_tokens=self.moe_max_num_tokens,
-            moe_load_balancer=self.moe_load_balancer,
-            attn_backend=self.attn_backend,
-            moe_backend=self.moe_backend,
-            mixed_sampler=self.mixed_sampler,
-            enable_trtllm_sampler=self.enable_trtllm_sampler,
-            kv_cache_dtype=self.kv_cache_dtype,
-            enable_iter_perf_stats=self.enable_iter_perf_stats,
-            enable_iter_req_stats=self.enable_iter_req_stats,
-            print_iter_log=self.print_iter_log,
-            torch_compile_enabled=bool(self.torch_compile_config is not None),
-            torch_compile_fullgraph=self.torch_compile_config.enable_fullgraph
-            if self.torch_compile_config is not None else True,
-            torch_compile_inductor_enabled=self.torch_compile_config.
-            enable_inductor if self.torch_compile_config is not None else False,
-            torch_compile_piecewise_cuda_graph=self.torch_compile_config.
-            enable_piecewise_cuda_graph
-            if self.torch_compile_config is not None else False,
-            torch_compile_enable_userbuffers=self.torch_compile_config.
-            enable_userbuffers
-            if self.torch_compile_config is not None else True,
-            autotuner_enabled=self.autotuner_enabled,
-            enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
-            load_format=self.load_format,
-            enable_min_latency=self.enable_min_latency,
-            stream_interval=self.stream_interval)
-
-    @field_validator('cuda_graph_max_batch_size')
-    @classmethod
-    def validate_cuda_graph_max_batch_size(cls, v):
-        """Validate cuda_graph_max_batch_size is non-negative."""
-        if v < 0:
-            raise ValueError("cuda_graph_max_batch_size must be non-negative")
-        return v
-
-    @model_validator(mode='after')
-    def validate_cuda_graph_config(self) -> 'TorchLlmArgs':
-        """Validate CUDA graph configuration.
-
-        Ensures that:
-        1. If cuda_graph_batch_sizes is provided, cuda_graph_max_batch_size must be 0
-        2. If cuda_graph_batch_sizes is not provided, it is generated based on cuda_graph_max_batch_size
-        3. If both are provided, cuda_graph_batch_sizes must match the generated values
-        """
-        if self.cuda_graph_batch_sizes:
-            self.cuda_graph_batch_sizes = sorted(self.cuda_graph_batch_sizes)
-            if self.cuda_graph_max_batch_size != 0:
-                if self.cuda_graph_batch_sizes != self._generate_cuda_graph_batch_sizes(
-                        self.cuda_graph_max_batch_size,
-                        self.cuda_graph_padding_enabled):
-                    raise ValueError(
-                        "Please don't set both cuda_graph_batch_sizes "
-                        "and cuda_graph_max_batch_size.\n"
-                        f"cuda_graph_batch_sizes: {self.cuda_graph_batch_sizes}, "
-                        f"cuda_graph_max_batch_size: {self.cuda_graph_max_batch_size}"
-                    )
-            else:
-                self.cuda_graph_max_batch_size = max(
-                    self.cuda_graph_batch_sizes)
-        else:
-            max_batch_size = self.cuda_graph_max_batch_size or 128
-            generated_sizes = self._generate_cuda_graph_batch_sizes(
-                max_batch_size, self.cuda_graph_padding_enabled)
-            self.cuda_graph_batch_sizes = generated_sizes
-            self.cuda_graph_max_batch_size = max_batch_size
-
-        return self
-
     @staticmethod
     def _generate_cuda_graph_batch_sizes(max_batch_size: int,
                                          padding_enabled: bool) -> List[int]:
@@ -1910,6 +1847,86 @@ class TorchLlmArgs(BaseLlmArgs):
             batch_sizes.append(max_batch_size)
 
         return batch_sizes
+
+    @model_validator(mode='after')
+    def validate_cuda_graph_config(self) -> 'TorchLlmArgs':
+        """Validate CUDA graph configuration.
+
+        Ensures that:
+        1. If cuda_graph_batch_sizes is provided, cuda_graph_max_batch_size must be 0
+        2. If cuda_graph_batch_sizes is not provided, it is generated based on cuda_graph_max_batch_size
+        3. If both are provided, cuda_graph_batch_sizes must match the generated values
+        """
+        if self.cuda_graph_config is None:
+            return self
+
+        config = self.cuda_graph_config
+
+        if config.cuda_graph_batch_sizes:
+            config.cuda_graph_batch_sizes = sorted(
+                config.cuda_graph_batch_sizes)
+            if config.cuda_graph_max_batch_size != 0:
+                if config.cuda_graph_batch_sizes != self._generate_cuda_graph_batch_sizes(
+                        config.cuda_graph_max_batch_size,
+                        config.cuda_graph_padding_enabled):
+                    raise ValueError(
+                        "Please don't set both cuda_graph_batch_sizes "
+                        "and cuda_graph_max_batch_size.\n"
+                        f"cuda_graph_batch_sizes: {self.cuda_graph_batch_sizes}, "
+                        f"cuda_graph_max_batch_size: {self.cuda_graph_max_batch_size}"
+                    )
+            else:
+                config.cuda_graph_max_batch_size = max(
+                    config.cuda_graph_batch_sizes)
+        else:
+            max_batch_size = config.cuda_graph_max_batch_size or 128
+            generated_sizes = self._generate_cuda_graph_batch_sizes(
+                max_batch_size, config.cuda_graph_padding_enabled)
+            config.cuda_graph_batch_sizes = generated_sizes
+            config.cuda_graph_max_batch_size = max_batch_size
+
+        return self
+
+    # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
+    def get_pytorch_backend_config(self) -> "PyTorchConfig":
+        from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
+
+        return PyTorchConfig(
+            extra_resource_managers=self.extra_resource_managers,
+            use_cuda_graph=bool(self.cuda_graph_config is not None),
+            cuda_graph_batch_sizes=self.cuda_graph_config.cuda_graph_batch_sizes
+            if self.cuda_graph_config else None,
+            cuda_graph_max_batch_size=self.cuda_graph_config.
+            cuda_graph_max_batch_size if self.cuda_graph_config else 0,
+            cuda_graph_padding_enabled=self.cuda_graph_config.
+            cuda_graph_padding_enabled if self.cuda_graph_config else False,
+            disable_overlap_scheduler=self.disable_overlap_scheduler,
+            moe_max_num_tokens=self.moe_max_num_tokens,
+            moe_load_balancer=self.moe_load_balancer,
+            attn_backend=self.attn_backend,
+            moe_backend=self.moe_backend,
+            mixed_sampler=self.mixed_sampler,
+            enable_trtllm_sampler=self.enable_trtllm_sampler,
+            kv_cache_dtype=self.kv_cache_dtype,
+            enable_iter_perf_stats=self.enable_iter_perf_stats,
+            enable_iter_req_stats=self.enable_iter_req_stats,
+            print_iter_log=self.print_iter_log,
+            torch_compile_enabled=bool(self.torch_compile_config is not None),
+            torch_compile_fullgraph=self.torch_compile_config.enable_fullgraph
+            if self.torch_compile_config is not None else True,
+            torch_compile_inductor_enabled=self.torch_compile_config.
+            enable_inductor if self.torch_compile_config is not None else False,
+            torch_compile_piecewise_cuda_graph=self.torch_compile_config.
+            enable_piecewise_cuda_graph
+            if self.torch_compile_config is not None else False,
+            torch_compile_enable_userbuffers=self.torch_compile_config.
+            enable_userbuffers
+            if self.torch_compile_config is not None else True,
+            autotuner_enabled=self.autotuner_enabled,
+            enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
+            load_format=self.load_format,
+            enable_min_latency=self.enable_min_latency,
+            stream_interval=self.stream_interval)
 
 
 def update_llm_args_with_extra_dict(

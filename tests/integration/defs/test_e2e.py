@@ -685,7 +685,7 @@ def temp_extra_llm_api_options_file(request):
             pytorch_backend_config = {}
             if request.node.callspec.params['pytorch_backend_config']:
                 pytorch_backend_config = {
-                    "use_cuda_graph": True,
+                    "cuda_graph_config": {},
                     # trtllm-bench will set cuda_max_batch_size to
                     # max_batch_size, so the cuda_graph_batch_sizes is not
                     # needed.
