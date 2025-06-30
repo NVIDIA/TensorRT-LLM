@@ -412,10 +412,10 @@ class TorchSampler(Sampler):
             new_tokens[:1].index_copy_(1, seq_slots, next_tokens)
             return
 
+        strategies = sampling_strategies(requests)
         batched_next_tokens, batched_softmax = None, None
         batched_strategy: Strategy | None = GREEDY
         if self.mixed_sampler:
-            strategies = sampling_strategies(requests)
             assert "d2t" not in model_outputs, "eagle3 does not yet support non-greedy sampling"
             if len(set(strategies)) == 1:
                 batched_strategy = strategies[0]
