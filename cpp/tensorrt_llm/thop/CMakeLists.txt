@@ -44,6 +44,7 @@ add_library(
   convertSpecDecodingMaskToPackedMaskOp.cpp
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
+  cudaScaledMM.cpp
   dynamicDecodeOp.cpp
   fmhaPackMaskOp.cpp
   fp8Op.cpp
