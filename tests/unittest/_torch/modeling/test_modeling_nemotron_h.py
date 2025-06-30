@@ -224,3 +224,85 @@ def test_nemotron_h_correctness():
 
     finally:
         nemotron_h.shutdown()
+
+
+def create_nemotron_h_llm(use_cuda_graph, disable_overlap_scheduler,
+                          max_batch_size):
+    """Create LLM with specific overlap scheduler setting"""
+    model_dir = f"{llm_models_root(check=True)}/Nemotron-H-8B-Base-8K"
+    return LLM(
+        model=model_dir,
+        tensor_parallel_size=1,
+        max_batch_size=max_batch_size,
+        use_cuda_graph=use_cuda_graph,
+        disable_overlap_scheduler=disable_overlap_scheduler,
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+        enable_trtllm_sampler=True,
+    )
+
+
+def test_nemotron_h_cuda_graph_overlap_scheduler():
+    prompts = [
+        "Tell me something I don't know about the future of AI",
+        "The president of the United States is",
+        "The capital of France is",
+        "Hello, this is a beautiful day and I'm eager to start my day and",
+    ]
+    sampling_config = SamplingParams(max_tokens=12,
+                                     temperature=0.0,
+                                     return_generation_logits=True)
+
+    # Test without cg and overlap scheduler disabled
+    with create_nemotron_h_llm(use_cuda_graph=False,
+                               disable_overlap_scheduler=True,
+                               max_batch_size=16) as llm:
+        outputs_no_cg_no_overlap = llm.generate(prompts,
+                                                sampling_params=sampling_config,
+                                                use_tqdm=True)
+
+    # Test with cg and overlap scheduler disabled
+    with create_nemotron_h_llm(use_cuda_graph=True,
+                               disable_overlap_scheduler=True,
+                               max_batch_size=16) as llm:
+        outputs_with_cg_no_overlap = llm.generate(
+            prompts, sampling_params=sampling_config, use_tqdm=True)
+
+    # Test with cg and overlap scheduler enabled
+    with create_nemotron_h_llm(use_cuda_graph=True,
+                               disable_overlap_scheduler=False,
+                               max_batch_size=16) as llm:
+        outputs_with_cg_with_overlap = llm.generate(
+            prompts, sampling_params=sampling_config, use_tqdm=True)
+
+    # Verify outputs are consistent
+    for (no_cg_no_overlap, with_cg_no_overlap,
+         with_cg_with_overlap) in zip(outputs_no_cg_no_overlap,
+                                      outputs_with_cg_no_overlap,
+                                      outputs_with_cg_with_overlap):
+
+        if no_cg_no_overlap.outputs[0].text != with_cg_no_overlap.outputs[
+                0].text:
+            print("no_cg_no_overlap != with_cg_no_overlap")
+        if with_cg_no_overlap.outputs[0].text != with_cg_with_overlap.outputs[
+                0].text:
+            print("with_cg_no_overlap != with_cg_with_overlap")
+        print()
+
+        assert no_cg_no_overlap.outputs[0].text == with_cg_no_overlap.outputs[
+            0].text
+        assert with_cg_no_overlap.outputs[
+            0].text == with_cg_with_overlap.outputs[0].text
+
+        # with/without CG can have some difference in logits - high tolerance
+        torch.testing.assert_close(
+            no_cg_no_overlap.outputs[0].generation_logits,
+            with_cg_no_overlap.outputs[0].generation_logits,
+            atol=0.4,
+            rtol=0.4)
+
+        # overlap scheduler should have no effect on logits - low tolerance
+        torch.testing.assert_close(
+            with_cg_no_overlap.outputs[0].generation_logits,
+            with_cg_with_overlap.outputs[0].generation_logits,
+            atol=0.05,
+            rtol=0.05)
