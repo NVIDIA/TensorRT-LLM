@@ -21,8 +21,8 @@ class TransformersTokenizer(TokenizerBase):
         self.tokenizer = tokenizer
         self._all_special_tokens_set = set(self.tokenizer.all_special_tokens)
         self.hf_decode_stream = None
-        self.STREAM_INTERVAL_THRESHOLD = os.getenv(
-            "TRTLLM_STREAM_INTERVAL_THRESHOLD", "64")
+        self.STREAM_INTERVAL_THRESHOLD = int(
+            os.getenv("TRTLLM_STREAM_INTERVAL_THRESHOLD", "64"))
 
     def __call__(self, text: str, *args, **kwargs) -> Any:
         return self.tokenizer(text, *args, **kwargs)
@@ -203,7 +203,6 @@ class TransformersTokenizer(TokenizerBase):
             self.hf_decode_stream = DecodeStream(
                 skip_special_tokens=skip_special_tokens)
 
-        assert self.hf_decode_stream.skip_special_tokens == skip_special_tokens
         results = []
         for token_id in token_ids:
             result = self.hf_decode_stream.step(self.tokenizer._tokenizer,
