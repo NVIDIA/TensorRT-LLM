@@ -1970,6 +1970,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             DLFW_IMAGE,
             false,
         ],
+        /* Clear unnecessary configs for feat/orangina
         "PY310-UB2204": [
             LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE,
             "A10",
@@ -1988,10 +1989,11 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             UBUNTU_24_04_IMAGE,
             true, // Extra PyTorch CUDA 12.8 install
         ],
+        */
     ]
 
     aarch64SanityCheckConfigs = [
-        "PY312-UB2404": [
+        /*"PY312-UB2404": [
             LLM_DOCKER_IMAGE,
             "GH200",
             AARCH64_TRIPLE,
@@ -1999,7 +2001,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             "",
             UBUNTU_24_04_IMAGE,
             true, // Extra PyTorch CUDA 12.8 install
-        ],
+        ],*/
         "PY312-DLFW": [
             LLM_DOCKER_IMAGE,
             "GH200",
@@ -2019,8 +2021,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     if (env.targetArch == AARCH64_TRIPLE) {
         sanityCheckConfigs = aarch64SanityCheckConfigs
     }
-    //Clear sanityCheckConfigs for feat/orangina
-    sanityCheckConfigs = [:]
+
 
     sanityCheckJobs = sanityCheckConfigs.collectEntries {key, values -> [toStageName(values[1], key), {
         cacheErrorAndUploadResult(toStageName(values[1], key), {
