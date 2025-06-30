@@ -452,7 +452,8 @@ __device__ void rescaleGemm1AccForNewColMax_sync(uint32_t warpRank, ShmQWiseVec 
 template <bool dstIsStrided = false, typename DstHead>
 __device__ void finalizeAndWriteOut_sync(uint32_t threadRank, uint32_t warpRank, DstHead* dst,
     SharedMem::OutSwizzleBuf& swizzleBuf, Gemm1Acc& acc, float xvoScale, CtaBarrier& warpGrpBar,
-    ShmQWiseVec const& accColSum, uint32_t nbKHeads = 0 /* only for final result in spec dec. */, ShmQWiseVec const& accColMax, ShmQWiseVec const* attentionSinksVec);
+    ShmQWiseVec const& accColSum, uint32_t nbKHeads = 0 /* only for final result in spec dec. */,
+    ShmQWiseVec const& accColMax, ShmQWiseVec const* attentionSinksVec);
 #else
 __device__ void transposeVTile(
     uint32_t warpRank, uint32_t lane, SharedMem::VTBuffer& dst, SharedMem::VBuffer const& src);
@@ -1250,7 +1251,8 @@ CUBIN_EXPORT __global__
                     }
 #if SWAP_AB
                     finalizeAndWriteOut_sync<SPEC_DEC>(threadIdx.x, warpRank, dst, smem.outSwizzleBuf(idxXBuf), acc,
-                        xvoScale, smem.gemm1WarpGrpBar, smem.gemm1AccColSum, nbKHeads, smem.gemm1AccColMax, attentionSinksVec);
+                        xvoScale, smem.gemm1WarpGrpBar, smem.gemm1AccColSum, nbKHeads, smem.gemm1AccColMax,
+                        attentionSinksVec);
 #else
                     finalizeAndWriteOut_sync(warpRank, dst, smem.outSwizzleBuf(idxXBuf), acc, xvoScale,
                         smem.gemm1AccColSum, nbKHeads, ctaNbValidTokens);
