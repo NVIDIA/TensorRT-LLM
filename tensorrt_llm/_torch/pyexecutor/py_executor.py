@@ -1208,10 +1208,10 @@ class PyExecutor:
         if self.dist.rank == 0:
             py_logits_post_processors = self._collect_py_objects_from_requests(
                 new_requests, "py_logits_post_processors")
-            py_mm_data = self._collect_py_objects_from_requests(
-                new_requests, "py_mm_data")
+            py_multimodal_data = self._collect_py_objects_from_requests(
+                new_requests, "py_multimodal_data")
             py_request_objects = tuple(
-                filter(None, [py_logits_post_processors, py_mm_data]))
+                filter(None, [py_logits_post_processors, py_multimodal_data]))
         else:
             py_request_objects = None
 

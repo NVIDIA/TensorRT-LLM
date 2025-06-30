@@ -10,7 +10,6 @@ import os
 import traceback
 import weakref
 from abc import ABC, abstractmethod
-from collections import defaultdict
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -27,6 +26,7 @@ from tensorrt_llm._utils import (is_trace_enabled, local_mpi_rank,
                                  local_mpi_size, nvtx_range, release_gc,
                                  torch_dtype_to_str, trace_func)
 from tensorrt_llm.bindings.executor import GuidedDecodingConfig
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import LoraConfig, LoraModelConfig
 from tensorrt_llm.mapping import Mapping
@@ -1197,19 +1197,38 @@ class PyTorchModelEngine(ModelEngine):
             prompt_lengths.append(len(prompt_tokens))
             past_seen_token_num = begin_compute
             num_cached_tokens_per_seq.append(past_seen_token_num)
-            multimodal_embedding = request.multimodal_embedding
-            if multimodal_embedding is not None:
-                multimodal_embedding = multimodal_embedding.pin_memory(
-                ) if multimodal_embedding.device == 'cpu' else multimodal_embedding
-                multi_modal_data.append(
-                    multimodal_embedding.to('cuda', non_blocking=True))
 
-            mrope_rotary_cos_sin = request.mrope_rotary_cos_sin
-            if mrope_rotary_cos_sin is not None:
-                mrope_rotary_cos_sin = mrope_rotary_cos_sin.pin_memory(
-                ) if mrope_rotary_cos_sin.device == 'cpu' else mrope_rotary_cos_sin
-                mrope_config['mrope_rotary_cos_sin'].append(
-                    mrope_rotary_cos_sin.to('cuda', non_blocking=True))
+            if request.multimodal_embedding is not None:
+                # TODO: Visit later once we have the SharedTensor.
+                request.multimodal_embedding = torch.tensor(
+                    request.multimodal_embedding,
+                    dtype=torch.float32,
+                    pin_memory=True)
+                request.multimodal_embedding = request.multimodal_embedding.to(
+                    'cuda', non_blocking=True)
+
+            if request.mrope_rotary_cos_sin is not None:
+                # TODO: Visit later once we have the SharedTensor.
+                mrope_rotary_cos_sin_tensor = torch.tensor(
+                    request.mrope_rotary_cos_sin,
+                    dtype=torch.float32,
+                    pin_memory=True)
+                mrope_rotary_cos_sin_tensor = mrope_rotary_cos_sin_tensor.to(
+                    'cuda', non_blocking=True)
+            else:
+                mrope_rotary_cos_sin_tensor = None
+            # Create MultimodalParams from request data
+            multimodal_params = MultimodalParams(
+                multimodal_embedding=request.multimodal_embedding,
+                mrope_config={
+                    'mrope_rotary_cos_sin': mrope_rotary_cos_sin_tensor
+                } if mrope_rotary_cos_sin_tensor is not None else None,
+                multimodal_data=request.py_multimodal_data,
+            )
+
+            if multimodal_params.has_content():
+                multimodal_params_list.append(multimodal_params)
+
             request.py_batch_idx = request.seq_slot
 
         num_ctx_requests = len(scheduled_requests.context_requests)
@@ -1238,13 +1257,19 @@ class PyTorchModelEngine(ModelEngine):
             else:
                 generation_requests.append(request)
 
+            # Handle generation request multimodal params
             mrope_position_deltas = request.mrope_position_deltas
             if mrope_position_deltas is not None:
-                mrope_position_deltas = torch.tensor([mrope_position_deltas],
-                                                     dtype=torch.int32,
-                                                     pin_memory=True)
-                mrope_config['mrope_position_deltas'].append(
-                    mrope_position_deltas.to('cuda', non_blocking=True))
+                mrope_position_deltas_tensor = torch.tensor(
+                    [mrope_position_deltas], dtype=torch.int32, pin_memory=True)
+                multimodal_params = MultimodalParams(
+                    mrope_config={
+                        'mrope_position_deltas':
+                        mrope_position_deltas_tensor.to('cuda',
+                                                        non_blocking=True)
+                    })
+                if multimodal_params.has_content():
+                    multimodal_params_list.append(multimodal_params)
         extend_requests += extend_dummy_requests
 
         if not self._disable_overlap_scheduler and self.is_spec_decode:
@@ -1494,9 +1519,7 @@ class PyTorchModelEngine(ModelEngine):
             'position_ids':
             self.position_ids_cuda[:total_num_tokens].unsqueeze(0),
             'inputs_embeds': None,
-            'multi_modal_data': multi_modal_data,
-            'mrope_config': mrope_config,
-            'mm_data': py_mm_data
+            "multimodal_params": multimodal_params_list,
         }
 
         if bool(lora_params):
