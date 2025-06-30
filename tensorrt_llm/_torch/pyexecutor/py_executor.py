@@ -660,11 +660,10 @@ class PyExecutor:
     def _process_iter_stats(self, finished_requests: list[LlmRequest],
                             active_requests: List[LlmRequest],
                             batch_state: BatchState):
-        if batch_state.iter_stats is None:
-            return
-
         iter_end_time = time.time()
         iter_latency_ms = (iter_end_time - batch_state.iter_start_time) * 1e3
+        if batch_state.iter_stats is None:
+            return
 
         req_stats = self._populate_req_stats(
             finished_requests, active_requests,
