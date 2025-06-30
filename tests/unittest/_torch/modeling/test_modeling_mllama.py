@@ -16,6 +16,7 @@ from tensorrt_llm._torch.models.modeling_mllama import \
     MllamaForConditionalGeneration
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
     DecodingCUDAGraphRunner
+from tensorrt_llm._torch.pyexecutor.llm_request import create_dummy_requests
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -343,7 +344,11 @@ class TestMLlama(unittest.TestCase):
         request_ids = [1]
         token_nums = [input_ids.size(-1)]
         prompt_lens = [input_ids.size(-1)]
-        kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+        requests = create_dummy_requests(
+            request_ids=request_ids,
+            token_nums=token_nums,
+            is_cross_kv=kv_cache_manager.is_cross_kv)
+        kv_cache_manager.prepare_dummy_resources(requests)
 
         attn_metadata = metadata_cls(
             seq_lens=torch.tensor([input_ids.size(-1)], dtype=torch.int),
