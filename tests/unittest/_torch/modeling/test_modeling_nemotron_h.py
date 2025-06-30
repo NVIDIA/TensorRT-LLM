@@ -28,26 +28,36 @@ def extract_decode_logprobs(result: RequestOutput,
     return get_logprobs(token_ids, logits)
 
 
+def create_nemotron_h_llm(use_cuda_graph, disable_overlap_scheduler,
+                          max_batch_size):
+    """Create LLM with specific overlap scheduler setting"""
+    model_dir = f"{llm_models_root(check=True)}/Nemotron-H-8B-Base-8K"
+    return LLM(
+        model=model_dir,
+        tensor_parallel_size=1,
+        max_batch_size=max_batch_size,
+        use_cuda_graph=use_cuda_graph,
+        disable_overlap_scheduler=disable_overlap_scheduler,
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+        enable_trtllm_sampler=True,
+    )
+
+
 @skip_gpu_memory_less_than(
     (2 * 8 + 1) * 2**30)  # 8B, bf16, plus 1 GB for good measure
 def test_nemotron_h_correctness():
     # This test is close to memory limit on A30 (with 24GB), so empty cache first
     torch.cuda.empty_cache()
 
-    model_dir = f"{llm_models_root(check=True)}/Nemotron-H-8B-Base-8K"
     text_prompts = [
         "The future of AI is",
         "The president of the United States is",
     ]
     num_prompts = len(text_prompts)
 
-    nemotron_h = LLM(
-        model=model_dir,
-        max_batch_size=num_prompts,
-        use_cuda_graph=False,
-        kv_cache_config=KvCacheConfig(enable_block_reuse=False),
-        enable_trtllm_sampler=True,
-    )
+    nemotron_h = create_nemotron_h_llm(use_cuda_graph=False,
+                                       disable_overlap_scheduler=False,
+                                       max_batch_size=num_prompts)
 
     expected_completions = [
         " bright, with endless possibilities for innovation and growth",
@@ -224,21 +234,6 @@ def test_nemotron_h_correctness():
 
     finally:
         nemotron_h.shutdown()
-
-
-def create_nemotron_h_llm(use_cuda_graph, disable_overlap_scheduler,
-                          max_batch_size):
-    """Create LLM with specific overlap scheduler setting"""
-    model_dir = f"{llm_models_root(check=True)}/Nemotron-H-8B-Base-8K"
-    return LLM(
-        model=model_dir,
-        tensor_parallel_size=1,
-        max_batch_size=max_batch_size,
-        use_cuda_graph=use_cuda_graph,
-        disable_overlap_scheduler=disable_overlap_scheduler,
-        kv_cache_config=KvCacheConfig(enable_block_reuse=False),
-        enable_trtllm_sampler=True,
-    )
 
 
 def test_nemotron_h_cuda_graph_overlap_scheduler():
