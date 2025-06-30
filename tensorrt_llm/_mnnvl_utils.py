@@ -326,6 +326,8 @@ class MnnvlMoe:
     moe_workspace: MnnvlMemory = None
     moe_workspace_tensor: torch.Tensor = None
     moe_mapping: Mapping = None
+    moe_aux_workspace: MnnvlMemory = None
+    moe_aux_workspace_tensor: torch.Tensor = None
 
     @staticmethod
     def get_moe_workspaces(mapping: Mapping):
@@ -340,6 +342,22 @@ class MnnvlMoe:
         MnnvlMoe.moe_workspace = MnnvlMemory(mapping, workspace_size_per_rank)
         MnnvlMoe.moe_workspace_tensor = MnnvlMoe.moe_workspace.as_torch_strided_tensor(torch.uint64)
         return MnnvlMoe.moe_workspace_tensor
+
+    @staticmethod
+    def get_moe_aux_workspace(mapping: Mapping):
+        if MnnvlMoe.moe_aux_workspace is not None:
+            assert mapping == MnnvlMoe.moe_mapping, "only one moe mapping supported now"
+            return MnnvlMoe.moe_aux_workspace_tensor
+
+        MnnvlMoe.moe_mapping = mapping
+        workspace_size_per_rank = torch.ops.trtllm.get_moe_commworkspace_size_per_rank(
+            mapping.tp_size
+        )
+        MnnvlMoe.moe_aux_workspace = MnnvlMemory(mapping, workspace_size_per_rank)
+        MnnvlMoe.moe_aux_workspace_tensor = MnnvlMoe.moe_aux_workspace.as_torch_strided_tensor(
+            torch.uint64
+        )
+        return MnnvlMoe.moe_aux_workspace_tensor
 
     @staticmethod
     def compute_target_rank_id(
