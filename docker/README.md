@@ -44,11 +44,16 @@ Containers can be started with the local user instead of `root` by appending `LO
 make -C docker devel_run LOCAL_USER=1
 ```
 
-Specific CUDA architectures supported by the `wheel` can be specified WITH `CUDA_ARCHS`:
+Specific CUDA architectures supported by the `wheel` can be specified with `CUDA_ARCHS`:
 
 ```bash
 make -C docker release_build CUDA_ARCHS="80-real;90-real"
 ```
+
+The `run` action maps the locally checked out source code into the `/code/tensorrt_llm` directory within the container.
+
+The `DOCKER_RUN_ARGS` option can be used to pass additional options to Docker,
+e.g., in order to mount additional volumes into the container.
 
 For more build options, see the variables defined in [`Makefile`](Makefile).
 
@@ -62,8 +67,7 @@ make -C docker ngc-devel_run LOCAL_USER=1 DOCKER_PULL=1
 ```
 
 As before, specifying `LOCAL_USER=1` will run the container with the local user's identity. Specifying `DOCKER_PULL=1`
-is optional, but it will pull the latest image from the NGC Catalog. This will map the source code into the container
-in the directory `/code/tensorrt_llm`.
+is optional, but it will pull the latest image from the NGC Catalog.
 
 We also provide an image with pre-installed binaries for release. This can be used like so:
 
@@ -72,7 +76,15 @@ make -C docker ngc-release_run LOCAL_USER=1 DOCKER_PULL=1
 ```
 
 If you want to deploy a specific version of TensorRT-LLM, you can specify the version with
-`TRT_LLM_VERSION=<version_tag>`. The application examples and benchmarks are installed in `/app/tensorrt_llm`.
+`IMAGE_TAG=<version_tag>` (cf. [release history on GitHub](https://github.com/NVIDIA/TensorRT-LLM/releases) and [tags in NGC Catalog](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags)). The application examples and benchmarks are installed
+in `/app/tensorrt_llm`.
+
+See the description of the `<stage>_run` make target in
+[Building and Running Options](#building-and-running-options) for additional information and
+running options.
+
+If you cannot access the NGC container images, you can instead locally build and use
+equivalent containers as [described above](#building-docker-images-with-gnu-make).
 
 ### Jenkins Integration
 
@@ -91,13 +103,21 @@ Start a new container using the same image as Jenkins using your local user acco
 make -C docker jenkins_run LOCAL_USER=1
 ```
 
+If you do not have access to the [internal artifact repository](https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm/), you can instead either use the [NGC Develop
+image](#ngc-integration) or [build an image locally](#building-docker-images-with-gnu-make).
+
+#### Release images based on Jenkins image
+
 One may also build a release image based on the Jenkins development image:
 
 ```bash
 make -C docker trtllm_build CUDA_ARCHS="80-real;90-real"
 ```
 
-These images can be pushed to
+Note that the above requires access to the Jenkins development image from the
+[internal artifact repository](https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm/).
+
+The resulting images can be pushed to
 the [internal artifact repository](https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm-staging/release/):
 
 ```bash
@@ -112,4 +132,16 @@ make -C docker trtllm_run LOCAL_USER=1 DOCKER_PULL=1
 ```
 
 The argument `DOCKER_PULL=1` instructs `make` to pull the latest version of the image before deploying it in the container.
-By default, images are tagged by their `git` branch name and may be frequently updated.
+By default, the release images built in the above manner are tagged by their `git` branch name and may be frequently updated.
+
+### Docker rootless
+
+Some aspects require special treatment when using [Docker rootless mode](https://docs.docker.com/engine/security/rootless/). The `docker/Makefile` contains heuristics to detect Docker rootless mode. When assuming
+Docker rootless mode, the `%_run` targets in `docker/Makefile` will output
+a corresponding message. The heuristics can be overridden by specifying
+`IS_ROOTLESS=0` or `IS_ROOTLESS=1`, respectively.
+
+Since Docker rootless mode remaps the UID/GID and the remapped UIDs and GIDs
+ (typically configured in `/etc/subuid` and `/etc/subgid`) generally do not coincide
+with the local UID/GID, both IDs need to be translated using a tool like `bindfs` in order to be able to smoothly share a local working directory with any containers
+started with `LOCAL_USER=1`. In this case, the `SOURCE_DIR` and `HOME_DIR` Makefile variables need to be set to the locations of the translated versions of the TensorRT-LLM working copy and the user home directory, respectively.
