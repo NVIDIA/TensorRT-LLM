@@ -1218,9 +1218,7 @@ class PyTorchModelEngine(ModelEngine):
                                                      dtype=torch.int32,
                                                      pin_memory=True)
                 mrope_config['mrope_position_deltas'].append(
-                    torch.tensor([mrope_position_deltas],
-                                 dtype=torch.int32).to('cuda',
-                                                       non_blocking=True))
+                    mrope_position_deltas.to('cuda', non_blocking=True))
 
         extend_requests = extend_cuda_graph_dummy_requests + extend_requests
         if not self._disable_overlap_scheduler and self.is_spec_decode:
