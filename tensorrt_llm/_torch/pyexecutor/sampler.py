@@ -520,10 +520,6 @@ class TRTLLMSampler(Sampler):
         self._initialize_store()
         self._instantiate_algorithms()
 
-        self.timers = []
-        self.gen_timers = []
-        self.make_decoding_batch_input_output_timers = []
-
     def _initialize_store(self):
         torch_stream = torch.cuda.current_stream().cuda_stream
         cuda_stream = CudaStream(torch_stream)
@@ -635,29 +631,17 @@ class TRTLLMSampler(Sampler):
             )
         self.setup_sampler_step(scheduled_requests.context_requests)
         
-        start_time = time.perf_counter()
         num_context_logits_prefix_sum = [0]
         prefix_sum = 0
         for request in scheduled_requests.context_requests:
             prefix_sum += request.context_chunk_size if request.py_return_context_logits else 1
             num_context_logits_prefix_sum.append(prefix_sum)
-        end_time = time.perf_counter()
-        self.timers.append((end_time - start_time) * 1000)
-        if len(self.timers) % 200 == 0:
-            print(f"prefix_sum time: {sum(self.timers[-200:]) / 200} ms")
         
         if any(r.py_return_context_logits or r.py_return_generation_logits for r in scheduled_requests.all_requests):
-            start_time = time.perf_counter()
             self.algs.handle_logits(
                 scheduled_requests.context_requests, scheduled_requests.generation_requests,
                 model_outputs["logits"], num_context_logits_prefix_sum, self.max_num_sequences, beam_width)
-            end_time = time.perf_counter()
-            self.gen_timers.append((end_time - start_time) * 1000)
-            if len(self.gen_timers) % 200 == 0:
-                print(f"handle_logits time: {sum(self.gen_timers[-200:]) / 200} ms")
             
-        start_time = time.perf_counter()
-
         # For beam search, cache indirection needs to be updated
         if (beam_width > 1):
             self._update_cache_indirection_buffer(scheduled_requests)
@@ -666,10 +650,6 @@ class TRTLLMSampler(Sampler):
             scheduled_requests, model_outputs["logits"],
             self.store["decoder_input_buffers"], self.store["decoder_state"],
             self.model_config, self.max_num_sequences, beam_width, num_context_logits_prefix_sum)
-        end_time = time.perf_counter()
-        self.make_decoding_batch_input_output_timers.append((end_time - start_time) * 1000)
-        if len(self.make_decoding_batch_input_output_timers) % 200 == 0:
-            print(f"make_decoding_batch_input_output time: {sum(self.make_decoding_batch_input_output_timers[-200:]) / 200} ms")
 
         self.algs.decoder.forward_async(self.store["decoder_state"],
                                         decoding_input)

@@ -65,6 +65,6 @@ class MakeDecodingBatchInputOutput:
 
         decoding_input = DecoderBatchInput(logits_vec, 1)
         decoding_input.generation_steps = generation_steps
-        decoding_input.batch_slots = [torch.tensor(active_slots[0])]
+        decoding_input.batch_slots = [torch.tensor(active_slots[0], dtype=torch.int32)]
 
         return decoding_input
