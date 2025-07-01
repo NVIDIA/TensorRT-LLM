@@ -1,4 +1,5 @@
 import os
+import sys
 
 import requests
 
@@ -93,9 +94,18 @@ def add_label_to_pr(repo_owner: str, repo_name: str, pr_number: str,
         print(f"Error adding label '{label}' to PR #{pr_number}: {e}")
         if e.response is not None:
             print(f"Response content: {e.response.content}")
+        raise e
 
 
 def main():
+    """
+    Main function to check user membership and apply community labels.
+
+    Exit codes:
+    0 - Success (user membership determined, appropriate action taken)
+    1 - Failed to determine user membership (API permission issues)
+    2 - Failed to add community label (labeling API issues)
+    """
     pr_author = os.environ.get("PR_AUTHOR")
     assert pr_author, "PR_AUTHOR environment variable not set"
     pr_number = os.environ.get("PR_NUMBER")
@@ -118,7 +128,7 @@ def main():
             f"Critical error during NVIDIA membership check for '{pr_author}': {e}"
         )
         print("Halting script due to inability to determine membership status.")
-        return
+        sys.exit(1)
 
     print(
         f"User '{pr_author}' is determined to be an NVIDIA member: {is_member}")
@@ -127,7 +137,11 @@ def main():
         print(
             f"User '{pr_author}' is a community user. Adding label '{community_label}'."
         )
-        add_label_to_pr(repo_owner, repo_name, pr_number, community_label)
+        try:
+            add_label_to_pr(repo_owner, repo_name, pr_number, community_label)
+        except requests.exceptions.RequestException as e:
+            print(f"Failed to add community label: {e}")
+            sys.exit(2)
     else:
         print(
             f"User '{pr_author}' is an NVIDIA member. No label will be added.")
