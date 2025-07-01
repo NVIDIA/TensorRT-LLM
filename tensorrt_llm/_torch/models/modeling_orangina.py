@@ -17,7 +17,8 @@ from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (MoE, MoEWeightLoadingMode,
-                                 RenormalizeMoeRoutingMethod, create_moe)
+                                 RenormalizeMoeRoutingMethod, create_moe,
+                                 create_renormalize_expert_load_balanced_logits)
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..utils import Fp4QuantizedTensor
@@ -144,6 +145,7 @@ class MLPBlock(torch.nn.Module):
     ):
         super().__init__()
 
+        self.config = config  # Store config as instance variable
         pretrained_config = config.pretrained_config
         self.num_experts = pretrained_config.num_experts
         self.layer_idx = layer_idx
@@ -195,9 +197,36 @@ class MLPBlock(torch.nn.Module):
         out_glu = x_glu * torch.sigmoid(alpha * x_glu)
         return out_glu * (x_linear + 1)
 
+    def _create_ideal_expert_load_balanced_logits(
+            self, num_tokens: int, num_experts: int,
+            device: torch.device) -> torch.Tensor:
+        """
+        Create ideal logits that produce GPU-aware load balanced expert assignment.
+        This method now delegates to the generic utility function in fused_moe.routing.
+        """
+        pretrained_config = self.config.pretrained_config
+        assert self.config.mapping.moe_tp_size == 1, "this load balance scheme is tested with only MOE EP"
+
+        return create_renormalize_expert_load_balanced_logits(
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            experts_per_token=pretrained_config.experts_per_token,
+            moe_ep_size=self.config.mapping.moe_ep_size,
+            device=device,
+            dtype=pretrained_config.torch_dtype)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         t = self.norm(x)
         g = self.gate(t)
+        # Use ideal load balanced logits if enabled, otherwise use gate output
+        if self.config.enable_perfect_router:
+            # WARNING: This discards the learned gate output and uses ideal logits for perfect load balancing
+            # Only use this for testing load balancing strategies, not for actual inference
+            # The gate is still computed to maintain realistic performance measurement
+            num_tokens, num_experts = g.shape
+            g = self._create_ideal_expert_load_balanced_logits(
+                num_tokens=num_tokens, num_experts=num_experts, device=x.device)
+
         t = self.experts(x=t, router_logits=g)
         return x + t
 
