@@ -29,13 +29,15 @@ global_kvcache_config = KvCacheConfig(max_tokens=10000)
 @pytest.mark.parametrize("gather_context_logits", [True, False])
 @pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
 @pytest.mark.parametrize("max_beam_width", [2])
+@pytest.mark.parametrize("num_output_beams", [1, 2])
 @pytest.mark.parametrize("max_tokens", [8])
 @pytest.mark.parametrize("num_prompts", [1, 2])
 def test_beam_search_output_shapes(disable_overlap_scheduler: bool,
                                    gather_context_logits: bool,
                                    gather_generation_logits: bool,
                                    return_log_probs: bool, max_beam_width: int,
-                                   max_tokens: int, num_prompts: int):
+                                   num_output_beams: int, max_tokens: int,
+                                   num_prompts: int):
     if return_log_probs and num_prompts > 1:
         pytest.skip(
             "Beam search currently does not support return_log_probs with multiple prompts"
@@ -54,7 +56,8 @@ def test_beam_search_output_shapes(disable_overlap_scheduler: bool,
     )
     sampling_params = SamplingParams(
         max_tokens=max_tokens,
-        n=max_beam_width,
+        n=num_output_beams,
+        best_of=max_beam_width,
         use_beam_search=max_beam_width > 1,
         return_context_logits=gather_context_logits,
         return_generation_logits=gather_generation_logits,
@@ -70,7 +73,7 @@ def test_beam_search_output_shapes(disable_overlap_scheduler: bool,
                     output.prompt_token_ids) == output.context_logits.shape[0]
             else:
                 assert output.context_logits is None
-            assert len(output.outputs) == max_beam_width
+            assert len(output.outputs) == num_output_beams
             for beam_idx, beam in enumerate(output.outputs):
                 if gather_generation_logits:
                     gen_logits = beam.generation_logits
@@ -84,5 +87,7 @@ def test_beam_search_output_shapes(disable_overlap_scheduler: bool,
                     assert len(beam.logprobs) == sampling_params.max_tokens
                 else:
                     assert len(beam.logprobs) == 0
-                assert similar(beam.text,
-                               expected_outputs[prompts[output_idx]][beam_idx])
+                if num_output_beams == max_beam_width:
+                    assert similar(
+                        beam.text,
+                        expected_outputs[prompts[output_idx]][beam_idx])

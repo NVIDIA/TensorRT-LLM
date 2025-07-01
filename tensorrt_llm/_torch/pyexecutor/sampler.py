@@ -619,7 +619,7 @@ class TRTLLMSampler(Sampler):
     def sample_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs) -> SampleStateTRTLLM:
         batch_size = scheduled_requests.batch_size
-        all_requests = scheduled_requests.all_requests
+        all_requests = scheduled_requests.all_requests()
         beam_width = self.beam_width(all_requests)
         if (batch_size > 1 and beam_width > 1
                 and any(request.py_return_log_probs
@@ -713,7 +713,7 @@ class TRTLLMSampler(Sampler):
 
         finalize_events = {}
 
-        for request in scheduled_requests.all_requests:
+        for request in requests:
             if request.is_context_init_state:
                 continue
 
@@ -785,7 +785,7 @@ class TRTLLMSampler(Sampler):
                     request, True)
         # post process all requests if necessary
         if beam_width > 1:
-            for request in scheduled_requests.all_requests:
+            for request in requests:
                 if request.request_id in finalize_events:
                     self._post_process_request(
                         request, finalize_events[request.request_id])

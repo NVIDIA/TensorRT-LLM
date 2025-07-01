@@ -340,7 +340,6 @@ def _filter_cuda_graph_batch_sizes(cuda_graph_batch_sizes: list[int],
 
 
 class PyTorchModelEngine(ModelEngine):
-    BEAM_WIDTH = 1
 
     def __init__(
         self,
@@ -1178,6 +1177,8 @@ class PyTorchModelEngine(ModelEngine):
         draft_tokens = []
         draft_lens = []
         mrope_config = defaultdict(list)
+        gen_request_seq_slots = []  # per generation request
+
 
         for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
@@ -1332,7 +1333,11 @@ class PyTorchModelEngine(ModelEngine):
                     past_seen_token_num = request.max_beam_num_tokens - 1
                 else:
                     # the request has previous tensor
-                    previous_batch_indices.append(request.py_batch_idx)
+                    # previous_batch_indices is used per request, not per beam
+                    # Only append it once for the first beam of each request
+                    first_beam = 0
+                    if beam == first_beam:
+                        previous_batch_indices.append(request.py_batch_idx)
                     past_seen_token_num = request.max_beam_num_tokens
 
                 position_ids.append(past_seen_token_num)
@@ -1343,7 +1348,7 @@ class PyTorchModelEngine(ModelEngine):
                 gather_ids.append(len(position_ids) - 1)
 
             request_ids.append(request.py_request_id)
-            seq_slots.append(request.seq_slot)
+            gen_request_seq_slots.append(request.seq_slot)
             request.py_batch_idx = request.seq_slot
 
         previous_batch_len = len(previous_batch_indices)
@@ -1422,21 +1427,11 @@ class PyTorchModelEngine(ModelEngine):
             seq_slots_device = previous_seq_slots_device()
             max_draft_len = max(draft_lens)
             new_tokens = new_tokens_device[:max_draft_len + 1,
-                                           seq_slots_device, :self.BEAM_WIDTH]
+                                           seq_slots_device, :self.
+                                           max_beam_width]
             self.input_ids_cuda[num_tokens:num_tokens +
-                                previous_batch_len].copy_(new_tokens.flatten(),
-                                                          non_blocking=True)
-            # for beam search
-            batch_and_beam_indices = ( # TODO -- fix this
-                self.max_beam_width *
-                self.previous_batch_indices_cuda[:previous_batchs])
-            # reshape to expose the beam_width as its own dimension and add the beam id to each beam for each request
-            batch_and_beam_indices = batch_and_beam_indices.reshape(
-                -1, self.max_beam_width) + torch.arange(
-                    self.max_beam_width, device=batch_and_beam_indices.device)
-            batch_and_beam_indices = batch_and_beam_indices.reshape(-1)
-            self.input_ids_cuda[num_tokens:num_tokens + previous_batchs].copy_(
-                new_tokens_device[batch_and_beam_indices], non_blocking=True)
+                                previous_batch_len * self.max_beam_width].copy_(
+                                    new_tokens.flatten(), non_blocking=True)
 
         position_ids = torch.tensor(position_ids,
                                     dtype=torch.int,
@@ -1464,7 +1459,7 @@ class PyTorchModelEngine(ModelEngine):
                 cache_indirection_buffer)
             #Copy cache indirection to local buffer with offsets changing:  seq_slots[i] -> i
             cache_indirection_attention[:num_generation_requests].copy_(
-                cache_indirection_buffer[seq_slots])
+                cache_indirection_buffer[gen_request_seq_slots])
             attn_metadata.cache_indirection = cache_indirection_attention
             attn_metadata.beam_width = self.max_beam_width
         else:
