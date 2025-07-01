@@ -308,7 +308,7 @@ class TestLlama3_2_1B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     def test_fp8_prequantized(self):
-        model_path = f"{llm_models_root()}/ llama-3.2-models/Llama-3.2-1B-FP8"
+        model_path = f"{llm_models_root()}/llama-3.2-models/Llama-3.2-1B-FP8"
         with LLM(model_path) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
