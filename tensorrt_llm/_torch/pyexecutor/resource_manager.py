@@ -25,7 +25,6 @@ if ENABLE_MULTI_DEVICE:
 if TYPE_CHECKING:
     from ..speculative.interface import SpecConfig
 
-ExecutorKvCacheConfig = tensorrt_llm.bindings.executor.KvCacheConfig
 BufferManagerCpp = tensorrt_llm.bindings.internal.runtime.BufferManager
 KVCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.KVCacheManager
 KvCacheConfigCpp = tensorrt_llm.bindings.executor.KvCacheConfig
@@ -206,18 +205,9 @@ class KVCacheManager(BaseResourceManager):
                     "model_config is required for VSWA (Variable Sliding Window Attention)"
                 )
             # kv cache config check
-            if not isinstance(kv_cache_config, KvCacheConfigCpp):
-                # NOTE: There is a difference between
-                # tensorrt_llm.bindings.KvCacheConfig(KvCacheConfigCpp) and
-                # tensorrt_llm.bindings.executor.KvCacheConfig
-                # calculate_max_num_blocks_from_cpp only accepts KvCacheConfigCpp
-                assert isinstance(kv_cache_config, ExecutorKvCacheConfig), (
-                    "Only ExecutorKvCacheConfig can be converted to KvCacheConfigCpp"
-                )
-                kv_cache_config = KvCacheConfigCpp(kv_cache_config)
-                logger.warning(
-                    "kv_cache_config is not a tensorrt_llm.bindings.KvCacheConfig, "
-                    "converting it to a tensorrt_llm.bindings.KvCacheConfig")
+            assert isinstance(
+                kv_cache_config, KvCacheConfigCpp
+            ), "calculate_max_num_blocks_from_cpp only accepts KvCacheConfigCpp"
             blocks_per_window = self.calculate_max_num_blocks_from_cpp(
                 kv_cache_config=kv_cache_config,
                 model_config=model_config,
