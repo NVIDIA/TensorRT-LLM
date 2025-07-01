@@ -4,6 +4,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from transformers import (AutoTokenizer, PreTrainedTokenizerBase,
                           PreTrainedTokenizerFast)
 
+from ..logger import logger
+
 
 class TokenizerBase(PreTrainedTokenizerBase):
     ''' This is a protocol for the tokenizer. Users can implement their own tokenizer by inheriting this class.  '''
@@ -40,6 +42,11 @@ class TransformersTokenizer(TokenizerBase):
 
     def batch_encode_plus(self, texts: List[str], *args, **kwargs) -> dict:
         return self.tokenizer.batch_encode_plus(texts, *args, **kwargs)
+
+    def get_chat_template(self,
+                          chat_template: Optional[str] = None,
+                          tools: Optional[List[Dict]] = None) -> str:
+        return self.tokenizer.get_chat_template(chat_template, tools)
 
     def apply_chat_template(
             self, conversation: Union[List[Dict[str, str]],
@@ -269,5 +276,8 @@ def load_hf_tokenizer(model_dir: str,
             trust_remote_code=trust_remote_code,
             use_fast=use_fast)
 
-    except Exception:
+    except Exception as e:
+        logger.warning(
+            f"Failed to load hf tokenizer from {model_dir}, encounter error: {e}"
+        )
         return None

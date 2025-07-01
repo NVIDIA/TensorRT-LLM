@@ -98,6 +98,9 @@ def add_llm_args(parser):
                         default=False,
                         action='store_true',
                         help='Use piecewise CUDA graph to optimize the model')
+    parser.add_argument('--apply_chat_template',
+                        default=False,
+                        action='store_true')
 
     # Sampling
     parser.add_argument("--max_tokens", type=int, default=64)
@@ -221,7 +224,8 @@ def setup_llm(args):
         enable_chunked_prefill=args.enable_chunked_prefill,
         speculative_config=spec_config,
         trust_remote_code=args.trust_remote_code,
-        gather_generation_logits=args.return_generation_logits)
+        gather_generation_logits=args.return_generation_logits,
+              trust_remote_code=True)
 
     sampling_params = SamplingParams(
         max_tokens=args.max_tokens,
@@ -239,6 +243,15 @@ def main():
     prompts = args.prompt if args.prompt else example_prompts
 
     llm, sampling_params = setup_llm(args)
+    new_prompts = []
+    if args.apply_chat_template:
+        for prompt in prompts:
+            messages = [{"role": "user", "content": f"{prompt}"}]
+            new_prompts.append(
+                llm.tokenizer.apply_chat_template(messages,
+                                                  tokenize=False,
+                                                  add_generation_prompt=True))
+        prompts = new_prompts
     outputs = llm.generate(prompts, sampling_params)
 
     for i, output in enumerate(outputs):
