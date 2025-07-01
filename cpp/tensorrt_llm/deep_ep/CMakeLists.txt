@@ -1,4 +1,4 @@
-set(DEEP_EP_COMMIT 205817d98b692ed32a1d104775251292091cfab7)
+set(DEEP_EP_COMMIT c381dadf43a85062f6a8947592017ee513abc70b)
 set(NVSHMEM_URL_HASH
     SHA256=eb2c8fb3b7084c2db86bd9fd905387909f1dfd483e7b45f7b3c3d5fcf5374b5a)
 
@@ -43,9 +43,10 @@ if(DEFINED $ENV{GITHUB_MIRROR})
 else()
   set(GITHUB_URL "https://github.com")
 endif()
-FetchContent_Declare(
-  deep_ep_download
-  URL ${GITHUB_URL}/deepseek-ai/DeepEP/archive/${DEEP_EP_COMMIT}.tar.gz)
+set(DEEP_EP_URL
+    "${GITHUB_URL}/deepseek-ai/DeepEP/archive/${DEEP_EP_COMMIT}.tar.gz")
+message(STATUS "deep_ep DEEP_EP_URL: ${DEEP_EP_URL}")
+FetchContent_Declare(deep_ep_download URL ${DEEP_EP_URL})
 FetchContent_MakeAvailable(deep_ep_download)
 set(DEEP_EP_SOURCE_DIR ${deep_ep_download_SOURCE_DIR})
 
@@ -192,7 +193,7 @@ set_target_properties(
              BUILD_WITH_INSTALL_RPATH TRUE)
 target_compile_options(
   deep_ep_cpp_tllm
-  PRIVATE ${TORCH_CXX_FLAGS} -O3
+  PRIVATE ${TORCH_CXX_FLAGS} -O3 $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-O3>
           $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=--register-usage-level=10>)
 target_compile_definitions(deep_ep_cpp_tllm
                            PRIVATE TORCH_EXTENSION_NAME=deep_ep_cpp_tllm)
