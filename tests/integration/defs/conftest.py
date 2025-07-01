@@ -1943,6 +1943,8 @@ def get_device_memory():
             "nvidia-smi" + suffix, "--query-gpu=memory.total",
             "--format=csv,noheader"
         ])
+        # Try to get memory from nvidia-smi first, if failed, fallback to system memory from /proc/meminfo
+        # This fallback is needed for systems with unified memory (e.g. DGX Spark)
         try:
             output = check_output(cmd, shell=True, cwd=temp_dirname)
             memory_str = output.strip().split()[0]
