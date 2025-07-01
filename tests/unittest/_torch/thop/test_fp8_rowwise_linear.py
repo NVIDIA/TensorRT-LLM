@@ -6,6 +6,7 @@ from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 
+@skip_blackwell
 @skip_pre_hopper
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_fp8_rowwise_linear(dtype):
