@@ -3,8 +3,6 @@ name: Label Community PR
 on:
   pull_request:
     types: [opened]
-permissions:
-  pull-requests: write
 
 jobs:
   label_pr:
