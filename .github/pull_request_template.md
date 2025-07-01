@@ -38,7 +38,7 @@ See details below for each supported subcommand.
 
 <details>
 
-`run  [--disable-fail-fast --skip-test --stage-list "A10-1, xxx" --gpu-type "A30, H100_PCIe" --test-backend "pytorch, cpp" --add-multi-gpu-test --only-multi-gpu-test --disable-multi-gpu-test --post-merge --extra-stage --debug --detailed-log "H100_PCIe-[Post-Merge]-1, xxx"]`
+`run  [--disable-fail-fast --skip-test --stage-list "A10-PyTorch-1, xxx" --gpu-type "A30, H100_PCIe" --test-backend "pytorch, cpp" --add-multi-gpu-test --only-multi-gpu-test --disable-multi-gpu-test --post-merge --extra-stage --detailed-log "H100_PCIe-TensorRT-Post-Merge-1, xxx"]`
 
 Launch build/test pipelines. All previously running jobs will be killed.
 
@@ -46,7 +46,7 @@ Launch build/test pipelines. All previously running jobs will be killed.
 
 `--skip-test ` *(OPTIONAL)* : Skip all test stages, but still run build stages, package stages and sanity check stages. Note: Does **NOT** update GitHub check status.
 
-`--stage-list "A10-1, xxx"` *(OPTIONAL)* : Only run the specified test stages. Examples: "A10-1, xxx". Note: Does **NOT** update GitHub check status.
+`--stage-list "A10-PyTorch-1, xxx"` *(OPTIONAL)* : Only run the specified test stages. Examples: "A10-PyTorch-1, xxx". Note: Does **NOT** update GitHub check status.
 
 `--gpu-type "A30, H100_PCIe"` *(OPTIONAL)* : Only run the test stages on the specified GPU types. Examples: "A30, H100_PCIe". Note: Does **NOT** update GitHub check status.
 
@@ -56,13 +56,11 @@ Launch build/test pipelines. All previously running jobs will be killed.
 
 `--disable-multi-gpu-test ` *(OPTIONAL)* : Disable the multi-GPU tests. Note: Does **NOT** update GitHub check status.
 
-`--add-multi-gpu-test ` *(OPTIONAL)* : Force run the multi-GPU tests. Will also run L0 pre-merge pipeline.
+`--add-multi-gpu-test ` *(OPTIONAL)* : Force run the multi-GPU tests in addition to running L0 pre-merge pipeline.
 
 `--post-merge ` *(OPTIONAL)* : Run the L0 post-merge pipeline instead of the ordinary L0 pre-merge pipeline.
 
-`--extra-stage "H100_PCIe-[Post-Merge]-1, xxx"` *(OPTIONAL)* : Run the ordinary L0 pre-merge pipeline and specified test stages. Examples: --extra-stage "H100_PCIe-[Post-Merge]-1, xxx".
-
-`--debug ` *(OPTIONAL)* : Enable access to the Blossom container for debugging purpose. Specify exactly one stage in the `stage-list` parameter to access the appropriate container environment. Note: Does **NOT** update GitHub check status.
+`--extra-stage "H100_PCIe-TensorRT-Post-Merge-1, xxx"` *(OPTIONAL)* : Run the ordinary L0 pre-merge pipeline and specified test stages. Examples: --extra-stage "H100_PCIe-TensorRT-Post-Merge-1, xxx".
 
 `--detailed-log ` *(OPTIONAL)* : Enable flushing out all logs to the Jenkins console. This will significantly increase the log volume and may slow down the job.
 
