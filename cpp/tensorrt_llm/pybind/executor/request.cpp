@@ -857,7 +857,6 @@ void initRequestBindings(nanobind::module_& m)
         result.decodingIter = nb::cast<SizeType32>(state[10]);
         result.contextPhaseParams = nb::cast<std::optional<tle::ContextPhaseParams>>(state[11]);
         result.requestPerfMetrics = nb::cast<std::optional<tle::RequestPerfMetrics>>(state[12]);
-        return std::make_unique<tle::Result>(result);
     };
 
     auto resultGetstate = [](tle::Result const& self)
