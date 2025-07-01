@@ -27,6 +27,7 @@ class RPCRequest(NamedTuple):
     args: tuple
     kwargs: dict
     need_response: bool = True
+    timeout: float = 0.5
 
 
 class RPCResponse(NamedTuple):
@@ -176,15 +177,35 @@ class RPCServer:
             if req.method_name in self._functions:
                 try:
                     if self._executor is not None:
-                        # Dispatch to worker thread and await result
+                        # Dispatch to worker thread and await result with timeout
                         loop = asyncio.get_running_loop()
-                        result = await loop.run_in_executor(
-                            self._executor, self._functions[req.method_name],
-                            *req.args, **req.kwargs)
+
+                        # Create a wrapper function to handle keyword arguments
+                        def call_with_kwargs():
+                            return self._functions[req.method_name](
+                                *req.args, **req.kwargs)
+
+                        result = await asyncio.wait_for(loop.run_in_executor(
+                            self._executor, call_with_kwargs),
+                                                        timeout=req.timeout)
                     else:
-                        result = self._functions[req.method_name](*req.args,
-                                                                  **req.kwargs)
+                        # For synchronous execution, we need to run in executor to support timeout
+                        loop = asyncio.get_running_loop()
+
+                        # Create a wrapper function to handle keyword arguments
+                        def call_with_kwargs():
+                            return self._functions[req.method_name](
+                                *req.args, **req.kwargs)
+
+                        result = await asyncio.wait_for(loop.run_in_executor(
+                            None, call_with_kwargs),
+                                                        timeout=req.timeout)
                     response = RPCResponse(req.request_id, 'OK', result)
+                except asyncio.TimeoutError:
+                    response = RPCResponse(
+                        req.request_id, 'ERROR',
+                        f"Method '{req.method_name}' timed out after {req.timeout} seconds"
+                    )
                 except Exception:
                     tb = traceback.format_exc()
                     response = RPCResponse(req.request_id, 'ERROR', tb)
@@ -313,13 +334,33 @@ class RPCClient:
             self._reader_task = loop.create_task(self._response_reader())
 
     async def _call_async(self, name, *args, **kwargs):
-        """Async version of RPC call."""
+        """Async version of RPC call.
+        Args:
+            name: Method name to call
+            *args: Positional arguments
+            **kwargs: Keyword arguments
+            __rpc_timeout: The timeout (seconds) for the RPC call.
+            __rpc_need_response: Whether the RPC call needs a response.
+                If set to False, the remote call will return immediately.
+
+        Returns:
+            The result of the remote method call
+        """
+        logger.debug(
+            f"RPC client calling method: {name} with args: {args} and kwargs: {kwargs}"
+        )
         await self._start_reader_if_needed()
-        need_response = kwargs.pop("need_response", True)
+        need_response = kwargs.pop("__rpc_need_response", True)
+        timeout = kwargs.pop("__rpc_timeout", self._timeout)
 
         request_id = uuid.uuid4().hex
         logger.debug(f"RPC client sending request: {request_id}")
-        request = RPCRequest(request_id, name, args, kwargs, need_response)
+        request = RPCRequest(request_id,
+                             name,
+                             args,
+                             kwargs,
+                             need_response,
+                             timeout=timeout)
         logger.debug(f"RPC client sending request: {request}")
         await self._client_socket.put_async(request)
 
@@ -331,9 +372,12 @@ class RPCClient:
         self._pending_futures[request_id] = future
 
         try:
-            return await asyncio.wait_for(future, self._timeout)
+            # If timeout, the remote call should return a timeout error timely,
+            # so we add 1 second to the timeout to ensure the client can get
+            # that result.
+            return await asyncio.wait_for(future, timeout + 1)
         except asyncio.TimeoutError:
-            raise RPCError(f"Request '{name}' timed out after {self._timeout}s")
+            raise RPCTimeout(f"Request '{name}' timed out after {timeout}s")
         finally:
             self._pending_futures.pop(request_id, None)
 
@@ -356,7 +400,7 @@ class RPCClient:
         Example:
             result = await client.call_async('remote_method', arg1, arg2, key=value)
         """
-        return self._call_async(name, *args, **kwargs, need_response=True)
+        return self._call_async(name, *args, **kwargs, __rpc_need_response=True)
 
     def call_future(self, name: str, *args,
                     **kwargs) -> concurrent.futures.Future:
@@ -418,9 +462,7 @@ class RPCClient:
 
             def call_async(self, *args, **kwargs):
                 """Async call - returns coroutine"""
-                return self.client._call_async(self.method_name,
-                                               *args,
-                                               need_response=True,
+                return self.client._call_async(self.method_name, *args,
                                                **kwargs)
 
             def call_future(self, *args, **kwargs) -> concurrent.futures.Future:
