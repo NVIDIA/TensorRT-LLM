@@ -26,7 +26,6 @@
 
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
-#include "tensorrt_llm/batch_manager/dataTransceiverImpl.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -45,7 +44,6 @@
 #include <gmock/gmock.h>
 #include <memory>
 #include <random>
-#include <tensorrt_llm/batch_manager/dataTransceiverImpl.h>
 #include <tensorrt_llm/batch_manager/mlaCacheFormatter.h>
 #include <tensorrt_llm/executor/cache_transmission/cacheConcatenate.h>
 
@@ -85,13 +83,15 @@ class UcxCommTest : public ::testing::Test
 
 using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
 
+constexpr int REQUEST_SEND = 1;
+
 TEST_F(UcxCommTest, Basic)
 {
 
     try
     {
-        TransceiverTag::Id id1;
-        TransceiverTag::Id id2;
+        int id1;
+        int id2;
 
         auto connectionManager1 = makeOneUcxConnectionManager();
         EXPECT_NE(connectionManager1, nullptr);
@@ -105,7 +105,7 @@ TEST_F(UcxCommTest, Basic)
         auto connections1 = connectionManager2->getConnections(CommState1);
         ASSERT_EQ(connections1.size(), 1);
         auto connection1 = connections1[0];
-        id1 = TransceiverTag::Id::REQUEST_SEND;
+        id1 = REQUEST_SEND;
         connection1->send(DataContext{TransceiverTag::kID_TAG}, &id1, sizeof(id1));
 
         auto connection1Peer = connectionManager1->recvConnect(DataContext{TransceiverTag::kID_TAG}, &id2, sizeof(id2));
@@ -162,10 +162,10 @@ TEST_F(UcxCommTest, multiSend)
 {
     try
     {
-        TransceiverTag::Id id1;
-        TransceiverTag::Id id2;
-        TransceiverTag::Id id1Peer;
-        TransceiverTag::Id id2Peer;
+        int id1;
+        int id2;
+        int id1Peer;
+        int id2Peer;
 
         auto manager1 = makeOneUcxConnectionManager();
         auto manager2 = makeOneUcxConnectionManager();
@@ -173,8 +173,8 @@ TEST_F(UcxCommTest, multiSend)
 
         auto connection1 = managerRecv->getConnections(manager1->getCommState())[0];
         auto connection2 = managerRecv->getConnections(manager2->getCommState())[0];
-        id1 = TransceiverTag::Id::REQUEST_SEND;
-        id2 = TransceiverTag::Id::REQUEST_SEND;
+        id1 = REQUEST_SEND;
+        id2 = REQUEST_SEND;
         connection1->send(DataContext{TransceiverTag::kID_TAG}, &id1, sizeof(id1));
         connection2->send(DataContext{TransceiverTag::kID_TAG}, &id2, sizeof(id2));
         auto connection1Peer = manager1->recvConnect(DataContext{TransceiverTag::kID_TAG}, &id1Peer, sizeof(id1Peer));
@@ -240,8 +240,8 @@ TEST_F(UcxCommTest, CommCache)
 
     try
     {
-        TransceiverTag::Id id1;
-        TransceiverTag::Id id2;
+        int id1;
+        int id2;
 
         auto connectionManager1 = makeOneUcxConnectionManager();
         EXPECT_NE(connectionManager1, nullptr);
@@ -255,14 +255,14 @@ TEST_F(UcxCommTest, CommCache)
         auto connections1 = connectionManager2->getConnections(CommState1);
         ASSERT_EQ(connections1.size(), 1);
         auto connection1 = connections1[0];
-        id1 = TransceiverTag::Id::REQUEST_SEND;
+        id1 = REQUEST_SEND;
         connection1->send(DataContext{TransceiverTag::kID_TAG}, &id1, sizeof(id1));
 
         auto connection1Peer = connectionManager1->recvConnect(DataContext{TransceiverTag::kID_TAG}, &id2, sizeof(id2));
         ASSERT_EQ(id2, id1);
         auto connection1Cached = connectionManager2->getConnections(CommState1)[0];
         ASSERT_EQ(connection1Cached, connection1);
-        id1 = TransceiverTag::Id::REQUEST_SEND;
+        id1 = REQUEST_SEND;
         connection1Cached->send(DataContext{TransceiverTag::kID_TAG}, &id1, sizeof(id1));
 
         auto connection1PeerCached
