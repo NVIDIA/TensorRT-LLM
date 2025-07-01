@@ -341,6 +341,7 @@ class PyTorchModelEngine(ModelEngine):
 
     def __init__(
         self,
+        *,
         model_path: str,
         pytorch_backend_config: PyTorchConfig,
         batch_size: int = 8,
