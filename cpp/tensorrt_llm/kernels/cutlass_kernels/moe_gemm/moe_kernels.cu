@@ -1441,8 +1441,6 @@ __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_inp
     constexpr bool need_fp4_quant = false;
 #endif
 
-    // static_assert(need_fp4_quant || std::is_same_v<InputActivationsType, ExpandedActivationsType>,
-    //     "Only FP4 quantization supports outputting a different format as part of the expansion");
     static_assert(need_fp4_quant || PRE_QUANT_AWQ || std::is_same_v<InputActivationsType, ExpandedActivationsType>,
         "Only FP4 and WINT4_AFP8 supports outputting a different format as part of the expansion");
 
@@ -1508,10 +1506,6 @@ __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_inp
         }
         else if constexpr (PRE_QUANT_AWQ)
         {
-            // if (threadIdx.x == 0 && blockIdx.x == 0)
-            // {
-            //     printf("PRE_QUANT_AWQ\n");
-            // }
             using InputElem = cutlass::Array<InputActivationsType, ELEM_PER_THREAD>;
             using OutputElem_ = cutlass::Array<ExpandedActivationsType, ELEM_PER_THREAD>;
             using OutputElem_AWQ = std::conditional_t<is_fp4, uint32_t, OutputElem_>;
