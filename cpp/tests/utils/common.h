@@ -187,9 +187,8 @@ public:
         tr::BufferManager& manager, executor::OutputConfig const& outConfig, ModelIds const& modelIds);
 
     void verifyOutput(std::unordered_map<SizeType32, std::vector<executor::BeamTokens>> const& resultTokens,
-        std::vector<SizeType32> const& givenInputLengths, SizeType32 nbGivenInputs, bool streaming,
-        bool excludeInputFromOutput, FlakyTestInfo flakyTestInfo, bool isSpeculativeDecoding,
-        bool returnAllGeneratedTokens, SizeType32 reqBeamWidth, SizeType32 numReturnSequences,
+        std::vector<SizeType32> const& givenInputLengths, bool streaming, bool excludeInputFromOutput,
+        FlakyTestInfo flakyTestInfo, bool isSpeculativeDecoding, SizeType32 reqBeamWidth, SizeType32 numReturnSequences,
         bool isNonGreedySampling);
 
     void verifyLogProbs(bool computeLogProbs, bool streaming, bool excludeInputFromOutput, SizeType32 inputLength,

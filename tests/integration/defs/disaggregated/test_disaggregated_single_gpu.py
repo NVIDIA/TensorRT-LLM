@@ -11,7 +11,7 @@ from mpi4py.futures import MPIPoolExecutor
 
 from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams
 from tensorrt_llm._utils import set_mpi_comm
-from tensorrt_llm.llmapi import KvCacheConfig, MpiCommSession
+from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MpiCommSession
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(
@@ -108,15 +108,17 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
 
     # Context worker
     worker_pytorch_configs.append(
-        dict(disable_overlap_scheduler=True,
-             kv_cache_dtype="auto",
-             use_cuda_graph=enable_cuda_graph))
+        dict(
+            disable_overlap_scheduler=True,
+            kv_cache_dtype="auto",
+            cuda_graph_config=CudaGraphConfig() if enable_cuda_graph else None))
 
     # Generation worker
     worker_pytorch_configs.append(
-        dict(disable_overlap_scheduler=not generation_overlap,
-             kv_cache_dtype="auto",
-             use_cuda_graph=enable_cuda_graph))
+        dict(
+            disable_overlap_scheduler=not generation_overlap,
+            kv_cache_dtype="auto",
+            cuda_graph_config=CudaGraphConfig() if enable_cuda_graph else None))
 
     kv_cache_configs = [KvCacheConfig(max_tokens=2048 * 8) for _ in range(2)]
     model_names = [model_path(model) for _ in range(2)]
@@ -229,15 +231,17 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
 
     # Context worker
     worker_pytorch_configs.append(
-        dict(disable_overlap_scheduler=True,
-             kv_cache_dtype="auto",
-             use_cuda_graph=enable_cuda_graph))
+        dict(
+            disable_overlap_scheduler=True,
+            kv_cache_dtype="auto",
+            cuda_graph_config=CudaGraphConfig() if enable_cuda_graph else None))
 
     # Generation worker
     worker_pytorch_configs.append(
-        dict(disable_overlap_scheduler=not generation_overlap,
-             kv_cache_dtype="auto",
-             use_cuda_graph=enable_cuda_graph))
+        dict(
+            disable_overlap_scheduler=not generation_overlap,
+            kv_cache_dtype="auto",
+            cuda_graph_config=CudaGraphConfig() if enable_cuda_graph else None))
 
     kv_cache_configs = [
         KvCacheConfig(max_tokens=128, enable_block_reuse=False)

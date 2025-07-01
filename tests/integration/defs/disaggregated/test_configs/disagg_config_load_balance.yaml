@@ -16,7 +16,6 @@ context_servers:
   kv_cache_config:
     free_gpu_memory_fraction: 0.15
     enable_partial_reuse: False
-  use_cuda_graph: False
   disable_overlap_scheduler: True
   urls:
       - "localhost:8001"
@@ -34,7 +33,6 @@ generation_servers:
   kv_cache_config:
     free_gpu_memory_fraction: 0.15
     enable_partial_reuse: False
-  use_cuda_graph: False
   disable_overlap_scheduler: False
   urls:
       - "localhost:8003"

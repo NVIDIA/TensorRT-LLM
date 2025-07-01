@@ -34,6 +34,8 @@ public:
     using TensorConstPtr = ITensor::SharedConstPtr;
     using TensorPtr = ITensor::SharedPtr;
 
+    DecodingInput() = default;
+
     DecodingInput(SizeType32 maxLength, SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 batchSize,
         TensorConstPtr logits, TensorPtr endIds, TensorConstPtr batchSlots)
         : step{maxLength}
@@ -41,8 +43,6 @@ public:
         , maxAttentionWindow{maxAttentionWindow}
         , sinkTokenLength{sinkTokenLength}
         , batchSize{batchSize}
-        , maxStopWordsLen{0}
-        , maxBadWordsLen{0}
         , logits{std::move(logits)}
         , endIds{std::move(endIds)}
         , batchSlots{std::move(batchSlots)}
@@ -53,21 +53,21 @@ public:
 
     //! Mandatory parameters
     //! The index of the decoding step we are on. Only used in Python runtime
-    SizeType32 step;
+    SizeType32 step{};
     //! The maximum number of tokens to decode
-    SizeType32 maxLength;
+    SizeType32 maxLength{};
     //! The maximum length of the attention window to consider while decoding
-    SizeType32 maxAttentionWindow;
+    SizeType32 maxAttentionWindow{};
     //! The number of tokens to use as attention sinks, https://arxiv.org/html/2309.17453v3
-    SizeType32 sinkTokenLength;
+    SizeType32 sinkTokenLength{};
     //! The number of samples in the batch
-    SizeType32 batchSize;
+    SizeType32 batchSize{};
     //! The beam widths of each request, [batchSize]
     std::vector<SizeType32> beamWidths;
     //! The maximum value in the `stopWordsLens` tensor
-    SizeType32 maxStopWordsLen;
+    SizeType32 maxStopWordsLen{};
     //! The maximum value in the `badWordsLens` tensor
-    SizeType32 maxBadWordsLen;
+    SizeType32 maxBadWordsLen{};
     //! The output of the model forward computation, a probability distribution over the vocabulary
     //! [batchSize, beamWidth, vocabSizePadded] on gpu
     TensorConstPtr logits;

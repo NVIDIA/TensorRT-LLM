@@ -3,7 +3,6 @@ hostname: localhost
 port: 8000
 backend: "pytorch"
 free_gpu_memory_fraction: 0.1
-use_cuda_graph: False
 disable_overlap_scheduler: True
 autotuner_enabled: False
 context_servers:

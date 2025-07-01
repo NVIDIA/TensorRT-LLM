@@ -1,8 +1,7 @@
 import os
 from pathlib import Path
 
-from tensorrt_llm import SamplingParams
-from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm import LLM, SamplingParams
 
 if __name__ == '__main__':
     prompts = [

@@ -518,14 +518,11 @@ def stress_test(config,
 
         if config.backend == "pytorch":
             extra_llm_options.update({
-                "use_cuda_graph":
-                True,
-                "cuda_graph_padding_enabled":
-                True,
-                "cuda_graph_batch_sizes":
-                [1, 2, 4, 8, 16, 32, 64, 128, 256, 384],
-                "print_iter_log":
-                True,
+                "cuda_graph_config": {
+                    "padding_enabled": True,
+                    "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128, 256, 384],
+                },
+                "print_iter_log": True,
             })
 
     with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml',

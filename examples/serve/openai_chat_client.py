@@ -1,4 +1,4 @@
-### OpenAI Chat Client
+### :title OpenAI Chat Client
 
 from openai import OpenAI
 

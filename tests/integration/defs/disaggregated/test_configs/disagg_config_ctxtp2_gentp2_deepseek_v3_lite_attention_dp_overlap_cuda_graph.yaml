@@ -8,7 +8,6 @@ context_servers:
   tensor_parallel_size: 2
   pipeline_parallel_size: 1
   enable_attention_dp: true
-  use_cuda_graph: False
   disable_overlap_scheduler: True
   urls:
       - "localhost:8001"
@@ -17,7 +16,8 @@ generation_servers:
   tensor_parallel_size: 2
   pipeline_parallel_size: 1
   enable_attention_dp: true
-  use_cuda_graph: True
+  cuda_graph_config:
+    padding_enabled: False
   disable_overlap_scheduler: False
   urls:
       - "localhost:8002"

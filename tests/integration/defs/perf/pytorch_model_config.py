@@ -29,8 +29,9 @@ def get_model_yaml_config(model_label: str,
         """
     base_config = {
         'print_iter_log': True,
-        'use_cuda_graph': True,
-        'cuda_graph_padding_enabled': True,
+        'cuda_graph_config': {
+            'padding_enabled': True,
+        },
     }
     if 'kv_cache_dtype' in model_label:
         base_config.update({
@@ -49,7 +50,7 @@ def get_model_yaml_config(model_label: str,
             ],
             'config': {
                 'enable_attention_dp': True,
-                'use_cuda_graph': True,
+                'cuda_graph_config': {},
                 'speculative_config': {
                     'decoding_type': 'MTP',
                     'num_nextn_predict_layers': 3
@@ -84,9 +85,10 @@ def get_model_yaml_config(model_label: str,
             'deepseek_v3_lite_nvfp4-bench-pytorch-streaming-float4-maxbs:2048-maxnt:8192-input_output_len:256,256-reqs:200',
             'config': {
                 'print_iter_log': True,
-                'use_cuda_graph': True,
-                'cuda_graph_padding_enabled': True,
-                'cuda_graph_batch_sizes': [1, 512, 1024, 2048]
+                'cuda_graph_config': {
+                    'padding_enabled': True,
+                    'batch_sizes': [1, 512, 1024, 2048]
+                }
             }
         },
         # Llama Nemotron models with attention_dp disabled to prevent hangs
