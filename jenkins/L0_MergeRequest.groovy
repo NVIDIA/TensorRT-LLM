@@ -361,11 +361,12 @@ def getMergeRequestOneFileChangesGitlab(pipeline, filePath) {
                 returnStdout: true
             )
             def rawDataList = readJSON text: rawDataJson, returnPojo: true
-            rawDataList.each { rawData ->
+            def found = rawDataList.find { rawData ->
                 if (rawData.get("new_path") == filePath || rawData.get("old_path") == filePath) {
                     diff = rawData.get("diff")
-                    return true  // This will break the each loop
+                    return true
                 }
+                return false
             }
             if (!rawDataList || diff != "") { break }
         }
@@ -394,15 +395,12 @@ def getMergeRequestOneFileChangesGithub(pipeline, githubPrApiUrl, filePath) {
             )
             echo "rawDataJson: ${rawDataJson}"
             def rawDataList = readJSON text: rawDataJson, returnPojo: true
-            rawDataList.each { rawData ->
-                try {
-                    if (rawData.get("filename") == filePath || rawData.get("previous_filename") == filePath) {
-                        diff = rawData.get("patch")
-                        return true  // This will break the each loop
-                    }
-                } catch (Exception e) {
-                    echo "Error processing rawData: ${e.message}"
+            def found = rawDataList.find { rawData ->
+                if (rawData.get("filename") == filePath || rawData.get("previous_filename") == filePath) {
+                    diff = rawData.get("patch")
+                    return true
                 }
+                return false
             }
             if (!rawDataList || diff != "") { break }
         }

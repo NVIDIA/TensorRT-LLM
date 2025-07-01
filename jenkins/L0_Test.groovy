@@ -1267,11 +1267,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def waivesTxt = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/waive_list/waives.txt"
         try {
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${waivesTxt}")
-            echo "Download merged waives.txt successfully"
             if (fileExists("waives.txt")) {
                 sh "rm ${llmSrc}/tests/integration/test_lists/waives.txt"
                 sh "mv waives.txt ${llmSrc}/tests/integration/test_lists/waives.txt"
             }
+            echo "Download merged waives.txt successfully"
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
