@@ -50,7 +50,8 @@ def get_spec_metadata(spec_config,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
         )
-    if spec_config.spec_dec_mode.is_ngram():
+    if spec_config.spec_dec_mode.is_ngram(
+    ) or spec_config.spec_dec_mode.is_user_provided():
         return SpecMetadata(
             max_draft_tokens=spec_config.max_draft_tokens,
             spec_dec_mode=spec_config.spec_dec_mode,
@@ -59,7 +60,9 @@ def get_spec_metadata(spec_config,
     return None
 
 
-def get_spec_resource_manager(model_engine, draft_model_engine=None):
+def get_spec_resource_manager(model_engine,
+                              draft_model_engine=None,
+                              drafter=None):
     spec_config = model_engine.spec_config
     if spec_config is None:
         return None
@@ -95,8 +98,9 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             max_seq_len,
             max_num_tokens,
         )
-    if spec_dec_mode.is_ngram():
-        return NGramPoolManager(spec_config, max_num_requests)
+    if spec_dec_mode.is_ngram() or spec_dec_mode.is_user_provided():
+        assert drafter is not None, "Drafter is required for ngram or user provided speculative decoding."
+        return drafter.spec_resource_manager
     return None
 
 
@@ -113,12 +117,16 @@ def get_spec_decoder(sampler_args: TorchSampler.Args, spec_config: SpecConfig):
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 
 
-def get_spec_drafter(model_engine, spec_resource_manager=None):
+def get_spec_drafter(model_engine):
     spec_config = model_engine.spec_config
+    max_num_requests = model_engine.batch_size
     if spec_config is None:
         return None
     if spec_config.spec_dec_mode.is_ngram():
-        return NGramDrafter(spec_config, spec_resource_manager)
+        return NGramDrafter(spec_config,
+                            NGramPoolManager(spec_config, max_num_requests))
+    if spec_config.spec_dec_mode.is_user_provided():
+        return spec_config.drafter
     return None
 
 
