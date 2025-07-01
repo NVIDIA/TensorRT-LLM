@@ -335,6 +335,12 @@ class Eagle3OneModelWorker(nn.Module):
         next_draft_tokens = []
         for i in range(self.max_draft_tokens):
             hidden_states, hidden_states_to_save = draft_model.model(**inputs)
+
+            # FIXME (jhaotingc): Currently we disable use_spec_decoding mode for Eagle engine nth steps except 1st step.
+            # Eagle engine takes in draft_len tokens from the previous step, run spec-dec mode with those tokens,
+            # then the following step can use regular decoding mode to generate 1 tokens per step.
+            # Currently the spec-dec mask for chained tree is not implemented yet.
+            # When token tree is supported, this can be removed and all steps may use spec-dec mode as well.
             attn_metadata.use_spec_decoding = False
             if i == 0:
                 start_ids_gen = (spec_metadata.batch_indices_cuda[:num_gens] *
