@@ -319,8 +319,8 @@ def create_py_executor(
 
     if executor_config.enable_chunked_context:
         chunk_unit_size = executor_config.tokens_per_block
-        if (max_seq_len
-                > min(executor_config.kv_cache_config.max_attention_window)):
+        max_attention_window = executor_config.kv_cache_config.max_attention_window
+        if max_attention_window and max_seq_len > min(max_attention_window):
             # maxKvStepSizeInFmha = 256
             chunk_unit_size = max(256, chunk_unit_size)
             logger.info(
