@@ -93,13 +93,27 @@ Developer workflow for code contributions is as follows:
 3. Once the code changes are staged on the fork and ready for review, a [Pull Request](https://help.github.com/en/articles/about-pull-requests) (PR) can be [requested](https://help.github.com/en/articles/creating-a-pull-request) to merge the changes from a branch of the fork into a selected branch of upstream. PRs should typically target the `main` branch.
   * Creation of a PR creation kicks off the code review process.
   * At least one TensorRT-LLM engineer will be assigned for the review. When the PR is under review, the label `Pending Review` will be added to the PR.
-  * Reviewers are automatically requested based on the modules affected in the PR. Module paths are defined in `.github/module-paths.json` and ownership in `.github/workflows/module-owners.json`.
-  * You can test the assignment script locally with the `--dry-run` flag:
-    ```bash
-    GH_TOKEN=<token> BASE_SHA=<base> HEAD_SHA=<head> PR_NUMBER=<pr> \
-      PR_AUTHOR=<username> \
-      python3 .github/scripts/assign_reviewers.py --dry-run
-    ```
+
+### Automatic Reviewer Assignment
+
+Reviewers are automatically assigned to PRs through a GitHub Action that:
+
+* **Triggers**: Runs automatically when PRs are opened, synchronized, or reopened
+* **Module-based assignment**: Maps changed files to modules using `.github/module-paths.json` and assigns reviewers based on module ownership defined in `.github/workflows/module-owners.json`
+* **Respects existing assignments**: Won't assign additional reviewers if any reviewers are already assigned (unless forced)
+* **Excludes PR author**: Automatically excludes the PR author from reviewer assignments
+* **Limits reviewer count**: Randomly samples up to 3 reviewers if more are eligible (configurable via `REVIEWER_LIMIT`)
+* **Coexists with CODEOWNERS**: Works alongside GitHub's CODEOWNERS file (`.github/CODEOWNERS`) which enforces mandatory approvals for specific paths (e.g., API stability tests, release branches)
+
+The auto-assignment system analyzes all files changed in your PR, maps them to the appropriate code modules, and assigns reviewers from the module owner lists. This ensures domain experts review relevant changes while avoiding over-assignment.
+
+**Testing the assignment locally**: You can test reviewer assignment with the `--dry-run` flag:
+  ```bash
+  GH_TOKEN=<token> PR_NUMBER=<pr> PR_AUTHOR=<username> \
+    python3 .github/scripts/assign_reviewers.py --dry-run
+  ```
+
+**Manual assignment**: You can also manually trigger reviewer assignment via GitHub's workflow dispatch with options for dry-run mode and force-assignment.
   * If changes are requested, then the reviewer will add the label `Changes Requested` to the PR.
   * Once changes are approved, CI will be launched to validate the change. When CI passes, the reviewer will merge the PR.
   * If CI reports any failures, it's up to the requester to fix any CI failures before requesting another review.
