@@ -164,6 +164,7 @@ def llama_7b_multi_lora_test_harness(**llm_kwargs) -> None:
     # (2) provide a lora_dir to infer the lora_target_modules.
     lora_config = LoraConfig(lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
                              max_lora_rank=8)
+
     llm = LLM(hf_model_dir, lora_config=lora_config, **llm_kwargs)
 
     prompts = [

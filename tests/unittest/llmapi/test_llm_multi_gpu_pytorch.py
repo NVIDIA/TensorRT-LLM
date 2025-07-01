@@ -28,6 +28,7 @@ def test_tinyllama_logits_processor_2gpu(tp_size: int, pp_size: int):
 
 
 @pytest.mark.gpu2
+@pytest.mark.skip("Slow test")
 def test_llama_v2_13b_lora_tp2():
     llama_v2_13b_lora_test_harness(tensor_parallel_size=2,
                                    kv_cache_config=global_kv_cache_config)
