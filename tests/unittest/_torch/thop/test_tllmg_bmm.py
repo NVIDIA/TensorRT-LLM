@@ -419,6 +419,8 @@ class TestFP8BatchedGemmTRTLLMGen:
             c_actual, c_dq_sf = torch.ops.trtllm.fp8_batched_gemm_trtllmgen(
                 a_fp8.contiguous(),
                 b_fp8.contiguous(),
+                tile_size=tile_size,
+                epilogue_tile_m=epilogue_tile_m,
                 use_deep_seek_fp8=use_deep_seek_fp8,
                 low_latency=low_latency,
                 out_dtype=dtype_c,
