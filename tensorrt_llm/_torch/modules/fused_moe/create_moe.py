@@ -68,6 +68,8 @@ def create_moe(
     bias: bool = False,
     apply_router_weight_on_input: bool = False,
     layer_idx: Optional[int] = None,
+    swiglu_alpha: Optional[torch.Tensor] = None,
+    swiglu_beta: Optional[torch.Tensor] = None,
 ) -> MoE:
     moe_cls = get_moe_cls(model_config, routing_method, dtype,
                           override_quant_config)
@@ -79,6 +81,12 @@ def create_moe(
     if bias:
         assert moe_cls in [CutlassFusedMoE, TritonFusedMoE
                            ], f"bias not supported in {moe_cls.__name__}."
+
+    if swiglu_alpha is not None or swiglu_beta is not None:
+        assert moe_cls in [TritonFusedMoE], \
+            f"swiglu_alpha and swiglu_beta are only supported in TritonFusedMoE, not in {moe_cls.__name__}."
+        assert swiglu_alpha is not None and swiglu_beta is not None, \
+            "Both swiglu_alpha and swiglu_beta must be provided."
 
     if moe_cls == TRTLLMGenFusedMoE:
         assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in TRTLLMGenFusedMoE."
@@ -180,6 +188,8 @@ def create_moe(
             weight_loading_mode=weight_loading_mode,
             bias=bias,
             layer_idx=layer_idx,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
         )
     else:
         raise ValueError(f"Unsupported moe backend: {moe_cls}")
