@@ -117,7 +117,7 @@ endif()
 include(ExternalProject)
 ExternalProject_Add(
   nvshmem_project
-  URL https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/source/nvshmem_src_3.2.5-1.txz
+  URL file://${CMAKE_CURRENT_SOURCE_DIR}/nvshmem_src_3.2.5-1.txz
   URL_HASH ${NVSHMEM_URL_HASH}
   PATCH_COMMAND patch -p1 --forward --batch -i
                 ${CMAKE_CURRENT_BINARY_DIR}/nvshmem.patch
