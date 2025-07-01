@@ -621,35 +621,37 @@ class TRTLLMSampler(Sampler):
                      model_outputs) -> SampleStateTRTLLM:
 
         batch_size = scheduled_requests.batch_size
-        all_requests = scheduled_requests.all_requests()
-        beam_width = self.beam_width(all_requests)
+        beam_width = self.beam_width(scheduled_requests.all_requests())
         if (batch_size > 1 and beam_width > 1
                 and any(request.py_return_log_probs
                         for request in all_requests)):
             raise ValueError(
                 "Beam search is not supported for multiple prompts and logprobs"
             )
+
         self.setup_sampler_step(scheduled_requests.context_requests)
-        
+
         num_context_logits_prefix_sum = [0]
         prefix_sum = 0
         for request in scheduled_requests.context_requests:
             prefix_sum += request.context_chunk_size if request.py_return_context_logits else 1
             num_context_logits_prefix_sum.append(prefix_sum)
-        
-        if any(r.py_return_context_logits or r.py_return_generation_logits for r in scheduled_requests.all_requests):
-            self.algs.handle_logits(
-                scheduled_requests.context_requests, scheduled_requests.generation_requests,
-                model_outputs["logits"], num_context_logits_prefix_sum, self.max_num_sequences, beam_width)
-            
+
+        if any(r.py_return_context_logits or r.py_return_generation_logits
+               for r in scheduled_requests.all_requests()):
+            self.algs.handle_logits(scheduled_requests.context_requests,
+                                    scheduled_requests.generation_requests,
+                                    model_outputs["logits"],
+                                    num_context_logits_prefix_sum,
+                                    self.max_num_sequences, beam_width)
+
         # For beam search, cache indirection needs to be updated
         if (beam_width > 1):
             self._update_cache_indirection_buffer(scheduled_requests)
 
         decoding_input = self.algs.make_decoding_batch_input_output(
-            scheduled_requests, model_outputs["logits"],
-            self.store["decoder_input_buffers"], self.store["decoder_state"],
-            self.model_config, self.max_num_sequences, beam_width, num_context_logits_prefix_sum)
+            scheduled_requests, model_outputs["logits"], beam_width,
+            num_context_logits_prefix_sum)
 
         self.algs.decoder.forward_async(self.store["decoder_state"],
                                         decoding_input)
@@ -698,7 +700,7 @@ class TRTLLMSampler(Sampler):
         if state.sampler_event:
             state.sampler_event.synchronize()
 
-        beam_width = self.beam_width(state.scheduled_requests.all_requests)
+        beam_width = self.beam_width(state.scheduled_requests.all_requests())
 
         if beam_width == 1 and self.MAX_DECODING_TOKENS == 1:
             self.update_requests_single_beam_single_step(state)
@@ -713,11 +715,13 @@ class TRTLLMSampler(Sampler):
         sequence_lengths_host_data = state.host.sequence_lengths.flatten(
         ).tolist()
         finish_reasons = state.host.finish_reasons.flatten().tolist()
-        log_probs_host = state.host.log_probs.tolist()
-        cum_log_probs_host = state.host.cum_log_probs.tolist()
+        log_probs_host = state.host.log_probs.tolist(
+        ) if state.host.log_probs is not None else None
+        cum_log_probs_host = state.host.cum_log_probs.tolist(
+        ) if state.host.cum_log_probs is not None else None
 
         reqs = [
-            r for r in state.scheduled_requests.all_requests
+            r for r in state.scheduled_requests.all_requests()
             if not r.is_generation_complete_state
         ]
         reqs_with_new_tokens = [
