@@ -179,7 +179,6 @@ private:
 
 TYPED_TEST_SUITE(RoutingRenormalizeKernelTest, FloatAndBf16Types);
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 TYPED_TEST(RoutingRenormalizeKernelTest, ClusterLevelParallelization)
 {
     RoutingKernelTestParam param(RoutingMethodType::Renormalize, /*numTokens=*/10,
@@ -187,7 +186,7 @@ TYPED_TEST(RoutingRenormalizeKernelTest, ClusterLevelParallelization)
         /*expertParallelization=*/1, /*expertParallelizationId=*/0,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true,
-        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f);
+        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
     this->runTest(param);
 };
 
@@ -198,7 +197,7 @@ TYPED_TEST(RoutingRenormalizeKernelTest, ClusterLevelParallelizationWithExpertPa
         /*expertParallelization=*/2, /*expertParallelizationId=*/1,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true,
-        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f);
+        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
     this->runTest(param);
 };
 
@@ -209,10 +208,9 @@ TYPED_TEST(RoutingRenormalizeKernelTest, ClusterLevelParallelizationWithRenormal
         /*expertParallelization=*/1, /*expertParallelizationId=*/0,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true,
-        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f);
+        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
     this->runTest(param);
 };
-#endif
 
 TYPED_TEST(RoutingRenormalizeKernelTest, DeviceLevelParallelization)
 {
@@ -221,7 +219,7 @@ TYPED_TEST(RoutingRenormalizeKernelTest, DeviceLevelParallelization)
         /*expertParallelization=*/1, /*expertParallelizationId=*/0,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true,
-        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f);
+        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 8);
     this->runTest(param);
 };
 
