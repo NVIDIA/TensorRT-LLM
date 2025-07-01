@@ -3421,8 +3421,11 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
             }
         }
 
-        // auto gemm1_input = applyPrequantScale(smoothed_act_, permuted_data_, quant_params.groupwise.fc1.act_scales,
-        //     num_valid_tokens_ptr, expanded_num_rows, hidden_size, use_awq, stream);
+        if constexpr (!use_w4afp8)
+        {
+            gemm1_input = applyPrequantScale(smoothed_act_, permuted_data_, quant_params.groupwise.fc1.act_scales,
+                num_valid_tokens_ptr, expanded_num_rows, hidden_size, use_awq, stream);
+        }
         sync_check_cuda_error(stream);
         Self::gemm1(moe_gemm_runner_, blockscale_gemm_runner, gemm1_input, fc1_result_, glu_inter_result_,
             expert_first_token_offset_, gemm1_tma_ws_input, fc1_expert_weights, fc1_expert_biases, num_valid_tokens_ptr,
