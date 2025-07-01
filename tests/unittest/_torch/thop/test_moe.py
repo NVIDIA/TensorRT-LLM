@@ -1431,8 +1431,11 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
 )
 @pytest.mark.parametrize("dtype_activation", ["mxfp8", "bf16"])
 @pytest.mark.parametrize("act_type", [ActType.Silu, ActType.Swish])
+@pytest.mark.parametrize("use_autotune", [True, False],
+                         ids=["autotune", "no_autotune"])
 def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
-                            routing_info, dtype_activation, act_type):
+                            routing_info, dtype_activation, act_type,
+                            use_autotune):
     torch.random.manual_seed(0)
 
     #
@@ -1652,33 +1655,35 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
     # Run the TRT-LLM kernel
     #
     if is_mx_fp8:
-        output = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
-            expert_logits, routing_bias,
-            hidden_states_mxe4m3.cuda().view(torch.float8_e4m3fn),
-            hidden_states_scale_linear_mxe4m3.cuda(),
-            gemm1_weights_mxe2m1_shuffled.cuda(),
-            gemm1_scales_mxe2m1_shuffled.cuda(), gemm1_bias_shuffled.cuda(),
-            gemm1_alpha.cuda() if act_type is not ActType.Silu else None,
-            gemm1_beta.cuda() if act_type is not ActType.Silu else None,
-            gemm2_weights_mxe2m1_shuffled.cuda(),
-            gemm2_scales_mxe2m1_shuffled.cuda(), gemm2_bias_shuffled.cuda(),
-            output1_scales_scalar.cuda(), output1_scales_gate_scalar.cuda(),
-            output2_scales_scalar.cuda(), num_experts, top_k, n_groups,
-            top_k_groups, intermediate_size, 0, num_experts, routed_scaling,
-            tile_tokens_dim, routing_method_type, act_type.value)
+        with autotune(use_autotune):
+            output = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
+                expert_logits, routing_bias,
+                hidden_states_mxe4m3.cuda().view(torch.float8_e4m3fn),
+                hidden_states_scale_linear_mxe4m3.cuda(),
+                gemm1_weights_mxe2m1_shuffled.cuda(),
+                gemm1_scales_mxe2m1_shuffled.cuda(), gemm1_bias_shuffled.cuda(),
+                gemm1_alpha.cuda() if act_type is not ActType.Silu else None,
+                gemm1_beta.cuda() if act_type is not ActType.Silu else None,
+                gemm2_weights_mxe2m1_shuffled.cuda(),
+                gemm2_scales_mxe2m1_shuffled.cuda(), gemm2_bias_shuffled.cuda(),
+                output1_scales_scalar.cuda(), output1_scales_gate_scalar.cuda(),
+                output2_scales_scalar.cuda(), num_experts, top_k, n_groups,
+                top_k_groups, intermediate_size, 0, num_experts, routed_scaling,
+                tile_tokens_dim, routing_method_type, act_type.value)
     else:
-        output = torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
-            expert_logits, routing_bias,
-            hidden_states.cuda().to(torch.bfloat16),
-            gemm1_weights_mxe2m1_shuffled.cuda(),
-            gemm1_scales_mxe2m1_shuffled.cuda(), gemm1_bias_shuffled.cuda(),
-            gemm1_alpha.cuda() if act_type is not ActType.Silu else None,
-            gemm1_beta.cuda() if act_type is not ActType.Silu else None,
-            gemm2_weights_mxe2m1_shuffled.cuda(),
-            gemm2_scales_mxe2m1_shuffled.cuda(), gemm2_bias_shuffled.cuda(),
-            num_experts, top_k, n_groups, top_k_groups, intermediate_size, 0,
-            num_experts, routed_scaling, tile_tokens_dim, routing_method_type,
-            act_type.value)
+        with autotune(use_autotune):
+            output = torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
+                expert_logits, routing_bias,
+                hidden_states.cuda().to(torch.bfloat16),
+                gemm1_weights_mxe2m1_shuffled.cuda(),
+                gemm1_scales_mxe2m1_shuffled.cuda(), gemm1_bias_shuffled.cuda(),
+                gemm1_alpha.cuda() if act_type is not ActType.Silu else None,
+                gemm1_beta.cuda() if act_type is not ActType.Silu else None,
+                gemm2_weights_mxe2m1_shuffled.cuda(),
+                gemm2_scales_mxe2m1_shuffled.cuda(), gemm2_bias_shuffled.cuda(),
+                num_experts, top_k, n_groups, top_k_groups, intermediate_size,
+                0, num_experts, routed_scaling, tile_tokens_dim,
+                routing_method_type, act_type.value)
 
     output_dequant_actual = output.to(torch.float)
     percent = 0.8 if is_mx_fp8 else 0.85
