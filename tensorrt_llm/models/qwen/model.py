@@ -21,7 +21,7 @@ import torch
 from tqdm import tqdm
 
 from ..._utils import pad_vocab_size
-from ...functional import Tensor, recv, send
+from ...functional import Tensor, recv, send, LayerNormType
 from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, GatedMLP, RmsNorm, SharedMoE)
 from ...layers.moe import MOEWeightWrapper
@@ -37,6 +37,9 @@ from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
 from .config import QWenConfig
 from .convert import (load_hf_qwen, load_weights_from_hf_gptq_model,
                       load_weights_from_hf_model)
+
+
+# QWenAttention은 제거하고 기존 Attention + qk_layernorm 사용
 
 
 class QWenDecoderLayer(Module):
@@ -56,6 +59,9 @@ class QWenDecoderLayer(Module):
 
         layers_range = config.mapping.pp_layers(config.num_hidden_layers)
         local_layer_idx = layer_idx - layers_range[0]
+        # Qwen3: Enable qk_layernorm for Q/K normalization (similar to Gemma3)
+        qk_layernorm = config.qwen_type in ('qwen3', 'qwen3_moe')
+        
         self.attention = Attention(
             local_layer_idx=local_layer_idx,
             hidden_size=config.hidden_size,
@@ -78,7 +84,10 @@ class QWenDecoderLayer(Module):
             cp_group=config.mapping.cp_group,
             quant_mode=config.quant_mode,
             use_logn_scaling=config.use_logn_attn,
-            dense_bias=False)
+            dense_bias=False,
+            # Qwen3: Add Q/K layer normalization
+            qk_layernorm=qk_layernorm,
+            layernorm_type=LayerNormType.RmsNorm if qk_layernorm else LayerNormType.LayerNorm)
 
         if config.moe.has_moe():
             mlp_kwargs = {'moe_config': config.moe, 'mapping': config.mapping}
@@ -352,6 +361,11 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                 custom_dict = {
                     "transformer": "language_model.model",
                     "lm_head": "language_model.lm_head",
+                }
+            elif config.qwen_type in ("qwen3", "qwen3_moe"):
+                custom_dict = {
+                    "q_layernorm": "q_norm",
+                    "k_layernorm": "k_norm",
                 }
             loader = ModelWeightsLoader(hf_model_dir, custom_dict)
             model = cls(config)
