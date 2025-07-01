@@ -275,18 +275,10 @@ def test_nemotron_h_cuda_graph_overlap_scheduler():
                                       outputs_with_cg_no_overlap,
                                       outputs_with_cg_with_overlap):
 
-        if no_cg_no_overlap.outputs[0].text != with_cg_no_overlap.outputs[
-                0].text:
-            print("no_cg_no_overlap != with_cg_no_overlap")
-        if with_cg_no_overlap.outputs[0].text != with_cg_with_overlap.outputs[
-                0].text:
-            print("with_cg_no_overlap != with_cg_with_overlap")
-        print()
-
-        assert no_cg_no_overlap.outputs[0].text == with_cg_no_overlap.outputs[
-            0].text
-        assert with_cg_no_overlap.outputs[
-            0].text == with_cg_with_overlap.outputs[0].text
+        assert (no_cg_no_overlap.outputs[0].text ==
+                with_cg_no_overlap.outputs[0].text)
+        assert (with_cg_no_overlap.outputs[0].text ==
+                with_cg_with_overlap.outputs[0].text)
 
         # with/without CG can have some difference in logits - high tolerance
         torch.testing.assert_close(
