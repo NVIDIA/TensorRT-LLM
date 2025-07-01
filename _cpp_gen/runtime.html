@@ -51,7 +51,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -63,7 +63,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc0" />
+  <meta name="docsearch:version" content="1.0.0rc1" />
 
 
   </head>
@@ -9614,7 +9614,7 @@ one more than decoding draft tokens for prediction from primary head </p>
 </dl>
 
 <span class="sig-paren">)</span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="m"><span class="pre">0</span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime18IGptDecoderBatched5setupERKN8executor12DecodingModeE10SizeType3210SizeType32N8nvinfer18DataTypeERK11ModelConfigRK11WorldConfig" title="Link to this definition">#</a><br /></dt>
-<dd><p>Setup the decoder before calling <code class="docutils literal notranslate"><a class="reference internal" href="#classtensorrt__llm_1_1runtime_1_1IGptDecoderBatched_1ab71a988f92d801a763c8b7b960fd0769"><span class="std std-ref"><span class="pre">forward()</span></span></a></code></p>
+<dd><p>Setup the decoder before calling <code class="docutils literal notranslate"><a class="reference internal" href="#classtensorrt__llm_1_1runtime_1_1IGptDecoderBatched_1a4da8938fdafb368284faacaa41a488ba"><span class="std std-ref"><span class="pre">forward()</span></span></a></code></p>
 </dd></dl>
 
 <dl class="cpp function">
@@ -9631,30 +9631,28 @@ one more than decoding draft tokens for prediction from primary head </p>
 </dd></dl>
 
 <dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime18IGptDecoderBatched12forwardAsyncERKN7decoder12DecoderStateERN13decoder_batch6OutputERKN13decoder_batch5InputE">
-<span id="_CPPv3N12tensorrt_llm7runtime18IGptDecoderBatched12forwardAsyncERKN7decoder12DecoderStateERN13decoder_batch6OutputERKN13decoder_batch5InputE"></span><span id="_CPPv2N12tensorrt_llm7runtime18IGptDecoderBatched12forwardAsyncERKN7decoder12DecoderStateERN13decoder_batch6OutputERKN13decoder_batch5InputE"></span><span id="tensorrt_llm::runtime::IGptDecoderBatched::forwardAsync__decoder::DecoderStateCR.decoder_batch::OutputR.decoder_batch::InputCR"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1IGptDecoderBatched_1a654fbc257f26b53dadb65937899938c0"></span><span class="k"><span class="pre">virtual</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime9CudaEventE" title="tensorrt_llm::runtime::CudaEvent"><span class="n"><span class="pre">CudaEvent</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">forwardAsync</span></span></span><span class="sig-paren">(</span>
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime18IGptDecoderBatched12forwardAsyncERKN7decoder12DecoderStateERKN13decoder_batch5InputE">
+<span id="_CPPv3N12tensorrt_llm7runtime18IGptDecoderBatched12forwardAsyncERKN7decoder12DecoderStateERKN13decoder_batch5InputE"></span><span id="_CPPv2N12tensorrt_llm7runtime18IGptDecoderBatched12forwardAsyncERKN7decoder12DecoderStateERKN13decoder_batch5InputE"></span><span id="tensorrt_llm::runtime::IGptDecoderBatched::forwardAsync__decoder::DecoderStateCR.decoder_batch::InputCR"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1IGptDecoderBatched_1a607be6a62cc79a01e7cdc638a2e0eb72"></span><span class="k"><span class="pre">virtual</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime9CudaEventE" title="tensorrt_llm::runtime::CudaEvent"><span class="n"><span class="pre">CudaEvent</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">forwardAsync</span></span></span><span class="sig-paren">(</span>
 
 <dl>
 <dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime7decoderE" title="tensorrt_llm::runtime::decoder"><span class="n"><span class="pre">decoder</span></span></a><span class="p"><span class="pre">::</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderStateE" title="tensorrt_llm::runtime::decoder::DecoderState"><span class="n"><span class="pre">DecoderState</span></span></a><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="n sig-param"><span class="pre">decoderState</span></span></em>,</dd>
-<dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batchE" title="tensorrt_llm::runtime::decoder_batch"><span class="n"><span class="pre">decoder_batch</span></span></a><span class="p"><span class="pre">::</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch6OutputE" title="tensorrt_llm::runtime::decoder_batch::Output"><span class="n"><span class="pre">Output</span></span></a><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="n sig-param"><span class="pre">output</span></span></em>,</dd>
 <dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batchE" title="tensorrt_llm::runtime::decoder_batch"><span class="n"><span class="pre">decoder_batch</span></span></a><span class="p"><span class="pre">::</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch5InputE" title="tensorrt_llm::runtime::decoder_batch::Input"><span class="n"><span class="pre">Input</span></span></a><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="n sig-param"><span class="pre">input</span></span></em>,</dd>
 </dl>
 
-<span class="sig-paren">)</span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="m"><span class="pre">0</span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime18IGptDecoderBatched12forwardAsyncERKN7decoder12DecoderStateERN13decoder_batch6OutputERKN13decoder_batch5InputE" title="Link to this definition">#</a><br /></dt>
+<span class="sig-paren">)</span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="m"><span class="pre">0</span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime18IGptDecoderBatched12forwardAsyncERKN7decoder12DecoderStateERKN13decoder_batch5InputE" title="Link to this definition">#</a><br /></dt>
 <dd><p>Run one step for all requests without blocking the host process and return the token for synchronization. </p>
 </dd></dl>
 
 <dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime18IGptDecoderBatched7forwardERKN7decoder12DecoderStateERN13decoder_batch6OutputERKN13decoder_batch5InputE">
-<span id="_CPPv3N12tensorrt_llm7runtime18IGptDecoderBatched7forwardERKN7decoder12DecoderStateERN13decoder_batch6OutputERKN13decoder_batch5InputE"></span><span id="_CPPv2N12tensorrt_llm7runtime18IGptDecoderBatched7forwardERKN7decoder12DecoderStateERN13decoder_batch6OutputERKN13decoder_batch5InputE"></span><span id="tensorrt_llm::runtime::IGptDecoderBatched::forward__decoder::DecoderStateCR.decoder_batch::OutputR.decoder_batch::InputCR"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1IGptDecoderBatched_1ab71a988f92d801a763c8b7b960fd0769"></span><span class="k"><span class="pre">virtual</span></span><span class="w"> </span><span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">forward</span></span></span><span class="sig-paren">(</span>
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime18IGptDecoderBatched7forwardERKN7decoder12DecoderStateERKN13decoder_batch5InputE">
+<span id="_CPPv3N12tensorrt_llm7runtime18IGptDecoderBatched7forwardERKN7decoder12DecoderStateERKN13decoder_batch5InputE"></span><span id="_CPPv2N12tensorrt_llm7runtime18IGptDecoderBatched7forwardERKN7decoder12DecoderStateERKN13decoder_batch5InputE"></span><span id="tensorrt_llm::runtime::IGptDecoderBatched::forward__decoder::DecoderStateCR.decoder_batch::InputCR"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1IGptDecoderBatched_1a4da8938fdafb368284faacaa41a488ba"></span><span class="k"><span class="pre">virtual</span></span><span class="w"> </span><span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">forward</span></span></span><span class="sig-paren">(</span>
 
 <dl>
 <dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime7decoderE" title="tensorrt_llm::runtime::decoder"><span class="n"><span class="pre">decoder</span></span></a><span class="p"><span class="pre">::</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderStateE" title="tensorrt_llm::runtime::decoder::DecoderState"><span class="n"><span class="pre">DecoderState</span></span></a><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="n sig-param"><span class="pre">decoderState</span></span></em>,</dd>
-<dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batchE" title="tensorrt_llm::runtime::decoder_batch"><span class="n"><span class="pre">decoder_batch</span></span></a><span class="p"><span class="pre">::</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch6OutputE" title="tensorrt_llm::runtime::decoder_batch::Output"><span class="n"><span class="pre">Output</span></span></a><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="n sig-param"><span class="pre">output</span></span></em>,</dd>
 <dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batchE" title="tensorrt_llm::runtime::decoder_batch"><span class="n"><span class="pre">decoder_batch</span></span></a><span class="p"><span class="pre">::</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch5InputE" title="tensorrt_llm::runtime::decoder_batch::Input"><span class="n"><span class="pre">Input</span></span></a><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="n sig-param"><span class="pre">input</span></span></em>,</dd>
 </dl>
 
-<span class="sig-paren">)</span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="m"><span class="pre">0</span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime18IGptDecoderBatched7forwardERKN7decoder12DecoderStateERN13decoder_batch6OutputERKN13decoder_batch5InputE" title="Link to this definition">#</a><br /></dt>
+<span class="sig-paren">)</span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="m"><span class="pre">0</span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime18IGptDecoderBatched7forwardERKN7decoder12DecoderStateERKN13decoder_batch5InputE" title="Link to this definition">#</a><br /></dt>
 <dd><p>Run one step for all requests and wait for completion on the host. </p>
 </dd></dl>
 
@@ -9761,15 +9759,9 @@ one more than decoding draft tokens for prediction from primary head </p>
 </dd></dl>
 
 <dl class="cpp var">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13decoder_batch5Input16cacheIndirectionE">
-<span id="_CPPv3N12tensorrt_llm7runtime13decoder_batch5Input16cacheIndirectionE"></span><span id="_CPPv2N12tensorrt_llm7runtime13decoder_batch5Input16cacheIndirectionE"></span><span id="tensorrt_llm::runtime::decoder_batch::Input::cacheIndirection__TensorPtr"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1decoder__batch_1_1Input_1ad1b93f5e2145ae272a72811679f7673a"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch5Input9TensorPtrE" title="tensorrt_llm::runtime::decoder_batch::Input::TensorPtr"><span class="n"><span class="pre">TensorPtr</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">cacheIndirection</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch5Input16cacheIndirectionE" title="Link to this definition">#</a><br /></dt>
-<dd><p>For Beam Search Indices into KV cache of different rays within one beam, [maxBatchSize, maxBeamWidth, maxSeqLen], on gpu </p>
-</dd></dl>
-
-<dl class="cpp var">
 <dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13decoder_batch5Input15generationStepsE">
 <span id="_CPPv3N12tensorrt_llm7runtime13decoder_batch5Input15generationStepsE"></span><span id="_CPPv2N12tensorrt_llm7runtime13decoder_batch5Input15generationStepsE"></span><span id="tensorrt_llm::runtime::decoder_batch::Input::generationSteps__std::vector:SizeType32:"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1decoder__batch_1_1Input_1ab585fbd53121a6094355bdc7cc5c195d"></span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">vector</span></span><span class="p"><span class="pre">&lt;</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">generationSteps</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch5Input15generationStepsE" title="Link to this definition">#</a><br /></dt>
-<dd><p>The generation step of each request (for Variable-Beam-Width-Search), [batchSize]. </p>
+<dd><p>For Beam Search The generation step of each request (for Variable-Beam-Width-Search), [batchSize] </p>
 </dd></dl>
 
 <dl class="cpp var">
@@ -9799,36 +9791,6 @@ one more than decoding draft tokens for prediction from primary head </p>
 <dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13decoder_batch5Input15eagleLastInputsE">
 <span id="_CPPv3N12tensorrt_llm7runtime13decoder_batch5Input15eagleLastInputsE"></span><span id="_CPPv2N12tensorrt_llm7runtime13decoder_batch5Input15eagleLastInputsE"></span><span id="tensorrt_llm::runtime::decoder_batch::Input::eagleLastInputs__std::optional:EagleBuffers::Inputs:"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1decoder__batch_1_1Input_1a68e11bed66f250eedc5e74d45973fcaf"></span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">optional</span></span><span class="p"><span class="pre">&lt;</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime12EagleBuffersE" title="tensorrt_llm::runtime::EagleBuffers"><span class="n"><span class="pre">EagleBuffers</span></span></a><span class="p"><span class="pre">::</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime12EagleBuffers6InputsE" title="tensorrt_llm::runtime::EagleBuffers::Inputs"><span class="n"><span class="pre">Inputs</span></span></a><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">eagleLastInputs</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch5Input15eagleLastInputsE" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
-
-</div>
-</dd></dl>
-
-<dl class="cpp class">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13decoder_batch6OutputE">
-<span id="_CPPv3N12tensorrt_llm7runtime13decoder_batch6OutputE"></span><span id="_CPPv2N12tensorrt_llm7runtime13decoder_batch6OutputE"></span><span id="tensorrt_llm::runtime::decoder_batch::Output"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1decoder__batch_1_1Output"></span><span class="k"><span class="pre">class</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">Output</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch6OutputE" title="Link to this definition">#</a><br /></dt>
-<dd><div class="breathe-sectiondef docutils container">
-<p class="breathe-sectiondef-title rubric" id="breathe-section-title-public-types">Public Types</p>
-<dl class="cpp type">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13decoder_batch6Output9TensorPtrE">
-<span id="_CPPv3N12tensorrt_llm7runtime13decoder_batch6Output9TensorPtrE"></span><span id="_CPPv2N12tensorrt_llm7runtime13decoder_batch6Output9TensorPtrE"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1decoder__batch_1_1Output_1ab1a4d43f1e25e7ffc107edf438b75ff8"></span><span class="k"><span class="pre">using</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">TensorPtr</span></span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">shared_ptr</span></span><span class="p"><span class="pre">&lt;</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime7ITensorE" title="tensorrt_llm::runtime::ITensor"><span class="n"><span class="pre">ITensor</span></span></a><span class="p"><span class="pre">&gt;</span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch6Output9TensorPtrE" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-</div>
-<div class="breathe-sectiondef docutils container">
-<p class="breathe-sectiondef-title rubric" id="breathe-section-title-public-functions">Public Functions</p>
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13decoder_batch6Output6OutputEv">
-<span id="_CPPv3N12tensorrt_llm7runtime13decoder_batch6Output6OutputEv"></span><span id="_CPPv2N12tensorrt_llm7runtime13decoder_batch6Output6OutputEv"></span><span id="tensorrt_llm::runtime::decoder_batch::Output::Output"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1decoder__batch_1_1Output_1a11aaaeb3c20e5f93d815b2b6c86f345f"></span><span class="sig-name descname"><span class="n"><span class="pre">Output</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="k"><span class="pre">default</span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch6Output6OutputEv" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-</div>
-<div class="breathe-sectiondef docutils container">
-<p class="breathe-sectiondef-title rubric" id="breathe-section-title-public-members">Public Members</p>
-<dl class="cpp var">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13decoder_batch6Output16cacheIndirectionE">
-<span id="_CPPv3N12tensorrt_llm7runtime13decoder_batch6Output16cacheIndirectionE"></span><span id="_CPPv2N12tensorrt_llm7runtime13decoder_batch6Output16cacheIndirectionE"></span><span id="tensorrt_llm::runtime::decoder_batch::Output::cacheIndirection__TensorPtr"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1decoder__batch_1_1Output_1ab579f71d5d5639305bb67ecf1a58ba55"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch6Output9TensorPtrE" title="tensorrt_llm::runtime::decoder_batch::Output::TensorPtr"><span class="n"><span class="pre">TensorPtr</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">cacheIndirection</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch6Output16cacheIndirectionE" title="Link to this definition">#</a><br /></dt>
-<dd><p>parameters for beam search, [batchSize, maxBeamWidth, maxSeqLen], on gpu </p>
-</dd></dl>
 
 </div>
 </dd></dl>
@@ -10024,7 +9986,7 @@ one more than decoding draft tokens for prediction from primary head </p>
 </dl>
 
 <span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">override</span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime17GptDecoderBatched5setupERKN8executor12DecodingModeE10SizeType3210SizeType32N8nvinfer18DataTypeERK11ModelConfigRK11WorldConfig" title="Link to this definition">#</a><br /></dt>
-<dd><p>Setup the decoder before calling <code class="docutils literal notranslate"><a class="reference internal" href="#classtensorrt__llm_1_1runtime_1_1GptDecoderBatched_1a41740e026890310d78a3ac98c22e3132"><span class="std std-ref"><span class="pre">forward()</span></span></a></code></p>
+<dd><p>Setup the decoder before calling <code class="docutils literal notranslate"><a class="reference internal" href="#classtensorrt__llm_1_1runtime_1_1GptDecoderBatched_1a1644b6eedbe77c15d3486b1ab688dd85"><span class="std std-ref"><span class="pre">forward()</span></span></a></code></p>
 </dd></dl>
 
 <dl class="cpp function">
@@ -10041,30 +10003,28 @@ one more than decoding draft tokens for prediction from primary head </p>
 </dd></dl>
 
 <dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime17GptDecoderBatched12forwardAsyncERKN7decoder12DecoderStateERN13decoder_batch6OutputERKN13decoder_batch5InputE">
-<span id="_CPPv3N12tensorrt_llm7runtime17GptDecoderBatched12forwardAsyncERKN7decoder12DecoderStateERN13decoder_batch6OutputERKN13decoder_batch5InputE"></span><span id="_CPPv2N12tensorrt_llm7runtime17GptDecoderBatched12forwardAsyncERKN7decoder12DecoderStateERN13decoder_batch6OutputERKN13decoder_batch5InputE"></span><span id="tensorrt_llm::runtime::GptDecoderBatched::forwardAsync__decoder::DecoderStateCR.decoder_batch::OutputR.decoder_batch::InputCR"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptDecoderBatched_1a6f28f352026b3d0beb36947fb5706392"></span><span class="k"><span class="pre">virtual</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime9CudaEventE" title="tensorrt_llm::runtime::CudaEvent"><span class="n"><span class="pre">CudaEvent</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">forwardAsync</span></span></span><span class="sig-paren">(</span>
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime17GptDecoderBatched12forwardAsyncERKN7decoder12DecoderStateERKN13decoder_batch5InputE">
+<span id="_CPPv3N12tensorrt_llm7runtime17GptDecoderBatched12forwardAsyncERKN7decoder12DecoderStateERKN13decoder_batch5InputE"></span><span id="_CPPv2N12tensorrt_llm7runtime17GptDecoderBatched12forwardAsyncERKN7decoder12DecoderStateERKN13decoder_batch5InputE"></span><span id="tensorrt_llm::runtime::GptDecoderBatched::forwardAsync__decoder::DecoderStateCR.decoder_batch::InputCR"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptDecoderBatched_1ad077bf32d0116473d4e537750c7d90c4"></span><span class="k"><span class="pre">virtual</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime9CudaEventE" title="tensorrt_llm::runtime::CudaEvent"><span class="n"><span class="pre">CudaEvent</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">forwardAsync</span></span></span><span class="sig-paren">(</span>
 
 <dl>
 <dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime7decoderE" title="tensorrt_llm::runtime::decoder"><span class="n"><span class="pre">decoder</span></span></a><span class="p"><span class="pre">::</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderStateE" title="tensorrt_llm::runtime::decoder::DecoderState"><span class="n"><span class="pre">DecoderState</span></span></a><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="n sig-param"><span class="pre">decoderState</span></span></em>,</dd>
-<dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batchE" title="tensorrt_llm::runtime::decoder_batch"><span class="n"><span class="pre">decoder_batch</span></span></a><span class="p"><span class="pre">::</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch6OutputE" title="tensorrt_llm::runtime::decoder_batch::Output"><span class="n"><span class="pre">Output</span></span></a><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="n sig-param"><span class="pre">output</span></span></em>,</dd>
 <dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batchE" title="tensorrt_llm::runtime::decoder_batch"><span class="n"><span class="pre">decoder_batch</span></span></a><span class="p"><span class="pre">::</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch5InputE" title="tensorrt_llm::runtime::decoder_batch::Input"><span class="n"><span class="pre">Input</span></span></a><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="n sig-param"><span class="pre">input</span></span></em>,</dd>
 </dl>
 
-<span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">override</span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime17GptDecoderBatched12forwardAsyncERKN7decoder12DecoderStateERN13decoder_batch6OutputERKN13decoder_batch5InputE" title="Link to this definition">#</a><br /></dt>
+<span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">override</span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime17GptDecoderBatched12forwardAsyncERKN7decoder12DecoderStateERKN13decoder_batch5InputE" title="Link to this definition">#</a><br /></dt>
 <dd><p>Run one step for all requests without blocking the host process and return the token for synchronization. </p>
 </dd></dl>
 
 <dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime17GptDecoderBatched7forwardERKN7decoder12DecoderStateERN13decoder_batch6OutputERKN13decoder_batch5InputE">
-<span id="_CPPv3N12tensorrt_llm7runtime17GptDecoderBatched7forwardERKN7decoder12DecoderStateERN13decoder_batch6OutputERKN13decoder_batch5InputE"></span><span id="_CPPv2N12tensorrt_llm7runtime17GptDecoderBatched7forwardERKN7decoder12DecoderStateERN13decoder_batch6OutputERKN13decoder_batch5InputE"></span><span id="tensorrt_llm::runtime::GptDecoderBatched::forward__decoder::DecoderStateCR.decoder_batch::OutputR.decoder_batch::InputCR"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptDecoderBatched_1a41740e026890310d78a3ac98c22e3132"></span><span class="k"><span class="pre">virtual</span></span><span class="w"> </span><span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">forward</span></span></span><span class="sig-paren">(</span>
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime17GptDecoderBatched7forwardERKN7decoder12DecoderStateERKN13decoder_batch5InputE">
+<span id="_CPPv3N12tensorrt_llm7runtime17GptDecoderBatched7forwardERKN7decoder12DecoderStateERKN13decoder_batch5InputE"></span><span id="_CPPv2N12tensorrt_llm7runtime17GptDecoderBatched7forwardERKN7decoder12DecoderStateERKN13decoder_batch5InputE"></span><span id="tensorrt_llm::runtime::GptDecoderBatched::forward__decoder::DecoderStateCR.decoder_batch::InputCR"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptDecoderBatched_1a1644b6eedbe77c15d3486b1ab688dd85"></span><span class="k"><span class="pre">virtual</span></span><span class="w"> </span><span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">forward</span></span></span><span class="sig-paren">(</span>
 
 <dl>
 <dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime7decoderE" title="tensorrt_llm::runtime::decoder"><span class="n"><span class="pre">decoder</span></span></a><span class="p"><span class="pre">::</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderStateE" title="tensorrt_llm::runtime::decoder::DecoderState"><span class="n"><span class="pre">DecoderState</span></span></a><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="n sig-param"><span class="pre">decoderState</span></span></em>,</dd>
-<dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batchE" title="tensorrt_llm::runtime::decoder_batch"><span class="n"><span class="pre">decoder_batch</span></span></a><span class="p"><span class="pre">::</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch6OutputE" title="tensorrt_llm::runtime::decoder_batch::Output"><span class="n"><span class="pre">Output</span></span></a><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="n sig-param"><span class="pre">output</span></span></em>,</dd>
 <dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batchE" title="tensorrt_llm::runtime::decoder_batch"><span class="n"><span class="pre">decoder_batch</span></span></a><span class="p"><span class="pre">::</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch5InputE" title="tensorrt_llm::runtime::decoder_batch::Input"><span class="n"><span class="pre">Input</span></span></a><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="n sig-param"><span class="pre">input</span></span></em>,</dd>
 </dl>
 
-<span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">override</span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime17GptDecoderBatched7forwardERKN7decoder12DecoderStateERN13decoder_batch6OutputERKN13decoder_batch5InputE" title="Link to this definition">#</a><br /></dt>
+<span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">override</span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime17GptDecoderBatched7forwardERKN7decoder12DecoderStateERKN13decoder_batch5InputE" title="Link to this definition">#</a><br /></dt>
 <dd><p>Run one step for all requests and wait for completion on the host. </p>
 </dd></dl>
 
@@ -10110,16 +10070,15 @@ one more than decoding draft tokens for prediction from primary head </p>
 <div class="breathe-sectiondef docutils container">
 <p class="breathe-sectiondef-title rubric" id="breathe-section-title-private-functions">Private Functions</p>
 <dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime17GptDecoderBatched15forwardDispatchERKN7decoder12DecoderStateERN13decoder_batch6OutputERKN13decoder_batch5InputE">
-<span id="_CPPv3N12tensorrt_llm7runtime17GptDecoderBatched15forwardDispatchERKN7decoder12DecoderStateERN13decoder_batch6OutputERKN13decoder_batch5InputE"></span><span id="_CPPv2N12tensorrt_llm7runtime17GptDecoderBatched15forwardDispatchERKN7decoder12DecoderStateERN13decoder_batch6OutputERKN13decoder_batch5InputE"></span><span id="tensorrt_llm::runtime::GptDecoderBatched::forwardDispatch__decoder::DecoderStateCR.decoder_batch::OutputR.decoder_batch::InputCR"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptDecoderBatched_1a6afa6ebdff09dba1bd53d47aa74e2967"></span><span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">forwardDispatch</span></span></span><span class="sig-paren">(</span>
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime17GptDecoderBatched15forwardDispatchERKN7decoder12DecoderStateERKN13decoder_batch5InputE">
+<span id="_CPPv3N12tensorrt_llm7runtime17GptDecoderBatched15forwardDispatchERKN7decoder12DecoderStateERKN13decoder_batch5InputE"></span><span id="_CPPv2N12tensorrt_llm7runtime17GptDecoderBatched15forwardDispatchERKN7decoder12DecoderStateERKN13decoder_batch5InputE"></span><span id="tensorrt_llm::runtime::GptDecoderBatched::forwardDispatch__decoder::DecoderStateCR.decoder_batch::InputCR"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1GptDecoderBatched_1a310e2010c97a4654e70f3eba7d5df5be"></span><span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">forwardDispatch</span></span></span><span class="sig-paren">(</span>
 
 <dl>
 <dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime7decoderE" title="tensorrt_llm::runtime::decoder"><span class="n"><span class="pre">decoder</span></span></a><span class="p"><span class="pre">::</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderStateE" title="tensorrt_llm::runtime::decoder::DecoderState"><span class="n"><span class="pre">DecoderState</span></span></a><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="n sig-param"><span class="pre">decoderState</span></span></em>,</dd>
-<dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batchE" title="tensorrt_llm::runtime::decoder_batch"><span class="n"><span class="pre">decoder_batch</span></span></a><span class="p"><span class="pre">::</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch6OutputE" title="tensorrt_llm::runtime::decoder_batch::Output"><span class="n"><span class="pre">Output</span></span></a><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="n sig-param"><span class="pre">output</span></span></em>,</dd>
 <dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batchE" title="tensorrt_llm::runtime::decoder_batch"><span class="n"><span class="pre">decoder_batch</span></span></a><span class="p"><span class="pre">::</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch5InputE" title="tensorrt_llm::runtime::decoder_batch::Input"><span class="n"><span class="pre">Input</span></span></a><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="n sig-param"><span class="pre">input</span></span></em>,</dd>
 </dl>
 
-<span class="sig-paren">)</span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime17GptDecoderBatched15forwardDispatchERKN7decoder12DecoderStateERN13decoder_batch6OutputERKN13decoder_batch5InputE" title="Link to this definition">#</a><br /></dt>
+<span class="sig-paren">)</span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime17GptDecoderBatched15forwardDispatchERKN7decoder12DecoderStateERKN13decoder_batch5InputE" title="Link to this definition">#</a><br /></dt>
 <dd><p>Calls decoders for tokens per engine step. </p>
 </dd></dl>
 
@@ -10992,7 +10951,23 @@ one more than decoding draft tokens for prediction from primary head </p>
 </dl>
 
 <span class="sig-paren">)</span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState5setupE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType32RK11ModelConfigRK11WorldConfigRK13BufferManager" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
+<dd><p>Setup buffers for the decoder excluding speculative decoding. </p>
+</dd></dl>
+
+<dl class="cpp function">
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState21setupCacheIndirectionE10SizeType3210SizeType3210SizeType32">
+<span id="_CPPv3N12tensorrt_llm7runtime7decoder12DecoderState21setupCacheIndirectionE10SizeType3210SizeType3210SizeType32"></span><span id="_CPPv2N12tensorrt_llm7runtime7decoder12DecoderState21setupCacheIndirectionE10SizeType3210SizeType3210SizeType32"></span><span id="tensorrt_llm::runtime::decoder::DecoderState::setupCacheIndirection__SizeType32.SizeType32.SizeType32"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1decoder_1_1DecoderState_1aac08ec4e2c6f8a9e8b10dec6c20a337c"></span><span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">setupCacheIndirection</span></span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">maxBatchSize</span></span></em>,</dd>
+<dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">maxBeamWidth</span></span></em>,</dd>
+<dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">maxAttentionWindow</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState21setupCacheIndirectionE10SizeType3210SizeType3210SizeType32" title="Link to this definition">#</a><br /></dt>
+<dd><p>Setup buffers for the cache indirection. </p>
+<p>This is used for beam search on pipeline parallel ranks without a decoder. </p>
+</dd></dl>
 
 <dl class="cpp function">
 <dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState24setupSpeculativeDecodingERK23SpeculativeDecodingMode10SizeType32RK11ModelConfigRK11WorldConfigRK13BufferManager">
@@ -11330,6 +11305,18 @@ one more than decoding draft tokens for prediction from primary head </p>
 <dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState20getBeamSearchBuffersEv">
 <span id="_CPPv3NK12tensorrt_llm7runtime7decoder12DecoderState20getBeamSearchBuffersEv"></span><span id="_CPPv2NK12tensorrt_llm7runtime7decoder12DecoderState20getBeamSearchBuffersEv"></span><span id="tensorrt_llm::runtime::decoder::DecoderState::getBeamSearchBuffersC"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1decoder_1_1DecoderState_1adb726256c2898dc6eb2af559c6191dec"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime7decoder17BeamSearchBuffersE" title="tensorrt_llm::runtime::decoder::BeamSearchBuffers"><span class="n"><span class="pre">BeamSearchBuffers</span></span></a><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="sig-name descname"><span class="n"><span class="pre">getBeamSearchBuffers</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState20getBeamSearchBuffersEv" title="Link to this definition">#</a><br /></dt>
 <dd><p>Workspace for beam search in streaming mode. </p>
+</dd></dl>
+
+<dl class="cpp function">
+<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState24getCacheIndirectionInputEv">
+<span id="_CPPv3NK12tensorrt_llm7runtime7decoder12DecoderState24getCacheIndirectionInputEv"></span><span id="_CPPv2NK12tensorrt_llm7runtime7decoder12DecoderState24getCacheIndirectionInputEv"></span><span id="tensorrt_llm::runtime::decoder::DecoderState::getCacheIndirectionInputC"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1decoder_1_1DecoderState_1adc8e71751b62a60ce0d77e846c96f9fc"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState9TensorPtrE" title="tensorrt_llm::runtime::decoder::DecoderState::TensorPtr"><span class="n"><span class="pre">TensorPtr</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">getCacheIndirectionInput</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState24getCacheIndirectionInputEv" title="Link to this definition">#</a><br /></dt>
+<dd><p>Cache indirection input for beam search. </p>
+</dd></dl>
+
+<dl class="cpp function">
+<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState25getCacheIndirectionOutputEv">
+<span id="_CPPv3NK12tensorrt_llm7runtime7decoder12DecoderState25getCacheIndirectionOutputEv"></span><span id="_CPPv2NK12tensorrt_llm7runtime7decoder12DecoderState25getCacheIndirectionOutputEv"></span><span id="tensorrt_llm::runtime::decoder::DecoderState::getCacheIndirectionOutputC"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1decoder_1_1DecoderState_1a891c5a9630f5035fb7391ed2b90ac75f"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState9TensorPtrE" title="tensorrt_llm::runtime::decoder::DecoderState::TensorPtr"><span class="n"><span class="pre">TensorPtr</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">getCacheIndirectionOutput</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState25getCacheIndirectionOutputEv" title="Link to this definition">#</a><br /></dt>
+<dd><p>Cache indirection output for beam search. </p>
 </dd></dl>
 
 <dl class="cpp function">
@@ -13262,8 +13249,8 @@ one more than decoding draft tokens for prediction from primary head </p>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime18IGptDecoderBatched9TensorPtrE"><code class="docutils literal notranslate"><span class="pre">TensorPtr</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime18IGptDecoderBatched5setupERKN8executor12DecodingModeE10SizeType3210SizeType32N8nvinfer18DataTypeERK11ModelConfigRK11WorldConfig"><code class="docutils literal notranslate"><span class="pre">setup()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime18IGptDecoderBatched16disableLookaheadERK13RequestVectorRK9TensorPtr"><code class="docutils literal notranslate"><span class="pre">disableLookahead()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime18IGptDecoderBatched12forwardAsyncERKN7decoder12DecoderStateERN13decoder_batch6OutputERKN13decoder_batch5InputE"><code class="docutils literal notranslate"><span class="pre">forwardAsync()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime18IGptDecoderBatched7forwardERKN7decoder12DecoderStateERN13decoder_batch6OutputERKN13decoder_batch5InputE"><code class="docutils literal notranslate"><span class="pre">forward()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime18IGptDecoderBatched12forwardAsyncERKN7decoder12DecoderStateERKN13decoder_batch5InputE"><code class="docutils literal notranslate"><span class="pre">forwardAsync()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime18IGptDecoderBatched7forwardERKN7decoder12DecoderStateERKN13decoder_batch5InputE"><code class="docutils literal notranslate"><span class="pre">forward()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime18IGptDecoderBatched8finalizeERKN7decoder12DecoderStateE10SizeType32RK14SamplingConfigb"><code class="docutils literal notranslate"><span class="pre">finalize()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime18IGptDecoderBatched18IGptDecoderBatchedEv"><code class="docutils literal notranslate"><span class="pre">IGptDecoderBatched()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime18IGptDecoderBatchedD0Ev"><code class="docutils literal notranslate"><span class="pre">~IGptDecoderBatched()</span></code></a></li>
@@ -13280,19 +13267,12 @@ one more than decoding draft tokens for prediction from primary head </p>
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch5Input15maxDecoderStepsE"><code class="docutils literal notranslate"><span class="pre">maxDecoderSteps</span></code></a></li>
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch5Input10batchSlotsE"><code class="docutils literal notranslate"><span class="pre">batchSlots</span></code></a></li>
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch5Input22batchSlotsRequestOrderE"><code class="docutils literal notranslate"><span class="pre">batchSlotsRequestOrder</span></code></a></li>
-<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch5Input16cacheIndirectionE"><code class="docutils literal notranslate"><span class="pre">cacheIndirection</span></code></a></li>
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch5Input15generationStepsE"><code class="docutils literal notranslate"><span class="pre">generationSteps</span></code></a></li>
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch5Input20predictedDraftLogitsE"><code class="docutils literal notranslate"><span class="pre">predictedDraftLogits</span></code></a></li>
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch5Input25explicitDraftTokensInputsE"><code class="docutils literal notranslate"><span class="pre">explicitDraftTokensInputs</span></code></a></li>
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch5Input29explicitDraftTokensLastInputsE"><code class="docutils literal notranslate"><span class="pre">explicitDraftTokensLastInputs</span></code></a></li>
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch5Input11eagleInputsE"><code class="docutils literal notranslate"><span class="pre">eagleInputs</span></code></a></li>
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch5Input15eagleLastInputsE"><code class="docutils literal notranslate"><span class="pre">eagleLastInputs</span></code></a></li>
-</ul>
-</li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch6OutputE"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm::runtime::decoder_batch::Output</span></code></a><ul class="nav section-nav flex-column">
-<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch6Output9TensorPtrE"><code class="docutils literal notranslate"><span class="pre">TensorPtr</span></code></a></li>
-<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch6Output6OutputEv"><code class="docutils literal notranslate"><span class="pre">Output()</span></code></a></li>
-<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch6Output16cacheIndirectionE"><code class="docutils literal notranslate"><span class="pre">cacheIndirection</span></code></a></li>
 </ul>
 </li>
 </ul>
@@ -13331,14 +13311,14 @@ one more than decoding draft tokens for prediction from primary head </p>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime17GptDecoderBatched17GptDecoderBatchedE13CudaStreamPtr"><code class="docutils literal notranslate"><span class="pre">GptDecoderBatched()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime17GptDecoderBatched5setupERKN8executor12DecodingModeE10SizeType3210SizeType32N8nvinfer18DataTypeERK11ModelConfigRK11WorldConfig"><code class="docutils literal notranslate"><span class="pre">setup()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime17GptDecoderBatched16disableLookaheadERK13RequestVectorRK9TensorPtr"><code class="docutils literal notranslate"><span class="pre">disableLookahead()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime17GptDecoderBatched12forwardAsyncERKN7decoder12DecoderStateERN13decoder_batch6OutputERKN13decoder_batch5InputE"><code class="docutils literal notranslate"><span class="pre">forwardAsync()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime17GptDecoderBatched7forwardERKN7decoder12DecoderStateERN13decoder_batch6OutputERKN13decoder_batch5InputE"><code class="docutils literal notranslate"><span class="pre">forward()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime17GptDecoderBatched12forwardAsyncERKN7decoder12DecoderStateERKN13decoder_batch5InputE"><code class="docutils literal notranslate"><span class="pre">forwardAsync()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime17GptDecoderBatched7forwardERKN7decoder12DecoderStateERKN13decoder_batch5InputE"><code class="docutils literal notranslate"><span class="pre">forward()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime17GptDecoderBatched8finalizeERKN7decoder12DecoderStateE10SizeType32RK14SamplingConfigb"><code class="docutils literal notranslate"><span class="pre">finalize()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime17GptDecoderBatched16getDecoderStreamEv"><code class="docutils literal notranslate"><span class="pre">getDecoderStream()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime17GptDecoderBatched20getUnderlyingDecoderEv"><code class="docutils literal notranslate"><span class="pre">getUnderlyingDecoder()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime17GptDecoderBatched16getBufferManagerEv"><code class="docutils literal notranslate"><span class="pre">getBufferManager()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime17GptDecoderBatched13GptDecoderPtrE"><code class="docutils literal notranslate"><span class="pre">GptDecoderPtr</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime17GptDecoderBatched15forwardDispatchERKN7decoder12DecoderStateERN13decoder_batch6OutputERKN13decoder_batch5InputE"><code class="docutils literal notranslate"><span class="pre">forwardDispatch()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime17GptDecoderBatched15forwardDispatchERKN7decoder12DecoderStateERKN13decoder_batch5InputE"><code class="docutils literal notranslate"><span class="pre">forwardDispatch()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime17GptDecoderBatched14mRuntimeStreamE"><code class="docutils literal notranslate"><span class="pre">mRuntimeStream</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime17GptDecoderBatched14mDecoderStreamE"><code class="docutils literal notranslate"><span class="pre">mDecoderStream</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime17GptDecoderBatched14mBufferManagerE"><code class="docutils literal notranslate"><span class="pre">mBufferManager</span></code></a></li>
@@ -13492,6 +13472,7 @@ one more than decoding draft tokens for prediction from primary head </p>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState12DecoderStateEN8nvinfer18DataTypeERK13BufferManager"><code class="docutils literal notranslate"><span class="pre">DecoderState()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState34allocateSpeculativeDecodingBuffersE23SpeculativeDecodingModeN8nvinfer18DataTypeERK13BufferManager"><code class="docutils literal notranslate"><span class="pre">allocateSpeculativeDecodingBuffers()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState5setupE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType32RK11ModelConfigRK11WorldConfigRK13BufferManager"><code class="docutils literal notranslate"><span class="pre">setup()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState21setupCacheIndirectionE10SizeType3210SizeType3210SizeType32"><code class="docutils literal notranslate"><span class="pre">setupCacheIndirection()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState24setupSpeculativeDecodingERK23SpeculativeDecodingMode10SizeType32RK11ModelConfigRK11WorldConfigRK13BufferManager"><code class="docutils literal notranslate"><span class="pre">setupSpeculativeDecoding()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState16disableLookaheadERK13RequestVector"><code class="docutils literal notranslate"><span class="pre">disableLookahead()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState14getFinishedSumEv"><code class="docutils literal notranslate"><span class="pre">getFinishedSum()</span></code></a></li>
@@ -13527,6 +13508,8 @@ one more than decoding draft tokens for prediction from primary head </p>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState15getEagleBuffersEv"><code class="docutils literal notranslate"><span class="pre">getEagleBuffers()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState19getLookaheadBuffersEv"><code class="docutils literal notranslate"><span class="pre">getLookaheadBuffers()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState20getBeamSearchBuffersEv"><code class="docutils literal notranslate"><span class="pre">getBeamSearchBuffers()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState24getCacheIndirectionInputEv"><code class="docutils literal notranslate"><span class="pre">getCacheIndirectionInput()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState25getCacheIndirectionOutputEv"><code class="docutils literal notranslate"><span class="pre">getCacheIndirectionOutput()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState21getJointDecodingInputEv"><code class="docutils literal notranslate"><span class="pre">getJointDecodingInput()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState22getJointDecodingOutputEv"><code class="docutils literal notranslate"><span class="pre">getJointDecodingOutput()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState13mMaxBatchSizeE"><code class="docutils literal notranslate"><span class="pre">mMaxBatchSize</span></code></a></li>
@@ -13706,9 +13689,9 @@ one more than decoding draft tokens for prediction from primary head </p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 21, 2025.</p>
+  <p>Last updated on June 29, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ebadc13">ebadc13</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/de97799">de97799</a>.</p>
   
 </div></div>
       

@@ -51,7 +51,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -63,7 +63,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc0" />
+  <meta name="docsearch:version" content="1.0.0rc1" />
 
 
   </head>
@@ -2865,43 +2865,23 @@ ranges of the dimensions of when using TRT dynamic shapes.</p>
 </dd></dl>
 
 <dl class="py class">
-<dt class="sig sig-object py" id="tensorrt_llm.models.ReDrafterForCausalLM">
-<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.models.</span></span><span class="sig-name descname"><span class="pre">ReDrafterForCausalLM</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/models/redrafter/model.html#ReDrafterForCausalLM"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.models.ReDrafterForCausalLM" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <a class="reference internal" href="#tensorrt_llm.models.LLaMAForCausalLM" title="tensorrt_llm.models.llama.model.LLaMAForCausalLM"><code class="xref py py-class docutils literal notranslate"><span class="pre">LLaMAForCausalLM</span></code></a></p>
-<dl class="py method">
-<dt class="sig sig-object py" id="tensorrt_llm.models.ReDrafterForCausalLM.forward">
-<span class="sig-name descname"><span class="pre">forward</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/models/redrafter/model.html#ReDrafterForCausalLM.forward"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.models.ReDrafterForCausalLM.forward" title="Link to this definition">#</a></dt>
-<dd><ol class="arabic simple" start="0">
-<li><p>run base model, get logits, hidden_states</p></li>
-</ol>
+<dt class="sig sig-object py" id="tensorrt_llm.models.ReDrafterForLLaMALM">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.models.</span></span><span class="sig-name descname"><span class="pre">ReDrafterForLLaMALM</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/models/redrafter/model.html#ReDrafterForLLaMALM"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.models.ReDrafterForLLaMALM" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">ReDrafterMixin</span></code>, <a class="reference internal" href="#tensorrt_llm.models.LLaMAForCausalLM" title="tensorrt_llm.models.llama.model.LLaMAForCausalLM"><code class="xref py py-class docutils literal notranslate"><span class="pre">LLaMAForCausalLM</span></code></a></p>
+<p>ReDrafter implementation for LLaMA models.</p>
+<p>Combines:
+- Base LLaMA model functionality from LLaMAForCausalLM
+- Drafting/speculative decoding logic from ReDrafterMixin</p>
 </dd></dl>
 
-<dl class="py method">
-<dt class="sig sig-object py" id="tensorrt_llm.models.ReDrafterForCausalLM.prepare_inputs">
-<span class="sig-name descname"><span class="pre">prepare_inputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/models/redrafter/model.html#ReDrafterForCausalLM.prepare_inputs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.models.ReDrafterForCausalLM.prepare_inputs" title="Link to this definition">#</a></dt>
-<dd><dl>
-<dt>Inputs needed:</dt><dd><p>Assuming, max_gen_tokens = 1 + nb*(bl - 1), counting true token
-device_request_types: [bs]
-draft_tokens: [bs, nb, bl]
-draft_indices: [bs, nb, bl]
-draft_probs: [bs, nb, bl-1, V]
-spec_decoding_generation_lengths: [bs]
-spec_decoding_position_offsets: [bs, max_gen_tokens]
-spec_decoding_packed_mask: [bs, max_gen_tokens, packed_length] **
-redrafter_inverted_temperature: [bs]
-rand_data_sample: [bs]
-rand_data_validation: [bs, nb, bl-1]</p>
-<dl class="simple">
-<dt>** The mask is tricky since the boolean mask will need to be</dt><dd><dl class="simple">
-<dt>packed in runtime. So, the last dim will be:</dt><dd><p>packed_length = ceil(max_gen_tokens/32)</p>
-</dd>
-</dl>
-</dd>
-</dl>
-</dd>
-</dl>
-</dd></dl>
-
+<dl class="py class">
+<dt class="sig sig-object py" id="tensorrt_llm.models.ReDrafterForQWenLM">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.models.</span></span><span class="sig-name descname"><span class="pre">ReDrafterForQWenLM</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/models/redrafter/model.html#ReDrafterForQWenLM"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.models.ReDrafterForQWenLM" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">ReDrafterMixin</span></code>, <code class="xref py py-class docutils literal notranslate"><span class="pre">QWenForCausalLM</span></code></p>
+<p>ReDrafter implementation for QWen models.</p>
+<p>Combines:
+- Base QWen model functionality from QWenForCausalLM
+- Drafting/speculative decoding logic from ReDrafterMixin</p>
 </dd></dl>
 
 <dl class="py class">
@@ -3530,11 +3510,8 @@ ranges of the dimensions of when using TRT dynamic shapes.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.models.PretrainedModel.save_checkpoint"><code class="docutils literal notranslate"><span class="pre">save_checkpoint()</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.models.ReDrafterForCausalLM"><code class="docutils literal notranslate"><span class="pre">ReDrafterForCausalLM</span></code></a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.models.ReDrafterForCausalLM.forward"><code class="docutils literal notranslate"><span class="pre">forward()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.models.ReDrafterForCausalLM.prepare_inputs"><code class="docutils literal notranslate"><span class="pre">prepare_inputs()</span></code></a></li>
-</ul>
-</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.models.ReDrafterForLLaMALM"><code class="docutils literal notranslate"><span class="pre">ReDrafterForLLaMALM</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.models.ReDrafterForQWenLM"><code class="docutils literal notranslate"><span class="pre">ReDrafterForQWenLM</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.models.RecurrentGemmaForCausalLM"><code class="docutils literal notranslate"><span class="pre">RecurrentGemmaForCausalLM</span></code></a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.models.RecurrentGemmaForCausalLM.forward"><code class="docutils literal notranslate"><span class="pre">forward()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.models.RecurrentGemmaForCausalLM.prepare_inputs"><code class="docutils literal notranslate"><span class="pre">prepare_inputs()</span></code></a></li>
@@ -3669,9 +3646,9 @@ ranges of the dimensions of when using TRT dynamic shapes.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 21, 2025.</p>
+  <p>Last updated on June 29, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ebadc13">ebadc13</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/de97799">de97799</a>.</p>
   
 </div></div>
       

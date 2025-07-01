@@ -51,7 +51,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -63,7 +63,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc0" />
+  <meta name="docsearch:version" content="1.0.0rc1" />
 
 
   </head>
@@ -562,14 +562,14 @@
 <li><p><strong>quant_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.QuantConfig" title="tensorrt_llm.models.modeling_utils.QuantConfig"><em>tensorrt_llm.models.modeling_utils.QuantConfig</em></a><em>]</em>) – Quantization config. Defaults to None.</p></li>
 <li><p><strong>kv_cache_config</strong> (<a class="reference internal" href="#tensorrt_llm.llmapi.KvCacheConfig" title="tensorrt_llm.llmapi.llm_args.KvCacheConfig"><em>tensorrt_llm.llmapi.llm_args.KvCacheConfig</em></a>) – KV cache config. Defaults to None.</p></li>
 <li><p><strong>enable_chunked_prefill</strong> (<em>bool</em>) – Enable chunked prefill. Defaults to False.</p></li>
-<li><p><strong>guided_decoding_backend</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – Guided decoding backend. Defaults to None.</p></li>
+<li><p><strong>guided_decoding_backend</strong> (<em>Optional</em><em>[</em><em>Literal</em><em>[</em><em>'xgrammar'</em><em>, </em><em>'llguidance'</em><em>]</em><em>]</em>) – Guided decoding backend. llguidance is supported in PyTorch backend only. Defaults to None.</p></li>
 <li><p><strong>batched_logits_processor</strong> (<em>Optional</em><em>[</em><em>tensorrt_llm.sampling_params.BatchedLogitsProcessor</em><em>]</em>) – Batched logits processor. Defaults to None.</p></li>
 <li><p><strong>iter_stats_max_iterations</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – The maximum number of iterations for iter stats. Defaults to None.</p></li>
 <li><p><strong>request_stats_max_iterations</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – The maximum number of iterations for request stats. Defaults to None.</p></li>
 <li><p><strong>peft_cache_config</strong> (<em>Optional</em><em>[</em><em>tensorrt_llm.llmapi.llm_args.PeftCacheConfig</em><em>]</em>) – PEFT cache config. Defaults to None.</p></li>
 <li><p><strong>scheduler_config</strong> (<a class="reference internal" href="#tensorrt_llm.llmapi.SchedulerConfig" title="tensorrt_llm.llmapi.llm_args.SchedulerConfig"><em>tensorrt_llm.llmapi.llm_args.SchedulerConfig</em></a>) – Scheduler config. Defaults to None.</p></li>
 <li><p><strong>cache_transceiver_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.CacheTransceiverConfig" title="tensorrt_llm.llmapi.llm_args.CacheTransceiverConfig"><em>tensorrt_llm.llmapi.llm_args.CacheTransceiverConfig</em></a><em>]</em>) – Cache transceiver config. Defaults to None.</p></li>
-<li><p><strong>speculative_config</strong> (<em>Union</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig" title="tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig</em></a><em>, </em><a class="reference internal" href="#tensorrt_llm.llmapi.MedusaDecodingConfig" title="tensorrt_llm.llmapi.llm_args.MedusaDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.MedusaDecodingConfig</em></a><em>, </em><a class="reference internal" href="#tensorrt_llm.llmapi.EagleDecodingConfig" title="tensorrt_llm.llmapi.llm_args.EagleDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.EagleDecodingConfig</em></a><em>, </em><a class="reference internal" href="#tensorrt_llm.llmapi.MTPDecodingConfig" title="tensorrt_llm.llmapi.llm_args.MTPDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.MTPDecodingConfig</em></a><em>, </em><a class="reference internal" href="#tensorrt_llm.llmapi.NGramDecodingConfig" title="tensorrt_llm.llmapi.llm_args.NGramDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.NGramDecodingConfig</em></a><em>, </em><a class="reference internal" href="#tensorrt_llm.llmapi.DraftTargetDecodingConfig" title="tensorrt_llm.llmapi.llm_args.DraftTargetDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.DraftTargetDecodingConfig</em></a><em>, </em><em>NoneType</em><em>]</em>) – Speculative decoding config. Defaults to None.</p></li>
+<li><p><strong>speculative_config</strong> (<em>Union</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.DraftTargetDecodingConfig" title="tensorrt_llm.llmapi.llm_args.DraftTargetDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.DraftTargetDecodingConfig</em></a><em>, </em><a class="reference internal" href="#tensorrt_llm.llmapi.EagleDecodingConfig" title="tensorrt_llm.llmapi.llm_args.EagleDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.EagleDecodingConfig</em></a><em>, </em><a class="reference internal" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig" title="tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig</em></a><em>, </em><a class="reference internal" href="#tensorrt_llm.llmapi.MedusaDecodingConfig" title="tensorrt_llm.llmapi.llm_args.MedusaDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.MedusaDecodingConfig</em></a><em>, </em><a class="reference internal" href="#tensorrt_llm.llmapi.MTPDecodingConfig" title="tensorrt_llm.llmapi.llm_args.MTPDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.MTPDecodingConfig</em></a><em>, </em><a class="reference internal" href="#tensorrt_llm.llmapi.NGramDecodingConfig" title="tensorrt_llm.llmapi.llm_args.NGramDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.NGramDecodingConfig</em></a><em>, </em><em>NoneType</em><em>]</em>) – Speculative decoding config. Defaults to None.</p></li>
 <li><p><strong>batching_type</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.BatchingType" title="tensorrt_llm.llmapi.llm_args.BatchingType"><em>tensorrt_llm.llmapi.llm_args.BatchingType</em></a><em>]</em>) – Batching type. Defaults to None.</p></li>
 <li><p><strong>normalize_log_probs</strong> (<em>bool</em>) – Normalize log probabilities. Defaults to False.</p></li>
 <li><p><strong>max_batch_size</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – The maximum batch size. Defaults to None.</p></li>
@@ -581,9 +581,9 @@
 <li><p><strong>num_postprocess_workers</strong> (<em>int</em>) – The number of processes used for postprocessing the generated tokens, including detokenization. Defaults to 0.</p></li>
 <li><p><strong>postprocess_tokenizer_dir</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – The path to the tokenizer directory for postprocessing. Defaults to None.</p></li>
 <li><p><strong>reasoning_parser</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – The parser to separate reasoning content from output. Defaults to None.</p></li>
-<li><p><strong>garbage_collection_gen0_threshold</strong> (<em>int</em>) – Threshold for Python garbage collection of generation 0 objects.Lower values trigger more frequent garbage collection. Defaults to 20000.</p></li>
 <li><p><strong>backend</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – The backend to use for this LLM instance. Defaults to None.</p></li>
 <li><p><strong>build_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.BuildConfig" title="tensorrt_llm.builder.BuildConfig"><em>tensorrt_llm.builder.BuildConfig</em></a><em>]</em>) – Build config. Defaults to None.</p></li>
+<li><p><strong>garbage_collection_gen0_threshold</strong> (<em>int</em>) – Threshold for Python garbage collection of generation 0 objects.Lower values trigger more frequent garbage collection. Defaults to 20000.</p></li>
 <li><p><strong>use_cuda_graph</strong> (<em>bool</em>) – If true, use CUDA graphs for decoding. CUDA graphs are only created for the batch sizes in cuda_graph_batch_sizes, and are enabled for batches that consist of decoding requests <em>only</em> (the reason is that it’s hard to capture a single graph with prefill requests since the input shapes are a function of the sequence lengths). Note that each CUDA graph can use up to 200 MB of extra memory. Defaults to False.</p></li>
 <li><p><strong>cuda_graph_batch_sizes</strong> (<em>Optional</em><em>[</em><em>List</em><em>[</em><em>int</em><em>]</em><em>]</em>) – List of batch sizes to create CUDA graphs for. Defaults to None.</p></li>
 <li><p><strong>cuda_graph_max_batch_size</strong> (<em>int</em>) – Maximum batch size for CUDA graphs. Defaults to 0.</p></li>
@@ -867,6 +867,7 @@ after prompts have been submitted.</p>
 <dd><em class="sig-param"><span class="n"><span class="pre">stop_reason:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">generation_logits:</span> <span class="pre">~torch.Tensor</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">disaggregated_params:</span> <span class="pre">~tensorrt_llm.disaggregated_params.DisaggregatedParams</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">request_perf_metrics:</span> <span class="pre">~tensorrt_llm.bindings.executor.RequestPerfMetrics</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">_postprocess_result:</span> <span class="pre">~typing.Any</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 </dl>
 
@@ -886,6 +887,7 @@ after prompts have been submitted.</p>
 <li><p><strong>stop_reason</strong> (<em>int</em><em>, </em><em>str</em><em>, </em><em>optional</em>) – The stop string or token id that caused the completion to stop, None if the completion finished for some other reason. Defaults to None.</p></li>
 <li><p><strong>generation_logits</strong> (<em>torch.Tensor</em><em>, </em><em>optional</em>) – The logits on the generated output token ids. Defaults to None.</p></li>
 <li><p><strong>disaggregated_params</strong> (<a class="reference internal" href="#tensorrt_llm.llmapi.DisaggregatedParams" title="tensorrt_llm.disaggregated_params.DisaggregatedParams"><em>tensorrt_llm.disaggregated_params.DisaggregatedParams</em></a><em>, </em><em>optional</em>) – Parameters needed for disaggregated serving. Includes the type of request, the first generated tokens, the context request id and the any additional state needing to be transferred from context and generation instances. Defaults to None.</p></li>
+<li><p><strong>request_perf_metrics</strong> (<em>tensorrt_llm.bindings.executor.RequestPerfMetrics</em><em>, </em><em>optional</em>) – Performance metrics for the request. Defaults to None.</p></li>
 </ul>
 </dd>
 </dl>
@@ -953,6 +955,7 @@ after prompts have been submitted.</p>
 <dd><em class="sig-param"><span class="n"><span class="pre">stop_reason:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">generation_logits:</span> <span class="pre">~torch.Tensor</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">disaggregated_params:</span> <span class="pre">~tensorrt_llm.disaggregated_params.DisaggregatedParams</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">request_perf_metrics:</span> <span class="pre">~tensorrt_llm.bindings.executor.RequestPerfMetrics</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">_postprocess_result:</span> <span class="pre">~typing.Any</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 </dl>
 
@@ -1002,6 +1005,11 @@ after prompts have been submitted.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.CompletionOutput.prompt_logprobs">
 <span class="sig-name descname"><span class="pre">prompt_logprobs</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">list</span><span class="p"><span class="pre">[</span></span><span class="pre">dict</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">Logprob</span><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.CompletionOutput.prompt_logprobs" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.CompletionOutput.request_perf_metrics">
+<span class="sig-name descname"><span class="pre">request_perf_metrics</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">RequestPerfMetrics</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.CompletionOutput.request_perf_metrics" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -1137,7 +1145,7 @@ after prompts have been submitted.</p>
 <li><p><strong>regex</strong> (<em>str</em><em>, </em><em>optional</em>) – The generated text is amenable to the user-specified regular expression. Defaults to None.</p></li>
 <li><p><strong>grammar</strong> (<em>str</em><em>, </em><em>optional</em>) – The generated text is amenable to the user-specified extended Backus-Naur form (EBNF) grammar. Defaults to None.</p></li>
 <li><p><strong>json_object</strong> (<em>bool</em>) – If True, the generated text is amenable to json format. Defaults to False.</p></li>
-<li><p><strong>structural_tag</strong> (<em>str</em><em>, </em><em>optional</em>) – The generated text is amenable to the user-specified structural tag. Defaults to None.</p></li>
+<li><p><strong>structural_tag</strong> (<em>str</em><em>, </em><em>optional</em>) – The generated text is amenable to the user-specified structural tag. Structural tag is supported by xgrammar in PyTorch backend only. Defaults to None.</p></li>
 </ul>
 </dd>
 </dl>
@@ -1710,6 +1718,7 @@ The BatchedLogitsProcessor class is recommended for callback creation. The callb
 <dd><em class="sig-param"><span class="n"><span class="pre">event_buffer_max_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">0</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_partial_reuse</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">copy_on_partial_reuse</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">use_uvm</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#KvCacheConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.KvCacheConfig" title="Link to this definition">#</a></dt>
@@ -1791,6 +1800,12 @@ The BatchedLogitsProcessor class is recommended for callback creation. The callb
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.KvCacheConfig.sink_token_length">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">sink_token_length</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.KvCacheConfig.sink_token_length" title="Link to this definition">#</a></dt>
 <dd><p>Number of sink tokens (tokens to always keep in attention window).</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.KvCacheConfig.use_uvm">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">use_uvm</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.KvCacheConfig.use_uvm" title="Link to this definition">#</a></dt>
+<dd><p>Whether to use UVM for the KV cache.</p>
 </dd></dl>
 
 </dd></dl>
@@ -1970,7 +1985,7 @@ validated to form a valid model.</p>
 
 <dl class="py method pydantic_validator">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.LookaheadDecodingConfig.validate_positive_values">
-<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_positive_values</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">max_window_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">max_ngram_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">max_verification_set_size</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#LookaheadDecodingConfig.validate_positive_values"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.validate_positive_values" title="Link to this definition">#</a></dt>
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_positive_values</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">max_ngram_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">max_window_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">max_verification_set_size</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#LookaheadDecodingConfig.validate_positive_values"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.validate_positive_values" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -3412,14 +3427,15 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dd><em class="sig-param"><span class="n"><span class="pre">quant_config:</span> <span class="pre">~tensorrt_llm.models.modeling_utils.QuantConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">kv_cache_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.KvCacheConfig</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_chunked_prefill:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">guided_decoding_backend:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">guided_decoding_backend:</span> <span class="pre">~typing.Literal['xgrammar'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">'llguidance']</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">batched_logits_processor:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">iter_stats_max_iterations:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">request_stats_max_iterations:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">peft_cache_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.PeftCacheConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">scheduler_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.SchedulerConfig</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">cache_transceiver_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.CacheTransceiverConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">speculative_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.MedusaDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.EagleDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.MTPDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.NGramDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.DraftTargetDecodingConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">speculative_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.DraftTargetDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.EagleDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.MedusaDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.MTPDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.NGramDecodingConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">batching_type:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.BatchingType</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">normalize_log_probs:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_batch_size:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
@@ -3431,11 +3447,11 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dd><em class="sig-param"><span class="n"><span class="pre">num_postprocess_workers:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">0</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">postprocess_tokenizer_dir:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">reasoning_parser:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">garbage_collection_gen0_threshold:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">20000</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">decoding_config:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">_mpi_session:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">backend:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">build_config:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">garbage_collection_gen0_threshold:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">20000</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">use_cuda_graph:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">cuda_graph_batch_sizes:</span> <span class="pre">~typing.List[int]</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">cuda_graph_max_batch_size:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">0</span></span></em>,</dd>
@@ -3794,6 +3810,31 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.extra_resource_managers">
 <em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">extra_resource_managers</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">Dict</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">object</span><span class="p"><span class="pre">]</span></span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.extra_resource_managers" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.garbage_collection_gen0_threshold">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">garbage_collection_gen0_threshold</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">20000</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.garbage_collection_gen0_threshold" title="Link to this definition">#</a></dt>
+<dd><p>Threshold for Python garbage collection of generation 0 objects.Lower values trigger more frequent garbage collection.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_stream_interval</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.get_pytorch_backend_config">
@@ -4213,14 +4254,15 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dd><em class="sig-param"><span class="n"><span class="pre">quant_config:</span> <span class="pre">~tensorrt_llm.models.modeling_utils.QuantConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">kv_cache_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.KvCacheConfig</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_chunked_prefill:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">guided_decoding_backend:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">guided_decoding_backend:</span> <span class="pre">~typing.Literal['xgrammar'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">'llguidance']</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">batched_logits_processor:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">iter_stats_max_iterations:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">request_stats_max_iterations:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">peft_cache_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.PeftCacheConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">scheduler_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.SchedulerConfig</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">cache_transceiver_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.CacheTransceiverConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">speculative_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.MedusaDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.EagleDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.MTPDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.NGramDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.DraftTargetDecodingConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">speculative_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.DraftTargetDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.EagleDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.MedusaDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.MTPDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.NGramDecodingConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">batching_type:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.BatchingType</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">normalize_log_probs:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_batch_size:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
@@ -4232,7 +4274,6 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dd><em class="sig-param"><span class="n"><span class="pre">num_postprocess_workers:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">0</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">postprocess_tokenizer_dir:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">reasoning_parser:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">garbage_collection_gen0_threshold:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">20000</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">decoding_config:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">_mpi_session:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">backend:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
@@ -4723,6 +4764,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.CompletionOutput.logprobs"><code class="docutils literal notranslate"><span class="pre">logprobs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id3"><code class="docutils literal notranslate"><span class="pre">logprobs_diff</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.CompletionOutput.prompt_logprobs"><code class="docutils literal notranslate"><span class="pre">prompt_logprobs</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.CompletionOutput.request_perf_metrics"><code class="docutils literal notranslate"><span class="pre">request_perf_metrics</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.CompletionOutput.stop_reason"><code class="docutils literal notranslate"><span class="pre">stop_reason</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.CompletionOutput.text"><code class="docutils literal notranslate"><span class="pre">text</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id4"><code class="docutils literal notranslate"><span class="pre">text_diff</span></code></a></li>
@@ -4826,6 +4868,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KvCacheConfig.onboard_blocks"><code class="docutils literal notranslate"><span class="pre">onboard_blocks</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KvCacheConfig.secondary_offload_min_priority"><code class="docutils literal notranslate"><span class="pre">secondary_offload_min_priority</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KvCacheConfig.sink_token_length"><code class="docutils literal notranslate"><span class="pre">sink_token_length</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KvCacheConfig.use_uvm"><code class="docutils literal notranslate"><span class="pre">use_uvm</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KvCacheRetentionConfig"><code class="docutils literal notranslate"><span class="pre">KvCacheRetentionConfig</span></code></a><ul class="nav section-nav flex-column">
@@ -5098,6 +5141,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.enable_min_latency"><code class="docutils literal notranslate"><span class="pre">enable_min_latency</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.enable_trtllm_sampler"><code class="docutils literal notranslate"><span class="pre">enable_trtllm_sampler</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.extra_resource_managers"><code class="docutils literal notranslate"><span class="pre">extra_resource_managers</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.garbage_collection_gen0_threshold"><code class="docutils literal notranslate"><span class="pre">garbage_collection_gen0_threshold</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.get_pytorch_backend_config"><code class="docutils literal notranslate"><span class="pre">get_pytorch_backend_config()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.init_backend"><code class="docutils literal notranslate"><span class="pre">init_backend</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.kv_cache_dtype"><code class="docutils literal notranslate"><span class="pre">kv_cache_dtype</span></code></a></li>
@@ -5284,9 +5328,9 @@ Whether to use a common pool for all requests, or the pool is private for each r
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 21, 2025.</p>
+  <p>Last updated on June 29, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ebadc13">ebadc13</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/de97799">de97799</a>.</p>
   
 </div></div>
       
