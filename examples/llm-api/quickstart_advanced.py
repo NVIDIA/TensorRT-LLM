@@ -92,6 +92,10 @@ def add_llm_args(parser):
                         default=False,
                         action='store_true',
                         help='Print iteration logs during execution')
+    parser.add_argument('--enable_perfect_router',
+                        default=False,
+                        action='store_true',
+                        help='Enable perfect router')
     parser.add_argument('--use_torch_compile',
                         default=False,
                         action='store_true',
@@ -225,8 +229,8 @@ def setup_llm(args, **kwargs):
         trust_remote_code=args.trust_remote_code,
         gather_generation_logits=args.return_generation_logits,
         max_beam_width=args.max_beam_width,
-        **kwargs,
-    )
+        enable_perfect_router=args.enable_perfect_router,
+        **kwargs)
 
     sampling_params = SamplingParams(
         max_tokens=args.max_tokens,

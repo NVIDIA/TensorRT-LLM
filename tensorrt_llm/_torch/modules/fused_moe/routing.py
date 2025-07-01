@@ -267,3 +267,162 @@ class RenormalizeNaiveMoeRoutingMethod(RenormalizeMoeRoutingMethod):
     @property
     def routing_method_type(self) -> RoutingMethodType:
         return RoutingMethodType.RenormalizeNaive
+
+
+def create_renormalize_expert_load_balanced_logits(
+        num_tokens: int,
+        num_experts: int,
+        experts_per_token: int,
+        moe_ep_size: int,
+        device: torch.device,
+        dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """
+    Create ideal logits that produce GPU-aware expert load balanced assignment for RenormalizeMoeRoutingMethod.
+
+    This function is specifically designed to work with RenormalizeMoeRoutingMethod, which applies
+    TopK selection first, then Softmax normalization on the selected experts. The function generates
+    logits with high values for the desired experts and low values for others, ensuring that the
+    TopK selection picks the intended experts for perfect load balancing.
+
+    This is a GPU-optimized version that avoids Python loops.
+
+    The function creates routing logits that ensure perfect load balancing across GPUs
+    by cycling through experts in a GPU-aware pattern. Each token is assigned to
+    exactly k=experts_per_token experts, distributed evenly across all GPUs.
+
+    Strategy:
+    1. First cycle through one expert from each GPU (GPU representatives)
+    2. Then move to the next expert on each GPU, and so on
+    3. This ensures even distribution of work across all GPUs
+
+    Example 1: num_gpus=4, num_experts=8, experts_per_token=2, tokens=3
+    experts_per_gpu = 8 // 4 = 2
+    gpu_representatives = [0, 2, 4, 6] (first expert from each GPU)
+    final_size = 3 * 2 = 6 (total expert assignments needed)
+
+    | i_tensor | gpu_idx | expert_offset | indices | Explanation |
+    |----------|---------|---------------|---------|-------------|
+    | 0        | 0       | 0             | 0       | GPU 0, expert 0 |
+    | 1        | 1       | 0             | 2       | GPU 1, expert 0 |
+    | 2        | 2       | 0             | 4       | GPU 2, expert 0 |
+    | 3        | 3       | 0             | 6       | GPU 3, expert 0 |
+    | 4        | 0       | 1             | 1       | GPU 0, expert 1 |
+    | 5        | 1       | 1             | 3       | GPU 1, expert 1 |
+
+    Reshaped to (3, 2): [[0, 2], [4, 6], [1, 3]]
+    Token 0 -> experts [0, 2], Token 1 -> experts [4, 6], Token 2 -> experts [1, 3]
+
+    Final GPU Load Balance (Example 1):
+    - GPU 0: 2 expert calls (expert 0 from token 0, expert 1 from token 2)
+    - GPU 1: 2 expert calls (expert 0 from token 0, expert 1 from token 2)
+    - GPU 2: 1 expert call (expert 0 from token 1)
+    - GPU 3: 1 expert call (expert 0 from token 1)
+    Note: Slight imbalance due to (3 tokens * 2 experts = 6 total work units) not being divisible by EP size (4 GPUs)
+
+    Example 2: num_gpus=4, num_experts=8, experts_per_token=2, tokens=4
+    experts_per_gpu = 8 // 4 = 2
+    gpu_representatives = [0, 2, 4, 6]
+    final_size = 4 * 2 = 8
+
+    | i_tensor | gpu_idx | expert_offset | indices | Explanation |
+    |----------|---------|---------------|---------|-------------|
+    | 0        | 0       | 0             | 0       | GPU 0, expert 0 |
+    | 1        | 1       | 0             | 2       | GPU 1, expert 0 |
+    | 2        | 2       | 0             | 4       | GPU 2, expert 0 |
+    | 3        | 3       | 0             | 6       | GPU 3, expert 0 |
+    | 4        | 0       | 1             | 1       | GPU 0, expert 1 |
+    | 5        | 1       | 1             | 3       | GPU 1, expert 1 |
+    | 6        | 2       | 1             | 5       | GPU 2, expert 1 |
+    | 7        | 3       | 1             | 7       | GPU 3, expert 1 |
+
+    Reshaped to (4, 2): [[0, 2], [4, 6], [1, 3], [5, 7]]
+    Token 0 -> experts [0, 2], Token 1 -> experts [4, 6],
+    Token 2 -> experts [1, 3], Token 3 -> experts [5, 7]
+
+    Final GPU Load Balance (Example 2):
+    - GPU 0: 2 expert calls (expert 0 from token 0, expert 1 from token 2)
+    - GPU 1: 2 expert calls (expert 0 from token 0, expert 1 from token 2)
+    - GPU 2: 2 expert calls (expert 0 from token 1, expert 1 from token 3)
+    - GPU 3: 2 expert calls (expert 0 from token 1, expert 1 from token 3)
+    Perfect balance: Each GPU handles exactly 2 expert calls
+
+    Args:
+        num_tokens: Number of tokens to route
+        num_experts: Total number of experts
+        experts_per_token: Number of experts each token should be routed to (top-k)
+        moe_ep_size: Number of GPUs for MoE expert parallelism
+        device: Device to create tensors on
+        dtype: Data type for the logits tensor
+
+    Returns:
+        torch.Tensor: Logits tensor of shape [num_tokens, num_experts] with softmax-applied probabilities
+
+    Raises:
+        ValueError: If num_experts is not divisible by moe_ep_size or if moe_ep_size is zero
+    """
+    k = experts_per_token
+    experts_per_gpu = num_experts // moe_ep_size
+    num_gpus = moe_ep_size
+
+    # Validation checks
+    if num_experts % moe_ep_size != 0:
+        raise ValueError(
+            f"num_experts ({num_experts}) must be divisible by moe_ep_size ({moe_ep_size})"
+        )
+
+    if moe_ep_size == 0:
+        raise ValueError("moe_ep_size cannot be zero")
+
+    # Create logits tensor on the same device and dtype as input
+    # Shape: [num_tokens, num_experts] - will hold routing probabilities
+    logits = torch.zeros(num_tokens, num_experts, device=device, dtype=dtype)
+
+    # GPU-aware expert assignment: cycle through one expert from each GPU first
+    final_size = num_tokens * k  # Total number of expert assignments needed
+
+    # Create GPU representatives (first expert from each GPU): [0, 8, 16, 24, ...]
+    # These are the starting expert indices for each GPU
+    gpu_representatives = torch.arange(0,
+                                       num_experts,
+                                       experts_per_gpu,
+                                       device=device)
+
+    # Generate indices using GPU-aware pattern (vectorized)
+    # i_tensor: sequential indices from 0 to final_size-1
+    i_tensor = torch.arange(final_size, device=device)
+
+    # gpu_idx: which GPU this assignment should go to (cycles through 0,1,2,3,0,1,2,3,...)
+    gpu_idx = i_tensor % num_gpus
+
+    # expert_offset: which expert within the GPU (0,0,0,0,1,1,1,1,2,2,2,2,...)
+    # This ensures we use all experts from each GPU before moving to next expert
+    expert_offset = (i_tensor // num_gpus) % experts_per_gpu
+
+    # indices: actual expert indices by combining GPU base + offset
+    indices = gpu_representatives[gpu_idx] + expert_offset
+
+    # Reshape to (num_tokens, k) - each row contains k expert indices for that token
+    expert_indices = indices.view(num_tokens, k)
+
+    # Generate large random values for selected experts (5-10 range)
+    # These high values ensure the selected experts have high probability after softmax
+    large_values = torch.rand(num_tokens, k, device=device,
+                              dtype=dtype) * 5 + 5  # [5, 10]
+
+    # Assign large values to selected expert positions
+    # token_indices: [[0,0],[1,1],[2,2],...] for indexing tokens
+    token_indices = torch.arange(num_tokens,
+                                 device=device).unsqueeze(1).expand(-1, k)
+    logits[token_indices, expert_indices] = large_values
+
+    # Fill remaining positions with small random values (0-1 range)
+    # This ensures non-selected experts have low but non-zero probability
+    mask = (logits == 0)
+    logits[mask] = torch.rand(mask.sum(), device=device, dtype=dtype)
+
+    # Apply softmax to get probabilities
+    # After softmax, selected experts will have high probability (~0.99)
+    # while non-selected experts will have very low probability
+    logits = torch.nn.functional.softmax(logits, dim=-1)
+
+    return logits
