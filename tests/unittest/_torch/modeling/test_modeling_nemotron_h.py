@@ -5,6 +5,7 @@ from utils.util import skip_gpu_memory_less_than
 from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.llm import RequestOutput
+from tensorrt_llm.llmapi.llm_args import CudaGraphConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
 
@@ -36,7 +37,7 @@ def create_nemotron_h_llm(use_cuda_graph, disable_overlap_scheduler,
         model=model_dir,
         tensor_parallel_size=1,
         max_batch_size=max_batch_size,
-        use_cuda_graph=use_cuda_graph,
+        cuda_graph_config=CudaGraphConfig() if use_cuda_graph else None,
         disable_overlap_scheduler=disable_overlap_scheduler,
         kv_cache_config=KvCacheConfig(enable_block_reuse=False),
         enable_trtllm_sampler=True,
