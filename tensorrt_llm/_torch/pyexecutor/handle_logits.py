@@ -1,0 +1,60 @@
+from typing import List, Tuple, Optional
+
+import torch
+
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm.logger import logger
+from tensorrt_llm._utils import nvtx_range
+
+
+class HandleLogits:
+
+    @torch.inference_mode()
+    @nvtx_range("handle_logits")
+    def __call__(
+        self,
+        context_requests: List[LlmRequest],
+        generation_requests: List[LlmRequest],
+        logits: torch.Tensor,
+        num_context_logits_prefix_sum: List[int],
+        max_num_sequences: int,
+        beam_width: int,
+    ):
+        """Handle context logits for a batch of requests.
+
+        Args:
+            context_requests: List of context requests to process
+            logits: Input logits tensor
+            num_context_logits_prefix_sum: Prefix sum of context logits for each request
+            max_num_sequences: Maximum number of sequences to process
+
+        Returns:
+            List[torch.Tensor]: List of logits tensors for each request
+            int: Index into logits tensor after processing all requests
+        """
+        # Copy logits into decoderBuffers.logits
+        for batch_index, llm_req in enumerate(context_requests):
+            logits_offset = num_context_logits_prefix_sum[batch_index]
+            logits_next_offset = num_context_logits_prefix_sum[batch_index + 1]
+
+            if llm_req.py_return_context_logits:
+                if llm_req.prepopulated_prompt_len > 0:
+                    logger.warning(
+                        f"Because of KV cache reuse, not all context logits could be produced for request {llm_req.request_id}."
+                    )
+                context_logits_device_view = logits[logits_offset:logits_next_offset]
+                llm_req.py_result.append_context_logits(context_logits_device_view)
+
+            if llm_req.py_return_generation_logits and llm_req.is_last_context_chunk:
+                # Get the logits from the last context token and draft tokens
+                logits_view = logits[logits_offset:logits_next_offset]
+                llm_req.py_result.append_generation_logits(logits_view)
+        
+        total_context_logits = num_context_logits_prefix_sum[-1]
+        for batch_index, llm_req in enumerate(generation_requests):
+            logits_offset = total_context_logits + batch_index * beam_width
+            logits_next_offset = logits_offset + beam_width
+
+            if llm_req.py_return_generation_logits and llm_req.is_last_context_chunk:
+                logits_view = logits[logits_offset:logits_next_offset]
+                llm_req.py_result.append_generation_logits(logits_view)

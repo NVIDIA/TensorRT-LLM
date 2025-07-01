@@ -5,7 +5,7 @@ import torch
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm.bindings.internal.runtime import DecoderBatchInput
-
+from tensorrt_llm._utils import nvtx_range
 
 @dataclass
 class MakeDecodingBatchInputOutput:
@@ -15,83 +15,18 @@ class MakeDecodingBatchInputOutput:
     It handles both context and generation requests, managing their logits and batch slots.
     """
 
-    @staticmethod
-    def create_decoder_batch_inputs(
-        *,
-        active_slots: List[int],
-        decoder_state,
-        logits: List[torch.Tensor],
-        max_num_sequences: int,
-        batch_slots: List[torch.Tensor],
-    ) -> DecoderBatchInput:
-        """Create decoder batch inputs from active slots and logits.
-
-        Args:
-            active_slots: List of active sequence slots
-            decoder_state: Current decoder state
-            logits: List of logit tensors for each slot
-            max_num_sequences: Maximum number of sequences to process
-            batch_slots: List of batch slot tensors for each decoding step
-
-        Returns:
-            DecoderBatchInput containing the prepared inputs
-        """
-        num_decoding_engine_tokens = decoder_state.num_decoding_engine_tokens
-        max_decoding_engine_tokens = decoder_state.max_decoding_engine_tokens
-        max_decoding_decoder_tokens = decoder_state.max_decoding_decoder_tokens
-        max_decoder_steps = (max_decoding_engine_tokens +
-                             max_decoding_decoder_tokens -
-                             1) // max_decoding_decoder_tokens
-
-        # Resize batch slots for each step
-        for step in range(max_decoder_steps):
-            batch_slots[step].resize_(max_num_sequences)
-
-        # Track batch indices and find max active decoder steps
-        batch_idx = [0] * max_decoder_steps
-        max_active_decoder_steps = 1
-
-        for slot in active_slots:
-            num_decoder_steps = (num_decoding_engine_tokens[slot] +
-                                 max_decoding_decoder_tokens -
-                                 1) // max_decoding_decoder_tokens
-            max_active_decoder_steps = max(max_active_decoder_steps,
-                                           num_decoder_steps)
-
-            for step in range(num_decoder_steps):
-                batch_slots[step][batch_idx[step]] = slot
-                batch_idx[step] += 1
-
-        # Resize batch slots to actual size used
-        for step in range(max_decoder_steps):
-            batch_slots[step].resize_(batch_idx[step])
-
-        # Create logits vector for each step
-        single_request = 1
-        logits_vec = [[] for _ in range(max_active_decoder_steps)]
-
-        for step in range(max_active_decoder_steps):
-            batch_slots_range = batch_slots[step]
-
-            for slot in batch_slots_range:
-                target_logits = logits[slot]
-                logits_slice = target_logits[step:step + single_request]
-                logits_vec[step].append(logits_slice)
-
-        # Create decoder batch input
-        decoding_input = DecoderBatchInput(logits_vec, max_active_decoder_steps)
-        decoding_input.batch_slots = batch_slots
-
-        return decoding_input
-
+    @torch.inference_mode()
+    @nvtx_range("make_decoding_batch_input_output")
     def __call__(
         self,
-        context_requests: List[LlmRequest],
-        generation_requests: List[LlmRequest],
+        scheduled_requests,
+        logits: torch.Tensor,
         decoder_input_buffers,
         decoder_state,
         model_config,
         max_num_sequences: int,
+        beam_width: int,
+        num_context_logits_prefix_sum: List[int],
     ) -> DecoderBatchInput:
         """Create decoder batch inputs and outputs for the given requests.
 
@@ -107,46 +42,29 @@ class MakeDecodingBatchInputOutput:
         Returns:
             DecoderBatchInput
         """
-        # Get active slots and generation steps
-        active_slots = []
+        # In order to make a decoding_input assuming no drafting, we need:
+        # 1. logits_vec = [[logits_slice of each active slot]]
+        # 2. batch_slots = [[active_slots]]
+        # 3. generation_steps = [decoding_iters]
+
+        active_slots = [[]]
         generation_steps = []
+        logits_vec = [[]]
+        for i, r in enumerate(scheduled_requests.context_requests):
+            if r.is_last_context_chunk:
+                active_slots[0].append(r.py_seq_slot)
+                generation_steps.append(r.decoding_iter)
+                logits_vec[0].append(logits[num_context_logits_prefix_sum[i]:num_context_logits_prefix_sum[i+1]].unsqueeze(0))
+        
+        logits_index = num_context_logits_prefix_sum[-1]
+        for i, r in enumerate(scheduled_requests.generation_requests):
+            if r.is_generation_in_progress_state:
+                active_slots[0].append(r.py_seq_slot)
+                generation_steps.append(r.decoding_iter)
+                logits_vec[0].append(logits.narrow(dim=0, start=logits_index + i * beam_width, length=beam_width).unsqueeze(0))
 
-        for requests in [context_requests, generation_requests]:
-            for request in requests:
-                if request.is_generation_in_progress_state or request.is_last_context_chunk:
-                    active_slots.append(request.seq_slot)
-                    generation_steps.append(request.decoding_iter)
-
-        # Sort by slot number
-        sorted_indices = sorted(range(len(active_slots)),
-                                key=lambda i: active_slots[i])
-        active_slots = [active_slots[i] for i in sorted_indices]
-        generation_steps = [generation_steps[i] for i in sorted_indices]
-
-        # Create decoder batch inputs
-        decoding_input = self.create_decoder_batch_inputs(
-            active_slots=active_slots,
-            decoder_state=decoder_state,
-            logits=decoder_input_buffers.logits,
-            max_num_sequences=max_num_sequences,
-            batch_slots=decoder_input_buffers.forward_batch_slots,
-        )
-        decoder_state.generation_steps = generation_steps
-
-        # TODO: Handle speculative decoding modes.
-        # fused_runtime_buffers is not created in the pytorch framework.
-
-        # if model_config.speculative_decoding_mode.is_explicit_draft_tokens:
-        #     if fused_runtime_buffers is None:
-        #         raise RuntimeError("Fused runtime buffers required for explicit draft tokens")
-        #     decoding_input.batch_slots_request_order = fused_runtime_buffers.seq_slots
-        #     decoding_input.explicit_draft_tokens_inputs = fused_runtime_buffers.explicit_draft_tokens_buffers.engine_outputs
-        #     decoding_input.explicit_draft_tokens_last_inputs = fused_runtime_buffers.explicit_draft_tokens_buffers.engine_inputs
-        # elif model_config.speculative_decoding_mode.is_eagle:
-        #     if fused_runtime_buffers is None:
-        #         raise RuntimeError("Fused runtime buffers required for eagle mode")
-        #     decoding_input.batch_slots_request_order = fused_runtime_buffers.seq_slots
-        #     decoding_input.eagle_inputs = fused_runtime_buffers.eagle_buffers.engine_outputs
-        #     decoding_input.eagle_last_inputs = fused_runtime_buffers.eagle_buffers.engine_inputs
+        decoding_input = DecoderBatchInput(logits_vec, 1)
+        decoding_input.generation_steps = generation_steps
+        decoding_input.batch_slots = [torch.tensor(active_slots[0])]
 
         return decoding_input

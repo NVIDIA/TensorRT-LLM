@@ -5,10 +5,7 @@ from typing import Literal
 
 import torch
 
-from tensorrt_llm._torch.pyexecutor.handle_context_logits import \
-    HandleContextLogits
-from tensorrt_llm._torch.pyexecutor.handle_generation_logits import \
-    HandleGenerationLogits
+from tensorrt_llm._torch.pyexecutor.handle_logits import HandleLogits
 from tensorrt_llm._torch.pyexecutor.make_decoding_batch_input_output import \
     MakeDecodingBatchInputOutput
 from tensorrt_llm._utils import nvtx_range, torch_dtype_to_binding
@@ -523,6 +520,10 @@ class TRTLLMSampler(Sampler):
         self._initialize_store()
         self._instantiate_algorithms()
 
+        self.timers = []
+        self.gen_timers = []
+        self.make_decoding_batch_input_output_timers = []
+
     def _initialize_store(self):
         torch_stream = torch.cuda.current_stream().cuda_stream
         cuda_stream = CudaStream(torch_stream)
@@ -575,11 +576,12 @@ class TRTLLMSampler(Sampler):
             speculative_decoding_fast_logits=False,
             is_leader_in_orch_mode=False,
             is_normalize_log_probs=False)
-        self.algs.handle_context_logits = HandleContextLogits()
-        self.algs.handle_generation_logits = HandleGenerationLogits()
+        self.algs.handle_logits = HandleLogits()
         self.algs.make_decoding_batch_input_output = MakeDecodingBatchInputOutput(
         )
 
+    @torch.inference_mode()
+    @nvtx_range("setup_sampler_step")
     def setup_sampler_step(self, requests):
         batch_slots, sampling_configs, lookahead_prompt, lookahead_algo_configs = self.algs.create_new_decoder_requests(
             self.model_config, self.world_config, self.decoding_config,
@@ -598,6 +600,7 @@ class TRTLLMSampler(Sampler):
                 lookahead_algo_configs)
 
     @staticmethod
+    @torch.inference_mode()
     def beam_width(scheduled_requests: Iterable[LlmRequest]) -> int:
         for req in scheduled_requests:
             return req.sampling_config.beam_width
@@ -617,8 +620,10 @@ class TRTLLMSampler(Sampler):
                     non_blocking=True)
 
     @torch.inference_mode()
+    @nvtx_range("sample_async")
     def sample_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs) -> SampleStateTRTLLM:
+
         batch_size = scheduled_requests.batch_size
         all_requests = scheduled_requests.all_requests()
         beam_width = self.beam_width(all_requests)
@@ -629,32 +634,42 @@ class TRTLLMSampler(Sampler):
                 "Beam search is not supported for multiple prompts and logprobs"
             )
         self.setup_sampler_step(scheduled_requests.context_requests)
-
-        num_context_logits = [1] * batch_size
-        for batch_index, request in enumerate(
-                scheduled_requests.context_requests):
-            num_context_logits[
-                batch_index] = request.context_chunk_size if request.py_return_context_logits else 1
-
-        decoder_logits, logits_index = self.algs.handle_context_logits(
-            scheduled_requests.context_requests, model_outputs["logits"],
-            num_context_logits, self.max_num_sequences)
-
-        decoder_logits = self.algs.handle_generation_logits(
-            decoder_logits, scheduled_requests.generation_requests,
-            model_outputs["logits"], logits_index)
-
-        self.store["decoder_input_buffers"].logits = decoder_logits
+        
+        start_time = time.perf_counter()
+        num_context_logits_prefix_sum = [0]
+        prefix_sum = 0
+        for request in scheduled_requests.context_requests:
+            prefix_sum += request.context_chunk_size if request.py_return_context_logits else 1
+            num_context_logits_prefix_sum.append(prefix_sum)
+        end_time = time.perf_counter()
+        self.timers.append((end_time - start_time) * 1000)
+        if len(self.timers) % 200 == 0:
+            print(f"prefix_sum time: {sum(self.timers[-200:]) / 200} ms")
+        
+        if any(r.py_return_context_logits or r.py_return_generation_logits for r in scheduled_requests.all_requests):
+            start_time = time.perf_counter()
+            self.algs.handle_logits(
+                scheduled_requests.context_requests, scheduled_requests.generation_requests,
+                model_outputs["logits"], num_context_logits_prefix_sum, self.max_num_sequences, beam_width)
+            end_time = time.perf_counter()
+            self.gen_timers.append((end_time - start_time) * 1000)
+            if len(self.gen_timers) % 200 == 0:
+                print(f"handle_logits time: {sum(self.gen_timers[-200:]) / 200} ms")
+            
+        start_time = time.perf_counter()
 
         # For beam search, cache indirection needs to be updated
         if (beam_width > 1):
             self._update_cache_indirection_buffer(scheduled_requests)
 
         decoding_input = self.algs.make_decoding_batch_input_output(
-            scheduled_requests.context_requests,
-            scheduled_requests.generation_requests,
+            scheduled_requests, model_outputs["logits"],
             self.store["decoder_input_buffers"], self.store["decoder_state"],
-            self.model_config, self.max_num_sequences)
+            self.model_config, self.max_num_sequences, beam_width, num_context_logits_prefix_sum)
+        end_time = time.perf_counter()
+        self.make_decoding_batch_input_output_timers.append((end_time - start_time) * 1000)
+        if len(self.make_decoding_batch_input_output_timers) % 200 == 0:
+            print(f"make_decoding_batch_input_output time: {sum(self.make_decoding_batch_input_output_timers[-200:]) / 200} ms")
 
         self.algs.decoder.forward_async(self.store["decoder_state"],
                                         decoding_input)
