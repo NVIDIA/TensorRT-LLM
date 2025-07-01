@@ -34,29 +34,28 @@ class HandleLogits:
         """
         # Copy logits into decoderBuffers.logits
         for batch_index, llm_req in enumerate(context_requests):
-            logits_offset = num_context_logits_prefix_sum[batch_index]
-            logits_next_offset = num_context_logits_prefix_sum[batch_index + 1]
+            logits_begin = num_context_logits_prefix_sum[batch_index]
+            logits_end = num_context_logits_prefix_sum[batch_index + 1]
 
             if llm_req.py_return_context_logits:
                 if llm_req.prepopulated_prompt_len > 0:
                     logger.warning(
                         f"Because of KV cache reuse, not all context logits could be produced for request {llm_req.request_id}."
                     )
-                context_logits_device_view = logits[
-                    logits_offset:logits_next_offset]
+                context_logits_device_view = logits[logits_begin:logits_end]
                 llm_req.py_result.append_context_logits(
                     context_logits_device_view)
 
             if llm_req.py_return_generation_logits and llm_req.is_last_context_chunk:
                 # Get the logits from the last context token and draft tokens
-                logits_view = logits[logits_offset:logits_next_offset]
+                logits_view = logits[logits_begin:logits_end]
                 llm_req.py_result.append_generation_logits(logits_view)
 
         total_context_logits = num_context_logits_prefix_sum[-1]
         for batch_index, llm_req in enumerate(generation_requests):
-            logits_offset = total_context_logits + batch_index * beam_width
-            logits_next_offset = logits_offset + beam_width
+            logits_begin = total_context_logits + batch_index * beam_width
+            logits_end = logits_begin + beam_width
 
             if llm_req.py_return_generation_logits and llm_req.is_last_context_chunk:
-                logits_view = logits[logits_offset:logits_next_offset]
+                logits_view = logits[logits_begin:logits_end]
                 llm_req.py_result.append_generation_logits(logits_view)
