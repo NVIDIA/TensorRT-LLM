@@ -168,7 +168,7 @@ def get_shuffle_matrix_sf_a_row_indices(
         num_elts_per_sf: int = 16) -> torch.Tensor:
 
     assert input_tensor.dtype == float4_sf_dtype
-    assert num_elts_per_sf == 16
+    assert num_elts_per_sf == 16 or num_elts_per_sf == 32
 
     assert input_tensor.dim(
     ) == 2, f"input_tensor should be a 2D tensor, not {input_tensor.dim()}"

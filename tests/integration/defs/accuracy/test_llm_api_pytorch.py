@@ -2173,7 +2173,7 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRITON"])
+    @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRITON", "TRTLLM"])
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
         [(1, 1, 1, False, True, True)],
@@ -2182,8 +2182,9 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
                            attention_dp, cuda_graph, overlap_scheduler):
         if moe_backend == "TRITON" and get_sm_version() < 90:
             pytest.skip("TRITON moe backend requires Hopper or newer.")
-        if moe_backend == "CUTLASS" and get_sm_version() < 100:
-            pytest.skip("CUTLASS moe backend requires Blackwell or newer.")
+        if moe_backend in ["CUTLASS", "TRTLLM"] and get_sm_version() < 100:
+            pytest.skip(
+                "CUTLASS or TRTLLM moe backend requires Blackwell or newer.")
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
                               use_cuda_graph=cuda_graph)
 
@@ -2195,6 +2196,28 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             **pytorch_config,
             enable_attention_dp=attention_dp,
             moe_backend=moe_backend)
+        with llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_blackwell
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend",
+        [(1, 1, 1, False, True, True, "TRTLLM")],
+        ids=["latency-TRTLLM"])
+    def test_w4a16_mxfp4(self, tp_size, pp_size, ep_size, attention_dp,
+                         cuda_graph, overlap_scheduler, moe_backend):
+        pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
+                              use_cuda_graph=cuda_graph,
+                              moe_backend=moe_backend)
+
+        llm = LLM(
+            f"{llm_models_root()}/mxfp4-qwen3/saved_models_Qwen3-30B-A3B_w4a16_mxfp4_kv_none_hf_moeonly",
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=pp_size,
+            moe_expert_parallel_size=ep_size,
+            enable_attention_dp=attention_dp,
+            **pytorch_config)
         with llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)

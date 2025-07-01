@@ -20,8 +20,10 @@ from .interface import MoEWeightLoadingMode
 FUSED_MOE_NVFP4_INPUT_DTYPE = torch.int64
 # pack weights into int64, e.g. 16 x nvfp4 weight values
 FUSED_MOE_NVFP4_WEIGHT_DTYPE = torch.int64
+FUSED_MOE_MXFP4_WEIGHT_DTYPE = torch.int64
 # pack weight block scales into int32, e.g. 4 x fp8 weight values
 FUSED_MOE_NVFP4_WEIGHT_BLOCK_SCALE_DTYPE = torch.int32
+FUSED_MOE_MXFP4_WEIGHT_BLOCK_SCALE_DTYPE = torch.int32
 
 
 class FusedMoEQuantScalesFP8(NamedTuple):
@@ -65,6 +67,50 @@ class FusedMoEQuantScalesW4A8MXFP4FP8(NamedTuple):
     fc2_input_scale: torch.Tensor
     fc2_weight_block_scale: torch.Tensor
     fc2_dequant_scale: torch.Tensor
+
+
+def trtllmgen_maybe_get_cached_w3_w1_permute_indices(
+        dst_w3_w1_weight: torch.Tensor,
+        cache_permute_indices: Dict[tuple[int, int, int], torch.Tensor],
+        epilogue_tile_m: int,
+        num_elts_per_sf: Union[None, int] = None) -> torch.Tensor:
+    if dst_w3_w1_weight.shape not in cache_permute_indices:
+        # Get permute indices and chain them together
+        permute0 = get_reorder_rows_for_gated_act_gemm_row_indices(
+            dst_w3_w1_weight)
+        if num_elts_per_sf is None:
+            permute1 = get_shuffle_matrix_a_row_indices(
+                dst_w3_w1_weight, epilogue_tile_m=epilogue_tile_m)
+        else:
+            permute1 = get_shuffle_matrix_sf_a_row_indices(
+                dst_w3_w1_weight,
+                epilogue_tile_m=epilogue_tile_m,
+                num_elts_per_sf=num_elts_per_sf)
+        # Memoize permute indices as recompute is **very** costly
+        cache_permute_indices[dst_w3_w1_weight.shape] = permute0[permute1].to(
+            dst_w3_w1_weight.device)
+    permute_indices = cache_permute_indices[dst_w3_w1_weight.shape]
+    return permute_indices
+
+
+def trtllmgen_maybe_get_cached_w2_permute_indices(
+        dst_w2_weight: torch.Tensor,
+        cache_permute_indices: Dict[tuple[int, int, int], torch.Tensor],
+        epilogue_tile_m: int,
+        num_elts_per_sf: Union[None, int] = None) -> torch.Tensor:
+    if dst_w2_weight.shape not in cache_permute_indices:
+        if num_elts_per_sf is None:
+            permute_indices = (get_shuffle_matrix_a_row_indices(
+                dst_w2_weight, epilogue_tile_m).to(dst_w2_weight.device))
+        else:
+            permute_indices = (get_shuffle_matrix_sf_a_row_indices(
+                dst_w2_weight,
+                epilogue_tile_m=epilogue_tile_m,
+                num_elts_per_sf=num_elts_per_sf).to(dst_w2_weight.device))
+        # Memoize permute indices as recompute is **very** costly
+        cache_permute_indices[dst_w2_weight.shape] = permute_indices
+    permute_indices = cache_permute_indices[dst_w2_weight.shape]
+    return permute_indices
 
 
 class FusedMoEMethodBase(ABC):
@@ -1113,7 +1159,7 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
             module.w3_w1_weight_scale.data, module.w2_weight_scale.data,
             module.fc31_alpha.data, module.fc2_alpha.data)
 
-        # Step 3: if need load into shared
+        # Step 3: if needed, load into shared
         if self.need_load_shared_weights(module):
             local_shared_load_expert_ids = module.layer_load_balancer.get_load_expert_ids(
             )
@@ -1247,264 +1293,6 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
         dst_w2_weight_scale.copy_(dst_w2_weight_scale_interleaved)
 
 
-class W4A8MXFP4FP8FusedMoEMethod(FusedMoEMethodBase):
-    """
-    Base class for W4A8MXFP4FP8 fused MoE methods for all backends.
-    """
-
-    def create_weights(self, module: torch.nn.Module, weight_dtype,
-                       weight_vec_size, block_scales_dtype,
-                       block_scales_vec_size):
-
-        module.scaling_vector_size = 32
-        # Divide by 32 because we use int64 to pack 16 fp4 values
-        w3_w1_weight_shape = (module.expert_size_per_partition,
-                              module.intermediate_size_per_partition * 2,
-                              module.hidden_size // weight_vec_size)
-        w2_weight_shape = (module.expert_size_per_partition, module.hidden_size,
-                           module.intermediate_size_per_partition //
-                           weight_vec_size)
-
-        # Divide by 4 because we use int32 to pack 4 fp8 values
-        # column parallel
-        assert module.hidden_size % (module.scaling_vector_size *
-                                     block_scales_vec_size) == 0
-        w3_w1_weight_scale = nn.Parameter(
-            torch.ones(module.expert_size_per_partition,
-                       module.intermediate_size_per_partition * 2,
-                       module.hidden_size // module.scaling_vector_size //
-                       block_scales_vec_size,
-                       dtype=block_scales_dtype),
-            requires_grad=False)
-        module.register_parameter("w3_w1_weight_scale", w3_w1_weight_scale)
-
-        # row parallel
-        assert module.intermediate_size_per_partition % (
-            module.scaling_vector_size * block_scales_vec_size) == 0
-        w2_weight_scale = nn.Parameter(
-            torch.ones(module.expert_size_per_partition,
-                       module.hidden_size,
-                       module.intermediate_size_per_partition //
-                       module.scaling_vector_size // block_scales_vec_size,
-                       dtype=block_scales_dtype),
-            requires_grad=False)
-        module.register_parameter("w2_weight_scale", w2_weight_scale)
-
-        fc31_input_scale = nn.Parameter(torch.tensor(1., dtype=torch.float32),
-                                        requires_grad=False)
-        module.register_parameter("fc31_input_scale", fc31_input_scale)
-
-        fc31_input_dequant = nn.Parameter(torch.empty(
-            module.expert_size_per_partition, dtype=torch.float32),
-                                          requires_grad=False)
-        module.register_parameter("fc31_input_dequant", fc31_input_dequant)
-
-        fc2_input_scale = nn.Parameter(torch.tensor(1., dtype=torch.float32),
-                                       requires_grad=False)
-        module.register_parameter("fc2_input_scale", fc2_input_scale)
-
-        fc2_input_dequant = nn.Parameter(torch.empty(
-            module.expert_size_per_partition, dtype=torch.float32),
-                                         requires_grad=False)
-        module.register_parameter("fc2_input_dequant", fc2_input_dequant)
-
-        super().create_weights(module, weight_dtype, w3_w1_weight_shape,
-                               w2_weight_shape)
-
-        self.setup_quant_scales(module)
-
-    def load_expert_w3_w1_weight_scale_w4a8_mxfp4_fp8(
-            self, module: torch.nn.Module, w1_weight_scale: torch.Tensor,
-            w3_weight_scale: torch.Tensor,
-            dst_w3_w1_weight_scale: torch.Tensor):
-        w1_weight_scale = load_weight_shard(w1_weight_scale, module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN)
-        w3_weight_scale = load_weight_shard(w3_weight_scale, module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN)
-        # Keep weights in device buffer
-        # w3
-        dst_w3_weight_scale = dst_w3_w1_weight_scale.narrow(
-            dim=0, start=0, length=module.intermediate_size_per_partition)
-        dst_w3_weight_scale.copy_(
-            w3_weight_scale.view(dst_w3_weight_scale.dtype))
-
-        # w1
-        dst_w1_weight_scale = dst_w3_w1_weight_scale.narrow(
-            dim=0,
-            start=module.intermediate_size_per_partition,
-            length=module.intermediate_size_per_partition)
-        dst_w1_weight_scale.copy_(
-            w1_weight_scale.view(dst_w1_weight_scale.dtype))
-
-        orig_shape = dst_w3_w1_weight_scale.shape
-
-        dst_w3_w1_weight_scale.copy_(
-            torch.ops.tensorrt_llm.block_scale_interleave(
-                dst_w3_w1_weight_scale.view(float4_sf_dtype)).view(
-                    self.block_scales_dtype).reshape(orig_shape))
-
-    def load_expert_w2_weight_scale_w4a8_mxfp4_fp8(
-            self, module: torch.nn.Module, w2_weight_scale: torch.Tensor,
-            dst_w2_weight_scale: torch.Tensor):
-        w2_weight_scale = load_weight_shard(w2_weight_scale, module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.ROW)
-        # Keep weights in device buffer
-        dst_w2_weight_scale.copy_(
-            w2_weight_scale.view(dst_w2_weight_scale.dtype))
-
-        orig_shape = dst_w2_weight_scale.shape
-
-        dst_w2_weight_scale.copy_(
-            torch.ops.tensorrt_llm.block_scale_interleave(
-                dst_w2_weight_scale.view(float4_sf_dtype)).view(
-                    self.block_scales_dtype).reshape(orig_shape))
-
-    def load_expert_fc31_input_scale_w4a8_mxfp4_fp8(
-            self, w1_input_scale, w3_input_scale,
-            dst_fc31_input_scale: torch.Tensor):
-        w1_input_scale = w1_input_scale[...].reshape([])
-        assert torch.allclose(
-            w1_input_scale, w3_input_scale), "w1_input_scale != w3_input_scale"
-        dst_fc31_input_scale.copy_(w1_input_scale)
-
-    def load_expert_fc2_input_scale_w4a8_mxfp4_fp8(
-            self, w2_input_scale, dst_fc2_input_scale: torch.Tensor):
-        dst_fc2_input_scale.copy_(w2_input_scale[...].reshape([]))
-
-    def load_all_w4a8_mxfp4_fp8_weight_scales(
-            self, module: torch.nn.Module, weights: Dict,
-            load_expert_ids: List[int], dst_w3_w1_weight_scale: torch.Tensor,
-            dst_w2_weight_scale: torch.Tensor):
-        for local_slot_id, expert_id in enumerate(load_expert_ids):
-            if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
-                w1_weight_scale = weights[f"{expert_id}.w1.weight_scale"]
-                w3_weight_scale = weights[f"{expert_id}.w3.weight_scale"]
-                w2_weight_scale = weights[f"{expert_id}.w2.weight_scale"]
-            elif module.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
-                w1_w3_weight_scale = weights["gate_up_proj_weight_scale"][
-                    expert_id].transpose(0, 1).contiguous()
-                w1_weight_scale, w3_weight_scale = w1_w3_weight_scale.chunk(
-                    2, dim=0)
-                w2_weight_scale = weights["down_proj_weight_scale"][
-                    expert_id].transpose(0, 1).contiguous()
-            else:
-                raise NotImplementedError(
-                    f"Unknown weight loading mode in MoE: {module.weight_loading_mode}"
-                )
-
-            expert_idx = local_slot_id
-
-            self.load_expert_w3_w1_weight_scale_w4a8_mxfp4_fp8(
-                module, w1_weight_scale, w3_weight_scale,
-                dst_w3_w1_weight_scale[expert_idx])
-            self.load_expert_w2_weight_scale_w4a8_mxfp4_fp8(
-                module, w2_weight_scale, dst_w2_weight_scale[expert_idx])
-
-    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
-        # Step1: Load input scales.
-        tmp_fc31_input_scale = torch.empty(module.num_experts,
-                                           dtype=torch.float32)
-        tmp_fc2_input_scale = torch.empty(module.num_experts,
-                                          dtype=torch.float32)
-
-        for expert_id in range(module.num_experts):
-            if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
-                w1_input_scale = weights[f"{expert_id}.w1.input_scale"]
-                w3_input_scale = weights[f"{expert_id}.w3.input_scale"]
-                w2_input_scale = weights[f"{expert_id}.w2.input_scale"]
-            elif module.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
-                w1_input_scale = weights["gate_up_proj_input_scale"]
-                w3_input_scale = weights["gate_up_proj_input_scale"]
-                w2_input_scale = weights["down_proj_input_scale"]
-            else:
-                raise NotImplementedError(
-                    f"Unknown weight loading mode in MoE: {module.weight_loading_mode}"
-                )
-
-            self.load_expert_fc31_input_scale_w4a8_mxfp4_fp8(
-                w1_input_scale, w3_input_scale, tmp_fc31_input_scale[expert_id])
-            self.load_expert_fc2_input_scale_w4a8_mxfp4_fp8(
-                w2_input_scale, tmp_fc2_input_scale[expert_id])
-
-        # fc31_input_scale is the reciprocal of the maximum of all w1 input scales and w3 input scales.
-        module.fc31_input_scale.data.copy_(
-            tmp_fc31_input_scale.max().reciprocal())
-        module.fc31_input_dequant.data.copy_(tmp_fc31_input_scale.max())
-        # fc2_input_scale is the reciprocal of the maximum of all w2 input scales.
-        module.fc2_input_scale.data.copy_(
-            tmp_fc2_input_scale.max().reciprocal())
-        module.fc2_input_dequant.data.copy_(tmp_fc2_input_scale.max())
-
-        # Step2: Load weight block scales.
-        self.load_all_w4a8_mxfp4_fp8_weight_scales(
-            module, weights, module.initial_local_expert_ids,
-            module.w3_w1_weight_scale.data, module.w2_weight_scale.data)
-
-        # Step 3: if need load into shared
-        if self.need_load_shared_weights(module):
-            local_shared_load_expert_ids = module.layer_load_balancer.get_load_expert_ids(
-            )
-            local_shared_w3_w1_scale_tensors = torch.empty(
-                (len(local_shared_load_expert_ids), ) +
-                module.w3_w1_weight_scale.data.shape[1:],
-                dtype=module.w3_w1_weight_scale.data.dtype,
-                device='cpu')
-            local_shared_w2_scale_tensors = torch.empty(
-                (len(local_shared_load_expert_ids), ) +
-                module.w2_weight_scale.data.shape[1:],
-                dtype=module.w2_weight_scale.data.dtype,
-                device='cpu')
-            self.load_all_w4a8_mxfp4_fp8_weight_scales(
-                module, weights, local_shared_load_expert_ids,
-                local_shared_w3_w1_scale_tensors, local_shared_w2_scale_tensors)
-
-            module.register_all_parameter_slot_and_to_fix_weight_fns({
-                'w3_w1_weight_scale':
-                local_shared_w3_w1_scale_tensors,
-                'w2_weight_scale':
-                local_shared_w2_scale_tensors,
-            })
-
-    def setup_quant_scales(self, module: torch.nn.Module):
-        module.quant_scales = FusedMoEQuantScalesW4A8MXFP4FP8(
-            fc31_weight_block_scale=module.w3_w1_weight_scale,
-            fc31_dequant_scale=module.fc31_input_dequant,
-            fc2_input_scale=module.fc2_input_scale,
-            fc2_weight_block_scale=module.w2_weight_scale,
-            fc2_dequant_scale=module.fc2_input_dequant,
-        )
-
-    def get_quant_scales(self, module: torch.nn.Module, slot_start,
-                         slot_end) -> tuple[torch.Tensor, ...]:
-        assert module.smart_router
-        return FusedMoEQuantScalesW4A8MXFP4FP8(
-            fc31_weight_block_scale=module.w3_w1_weight_scale.narrow(
-                0, slot_start, slot_end - slot_start),
-            fc31_dequant_scale=module.fc31_input_dequant.narrow(
-                0, slot_start, slot_end - slot_start),
-            fc2_input_scale=module.fc2_input_scale,
-            fc2_weight_block_scale=module.w2_weight_scale.narrow(
-                0, slot_start, slot_end - slot_start),
-            fc2_dequant_scale=module.fc2_input_dequant.narrow(
-                0, slot_start, slot_end - slot_start),
-        )
-
-
-class W4A8MXFP4FP8CutlassFusedMoEMethod(W4A8MXFP4FP8FusedMoEMethod):
-    weight_dtype = FUSED_MOE_NVFP4_WEIGHT_DTYPE
-    block_scales_dtype = FUSED_MOE_NVFP4_WEIGHT_BLOCK_SCALE_DTYPE
-
-    def create_weights(self, module: torch.nn.Module):
-        weight_vec_size = torch.iinfo(self.weight_dtype).bits // 4
-        block_scales_vec_size = torch.iinfo(self.block_scales_dtype).bits // 8
-
-        super().create_weights(module, self.weight_dtype, weight_vec_size,
-                               self.block_scales_dtype, block_scales_vec_size)
-
-
 class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
     weight_dtype = float4_sf_dtype
     block_scales_dtype = torch.float8_e4m3fn
@@ -1512,49 +1300,6 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
     # Cache the permute indices during weight loading to avoid recompute
     # This assumes the same input shape always results in the same permute indices
     _cache_permute_indices: Dict[torch.Size, torch.Tensor] = {}
-
-    def _maybe_get_cached_w3_w1_permute_indices(
-            self,
-            dst_w3_w1_weight: torch.Tensor,
-            epilogue_tile_m: int,
-            num_elts_per_sf: Union[None, int] = None) -> torch.Tensor:
-        if dst_w3_w1_weight.shape not in self._cache_permute_indices:
-            # Get permute indices and chain them together
-            permute0 = get_reorder_rows_for_gated_act_gemm_row_indices(
-                dst_w3_w1_weight)
-            if num_elts_per_sf is None:
-                permute1 = get_shuffle_matrix_a_row_indices(
-                    dst_w3_w1_weight, epilogue_tile_m=epilogue_tile_m)
-            else:
-                permute1 = get_shuffle_matrix_sf_a_row_indices(
-                    dst_w3_w1_weight,
-                    epilogue_tile_m=epilogue_tile_m,
-                    num_elts_per_sf=num_elts_per_sf)
-            # Memoize permute indices as recompute is **very** costly
-            self._cache_permute_indices[
-                dst_w3_w1_weight.shape] = permute0[permute1].to(
-                    dst_w3_w1_weight.device)
-        permute_indices = self._cache_permute_indices[dst_w3_w1_weight.shape]
-        return permute_indices
-
-    def _maybe_get_cached_w2_permute_indices(
-            self,
-            dst_w2_weight: torch.Tensor,
-            epilogue_tile_m: int,
-            num_elts_per_sf: Union[None, int] = None) -> torch.Tensor:
-        if dst_w2_weight.shape not in self._cache_permute_indices:
-            if num_elts_per_sf is None:
-                permute_indices = (get_shuffle_matrix_a_row_indices(
-                    dst_w2_weight, epilogue_tile_m).to(dst_w2_weight.device))
-            else:
-                permute_indices = (get_shuffle_matrix_sf_a_row_indices(
-                    dst_w2_weight,
-                    epilogue_tile_m=epilogue_tile_m,
-                    num_elts_per_sf=num_elts_per_sf).to(dst_w2_weight.device))
-            # Memoize permute indices as recompute is **very** costly
-            self._cache_permute_indices[dst_w2_weight.shape] = permute_indices
-        permute_indices = self._cache_permute_indices[dst_w2_weight.shape]
-        return permute_indices
 
     def create_weights(self, module: torch.nn.Module):
         weight_vec_size = torch.iinfo(self.weight_dtype).bits // 4
@@ -1602,8 +1347,8 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         dst_w1_weight.copy_(w1_weight_shard.view(dst_w1_weight.dtype))
 
         # Get permute indices
-        permute_indices = self._maybe_get_cached_w3_w1_permute_indices(
-            dst_w3_w1_weight, epilogue_tile_m)
+        permute_indices = trtllmgen_maybe_get_cached_w3_w1_permute_indices(
+            dst_w3_w1_weight, self._cache_permute_indices, epilogue_tile_m)
 
         # Shuffle the weight according to permute indices
         processed_w31_weight_shard = torch.ops.trtllm.shuffle_matrix(
@@ -1628,8 +1373,8 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype),
                             non_blocking=True)
         # Get permuted indices
-        permute_indices = self._maybe_get_cached_w2_permute_indices(
-            dst_w2_weight, epilogue_tile_m)
+        permute_indices = trtllmgen_maybe_get_cached_w2_permute_indices(
+            dst_w2_weight, self._cache_permute_indices, epilogue_tile_m)
 
         # Shuffle the weight according to permute indices
         processed_w2_weight = torch.ops.trtllm.shuffle_matrix(
@@ -1670,8 +1415,9 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         epilogue_tile_m = 128  # FIXME
 
         # Get permute indices
-        permute_indices = self._maybe_get_cached_w3_w1_permute_indices(
+        permute_indices = trtllmgen_maybe_get_cached_w3_w1_permute_indices(
             dst_w3_w1_weight_scale.view(float4_sf_dtype),
+            self._cache_permute_indices,
             epilogue_tile_m,
             num_elts_per_sf=16)
 
@@ -1708,8 +1454,9 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         assert dst_w2_weight_scale.is_cuda, "dst_w2_weight_scale.is_cuda should be true or suffer from slow speed"
 
         # Get permute indices
-        permute_indices = self._maybe_get_cached_w2_permute_indices(
+        permute_indices = trtllmgen_maybe_get_cached_w2_permute_indices(
             dst_w2_weight_scale.view(float4_sf_dtype),
+            self._cache_permute_indices,
             epilogue_tile_m,
             num_elts_per_sf=16)
 
@@ -1731,3 +1478,555 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         module.fc31_scale_c.data.copy_(module.fc2_input_scale.data *
                                        module.fc31_alpha.data,
                                        non_blocking=True)
+
+
+class MXFP4WeightFusedMoEMethod(FusedMoEMethodBase):
+
+    def create_weights(self, module: torch.nn.Module, weight_dtype,
+                       weight_vec_size, block_scales_dtype,
+                       block_scales_vec_size):
+
+        module.scaling_vector_size = 32
+        w3_w1_weight_shape = (module.expert_size_per_partition,
+                              module.intermediate_size_per_partition * 2,
+                              module.hidden_size // weight_vec_size)
+        w2_weight_shape = (module.expert_size_per_partition, module.hidden_size,
+                           module.intermediate_size_per_partition //
+                           weight_vec_size)
+
+        # column parallel
+        assert module.hidden_size % (module.scaling_vector_size *
+                                     block_scales_vec_size) == 0
+        w3_w1_weight_scale = nn.Parameter(
+            torch.empty(module.expert_size_per_partition,
+                        module.intermediate_size_per_partition * 2,
+                        module.hidden_size // module.scaling_vector_size //
+                        block_scales_vec_size,
+                        dtype=block_scales_dtype),
+            requires_grad=False)
+        module.register_parameter("w3_w1_weight_scale", w3_w1_weight_scale)
+
+        # row parallel
+        assert module.intermediate_size_per_partition % (
+            module.scaling_vector_size * block_scales_vec_size) == 0
+        w2_weight_scale = nn.Parameter(
+            torch.empty(module.expert_size_per_partition,
+                        module.hidden_size,
+                        module.intermediate_size_per_partition //
+                        module.scaling_vector_size // block_scales_vec_size,
+                        dtype=block_scales_dtype),
+            requires_grad=False)
+        module.register_parameter("w2_weight_scale", w2_weight_scale)
+
+        super().create_weights(module, weight_dtype, w3_w1_weight_shape,
+                               w2_weight_shape)
+
+        self.setup_quant_scales(module)
+
+    @abstractmethod
+    def load_expert_w3_w1_weight_scale_mxfp4(
+            self, module: torch.nn.Module, w1_weight_scale: torch.Tensor,
+            w3_weight_scale: torch.Tensor,
+            dst_w3_w1_weight_scale: torch.Tensor):
+        pass
+
+    @abstractmethod
+    def load_expert_w2_weight_scale_mxfp4(self, module: torch.nn.Module,
+                                          w2_weight_scale: torch.Tensor,
+                                          dst_w2_weight_scale: torch.Tensor):
+        pass
+
+    def load_all_mxfp4_weight_scales(self, module: torch.nn.Module,
+                                     weights: Dict, load_expert_ids: List[int],
+                                     dst_w3_w1_weight_scale: torch.Tensor,
+                                     dst_w2_weight_scale: torch.Tensor):
+        for local_slot_id, expert_id in enumerate(load_expert_ids):
+            if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+                w1_weight_scale = weights[f"{expert_id}.w1.weight_scale"]
+                w3_weight_scale = weights[f"{expert_id}.w3.weight_scale"]
+                w2_weight_scale = weights[f"{expert_id}.w2.weight_scale"]
+            elif module.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+                w1_w3_weight_scale = weights["gate_up_proj_weight_scale"][
+                    expert_id].transpose(0, 1).contiguous()
+                w1_weight_scale, w3_weight_scale = w1_w3_weight_scale.chunk(
+                    2, dim=0)
+                w2_weight_scale = weights["down_proj_weight_scale"][
+                    expert_id].transpose(0, 1).contiguous()
+            else:
+                raise NotImplementedError(
+                    f"Unknown weight loading mode in MoE: {module.weight_loading_mode}"
+                )
+
+            expert_idx = local_slot_id
+
+            self.load_expert_w3_w1_weight_scale_mxfp4(
+                module, w1_weight_scale, w3_weight_scale,
+                dst_w3_w1_weight_scale[expert_idx])
+            self.load_expert_w2_weight_scale_mxfp4(
+                module, w2_weight_scale, dst_w2_weight_scale[expert_idx])
+
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+        # Step1: Load weight block scales.
+        self.load_all_mxfp4_weight_scales(module, weights,
+                                          module.initial_local_expert_ids,
+                                          module.w3_w1_weight_scale.data,
+                                          module.w2_weight_scale.data)
+
+        # Step 2: if needed, load into shared
+        if self.need_load_shared_weights(module):
+            local_shared_load_expert_ids = module.layer_load_balancer.get_load_expert_ids(
+            )
+            local_shared_w3_w1_scale_tensors = torch.empty(
+                (len(local_shared_load_expert_ids), ) +
+                module.w3_w1_weight_scale.data.shape[1:],
+                dtype=module.w3_w1_weight_scale.data.dtype,
+                device='cpu')
+            local_shared_w2_scale_tensors = torch.empty(
+                (len(local_shared_load_expert_ids), ) +
+                module.w2_weight_scale.data.shape[1:],
+                dtype=module.w2_weight_scale.data.dtype,
+                device='cpu')
+
+            self.load_all_mxfp4_weight_scales(module, weights,
+                                              local_shared_load_expert_ids,
+                                              local_shared_w3_w1_scale_tensors,
+                                              local_shared_w2_scale_tensors)
+
+            module.register_all_parameter_slot_and_to_fix_weight_fns({
+                'w3_w1_weight_scale':
+                local_shared_w3_w1_scale_tensors,
+                'w2_weight_scale':
+                local_shared_w2_scale_tensors,
+            })
+
+    @abstractmethod
+    def setup_quant_scales(self, module: torch.nn.Module):
+        pass
+
+    @abstractmethod
+    def get_quant_scales(self, module: torch.nn.Module, slot_start,
+                         slot_end) -> tuple[torch.Tensor, ...]:
+        pass
+
+
+class MXFP4WeightCutlassFusedMoEMethod(MXFP4WeightFusedMoEMethod):
+    weight_dtype = FUSED_MOE_MXFP4_WEIGHT_DTYPE
+    block_scales_dtype = FUSED_MOE_MXFP4_WEIGHT_BLOCK_SCALE_DTYPE
+
+    def create_weights(self, module: torch.nn.Module):
+        weight_vec_size = torch.iinfo(self.weight_dtype).bits // 4
+        block_scales_vec_size = torch.iinfo(self.block_scales_dtype).bits // 8
+
+        super().create_weights(module, self.weight_dtype, weight_vec_size,
+                               self.block_scales_dtype, block_scales_vec_size)
+
+    def load_expert_w3_w1_weight_scale_mxfp4(
+            self, module: torch.nn.Module, w1_weight_scale: torch.Tensor,
+            w3_weight_scale: torch.Tensor,
+            dst_w3_w1_weight_scale: torch.Tensor):
+        w1_weight_scale = load_weight_shard(w1_weight_scale, module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.COLUMN)
+        w3_weight_scale = load_weight_shard(w3_weight_scale, module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.COLUMN)
+        # Keep weights in device buffer
+        # w3
+        dst_w3_weight_scale = dst_w3_w1_weight_scale.narrow(
+            dim=0, start=0, length=module.intermediate_size_per_partition)
+        dst_w3_weight_scale.copy_(
+            w3_weight_scale.view(dst_w3_weight_scale.dtype))
+
+        # w1
+        dst_w1_weight_scale = dst_w3_w1_weight_scale.narrow(
+            dim=0,
+            start=module.intermediate_size_per_partition,
+            length=module.intermediate_size_per_partition)
+        dst_w1_weight_scale.copy_(
+            w1_weight_scale.view(dst_w1_weight_scale.dtype))
+
+        orig_shape = dst_w3_w1_weight_scale.shape
+
+        dst_w3_w1_weight_scale.copy_(
+            torch.ops.tensorrt_llm.block_scale_interleave(
+                dst_w3_w1_weight_scale.view(float4_sf_dtype)).view(
+                    self.block_scales_dtype).reshape(orig_shape))
+
+    def load_expert_w2_weight_scale_mxfp4(self, module: torch.nn.Module,
+                                          w2_weight_scale: torch.Tensor,
+                                          dst_w2_weight_scale: torch.Tensor):
+        w2_weight_scale = load_weight_shard(w2_weight_scale, module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.ROW)
+        # Keep weights in device buffer
+        dst_w2_weight_scale.copy_(
+            w2_weight_scale.view(dst_w2_weight_scale.dtype))
+
+        orig_shape = dst_w2_weight_scale.shape
+
+        dst_w2_weight_scale.copy_(
+            torch.ops.tensorrt_llm.block_scale_interleave(
+                dst_w2_weight_scale.view(float4_sf_dtype)).view(
+                    self.block_scales_dtype).reshape(orig_shape))
+
+
+class W4A16MXFP4CutlassFusedMoEMethod(MXFP4WeightCutlassFusedMoEMethod):
+    pass
+
+
+class W4A8MXFP4MXFP8CutlassFusedMoEMethod(MXFP4WeightCutlassFusedMoEMethod):
+    pass
+
+
+class W4A8MXFP4FP8CutlassFusedMoEMethod(MXFP4WeightCutlassFusedMoEMethod):
+
+    def create_weights(self, module: torch.nn.Module):
+        fc31_input_scale = nn.Parameter(torch.tensor(1., dtype=torch.float32),
+                                        requires_grad=False)
+        module.register_parameter("fc31_input_scale", fc31_input_scale)
+
+        fc31_input_dequant = nn.Parameter(torch.empty(
+            module.expert_size_per_partition, dtype=torch.float32),
+                                          requires_grad=False)
+        module.register_parameter("fc31_input_dequant", fc31_input_dequant)
+
+        fc2_input_scale = nn.Parameter(torch.tensor(1., dtype=torch.float32),
+                                       requires_grad=False)
+        module.register_parameter("fc2_input_scale", fc2_input_scale)
+
+        fc2_input_dequant = nn.Parameter(torch.empty(
+            module.expert_size_per_partition, dtype=torch.float32),
+                                         requires_grad=False)
+        module.register_parameter("fc2_input_dequant", fc2_input_dequant)
+
+        super().create_weights(module)
+
+        self.setup_quant_scales(module)
+
+    def load_expert_fc31_input_scale_w4a8_mxfp4_fp8(
+            self, w1_input_scale, w3_input_scale,
+            dst_fc31_input_scale: torch.Tensor):
+        w1_input_scale = w1_input_scale[...].reshape([])
+        assert torch.allclose(
+            w1_input_scale, w3_input_scale), "w1_input_scale != w3_input_scale"
+        dst_fc31_input_scale.copy_(w1_input_scale)
+
+    def load_expert_fc2_input_scale_w4a8_mxfp4_fp8(
+            self, w2_input_scale, dst_fc2_input_scale: torch.Tensor):
+        dst_fc2_input_scale.copy_(w2_input_scale[...].reshape([]))
+
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+        # Step1: Load input scales.
+        tmp_fc31_input_scale = torch.empty(module.num_experts,
+                                           dtype=torch.float32)
+        tmp_fc2_input_scale = torch.empty(module.num_experts,
+                                          dtype=torch.float32)
+
+        for expert_id in range(module.num_experts):
+            if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+                w1_input_scale = weights[f"{expert_id}.w1.input_scale"]
+                w3_input_scale = weights[f"{expert_id}.w3.input_scale"]
+                w2_input_scale = weights[f"{expert_id}.w2.input_scale"]
+            elif module.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+                w1_input_scale = weights["gate_up_proj_input_scale"]
+                w3_input_scale = weights["gate_up_proj_input_scale"]
+                w2_input_scale = weights["down_proj_input_scale"]
+            else:
+                raise NotImplementedError(
+                    f"Unknown weight loading mode in MoE: {module.weight_loading_mode}"
+                )
+
+            self.load_expert_fc31_input_scale_w4a8_mxfp4_fp8(
+                w1_input_scale, w3_input_scale, tmp_fc31_input_scale[expert_id])
+            self.load_expert_fc2_input_scale_w4a8_mxfp4_fp8(
+                w2_input_scale, tmp_fc2_input_scale[expert_id])
+
+        # fc31_input_scale is the reciprocal of the maximum of all w1 input scales and w3 input scales.
+        module.fc31_input_scale.data.copy_(
+            tmp_fc31_input_scale.max().reciprocal())
+        module.fc31_input_dequant.data.copy_(tmp_fc31_input_scale.max())
+        # fc2_input_scale is the reciprocal of the maximum of all w2 input scales.
+        module.fc2_input_scale.data.copy_(
+            tmp_fc2_input_scale.max().reciprocal())
+        module.fc2_input_dequant.data.copy_(tmp_fc2_input_scale.max())
+
+        # Step2: Load weight block scales.
+        super().load_quant_scales(module, weights)
+
+    def setup_quant_scales(self, module: torch.nn.Module):
+        module.quant_scales = FusedMoEQuantScalesW4A8MXFP4FP8(
+            fc31_weight_block_scale=module.w3_w1_weight_scale,
+            fc31_dequant_scale=module.fc31_input_dequant,
+            fc2_input_scale=module.fc2_input_scale,
+            fc2_weight_block_scale=module.w2_weight_scale,
+            fc2_dequant_scale=module.fc2_input_dequant,
+        )
+
+    def get_quant_scales(self, module: torch.nn.Module, slot_start,
+                         slot_end) -> tuple[torch.Tensor, ...]:
+        assert module.smart_router
+        return FusedMoEQuantScalesW4A8MXFP4FP8(
+            fc31_weight_block_scale=module.w3_w1_weight_scale.narrow(
+                0, slot_start, slot_end - slot_start),
+            fc31_dequant_scale=module.fc31_input_dequant.narrow(
+                0, slot_start, slot_end - slot_start),
+            fc2_input_scale=module.fc2_input_scale,
+            fc2_weight_block_scale=module.w2_weight_scale.narrow(
+                0, slot_start, slot_end - slot_start),
+            fc2_dequant_scale=module.fc2_input_dequant.narrow(
+                0, slot_start, slot_end - slot_start),
+        )
+
+
+class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
+    weight_dtype = torch.uint8
+    block_scales_dtype = torch.uint8
+
+    # Cache the permute indices during weight loading to avoid recompute
+    # This assumes the same input shape always results in the same permute indices
+    _cache_permute_indices: Dict[torch.Size, torch.Tensor] = {}
+
+    def create_weights(self, module: torch.nn.Module):
+        weight_vec_size = torch.iinfo(self.weight_dtype).bits // 4
+        block_scales_vec_size = torch.iinfo(self.block_scales_dtype).bits // 8
+
+        super().create_weights(module, self.weight_dtype, weight_vec_size,
+                               self.block_scales_dtype, block_scales_vec_size)
+
+    def setup_quant_scales(self, module: torch.nn.Module):
+        module.quant_scales = tuple()
+
+    def get_quant_scales(self, module: torch.nn.Module, slot_start,
+                         slot_end) -> tuple[torch.Tensor, ...]:
+        """
+        The TRTLLM-Gen backend of FusedMoE does not use FusedMoEQuantScales.
+        """
+        raise NotImplementedError
+
+    def load_expert_w3_w1_weight(self, module: torch.nn.Module,
+                                 w1_weight: torch.Tensor,
+                                 w3_weight: torch.Tensor,
+                                 dst_w3_w1_weight: torch.Tensor):
+        w1_weight_shard = load_weight_shard(w1_weight, module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.COLUMN)
+        w3_weight_shard = load_weight_shard(w3_weight, module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.COLUMN)
+
+        # FIXME: this depends on the kernel internals
+        epilogue_tile_m = 128
+
+        # Keep weights in device buffer
+        dst_w3_weight, dst_w1_weight = dst_w3_w1_weight.split(
+            module.intermediate_size_per_partition, dim=0)
+
+        dst_w3_weight.copy_(w3_weight_shard.view(dst_w3_weight.dtype))
+        dst_w1_weight.copy_(w1_weight_shard.view(dst_w1_weight.dtype))
+
+        # Get permute indices
+        permute_indices = trtllmgen_maybe_get_cached_w3_w1_permute_indices(
+            dst_w3_w1_weight, self._cache_permute_indices, epilogue_tile_m)
+
+        # Shuffle the weight according to permute indices
+        processed_w31_weight_shard = torch.ops.trtllm.shuffle_matrix(
+            dst_w3_w1_weight, permute_indices.to(dst_w3_w1_weight.device))
+
+        # Copy the result into device buffer
+        dst_w3_w1_weight.copy_(processed_w31_weight_shard.view(
+            dst_w3_w1_weight.dtype),
+                               non_blocking=True)
+
+    def load_expert_w2_weight(self, module: torch.nn.Module,
+                              w2_weight: torch.Tensor,
+                              dst_w2_weight: torch.Tensor):
+        w2_weight_shard = load_weight_shard(w2_weight, module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.ROW)
+
+        # FIXME: this depends on the kernel internals
+        epilogue_tile_m = 128
+
+        # Keep weights in device buffer
+        dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype),
+                            non_blocking=True)
+        # Get permuted indices
+        permute_indices = trtllmgen_maybe_get_cached_w2_permute_indices(
+            dst_w2_weight, self._cache_permute_indices, epilogue_tile_m)
+
+        # Shuffle the weight according to permute indices
+        processed_w2_weight = torch.ops.trtllm.shuffle_matrix(
+            dst_w2_weight, permute_indices.to(dst_w2_weight.device))
+
+        # Copy the result into device buffer
+        dst_w2_weight.copy_(processed_w2_weight.view(dst_w2_weight.dtype),
+                            non_blocking=True)
+
+    def load_expert_w3_w1_weight_scale_mxfp4(
+            self, module: torch.nn.Module, w1_weight_scale: torch.Tensor,
+            w3_weight_scale: torch.Tensor,
+            dst_w3_w1_weight_scale: torch.Tensor):
+        w1_weight_scale = load_weight_shard(w1_weight_scale, module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.COLUMN)
+        w3_weight_scale = load_weight_shard(w3_weight_scale, module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.COLUMN)
+        # Keep weights in device buffer
+        # w3
+        dst_w3_weight_scale = dst_w3_w1_weight_scale.narrow(
+            dim=0, start=0, length=module.intermediate_size_per_partition)
+        dst_w3_weight_scale.copy_(
+            w3_weight_scale.view(dst_w3_weight_scale.dtype))
+
+        # w1
+        dst_w1_weight_scale = dst_w3_w1_weight_scale.narrow(
+            dim=0,
+            start=module.intermediate_size_per_partition,
+            length=module.intermediate_size_per_partition)
+        dst_w1_weight_scale.copy_(
+            w1_weight_scale.view(dst_w1_weight_scale.dtype))
+
+        orig_shape = dst_w3_w1_weight_scale.shape
+
+        # trtllm-gen specific block scales preprocessing logics
+        epilogue_tile_m = 128  # FIXME
+
+        # Get permute indices
+        permute_indices = trtllmgen_maybe_get_cached_w3_w1_permute_indices(
+            dst_w3_w1_weight_scale.view(float4_sf_dtype),
+            self._cache_permute_indices,
+            epilogue_tile_m,
+            num_elts_per_sf=32)
+
+        # Shuffle the weight according to permute indices
+        w3_w1_weight_scale = torch.ops.trtllm.shuffle_matrix(
+            dst_w3_w1_weight_scale.view(float4_sf_dtype), permute_indices)
+
+        # Assert should only be removed during debugging
+        assert w3_w1_weight_scale.is_cuda, "w3_w1_weight_scale.is_cuda should be true or suffer from slow speed"
+        # Interleave the weight.
+        processed_w3_w1_weight_scale = torch.ops.tensorrt_llm.block_scale_interleave(
+            w3_w1_weight_scale.view(float4_sf_dtype).reshape(orig_shape))
+        # Copy the result into device buffer
+        dst_w3_w1_weight_scale.copy_(
+            processed_w3_w1_weight_scale.view(
+                self.block_scales_dtype).reshape(orig_shape))
+
+    def load_expert_w2_weight_scale_mxfp4(self, module: torch.nn.Module,
+                                          w2_weight_scale: torch.Tensor,
+                                          dst_w2_weight_scale: torch.Tensor):
+        w2_weight_scale = load_weight_shard(w2_weight_scale, module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.ROW)
+        # Keep weights in device buffer
+        dst_w2_weight_scale.copy_(
+            w2_weight_scale.view(dst_w2_weight_scale.dtype))
+
+        orig_shape = dst_w2_weight_scale.shape
+
+        # trtllm-gen specific block scales preprocessing logics
+        epilogue_tile_m = 128  # FIXME: read from kernel
+
+        # Assert should only be removed during debugging
+        assert dst_w2_weight_scale.is_cuda, "dst_w2_weight_scale.is_cuda should be true or suffer from slow speed"
+
+        # Get permute indices
+        permute_indices = trtllmgen_maybe_get_cached_w2_permute_indices(
+            dst_w2_weight_scale.view(float4_sf_dtype),
+            self._cache_permute_indices,
+            epilogue_tile_m,
+            num_elts_per_sf=32)
+
+        # Shuffle the weight according to permute indices
+        w_shuffled = torch.ops.trtllm.shuffle_matrix(
+            dst_w2_weight_scale.view(dtype=float4_sf_dtype), permute_indices)
+        # Interleave the weight.
+        processed_w2_weight_scale = torch.ops.tensorrt_llm.block_scale_interleave(
+            w_shuffled)
+        # Copy the result into device buffer
+        dst_w2_weight_scale.copy_(
+            processed_w2_weight_scale.view(
+                self.block_scales_dtype).reshape(orig_shape))
+
+
+class W4A16MXFP4TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
+    pass
+
+
+class W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
+    pass
+
+
+class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
+    # Cache the permute indices during weight loading to avoid recompute
+    # This assumes the same input shape always results in the same permute indices
+    _cache_permute_indices: Dict[torch.Size, torch.Tensor] = {}
+
+    def create_weights(self, module: torch.nn.Module):
+        fc31_input_dequant = nn.Parameter(torch.empty(
+            module.expert_size_per_partition, dtype=torch.float32),
+                                          requires_grad=False)
+        module.register_parameter("fc31_input_dequant", fc31_input_dequant)
+
+        fc2_input_dequant = nn.Parameter(torch.empty(
+            module.expert_size_per_partition, dtype=torch.float32),
+                                         requires_grad=False)
+        module.register_parameter("fc2_input_dequant", fc2_input_dequant)
+
+        super().create_weights(module)
+
+    def load_expert_fc31_input_scale_w4a8_mxfp4_fp8(
+            self, w1_input_scale, w3_input_scale,
+            dst_fc31_input_scale: torch.Tensor):
+        w1_input_scale = w1_input_scale[...].reshape([])
+        assert torch.allclose(
+            w1_input_scale, w3_input_scale), "w1_input_scale != w3_input_scale"
+        dst_fc31_input_scale.copy_(w1_input_scale)
+
+    def load_expert_fc2_input_scale_w4a8_mxfp4_fp8(
+            self, w2_input_scale, dst_fc2_input_scale: torch.Tensor):
+        dst_fc2_input_scale.copy_(w2_input_scale[...].reshape([]))
+
+    def setup_quant_scales(self, module: torch.nn.Module):
+        module.quant_scales = tuple()
+
+    def get_quant_scales(self, module: torch.nn.Module, slot_start,
+                         slot_end) -> tuple[torch.Tensor, ...]:
+        """
+        The TRTLLM-Gen backend of FusedMoE does not use FusedMoEQuantScales.
+        """
+        raise NotImplementedError
+
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+        # Step1: Load input scales.
+        tmp_fc31_input_scale = torch.empty(module.num_experts,
+                                           dtype=torch.float32)
+        tmp_fc2_input_scale = torch.empty(module.num_experts,
+                                          dtype=torch.float32)
+
+        for expert_id in range(module.num_experts):
+            if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+                w1_input_scale = weights[f"{expert_id}.w1.input_scale"]
+                w3_input_scale = weights[f"{expert_id}.w3.input_scale"]
+                w2_input_scale = weights[f"{expert_id}.w2.input_scale"]
+            elif module.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+                w1_input_scale = weights["gate_up_proj_input_scale"]
+                w3_input_scale = weights["gate_up_proj_input_scale"]
+                w2_input_scale = weights["down_proj_input_scale"]
+            else:
+                raise NotImplementedError(
+                    f"Unknown weight loading mode in MoE: {module.weight_loading_mode}"
+                )
+
+            self.load_expert_fc31_input_scale_w4a8_mxfp4_fp8(
+                w1_input_scale, w3_input_scale, tmp_fc31_input_scale[expert_id])
+            self.load_expert_fc2_input_scale_w4a8_mxfp4_fp8(
+                w2_input_scale, tmp_fc2_input_scale[expert_id])
+
+        module.fc31_input_dequant.data.copy_(tmp_fc31_input_scale.max())
+        # TRTLLMGen uses dynamic MXFP8 for fc2 so we need to set scales to 1.0.
+        module.fc2_input_dequant.fill_(1.0)
+
+        # Step2: Load weight block scales.
+        super().load_quant_scales(module, weights)

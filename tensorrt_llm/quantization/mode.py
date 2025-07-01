@@ -41,6 +41,8 @@ class QuantAlgo(StrEnum, metaclass=BaseEnumMeta):
     MIXED_PRECISION = auto()
     NVFP4 = auto()
     W4A8_MXFP4_FP8 = auto()
+    W4A8_MXFP4_MXFP8 = auto()
+    W4A16_MXFP4 = auto()
     NO_QUANT = auto()
 
 
@@ -90,6 +92,8 @@ class QuantMode(IntFlag):
     NVFP4_KV_CACHE = auto()
     # W4A8 MXFP4
     W4A8_MXFP4_FP8 = auto()
+    W4A8_MXFP4_MXFP8 = auto()
+    W4A16_MXFP4 = auto()
 
     # The smallest power-of-two that is not used by a flag. Do not call auto() after that line.
     COUNT = auto()
@@ -178,6 +182,12 @@ class QuantMode(IntFlag):
     def has_w4a8_mxfp4_fp8(self):
         return self._any(self.W4A8_MXFP4_FP8)
 
+    def has_w4a8_mxfp4_mxfp8(self):
+        return self._any(self.W4A8_MXFP4_MXFP8)
+
+    def has_w4a16_mxfp4(self):
+        return self._any(self.W4A16_MXFP4)
+
     def has_weight_quant(self):
         return self._any(self.INT4_WEIGHTS | self.INT8_WEIGHTS)
 
@@ -189,7 +199,9 @@ class QuantMode(IntFlag):
                               | self.W4A8_QSERVE
                               | self.FP8_1x128_128x128
                               | self.NVFP4
-                              | self.W4A8_MXFP4_FP8)
+                              | self.W4A8_MXFP4_FP8
+                              | self.W4A16_MXFP4
+                              | self.W4A8_MXFP4_MXFP8)
         if exclude_kv_cache:
             return has_quant
 
@@ -225,7 +237,9 @@ class QuantMode(IntFlag):
                          use_fp8_rowwise=False,
                          use_nvfp4=False,
                          use_w4a8_qserve=False,
-                         use_w4a8_mxfp4_fp8=False):
+                         use_w4a8_mxfp4_fp8=False,
+                         use_w4a8_mxfp4_mxfp8=False,
+                         use_w4a16_mxfp4=False):
 
         def raise_error():
             raise ValueError(f"Unsupported combination of QuantMode args: "
@@ -242,7 +256,9 @@ class QuantMode(IntFlag):
                              f"{use_fp8_rowwise=}, "
                              f"{use_nvfp4=}, "
                              f"{use_w4a8_qserve=}, "
-                             f"{use_w4a8_mxfp4_fp8=}")
+                             f"{use_w4a8_mxfp4_fp8=}, "
+                             f"{use_w4a8_mxfp4_mxfp8=}, "
+                             f"{use_w4a16_mxfp4=}")
 
         # We must quantize weights when we quantize activations.
         if quantize_activations and not quantize_weights:
@@ -299,6 +315,12 @@ class QuantMode(IntFlag):
 
         if use_w4a8_mxfp4_fp8:
             mode = mode | QuantMode.W4A8_MXFP4_FP8
+
+        if use_w4a8_mxfp4_mxfp8:
+            mode = mode | QuantMode.W4A8_MXFP4_MXFP8
+
+        if use_w4a16_mxfp4:
+            mode = mode | QuantMode.W4A16_MXFP4
 
         return mode
 
@@ -375,6 +397,10 @@ class QuantMode(IntFlag):
             quant_mode = QuantMode.from_description(use_nvfp4=True)
         elif quant_algo == QuantAlgo.W4A8_MXFP4_FP8:
             quant_mode = QuantMode.from_description(use_w4a8_mxfp4_fp8=True)
+        elif quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
+            quant_mode = QuantMode.from_description(use_w4a8_mxfp4_mxfp8=True)
+        elif quant_algo == QuantAlgo.W4A16_MXFP4:
+            quant_mode = QuantMode.from_description(use_w4a16_mxfp4=True)
         else:
             quant_mode = QuantMode(0)
 
@@ -409,6 +435,10 @@ class QuantMode(IntFlag):
             self.has_nvfp4(),
             'enable_w4a8_mxfp4_fp8':
             self.has_w4a8_mxfp4_fp8(),
+            'enable_w4a8_mxfp4_mxfp8':
+            self.has_w4a8_mxfp4_mxfp8(),
+            'enable_w4a16_mxfp4':
+            self.has_w4a16_mxfp4(),
             'fp8_kv_cache':
             self.has_fp8_kv_cache(),
             'use_weight_only':

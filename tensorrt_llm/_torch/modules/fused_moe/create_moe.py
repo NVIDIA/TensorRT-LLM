@@ -38,11 +38,13 @@ def get_moe_cls(
     elif moe_backend.upper() == "TRTLLM":
         if quant_config is not None and (
                 quant_config.quant_mode.has_fp8_block_scales()
-                or quant_config.quant_mode.has_nvfp4()):
+                or quant_config.quant_mode.has_nvfp4()
+                or quant_config.quant_mode.has_w4a16_mxfp4()
+                or quant_config.quant_mode.has_w4a8_mxfp4_fp8()):
             return TRTLLMGenFusedMoE
         else:
             logger.warning(
-                "TRTLLMGenFusedMoE only supports fp8_block_scales or nvfp4. "
+                "TRTLLMGenFusedMoE only supports fp8_block_scales, nvfp4, w4a16_mxfp4 and w4a8_mxfp4_mxfp8. "
                 f"Check out details in quant_config: {quant_config}"
                 "Using CutlassFusedMoE instead.")
             return CutlassFusedMoE
