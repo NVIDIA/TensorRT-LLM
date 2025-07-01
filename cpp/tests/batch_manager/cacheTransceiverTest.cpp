@@ -293,15 +293,13 @@ protected:
         mCacheTransBufferManager = std::make_unique<CacheTransBufferManager>(mManager.get(), maxNumTokens);
         if (isSender)
         {
-            mResponder
-                = std::make_unique<DataResponder>(std::make_unique<DataSender>(mConnectionManager.get(), *mCacheState,
-                    mlocalRank, std::make_unique<CacheFormatter>(mManager.get(), mCacheTransBufferManager.get())));
+            mResponder = std::make_unique<DataResponder>(mConnectionManager.get(), *mCacheState,
+                std::make_unique<CacheFormatter>(mManager.get(), mCacheTransBufferManager.get()));
         }
         else
         {
-            mRequester
-                = std::make_unique<DataRequester>(std::make_unique<DataReceiver>(mConnectionManager.get(), *mCacheState,
-                    mlocalRank, std::make_unique<CacheFormatter>(mManager.get(), mCacheTransBufferManager.get())));
+            mRequester = std::make_unique<DataRequester>(mConnectionManager.get(), *mCacheState,
+                std::make_unique<CacheFormatter>(mManager.get(), mCacheTransBufferManager.get()));
         }
     }
 
@@ -647,13 +645,11 @@ protected:
 
             if (mIsContext)
             {
-                mResponder = std::make_unique<DataResponder>(std::make_unique<DataSender>(
-                    mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter()));
+                mResponder = std::make_unique<DataResponder>(mConnectionManager.get(), *mCacheState, makeFormatter());
             }
             else
             {
-                mRequester = std::make_unique<DataRequester>(std::make_unique<DataReceiver>(
-                    mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter()));
+                mRequester = std::make_unique<DataRequester>(mConnectionManager.get(), *mCacheState, makeFormatter());
             }
 
             std::vector<int> contextRankVec(mContextRankSize);

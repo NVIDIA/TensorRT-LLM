@@ -173,7 +173,7 @@ class DataSender
 public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
-    DataSender(ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState, SizeType32 selfIndex,
+    DataSender(ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
         std::unique_ptr<kv_cache_manager::BaseCacheFormatter> formatter);
 
     /// @brief Receive the request information.
@@ -210,7 +210,7 @@ public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
     DataReceiver(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
-        SizeType32 selfIndex, std::unique_ptr<kv_cache_manager::BaseCacheFormatter> formatter);
+        std::unique_ptr<kv_cache_manager::BaseCacheFormatter> formatter);
 
     /// @brief Send the request information.
     /// @param llmRequest The request object to which the information belongs.
@@ -233,8 +233,6 @@ private:
         }
     };
 
-    static void sendRequestInfo(executor::kv_cache::Connection const* connection, RequestInfo const& info);
-
     [[nodiscard]] std::unique_ptr<ReceiveCacheResource> const& getReceiveCacheResource(LlmRequest const& llmRequest);
 
     executor::kv_cache::ConnectionManager* mManager;
@@ -249,7 +247,8 @@ class DataResponder
 public:
     /// @brief Constructor.
     /// @param sender The sender used at the underlying level.
-    explicit DataResponder(std::unique_ptr<DataSender> sender);
+    explicit DataResponder(ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
+        std::unique_ptr<kv_cache_manager::BaseCacheFormatter> formatter);
 
     /// @brief Asynchronously respond to the request and send data.
     /// @param llmRequest Request object. Its data should be ready when called, and the data for this request
@@ -274,7 +273,8 @@ class DataRequester
 public:
     /// @brief Constructor.
     /// @param receiver The receiver used at the underlying level.
-    explicit DataRequester(std::unique_ptr<DataReceiver> receiver);
+    explicit DataRequester(ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
+        std::unique_ptr<kv_cache_manager::BaseCacheFormatter> formatter);
 
     /// @brief Asynchronously send a request to receive data.
     /// @param llmRequest Request object. Its data should be in an allocated but unwritten state when called, and the

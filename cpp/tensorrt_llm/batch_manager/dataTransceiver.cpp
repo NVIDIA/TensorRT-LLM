@@ -101,14 +101,13 @@ static int32_t tagFromRequestId(LlmRequest::RequestIdType requestId)
 using BaseCacheFormatter = kv_cache_manager::BaseCacheFormatter;
 
 DataSender::DataSender(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
-    SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter)
+    std::unique_ptr<BaseCacheFormatter> formatter)
     : mManager{manager}
     , mSelfState{std::move(selfCacheState), executor::kv_cache::CommState{manager->getCommState()}}
     , mFormatter(std::move(formatter))
     , mBufferManager{std::make_shared<runtime::CudaStream>()}
 {
     TLLM_CHECK(mManager);
-    TLLM_CHECK(mManager->getCommState().getSelfIdx() == selfIndex);
 }
 
 [[nodiscard]] RequestInfo DataSender::recvRequestInfo()
@@ -190,13 +189,12 @@ void DataSender::release(LlmRequest::RequestIdType requestId)
 DataSender::~DataSender() = default;
 
 DataReceiver::DataReceiver(executor::kv_cache::ConnectionManager* manager,
-    executor::kv_cache::CacheState selfCacheState, SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter)
+    executor::kv_cache::CacheState selfCacheState, std::unique_ptr<BaseCacheFormatter> formatter)
     : mManager{manager}
     , mSelfState{std::move(selfCacheState), executor::kv_cache::CommState{manager->getCommState()}}
     , mFormatter(std::move(formatter))
 {
     TLLM_CHECK(mManager);
-    TLLM_CHECK(mManager->getCommState().getSelfIdx() == selfIndex);
     TLLM_CHECK(mFormatter);
 }
 
@@ -250,7 +248,12 @@ void DataReceiver::sendRequestInfo(LlmRequest const& llmRequest)
         }
         else
         {
-            sendRequestInfo(connection, requestInfo);
+            std::ostringstream oss;
+            RequestInfo::serialize(requestInfo, oss);
+            auto const& serializedInfo = oss.str();
+            std::size_t const infoSize = serializedInfo.size();
+            connection->send(DataContext{TransceiverTag::kID_TAG}, &infoSize, sizeof(infoSize));
+            connection->send(DataContext{TransceiverTag::kDATA_TAG}, serializedInfo.data(), infoSize);
         }
     }
 }
@@ -271,16 +274,6 @@ void DataReceiver::receiveSync(LlmRequest const& llmRequest)
     TransferSession session(connections, DataContext{tagFromRequestId(llmRequest.mRequestId)}, mSelfState, contextState,
         resource->mBufferManager);
     mFormatter->unformat(session, llmRequest);
-}
-
-void DataReceiver::sendRequestInfo(executor::kv_cache::Connection const* connection, RequestInfo const& info)
-{
-    std::ostringstream oss;
-    RequestInfo::serialize(info, oss);
-    auto const& serializedInfo = oss.str();
-    std::size_t const infoSize = serializedInfo.size();
-    connection->send(DataContext{TransceiverTag::kID_TAG}, &infoSize, sizeof(infoSize));
-    connection->send(DataContext{TransceiverTag::kDATA_TAG}, serializedInfo.data(), infoSize);
 }
 
 std::unique_ptr<DataReceiver::ReceiveCacheResource> const& DataReceiver::getReceiveCacheResource(
@@ -308,8 +301,9 @@ class DataResponder::Impl
 public:
     using RequestIdType = LlmRequest::RequestIdType;
 
-    Impl(std::unique_ptr<DataSender> sender)
-        : mSender{std::move(sender)}
+    Impl(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
+        std::unique_ptr<kv_cache_manager::BaseCacheFormatter> formatter)
+        : mSender(std::make_unique<DataSender>(manager, std::move(selfCacheState), std::move(formatter)))
     {
         TLLM_CHECK(mSender);
         TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
@@ -502,8 +496,9 @@ private:
 class DataRequester::Impl
 {
 public:
-    Impl(std::unique_ptr<DataReceiver> receiver)
-        : mReceiver{std::move(receiver)}
+    Impl(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
+        std::unique_ptr<kv_cache_manager::BaseCacheFormatter> formatter)
+        : mReceiver(std::make_unique<DataReceiver>(manager, std::move(selfCacheState), std::move(formatter)))
     {
         TLLM_CHECK(mReceiver);
         TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
@@ -684,8 +679,9 @@ private:
     std::unordered_map<std::string, std::unique_ptr<AsyncResource>> mInstanceToAsyncResource;
 };
 
-DataResponder::DataResponder(std::unique_ptr<DataSender> sender)
-    : mImpl{std::make_unique<Impl>(std::move(sender))}
+DataResponder::DataResponder(executor::kv_cache::ConnectionManager* manager,
+    executor::kv_cache::CacheState selfCacheState, std::unique_ptr<kv_cache_manager::BaseCacheFormatter> formatter)
+    : mImpl{std::make_unique<Impl>(manager, std::move(selfCacheState), std::move(formatter))}
 {
 }
 
@@ -701,8 +697,9 @@ executor::kv_cache::CommState const& DataResponder::getCommState() const
 
 DataResponder::~DataResponder() = default;
 
-DataRequester::DataRequester(std::unique_ptr<DataReceiver> receiver)
-    : mImpl{std::make_unique<Impl>(std::move(receiver))}
+DataRequester::DataRequester(executor::kv_cache::ConnectionManager* manager,
+    executor::kv_cache::CacheState selfCacheState, std::unique_ptr<kv_cache_manager::BaseCacheFormatter> formatter)
+    : mImpl{std::make_unique<Impl>(manager, std::move(selfCacheState), std::move(formatter))}
 {
 }
 
