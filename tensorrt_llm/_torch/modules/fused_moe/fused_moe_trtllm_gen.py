@@ -1,13 +1,16 @@
 from typing import Dict, List, Optional, Union
 
 import torch
+from torch import nn
 
 from ...distributed.ops import reducescatter
 from ...model_config import ModelConfig
 from ...utils import Fp4QuantizedTensor
 from .interface import MoE, MoEWeightLoadingMode
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
-                           NVFP4TRTLLMGenFusedMoEMethod)
+                           NVFP4TRTLLMGenFusedMoEMethod,
+                           W4A8MXFP4FP8TRTLLMGenFusedMoEMethod,
+                           W4A16MXFP4TRTLLMGenFusedMoEMethod)
 from .routing import BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod
 
 
@@ -27,7 +30,7 @@ class TRTLLMGenFusedMoE(MoE):
 
     MoE torch custom op:
         Only support min-latency mode now (SM100 Blackwell only).
-        Quant: fp8 block scales quant and nvfp4 quant
+        Quant: fp8 block scales quant and nvfp4 quant and w4a16_mxfp4 quant
             FusedMoE Op: routing(topK, etc.) + scatter + gemm1 + swiglu + gemm2 + finalize MoeRoute
 
     FusedMoE module:
@@ -89,7 +92,9 @@ class TRTLLMGenFusedMoE(MoE):
             self.create_weights()
 
     def _check_configs(self):
-        assert self.has_deepseek_fp8_block_scales or self.has_nvfp4, "TRTLLMGenFusedMoE only supports fp8_block_scaling and nvfp4 dtypes."
+        assert self.has_deepseek_fp8_block_scales \
+            or self.has_nvfp4 or self.has_w4a16_mxfp4 \
+            or self.has_w4a8_mxfp4_fp8, "TRTLLMGenFusedMoE only supports fp8_block_scaling, nvfp4, w4a16_mxfp4 and w4a8_mxfp4_fp8 dtypes."
 
     def _get_quant_method(self):
         if self.quant_config is not None:
@@ -97,6 +102,10 @@ class TRTLLMGenFusedMoE(MoE):
                 return DeepSeekFP8BlockScalesFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_nvfp4():
                 return NVFP4TRTLLMGenFusedMoEMethod()
+            elif self.quant_config.layer_quant_mode.has_w4a16_mxfp4():
+                return W4A16MXFP4TRTLLMGenFusedMoEMethod()
+            elif self.quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8():
+                return W4A8MXFP4FP8TRTLLMGenFusedMoEMethod()
             else:
                 raise NotImplementedError(
                     f"Unsupported quantization method by TRTLLMGenFusedMoE: {self.quant_config.quant_mode}"
@@ -132,6 +141,19 @@ class TRTLLMGenFusedMoE(MoE):
 
         self._weights_created = True
         self._check_configs()
+
+        # TODO: FIX this.
+        if (self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8) and not self.bias:
+            self.w3_w1_bias = nn.Parameter(torch.zeros(
+                (self.w3_w1_weight.shape[0], self.w3_w1_weight.shape[1]),
+                dtype=torch.float32),
+                                           requires_grad=False)
+            self.register_parameter("w3_w1_bias", self.w3_w1_bias)
+            self.w2_bias = nn.Parameter(torch.zeros(
+                (self.w2_weight.shape[0], self.w2_weight.shape[1]),
+                dtype=torch.float32),
+                                        requires_grad=False)
+            self.register_parameter("w2_bias", self.w2_bias)
 
     def load_weights(self, weights: List[Dict]):
         assert self._weights_created
@@ -242,9 +264,82 @@ class TRTLLMGenFusedMoE(MoE):
                 return outputs
             else:
                 final_hidden_states = outputs[0]
+        elif self.has_w4a16_mxfp4:
+            assert x.dtype == torch.bfloat16
+
+            # FIXME: tile_tokens_dim is hardcoded for now
+            tile_tokens_dim = 8
+
+            # TODO: remove bias / act_type
+            final_hidden_states = torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
+                router_logits,
+                routing_bias,
+                x,
+                self.w3_w1_weight,
+                self.w3_w1_weight_scale,
+                self.w3_w1_bias,
+                None,  # swiglu_alpha
+                None,  # swiglu_beta
+                self.w2_weight,
+                self.w2_weight_scale,
+                self.w2_bias,
+                self.num_slots,
+                top_k,
+                n_group,
+                topk_group,
+                self.intermediate_size_per_partition,
+                self.
+                slot_start,  # local_expert_start;  use ep_rank if stride!=1
+                self.expert_size_per_partition,  # local_expert_size
+                routed_scaling_factor,
+                tile_tokens_dim,
+                self.routing_method.routing_method_type,
+                0,  # act_type
+            )
+        elif self.has_w4a8_mxfp4_fp8:
+            x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                x, self.fc31_input_dequant[0])
+            fake_block_scale = torch.zeros(
+                (x.shape[0] * x.shape[1] // 32),
+                device='cuda',
+                dtype=torch.float).to(torch.uint8).fill_(127)
+
+            # FIXME: tile_tokens_dim is hardcoded for now
+            tile_tokens_dim = 8
+
+            # TODO: remove bias / act_type
+            final_hidden_states = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
+                router_logits,
+                routing_bias,
+                x,
+                fake_block_scale,
+                self.w3_w1_weight,
+                self.w3_w1_weight_scale,
+                self.w3_w1_bias,
+                None,  # swiglu_alpha
+                None,  # swiglu_beta
+                self.w2_weight,
+                self.w2_weight_scale,
+                self.w2_bias,
+                self.fc31_input_dequant,  # output1_scales_scalar
+                self.fc31_input_dequant,  # output1_scales_gate_scalar
+                self.fc2_input_dequant,  # output2_scales_scalar always 1.0
+                self.num_slots,
+                top_k,
+                n_group,
+                topk_group,
+                self.intermediate_size_per_partition,
+                self.
+                slot_start,  # local_expert_start;  use ep_rank if stride!=1
+                self.expert_size_per_partition,  # local_expert_size
+                routed_scaling_factor,
+                tile_tokens_dim,
+                self.routing_method.routing_method_type,
+                0,  # act_type
+            )
         else:
             raise NotImplementedError(
-                "TRTLLMGenFusedMoE only supports fp8_block_scaling and nvfp4 dtypes."
+                "TRTLLMGenFusedMoE only supports fp8_block_scaling, nvfp4, w4a16_mxfp4 and w4a8_mxfp4_fp8 dtypes."
             )
 
         final_hidden_states = self.reducescatter_or_allreduce(
