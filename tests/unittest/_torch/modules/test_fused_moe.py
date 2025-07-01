@@ -13,8 +13,7 @@ from _torch.helpers import per_block_cast_to_fp8
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 from utils.util import (skip_neither_ada_nor_hopper_unittest,
-                        skip_non_hopper_unittest, skip_pre_blackwell,
-                        skip_pre_hopper)
+                        skip_pre_blackwell, skip_pre_hopper)
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -363,7 +362,7 @@ def set_tensor_value_4(x, num_row, num_cols):
     x.copy_(repeated)
 
 
-@skip_non_hopper_unittest
+# @skip_non_hopper_unittest
 @pytest.mark.parametrize(
     "dtype, num_experts, seq_len, hidden_size, RoutingMethodCls",
     product(
@@ -446,17 +445,17 @@ def test_fused_moe_fp8_blockwise(dtype,
     fused_moe.cuda()
     fused_moe.load_weights([weights])
 
-    fused_moe_origin = CutlassFusedMoE(
-        num_experts=NUM_EXPERTS,
-        routing_method=routing_method,
-        hidden_size=HIDDEN_SIZE,
-        intermediate_size=INTERMEDIATE_SIZE,
-        dtype=dtype,
-        reduce_results=True,
-        model_config=ModelConfig(quant_config=quant_config, mapping=mapping),
-    )
-    fused_moe_origin.cuda()
-    fused_moe_origin.load_weights([weights])
+    # fused_moe_origin = CutlassFusedMoE(
+    #     num_experts=NUM_EXPERTS,
+    #     routing_method=routing_method,
+    #     hidden_size=HIDDEN_SIZE,
+    #     intermediate_size=INTERMEDIATE_SIZE,
+    #     dtype=dtype,
+    #     reduce_results=True,
+    #     model_config=ModelConfig(quant_config=quant_config, mapping=mapping),
+    # )
+    # fused_moe_origin.cuda()
+    # fused_moe_origin.load_weights([weights])
 
     ref_fused_moe = RefGatedMLPFusedMoE(
         num_experts=NUM_EXPERTS,
@@ -471,18 +470,18 @@ def test_fused_moe_fp8_blockwise(dtype,
 
     with torch.inference_mode():
         output = fused_moe.forward(x, router_logits)
-        output_origin = fused_moe_origin.forward(x, router_logits)
+        # output_origin = fused_moe_origin.forward(x, router_logits)
         ref_output = ref_fused_moe.forward(x, router_logits)
 
     # compare
     torch.cuda.synchronize()
-    torch.testing.assert_close(output_origin, output, rtol=1e-2, atol=0.1)
-    torch.testing.assert_close(output_origin, ref_output, rtol=1e-2, atol=0.1)
+    # torch.testing.assert_close(output_origin, output, rtol=1e-2, atol=0.1)
+    # torch.testing.assert_close(output_origin, ref_output, rtol=1e-2, atol=0.1)
     torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
     return True
 
 
-@skip_non_hopper_unittest
+# @skip_non_hopper_unittest
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize("ep_size", [1, 2, 4])

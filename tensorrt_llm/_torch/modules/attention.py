@@ -1182,11 +1182,25 @@ class MLA(nn.Module):
                                      self.k_b_proj_trans.transpose(1, 2),
                                      q_nope_out)
         elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
+            q_nope_fp8, q_nope_scales = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
+                q_nope)
+            # print(f"limin: q_node.shape = {q_nope.shape}, q_nope_fp8.shape = {q_nope_fp8.shape}, q_nope_fp8.stride = {q_nope_fp8.stride()}, q_nope_scales.shape = {q_nope_scales.shape}, q_nope_scales.stride = {q_nope_scales.stride()}")
             # [num_heads, num_tokens, self.kv_lora_rank]
             q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
 
-            fp8_block_scaling_bmm_out(q_nope, self.k_b_proj_trans,
-                                      self.k_b_proj_trans_scale, q_nope_out)
+            # torch.ops.trtllm.fp8_block_scaling_bmm_out(
+            #     q_nope_fp8, self.k_b_proj_trans, q_nope_scales,
+            #     self.k_b_proj_trans_scale, q_nope_out)
+            torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(
+                q_nope_fp8, self.k_b_proj_trans, q_nope_scales,
+                self.k_b_proj_trans_scale, q_nope_out)
+            q_nope_scales = None
+
+            # # [num_heads, num_tokens, self.kv_lora_rank]
+            # q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
+
+            # fp8_block_scaling_bmm_out(q_nope, self.k_b_proj_trans,
+            #                           self.k_b_proj_trans_scale, q_nope_out)
         else:
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}.")
@@ -1235,9 +1249,19 @@ class MLA(nn.Module):
                                      self.v_b_proj.transpose(1, 2),
                                      attn_output.transpose(0, 1))
         elif self.v_b_proj.dtype == torch.float8_e4m3fn:
-            fp8_block_scaling_bmm_out(attn_out_latent, self.v_b_proj,
-                                      self.v_b_proj_scale,
-                                      attn_output.transpose(0, 1))
+            attn_out_latent, attn_out_latent_scales = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
+                attn_out_latent)
+
+            # torch.ops.trtllm.fp8_block_scaling_bmm_out(
+            #     attn_out_latent, self.v_b_proj, attn_out_latent_scales,
+            #     self.v_b_proj_scale, attn_output.transpose(0, 1))
+            torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(
+                attn_out_latent, self.v_b_proj, attn_out_latent_scales,
+                self.v_b_proj_scale, attn_output.transpose(0, 1))
+            attn_out_latent_scales = None
+            # fp8_block_scaling_bmm_out(attn_out_latent, self.v_b_proj,
+            #                           self.v_b_proj_scale,
+            #                           attn_output.transpose(0, 1))
         else:
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
