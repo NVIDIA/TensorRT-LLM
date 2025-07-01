@@ -1598,13 +1598,14 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
 }
 
 #define INSTANTIATE_EXPAND_INPUT_ROWS(InputActivationsType, ExpandedActivationsType)                                   \
-    template void expandInputRowsKernelLauncher<InputActivationsType, ExpandedActivationsType>(                        \
+    template void expandInputRowsKernelLauncher<InputActivationsType, ExpandedActivationsType, false>(                 \
         InputActivationsType const* unpermuted_input, ExpandedActivationsType* permuted_output,                        \
         float const* unpermuted_scales, float* permuted_scales, int const* permuted_row_to_unpermuted_row,             \
         int64_t const num_rows, int64_t const cols, int const k, int const num_experts_per_node,                       \
         float const* fc1_act_global_scale, bool use_per_expert_act_scale, int64_t* expert_first_token_offset,          \
         TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,                                                \
-        TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, cudaStream_t stream);
+        TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, cudaStream_t stream,                            \
+        void const* prequant_scales);
 
 INSTANTIATE_EXPAND_INPUT_ROWS(half, half);
 INSTANTIATE_EXPAND_INPUT_ROWS(float, float);
