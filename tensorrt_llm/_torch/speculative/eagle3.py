@@ -4,7 +4,6 @@ from typing import List, Optional, Tuple
 import torch
 from torch import nn
 
-from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
@@ -12,40 +11,8 @@ from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
-from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
+from .interface import SpecMetadata
 from .mtp import MTPSampler
-
-
-@dataclass
-class Eagle3Config(SpecConfig):
-    spec_dec_name: str = "EAGLE3"
-    num_layers: int = 0
-    hidden_size: int = 0
-    eagle3_one_model: bool = True
-
-    def __post_init__(self):
-        if self.draft_model_path is None:
-            raise ValueError("Path to EAGLE3 weights must be specified.")
-
-        if self.eagle3_one_model:
-            self.spec_dec_mode = SpeculativeDecodingMode.EAGLE3_ONE_MODEL
-            self.num_extra_kv_tokens = self.max_draft_tokens - 1
-        else:
-            self.spec_dec_mode = SpeculativeDecodingMode.from_string(
-                self.spec_dec_name)
-        logger.info(f"EAGLE3 Config: {self}")
-
-    def update_from_model_config(self, model_config):
-        self.num_layers = model_config.num_hidden_layers
-        self.hidden_size = model_config.hidden_size
-        self.dtype = model_config.torch_dtype
-
-    def get_draft_model_prompt(self,
-                               input_tokens: torch.Tensor) -> torch.Tensor:
-        """
-        Eagle3 always throws away the first token when processing draft inputs
-        """
-        return input_tokens[1:]
 
 
 class Eagle3ResourceManager(BaseResourceManager):
@@ -55,11 +22,11 @@ class Eagle3ResourceManager(BaseResourceManager):
     and one for the draft model. Use this class to manage the hidden states.
     """
 
-    def __init__(self, config: Eagle3Config, dtype: torch.dtype,
+    def __init__(self, config: "EagleDecodingConfig", dtype: torch.dtype,
                  hidden_size: int, max_num_requests: int, max_seq_len: int,
                  max_num_tokens: int):
         self.dtype = dtype
-        self.max_draft_tokens = config.max_draft_tokens
+        self.max_draft_tokens = config.max_draft_len
         self.hidden_size = hidden_size
         self.max_num_requests = max_num_requests
         self.max_seq_len = max_seq_len
@@ -293,10 +260,10 @@ class Eagle3OneModelSampler(MTPSampler):
 
 class Eagle3OneModelWorker(nn.Module):
 
-    def __init__(self, spec_config: Eagle3Config, mapping: Mapping):
+    def __init__(self, spec_config: "EagleDecodingConfig", mapping: Mapping):
         super().__init__()
         self.spec_config = spec_config
-        self.max_draft_tokens = self.spec_config.max_draft_tokens
+        self.max_draft_tokens = self.spec_config.max_draft_len
         self.mapping = mapping
 
     @torch.compile(mode="max-autotune-no-cudagraphs")

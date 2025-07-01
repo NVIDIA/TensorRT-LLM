@@ -17,7 +17,7 @@ from tensorrt_llm.lora_manager import (LoraConfig,
 from tensorrt_llm.mapping import Mapping
 
 from ..model_config import ModelConfig
-from ..speculative import get_spec_decoder
+from ..speculative import get_num_extra_kv_tokens, get_spec_decoder
 from .config_utils import is_mla, is_nemotron_hybrid
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .llm_request import ExecutorResponse
@@ -157,11 +157,11 @@ class KvCacheCreator:
         if not pytorch_backend_config.disable_overlap_scheduler:
             num_extra_tokens_per_seq = num_extra_tokens_per_seq + 1
             if spec_cfg is not None:
-                num_extra_tokens_per_seq += spec_cfg.max_draft_tokens
+                num_extra_tokens_per_seq += spec_cfg.max_draft_len
 
         if spec_cfg is not None:
-            num_extra_tokens_per_seq += spec_cfg.max_draft_tokens
-            num_extra_tokens_per_seq += spec_cfg.num_extra_kv_tokens
+            num_extra_tokens_per_seq += spec_cfg.max_draft_len
+            num_extra_tokens_per_seq += get_num_extra_kv_tokens(spec_cfg)
         for req in self._dummy_reqs:
             num_req_tokens = len(req.input_token_ids) + num_extra_tokens_per_seq
             # Requests cannot share KV cache blocks. Round up to nearest integer multiple of block size.
@@ -538,7 +538,7 @@ def create_py_executor_instance(
         disable_overlap_scheduler,
         max_batch_size=executor_config.max_batch_size,
         max_beam_width=executor_config.max_beam_width,
-        max_draft_tokens=spec_config.max_draft_tokens
+        max_draft_tokens=spec_config.max_draft_len
         if spec_config is not None else 0,
         kv_cache_transceiver=kv_cache_transceiver,
         draft_model_engine=draft_model_engine,
@@ -550,7 +550,7 @@ def create_torch_sampler_args(executor_config: ExecutorConfig, mapping: Mapping,
                               *, max_seq_len: int, enable_mixed_sampler: bool):
     max_num_sequences = executor_config.max_batch_size * mapping.pp_size
     max_draft_tokens = (0 if executor_config.speculative_config is None else
-                        executor_config.speculative_config.max_draft_tokens)
+                        executor_config.speculative_config.max_draft_len)
     return TorchSampler.Args(
         max_seq_len=max_seq_len,
         max_draft_tokens=max_draft_tokens,

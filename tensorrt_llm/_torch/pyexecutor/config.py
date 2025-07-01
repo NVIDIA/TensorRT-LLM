@@ -8,7 +8,6 @@ from ...llmapi.llm_args import LoadFormat
 from ...logger import logger
 from ...mapping import Mapping
 from ..model_config import MoeLoadBalancerConfig
-from ..speculative import SpecConfig
 from .resource_manager import BaseResourceManager
 
 
@@ -110,7 +109,7 @@ def update_executor_config(
         pytorch_backend_config: Optional[PyTorchConfig] = None,
         mapping: Optional[Mapping] = None,
         build_config: Optional[BuildConfig] = None,
-        speculative_config: Optional[SpecConfig] = None,
+        speculative_config: Optional["DecodingBaseConfig"] = None,
         hf_model_dir: Optional[str] = None,
         max_input_len: Optional[int] = None,
         max_seq_len: Optional[int] = None):

@@ -1,4 +1,3 @@
-from dataclasses import dataclass
 from itertools import chain
 
 from ordered_set import OrderedSet
@@ -9,34 +8,6 @@ from ..pyexecutor.llm_request import *
 from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.scheduler import ScheduledRequests
 from .drafter import Drafter
-from .interface import SpecConfig, SpeculativeDecodingMode
-
-
-@dataclass
-class NGramConfig(SpecConfig):
-    """
-    Configuration for NGram drafter.
-    """
-    # The name of speculative decoding.
-    spec_dec_name = "NGRAM"
-
-    num_extra_kv_tokens: int = 0
-    max_draft_tokens: int = 0
-
-    prompt_lookup_num_tokens: int = 5
-    max_matching_ngram_size: int = 5
-    end_id: int = -1
-    is_keep_all: bool = True
-    is_use_oldest: bool = True
-    is_public_pool: bool = True
-
-    def __post_init__(self) -> None:
-        self.spec_dec_mode = SpeculativeDecodingMode.from_string(
-            self.spec_dec_name)
-        self.max_draft_tokens = self.prompt_lookup_num_tokens
-
-    def update_from_model_config(self, model_config):
-        pass
 
 
 class NGramPoolManager(BaseResourceManager):
@@ -76,7 +47,8 @@ class NGramPoolManager(BaseResourceManager):
             It maps from request ID to the index of the prompt to update the pool in the next step.
     """
 
-    def __init__(self, spec_config: SpecConfig, max_num_requests: int):
+    def __init__(self, spec_config: "NGramDecodingConfig",
+                 max_num_requests: int):
         self.prompt_lookup_num_tokens = spec_config.prompt_lookup_num_tokens
         self.max_matching_ngram_size = spec_config.max_matching_ngram_size
         self.is_keep_all = spec_config.is_keep_all
@@ -191,12 +163,12 @@ class NGramDrafter(Drafter):
 
     def __init__(
         self,
-        spec_config: SpecConfig,
+        spec_config: "NGramDecodingConfig",
         ngram_pool_manager: NGramPoolManager = None,
     ):
         assert ngram_pool_manager is not None, "NGram needs a resource manager to maintain the pool."
         super().__init__(spec_resource_manager=ngram_pool_manager)
-        self.max_num_draft_tokens = spec_config.max_draft_tokens
+        self.max_draft_len = spec_config.max_draft_len
 
     def prepare_draft_tokens(
         self,
@@ -220,8 +192,8 @@ class NGramDrafter(Drafter):
                 request.py_end_id,
                 request.py_orig_prompt_len + request.py_max_new_tokens,
             )
-            # Pad length to `self.max_num_draft_tokens`
+            # Pad length to `self.max_draft_len`
             if len(draft_tokens) > 0:
-                pad_length = self.max_num_draft_tokens - len(draft_tokens)
+                pad_length = self.max_draft_len - len(draft_tokens)
                 draft_tokens.extend([request.py_end_id] * pad_length)
             request.py_draft_tokens = draft_tokens
