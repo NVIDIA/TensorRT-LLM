@@ -530,6 +530,14 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
                 q = mmha::mul<VecType, float, VecType>(logn_scale, q);
             }
             auto const channelIdx{tidx};
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000))
+            // Blackwell has already supported non-cyclic kv cache.
+            bool const useKVCache = params.kv_cache_buffer.data != nullptr;
+            auto token_idx_in_kv_cache = token_idx_in_seq;
+            bool valid_kv_cache_pos = useKVCache;
+#else
+            // FIXME: This is a WAR for Hopper as the kernel has not been updated to support non-cyclic kv cache. Should
+            // be removed after Hopper kernel is updated.
             auto const tokenIdxLowerBound
                 = max(cache_seq_len - params.cyclic_kv_cache_len + params.sink_token_len, params.sink_token_len);
             bool const useKVCache = params.kv_cache_buffer.data != nullptr;
@@ -556,6 +564,7 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
                     token_idx_in_kv_cache = params.cyclic_kv_cache_len + local_token_idx;
                 }
             }
+#endif
 
             // Make sure pairs of q or v vecs have been read before write.
             // One block will handle single head.
@@ -945,6 +954,13 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
         }
 
         auto const channelIdx = head_dim_vec_idx;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000))
+        // Blackwell has already supported non-cyclic kv cache.
+        bool const useKVCache = GEN_PHASE || params.kv_cache_buffer.data != nullptr;
+        bool valid_kv_cache_pos = useKVCache;
+#else
+        // FIXME: This is a WAR for Hopper as the kernel has not been updated to support non-cyclic kv cache. Should be
+        // removed after Hopper kernel is updated.
         auto const tokenIdxLowerBound = max(cache_seq_len - params.cyclic_kv_cache_len, 0);
         bool const useKVCache = GEN_PHASE || params.kv_cache_buffer.data != nullptr;
         bool valid_kv_cache_pos = useKVCache // In KV-cache-less mode. No need to store KV values
@@ -971,6 +987,7 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
                 token_idx_in_kv_cache = params.cyclic_kv_cache_len + token_idx_in_seq;
             }
         }
+#endif
 
         auto kDst = useKVCache
             ? reinterpret_cast<TCache*>(params.kv_cache_buffer.getKBlockPtr(batch_idx, token_idx_in_kv_cache))
