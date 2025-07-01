@@ -78,6 +78,8 @@ MODEL_PATH_DICT = {
     "modelopt-hf-model-hub/Mixtral-8x7B-Instruct-v0.1-fp4",
     "mixtral_8x22b_v0.1": "Mixtral-8x22B-v0.1",
     "mistral_7b_v0.1": "mistral-7b-v0.1",
+    "ministral_8b": "Ministral-8B-Instruct-2410",
+    "ministral_8b_fp8": "Ministral-8B-Instruct-2410-FP8",
     "deepseek_r1_fp8": "DeepSeek-R1/DeepSeek-R1",
     "deepseek_r1_nvfp4": "DeepSeek-R1/DeepSeek-R1-FP4",
     "deepseek_v3_lite_fp8": "DeepSeek-V3-Lite/fp8",
@@ -131,6 +133,7 @@ HF_MODEL_PATH = {
     "mixtral_8x7b_v0.1_hf": "mistralai/Mixtral-8x7B-v0.1",
     "mixtral_8x7b_v0.1_instruct_hf": "mistralai/Mixtral-8x7B-Instruct-v0.1",
     "mistral_7b_v0.1_hf": "mistralai/Mistral-7B-v0.1",
+    "ministral_8b_hf": "mistralai/Ministral-8B-Instruct-2410",
     "flan_t5_base_hf": "google/flan-t5-small",
     "phi_4_mini_instruct_hf": "microsoft/Phi-4-mini-instruct",
 }
