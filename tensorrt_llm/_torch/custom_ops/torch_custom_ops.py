@@ -224,6 +224,7 @@ def _(
     ep_rank: int = 0,
     cluster_size: int = 1,
     cluster_rank: int = 0,
+    enable_alltoall: bool = False,
     use_deepseek_fp8_block_scale: bool = False,
     use_w4a8_group_scaling: bool = False,
     min_latency_mode: bool = False,

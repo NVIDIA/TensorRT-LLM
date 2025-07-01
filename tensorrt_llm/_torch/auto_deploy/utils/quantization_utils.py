@@ -300,7 +300,7 @@ class FP4QuantizationImpl(QuantizationImpl):
                     weight_scale = state_dict[weight_name + "_scale"].view(float4_sf_dtype)
                     ori_shape = weight_scale.shape
                     state_dict[weight_name + "_scale"] = (
-                        torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+                        torch.ops.trtllm.nvfp4_block_scale_interleave(
                             weight_scale.view(torch.uint8).cpu().contiguous()
                         )
                         .reshape(ori_shape)
