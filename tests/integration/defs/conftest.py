@@ -1825,7 +1825,7 @@ def skip_by_device_count(request):
 
 @pytest.fixture(autouse=True)
 def skip_by_mpi_world_size(request):
-    "fixture for skip less mpi word size"
+    "fixture for skip less mpi world size"
     if request.node.get_closest_marker('skip_less_mpi_world_size'):
         mpi_world_size = get_mpi_world_size()
         device_count = get_device_count()
