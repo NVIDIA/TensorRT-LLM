@@ -205,7 +205,7 @@ CacheTransBufferManager::CacheTransBufferManager(
     auto kvCachePerToken
         = (mCacheManager->getBlockManager().getBlockSize(0) * mCacheManager->getBlockManager().getNumLayers()
               * (mCacheManager->getCacheType() == CacheType::kSELFKONLY ? 1 : 2))
-        / tokensPerBlock;
+        / tokensPerBlock * common::getDTypeSize(mDataType);
     mTransferBufferSize = maxNumTokens.has_value() ? maxNumTokens.value() * kvCachePerToken
                                                    : common::getEnvMemSizeForKVCacheTransferBuffer();
     mOnlyUseDynamicBuffer = mTransferBufferSize == 0;
@@ -221,9 +221,9 @@ CacheTransBufferManager::CacheTransBufferManager(
     TLLM_LOG_INFO(
         "CacheTransBufferManager: mMaxNumTokens:%ld, mRecvBufferCount:%ld, "
         "mSendBufferCount:%ld,mTransferBufferSize:%ld, mPreAllocBufferSize:%ld,mOnlyUseDynamicBuffer:%d "
-        "mUseFabricMemory:%d",
+        "mUseFabricMemory:%d mDataType:%d",
         maxNumTokens.has_value() ? maxNumTokens.value() : 0, mRecvBufferCount, mSendBufferCount, mTransferBufferSize,
-        mPreAllocBufferSize, mOnlyUseDynamicBuffer, mUseFabricMemory);
+        mPreAllocBufferSize, mOnlyUseDynamicBuffer, mUseFabricMemory, mDataType);
 
     allocateBuffer();
 }
