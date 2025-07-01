@@ -13,7 +13,6 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
 
 
-@pytest.mark.skip(reason="https://nvbugs/5363158")
 @pytest.mark.parametrize("use_cuda_graph,attn_backend",
                          [[True, "TRTLLM"], [False, "TRTLLM"],
                           [True, "FLASHINFER"], [False, "FLASHINFER"]])
@@ -47,6 +46,9 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str):
     llm_spec = LLM(
         model=target_model_dir,
         **pytorch_config,
+        # bs > 1 gives non-deterministic when doing IFB. There are slight chances
+        # that ref and spec does not match 100%
+        max_batch_size=1,
         # This max_seq_len is larger than the one specified
         # in the llama 3 8B eagle's config. We want to make sure
         # that the draft model won't go above its max in warmup
@@ -134,6 +136,9 @@ def test_llama_eagle3_one_model(use_cuda_graph: bool, attn_backend: str):
     llm_spec = LLM(
         model=target_model_dir,
         **pytorch_config,
+        # bs > 1 gives non-deterministic when doing IFB. There are slight chances
+        # that ref and spec does not match 100%
+        max_batch_size=1,
         # This max_seq_len is larger than the one specified
         # in the llama 3 8B eagle's config. We want to make sure
         # that the draft model won't go above its max in warmup

@@ -4,6 +4,8 @@ from typing import List, Optional
 import torch
 from torch import nn
 
+from tensorrt_llm.bindings.executor import FinishReason
+
 from ..attention_backend import AttentionMetadata
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
@@ -251,6 +253,12 @@ class MTPSampler(TorchSampler):
         self.mapping = None
         self.draft_len = nextn
 
+    def _draft_meet_max_token_stop_criteria(self, request: LlmRequest,
+                                            num_tokens: int, beam_idx: int):
+        if self._meet_max_token_stop_criteria(request, num_tokens):
+            request.state = LlmRequestState.GENERATION_COMPLETE
+            request.set_finished_reason(FinishReason.LENGTH, beam_idx)
+
     def update_requests(self, state: SampleStateMTP) -> None:
         assert isinstance(state, SampleStateMTP)
 
@@ -271,10 +279,13 @@ class MTPSampler(TorchSampler):
 
             if request.state != LlmRequestState.GENERATION_COMPLETE:
                 new_token = new_tokens_list[idx][0]
-                request.add_new_token(new_token, beam_idx)
+                num_tokens = request.add_new_token(new_token, beam_idx)
                 should_stop = self._handle_stop_criteria(request,
                                                          new_token,
                                                          beam=beam_idx)
+                if self._draft_meet_max_token_stop_criteria(
+                        request, num_tokens, beam_idx):
+                    should_stop = True
                 request.py_draft_tokens = next_draft_tokens_list[idx]
                 request.py_decoding_iter += 1
             idx += 1
@@ -289,12 +300,15 @@ class MTPSampler(TorchSampler):
                 should_stop = False
                 for i in range(num_new_tokens):
                     new_token = new_tokens[i]
-                    request.add_new_token(new_token, beam_idx)
+                    num_tokens = request.add_new_token(new_token, beam_idx)
                     should_stop = self._handle_stop_criteria(request,
                                                              new_token,
                                                              beam=beam_idx)
                     if should_stop:
                         break
+                if self._draft_meet_max_token_stop_criteria(
+                        request, num_tokens, beam_idx):
+                    should_stop = True
                 request.py_draft_tokens = next_draft_tokens_list[idx]
                 request.py_rewind_len = self.draft_len - (num_new_tokens - 1)
                 request.py_decoding_iter += 1
