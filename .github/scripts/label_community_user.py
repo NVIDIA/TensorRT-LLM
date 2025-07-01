@@ -22,11 +22,19 @@ def check_user_membership(org: str, username: str) -> bool:
                                 timeout=10,
                                 allow_redirects=False)
 
-        if response.status_code == 204 or response.status_code == 302:
+        if response.status_code == 204:
             print(
                 f"Membership check for '{username}' in '{org}': Positive (Status {response.status_code})."
             )
             return True
+        elif response.status_code == 302:
+            detail = (
+                f"Cannot determine membership for '{username}' in '{org}' (Status 302). "
+                f"The requester token does not have organization membership privileges. "
+                f"This usually means the token is not associated with an org member."
+            )
+            print(detail)
+            raise RuntimeError(detail)
         elif response.status_code == 404:
             print(
                 f"Membership check for '{username}' in '{org}': Negative (Status {response.status_code})."
