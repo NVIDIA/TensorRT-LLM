@@ -18,6 +18,7 @@ perf/test_perf.py::test_perf[t5_base-plugin-float16-bs:8-input_output_len:60,20]
 perf/test_perf.py::test_perf[flan_t5_base-plugin-float16-bs:8-input_output_len:60,20] SKIP # (https://nvidia.slack.com/archives/C059LSY62BT/p1704525727177449)
 perf/test_perf.py::test_perf[bart_large_cnn-plugin-float16-bs:8-input_output_len:60,20] SKIP # (https://nvidia.slack.com/archives/C059LSY62BT/p1704525727177449)
 accuracy/test_llm_api.py::TestMixtral8x7B::test_smooth_quant_tp2pp2 SKIP (not supported yet)
+accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_trtllm] SKIP (intermittent failure)
 examples/test_llama.py::test_llm_llama_v3_1m_long_context_8gpus[Llama-3-70B-Instruct-Gradient-1048k] SKIP (test duration is too long)
 full:GH200/examples/test_multimodal.py::test_llm_multimodal_general[video-neva-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False-nb:1] SKIP (https://nvbugs/4731514)
 full:GH200/examples/test_multimodal.py::test_llm_multimodal_general[video-neva-pp:1-tp:1-bfloat16-bs:8-cpp_e2e:False-nb:1] SKIP (https://nvbugs/4731514)

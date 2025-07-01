@@ -2173,13 +2173,17 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @skip_pre_blackwell
+    @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRITON"])
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
         [(1, 1, 1, False, True, True)],
         ids=["latency"])
-    def test_w4a8_mxfp4fp8(self, tp_size, pp_size, ep_size, attention_dp,
-                           cuda_graph, overlap_scheduler):
+    def test_w4a8_mxfp4fp8(self, moe_backend, tp_size, pp_size, ep_size,
+                           attention_dp, cuda_graph, overlap_scheduler):
+        if moe_backend == "TRITON" and get_sm_version() < 90:
+            pytest.skip("TRITON moe backend requires Hopper or newer.")
+        if moe_backend == "CUTLASS" and get_sm_version() < 100:
+            pytest.skip("CUTLASS moe backend requires Blackwell or newer.")
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
                               use_cuda_graph=cuda_graph)
 
@@ -2189,7 +2193,8 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             pipeline_parallel_size=pp_size,
             moe_expert_parallel_size=ep_size,
             **pytorch_config,
-            enable_attention_dp=attention_dp)
+            enable_attention_dp=attention_dp,
+            moe_backend=moe_backend)
         with llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)

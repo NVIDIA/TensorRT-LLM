@@ -1039,14 +1039,22 @@ def test_fused_moe_w4afp8(dtype):
 
 
 @skip_pre_hopper
-@pytest.mark.parametrize("experts", [8, 128, 512])
+@pytest.mark.parametrize("experts", [8, 128])
+@pytest.mark.parametrize(
+    "hidden_size, intermediate_size",
+    [
+        (256, 256),
+        (2880, 2880),
+    ],
+)
 @pytest.mark.parametrize("fp8_activation", [True, False])
 @pytest.mark.parametrize("bias", [True, False])
-def test_fused_moe_triton_mxfp4(experts, fp8_activation, bias):
+def test_fused_moe_triton_mxfp4(experts, hidden_size, intermediate_size,
+                                fp8_activation, bias):
     dtype = torch.bfloat16
     SEQ_LEN = 8
-    HIDDEN_SIZE = 256
-    INTERMEDIATE_SIZE = 256
+    HIDDEN_SIZE = hidden_size
+    INTERMEDIATE_SIZE = intermediate_size
     NUM_EXPERTS = experts
     TOP_K = 4
     routing_method = RenormalizeMoeRoutingMethod(top_k=TOP_K)

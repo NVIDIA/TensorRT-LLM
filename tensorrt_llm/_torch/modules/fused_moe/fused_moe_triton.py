@@ -1,7 +1,10 @@
+from __future__ import annotations
+
 from typing import Dict, List, NamedTuple, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 IS_TRITON_KERNELS_AVAILABLE = False
 try:
@@ -142,6 +145,10 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
         if w2_weight_shard.dim() == 2:
             # Transpose the weights to match the expected format for the Triton gemm kernel
             w2_weight_shard = w2_weight_shard.transpose(0, 1).contiguous()
+        else:
+            assert w2_weight_shard.dim() == 1
+            # Handle TP contribution of bias
+            w2_weight_shard /= module.tp_size
 
         dst_w2_weight.copy_(w2_weight_shard, non_blocking=True)
 
@@ -187,8 +194,9 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
         # Call the Triton activation kernel
         act_out = triton_kernels.swiglu.swiglu(
             gemm1_output,
-            1.0,  # scale before sigmoid
-            0.0,  # bias added to the linear term of swiglu
+            module.swiglu_alpha or 1.0,  # scale before sigmoid
+            module.swiglu_beta
+            or 0.0,  # bias added to the linear term of swiglu
             pcs,
             routing_data=rdata)
 
@@ -396,8 +404,9 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         # Call the Triton activation kernel
         act_out = triton_kernels.swiglu.swiglu(
             gemm1_output,
-            1.0,  # scale before sigmoid
-            0.0,  # bias added to the linear term of swiglu
+            module.swiglu_alpha or 1.0,  # scale before sigmoid
+            module.swiglu_beta
+            or 0.0,  # bias added to the linear term of swiglu
             pcs,
             routing_data=rdata)
         # Quantize the activation output manually since the Triton activation kernel doesn't support bf16 in fp8 out
@@ -626,21 +635,43 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         tmp_w3_w1_weight_scale = shuffle_weight_for_activation_kernel(
             tmp_w3_w1_weight_scale)
 
+        # For Hopper style swizzle, we need to pad the out dim to multiple of 256
+        def _maybe_pad_weight_and_scale(weight, scale):
+            if self.swizzle_scale != SwizzlingType.HOPPER:
+                return weight, scale
+            out_dim = weight.shape[-1]
+            assert scale.shape[
+                -1] == out_dim, "Out dim of weight and scale should match"
+            pad_size = (256 - out_dim % 256) % 256
+            weight = F.pad(
+                weight,
+                (0,
+                 pad_size)).contiguous()  # Pad the last dimension on right side
+            scale = F.pad(scale, (0, pad_size)).contiguous()
+            return weight, scale
+
+        tmp_w3_w1_weight, tmp_w3_w1_weight_scale = _maybe_pad_weight_and_scale(
+            module.w3_w1_weight, tmp_w3_w1_weight_scale)
+
+        tmp_w2_weight, tmp_w2_weight_scale = _maybe_pad_weight_and_scale(
+            module.w2_weight, tmp_w2_weight_scale)
+
         # Apply swizzle to the scales
         tmp_w3_w1_weight, tmp_w3_w1_weight_scale, tmp_w3_w1_scale_shape = swizzle_weight_and_scale(
-            module.w3_w1_weight, tmp_w3_w1_weight_scale, self.swizzle_value,
+            tmp_w3_w1_weight, tmp_w3_w1_weight_scale, self.swizzle_value,
             self.swizzle_scale)
         tmp_w2_weight, tmp_w2_weight_scale, tmp_w2_scale_shape = swizzle_weight_and_scale(
-            module.w2_weight, tmp_w2_weight_scale, self.swizzle_value,
+            tmp_w2_weight, tmp_w2_weight_scale, self.swizzle_value,
             self.swizzle_scale)
 
         # Step3: store final loaded weights and scales
         # Don't use copy_ here, it will break the swizzle stride
         module.w3_w1_weight.data = tmp_w3_w1_weight
-        module.fc31_dequant.data = tmp_w3_w1_weight_scale
+        device = module.w3_w1_weight.device
+        module.fc31_dequant.data = tmp_w3_w1_weight_scale.to(device)
         self.w3_w1_scale_shape = tmp_w3_w1_scale_shape  # Triton swizzle needs this original shape as the swizzle may not keep the original shape
         module.w2_weight.data = tmp_w2_weight
-        module.fc2_dequant.data = tmp_w2_weight_scale
+        module.fc2_dequant.data = tmp_w2_weight_scale.to(device)
         self.w2_scale_shape = tmp_w2_scale_shape
         if self.activation_dtype == torch.float8_e4m3fn:
             if max_fc31_input_scale is None or max_fc2_input_scale is None:
@@ -710,6 +741,19 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                                   gather_indx=gather_indx,
                                   precision_config=pc1)
 
+        def _maybe_remove_padding(gemm_output, expected_size):
+            assert gemm_output.dim() == 2
+            if gemm_output.shape[-1] != expected_size:
+                assert self.swizzle_scale == SwizzlingType.HOPPER, "Only Hopper style swizzle can have padding"
+                assert gemm_output.shape[
+                    -1] % 256 == 0, "The padding is not done correctly"
+                gemm_output = gemm_output[:, :expected_size]
+            return gemm_output
+
+        gemm1_output = _maybe_remove_padding(
+            gemm1_output,
+            module.intermediate_size_per_partition * 2).contiguous()
+
         # Step 3: Activation
         # Setup quantization context
         pcs = triton_kernels.swiglu.PrecisionConfig(limit=None)
@@ -717,8 +761,9 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         # Call the Triton activation kernel
         act_out = triton_kernels.swiglu.swiglu(
             gemm1_output,
-            1.0,  # scale before sigmoid
-            0.0,  # bias added to the linear term of swiglu
+            module.swiglu_alpha or 1.0,  # scale before sigmoid
+            module.swiglu_beta
+            or 0.0,  # bias added to the linear term of swiglu
             pcs,
             routing_data=rdata)
 
@@ -756,6 +801,8 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                                   scatter_indx=scatter_indx,
                                   precision_config=pc2,
                                   gammas=rdata.gate_scal if rdata else None)
+
+        gemm2_output = _maybe_remove_padding(gemm2_output, module.hidden_size)
         return gemm2_output
 
 
@@ -776,6 +823,8 @@ class TritonFusedMoE(MoE):
         VANILLA,
         bias: bool = False,
         layer_idx: Optional[int] = None,
+        swiglu_alpha: Optional[torch.Tensor] = None,
+        swiglu_beta: Optional[torch.Tensor] = None,
         override_quant_method=None,
     ):
         # Override the quantization method if needed for test purpose
@@ -798,7 +847,7 @@ class TritonFusedMoE(MoE):
             "routing_method must be an instance of RenormalizeMoeRoutingMethod for TritonFusedMoE"
         assert not self.smart_router, "Smart router is not supported in TritonFusedMoE."
         assert not self.use_dp, "AttentionDP is not supported in TritonFusedMoE."
-        assert self.parallel_size == 1, "TritonFusedMoE only supports single parallelism for now"
+        assert self.ep_size == 1, " TritonFusedMoE does not support expert parallelism (ep_size > 1)."
 
         self.num_slots = self.num_experts
         self.expert_size_per_partition = self.num_experts // self.ep_size
@@ -816,6 +865,21 @@ class TritonFusedMoE(MoE):
 
         self.bias = bias
 
+        def _maybe_squeeze_act_param(p):
+            if p is None or isinstance(p, (int, float)):
+                return p
+            assert isinstance(p, torch.Tensor)
+            assert p.dtype == torch.float32
+            assert p.shape == (self.num_experts, 1)
+            assert torch.all(
+                p == p[0]
+            ), "All experts must have the same swiglu alpha/beta for Triton kernel"
+            p = p[0].item()
+            return p
+
+        self.swiglu_alpha = _maybe_squeeze_act_param(swiglu_alpha)
+        self.swiglu_beta = _maybe_squeeze_act_param(swiglu_beta)
+
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
@@ -828,6 +892,9 @@ class TritonFusedMoE(MoE):
                 exclude_kv_cache=True):
             if self.quant_config.layer_quant_mode.has_fp8_qdq():
                 return TritonFP8QDQFusedMoEMethod()
+            elif self.quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8():
+                return TritonMXFP4FusedMoEMethod(
+                    activation_dtype=torch.float8_e4m3fn)
             else:
                 raise ValueError(
                     f"Unsupported quantization mode: {self.quant_config.quant_mode}"
@@ -852,7 +919,15 @@ class TritonFusedMoE(MoE):
         **kwargs,
     ) -> torch.Tensor:
         # TODO(dongfengy): Add missing comm primitives for TP/EP
-        return self.quant_method.apply(self, x, router_logits)
+        hidden_states = self.quant_method.apply(self, x, router_logits)
+
+        if self.tp_size > 1:
+            assert self.reduce_results
+            hidden_states = hidden_states.contiguous(
+            )  # There might be padding going on
+            hidden_states = self.all_reduce(hidden_states)
+
+        return hidden_states
 
     def load_weights(self, weights: List[Dict]):
         assert self._weights_created

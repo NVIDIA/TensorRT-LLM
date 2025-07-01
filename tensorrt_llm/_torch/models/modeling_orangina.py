@@ -163,6 +163,12 @@ class MLPBlock(torch.nn.Module):
 
         self.routing_method = RenormalizeMoeRoutingMethod(
             top_k=pretrained_config.experts_per_token)
+        self.swiglu_alpha = torch.tensor([1.702] * self.num_experts,
+                                         dtype=torch.float32).cuda().reshape(
+                                             self.num_experts, 1)
+        self.swiglu_beta = torch.tensor([1.0] * self.num_experts,
+                                        dtype=torch.float32).cuda().reshape(
+                                            self.num_experts, 1)
 
         self.experts = create_moe(
             routing_method=self.routing_method,
@@ -174,6 +180,8 @@ class MLPBlock(torch.nn.Module):
             model_config=config,
             weight_loading_mode=MoEWeightLoadingMode.FUSED_GATE_UP_PROJ,
             bias=True,
+            swiglu_alpha=self.swiglu_alpha,
+            swiglu_beta=self.swiglu_beta,
         )
 
     @staticmethod
