@@ -92,8 +92,9 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
             llm_args_dict = yaml.safe_load(f)
             if "kv_cache_dtype" in llm_args_dict:
                 kv_cache_dtype = llm_args_dict["kv_cache_dtype"]
-            if "cuda_graph_batch_sizes" in llm_args_dict:
-                cuda_graph_batch_sizes = llm_args_dict["cuda_graph_batch_sizes"]
+            if "cuda_graph_config" in llm_args_dict:
+                cuda_graph_batch_sizes = \
+                    llm_args_dict["cuda_graph_config"].get("max_batch_sizes", None)
 
             enable_chunked_prefill = llm_args_dict.get("enable_chunked_prefill",
                                                        enable_chunked_prefill)

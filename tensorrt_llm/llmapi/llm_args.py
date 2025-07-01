@@ -1953,6 +1953,7 @@ def update_llm_args_with_extra_dict(
         "extended_runtime_perf_knob_config": ExtendedRuntimePerfKnobConfig,
         "cache_transceiver_config": CacheTransceiverConfig,
         "lora_config": LoraConfig,
+        "cuda_graph_config": CudaGraphConfig,
     }
     for field_name, field_type in field_mapping.items():
         if field_name in llm_args_dict:
