@@ -119,10 +119,12 @@ ExternalProject_Add(
   nvshmem_project
   URL https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/source/nvshmem_src_3.2.5-1.txz
   URL_HASH ${NVSHMEM_URL_HASH}
-  PATCH_COMMAND patch -p1 -i ${CMAKE_CURRENT_BINARY_DIR}/nvshmem.patch
+  PATCH_COMMAND patch -p1 --forward --batch -i
+                ${CMAKE_CURRENT_BINARY_DIR}/nvshmem.patch
   COMMAND sed "s/TRANSPORT_VERSION_MAJOR 3/TRANSPORT_VERSION_MAJOR 103/" -i
           src/CMakeLists.txt
-  COMMAND patch -p1 -i ${CMAKE_CURRENT_SOURCE_DIR}/nvshmem_fast_build.patch
+  COMMAND patch -p1 --forward --batch -i
+          ${CMAKE_CURRENT_SOURCE_DIR}/nvshmem_fast_build.patch
   CMAKE_CACHE_ARGS
     -DCMAKE_C_COMPILER:STRING=${CMAKE_C_COMPILER}
     -DCMAKE_C_COMPILER_LAUNCHER:STRING=${CMAKE_C_COMPILER_LAUNCHER}
@@ -173,14 +175,9 @@ find_library(TORCH_PYTHON_LIB torch_python REQUIRED
              HINTS ${TORCH_INSTALL_PREFIX}/lib)
 
 # Add deep_ep_cpp_tllm
-pybind11_add_module(
-  deep_ep_cpp_tllm
-  ${DEEP_EP_SOURCE_DIR}/csrc/deep_ep.cpp
-  ${DEEP_EP_SOURCE_DIR}/csrc/kernels/internode.cu
-  ${DEEP_EP_SOURCE_DIR}/csrc/kernels/internode_ll.cu
-  ${DEEP_EP_SOURCE_DIR}/csrc/kernels/intranode.cu
-  ${DEEP_EP_SOURCE_DIR}/csrc/kernels/layout.cu
-  ${DEEP_EP_SOURCE_DIR}/csrc/kernels/runtime.cu)
+file(GLOB_RECURSE SRC_CPP ${DEEP_EP_SOURCE_DIR}/csrc/*.cpp)
+file(GLOB_RECURSE SRC_CU ${DEEP_EP_SOURCE_DIR}/csrc/*.cu)
+pybind11_add_module(deep_ep_cpp_tllm ${SRC_CPP} ${SRC_CU})
 set_target_properties(
   deep_ep_cpp_tllm
   PROPERTIES CXX_STANDARD_REQUIRED ON
