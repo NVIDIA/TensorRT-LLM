@@ -1,10 +1,10 @@
-from typing import List, Tuple, Optional
+from typing import List
 
 import torch
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm.logger import logger
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.logger import logger
 
 
 class HandleLogits:
@@ -42,14 +42,16 @@ class HandleLogits:
                     logger.warning(
                         f"Because of KV cache reuse, not all context logits could be produced for request {llm_req.request_id}."
                     )
-                context_logits_device_view = logits[logits_offset:logits_next_offset]
-                llm_req.py_result.append_context_logits(context_logits_device_view)
+                context_logits_device_view = logits[
+                    logits_offset:logits_next_offset]
+                llm_req.py_result.append_context_logits(
+                    context_logits_device_view)
 
             if llm_req.py_return_generation_logits and llm_req.is_last_context_chunk:
                 # Get the logits from the last context token and draft tokens
                 logits_view = logits[logits_offset:logits_next_offset]
                 llm_req.py_result.append_generation_logits(logits_view)
-        
+
         total_context_logits = num_context_logits_prefix_sum[-1]
         for batch_index, llm_req in enumerate(generation_requests):
             logits_offset = total_context_logits + batch_index * beam_width
