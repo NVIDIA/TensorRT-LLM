@@ -1,8 +1,8 @@
 # Description
 
-TensorRT-LLM provides users with an easy-to-use Python API to define Large Language Models (LLMs) and support
+TensorRT-LLM provides users with an easy-to-use Python API to define Large Language Models (LLMs) and supports
 state-of-the-art optimizations to perform inference efficiently on NVIDIA GPUs. TensorRT-LLM also contains components to
-create Python and C++ runtimes that orchestrate the inference execution in performant way.
+create Python and C++ runtimes that orchestrate the inference execution in a performant way.
 
 # Overview
 
@@ -22,15 +22,15 @@ With the top-level directory of the TensorRT-LLM repository cloned to your local
 command to start the development container:
 
 ```bash
-make -C docker ngc-devel_run LOCAL_USER=1 DOCKER_PULL=1 IMAGE_TAG=x.xx.x
+make -C docker ngc-devel_run LOCAL_USER=1 DOCKER_PULL=1 IMAGE_TAG=x.y.z
 ```
 
-where `x.xx.x` is the version of the TensorRT-LLM container to use. This command pulls the specified container from the
+where `x.y.z` is the version of the TensorRT-LLM container to use (cf. [release history on GitHub](https://github.com/NVIDIA/TensorRT-LLM/releases) and [tags in NGC Catalog](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/devel/tags)). This command pulls the specified container from the
 NVIDIA NGC registry, sets up the local user's account within the container, and launches it with full GPU support. The
 local source code of TensorRT-LLM will be mounted inside the container at the path `/code/tensorrt_llm` for seamless
-integration. Ensure that the image version matches the version of TensorRT-LLM in your current local git branch. Not
-specifying an `IMAGE_TAG` will attempt to resolve this automatically, but not every intermediate release might be
-accompanied by development container. In that case, use the latest version preceding the version of your development
+integration. Ensure that the image version matches the version of TensorRT-LLM in your currently checked out local git branch. Not
+specifying a `IMAGE_TAG` will attempt to resolve this automatically, but not every intermediate release might be
+accompanied by a development container. In that case, use the latest version preceding the version of your development
 branch.
 
 If you prefer launching the container directly with `docker`, you can use the following command:
@@ -44,7 +44,7 @@ docker run --rm -it --ipc=host --ulimit memlock=-1 --ulimit stack=67108864  \
            --workdir /code/tensorrt_llm \
            --tmpfs /tmp:exec \
            --volume .:/code/tensorrt_llm \
-           nvcr.io/nvidia/tensorrt-llm/devel:x.xx.x
+           nvcr.io/nvidia/tensorrt-llm/devel:x.y.z
 ```
 
 Note that this will start the container with the user `root`, which may leave files with root ownership in your local

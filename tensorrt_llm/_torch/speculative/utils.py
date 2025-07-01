@@ -1,6 +1,9 @@
+from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler
+from tensorrt_llm._torch.speculative.interface import SpecConfig
+
 from .draft_target import DraftTargetSpecMetadata
-from .eagle3 import (Eagle3OneModelDecoder, Eagle3OneModelSpecMetadata,
-                     Eagle3OneModelWorker, Eagle3ResourceManager, Eagle3Sampler,
+from .eagle3 import (Eagle3OneModelSampler, Eagle3OneModelSpecMetadata,
+                     Eagle3OneModelWorker, Eagle3ResourceManager,
                      Eagle3SpecMetadata)
 from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
@@ -97,14 +100,17 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
     return None
 
 
-def get_spec_decoder(max_seq_len, spec_config):
+def get_spec_decoder(sampler_args: TorchSampler.Args, spec_config: SpecConfig):
     if spec_config.spec_dec_mode.is_mtp():
-        return MTPSampler(max_seq_len, spec_config)
+        return MTPSampler(sampler_args,
+                          nextn=spec_config.num_nextn_predict_layers)
     if spec_config.spec_dec_mode.is_eagle3():
-        return Eagle3Sampler(max_seq_len)
+        # TorchSampler handles Eagle3 gracefully, by integrating d2t into the sampling process
+        return TorchSampler(sampler_args)
     if spec_config.spec_dec_mode.is_eagle3_one_model():
-        return Eagle3OneModelDecoder(max_seq_len, spec_config)
-    return None
+        return Eagle3OneModelSampler(sampler_args)
+    raise ValueError(
+        f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 
 
 def get_spec_drafter(model_engine, spec_resource_manager=None):

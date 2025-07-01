@@ -4,6 +4,7 @@ from typing import List, Optional, Tuple
 import torch
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+from tensorrt_llm._utils import get_sm_version
 
 from ..attention_backend.interface import AttentionInputType
 from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
@@ -577,6 +578,84 @@ def _(
 ) -> torch.Tensor:
     return act_fp8.new_empty((act_fp8.size(0), weight.size(0)),
                              dtype=output_dtype)
+
+
+class W4A16GemmRunner(TunableRunner):
+    _runner_dict = dict()
+    MAX_SUPPORTED_SM_VERSION = 90
+
+    def __init__(self, activation_dtype: torch.dtype, quant_mode: int):
+        instance_key = (activation_dtype, quant_mode)
+        if instance_key not in W4A16GemmRunner._runner_dict:
+            W4A16GemmRunner._runner_dict[
+                instance_key] = torch.classes.trtllm.W4A16GemmRunner(
+                    activation_dtype, quant_mode)
+        self._w4a16_gemm_runner = W4A16GemmRunner._runner_dict[instance_key]
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+    ) -> List[int]:
+        return list(range(self._w4a16_gemm_runner.get_num_configs()))
+
+    def forward(self,
+                inputs: List[torch.Tensor],
+                tactic: int = -1,
+                do_preparation: bool = False,
+                **kwargs) -> torch.Tensor:
+
+        if get_sm_version() > self.MAX_SUPPORTED_SM_VERSION:
+            raise ValueError(
+                f"SM version {get_sm_version()} is not supported for W4A16 GEMM"
+            )
+
+        activation, weights_packed, scales = inputs
+
+        return self._w4a16_gemm_runner.run_gemm(
+            activation,
+            weights_packed,
+            scales,
+            kwargs["group_size"],
+            tactic,
+            kwargs["bias"],
+            kwargs["zeros"],
+        )
+
+
+@torch.library.custom_op("trtllm::w4a16_gemm", mutates_args=())
+def w4a16_gemm(input: torch.Tensor,
+               weight: torch.Tensor,
+               scales: torch.Tensor,
+               group_size: int,
+               has_zero_point: bool,
+               bias: Optional[torch.Tensor] = None,
+               zeros: Optional[torch.Tensor] = None) -> torch.Tensor:
+
+    assert not has_zero_point or zeros is not None, "Expected 'zeros' tensor when has_zero_point is True"
+
+    tuner = AutoTuner.get()
+
+    tuning_config = TuningConfig(dynamic_tensor_specs=(
+        # For tensor index 0 (input A), tune dimension 0 (M dimension)
+        DynamicTensorSpec(0, 0, (8192, 4096, 2048, 1024, 512, 256, 128, 64, 32,
+                                 16, 8, 4, 2, 1), last_positive_power_of_2), ))
+
+    # NOTE: qunant_mode equals 0 it means we use scale only (FINEGRAINED_SCALE_ONLY), zeros is not used, else we use scale and zero point
+    quant_mode = 1 if has_zero_point else 0
+    if quant_mode == 0:
+        assert zeros is None, "When quant_mode is 0 (FINEGRAINED_SCALE_ONLY), zeros must be None"
+
+    w4a16_gemm_runner = W4A16GemmRunner(input.dtype, quant_mode)
+
+    kwargs = {"group_size": group_size, "zeros": zeros, "bias": bias}
+    _, best_tactic = tuner.choose_one("trtllm::w4a16_gemm::gemm",
+                                      [w4a16_gemm_runner], tuning_config,
+                                      [input, weight, scales], **kwargs)
+
+    return w4a16_gemm_runner(inputs=[input, weight, scales],
+                             tactic=best_tactic,
+                             **kwargs)
 
 
 @torch.library.custom_op("trtllm::attention", mutates_args=())

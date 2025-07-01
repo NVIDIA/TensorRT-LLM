@@ -1427,7 +1427,6 @@ CUBIN_EXPORT __global__
     uint32_t const idxSubSeqInSeq = allowMultiBlockMode ? blockIdx.x : 0;
     assert(!isMultiBlock || (semaphores != nullptr && scratch != nullptr));
 
-    static_assert(inputSeqLen == 1);
     // gridDim: x - K/V sequence-dim split; y - number of K or V heads per token; z - number of requests
     assert(gridDim.z == batchSize && gridDim.y == nbKHeads);
     extern __shared__ char smemByteBuf[];

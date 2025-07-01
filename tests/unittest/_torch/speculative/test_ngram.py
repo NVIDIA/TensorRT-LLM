@@ -6,7 +6,8 @@ import pytest
 import torch
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import KvCacheConfig, NGramDecodingConfig
+from tensorrt_llm.llmapi import (CudaGraphConfig, KvCacheConfig,
+                                 NGramDecodingConfig)
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
@@ -22,13 +23,15 @@ def test_llama_ngram(disable_overlap_scheduler: bool, use_cuda_graph: bool,
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 20:
         pytest.skip("Not enough memory to load target model")
+    cuda_graph_config = CudaGraphConfig(
+        cuda_graph_batch_sizes=[1]) if use_cuda_graph else None
 
     llm_common_config = dict( \
         model=llm_models_root() / "llama-3.1-model" /"Meta-Llama-3.1-8B",
         backend='pytorch',
         attn_backend=attn_backend,
         disable_overlap_scheduler=disable_overlap_scheduler,
-        use_cuda_graph=use_cuda_graph,
+        cuda_graph_config=cuda_graph_config,
         max_batch_size=4,
         kv_cache_config=KvCacheConfig(enable_block_reuse=False),
         max_num_tokens=2048,
