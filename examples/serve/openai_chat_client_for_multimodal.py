@@ -1,4 +1,4 @@
-### OpenAI Chat Client
+### :title OpenAI Chat Client for Multimodal
 
 from openai import OpenAI
 
