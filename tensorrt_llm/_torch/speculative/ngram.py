@@ -7,7 +7,6 @@ from tensorrt_llm.logger import logger
 
 from ..pyexecutor.llm_request import *
 from ..pyexecutor.resource_manager import BaseResourceManager
-from ..pyexecutor.sampler import SampleState
 from ..pyexecutor.scheduler import ScheduledRequests
 from .drafter import Drafter
 from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
@@ -212,11 +211,7 @@ class NGramDrafter(Drafter):
     def prepare_draft_tokens(
         self,
         scheduled_requests: ScheduledRequests,
-        state: SampleState,
     ) -> None:
-
-        if state is None:  # Skip the first step
-            return
 
         for request in sorted(scheduled_requests.generation_requests,
                               key=lambda r: r.py_batch_idx):
