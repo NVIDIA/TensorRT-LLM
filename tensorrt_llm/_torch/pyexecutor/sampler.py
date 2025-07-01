@@ -15,7 +15,7 @@ from tensorrt_llm.bindings.executor import (DecodingConfig, DecodingMode,
                                             ExecutorConfig, FinishReason)
 from tensorrt_llm.bindings.internal.algorithms import CreateNewDecoderRequests
 from tensorrt_llm.bindings.internal.batch_manager import (
-    DecoderInputBuffers, add_new_tokens_to_requests)
+    DecoderInputBuffers, add_new_tokens_to_requests, make_decoding_batch_input)
 from tensorrt_llm.bindings.internal.runtime import (BufferManager, CudaEvent,
                                                     DecoderState,
                                                     GptDecoderBatched)
@@ -510,6 +510,9 @@ class TRTLLMSampler(Sampler):
         self.max_num_sequences = mapping.pp_size * self.executor_config.max_batch_size
         self.max_seq_idle_microseconds = 180 * 1000 * 1000
         self.is_trt_overlap = not disable_overlap_scheduler
+        self.num_micro_batches = mapping.pp_size if mapping.pp_size > 1 else (
+            2 if self.is_trt_overlap else 1)
+        self.micro_batch_idx = 0
 
         self.world_config = WorldConfig.mpi(mapping.gpus_per_node,
                                             mapping.tp_size, mapping.pp_size)
@@ -532,10 +535,12 @@ class TRTLLMSampler(Sampler):
             cuda_stream,
             "buffer_manager":
             buffer_manager,
-            "decoder_input_buffers":
-            DecoderInputBuffers(self.max_num_sequences,
-                                self.executor_config.max_batch_size,
-                                self.MAX_DECODING_TOKENS, buffer_manager),
+            "decoder_input_buffers": [
+                DecoderInputBuffers(self.max_num_sequences,
+                                    self.executor_config.max_batch_size,
+                                    self.MAX_DECODING_TOKENS, buffer_manager)
+                for _ in range(self.num_micro_batches)
+            ],
             "sequence_lengths_host":
             torch.empty((
                 self.executor_config.max_batch_size,
@@ -543,7 +548,8 @@ class TRTLLMSampler(Sampler):
             ),
                         dtype=torch.int),
             "decoder_state":
-            DecoderState()
+            DecoderState(),
+            "decoding_input": [None] * self.num_micro_batches,
         }
 
         self.store["decoder_state"].setup(
@@ -582,9 +588,10 @@ class TRTLLMSampler(Sampler):
         batch_slots, sampling_configs, lookahead_prompt, lookahead_algo_configs = self.algs.create_new_decoder_requests(
             self.model_config, self.world_config, self.decoding_config,
             requests, self.store["buffer_manager"], self.logits_datatype,
-            self.store["decoder_input_buffers"], self.store["decoder_state"],
-            self.store["cuda_stream"], self.algs.decoder.decoder_stream,
-            self.executor_config.max_seq_len, self.beam_width(requests))
+            self.store["decoder_input_buffers"][self.micro_batch_idx],
+            self.store["decoder_state"], self.store["cuda_stream"],
+            self.algs.decoder.decoder_stream, self.executor_config.max_seq_len,
+            self.beam_width(requests))
 
         local_batch_size = len(batch_slots)
         if local_batch_size > 0:
@@ -649,12 +656,21 @@ class TRTLLMSampler(Sampler):
         if (beam_width > 1):
             self._update_cache_indirection_buffer(scheduled_requests)
 
-        decoding_input = self.algs.make_decoding_batch_input_output(
-            scheduled_requests, model_outputs["logits"], beam_width,
-            num_context_logits_prefix_sum)
+        # TODO: Enable this back once nanobind is merged and/or llm request is a pure python object
+        # decoding_input = self.algs.make_decoding_batch_input_output(
+        #     scheduled_requests, model_outputs["logits"], beam_width,
+        #     num_context_logits_prefix_sum)
 
-        self.algs.decoder.forward_async(self.store["decoder_state"],
-                                        decoding_input)
+        self.store["decoding_input"][
+            self.micro_batch_idx] = make_decoding_batch_input(
+                scheduled_requests.context_requests,
+                scheduled_requests.generation_requests, model_outputs["logits"],
+                beam_width, num_context_logits_prefix_sum,
+                self.store["decoder_input_buffers"][self.micro_batch_idx])
+
+        self.algs.decoder.forward_async(
+            self.store["decoder_state"],
+            self.store["decoding_input"][self.micro_batch_idx])
 
         new_output_tokens = self.store["decoder_state"].all_new_tokens.to(
             'cpu', non_blocking=True)
@@ -686,6 +702,9 @@ class TRTLLMSampler(Sampler):
 
         sampler_event = torch.cuda.Event()
         sampler_event.record()
+
+        self.micro_batch_idx = (self.micro_batch_idx +
+                                1) % self.num_micro_batches
 
         return SampleStateTRTLLM(scheduled_requests=scheduled_requests,
                                  device=device,
