@@ -114,7 +114,7 @@ class SanityScenario:
 
 @dataclass(repr=False)
 class AllCloseScenario:
-    use_cuda_graph: bool = True
+    use_cuda_graph: bool = False
     enable_min_latency: bool = False
 
     def __repr__(self) -> str:

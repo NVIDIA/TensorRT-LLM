@@ -49,7 +49,7 @@ Nemotron_4_4B_CONFIG = {
 @dataclass(repr=False)
 class Scenario:
     backend: str
-    use_cuda_graph: bool = True
+    use_cuda_graph: bool = False
 
     def __repr__(self) -> str:
         return f"backend:{self.backend.lower()}-use_cuda_graph:{self.use_cuda_graph}"
