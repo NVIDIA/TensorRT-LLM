@@ -1341,7 +1341,7 @@ class W4A8MXFP4FP8FusedMoEMethod(FusedMoEMethodBase):
         orig_shape = dst_w3_w1_weight_scale.shape
 
         dst_w3_w1_weight_scale.copy_(
-            torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+            torch.ops.tensorrt_llm.block_scale_interleave(
                 dst_w3_w1_weight_scale.view(float4_sf_dtype)).view(
                     self.block_scales_dtype).reshape(orig_shape))
 
@@ -1358,7 +1358,7 @@ class W4A8MXFP4FP8FusedMoEMethod(FusedMoEMethodBase):
         orig_shape = dst_w2_weight_scale.shape
 
         dst_w2_weight_scale.copy_(
-            torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+            torch.ops.tensorrt_llm.block_scale_interleave(
                 dst_w2_weight_scale.view(float4_sf_dtype)).view(
                     self.block_scales_dtype).reshape(orig_shape))
 
