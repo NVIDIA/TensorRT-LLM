@@ -29,22 +29,23 @@ execute_process(
   COMMAND ${Python3_EXECUTABLE} setup_library.py develop --user
   RESULT_VARIABLE _CUTLASS_LIBRARY_SUCCESS)
 
-if(NOT _CUTLASS_LIBRARY_SUCCESS MATCHES 0)
+if(NOT _CUTLASS_LIBRARY_SUCCESS EQUAL 0)
   message(
     FATAL_ERROR
       "Failed to set up the CUTLASS library due to ${_CUTLASS_LIBRARY_SUCCESS}."
   )
 endif()
 
+set(GENERATE_KERNELS_SCRIPT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/python)
 set_directory_properties(
   PROPERTIES CMAKE_CONFIGURE_DEPENDS
-             ${CMAKE_CURRENT_SOURCE_DIR}/python/generate_kernels.py)
+             ${GENERATE_KERNELS_SCRIPT_DIR}/generate_kernels.py)
 
 set(INSTANTIATION_GENERATION_DIR
     ${CMAKE_CURRENT_BINARY_DIR}/cutlass_instantiations)
 
 execute_process(
-  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/python/
+  WORKING_DIRECTORY ${GENERATE_KERNELS_SCRIPT_DIR}
   COMMAND
     ${Python3_EXECUTABLE} generate_kernels.py -a
     "${CMAKE_CUDA_ARCHITECTURES_ORIG};${CMAKE_CUDA_ARCHITECTURES_NATIVE}" -o
@@ -52,26 +53,33 @@ execute_process(
   OUTPUT_VARIABLE _KERNEL_GEN_OUTPUT
   RESULT_VARIABLE _KERNEL_GEN_SUCCESS)
 
-if(NOT _KERNEL_GEN_SUCCESS MATCHES 0)
+if(NOT _KERNEL_GEN_SUCCESS EQUAL 0)
   message(
     FATAL_ERROR
-      "Failed to generate CUTLASS kernel instantiations due to ${_KERNEL_GEN_SUCCESS}."
+      "Failed to generate internal CUTLASS kernel instantiations due to ${_KERNEL_GEN_SUCCESS}."
   )
 endif()
 
 file(GLOB_RECURSE INSTANTIATIONS_GENERATED ${INSTANTIATION_GENERATION_DIR}/*.cu)
+
 string(STRIP "${_KERNEL_GEN_OUTPUT}" _KERNEL_GEN_OUTPUT)
 
-# for some reason _KERNEL_GEN_OUTPUT is empty, so have to drop this stale check
-# code # Sort both lists to ensure order doesn't matter list(SORT
-# _KERNEL_GEN_OUTPUT) list(SORT INSTANTIATIONS_GENERATED)
+# Sort both lists to ensure order doesn't matter
+list(SORT _KERNEL_GEN_OUTPUT)
+list(SORT INSTANTIATIONS_GENERATED)
 
-# # Compare the lists if(NOT _KERNEL_GEN_OUTPUT STREQUAL
-# INSTANTIATIONS_GENERATED) list(REMOVE_ITEM INSTANTIATIONS_GENERATED
-# ${_KERNEL_GEN_OUTPUT}) message( WARNING "There exist stale generated kernels
-# in ${INSTANTIATION_GENERATION_DIR}. Removing these
-# files:\n${INSTANTIATIONS_GENERATED}" ) file(REMOVE
-# ${INSTANTIATIONS_GENERATED}) endif()
+# Compare the lists
+if(NOT _KERNEL_GEN_OUTPUT STREQUAL INSTANTIATIONS_GENERATED)
+  list(REMOVE_ITEM INSTANTIATIONS_GENERATED ${_KERNEL_GEN_OUTPUT})
+  message(
+    WARNING
+      "There exist stale generated kernels in ${INSTANTIATION_GENERATION_DIR}. Removing these files:\n${INSTANTIATIONS_GENERATED}"
+  )
+  file(REMOVE ${INSTANTIATIONS_GENERATED})
+endif()
+
+file(GLOB_RECURSE INSTANTIATIONS_GENERATED ${INSTANTIATION_GENERATION_DIR}/*.cu)
+string(STRIP "${_KERNEL_GEN_OUTPUT}" _KERNEL_GEN_OUTPUT)
 
 # Get the sources for Mixed Input GEMM launchers
 file(GLOB_RECURSE MIXED_CU_INSTANTIATIONS
@@ -166,7 +174,7 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
                                   ${GROUPED_CU_INSTANTIATIONS})
   target_include_directories(
     moe_gemm_src
-    PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include)
+    PUBLIC ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include)
   set_property(TARGET moe_gemm_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 endif()
 
@@ -188,9 +196,9 @@ function(process_target target_name enable_hopper enable_blackwell)
   if(${enable_hopper} AND "90" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
     # No kernels should be parsed, unless hopper is specified. This is a build
     # time improvement
-    target_compile_definitions(${target_name} PRIVATE COMPILE_HOPPER_TMA_GEMMS)
+    target_compile_definitions(${target_name} PUBLIC COMPILE_HOPPER_TMA_GEMMS)
     target_compile_definitions(${target_name}
-                               PRIVATE COMPILE_HOPPER_TMA_GROUPED_GEMMS)
+                               PUBLIC COMPILE_HOPPER_TMA_GROUPED_GEMMS)
   endif()
 
   if(${enable_blackwell} AND ("100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
@@ -200,9 +208,15 @@ function(process_target target_name enable_hopper enable_blackwell)
       # No kernels should be parsed, unless blackwell is specified. This is a
       # build time improvement
       target_compile_definitions(${target_name}
-                                 PRIVATE COMPILE_BLACKWELL_TMA_GEMMS)
+                                 PUBLIC COMPILE_BLACKWELL_TMA_GEMMS)
       target_compile_definitions(${target_name}
-                                 PRIVATE COMPILE_BLACKWELL_TMA_GROUPED_GEMMS)
+                                 PUBLIC COMPILE_BLACKWELL_TMA_GROUPED_GEMMS)
+    endif()
+    if("120" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
+      target_compile_definitions(${target_name}
+                                 PRIVATE COMPILE_BLACKWELL_SM120_TMA_GEMMS)
+      target_compile_definitions(
+        ${target_name} PRIVATE COMPILE_BLACKWELL_SM120_TMA_GROUPED_GEMMS)
     endif()
   endif()
 

@@ -263,11 +263,11 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
             do_finalize=do_finalize,
         )
 
-        if spec_metadata:
-            spec_metadata.maybe_capture_hidden_states(self.layer_idx,
-                                                      hidden_states, residual)
         if self.fusion_config.POST_MOE_FUSION:
             if do_finalize:
+                if spec_metadata:
+                    spec_metadata.maybe_capture_hidden_states(
+                        self.layer_idx, hidden_states, residual)
                 hidden_states, residual = self.allreduce(
                     hidden_states,
                     all_reduce_params=AllReduceParams(
@@ -296,7 +296,15 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
                 )
                 hidden_states, residual = self.moe_allreduce(
                     fc2_output, all_reduce_params=moe_all_reduce_params)
+
+                if spec_metadata:
+                    spec_metadata.maybe_capture_hidden_states(
+                        self.layer_idx, hidden_states, residual)
+
         else:
+            if spec_metadata:
+                spec_metadata.maybe_capture_hidden_states(
+                    self.layer_idx, hidden_states, residual)
             if self.next_layer_layernorm is not None:
                 hidden_states, residual = self.next_layer_layernorm(
                     hidden_states, residual)
@@ -308,7 +316,6 @@ class Qwen3MoEModel(DecoderModel):
     def __init__(self, model_config: ModelConfig[Qwen3MoeConfig]):
         super().__init__(model_config)
         config = self.model_config
-        self.padding_idx = config.pretrained_config.pad_token_id
         self.aux_stream = torch.cuda.Stream()
 
         if model_config.mapping.enable_attention_dp:
@@ -387,9 +394,7 @@ class Qwen3MoeForCausalLM(SpecDecOneEngineForCausalLM[Qwen3MoEModel,
         tp_size = self.model_config.mapping.tp_size
         enable_attention_dp = self.model_config.mapping.enable_attention_dp
 
-        head_dim = getattr(
-            self.config, "head_dim",
-            self.config.hidden_size // self.config.num_attention_heads)
+        num_kv_heads = self.config.num_key_value_heads
 
         params_map = {
             "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -412,11 +417,14 @@ class Qwen3MoeForCausalLM(SpecDecOneEngineForCausalLM[Qwen3MoEModel,
                         tensors_need_duplication = ["weight", "bias"]
                         if module.quant_config.quant_mode.has_nvfp4():
                             tensors_need_duplication.append("weight_scale")
+                        if module.quant_config.quant_mode.has_fp8_block_scales(
+                        ):
+                            tensors_need_duplication.append("weight_scale_inv")
                         if new_name in ["k_proj", "v_proj"]:
                             fw = {
                                 k: (duplicate_kv_weight(
                                     weight=v[:],
-                                    head_dim=head_dim,
+                                    num_kv_heads=num_kv_heads,
                                     tensor_parallel_size=tp_size
                                     if not enable_attention_dp else 1)
                                     if k in tensors_need_duplication else v)

@@ -521,7 +521,6 @@ class MTPWorker(nn.Module):
                 "position_ids": draft_inputs["position_ids"],
                 "hidden_states": draft_hidden_states,
                 "attn_metadata": draft_inputs["attn_metadata"],
-                "spec_metadata": draft_inputs["spec_metadata"],
             }
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 

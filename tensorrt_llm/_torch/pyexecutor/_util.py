@@ -151,7 +151,13 @@ class KvCacheCreator:
         # estimate_max_kv_cache_tokens submits self._dummy_reqs
         num_cache_blocks = 0
         num_extra_tokens_per_seq = 1  # account for generated tokens
+        pytorch_backend_config = executor_config.pytorch_backend_config
         spec_cfg = executor_config.speculative_config
+        if not pytorch_backend_config.disable_overlap_scheduler:
+            num_extra_tokens_per_seq = num_extra_tokens_per_seq + 1
+            if spec_cfg is not None:
+                num_extra_tokens_per_seq += spec_cfg.max_draft_tokens
+
         if spec_cfg is not None:
             num_extra_tokens_per_seq += spec_cfg.max_draft_tokens
             num_extra_tokens_per_seq += spec_cfg.num_extra_kv_tokens
@@ -385,6 +391,7 @@ def create_py_executor_instance(
         draft_model_engine,
         start_worker,
         sampler,
+        drafter,
         lora_config: Optional[LoraConfig] = None,
         garbage_collection_gen0_threshold: Optional[int] = None) -> PyExecutor:
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
@@ -504,6 +511,7 @@ def create_py_executor_instance(
         scheduler,
         model_engine=model_engine,
         sampler=sampler,
+        drafter=drafter,
         dist=dist,
         max_num_sequences=max_num_sequences,
         disable_overlap_scheduler=pytorch_backend_config.

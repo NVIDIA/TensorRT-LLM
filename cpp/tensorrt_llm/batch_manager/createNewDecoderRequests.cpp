@@ -306,6 +306,12 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
         parentIds->reshape(outputIdsShape);
         manager.setZero(*parentIds);
 
+        auto cacheIndirectionInput = ITensor::slice(dJointInput.cacheIndirection, batchSlot, 1);
+        manager.setZero(*cacheIndirectionInput);
+
+        auto cacheIndirectionOutput = ITensor::slice(dJointOutput.cacheIndirection, batchSlot, 1);
+        manager.setZero(*cacheIndirectionOutput);
+
         auto beamHypotheses = dJointOutput.beamHypotheses.slice(batchSlot, 1);
         beamHypotheses.init(manager, endId);
     }

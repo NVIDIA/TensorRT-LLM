@@ -17,7 +17,6 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/common.h"
-#include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/runtime/eagleBuffers.h"
@@ -237,7 +236,7 @@ public:
     TensorPtr seqSlots;
     TensorPtr seqSlotsDevice;
     TensorPtr sortedSeqSlots;
-    //! TODO: move into decoderBuffers.DraftBuffers
+    //! For KV cache rewind
     TensorPtr seqSlotRemappingHost;   // [numSequences]
     TensorPtr seqSlotRemappingDevice; // [numSequences]
 
@@ -279,10 +278,9 @@ public:
 
     std::tuple<SizeType32, TensorMap const&, TensorMap&> prepareStep(RequestVector const& contextRequests,
         RequestVector const& genRequests, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
-        DecoderBuffers& decoderBuffers, runtime::decoder::DecoderState const& decoderState,
-        kv_cache_manager::BaseKVCacheManager* kvCacheManager, kv_cache_manager::BaseKVCacheManager* crossKvCacheManager,
-        rnn_state_manager::RnnStateManager* rnnStateManager, PeftTable const& peftTable,
-        runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
+        runtime::decoder::DecoderState const& decoderState, kv_cache_manager::BaseKVCacheManager* kvCacheManager,
+        kv_cache_manager::BaseKVCacheManager* crossKvCacheManager, rnn_state_manager::RnnStateManager* rnnStateManager,
+        PeftTable const& peftTable, runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig, bool gatherGenerationLogits, bool trtOverlap,
         OptionalRef<runtime::ITensor const> newOutputTokens = std::nullopt);
 
@@ -314,8 +312,8 @@ private:
         runtime::WorldConfig const& worldConfig, bool gatherGenerationLogits);
 
     void setFromInputs(RequestVector const& contextRequests, RequestVector const& genRequests, SizeType32 maxBeamWidth,
-        SizeType32 maxAttentionWindow, DecoderBuffers& decoderBuffers,
-        runtime::decoder::DecoderState const& decoderState, kv_cache_manager::BaseKVCacheManager* kvCacheManagerPtr,
+        SizeType32 maxAttentionWindow, runtime::decoder::DecoderState const& decoderState,
+        kv_cache_manager::BaseKVCacheManager* kvCacheManagerPtr,
         kv_cache_manager::BaseKVCacheManager* crossKvCacheManagerPtr,
         rnn_state_manager::RnnStateManager* rnnStateManagerPtr, PeftTable const& peftTable,
         runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,

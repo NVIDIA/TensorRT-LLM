@@ -6,7 +6,8 @@ import pytest
 import torch
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import DraftTargetDecodingConfig, KvCacheConfig
+from tensorrt_llm.llmapi import (CudaGraphConfig, DraftTargetDecodingConfig,
+                                 KvCacheConfig)
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
@@ -38,9 +39,9 @@ def test_llama_draft_target(use_cuda_graph: bool, attn_backend: str):
     llm_spec = LLM(model=target_model_dir,
                    max_batch_size=max_batch_size,
                    disable_overlap_scheduler=True,
-                   use_cuda_graph=use_cuda_graph,
+                   cuda_graph_config=CudaGraphConfig(
+                       cuda_graph_batch_sizes=[1]) if use_cuda_graph else None,
                    attn_backend=attn_backend,
-                   cuda_graph_batch_sizes=[1],
                    kv_cache_config=kv_cache_config,
                    speculative_config=spec_config)
 
@@ -54,9 +55,9 @@ def test_llama_draft_target(use_cuda_graph: bool, attn_backend: str):
     llm_ref = LLM(model=target_model_dir,
                   max_batch_size=max_batch_size,
                   disable_overlap_scheduler=True,
-                  use_cuda_graph=use_cuda_graph,
+                  cuda_graph_config=CudaGraphConfig(
+                      cuda_graph_batch_sizes=[1]) if use_cuda_graph else None,
                   attn_backend=attn_backend,
-                  cuda_graph_batch_sizes=[1],
                   kv_cache_config=kv_cache_config)
 
     results_ref = llm_ref.generate(prompts, sampling_params)

@@ -250,7 +250,8 @@ void initBindings(pybind11::module_& m)
                     self.setDraftTokens(std::make_shared<GenLlmReq::VecTokens>(draftTokens.value()));
                 }
             })
-        .def_property("is_dummy_request", &GenLlmReq::isDummyRequest, &GenLlmReq::setIsDummyRequest);
+        .def_property("is_dummy_request", &GenLlmReq::isDummyRequest, &GenLlmReq::setIsDummyRequest)
+        .def_property_readonly("return_perf_metrics", &GenLlmReq::getReturnPerfMetrics);
 
     py::classh<tb::LlmRequest, GenLlmReq>(m, "LlmRequest", pybind11::dynamic_attr())
         .def(py::init(
@@ -373,7 +374,9 @@ void initBindings(pybind11::module_& m)
             })
         .def("move_prompt_embedding_table_to_gpu", &tb::LlmRequest::movePromptEmbeddingTableToGpu, py::arg("manager"))
         .def("move_lora_weights_to_gpu", &tb::LlmRequest::moveLoraWeightsToGpu, py::arg("manager"))
-        .def("finish_by_reason", &tb::LlmRequest::finishByReason, py::arg("finish_reason"));
+        .def("finish_by_reason", &tb::LlmRequest::finishByReason, py::arg("finish_reason"))
+        .def("set_first_scheduled_time", &tb::LlmRequest::setFirstScheduledTime)
+        .def("update_perf_metrics", &tb::LlmRequest::updatePerfMetrics, py::arg("iter_counter"));
 
     py::classh<tb::SequenceSlotManager>(m, "SequenceSlotManager")
         .def(py::init<tb::SequenceSlotManager::SlotIdType, uint64_t>(), py::arg("max_num_slots"),
@@ -407,29 +410,6 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("cum_log_probs_host", &tb::DecoderOutputBuffers::cumLogProbsHost)
         .def_readwrite("log_probs_host", &tb::DecoderOutputBuffers::logProbsHost)
         .def_readwrite("finish_reasons_host", &tb::DecoderOutputBuffers::finishReasonsHost);
-
-    py::class_<tb::DraftBuffers>(m, "DraftBuffers")
-        .def(py::init())
-        .def_readwrite("next_draft_tokens_device", &tb::DraftBuffers::nextDraftTokensDevice)
-        .def_readwrite("next_draft_tokens_host", &tb::DraftBuffers::nextDraftTokensHost)
-        .def_readwrite("prev_draft_tokens_lengths_device", &tb::DraftBuffers::prevDraftTokensLengthsDevice)
-        .def_readwrite("prev_draft_tokens_lengths_host", &tb::DraftBuffers::prevDraftTokensLengthsHost)
-        .def_readwrite("next_draft_tokens_lengths_device", &tb::DraftBuffers::nextDraftTokensLengthsDevice)
-        .def_readwrite("next_draft_tokens_lengths_host", &tb::DraftBuffers::nextDraftTokensLengthsHost)
-        .def_readwrite("accepted_lengths_cum_sum_device", &tb::DraftBuffers::acceptedLengthsCumSumDevice)
-        .def_readwrite("accepted_packed_paths_device", &tb::DraftBuffers::acceptedPackedPathsDevice)
-        .def_readwrite("predicted_draft_logits", &tb::DraftBuffers::predictedDraftLogits)
-        .def("create", &tb::DraftBuffers::create, py::arg("max_num_sequences"), py::arg("max_tokens_per_step"),
-            py::arg("runtime"), py::arg("model_config"));
-
-    py::classh<tb::DecoderBuffers>(m, "DecoderBuffers")
-        .def(py::init<runtime::SizeType32, runtime::SizeType32, runtime::SizeType32, runtime::SizeType32,
-                 runtime::BufferManager const&, runtime::ModelConfig const&, runtime::WorldConfig const&>(),
-            py::arg("max_num_sequences"), py::arg("max_beam_width"), py::arg("max_attention_window"),
-            py::arg("max_tokens_per_step"), py::arg("buffer_manager"), py::arg("model_config"), py::arg("world_config"))
-        .def_readwrite("cache_indirection_input", &tb::DecoderBuffers::cacheIndirectionInput)
-        .def_readwrite("cache_indirection_output", &tb::DecoderBuffers::cacheIndirectionOutput)
-        .def_readwrite("draft_buffers", &tb::DecoderBuffers::draftBuffers);
 
     py::class_<tb::SlotDecoderBuffers>(m, "SlotDecoderBuffers")
         .def(py::init<runtime::SizeType32, runtime::SizeType32, runtime::BufferManager const&>(),

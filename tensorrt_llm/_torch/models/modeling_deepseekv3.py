@@ -38,6 +38,7 @@ from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
 
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.llmapi.utils import enable_llm_debug
 from tensorrt_llm.mapping import Mapping
@@ -53,7 +54,8 @@ from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (CutlassFusedMoE, DeepSeekV3MoeRoutingMethod,
-                                 WideEPMoE, create_moe)
+                                 WideEPMoE, create_moe,
+                                 moe_load_balancer_set_repeated_for_next_layer)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
@@ -197,7 +199,8 @@ class DeepseekV3Linear(Linear):
                      lora_params: Optional[dict] | None = None,
                      layer_idx: Optional[int] | None = None):
         num_tokens = input.shape[0]
-        if (not self.has_any_quant) and num_tokens >= 1 and num_tokens <= 16:
+        if (not self.has_any_quant and 1 <= num_tokens <= 16
+                and get_sm_version() != 120):
             output = torch.ops.trtllm.dsv3_fused_a_gemm_op(
                 input, self.weight.t(), bias, None)
         else:
@@ -998,7 +1001,6 @@ class DeepseekV3Model(DecoderModel):
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__(model_config)
         config = model_config.pretrained_config
-        self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
         aux_stream_list = [torch.cuda.Stream() for _ in range(2)]
@@ -1069,6 +1071,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             self.num_hidden_layers = self.config.num_hidden_layers
             assert ckpt_nextn > 0, "There is not MTP modules in the checkpoint."
             if ckpt_nextn == 1 and not model_config.spec_config.use_mtp_vanilla:
+                moe_load_balancer_set_repeated_for_next_layer(model_nextn)
                 mtp_layer = DeepseekV3MTP(model_config, self.num_hidden_layers,
                                           self.model.aux_stream_dict)
                 self.model.layers.append(mtp_layer)

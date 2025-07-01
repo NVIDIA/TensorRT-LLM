@@ -55,6 +55,11 @@ public:
     // Returns 0 as a default or -1 on error.
     int getCurrentGpuNumaId();
 
+    // Returns the ID of the NUMA node that current GPU's memory is assigned.
+    // GPUs using C2C link with CPU may have assigned NUMA ID for its memory, like GB200.
+    // Returns -1 if it doesn't have NUMA ID.
+    int getCurrentGpuMemoryNumaId();
+
     // Returns the number of GPUs associated with the given NUMA node ID.
     int getGpuCountUnderNuma(int numaId);
 
@@ -64,11 +69,14 @@ public:
         return getGpuCountUnderNuma(getCurrentGpuNumaId());
     }
 
+    // Returns a pointer to a memory region on the current GPU's NUMA node.
+    void* allocateCurrentGpuNumaMemory(size_t memorySize);
+
+    // Frees a memory region allocated by allocateCurrentGpuNumaMemory.
+    void freeCurrentGpuNumaMemory(void* ptr, size_t memorySize);
+
     // Returns the detected CPU architecture (e.g., "x86_64", "aarch64").
     std::string getCpuArchitecture();
-
-    // Checks if the current CUDA device and host system support native atomic operations.
-    bool canSupportHostNativeAtomics();
 
 #ifdef __linux__
     // Getters for precomputed CPU affinity masks
@@ -85,6 +93,7 @@ private:
 
     // Member variables
     std::map<int, int> mGpuToNumaMap;              // GPU ID -> NUMA Node ID
+    std::map<int, int> mGpuMemoryToNumaMap;        // GPU ID -> Memory NUMA Node ID
     std::map<int, std::vector<int>> mNumaToGpuMap; // NUMA Node ID -> List of GPU IDs
     std::map<int, int> mNumaToCpuCountMap;         // NUMA Node ID -> CPU Core Count
     std::string mCpuArchitecture;

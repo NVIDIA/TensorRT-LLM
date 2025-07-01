@@ -8,7 +8,7 @@ import torch
 from torch._ops import OpOverload, OpOverloadPacket
 from torch.fx import Graph, GraphModule, Node
 
-from ..custom_ops.quant import QUANT_OPS
+from ..custom_ops.quant import QUANT_BMM_OPS, QUANT_LINEAR_OPS
 from .logger import ad_logger
 
 try:
@@ -222,19 +222,29 @@ def is_linear_op(node: Node, include_quantization: bool = False) -> bool:
     """
     lin_ops = {
         torch.ops.aten.linear,
-        torch.ops.linear.simple,
+        torch.ops.auto_deploy.torch_linear_simple,
     }
 
     if include_quantization:
-        lin_ops.update(QUANT_OPS)
+        lin_ops.update(QUANT_LINEAR_OPS)
     return is_op(node, lin_ops)
+
+
+def is_bmm_op(node: Node, include_quantization: bool = False) -> bool:
+    """Check if the node is a distributed op."""
+    dist_ops = {torch.ops.aten.bmm}
+
+    if include_quantization:
+        dist_ops.update(QUANT_BMM_OPS)
+
+    return is_op(node, dist_ops)
 
 
 def is_dist_op(node: Node) -> bool:
     """Check if the node is a distributed op."""
     dist_ops = {
-        torch.ops.dist.all_gather,
-        torch.ops.dist.all_reduce,
+        torch.ops.auto_deploy.torch_dist_all_gather,
+        torch.ops.auto_deploy.torch_dist_all_reduce,
     }
     return is_op(node, dist_ops)
 

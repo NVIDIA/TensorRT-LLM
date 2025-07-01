@@ -16,16 +16,18 @@
 
 #pragma once
 
-#include "tensorrt_llm/runtime/eagleBuffers.h"
-#include "tensorrt_llm/runtime/explicitDraftTokensBuffers.h"
+#include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
-#include "tensorrt_llm/runtime/lookaheadBuffers.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
-#include <optional>
 #include <vector>
+
+namespace tensorrt_llm::runtime::decoder
+{
+class DecoderState;
+}
 
 namespace tensorrt_llm::batch_manager
 {
@@ -38,6 +40,8 @@ public:
 
     explicit DecoderInputBuffers(SizeType32 maxNumSequences, SizeType32 maxBatchSize, SizeType32 maxDecoderSteps,
         runtime::BufferManager const& manager);
+
+    void setupMedusaLogits(SizeType32 maxNumSequences, runtime::ModelConfig const& modelConfig);
 
     //! Buffers for decoder setup
 
@@ -58,6 +62,10 @@ public:
     //! Logits for all batch slots, [maxNumSequences]
     //! The vector is sparse, only slots in forwardBatchSlots are used.
     std::vector<TensorPtr> logits;
+
+    //! Logits for speculative decoding (Medusa)
+    //! [maxBatchSize][maxAcceptedDraftTokensPerStep][maxDraftTokens + 1, vocabSizePadded]
+    std::vector<std::vector<runtime::ITensor::SharedPtr>> predictedDraftLogits;
 };
 
 class DecoderOutputBuffers
@@ -72,67 +80,41 @@ public:
     void enableLookaheadDecoding(SizeType32 maxNumSequences, SizeType32 maxTokensPerStep);
     void disableLookaheadDecoding(SizeType32 maxNumSequences);
 
+    void setupSpeculativeDecoding(
+        SizeType32 maxNumSequences, SizeType32 maxTokensPerStep, runtime::ModelConfig const& modelConfig);
+
     TensorPtr sequenceLengthsHost; // [mMaxNumRequests, beamWidth], pinned host tensor
     TensorPtr newOutputTokensHost; // [maxTokensPerStep, mMaxNumRequests, beamWidth]
     TensorPtr cumLogProbsHost;     // [mMaxNumRequests, beamWidth]
     TensorPtr logProbsHost;        // [mMaxNumRequests, beamWidth, maxSeqLen]
     TensorPtr finishedSumHost;     // [mMaxNumRequests], pinned host tensor
     TensorPtr finishReasonsHost;   // [mMaxNumRequests, beamWidth], pinned host tensor
-};
 
-class DraftBuffers
-{
-public:
-    using SizeType32 = runtime::SizeType32;
-    using TensorPtr = runtime::ITensor::SharedPtr;
-
-    TensorPtr nextDraftTokensDevice;        // [mMaxNumRequests, maxTokensPerStep-1]
-    TensorPtr nextDraftTokensHost;          // [mMaxNumRequests, maxTokensPerStep-1]
-    TensorPtr prevDraftTokensLengthsDevice; // [mMaxNumRequests]
-    TensorPtr prevDraftTokensLengthsHost;   // [mMaxNumRequests]
-    TensorPtr nextDraftTokensLengthsDevice; // [mMaxNumRequests]
-    TensorPtr nextDraftTokensLengthsHost;   // [mMaxNumRequests]
-    TensorPtr acceptedLengthsCumSumDevice;  // [mMaxNumRequests+1]
-    TensorPtr acceptedPackedPathsDevice;    // [mMaxNumRequests * maxAcceptedTokens]
-    std::vector<std::vector<runtime::ITensor::SharedPtr>>
-        predictedDraftLogits;               // [mMaxNumRequests][mMaxNumHeads][maxDraftTokens + 1, vocabSize]
-
-    void create(SizeType32 maxNumSequences, SizeType32 maxTokensPerStep, runtime::BufferManager const& manager,
-        runtime::ModelConfig const& modelConfig);
-};
-
-class DecoderBuffers
-{
-public:
-    using SizeType32 = runtime::SizeType32;
-    using TensorPtr = runtime::ITensor::SharedPtr;
-
-    TensorPtr cacheIndirectionInput;
-    TensorPtr cacheIndirectionOutput;
-
-    DraftBuffers draftBuffers;
-
-    DecoderBuffers(SizeType32 maxNumSequences, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
-        SizeType32 maxTokensPerStep, runtime::BufferManager const& manager, runtime::ModelConfig const& modelConfig,
-        runtime::WorldConfig const& worldConfig);
+    // speculative decoding buffers
+    TensorPtr nextDraftTokensHost;        // [mMaxNumRequests, maxTokensPerStep-1]
+    TensorPtr prevDraftTokensLengthsHost; // [mMaxNumRequests]
+    TensorPtr nextDraftTokensLengthsHost; // [mMaxNumRequests]
 };
 
 class DecoderStepAsyncSend
 {
 public:
     using SizeType32 = runtime::SizeType32;
-    using BufferPtr = runtime::IBuffer::SharedPtr;
+    using TensorPtr = runtime::ITensor::SharedPtr;
 
-    DecoderStepAsyncSend(DecoderOutputBuffers const& decoderOutputBuffers, DecoderBuffers const& decoderBuffers,
-        bool returnLogProbs, SizeType32 maxBeamWidth, bool useMedusa, mpi::MpiComm const& commSession, int peer);
+    DecoderStepAsyncSend(DecoderOutputBuffers const& decoderOutputBuffers,
+        runtime::decoder::DecoderState const& decoderState, bool returnLogProbs, SizeType32 maxBeamWidth,
+        bool useMedusa, mpi::MpiComm const& commSession, int peer);
 
     ~DecoderStepAsyncSend();
 
-    static void recv(DecoderOutputBuffers const& decoderOutputBuffers, DecoderBuffers const& decoderBuffers,
-        bool returnLogProbs, SizeType32 maxBeamWidth, bool useMedusa, mpi::MpiComm const& commSession, int peer);
+    static void recv(DecoderOutputBuffers const& decoderOutputBuffers,
+        runtime::decoder::DecoderState const& decoderState, bool returnLogProbs, SizeType32 maxBeamWidth,
+        bool useMedusa, mpi::MpiComm const& commSession, int peer);
 
-    static void bcast(DecoderOutputBuffers const& decoderOutputBuffers, DecoderBuffers const& decoderBuffers,
-        bool returnLogProbs, SizeType32 maxBeamWidth, bool useMedusa, mpi::MpiComm const& commSession, int root);
+    static void bcast(DecoderOutputBuffers const& decoderOutputBuffers,
+        runtime::decoder::DecoderState const& decoderState, bool returnLogProbs, SizeType32 maxBeamWidth,
+        bool useMedusa, mpi::MpiComm const& commSession, int root);
 
 private:
     std::unique_ptr<mpi::MpiRequest> mRequest1;

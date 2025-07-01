@@ -733,19 +733,19 @@ To serve the model using `trtllm-serve`:
 
 ```bash
 cat >./extra-llm-api-config.yml <<EOF
-use_cuda_graph: true
-cuda_graph_padding_enabled: true
-cuda_graph_batch_sizes:
-- 1
-- 2
-- 4
-- 8
-- 16
-- 32
-- 64
-- 128
-- 256
-- 384
+cuda_graph_config:
+  padding_enabled: true
+  batch_sizes:
+  - 1
+  - 2
+  - 4
+  - 8
+  - 16
+  - 32
+  - 64
+  - 128
+  - 256
+  - 384
 print_iter_log: true
 enable_attention_dp: true
 EOF
@@ -809,19 +809,19 @@ And you can launch two generation servers on port 8002 and 8003 with:
 export TRTLLM_USE_UCX_KVCACHE=1
 
 cat >./gen-extra-llm-api-config.yml <<EOF
-use_cuda_graph: true
-cuda_graph_padding_enabled: true
-cuda_graph_batch_sizes:
-  - 1
-  - 2
-  - 4
-  - 8
-  - 16
-  - 32
-  - 64
-  - 128
-  - 256
-  - 384
+cuda_graph_config:
+  padding_enabled: true
+  batch_sizes:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    - 64
+    - 128
+    - 256
+    - 384
 print_iter_log: true
 enable_attention_dp: true
 EOF
