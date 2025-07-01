@@ -1,6 +1,6 @@
 import pytest
 import torch
-from utils.util import skip_pre_hopper
+from utils.util import skip_blackwell, skip_pre_hopper
 
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
