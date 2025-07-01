@@ -87,7 +87,7 @@ torch::Tensor fp8_rowwise_gemm_launch(torch::Tensor const& mat1, torch::Tensor c
     auto stream = at::cuda::getCurrentCUDAStream(mat1.get_device());
 
     auto mGemmRunner = std::make_shared<CutlassFp8RowwiseGemmRunner<OutputType>>();
-    size_t const wsSize = mGemmRunner->getWorkspaceSize(m, n, k);
+    int64_t const wsSize = mGemmRunner->getWorkspaceSize(m, n, k);
     auto gemmConfig = maybe_config ? *maybe_config : mGemmRunner->getConfigs()[0];
     at::Tensor workspace = at::detail::empty_cuda({wsSize}, at::ScalarType::Char, torch::kCUDA, std::nullopt);
 
