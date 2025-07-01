@@ -68,6 +68,14 @@ ARG TORCH_INSTALL_TYPE="skip"
 COPY docker/common/install_pytorch.sh install_pytorch.sh
 RUN bash ./install_pytorch.sh $TORCH_INSTALL_TYPE && rm install_pytorch.sh
 
+# Install NIXL
+COPY docker/common/install_nixl.sh install_nixl.sh
+RUN bash ./install_nixl.sh && rm install_nixl.sh
+
+# Install etcd
+COPY docker/common/install_etcd.sh install_etcd.sh
+RUN bash ./install_etcd.sh && rm install_etcd.sh
+
 # Install OpenCV with FFMPEG support
 RUN pip3 uninstall -y opencv && rm -rf /usr/local/lib/python3*/dist-packages/cv2/
 RUN pip3 install opencv-python-headless --force-reinstall --no-deps --no-cache-dir
@@ -96,14 +104,6 @@ COPY --from=triton /opt/tritonserver/bin /opt/tritonserver/bin
 COPY --from=triton /opt/tritonserver/caches /opt/tritonserver/caches
 COPY docker/common/install_triton.sh install_triton.sh
 RUN bash ./install_triton.sh && rm install_triton.sh
-
-# Install NIXL
-COPY docker/common/install_nixl.sh install_nixl.sh
-RUN bash ./install_nixl.sh && rm install_nixl.sh
-
-# Install etcd
-COPY docker/common/install_etcd.sh install_etcd.sh
-RUN bash ./install_etcd.sh && rm install_etcd.sh
 
 
 FROM ${DEVEL_IMAGE} AS wheel
