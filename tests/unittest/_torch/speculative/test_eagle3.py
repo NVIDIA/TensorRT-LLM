@@ -30,7 +30,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str):
         attn_backend=attn_backend,
     )
     cuda_graph_config = CudaGraphConfig(
-        cuda_graph_batch_sizes=[1]) if use_cuda_graph else None
+        batch_sizes=[1]) if use_cuda_graph else None
 
     kv_cache_config = KvCacheConfig(enable_block_reuse=False, )
 
@@ -119,7 +119,7 @@ def test_llama_eagle3_one_model(use_cuda_graph: bool, attn_backend: str):
         attn_backend=attn_backend,
     )
     cuda_graph_config = CudaGraphConfig(
-        cuda_graph_batch_sizes=[1]) if use_cuda_graph else None
+        batch_sizes=[1]) if use_cuda_graph else None
 
     kv_cache_config = KvCacheConfig(enable_block_reuse=True, )
 
@@ -127,11 +127,9 @@ def test_llama_eagle3_one_model(use_cuda_graph: bool, attn_backend: str):
     target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
 
     draft_len = 4
-    spec_config = EagleDecodingConfig(
-        max_draft_len=draft_len,
-        pytorch_weights_path=eagle_model_dir,
-        # Llama 3 does not support one model eagle.
-        eagle3_one_model=True)
+    spec_config = EagleDecodingConfig(max_draft_len=draft_len,
+                                      pytorch_weights_path=eagle_model_dir,
+                                      eagle3_one_model=True)
 
     llm_spec = LLM(
         model=target_model_dir,
