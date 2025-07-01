@@ -77,7 +77,7 @@ MODEL_CLASS = {"qwen": Qwen2ForCausalLM, "qwen_prm": Qwen2ForProcessRewardModel}
 class Scenario:
     backend: str
     model_name: str = "qwen"
-    use_cuda_graph: bool = True
+    use_cuda_graph: bool = False
 
     def __repr__(self) -> str:
         return f"model:{self.model_name}-backend:{self.backend.lower()}-use_cuda_graph:{self.use_cuda_graph}"
