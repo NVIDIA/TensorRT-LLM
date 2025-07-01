@@ -451,6 +451,42 @@ class TestMistral7B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+class TestMinistral8BInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "mistralai/Ministral-8B-Instruct-2410"
+    MODEL_PATH = f"{llm_models_root()}/Ministral-8B-Instruct-2410"
+
+    def test_auto_dtype_gsm8k(self):
+        with LLM(self.MODEL_PATH) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    def test_auto_dtype_comprehensive(self):
+        with LLM(self.MODEL_PATH) as llm:
+            # Test multiple datasets for comprehensive evaluation
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_ada
+    def test_fp8(self):
+        # Test with FP8 quantization if pre-quantized model is available
+        model_path = f"{llm_models_root()}/Ministral-8B-Instruct-2410-FP8"
+        try:
+            with LLM(model_path) as llm:
+                assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+                task = GSM8K(self.MODEL_NAME)
+                task.evaluate(llm)
+                task = MMLU(self.MODEL_NAME)
+                task.evaluate(llm)
+        except (FileNotFoundError, OSError):
+            pytest.skip("FP8 pre-quantized Ministral-8B model not available")
+
+
 class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-3-1b-it"
     MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-1b-it/"
