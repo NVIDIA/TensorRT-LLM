@@ -199,14 +199,13 @@ def add_token(request: LlmRequest,
     return new_token
 
 
+def int_tensor(shape: tuple[int, ...], device: str = 'cuda') -> torch.Tensor:
+    return torch.empty(shape, dtype=torch.int, device=device)
+
+
 class TorchSampler(Sampler):
     BEAM = 0
     MAX_BEAM_WIDTH = BEAM + 1
-
-    @dataclass(frozen=True, kw_only=True)
-    class Store:
-        new_tokens: torch.Tensor
-        """Shape: See cpp DecoderState.getAllNewTokens()"""
 
     @dataclass(frozen=True, kw_only=True)
     class Args:
@@ -223,15 +222,21 @@ class TorchSampler(Sampler):
         assert args.max_beam_width == self.MAX_BEAM_WIDTH, "TorchSampler only supports beam_width = 1"
         self.num_seq_slots = args.max_num_sequences
 
+        self.NEW_TOKENS_SHAPE = (self.max_tokens, self.num_seq_slots,
+                                 self.MAX_BEAM_WIDTH)
         # AutoDeploy build creates the sampler in inference mode,
         # which would disallow in-place mutating of new_tokens.
         # So, we temporarily exit inference mode.
         with torch.inference_mode(False):
-            new_tokens = torch.zeros(
-                (self.max_tokens, self.num_seq_slots, self.MAX_BEAM_WIDTH),
-                dtype=torch.int,
-                device='cuda')
-            self.store = self.Store(new_tokens=new_tokens)
+            self.store = self.create_store()
+
+    @dataclass(frozen=True, kw_only=True)
+    class Store:
+        new_tokens: torch.Tensor
+        """Shape: See cpp DecoderState.getAllNewTokens()"""
+
+    def create_store(self) -> Store:
+        return self.Store(new_tokens=int_tensor(self.NEW_TOKENS_SHAPE))
 
     def _meet_max_token_stop_criteria(self, request: LlmRequest,
                                       num_tokens: int):

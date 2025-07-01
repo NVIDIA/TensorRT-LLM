@@ -9,7 +9,8 @@ from tensorrt_llm.bindings.executor import FinishReason
 from ..attention_backend import AttentionMetadata
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
-from ..pyexecutor.sampler import SampleState, SampleStateTensors, TorchSampler
+from ..pyexecutor.sampler import (SampleState, SampleStateTensors, TorchSampler,
+                                  int_tensor)
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
 
@@ -249,15 +250,43 @@ class MTPSampler(TorchSampler):
     SampleState = SampleStateMTP
 
     def __init__(self, args: TorchSampler.Args, *, nextn: int):
-        super().__init__(args)
         self.mapping = None
         self.draft_len = nextn
+        super().__init__(args)
+
+    @dataclass(frozen=True, kw_only=True)
+    class Store(TorchSampler.Store):
+        next_new_tokens: torch.Tensor
+        next_draft_tokens: torch.Tensor
+        new_tokens_lens: torch.Tensor
+
+    def create_store(self) -> Store:
+        num_tokens, seq_slots, _ = self.NEW_TOKENS_SHAPE
+        draft_len = num_tokens - 1
+        assert draft_len == self.draft_len
+        return self.Store(
+            new_tokens=int_tensor(self.NEW_TOKENS_SHAPE),
+            next_new_tokens=int_tensor(self.NEW_TOKENS_SHAPE),
+            next_draft_tokens=int_tensor((seq_slots, draft_len)),
+            new_tokens_lens=int_tensor((seq_slots, )),
+        )
 
     def _draft_meet_max_token_stop_criteria(self, request: LlmRequest,
-                                            num_tokens: int, beam_idx: int):
+                                            beam_idx: int):
+        num_tokens = request.get_num_tokens(beam_idx)
         if self._meet_max_token_stop_criteria(request, num_tokens):
             request.state = LlmRequestState.GENERATION_COMPLETE
             request.set_finished_reason(FinishReason.LENGTH, beam_idx)
+
+    def _request_common_handling(self, request: LlmRequest,
+                                 next_draft_tokens: list[list[int]], idx):
+        beam_idx = self.BEAM
+        assert not request.py_return_context_logits, "return_context_logits not implemented for MTPSampler"
+        assert not request.py_return_generation_logits, "return_generation_logits not implemented for MTPSampler"
+        assert not request.py_return_log_probs, "return_log_probs not implemented for MTPSampler"
+        self._draft_meet_max_token_stop_criteria(request, beam_idx)
+        request.py_draft_tokens = next_draft_tokens[idx]
+        request.py_decoding_iter += 1
 
     def update_requests(self, state: SampleStateMTP) -> None:
         assert isinstance(state, SampleStateMTP)
@@ -268,62 +297,51 @@ class MTPSampler(TorchSampler):
         next_draft_tokens_list = state.host.next_draft_tokens.tolist()
 
         idx = 0
-        beam_idx = 0
-        for request in state.scheduled_requests.context_requests:
-            assert not request.py_return_context_logits, "return_context_logits not implemented for MTPSampler"
-            assert not request.py_return_generation_logits, "return_generation_logits not implemented for MTPSampler"
-            assert not request.py_return_log_probs, "return_log_probs not implemented for MTPSampler"
-            if request.context_remaining_length != 0:
+        beam_idx = self.BEAM
+        for req in state.scheduled_requests.context_requests:
+            if req.state == LlmRequestState.GENERATION_COMPLETE or req.context_remaining_length != 0:
                 idx += 1
                 continue
-
-            if request.state != LlmRequestState.GENERATION_COMPLETE:
-                new_token = new_tokens_list[idx][0]
-                num_tokens = request.add_new_token(new_token, beam_idx)
-                should_stop = self._handle_stop_criteria(request,
-                                                         new_token,
-                                                         beam=beam_idx)
-                if self._draft_meet_max_token_stop_criteria(
-                        request, num_tokens, beam_idx):
-                    should_stop = True
-                request.py_draft_tokens = next_draft_tokens_list[idx]
-                request.py_decoding_iter += 1
+            new_token = new_tokens_list[idx][0]
+            req.add_new_token(new_token, beam_idx)
+            self._handle_stop_criteria(req, new_token, beam=beam_idx)
+            self._request_common_handling(req, next_draft_tokens_list, idx)
             idx += 1
 
-        for request in state.scheduled_requests.generation_requests:
-            assert not request.py_return_context_logits, "return_context_logits not implemented for MTPSampler"
-            assert not request.py_return_generation_logits, "return_generation_logits not implemented for MTPSampler"
-            assert not request.py_return_log_probs, "return_log_probs not implemented for MTPSampler"
-            if request.state != LlmRequestState.GENERATION_COMPLETE:
-                new_tokens = new_tokens_list[idx]
-                num_new_tokens = new_tokens_lens_list[idx]
-                should_stop = False
-                for i in range(num_new_tokens):
-                    new_token = new_tokens[i]
-                    num_tokens = request.add_new_token(new_token, beam_idx)
-                    should_stop = self._handle_stop_criteria(request,
-                                                             new_token,
-                                                             beam=beam_idx)
-                    if should_stop:
-                        break
-                if self._draft_meet_max_token_stop_criteria(
-                        request, num_tokens, beam_idx):
-                    should_stop = True
-                request.py_draft_tokens = next_draft_tokens_list[idx]
-                request.py_rewind_len = self.draft_len - (num_new_tokens - 1)
-                request.py_decoding_iter += 1
+        for req in state.scheduled_requests.generation_requests:
+            if req.state == LlmRequestState.GENERATION_COMPLETE:
+                idx += 1
+                continue
+            new_tokens = new_tokens_list[idx]
+            num_new_tokens = new_tokens_lens_list[idx]
+            for i in range(num_new_tokens):
+                new_token = new_tokens[i]
+                req.add_new_token(new_token, beam_idx)
+                if self._handle_stop_criteria(req, new_token, beam=beam_idx):
+                    break
+            self._request_common_handling(req, next_draft_tokens_list, idx)
+            req.py_rewind_len = self.draft_len - (num_new_tokens - 1)
             idx += 1
 
     def sample_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs) -> SampleStateMTP:
-        # new_tokens_device: all of the accepted tokens, device tensor
-        # new_tokens_lens_device: the accepted lengths, device tensor
-        # next_draft_tokens_device: predicted draft tokens, device tensor
-        # next_new_tokens_device: input tokens for the next iteration, device tensor
+        # new_tokens_device: all of the accepted tokens, device tensor, shape: batch_size, nextn + 1
+        # new_tokens_lens_device: the accepted lengths, device tensor, shape: batch_size
+        # next_draft_tokens_device: predicted draft tokens, device tensor, shape: batch_size, nextn
+        # next_new_tokens_device: input tokens for the next iteration, device tensor, shape: batch_size, nextn + 1
         new_tokens_device = model_outputs['new_tokens']
         new_tokens_lens_device = model_outputs['new_tokens_lens']
         next_draft_tokens_device = model_outputs['next_draft_tokens']
         next_new_tokens_device = model_outputs['next_new_tokens']
+
+        requests = scheduled_requests.all_requests()
+        seq_slots = torch.as_tensor([r.seq_slot for r in requests])
+        seq_slots = seq_slots.to(device="cuda", non_blocking=True)
+
+        self.store.new_tokens
+        self.store.next_new_tokens
+        self.store.new_tokens_lens
+        self.store.next_draft_tokens
 
         device = SampleStateTensorsMTP(
             new_tokens=next_new_tokens_device,
