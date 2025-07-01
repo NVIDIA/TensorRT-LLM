@@ -15,9 +15,7 @@ from tensorrt_llm.logger import logger
 from .._utils import KVCacheEventSerializer, mpi_comm, mpi_rank
 from ..bindings import executor as tllm
 from ..builder import Engine
-from ..llmapi.llm_args import BaseLlmArgs, KvCacheConnectorConfig
 from ..llmapi.mpi_session import set_mpi_session_cpp
-from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import VizTracer, set_global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             clear_sched_affinity, print_colored_debug,
@@ -52,10 +50,7 @@ class GenerationExecutorWorker(BaseWorker):
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
-        kv_connector_config: Optional[KvCacheConnectorConfig] = None,
-        hf_model_dir: Optional[Path] = None,
-        tokenizer: Optional[TokenizerBase] = None,
-        llm_args: Optional[BaseLlmArgs] = None,
+        garbage_collection_gen0_threshold: Optional[int] = None,
     ) -> None:
         super().__init__(
             engine=engine,
@@ -162,7 +157,7 @@ class GenerationExecutorWorker(BaseWorker):
 
         return self._iteration_result_task(self.stats_queues, self.fetch_stats,
                                            self._iter_stats_result,
-                                           stats_serializer)
+                                           self._stats_serializer)
 
     def dispatch_kv_cache_events_task(self) -> bool:
         if isinstance(self.engine, tllm.Executor):
@@ -215,22 +210,7 @@ class GenerationExecutorWorker(BaseWorker):
                     self.dispatch_kv_cache_events_thread.stop()
                     self.dispatch_kv_cache_events_thread.join()
 
-            self.engine.shutdown()
-            self.engine = None
-
-            if self.llm_args is not None:
-                assert self._executor_config is None, "An empty executor_config is expected in shutdown when LLM arguments are defined."
-                if (self.llm_args.backend == "pytorch"
-                        and hasattr(self, "checkpoint_loader")
-                        and self.checkpoint_loader is not None):
-                    self.checkpoint_loader.cleanup()
-                    self.checkpoint_loader = None
-            else:
-                if hasattr(
-                        self._executor_config, "checkpoint_loader"
-                ) and self._executor_config.checkpoint_loader is not None:
-                    self._executor_config.checkpoint_loader.cleanup()
-                    self._executor_config.checkpoint_loader = None
+            super().shutdown()
 
         # Check if there are any errors from the threads before shutdown.
         self._handle_background_error()
@@ -268,10 +248,7 @@ def worker_main(
     is_llm_executor: Optional[
         bool] = True,  # whether it's the main executor instance
     lora_config: Optional[LoraConfig] = None,
-    kv_connector_config: Optional[KvCacheConnectorConfig] = None,
-    hf_model_dir: Optional[Path] = None,
-    tokenizer: Optional[TokenizerBase] = None,
-    llm_args: Optional[BaseLlmArgs] = None,
+    garbage_collection_gen0_threshold: Optional[int] = None,
 ) -> None:
     mpi_comm().barrier()
     print_colored_debug(f"Worker {mpi_rank()} entering worker_main...\n",
@@ -399,10 +376,7 @@ def worker_main(
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,
             lora_config=lora_config,
-            kv_connector_config=kv_connector_config,
-            hf_model_dir=hf_model_dir,
-            tokenizer=tokenizer,
-            llm_args=llm_args)
+            garbage_collection_gen0_threshold=garbage_collection_gen0_threshold)
     except Exception as e:
         logger.error(f"Failed to initialize executor on rank {mpi_rank()}: {e}")
         logger.error(traceback.format_exc())

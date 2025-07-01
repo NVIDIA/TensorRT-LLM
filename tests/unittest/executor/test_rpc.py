@@ -123,7 +123,7 @@ def test_rpc_without_wait_response():
         server.start()
         time.sleep(0.1)
         client = RPCClient("ipc:///tmp/rpc_test_no_wait")
-        client.send_task(need_response=False)
+        client.send_task(__rpc_need_response=False)
         time.sleep(0.1)  # wait for some time to make sure the task is submitted
         assert client.get_task_submitted()
 
@@ -149,14 +149,14 @@ def test_rpc_without_response_performance():
 
         time_start = time.time()
         for i in range(100):
-            client.send_task(need_response=False)
+            client.send_task(__rpc_need_response=False)
         time_end = time.time()
 
         no_wait_time = time_end - time_start
 
         time_start = time.time()
         for i in range(100):
-            client.send_task(need_response=True)
+            client.send_task(__rpc_need_response=True)
         time_end = time.time()
         wait_time = time_end - time_start
 
@@ -183,9 +183,66 @@ def test_rpc_benchmark(async_run_task: bool, use_ipc_addr: bool):
 
         time_start = time.time()
         for i in range(10000):
-            ret = client.cal(i)  # sync call
+            ret = client.cal(i, __rpc_timeout=10)  # sync call
             assert ret == i * 2, f"{ret} != {i * 2}"
         time_end = time.time()
         print(
             f"Time taken: {time_end - time_start} seconds, {10000 / (time_end - time_start)} calls/second"
         )
+
+
+@pytest.mark.parametrize("use_async", [True, False])
+def test_rpc_timeout(use_async: bool):
+    """Test RPC timeout functionality.
+
+    Args:
+        use_async: Whether to test async RPC calls or sync RPC calls
+    """
+
+    class App:
+
+        def slow_operation(self, delay: float):
+            """A method that takes a long time to complete."""
+            time.sleep(delay)
+            return "completed"
+
+    with RPCServer(App()) as server:
+        server.bind("ipc:///tmp/rpc_test_timeout")
+        server.start()
+        time.sleep(0.1)
+        client = RPCClient("ipc:///tmp/rpc_test_timeout")
+
+        # Test that a short timeout causes RPCTimeout exception
+        with pytest.raises(RPCError) as exc_info:
+            if use_async:
+                # Test async call with timeout
+                import asyncio
+
+                async def test_async_timeout():
+                    return await client.call_async('slow_operation',
+                                                   2.0,
+                                                   __rpc_timeout=0.1)
+
+                asyncio.run(test_async_timeout())
+            else:
+                # Test sync call with timeout
+                client.slow_operation(2.0, __rpc_timeout=0.1)
+
+            assert "timed out" in str(
+                exc_info.value), f"Timeout message not found: {exc_info.value}"
+
+        # Test that a long timeout allows the operation to complete
+        if use_async:
+            # Test async call with sufficient timeout
+            import asyncio
+
+            async def test_async_success():
+                return await client.call_async('slow_operation',
+                                               0.1,
+                                               __rpc_timeout=1.0)
+
+            result = asyncio.run(test_async_success())
+        else:
+            result = client.slow_operation(0.1, __rpc_timeout=1.0)
+
+        assert result == "completed"
