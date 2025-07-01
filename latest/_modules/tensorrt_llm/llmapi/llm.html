@@ -50,7 +50,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -60,7 +60,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc0" />
+  <meta name="docsearch:version" content="1.0.0rc1" />
 
 
   </head>
@@ -522,11 +522,9 @@
 <span class="kn">from</span><span class="w"> </span><span class="nn">tqdm</span><span class="w"> </span><span class="kn">import</span> <span class="n">tqdm</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">PreTrainedTokenizerBase</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.builder</span><span class="w"> </span><span class="kn">import</span> <span class="n">BuildConfig</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.inputs.data</span><span class="w"> </span><span class="kn">import</span> <span class="n">TextPrompt</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.inputs.registry</span><span class="w"> </span><span class="kn">import</span> <span class="n">DefaultInputProcessor</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">..</span><span class="w"> </span><span class="kn">import</span> <span class="n">bindings</span> <span class="k">as</span> <span class="n">tllm</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">nvtx_range_debug</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..bindings</span><span class="w"> </span><span class="kn">import</span> <span class="n">executor</span> <span class="k">as</span> <span class="n">tllm</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..builder</span><span class="w"> </span><span class="kn">import</span> <span class="n">EngineConfig</span>
@@ -543,7 +541,7 @@
 <span class="kn">from</span><span class="w"> </span><span class="nn">..sampling_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">SamplingParams</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.llm_args</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">TORCH_LLMARGS_EXPLICIT_DOCSTRING</span><span class="p">,</span>
                        <span class="n">TRT_LLMARGS_EXPLICIT_DOCSTRING</span><span class="p">,</span> <span class="n">PybindMirror</span><span class="p">,</span>
-                       <span class="n">TorchLlmArgs</span><span class="p">,</span> <span class="n">TrtLlmArgs</span><span class="p">,</span> <span class="n">_AutoDeployLlmArgs</span><span class="p">)</span>
+                       <span class="n">TorchLlmArgs</span><span class="p">,</span> <span class="n">TrtLlmArgs</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.llm_utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">CachedModelLoader</span><span class="p">,</span> <span class="n">KvCacheRetentionConfig</span><span class="p">,</span>
                         <span class="n">LlmBuildStats</span><span class="p">,</span> <span class="n">ModelLoader</span><span class="p">,</span> <span class="n">_ModelRuntimeContext</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.mpi_session</span><span class="w"> </span><span class="kn">import</span> <span class="n">MpiPoolSession</span><span class="p">,</span> <span class="n">external_mpi_comm_available</span>
@@ -643,7 +641,9 @@
             <span class="k">if</span> <span class="n">backend</span> <span class="o">==</span> <span class="s1">&#39;pytorch&#39;</span><span class="p">:</span>
                 <span class="n">llm_args_cls</span> <span class="o">=</span> <span class="n">TorchLlmArgs</span>
             <span class="k">elif</span> <span class="n">backend</span> <span class="o">==</span> <span class="s1">&#39;_autodeploy&#39;</span><span class="p">:</span>
-                <span class="n">llm_args_cls</span> <span class="o">=</span> <span class="n">_AutoDeployLlmArgs</span>
+                <span class="kn">from</span><span class="w"> </span><span class="nn">.._torch.auto_deploy.llm_args</span><span class="w"> </span><span class="kn">import</span> \
+                    <span class="n">LlmArgs</span> <span class="k">as</span> <span class="n">AutoDeployLlmArgs</span>
+                <span class="n">llm_args_cls</span> <span class="o">=</span> <span class="n">AutoDeployLlmArgs</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="n">llm_args_cls</span> <span class="o">=</span> <span class="n">TrtLlmArgs</span>
 
@@ -1047,8 +1047,6 @@
                     <span class="sa">f</span><span class="s2">&quot;PyTorch backend currently only supports `logprobs=1`. Received `logprobs=</span><span class="si">{</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">logprobs</span><span class="si">}</span><span class="s2">` (Top</span><span class="si">{</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">logprobs</span><span class="si">}</span><span class="s2"> logprobs). Please set `logprobs=1` in `sampling_params` instead.&quot;</span>
                 <span class="p">)</span>
             <span class="k">return</span>
-        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">backend</span> <span class="o">==</span> <span class="s2">&quot;_autodeploy&quot;</span><span class="p">:</span>
-            <span class="k">return</span>
 
         <span class="n">build_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span>
 
@@ -1108,134 +1106,6 @@
                                          <span class="n">llm_build_stats</span><span class="o">=</span><span class="n">weakref</span><span class="o">.</span><span class="n">proxy</span><span class="p">(</span>
                                              <span class="bp">self</span><span class="o">.</span><span class="n">llm_build_stats</span><span class="p">))</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span> <span class="o">=</span> <span class="n">model_loader</span><span class="p">()</span>
-        <span class="c1"># update the model_dir to a local dir for the runtime, such as tokenizer loading.</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">model</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span>
-
-        <span class="c1"># Tokenizer loading should be after calling model_loader(), since model_loader() may download the model from HF hub.</span>
-        <span class="c1"># It should also be before bindings ExecutorConfig, which may depend on tokenizer info.</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_tokenizer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_try_load_tokenizer</span><span class="p">()</span>
-
-        <span class="c1"># Multimodal special handling:</span>
-        <span class="c1"># 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor</span>
-        <span class="c1"># 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor&#39;s __init__</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span> <span class="o">=</span> <span class="n">create_input_processor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span><span class="p">,</span>
-                                                      <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="o">.</span><span class="n">tokenizer</span>
-
-        <span class="n">max_batch_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_batch_size</span>
-        <span class="n">max_num_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_num_tokens</span>
-        <span class="n">max_seq_len</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_seq_len</span>
-
-        <span class="n">build_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_trt_backend</span> <span class="k">else</span> <span class="n">BuildConfig</span><span class="p">(</span>
-        <span class="p">)</span>
-
-        <span class="n">max_batch_size</span> <span class="o">=</span> <span class="n">max_batch_size</span> <span class="ow">or</span> <span class="n">build_config</span><span class="o">.</span><span class="n">max_batch_size</span>
-        <span class="n">max_num_tokens</span> <span class="o">=</span> <span class="n">max_num_tokens</span> <span class="ow">or</span> <span class="n">build_config</span><span class="o">.</span><span class="n">max_num_tokens</span>
-        <span class="n">max_seq_len</span> <span class="o">=</span> <span class="n">max_seq_len</span> <span class="ow">or</span> <span class="n">build_config</span><span class="o">.</span><span class="n">max_seq_len</span>
-
-        <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span> <span class="o">=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">ExecutorConfig</span><span class="p">(</span>
-            <span class="n">max_beam_width</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_beam_width</span><span class="p">,</span>
-            <span class="n">scheduler_config</span><span class="o">=</span><span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">scheduler_config</span><span class="p">),</span>
-            <span class="n">batching_type</span><span class="o">=</span><span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batching_type</span><span class="p">)</span>
-            <span class="ow">or</span> <span class="n">tllm</span><span class="o">.</span><span class="n">BatchingType</span><span class="o">.</span><span class="n">INFLIGHT</span><span class="p">,</span>
-            <span class="n">max_batch_size</span><span class="o">=</span><span class="n">max_batch_size</span><span class="p">,</span>
-            <span class="n">max_num_tokens</span><span class="o">=</span><span class="n">max_num_tokens</span><span class="p">,</span>
-            <span class="n">gather_generation_logits</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">gather_generation_logits</span><span class="p">)</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">backend</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="c1"># also set executor_config.max_seq_len in TRT workflow, to deduce default max_tokens</span>
-            <span class="k">if</span> <span class="n">max_seq_len</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">max_seq_len</span> <span class="o">=</span> <span class="n">max_seq_len</span>
-            <span class="k">else</span><span class="p">:</span>
-                <span class="n">engine_config</span> <span class="o">=</span> <span class="n">EngineConfig</span><span class="o">.</span><span class="n">from_json_file</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span> <span class="o">/</span>
-                                                            <span class="s2">&quot;config.json&quot;</span><span class="p">)</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">max_seq_len</span> <span class="o">=</span> <span class="n">engine_config</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_seq_len</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">kv_cache_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">kv_cache_config</span> <span class="o">=</span> <span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">&quot;FORCE_DETERMINISTIC&quot;</span><span class="p">,</span> <span class="s2">&quot;0&quot;</span><span class="p">)</span> <span class="o">==</span> <span class="s2">&quot;1&quot;</span><span class="p">:</span>
-            <span class="c1"># Disable KV cache reuse for deterministic mode</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">enable_block_reuse</span> <span class="o">=</span> <span class="kc">False</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">enable_partial_reuse</span> <span class="o">=</span> <span class="kc">False</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">peft_cache_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">peft_cache_config</span> <span class="o">=</span> <span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">peft_cache_config</span><span class="p">)</span>
-        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_trt_backend</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">lora_plugin</span><span class="p">:</span>
-            <span class="n">engine_config</span> <span class="o">=</span> <span class="n">EngineConfig</span><span class="o">.</span><span class="n">from_json_file</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span> <span class="o">/</span>
-                                                        <span class="s2">&quot;config.json&quot;</span><span class="p">)</span>
-            <span class="n">lora_config</span> <span class="o">=</span> <span class="n">engine_config</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">lora_config</span>
-            <span class="n">max_lora_rank</span> <span class="o">=</span> <span class="n">lora_config</span><span class="o">.</span><span class="n">max_lora_rank</span>
-            <span class="n">num_lora_modules</span> <span class="o">=</span> <span class="n">engine_config</span><span class="o">.</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">num_hidden_layers</span> <span class="o">*</span> \
-                <span class="nb">len</span><span class="p">(</span><span class="n">lora_config</span><span class="o">.</span><span class="n">lora_target_modules</span> <span class="o">+</span> <span class="n">lora_config</span><span class="o">.</span><span class="n">missing_qkv_modules</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">peft_cache_config</span> <span class="o">=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">PeftCacheConfig</span><span class="p">(</span>
-                <span class="n">num_device_module_layer</span><span class="o">=</span><span class="n">max_lora_rank</span> <span class="o">*</span> <span class="n">num_lora_modules</span> <span class="o">*</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_loras</span><span class="p">,</span>
-                <span class="n">num_host_module_layer</span><span class="o">=</span><span class="n">max_lora_rank</span> <span class="o">*</span> <span class="n">num_lora_modules</span> <span class="o">*</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_cpu_loras</span><span class="p">,</span>
-            <span class="p">)</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">decoding_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">decoding_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">decoding_config</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">guided_decoding_backend</span> <span class="o">==</span> <span class="s1">&#39;xgrammar&#39;</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">guided_decoding_config</span> <span class="o">=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">GuidedDecodingConfig</span><span class="p">(</span>
-                <span class="n">backend</span><span class="o">=</span><span class="n">tllm</span><span class="o">.</span><span class="n">GuidedDecodingConfig</span><span class="o">.</span><span class="n">GuidedDecodingBackend</span><span class="o">.</span>
-                <span class="n">XGRAMMAR</span><span class="p">,</span>
-                <span class="o">**</span><span class="n">_xgrammar_tokenizer_info</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">))</span>
-        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">guided_decoding_backend</span> <span class="o">==</span> <span class="s1">&#39;llguidance&#39;</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">guided_decoding_config</span> <span class="o">=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">GuidedDecodingConfig</span><span class="p">(</span>
-                <span class="n">backend</span><span class="o">=</span><span class="n">tllm</span><span class="o">.</span><span class="n">GuidedDecodingConfig</span><span class="o">.</span><span class="n">GuidedDecodingBackend</span><span class="o">.</span>
-                <span class="n">LLGUIDANCE</span><span class="p">,</span>
-                <span class="o">**</span><span class="n">_llguidance_tokenizer_info</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">))</span>
-        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">guided_decoding_backend</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">&quot;Unrecognized guided decoding backend </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">guided_decoding_backend</span><span class="si">}</span><span class="s2">&quot;</span>
-            <span class="p">)</span>
-
-        <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">normalize_log_probs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">normalize_log_probs</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">enable_chunked_context</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">enable_chunked_prefill</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">max_beam_width</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_beam_width</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_beam_width</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_trt_backend</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">extended_runtime_perf_knob_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">extended_runtime_perf_knob_config</span> <span class="o">=</span> <span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">extended_runtime_perf_knob_config</span><span class="p">)</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">cache_transceiver_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">cache_transceiver_config</span> <span class="o">=</span> <span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">cache_transceiver_config</span><span class="p">)</span>
-        <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.pyexecutor.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">update_executor_config</span>
-        <span class="n">update_executor_config</span><span class="p">(</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="p">,</span>
-            <span class="n">backend</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">backend</span><span class="p">,</span>
-            <span class="n">pytorch_backend_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">get_pytorch_backend_config</span><span class="p">()</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">backend</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;pytorch&quot;</span><span class="p">,</span> <span class="s2">&quot;_autodeploy&quot;</span><span class="p">]</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
-            <span class="n">mapping</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">to_mapping</span><span class="p">(),</span>
-            <span class="n">build_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_trt_backend</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
-            <span class="n">speculative_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span>
-            <span class="n">hf_model_dir</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span><span class="p">,</span>
-            <span class="n">trt_engine_dir</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span><span class="p">,</span>
-            <span class="n">max_input_len</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_input_len</span><span class="p">,</span>
-            <span class="n">max_seq_len</span><span class="o">=</span><span class="n">max_seq_len</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">llm_parallel_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span>
-        <span class="n">return_logits</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">gather_generation_logits</span>
-                         <span class="ow">or</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span>
-                             <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">gather_context_logits</span><span class="p">))</span>
-
-        <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor_cls</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span><span class="p">,</span>
-            <span class="n">executor_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="p">,</span>
-            <span class="n">batched_logits_processor</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batched_logits_processor</span><span class="p">,</span>
-            <span class="n">model_world_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">world_size</span><span class="p">,</span>
-            <span class="n">mpi_session</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span><span class="p">,</span>
-            <span class="n">reuse_mpi_comm</span><span class="o">=</span><span class="n">external_mpi_comm_available</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">world_size</span><span class="p">),</span>
-            <span class="n">return_logits</span><span class="o">=</span><span class="n">return_logits</span><span class="p">,</span>
-            <span class="n">postproc_worker_config</span><span class="o">=</span><span class="n">PostprocWorkerConfig</span><span class="p">(</span>
-                <span class="n">num_postprocess_workers</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">num_postprocess_workers</span><span class="p">,</span>
-                <span class="n">postprocess_tokenizer_dir</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">postprocess_tokenizer_dir</span><span class="p">,</span>
-            <span class="p">),</span>
-            <span class="n">is_llm_executor</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-            <span class="n">lora_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">lora_config</span><span class="p">,</span>
-            <span class="n">garbage_collection_gen0_threshold</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span>
-            <span class="n">garbage_collection_gen0_threshold</span><span class="p">)</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">_on_trt_backend</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
@@ -1376,6 +1246,116 @@
                     <span class="sa">f</span><span class="s2">&quot;Copying </span><span class="si">{</span><span class="n">file</span><span class="si">}</span><span class="s2"> to </span><span class="si">{</span><span class="n">target_engine_dir</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">file</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">)</span>
                 <span class="n">shutil</span><span class="o">.</span><span class="n">copy</span><span class="p">(</span><span class="n">file</span><span class="p">,</span> <span class="n">target_engine_dir</span> <span class="o">/</span> <span class="n">file</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
 
+    <span class="k">def</span><span class="w"> </span><span class="nf">_build_model</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">_build_model</span><span class="p">()</span>
+        <span class="c1"># update the model_dir to a local dir for the runtime, such as tokenizer loading.</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">model</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span>
+
+        <span class="c1"># Tokenizer loading should be after calling model_loader(), since model_loader() may download the model from HF hub.</span>
+        <span class="c1"># It should also be before bindings ExecutorConfig, which may depend on tokenizer info.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_tokenizer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_try_load_tokenizer</span><span class="p">()</span>
+
+        <span class="c1"># Multimodal special handling:</span>
+        <span class="c1"># 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor</span>
+        <span class="c1"># 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor&#39;s __init__</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span> <span class="o">=</span> <span class="n">create_input_processor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span><span class="p">,</span>
+                                                      <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="o">.</span><span class="n">tokenizer</span>
+
+        <span class="n">max_batch_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_batch_size</span>
+        <span class="n">max_num_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_num_tokens</span>
+        <span class="n">max_seq_len</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_seq_len</span>
+
+        <span class="n">build_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span>
+
+        <span class="n">max_batch_size</span> <span class="o">=</span> <span class="n">max_batch_size</span> <span class="ow">or</span> <span class="n">build_config</span><span class="o">.</span><span class="n">max_batch_size</span>
+        <span class="n">max_num_tokens</span> <span class="o">=</span> <span class="n">max_num_tokens</span> <span class="ow">or</span> <span class="n">build_config</span><span class="o">.</span><span class="n">max_num_tokens</span>
+        <span class="n">max_seq_len</span> <span class="o">=</span> <span class="n">max_seq_len</span> <span class="ow">or</span> <span class="n">build_config</span><span class="o">.</span><span class="n">max_seq_len</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span> <span class="o">=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">ExecutorConfig</span><span class="p">(</span>
+            <span class="n">max_beam_width</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_beam_width</span><span class="p">,</span>
+            <span class="n">scheduler_config</span><span class="o">=</span><span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">scheduler_config</span><span class="p">),</span>
+            <span class="n">batching_type</span><span class="o">=</span><span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batching_type</span><span class="p">)</span>
+            <span class="ow">or</span> <span class="n">tllm</span><span class="o">.</span><span class="n">BatchingType</span><span class="o">.</span><span class="n">INFLIGHT</span><span class="p">,</span>
+            <span class="n">max_batch_size</span><span class="o">=</span><span class="n">max_batch_size</span><span class="p">,</span>
+            <span class="n">max_num_tokens</span><span class="o">=</span><span class="n">max_num_tokens</span><span class="p">,</span>
+            <span class="n">gather_generation_logits</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">gather_generation_logits</span><span class="p">)</span>
+
+        <span class="c1"># also set executor_config.max_seq_len in TRT workflow, to deduce default max_tokens</span>
+        <span class="k">if</span> <span class="n">max_seq_len</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">max_seq_len</span> <span class="o">=</span> <span class="n">max_seq_len</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">engine_config</span> <span class="o">=</span> <span class="n">EngineConfig</span><span class="o">.</span><span class="n">from_json_file</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span> <span class="o">/</span>
+                                                        <span class="s2">&quot;config.json&quot;</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">max_seq_len</span> <span class="o">=</span> <span class="n">engine_config</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_seq_len</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">kv_cache_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">kv_cache_config</span> <span class="o">=</span> <span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">&quot;FORCE_DETERMINISTIC&quot;</span><span class="p">,</span> <span class="s2">&quot;0&quot;</span><span class="p">)</span> <span class="o">==</span> <span class="s2">&quot;1&quot;</span><span class="p">:</span>
+            <span class="c1"># Disable KV cache reuse for deterministic mode</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">enable_block_reuse</span> <span class="o">=</span> <span class="kc">False</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">enable_partial_reuse</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">peft_cache_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">peft_cache_config</span> <span class="o">=</span> <span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">peft_cache_config</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">lora_plugin</span><span class="p">:</span>
+            <span class="n">engine_config</span> <span class="o">=</span> <span class="n">EngineConfig</span><span class="o">.</span><span class="n">from_json_file</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span> <span class="o">/</span>
+                                                        <span class="s2">&quot;config.json&quot;</span><span class="p">)</span>
+            <span class="n">lora_config</span> <span class="o">=</span> <span class="n">engine_config</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">lora_config</span>
+            <span class="n">max_lora_rank</span> <span class="o">=</span> <span class="n">lora_config</span><span class="o">.</span><span class="n">max_lora_rank</span>
+            <span class="n">num_lora_modules</span> <span class="o">=</span> <span class="n">engine_config</span><span class="o">.</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">num_hidden_layers</span> <span class="o">*</span> \
+                <span class="nb">len</span><span class="p">(</span><span class="n">lora_config</span><span class="o">.</span><span class="n">lora_target_modules</span> <span class="o">+</span> <span class="n">lora_config</span><span class="o">.</span><span class="n">missing_qkv_modules</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">peft_cache_config</span> <span class="o">=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">PeftCacheConfig</span><span class="p">(</span>
+                <span class="n">num_device_module_layer</span><span class="o">=</span><span class="n">max_lora_rank</span> <span class="o">*</span> <span class="n">num_lora_modules</span> <span class="o">*</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_loras</span><span class="p">,</span>
+                <span class="n">num_host_module_layer</span><span class="o">=</span><span class="n">max_lora_rank</span> <span class="o">*</span> <span class="n">num_lora_modules</span> <span class="o">*</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_cpu_loras</span><span class="p">,</span>
+            <span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">decoding_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">decoding_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">decoding_config</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">guided_decoding_backend</span> <span class="o">==</span> <span class="s1">&#39;xgrammar&#39;</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">guided_decoding_config</span> <span class="o">=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">GuidedDecodingConfig</span><span class="p">(</span>
+                <span class="n">backend</span><span class="o">=</span><span class="n">tllm</span><span class="o">.</span><span class="n">GuidedDecodingConfig</span><span class="o">.</span><span class="n">GuidedDecodingBackend</span><span class="o">.</span>
+                <span class="n">XGRAMMAR</span><span class="p">,</span>
+                <span class="o">**</span><span class="n">_xgrammar_tokenizer_info</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">))</span>
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">guided_decoding_backend</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;Unsupported guided decoding backend </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">guided_decoding_backend</span><span class="si">}</span><span class="s2">&quot;</span>
+            <span class="p">)</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">normalize_log_probs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">normalize_log_probs</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">enable_chunked_context</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">enable_chunked_prefill</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">max_beam_width</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_beam_width</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_beam_width</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">extended_runtime_perf_knob_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">extended_runtime_perf_knob_config</span> <span class="o">=</span> <span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">extended_runtime_perf_knob_config</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">cache_transceiver_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">cache_transceiver_config</span> <span class="o">=</span> <span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">cache_transceiver_config</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">llm_parallel_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span>
+        <span class="n">return_logits</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">gather_generation_logits</span>
+                         <span class="ow">or</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span>
+                             <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">gather_context_logits</span><span class="p">))</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor_cls</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span><span class="p">,</span>
+            <span class="n">executor_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="p">,</span>
+            <span class="n">batched_logits_processor</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batched_logits_processor</span><span class="p">,</span>
+            <span class="n">model_world_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">world_size</span><span class="p">,</span>
+            <span class="n">mpi_session</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span><span class="p">,</span>
+            <span class="n">reuse_mpi_comm</span><span class="o">=</span><span class="n">external_mpi_comm_available</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">world_size</span><span class="p">),</span>
+            <span class="n">return_logits</span><span class="o">=</span><span class="n">return_logits</span><span class="p">,</span>
+            <span class="n">postproc_worker_config</span><span class="o">=</span><span class="n">PostprocWorkerConfig</span><span class="p">(</span>
+                <span class="n">num_postprocess_workers</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">num_postprocess_workers</span><span class="p">,</span>
+                <span class="n">postprocess_tokenizer_dir</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">postprocess_tokenizer_dir</span><span class="p">,</span>
+            <span class="p">),</span>
+            <span class="n">is_llm_executor</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+            <span class="n">lora_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">lora_config</span><span class="p">)</span>
+
 
 <span class="nd">@append_docstring</span><span class="p">(</span><span class="n">TORCH_LLM_DOCSTRING</span><span class="p">)</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">_TorchLLM</span><span class="p">(</span><span class="n">BaseLLM</span><span class="p">):</span>
@@ -1398,7 +1378,7 @@
                  <span class="o">**</span><span class="n">kwargs</span><span class="p">:</span> <span class="n">Any</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 
         <span class="c1"># TODO: deprecate backend in LLM kwargs</span>
-        <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">&quot;backend&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="n">backend</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">&quot;backend&quot;</span><span class="p">,</span> <span class="s2">&quot;pytorch&quot;</span><span class="p">)</span>
 
         <span class="c1"># Validate that users don&#39;t pass TrtLlmArgs-specific arguments</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_validate_args_for_torch_backend</span><span class="p">(</span><span class="n">kwargs</span><span class="p">)</span>
@@ -1412,8 +1392,103 @@
                          <span class="n">dtype</span><span class="p">,</span>
                          <span class="n">revision</span><span class="p">,</span>
                          <span class="n">tokenizer_revision</span><span class="p">,</span>
-                         <span class="n">backend</span><span class="o">=</span><span class="s1">&#39;pytorch&#39;</span><span class="p">,</span>
+                         <span class="n">backend</span><span class="o">=</span><span class="n">backend</span><span class="p">,</span>
                          <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_build_model</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">_build_model</span><span class="p">()</span>
+        <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span> <span class="ow">is</span> <span class="kc">None</span>
+
+        <span class="c1"># Tokenizer loading should be after calling model_loader(), since model_loader() may download the model from HF hub.</span>
+        <span class="c1"># It should also be before bindings ExecutorConfig, which may depend on tokenizer info.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_tokenizer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_try_load_tokenizer</span><span class="p">()</span>
+
+        <span class="c1"># Multimodal special handling:</span>
+        <span class="c1"># 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor</span>
+        <span class="c1"># 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor&#39;s __init__</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span> <span class="o">=</span> <span class="n">create_input_processor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span><span class="p">,</span>
+                                                      <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="o">.</span><span class="n">tokenizer</span>
+
+        <span class="n">max_batch_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_batch_size</span>
+        <span class="n">max_num_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_num_tokens</span>
+        <span class="n">max_seq_len</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_seq_len</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span> <span class="o">=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">ExecutorConfig</span><span class="p">(</span>
+            <span class="n">max_beam_width</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_beam_width</span><span class="p">,</span>
+            <span class="n">scheduler_config</span><span class="o">=</span><span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">scheduler_config</span><span class="p">),</span>
+            <span class="n">batching_type</span><span class="o">=</span><span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batching_type</span><span class="p">)</span>
+            <span class="ow">or</span> <span class="n">tllm</span><span class="o">.</span><span class="n">BatchingType</span><span class="o">.</span><span class="n">INFLIGHT</span><span class="p">,</span>
+            <span class="n">max_batch_size</span><span class="o">=</span><span class="n">max_batch_size</span><span class="p">,</span>
+            <span class="n">max_num_tokens</span><span class="o">=</span><span class="n">max_num_tokens</span><span class="p">,</span>
+            <span class="n">gather_generation_logits</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">gather_generation_logits</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">kv_cache_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">kv_cache_config</span> <span class="o">=</span> <span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">&quot;FORCE_DETERMINISTIC&quot;</span><span class="p">,</span> <span class="s2">&quot;0&quot;</span><span class="p">)</span> <span class="o">==</span> <span class="s2">&quot;1&quot;</span><span class="p">:</span>
+            <span class="c1"># Disable KV cache reuse for deterministic mode</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">enable_block_reuse</span> <span class="o">=</span> <span class="kc">False</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">enable_partial_reuse</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">peft_cache_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">peft_cache_config</span> <span class="o">=</span> <span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">peft_cache_config</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">decoding_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">decoding_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">decoding_config</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">guided_decoding_backend</span> <span class="o">==</span> <span class="s1">&#39;xgrammar&#39;</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">guided_decoding_config</span> <span class="o">=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">GuidedDecodingConfig</span><span class="p">(</span>
+                <span class="n">backend</span><span class="o">=</span><span class="n">tllm</span><span class="o">.</span><span class="n">GuidedDecodingConfig</span><span class="o">.</span><span class="n">GuidedDecodingBackend</span><span class="o">.</span>
+                <span class="n">XGRAMMAR</span><span class="p">,</span>
+                <span class="o">**</span><span class="n">_xgrammar_tokenizer_info</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">))</span>
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">guided_decoding_backend</span> <span class="o">==</span> <span class="s1">&#39;llguidance&#39;</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">guided_decoding_config</span> <span class="o">=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">GuidedDecodingConfig</span><span class="p">(</span>
+                <span class="n">backend</span><span class="o">=</span><span class="n">tllm</span><span class="o">.</span><span class="n">GuidedDecodingConfig</span><span class="o">.</span><span class="n">GuidedDecodingBackend</span><span class="o">.</span>
+                <span class="n">LLGUIDANCE</span><span class="p">,</span>
+                <span class="o">**</span><span class="n">_llguidance_tokenizer_info</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">))</span>
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">guided_decoding_backend</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;Unsupported guided decoding backend </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">guided_decoding_backend</span><span class="si">}</span><span class="s2">&quot;</span>
+            <span class="p">)</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">normalize_log_probs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">normalize_log_probs</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">enable_chunked_context</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">enable_chunked_prefill</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">max_beam_width</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_beam_width</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">cache_transceiver_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">cache_transceiver_config</span> <span class="o">=</span> <span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">cache_transceiver_config</span><span class="p">)</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.pyexecutor.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">update_executor_config</span>
+        <span class="n">update_executor_config</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="p">,</span>
+            <span class="n">backend</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">backend</span><span class="p">,</span>
+            <span class="n">pytorch_backend_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">get_pytorch_backend_config</span><span class="p">()</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">backend</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;pytorch&quot;</span><span class="p">,</span> <span class="s2">&quot;_autodeploy&quot;</span><span class="p">]</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="n">mapping</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">to_mapping</span><span class="p">(),</span>
+            <span class="n">speculative_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span>
+            <span class="n">hf_model_dir</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span><span class="p">,</span>
+            <span class="n">max_input_len</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_input_len</span><span class="p">,</span>
+            <span class="n">max_seq_len</span><span class="o">=</span><span class="n">max_seq_len</span><span class="p">)</span>
+
+        <span class="c1"># TODO: revisit gather_context_logits</span>
+        <span class="n">return_logits</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">gather_generation_logits</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor_cls</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span><span class="p">,</span>
+            <span class="n">executor_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="p">,</span>
+            <span class="n">batched_logits_processor</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batched_logits_processor</span><span class="p">,</span>
+            <span class="n">model_world_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">world_size</span><span class="p">,</span>
+            <span class="n">mpi_session</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span><span class="p">,</span>
+            <span class="n">reuse_mpi_comm</span><span class="o">=</span><span class="n">external_mpi_comm_available</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">world_size</span><span class="p">),</span>
+            <span class="n">return_logits</span><span class="o">=</span><span class="n">return_logits</span><span class="p">,</span>
+            <span class="n">postproc_worker_config</span><span class="o">=</span><span class="n">PostprocWorkerConfig</span><span class="p">(</span>
+                <span class="n">num_postprocess_workers</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">num_postprocess_workers</span><span class="p">,</span>
+                <span class="n">postprocess_tokenizer_dir</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">postprocess_tokenizer_dir</span><span class="p">,</span>
+            <span class="p">),</span>
+            <span class="n">is_llm_executor</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+            <span class="n">lora_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">lora_config</span><span class="p">,</span>
+            <span class="n">garbage_collection_gen0_threshold</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span>
+            <span class="n">garbage_collection_gen0_threshold</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_validate_args_for_torch_backend</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">kwargs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Validate that users don&#39;t pass TrtLlmArgs-specific arguments when using PyTorch backend.</span>
@@ -1579,9 +1654,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 21, 2025.</p>
+  <p>Last updated on June 29, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ebadc13">ebadc13</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/de97799">de97799</a>.</p>
   
 </div></div>
       

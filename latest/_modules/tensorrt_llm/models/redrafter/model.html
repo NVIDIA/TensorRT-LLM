@@ -50,7 +50,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -60,7 +60,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc0" />
+  <meta name="docsearch:version" content="1.0.0rc1" />
 
 
   </head>
@@ -530,7 +530,7 @@
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._common</span><span class="w"> </span><span class="kn">import</span> <span class="n">default_net</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.bindings</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVCacheType</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.functional</span><span class="w"> </span><span class="kn">import</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">cast</span><span class="p">,</span> <span class="n">categorical_sample</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.models</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLaMAForCausalLM</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.models</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLaMAForCausalLM</span><span class="p">,</span> <span class="n">QWenForCausalLM</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.models.generation_mixin</span><span class="w"> </span><span class="kn">import</span> <span class="n">GenerationMixin</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">..._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">pad_vocab_size</span><span class="p">,</span> <span class="n">str_dtype_to_trt</span>
@@ -539,9 +539,7 @@
                                <span class="n">_process_logits_and_hidden_states</span><span class="p">)</span>
 
 
-<div class="viewcode-block" id="ReDrafterForCausalLM">
-<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.ReDrafterForCausalLM">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">ReDrafterForCausalLM</span><span class="p">(</span><span class="n">LLaMAForCausalLM</span><span class="p">):</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">ReDrafterMixin</span><span class="p">:</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">):</span>
 
@@ -624,8 +622,6 @@
 
         <span class="k">return</span> <span class="n">next_token</span><span class="p">,</span> <span class="n">probs</span><span class="p">,</span> <span class="n">draft_input</span>
 
-<div class="viewcode-block" id="ReDrafterForCausalLM.forward">
-<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.ReDrafterForCausalLM.forward">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        0. run base model, get logits, hidden_states</span>
@@ -661,11 +657,8 @@
             <span class="bp">self</span><span class="o">.</span><span class="n">drafter</span><span class="p">,</span>
             <span class="n">kwargs</span><span class="o">=</span><span class="n">kwargs</span><span class="p">)</span>
 
-        <span class="k">return</span> <span class="n">new_draft_tokens</span><span class="p">,</span> <span class="n">new_draft_logits</span><span class="p">,</span> <span class="n">probs</span></div>
+        <span class="k">return</span> <span class="n">new_draft_tokens</span><span class="p">,</span> <span class="n">new_draft_logits</span><span class="p">,</span> <span class="n">probs</span>
 
-
-<div class="viewcode-block" id="ReDrafterForCausalLM.prepare_inputs">
-<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.ReDrafterForCausalLM.prepare_inputs">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">prepare_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Inputs needed:</span>
@@ -813,8 +806,30 @@
         <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;rand_data_validation&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">rand_data_validation</span>
         <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;rand_data_sample&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">rand_data_sample</span>
         <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;position_ids_base&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">position_ids_base</span>
-        <span class="k">return</span> <span class="n">inputs</span></div>
-</div>
+        <span class="k">return</span> <span class="n">inputs</span>
+
+
+<div class="viewcode-block" id="ReDrafterForQWenLM">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.ReDrafterForQWenLM">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">ReDrafterForQWenLM</span><span class="p">(</span><span class="n">ReDrafterMixin</span><span class="p">,</span> <span class="n">QWenForCausalLM</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;ReDrafter implementation for QWen models.</span>
+
+<span class="sd">    Combines:</span>
+<span class="sd">    - Base QWen model functionality from QWenForCausalLM</span>
+<span class="sd">    - Drafting/speculative decoding logic from ReDrafterMixin</span>
+<span class="sd">    &quot;&quot;&quot;</span></div>
+
+
+
+<div class="viewcode-block" id="ReDrafterForLLaMALM">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.ReDrafterForLLaMALM">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">ReDrafterForLLaMALM</span><span class="p">(</span><span class="n">ReDrafterMixin</span><span class="p">,</span> <span class="n">LLaMAForCausalLM</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;ReDrafter implementation for LLaMA models.</span>
+
+<span class="sd">    Combines:</span>
+<span class="sd">    - Base LLaMA model functionality from LLaMAForCausalLM</span>
+<span class="sd">    - Drafting/speculative decoding logic from ReDrafterMixin</span>
+<span class="sd">    &quot;&quot;&quot;</span></div>
 
 </pre></div>
 
@@ -927,9 +942,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 21, 2025.</p>
+  <p>Last updated on June 29, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ebadc13">ebadc13</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/de97799">de97799</a>.</p>
   
 </div></div>
       

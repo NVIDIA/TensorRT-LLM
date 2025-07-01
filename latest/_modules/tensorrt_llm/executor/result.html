@@ -50,7 +50,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -60,7 +60,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc0" />
+  <meta name="docsearch:version" content="1.0.0rc1" />
 
 
   </head>
@@ -596,6 +596,7 @@
 <span class="sd">        stop_reason (int, str, optional): The stop string or token id that caused the completion to stop, None if the completion finished for some other reason. Defaults to None.</span>
 <span class="sd">        generation_logits (torch.Tensor, optional): The logits on the generated output token ids. Defaults to None.</span>
 <span class="sd">        disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Parameters needed for disaggregated serving. Includes the type of request, the first generated tokens, the context request id and the any additional state needing to be transferred from context and generation instances. Defaults to None.</span>
+<span class="sd">        request_perf_metrics (tensorrt_llm.bindings.executor.RequestPerfMetrics, optional): Performance metrics for the request. Defaults to None.</span>
 
 <span class="sd">    Attributes:</span>
 <span class="sd">        length (int): The number of generated tokens.</span>
@@ -614,6 +615,7 @@
     <span class="n">stop_reason</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">generation_logits</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">disaggregated_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">DisaggregatedParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">request_perf_metrics</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">tllm</span><span class="o">.</span><span class="n">RequestPerfMetrics</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="c1"># hidden fields for tracking the diffs</span>
     <span class="n">_last_text_len</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="nb">repr</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
@@ -749,6 +751,9 @@
         <span class="k">if</span> <span class="n">finish_reasons</span> <span class="ow">and</span> <span class="n">finish_reasons</span><span class="p">[</span>
                 <span class="n">src_idx</span><span class="p">]</span> <span class="o">==</span> <span class="n">tllm</span><span class="o">.</span><span class="n">FinishReason</span><span class="o">.</span><span class="n">CANCELLED</span><span class="p">:</span>
             <span class="n">output</span><span class="o">.</span><span class="n">finish_reason</span> <span class="o">=</span> <span class="s1">&#39;cancelled&#39;</span>
+
+        <span class="k">if</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">request_perf_metrics</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">output</span><span class="o">.</span><span class="n">request_perf_metrics</span> <span class="o">=</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">request_perf_metrics</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_done</span><span class="p">:</span>
             <span class="k">if</span> <span class="n">finish_reasons</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span> <span class="o">==</span> <span class="n">tllm</span><span class="o">.</span><span class="n">FinishReason</span><span class="o">.</span><span class="n">END_ID</span><span class="p">:</span>
@@ -1283,9 +1288,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 21, 2025.</p>
+  <p>Last updated on June 29, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ebadc13">ebadc13</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/de97799">de97799</a>.</p>
   
 </div></div>
       
