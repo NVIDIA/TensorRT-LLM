@@ -304,7 +304,7 @@ class FP8RowwiseGemmRunner(TunableRunner):
         )
 
 
-@torch.library.custom_op("trtllm::fp8_rowwise_gemm_tunable", mutates_args=())
+@torch.library.custom_op("trtllm::fp8_rowwise_gemm", mutates_args=())
 def fp8_rowwise_gemm(
     act: torch.Tensor,
     weight: torch.Tensor,
@@ -325,8 +325,6 @@ def fp8_rowwise_gemm(
         FP8RowwiseGemmRunner.tuning_config,
         [act, weight, act_scale, weight_scale],
     )
-    # if best_tactic < 0:
-    #     print("czq best_tactic", best_tactic)
 
     return fp8_rowwise_gemm_runner(
         inputs=[act, weight, act_scale, weight_scale], tactic=best_tactic)

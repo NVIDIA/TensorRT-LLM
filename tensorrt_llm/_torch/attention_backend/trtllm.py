@@ -1062,6 +1062,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.has_fp8_qdq = self.quant_config.layer_quant_mode.has_fp8_qdq()
             self.has_fp8_block_wise = self.quant_config.layer_quant_mode.has_fp8_block_scales(
             )
+            self.has_fp8_rowwise = self.quant_config.layer_quant_mode.has_fp8_rowwise(
+            )
             self.has_nvfp4 = self.quant_config.layer_quant_mode.has_nvfp4()
 
     def get_local_layer_idx(self, metadata: TrtllmAttentionMetadata) -> int:
@@ -1167,8 +1169,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             if use_nvfp4_output:
                 # Use UINT8 as the container dtype for NVFP4.
                 out_dtype = torch.uint8
-            elif (self.has_fp8_qdq or self.has_nvfp4
-                  or self.has_fp8_block_wise) and self.has_fp8_kv_cache:
+            elif (self.has_fp8_qdq or self.has_nvfp4 or self.has_fp8_block_wise
+                  or self.has_fp8_rowwise) and self.has_fp8_kv_cache:
                 # TODO(qijun): revisit fp8_context_fmha logic
                 out_dtype = torch.float8_e4m3fn
 

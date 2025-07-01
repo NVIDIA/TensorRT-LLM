@@ -407,6 +407,13 @@ class FP8RowwiseLinearMethod(LinearMethodBase):
                                   requires_grad=False)
         module.weight_scale = Parameter(torch.empty(out_features),
                                         requires_grad=False)
+        # Not really used for Gemm now.
+        # Only used to quantize output of FP8 attention.
+        module.input_scale = Parameter(torch.tensor(1., dtype=torch.float32),
+                                       requires_grad=False)
+        module.inv_input_scale = Parameter(torch.tensor(1.,
+                                                        dtype=torch.float32),
+                                           requires_grad=False)
         if bias:
             module.bias = Parameter(torch.empty((out_features), dtype=dtype),
                                     requires_grad=False)
@@ -415,17 +422,19 @@ class FP8RowwiseLinearMethod(LinearMethodBase):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
-        # output = input @ (module.weight.t().to(module.weight_scale.dtype) * module.weight_scale).to(input.dtype)
-        # return output
-
-        # always use dynamic per-token quantization for activation
-        qinput, cur_input_scale = torch.ops.tensorrt_llm.quantize_e4m3_activation(
-            input)
+        # FP8 tensor inputs are from attention. Directly use ones as scale.
+        if input.dtype == torch.float8_e4m3fn:
+            qinput = input
+            cur_input_scale = torch.ones(input.shape[0],
+                                         device=input.device,
+                                         dtype=torch.float32)
+        else:
+            # Use dynamic per-token quantization for activation
+            qinput, cur_input_scale = torch.ops.tensorrt_llm.quantize_e4m3_activation(
+                input)
 
         # This op does not support bias now.
-        # print("czq mnk: ", qinput.shape[0], module.weight.shape[0], module.weight.shape[1])
-        # output = torch.ops.trtllm.fp8_rowwise_gemm(
-        output = torch.ops.trtllm.fp8_rowwise_gemm_tunable(
+        output = torch.ops.trtllm.fp8_rowwise_gemm(
             qinput,
             module.weight,
             cur_input_scale.float(),
@@ -453,8 +462,7 @@ class FP8RowwiseLinearMethod(LinearMethodBase):
         copy_weight(module.weight_scale, weight_scale)
         if "input_scale" in weights[0]:
             copy_weight(module.input_scale, weights[0]["input_scale"])
-            # 有用吗
-            # module.inv_input_scale.data = 1.0 / module.input_scale
+            module.inv_input_scale.data = 1.0 / module.input_scale
 
     def load_weights_fused_qkv_linear(self, module: Linear,
                                       weights: List[Dict]):
@@ -1097,6 +1105,12 @@ class Linear(nn.Module):
     def has_fp8_qdq(self):
         assert self._weights_created
         return self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp8_qdq(
+        )
+
+    @property
+    def has_fp8_rowwise(self):
+        assert self._weights_created
+        return self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp8_rowwise(
         )
 
     @property
