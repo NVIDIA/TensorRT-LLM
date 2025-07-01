@@ -87,6 +87,8 @@ class ModelConfig(Generic[TConfig]):
     # Allow models to select op according to whether CUDA Graphs are used.
     use_cuda_graph: bool = False
 
+    force_dynamic_quantization: bool = False
+
     extra_attrs: Dict = field(default_factory=dict, repr=False, init=False)
 
     _frozen: bool = field(default=False, init=False, repr=False)

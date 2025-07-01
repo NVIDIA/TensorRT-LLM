@@ -297,7 +297,7 @@ class FP8QDQLinearMethod(LinearMethodBase):
               bias: Optional[torch.Tensor]):
         cur_input_scale = module.input_scale
         if input.dtype != torch.float8_e4m3fn:
-            if module.input_scale is not None:
+            if module.input_scale is not None and not module.force_dynamic_quantization:
                 # Static quantization
                 qinput, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
                     input, module.input_scale)
@@ -926,6 +926,7 @@ class Linear(nn.Module):
         use_custom_cublas_mm: bool = False,
         lora: Optional[LoraLayer] = None,
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
+        force_dynamic_quantization: bool = False,
     ):
         from ..distributed import AllReduce
 
@@ -941,6 +942,7 @@ class Linear(nn.Module):
         self.tp_rank = self.mapping.tp_rank
         self.tp_mode = tensor_parallel_mode
         self.gather_output = gather_output
+        self.force_dynamic_quantization = force_dynamic_quantization
 
         local_in_features = in_features
         local_out_features = out_features
