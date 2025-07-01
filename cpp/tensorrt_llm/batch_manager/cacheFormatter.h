@@ -22,14 +22,10 @@
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
-#include "tensorrt_llm/executor/cacheCommunicator.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheConcatenate.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
-#include "tensorrt_llm/runtime/bufferManager.h"
-#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <NvInferRuntimeBase.h>
 #include <cstddef>
-#include <cstdint>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
@@ -111,8 +107,8 @@ public:
     }
 
     static bool needSendCache(CacheState const& selfConfig, CacheState const& destConfig, runtime::SizeType32 selfIdx);
-    [[nodiscard]] std::vector<size_t> pickRecvConnections(
-        size_t numConnections, CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig) const;
+    [[nodiscard]] std::vector<size_t> pickRecvConnections(size_t numConnections, CacheState const& selfConfig,
+        SizeType32 selfIdx, CacheState const& destConfig) const override;
 
 private:
     BaseKVCacheManager* mCacheManager;
