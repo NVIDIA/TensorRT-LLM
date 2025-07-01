@@ -361,8 +361,6 @@ class TestFP8BatchedGemmTRTLLMGen:
         a_fp32 = torch.randn((b, m, k), device="cuda", dtype=torch.float32)
         b_fp32 = torch.randn((b, n, k), device="cuda", dtype=torch.float32)
         # Pad to the tile size. It is needed for the TRT-LLM Gen BMM input requirements.
-        # TODO: Lets assume m is a multiple of tile_size.
-        # Not stand for small m because of the padding.
         if m % tile_size:
             tiled_shape = ((m + tile_size - 1) // tile_size) * tile_size
             a_fp32 = torch.nn.functional.pad(a_fp32, (0, 0, 0, tiled_shape - m),
