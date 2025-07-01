@@ -281,13 +281,13 @@ class ScenarioSpecification(BaseModel):
     )
     world: WorldConfig = Field(description="The world to use for benchmarking.")
 
-    _engine_config: Dict[str, Any] = PrivateAttr(init=False)
+    _engine_config: Optional[Dict[str, Any]] = PrivateAttr(default=None)
 
     class Config:
         validate_assignment = True
 
     @model_validator(mode="after")
-    def validate_engine_dir(self, v: Optional[Path]) -> Optional[Path]:
+    def validate_engine_dir(self) -> Self:
         engine_dir = bool(self.engine_dir is not None)
         trt_backend = bool(self.llm_config.backend == "tensorrt")
         engine_dir_exists = bool(self.engine_dir is not None
@@ -319,6 +319,8 @@ class ScenarioSpecification(BaseModel):
 
         # Validate/update settings in relation to the engine config.
         engine_mapping = self._engine_config["pretrained_config"]["mapping"]
+        build_config = self._engine_config["build_config"]
+
         engine_to_config_map = {
             "gpus_per_node": "gpus_per_node",
             "tp": "tp",
@@ -338,10 +340,20 @@ class ScenarioSpecification(BaseModel):
                     invalid_values.append(
                         f"{config_key}: Config: {cfg_value} -> Engine: {engine_value}"
                     )
-
+        # Print out all the invalid values we encountered.
         if invalid_values:
             raise ValueError("Invalid values detected in the engine config: \n"
                              f"{invalid_values.join('\n')}")
+
+        # The engine config has a max sequence length, so we need to validate
+        # that the dataset max sequence length is less than the engine max
+        # sequence length.
+        max_seq_len = self.dataset_metadata.seq_len_stats.maximum
+        if max_seq_len > build_config["max_seq_len"]:
+            raise ValueError(
+                f"Dataset max sequence length ({max_seq_len}) is greater than "
+                f"the maximum sequence length for the specified engine with"
+                f"(max sequence length={build_config['max_seq_len']}).")
 
         return self
 
