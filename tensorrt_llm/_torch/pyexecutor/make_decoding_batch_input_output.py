@@ -65,18 +65,6 @@ class MakeDecodingBatchInputOutput:
 
         decoding_input = DecoderBatchInput(logits_vec, 1)
         decoding_input.generation_steps = generation_steps
-        decoding_input.batch_slots = [torch.tensor(active_slots[0])]
-
-        print("Decoding input:")
-        print(f"logits_vec: {logits_vec}")
-        print(f"generation_steps: {generation_steps}")
-        print(f"batch_slots: {active_slots}")
-
-        # TODO: Needed?
-        # # Sort by slot number
-        # sorted_indices = sorted(range(len(active_slots)),
-        #                         key=lambda i: active_slots[i])
-        # active_slots = [active_slots[i] for i in sorted_indices]
-        # generation_steps = [generation_steps[i] for i in sorted_indices]
+        decoding_input.batch_slots = [torch.tensor(active_slots[0], dtype=torch.int32)]
 
         return decoding_input
