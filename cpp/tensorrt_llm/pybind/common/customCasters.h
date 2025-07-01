@@ -27,6 +27,7 @@
 #include "tensorrt_llm/runtime/torchView.h"
 
 #include <ATen/DLConvertor.h>
+#include <deque>
 #include <filesystem>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/filesystem.h>
@@ -56,6 +57,41 @@ namespace NB_NAMESPACE
 
 namespace detail
 {
+
+template <typename T, typename Alloc>
+struct type_caster<std::deque<T, Alloc>>
+{
+    using Type = std::deque<T, Alloc>;
+    NB_TYPE_CASTER(Type, const_name("List"));
+
+    bool from_python(handle src, uint8_t flags, cleanup_list* cleanup) noexcept
+    {
+        sequence seq(src, nanobind::detail::borrow_t{});
+        value.clear();
+        make_caster<T> caster;
+        for (auto const& item : seq)
+        {
+            if (!caster.from_python(item, flags, cleanup))
+                return false;
+            value.push_back(caster.operator T&());
+        }
+        return true;
+    }
+
+    static handle from_cpp(Type const& deque, rv_policy policy, cleanup_list* cleanup) noexcept
+    {
+        nb::list list;
+
+        for (auto const& item : deque)
+        {
+            nb::object py_item = steal(make_caster<T>::from_cpp(item, policy, cleanup));
+            if (!py_item)
+                return {};
+            list.append(py_item);
+        }
+        return list.release();
+    }
+};
 
 template <typename T>
 struct type_caster<tensorrt_llm::common::OptionalRef<T>>
