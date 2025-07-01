@@ -1,5 +1,6 @@
 import os
 import sys
+from datetime import datetime, timedelta
 
 import requests
 
@@ -97,6 +98,71 @@ def add_label_to_pr(repo_owner: str, repo_name: str, pr_number: str,
         raise e
 
 
+def get_recent_open_prs(repo_owner: str,
+                        repo_name: str,
+                        minutes_back: int = 65):
+    """Get open PRs created or updated in the last N minutes."""
+    cutoff_time = datetime.utcnow() - timedelta(minutes=minutes_back)
+
+    url = f"{GITHUB_API_URL}/repos/{repo_owner}/{repo_name}/pulls"
+    params = {
+        "state": "open",
+        "sort": "updated",
+        "direction": "desc",
+        "per_page": 100
+    }
+
+    recent_prs = []
+    page = 1
+
+    try:
+        while True:
+            params["page"] = page
+            response = requests.get(url,
+                                    headers=HEADERS,
+                                    params=params,
+                                    timeout=30)
+            response.raise_for_status()
+            page_prs = response.json()
+
+            if not page_prs:  # no more PRs
+                break
+
+            found_old_pr = False
+            for pr in page_prs:
+                created_at = datetime.strptime(pr["created_at"],
+                                               "%Y-%m-%dT%H:%M:%SZ")
+                updated_at = datetime.strptime(pr["updated_at"],
+                                               "%Y-%m-%dT%H:%M:%SZ")
+
+                if created_at >= cutoff_time or updated_at >= cutoff_time:
+                    recent_prs.append(pr)
+                else:
+                    # since sorted by updated desc, once we hit an old PR we can stop
+                    found_old_pr = True
+                    break
+
+            if found_old_pr:
+                break
+
+            page += 1
+            # safety limit to avoid infinite loops
+            if page > 10:  # max 1000 PRs (100 * 10)
+                print(
+                    f"Warning: Hit pagination limit at page {page}, may have missed some PRs"
+                )
+                break
+
+        print(
+            f"Found {len(recent_prs)} PRs created/updated in the last {minutes_back} minutes (checked {page} pages)"
+        )
+        return recent_prs
+
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching PRs: {e}")
+        raise
+
+
 def main():
     """
     Main function to check user membership and apply community labels.
@@ -106,10 +172,6 @@ def main():
     1 - Failed to determine user membership (API permission issues)
     2 - Failed to add community label (labeling API issues)
     """
-    pr_author = os.environ.get("PR_AUTHOR")
-    assert pr_author, "PR_AUTHOR environment variable not set"
-    pr_number = os.environ.get("PR_NUMBER")
-    assert pr_number, "PR_NUMBER environment variable not set"
     repo_owner = os.environ.get("REPO_OWNER")
     assert repo_owner, "REPO_OWNER environment variable not set"
     repo_name = os.environ.get("REPO_NAME")
@@ -117,34 +179,59 @@ def main():
     community_label = os.environ.get("COMMUNITY_LABEL")
     assert community_label, "COMMUNITY_LABEL environment variable not set"
 
-    print(
-        f"Starting NVIDIA membership check for PR author '{pr_author}' on PR #{pr_number}."
-    )
+    print(f"Starting community PR labeling sweep for {repo_owner}/{repo_name}")
 
     try:
-        is_member = check_user_membership("NVIDIA", pr_author)
-    except RuntimeError as e:
-        print(
-            f"Critical error during NVIDIA membership check for '{pr_author}': {e}"
-        )
-        print("Halting script due to inability to determine membership status.")
+        recent_prs = get_recent_open_prs(repo_owner, repo_name, 65)
+    except requests.exceptions.RequestException:
+        print("Failed to fetch recent PRs")
         sys.exit(1)
 
-    print(
-        f"User '{pr_author}' is determined to be an NVIDIA member: {is_member}")
+    processed_count = 0
+    labeled_count = 0
 
-    if not is_member:
-        print(
-            f"User '{pr_author}' is a community user. Adding label '{community_label}'."
-        )
+    for pr in recent_prs:
+        pr_number = pr["number"]
+        pr_author = pr["user"]["login"]
+        existing_labels = {label["name"] for label in pr["labels"]}
+
+        # skip if already has the community label
+        if community_label in existing_labels:
+            print(
+                f"PR #{pr_number} by {pr_author} already has community label, skipping"
+            )
+            continue
+
+        print(f"Processing PR #{pr_number} by {pr_author}")
+        processed_count += 1
+
         try:
-            add_label_to_pr(repo_owner, repo_name, pr_number, community_label)
-        except requests.exceptions.RequestException as e:
-            print(f"Failed to add community label: {e}")
-            sys.exit(2)
-    else:
-        print(
-            f"User '{pr_author}' is an NVIDIA member. No label will be added.")
+            is_member = check_user_membership("NVIDIA", pr_author)
+        except RuntimeError as e:
+            print(
+                f"Critical error during NVIDIA membership check for '{pr_author}': {e}"
+            )
+            print("Continuing with next PR...")
+            continue
+
+        if not is_member:
+            print(
+                f"User '{pr_author}' is a community user. Adding label '{community_label}'."
+            )
+            try:
+                add_label_to_pr(repo_owner, repo_name, str(pr_number),
+                                community_label)
+                labeled_count += 1
+            except requests.exceptions.RequestException as e:
+                print(f"Failed to add community label to PR #{pr_number}: {e}")
+                # continue with other PRs instead of exiting
+                continue
+        else:
+            print(f"User '{pr_author}' is an NVIDIA member. No label needed.")
+
+    print(
+        f"Sweep complete: processed {processed_count} PRs, labeled {labeled_count} as community"
+    )
 
 
 if __name__ == "__main__":
