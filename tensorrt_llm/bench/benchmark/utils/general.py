@@ -86,18 +86,15 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
     enable_chunked_prefill = params.get("enable_chunked_prefill", False)
 
     kv_cache_dtype = "auto"
-    cuda_graph_batch_sizes = None
     if extra_llm_api_options:
         with open(extra_llm_api_options, 'r') as f:
             llm_args_dict = yaml.safe_load(f)
-            if "kv_cache_dtype" in llm_args_dict:
-                kv_cache_dtype = llm_args_dict["kv_cache_dtype"]
-            if "cuda_graph_config" in llm_args_dict:
-                cuda_graph_batch_sizes = \
-                    llm_args_dict["cuda_graph_config"].get("max_batch_sizes", None)
 
-            enable_chunked_prefill = llm_args_dict.get("enable_chunked_prefill",
-                                                       enable_chunked_prefill)
+    if "kv_cache_dtype" in llm_args_dict:
+        kv_cache_dtype = llm_args_dict["kv_cache_dtype"]
+
+    enable_chunked_prefill = llm_args_dict.get("enable_chunked_prefill",
+                                               enable_chunked_prefill)
 
     world_config = {
         "pp_size": params.get("pp"),
@@ -148,13 +145,35 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
             )
             max_num_tokens = dataset_metadata.max_isl + max_batch_size
 
-    pyt_options = {
-        "cuda_graph_config": {
+    # We need to check if the cuda_graph_config is provided in the extra_llm_api_options file.
+    # It can be provided with settings or as None (to disable cuda graphs)
+    # We need to check for both its value and existence.
+    cuda_graph_config = llm_args_dict.get("cuda_graph_config", None)
+    cuda_graph_in_options = "cuda_graph_config" in llm_args_dict
+    cuda_graph_batch_sizes = None
+    # If it's not None, we need to check if the max_batch_sizes is provided.
+    if cuda_graph_config is not None:
+        cuda_graph_batch_sizes = \
+            llm_args_dict["cuda_graph_config"].get("batch_sizes", None)
+
+    # We now have three cases:
+    # 1. cuda_graph_config is provided in the extra_llm_api_options file and is None (disabled)
+    if cuda_graph_in_options and cuda_graph_config is None:
+        logger.warning(
+            "'cuda_graph_config' is forced to be disabled in the extra_llm_api_options file."
+        )
+        cuda_graph_config = None
+    # 2. cuda_graph_config is provided in the extra_llm_api_options or is not provided (enabled)
+    else:
+        cuda_graph_config = {
             "padding_enabled":
             True,
             "max_batch_size":
             max_batch_size if cuda_graph_batch_sizes is None else 0,
-        },
+        }
+
+    pyt_options = {
+        "cuda_graph_config": cuda_graph_config,
         "kv_cache_dtype": kv_cache_dtype,
     }
     backend = params.get("backend", "pytorch")
