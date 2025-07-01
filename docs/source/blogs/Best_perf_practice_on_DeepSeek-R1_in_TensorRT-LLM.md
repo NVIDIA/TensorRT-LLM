@@ -196,20 +196,20 @@ We are seeing meaningful speedup using FP8 KV cache, thus refreshing the numbers
 ```bash
 cat >./extra-llm-api-config.yml <<EOF
 pytorch_backend_config:
-  use_cuda_graph: true
-  cuda_graph_padding_enabled: true
-  cuda_graph_batch_sizes:
-  - 896
-  - 512
-  - 256
-  - 128
-  - 64
-  - 32
-  - 16
-  - 8
-  - 4
-  - 2
-  - 1
+  cuda_graph_config:
+    padding_enabled: true
+    batch_sizes:
+    - 896
+    - 512
+    - 256
+    - 128
+    - 64
+    - 32
+    - 16
+    - 8
+    - 4
+    - 2
+    - 1
   print_iter_log: true
   kv_cache_dtype: fp8
 enable_attention_dp: true
@@ -264,19 +264,19 @@ YOUR_DATA_PATH=./dataset.txt
 
 cat >./extra-llm-api-config.yml <<EOF
 pytorch_backend_config:
-    use_cuda_graph: true
-    cuda_graph_padding_enabled: true
-    cuda_graph_batch_sizes:
-    - 1
-    - 2
-    - 4
-    - 8
-    - 16
-    - 32
-    - 64
-    - 128
-    - 256
-    - 384
+    cuda_graph_config:
+      padding_enabled: true
+      batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 384
     print_iter_log: ${PRINT_ITER_LOG}
 enable_attention_dp: true
 EOF

@@ -187,8 +187,8 @@ def setup_llm(args):
         spec_config = None
 
     cuda_graph_config = CudaGraphConfig(
-        cuda_graph_batch_sizes=args.cuda_graph_batch_sizes,
-        cuda_graph_padding_enabled=args.cuda_graph_padding_enabled,
+        batch_sizes=args.cuda_graph_batch_sizes,
+        padding_enabled=args.cuda_graph_padding_enabled,
     ) if args.use_cuda_graph else None
     llm = LLM(
         model=args.model_dir,
