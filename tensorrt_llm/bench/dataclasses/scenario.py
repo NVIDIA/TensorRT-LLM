@@ -15,6 +15,7 @@ from tensorrt_llm.bench.benchmark.tuning.utils import get_model_config
 from tensorrt_llm.bench.build.utils import get_safetensors_metadata
 from tensorrt_llm.bench.dataclasses.general import DatasetMetadata
 from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
+from tensorrt_llm.logger import logger
 # isort: on
 
 
@@ -31,7 +32,7 @@ class BatchingConfiguration(BaseModel):
 
 
 class LlmRuntimeSpecification(BaseModel):
-    backend: Optional[Literal["pytorch", "_autodeploy", "trt"]] = Field(
+    backend: Optional[Literal["pytorch", "_autodeploy", "tensorrt"]] = Field(
         default="pytorch", description="The backend to use for benchmarking.")
     beam_width: Optional[int] = Field(
         default=None, description="The beam width to use for benchmarking.")
@@ -196,7 +197,7 @@ class ModelConfig(BaseModel):
                                      "dtype", "torch_dtype"))
 
     @model_validator(mode="after")
-    def set_values_if_none(self):
+    def set_values_if_none(self) -> Self:
         """ Set the values if cannot get values from HF config.json. """
         if not self.dtype:  # for GPT-J
             self.dtype = "float16"
@@ -207,7 +208,7 @@ class ModelConfig(BaseModel):
         return self
 
     @classmethod
-    def get_param_count(cls, model_hf_name, hf_model_path):
+    def get_param_count(cls, model_hf_name, hf_model_path) -> int:
         """ Read the parameter count from HF safetensor metadata. """
         if model_hf_name == "EleutherAI/gpt-j-6b":  # GPT-J repo doesn't use safetensor format.
             param_count = 6053381344
@@ -220,7 +221,7 @@ class ModelConfig(BaseModel):
         return param_count
 
     @classmethod
-    def from_hf(cls, model_hf_name, hf_model_path):
+    def from_hf(cls, model_hf_name, hf_model_path) -> Self:
         model_name_or_path = hf_model_path or model_hf_name
         hf_config = AutoConfig.from_pretrained(
             model_name_or_path, trust_remote_code=True).to_dict()
@@ -281,7 +282,7 @@ class ScenarioSpecification(BaseModel):
     )
     world: WorldConfig = Field(description="The world to use for benchmarking.")
 
-    _engine_config: Optional[Dict[str, Any]] = PrivateAttr(default=None)
+    _engine_config: Dict[str, Any] = PrivateAttr(default=dict)
 
     class Config:
         validate_assignment = True
@@ -309,6 +310,8 @@ class ScenarioSpecification(BaseModel):
                 f"Engine directory ('engine_dir') does not exist: {self.engine_dir}"
             )
 
+        return self
+
     @model_validator(mode="after")
     def validate_engine_config(self) -> Self:
         if self.engine_dir is None:
@@ -328,13 +331,13 @@ class ScenarioSpecification(BaseModel):
             "ep": "ep",
             "cluster_size": "cluster_size",
         }
-        invalid_values = []
+        invalid_values: list[str] = []
         for engine_key, config_key in engine_to_config_map.items():
             if engine_key in engine_mapping:
-                cfg_value = self.world.model_getattr(config_key)
+                cfg_value = getattr(self.world, config_key)
                 engine_value = engine_mapping[engine_key]
                 value = cfg_value or engine_value
-                self.world.model_setattr(config_key, value)
+                setattr(self.world, config_key, value)
 
                 if value != engine_value:
                     invalid_values.append(
@@ -343,17 +346,20 @@ class ScenarioSpecification(BaseModel):
         # Print out all the invalid values we encountered.
         if invalid_values:
             raise ValueError("Invalid values detected in the engine config: \n"
-                             f"{invalid_values.join('\n')}")
+                             f"{'\n'.join(invalid_values)}")
 
-        # The engine config has a max sequence length, so we need to validate
-        # that the dataset max sequence length is less than the engine max
-        # sequence length.
-        max_seq_len = self.dataset_metadata.seq_len_stats.maximum
-        if max_seq_len > build_config["max_seq_len"]:
-            raise ValueError(
-                f"Dataset max sequence length ({max_seq_len}) is greater than "
-                f"the maximum sequence length for the specified engine with"
-                f"(max sequence length={build_config['max_seq_len']}).")
+        if self.dataset_metadata is None:
+            logger.warning("Dataset metadata is not set, skipping max sequence length validation.")
+        else:
+            # The engine config has a max sequence length, so we need to validate
+            # that the dataset max sequence length is less than the engine max
+            # sequence length.
+            max_seq_len = self.dataset_metadata.seq_len_stats.maximum
+            if max_seq_len > build_config["max_seq_len"]:
+                raise ValueError(
+                    f"Dataset max sequence length ({max_seq_len}) is greater than "
+                    f"the maximum sequence length for the specified engine with"
+                    f"(max sequence length={build_config['max_seq_len']}).")
 
         return self
 
@@ -437,11 +443,16 @@ class BenchmarkEnvironment(BaseModel):
     workspace: Path = Field(
         default="/tmp", description="The workspace to use for engine building.")
 
+    @property
+    def model_path(self) -> str:
+        return str(self.checkpoint_path or self.model)
+
     @computed_field(
         description=
         "The type of model being used, derived from the model configuration.")
     def model_type(self) -> str:
         return get_model_config(self.model, self.checkpoint_path).model_type
+
 
 
 class BenchmarkSpecification(BaseModel):
