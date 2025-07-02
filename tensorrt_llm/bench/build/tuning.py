@@ -1,10 +1,9 @@
 from typing import Tuple
 
-from tensorrt_llm._torch.pyexecutor.config_utils import is_nemotron_hybrid
 from tensorrt_llm.llmapi.llm_utils import QuantConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
-from tensorrt_llm.bench.build.dataclasses import ModelConfig
+from tensorrt_llm.bench.build.dataclasses import ModelConfig, NemotronHybridConfig
 from .utils import get_device_memory
 import math
 
@@ -57,11 +56,10 @@ def calc_engine_setting(
     # Each GPU in TP group has at least 1 kv head
     adjusted_num_kv_heads = max(tp_size, model_config.num_key_value_heads)
 
-    is_mamba_attn_hybrid = is_nemotron_hybrid(model_config)
-    if is_mamba_attn_hybrid:
-        num_attention_layers = model_config.hybrid_override_pattern.count("*")
-    else:
-        num_attention_layers = model_config.num_hidden_layers
+    num_attention_layers = model_config.num_attention_layers
+
+    is_mamba_attn_hybrid = isinstance(model_config, NemotronHybridConfig)
+
     logger.info(f"Number of attention layers: {num_attention_layers}")
 
     byte_per_token = 2 * num_attention_layers * adjusted_num_kv_heads \
@@ -82,11 +80,11 @@ def calc_engine_setting(
     target_seq_len = target_input_len + target_output_len
 
     if is_mamba_attn_hybrid:
-        num_mamba_layers = model_config.hybrid_override_pattern.count("M")
-        conv_dim = model_config.mamba_config.d_inner + 2 * model_config.mamba_config.n_groups * model_config.mamba_config.d_state
+        num_mamba_layers = model_config.num_mamba_layers
+        conv_dim = model_config.d_inner + 2 * model_config.n_groups * model_config.d_state
         num_conv_state_elements = num_mamba_layers * conv_dim * (
-            model_config.mamba_config.d_conv - 1)
-        num_ssm_state_elements = num_mamba_layers * model_config.mamba_config.n_heads * model_config.mamba_config.head_dim * model_config.mamba_config.d_state
+            model_config.d_conv - 1)
+        num_ssm_state_elements = num_mamba_layers * model_config.mamba_num_heads * model_config.mamba_head_dim * model_config.d_state
         byte_per_state_elem = BYTES_PER_ELEM.get(QuantAlgo.NO_QUANT)
         byte_per_mamba_cache = byte_per_state_elem * (
             num_conv_state_elements + num_ssm_state_elements) / (1024**3)

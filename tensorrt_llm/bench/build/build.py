@@ -1,10 +1,12 @@
 from __future__ import annotations
+from transformers import AutoConfig
 
 from pathlib import Path
 from typing import Tuple, get_args
 import click
 from click_option_group import AllOptionGroup, optgroup
 
+from tensorrt_llm._torch.pyexecutor.config_utils import is_nemotron_hybrid
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.utils.data import create_dataset_from_stream, initialize_tokenizer
 from tensorrt_llm.bench.utils import VALID_QUANT_ALGOS
@@ -13,7 +15,7 @@ from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.llmapi.llm_utils import QuantConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
-from tensorrt_llm.bench.build.dataclasses import ModelConfig
+from tensorrt_llm.bench.build.dataclasses import ModelConfig, NemotronHybridConfig
 from tensorrt_llm.bench.build.tuning import calc_engine_setting
 
 TUNED_QUANTS = {
@@ -84,6 +86,10 @@ def get_model_config(model_name: str, model_path: Path = None) -> ModelConfig:
     Raises:
         ValueError: When model is not supported.
     """
+    if is_nemotron_hybrid(
+            AutoConfig.from_pretrained(model_path or model_name,
+                                       trust_remote_code=True)):
+        return NemotronHybridConfig.from_hf(model_name, model_path)
     return ModelConfig.from_hf(model_name, model_path)
 
 
