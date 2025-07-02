@@ -4,7 +4,6 @@ import pytest
 from .test_llm import tinyllama_logits_processor_test_harness
 from tensorrt_llm.llmapi import KvCacheConfig
 from .test_llm_pytorch import (llama_7b_lora_from_dir_test_harness,
-                               llama_v2_13b_lora_from_dir_test_harness,
                                llama_7b_multi_lora_from_request_test_harness)
 
 # isort: on
@@ -26,13 +25,6 @@ def test_tinyllama_logits_processor_2gpu(tp_size: int, pp_size: int):
     tinyllama_logits_processor_test_harness(backend="pytorch",
                                             tensor_parallel_size=tp_size,
                                             pipeline_parallel_size=pp_size)
-
-
-@pytest.mark.gpu2
-@pytest.mark.skip("prefer 7b test")
-def test_llama_v2_13b_lora_tp2():
-    llama_v2_13b_lora_from_dir_test_harness(
-        tensor_parallel_size=2, kv_cache_config=global_kv_cache_config)
 
 
 @pytest.mark.gpu2
