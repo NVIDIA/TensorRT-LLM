@@ -33,6 +33,7 @@ def create_nemotron_h_llm(use_cuda_graph, disable_overlap_scheduler,
                           max_batch_size):
     """Create LLM with specific overlap scheduler setting"""
     model_dir = f"{llm_models_root(check=True)}/Nemotron-H-8B-Base-8K"
+    # model_dir = f"{llm_models_root(check=True)}/Qwen3/Qwen3-8B"
     return LLM(
         model=model_dir,
         tensor_parallel_size=1,
@@ -281,14 +282,20 @@ def test_nemotron_h_cuda_graph_overlap_scheduler():
         assert (with_cg_no_overlap.outputs[0].text ==
                 with_cg_with_overlap.outputs[0].text)
 
-        # with/without CG can have some difference in logits - high tolerance
+        # similar to other unittests comparing with / without CG, compare logits of first generation step (2nd generated token)
         torch.testing.assert_close(
-            no_cg_no_overlap.outputs[0].generation_logits,
-            with_cg_no_overlap.outputs[0].generation_logits,
-            atol=0.4,
-            rtol=0.4)
+            no_cg_no_overlap.outputs[0].generation_logits[1, :],
+            with_cg_no_overlap.outputs[0].generation_logits[1, :],
+            atol=0.2,
+            rtol=0.2)
 
-        # overlap scheduler should have no effect on logits - low tolerance
+        # compare logprobs of all generated tokens
+        torch.testing.assert_close(extract_decode_logprobs(no_cg_no_overlap),
+                                   extract_decode_logprobs(with_cg_no_overlap),
+                                   atol=0.2,
+                                   rtol=0.2)
+
+        # overlap scheduler should have no effect on all logits - low tolerance
         torch.testing.assert_close(
             with_cg_no_overlap.outputs[0].generation_logits,
             with_cg_with_overlap.outputs[0].generation_logits,
