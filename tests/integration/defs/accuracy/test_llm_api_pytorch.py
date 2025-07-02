@@ -1738,8 +1738,10 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             (4, 1, 4, False, True, True, "TRTLLM"),
         ],
         ids=[
-            "latency_moe_cutlass", "latency_moe_trtllm",
-            "4gpu_latency_moe_trtllm", "4gpu_latency_moe_cutlass"
+            "latency_moe_cutlass",
+            "latency_moe_trtllm",
+            "4gpu_latency_moe_cutlass",
+            "4gpu_latency_moe_trtllm",
         ],
     )
     def test_nvfp4(
