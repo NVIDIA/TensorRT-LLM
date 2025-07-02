@@ -33,7 +33,6 @@ def create_nemotron_h_llm(use_cuda_graph, disable_overlap_scheduler,
                           max_batch_size):
     """Create LLM with specific overlap scheduler setting"""
     model_dir = f"{llm_models_root(check=True)}/Nemotron-H-8B-Base-8K"
-    # model_dir = f"{llm_models_root(check=True)}/Qwen3/Qwen3-8B"
     return LLM(
         model=model_dir,
         tensor_parallel_size=1,
