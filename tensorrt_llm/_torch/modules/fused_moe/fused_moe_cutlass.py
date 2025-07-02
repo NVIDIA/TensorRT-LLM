@@ -59,6 +59,8 @@ class CutlassFusedMoE(MoE):
         bias: bool = False,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
+        swiglu_alpha: Optional[torch.Tensor] = None,
+        swiglu_beta: Optional[torch.Tensor] = None,
     ):
 
         super().__init__(
@@ -71,6 +73,8 @@ class CutlassFusedMoE(MoE):
             model_config=model_config,
             weight_loading_mode=weight_loading_mode,
             bias=bias,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
         )
 
         self.layer_idx = layer_idx
@@ -288,14 +292,14 @@ class CutlassFusedMoE(MoE):
             token_selected_experts,
             token_final_scales,
             self.w3_w1_weight.view(weight_dtype),
-            None,  # fc1_expert_biases
+            self.w3_w1_bias,
             self.w2_weight.view(weight_dtype),
-            None,  # fc2_expert_biases
+            self.w2_bias,
             output_dtype,
             quant_scales=self.quant_scales,
             input_sf=x_sf,
-            swiglu_alpha=None,
-            swiglu_beta=None,
+            swiglu_alpha=self.swiglu_alpha,
+            swiglu_beta=self.swiglu_beta,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             ep_size=self.ep_size,

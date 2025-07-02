@@ -42,6 +42,8 @@ class MoE(nn.Module):
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
         bias: bool = False,
+        swiglu_alpha: Optional[torch.Tensor] = None,
+        swiglu_beta: Optional[torch.Tensor] = None,
     ):
         from ...distributed import AllReduce
 
@@ -54,6 +56,8 @@ class MoE(nn.Module):
         self.bias = bias
         self.dtype = dtype
         self.reduce_results = reduce_results
+        self.swiglu_alpha = swiglu_alpha
+        self.swiglu_beta = swiglu_beta
 
         # could be modified later
         self.quant_config = model_config.quant_config

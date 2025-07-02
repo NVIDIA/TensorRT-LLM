@@ -159,6 +159,9 @@ class FusedMoEMethodBase(ABC):
                 dtype=bias_dtype),
                                    requires_grad=False)
             module.register_parameter("w2_bias", w2_bias)
+        else:
+            module.w3_w1_bias = None
+            module.w2_bias = None
 
     def load_expert_weights_to_dst(
             self, module: torch.nn.Module, weights: List[Dict],
