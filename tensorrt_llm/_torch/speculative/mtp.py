@@ -304,33 +304,30 @@ class MTPSampler(TorchSampler):
             self._request_common_handling(req, next_draft_tokens_list)
 
     def sample_async(self, scheduled_requests: ScheduledRequests,
-                     model_outputs) -> SampleStateMTP:
-        # new_tokens_device: all of the accepted tokens, device tensor, shape: batch_size, nextn + 1
-        # new_tokens_lens_device: the accepted lengths, device tensor, shape: batch_size
+                     outputs) -> SampleStateMTP:
+        # new_tokens_device: accepted tokens, device tensor, shape: batch_size, nextn + 1
+        # new_tokens_lens_device: accepted lengths, device tensor, shape: batch_size
         # next_draft_tokens_device: predicted draft tokens, device tensor, shape: batch_size, nextn
         # next_new_tokens_device: input tokens for the next iteration, device tensor, shape: batch_size, nextn + 1
-        new_tokens_device = model_outputs['new_tokens']
-        new_tokens_lens_device = model_outputs['new_tokens_lens']
-        next_draft_tokens_device = model_outputs['next_draft_tokens']
-        next_new_tokens_device = model_outputs['next_new_tokens']
 
         requests = scheduled_requests.all_requests()
-        seq_slots = torch.as_tensor([r.seq_slot for r in requests])
-        seq_slots = seq_slots.to(device="cuda", non_blocking=True)
+        slots = torch.as_tensor([r.seq_slot for r in requests])
+        slots = slots.to(device="cuda", non_blocking=True)
+
+        o_new_tokens = outputs['new_tokens'][:len(requests)]
+        o_new_tokens_lens = outputs['new_tokens_lens'][:len(requests)]
+        o_next_draft_tokens = outputs['next_draft_tokens'][:len(requests)]
+        o_next_new_tokens = outputs['next_new_tokens'][:len(requests)]
 
         new_tokens = self.store.new_tokens
         next_new_tokens = self.store.next_new_tokens
         new_tokens_lens = self.store.new_tokens_lens
         next_draft_tokens = self.store.next_draft_tokens
-        for idx, seq_slot in enumerate(seq_slots):
-            slc = slice(0, self.draft_len + 1), seq_slot, self.BEAM
-            new_tokens[slc].copy_(new_tokens_device[idx], non_blocking=True)
-            next_new_tokens[slc].copy_(next_new_tokens_device[idx],
-                                       non_blocking=True)
-            new_tokens_lens[seq_slot].copy_(new_tokens_lens_device[idx],
-                                            non_blocking=True)
-            next_draft_tokens[seq_slot].copy_(next_draft_tokens_device[idx],
-                                              non_blocking=True)
+
+        new_tokens.squeeze(-1).T.index_copy_(0, slots, o_new_tokens)
+        next_new_tokens.squeeze(-1).T.index_copy_(0, slots, o_next_new_tokens)
+        new_tokens_lens.index_copy_(0, slots, o_new_tokens_lens)
+        next_draft_tokens.index_copy_(0, slots, o_next_draft_tokens)
 
         device = SampleStateTensorsMTP(
             new_tokens=next_new_tokens,
