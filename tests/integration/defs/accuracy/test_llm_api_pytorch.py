@@ -1457,13 +1457,15 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
                               use_cuda_graph=cuda_graph)
 
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
         llm = LLM(
             f"{llm_models_root()}/Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
             tensor_parallel_size=tp_size,
             pipeline_parallel_size=pp_size,
             moe_expert_parallel_size=ep_size,
             **pytorch_config,
-            enable_attention_dp=attention_dp)
+            enable_attention_dp=attention_dp,
+            kv_cache_config=kv_cache_config)
         with llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
