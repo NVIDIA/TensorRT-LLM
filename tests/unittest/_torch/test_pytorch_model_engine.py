@@ -284,34 +284,29 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                          [1, 2, 3, model_engine.max_seq_len])
 
     def test_cuda_graph_enable(self):
-        print(
-            "\n=== Test 1: Default behavior (no cuda_graph_config specified) ==="
-        )
+        # Test 1: Default behavior (no cuda_graph_config specified)
         llm_args_default = LlmArgs.from_kwargs(model="dummy_model")
         pytorch_config_default = llm_args_default.get_pytorch_backend_config()
         self.assertTrue(pytorch_config_default.use_cuda_graph,
                         "CUDA graphs should be enabled by default")
-        print(f"use_cuda_graph: {pytorch_config_default.use_cuda_graph}")
 
-        print("\n=== Test 2: Explicit CudaGraphConfig() ===")
+        # Test 2: Explicit CudaGraphConfig()
         llm_args_explicit = LlmArgs.from_kwargs(
             model="dummy_model", cuda_graph_config=CudaGraphConfig())
         pytorch_config_explicit = llm_args_explicit.get_pytorch_backend_config()
         self.assertTrue(
             pytorch_config_explicit.use_cuda_graph,
             "CUDA graphs should be enabled when CudaGraphConfig() is provided")
-        print(f"use_cuda_graph: {pytorch_config_explicit.use_cuda_graph}")
 
-        print("\n=== Test 3: cuda_graph_config=None (explicitly disabled) ===")
+        # Test 3: cuda_graph_config=None (explicitly disabled)
         llm_args_disabled = LlmArgs.from_kwargs(model="dummy_model",
                                                 cuda_graph_config=None)
         pytorch_config_disabled = llm_args_disabled.get_pytorch_backend_config()
         self.assertFalse(
             pytorch_config_disabled.use_cuda_graph,
             "CUDA graphs should be disabled when cuda_graph_config=None")
-        print(f"use_cuda_graph: {pytorch_config_disabled.use_cuda_graph}")
 
-        print("\n=== Test 4: Custom CudaGraphConfig with specific settings ===")
+        # Test 4: Custom CudaGraphConfig with specific settings
         custom_config = CudaGraphConfig(max_batch_size=256,
                                         padding_enabled=True)
         llm_args_custom = LlmArgs.from_kwargs(model="dummy_model",
@@ -323,13 +318,6 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                          "Custom max_batch_size should be respected")
         self.assertTrue(pytorch_config_custom.cuda_graph_padding_enabled,
                         "Custom padding_enabled should be respected")
-        print(f"use_cuda_graph: {pytorch_config_custom.use_cuda_graph}")
-        print(
-            f"cuda_graph_max_batch_size: {pytorch_config_custom.cuda_graph_max_batch_size}"
-        )
-        print(
-            f"cuda_graph_padding_enabled: {pytorch_config_custom.cuda_graph_padding_enabled}"
-        )
 
 
 if __name__ == "__main__":
