@@ -812,6 +812,7 @@ class PyTorchModelEngine(ModelEngine):
             return self.attn_backend.Metadata(
                 max_num_requests=self.batch_size,
                 max_num_tokens=self.max_num_tokens,
+                max_num_sequences=self.batch_size * self.max_beam_width,
                 kv_cache_manager=None,
                 mapping=self.mapping,
                 runtime_features=self.attn_runtime_features,
@@ -827,6 +828,7 @@ class PyTorchModelEngine(ModelEngine):
         self.attn_metadata = self.attn_backend.Metadata(
             max_num_requests=self.batch_size,
             max_num_tokens=self.max_num_tokens,
+            max_num_sequences=self.batch_size * self.max_beam_width,
             kv_cache_manager=kv_cache_manager,
             mapping=self.mapping,
             runtime_features=self.attn_runtime_features,

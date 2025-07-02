@@ -169,7 +169,9 @@ class KvCacheCreator:
             num_cache_blocks += (num_req_tokens +
                                  executor_config.tokens_per_block -
                                  1) // executor_config.tokens_per_block
-        return num_cache_blocks * executor_config.tokens_per_block
+        # Multiply by beam width, to prevent rescaling of the max_seq_len caused by the influence of beam width during the preparation for kv_cache_estimation
+        return num_cache_blocks * executor_config.tokens_per_block * self._dummy_reqs[
+            0].sampling_config.beam_width
 
     def try_prepare_estimation(self) -> bool:
         """Prepare for possible KV cache capacity estimation.
@@ -366,13 +368,10 @@ class KvCacheCreator:
                 mapping=mapping,
                 dtype=kv_cache_dtype,
                 spec_config=spec_config,
-<<<<<<< HEAD
                 max_num_tokens=executor_config.max_num_tokens,
-                model_config=binding_model_config)
-=======
+                model_config=binding_model_config,
                 max_beam_width=executor_config.max_beam_width,
             )
->>>>>>> bceaf63bb (feat: added beam search support to the PyTorch Workflow)
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to executor_config
         if model_engine.kv_cache_manager_key == ResourceManagerType.KV_CACHE_MANAGER:
             executor_config.max_seq_len = kv_cache_manager.max_seq_len

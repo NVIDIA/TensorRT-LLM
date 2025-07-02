@@ -236,7 +236,8 @@ class KVCacheManager(BaseResourceManager):
             tokens_per_block=tokens_per_block,
             sink_token_length=sink_token_length,
             max_seq_len=self.max_seq_len,
-            max_beam_width=self.max_beam_width,)
+            max_beam_width=max_beam_width,
+        )
 
         if kv_cache_type != CacheTypeCpp.SELF:
             assert len(
@@ -658,6 +659,7 @@ class KVCacheManager(BaseResourceManager):
         tokens_per_block: int,
         sink_token_length: int,
         max_seq_len: int,
+        max_beam_width: int,
     ) -> Tuple[BlocksPerWindow, int, List[int]]:
         """
         Validate and adjust attention windows against their upper bounds if needed.
@@ -673,7 +675,6 @@ class KVCacheManager(BaseResourceManager):
         Returns:
             Tuple of (adjusted_blocks_per_window, adjusted_max_seq_len, adjusted_max_attention_window_vec)
         """
-        max_beam_width = 1  # TODO: support more than 1 beam?
         window_adjustments = {}
         # Validate each window size in blocks_per_window against its upper bound
         for window_size, (blocks_in_primary_pool,

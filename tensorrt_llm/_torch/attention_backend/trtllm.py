@@ -592,7 +592,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     def __post_init__(self) -> None:
         super().__post_init__()
         self.prompt_lens_cuda = torch.empty(
-            (self.max_num_requests, ),
+            (self.max_num_sequences, ),
             device='cuda',
             dtype=torch.int,
         )
@@ -617,8 +617,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.kv_cache_manager is not None:
             self.kv_cache_block_offsets = torch.empty(
                 [
-                    self.kv_cache_manager.num_pools, self.max_num_requests *
-                    self.beam_width, 2, self.kv_cache_manager.max_blocks_per_seq
+                    self.kv_cache_manager.num_pools, self.max_num_sequences, 2,
+                    self.kv_cache_manager.max_blocks_per_seq
                 ],
                 dtype=torch.int32,
                 device='cuda',

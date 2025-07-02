@@ -270,7 +270,9 @@ class PyExecutor:
             self.event_loop = self._executor_loop_pp
         else:
             self.event_loop = self._executor_loop if disable_overlap_scheduler else self._executor_loop_overlap
-
+        if not disable_overlap_scheduler and model_engine.max_beam_width > 1:
+            raise NotImplementedError(
+                "Overlap scheduler is not supported for beam search.")
         if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
             self.event_loop = trace_func(self.event_loop)
 
