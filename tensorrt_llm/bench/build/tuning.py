@@ -80,7 +80,6 @@ def calc_engine_setting(
 
     # Calculate max requests in KV cache based on target ISL and OSL.
     target_seq_len = target_input_len + target_output_len
-
     cache_memory = available_memory * kv_cache_gpu_mem_fraction
     gb_per_extra_cache = model_config.extra_model_cache_in_gb(
         BYTES_PER_ELEM.get(QuantAlgo.NO_QUANT), target_seq_len)
