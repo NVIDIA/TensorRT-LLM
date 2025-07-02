@@ -269,12 +269,9 @@ class NGramDrafter(Drafter):
         total_num_accepted_tokens = 0
         num_requests_with_draft_tokens = 0
         for request in scheduled_requests.generation_requests:
-            num_draft_tokens = 0 if request.py_last_draft_tokens is None else len(
-                request.py_last_draft_tokens)
-            num_accepted_tokens = request.py_num_accepted_draft_tokens
-            if num_draft_tokens > 0:
-                total_num_draft_tokens += num_draft_tokens
-                total_num_accepted_tokens += num_accepted_tokens
+            if request.py_last_draft_tokens is not None:
+                total_num_draft_tokens += len(request.py_last_draft_tokens)
+                total_num_accepted_tokens += request.py_num_accepted_draft_tokens
                 num_requests_with_draft_tokens += 1
 
         if num_requests_with_draft_tokens > 0:
