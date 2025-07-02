@@ -28,10 +28,10 @@ UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifac
 // Container configuration
 // available tags can be found in: https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm/
 // [base_image_name]-[arch]-[os](-[python_version])-[trt_version]-[torch_install_type]-[stage]-[date]-[mr_id]
-LLM_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/tritondevel:x86_64-tritondevel-torch_skip-acbaf3f-github-pr-5534-317"
-LLM_SBSA_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/tritondevel:sbsa-tritondevel-torch_skip-acbaf3f-github-pr-5534-317"
-LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/tritondevel:x86_64-rockylinux8-torch_skip-py310-acbaf3f-github-pr-5534-317"
-LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/tritondevel:x86_64-rockylinux8-torch_skip-py312-acbaf3f-github-pr-5534-317"
+LLM_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/tritondevel:x86_64-tritondevel-torch_skip-8be509a-github-pr-5534-323"
+LLM_SBSA_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/tritondevel:sbsa-tritondevel-torch_skip-8be509a-github-pr-5534-323"
+LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/tritondevel:x86_64-rockylinux8-torch_skip-py310-8be509a-github-pr-5534-323"
+LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/tritondevel:x86_64-rockylinux8-torch_skip-py312-8be509a-github-pr-5534-323"
 
 // TODO: Move common variables to an unified location
 BUILD_CORES_REQUEST = "8"
