@@ -2061,27 +2061,37 @@ def test_llm_chunked_prefill():
     success_path()
 
 
-def _test_llm_capture_request_error(backend: Optional[str], tp_size: int = 1):
-    build_config = BuildConfig()
-    build_config.max_num_tokens = 64
+def _test_llm_capture_request_error(pytorch_backend: bool, tp_size: int = 1):
+    llm_args_extra = {}
+    if pytorch_backend:
+        from tensorrt_llm._torch import LLM as LLM_torch
+        LLM_CLASS = LLM_torch
+        llm_args_extra["max_num_tokens"] = 64
+    else:
+        LLM_CLASS = LLM
+        build_config = BuildConfig()
+        build_config.max_num_tokens = 64
+        llm_args_extra["fast_build"] = True
+        llm_args_extra["build_config"] = build_config
 
-    llm = LLM(
+    llm = LLM_CLASS(
         model=llama_model_path,
-        build_config=build_config,
         tensor_parallel_size=tp_size,
-        backend=backend,
-        fast_build=True,
+        **llm_args_extra,
     )
 
     prompt = 'A ' * 65  # the minimum max_num_tokens is 64
+    if pytorch_backend:
+        # pytorch backend will raise ValueError for max_num_tokens
+        with pytest.raises(ValueError):
+            llm.generate(prompt)
+    else:
+        with pytest.raises(RequestError):
+            llm.generate(prompt)
 
-    with pytest.raises(RequestError):
-        llm.generate(prompt)
 
-
-@pytest.mark.parametrize('backend', [None, 'pytorch'])
-def test_llm_capture_request_error(backend: Optional[str]):
-    _test_llm_capture_request_error(backend=backend, tp_size=1)
+def test_llm_capture_request_error():
+    _test_llm_capture_request_error(pytorch_backend=False, tp_size=1)
 
 
 def test_llm_api_jupyter_scenario():

@@ -530,7 +530,7 @@ class BaseLLM:
                     f"PyTorch backend currently only supports `logprobs=1`. Received `logprobs={sampling_params.logprobs}` (Top{sampling_params.logprobs} logprobs). Please set `logprobs=1` in `sampling_params` instead."
                 )
             # Check prompt length and query length against max_num_tokens to filter illegal requests.
-            if not self.args.enable_chunked_prefill:
+            if self.args.backend == "pytorch" and not self.args.enable_chunked_prefill:
                 max_num_tokens = self.args.max_num_tokens
                 if max_num_tokens and prompt_len / self.args.parallel_config.cp_size + query_len > max_num_tokens:
                     raise ValueError(
