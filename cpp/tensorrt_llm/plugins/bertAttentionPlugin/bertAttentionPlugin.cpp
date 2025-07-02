@@ -520,14 +520,8 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
                 cudaMemsetAsync(fmhaParams.outputPtr, 0, ring_block_output_size, stream);
                 cudaMemcpyAsync(fmhaParams.tileCounterPtr, fmha_scheduler_counter_h, sizeof(uint32_t),
                     cudaMemcpyHostToDevice, stream);
-                if (tensorrt_llm::common::getSMVersion() >= 100 && tensorrt_llm::common::getSMVersion() < 120)
-                {
-                    mFmhaDispatcher->run(fmhaParams);
-                }
-                else
-                {
-                    mFMHARunner->run(fmhaParams);
-                }
+                mFmhaDispatcher->run(fmhaParams);
+                mFMHARunner->run(fmhaParams);
                 if (iter != 0)
                 {
                     invokeRecoverFromRA<T>((T*) context_buf_, (float*) ring_softmax_accu_stats_buf_,
