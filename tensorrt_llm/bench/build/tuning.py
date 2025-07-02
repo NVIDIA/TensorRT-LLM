@@ -140,11 +140,12 @@ def calc_engine_setting(
 
 
 def finetune_setting(
-        kv_cache_max_requests: float,
-        input_len: int,
-        output_len: int,
-        pp_size: int,
-        disable_optimistic_tuning: bool = False) -> Tuple[int, int]:
+    kv_cache_max_requests: float,
+    input_len: int,
+    output_len: int,
+    pp_size: int,
+    disable_optimistic_tuning: bool = False,
+) -> Tuple[int, int]:
     """ Calculate and fine-tune the engine build settings (max batch size and
         max num tokens). Both max batch size and max num tokens are fine-tuned
         to be slightly optimistic.
