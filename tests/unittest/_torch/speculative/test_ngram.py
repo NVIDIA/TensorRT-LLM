@@ -24,7 +24,7 @@ def test_llama_ngram(disable_overlap_scheduler: bool, use_cuda_graph: bool,
     if total_mem_gb < 20:
         pytest.skip("Not enough memory to load target model")
     cuda_graph_config = CudaGraphConfig(
-        cuda_graph_batch_sizes=[1]) if use_cuda_graph else None
+        batch_sizes=[1]) if use_cuda_graph else None
 
     llm_common_config = dict( \
         model=llm_models_root() / "llama-3.1-model" /"Meta-Llama-3.1-8B",
