@@ -156,7 +156,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
         cuda_graph_batch_sizes = \
             llm_args_dict["cuda_graph_config"].get("batch_sizes", None)
 
-    # We now have three cases:
+    # We now have two cases:
     # 1. cuda_graph_config is provided in the extra_llm_api_options file and is None (disabled)
     if cuda_graph_in_options and cuda_graph_config is None:
         logger.warning(
