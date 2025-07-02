@@ -377,7 +377,17 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_device_not_contain(["B200"])
     def test_nvfp4_tp4(self):
         model_path = f"{llm_models_root()}/modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4"
-        with LLM(model_path, tensor_parallel_size=4) as llm:
+        torch_compile_config = TorchCompileConfig(
+            enable_inductor=False,
+            enable_userbuffers=False,
+            enable_piecewise_cuda_graph=True,
+        )
+        cuda_graph_config = CudaGraphConfig()
+
+        with LLM(model_path,
+                 tensor_parallel_size=4,
+                 torch_compile_config=torch_compile_config,
+                 cuda_graph_config=cuda_graph_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
             task = MMLU(self.MODEL_NAME)

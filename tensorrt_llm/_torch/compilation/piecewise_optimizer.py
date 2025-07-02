@@ -231,7 +231,7 @@ def piecewise_optimizer(
         if node.op in ("output", "placeholder"):
             continue
         if (not stop_partition and is_call_function(node, [
-                torch.ops.trtllm.attention_inplace.default,
+                torch.ops.trtllm.attn_custom_op_inplace.default,
                 torch.ops.trtllm.mla_custom_op_inplace.default,
                 torch.ops.aten.index.Tensor,
                 torch.ops.aten.cumsum.default,
@@ -239,7 +239,7 @@ def piecewise_optimizer(
             idx += 1
             node_to_graph_id[node] = idx
             exclude_modules_id.append(idx)
-            if node.target != torch.ops.trtllm.attention_inplace.default and node.target != torch.ops.trtllm.mla_custom_op_inplace.default:
+            if node.target != torch.ops.trtllm.attn_custom_op_inplace.default and node.target != torch.ops.trtllm.mla_custom_op_inplace.default:
                 # We only know it is safe to continue splitting after attention
                 # since attention_inplace will not produce any new tensor
                 stop_partition = True

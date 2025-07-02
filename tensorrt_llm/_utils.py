@@ -389,6 +389,7 @@ _torch_dtype_to_np_typestr_dict = {
     torch.int64: "<i8",
     torch.int32: "<i4",
     torch.int8: "|i1",
+    torch.uint8: "|i1",
     torch.float8_e4m3fn: "|i1",
     torch.qint8: "|u1",
     torch.bool: "|b1",
