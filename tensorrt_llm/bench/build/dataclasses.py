@@ -111,29 +111,6 @@ def get_safetensors_metadata(model_name_or_path):
         return huggingface_hub.get_safetensors_metadata(model_name_or_path)
 
 
-class MambaConfig(BaseModel):
-    d_model: int = Field(
-        validation_alias=AliasChoices("d_model", "hidden_size", "n_embd"))
-    d_state: int = Field(
-        validation_alias=AliasChoices("d_state", "ssm_state_size"))
-    d_conv: int = Field(validation_alias=AliasChoices("d_conv", "conv_kernel"))
-    expand: int
-    n_groups: int
-    head_dim: int = Field(
-        validation_alias=AliasChoices("head_dim", "mamba_head_dim"))
-    d_inner: int = Field(default=None)
-    n_heads: int = Field(default=None)
-
-    @model_validator(mode="after")
-    def set_values_if_none(self):
-        """ Set the values if cannot get values from HF config.json. """
-        if not self.d_inner:
-            self.d_inner = self.d_model * self.expand
-        if not self.n_heads:
-            self.n_heads = self.d_inner // self.head_dim
-        return self
-
-
 class ModelConfig(BaseModel):
     """ Model specific configurations. The parameters are needed in engine
         setting calculation.
