@@ -21,9 +21,10 @@ from .test_llm import (
     DummyError, DummyExecutorWorker3, _test_llm_capture_request_error,
     _test_llm_generate_async, check_llm_return_context_logits,
     check_llm_return_generation_logits, llm_return_logprobs_test_harness,
-    default_model_name, get_model_path, llama_7b_multi_lora_test_harness,
-    llama_model_path, llama_v2_7b_prompt_adapter_test_harness,
-    llama_v2_13b_lora_test_harness, llm_check_output,
+    default_model_name, get_model_path,
+    llama_7b_multi_lora_from_request_test_harness, llama_model_path,
+    llama_v2_7b_prompt_adapter_test_harness,
+    llama_v2_13b_lora_from_dir_test_harness, llm_check_output,
     llm_get_stats_async_test_harness, llm_get_stats_test_harness,
     llm_test_harness, mixtral_model_name, prompts, test_llm_api_eagle,
     tinyllama_logits_processor_test_harness, run_llm_with_postprocess_parallel,
@@ -253,17 +254,18 @@ def test_tinyllama_logits_processor_tp2pp2():
 @pytest.mark.gpu2
 @pytest.mark.part3
 def test_llama_v2_13b_lora_tp2():
-    llama_v2_13b_lora_test_harness(tensor_parallel_size=2,
-                                   kv_cache_config=global_kv_cache_config)
+    llama_v2_13b_lora_from_dir_test_harness(
+        tensor_parallel_size=2, kv_cache_config=global_kv_cache_config)
 
 
 @pytest.mark.gpu2
 @pytest.mark.part3
 def test_llama_7b_multi_lora_tp2():
-    llama_7b_multi_lora_test_harness(tensor_parallel_size=2,
-                                     max_loras=1,
-                                     max_cpu_loras=8,
-                                     kv_cache_config=global_kv_cache_config)
+    llama_7b_multi_lora_from_request_test_harness(
+        tensor_parallel_size=2,
+        max_loras=1,
+        max_cpu_loras=8,
+        kv_cache_config=global_kv_cache_config)
 
 
 @pytest.mark.skip(reason="https://nvbugs/5362426")

@@ -128,7 +128,7 @@ def test_llm_with_postprocess_parallel_and_result_handler(streaming):
                                                          tp_size=1)
 
 
-def llama_v2_13b_lora_test_harness(**llm_kwargs) -> None:
+def llama_v2_13b_lora_from_dir_test_harness(**llm_kwargs) -> None:
     lora_config = LoraConfig(lora_dir=[
         f"{llm_models_root()}/llama-models-v2/chinese-llama-2-lora-13b"
     ],
@@ -154,7 +154,31 @@ def llama_v2_13b_lora_test_harness(**llm_kwargs) -> None:
     assert similar(outputs[0].outputs[0].text, references[0])
 
 
-def llama_7b_multi_lora_test_harness(**llm_kwargs) -> None:
+def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
+    lora_config = LoraConfig(
+        lora_dir=[f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"],
+        max_lora_rank=8)
+    llm = LLM(model=f"{llm_models_root()}/llama-models/llama-7b-hf",
+              lora_config=lora_config,
+              **llm_kwargs)
+
+    prompts = [
+        "美国的首都在哪里? \n答案:",
+    ]
+    references = [
+        "美国的首都是华盛顿。\n\n美国的",
+    ]
+    sampling_params = SamplingParams(max_tokens=20)
+    lora_req = LoRARequest(
+        "task-0", 0, f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1")
+    lora_request = [lora_req]
+
+    outputs = llm.generate(prompts, sampling_params, lora_request=lora_request)
+
+    assert similar(outputs[0].outputs[0].text, references[0])
+
+
+def llama_7b_multi_lora_from_request_test_harness(**llm_kwargs) -> None:
     hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
     hf_lora_dir1 = f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"
     hf_lora_dir2 = f"{llm_models_root()}/llama-models/Japanese-Alpaca-LoRA-7b-v0"
@@ -195,8 +219,14 @@ def llama_7b_multi_lora_test_harness(**llm_kwargs) -> None:
 
 
 @skip_gpu_memory_less_than_40gb
+@pytest.skip("Prefer 7b test")
 def test_llama_v2_13b_lora():
-    llama_v2_13b_lora_test_harness()
+    llama_v2_13b_lora_from_dir_test_harness()
+
+
+@skip_gpu_memory_less_than_40gb
+def test_llama_7b_lora():
+    llama_7b_lora_from_dir_test_harness()
 
 
 @skip_gpu_memory_less_than_40gb
@@ -225,7 +255,7 @@ def test_llama_7b_lora_default_modules() -> None:
 
 @skip_gpu_memory_less_than_40gb
 def test_llama_7b_multi_lora():
-    llama_7b_multi_lora_test_harness()
+    llama_7b_multi_lora_from_request_test_harness()
 
 
 # TODO smor: currently Nemotron-Super-49B-v1 with LoRA memory consumption is overly high
