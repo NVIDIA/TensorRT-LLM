@@ -115,6 +115,7 @@ install_gcctoolset_rockylinux() {
   # https://catalog.ngc.nvidia.com/orgs/nvidia/containers/cuda
   echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> "${ENV}"
   dnf install \
+    patch \
 	  vim \
 	  wget \
 	  git-lfs \
