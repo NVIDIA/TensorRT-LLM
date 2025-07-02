@@ -127,7 +127,7 @@ class OpenAIServer:
     def create_error_response(
             message: str,
             err_type: str = "BadRequestError",
-            status_code: HTTPStatus = HTTPStatus.BAD_REQUEST) -> ErrorResponse:
+            status_code: HTTPStatus = HTTPStatus.BAD_REQUEST) -> Response:
         error_response = ErrorResponse(message=message,
                                        type=err_type,
                                        code=status_code.value)
@@ -316,10 +316,10 @@ class OpenAIServer:
 
     async def openai_completion(self, request: CompletionRequest, raw_request: Request) -> Response:
 
-        async def completion_response(promise: RequestOutput, postproc_params: Optional[PostprocParams]):
+        async def completion_response(promise: RequestOutput,
+                                      postproc_params: Optional[PostprocParams]) -> CompletionResponse:
             response = await promise
             if not self.postproc_worker_enabled:
-                pp_result: CompletionResponse
                 post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
                 pp_result = post_processor(response, args)
             else:
@@ -329,7 +329,7 @@ class OpenAIServer:
                 pp_result.prompt_token_ids = response.prompt_token_ids
             return pp_result
 
-        def merge_completion_responses(responses: List[CompletionResponse]):
+        def merge_completion_responses(responses: List[CompletionResponse]) -> CompletionResponse:
             all_choices: List[CompletionResponseChoice] = []
             all_prompt_token_ids: List[List[int]] = []
             num_prompt_tokens = num_gen_tokens = 0
