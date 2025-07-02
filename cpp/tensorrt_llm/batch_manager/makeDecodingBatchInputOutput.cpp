@@ -118,6 +118,51 @@ std::pair<std::vector<SizeType32>, std::vector<SizeType32>> getActiveSlots(
     return {activeSlots, generationSteps};
 }
 
+//! @brief Sets inputs for explicit draft tokens.
+void setExplicitDraftTokensInputs(tr::DecodingInput& dInput, tr::decoder_batch::Input const& input)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    dInput.explicitDraftTokensInputs = tr::DecodingInput::ExplicitDraftTokensInputs();
+    TLLM_CHECK(input.explicitDraftTokensInputs.has_value());
+    TLLM_CHECK(input.explicitDraftTokensLastInputs.has_value());
+
+    dInput.explicitDraftTokensInputs->nextDraftTokens = input.explicitDraftTokensInputs->nextDraftTokens;
+    dInput.explicitDraftTokensInputs->nextFlatTokens = input.explicitDraftTokensInputs->nextFlatTokens;
+    dInput.explicitDraftTokensInputs->nextDraftIndices = input.explicitDraftTokensInputs->nextDraftIndices;
+    dInput.explicitDraftTokensInputs->nextDraftProbs = input.explicitDraftTokensInputs->nextDraftProbs;
+    dInput.explicitDraftTokensInputs->lastDraftTokens = input.explicitDraftTokensLastInputs->draftTokens;
+    dInput.explicitDraftTokensInputs->lastDraftIndices = input.explicitDraftTokensLastInputs->draftIndices;
+    dInput.explicitDraftTokensInputs->lastPositionIdsBase = input.explicitDraftTokensLastInputs->positionIdsBase;
+    dInput.explicitDraftTokensInputs->masks = input.explicitDraftTokensInputs->masks;
+    dInput.explicitDraftTokensInputs->packedPositionIds = input.explicitDraftTokensInputs->packedPositionIds;
+    dInput.explicitDraftTokensInputs->bestPathLengths = input.explicitDraftTokensInputs->bestPathLengths;
+    dInput.explicitDraftTokensInputs->bestPathIndices = input.explicitDraftTokensInputs->bestPathIndices;
+    dInput.explicitDraftTokensInputs->nextGenerationLengths = input.explicitDraftTokensInputs->nextGenerationLengths;
+    dInput.explicitDraftTokensInputs->lastGenerationLengths = input.explicitDraftTokensLastInputs->generationLengths;
+    dInput.explicitDraftTokensInputs->maxGenLengthDevice = input.explicitDraftTokensInputs->maxGenToken;
+    dInput.explicitDraftTokensInputs->seqSlots = input.batchSlotsRequestOrder;
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+//! @brief Sets inputs for eagle decoding.
+void setEagleInputs(tr::DecodingInput& dInput, tr::decoder_batch::Input const& input)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    TLLM_CHECK(input.eagleInputs.has_value());
+    TLLM_CHECK(input.eagleLastInputs.has_value());
+
+    dInput.eagleInputs = tr::DecodingInput::EagleInputs(input.eagleInputs->nextDraftTokens,
+        input.eagleInputs->nextDraftLens, input.eagleInputs->nextDraftPaths, input.eagleLastInputs->draftTokens,
+        input.eagleLastInputs->draftLens, input.eagleLastInputs->draftPaths, input.eagleInputs->acceptedTokens,
+        input.eagleInputs->acceptedLens, input.eagleInputs->acceptedPaths, input.eagleInputs->chunkedContextNextTokens,
+        input.batchSlotsRequestOrder);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
 } // namespace
 
 std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::operator()(RequestVector const& contextRequests,
@@ -136,6 +181,7 @@ std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::operator
     if (modelConfig.getSpeculativeDecodingMode().hasDraftLogits())
     {
         decodingInput->predictedDraftLogits = inputBuffers.predictedDraftLogits;
+        decoderState.getJointDecodingInput().medusaInputs->medusaLogits = decodingInput->predictedDraftLogits;
     }
 
     if (modelConfig.getSpeculativeDecodingMode().isExplicitDraftTokens())
@@ -145,6 +191,7 @@ std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::operator
         decodingInput->batchSlotsRequestOrder = fusedRuntimeBuffers->seqSlots;
         decodingInput->explicitDraftTokensInputs = fusedRuntimeBuffers->mExplicitDraftTokensBuffers->engineOutputs;
         decodingInput->explicitDraftTokensLastInputs = fusedRuntimeBuffers->mExplicitDraftTokensBuffers->engineInputs;
+        setExplicitDraftTokensInputs(decoderState.getJointDecodingInput(), *decodingInput);
     }
     else if (modelConfig.getSpeculativeDecodingMode().isEagle())
     {
@@ -153,6 +200,7 @@ std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::operator
         decodingInput->batchSlotsRequestOrder = fusedRuntimeBuffers->seqSlots;
         decodingInput->eagleInputs = fusedRuntimeBuffers->mEagleBuffers->engineOutputs;
         decodingInput->eagleLastInputs = fusedRuntimeBuffers->mEagleBuffers->engineInputs;
+        setEagleInputs(decoderState.getJointDecodingInput(), *decodingInput);
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
