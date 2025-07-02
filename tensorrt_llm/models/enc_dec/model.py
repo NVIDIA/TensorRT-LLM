@@ -1212,7 +1212,6 @@ class DecoderModel(PretrainedModel):
         config.set_if_not_exist('num_buckets', None)
         config.set_if_not_exist('max_distance', None)
         config.set_if_not_exist('relative_attention', False)
-        config.set_if_not_exist('residual_scaling', 1.0)
 
     def forward(self,
                 decoder_input_ids: Tensor,
