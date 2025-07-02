@@ -44,6 +44,8 @@ from tensorrt_llm.module import Module, ModuleList
 from tensorrt_llm.parameter import Parameter
 from tensorrt_llm.plugin.plugin import current_all_reduce_helper
 from tensorrt_llm.quantization import QuantMode
+from tensorrt_llm._utils import pad_vocab_size
+
 
 layernorm_map = {
     LayerNormType.LayerNorm: LayerNorm,
@@ -1156,9 +1158,11 @@ class DecoderModel(PretrainedModel):
         self.transformer.assign_module(decoder_layers, "layers")
 
         if self.mapping.is_last_pp_rank():
+            vocab_size_padded = pad_vocab_size(self.config.vocab_size,
+                                           self.config.mapping.tp_size)
             self.lm_head = ColumnLinear(
                 self.config.hidden_size,
-                self.config.vocab_size,
+                vocab_size_padded,
                 bias=False if not hasattr(self.config, "has_lm_head_bias") else
                 self.config.has_lm_head_bias,
                 dtype=self.config.dtype,
