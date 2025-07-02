@@ -383,6 +383,25 @@ public:
                 firstChunkReuseSmem.emplace_back(false);
             }
 
+            // SmemConstSfBuf
+            // A buffer used to copy constant values to TMEM.
+            {
+                // Do we need the buffer?
+                bool const useConstSfBuf = dtypeB == tg::Dtype::E4m3 && dtypeMmaB == tg::Dtype::MxE4m3;
+                // Number of bytes for the buffer.
+                auto const numSmemBytesConstSfBuf = useConstSfBuf ? 512 : 0;
+                // Number of bytes for the alignment of the buffer.
+                auto const numBytesAlignmentConstSfBuf = 16;
+                // No need to reuse the first chunk.
+                auto const reuseChunksSmemConstSfBuf = false;
+
+                // Add info.
+                smemChunkNames.emplace_back("smemConstSfBuf");
+                numBytesAndAlignmentPerSmemChunk.emplace_back(
+                    std::make_pair(numSmemBytesConstSfBuf, numBytesAlignmentConstSfBuf));
+                firstChunkReuseSmem.emplace_back(reuseChunksSmemConstSfBuf);
+            }
+
             // Create SMEM helper object.
             mSmemAllocatorHelper
                 = MemAllocatorHelper(numBytesAndAlignmentPerSmemChunk, firstChunkReuseSmem, smemChunkNames);
@@ -445,12 +464,16 @@ public:
 
             // Sf A
             {
+                // Does the MMA require block scales in TMEM for A?
                 bool const useBlockScalingA = tg::dtypeIsBlockFmt(dtypeMmaA);
+                // Are the block scales constant?
+                bool const useConstSfA = useBlockScalingA && !tg::dtypeIsBlockFmt(dtypeA);
                 // Number of columns for scaling factors of A.
-                auto const numTmemColsSfA
-                    = useBlockScalingA ? ((tileK / 64) * 2 * tg::ceilDiv(tileM, 64)) * numStages : 0;
+                auto const numTmemColsSfA = useConstSfA
+                    ? tg::roundUp((tileK / 64) * 2 * tg::ceilDiv(tileM, 64), 4)
+                    : (useBlockScalingA ? ((tileK / 64) * 2 * tg::ceilDiv(tileM, 64)) * numStages : 0);
                 // Number of columns for Sf alignment.
-                auto const numColsAlignmentSfA = 2;
+                auto const numColsAlignmentSfA = 4;
                 // No need to reuse TMEM.
                 auto const reuseChunksTmemSfA = false;
 
@@ -462,12 +485,16 @@ public:
 
             // Sf B
             {
+                // Does the MMA require block scales in TMEM for B?
                 bool const useBlockScalingB = tg::dtypeIsBlockFmt(dtypeMmaB);
+                // Are the block scales constant?
+                bool const useConstSfB = useBlockScalingB && !tg::dtypeIsBlockFmt(dtypeB);
                 // Number of columns for scaling factors of B.
-                auto const numTmemColsSfB
-                    = useBlockScalingB ? ((tileK / 64) * 2 * tg::ceilDiv(tileN, 64)) * numStages : 0;
+                auto const numTmemColsSfB = useConstSfB
+                    ? tg::roundUp((tileK / 64) * 2 * tg::ceilDiv(tileN, 64), 4)
+                    : (useBlockScalingB ? ((tileK / 64) * 2 * tg::ceilDiv(tileN, 64)) * numStages : 0);
                 // Number of columns for Sf alignment.
-                auto const numColsAlignmentSfB = 2;
+                auto const numColsAlignmentSfB = 4;
                 // No need to reuse TMEM.
                 auto const reuseChunksTmemSfB = false;
 
@@ -578,6 +605,13 @@ inline int32_t getSmemOffsetBias(KernelTraits traits)
 inline int32_t getSmemOffsetBlockAmax(KernelTraits traits)
 {
     return traits.mSmemAllocatorHelper.getChunkOffset(9);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline int32_t getSmemOffsetConstSfBuf(KernelTraits traits)
+{
+    return traits.mSmemAllocatorHelper.getChunkOffset(10);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -244,8 +244,10 @@ struct BatchedGemmData
         float const* mPtrScaleGate{nullptr};
 
         // The alpha and beta for SwiGlu.
-        // gatedActivation <- (x0 + beta) * sigmoid(alpha * x1)
-        // Shape is [B]
+        // gatedActivation <- (x0 + beta) * activation(x1, alpha)
+        // Shape is [B].
+        // Alpha is 1.f if nullptr.
+        // Beta is 0.f if nullptr.
         float const* mPtrSwiGluAlpha{nullptr};
         float const* mPtrSwiGluBeta{nullptr};
 
@@ -397,7 +399,7 @@ public:
     // Launch the cubin from the provided config. It calls all necessary memsets for internal buffers.
     // Provided config must be validated with isValidConfig before the call.
     int32_t run(BatchedGemmConfig const& config, void* workspace, BatchedGemmData const& options, void* cudaStream,
-        int32_t multiProcessorCount);
+        int32_t multiProcessorCount, bool usePdl = true);
 
     // Initializes the buffers before the world sync. Must be called before run.
     int32_t runInitBeforeWorldSync(
@@ -581,8 +583,10 @@ std::vector<size_t> BatchedGemmInterface::getWorkspaceSizesInBytes(
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspace,
-    BatchedGemmData const& batchedGemmData, void* cudaStream, int32_t /* multiProcessorCount */)
+    BatchedGemmData const& batchedGemmData, void* cudaStream, int32_t /* multiProcessorCount */, bool usePdl)
 {
+    // Might be used.
+    (void) usePdl;
     // Get options from config and data.
     auto options = getOptionsFromConfigAndData(config, batchedGemmData);
 
@@ -667,8 +671,9 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
     // Run the kernel.
     auto result = trtllm::gen::launchKernel((void*) &kernelParams, cudaStream, config.mSharedMemSize, cuFunction,
         block3, grid3, cluster3,
-        config.mOptions.mGridWaitForPrimaryEarlyExit | config.mOptions.mGridWaitForPrimaryA
-            | config.mOptions.mGridWaitForPrimaryB);
+        usePdl
+            && (config.mOptions.mGridWaitForPrimaryEarlyExit | config.mOptions.mGridWaitForPrimaryA
+                | config.mOptions.mGridWaitForPrimaryB));
     if (result != CUDA_SUCCESS)
     {
         return -1;

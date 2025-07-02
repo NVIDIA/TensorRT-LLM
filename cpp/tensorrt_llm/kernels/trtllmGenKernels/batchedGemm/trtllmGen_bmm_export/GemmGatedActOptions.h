@@ -58,17 +58,15 @@ namespace tg = trtllm::gen;
 // Type of the gated activation
 enum class ActType
 {
-    // silu(x) = x * sigmoid(x) = x * (1 / (1 + e^(-x)))
-    // For ActType == Silu,
-    //    gatedAct = scaleC * x0 * silu(x1 * scaleGate),
-    // where x0 and x1 are the raw numbers from Gemm, while scaleC and scaleGate are input scales.
-    Silu = 0,
     // For ActType == SwiGlu, ideally we would like to have something like
-    //    gatedAct = scaleC * (x0 * scaleAb + beta) * sigmoid(alpha * x1 * scaleGate).
+    //    gatedAct = scaleC * (x0 * scaleAb + beta) * ((x1 * scaleGate) * sigmoid(alpha * x1 *
+    //    scaleGate)).
     // But for now, we use the simplified version
-    //    gatedAct = scaleC' * (x0 + beta') * sigmoid(alpha * x1 * scaleGate),
+    //    gatedAct = scaleC' * (x0 + beta') * ((x1 * scaleGate) * sigmoid(alpha * x1 * scaleGate)),
     // where x0 and x1 are the raw numbers from Gemm, while scaleC and scaleGate are input scales,
     // beta' = beta / scaleAb, scaleC' = scaleC * scaleAb.
+    //
+    // GatedSilu is a special case of SwiGlu where the alpha is 1.0 and the beta is 0.0.
     SwiGlu
 };
 
@@ -82,7 +80,6 @@ enum class ActType
         return (type == ActType::actType);                                                                             \
     }
 
-TLLM_ACT_TYPE_FUNCTION(Silu)
 TLLM_ACT_TYPE_FUNCTION(SwiGlu)
 
 #undef TLLM_ACT_TYPE_FUNCTION
@@ -93,7 +90,6 @@ inline std::string getActTypeName(ActType type)
 {
     switch (type)
     {
-    case ActType::Silu: return "Silu";
     case ActType::SwiGlu: return "SwiGlu";
     default: return "Unknown type";
     }
@@ -112,7 +108,7 @@ struct GemmGatedActOptions : public gemm::GemmOptions
     }
 
     // Type of the gated activation.
-    ActType mActType{ActType::Silu};
+    ActType mActType{ActType::SwiGlu};
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
