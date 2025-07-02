@@ -50,11 +50,6 @@ def calc_engine_setting(
         Tuple[int, int]: Tuple containing engine configuration information for
         engine build (max_num_tokens, max_batch_size).
     """
-    is_mamba_attn_hybrid = isinstance(model_config, NemotronHybridConfig)
-    if is_mamba_attn_hybrid:
-        # Each mamba cache entry is pretty large (~50MB for 8B model), so we are more conservative when estimating the max batch size
-        kv_cache_gpu_mem_fraction *= kv_cache_gpu_mem_fraction
-
     byte_per_elem = BYTES_PER_ELEM.get(quant_config.quant_algo, 2)
     byte_per_kv_elem = BYTES_PER_ELEM.get(quant_config.kv_cache_quant_algo, 2)
 
@@ -80,7 +75,8 @@ def calc_engine_setting(
 
     # Calculate max requests in KV cache based on target ISL and OSL.
     target_seq_len = target_input_len + target_output_len
-    cache_memory = available_memory * kv_cache_gpu_mem_fraction
+    cache_memory = available_memory * model_config.cache_memory_fraction(
+        kv_cache_gpu_mem_fraction)
     gb_per_extra_cache = model_config.extra_model_cache_in_gb(
         BYTES_PER_ELEM.get(QuantAlgo.NO_QUANT), target_seq_len)
     kv_cache_max_requests = cache_memory / (gb_per_token * target_seq_len +
@@ -103,7 +99,8 @@ def calc_engine_setting(
         target_input_len,
         target_output_len,
         pp_size,
-        enable_optimistic_tuning=not is_mamba_attn_hybrid)
+        disable_optimistic_tuning=isinstance(model_config,
+                                             NemotronHybridConfig))
 
     # Functional and performance
     if total_gpu_memory < engine_size:
@@ -142,11 +139,12 @@ def calc_engine_setting(
     return max_batch_size, max_num_tokens
 
 
-def finetune_setting(kv_cache_max_requests: float,
-                     input_len: int,
-                     output_len: int,
-                     pp_size: int,
-                     enable_optimistic_tuning: bool = True) -> Tuple[int, int]:
+def finetune_setting(
+        kv_cache_max_requests: float,
+        input_len: int,
+        output_len: int,
+        pp_size: int,
+        disable_optimistic_tuning: bool = False) -> Tuple[int, int]:
     """ Calculate and fine-tune the engine build settings (max batch size and
         max num tokens). Both max batch size and max num tokens are fine-tuned
         to be slightly optimistic.
@@ -157,7 +155,7 @@ def finetune_setting(kv_cache_max_requests: float,
         input_len (int): Input sequence length to compile the engine.
         output_len (int): Output sequence length to compile the engine.
         pp_size (int): Number of pipeline parallel stages.
-        enable_optimistic_tuning (bool): Whether to enable optimistic tuning.
+        disable_optimistic_tuning (bool): Whether to disable optimistic tuning.
 
     Returns:
         Tuple[int, int]: Tuple containing fine-tuned values for engine
@@ -169,7 +167,9 @@ def finetune_setting(kv_cache_max_requests: float,
     raw_token = min(raw_bs * (1 + input_len / output_len), 32768)
 
     # Fine-tune the max batch size.
-    if enable_optimistic_tuning:
+    if disable_optimistic_tuning:
+        max_bs = 2 * math.floor(raw_bs / 2)
+    else:
         # Set min BS to be 64.
         if raw_bs < 256:
             max_bs = max(64, 32 * math.ceil(raw_bs / 32))
@@ -177,8 +177,6 @@ def finetune_setting(kv_cache_max_requests: float,
             max_bs = 128 * math.ceil(raw_bs / 128)
         else:
             max_bs = 256 * math.ceil(raw_bs / 256)
-    else:
-        max_bs = 2 * math.floor(raw_bs / 2)
 
     # Fine-tune the max num tokens.
     # Set min to 2048 to ensure Ctx/Gen overlap efficiency

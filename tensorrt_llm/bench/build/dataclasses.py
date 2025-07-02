@@ -202,6 +202,9 @@ class ModelConfig(BaseModel):
     def extra_model_cache_in_gb(self, bytes_per_elem, target_seq_len=None):
         return 0
 
+    def cache_memory_fraction(self, cache_memory_fraction):
+        return cache_memory_fraction
+
 
 class NemotronHybridConfig(ModelConfig):
     hybrid_override_pattern: str
@@ -247,3 +250,7 @@ class NemotronHybridConfig(ModelConfig):
         gb_per_mamba_cache = bytes_per_elem * self.num_mamba_layers * (
             conv_state_elems + ssm_state_elems) / (1024**3)
         return gb_per_mamba_cache
+
+    def cache_memory_fraction(self, cache_memory_fraction):
+        # Each mamba cache entry is pretty large (~50MB for 8B model), so we are more conservative when estimating the max batch size
+        return cache_memory_fraction**2
