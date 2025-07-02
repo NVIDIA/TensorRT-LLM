@@ -78,19 +78,6 @@ public:
     //! For Beam Search
     //! The generation step of each request (for Variable-Beam-Width-Search), [batchSize]
     std::vector<SizeType32> generationSteps;
-
-    //! For speculative decoding
-    //! Logits of draft
-    //! [maxBatchSize][maxAcceptedDraftTokensPerStep][maxDraftTokens + 1, vocabSizePadded]
-    std::vector<std::vector<TensorPtr>> predictedDraftLogits;
-
-    //! Explicit draft tokens data
-    std::optional<ExplicitDraftTokensBuffers::EngineOutputs> explicitDraftTokensInputs;
-    std::optional<ExplicitDraftTokensBuffers::EngineInputs> explicitDraftTokensLastInputs;
-
-    //! Eagle data
-    std::optional<EagleBuffers::EngineOutputs> eagleInputs;
-    std::optional<EagleBuffers::Inputs> eagleLastInputs;
 };
 
 } // namespace decoder_batch

@@ -119,46 +119,55 @@ std::pair<std::vector<SizeType32>, std::vector<SizeType32>> getActiveSlots(
 }
 
 //! @brief Sets inputs for explicit draft tokens.
-void setExplicitDraftTokensInputs(tr::DecodingInput& dInput, tr::decoder_batch::Input const& input)
+void setExplicitDraftTokensInputs(tr::DecodingInput& dInput, RuntimeBuffers const& fusedRuntimeBuffers)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    dInput.explicitDraftTokensInputs = tr::DecodingInput::ExplicitDraftTokensInputs();
-    TLLM_CHECK(input.explicitDraftTokensInputs.has_value());
-    TLLM_CHECK(input.explicitDraftTokensLastInputs.has_value());
+    TLLM_CHECK(fusedRuntimeBuffers.mExplicitDraftTokensBuffers);
+    auto const& explicitDraftTokensInputs = fusedRuntimeBuffers.mExplicitDraftTokensBuffers->engineOutputs;
+    auto const& explicitDraftTokensLastInputs = fusedRuntimeBuffers.mExplicitDraftTokensBuffers->engineInputs;
 
-    dInput.explicitDraftTokensInputs->nextDraftTokens = input.explicitDraftTokensInputs->nextDraftTokens;
-    dInput.explicitDraftTokensInputs->nextFlatTokens = input.explicitDraftTokensInputs->nextFlatTokens;
-    dInput.explicitDraftTokensInputs->nextDraftIndices = input.explicitDraftTokensInputs->nextDraftIndices;
-    dInput.explicitDraftTokensInputs->nextDraftProbs = input.explicitDraftTokensInputs->nextDraftProbs;
-    dInput.explicitDraftTokensInputs->lastDraftTokens = input.explicitDraftTokensLastInputs->draftTokens;
-    dInput.explicitDraftTokensInputs->lastDraftIndices = input.explicitDraftTokensLastInputs->draftIndices;
-    dInput.explicitDraftTokensInputs->lastPositionIdsBase = input.explicitDraftTokensLastInputs->positionIdsBase;
-    dInput.explicitDraftTokensInputs->masks = input.explicitDraftTokensInputs->masks;
-    dInput.explicitDraftTokensInputs->packedPositionIds = input.explicitDraftTokensInputs->packedPositionIds;
-    dInput.explicitDraftTokensInputs->bestPathLengths = input.explicitDraftTokensInputs->bestPathLengths;
-    dInput.explicitDraftTokensInputs->bestPathIndices = input.explicitDraftTokensInputs->bestPathIndices;
-    dInput.explicitDraftTokensInputs->nextGenerationLengths = input.explicitDraftTokensInputs->nextGenerationLengths;
-    dInput.explicitDraftTokensInputs->lastGenerationLengths = input.explicitDraftTokensLastInputs->generationLengths;
-    dInput.explicitDraftTokensInputs->maxGenLengthDevice = input.explicitDraftTokensInputs->maxGenToken;
-    dInput.explicitDraftTokensInputs->seqSlots = input.batchSlotsRequestOrder;
+    dInput.explicitDraftTokensInputs = tr::DecodingInput::ExplicitDraftTokensInputs();
+    dInput.explicitDraftTokensInputs->nextDraftTokens = explicitDraftTokensInputs.nextDraftTokens;
+    dInput.explicitDraftTokensInputs->nextFlatTokens = explicitDraftTokensInputs.nextFlatTokens;
+    dInput.explicitDraftTokensInputs->nextDraftIndices = explicitDraftTokensInputs.nextDraftIndices;
+    dInput.explicitDraftTokensInputs->nextDraftProbs = explicitDraftTokensInputs.nextDraftProbs;
+    dInput.explicitDraftTokensInputs->lastDraftTokens = explicitDraftTokensLastInputs.draftTokens;
+    dInput.explicitDraftTokensInputs->lastDraftIndices = explicitDraftTokensLastInputs.draftIndices;
+    dInput.explicitDraftTokensInputs->lastPositionIdsBase = explicitDraftTokensLastInputs.positionIdsBase;
+    dInput.explicitDraftTokensInputs->masks = explicitDraftTokensInputs.masks;
+    dInput.explicitDraftTokensInputs->packedPositionIds = explicitDraftTokensInputs.packedPositionIds;
+    dInput.explicitDraftTokensInputs->bestPathLengths = explicitDraftTokensInputs.bestPathLengths;
+    dInput.explicitDraftTokensInputs->bestPathIndices = explicitDraftTokensInputs.bestPathIndices;
+    dInput.explicitDraftTokensInputs->nextGenerationLengths = explicitDraftTokensInputs.nextGenerationLengths;
+    dInput.explicitDraftTokensInputs->lastGenerationLengths = explicitDraftTokensLastInputs.generationLengths;
+    dInput.explicitDraftTokensInputs->maxGenLengthDevice = explicitDraftTokensInputs.maxGenToken;
+    dInput.explicitDraftTokensInputs->seqSlots = fusedRuntimeBuffers.seqSlots;
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 //! @brief Sets inputs for eagle decoding.
-void setEagleInputs(tr::DecodingInput& dInput, tr::decoder_batch::Input const& input)
+void setEagleInputs(tr::DecodingInput& dInput, RuntimeBuffers const& fusedRuntimeBuffers)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    TLLM_CHECK(input.eagleInputs.has_value());
-    TLLM_CHECK(input.eagleLastInputs.has_value());
+    TLLM_CHECK(fusedRuntimeBuffers.mEagleBuffers);
+    auto const& eagleInputs = fusedRuntimeBuffers.mEagleBuffers->engineOutputs;
+    auto const& eagleLastInputs = fusedRuntimeBuffers.mEagleBuffers->engineInputs;
 
-    dInput.eagleInputs = tr::DecodingInput::EagleInputs(input.eagleInputs->nextDraftTokens,
-        input.eagleInputs->nextDraftLens, input.eagleInputs->nextDraftPaths, input.eagleLastInputs->draftTokens,
-        input.eagleLastInputs->draftLens, input.eagleLastInputs->draftPaths, input.eagleInputs->acceptedTokens,
-        input.eagleInputs->acceptedLens, input.eagleInputs->acceptedPaths, input.eagleInputs->chunkedContextNextTokens,
-        input.batchSlotsRequestOrder);
+    dInput.eagleInputs = tr::DecodingInput::EagleInputs();
+    dInput.eagleInputs->nextDraftTokens = eagleInputs.nextDraftTokens;
+    dInput.eagleInputs->nextDraftLens = eagleInputs.nextDraftLens;
+    dInput.eagleInputs->nextDraftPaths = eagleInputs.nextDraftPaths;
+    dInput.eagleInputs->lastDraftTokens = eagleLastInputs.draftTokens;
+    dInput.eagleInputs->lastDraftLens = eagleLastInputs.draftLens;
+    dInput.eagleInputs->lastDraftPaths = eagleLastInputs.draftPaths;
+    dInput.eagleInputs->acceptedTokens = eagleInputs.acceptedTokens;
+    dInput.eagleInputs->acceptedLens = eagleInputs.acceptedLens;
+    dInput.eagleInputs->acceptedPathIds = eagleInputs.acceptedPaths;
+    dInput.eagleInputs->chunkedContextNextTokens = eagleInputs.chunkedContextNextTokens;
+    dInput.eagleInputs->seqSlots = fusedRuntimeBuffers.seqSlots;
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -180,27 +189,20 @@ std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::operator
 
     if (modelConfig.getSpeculativeDecodingMode().hasDraftLogits())
     {
-        decodingInput->predictedDraftLogits = inputBuffers.predictedDraftLogits;
-        decoderState.getJointDecodingInput().medusaInputs->medusaLogits = decodingInput->predictedDraftLogits;
+        decoderState.getJointDecodingInput().medusaInputs->medusaLogits = inputBuffers.predictedDraftLogits;
     }
 
     if (modelConfig.getSpeculativeDecodingMode().isExplicitDraftTokens())
     {
         TLLM_CHECK(fusedRuntimeBuffers);
         // requires mCtxGenFusion == true
-        decodingInput->batchSlotsRequestOrder = fusedRuntimeBuffers->seqSlots;
-        decodingInput->explicitDraftTokensInputs = fusedRuntimeBuffers->mExplicitDraftTokensBuffers->engineOutputs;
-        decodingInput->explicitDraftTokensLastInputs = fusedRuntimeBuffers->mExplicitDraftTokensBuffers->engineInputs;
-        setExplicitDraftTokensInputs(decoderState.getJointDecodingInput(), *decodingInput);
+        setExplicitDraftTokensInputs(decoderState.getJointDecodingInput(), *fusedRuntimeBuffers);
     }
     else if (modelConfig.getSpeculativeDecodingMode().isEagle())
     {
         TLLM_CHECK(fusedRuntimeBuffers);
         // requires mCtxGenFusion == true
-        decodingInput->batchSlotsRequestOrder = fusedRuntimeBuffers->seqSlots;
-        decodingInput->eagleInputs = fusedRuntimeBuffers->mEagleBuffers->engineOutputs;
-        decodingInput->eagleLastInputs = fusedRuntimeBuffers->mEagleBuffers->engineInputs;
-        setEagleInputs(decoderState.getJointDecodingInput(), *decodingInput);
+        setEagleInputs(decoderState.getJointDecodingInput(), *fusedRuntimeBuffers);
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
