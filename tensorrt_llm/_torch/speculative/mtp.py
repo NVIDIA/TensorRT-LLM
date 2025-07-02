@@ -14,7 +14,7 @@ from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclass(kw_only=True)
 class SampleStateTensorsMTP(SampleStateTensors):
     new_tokens_lens: torch.Tensor
     next_draft_tokens: torch.Tensor
@@ -248,12 +248,10 @@ class MTPSampler(TorchSampler):
 
     SampleState = SampleStateMTP
 
-    def __init__(self, max_seq_len: int, config: MTPConfig):
-        super().__init__(max_seq_len, False)
+    def __init__(self, args: TorchSampler.Args, *, nextn: int):
+        super().__init__(args)
         self.mapping = None
-        self.draft_len = 0
-        if config is not None:
-            self.draft_len = config.num_nextn_predict_layers
+        self.draft_len = nextn
 
     def _draft_meet_max_token_stop_criteria(self, request: LlmRequest,
                                             num_tokens: int, beam_idx: int):
@@ -283,8 +281,9 @@ class MTPSampler(TorchSampler):
             if request.state != LlmRequestState.GENERATION_COMPLETE:
                 new_token = new_tokens_list[idx][0]
                 num_tokens = request.add_new_token(new_token, beam_idx)
-                should_stop = self._handle_stop_criteria(
-                    request, new_token, num_tokens, beam_idx)
+                should_stop = self._handle_stop_criteria(request,
+                                                         new_token,
+                                                         beam=beam_idx)
                 if self._draft_meet_max_token_stop_criteria(
                         request, num_tokens, beam_idx):
                     should_stop = True
@@ -303,8 +302,9 @@ class MTPSampler(TorchSampler):
                 for i in range(num_new_tokens):
                     new_token = new_tokens[i]
                     num_tokens = request.add_new_token(new_token, beam_idx)
-                    should_stop = self._handle_stop_criteria(
-                        request, new_token, num_tokens, beam_idx)
+                    should_stop = self._handle_stop_criteria(request,
+                                                             new_token,
+                                                             beam=beam_idx)
                     if should_stop:
                         break
                 if self._draft_meet_max_token_stop_criteria(
@@ -344,7 +344,6 @@ class MTPSampler(TorchSampler):
         for request in scheduled_requests.context_requests:
             request.py_draft_tokens = [1] * self.draft_len
         return SampleStateMTP(scheduled_requests=scheduled_requests,
-                              logits=model_outputs['logits'],
                               device=device,
                               host=host,
                               sampler_event=sampler_event)
@@ -522,7 +521,6 @@ class MTPWorker(nn.Module):
                 "position_ids": draft_inputs["position_ids"],
                 "hidden_states": draft_hidden_states,
                 "attn_metadata": draft_inputs["attn_metadata"],
-                "spec_metadata": draft_inputs["spec_metadata"],
             }
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
@@ -1139,6 +1137,8 @@ class MTPEagleWorker(MTPWorker):
                 hidden_states = mtp_layers[0](
                     embed_tokens=embed_tokens,
                     all_rank_num_tokens=spec_metadata.all_rank_num_tokens,
+                    all_rank_max_num_tokens=spec_metadata.
+                    all_rank_max_num_tokens,
                     **inputs)
                 start_ids_gen = (spec_metadata.batch_indices_cuda[:num_gens] *
                                  (self.mtp_num_modules + 1)).long()
@@ -1148,10 +1148,15 @@ class MTPEagleWorker(MTPWorker):
                 gather_ids = torch.concat(
                     [last_tokens_idx[:num_contexts], gather_ids_gen], dim=0)
             else:
-                hidden_states = mtp_layers[0](embed_tokens=embed_tokens,
-                                              all_rank_num_tokens=spec_metadata.
-                                              subseq_all_rank_num_tokens,
-                                              **inputs)
+                hidden_states = mtp_layers[0](
+                    embed_tokens=embed_tokens,
+                    all_rank_num_tokens=spec_metadata.
+                    subseq_all_rank_num_tokens,
+                    all_rank_max_num_tokens=max(
+                        spec_metadata.subseq_all_rank_num_tokens)
+                    if spec_metadata.subseq_all_rank_num_tokens is not None else
+                    None,
+                    **inputs)
                 # All of the seq_len are 1, use batch_indices_cuda as gather_ids
                 gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
             logits = mtp_layers[0].shared_head(hidden_states[gather_ids],

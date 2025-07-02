@@ -102,3 +102,43 @@ Or using the provided client parsing the prompts from a file and sending request
 ```
 python3 ./clients/disagg_client.py -c disagg_config.yaml -p ./clients/prompts.json -e chat
 ```
+
+## Dynamic scaling with ETCD (experimental)
+Currently, trtllm supports dynamic addition and removal of servers by leveraging ETCD. To enable this feature, you should start the context and generation servers with an additional flag ```--metadata_server_config_file``` and ```--server_role```.
+Before launching the context and generation servers, you should first start the ETCD server. By default, the ETCD server listens for client requests at ```localhost:2379```.
+```
+etcd
+```
+After this, you can enable the dynamic scaling feature for the use case above as follows:
+```
+export TRTLLM_USE_UCX_KVCACHE=1
+#Context servers
+CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001 --backend pytorch --server_role CONTEXT --extra_llm_api_options ./context_extra-llm-api-config.yml --metadata_server_config_file ./metadata_config.yml &> log_ctx_0 &
+CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002 --backend pytorch --server_role CONTEXT --extra_llm_api_options ./context_extra-llm-api-config.yml --metadata_server_config_file ./metadata_config.yml &> log_ctx_1 &
+#Generation servers
+CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8003 --backend pytorch --server_role GENERATION --extra_llm_api_options ./gen_extra-llm-api-config.yml --metadata_server_config_file ./metadata_config.yml &> log_gen_0 &
+```
+As for the disaggregated server, you should also specify the --metadata_server_config_file like the following
+```
+trtllm-serve disaggregated -c disagg_config.yaml -m ./metadata_config.yml
+```
+
+The metadata_config file looks like
+```
+hostname: "localhost"
+port: 2379
+health_check_timeout: 5.0
+refersh_interval: 10.0
+```
+
+The ```hostname``` and ```port``` must match those used when starting the ETCD server. The ```health_check_timeout``` parameter specifies how long a server will be considered dead if no healthy response is received. By default, trtllm will perform two checks before marking a server as dead. The ```refresh_interval``` parameter determines how often the latest server list is fetched from the ETCD server.
+
+### Dynamically adding servers
+Users can add servers by directly launching them with trtllm-serve. For example, you can start an additional generation server as follows:
+```
+CUDA_VISIBLE_DEVICES=3 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8004 --backend pytorch --server_role GENERATION --extra_llm_api_options ./gen_extra-llm-api-config.yml --metadata_server_config_file ./metadata_config.yml &> log_gen_0 &
+```
+Trtllm will automatically register any newly launched server with the ETCD server, allowing the router to send new requests to the added server.
+
+### Dynamically removing servers
+When removing servers, special attention is required in the current version. You need to first remove the corresponding key from the ETCD server. After you see the log message "Server xxxx is removed," you can then safely shut down the server. This part will be improved soon.

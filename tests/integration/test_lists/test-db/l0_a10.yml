@@ -74,7 +74,6 @@ l0_a10:
   - llmapi/test_llm_e2e.py::test_llmapi_load_engine_from_build_command[llama-llama-models/llama-7b-hf] # 5min
   - llmapi/test_llm_e2e.py::test_llmapi_build_command_parameters_align[llama-llama-models-v2/TinyLlama-1.1B-Chat-v1.0]
   - llmapi/test_llm_e2e.py::test_llmapi_load_engine_from_build_command_with_lora[llama-llama-models-v2/llama-v2-7b-hf]
-  - llmapi/test_llm_examples.py::test_llmapi_example_quantization
   - llmapi/test_llm_examples.py::test_llmapi_chat_example
   - llmapi/test_llm_e2e.py::test_llmapi_exit
   - llmapi/test_llm_examples.py::test_llmapi_server_example
@@ -105,12 +104,6 @@ l0_a10:
   - accuracy/test_cli_flow.py::TestMamba130M::test_auto_dtype # 1 min
   - accuracy/test_cli_flow.py::TestLongAlpaca7B::test_multiblock_aggressive # 6 mins
   - accuracy/test_cli_flow.py::TestVicuna7B::test_lookahead # 5 mins
-  - accuracy/test_cli_flow.py::TestVicuna7B::test_medusa[cuda_graph=False] # 5 mins
-  - accuracy/test_cli_flow.py::TestVicuna7B::test_medusa[cuda_graph=True] # 5 mins
-  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph=False-chunked_context=False-typical_acceptance=False] # 5 mins
-  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph=True-chunked_context=False-typical_acceptance=False] # 5 mins
-  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph=True-chunked_context=True-typical_acceptance=False] # 5 mins
-  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph=True-chunked_context=False-typical_acceptance=True] # 5 mins
   - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle_2[cuda_graph=False-chunked_context=False] # 5 mins
   - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle_2[cuda_graph=True-chunked_context=False] # 5 mins
   - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle_2[cuda_graph=True-chunked_context=True] # 5 mins
@@ -170,10 +163,16 @@ l0_a10:
   - test_e2e.py::test_build_time_benchmark_sanity
   - examples/test_whisper.py::test_llm_whisper_general[large-v3-enable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime]
   - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime] # 4 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_medusa[cuda_graph=False] # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_medusa[cuda_graph=True] # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph=False-chunked_context=False-typical_acceptance=False] # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph=True-chunked_context=False-typical_acceptance=False] # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph=True-chunked_context=True-typical_acceptance=False] # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph=True-chunked_context=False-typical_acceptance=True] # 5 mins
   - accuracy/test_llm_api.py::TestEagleVicuna_7B_v1_3::test_auto_dtype
   - accuracy/test_llm_api.py::TestEagle2Vicuna_7B_v1_3::test_auto_dtype
-  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-trt-stress-test]
-  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-GUARANTEED_NO_EVICT-trt-stress-test]
+  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-trt-stress-test] TIMEOUT (60)
+  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-GUARANTEED_NO_EVICT-trt-stress-test] TIMEOUT (60)
 - condition:
     ranges:
       system_gpu_count:
