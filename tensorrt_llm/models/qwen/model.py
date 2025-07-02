@@ -38,10 +38,6 @@ from .config import QWenConfig
 from .convert import (load_hf_qwen, load_weights_from_hf_gptq_model,
                       load_weights_from_hf_model)
 
-
-# QWenAttention은 제거하고 기존 Attention + qk_layernorm 사용
-
-
 class QWenDecoderLayer(Module):
 
     def __init__(self, config: QWenConfig, layer_idx: int):
