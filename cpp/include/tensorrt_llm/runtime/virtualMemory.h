@@ -23,6 +23,7 @@
 #include "tensorrt_llm/runtime/memoryCounters.h"
 
 #include <cuda.h>
+#include <map>
 #include <mutex>
 #include <unistd.h>
 
@@ -417,8 +418,9 @@ private:
     void addBadHandle(uintptr_t handle) noexcept;
 
     struct Entry;
-    using PointerMemoryMap = std::unordered_map<uintptr_t, Entry>;
-    using MarkEntryMap = std::unordered_multimap<std::string, PointerMemoryMap::iterator>;
+    // Unordered map invalidates iterator upon rehash, so we can only use the ordered map.
+    using PointerMemoryMap = std::map<uintptr_t, Entry>;
+    using MarkEntryMap = std::multimap<std::string, PointerMemoryMap::iterator>;
 
     struct Entry
     {
