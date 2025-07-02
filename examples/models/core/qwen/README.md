@@ -692,7 +692,7 @@ concurrency=128
 path_data=./aa_prompt_isl_1k_osl_2k_qwen3_10000samples.txt
 
 # Setup the extra configuration for llm-api
-echo -e "disable_overlap_scheduler: false\nuse_cuda_graph: true\nprint_iter_log: true\ncuda_graph_batch_sizes: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,32,64,128]\nenable_attention_dp: true " > ${path_config}
+echo -e "disable_overlap_scheduler: false\cuda_graph_config: {}\nprint_iter_log: true\ncuda_graph_batch_sizes: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,32,64,128]\nenable_attention_dp: true " > ${path_config}
 
 # Run trtllm-bench with pytorch backend
 mpirun --allow-run-as-root --oversubscribe -n 1 \
