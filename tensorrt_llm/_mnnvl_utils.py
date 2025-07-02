@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import ctypes
+import os
 import platform
 import sys
 from dataclasses import dataclass
@@ -110,8 +112,9 @@ class MnnvlMemory:
         location.id = dev_id
         allocation_prop = cuda.CUmemAllocationProp()
         allocation_prop.type = cuda.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
+        # allocation_prop.requestedHandleTypes = cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
         allocation_prop.requestedHandleTypes = (
-            cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+            cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
         )
         allocation_prop.location = location
         return allocation_prop
@@ -174,10 +177,26 @@ class MnnvlMemory:
         )
         exported_fabric_handle = _check_cu_result(
             cuda.cuMemExportToShareableHandle(
-                allocated_mem_handle, cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC, 0
+                allocated_mem_handle, allocation_prop.requestedHandleTypes, 0
             )
         )
-        all_handles_data = comm.allgather(exported_fabric_handle.data)
+        if (
+            allocation_prop.requestedHandleTypes
+            == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+        ):
+            all_handles_data = comm.allgather(exported_fabric_handle.data)
+        else:
+            all_handles_data = comm.allgather(exported_fabric_handle)
+            all_pids = comm.allgather(os.getpid())
+            syscall = ctypes.CDLL(None).syscall
+            SYS_pidfd_open = 434
+            SYS_pidfd_getfd = 438
+            pidfds = [syscall(SYS_pidfd_open, pid, 0) for pid in all_pids]
+            remote_fds = [
+                syscall(SYS_pidfd_getfd, pidfd, fd, 0)
+                for pidfd, fd in zip(pidfds, all_handles_data)
+            ]
+            all_handles_data = remote_fds
         # all_handles_data like b'\x00\x00\x00 \x00\x00\x00\x00\x8f\xec\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\t\x00\x00\x00\x00\x00\x1d\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'  # noqa: E501
         # can use buf = memoryview(data) to import if using plain buffer for data.
 
@@ -201,7 +220,7 @@ class MnnvlMemory:
                 # Fabric memory mapping
                 imported_mem_handle = _check_cu_result(
                     cuda.cuMemImportFromShareableHandle(
-                        remote_handle_data, cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+                        remote_handle_data, allocation_prop.requestedHandleTypes
                     )
                 )
                 mem_handles[i] = imported_mem_handle
@@ -274,6 +293,9 @@ class MnnvlMemory:
 
     @staticmethod
     def supports_mnnvl() -> bool:
+        # TODO: Experimentally enabling this for now.
+        return True
+
         # TODO:
         # We check if it is an aarch64 platform and has all NVLink up now.
         # But it is not equivalent to MNNVL support.
