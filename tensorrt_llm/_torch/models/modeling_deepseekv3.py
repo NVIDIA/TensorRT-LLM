@@ -812,6 +812,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                            and self.fusion_config.POST_MOE_FUSION
                            and self.model_config.moe_backend == 'TRTLLM'
                            and self.mlp.experts.has_nvfp4)
+        do_finalize = True
 
         hidden_states = _run_MoE(hidden_states,
                                  hidden_states_fp4=None,

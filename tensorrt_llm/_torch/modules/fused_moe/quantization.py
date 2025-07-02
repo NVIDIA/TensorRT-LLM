@@ -1521,36 +1521,46 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
                 w1_weight_scale[i], w2_weight_scale[i], w3_weight_scale[i])
 
         # update fc31_alpha and fc31_input_scale
-        fc31_input_scale = shared_experts.gate_up_proj.input_scale.data.view(
+        shared_input_scale = 1.0 / shared_experts.gate_up_proj.input_scale.data.view(
             module.fc31_input_scale.shape)
-        shared_fc31_weight_scale_2 = shared_experts.gate_up_proj.alpha.data * fc31_input_scale
-        expert_fc31_weight_scale_2 = module.fc31_alpha.data * module.fc31_input_scale.data
+        shared_fc31_weight_scale_2 = shared_experts.gate_up_proj.alpha.data / shared_input_scale
+
+        fc31_input_scale = 1.0 / module.fc31_input_scale.data
+        expert_fc31_weight_scale_2 = module.fc31_alpha.data / fc31_input_scale
         expert_fc31_weight_scale_2[
             module.expert_size_per_partition:] = shared_fc31_weight_scale_2
-
-        module.fc31_input_scale.data.copy_(torch.minimum(
-            fc31_input_scale, module.fc31_input_scale.data),
+        fc31_input_scale = torch.max(fc31_input_scale, shared_input_scale)
+        module.fc31_input_scale.data.copy_(1.0 / fc31_input_scale,
                                            non_blocking=True)
         module.fc31_alpha.data.copy_(expert_fc31_weight_scale_2 *
-                                     (1.0 / module.fc31_input_scale.data),
+                                     fc31_input_scale,
                                      non_blocking=True)
 
         # update fc2_alpha and fc2_input_scale
-        fc2_input_scale = shared_experts.down_proj.input_scale.data.view(
+        shared_fc2_input_scale = 1.0 / shared_experts.down_proj.input_scale.data.view(
             module.fc2_input_scale.shape)
-        shared_fc2_weight_scale_2 = shared_experts.down_proj.alpha.data * fc2_input_scale
-        expert_fc2_weight_scale_2 = module.fc2_alpha.data * module.fc2_input_scale.data
+        shared_fc2_weight_scale_2 = shared_experts.down_proj.alpha.data / shared_fc2_input_scale
+
+        fc2_input_scale = 1.0 / module.fc2_input_scale.data
+        fc2_input_scale_vec = fc2_input_scale.expand(
+            module.expert_size_per_partition)
+        fc2_input_scale_vec = torch.cat([
+            fc2_input_scale_vec,
+            shared_fc2_input_scale.expand(n_shared_experts)
+        ],
+                                        dim=0)
+        expert_fc2_weight_scale_2 = module.fc2_alpha.data / fc2_input_scale
         expert_fc2_weight_scale_2[
             module.expert_size_per_partition:] = shared_fc2_weight_scale_2
 
-        module.fc2_input_scale.data.copy_(torch.minimum(
-            fc2_input_scale, module.fc2_input_scale.data),
+        fc2_input_scale = torch.max(fc2_input_scale, shared_fc2_input_scale)
+        module.fc2_input_scale.data.copy_(1.0 / fc2_input_scale,
                                           non_blocking=True)
         module.fc2_alpha.data.copy_(expert_fc2_weight_scale_2 *
-                                    (1.0 / module.fc2_input_scale.data),
+                                    fc2_input_scale_vec,
                                     non_blocking=True)
-        module.fc31_scale_c.data.copy_(module.fc2_input_scale.data *
-                                       module.fc31_alpha.data,
-                                       non_blocking=True)
+        module.fc31_scale_c.data.copy_(
+            (1.0 / fc2_input_scale_vec) * module.fc31_alpha.data,
+            non_blocking=True)
 
         self.setup_quant_scales(module)

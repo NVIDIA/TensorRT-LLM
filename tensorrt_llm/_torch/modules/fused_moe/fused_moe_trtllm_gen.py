@@ -88,6 +88,7 @@ class TRTLLMGenFusedMoE(MoE):
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
         self.num_fused_shared_expert = 0
+        self.layer_idx = layer_idx
 
         if not model_config.mapping.enable_attention_dp and self.quant_config.layer_quant_mode.has_nvfp4(
         ):
