@@ -870,7 +870,7 @@ class TritonFusedMoE(MoE):
                 return p
             assert isinstance(p, torch.Tensor)
             assert p.dtype == torch.float32
-            assert p.shape == (self.num_experts, 1)
+            assert p.shape == (self.expert_size_per_partition, ), p.shape
             assert torch.all(
                 p == p[0]
             ), "All experts must have the same swiglu alpha/beta for Triton kernel"

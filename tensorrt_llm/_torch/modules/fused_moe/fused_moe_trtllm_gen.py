@@ -5,7 +5,7 @@ from torch import nn
 
 from ...distributed.ops import reducescatter
 from ...model_config import ModelConfig
-from ...utils import Fp4QuantizedTensor
+from ...utils import Fp4QuantizedTensor, next_positive_power_of_2
 from .interface import MoE, MoEWeightLoadingMode
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            NVFP4TRTLLMGenFusedMoEMethod,
@@ -59,6 +59,9 @@ class TRTLLMGenFusedMoE(MoE):
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
         layer_idx: Optional[int] = None,
+        bias: bool = False,
+        swiglu_alpha: Optional[torch.Tensor] = None,
+        swiglu_beta: Optional[torch.Tensor] = None,
     ):
         super().__init__(
             routing_method=routing_method,
@@ -69,6 +72,9 @@ class TRTLLMGenFusedMoE(MoE):
             reduce_results=reduce_results,
             model_config=model_config,
             weight_loading_mode=weight_loading_mode,
+            bias=bias,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
         )
 
         assert not self.smart_router, "Smart router is not supported in TRTLLMGenFusedMoE."
@@ -95,6 +101,22 @@ class TRTLLMGenFusedMoE(MoE):
         assert self.has_deepseek_fp8_block_scales \
             or self.has_nvfp4 or self.has_w4a16_mxfp4 \
             or self.has_w4a8_mxfp4_fp8, "TRTLLMGenFusedMoE only supports fp8_block_scaling, nvfp4, w4a16_mxfp4 and w4a8_mxfp4_fp8 dtypes."
+
+        if self.bias or self.swiglu_alpha is not None or self.swiglu_beta is not None:
+            assert self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8, "TRTLLMGenFusedMoE only supports w4a16_mxfp4 and w4a8_mxfp4_fp8 dtypes with bias, swiglu_alpha and swiglu_beta."
+
+    def _get_tile_tokens_dim(self, x: torch.Tensor):
+        top_k = self.routing_method.top_k
+        # Number of tokens in the input tensor.
+        num_tokens = x.shape[0]
+        # Guess tokens per expert assuming perfect expert distribution first.
+        num_tokens_per_expert = (num_tokens * top_k) // self.num_experts
+        # And pad the number to the next power of 2.
+        tile_tokens_dim = next_positive_power_of_2(num_tokens_per_expert)
+        # Cap to 8-64 tokens per CTA tile as it's the range supported by the kernel.
+        tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
+
+        return tile_tokens_dim
 
     def _get_quant_method(self):
         if self.quant_config is not None:
@@ -278,8 +300,8 @@ class TRTLLMGenFusedMoE(MoE):
                 self.w3_w1_weight,
                 self.w3_w1_weight_scale,
                 self.w3_w1_bias,
-                None,  # swiglu_alpha
-                None,  # swiglu_beta
+                self.swiglu_alpha,
+                self.swiglu_beta,
                 self.w2_weight,
                 self.w2_weight_scale,
                 self.w2_bias,
@@ -294,7 +316,7 @@ class TRTLLMGenFusedMoE(MoE):
                 routed_scaling_factor,
                 tile_tokens_dim,
                 self.routing_method.routing_method_type,
-                0,  # act_type
+                0 if self.swiglu_alpha is None else 2,  # act_type
             )
         elif self.has_w4a8_mxfp4_fp8:
             x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
@@ -316,8 +338,8 @@ class TRTLLMGenFusedMoE(MoE):
                 self.w3_w1_weight,
                 self.w3_w1_weight_scale,
                 self.w3_w1_bias,
-                None,  # swiglu_alpha
-                None,  # swiglu_beta
+                self.swiglu_alpha,
+                self.swiglu_beta,
                 self.w2_weight,
                 self.w2_weight_scale,
                 self.w2_bias,
@@ -335,7 +357,7 @@ class TRTLLMGenFusedMoE(MoE):
                 routed_scaling_factor,
                 tile_tokens_dim,
                 self.routing_method.routing_method_type,
-                0,  # act_type
+                0 if self.swiglu_alpha is None else 2,  # act_type
             )
         else:
             raise NotImplementedError(

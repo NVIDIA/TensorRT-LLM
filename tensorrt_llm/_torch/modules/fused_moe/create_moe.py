@@ -81,11 +81,11 @@ def create_moe(
         assert moe_cls == WideEPMoE, "MoE Load Balance is only supported in WideEPMoE now."
 
     if bias:
-        assert moe_cls in [CutlassFusedMoE, TritonFusedMoE
+        assert moe_cls in [CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE
                            ], f"bias not supported in {moe_cls.__name__}."
 
     if swiglu_alpha is not None or swiglu_beta is not None:
-        assert moe_cls in [TritonFusedMoE], \
+        assert moe_cls in [CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE], \
             f"swiglu_alpha and swiglu_beta are only supported in TritonFusedMoE, not in {moe_cls.__name__}."
         assert swiglu_alpha is not None and swiglu_beta is not None, \
             "Both swiglu_alpha and swiglu_beta must be provided."
@@ -103,6 +103,8 @@ def create_moe(
             model_config=model_config,
             weight_loading_mode=weight_loading_mode,
             layer_idx=layer_idx,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
         )
     elif moe_cls == CutlassFusedMoE:
         return moe_cls(
@@ -118,6 +120,8 @@ def create_moe(
             bias=bias,
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
         )
     elif moe_cls == WideEPMoE:
         return moe_cls(
