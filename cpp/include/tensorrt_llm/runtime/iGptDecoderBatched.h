@@ -72,10 +72,6 @@ public:
 
     //! Batch of active decoder slots, sorted by slots, [maxDecoderSteps][batchSize]
     std::vector<TensorPtr> batchSlots;
-
-    //! For Beam Search
-    //! The generation step of each request (for Variable-Beam-Width-Search), [batchSize]
-    std::vector<SizeType32> generationSteps;
 };
 
 } // namespace decoder_batch

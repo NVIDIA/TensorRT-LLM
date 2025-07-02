@@ -273,8 +273,7 @@ void initBindings(pybind11::module_& m)
         .def(py::init<std::vector<tr::ITensor::SharedConstPtr>>(), py::arg("logits"))
         .def_readwrite("logits", &tr::decoder_batch::Input::logits)
         .def_readwrite("max_decoder_steps", &tr::decoder_batch::Input::maxDecoderSteps)
-        .def_readwrite("batch_slots", &tr::decoder_batch::Input::batchSlots)
-        .def_readwrite("generation_steps", &tr::decoder_batch::Input::generationSteps);
+        .def_readwrite("batch_slots", &tr::decoder_batch::Input::batchSlots);
 
     py::class_<tr::LookaheadDecodingBuffers>(m, "LookaheadDecodingBuffers")
         .def(py::init<tr::SizeType32, tr::SizeType32, tr::BufferManager const&>(), py::arg("max_num_sequences"),

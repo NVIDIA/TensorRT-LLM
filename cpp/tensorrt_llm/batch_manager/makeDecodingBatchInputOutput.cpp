@@ -192,8 +192,7 @@ std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::operator
     if (maxBeamWidth > 1)
     {
         // For Variable-Beam-Width-Search
-        decodingInput->generationSteps = generationSteps;
-        decoderState.getJointDecodingInput().generationSteps = decodingInput->generationSteps;
+        decoderState.getJointDecodingInput().generationSteps = generationSteps;
     }
 
     if (modelConfig.getSpeculativeDecodingMode().hasDraftLogits())
