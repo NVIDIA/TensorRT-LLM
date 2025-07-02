@@ -568,7 +568,7 @@ def quant_dequant_per_tensor_fp8(a):
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 100,
+    getSMVersion() < 100 or getSMVersion() >= 110,
     reason="The kernel only supports Blackwell. Current SM is %d." %
     getSMVersion(),
 )
@@ -702,7 +702,7 @@ class TestMoeFP8:
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 100,
+    getSMVersion() < 100 or getSMVersion() >= 110,
     reason="The kernel only supports Blackwell. Current SM is %d." %
     getSMVersion(),
 )
@@ -1061,7 +1061,7 @@ class TestMoeFp4:
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 100,
+    getSMVersion() < 100 or getSMVersion() >= 110,
     reason="The kernel only supports Blackwell. Current SM is %d." %
     getSMVersion(),
 )

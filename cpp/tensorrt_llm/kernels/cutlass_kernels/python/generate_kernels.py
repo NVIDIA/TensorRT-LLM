@@ -809,7 +809,7 @@ if __name__ == "__main__":
     }
 
     def has_arch(sm):
-        return f"{sm}" in arches or f"{sm}-real" in arches
+        return f"{sm}" in arches or f"{sm}-real" in arches or f"{sm}f-real" in arches or f"{sm}f" in arches
 
     # The goal here is to group kernels with common instantiations together in order to reduce template instantiation overheads.
     # Template instantiation dominates the time in a compilation unit, so it is the most important factor to improve.

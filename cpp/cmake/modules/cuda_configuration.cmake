@@ -160,13 +160,19 @@ function(setup_cuda_architectures)
       ${CMAKE_CUDA_ARCHITECTURES_ORIG}
       PARENT_SCOPE)
 
-  set(ARCHITECTURES_WITH_KERNELS 80 86 89 90 100 120)
+  set(ARCHITECTURES_WITH_KERNELS 80 86 89 90 120)
   foreach(CUDA_ARCH IN LISTS ARCHITECTURES_WITH_KERNELS)
     if(NOT ${CUDA_ARCH} IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
       add_definitions("-DEXCLUDE_SM_${CUDA_ARCH}")
       message(STATUS "Excluding SM ${CUDA_ARCH}")
     endif()
   endforeach()
+  # deal with SM100/f
+  if(NOT "100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+     AND NOT "100f" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
+    add_definitions("-DEXCLUDE_SM_100")
+    message(STATUS "Excluding SM 100(f)")
+  endif()
 
   # -a suffix supported from Hopper (90)
   set(MIN_ARCHITECTURE_HAS_ACCEL 90)

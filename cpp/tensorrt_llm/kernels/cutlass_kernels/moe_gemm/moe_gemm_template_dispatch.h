@@ -665,8 +665,9 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
             // numbers of tokens SM80 is faster. We check here to see which is selected
             if (inputs.gemm_config.sm_version >= 90)
             {
-                TLLM_CHECK_WITH_INFO(inputs.gemm_config.sm_version == sm_, "Using SM %d configuration for SM %d device",
-                    inputs.gemm_config.sm_version, sm_);
+                TLLM_CHECK_WITH_INFO(
+                    (inputs.gemm_config.sm_version == sm_) || (inputs.gemm_config.sm_version == 100 && sm_ == 103),
+                    "Using SM %d configuration for SM %d device", inputs.gemm_config.sm_version, sm_);
                 TLLM_CHECK_WITH_INFO(inputs.biases != nullptr || hopper_inputs.ptr_c == nullptr,
                     "Input biases and hopper input disagree if bias is enabled");
                 TLLM_CHECK_WITH_INFO(
@@ -788,6 +789,14 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspace
     {
         return 0;
     }
+    // #ifndef CUTLASS_ARCH_MMA_SM100F_SUPPORTED
+    // static_assert(__CUDA_ARCH__ == 1000, "__CUDA_ARCH__");
+    // static_assert(CUTLASS_ARCH_MMA_SM100_SUPPORTED, "CUTLASS_ARCH_MMA_SM100F_SUPPORTED");
+    // static_assert(CUTLASS_ARCH_MMA_SM100_ENABLED, "CUTLASS_ARCH_MMA_SM100_ENABLED");
+    // static_assert(CUTLASS_ARCH_MMA_SM100F_SUPPORTED, "CUTLASS_ARCH_MMA_SM100F_SUPPORTED");
+    // static_assert(CUTLASS_ARCH_MMA_SM100F_ENABLED, "CUTLASS_ARCH_MMA_SM100F_ENABLED");
+    // // #error "SM100F not supported!"
+    // #endif
     if constexpr (kernels::cutlass_kernels::isValidTmaWarpSpecializedMOESpecialisation<T, WeightType>() && !use_w4afp8)
     {
         auto configs = getTmaWarpSpecializedConfigs(sm_);

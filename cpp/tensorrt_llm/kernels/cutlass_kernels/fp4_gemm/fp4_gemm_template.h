@@ -330,7 +330,7 @@ size_t CutlassFp4GemmRunner<T, fp4GemmType>::dispatchToArch(T* D, void const* A,
 {
     if constexpr (fp4GemmType == FP4GemmType::W4A8_MXFP4_MXFP8)
     {
-        if (mSm == 100)
+        if (mSm == 100 || mSm == 103)
         {
             return dispatchMXFP8xMXFP4GemmCTAShapeSm100<T>(D, A, B, input_sf, weight_sf, global_sf, m, n, k,
                 batch_count, gemmConfig, workspace, workspaceBytes, stream, occupancy);
@@ -343,7 +343,7 @@ size_t CutlassFp4GemmRunner<T, fp4GemmType>::dispatchToArch(T* D, void const* A,
     }
     else if constexpr (fp4GemmType == FP4GemmType::W4A4_NVFP4_NVFP4)
     {
-        if (mSm == 100)
+        if (mSm == 100 || mSm == 103)
         {
             return dispatchNVFP4xNVFP4GemmCTAShapeSm100<T>(D, A, B, input_sf, weight_sf, global_sf, m, n, k,
                 batch_count, gemmConfig, workspace, workspaceBytes, stream, occupancy);
@@ -384,7 +384,7 @@ std::vector<tkc::CutlassGemmConfig> CutlassFp4GemmRunner<T, fp4GemmType>::getCon
 
     std::vector<CutlassGemmConfig> candidateConfigs;
 
-    if (mSm == 100)
+    if (mSm == 100 || mSm == 103)
     {
         std::vector<tkc::CutlassTileConfigSM100> tilesSm100 = {
             tkc::CutlassTileConfigSM100::CtaShape128x64x128B,
