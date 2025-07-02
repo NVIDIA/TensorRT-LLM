@@ -79,21 +79,13 @@ def calc_engine_setting(
     # Calculate max requests in KV cache based on target ISL and OSL.
     target_seq_len = target_input_len + target_output_len
 
-    if is_mamba_attn_hybrid:
-        num_mamba_layers = model_config.num_mamba_layers
-        conv_dim = model_config.d_inner + 2 * model_config.n_groups * model_config.d_state
-        num_conv_state_elements = num_mamba_layers * conv_dim * (
-            model_config.d_conv - 1)
-        num_ssm_state_elements = num_mamba_layers * model_config.mamba_num_heads * model_config.mamba_head_dim * model_config.d_state
-        byte_per_state_elem = BYTES_PER_ELEM.get(QuantAlgo.NO_QUANT)
-        byte_per_mamba_cache = byte_per_state_elem * (
-            num_conv_state_elements + num_ssm_state_elements) / (1024**3)
-
-        # Each mamba cache entry is pretty large (~50MB), so we are more conservative when estimating the max batch size
+    byte_per_mamba_cache = model_config.extra_model_cache_in_gb(
+        BYTES_PER_ELEM.get(QuantAlgo.NO_QUANT), target_seq_len)
+    if byte_per_mamba_cache > 0:
         kv_cache_gpu_mem_fraction *= kv_cache_gpu_mem_fraction
-    else:
-        byte_per_mamba_cache = 0
-
+        print(
+            f"Using Mamba cache, reducing KV cache GPU memory fraction to {kv_cache_gpu_mem_fraction}"
+        )
     cache_memory = available_memory * kv_cache_gpu_mem_fraction
     kv_cache_max_requests = cache_memory / (byte_per_token * target_seq_len +
                                             byte_per_mamba_cache)

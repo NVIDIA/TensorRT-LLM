@@ -222,6 +222,9 @@ class ModelConfig(BaseModel):
 
         return cls(name=model_hf_name, param_count=param_count, **hf_config)
 
+    def extra_model_cache_in_gb(self, bytes_per_elem, target_seq_len=None):
+        return 0
+
 
 class NemotronHybridConfig(ModelConfig):
     hybrid_override_pattern: str
@@ -259,3 +262,11 @@ class NemotronHybridConfig(ModelConfig):
 
         super().set_values_if_none()
         return self
+
+    def extra_model_cache_in_gb(self, bytes_per_elem, target_seq_len=None):
+        conv_dim = self.d_inner + 2 * self.n_groups * self.d_state
+        conv_state_elems = conv_dim * (self.d_conv - 1)
+        ssm_state_elems = self.mamba_num_heads * self.mamba_head_dim * self.d_state
+        gb_per_mamba_cache = bytes_per_elem * self.num_mamba_layers * (
+            conv_state_elems + ssm_state_elems) / (1024**3)
+        return gb_per_mamba_cache
