@@ -172,6 +172,9 @@ public:
         }
     }
 
+    /**
+     * Test if this CUDAVirtualMemory is managing a memory block.
+     */
     explicit operator bool() const noexcept
     {
         return mCreator != nullptr;
@@ -306,13 +309,13 @@ struct MemsetConfigurator : CUDAVirtualMemory::Configurator
 };
 
 /**
- * BackedConfigurator backup the content of the allocation when teardown,
- * and restore the backup on the following setup.
+ * OffloadConfigurator offload the content of the allocation to the backup storage when teardown,
+ * and restore the content on the following setup.
  */
 
-struct BackedConfigurator : CUDAVirtualMemory::Configurator
+struct OffloadConfigurator : CUDAVirtualMemory::Configurator
 {
-    BackedConfigurator(CUdeviceptr address, size_t size, MemoryType backType, CUstream stream, bool ondemand = false)
+    OffloadConfigurator(CUdeviceptr address, size_t size, MemoryType backType, CUstream stream, bool ondemand = false)
         : mAddress(address)
         , mSize(size)
         , mBackType(backType)
@@ -331,7 +334,6 @@ struct BackedConfigurator : CUDAVirtualMemory::Configurator
     bool mOndemand;
 
     IBuffer::UniquePtr mBackedStorage;
-    CudaEvent mEvent;
 };
 
 class CudaVirtualMemoryManager
@@ -439,7 +441,7 @@ class CudaVirtualAddressAllocator
     using Pointer = void*;
 
 public:
-    enum BackedMode
+    enum RestoreMode
     {
         NONE,   // The memory is not backed. Upon rematerialize, memory has uninitialized content.
         MEMSET, // The memory is memset to zero upon rematerialize.
@@ -453,7 +455,7 @@ public:
         std::string mMark;
         CudaStreamPtr mBackStream;
         std::size_t mPageSize;
-        BackedMode mMode;
+        RestoreMode mMode;
 
         friend class CudaVirtualAddressAllocator;
 
@@ -467,7 +469,7 @@ public:
          *                   Note: Virtual Address Allocation is not async. The stream is not used in allocation.
          */
         Configuration(
-            CudaVirtualMemoryManager* manager, std::string const& mark, BackedMode mode, CudaStreamPtr backStream)
+            CudaVirtualMemoryManager* manager, std::string const& mark, RestoreMode mode, CudaStreamPtr backStream)
             : mManager(manager)
             , mMark(mark)
             , mBackStream(std::move(backStream))
@@ -507,7 +509,7 @@ void cudaVirtualAddressAllocatorDeallocate(void* ptr, std::size_t n);
 
 CudaVirtualAddressAllocator const& getVirtualAddressAllocator();
 void pushVirtualAddressAllocator(
-    std::string const& mark, CudaVirtualAddressAllocator::BackedMode mode, std::shared_ptr<CudaStream> backStream);
+    std::string const& mark, CudaVirtualAddressAllocator::RestoreMode mode, std::shared_ptr<CudaStream> backStream);
 void popVirtualAddressAllocator();
 
 } // namespace tensorrt_llm::runtime

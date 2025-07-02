@@ -3,13 +3,13 @@ from contextlib import contextmanager
 import torch
 
 from tensorrt_llm.bindings.internal.runtime import \
-    CudaVirtualAddressAllocatorBackedMode as BackedMode
+    CudaVirtualAddressAllocatorRestoreMode as RestoreMode
 from tensorrt_llm.bindings.internal.runtime import (
     get_virtual_memory_manager, pop_virtual_address_allocator,
     push_virtual_address_allocator)
 
 __all__ = [
-    "BackedMode", "maybe_scope", "scope", "release_with_mark",
+    "RestoreMode", "maybe_scope", "scope", "release_with_mark",
     "materialize_with_mark"
 ]
 
@@ -30,7 +30,7 @@ def _get_torch_pluggable_virtual_memory_allocator():
 
 
 @contextmanager
-def _virtual_address_helper(mark: str, mode: BackedMode):
+def _virtual_address_helper(mark: str, mode: RestoreMode):
     stream = torch.cuda.current_stream()
     push_virtual_address_allocator(mark, mode, stream.cuda_stream)
     try:
@@ -39,7 +39,7 @@ def _virtual_address_helper(mark: str, mode: BackedMode):
         pop_virtual_address_allocator()
 
 
-def _scope(mark: str, mode: BackedMode = BackedMode.NONE):
+def _scope(mark: str, mode: RestoreMode = RestoreMode.NONE):
     """A context manager that routes allocations to virtual memory allocator
     using given mark and backed mode.
 
@@ -55,7 +55,7 @@ scope = contextmanager(_scope)
 
 
 @contextmanager
-def maybe_scope(enable: bool, mark: str, mode: BackedMode = BackedMode.NONE):
+def maybe_scope(enable: bool, mark: str, mode: RestoreMode = RestoreMode.NONE):
     if enable:
         yield from _scope(mark, mode)
     else:

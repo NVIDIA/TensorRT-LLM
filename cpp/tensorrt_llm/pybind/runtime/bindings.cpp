@@ -425,18 +425,18 @@ void initBindings(pybind11::module_& m)
         [](int32_t tp_size) { return tensorrt_llm::kernels::max_workspace_size_lowprecision(tp_size); },
         "Calculate the maximum workspace size needed for low precision all-reduce operations");
 
-    py::enum_<tr::CudaVirtualAddressAllocator::BackedMode>(m, "CudaVirtualAddressAllocatorBackedMode")
-        .value("NONE", tr::CudaVirtualAddressAllocator::BackedMode::NONE)
-        .value("CPU", tr::CudaVirtualAddressAllocator::BackedMode::CPU)
-        .value("PINNED", tr::CudaVirtualAddressAllocator::BackedMode::PINNED)
-        .value("MEMSET", tr::CudaVirtualAddressAllocator::BackedMode::MEMSET);
+    py::enum_<tr::CudaVirtualAddressAllocator::RestoreMode>(m, "CudaVirtualAddressAllocatorRestoreMode")
+        .value("NONE", tr::CudaVirtualAddressAllocator::RestoreMode::NONE)
+        .value("CPU", tr::CudaVirtualAddressAllocator::RestoreMode::CPU)
+        .value("PINNED", tr::CudaVirtualAddressAllocator::RestoreMode::PINNED)
+        .value("MEMSET", tr::CudaVirtualAddressAllocator::RestoreMode::MEMSET);
 
     m.def("get_virtual_memory_manager", &tr::getVirtualMemoryManager, "Get the virtual memory manager",
         py::return_value_policy::reference);
 
     m.def(
         "push_virtual_address_allocator",
-        [](std::string const& mark, tr::CudaVirtualAddressAllocator::BackedMode mode, uintptr_t stream)
+        [](std::string const& mark, tr::CudaVirtualAddressAllocator::RestoreMode mode, uintptr_t stream)
         {
             tr::pushVirtualAddressAllocator(mark, mode,
                 std::make_shared<tr::CudaStream>(

@@ -112,7 +112,7 @@ void CUDAVirtualMemory::release()
     }
 }
 
-void BackedConfigurator::setup(CUmemGenericAllocationHandle)
+void OffloadConfigurator::setup(CUmemGenericAllocationHandle)
 {
     if (mBackedStorage != nullptr)
     {
@@ -124,7 +124,7 @@ void BackedConfigurator::setup(CUmemGenericAllocationHandle)
     }
 }
 
-void BackedConfigurator::teardown(CUmemGenericAllocationHandle)
+void OffloadConfigurator::teardown(CUmemGenericAllocationHandle)
 {
     if (mBackedStorage == nullptr)
     {
@@ -135,10 +135,8 @@ void BackedConfigurator::teardown(CUmemGenericAllocationHandle)
         default: TLLM_THROW("Unknown memory type: %d", static_cast<int32_t>(mBackType));
         }
     }
-    TLLM_CU_CHECK(cuMemcpyDtoHAsync_v2(mBackedStorage->data(), mAddress, mSize, mStream));
     // We have to synchronize here, or the memory may be unmapped before the copy operation.
-    TLLM_CU_CHECK(cuEventRecord(mEvent.get(), mStream));
-    mEvent.synchronize();
+    TLLM_CU_CHECK(cuMemcpyDtoH_v2(mBackedStorage->data(), mAddress, mSize));
 }
 
 void CudaVirtualMemoryManager::add(uintptr_t handle, std::string mark, CUDAVirtualMemory&& memory)
@@ -154,7 +152,7 @@ void CudaVirtualMemoryManager::add(uintptr_t handle, std::string mark, CUDAVirtu
         created, "CudaVirtualMemoryManager: handle 0x%016zx already being used by another memory", handle);
     ScopeGuard eraseMemIt{success, [&, memIt_ = memIt] { mMemories.erase(memIt_); }};
 
-    auto entryIt = mEntries.emplace(std::move(mark), memIt);
+    auto const entryIt = mEntries.emplace(std::move(mark), memIt);
     entryIt->second->second.mEntryIt = entryIt;
 
     memIt->second.mMemory = std::move(memory);
@@ -203,7 +201,7 @@ CUDAVirtualMemory CudaVirtualMemoryManager::remove(uintptr_t handle) noexcept
 
 CUDAVirtualMemory CudaVirtualMemoryManager::unsafeRemove(uintptr_t handle) noexcept
 {
-    auto nodeHandle = mMemories.extract(handle);
+    auto const nodeHandle = mMemories.extract(handle);
     if (!nodeHandle)
     {
         return {};
@@ -238,7 +236,7 @@ size_t CudaVirtualMemoryManager::releaseWithMark(std::string const& mark)
     size_t count = 0;
     for (auto it = begin; it != end;)
     {
-        auto handle = it->second->first;
+        auto const handle = it->second->first;
         auto& memory = it->second->second.mMemory;
         ++it; // element referenced by `it` will be invalidated by unsafeRemove(handle)
         if (memory.status() == CUDAVirtualMemory::MATERIALIZED)
@@ -285,11 +283,11 @@ size_t CudaVirtualMemoryManager::materializeWithMark(std::string const& mark)
     }
     catch (...)
     {
-        for (auto it2 = begin; it2 != it;)
+        for (auto itRollback = begin; itRollback != it;)
         {
-            auto handle = it2->second->first;
-            auto& memory = it2->second->second.mMemory;
-            ++it2;
+            auto const handle = itRollback->second->first;
+            auto& memory = itRollback->second->second.mMemory;
+            ++itRollback;
             try
             {
                 memory.release();
@@ -348,11 +346,11 @@ void CudaVirtualAddressAllocator::allocate(Pointer* ptr, std::size_t n, int devi
         break;
     case CPU:
         configurators.push_back(
-            std::make_unique<BackedConfigurator>(address, n, MemoryType::kCPU, mConfig->mBackStream->get()));
+            std::make_unique<OffloadConfigurator>(address, n, MemoryType::kCPU, mConfig->mBackStream->get()));
         break;
     case PINNED:
         configurators.push_back(
-            std::make_unique<BackedConfigurator>(address, n, MemoryType::kPINNED, mConfig->mBackStream->get()));
+            std::make_unique<OffloadConfigurator>(address, n, MemoryType::kPINNED, mConfig->mBackStream->get()));
         break;
     }
 
@@ -393,7 +391,7 @@ void cudaVirtualAddressAllocatorDeallocate(void* ptr, std::size_t n)
     auto const address = deviceptr_cast(ptr);
     getVirtualMemoryManager()->remove(address);
 
-    auto pageSize = getpagesize();
+    auto const pageSize = getpagesize();
     std::size_t const pageAlignedSize = (n + pageSize - 1) & ~(pageSize - 1);
     TLLM_CU_CHECK_FREE_RESOURCE(cuMemAddressFree(address, pageAlignedSize));
 }
@@ -411,7 +409,7 @@ CudaVirtualAddressAllocator const& getVirtualAddressAllocator()
 }
 
 void pushVirtualAddressAllocator(
-    std::string const& mark, CudaVirtualAddressAllocator::BackedMode mode, std::shared_ptr<CudaStream> backStream)
+    std::string const& mark, CudaVirtualAddressAllocator::RestoreMode mode, std::shared_ptr<CudaStream> backStream)
 {
     vaAllocators.emplace_front(std::make_shared<CudaVirtualAddressAllocator::Configuration>(
         getVirtualMemoryManager(), mark, mode, backStream));

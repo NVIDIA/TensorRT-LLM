@@ -501,16 +501,17 @@ protected:
 
 using PinnedPoolAllocator = PoolAllocator<PinnedAllocator>;
 
-class CudaVirtualAddressAllocator1
-    : public BaseAllocator<CudaVirtualAddressAllocator1, MemoryType::kGPU, /* count */ false>,
+class CudaVirtualAddressAllocatorAdaptor
+    : public BaseAllocator<CudaVirtualAddressAllocatorAdaptor, MemoryType::kGPU, /* count */ false>,
       CudaVirtualAddressAllocator
 {
     // Update to MemoryCounters is done in Creator to more precisely reflect the memory usage.
-    using Base = BaseAllocator<CudaVirtualAddressAllocator1, MemoryType::kGPU, false>;
+    using Base = BaseAllocator<CudaVirtualAddressAllocatorAdaptor, MemoryType::kGPU, false>;
     friend Base;
 
 public:
-    CudaVirtualAddressAllocator1(CudaVirtualAddressAllocator const& allocator)
+    // No explicit, to allow implicit conversion from CudaVirtualAddressAllocator
+    CudaVirtualAddressAllocatorAdaptor(CudaVirtualAddressAllocator const& allocator)
         : CudaVirtualAddressAllocator(allocator)
     {
     }
@@ -864,7 +865,7 @@ using HostBuffer = GenericBuffer<HostAllocator>;
 using PinnedBuffer = GenericBuffer<PinnedAllocator>;
 using PinnedPoolBuffer = GenericBuffer<PinnedPoolAllocator>;
 using UVMBuffer = GenericBuffer<UVMAllocator>;
-using VirtualAddressDeviceBuffer = GenericBuffer<CudaVirtualAddressAllocator1>;
+using VirtualAddressDeviceBuffer = GenericBuffer<CudaVirtualAddressAllocatorAdaptor>;
 
 template <typename T>
 std::make_unsigned_t<T> nonNegative(T value)
@@ -1100,6 +1101,6 @@ using HostTensor = GenericTensor<HostAllocator>;
 using PinnedTensor = GenericTensor<PinnedAllocator>;
 using PinnedPoolTensor = GenericTensor<PinnedPoolAllocator>;
 using UVMTensor = GenericTensor<UVMAllocator>;
-using VirtualAddressDeviceTensor = GenericTensor<CudaVirtualAddressAllocator1>;
+using VirtualAddressDeviceTensor = GenericTensor<CudaVirtualAddressAllocatorAdaptor>;
 
 } // namespace tensorrt_llm::runtime

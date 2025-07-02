@@ -190,11 +190,11 @@ TEST_F(VirtualMemoryTest, TestBasic)
 }
 
 // Test BackedConfigurator refills memory correctly for both CPU and PINNED memory types
-class VirtualMemoryBackedConfigurator : public VirtualMemoryTest, public ::testing::WithParamInterface<MemoryType>
+class VirtualMemoryOffloadConfigurator : public VirtualMemoryTest, public ::testing::WithParamInterface<MemoryType>
 {
 };
 
-TEST_P(VirtualMemoryBackedConfigurator, Test)
+TEST_P(VirtualMemoryOffloadConfigurator, Test)
 {
     MemoryType backType = GetParam();
     CUdeviceptr address{};
@@ -218,7 +218,7 @@ TEST_P(VirtualMemoryBackedConfigurator, Test)
                             0,
                         },
             CU_MEM_ACCESS_FLAGS_PROT_READWRITE}));
-    configurators.push_back(std::make_unique<BackedConfigurator>(address, size, backType, stream.get(), false));
+    configurators.push_back(std::make_unique<OffloadConfigurator>(address, size, backType, stream.get(), false));
 
     CUDAVirtualMemory vm(std::move(creator), std::move(configurators));
 
@@ -248,7 +248,7 @@ TEST_P(VirtualMemoryBackedConfigurator, Test)
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    Backends, VirtualMemoryBackedConfigurator, ::testing::Values(MemoryType::kCPU, MemoryType::kPINNED));
+    Backends, VirtualMemoryOffloadConfigurator, ::testing::Values(MemoryType::kCPU, MemoryType::kPINNED));
 
 // Test CUDAVirtualMemory calls creator and configurators in correct order
 TEST_F(VirtualMemoryTest, TestOrder)
@@ -1510,7 +1510,7 @@ TEST_F(VirtualMemoryManagerTest, TestCudaVirtualAddressAllocator)
 
     // Create configuration for the virtual address allocator
     auto config = std::make_shared<CudaVirtualAddressAllocator::Configuration>(
-        mVMManager.get(), mark, CudaVirtualAddressAllocator::BackedMode::NONE, streamPtr);
+        mVMManager.get(), mark, CudaVirtualAddressAllocator::RestoreMode::NONE, streamPtr);
 
     auto memoryBegin = getCurrentProcessMemoryInfo();
 
