@@ -1,6 +1,9 @@
+import os
 from typing import Dict, List, Optional, Union
 
 import torch
+
+from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
 
 from ...distributed import allgather, reducescatter
 from ...model_config import ModelConfig
@@ -112,6 +115,18 @@ class CutlassFusedMoE(MoE):
         )
         self.has_been_profiled = False
         self.has_been_profiled_min_latency = False
+
+        # Alltoall support for single-node inference
+        self._enable_alltoall = False  # TODO: Hard coding temporarily.
+        self.alltoall_workspace = None
+        if (model_config.mapping.enable_attention_dp
+                and model_config.mapping.tp_size > 1
+                and os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") != "1"):
+            if MnnvlMemory.supports_mnnvl():
+                self._enable_alltoall = True
+                MnnvlMemory.initialize()
+                self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
+                    model_config.mapping)
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
@@ -228,6 +243,8 @@ class CutlassFusedMoE(MoE):
         use_w4a8_group_scaling = False
         weight_dtype = self.w3_w1_weight.dtype
         x_sf = None
+        x_row = x.shape[0]
+        x_col = x.shape[1]
         if self.has_any_quant:
             if self.has_fp8_qdq:
                 x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
@@ -238,7 +255,7 @@ class CutlassFusedMoE(MoE):
                 use_w4a8_group_scaling = True
                 weight_dtype = torch.quint4x2
             elif self.has_nvfp4:
-                if use_allgather:
+                if use_allgather or self._enable_alltoall:
                     if isinstance(x, Fp4QuantizedTensor):
                         assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before communication"
                         x_row = x.shape[0]
@@ -269,8 +286,68 @@ class CutlassFusedMoE(MoE):
                     f"unsupported quantization mode: {self.quant_config.quant_mode}"
                 )
 
-        # gather inputs for attention dp
-        if use_allgather:
+        # Alltoall or allgather for attention DP
+        token_count = x.shape[0]
+        alltoall_info = None  # Store for later combine
+        if self._enable_alltoall:
+            assert all_rank_num_tokens is not None, "all_rank_num_tokens required for alltoall"
+            # Prepare alltoall indices
+            top_k = self.routing_method.experts_per_token
+            max_num_token = max(
+                all_rank_num_tokens) if all_rank_num_tokens else token_count
+
+            # Handle case where token_final_scales might be None (when apply_router_weight_on_input=True)
+            if token_final_scales is None:
+                token_final_scales = torch.ones_like(token_selected_experts,
+                                                     dtype=torch.float32)
+
+            # Pad tokens if needed
+            if max_num_token > token_selected_experts.shape[0]:
+                token_selected_experts = torch.nn.functional.pad(
+                    token_selected_experts,
+                    (0, 0, 0, max_num_token - token_selected_experts.shape[0]),
+                    'constant', self.num_experts)
+            if max_num_token > token_final_scales.shape[0]:
+                token_final_scales = torch.nn.functional.pad(
+                    token_final_scales,
+                    (0, 0, 0, max_num_token - token_final_scales.shape[0]))
+
+            # Gather expert assignments across ranks
+            gathered_token_selected_experts, gathered_token_final_scales = allgather(
+                [token_selected_experts, token_final_scales],
+                self.mapping,
+                dim=0)
+            gathered_token_selected_experts = torch.flatten(
+                gathered_token_selected_experts.contiguous(),
+                start_dim=0,
+                end_dim=-2)
+            gathered_token_final_scales = torch.flatten(
+                gathered_token_final_scales.contiguous(),
+                start_dim=0,
+                end_dim=-2)
+
+            # Compute target ranks for each token-expert pair
+            gathered_target_rank_ids = MnnvlMoe.compute_target_rank_id(
+                gathered_token_selected_experts, self.num_experts, self.ep_size)
+
+            # Prepare alltoall indices
+            alltoall_info, token_selected_experts, token_final_scales = MnnvlMoe.mnnvl_moe_alltoallv_prepare(
+                gathered_target_rank_ids, None, gathered_token_selected_experts,
+                gathered_token_final_scales, max_num_token, self.num_experts,
+                top_k, self.ep_rank, self.ep_size)
+
+            # Dispatch alltoall
+            x = MnnvlMoe.mnnvl_moe_alltoallv(x, alltoall_info,
+                                             self.alltoall_workspace,
+                                             self.ep_rank, self.ep_size)
+            if x_sf is not None:
+                x_sf = MnnvlMoe.mnnvl_moe_alltoallv(x_sf, alltoall_info,
+                                                    self.alltoall_workspace,
+                                                    self.ep_rank, self.ep_size)
+                x_sf = swizzle_sf(x_sf, x.shape[0], x.shape[1] * 2,
+                                  self.scaling_vector_size)
+        elif use_allgather:
+            # Original allgather logic
             x, x_sf, token_selected_experts, token_final_scales = allgather(
                 [x, x_sf, token_selected_experts, token_final_scales],
                 self.mapping,
@@ -298,7 +375,7 @@ class CutlassFusedMoE(MoE):
             ep_rank=self.ep_rank,
             cluster_size=self.cluster_size,
             cluster_rank=self.cluster_rank,
-            enable_alltoall=self.enable_alltoall,
+            enable_alltoall=self._enable_alltoall,
             use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
             use_w4a8_group_scaling=use_w4a8_group_scaling,
             min_latency_mode=False,
@@ -309,6 +386,18 @@ class CutlassFusedMoE(MoE):
         # Only in cutlass_min_latency_mode, the output is a list of tensors.
         # Otherwise, the output should be unpacked as a single tensor.
         final_hidden_states = final_hidden_states[0]
+
+        # Combine results if using alltoall
+        if self._enable_alltoall and alltoall_info is not None:
+            top_k = self.routing_method.experts_per_token
+            final_hidden_states = MnnvlMoe.mnnvl_moe_alltoallv_combine(
+                final_hidden_states,
+                alltoall_info,
+                self.alltoall_workspace,
+                ep_rank=self.ep_rank,
+                ep_size=self.ep_size,
+                top_k=top_k,
+                token_count=token_count)
 
         return final_hidden_states
 
