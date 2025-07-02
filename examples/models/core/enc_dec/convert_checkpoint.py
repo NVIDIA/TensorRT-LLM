@@ -644,6 +644,10 @@ def parse_bart_config(args, hf_model):
         ]
         for key in encoder_config_keys:
             config['encoder'][key] = config['decoder'][key]
+        
+        if args.eclair_radio:
+            # Set has_position_embedding to False for Eclair, i.e., use NoPE
+            config['decoder']['has_position_embedding'] = str(False)
     else:
         config['encoder'] = dict()
         for key, val in hf_model.model.encoder.config.to_dict().items():
@@ -1626,7 +1630,7 @@ def convert_checkpoint(args):
     if model_type == 'language_adapter':
         additional_settings += ["residual_scaling", "language_adapter_config"]
 
-    if not (args.nougat or args.eclair_radio)  and args.model_type != "pix2struct":
+    if not (args.nougat or args.eclair_radio) and args.model_type != "pix2struct":
         tllm_encoder_config = {
             'architecture': "EncoderModel",
             'dtype': args.dtype,
