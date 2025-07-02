@@ -29,12 +29,13 @@ namespace kernels
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 TllmGenFmhaRunner::TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut)
-    : mSM(tensorrt_llm::common::getSMVersion())
+    : mSM(kSM_100)
     , mDtypeQ(dtypeQ)
     , mDtypeKv(dtypeKv)
     , mDtypeOut(dtypeOut)
 {
-    TLLM_CHECK_WITH_INFO(mSM == kSM_100, "Unsupported architecture");
+    auto smVer = tensorrt_llm::common::getSMVersion();
+    TLLM_CHECK_WITH_INFO(smVer == kSM_100 || smVer == kSM_103, "Unsupported architecture");
     TLLM_CHECK_WITH_INFO(
         mDtypeQ == DATA_TYPE_E4M3 || mDtypeQ == DATA_TYPE_FP16 || mDtypeQ == DATA_TYPE_BF16, "Unsupported Q data type");
     TLLM_CHECK_WITH_INFO(mDtypeKv == DATA_TYPE_E4M3 || mDtypeKv == DATA_TYPE_FP16 || mDtypeKv == DATA_TYPE_BF16,

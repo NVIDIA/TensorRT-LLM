@@ -43,7 +43,7 @@ namespace tensorrt_llm::kernels
 XqaDispatcher::XqaDispatcher(XqaFixedParams fixedParams)
     : mFixedParams(fixedParams)
     , mQDataType(mFixedParams.inputDataType)
-    , mUseTllmGen(tensorrt_llm::common::getSMVersion() == 100)
+    , mUseTllmGen(tensorrt_llm::common::getSMVersion() == 100 || tensorrt_llm::common::getSMVersion() == 103)
     , mMultiProcessorCount(getMultiProcessorCount())
 {
     if (mUseTllmGen)
