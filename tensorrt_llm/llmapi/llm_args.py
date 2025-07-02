@@ -1949,15 +1949,9 @@ def update_llm_args_with_extra_dict(
         "quant_config": QuantConfig,
         "calib_config": CalibConfig,
         "build_config": BuildConfig,
-        "kv_cache_config": KvCacheConfig,
         "decoding_config": DecodingConfig,
         "enable_build_cache": BuildCacheConfig,
-        "peft_cache_config": PeftCacheConfig,
-        "scheduler_config": SchedulerConfig,
         "speculative_config": DecodingBaseConfig,
-        "batching_type": BatchingType,
-        "extended_runtime_perf_knob_config": ExtendedRuntimePerfKnobConfig,
-        "cache_transceiver_config": CacheTransceiverConfig,
         "lora_config": LoraConfig,
     }
     for field_name, field_type in field_mapping.items():
