@@ -1764,6 +1764,12 @@ class TorchLlmArgs(BaseLlmArgs):
         description="If true, force dynamic quantization. Defaults to False.",
     )
 
+    allreduce_strategy: Optional[
+        Literal['AUTO', 'NCCL', 'UB', 'MINLATENCY', 'ONESHOT', 'TWOSHOT',
+                'LOWPRECISION',
+                'MNNVL']] = Field(default='AUTO',
+                                  description="Allreduce strategy to use.")
+
     # TODO: remove backend later
     @field_validator('backend', mode='before')
     def init_backend(cls, v):
