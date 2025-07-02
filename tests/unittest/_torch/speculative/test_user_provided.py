@@ -31,7 +31,7 @@ def test_llama_user_provided(disable_overlap_scheduler: bool,
     max_batch_size = 4
 
     llm_common_config = dict( \
-        model=llm_models_root() / "llama-models-v2" /"TinyLlama-1.1B-Chat-v1.0",
+        model=llm_models_root() / "llama-3.1-model" /"Meta-Llama-3.1-8B",
         backend='pytorch',
         attn_backend=attn_backend,
         disable_overlap_scheduler=disable_overlap_scheduler,
