@@ -1937,7 +1937,7 @@ class TorchLlmArgs(BaseLlmArgs):
             load_format=self.load_format,
             enable_min_latency=self.enable_min_latency,
             stream_interval=self.stream_interval,
-            force_dynamic_quantization=force_dynamic_quantization)
+            force_dynamic_quantization=self.force_dynamic_quantization)
 
 
 def update_llm_args_with_extra_dict(
