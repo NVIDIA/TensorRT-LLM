@@ -630,6 +630,8 @@ def parse_bart_config(args, hf_model):
     config["decoder"]["rescale_before_lm_head"] = str(False)
     config['decoder']['has_model_final_layernorm'] = str(
         args.nougat or args.eclair_radio or isinstance(hf_model, MBartForConditionalGeneration))
+    # Set has_position_embedding to False for Eclair, i.e., use NoPE
+    config['decoder']['has_position_embedding'] = str(not args.eclair_radio)
 
     if args.nougat or args.eclair_radio:
         # These flags are true for mbart decoders, but missing in HF config
@@ -644,10 +646,6 @@ def parse_bart_config(args, hf_model):
         ]
         for key in encoder_config_keys:
             config['encoder'][key] = config['decoder'][key]
-        
-        if args.eclair_radio:
-            # Set has_position_embedding to False for Eclair, i.e., use NoPE
-            config['decoder']['has_position_embedding'] = str(False)
     else:
         config['encoder'] = dict()
         for key, val in hf_model.model.encoder.config.to_dict().items():
@@ -975,10 +973,10 @@ def convert_bart_weights_to_tllm_safetensors(config, component, params):
                                                       value=0)
             vocab_size=vocab_size_padded
         weights['lm_head.weight'] = reshape(
-                split(lm_head_weights,
-                    mapping.tp_size,
-                    mapping.tp_rank,
-                    dim=0), (vocab_size // mapping.tp_size, hidden_size))
+            split(lm_head_weights,
+                mapping.tp_size,
+                mapping.tp_rank,
+                dim=0), (vocab_size // mapping.tp_size, hidden_size))
 
     if config.has_model_final_layernorm:
         weights['transformer.ln_f.weight'] = params[
