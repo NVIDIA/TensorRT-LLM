@@ -1412,6 +1412,8 @@ void TrtGptModelInflightBatching::createDecoder(std::optional<executor::Decoding
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
+    mDecoderState = std::make_unique<runtime::decoder::DecoderState>();
+
     if (mWorldConfig.isLastPipelineParallelRank())
     {
         auto decoderType = mRuntime->getEngine().getTensorDataType("logits");
@@ -1435,24 +1437,20 @@ void TrtGptModelInflightBatching::createDecoder(std::optional<executor::Decoding
         mDecoder->setup(
             decodingMode, getMaxNumSequences(), mOperatingBeamWidth, decoderType, mModelConfig, mWorldConfig);
 
-        mDecoderState = std::make_unique<runtime::decoder::DecoderState>(decoderType, mRuntime->getBufferManager());
+        mDecoderState->setup(getMaxNumSequences(), mOperatingBeamWidth, getMaxAttentionWindow(), getSinkTokenLen(),
+            getMaxSequenceLen(), decoderType, mModelConfig, mWorldConfig, mRuntime->getBufferManager());
+
         if (!mModelConfig.getSpeculativeDecodingMode().isNone())
         {
-            mDecoderState->allocateSpeculativeDecodingBuffers(
-                mModelConfig.getSpeculativeDecodingMode(), decoderType, mRuntime->getBufferManager());
+            mDecoderState->setupSpeculativeDecoding(mModelConfig.getSpeculativeDecodingMode(),
+                mModelConfig.getMaxDecodingTokens(), decoderType, mModelConfig, mWorldConfig,
+                mRuntime->getBufferManager());
         }
-
-        mDecoderState->setup(getMaxNumSequences(), mOperatingBeamWidth, getMaxAttentionWindow(), getSinkTokenLen(),
-            getMaxSequenceLen(), mModelConfig, mWorldConfig, mRuntime->getBufferManager());
-        mDecoderState->setupSpeculativeDecoding(mDecoderState->getSpeculativeDecodingMode(),
-            mModelConfig.getMaxDecodingTokens(), mModelConfig, mWorldConfig, mRuntime->getBufferManager());
     }
     else
     {
-        auto constexpr decoderDummyType = TRTDataType<float>::value;
-        mDecoderState
-            = std::make_unique<runtime::decoder::DecoderState>(decoderDummyType, mRuntime->getBufferManager());
-        mDecoderState->setupCacheIndirection(getMaxNumSequences(), mOperatingBeamWidth, getMaxAttentionWindow());
+        mDecoderState->setupCacheIndirection(
+            getMaxNumSequences(), mOperatingBeamWidth, getMaxAttentionWindow(), mRuntime->getBufferManager());
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -1842,40 +1840,6 @@ void TrtGptModelInflightBatching::postProcessRequest(
             genRuntimeBuffers.generationLogitsCache, bufferManager, llmReq, beforeDecoder, numDroppedTokens);
 
         bufferManager.getStream().synchronize();
-    }
-
-    if (mWorldConfig.isPipelineParallel())
-    {
-        // Send context logits from last to first PP rank
-        if (llmReq.getReturnContextLogits())
-        {
-            if (mWorldConfig.isLastPipelineParallelRank())
-            {
-                mMpiCommPipelinePara->send(
-                    *(llmReq.getContextLogitsHost()), 0, mpi::MpiTag::kTrtGptModelInflightBatchingContextLogits);
-            }
-            else if (mWorldConfig.isFirstPipelineParallelRank())
-            {
-                mMpiCommPipelinePara->recv(*(llmReq.getContextLogitsHost()), mWorldConfig.getPipelineParallelism() - 1,
-                    mpi::MpiTag::kTrtGptModelInflightBatchingContextLogits);
-            }
-        }
-
-        // Send generation logits from last to first PP rank
-        if (llmReq.getReturnGenerationLogits())
-        {
-            if (mWorldConfig.isLastPipelineParallelRank())
-            {
-                mMpiCommPipelinePara->send(
-                    *(llmReq.getGenerationLogitsHost()), 0, mpi::MpiTag::kTrtGptModelInflightBatchingGenerationLogits);
-            }
-            else if (mWorldConfig.isFirstPipelineParallelRank())
-            {
-                mMpiCommPipelinePara->recv(*(llmReq.getGenerationLogitsHost()),
-                    mWorldConfig.getPipelineParallelism() - 1,
-                    mpi::MpiTag::kTrtGptModelInflightBatchingGenerationLogits);
-            }
-        }
     }
 
     if (reqBeamWidth == 1)

@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 import torch
 from torch._prims_common import DeviceLikeType
 
+from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._utils import nvtx_range
 
 from ...._utils import mpi_rank, mpi_world_size
@@ -256,6 +257,7 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
     assert isinstance(executor_config.pytorch_backend_config, LlmArgs), msg
     ad_config: LlmArgs = executor_config.pytorch_backend_config
 
+    max_num_sequences = ad_config.max_batch_size * dist_mapping.pp_size
     # some derivative properties
     max_draft_tokens = (
         0 if ad_config.speculative_config is None else ad_config.speculative_config.max_draft_tokens
@@ -272,7 +274,13 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
         max_seq_len=ad_config.max_seq_len,
         max_batch_size=ad_config.max_batch_size,
     )
-    resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+    seq_slot_manager = SeqSlotManager(max_num_sequences=max_num_sequences)
+    resource_manager = ResourceManager(
+        {
+            ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager,
+            ResourceManagerType.SEQ_SLOT_MANAGER: seq_slot_manager,
+        }
+    )
     resource_manager.resource_managers.move_to_end(ResourceManagerType.KV_CACHE_MANAGER, last=True)
 
     # scheduling
@@ -287,10 +295,14 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
     # https://github.com/NVIDIA/TensorRT-LLM/issues/5254
     # We should expose mixed_sample to our build_and_run_ad script so we can configure this
     # correctly for models as needed.
-    sampler = TorchSampler(
+    sampler_args = TorchSampler.Args(
         max_seq_len=ad_config.max_seq_len,
+        max_draft_tokens=max_draft_tokens,
+        max_num_sequences=max_num_sequences,
+        max_beam_width=executor_config.max_beam_width,
         mixed_sampler=ad_config.mixed_sampler,
     )
+    sampler = TorchSampler(sampler_args)
 
     # creating the executor object
     py_executor = PyExecutor(
@@ -299,6 +311,7 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
         model_engine=engine,
         sampler=sampler,
         dist=mpi_dist,
+        max_num_sequences=max_num_sequences,
         disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
         max_input_len=ad_config.max_input_len,
         max_batch_size=ad_config.max_batch_size,

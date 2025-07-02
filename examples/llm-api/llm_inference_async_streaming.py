@@ -1,8 +1,9 @@
-### Generate Text in Streaming
+### :section Basics
+### :title Generate text in streaming
+### :order 2
 import asyncio
 
-from tensorrt_llm import SamplingParams
-from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm import LLM, SamplingParams
 
 
 def main():
