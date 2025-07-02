@@ -1,6 +1,6 @@
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -102,7 +102,7 @@ def get_recent_open_prs(repo_owner: str,
                         repo_name: str,
                         minutes_back: int = 65):
     """Get open PRs created or updated in the last N minutes."""
-    cutoff_time = datetime.utcnow() - timedelta(minutes=minutes_back)
+    cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=minutes_back)
 
     url = f"{GITHUB_API_URL}/repos/{repo_owner}/{repo_name}/pulls"
     params = {
@@ -130,10 +130,12 @@ def get_recent_open_prs(repo_owner: str,
 
             found_old_pr = False
             for pr in page_prs:
-                created_at = datetime.strptime(pr["created_at"],
-                                               "%Y-%m-%dT%H:%M:%SZ")
-                updated_at = datetime.strptime(pr["updated_at"],
-                                               "%Y-%m-%dT%H:%M:%SZ")
+                created_at = datetime.strptime(
+                    pr["created_at"],
+                    "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                updated_at = datetime.strptime(
+                    pr["updated_at"],
+                    "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
 
                 if created_at >= cutoff_time or updated_at >= cutoff_time:
                     recent_prs.append(pr)
@@ -178,11 +180,15 @@ def main():
     assert repo_name, "REPO_NAME environment variable not set"
     community_label = os.environ.get("COMMUNITY_LABEL")
     assert community_label, "COMMUNITY_LABEL environment variable not set"
+    time_window_minutes = int(os.environ.get("TIME_WINDOW_MINUTES"))
 
-    print(f"Starting community PR labeling sweep for {repo_owner}/{repo_name}")
+    print(
+        f"Starting community PR labeling sweep for {repo_owner}/{repo_name}. Time window: {time_window_minutes} minutes."
+    )
 
     try:
-        recent_prs = get_recent_open_prs(repo_owner, repo_name, 65)
+        recent_prs = get_recent_open_prs(repo_owner, repo_name,
+                                         time_window_minutes)
     except requests.exceptions.RequestException:
         print("Failed to fetch recent PRs")
         sys.exit(1)
