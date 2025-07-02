@@ -4,13 +4,11 @@ from typing import List, Optional
 import torch
 from torch import nn
 
-from tensorrt_llm.bindings.executor import FinishReason
-
 from ..attention_backend import AttentionMetadata
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import (SampleState, SampleStateTensors, TorchSampler,
-                                  int_tensor)
+                                  add_token, int_tensor)
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
 
@@ -271,57 +269,39 @@ class MTPSampler(TorchSampler):
             new_tokens_lens=int_tensor((seq_slots, )),
         )
 
-    def _draft_meet_max_token_stop_criteria(self, request: LlmRequest,
-                                            beam_idx: int):
-        num_tokens = request.get_num_tokens(beam_idx)
-        if self._meet_max_token_stop_criteria(request, num_tokens):
-            request.state = LlmRequestState.GENERATION_COMPLETE
-            request.set_finished_reason(FinishReason.LENGTH, beam_idx)
-
     def _request_common_handling(self, request: LlmRequest,
-                                 next_draft_tokens: list[list[int]], idx):
-        beam_idx = self.BEAM
+                                 next_draft_tokens: list[list[int]]):
         assert not request.py_return_context_logits, "return_context_logits not implemented for MTPSampler"
         assert not request.py_return_generation_logits, "return_generation_logits not implemented for MTPSampler"
         assert not request.py_return_log_probs, "return_log_probs not implemented for MTPSampler"
-        self._draft_meet_max_token_stop_criteria(request, beam_idx)
-        request.py_draft_tokens = next_draft_tokens[idx]
+        request.py_draft_tokens = next_draft_tokens[request.seq_slot]
         request.py_decoding_iter += 1
 
     def update_requests(self, state: SampleStateMTP) -> None:
         assert isinstance(state, SampleStateMTP)
 
         state.sampler_event.synchronize()
-        new_tokens_list = state.host.new_tokens.tolist()
-        new_tokens_lens_list = state.host.new_tokens_lens.tolist()
+        new_tokens = state.host.new_tokens
+        new_tokens_lens = state.host.new_tokens_lens
         next_draft_tokens_list = state.host.next_draft_tokens.tolist()
-
-        idx = 0
         beam_idx = self.BEAM
         for req in state.scheduled_requests.context_requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE or req.context_remaining_length != 0:
-                idx += 1
                 continue
-            new_token = new_tokens_list[idx][0]
-            req.add_new_token(new_token, beam_idx)
-            self._handle_stop_criteria(req, new_token, beam=beam_idx)
-            self._request_common_handling(req, next_draft_tokens_list, idx)
-            idx += 1
+            new_token = add_token(req, new_tokens, beam=beam_idx)
+            self._handle_stop_criteria(req, new_token)
+            self._request_common_handling(req, next_draft_tokens_list)
 
         for req in state.scheduled_requests.generation_requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE:
-                idx += 1
                 continue
-            new_tokens = new_tokens_list[idx]
-            num_new_tokens = new_tokens_lens_list[idx]
+            num_new_tokens = new_tokens_lens[req.seq_slot]
             for i in range(num_new_tokens):
-                new_token = new_tokens[i]
-                req.add_new_token(new_token, beam_idx)
-                if self._handle_stop_criteria(req, new_token, beam=beam_idx):
+                new_token = add_token(req, new_tokens, beam=beam_idx, step=i)
+                if self._handle_stop_criteria(req, new_token):
                     break
-            self._request_common_handling(req, next_draft_tokens_list, idx)
             req.py_rewind_len = self.draft_len - (num_new_tokens - 1)
-            idx += 1
+            self._request_common_handling(req, next_draft_tokens_list)
 
     def sample_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs) -> SampleStateMTP:
@@ -338,21 +318,29 @@ class MTPSampler(TorchSampler):
         seq_slots = torch.as_tensor([r.seq_slot for r in requests])
         seq_slots = seq_slots.to(device="cuda", non_blocking=True)
 
-        self.store.new_tokens
-        self.store.next_new_tokens
-        self.store.new_tokens_lens
-        self.store.next_draft_tokens
+        new_tokens = self.store.new_tokens
+        next_new_tokens = self.store.next_new_tokens
+        new_tokens_lens = self.store.new_tokens_lens
+        next_draft_tokens = self.store.next_draft_tokens
+        for idx, seq_slot in enumerate(seq_slots):
+            slc = slice(0, self.draft_len + 1), seq_slot, self.BEAM
+            new_tokens[slc].copy_(new_tokens_device[idx], non_blocking=True)
+            next_new_tokens[slc].copy_(next_new_tokens_device[idx],
+                                       non_blocking=True)
+            new_tokens_lens[seq_slot].copy_(new_tokens_lens_device[idx],
+                                            non_blocking=True)
+            next_draft_tokens[seq_slot].copy_(next_draft_tokens_device[idx],
+                                              non_blocking=True)
 
         device = SampleStateTensorsMTP(
-            new_tokens=next_new_tokens_device,
-            new_tokens_lens=new_tokens_lens_device,
-            next_draft_tokens=next_draft_tokens_device,
+            new_tokens=next_new_tokens,
+            new_tokens_lens=new_tokens_lens,
+            next_draft_tokens=next_draft_tokens,
         )
         host = SampleStateTensorsMTP(
-            new_tokens=new_tokens_device.to('cpu', non_blocking=True),
-            new_tokens_lens=new_tokens_lens_device.to('cpu', non_blocking=True),
-            next_draft_tokens=next_draft_tokens_device.to('cpu',
-                                                          non_blocking=True),
+            new_tokens=new_tokens.to('cpu', non_blocking=True),
+            new_tokens_lens=new_tokens_lens.to('cpu', non_blocking=True),
+            next_draft_tokens=next_draft_tokens.to('cpu', non_blocking=True),
         )
         sampler_event = torch.cuda.Event()
         sampler_event.record()

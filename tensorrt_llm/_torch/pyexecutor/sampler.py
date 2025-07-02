@@ -208,6 +208,14 @@ class TorchSampler(Sampler):
     MAX_BEAM_WIDTH = BEAM + 1
 
     @dataclass(frozen=True, kw_only=True)
+    class Store:
+        new_tokens: torch.Tensor
+        """Shape: See cpp DecoderState.getAllNewTokens()"""
+
+    def create_store(self) -> Store:
+        return self.Store(new_tokens=int_tensor(self.NEW_TOKENS_SHAPE))
+
+    @dataclass(frozen=True, kw_only=True)
     class Args:
         max_seq_len: int
         max_draft_tokens: int
@@ -230,16 +238,8 @@ class TorchSampler(Sampler):
         with torch.inference_mode(False):
             self.store = self.create_store()
 
-    @dataclass(frozen=True, kw_only=True)
-    class Store:
-        new_tokens: torch.Tensor
-        """Shape: See cpp DecoderState.getAllNewTokens()"""
-
-    def create_store(self) -> Store:
-        return self.Store(new_tokens=int_tensor(self.NEW_TOKENS_SHAPE))
-
-    def _meet_max_token_stop_criteria(self, request: LlmRequest,
-                                      num_tokens: int):
+    def _meet_max_token_stop_criteria(self, request: LlmRequest):
+        num_tokens = request.get_num_tokens(self.BEAM)
         return (num_tokens - request.py_orig_prompt_len
                 >= request.py_max_new_tokens) or (num_tokens
                                                   >= self.max_seq_len)
@@ -263,21 +263,20 @@ class TorchSampler(Sampler):
                     return True
         return False
 
-    def _handle_stop_criteria(self, request: LlmRequest, new_token: int, *,
-                              beam: int) -> bool:
+    def _handle_stop_criteria(self, request: LlmRequest,
+                              new_token: int) -> bool:
         """Handle stop criteria and set appropriate finish reasons and state.
         Returns True if generation should stop."""
         if new_token == request.py_end_id:
-            request.finish_by_reason(FinishReason.END_ID)
+            request.finish_by(FinishReason.END_ID, self.BEAM)
             return True
 
-        num_tokens = request.get_num_tokens(beam)
-        if self._meet_max_token_stop_criteria(request, num_tokens):
-            request.finish_by_reason(FinishReason.LENGTH)
+        if self._meet_max_token_stop_criteria(request):
+            request.finish_by(FinishReason.LENGTH, self.BEAM)
             return True
 
         if self._meet_stop_token_criteria(request):
-            request.finish_by_reason(FinishReason.STOP_WORDS)
+            request.finish_by(FinishReason.STOP_WORDS, self.BEAM)
             return True
 
         return False
@@ -312,7 +311,7 @@ class TorchSampler(Sampler):
                                   new_tokens,
                                   beam=self.BEAM,
                                   step=num_accepted)
-            if self._handle_stop_criteria(request, new_token, beam=self.BEAM):
+            if self._handle_stop_criteria(request, new_token):
                 break
         return num_accepted
 
@@ -326,7 +325,7 @@ class TorchSampler(Sampler):
             if req.state == LlmRequestState.GENERATION_COMPLETE or req.context_remaining_length != 0:
                 continue
             new_token = add_token(req, new_tokens, beam=self.BEAM)
-            stop = self._handle_stop_criteria(req, new_token, beam=self.BEAM)
+            self._handle_stop_criteria(req, new_token)
             self.handle_logits(req, state, beam=self.BEAM, count=1)
             req.py_decoding_iter += 1
 
@@ -334,7 +333,7 @@ class TorchSampler(Sampler):
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
             new_token = add_token(req, new_tokens, beam=self.BEAM)
-            stop = self._handle_stop_criteria(req, new_token, beam=self.BEAM)
+            stop = self._handle_stop_criteria(req, new_token)
             processed = 1
             if not stop and len(req.py_draft_tokens) > 0:
                 num_accepted = self.process_draft_tokens(
