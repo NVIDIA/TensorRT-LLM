@@ -18,6 +18,8 @@ l0_rtx_pro_6000:
   - unittest/_torch/modeling -k "modeling_out_of_tree"
   # - unittest/_torch/modeling -k "modeling_qwen" # https://nvbugs/5234573
   - unittest/_torch/test_attention_mla.py
+  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_nvfp4[dtype0]
+  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_nvfp4[dtype1]
   - test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
   - test_e2e.py::test_ptp_quickstart_bert[TRTLLM-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
   - test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-BF16-llama-3.1-model/Meta-Llama-3.1-8B]
