@@ -50,19 +50,21 @@ def calc_engine_setting(
         Tuple[int, int]: Tuple containing engine configuration information for
         engine build (max_num_tokens, max_batch_size).
     """
+    is_mamba_attn_hybrid = isinstance(model_config, NemotronHybridConfig)
+    if is_mamba_attn_hybrid:
+        # Each mamba cache entry is pretty large (~50MB for 8B model), so we are more conservative when estimating the max batch size
+        kv_cache_gpu_mem_fraction *= kv_cache_gpu_mem_fraction
+
     byte_per_elem = BYTES_PER_ELEM.get(quant_config.quant_algo, 2)
     byte_per_kv_elem = BYTES_PER_ELEM.get(quant_config.kv_cache_quant_algo, 2)
 
     # Each GPU in TP group has at least 1 kv head
     adjusted_num_kv_heads = max(tp_size, model_config.num_key_value_heads)
 
-    num_attention_layers = model_config.num_attention_layers
+    logger.info(
+        f"Number of attention layers: {model_config.num_attention_layers}")
 
-    is_mamba_attn_hybrid = isinstance(model_config, NemotronHybridConfig)
-
-    logger.info(f"Number of attention layers: {num_attention_layers}")
-
-    byte_per_token = 2 * num_attention_layers * adjusted_num_kv_heads \
+    gb_per_token = 2 * model_config.num_attention_layers * adjusted_num_kv_heads \
         * model_config.head_size * byte_per_kv_elem / (1024 ** 3)
 
     # Number of GPU used for this run.
@@ -79,26 +81,18 @@ def calc_engine_setting(
     # Calculate max requests in KV cache based on target ISL and OSL.
     target_seq_len = target_input_len + target_output_len
 
-    byte_per_mamba_cache = model_config.extra_model_cache_in_gb(
-        BYTES_PER_ELEM.get(QuantAlgo.NO_QUANT), target_seq_len)
-    if byte_per_mamba_cache > 0:
-        kv_cache_gpu_mem_fraction *= kv_cache_gpu_mem_fraction
-        print(
-            f"Using Mamba cache, reducing KV cache GPU memory fraction to {kv_cache_gpu_mem_fraction}"
-        )
     cache_memory = available_memory * kv_cache_gpu_mem_fraction
-    kv_cache_max_requests = cache_memory / (byte_per_token * target_seq_len +
-                                            byte_per_mamba_cache)
-    mamba_cache_memory = byte_per_mamba_cache * kv_cache_max_requests
-    kv_cache_max_tokens = (cache_memory - mamba_cache_memory) / byte_per_token
+    gb_per_extra_cache = model_config.extra_model_cache_in_gb(
+        BYTES_PER_ELEM.get(QuantAlgo.NO_QUANT), target_seq_len)
+    kv_cache_max_requests = cache_memory / (gb_per_token * target_seq_len +
+                                            gb_per_extra_cache)
+    extra_cache_memory = gb_per_extra_cache * kv_cache_max_requests
+    kv_cache_max_tokens = (cache_memory - extra_cache_memory) / gb_per_token
+    kv_cache_memory = kv_cache_max_tokens * gb_per_token
 
-    if is_mamba_attn_hybrid:
-        kv_cache_memory = kv_cache_max_tokens * byte_per_token
-        logger.info(
-            f"Estimated total cache memory: {cache_memory:.2f} GB. KV cache: {kv_cache_memory:.2f} GB, Mamba cache: {mamba_cache_memory:.2f} GB"
-        )
-    else:
-        logger.info(f"Estimated total KV cache memory: {cache_memory:.2f} GB")
+    logger.info(
+        f"Estimated total cache memory: {cache_memory:.2f} GB. KV cache: {kv_cache_memory:.2f} GB, Extra cache: {extra_cache_memory:.2f} GB"
+    )
     logger.info(f"Estimated kv cache max tokens: {kv_cache_max_tokens:.2f}")
     logger.info("Estimated max number of requests in KV cache memory: "
                 f"{kv_cache_max_requests:.2f}")
