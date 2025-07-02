@@ -10,7 +10,7 @@ from tensorrt_llm.mapping import Mapping
 from ..attention_backend import AttentionMetadata
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
-from ..pyexecutor.sampler import SampleState, SampleStateTensors, TorchSampler
+from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
 from .mtp import MTPSampler
@@ -214,26 +214,6 @@ class Eagle3SpecMetadata(SpecMetadata):
         return hidden_states
 
 
-class Eagle3Sampler(TorchSampler):
-
-    def _batch_sample(self, scheduled_requests, model_outputs) -> SampleState:
-        logits = model_outputs["logits"]
-        new_tokens_device = torch.argmax(logits, dim=-1)
-        if "d2t" in model_outputs:
-            d2t = model_outputs["d2t"]
-            new_tokens_device = d2t[new_tokens_device] + new_tokens_device
-        device = SampleStateTensors(new_tokens=new_tokens_device)
-        host = SampleStateTensors(
-            new_tokens=new_tokens_device.to('cpu', non_blocking=True))
-        sampler_event = torch.cuda.Event()
-        sampler_event.record()
-        return SampleState(scheduled_requests=scheduled_requests,
-                           logits=logits,
-                           device=device,
-                           host=host,
-                           sampler_event=sampler_event)
-
-
 @dataclass
 class Eagle3OneModelSpecMetadata(SpecMetadata):
     # The hidden states
@@ -269,6 +249,12 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
             device='cuda',
         )
 
+        # currently Eagle3 only supports linear tree
+        self.is_spec_dec_tree = False
+
+        # currently Eagle3 only supports static tree
+        self.is_spec_dec_dynamic_tree = False
+
     def is_layer_capture(self, layer_id: int):
         return layer_id in self.layers_to_capture
 
@@ -299,31 +285,10 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                 break
 
 
-class Eagle3Decoder(TorchSampler):
+class Eagle3OneModelSampler(MTPSampler):
 
-    def _batch_sample(self, scheduled_requests, model_outputs) -> SampleState:
-        logits = model_outputs["logits"]
-        new_tokens_device = torch.argmax(logits, dim=-1)
-        if "d2t" in model_outputs:
-            d2t = model_outputs["d2t"]
-            new_tokens_device = d2t[new_tokens_device] + new_tokens_device
-        new_tokens_host = new_tokens_device.to('cpu', non_blocking=True)
-        new_tensors_device = {"new_tokens_device": new_tokens_device}
-        new_tensors_host = {"new_tokens_host": new_tokens_host}
-        decoder_event = torch.cuda.Event()
-        decoder_event.record()
-        return SampleState(scheduled_requests=scheduled_requests,
-                           logits=logits,
-                           new_tensors_device=new_tensors_device,
-                           new_tensors_host=new_tensors_host,
-                           decoder_event=decoder_event)
-
-
-class Eagle3OneModelDecoder(MTPSampler):
-
-    def __init__(self, max_seq_len: int, config: Eagle3Config):
-        super().__init__(max_seq_len, None)
-        self.draft_len = config.max_draft_tokens
+    def __init__(self, args: TorchSampler.Args):
+        super().__init__(args, nextn=args.max_draft_tokens)
 
 
 class Eagle3OneModelWorker(nn.Module):
@@ -370,6 +335,13 @@ class Eagle3OneModelWorker(nn.Module):
         next_draft_tokens = []
         for i in range(self.max_draft_tokens):
             hidden_states, hidden_states_to_save = draft_model.model(**inputs)
+
+            # FIXME (jhaotingc): Currently we disable use_spec_decoding mode for Eagle engine nth steps except 1st step.
+            # Eagle engine takes in draft_len tokens from the previous step, run spec-dec mode with those tokens,
+            # then the following step can use regular decoding mode to generate 1 tokens per step.
+            # Currently the spec-dec mask for chained tree is not implemented yet.
+            # When token tree is supported, this can be removed and all steps may use spec-dec mode as well.
+            attn_metadata.use_spec_decoding = False
             if i == 0:
                 start_ids_gen = (spec_metadata.batch_indices_cuda[:num_gens] *
                                  (self.max_draft_tokens + 1)).long()
@@ -432,6 +404,8 @@ class Eagle3OneModelWorker(nn.Module):
         next_new_tokens = torch.concat([next_new_tokens, next_draft_tokens],
                                        dim=1)
 
+        attn_metadata.use_spec_decoding = True
+
         return {
             'logits': raw_logits,
             'new_tokens': accepted_tokens,
@@ -463,7 +437,6 @@ class Eagle3OneModelWorker(nn.Module):
 
         # Do greedy sampling for the input logits
         target_tokens = torch.argmax(logits, dim=-1)
-
         # context
         accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
 
@@ -476,7 +449,6 @@ class Eagle3OneModelWorker(nn.Module):
         num_accepted_tokens[num_contexts:] += torch.cumprod((
             draft_tokens == gen_target_tokens[:, :self.max_draft_tokens]).int(),
                                                             dim=-1).sum(1)
-
         return accepted_tokens, num_accepted_tokens
 
     def draft_decoder(

@@ -6,9 +6,8 @@ import torch.nn.functional as F
 
 from tensorrt_llm._utils import get_sm_version
 
-from ...distributed import allgather
 from ...model_config import ModelConfig
-from ...utils import Fp4QuantizedTensor, disable_fp4_allgather, reswizzle_sf
+from ...utils import Fp4QuantizedTensor
 from .fused_moe_cutlass import CutlassFusedMoE
 from .quantization import MoEWeightLoadingMode
 from .routing import BaseMoeRoutingMethod
@@ -183,28 +182,13 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                     f"unsupported quantization mode for CUTEDSL backend: {self.quant_config.quant_mode}"
                 )
 
-        # gather inputs for attention dp
-        if self.use_dp and self.parallel_size > 1 and not disable_fp4_allgather(
-        ):
-            x, x_sf, token_selected_experts, token_final_scales = allgather(
-                [x, x_sf, token_selected_experts, token_final_scales],
-                self.mapping,
-                dim=0,
-                sizes=None if use_dp_padding else all_rank_num_tokens)
-            # Fp4 gemm has extra scaling factor
-            if x_sf is not None:
-                x_sf = reswizzle_sf(x_sf, x_row, x_col,
-                                    self.scaling_vector_size)
-
         (
-            unpermuted_token_selected_experts_tensor,
-            unpermuted_source_token_ids_tensor,
-            permuted_source_token_ids_tensor,
+            permuted_row_to_unpermuted_row_tensor,
             permuted_token_selected_experts_tensor,
             permuted_data_tensor,
             expert_first_token_offset_tensor,
             permuted_token_final_scales_tensor,
-            src_to_dest_map_tensor,
+            unpermuted_row_to_permuted_row_tensor,
         ) = torch.ops.trtllm.moe_permute_op(
             x,
             token_selected_experts,
@@ -223,7 +207,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             min_latency_mode=False,
             use_fp8_block_scaling=use_deepseek_fp8_block_scale,
         )
-
         act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
             permuted_data_tensor)
         h1 = cute_dsl_fp8_group_blockwise_gemm_ref(
@@ -244,11 +227,13 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         )
         final_hidden_states = torch.ops.trtllm.moe_finalize_scale_op(
             h3,
-            None,
+            None,  # biases
             token_final_scales,
-            src_to_dest_map_tensor,
-            unpermuted_token_selected_experts_tensor,
+            unpermuted_row_to_permuted_row_tensor,
+            permuted_row_to_unpermuted_row_tensor,
+            token_selected_experts,
             expert_first_token_offset_tensor,
+            False,  # enable_alltoall
             x.shape[0],  # num_rows
             x.shape[1],  # hidden_size
             self.routing_method.top_k,

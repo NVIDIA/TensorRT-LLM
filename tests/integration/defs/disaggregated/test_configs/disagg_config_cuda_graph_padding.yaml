@@ -13,7 +13,7 @@ context_servers:
     free_gpu_memory_fraction: 0.2
     enable_partial_reuse: False
   cuda_graph_config:
-    cuda_graph_batch_sizes: [1,3000]
+    batch_sizes: [1,3000]
   disable_overlap_scheduler: True
   urls:
       - "localhost:8001"
@@ -28,8 +28,8 @@ generation_servers:
     free_gpu_memory_fraction: 0.2
     enable_partial_reuse: False
   cuda_graph_config:
-    cuda_graph_padding_enabled: True
-    cuda_graph_batch_sizes: [1,4,8,16,24,32]
+    padding_enabled: True
+    batch_sizes: [1,4,8,16,24,32]
   disable_overlap_scheduler: True
   urls:
       - "localhost:8002"

@@ -95,6 +95,6 @@ l0_a100:
   - triton_server/test_triton.py::test_gpt_gather_logits[gpt-gather-logits]
   - triton_server/test_triton.py::test_medusa[medusa]
   - triton_server/test_triton.py::test_mllama[mllama]
-  - triton_server/test_triton.py::test_eagle[eagle]
+  - triton_server/test_triton.py::test_eagle[eagle] TIMEOUT (60)
   - triton_server/test_triton.py::test_llava_onevision[llava_onevision]
   - triton_server/test_triton.py::test_qwen2_vl[qwen2_vl]

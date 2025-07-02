@@ -65,27 +65,22 @@ def generate_output(engine: str,
 
     base_output_name = os.path.splitext(model_spec_obj.get_results_file())[0]
 
-    output_logits_args = []
-    if output_logits:
-        logits_file = base_output_name + '_logits.npy'
-        output_logits_args = [
-            '--output_logits_npy',
-            str(output_dir / logits_file),
-            '--output_generation_logits',
-        ]
-
-    results_file = str(output_dir / (base_output_name + '.npy'))
-    results_csv = str(output_dir / (base_output_name + '.csv'))
-
     args_list = [
-        '--engine_dir',
-        str(engine_dir), '--input_file',
-        str(input_file), '--tokenizer_dir',
-        str(models_dir / model), '--output_npy', results_file, '--output_csv',
-        results_csv, '--max_output_len',
-        str(max_output_len), '--num_beams',
-        str(num_beams), '--use_py_session'
-    ] + output_logits_args
+        f'--engine_dir={engine_dir}',
+        f'--input_file={input_file}',
+        f'--tokenizer_dir={models_dir / model}',
+        f'--output_npy={output_dir / (base_output_name + ".npy")}',
+        f'--output_csv={output_dir / (base_output_name + ".csv")}',
+        f'--max_output_len={max_output_len}',
+        f'--num_beams={num_beams}',
+        '--use_py_session',
+    ]
+
+    if output_logits:
+        args_list.extend([
+            f'--output_logits_npy={output_dir / (base_output_name + "_logits.npy")}',
+            '--output_generation_logits',
+        ])
 
     # Generate context_fmha_fp32_acc enabled results for GptExecutorTest.GenerationLogitsEarlyStop
     if model_spec_obj.get_enable_context_fmha_fp32_acc():
@@ -93,14 +88,12 @@ def generate_output(engine: str,
 
     if output_cum_log_probs:
         args_list.extend([
-            '--output_cum_log_probs_npy',
-            f'{output_dir / model_spec_obj.get_cum_log_probs_file()}'
+            f'--output_cum_log_probs_npy={output_dir / model_spec_obj.get_cum_log_probs_file()}'
         ])
 
     if output_log_probs:
         args_list.extend([
-            '--output_log_probs_npy',
-            f'{output_dir / model_spec_obj.get_log_probs_file()}'
+            f'--output_log_probs_npy={output_dir / model_spec_obj.get_log_probs_file()}'
         ])
 
     args = run.parse_arguments(args_list)
