@@ -185,7 +185,14 @@ std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::operator
 
     auto decodingInput = createDecoderBatchInputs(
         activeSlots, decoderState, inputBuffers.logits, maxNumSequences, inputBuffers.forwardBatchSlots);
-    decodingInput->generationSteps = generationSteps;
+
+    auto const maxBeamWidth = decoderState.getMaxBeamWidth();
+    if (maxBeamWidth > 1)
+    {
+        // For Variable-Beam-Width-Search
+        decodingInput->generationSteps = generationSteps;
+        decoderState.getJointDecodingInput().generationSteps = decodingInput->generationSteps;
+    }
 
     if (modelConfig.getSpeculativeDecodingMode().hasDraftLogits())
     {

@@ -107,16 +107,10 @@ void prepareForward(decoder::DecoderState const& decoderState, SizeType32 step, 
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto const maxBeamWidth = decoderState.getMaxBeamWidth();
     auto const speculativeDecodingMode = decoderState.getSpeculativeDecodingMode();
 
     auto& dInput = decoderState.getJointDecodingInput();
     auto& dOutput = decoderState.getJointDecodingOutput();
-
-    if (maxBeamWidth > 1)
-    {
-        dInput.generationSteps = input.generationSteps; // For Variable-Beam-Width-Search
-    }
 
     dInput.batchSlots = input.batchSlots.at(step);
     dInput.batchSize = static_cast<SizeType32>(dInput.batchSlots->getSize());
