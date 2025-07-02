@@ -87,8 +87,8 @@ def calc_engine_setting(
     kv_cache_max_requests = cache_memory / (gb_per_token * target_seq_len +
                                             gb_per_extra_cache)
     extra_cache_memory = gb_per_extra_cache * kv_cache_max_requests
-    kv_cache_max_tokens = (cache_memory - extra_cache_memory) / gb_per_token
-    kv_cache_memory = kv_cache_max_tokens * gb_per_token
+    kv_cache_memory = cache_memory - extra_cache_memory
+    kv_cache_max_tokens = kv_cache_memory / gb_per_token
 
     logger.info(
         f"Estimated total cache memory: {cache_memory:.2f} GB. KV cache: {kv_cache_memory:.2f} GB, Extra cache: {extra_cache_memory:.2f} GB"
