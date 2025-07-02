@@ -38,7 +38,7 @@ endif()
 
 # Download DeepEP
 include(FetchContent)
-if(DEFINED $ENV{GITHUB_MIRROR})
+if(DEFINED ENV{GITHUB_MIRROR})
   set(GITHUB_URL "$ENV{GITHUB_MIRROR}")
 else()
   set(GITHUB_URL "https://github.com")
