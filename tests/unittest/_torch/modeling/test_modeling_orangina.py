@@ -5,7 +5,7 @@ import shutil
 import pytest
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import KvCacheConfig
+from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
 
 configs = """
 {
@@ -56,7 +56,7 @@ def test_orangina_trtllmgen(kv_cache):
 
     pytorch_config = dict(
         disable_overlap_scheduler=False,
-        use_cuda_graph=True,
+        cuda_graph_config=CudaGraphConfig(),
         kv_cache_dtype=kv_cache,
         attn_backend="TRTLLM",
         load_format="dummy",

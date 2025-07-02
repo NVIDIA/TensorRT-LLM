@@ -1651,7 +1651,7 @@ class MXFP4WeightCutlassFusedMoEMethod(MXFP4WeightFusedMoEMethod):
         orig_shape = dst_w3_w1_weight_scale.shape
 
         dst_w3_w1_weight_scale.copy_(
-            torch.ops.tensorrt_llm.block_scale_interleave(
+            torch.ops.trtllm.block_scale_interleave(
                 dst_w3_w1_weight_scale.view(float4_sf_dtype)).view(
                     self.block_scales_dtype).reshape(orig_shape))
 
@@ -1668,7 +1668,7 @@ class MXFP4WeightCutlassFusedMoEMethod(MXFP4WeightFusedMoEMethod):
         orig_shape = dst_w2_weight_scale.shape
 
         dst_w2_weight_scale.copy_(
-            torch.ops.tensorrt_llm.block_scale_interleave(
+            torch.ops.trtllm.block_scale_interleave(
                 dst_w2_weight_scale.view(float4_sf_dtype)).view(
                     self.block_scales_dtype).reshape(orig_shape))
 
@@ -1909,7 +1909,7 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
         # Assert should only be removed during debugging
         assert w3_w1_weight_scale.is_cuda, "w3_w1_weight_scale.is_cuda should be true or suffer from slow speed"
         # Interleave the weight.
-        processed_w3_w1_weight_scale = torch.ops.tensorrt_llm.block_scale_interleave(
+        processed_w3_w1_weight_scale = torch.ops.trtllm.block_scale_interleave(
             w3_w1_weight_scale.view(float4_sf_dtype).reshape(orig_shape))
         # Copy the result into device buffer
         dst_w3_w1_weight_scale.copy_(
@@ -1945,7 +1945,7 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
         w_shuffled = torch.ops.trtllm.shuffle_matrix(
             dst_w2_weight_scale.view(dtype=float4_sf_dtype), permute_indices)
         # Interleave the weight.
-        processed_w2_weight_scale = torch.ops.tensorrt_llm.block_scale_interleave(
+        processed_w2_weight_scale = torch.ops.trtllm.block_scale_interleave(
             w_shuffled)
         # Copy the result into device buffer
         dst_w2_weight_scale.copy_(
