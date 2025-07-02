@@ -18,7 +18,6 @@
 
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/quantization.h"
-#include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmhaRunner.h"
 #include "tensorrt_llm/kernels/fmhaDispatcher.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
@@ -115,7 +114,6 @@ private:
     cudaStream_t mNcclStream;
 
     // The default copy constructor will leave them as nullptr. clone() shall initialize it.
-    UniqPtrWNullCopy<tensorrt_llm::kernels::FusedMHARunnerV2> mFMHARunner;
     UniqPtrWNullCopy<tensorrt_llm::kernels::FmhaDispatcher> mFmhaDispatcher;
     UniqPtrWNullCopy<tensorrt_llm::common::CublasMMWrapper> mCublasWrapper;
 };

@@ -959,25 +959,14 @@ int BertAttentionPlugin::initialize() noexcept
         }
 
         // Load kernels from the pre-compiled cubins.
-        if (tensorrt_llm::common::getSMVersion() >= 100)
-        {
-            // // The KV input data type. The default is same as dataType.
-            fmhaParams.dataTypeKv = data_type;
-            fmhaParams.forceFp32Acc = false;
-            fmhaParams.headSizeV = mHeadSize;
+        // The KV input data type. The default is same as dataType.
+        fmhaParams.dataTypeKv = data_type;
+        fmhaParams.headSizeV = mHeadSize;
 
-            // Load kernels from the pre-compiled cubins for blackwell.
-            mFmhaDispatcher.reset(new FmhaDispatcher(fmhaParams));
-            // Fall back to unfused MHA kernels if not supported for blackwell.
-            mEnableContextFMHA = mFmhaDispatcher->isSupported();
-        }
-        else
-        {
-            // Load kernels from the pre-compiled cubins.
-            mFMHARunner.reset(new FusedMHARunnerV2(fmhaParams));
-            // Fall back to unfused MHA kernels if not supported.
-            mEnableContextFMHA = mFMHARunner->isFmhaSupported();
-        }
+        // Load kernels from the pre-compiled cubins.
+        mFmhaDispatcher.reset(new FmhaDispatcher(fmhaParams));
+        // Fall back to unfused MHA kernels if not supported.
+        mEnableContextFMHA = mFmhaDispatcher->isSupported();
     }
 
 #if ENABLE_MULTI_DEVICE
