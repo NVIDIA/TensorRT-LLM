@@ -185,6 +185,9 @@ class SpecMetadata:
     # if spec-dec tree wouldn't be changed at all, the mask won't be computed every step.
     is_spec_dec_dynamic_tree: bool = False
 
+    def __post_init__(self):
+        pass
+
     def prepare(self):
         """
         Hook to be called before the forward step of the model.

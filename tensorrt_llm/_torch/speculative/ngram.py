@@ -9,7 +9,7 @@ from ..pyexecutor.llm_request import *
 from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.scheduler import ScheduledRequests
 from .drafter import Drafter
-from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
+from .interface import SpecConfig, SpeculativeDecodingMode
 
 
 @dataclass
@@ -37,16 +37,6 @@ class NGramConfig(SpecConfig):
 
     def update_from_model_config(self, model_config):
         pass
-
-
-@dataclass
-class NGramSpecMetadata(SpecMetadata):
-    """
-    Metadata for NGram.
-    """
-
-    def __post_init__(self) -> None:
-        return
 
 
 class NGramPoolManager(BaseResourceManager):

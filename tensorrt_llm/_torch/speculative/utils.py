@@ -1,5 +1,5 @@
 from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler
-from tensorrt_llm._torch.speculative.interface import SpecConfig
+from tensorrt_llm._torch.speculative.interface import SpecConfig, SpecMetadata
 
 from .draft_target import DraftTargetSpecMetadata
 from .eagle3 import (Eagle3OneModelSampler, Eagle3OneModelSpecMetadata,
@@ -7,7 +7,7 @@ from .eagle3 import (Eagle3OneModelSampler, Eagle3OneModelSpecMetadata,
                      Eagle3SpecMetadata)
 from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
-from .ngram import NGramDrafter, NGramPoolManager, NGramSpecMetadata
+from .ngram import NGramDrafter, NGramPoolManager
 
 
 def get_spec_metadata(spec_config,
@@ -51,7 +51,7 @@ def get_spec_metadata(spec_config,
             max_num_requests=max_num_requests,
         )
     if spec_config.spec_dec_mode.is_ngram():
-        return NGramSpecMetadata(
+        return SpecMetadata(
             max_draft_tokens=spec_config.max_draft_tokens,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
