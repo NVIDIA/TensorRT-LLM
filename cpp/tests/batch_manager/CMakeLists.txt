@@ -19,3 +19,6 @@ add_gtest(peftCacheManagerTest peftCacheManagerTest.cpp)
 add_gtest(trtEncoderModelTest trtEncoderModelTest.cpp)
 add_gtest(guidedDecoderTest guidedDecoderTest.cpp)
 add_gtest(blockKeyTest blockKeyTest.cpp)
+
+add_gtest(metaTransceiverTest metaTransceiverTest.cpp)
+target_link_libraries(metaTransceiverTest PRIVATE ${ZeroMQ_LIBRARIES})

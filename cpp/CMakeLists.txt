@@ -197,7 +197,8 @@ include_directories(
   ${3RDPARTY_DIR}/cutlass/tools/util/include
   ${3RDPARTY_DIR}/NVTX/include
   ${3RDPARTY_DIR}/json/include
-  ${3RDPARTY_DIR}/pybind11/include)
+  ${3RDPARTY_DIR}/pybind11/include
+  ${3RDPARTY_DIR}/cppzmq)
 
 if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "11")
   add_definitions("-DENABLE_BF16")
@@ -453,6 +454,8 @@ if(ENABLE_UCX)
 else()
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DENABLE_UCX=0")
 endif()
+
+find_package(cppzmq REQUIRED)
 
 list(APPEND COMMON_HEADER_DIRS)
 include_directories(${COMMON_HEADER_DIRS})
