@@ -210,7 +210,7 @@ void initRequestBindings(nanobind::module_& m)
     };
     nb::class_<tle::OutputConfig>(m, "OutputConfig")
         .def(nb::init<bool, bool, bool, bool, bool, bool, std::optional<std::vector<tle::AdditionalModelOutput>>>(),
-            nb::arg("return_log_probs") = false, nb::arg("return_context_logits") = false,
+            nb::arg("return_log_probs").none() = false, nb::arg("return_context_logits") = false,
             nb::arg("return_generation_logits") = false, nb::arg("exclude_input_from_output") = false,
             nb::arg("return_encoder_output") = false, nb::arg("return_perf_metrics") = false,
             nb::arg("additional_model_outputs") = nb::none())
@@ -450,8 +450,9 @@ void initRequestBindings(nanobind::module_& m)
 
     nb::class_<tle::ContextPhaseParams>(m, "ContextPhaseParams")
         .def("__init__",
-            [](VecTokens const& first_gen_tokens, tle::ContextPhaseParams::RequestIdType req_id,
-                std::optional<nb::bytes> const& opaque_state, std::optional<VecTokens> const& draft_tokens)
+            [](tle::ContextPhaseParams const& self, VecTokens const& first_gen_tokens,
+                tle::ContextPhaseParams::RequestIdType req_id, std::optional<nb::bytes> const& opaque_state,
+                std::optional<VecTokens> const& draft_tokens)
             {
                 if (opaque_state)
                 {
@@ -832,7 +833,7 @@ void initRequestBindings(nanobind::module_& m)
 
     nb::class_<tle::AdditionalOutput>(m, "AdditionalOutput")
         .def("__init__ ",
-            [](std::string const& name, tle::Tensor const& output)
+            [](tle::AdditionalOutput const& self, std::string const& name, tle::Tensor const& output)
             { return std::make_unique<tle::AdditionalOutput>(name, output); })
         .def_rw("name", &tle::AdditionalOutput::name)
         .def_rw("output", &tle::AdditionalOutput::output);
