@@ -468,7 +468,7 @@ void initBindings(pybind11::module_& m)
                     auto numberOfContextLogits = numContextLogitsPrefixSum[i + 1] - contextLogitsOffset;
                     tr::ITensor::SharedPtr logitsView
                         = ITensor::slice(logits, contextLogitsOffset, numberOfContextLogits);
-                    logitsView->unsqueeze(0);
+                    logitsView->unsqueeze(1);
                     logitsVec[0].push_back(std::move(logitsView));
                 }
             }
@@ -484,7 +484,7 @@ void initBindings(pybind11::module_& m)
                     auto logitsOffset = genLogitsOffset + i * beamWidth;
                     auto numberOfLogits = beamWidth;
                     tr::ITensor::SharedPtr logitsView = ITensor::slice(logits, logitsOffset, numberOfLogits);
-                    logitsView->unsqueeze(0);
+                    logitsView->unsqueeze(1);
                     logitsVec[0].push_back(std::move(logitsView));
                 }
             }
