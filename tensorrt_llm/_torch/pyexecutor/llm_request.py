@@ -56,17 +56,6 @@ class LogitsStorage:
         self.beam_width = -1
         self.vocab_size = -1
 
-    def __str__(self):
-        properties = []
-        properties.append(f"seq_length: {self.seq_length}")
-        properties.append(f"use_device_memory: {self.use_device_memory}")
-        properties.append(f"position: {self.position}")
-        properties.append(f"last_position: {self.last_position}")
-        properties.append(f"_storage: {self._storage}")
-        properties.append(f"beam_width: {self.beam_width}")
-        properties.append(f"vocab_size: {self.vocab_size}")
-        return "LogitsStorage:\n" + "\n".join(properties)
-
     def _init(self, logits: torch.Tensor):
         _, self.beam_width, self.vocab_size = logits.shape
 
@@ -169,20 +158,6 @@ class PyResult:
             max_new_tokens, use_device_memory, exclude_last_generation_logits
         ) if return_generation_logits else None
         self._log_probs = LogProbStorage() if return_log_probs else None
-
-    def __str__(self):
-        properties = []
-        context_str = str(self._context_logits)
-        context_str = context_str.replace("\n", "\n\t")
-        properties.append(f"_streaming: {self._streaming}")
-        properties.append(f"_context_logits: {context_str}")
-        generation_str = str(self._generation_logits)
-        generation_str = generation_str.replace("\n", "\n\t")
-        properties.append(f"_generation_logits: {generation_str}")
-        log_probs_str = str(self._log_probs)
-        log_probs_str = log_probs_str.replace("\n", "\n\t")
-        properties.append(f"_log_probs: {log_probs_str}")
-        return "PyResult:\n" + "\n".join(properties)
 
     def append_context_logits(self, context_logits: torch.Tensor):
         if self._context_logits:
@@ -326,41 +301,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
     def is_generation_only_request(self):
         return self.py_llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
-
-    def __str__(self):
-        properties = []
-        properties.append(
-            f"py_logits_post_processors: {self.py_logits_post_processors}")
-        properties.append(f"py_client_id: {self.py_client_id}")
-        properties.append(f"py_request_id: {self.py_request_id}")
-        properties.append(f"py_end_id: {self.py_end_id}")
-        properties.append(f"py_prompt_len: {self.py_prompt_len}")
-        properties.append(f"py_orig_prompt_len: {self.py_orig_prompt_len}")
-        properties.append(f"py_max_new_tokens: {self.py_max_new_tokens}")
-        properties.append(f"py_batch_idx: {self.py_batch_idx}")
-        properties.append(f"py_rewind_len: {self.py_rewind_len}")
-        properties.append(f"py_draft_tokens: {self.py_draft_tokens}")
-        properties.append(f"py_last_draft_tokens: {self.py_last_draft_tokens}")
-        properties.append(f"py_decoding_iter: {self.py_decoding_iter}")
-        properties.append(
-            f"is_attention_dp_dummy: {self.is_attention_dp_dummy}")
-        properties.append(f"is_cuda_graph_dummy: {self.is_cuda_graph_dummy}")
-        properties.append(
-            f"py_lora_task_layer_module_configs: {self.py_lora_task_layer_module_configs}"
-        )
-        properties.append(f"py_return_log_probs: {self.py_return_log_probs}")
-        properties.append(
-            f"py_return_context_logits: {self.py_return_context_logits}")
-        properties.append(
-            f"py_return_generation_logits: {self.py_return_generation_logits}")
-        properties.append(
-            f"py_return_logits_device_memory: {self.py_return_logits_device_memory}"
-        )
-        properties.append(f"py_stop_words_list: {self.py_stop_words_list}")
-        result_str = str(self.py_result)
-        result_str = result_str.replace("\n", "\n\t")
-        properties.append(f"py_result: {result_str}")
-        return "LlmRequest:\n" + "\n".join(properties)
 
     def create_response(
             self,

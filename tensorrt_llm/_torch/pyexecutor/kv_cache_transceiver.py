@@ -107,7 +107,6 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
         return self.impl.check_context_transfer_status(at_least_request_num)
 
     def check_gen_transfer_status(self, at_least_request_num: int):
-        # TODO for helix, getting IndexError here in backend. Need to debug
         return self.impl.check_gen_transfer_status(at_least_request_num)
 
     def check_gen_transfer_complete(self):
@@ -123,6 +122,5 @@ class CacheTransBufferManager:
     @staticmethod
     def pre_alloc_buffer_size(max_num_tokens: int,
                               kv_cache_size_per_token: int):
-        # TODO for helix parallelism, should adjust max_num_tokens here to avoid over-allocating
         return CacheTransBufferManagerCpp.pre_alloc_buffer_size(
             max_num_tokens) * kv_cache_size_per_token

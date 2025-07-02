@@ -1444,7 +1444,7 @@ class PyExecutor:
         return result
 
     def _merge_helix_requests(self, new_requests: list[RequestQueueItem]):
-        # TODO unsure whether this is correct and even needed
+
         def make_fake_data(req_item: RequestQueueItem):
             # similar to _merge_star_attention_requests, we need fake data for scheduler
             # we simply partition by cp_size

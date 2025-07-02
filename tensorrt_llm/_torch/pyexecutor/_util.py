@@ -532,7 +532,6 @@ def instantiate_sampler(model_engine: PyTorchModelEngine,
     if mapping.cp_config.get('cp_type') == CpType.STAR:
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
         return TorchStarAttentionSampler(max_seq_len=model_engine.max_seq_len)
-    # TODO probably need new sampler for Helix parallelism
     spec_config = model_engine.spec_config
     if spec_config is not None and spec_config.spec_dec_mode.has_spec_decoder():
         return get_spec_decoder(max_seq_len=model_engine.max_seq_len,

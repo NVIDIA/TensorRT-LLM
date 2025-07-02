@@ -2010,16 +2010,6 @@ class PyTorchModelEngine(ModelEngine):
             new_tensors_device: Optional[SampleStateTensors] = None):
         cp_type = None if self.mapping is None else self.mapping.cp_config.get(
             "cp_type", None)
-        print(
-            f"#scheduled context requests: {len(scheduled_requests.context_requests)}"
-        )
-        print(
-            f"#scheduled generation requests: {len(scheduled_requests.generation_requests)}"
-        )
-        # for request in scheduled_requests.context_requests:
-        #     print(f"context request: {request}")
-        for request in scheduled_requests.generation_requests:
-            print(f"generation request: {request}")
         if cp_type is None or cp_type == CpType.HELIX:
             return self._prepare_tp_inputs(scheduled_requests, kv_cache_manager,
                                            attn_metadata, spec_metadata,
@@ -2029,7 +2019,7 @@ class PyTorchModelEngine(ModelEngine):
             if 'star_attention' == cp_type:
                 return self._prepare_star_attention_inputs(
                     scheduled_requests, kv_cache_manager, attn_metadata)
-        assert False, f'Unsupport cp_type {cp_type}'
+        assert False, f'Unsupported cp_type {cp_type}'
 
     @torch.inference_mode()
     @with_model_extra_attrs(lambda self: self.model.extra_attrs)
