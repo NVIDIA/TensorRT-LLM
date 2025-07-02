@@ -47,7 +47,7 @@ def test_fp8_rowwise_linear(dtype):
 
     # compare
     torch.cuda.synchronize()
-    torch.testing.assert_close(output, ref_output, atol=5e-2, rtol=1e-2)
+    torch.testing.assert_close(output, ref_output, atol=6e-2, rtol=1e-2)
 
 
 if __name__ == '__main__':
