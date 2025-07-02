@@ -56,6 +56,6 @@ class HandleLogits:
             logits_begin = total_context_logits + batch_index * beam_width
             logits_end = logits_begin + beam_width
 
-            if llm_req.py_return_generation_logits and llm_req.is_last_context_chunk:
+            if llm_req.py_return_generation_logits:
                 logits_view = logits[logits_begin:logits_end]
                 llm_req.py_result.append_generation_logits(logits_view)

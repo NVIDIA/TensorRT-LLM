@@ -740,9 +740,13 @@ class TRTLLMSampler(Sampler):
         ) if state.host.cum_log_probs is not None else None
 
         reqs = [
-            r for r in state.scheduled_requests.all_requests()
+            r for r in state.scheduled_requests.context_requests
+            if not r.is_context_init_state
+        ] + [
+            r for r in state.scheduled_requests.generation_requests
             if not r.is_generation_complete_state
         ]
+
         reqs_with_new_tokens = [
             r for r in reqs
             if (sequence_lengths_host_data[r.py_seq_slot] > r.get_num_tokens(0)
@@ -793,8 +797,11 @@ class TRTLLMSampler(Sampler):
         log_probs_host = state.host.log_probs.tolist()
 
         reqs = [
-            r for r in state.scheduled_requests.all_requests
+            r for r in state.scheduled_requests.context_requests
             if not r.is_context_init_state
+        ] + [
+            r for r in state.scheduled_requests.generation_requests
+            if not r.is_generation_complete_state
         ]
 
         for request in reqs:

@@ -1098,12 +1098,6 @@ class PyExecutor:
                             self._process_previous_batch()
                         self.previous_batch: Optional[BatchState] = None
 
-                    # Separate chunked requests so we can handle them in _update_requests w/o relying on the request state.
-                    # This is necessary because _forward_step updates the state before _update_requests is executed.
-                    scheduled_batch.chunked_requests = [
-                        r for r in scheduled_batch.context_requests
-                        if r.context_remaining_length != 0
-                    ]
                     scheduled_batch.context_requests = [
                         r for r in scheduled_batch.context_requests
                         if r.context_remaining_length == 0
