@@ -915,6 +915,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.kv_scale_orig_quant = 1.0 / self.kv_scale_quant_orig
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
+        self.use_nvfp4_output = None
 
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config
@@ -935,6 +936,60 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             return self.layer_idx
         else:
             return metadata.kv_cache_manager.layer_offsets[self.layer_idx]
+
+    def get_out_dtype(
+            self,
+            out_scale: Optional[torch.Tensor] = None) -> Optional[torch.dtype]:
+        out_dtype = None
+        if out_scale is not None:
+            if self.use_nvfp4_output:
+                # Use UINT8 as the container dtype for NVFP4.
+                out_dtype = torch.uint8
+            elif (self.has_fp8_qdq or self.has_nvfp4
+                  or self.has_fp8_block_wise) and self.has_fp8_kv_cache:
+                # TODO(qijun): revisit fp8_context_fmha logic
+                out_dtype = torch.float8_e4m3fn
+        return out_dtype
+
+    def create_output(self,
+                      q: torch.Tensor,
+                      out_scale: Optional[torch.Tensor] = None,
+                      **kwargs):
+        num_tokens = q.size(0)
+        out_dtype = self.get_out_dtype(out_scale)
+        if out_dtype is None:
+            out_dtype = q.dtype
+        v_head_size = self.head_dim
+        if out_dtype == torch.uint8:
+            num_nvfp4_elements_per_container = 2
+            scaling_vector_size = 16
+            size_per_token = self.num_heads * v_head_size
+            output = q.new_empty(
+                (num_tokens,
+                 size_per_token // num_nvfp4_elements_per_container),
+                dtype=torch.uint8)
+            # Create a sf (scaling factors) tensor for NVFP4 (use INT8 as the container dtype).
+            output_sf = q.new_empty(compute_swizzled_sf_shape(
+                num_tokens, size_per_token // scaling_vector_size),
+                                    dtype=torch.uint8)
+        else:
+            output = q.new_empty((num_tokens, self.num_heads * v_head_size),
+                                 dtype=out_dtype)
+            # Seems torch does not support None for mutable tensors, so we need to create an empty tensor.
+            output_sf = q.new_empty(())
+        return output, output_sf
+
+    def use_paged_context_fmha(self, metadata: TrtllmAttentionMetadata) -> bool:
+        use_paged_context_fmha = (
+            metadata.runtime_features.chunked_prefill
+            or metadata.runtime_features.cache_reuse
+            or metadata.runtime_features.has_speculative_draft_tokens
+        ) if metadata.runtime_features else False
+
+        if self.is_mla_enable:
+            use_paged_context_fmha = use_paged_context_fmha and self.has_cached_kv_for_mla_context(
+                metadata)
+        return use_paged_context_fmha
 
     def forward(
         self,
@@ -964,27 +1019,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         )
         assert not metadata.is_cross, "TRT-LLM Attention does not support cross attention yet."
 
-        use_paged_context_fmha = (
-            metadata.runtime_features.chunked_prefill
-            or metadata.runtime_features.cache_reuse
-            or metadata.runtime_features.has_speculative_draft_tokens
-        ) if metadata.runtime_features else False
-
-        if self.is_mla_enable:
-            # for MLA, we only use paged_context_fmha when there is cached kv
-            use_paged_context_fmha = use_paged_context_fmha and self.has_cached_kv_for_mla_context(
-                metadata)
-
-        use_nvfp4_output = False
-        if self.has_nvfp4 and self.support_nvfp4_output():
-            # Runtime check whether the NVFP4 output kernel is available.
-            use_nvfp4_output = self.wrapper.is_nvfp4_output_kernel_available(
-                tokens_per_block=metadata.tokens_per_block,
-                attention_mask=attention_mask,
-                use_paged_context_fmha=use_paged_context_fmha,
-                is_mla_enable=self.is_mla_enable,
-            )
-
         self.wrapper.plan(
             layer_idx=self.get_local_layer_idx(metadata),
             tokens_per_block=metadata.tokens_per_block,
@@ -1011,8 +1045,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             kv_scale_quant_orig=self.kv_scale_quant_orig,
             out_scale=out_scale,
             out_scale_sf=out_scale_sf,
-            use_nvfp4_output=use_nvfp4_output,
-            use_paged_context_fmha=use_paged_context_fmha,
+            use_nvfp4_output=self.use_nvfp4_output,
+            use_paged_context_fmha=self.use_paged_context_fmha(metadata),
             attention_input_type=attention_input_type,
             latent_cache=latent_cache,
             q_pe=q_pe,
@@ -1022,15 +1056,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             mla_context_kv_cache_block_offsets,
             softmax_stats_tensor=softmax_stats_tensor,
         )
-        out_dtype = None
-        if out_scale is not None:
-            if use_nvfp4_output:
-                # Use UINT8 as the container dtype for NVFP4.
-                out_dtype = torch.uint8
-            elif (self.has_fp8_qdq or self.has_nvfp4
-                  or self.has_fp8_block_wise) and self.has_fp8_kv_cache:
-                # TODO(qijun): revisit fp8_context_fmha logic
-                out_dtype = torch.float8_e4m3fn
+        out_dtype = self.get_out_dtype(out_scale)
 
         output, output_sf = self.wrapper.run(
             q,
