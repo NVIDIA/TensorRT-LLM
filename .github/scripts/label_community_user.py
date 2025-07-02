@@ -201,7 +201,6 @@ def main():
         pr_author = pr["user"]["login"]
         existing_labels = {label["name"] for label in pr["labels"]}
 
-        # skip if already has the community label
         if community_label in existing_labels:
             print(
                 f"PR #{pr_number} by {pr_author} already has community label, skipping"
