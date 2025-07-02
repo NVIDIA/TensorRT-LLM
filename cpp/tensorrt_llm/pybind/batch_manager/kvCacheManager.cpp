@@ -26,6 +26,7 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/operators.h>
+#include <nanobind/stl/bind_vector.h>
 #include <nanobind/stl/map.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
@@ -60,7 +61,7 @@ std::optional<tensorrt_llm::runtime::ITensor::UniquePtr> from_torch(std::optiona
 class PyKvCacheManager : public tbk::BaseKVCacheManager
 {
 public:
-    NB_TRAMPOLINE(tbk::BaseKVCacheManager, 27);
+    NB_TRAMPOLINE(tbk::BaseKVCacheManager, 28);
 
     // using BaseKVCacheManager::BaseKVCacheManager; // Inherit constructors
     void allocatePools(bool useUvm = false) override
@@ -173,13 +174,11 @@ public:
         NB_OVERRIDE_PURE(storeContextBlocks, llmRequest);
     }
 
-    // todo
-    // std::vector<std::vector<SizeType32>> const& getCacheBlockIds(
-    //     tb::LlmRequest::RequestIdType requestId, SizeType32 windowSize) const override
-    // {
-    //     NB_OVERRIDE_PURE(getCacheBlockIds,
-    //         requestId, windowSize);
-    // }
+    std::vector<std::vector<SizeType32>> const& getCacheBlockIds(
+        tb::LlmRequest::RequestIdType requestId, SizeType32 windowSize) const override
+    {
+        NB_OVERRIDE_PURE(getCacheBlockIds, requestId, windowSize);
+    }
 
     std::vector<std::vector<std::vector<SizeType32>>> getBatchCacheBlockIds(
         std::vector<tb::LlmRequest::RequestIdType> const& requestIds, SizeType32 windowSize) const override
@@ -416,10 +415,12 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("rewind_kv_cache", &BaseKVCacheManager::rewindKVCache)
         .def_prop_ro("cross_kv", &BaseKVCacheManager::isCrossKv)
         .def("store_context_blocks", &BaseKVCacheManager::storeContextBlocks)
-        // .def("get_cache_block_ids", &BaseKVCacheManager::getCacheBlockIds)
+        .def("get_cache_block_ids", &BaseKVCacheManager::getCacheBlockIds)
         .def("get_batch_cache_block_ids", &BaseKVCacheManager::getBatchCacheBlockIds)
         .def("get_newly_allocated_block_ids", &BaseKVCacheManager::getNewlyAllocatedBlockIds)
         .def("flush_iteration_events", &BaseKVCacheManager::flushIterationEvents);
+
+    nb::bind_vector<std::vector<std::vector<SizeType32>>>(m, "CacheBlockIds");
 
     nb::enum_<tbk::CacheType>(m, "CacheType")
         .value("SELF", tbk::CacheType::kSELF)
@@ -436,7 +437,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("num_kv_heads_per_layer"), nb::arg("size_per_head"), nb::arg("tokens_per_block"),
             nb::arg("blocks_per_window"), nb::arg("max_num_sequences"), nb::arg("max_beam_width"),
             nb::arg("max_attention_window_vec"), nb::arg("temp_attention_window_inputs").none(), nb::arg("dtype"),
-            nb::arg("sink_token_length"), nb::arg("stream"), nb::arg("max_sequence_length"),
+            nb::arg("sink_token_length"), nb::arg("stream"), nb::arg("max_sequence_length").none(),
             nb::arg("enable_block_reuse") = false, nb::arg("onboard_blocks") = true,
             nb::arg("cache_type") = tbk::CacheType::kSELF, nb::arg("secondary_offload_min_priority") = std::nullopt,
             nb::arg("event_manager") = nullptr, nb::arg("enable_partial_reuse") = true,

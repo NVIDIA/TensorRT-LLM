@@ -48,6 +48,7 @@ NB_MAKE_OPAQUE(tensorrt_llm::batch_manager::ReqIdsSet)
 NB_MAKE_OPAQUE(std::vector<tensorrt_llm::batch_manager::SlotDecoderBuffers>)
 NB_MAKE_OPAQUE(std::vector<tensorrt_llm::runtime::decoder_batch::Request>)
 NB_MAKE_OPAQUE(std::vector<tensorrt_llm::runtime::SamplingConfig>)
+NB_MAKE_OPAQUE(std::vector<std::vector<tensorrt_llm::runtime::SizeType32>>)
 
 namespace nb = nanobind;
 
