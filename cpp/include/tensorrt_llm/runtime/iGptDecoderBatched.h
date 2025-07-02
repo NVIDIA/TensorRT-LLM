@@ -18,9 +18,9 @@
 
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
-#include "tensorrt_llm/runtime/eagleBuffers.h"
-#include "tensorrt_llm/runtime/explicitDraftTokensBuffers.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
+#include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <memory>
 #include <vector>
@@ -72,8 +72,6 @@ public:
 
     //! Batch of active decoder slots, sorted by slots, [maxDecoderSteps][batchSize]
     std::vector<TensorPtr> batchSlots;
-    //! Filled with slots in request order, [batchSize]
-    TensorPtr batchSlotsRequestOrder;
 
     //! For Beam Search
     //! The generation step of each request (for Variable-Beam-Width-Search), [batchSize]

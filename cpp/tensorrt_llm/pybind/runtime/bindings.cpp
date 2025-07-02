@@ -274,7 +274,6 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("logits", &tr::decoder_batch::Input::logits)
         .def_readwrite("max_decoder_steps", &tr::decoder_batch::Input::maxDecoderSteps)
         .def_readwrite("batch_slots", &tr::decoder_batch::Input::batchSlots)
-        .def_readwrite("batch_slots_request_order", &tr::decoder_batch::Input::batchSlotsRequestOrder)
         .def_readwrite("generation_steps", &tr::decoder_batch::Input::generationSteps);
 
     py::class_<tr::LookaheadDecodingBuffers>(m, "LookaheadDecodingBuffers")

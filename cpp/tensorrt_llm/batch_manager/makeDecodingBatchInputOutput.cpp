@@ -142,6 +142,7 @@ void setExplicitDraftTokensInputs(tr::DecodingInput& dInput, RuntimeBuffers cons
     dInput.explicitDraftTokensInputs->nextGenerationLengths = explicitDraftTokensInputs.nextGenerationLengths;
     dInput.explicitDraftTokensInputs->lastGenerationLengths = explicitDraftTokensLastInputs.generationLengths;
     dInput.explicitDraftTokensInputs->maxGenLengthDevice = explicitDraftTokensInputs.maxGenToken;
+    // Slots in request order
     dInput.explicitDraftTokensInputs->seqSlots = fusedRuntimeBuffers.seqSlots;
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -167,6 +168,7 @@ void setEagleInputs(tr::DecodingInput& dInput, RuntimeBuffers const& fusedRuntim
     dInput.eagleInputs->acceptedLens = eagleInputs.acceptedLens;
     dInput.eagleInputs->acceptedPathIds = eagleInputs.acceptedPaths;
     dInput.eagleInputs->chunkedContextNextTokens = eagleInputs.chunkedContextNextTokens;
+    // Slots in request order
     dInput.eagleInputs->seqSlots = fusedRuntimeBuffers.seqSlots;
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
