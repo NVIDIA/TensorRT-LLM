@@ -479,12 +479,6 @@ void initRequestBindings(nanobind::module_& m)
                     opaque_state = nb::bytes(serializedState.data(), serializedState.size());
                 }
                 return opaque_state;
-                //         auto serializedState = self.getSerializedState();
-                // if (serializedState.empty())
-                // {
-                //     return std::optional<nb::bytes>{std::nullopt};
-                // }
-                // return std::optional<nb::bytes>{nb::bytes(serializedState.data(), serializedState.size())};
             })
         .def("__getstate__", ContextPhaseParamsGetState)
         .def("__setstate__", ContextPhaseParamsSetState);

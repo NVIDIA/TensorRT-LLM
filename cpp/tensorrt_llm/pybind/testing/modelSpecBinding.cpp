@@ -18,8 +18,6 @@
 #include "modelSpecBinding.h"
 #include "tensorrt_llm/testing/modelSpec.h"
 
-// #include <pybind11/pybind11.h>
-// #include <pybind11/stl.h>
 #include <nanobind/nanobind.h>
 
 namespace nb = nanobind;

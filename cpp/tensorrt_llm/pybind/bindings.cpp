@@ -459,45 +459,6 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .value("DISAGG_GENERATION_TRANS_COMPLETE", tb::LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE)
         .value("DISAGG_CONTEXT_INIT_AND_TRANS", tb::LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS);
 
-    // auto gptModelParamsGetState = [&kvCacheConfigGetState](tb::TrtGptModelOptionalParams const& params) // todo
-    // {
-    //     auto kvCacheState = kvCacheConfigGetState(params.kvCacheConfig);
-    //     return nb::make_tuple(kvCacheState, params.enableTrtOverlap, params.deviceIds, params.normalizeLogProbs,
-    //         params.enableChunkedContext, params.decodingConfig.getDecodingMode());
-    // };
-    // auto gptModelParamsSetState = [&kvCacheConfigSetState](nb::tuple t)
-    // {
-    //     auto kvCacheConfig = kvCacheConfigSetState(t[0]);
-    //     return tb::TrtGptModelOptionalParams(kvCacheConfig, nb::cast<bool>(t[1]),
-    //         nb::cast<std::optional<std::vector<SizeType32>>>(t[2]), nb::cast<bool>(t[3]), nb::cast<bool>(t[4]),
-    //         tb::PeftCacheManagerConfig{},
-    //         tensorrt_llm::executor::DecodingConfig(
-    //             nb::cast<std::optional<tensorrt_llm::executor::DecodingMode>>(t[5])));
-    // };
-
-    // nb::class_<tb::TrtGptModelOptionalParams>(m, "TrtGptModelOptionalParams")
-    //     .def(nb::init<tbk::KvCacheConfig, bool, std::optional<std::vector<SizeType32>> const&, bool, bool,
-    //              tb::PeftCacheManagerConfig const&>(),
-    //         nb::arg("kv_cache_config") = tbk::KvCacheConfig{}, nb::arg("enable_trt_overlap") = false,
-    //         nb::arg("device_ids") = std::nullopt, nb::arg("normalize_log_probs") = true,
-    //         nb::arg("enable_chunked_context") = false,
-    //         nb::arg("peft_cache_manager_config") = tb::PeftCacheManagerConfig{})
-    //     .def(nb::init<tensorrt_llm::executor::ExecutorConfig const&, bool>(), nb::arg("executor_config"),
-    //         nb::arg("is_leader_in_orch_mode") = false)
-    //     .def_rw("kv_cache_config", &tb::TrtGptModelOptionalParams::kvCacheConfig)
-    //     .def_rw("enable_trt_overlap", &tb::TrtGptModelOptionalParams::enableTrtOverlap)
-    //     .def_rw("device_ids", &tb::TrtGptModelOptionalParams::deviceIds)
-    //     .def_rw("enable_chunked_context", &tb::TrtGptModelOptionalParams::enableChunkedContext)
-    //     .def_rw("normalize_log_probs", &tb::TrtGptModelOptionalParams::normalizeLogProbs)
-    //     .def_rw("decoding_config", &tb::TrtGptModelOptionalParams::decodingConfig)
-    //     .def_rw("use_gpu_direct_storage", &tb::TrtGptModelOptionalParams::useGpuDirectStorage)
-    //     .def_rw("gpu_weights_percent", &tb::TrtGptModelOptionalParams::gpuWeightsPercent)
-    //     .def_rw("max_beam_width", &tb::TrtGptModelOptionalParams::maxBeamWidth)
-    //     .def_rw("scheduler_config", &tb::TrtGptModelOptionalParams::schedulerConfig)
-    //     .def_rw("cache_transceiver_config", &tb::TrtGptModelOptionalParams::cacheTransceiverConfig)
-    //     .def("__getstate__", gptModelParamsGetState)
-    //     .def("__setstate__", gptModelParamsSetState);
-
     nb::class_<tr::MemoryCounters>(m, "MemoryCounters")
         .def_static("instance", &tr::MemoryCounters::getInstance, nb::rv_policy::reference)
         .def_prop_ro("gpu", &tr::MemoryCounters::getGpu)

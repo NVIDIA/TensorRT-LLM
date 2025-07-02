@@ -41,8 +41,6 @@
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAStream.h>
-// #include <pybind11/stl.h>
-// #include <pybind11/stl_bind.h>
 #include <nanobind/stl/vector.h>
 
 #include <nanobind/nanobind.h>
@@ -104,96 +102,6 @@ struct type_caster<void const*>
 };
 } // namespace nanobind::detail
 
-// class PyITensor : public tr::ITensor
-// {
-// public:
-// NB_TRAMPOLINE(tr::ITensor, 11);
-//     /* Inherit the constructors */
-//     // using ITensor::ITensor;
-
-//     [[nodiscard]] void* data() override
-//     {
-//         NB_OVERRIDE_PURE(data);
-//     }
-
-//     [[nodiscard]] void const* data() const override
-//     {
-//         NB_OVERRIDE_PURE(data);
-//     }
-
-//     [[nodiscard]] std::size_t getSize() const override
-//     {
-//         NB_OVERRIDE_PURE(
-//             getSize                         /* Name of function in C++ (must match Python name) */
-//                                             /* Argument(s) */
-//         );
-//     }
-
-//     [[nodiscard]] std::size_t getCapacity() const override
-//     {
-//         NB_OVERRIDE_PURE(
-//             getCapacity                     /* Name of function in C++ (must match Python name) */
-//                                             /* Argument(s) */
-//         );
-//     }
-
-//     [[nodiscard]] DataType getDataType() const override
-//     {
-//         NB_OVERRIDE_PURE(
-//             getDataType                  /* Name of function in C++ (must match Python name) */
-//                                          /* Argument(s) */
-//         );
-//     }
-
-//     [[nodiscard]] tr::MemoryType getMemoryType() const override
-//     {
-//         NB_OVERRIDE_PURE(
-//             getMemoryType                      /* Name of function in C++ (must match Python name) */
-//                                                /* Argument(s) */
-//         );
-//     }
-
-//     [[nodiscard]] char const* getMemoryTypeName() const override
-//     {
-//         NB_OVERRIDE_PURE(
-//             getMemoryTypeName               /* Name of function in C++ (must match Python name) */
-//                                             /* Argument(s) */
-//         );
-//     }
-
-//     virtual void resize(std::size_t newSize) override
-//     {
-//         NB_OVERRIDE_PURE(
-//             resize,                   /* Name of function in C++ (must match Python name) */
-//             newSize                         /* Argument(s) */
-//         );
-//     }
-
-//     void release() override
-//     {
-//         NB_OVERRIDE_PURE(
-//             release                  /* Name of function in C++ (must match Python name) */
-//                                      /* Argument(s) */
-//         );
-//     }
-
-//     [[nodiscard]] Shape const& getShape() const override
-//     {
-//         NB_OVERRIDE_PURE(
-//             getShape                         /* Name of function in C++ (must match Python name) */
-//                                              /* Argument(s) */
-//         );
-//     }
-
-//     void reshape(Shape const& dims) override
-//     {
-//         NB_OVERRIDE_PURE(
-//             reshape,                 /* Name of function in C++ (must match Python name) */
-//             dims                     /* Argument(s) */
-//         );
-//     }
-// };
-
 class PyIGptDecoder : public tr::IGptDecoder
 {
 public:
@@ -239,24 +147,6 @@ namespace tensorrt_llm::pybind::runtime
 
 void initBindings(nanobind::module_& m)
 {
-    // nb::class_<tr::ITensor, PyITensor>(m, "ITensor")
-    //     .def(nb::init<>());
-    // .def("data", [](tr::ITensor& self) -> nb::object {
-    //     void* ptr = self.data();
-    //     if (ptr == nullptr) {
-    //         return nb::none();
-    //     }
-    //     return nb::capsule(ptr, "void*", nullptr);
-    // })
-    // .def("data", [](const tr::ITensor& self) -> nb::object {
-    //     const void* ptr = self.data();
-    //     if (ptr == nullptr) {
-    //         return nb::none();
-    //     }
-    //     // Create a non-const copy of the pointer for the capsule
-    //     void* non_const_ptr = const_cast<void*>(ptr);
-    //     return nb::capsule(non_const_ptr, "const void*", nullptr);
-    // }, nb::const_);
 
     nb::class_<tr::LoraCache::TaskLayerModuleConfig>(m, "TaskLayerModuleConfig")
         .def(nb::init<>())
@@ -351,10 +241,6 @@ void initBindings(nanobind::module_& m)
         .def_rw("batch_slots_request_order", &tr::decoder_batch::Input::batchSlotsRequestOrder)
         .def_rw("generation_steps", &tr::decoder_batch::Input::generationSteps)
         .def_rw("predicted_draft_logits", &tr::decoder_batch::Input::predictedDraftLogits);
-
-    // nb::class_<tr::decoder_batch::Output>(m, "DecoderBatchOutput")
-    //     .def(nb::init<>())
-    //     .def_rw("cache_indirection", &tr::decoder_batch::Output::cacheIndirection);
 
     nb::class_<tr::LookaheadDecodingBuffers>(m, "LookaheadDecodingBuffers")
         .def(nb::init<tr::SizeType32, tr::SizeType32, tr::BufferManager const&>(), nb::arg("max_num_sequences"),
