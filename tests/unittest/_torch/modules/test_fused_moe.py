@@ -618,7 +618,6 @@ def test_fused_moe_nvfp4(dtype):
     torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
 
 
-@pytest.mark.skip(reason="https://nvbugs/5325653")
 @skip_neither_ada_nor_hopper_unittest
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_fused_moe_w4afp8(dtype):

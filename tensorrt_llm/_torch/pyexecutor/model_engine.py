@@ -2008,6 +2008,12 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata = self._set_up_spec_metadata(spec_resource_manager,
                                                        no_cache=kv_cache_manager
                                                        is None)
+            # attn_metadata now depends on spec_metadata since it determines the shape/content of spec_dec parameter Tensors
+            attn_metadata.update_spec_dec_param(
+                spec_metadata.spec_dec_mode.attention_need_spec_dec_mode(),
+                spec_metadata.is_spec_dec_tree,
+                spec_metadata.is_spec_dec_dynamic_tree,
+                spec_metadata.max_draft_tokens)
         else:
             spec_metadata = None
 

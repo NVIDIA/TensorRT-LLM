@@ -704,11 +704,8 @@ def attention(
     rotary_embedding_dim: int,
     rotary_embedding_base: float,
     rotary_embedding_scale_type: int,
-    rotary_embedding_scale: float,
-    rotary_embedding_short_m_scale: float,
-    rotary_embedding_long_m_scale: float,
-    rotary_embedding_max_positions: int,
-    rotary_embedding_original_max_positions: int,
+    rotary_embedding_scales: List[float],
+    rotary_embedding_max_position_info: List[int],
     use_paged_context_fmha: bool,
     attention_input_type: Optional[int],
     is_mla_enable: bool,
@@ -723,6 +720,8 @@ def attention(
     mla_context_kv_cache_block_offsets: Optional[torch.Tensor],
     attention_chunk_size: Optional[int],
     softmax_stats_tensor: Optional[torch.Tensor],
+    spec_decoding_bool_params: List[bool],
+    spec_decoding_tensor_params: List[Optional[torch.Tensor]],
 ) -> List[torch.Tensor]:
     num_tokens = q.size(0)
     attention_input_type = (AttentionInputType(attention_input_type)
@@ -750,6 +749,8 @@ def attention(
         # NOTE(tizheng): Does this introduce overhead?
         output_sf = torch.empty(())  # Create a placeholder, which is not used.
 
+    # this function shouldn't maxed out 64 arguments
+    # https://github.com/pytorch/pytorch/blob/a2b0b2698d5b953861b2e4f3cdee11136f07bd3b/aten/src/ATen/core/dispatch/DispatchKeyExtractor.h#L235
     torch.ops.trtllm.attention_inplace(
         q, k, v, output_act, output_sf, out_dtype, workspace, sequence_length,
         host_past_key_value_lengths, context_lengths, host_context_lengths,
@@ -762,14 +763,15 @@ def attention(
         max_context_length, attention_window_size, sink_token_length,
         beam_width, mask_type, quant_mode, q_scaling, position_embedding_type,
         rotary_embedding_dim, rotary_embedding_base,
-        rotary_embedding_scale_type, rotary_embedding_scale,
-        rotary_embedding_short_m_scale, rotary_embedding_long_m_scale,
-        rotary_embedding_max_positions, rotary_embedding_original_max_positions,
-        use_paged_context_fmha, attention_input_type, is_mla_enable,
-        q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim,
-        v_head_dim, mrope_rotary_cos_sin, mrope_position_deltas,
-        mla_context_paged_kv, mla_context_kv_cache_block_offsets,
-        attention_chunk_size, softmax_stats_tensor)
+        rotary_embedding_scale_type, rotary_embedding_scales,
+        rotary_embedding_max_position_info, use_paged_context_fmha,
+        attention_input_type, is_mla_enable, q_lora_rank, kv_lora_rank,
+        qk_nope_head_dim, qk_rope_head_dim, v_head_dim, mrope_rotary_cos_sin,
+        mrope_position_deltas, mla_context_paged_kv,
+        mla_context_kv_cache_block_offsets, attention_chunk_size,
+        softmax_stats_tensor, spec_decoding_bool_params,
+        spec_decoding_tensor_params)
+
     return output_act, output_sf
 
 
@@ -818,11 +820,8 @@ def _(
     rotary_embedding_dim: int,
     rotary_embedding_base: float,
     rotary_embedding_scale_type: int,
-    rotary_embedding_scale: float,
-    rotary_embedding_short_m_scale: float,
-    rotary_embedding_long_m_scale: float,
-    rotary_embedding_max_positions: int,
-    rotary_embedding_original_max_positions: int,
+    rotary_embedding_scales: List[float],
+    rotary_embedding_max_position_info: List[int],
     use_paged_context_fmha: bool,
     attention_input_type: Optional[int],
     is_mla_enable: bool,
@@ -836,6 +835,8 @@ def _(
     mla_context_paged_kv: Optional[torch.Tensor],
     mla_context_kv_cache_block_offsets: Optional[torch.Tensor],
     attention_chunk_size: Optional[int],
+    spec_decoding_bool_params: List[bool],
+    spec_decoding_tensor_params: List[Optional[torch.Tensor]],
 ) -> List[torch.Tensor]:
     num_tokens = q.size(0)
     attention_input_type = (AttentionInputType(attention_input_type)

@@ -16,7 +16,7 @@ GROUP_ID           ?= $(shell id --group)
 GROUP_NAME         ?= $(shell id --group --name)
 
 # Try to detect Docker rootless mode
-IS_ROOTLESS        ?= $(shell if [ "$$(docker context inspect --format '{{.Endpoints.docker.Host}}' "$$(docker context show)")" = "unix:///run/user/$(USER_ID)/docker.sock" ]; then echo 1; else echo 0; fi)
+IS_ROOTLESS        ?= $(shell ./detect_rootless.sh)
 
 # Set this to 1 to add the current user to the docker image and run the container with the user
 LOCAL_USER         ?= 0
@@ -72,7 +72,7 @@ define rewrite_tag
 $(shell echo $(IMAGE_WITH_TAG) | sed "s/\/tensorrt-llm:/\/tensorrt-llm-staging:/g")
 endef
 
-%_build: DEVEL_IMAGE = $(if $(findstring 1,$(JENKINS_DEVEL)),$(shell grep '^[[:space:]]*LLM_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"'))
+%_build: DEVEL_IMAGE = $(if $(findstring 1,$(JENKINS_DEVEL)),$(shell . ../jenkins/current_image_tags.properties && echo $$LLM_DOCKER_IMAGE))
 %_build:
 	@echo "Building docker image: $(IMAGE_WITH_TAG)"
 	docker buildx build $(DOCKER_BUILD_OPTS) $(DOCKER_BUILD_ARGS) \
@@ -171,15 +171,15 @@ release_%: STAGE = release
 release_run: WORK_DIR = /app/tensorrt_llm
 
 # For x86_64
-jenkins_%: IMAGE_WITH_TAG = $(shell grep '^[[:space:]]*LLM_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
+jenkins_%: IMAGE_WITH_TAG = $(shell . ../jenkins/current_image_tags.properties && echo $$LLM_DOCKER_IMAGE)
 jenkins_%: STAGE = tritondevel
 
 # For aarch64
-jenkins-aarch64_%: IMAGE_WITH_TAG = $(shell grep '^[[:space:]]*LLM_SBSA_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
+jenkins-aarch64_%: IMAGE_WITH_TAG = $(shell . ../jenkins/current_image_tags.properties && echo $$LLM_SBSA_DOCKER_IMAGE)
 jenkins-aarch64_%: STAGE = tritondevel
 
 # For x86_64
-jenkins-rockylinux8_%: IMAGE_WITH_TAG = $(shell grep '^[[:space:]]*LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
+jenkins-rockylinux8_%: IMAGE_WITH_TAG = $(shell . ../jenkins/current_image_tags.properties && echo $$LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE)
 jenkins-rockylinux8_%: STAGE = tritondevel
 jenkins-rockylinux8_%: BASE_IMAGE = nvidia/cuda
 jenkins-rockylinux8_%: BASE_TAG = 12.9.0-devel-rockylinux8
@@ -197,11 +197,11 @@ trtllm_%: STAGE = release
 trtllm_%: PUSH_TO_STAGING := 0
 trtllm_%: DEVEL_IMAGE = $(shell \
     if [ "$(PLATFORM)" = "amd64" ]; then \
-        grep '^[[:space:]]*LLM_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"'; \
+        . ../jenkins/current_image_tags.properties && echo $$LLM_DOCKER_IMAGE; \
     elif [ "$(PLATFORM)" = "arm64" ]; then \
-        grep '^[[:space:]]*LLM_SBSA_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"'; \
+        . ../jenkins/current_image_tags.properties && echo $$LLM_SBSA_DOCKER_IMAGE; \
     fi)
-trtllm_%: IMAGE_NAME = $(shell grep '^[[:space:]]*IMAGE_NAME = ' ../jenkins/BuildDockerImage.groovy | grep -o '".*"' | tr -d '"')
+trtllm_%: IMAGE_NAME = $(shell . ../jenkins/current_image_tags.properties && echo $$IMAGE_NAME)
 trtllm_%: IMAGE_TAG = $(shell git rev-parse --abbrev-ref HEAD | tr '/' '_')-$(PLATFORM)
 trtllm_run: WORK_DIR = /app/tensorrt_llm
 
