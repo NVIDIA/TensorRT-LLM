@@ -1764,6 +1764,12 @@ class TorchLlmArgs(BaseLlmArgs):
         description="If true, force dynamic quantization. Defaults to False.",
     )
 
+    allreduce_strategy: Optional[
+        Literal['AUTO', 'NCCL', 'UB', 'MINLATENCY', 'ONESHOT', 'TWOSHOT',
+                'LOWPRECISION',
+                'MNNVL']] = Field(default='AUTO',
+                                  description="Allreduce strategy to use.")
+
     # TODO: remove backend later
     @field_validator('backend', mode='before')
     def init_backend(cls, v):
@@ -1931,7 +1937,7 @@ class TorchLlmArgs(BaseLlmArgs):
             load_format=self.load_format,
             enable_min_latency=self.enable_min_latency,
             stream_interval=self.stream_interval,
-            force_dynamic_quantization=force_dynamic_quantization)
+            force_dynamic_quantization=self.force_dynamic_quantization)
 
 
 def update_llm_args_with_extra_dict(
@@ -1943,15 +1949,9 @@ def update_llm_args_with_extra_dict(
         "quant_config": QuantConfig,
         "calib_config": CalibConfig,
         "build_config": BuildConfig,
-        "kv_cache_config": KvCacheConfig,
         "decoding_config": DecodingConfig,
         "enable_build_cache": BuildCacheConfig,
-        "peft_cache_config": PeftCacheConfig,
-        "scheduler_config": SchedulerConfig,
         "speculative_config": DecodingBaseConfig,
-        "batching_type": BatchingType,
-        "extended_runtime_perf_knob_config": ExtendedRuntimePerfKnobConfig,
-        "cache_transceiver_config": CacheTransceiverConfig,
         "lora_config": LoraConfig,
     }
     for field_name, field_type in field_mapping.items():

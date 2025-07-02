@@ -52,13 +52,14 @@ void threeStepBuildExpertMapsSortFirstToken(int const* token_selected_experts, i
     int64_t const num_tokens, int64_t const num_experts_per_node, int64_t const num_experts_per_token,
     int const start_expert_id, cudaStream_t stream);
 
-template <class InputActivationsType, class ExpandedActivationsType>
+template <class InputActivationsType, class ExpandedActivationsType, bool PRE_QUANT_AWQ = false>
 void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
     ExpandedActivationsType* permuted_output, float const* unpermuted_scales, float* permuted_scales,
     int const* permuted_row_to_unpermuted_row, int64_t const num_rows, int64_t const cols, int const k,
     int const num_experts_per_node, float const* fc1_act_global_scale, bool use_per_expert_act_scale,
     int64_t* expert_first_token_offset, TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
-    TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, cudaStream_t stream);
+    TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, cudaStream_t stream,
+    void const* prequant_scales = nullptr);
 
 template <class OutputType, class GemmOutputType, class ScaleBiasType>
 void finalizeMoeRoutingKernelLauncher(GemmOutputType const* expanded_permuted_rows,
