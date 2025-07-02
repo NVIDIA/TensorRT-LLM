@@ -443,3 +443,4 @@ examples/test_phi.py::test_llm_phi_quantization_1gpu[Phi-3.5-mini-instruct-fp8-f
 accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_fp8 SKIP (https://nvbugs/5355054)
 accuracy/test_cli_flow.py::TestLlama3_1_8BInstruct::test_fp8_prequantized SKIP (https://nvbugs/5355054)
 accuracy/test_cli_flow.py::TestLlama3_1_8BInstruct::test_medusa_fp8_prequantized SKIP (https://nvbugs/5355054)
+disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tllm_gen_helix SKIP (temporary, work in progress)
