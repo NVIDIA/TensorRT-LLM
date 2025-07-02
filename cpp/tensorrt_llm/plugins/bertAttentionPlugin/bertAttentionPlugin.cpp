@@ -521,7 +521,6 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
                 cudaMemcpyAsync(fmhaParams.tileCounterPtr, fmha_scheduler_counter_h, sizeof(uint32_t),
                     cudaMemcpyHostToDevice, stream);
                 mFmhaDispatcher->run(fmhaParams);
-                mFMHARunner->run(fmhaParams);
                 if (iter != 0)
                 {
                     invokeRecoverFromRA<T>((T*) context_buf_, (float*) ring_softmax_accu_stats_buf_,
@@ -705,26 +704,18 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
             }
 
             // Run the fmha kernel.
-            if (tensorrt_llm::common::getSMVersion() >= 100 && tensorrt_llm::common::getSMVersion() < 120)
-            {
 
-                // TODO: set it correctly for contiguous kv buffer (cross-attention).
-                fmhaParams.totalKvSeqLen = num_tokens;
+            // TODO: set it correctly for contiguous kv buffer (cross-attention).
+            fmhaParams.totalKvSeqLen = num_tokens;
 
-                fmhaParams.cuKvSeqLenPtr = cu_seqlens;
-                fmhaParams.cuMaskRowsPtr = cu_seqlens;
-                fmhaParams.tileCounterPtr = fmha_tile_counter_ptr;
+            fmhaParams.cuKvSeqLenPtr = cu_seqlens;
+            fmhaParams.cuMaskRowsPtr = cu_seqlens;
+            fmhaParams.tileCounterPtr = fmha_tile_counter_ptr;
 
-                fmhaParams.scaleBmm1Ptr = scale_bmm1_ptr;
-                fmhaParams.scaleBmm2Ptr = scale_bmm2_ptr;
-                fmhaParams.forceFp32Acc = mFMHAForceFP32Acc;
-                mFmhaDispatcher->run(fmhaParams);
-            }
-            else
-            {
-                // Run the fmha kernel.
-                mFMHARunner->run(fmhaParams);
-            }
+            fmhaParams.scaleBmm1Ptr = scale_bmm1_ptr;
+            fmhaParams.scaleBmm2Ptr = scale_bmm2_ptr;
+            fmhaParams.forceFp32Acc = mFMHAForceFP32Acc;
+            mFmhaDispatcher->run(fmhaParams);
             sync_check_cuda_error(stream);
             if (mSageAttn)
             {
