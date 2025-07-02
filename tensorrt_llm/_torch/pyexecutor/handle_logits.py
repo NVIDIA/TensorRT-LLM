@@ -48,7 +48,7 @@ class HandleLogits:
 
             if llm_req.py_return_generation_logits and llm_req.is_last_context_chunk:
                 # Get the logits from the last context token and draft tokens
-                logits_view = logits[logits_begin:logits_end]
+                logits_view = logits[logits_end-1:logits_end]
                 llm_req.py_result.append_generation_logits(logits_view)
 
         total_context_logits = num_context_logits_prefix_sum[-1]
