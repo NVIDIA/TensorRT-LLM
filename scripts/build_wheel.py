@@ -630,7 +630,7 @@ def main(*,
 
         with (build_dir / "tensorrt_llm" / "deep_ep" /
               "cuda_architectures.txt").open() as f:
-            deep_ep_cuda_architectures = f.read().strip().split(";")
+            deep_ep_cuda_architectures = f.read().strip().strip(";")
         if deep_ep_cuda_architectures:
             install_file(get_pybind_lib("deep_ep", "deep_ep_cpp_tllm"), pkg_dir)
             install_tree(build_dir / "tensorrt_llm" / "deep_ep" / "python" /
