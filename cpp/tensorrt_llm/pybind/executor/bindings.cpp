@@ -53,13 +53,13 @@ void initBindings(nanobind::module_& m)
         .value("ENCODER_DECODER", tle::ModelType::kENCODER_DECODER);
 
     auto decodingModeGetstate = [](tle::DecodingMode const& self) { return nb::make_tuple(self.getState()); };
-    auto decodingModeSetstate = [](nb::tuple const& state)
+    auto decodingModeSetstate = [](tle::DecodingMode& self, nb::tuple const& state)
     {
         if (state.size() != 1)
         {
             throw std::runtime_error("Invalid state!");
         }
-        return tle::DecodingMode(nb::cast<tle::DecodingMode::UnderlyingType>(state[0]));
+        new (&self) tle::DecodingMode(nb::cast<tle::DecodingMode::UnderlyingType>(state[0]));
     };
     nb::class_<tle::DecodingMode>(m, "DecodingMode")
         .def("Auto", &tle::DecodingMode::Auto)
