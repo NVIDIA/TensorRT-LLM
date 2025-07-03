@@ -382,6 +382,8 @@ def throughput_command(
                 logger.warning(
                     "Ignore extended_runtime_perf_knob_config for pytorch backend."
                 )
+            if kwargs.pop("batching_type", None):
+                logger.warning("Ignore batching_type for pytorch backend.")
             llm = PyTorchLLM(**kwargs)
         elif runtime_config.backend == "_autodeploy":
             if kwargs.pop("extended_runtime_perf_knob_config", None):
@@ -391,6 +393,8 @@ def throughput_command(
             kwargs["world_size"] = kwargs.pop("tensor_parallel_size", None)
             kwargs.pop("pipeline_parallel_size", None)
 
+            if kwargs.pop("batching_type", None):
+                logger.warning("Ignore batching_type for pytorch backend.")
             llm = AutoDeployLLM(**kwargs)
         else:
             llm = LLM(**kwargs)
