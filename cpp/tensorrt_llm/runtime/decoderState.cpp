@@ -73,7 +73,6 @@ void DecoderState::setupBuffers(nvinfer1::DataType dtype, BufferManager const& b
 
     auto& dInput = mJointDecodingInput;
     TLLM_CHECK(static_cast<bool>(dInput));
-    dInput->logits = bufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
     dInput->endIds = bufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
     dInput->batchSlots = bufferManager.emptyTensor(MemoryType::kPINNEDPOOL, nvSizeType);
 

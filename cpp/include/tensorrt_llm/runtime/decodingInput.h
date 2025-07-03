@@ -36,21 +36,6 @@ public:
 
     DecodingInput() = default;
 
-    DecodingInput(SizeType32 maxLength, SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 batchSize,
-        TensorConstPtr logits, TensorPtr endIds, TensorConstPtr batchSlots)
-        : step{maxLength}
-        , maxLength{maxLength}
-        , maxAttentionWindow{maxAttentionWindow}
-        , sinkTokenLength{sinkTokenLength}
-        , batchSize{batchSize}
-        , logits{std::move(logits)}
-        , endIds{std::move(endIds)}
-        , batchSlots{std::move(batchSlots)}
-    {
-        TLLM_CHECK_WITH_INFO(static_cast<bool>(this->logits), "Invalid logits tensor");
-        TLLM_CHECK_WITH_INFO(static_cast<bool>(this->endIds), "Invalid endIds tensor");
-    }
-
     //! Mandatory parameters
     //! The index of the decoding step we are on. Only used in Python runtime
     SizeType32 step{};
@@ -69,10 +54,8 @@ public:
     //! The maximum value in the `badWordsLens` tensor
     SizeType32 maxBadWordsLen{};
     //! The output of the model forward computation, a probability distribution over the vocabulary
-    //! [batchSize, beamWidth, vocabSizePadded] on gpu
-    TensorConstPtr logits;
-    //! Another view on the logits, [batchSize][beamWidth, vocabSizePadded] on gpu
-    std::optional<std::vector<TensorConstPtr>> logitsVec;
+    //! [batchSize][numGenTokens, beamWidth, vocabSizePadded] on gpu
+    std::vector<TensorConstPtr> logitsVec;
     //! The end ids, [batchSize * beamWidth] on gpu
     TensorConstPtr endIds;
     //! Address map of the linear batch id to to the seq slots, [batchSize] on pinned, int32_t

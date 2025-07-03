@@ -470,21 +470,11 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
     // No logits for explicit draft tokens and eagle
     if (!decodingMode.isExplicitDraftTokens() && !decodingMode.isEagle())
     {
-        if (input.logitsVec)
+        for (auto const& logits : input.logitsVec)
         {
-            std::vector<TensorConstPtr> logitsVec;
-            for (auto const& logits : input.logitsVec.value())
-            {
-                TLLM_CHECK(logits->getDataType() == TRTDataType<T>::value);
-                logitsVec.push_back(logits);
-            }
-            forwardParams->logitsVec = logitsVec;
+            TLLM_CHECK(logits->getDataType() == TRTDataType<T>::value);
         }
-        else if (input.logits)
-        {
-            TLLM_CHECK(input.logits->getDataType() == TRTDataType<T>::value);
-            forwardParams->logits = input.logits;
-        }
+        forwardParams->logitsVec = input.logitsVec;
     }
 
     if (input.embeddingBias)

@@ -118,7 +118,13 @@ class AttentionMetadata:
     runtime_features: AttentionRuntimeFeatures = field(
         default_factory=AttentionRuntimeFeatures)
 
-    all_rank_num_tokens: Optional[List[int]] = None
+    # The number of tokens in each rank.
+    _all_rank_num_tokens: Optional[List[int]] = field(init=False,
+                                                      default=None,
+                                                      repr=False)
+    all_rank_num_tokens: Optional[List[int]]
+    # The max number of tokens among all ranks.
+    all_rank_max_num_tokens: Optional[int] = None
 
     # These fields are set when changing seq_lens and _num_contexts to avoid computation
     # during execution. If the calculation happens during execution, torch compile treats it
@@ -148,6 +154,16 @@ class AttentionMetadata:
             self._num_tokens = self._seq_lens_kv.sum().item()
         elif self._seq_lens is not None:
             self._num_tokens = self._seq_lens.sum().item()
+
+    @property
+    def all_rank_num_tokens(self) -> Optional[List[int]]:
+        return self._all_rank_num_tokens
+
+    @all_rank_num_tokens.setter
+    def all_rank_num_tokens(self, value: Optional[List[int]]):
+        value = value if value is not AttentionMetadata.all_rank_num_tokens else None
+        self._all_rank_num_tokens = value
+        self.all_rank_max_num_tokens = max(value) if value is not None else None
 
     @property
     def seq_lens(self) -> Optional[torch.Tensor]:
@@ -299,6 +315,12 @@ class AttentionMetadata:
         cuda_graph_metadata.num_contexts = 0
         cuda_graph_metadata.__post_init__()
         return cuda_graph_metadata
+
+    def update_spec_dec_param(self, is_spec_decoding_enabled, is_spec_dec_tree,
+                              is_spec_dec_dynamic_tree, max_draft_tokens):
+        """
+        Hook to be called when using TRTLLM attention backend in spec-dec mode.
+        """
 
 
 class PositionalEmbedder(Protocol):

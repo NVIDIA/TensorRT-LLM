@@ -28,7 +28,7 @@ class FP4GemmType(IntEnum):
     W4A8_MXFP4_MXFP8 = 1
 
 
-def get_fp4_shape(input_shape, sf_vec_size):
+def get_fp4_shape(input_shape, sf_vec_size, is_swizzled_layout=True):
     m = 1
     for i in range(len(input_shape) - 1):
         m *= input_shape[i]
@@ -36,7 +36,9 @@ def get_fp4_shape(input_shape, sf_vec_size):
     output_shape = [i for i in input_shape]
     output_shape[-1] //= 2
 
-    scale_shape = pad_up(m, 128) * pad_up(input_shape[-1] // sf_vec_size, 4)
+    scale_shape = pad_up(m, 128) * pad_up(
+        input_shape[-1] // sf_vec_size,
+        4) if is_swizzled_layout else m * (input_shape[-1] // sf_vec_size)
     return output_shape, scale_shape
 
 
@@ -205,4 +207,4 @@ def shuffle_matrix_sf_a(
         input_tensor, row_indices.to(input_tensor.device))
 
     # 128x4
-    return torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(w_shuffled)
+    return torch.ops.trtllm.nvfp4_block_scale_interleave(w_shuffled)

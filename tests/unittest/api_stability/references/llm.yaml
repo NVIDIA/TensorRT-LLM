@@ -111,6 +111,12 @@ methods:
       enable_min_latency:
         annotation: bool
         default: False
+      force_dynamic_quantization:
+        annotation: bool
+        default: False
+      allreduce_strategy:
+        annotation: Optional[Literal['AUTO', 'NCCL', 'UB', 'MINLATENCY', 'ONESHOT', 'TWOSHOT', 'LOWPRECISION', 'MNNVL']]
+        default: AUTO
     return_annotation: None
   generate:
     parameters:

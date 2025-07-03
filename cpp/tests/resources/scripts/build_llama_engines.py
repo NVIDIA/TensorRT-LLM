@@ -18,6 +18,7 @@ import argparse as _arg
 import pathlib as _pl
 import platform as _pf
 import sys as _sys
+import time
 
 from build_engines_utils import run_command, wincopy
 
@@ -93,8 +94,10 @@ def build_engines(model_cache: str, only_multi_gpu: bool):
         tp_pp_cp_sizes = [(1, 4, 1), (4, 1, 1), (1, 2, 1), (2, 2, 1), (2, 1, 1),
                           (1, 1, 2), (2, 1, 2)]
     for tp_size, pp_size, cp_size in tp_pp_cp_sizes:
-        tp_pp_cp_dir = f"tp{tp_size}-pp{pp_size}-cp{cp_size}-gpu"
         print(f"\nBuilding fp16 tp{tp_size} pp{pp_size} cp{cp_size} engine")
+        start_time = time.time()
+
+        tp_pp_cp_dir = f"tp{tp_size}-pp{pp_size}-cp{cp_size}-gpu"
         model_spec_obj.use_tensor_parallelism(tp_size)
         model_spec_obj.use_pipeline_parallelism(pp_size)
         model_spec_obj.use_context_parallelism(cp_size)
@@ -106,8 +109,15 @@ def build_engines(model_cache: str, only_multi_gpu: bool):
                 f'--cp_size={cp_size}'
             ], ['--use_paged_context_fmha=disable'])
 
+        duration = time.time() - start_time
+        print(
+            f"Building fp16 tp{tp_size} pp{pp_size} cp{cp_size} engine took {duration} seconds"
+        )
+
     if not only_multi_gpu:
         print(f"\nBuilding lookahead engine")
+        start_time = time.time()
+
         model_spec_obj.use_tensor_parallelism(1)
         model_spec_obj.use_pipeline_parallelism(1)
         model_spec_obj.use_context_parallelism(1)
@@ -119,6 +129,9 @@ def build_engines(model_cache: str, only_multi_gpu: bool):
                 '--max_draft_len=39',
                 '--speculative_decoding_mode=lookahead_decoding'
             ])
+
+        duration = time.time() - start_time
+        print(f"Building lookahead engine took {duration} seconds")
 
     print("Done.")
 

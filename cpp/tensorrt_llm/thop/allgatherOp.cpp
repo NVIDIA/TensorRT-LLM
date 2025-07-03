@@ -70,7 +70,15 @@ public:
             outputShape[0] *= mGroup.size();
         }
         auto output = torch::empty(outputShape, input.options());
-        if (sizes.has_value())
+        bool use_nccl_allgather = !sizes.has_value()
+            || std::all_of(sizes.value().begin(), sizes.value().end(),
+                [&sizes](int64_t size) { return size == sizes.value()[0]; });
+        if (use_nccl_allgather)
+        {
+            NCCLCHECK_THROW(ncclAllGather(input.data_ptr(), output.mutable_data_ptr(), input.numel(),
+                (*getDtypeMap())[type], *mNcclComm, stream));
+        }
+        else
         {
             size_t numel_base = std::accumulate(outputShape.cbegin() + 1, outputShape.cend(), 1, std::multiplies<>{});
             int64_t split_offset = 0;
@@ -84,11 +92,6 @@ public:
                 split_offset += split_size;
             }
             ncclGroupEnd();
-        }
-        else
-        {
-            NCCLCHECK_THROW(ncclAllGather(input.data_ptr(), output.mutable_data_ptr(), input.numel(),
-                (*getDtypeMap())[type], *mNcclComm, stream));
         }
         return output;
     }
@@ -155,8 +158,8 @@ std::vector<torch::Tensor> allgather_list(
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("allgather(Tensor input, int[]? sizes, int[] group) -> Tensor");
-    m.def("allgather_list(Tensor[] input_list, int[]? sizes, int[] group) -> Tensor[]");
+    m.def("allgather(Tensor input, SymInt[]? sizes, int[] group) -> Tensor");
+    m.def("allgather_list(Tensor[] input_list, SymInt[]? sizes, int[] group) -> Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

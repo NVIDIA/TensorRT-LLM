@@ -1842,40 +1842,6 @@ void TrtGptModelInflightBatching::postProcessRequest(
         bufferManager.getStream().synchronize();
     }
 
-    if (mWorldConfig.isPipelineParallel())
-    {
-        // Send context logits from last to first PP rank
-        if (llmReq.getReturnContextLogits())
-        {
-            if (mWorldConfig.isLastPipelineParallelRank())
-            {
-                mMpiCommPipelinePara->send(
-                    *(llmReq.getContextLogitsHost()), 0, mpi::MpiTag::kTrtGptModelInflightBatchingContextLogits);
-            }
-            else if (mWorldConfig.isFirstPipelineParallelRank())
-            {
-                mMpiCommPipelinePara->recv(*(llmReq.getContextLogitsHost()), mWorldConfig.getPipelineParallelism() - 1,
-                    mpi::MpiTag::kTrtGptModelInflightBatchingContextLogits);
-            }
-        }
-
-        // Send generation logits from last to first PP rank
-        if (llmReq.getReturnGenerationLogits())
-        {
-            if (mWorldConfig.isLastPipelineParallelRank())
-            {
-                mMpiCommPipelinePara->send(
-                    *(llmReq.getGenerationLogitsHost()), 0, mpi::MpiTag::kTrtGptModelInflightBatchingGenerationLogits);
-            }
-            else if (mWorldConfig.isFirstPipelineParallelRank())
-            {
-                mMpiCommPipelinePara->recv(*(llmReq.getGenerationLogitsHost()),
-                    mWorldConfig.getPipelineParallelism() - 1,
-                    mpi::MpiTag::kTrtGptModelInflightBatchingGenerationLogits);
-            }
-        }
-    }
-
     if (reqBeamWidth == 1)
     {
         TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

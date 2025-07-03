@@ -1,7 +1,6 @@
 import math
 import os
 import threading
-from itertools import accumulate
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -126,13 +125,14 @@ def filter_valid_input(
     return input_list, valid_list
 
 
-def restore_full_output(output_list: List[torch.Tensor],
+def restore_full_output(valid_outputs: List[torch.Tensor],
                         valid_list: List[bool]) -> List[torch.Tensor]:
-    index_list = list(accumulate(map(int, valid_list)))
-    output_list = list(
-        map(lambda valid, index: output_list[index - 1]
-            if valid else None, valid_list, index_list))
-    return output_list
+    idx = 0
+    full_outputs = []
+    for v in valid_list:
+        full_outputs.append(valid_outputs[idx] if v else None)
+        idx += int(v)
+    return full_outputs
 
 
 def allgather(
@@ -178,12 +178,6 @@ def allgather(
                 val.shape[dim] == sizes[mapping.tp_rank] for val in input
                 if val is not None
             ])
-        # 'sizes' is not needed if all inputs in the same TP group have the same shape
-        for split_size in sizes[1:]:
-            if split_size != sizes[0]:
-                break
-        else:
-            sizes = None
 
     # Inputs are reshaped in this way to pass necessary shape information to the allgather op
     if isinstance(input, torch.Tensor):
@@ -247,12 +241,6 @@ def reducescatter(
                 val.shape[dim] == sum_split_size for val in input
                 if val is not None
             ])
-        # 'sizes' is not needed if all outputs in the same TP group have the same shape
-        for split_size in sizes[1:]:
-            if split_size != sizes[0]:
-                break
-        else:
-            sizes = None
 
     def convert_input(x, x_info):
         # Inputs are reshaped in this way to pass necessary shape information to the reducescatter op

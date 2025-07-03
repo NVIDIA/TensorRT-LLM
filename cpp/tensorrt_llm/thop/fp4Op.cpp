@@ -524,8 +524,20 @@ static auto e2m1_and_ufp8sf_scale_to_float
 static auto e2m1_and_ufp8sf_scale_to_float_v2 = torch::RegisterOperators(
     "tensorrt_llm::e2m1_and_ufp8sf_scale_to_float_v2", &torch_ext::E2M1AndUFP8SFScaleToFloatV2);
 
-static auto nvfp4_block_scale_interleave
-    = torch::RegisterOperators("tensorrt_llm::nvfp4_block_scale_interleave", &torch_ext::NVFP4BlockScaleInterleave);
+TORCH_LIBRARY_FRAGMENT(trtllm, m)
+{
+    m.def("nvfp4_block_scale_interleave(Tensor input) -> Tensor");
+    m.def("nvfp4_block_scale_interleave_reverse(Tensor input) -> Tensor");
+}
 
-static auto nvfp4_block_scale_interleave_reverse = torch::RegisterOperators(
-    "tensorrt_llm::nvfp4_block_scale_interleave_reverse", &torch_ext::NVFP4BlockScaleInterleaveReverse);
+TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
+{
+    m.impl("nvfp4_block_scale_interleave", &torch_ext::NVFP4BlockScaleInterleave);
+    m.impl("nvfp4_block_scale_interleave_reverse", &torch_ext::NVFP4BlockScaleInterleaveReverse);
+}
+
+TORCH_LIBRARY_IMPL(trtllm, CPU, m)
+{
+    m.impl("nvfp4_block_scale_interleave", &torch_ext::NVFP4BlockScaleInterleave);
+    m.impl("nvfp4_block_scale_interleave_reverse", &torch_ext::NVFP4BlockScaleInterleaveReverse);
+}

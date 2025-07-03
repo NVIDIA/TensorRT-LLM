@@ -9,9 +9,9 @@ ARG GROUP_ID=0
 ARG GROUP_NAME=root
 
 RUN (getent group ${GROUP_ID} || groupadd --gid ${GROUP_ID} ${GROUP_NAME}) && \
-    (getent passwd ${USER_ID} || useradd --gid ${GROUP_ID} --uid ${USER_ID} --create-home --no-log-init --shell /bin/bash ${USER_NAME})
-
-RUN apt-get update && \
+    (getent passwd ${USER_ID} || useradd --gid ${GROUP_ID} --uid ${USER_ID} --create-home --no-log-init --shell /bin/bash ${USER_NAME}) && \
+    if [ -d /app/tensorrt_llm ]; then chown ${USER_NAME}:${GROUP_NAME} /app/tensorrt_llm; fi && \
+    apt-get update && \
     apt-get install -y sudo && \
     adduser ${USER_NAME} sudo && \
     echo '%sudo ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers && \

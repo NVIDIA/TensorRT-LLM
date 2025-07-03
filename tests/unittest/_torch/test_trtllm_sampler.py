@@ -48,8 +48,8 @@ def test_trtllm_sampler(model_path, test_case):
         "The capital of Bolivia is",
     ]
 
-    expected_outputs = [["circumnavigation of the world."], ["Paris."],
-                        ["La Paz."]]
+    expected_outputs = [["circumnavigation of the world."], [" Paris."],
+                        [" La Paz."]]
 
     # Test configuration
     max_new_tokens = test_case["max_new_tokens"]
@@ -78,4 +78,4 @@ def test_trtllm_sampler(model_path, test_case):
 
     # Verify outputs are consistent
     for text, expected in zip(texts, expected_outputs):
-        assert similar(text, expected)
+        assert similar(text, expected), f"text: {text}, expected: {expected}"
