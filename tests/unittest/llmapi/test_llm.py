@@ -1448,7 +1448,7 @@ def test_llama_v2_13b_lora():
 
 @skip_gpu_memory_less_than_40gb
 def test_llama_7b_multi_lora():
-    llama_7b_multi_lora_test_harness(max_loras=1, max_cpu_loras=4)
+    llama_7b_multi_lora_test_harness(max_loras=1, max_cpu_loras=8)
 
 
 def llama_v2_7b_prompt_adapter_test_harness(**llm_kwargs):
