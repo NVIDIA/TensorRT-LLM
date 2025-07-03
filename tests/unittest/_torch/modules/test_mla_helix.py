@@ -66,7 +66,7 @@ class Scenario:
     bias: bool = False
     batch: int = 8
     seq_len: int = 1024
-    gen_steps: int = 256
+    gen_steps: int = 260
     ref_steps: int = 4
 
 
@@ -96,6 +96,11 @@ all_scenarios = [
     Scenario(batch=16, seq_len=65536),
     Scenario(batch=16, seq_len=131072),
 ]
+
+# ensure that max_position_embeddings is set large enough for every scenario
+for scenario in all_scenarios:
+    scenario.max_position_embeddings = max(scenario.max_position_embeddings,
+                                           scenario.seq_len + 1)
 
 # limit the number of test scenarios to avoid taking too long
 test_scenarios = [
