@@ -1002,20 +1002,6 @@ class BaseLlmArgs(BaseModel):
         exclude=True,
         alias="_mpi_session")
 
-    checkpoint_loader: Optional[object] = Field(
-        default=None,
-        description="The checkpoint loader to use for this LLM instance.",
-        json_schema_extra={
-            "type":
-            "Optional[tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader.BaseCheckpointLoader]"
-        },
-    )
-
-    checkpoint_format: Optional[str] = Field(
-        default=None,
-        description="The checkpoint format to use for this LLM instance.",
-    )
-
     backend: Optional[str] = Field(
         default=None,
         description="The backend to use for this LLM instance.",
@@ -1799,6 +1785,19 @@ class TorchLlmArgs(BaseLlmArgs):
                 'LOWPRECISION',
                 'MNNVL']] = Field(default='AUTO',
                                   description="Allreduce strategy to use.")
+
+    checkpoint_loader: Optional[object] = Field(
+        default=None,
+        description="The checkpoint loader to use for this LLM instance.",
+        json_schema_extra={
+            "type": "Optional[tensorrt_llm._torch.BaseCheckpointLoader]"
+        },
+    )
+
+    checkpoint_format: Optional[str] = Field(
+        default=None,
+        description="The checkpoint format to use for this LLM instance.",
+    )
 
     # TODO: remove backend later
     @field_validator('backend', mode='before')
