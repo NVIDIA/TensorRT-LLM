@@ -137,7 +137,8 @@ To do the benchmark, run the following command:
 YOUR_DATA_PATH=<your dataset file following the format>
 
 cat >./extra-llm-api-config.yml<<EOF
-use_cuda_graph: true
+cuda_graph_config:
+    max_batch_size: 128
 moe_backend: TRTLLM
 speculative_config:
     decoding_type: MTP
@@ -319,7 +320,6 @@ To do the benchmark, run the following command:
 YOUR_DATA_PATH=<your dataset file following the format>
 
 cat >./extra-llm-api-config.yml<<EOF
-use_cuda_graph: true
 speculative_config:
     decoding_type: MTP
     num_nextn_predict_layers: 3
@@ -368,7 +368,6 @@ python ${YOUR_WORK_PATH}/benchmarks/cpp/prepare_dataset.py \
 YOUR_DATA_PATH=./dataset.txt
 
 cat >./extra-llm-api-config.yml<<EOF
-use_cuda_graph: true
 cuda_graph_batch_sizes:
 - 128
 enable_attention_dp: true

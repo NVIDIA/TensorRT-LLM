@@ -63,7 +63,6 @@ hostname: localhost
 port: 8000
 model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
 backend: "pytorch"
-use_cuda_graph: False
 disable_overlap_scheduler: True
 context_servers:
   num_instances: 2
