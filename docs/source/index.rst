@@ -77,6 +77,7 @@ Welcome to TensorRT-LLM's Documentation!
    :caption: Command-Line Reference
    :hidden:
 
+   commands/trtllm-bench
    commands/trtllm-build
    commands/trtllm-serve
 
