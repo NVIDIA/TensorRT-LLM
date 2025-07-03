@@ -528,6 +528,20 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
             w2_weight_shape[2],
         )
 
+        def _check_shape_requirement(shape):
+            # Reject shapes that may cause kernels to fail
+            # For hidden_size = 2880 and intermediate_size = 2880,
+            # we have w3_w1_weight_shape = (?, 1440, 5760)
+            # and w2_weight_shape = (?, 1440, 2880).
+            # Note that the div 2 here is because we are using mxfp4 which packs two values into one byte.
+            # This check allows the 2880 case with tp1 to pass while rejecting larger tp.
+            assert len(shape) == 3
+            assert shape[1] % 32 == 0 and shape[
+                2] % 32 == 0, "Shape not well-supported by Triton kernel, try EP instead"
+
+        _check_shape_requirement(w3_w1_weight_shape)
+        _check_shape_requirement(w2_weight_shape)
+
         FusedMoEMethodBase.create_weights(self,
                                           module,
                                           weight_dtype,
@@ -636,19 +650,23 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
             tmp_w3_w1_weight_scale)
 
         # For Hopper style swizzle, we need to pad the out dim to multiple of 256
-        def _maybe_pad_weight_and_scale(weight, scale):
-            if self.swizzle_scale != SwizzlingType.HOPPER:
-                return weight, scale
-            out_dim = weight.shape[-1]
-            assert scale.shape[
-                -1] == out_dim, "Out dim of weight and scale should match"
-            pad_size = (256 - out_dim % 256) % 256
-            weight = F.pad(
-                weight,
-                (0,
-                 pad_size)).contiguous()  # Pad the last dimension on right side
-            scale = F.pad(scale, (0, pad_size)).contiguous()
-            return weight, scale
+        def _maybe_pad_weight_and_scale(weight, scale=None):
+            if self.swizzle_scale == SwizzlingType.HOPPER:
+                # Both weight and bias are handled here
+                assert weight.dim() in [2,
+                                        3], "Weight should be 2D or 3D tensor"
+
+                out_dim = weight.shape[-1]
+                assert scale is None or scale.shape[
+                    -1] == out_dim, "Out dim of weight and scale should match"
+                pad_size = (256 - out_dim % 256) % 256
+                weight = F.pad(
+                    weight,
+                    (0, pad_size
+                     )).contiguous()  # Pad the last dimension on right side
+                if scale is not None:
+                    scale = F.pad(scale, (0, pad_size)).contiguous()
+            return (weight, scale) if scale is not None else weight
 
         tmp_w3_w1_weight, tmp_w3_w1_weight_scale = _maybe_pad_weight_and_scale(
             module.w3_w1_weight, tmp_w3_w1_weight_scale)
@@ -673,6 +691,13 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         module.w2_weight.data = tmp_w2_weight
         module.fc2_dequant.data = tmp_w2_weight_scale.to(device)
         self.w2_scale_shape = tmp_w2_scale_shape
+
+        if module.bias:
+            module.w3_w1_bias.data = _maybe_pad_weight_and_scale(
+                module.w3_w1_bias.data)
+            module.w2_bias.data = _maybe_pad_weight_and_scale(
+                module.w2_bias.data)
+
         if self.activation_dtype == torch.float8_e4m3fn:
             if max_fc31_input_scale is None or max_fc2_input_scale is None:
                 module.fc31_input_dequant = None
