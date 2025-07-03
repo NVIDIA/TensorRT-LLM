@@ -304,11 +304,13 @@ def generate_llmapi():
             "    :members:", "    :undoc-members:", "    :show-inheritance:"
         ]
 
-        if cls_name != 'LLM':  # Conditionally add :special-members: __init__
+        if cls_name not in ['LLM', 'TorchLlmArgs', 'TrtLlmArgs', 'LlmArgs'
+                            ]:  # Conditionally add :special-members: __init__
             options.append("    :special-members: __init__")
+        elif cls_name in ["TorchLlmArgs", "TrtLlmArgs"]:
+            options.insert(0, "    :inherited-members: BaseModel")
 
-        if cls_name in ['TrtLLM', 'TorchLLM', 'LLM']:
-            options.append("    :inherited-members:")
+        options.append("    :member-order: groupwise")
 
         content += f".. autoclass:: tensorrt_llm.llmapi.{cls_name}\n"
         content += "\n".join(options) + "\n\n"
