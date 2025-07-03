@@ -316,10 +316,8 @@ class MTPSampler(TorchSampler):
 
         o_new_tokens = outputs['new_tokens'][:len(requests)]
         o_new_tokens_lens = outputs['new_tokens_lens'][:len(requests)]
-        o_next_draft_tokens = outputs['next_draft_tokens'][:len(requests)].to(
-            dtype=torch.int, non_blocking=True)
-        o_next_new_tokens = outputs['next_new_tokens'][:len(requests)].to(
-            dtype=torch.int, non_blocking=True)
+        o_next_draft_tokens = outputs['next_draft_tokens'][:len(requests)]
+        o_next_new_tokens = outputs['next_new_tokens'][:len(requests)]
 
         new_tokens = self.store.new_tokens
         next_new_tokens = self.store.next_new_tokens
