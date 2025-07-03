@@ -1882,7 +1882,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     }]]}
 
     // Python version and OS for sanity check
-    sanityCheckConfigs = [
+    x86SanityCheckConfigs = [
         "PY312-DLFW": [
             LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
             "B200_PCIe",
@@ -1912,31 +1912,35 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         ],
     ]
 
-    if (env.targetArch == AARCH64_TRIPLE) {
-        sanityCheckConfigs = [
-            "PY312-UB2404": [
-                LLM_DOCKER_IMAGE,
-                "GH200",
-                AARCH64_TRIPLE,
-                false,
-                "",
-                UBUNTU_24_04_IMAGE,
-                true, // Extra PyTorch CUDA 12.8 install
-            ],
-            "PY312-DLFW": [
-                LLM_DOCKER_IMAGE,
-                "GH200",
-                AARCH64_TRIPLE,
-                false,
-                "dlfw/",
-                DLFW_IMAGE,
-                false,
-            ],
-        ]
-    }
+    aarch64SanityCheckConfigs = [
+        "PY312-UB2404": [
+            LLM_DOCKER_IMAGE,
+            "GH200",
+            AARCH64_TRIPLE,
+            false,
+            "",
+            UBUNTU_24_04_IMAGE,
+            true, // Extra PyTorch CUDA 12.8 install
+        ],
+        "PY312-DLFW": [
+            LLM_DOCKER_IMAGE,
+            "GH200",
+            AARCH64_TRIPLE,
+            false,
+            "dlfw/",
+            DLFW_IMAGE,
+            false,
+        ],
+    ]
 
     def toStageName = { gpuType, key -> "${gpuType}-PackageSanityCheck-${key}".toString() }
-    fullSet += sanityCheckConfigs.collectEntries{ key, values -> [toStageName(values[1], key), null] }.keySet()
+    fullSet += x86SanityCheckConfigs.collectEntries{ key, values -> [toStageName(values[1], key), null] }.keySet()
+    fullSet += aarch64SanityCheckConfigs.collectEntries{ key, values -> [toStageName(values[1], key), null] }.keySet()
+
+    sanityCheckConfigs = x86SanityCheckConfigs
+    if (env.targetArch == AARCH64_TRIPLE) {
+        sanityCheckConfigs = aarch64SanityCheckConfigs
+    }
 
     sanityCheckJobs = sanityCheckConfigs.collectEntries {key, values -> [toStageName(values[1], key), {
         cacheErrorAndUploadResult(toStageName(values[1], key), {

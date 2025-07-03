@@ -1,8 +1,15 @@
 name: Label Community PR
 
 on:
-  pull_request:
-    types: [opened]
+  schedule:
+    - cron: '0 * * * *'  # every hour at minute 0
+  workflow_dispatch:     # manual trigger option
+    inputs:
+      time_window_minutes:
+        description: 'Time window in minutes to look back for PRs'
+        required: false
+        default: 65
+        type: number
 
 jobs:
   label_pr:
@@ -22,9 +29,8 @@ jobs:
       - name: Run labeling script
         env:
           AUTO_LABEL_COMMUNITY_TOKEN: ${{ secrets.AUTO_LABEL_COMMUNITY_TOKEN }}
-          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO_OWNER: ${{ github.event.repository.owner.login }}
+          REPO_OWNER: ${{ github.repository_owner }}
           REPO_NAME: ${{ github.event.repository.name }}
           COMMUNITY_LABEL: "Community want to contribute"
+          TIME_WINDOW_MINUTES: ${{ inputs.time_window_minutes || 65 }}
         run: python .github/scripts/label_community_user.py

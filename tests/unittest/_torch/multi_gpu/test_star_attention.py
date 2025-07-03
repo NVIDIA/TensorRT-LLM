@@ -13,6 +13,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 MAX_SEQ_LEN = 4096 + 1024
 
 
+@pytest.mark.post_merge
 @pytest.mark.parametrize("backend", ["pytorch"])
 @pytest.mark.parametrize("model_name",
                          ["llama-models-v3/Llama-3-8B-Instruct-Gradient-1048k"],
