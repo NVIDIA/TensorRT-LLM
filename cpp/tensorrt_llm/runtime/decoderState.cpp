@@ -45,7 +45,26 @@ void BeamSearchBuffers::reshape(SizeType32 maxBeamWidth, SizeType32 maxSequenceL
     mCumLogProbsTmp->reshape(ITensor::makeShape({1, maxBeamWidth}));
 }
 
-DecoderState::DecoderState(nvinfer1::DataType dtype, BufferManager const& bufferManager)
+DecoderState::DecoderState()
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    mJointDecodingInput = std::make_unique<DecodingInput>();
+    mJointDecodingOutput = std::make_unique<DecodingOutput>();
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void DecoderState::setup(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
+    SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, nvinfer1::DataType dtype, ModelConfig const& modelConfig,
+    WorldConfig const& worldConfig, BufferManager const& bufferManager)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    setupBuffers(dtype, bufferManager);
+    reshapeBuffers(maxBatchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSequenceLength, modelConfig,
+        worldConfig, bufferManager);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void DecoderState::setupBuffers(nvinfer1::DataType dtype, BufferManager const& bufferManager)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto constexpr nvTokenIdType = TRTDataType<TokenIdType>::value;
@@ -53,22 +72,18 @@ DecoderState::DecoderState(nvinfer1::DataType dtype, BufferManager const& buffer
     auto constexpr nvFloatType = TRTDataType<float>::value;
 
     auto& dInput = mJointDecodingInput;
-    { // prevent reusing these vars after std::move
-        auto dummyLogits = bufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
-        auto endIds = bufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
-        auto batchSlots = bufferManager.emptyTensor(MemoryType::kPINNEDPOOL, nvSizeType);
-        dInput = std::make_unique<DecodingInput>(
-            0, 0, 0, 0, std::move(dummyLogits), std::move(endIds), std::move(batchSlots));
-    }
+    TLLM_CHECK(static_cast<bool>(dInput));
+    dInput->endIds = bufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
+    dInput->batchSlots = bufferManager.emptyTensor(MemoryType::kPINNEDPOOL, nvSizeType);
+
     dInput->sequenceLimitLength = bufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
     dInput->lengths = bufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
 
     auto& dOutput = mJointDecodingOutput;
-    { // prevent reusing these vars after std::move
-        auto outputIds = bufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
-        auto gatheredOutputIds = bufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
-        dOutput = std::make_unique<DecodingOutput>(std::move(outputIds), std::move(gatheredOutputIds));
-    }
+    TLLM_CHECK(static_cast<bool>(dOutput));
+    dOutput->ids = bufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
+    dOutput->gatheredIds = bufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
+
     dOutput->newTokensSteps = bufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
     dOutput->parentIds = bufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
 
@@ -95,13 +110,23 @@ DecoderState::DecoderState(nvinfer1::DataType dtype, BufferManager const& buffer
 
     mBeamSearchBuffers = std::make_unique<BeamSearchBuffers>(bufferManager);
 
-    dInput->cacheIndirection = bufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
-    dOutput->cacheIndirection = bufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
+    setupCacheIndirectionBuffers(bufferManager);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void DecoderState::allocateSpeculativeDecodingBuffers(
+void DecoderState::setupSpeculativeDecoding(SpeculativeDecodingMode const& speculativeDecodingMode,
+    SizeType32 maxTokensPerEngineStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig,
+    WorldConfig const& worldConfig, BufferManager const& bufferManager)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    setupSpeculativeDecodingBuffers(speculativeDecodingMode, dtype, bufferManager);
+    reshapeSpeculativeDecodingBuffers(
+        speculativeDecodingMode, maxTokensPerEngineStep, modelConfig, worldConfig, bufferManager);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void DecoderState::setupSpeculativeDecodingBuffers(
     SpeculativeDecodingMode const speculativeDecodingMode, nvinfer1::DataType dtype, BufferManager const& bufferManager)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -173,7 +198,7 @@ void DecoderState::allocateSpeculativeDecodingBuffers(
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void DecoderState::setup(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
+void DecoderState::reshapeBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
     SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, ModelConfig const& modelConfig,
     WorldConfig const& worldConfig, BufferManager const& bufferManager)
 {
@@ -252,7 +277,7 @@ void DecoderState::setup(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeT
         dOutput.beamHypotheses.reshape(mMaxBatchSize, mMaxBeamWidth, mMaxSequenceLength);
         mBeamSearchBuffers->reshape(mMaxBeamWidth, mMaxSequenceLength);
 
-        setupCacheIndirection(mMaxBatchSize, mMaxBeamWidth, maxAttentionWindow);
+        reshapeCacheIndirectionBuffers(mMaxBatchSize, mMaxBeamWidth, maxAttentionWindow);
 
         dOutput.gatheredIds->reshape(maxTotalTokensShape);
     }
@@ -274,6 +299,22 @@ void DecoderState::setup(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeT
 }
 
 void DecoderState::setupCacheIndirection(
+    SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow, BufferManager const& bufferManager)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    setupCacheIndirectionBuffers(bufferManager);
+    reshapeCacheIndirectionBuffers(maxBatchSize, maxBeamWidth, maxAttentionWindow);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void DecoderState::setupCacheIndirectionBuffers(BufferManager const& bufferManager)
+{
+    auto constexpr nvSizeType = TRTDataType<SizeType32>::value;
+    mJointDecodingInput->cacheIndirection = bufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
+    mJointDecodingOutput->cacheIndirection = bufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
+}
+
+void DecoderState::reshapeCacheIndirectionBuffers(
     SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow)
 {
     mJointDecodingInput->cacheIndirection->reshape(
@@ -282,7 +323,7 @@ void DecoderState::setupCacheIndirection(
         ITensor::makeShape({maxBatchSize, maxBeamWidth, maxAttentionWindow}));
 }
 
-void DecoderState::setupSpeculativeDecoding(SpeculativeDecodingMode const& speculativeDecodingMode,
+void DecoderState::reshapeSpeculativeDecodingBuffers(SpeculativeDecodingMode const& speculativeDecodingMode,
     SizeType32 maxTokensPerEngineStep, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
     BufferManager const& bufferManager)
 {
@@ -296,8 +337,9 @@ void DecoderState::setupSpeculativeDecoding(SpeculativeDecodingMode const& specu
 
     TLLM_CHECK_WITH_INFO((mMaxDecodingEngineTokens == 1 && speculativeDecodingMode.isNone())
             || (mMaxDecodingEngineTokens > 1 && !speculativeDecodingMode.isNone()),
-        "Max tokens per engine step must be equal to 1 when no speculative decoding is configured, "
-        "or > 1 for any speculative decoding mode");
+        "Max tokens per engine step is %d, but must be equal to 1 when no speculative decoding is configured, "
+        "or > 1 for any speculative decoding mode.",
+        mMaxDecodingEngineTokens);
 
     auto const maxNewTokensShape = ITensor::makeShape({mMaxDecodingEngineTokens, mMaxBatchSize, mMaxBeamWidth});
     mFinishedSteps->reshape(maxNewTokensShape);

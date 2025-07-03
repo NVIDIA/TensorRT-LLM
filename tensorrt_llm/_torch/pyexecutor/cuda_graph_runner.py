@@ -7,7 +7,14 @@ from ..attention_backend.interface import AttentionMetadata
 from ..speculative.interface import SpecMetadata
 from ..utils import make_weak_ref, set_piecewise_cuda_graph_flag
 
-_local = threading.local()
+
+class graph_capturing_local(threading.local):
+
+    def __init__(self):
+        self.is_graph_capturing = False
+
+
+_local = graph_capturing_local()
 
 
 def set_graph_capturing(enable: bool):
@@ -15,8 +22,6 @@ def set_graph_capturing(enable: bool):
 
 
 def is_graph_capturing() -> bool:
-    if not hasattr(_local, 'is_graph_capturing'):
-        return False
     return _local.is_graph_capturing
 
 

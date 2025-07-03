@@ -7,7 +7,7 @@ import torch
 from parameterized import parameterized
 from transformers import LlamaConfig
 from transformers import LlamaForCausalLM as HFLlamaForCausalLM
-from utils.util import getSMVersion
+from utils.util import default_dtype, getSMVersion
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
@@ -97,9 +97,10 @@ class TestLlama(unittest.TestCase):
         dtype = llama_config.torch_dtype
         device = torch.device('cuda')
 
-        model_config = ModelConfig(pretrained_config=llama_config,
-                                   quant_config=quant_config)
-        llama = LlamaForCausalLM(model_config).to(device)
+        with torch.device(device), default_dtype(dtype):
+            model_config = ModelConfig(pretrained_config=llama_config,
+                                       quant_config=quant_config)
+            llama = LlamaForCausalLM(model_config).to(device)
 
         input_ids = torch.tensor([100, 200, 300, 100, 200, 100, 400, 500],
                                  dtype=torch.int,
@@ -217,12 +218,14 @@ class TestLlama(unittest.TestCase):
         dtype = llama_config.torch_dtype
         device = torch.device('cuda')
 
-        hf_llama = HFLlamaForCausalLM(llama_config).to(dtype).to(device).eval()
+        with torch.device(device), default_dtype(dtype):
+            hf_llama = HFLlamaForCausalLM(llama_config).eval()
 
-        model_config = ModelConfig(pretrained_config=llama_config,
-                                   attn_backend=backend)
-        llama = LlamaForCausalLM(model_config).to(dtype).to(device)
-        llama.load_weights(hf_llama.state_dict())
+            model_config = ModelConfig(pretrained_config=llama_config,
+                                       attn_backend=backend)
+
+            llama = LlamaForCausalLM(model_config).to(dtype).to(device)
+            llama.load_weights(hf_llama.state_dict())
 
         num_blocks = 1
         tokens_per_block = 128

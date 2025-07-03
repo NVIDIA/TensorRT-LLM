@@ -59,9 +59,12 @@ llm-test-workspace/
 # Generated files
 cpp/include/tensorrt_llm/executor/version.h
 cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu/
+.devcontainer/.env
 
 # User config files
 CMakeUserPresets.json
 compile_commands.json
 *.bin
 .dir-locals.el
+.devcontainer/devcontainer.env.user
+.devcontainer/docker-compose.override.yml
