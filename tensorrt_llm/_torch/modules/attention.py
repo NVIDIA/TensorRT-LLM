@@ -5,6 +5,7 @@ from typing import Optional, Union, cast
 import torch
 from torch import nn
 
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -126,7 +127,8 @@ class Attention(nn.Module):
                 weight_mode=WeightMode.FUSED_QKV_LINEAR),
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-            allreduce_strategy=config.allreduce_strategy)
+            allreduce_strategy=config.allreduce_strategy,
+            force_dynamic_quantization=config.force_dynamic_quantization)
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])
 
@@ -140,7 +142,8 @@ class Attention(nn.Module):
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             lora=self.o_lora,
-            allreduce_strategy=config.allreduce_strategy)
+            allreduce_strategy=config.allreduce_strategy,
+            force_dynamic_quantization=config.force_dynamic_quantization)
 
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
@@ -346,6 +349,47 @@ def mla_custom_op_inplace(
     mla_layer.forward_impl(position_ids, hidden_states, metadata, output=output)
 
 
+def fp8_block_scaling_bmm_out(
+    mat1: torch.Tensor,
+    mat2_fp8: torch.Tensor,
+    mat2_scale: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    sm_version = get_sm_version()
+    if sm_version == 90:
+        mat1_fp8, mat1_scale = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
+            mat1)
+        torch.ops.trtllm.fp8_block_scaling_bmm_out(mat1_fp8, mat2_fp8,
+                                                   mat1_scale, mat2_scale, out)
+    elif sm_version == 100:
+        low_latency = True
+        use_deep_seek_fp8 = True
+        tile_size = 8
+        epilogue_tile_m = 64 if use_deep_seek_fp8 else 128
+        m_size = mat1.shape[0]
+        if m_size % tile_size != 0:
+            tiled_shape = ((m_size + tile_size - 1) // tile_size) * tile_size
+            mat1 = torch.nn.functional.pad(
+                mat1, (0, 0, 0, 0, 0, tiled_shape - m_size), "constant", 0)
+
+        mat1_fp8, mat1_scale = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
+            mat1)
+        output, output_sf = torch.ops.trtllm.fp8_batched_gemm_trtllmgen(
+            mat1_fp8,
+            mat2_fp8,
+            tile_size=tile_size,
+            epilogue_tile_m=epilogue_tile_m,
+            use_deep_seek_fp8=use_deep_seek_fp8,
+            low_latency=low_latency,
+            dq_sfs_a=mat1_scale.reshape(mat1.shape[-1] // 128, -1),
+            dq_sfs_b=mat2_scale,
+            out_dtype=out.dtype,
+        )
+        out.copy_(output[:, :m_size])
+    else:
+        raise NotImplementedError(f"SM{sm_version} is not supported")
+
+
 class MLA(nn.Module):
 
     def __init__(
@@ -462,7 +506,8 @@ class MLA(nn.Module):
                 dtype=dtype,
                 quant_config=quant_config,
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
-                use_custom_cublas_mm=True)
+                use_custom_cublas_mm=True,
+                force_dynamic_quantization=config.force_dynamic_quantization)
 
             self.q_a_layernorm = RMSNorm(hidden_size=self.q_lora_rank,
                                          eps=rms_norm_eps,
@@ -477,7 +522,8 @@ class MLA(nn.Module):
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 quant_config=quant_config,
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
-                allreduce_strategy=config.allreduce_strategy)
+                allreduce_strategy=config.allreduce_strategy,
+                force_dynamic_quantization=config.force_dynamic_quantization)
         else:
             self.fused_a = Linear(
                 hidden_size,
@@ -486,7 +532,8 @@ class MLA(nn.Module):
                 dtype=dtype,
                 quant_config=quant_config,
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
-                use_custom_cublas_mm=True)
+                use_custom_cublas_mm=True,
+                force_dynamic_quantization=config.force_dynamic_quantization)
 
             self.q_proj = Linear(
                 self.q_lora_rank,
@@ -497,7 +544,8 @@ class MLA(nn.Module):
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 quant_config=quant_config,
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
-                allreduce_strategy=config.allreduce_strategy)
+                allreduce_strategy=config.allreduce_strategy,
+                force_dynamic_quantization=config.force_dynamic_quantization)
             self.q_b_proj = self.q_proj
 
         self.kv_a_layernorm = RMSNorm(hidden_size=kv_lora_rank,
@@ -514,7 +562,8 @@ class MLA(nn.Module):
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             quant_config=quant_config,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-            allreduce_strategy=config.allreduce_strategy)
+            allreduce_strategy=config.allreduce_strategy,
+            force_dynamic_quantization=config.force_dynamic_quantization)
         # This parameter will view into self.kv_b_proj.weight after loading weights.
         # For dummy weight initialization, this parameter is initialized with empty tensor.
         # Used in forward_generation only
@@ -535,7 +584,8 @@ class MLA(nn.Module):
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=quant_config,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-            allreduce_strategy=config.allreduce_strategy)
+            allreduce_strategy=config.allreduce_strategy,
+            force_dynamic_quantization=config.force_dynamic_quantization)
 
         def yarn_get_mscale(scale=1, mscale=1):
             if scale <= 1:
@@ -938,7 +988,7 @@ class MLA(nn.Module):
 
         # determine the number of loop
         # currently we assume that the chunk size is the same as the max_num_tokens
-        chunk_size = attn_metadata.runtime_features.normal_chunk_size
+        chunk_size = attn_metadata.runtime_features.chunk_size
         chunked_loop_num = attn_metadata.chunked_loop_num
 
         # [toal_token_q, num_heads, 2] -> [toal_token_q, num_heads] float2
@@ -1140,15 +1190,11 @@ class MLA(nn.Module):
                                      self.k_b_proj_trans.transpose(1, 2),
                                      q_nope_out)
         elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
-            q_nope_fp8, q_nope_scales = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
-                q_nope)
             # [num_heads, num_tokens, self.kv_lora_rank]
             q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
 
-            torch.ops.trtllm.fp8_block_scaling_bmm_out(
-                q_nope_fp8, self.k_b_proj_trans, q_nope_scales,
-                self.k_b_proj_trans_scale, q_nope_out)
-            q_nope_scales = None
+            fp8_block_scaling_bmm_out(q_nope, self.k_b_proj_trans,
+                                      self.k_b_proj_trans_scale, q_nope_out)
         else:
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}.")
@@ -1197,13 +1243,9 @@ class MLA(nn.Module):
                                      self.v_b_proj.transpose(1, 2),
                                      attn_output.transpose(0, 1))
         elif self.v_b_proj.dtype == torch.float8_e4m3fn:
-            attn_out_latent, attn_out_latent_scales = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
-                attn_out_latent)
-
-            torch.ops.trtllm.fp8_block_scaling_bmm_out(
-                attn_out_latent, self.v_b_proj, attn_out_latent_scales,
-                self.v_b_proj_scale, attn_output.transpose(0, 1))
-            attn_out_latent_scales = None
+            fp8_block_scaling_bmm_out(attn_out_latent, self.v_b_proj,
+                                      self.v_b_proj_scale,
+                                      attn_output.transpose(0, 1))
         else:
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")

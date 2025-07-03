@@ -32,7 +32,6 @@ class DecoderState;
 namespace tensorrt_llm::batch_manager
 {
 class DecoderInputBuffers;
-class DecoderBuffers;
 class RuntimeBuffers;
 
 class MakeDecodingBatchInputOutput : Algorithm
@@ -48,10 +47,9 @@ public:
     MakeDecodingBatchInputOutput() = default;
 
     std::unique_ptr<runtime::decoder_batch::Input> operator()(RequestVector const& contextRequests,
-        RequestVector const& generationRequests, DecoderBuffers& decoderBuffers,
-        DecoderInputBuffers const& inputBuffers, runtime::decoder::DecoderState& decoderState,
-        runtime::ModelConfig const& modelConfig, SizeType32 maxNumSequences,
-        OptionalRef<RuntimeBuffers> fusedRuntimeBuffers) const;
+        RequestVector const& generationRequests, DecoderInputBuffers const& inputBuffers,
+        runtime::decoder::DecoderState& decoderState, runtime::ModelConfig const& modelConfig,
+        SizeType32 maxNumSequences, OptionalRef<RuntimeBuffers> fusedRuntimeBuffers) const;
 
     [[nodiscard]] static std::unique_ptr<runtime::decoder_batch::Input> createDecoderBatchInputs(
         std::vector<SizeType32> const& activeSlots, runtime::decoder::DecoderState const& decoderState,

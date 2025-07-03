@@ -93,6 +93,7 @@ def make_weak_ref(x):
 class Fp4QuantizedTensor:
     fp4_tensor: torch.Tensor
     scaling_factor: torch.Tensor
+    is_sf_swizzled: bool = True
 
     @property
     def shape(self):
@@ -127,7 +128,7 @@ def swizzle_sf(sf: torch.Tensor,
     """
     sf_cols = ceil_div(cols, scaling_vector_size)
     sf = sf.view(-1, rows, sf_cols)
-    return torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(sf)
+    return torch.ops.trtllm.nvfp4_block_scale_interleave(sf)
 
 
 def unswizzle_sf(sf: torch.Tensor,
@@ -145,14 +146,15 @@ def unswizzle_sf(sf: torch.Tensor,
     """
     sf_cols = ceil_div(cols, scaling_vector_size)
     sf = sf.view(-1, rows, sf_cols)
-    return torch.ops.tensorrt_llm.nvfp4_block_scale_interleave_reverse(sf).view(
+    return torch.ops.trtllm.nvfp4_block_scale_interleave_reverse(sf).view(
         -1, sf_cols)
 
 
+@torch.library.custom_op("trtllm::reswizzle_sf", mutates_args=())
 def reswizzle_sf(sf: torch.Tensor,
                  rows: int,
                  cols: int,
-                 scaling_vector_size: int = 16):
+                 scaling_vector_size: int = 16) -> torch.Tensor:
     """Reswizzle FP4 scaling factors using C++ torch op implementation.
        It unswizzles the scaling factors in each partition first, then concatenates them together, and finally swizzles them back.
     Args:
@@ -186,6 +188,16 @@ def reswizzle_sf(sf: torch.Tensor,
 
     # Finally swizzle the concatenated scaling factors
     return swizzle_sf(sf_concatenated, total_rows, cols, scaling_vector_size)
+
+
+@torch.library.register_fake("trtllm::reswizzle_sf")
+def _(sf, rows, cols, scaling_vector_size=16):
+    sf_cols = ceil_div(cols, scaling_vector_size)
+    padded_rows, padded_sf_cols = compute_swizzled_sf_shape(rows, sf_cols)
+    num_partitions = sf.numel() // (padded_rows * padded_sf_cols)
+    total_rows = num_partitions * rows
+    sz = pad_up(total_rows, 128) * pad_up(cols, 4)
+    return sf.new_empty(sz)
 
 
 def next_positive_power_of_2(x: int) -> int:

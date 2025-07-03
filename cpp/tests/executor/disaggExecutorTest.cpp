@@ -291,8 +291,8 @@ void runDisaggTest(tensorrt_llm::testing::disaggexecutor::DisaggExecutorLeader& 
             ++iter;
         }
         EXPECT_LT(iter, maxWaitMs);
-        testData.verifyOutput(tokens, givenInputLengths, nbGivenInputs, streaming, outConfig.excludeInputFromOutput,
-            flakyTestInfo, isSpeculativeDecoding, returnAllGeneratedTokens, beamWidth, numReturnSequences, false);
+        testData.verifyOutput(tokens, givenInputLengths, streaming, outConfig.excludeInputFromOutput, flakyTestInfo,
+            isSpeculativeDecoding, beamWidth, numReturnSequences, false);
     }
     comm.barrier();
     if (executor.isGenerationRank())
@@ -449,8 +449,8 @@ void runDisaggTest(DisaggExecutorOrchestrator& executor, tensorrt_llm::runtime::
             ++iter;
         }
         EXPECT_LT(iter, maxWaitMs);
-        testData.verifyOutput(tokens, givenInputLengths, nbGivenInputs, streaming, outConfig.excludeInputFromOutput,
-            flakyTestInfo, isSpeculativeDecoding, returnAllGeneratedTokens, beamWidth, numReturnSequences, false);
+        testData.verifyOutput(tokens, givenInputLengths, streaming, outConfig.excludeInputFromOutput, flakyTestInfo,
+            isSpeculativeDecoding, beamWidth, numReturnSequences, false);
     }
     comm.barrier();
 }
@@ -1110,8 +1110,8 @@ TEST_P(ConditionalDisaggParamsTest, DisaggTokenComparison)
             ++iter;
         }
         EXPECT_LT(iter, mMaxWaitMs);
-        testData.verifyOutput(tokens, givenInputLengths, nbGivenInputs, streaming, outConfig.excludeInputFromOutput,
-            flakyTestInfo, isSpeculativeDecoding, false, beamWidth, numReturnSequences, false);
+        testData.verifyOutput(tokens, givenInputLengths, streaming, outConfig.excludeInputFromOutput, flakyTestInfo,
+            isSpeculativeDecoding, beamWidth, numReturnSequences, false);
     }
     world_comm.barrier();
 #else

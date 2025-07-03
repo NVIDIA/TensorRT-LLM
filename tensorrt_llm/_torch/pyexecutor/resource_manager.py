@@ -1,7 +1,7 @@
 import enum
 import math
 from abc import ABC, abstractmethod
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -25,8 +25,9 @@ if ENABLE_MULTI_DEVICE:
 if TYPE_CHECKING:
     from ..speculative.interface import SpecConfig
 
+BufferManagerCpp = tensorrt_llm.bindings.internal.runtime.BufferManager
 KVCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.KVCacheManager
-KvCacheConfigCpp = tensorrt_llm.bindings.KvCacheConfig
+KvCacheConfigCpp = tensorrt_llm.bindings.executor.KvCacheConfig
 CacheTypeCpp = tensorrt_llm.bindings.internal.batch_manager.CacheType
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 DataType = tensorrt_llm.bindings.DataType
@@ -35,6 +36,10 @@ RequestList = list[LlmRequest]
 PeftCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.PeftCacheManager
 PeftCacheConfig = tensorrt_llm.bindings.executor.PeftCacheConfig
 WorldConfig = tensorrt_llm.bindings.WorldConfig
+TempAttentionWindowInputs = tensorrt_llm.bindings.internal.batch_manager.TempAttentionWindowInputs
+BlocksPerWindow = Dict[int, Tuple[
+    int,
+    int]]  # window_size -> (blocks_in_primary_pool, blocks_in_secondary_pool)
 
 
 class ResourceManagerType(enum.Enum):
@@ -58,6 +63,9 @@ class BaseResourceManager(ABC):
     @abstractmethod
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
         raise NotImplementedError
+
+    def add_dummy_requests(self, request_ids: List[int]):
+        pass
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         pass
@@ -121,6 +129,8 @@ class KVCacheManager(BaseResourceManager):
         dtype: DataType = DataType.HALF,
         spec_config: Optional["SpecConfig"] = None,
         layer_mask: Optional[List[bool]] = None,
+        max_num_tokens: int = 8192,
+        model_config: Optional[ModelConfig] = None,
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
@@ -146,7 +156,6 @@ class KVCacheManager(BaseResourceManager):
                 (num_kv_heads + tp_size - 1) // tp_size
                 for _ in range(self.num_local_layers)
             ]
-
         else:
             assert len(num_kv_heads) == self.num_layers
 
@@ -167,46 +176,80 @@ class KVCacheManager(BaseResourceManager):
         self.max_batch_size = max_batch_size
         self.kv_factor = 1 if kv_cache_type == CacheTypeCpp.SELFKONLY else 2
         # Some speculative decoding methods need to use different kv lengths for the
-        # draft/target layers. Add extra tokens to haddle this issue.
+        # draft/target layers. Add extra tokens to handle this issue.
         self.num_extra_kv_tokens = 0 if spec_config is None else spec_config.num_extra_kv_tokens
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
+        self.max_num_tokens = max_num_tokens
 
+        # Determine max_attention_window_vec
         if kv_cache_config.max_attention_window is None:
-            max_attention_window = max_seq_len
+            # Use max_seq_len as default max_attention_window
+            self.max_attention_window_vec = [max_seq_len]
         else:
-            assert len(
-                kv_cache_config.max_attention_window
-            ) == 1, "Python KvCacheManager doesn't currently support variable window attention"
-            max_attention_window = kv_cache_config.max_attention_window[0]
+            self.max_attention_window_vec = kv_cache_config.max_attention_window.copy(
+            )  # Make a copy to avoid modifying original
 
         sink_token_length = (kv_cache_config.sink_token_length
                              if kv_cache_config.sink_token_length is not None
                              else 0)
 
-        self.blocks_in_primary_pool, self.blocks_in_secondary_pool = self.calculate_max_num_blocks(
-            kv_cache_config,
-            head_dim=head_dim,
+        # Determine if this is VSWA (Variable Sliding Window Attention)
+        is_vswa = len(self.max_attention_window_vec) > 1
+
+        # Calculate blocks per window using appropriate method
+        if is_vswa:
+            # VSWA case: use C++ implementation for variable window sizes
+            # model config check
+            if model_config is None:
+                raise ValueError(
+                    "model_config is required for VSWA (Variable Sliding Window Attention)"
+                )
+            # kv cache config check
+            assert isinstance(
+                kv_cache_config, KvCacheConfigCpp
+            ), "calculate_max_num_blocks_from_cpp only accepts KvCacheConfigCpp"
+            blocks_per_window = self.calculate_max_num_blocks_from_cpp(
+                kv_cache_config=kv_cache_config,
+                model_config=model_config,
+                extra_cost_memory=0,
+            )
+        else:
+            # Standard case: use original Python implementation
+            self.blocks_in_primary_pool, self.blocks_in_secondary_pool = self.calculate_max_num_blocks(
+                kv_cache_config=kv_cache_config,
+                head_dim=head_dim,
+                tokens_per_block=tokens_per_block,
+                mapping=mapping,
+                dtype=dtype,
+                kv_factor=self.kv_factor,
+            )
+            blocks_per_window = {
+                self.max_attention_window_vec[0]:
+                (self.blocks_in_primary_pool, self.blocks_in_secondary_pool)
+            }
+
+        # Validate and adjust attention windows against their upper bounds if needed
+        blocks_per_window, self.max_seq_len, self.max_attention_window_vec = self._validate_and_adjust_attention_windows(
+            max_attention_window_vec=self.max_attention_window_vec,
+            blocks_per_window=blocks_per_window,
             tokens_per_block=tokens_per_block,
-            mapping=mapping,
-            dtype=dtype,
-            kv_factor=self.kv_factor,
+            sink_token_length=sink_token_length,
+            max_seq_len=self.max_seq_len,
         )
 
-        max_atten_window_upper_bound = self.get_max_atten_window_upper_bound(
-            blocks_in_primary_pool=self.blocks_in_primary_pool,
-            tokens_per_block=tokens_per_block,
-            max_beam_width=1,
-            sink_token_len=sink_token_length,
-            max_seq_len=max_seq_len)
-
-        if max_attention_window > max_atten_window_upper_bound:
-            logger.warning(
-                f"maxAttentionWindow and maxSequenceLen are too large for at least one sequence to fit in kvCache. They are reduced to {max_atten_window_upper_bound}"
+        if kv_cache_type != CacheTypeCpp.SELF:
+            assert len(
+                blocks_per_window
+            ) == 1, "Only one window size is supported for non-self KV cache"
+            # rewrite the attention window size in blocks_per_window
+            memory_pools = blocks_per_window[self.max_attention_window_vec[0]]
+            blocks_per_window = {self.max_seq_len: memory_pools}
+            logger.info(
+                f"Adjusted attention window size to {self.max_seq_len} in blocks_per_window"
             )
-            max_attention_window = max_atten_window_upper_bound
-            self.max_seq_len = max_atten_window_upper_bound
 
-        self.max_attention_window = max_attention_window if kv_cache_type == CacheTypeCpp.SELF else self.max_seq_len
+        # Set up temp_attention_window_inputs
+        temp_attention_window_inputs = self._set_temp_attention_window_inputs()
 
         # Note that this stream is unused for now. Will be used for copying to host
         # when that feature is enabled.
@@ -215,14 +258,11 @@ class KVCacheManager(BaseResourceManager):
             'num_kv_heads_per_layer': self.num_kv_heads_per_layer,
             'size_per_head': head_dim,
             'tokens_per_block': tokens_per_block,
-            'blocks_per_window': {
-                self.max_attention_window:
-                (self.blocks_in_primary_pool, self.blocks_in_secondary_pool)
-            },
+            'blocks_per_window': blocks_per_window,
             'max_num_sequences': max_batch_size,
             'max_beam_width': 1,  # TODO: more than 1 beam?
-            'max_attention_window_vec': [self.max_attention_window],
-            'temp_attention_window_inputs': None,
+            'max_attention_window_vec': self.max_attention_window_vec,
+            'temp_attention_window_inputs': temp_attention_window_inputs,
             'dtype': dtype,
             'sink_token_length': sink_token_length,
             'stream': self._stream.cuda_stream,
@@ -419,6 +459,9 @@ class KVCacheManager(BaseResourceManager):
                 )
             else:
                 max_tokens = kv_cache_config.max_tokens
+                logger.info(
+                    f"max_tokens is set by kv_cache_config.max_tokens: {max_tokens}"
+                )
 
         if mapping.world_size > 1:
             # make sure all ranks use same value for maxTokens
@@ -439,7 +482,7 @@ class KVCacheManager(BaseResourceManager):
         token_capacity = blocks_in_primary_pool * tokens_per_block
         max_blocks_per_seq = math.floor(token_capacity /
                                         (max_beam_width * tokens_per_block))
-        assert max_blocks_per_seq > 0, "Impossibe to fit in any sequence in kvCache"
+        assert max_blocks_per_seq > 0, "Impossible to fit in any sequence in kvCache"
 
         max_token_num = max_blocks_per_seq * tokens_per_block
         sink_tokens_in_last_block = sink_token_len % tokens_per_block
@@ -450,18 +493,30 @@ class KVCacheManager(BaseResourceManager):
         assert max_atten_window_upper_bound > 0, "Impossibe to fit in any sequence in kvCache"
         return max_atten_window_upper_bound
 
-    def get_cache_indices(self, request: LlmRequest) -> List[int]:
+    def get_cache_indices(self,
+                          request: LlmRequest,
+                          window_size: Optional[int] = None) -> List[int]:
+        if window_size is None:
+            if len(self.max_attention_window_vec) > 1:
+                raise ValueError("window_size must be provided for VSWA")
+            window_size = self.max_attention_window_vec[0]
+
         result = self.impl.get_cache_block_ids(request.py_request_id,
-                                               self.max_attention_window)
+                                               window_size)
         assert len(result) == 1
         return result[0]
 
     def get_batch_cache_indices(
         self,
         request_ids: List[int],
-    ) -> Dict[int, List[int]]:
-        result = self.impl.get_batch_cache_block_ids(request_ids,
-                                                     self.max_attention_window)
+        window_size: Optional[int] = None,
+    ) -> List[List[int]]:
+        if window_size is None:
+            if len(self.max_attention_window_vec) > 1:
+                raise ValueError("window_size must be provided for VSWA")
+            window_size = self.max_attention_window_vec[0]
+
+        result = self.impl.get_batch_cache_block_ids(request_ids, window_size)
         for i in range(len(result)):
             assert (len(result[i])) == 1
             result[i] = result[i][0]
@@ -509,6 +564,173 @@ class KVCacheManager(BaseResourceManager):
 
     def rewind_kv_cache(self, request: LlmRequest, rewind_len: int):
         self.impl.rewind_kv_cache(request.py_request_id, rewind_len)
+
+    def _get_window_size_to_layers(self) -> dict[int, list[int]]:
+        """
+        Get the window size to layers mapping.
+        The returned map has window sizes as keys and lists of layer indices as values.
+
+        max_attention_window_vec is treated as a repeating pattern.
+        """
+        window_size_to_layers_map = defaultdict(list)
+
+        if not self.max_attention_window_vec:
+            # This case should ideally be prevented by earlier config validation.
+            # If num_local_layers is 0, an empty map is fine.
+            if self.num_local_layers > 0:
+                raise Exception(
+                    "max_attention_window_vec cannot be empty if there are local layers."
+                )
+            return {
+            }  # Return an empty dict if no local layers or if somehow vec is empty and no layers.
+
+        # Treat max_attention_window_vec as a repeating pattern.
+        pattern_len = len(
+            self.max_attention_window_vec
+        )  # `sliding_window_pattern`, in HF config terms, e.g. https://huggingface.co/google/gemma-3-1b-it/blob/main/config.json#L32
+        # early return if max_attention_window_vec is a single value(SWA)
+        if pattern_len == 1:
+            return {
+                self.max_attention_window_vec[0]:
+                list(range(self.num_local_layers))
+            }
+        for local_layer_idx in range(self.num_local_layers):
+            window_size = self.max_attention_window_vec[local_layer_idx %
+                                                        pattern_len]
+            window_size_to_layers_map[window_size].append(local_layer_idx)
+        return window_size_to_layers_map
+
+    def calculate_max_num_blocks_from_cpp(
+            self,
+            kv_cache_config: KvCacheConfigCpp,
+            model_config: ModelConfig,
+            extra_cost_memory: int = 0) -> dict[int, tuple[int, int]]:
+        """
+        This function is a wrapper of KVCacheManagerCpp.calculate_max_num_blocks.
+        The final goal is to switch to the C++ implementation of calculate_max_num_blocks.
+        Currently, this function is added to support *ONLY* VSWA.
+
+        Args:
+            kv_cache_config: The KV cache configuration object.
+            model_config: The model configuration object.
+            extra_cost_memory: Extra memory in bytes to exclude from available memory.
+
+        Returns:
+            A dict of (max_attention_window, (blocks_in_primary_pool, blocks_in_secondary_pool)).
+        """
+
+        # Construct WorldConfig from self.mapping
+        world_config_cpp = WorldConfig(
+            tensor_parallelism=self.mapping.tp_size,
+            pipeline_parallelism=self.mapping.pp_size,
+            rank=self.mapping.rank,
+            gpus_per_node=self.mapping.gpus_per_node)
+
+        window_size_to_layers = self._get_window_size_to_layers()
+        logger.debug(f"window_size_to_layers: {window_size_to_layers}")
+
+        free_mem, total_mem = torch.cuda.mem_get_info()
+        primary_pool_memory_bytes = free_mem
+        secondary_pool_memory_bytes = 0
+        logger.debug(
+            f"primary_pool_memory_bytes is set to {primary_pool_memory_bytes/1024**3}GB, \nsecondary_pool_memory_bytes is set to {secondary_pool_memory_bytes/1024**3}GB"
+        )
+
+        blocks_per_window = KVCacheManagerCpp.calculate_max_num_blocks(
+            config=kv_cache_config,
+            is_cross_attention=False,  #TODO: support cross attention
+            dtype=self.dtype,
+            model_config=model_config,
+            world_config=world_config_cpp,
+            window_size_to_layers=window_size_to_layers,
+            allotted_primary_mem_bytes=primary_pool_memory_bytes,
+            allotted_secondary_mem_bytes=secondary_pool_memory_bytes,
+            extra_cost_memory=extra_cost_memory,
+            kv_factor=self.kv_factor,
+        )
+        return blocks_per_window
+
+    def _validate_and_adjust_attention_windows(
+        self,
+        max_attention_window_vec: List[int],
+        blocks_per_window: BlocksPerWindow,
+        tokens_per_block: int,
+        sink_token_length: int,
+        max_seq_len: int,
+    ) -> Tuple[BlocksPerWindow, int, List[int]]:
+        """
+        Validate and adjust attention windows against their upper bounds if needed.
+        If there is no adjustment, the returned max_attention_window_vec will be the same as the input.
+
+        Args:
+            max_attention_window_vec: List of attention window sizes
+            blocks_per_window: Dict mapping window size to (primary_blocks, secondary_blocks)
+            tokens_per_block: Number of tokens per block
+            sink_token_length: Length of sink tokens
+            max_seq_len: Maximum sequence length
+
+        Returns:
+            Tuple of (adjusted_blocks_per_window, adjusted_max_seq_len, adjusted_max_attention_window_vec)
+        """
+        max_beam_width = 1  # TODO: support more than 1 beam?
+        window_adjustments = {}
+        # Validate each window size in blocks_per_window against its upper bound
+        for window_size, (blocks_in_primary_pool,
+                          _) in blocks_per_window.items():
+            upper_bound = self.get_max_atten_window_upper_bound(
+                blocks_in_primary_pool=blocks_in_primary_pool,
+                tokens_per_block=tokens_per_block,
+                max_beam_width=max_beam_width,
+                sink_token_len=sink_token_length,
+                max_seq_len=max_seq_len)
+            if window_size > upper_bound:
+                logger.warning(
+                    f"Attention window size {window_size} exceeds upper bound {upper_bound} "
+                    f"for available blocks. Reducing to {upper_bound}.")
+                window_adjustments[window_size] = upper_bound
+        # Apply adjustments to the window vector if any were needed
+        if window_adjustments:
+            adjusted_window_vec = [
+                window_adjustments.get(window, window)
+                for window in max_attention_window_vec
+            ]
+            logger.warning(
+                f"Adjusted max_attention_window_vec to {adjusted_window_vec}")
+            # update the window size in blocks_per_window if it is adjusted
+            adjusted_blocks_per_window = {}
+            for window_size, memory_pools in blocks_per_window.items():
+                if window_size in window_adjustments:
+                    adjusted_window_size = window_adjustments[window_size]
+                    adjusted_blocks_per_window[
+                        adjusted_window_size] = memory_pools
+                    logger.warning(
+                        f"Adjusted window size {window_size} to {adjusted_window_size} in blocks_per_window"
+                    )
+                else:
+                    adjusted_blocks_per_window[window_size] = memory_pools
+            # Update max_seq_len to the maximum of adjusted windows
+            adjusted_max_seq_len = max(adjusted_window_vec)
+            logger.warning(f"Adjusted max_seq_len to {adjusted_max_seq_len}")
+
+            return adjusted_blocks_per_window, adjusted_max_seq_len, adjusted_window_vec
+        else:
+            return blocks_per_window, max_seq_len, max_attention_window_vec
+
+    def _set_temp_attention_window_inputs(
+            self) -> Optional[TempAttentionWindowInputs]:
+        """
+        Set up temp_attention_window_inputs for sliding window.
+        """
+        is_sliding_window = min(
+            self.max_attention_window_vec) < self.max_seq_len
+        if is_sliding_window:
+            temp_attention_window_inputs = TempAttentionWindowInputs()
+            temp_attention_window_inputs.paged_context_fmha = True
+            temp_attention_window_inputs.max_input_len = self.max_seq_len - 1
+            temp_attention_window_inputs.max_num_tokens = self.max_num_tokens
+            return temp_attention_window_inputs
+        else:
+            return None
 
 
 class MambaCacheManager(BaseResourceManager):

@@ -469,9 +469,17 @@ std::vector<int64_t> Runner::getValidConfigIndices(
 int64_t Runner::getDefaultValidConfigIndex(
     int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numLocalExperts, int32_t numTokens) const
 {
-    auto const validIndices = getValidConfigIndices(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens);
 
-    return validIndices[0];
+    int32_t indexGemm1
+        = mPermuteGemm1.getDefaultValidConfigIndex(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens);
+    int32_t indexGemm2
+        = mGemm2.getDefaultValidConfigIndex(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens);
+
+    auto it = std::find_if(mPassingConfigs.begin(), mPassingConfigs.end(),
+        [indexGemm1, indexGemm2](MoEConfig cfg)
+        { return (cfg.gemm1Config == indexGemm1 && cfg.gemm2Config == indexGemm2); });
+    TLLM_CHECK_WITH_INFO(it != mPassingConfigs.end(), "No compatible configs found for the block scale MoE runner.");
+    return std::distance(mPassingConfigs.begin(), it);
 }
 
 void Runner::run(
