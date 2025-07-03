@@ -74,6 +74,7 @@ throughput
 Run throughput benchmarks to measure the engine's processing capacity under load.
 
 **Usage:**
+
 .. code-block:: bash
 
     trtllm-bench -m <model_name> throughput [OPTIONS]
@@ -142,6 +143,7 @@ Run throughput benchmarks to measure the engine's processing capacity under load
      - KV cache scheduler policy (guaranteed_no_evict, max_utilization)
 
 **Performance Features:**
+
 - Supports both streaming and non-streaming modes
 - Configurable concurrency for load testing
 - Comprehensive reporting with detailed statistics
@@ -151,6 +153,7 @@ latency
 Run low-latency benchmarks optimized for minimal response time.
 
 **Usage:**
+
 .. code-block:: bash
 
     trtllm-bench -m <model_name> latency [OPTIONS]
@@ -189,21 +192,25 @@ Examples
 --------
 
 Build an engine optimized for a specific dataset (TensorRT backend only):
+
 .. code-block:: bash
 
     trtllm-bench -m <model_name> build --dataset <dataset_path> --tp_size <tp_size> --pp_size <pp_size> --quantization <quantization>
 
 Run throughput benchmark (PyTorch):
+
 .. code-block:: bash
 
     trtllm-bench -m <model_name> throughput --backend pytorch --dataset <dataset_path> --tp_size <tp_size> --pp_size <pp_size>
 
 Run throughput benchmark (TensorRT):
+
 .. code-block:: bash
 
     trtllm-bench -m <model_name> throughput --engine_dir <engine_path> --dataset <dataset_path>
 
 Run latency benchmark:
+
 .. code-block:: bash
 
     trtllm-bench -m <model_name> --engine_dir <engine_path> --kv_cache_free_gpu_mem_fraction <kv_cache_free_gpu_mem_fraction> --dataset <dataset_path> --num_requests <num_requests> --warmup <warmup> --concurrency <concurrency> --beam_width <beam_width> --medusa_choices <medusa_choices> --report_json <report_json> --iteration_log <iteration_log>
@@ -272,6 +279,7 @@ trtllm-bench is designed to work with the ``prepare_dataset.py`` script, which g
     python prepare_dataset.py --tokenizer meta-llama/Meta-Llama-3.3-8B --stdout dataset --output benchmark_data.jsonl
 
 This workflow allows you to:
+
 1. Prepare datasets using ``prepare_dataset.py`` with the required ``--stdout`` flag
 2. Build optimized engines with ``trtllm-bench build`` using the prepared dataset
 3. Run comprehensive benchmarks with ``trtllm-bench throughput`` or ``trtllm-bench latency``
