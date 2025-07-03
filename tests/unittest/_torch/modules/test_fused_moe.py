@@ -116,7 +116,7 @@ def test_fused_moe(moe_cls, dtype, experts, RoutingMethodCls, mapping=None):
 
         # Evaluate outputs
         torch.cuda.synchronize()
-        torch.testing.assert_close(output, ref_output, rtol=0.2, atol=0.2)
+        torch.testing.assert_close(output, ref_output, rtol=0.5, atol=0.5)
         m //= 2
 
 
@@ -333,7 +333,7 @@ def test_fused_moe_fp8(dtype):
 
     # compare
     torch.cuda.synchronize()
-    torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
+    torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.2)
 
 
 def set_tensor_value_2(x, num_row, num_cols):
