@@ -71,7 +71,7 @@ def _signal_handler_cleanup_child(signum, frame):
 
 def get_llm_args(model: str,
                  tokenizer: Optional[str] = None,
-                 backend: Optional[str] = None,
+                 backend: str = "pytorch",
                  max_beam_width: int = BuildConfig.max_beam_width,
                  max_batch_size: int = BuildConfig.max_batch_size,
                  max_num_tokens: int = BuildConfig.max_num_tokens,
@@ -165,8 +165,8 @@ def launch_server(host: str,
               help="Hostname of the server.")
 @click.option("--port", type=int, default=8000, help="Port of the server.")
 @click.option("--backend",
-              type=click.Choice(["pytorch"]),
-              default=None,
+              type=click.Choice(["pytorch", "tensorrt"]),
+              default="pytorch",
               help="Set to 'pytorch' for pytorch path. Default is cpp path.")
 @click.option('--log_level',
               type=click.Choice(severity_map.keys()),
