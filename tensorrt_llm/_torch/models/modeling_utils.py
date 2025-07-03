@@ -1,5 +1,6 @@
 import contextlib
 import math
+import os
 import time
 from dataclasses import dataclass
 from typing import Dict, Generic, List, Optional, Tuple, Type, TypeVar, Union
@@ -635,6 +636,42 @@ def filter_weights(prefix, weights: Dict):
     return result
 
 
+def run_concurrently(func,
+                     args_list,
+                     reduce_func=None,
+                     pbar=None,
+                     num_workers=None):
+    """
+    Run a function concurrently with a list of arguments.
+    func: the function to run concurrently.
+    args_list: a list of tuples of arguments for the function.
+    reduce_func: an optional function to reduce the results.
+    pbar: an optional tqdm progress bar.
+    """
+    from concurrent import futures
+    with futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+        # Submit all tasks
+        future_to_result = {
+            executor.submit(func, *arg): arg
+            for arg in args_list
+        }
+
+        # Process completed tasks as they finish
+        for result in futures.as_completed(future_to_result):
+            arg = future_to_result[result]
+            try:
+                part_weights = result.result()
+                if reduce_func:
+                    reduce_func(part_weights)
+                if pbar:
+                    pbar.update(1)
+            except Exception as e:
+                logger.error(
+                    f"Error executing {func.__name__} with args {arg}: {str(e)}"
+                )
+                raise
+
+
 def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                        weights: Dict,
                        skip_modules: List[str] = [],
@@ -659,30 +696,29 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
         'gate_up_proj': ['gate_proj', 'up_proj']
     }
 
-    for name, module in tqdm(list(model.named_modules()),
-                             desc="Loading weights"):
+    def load_single_module(name, module):
         if len(module._parameters) > 0:
             # skip load weights if module is in skip_modules
             if any(skip_module in name for skip_module in skip_modules):
-                continue
+                return
 
             # skip load weights if tie word embeddings is enabled and layer is lm_head
             if model.config.tie_word_embeddings and name.startswith("lm_head"):
-                continue
+                return
 
             # Skip loading weights for embedding and lm_head if LoRA is enabled and has custom values
             if hasattr(model, "model") and hasattr(
                     model.model, 'has_custom_embed_tokens'
             ) and model.model.has_custom_embed_tokens and name == "model.embed_tokens":
-                continue
+                return
             if hasattr(model, 'has_custom_lm_head'
                        ) and model.has_custom_lm_head and name == "lm_head":
-                continue
+                return
 
             names = name.split('.')
             # WAR: better solution is that llama has its own load_weights function.
             if names[-1] == 'next_layer_layernorm':
-                continue
+                return
             if names[-1] in params_map:
                 module_weights = []
                 for new_name in params_map[names[-1]]:
@@ -713,3 +749,14 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                     for n, p in module._parameters.items():
                         if p is not None:
                             p.data.copy_(module_weights[n][:])
+
+    if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
+                      False) in ["True", "true", "1", "yes", "y"]:
+        for name, module in tqdm(list(model.named_modules()),
+                                 desc="Loading weights"):
+            load_single_module(name, module)
+    else:
+        pbar = tqdm(list(model.named_modules()),
+                    desc="Loading weights concurrently")
+        args_list = [(name, module) for name, module in model.named_modules()]
+        run_concurrently(load_single_module, args_list, pbar=pbar)

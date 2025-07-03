@@ -364,6 +364,9 @@ class FP8QDQLinearMethod(LinearMethodBase):
         v_weight = v_weight.to(module.dtype) * weight_scale[2]
 
         fused_weight = torch.cat((q_weight, k_weight, v_weight))
+        if module.weight_scale.device != fused_weight.device:
+            module.weight_scale = Parameter(
+                module.weight_scale.data.to(fused_weight.device))
         fused_weight = (fused_weight / module.weight_scale).to(
             torch.float8_e4m3fn)
         copy_weight(module.weight, fused_weight)
@@ -385,6 +388,9 @@ class FP8QDQLinearMethod(LinearMethodBase):
         gate_weight = gate_weight.to(module.dtype) * weight_scale[0]
         up_weight = up_weight.to(module.dtype) * weight_scale[1]
         fused_weight = torch.cat((gate_weight, up_weight))
+        if module.weight_scale.device != fused_weight.device:
+            module.weight_scale = Parameter(
+                module.weight_scale.data.to(fused_weight.device))
         fused_weight = (fused_weight / module.weight_scale).to(
             torch.float8_e4m3fn)
         copy_weight(module.weight, fused_weight)
