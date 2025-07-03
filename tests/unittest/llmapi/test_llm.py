@@ -20,13 +20,15 @@ import random
 import shutil
 import sys
 import tempfile
-from typing import List, Optional, Union
+from typing import List, Optional, OrderedDict, Union
 
 import datasets
 import pytest
 import torch
 import transformers
-from utils.util import skip_single_gpu
+from utils.util import (EnvVarsContextManager, duplicate_list_to_length,
+                        flatten_list, run_function_in_sub_process,
+                        skip_single_gpu)
 
 from tensorrt_llm import LLM as LLM_torch
 from tensorrt_llm._tensorrt_engine import LLM
@@ -1372,6 +1374,109 @@ def llama_7b_multi_lora_from_request_test_harness(**llm_kwargs):
     for output, ref, key_word in zip(outputs, references, key_words):
         assert similar(output.outputs[0].text,
                        ref) or key_word in output.outputs[0].txt
+
+
+def llama_7b_multi_lora(lora_adapter_count_per_call: list[int], max_loras: int,
+                        max_cpu_loras: int, repeats: int, **llm_kwargs):
+    total_lora_adapters = sum(lora_adapter_count_per_call)
+
+    hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
+    hf_lora_dirs = [
+        f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1",
+        f"{llm_models_root()}/llama-models/Japanese-Alpaca-LoRA-7b-v0"
+    ]
+
+    # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
+    # (1) specify lora_target_modules, or
+    # (2) provide a lora_dir to infer the lora_target_modules.
+    build_config = BuildConfig(lora_config=LoraConfig(
+        lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
+        max_lora_rank=8,
+        max_loras=max_loras,
+        max_cpu_loras=max_cpu_loras))
+    llm = LLM(hf_model_dir,
+              enable_lora=True,
+              build_config=build_config,
+              fast_build=True)
+
+    # Each prompt should have a reference for every LoRA adapter dir (in the same order as in hf_lora_dirs)
+    prompt_to_references = OrderedDict({
+        "美国的首都在哪里? \n答案:": [
+            "美国的首都是华盛顿。\n\n美国的",
+            "纽约\n\n### カンファレンスの",
+        ],
+        "アメリカ合衆国の首都はどこですか? \n答え:": [
+            "华盛顿。\n\n英国の首都是什",
+            "ワシントン\nQ1. アメリカ合衆国",
+        ],
+    })
+
+    prompts_to_generate = duplicate_list_to_length(
+        flatten_list([[prompt] * len(hf_lora_dirs)
+                      for prompt in prompt_to_references.keys()]),
+        total_lora_adapters)
+    references = duplicate_list_to_length(
+        flatten_list(list(prompt_to_references.values())), total_lora_adapters)
+    lora_requests = [
+        LoRARequest(str(i), i, hf_lora_dirs[i % len(hf_lora_dirs)])
+        for i in range(total_lora_adapters)
+    ]
+
+    # Perform repeats of the same requests to test reuse and reload of adapters previously unloaded from cache
+    for i in range(repeats):
+        last_idx = 0
+        for adapter_count in lora_adapter_count_per_call:
+            sampling_params = SamplingParams(max_tokens=20)
+            outputs = llm.generate(
+                prompts_to_generate[last_idx:last_idx + adapter_count],
+                sampling_params,
+                lora_request=lora_requests[last_idx:last_idx + adapter_count])
+            for output, ref in zip(
+                    outputs, references[last_idx:last_idx + adapter_count]):
+                assert similar(output.outputs[0].text, ref)
+            last_idx += adapter_count
+
+
+@pytest.mark.parametrize(
+    "lora_adapter_count_per_call, max_loras, max_cpu_loras", [
+        ([5], 2, 2),
+        ([2, 2, 2], 1, 3),
+    ])
+@skip_gpu_memory_less_than_40gb
+def test_llama_7b_multi_lora_evict_load_new_adapters(
+        lora_adapter_count_per_call: list[int], max_loras: int,
+        max_cpu_loras: int):
+    llama_7b_multi_lora(lora_adapter_count_per_call,
+                        max_loras,
+                        max_cpu_loras,
+                        repeats=1)
+
+
+@pytest.mark.parametrize(
+    "lora_adapter_count_per_call, max_loras, max_cpu_loras", [
+        ([1, 1], 1, 1),
+    ])
+@skip_gpu_memory_less_than_40gb
+def test_llama_7b_multi_lora_load_previously_cpu_cache_evicted_adapter_fails(
+        lora_adapter_count_per_call: list[int], max_loras: int,
+        max_cpu_loras: int):
+    """Tests that trying to load a LoRA adapter after it was evicted from CPU cache fails with the expected
+    message, as this feature is currently not supported in favor of the performance improvement of not
+    sending the LoRA weights with every request after the first time.
+    """  # noqa: D205
+
+    def _check_contains_expected_message(stdout: str, stderr: str):
+        return "not found in cache" in stderr
+
+    repeats = 2
+    with EnvVarsContextManager({"TLLM_WORKER_USE_SINGLE_PROCESS": "1"}):
+        child_stdout, child_stderr = run_function_in_sub_process(
+            target=llama_7b_multi_lora,
+            args=(lora_adapter_count_per_call, max_loras, max_cpu_loras,
+                  repeats),
+            kwargs={},
+            stop_waiting_criteria=_check_contains_expected_message)
+    assert _check_contains_expected_message(child_stdout, child_stderr)
 
 
 @skip_gpu_memory_less_than_40gb
