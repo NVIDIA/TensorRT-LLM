@@ -2,7 +2,7 @@ import json
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields
-from typing import List, NamedTuple, Optional, Tuple, Union,Dict
+from typing import List, NamedTuple, Optional, Tuple, Union, Dict
 
 import torch
 from pydantic import BaseModel
@@ -112,25 +112,47 @@ class LogitBiasLogitsProcessor(LogitsProcessor):
         super().__init__()
         self.logit_bias = logit_bias
         self.tokens_to_adjust = {}
+        try:
+            self.tokens_to_adjust = self.process_logit_bias(logit_bias)
+        except ValueError as e:
+            logger.error(e)
+            raise
+                
+    def process_logit_bias(self,logit_bias: Dict[str, float]) -> Dict[int, float]:
+        valid = {}
+        invalid = {}
+        
         for k, v in logit_bias.items():
             try:
                 token_id = int(k)
-                self.tokens_to_adjust[token_id] = v
+                valid[token_id] = v
             except (ValueError, TypeError):
-                continue
-
+                invalid[k] = v
+        
+        if invalid:
+            raise ValueError(
+                f"Invalid token_ids in logit_bias: {list(invalid.keys())}. "
+                f"All keys must be integers."
+            )
+        return valid
+        
     def __call__(self, req_id: int, logits: torch.Tensor,
                  token_ids: List[List[int]], stream_ptr: Optional[int],
                  client_id: Optional[int]) -> None:
 
         if self.tokens_to_adjust:
+            vocab_size = logits.size(-1)
             token_ids_list = list(self.tokens_to_adjust.keys())
             bias_values = torch.tensor(
-                [self.tokens_to_adjust[token] for token in token_ids_list],
-                device=logits.device,
-                dtype=logits.dtype
+                list(self.tokens_to_adjust.values())
             )
-
+            
+            invalid_token_ids = [tid for tid in token_ids_list if tid >= vocab_size]
+            if invalid_token_ids:
+                raise ValueError(
+                    f"Token ID(s) {invalid_token_ids} exceed vocabulary size (vocab_size={vocab_size})"
+                )
+        
             stream = None if stream_ptr is None else torch.cuda.ExternalStream(stream_ptr)
             with torch.cuda.stream(stream):
                 logits[:, :, token_ids_list] += bias_values
