@@ -158,11 +158,6 @@ class AttentionMetadata:
             self._num_tokens = self._seq_lens.sum().item()
 
     @property
-    def all_tp_rank_num_tokens(self) -> Optional[List[int]]:
-        # this is just an alias for all_rank_num_tokens
-        return self._all_rank_num_tokens
-
-    @property
     def all_rank_num_tokens(self) -> Optional[List[int]]:
         return self._all_rank_num_tokens
 
@@ -171,6 +166,16 @@ class AttentionMetadata:
         value = value if value is not AttentionMetadata.all_rank_num_tokens else None
         self._all_rank_num_tokens = value
         self.all_rank_max_num_tokens = max(value) if value is not None else None
+
+    @property
+    def all_tp_rank_num_tokens(self) -> Optional[List[int]]:
+        # for now, this is just an alias for all_rank_num_tokens
+        return self.all_rank_num_tokens
+
+    @all_tp_rank_num_tokens.setter
+    def all_tp_rank_num_tokens(self, value: Optional[List[int]]):
+        # for now, this is just an alias for all_rank_num_tokens
+        self.all_rank_num_tokens = value
 
     @property
     def seq_lens(self) -> Optional[torch.Tensor]:
