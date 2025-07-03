@@ -1420,6 +1420,27 @@ class W4A8_AWQ_LinearMethod(LinearMethodBase):
             copy_weight(module.pre_quant_scale, pre_quant_scale)
 
 
+class W4A8MXFP4MXFP8LinearMethod(W4A8MXFP4FP8LinearMethod):
+
+    def create_weights(self, module: Linear, in_features: int,
+                       out_features: int, bias: bool, dtype: torch.dtype):
+        super().create_weights(module, in_features, out_features, bias, dtype)
+        module.scale_one = torch.tensor([1.0], dtype=torch.float32).cuda()
+
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]):
+        # requires the swizzled block scales.
+        fp8_input, input_scales = torch.ops.trtllm.mxfp8_quantize(input, True)
+        output = torch.ops.trtllm.w4a8_mxfp4_fp8_gemm(fp8_input, module.weight,
+                                                      input_scales,
+                                                      module.weight_scale,
+                                                      module.scale_one,
+                                                      module.dtype)
+        if bias is not None:
+            output = output + bias
+        return output
+
+
 def get_quant_method(quant_config: Optional[QuantConfig] = None):
     if quant_config is None or not quant_config.layer_quant_mode.has_any_quant(
             exclude_kv_cache=True):
@@ -1443,6 +1464,8 @@ def get_quant_method(quant_config: Optional[QuantConfig] = None):
     if quant_config.layer_quant_mode.is_int4_weight_only_per_group(
     ) and quant_config.quant_algo == QuantAlgo.W4A8_AWQ:
         return W4A8_AWQ_LinearMethod()
+    if quant_config.layer_quant_mode.has_w4a8_mxfp4_mxfp8():
+        return W4A8MXFP4MXFP8LinearMethod()
     raise ValueError(f'unsupported quant mode: {quant_config.quant_mode}')
 
 
@@ -1532,6 +1555,8 @@ class Linear(nn.Module):
             return NVFP4LinearMethod()
         if quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8():
             return W4A8MXFP4FP8LinearMethod()
+        if quant_config.layer_quant_mode.has_w4a8_mxfp4_mxfp8():
+            return W4A8MXFP4MXFP8LinearMethod()
         raise ValueError(f'unsupported quant mode: {quant_config.quant_mode}')
 
     def create_weights(self):
