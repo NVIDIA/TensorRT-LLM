@@ -1161,7 +1161,11 @@ class VilaModel(PreTrainedModel):
         """
 
         num_context_requests, num_generation_requests = attn_metadata.num_contexts, attn_metadata.num_generations
-        mm_embed = kwargs.get("multi_modal_data", [])
+        multimodal_params = kwargs.get("multimodal_params", [])
+        mm_embed = [
+            multimodal_param.mm_embedding
+            for multimodal_param in multimodal_params
+        ]
 
         assert mm_embed == [] or len(
             mm_embed
