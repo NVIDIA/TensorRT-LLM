@@ -429,7 +429,6 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
         disagg_cfg.server_configs)
 
     logger.set_level(log_level)
-    os.environ['TRTLLM_USE_MPI_KVCACHE'] = "1"
     set_mpi_comm(sub_comm)
     logger.info(
         f"mpi_session is provided for LLM instance. Global MPI rank: {global_mpi_rank()}, sub-comm MPI rank: {mpi_rank()}"

@@ -18,6 +18,7 @@
 #include "tensorrt_llm/batch_manager/cacheTransBuffer.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include <gtest/gtest.h>
@@ -109,12 +110,15 @@ TEST_F(CacheTransBufferTest, TestPreAllocBufferSize)
         size_t sendBufferCount = tensorrt_llm::common::getEnvParallelCacheSend()
             ? tensorrt_llm::common::getEnvKVCacheSendMaxConcurrenceNum()
             : 1;
-        size_t bufferSizeBytes = CacheTransBufferManager::preAllocBufferSize(maxNumTokens)
-            * kvCacheSizePerToken(4, 2, 64, CacheType::kSELFKONLY);
+        size_t cacheSizeBytesPerToken = kvCacheSizePerToken(4, 2, 64, CacheType::kSELFKONLY);
+        tensorrt_llm::executor::CacheTransceiverConfig cacheTransceiverConfig{
+            tensorrt_llm::executor::CacheTransceiverConfig::BackendType::UCX, maxNumTokens};
+        size_t bufferSizeBytes
+            = CacheTransBufferManager::preAllocBufferSize(cacheSizeBytesPerToken, cacheTransceiverConfig);
         auto bufferId = mTransBufferManager->assignBufferIndexForSend();
         EXPECT_TRUE(bufferId.has_value());
         EXPECT_EQ(bufferId.value(), 0);
-        EXPECT_GT(bufferSizeBytes,
+        EXPECT_EQ(bufferSizeBytes,
             mTransBufferManager->getSendBuffer(bufferId)->getSizeInBytes() * (recvbufferCount + sendBufferCount));
         mTransBufferManager->freeBufferIndexForSend(bufferId);
         exit(testing::Test::HasFailure() ? 1 : 0);
@@ -146,12 +150,15 @@ TEST_F(CacheTransBufferTest, TestPreAllocBufferSize2)
         size_t sendBufferCount = tensorrt_llm::common::getEnvParallelCacheSend()
             ? tensorrt_llm::common::getEnvKVCacheSendMaxConcurrenceNum()
             : 1;
-        size_t bufferSizeBytes = CacheTransBufferManager::preAllocBufferSize(maxNumTokens)
-            * kvCacheSizePerToken(4, 2, 64, CacheType::kSELFKONLY);
+        size_t cacheSizeBytesPerToken = kvCacheSizePerToken(4, 2, 64, CacheType::kSELF);
+        tensorrt_llm::executor::CacheTransceiverConfig cacheTransceiverConfig{
+            tensorrt_llm::executor::CacheTransceiverConfig::BackendType::UCX, maxNumTokens};
+        size_t bufferSizeBytes
+            = CacheTransBufferManager::preAllocBufferSize(cacheSizeBytesPerToken, cacheTransceiverConfig);
         auto bufferId = mTransBufferManager->assignBufferIndexForSend();
         EXPECT_TRUE(bufferId.has_value());
         EXPECT_EQ(bufferId.value(), 0);
-        EXPECT_GT(bufferSizeBytes,
+        EXPECT_EQ(bufferSizeBytes,
             mTransBufferManager->getSendBuffer(bufferId)->getSizeInBytes() * (recvbufferCount + sendBufferCount));
         mTransBufferManager->freeBufferIndexForSend(bufferId);
         exit(testing::Test::HasFailure() ? 1 : 0);
