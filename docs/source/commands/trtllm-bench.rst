@@ -215,7 +215,7 @@ Run latency benchmark:
 
 .. code-block:: bash
 
-    trtllm-bench -m <model_name> --engine_dir <engine_path> --kv_cache_free_gpu_mem_fraction <kv_cache_free_gpu_mem_fraction> --dataset <dataset_path> --num_requests <num_requests> --warmup <warmup> --concurrency <concurrency> --beam_width <beam_width> --medusa_choices <medusa_choices> --report_json <report_json> --iteration_log <iteration_log>
+    trtllm-bench -m <model_name> latency --engine_dir <engine_path> --dataset <dataset_path>
 
 Dataset Preparation
 ------------------
@@ -336,7 +336,7 @@ trtllm-bench is designed to work with the ``prepare_dataset.py`` script, which g
 
 .. code-block:: bash
 
-    python prepare_dataset.py --tokenizer meta-llama/Meta-Llama-3.3-8B --stdout dataset --output benchmark_data.jsonl
+    python prepare_dataset.py --tokenizer <model_name> --stdout dataset --output benchmark_data.jsonl
 
 This workflow allows you to:
 
