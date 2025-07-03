@@ -91,6 +91,13 @@ def get_model_yaml_config(model_label: str,
                 }
             }
         },
+        # Deepseek default cases
+        {
+            'patterns': 'deepseek_r1',
+            'config': {
+                'enable_attention_dp': True,
+            }
+        },
         # Llama Nemotron models with attention_dp disabled to prevent hangs
         {
             'patterns': [

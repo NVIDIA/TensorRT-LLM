@@ -297,7 +297,7 @@ class FP8QDQLinearMethod(LinearMethodBase):
               bias: Optional[torch.Tensor]):
         cur_input_scale = module.input_scale
         if input.dtype != torch.float8_e4m3fn:
-            if module.input_scale is not None:
+            if module.input_scale is not None and not module.force_dynamic_quantization:
                 # Static quantization
                 qinput, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
                     input, module.input_scale)
@@ -589,7 +589,7 @@ class NVFP4LinearMethod(LinearMethodBase):
         assert len(weights) == 1
         weight_scale = weight_scale[0]
         # Swizzle weight scale
-        weight_scale = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+        weight_scale = torch.ops.trtllm.nvfp4_block_scale_interleave(
             weight_scale)
 
         copy_weight(module.input_scale, input_scale)
@@ -610,7 +610,7 @@ class NVFP4LinearMethod(LinearMethodBase):
             tp_mode=module.tp_mode)
         # Swizzle weight scales after concatenation
         weight_scale = torch.cat(weight_scales, 0)
-        weight_scale = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+        weight_scale = torch.ops.trtllm.nvfp4_block_scale_interleave(
             weight_scale)
         copy_weight(module.input_scale, input_scale)
         copy_weight(module.weight_scale, weight_scale)
@@ -633,7 +633,7 @@ class NVFP4LinearMethod(LinearMethodBase):
             tp_mode=module.tp_mode)
         # Swizzle weight scales after concatenation
         weight_scale = torch.cat(weight_scales, 0)
-        weight_scale = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+        weight_scale = torch.ops.trtllm.nvfp4_block_scale_interleave(
             weight_scale)
         copy_weight(module.input_scale, input_scale)
         copy_weight(module.weight_scale, weight_scale)
@@ -717,7 +717,7 @@ class W4A8MXFP4FP8LinearMethod(LinearMethodBase):
         assert len(weights) == 1
         weight_scale = weight_scale[0]
         # Swizzle weight scale
-        weight_scale = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+        weight_scale = torch.ops.trtllm.nvfp4_block_scale_interleave(
             weight_scale)
         copy_weight(module.weight_scale, weight_scale)
 
@@ -733,7 +733,7 @@ class W4A8MXFP4FP8LinearMethod(LinearMethodBase):
                                                tp_rank=module.tp_rank,
                                                tp_mode=module.tp_mode)
         weight_scale = torch.cat(weight_scale, 0)
-        weight_scale = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+        weight_scale = torch.ops.trtllm.nvfp4_block_scale_interleave(
             weight_scale)
         copy_weight(module.weight_scale, weight_scale)
 
@@ -750,7 +750,7 @@ class W4A8MXFP4FP8LinearMethod(LinearMethodBase):
                                                tp_mode=module.tp_mode)
         # Swizzle weight scales after concatenation
         weight_scale = torch.cat(weight_scale, 0)
-        weight_scale = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+        weight_scale = torch.ops.trtllm.nvfp4_block_scale_interleave(
             weight_scale)
         copy_weight(module.weight_scale, weight_scale)
 
@@ -926,6 +926,7 @@ class Linear(nn.Module):
         use_custom_cublas_mm: bool = False,
         lora: Optional[LoraLayer] = None,
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
+        force_dynamic_quantization: bool = False,
     ):
         from ..distributed import AllReduce
 
@@ -941,6 +942,7 @@ class Linear(nn.Module):
         self.tp_rank = self.mapping.tp_rank
         self.tp_mode = tensor_parallel_mode
         self.gather_output = gather_output
+        self.force_dynamic_quantization = force_dynamic_quantization
 
         local_in_features = in_features
         local_out_features = out_features

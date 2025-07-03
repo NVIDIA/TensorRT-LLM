@@ -57,15 +57,22 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_blackwell
-    def test_nvfp4_streaming(self):
+    @pytest.mark.parametrize("stream_interval", [4, 64],
+                             ids=["stream_interval_4", "stream_interval_64"])
+    def test_nvfp4_streaming(self, stream_interval):
         model_path = f"{llm_models_root()}/nvfp4-quantized/Meta-Llama-3.1-8B"
-        with LLM(model_path, stream_interval=4) as llm:
+
+        # When stream_interval < 32, hf incremental detokenization is used.
+        # When stream_interval >= 32, trtllm implemented incremental detokenization is used.
+        # The behavior is due to perf considerations, while both paths need to be tested.
+        with LLM(model_path, stream_interval=stream_interval) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm, streaming=True)
 
 
+@skip_post_blackwell  # TODO: remove this skip after this nvbug is fixed: https://nvbugspro.nvidia.com/bug/5295470
 class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
@@ -445,9 +452,35 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-3-1b-it"
     MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-1b-it/"
 
+    # NOTE: Disable block reuse for SWA window model.
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+
     def test_auto_dtype(self):
-        with LLM(self.MODEL_PATH) as llm:
+        with LLM(self.MODEL_PATH, kv_cache_config=self.kv_cache_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    def test_auto_dtype_vswa(self):
+        # NOTE: Test with VSWA kv cache config.
+        self.kv_cache_config.max_attention_window = [
+            512, 512, 512, 512, 512, 32768
+        ]  # Gemma3 1B attention window size pattern
+
+        with LLM(self.MODEL_PATH, kv_cache_config=self.kv_cache_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+        # chunked prefill case or more features
+        extra_llm_config = dict(
+            enable_chunked_prefill=True,
+            max_num_tokens=1024,
+        )
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=self.kv_cache_config,
+                 **extra_llm_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
 
@@ -510,8 +543,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                       overlap_scheduler, torch_compile):
         if torch_compile and mtp_nextn > 0:
             pytest.skip("https://nvbugs/5252313")
-        if torch_compile and attention_dp:
-            pytest.skip("https://nvbugs/5252559")
+
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
@@ -552,14 +584,13 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                             torch_compile):
         if torch_compile and mtp_nextn > 0:
             pytest.skip("https://nvbugs/5252313")
-        if torch_compile and attention_dp:
-            pytest.skip("https://nvbugs/5252559")
         if torch_compile and pp_size > 1:
             pytest.skip("PP with torch.compile is not supported yet.")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
-            enable_piecewise_cuda_graph=cuda_graph) if torch_compile else None
+            enable_piecewise_cuda_graph=cuda_graph
+            and not attention_dp) if torch_compile else None
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
@@ -596,8 +627,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                               overlap_scheduler, torch_compile):
         if torch_compile and mtp != "disable":
             pytest.skip("https://nvbugs/5252313")
-        if torch_compile and attention_dp:
-            pytest.skip("https://nvbugs/5252559")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
@@ -769,14 +798,13 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                     overlap_scheduler, torch_compile):
         if torch_compile and mtp_nextn > 0:
             pytest.skip("https://nvbugs/5252313")
-        if torch_compile and attention_dp:
-            pytest.skip("https://nvbugs/5252559")
         if torch_compile and pp_size > 1:
             pytest.skip("PP with torch.compile is not supported yet.")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
-            enable_piecewise_cuda_graph=cuda_graph) if torch_compile else None
+            enable_piecewise_cuda_graph=cuda_graph
+            and not attention_dp) if torch_compile else None
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
@@ -983,8 +1011,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                    torch_compile, mtp_nextn, moe_backend):
         if torch_compile and mtp_nextn > 0:
             pytest.skip("https://nvbugs/5252313")
-        if torch_compile and attention_dp:
-            pytest.skip("https://nvbugs/5252559")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
@@ -1042,16 +1068,16 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                          torch_compile, mtp_nextn, moe_backend):
         if torch_compile and mtp_nextn > 0:
             pytest.skip("https://nvbugs/5252313")
-        if torch_compile and attention_dp:
-            pytest.skip("https://nvbugs/5252559")
         if torch_compile and pp_size > 1:
             pytest.skip("PP with torch.compile is not supported yet.")
         if not attention_dp and (tp_size > 1 or ep_size > 1):
             pytest.skip("https://nvbugs/5336321")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
+        # Picewise Cuda Graph cannot be enabled for nvfp4 attention dp.
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
-            enable_piecewise_cuda_graph=cuda_graph) if torch_compile else None
+            enable_piecewise_cuda_graph=cuda_graph
+            and not attention_dp) if torch_compile else None
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
@@ -1739,6 +1765,7 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-235B-A22B"
 
     @skip_pre_hopper
+    @pytest.mark.skip_less_device(8)
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
         [(8, 1, 8, True, True, True), (8, 1, 8, False, True, True)],

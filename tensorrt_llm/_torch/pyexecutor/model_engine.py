@@ -980,6 +980,8 @@ class PyTorchModelEngine(ModelEngine):
             trust_remote_code=True,
             enable_min_latency=self.pytorch_backend_config.enable_min_latency,
             use_cuda_graph=self.pytorch_backend_config.use_cuda_graph,
+            force_dynamic_quantization=self.pytorch_backend_config.
+            force_dynamic_quantization,
             spec_config=self.spec_config,
             max_num_tokens=max_num_tokens,
             moe_max_num_tokens=moe_max_num_tokens,
@@ -2006,6 +2008,12 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata = self._set_up_spec_metadata(spec_resource_manager,
                                                        no_cache=kv_cache_manager
                                                        is None)
+            # attn_metadata now depends on spec_metadata since it determines the shape/content of spec_dec parameter Tensors
+            attn_metadata.update_spec_dec_param(
+                spec_metadata.spec_dec_mode.attention_need_spec_dec_mode(),
+                spec_metadata.is_spec_dec_tree,
+                spec_metadata.is_spec_dec_dynamic_tree,
+                spec_metadata.max_draft_tokens)
         else:
             spec_metadata = None
 

@@ -255,8 +255,7 @@ class MTPSampler(TorchSampler):
 
     def _draft_meet_max_token_stop_criteria(self, request: LlmRequest,
                                             num_tokens: int, beam_idx: int):
-        if self._meet_max_token_stop_criteria(request,
-                                              num_tokens + self.draft_len):
+        if self._meet_max_token_stop_criteria(request, num_tokens):
             request.state = LlmRequestState.GENERATION_COMPLETE
             request.set_finished_reason(FinishReason.LENGTH, beam_idx)
 
@@ -1137,6 +1136,8 @@ class MTPEagleWorker(MTPWorker):
                 hidden_states = mtp_layers[0](
                     embed_tokens=embed_tokens,
                     all_rank_num_tokens=spec_metadata.all_rank_num_tokens,
+                    all_rank_max_num_tokens=spec_metadata.
+                    all_rank_max_num_tokens,
                     **inputs)
                 start_ids_gen = (spec_metadata.batch_indices_cuda[:num_gens] *
                                  (self.mtp_num_modules + 1)).long()
@@ -1146,10 +1147,15 @@ class MTPEagleWorker(MTPWorker):
                 gather_ids = torch.concat(
                     [last_tokens_idx[:num_contexts], gather_ids_gen], dim=0)
             else:
-                hidden_states = mtp_layers[0](embed_tokens=embed_tokens,
-                                              all_rank_num_tokens=spec_metadata.
-                                              subseq_all_rank_num_tokens,
-                                              **inputs)
+                hidden_states = mtp_layers[0](
+                    embed_tokens=embed_tokens,
+                    all_rank_num_tokens=spec_metadata.
+                    subseq_all_rank_num_tokens,
+                    all_rank_max_num_tokens=max(
+                        spec_metadata.subseq_all_rank_num_tokens)
+                    if spec_metadata.subseq_all_rank_num_tokens is not None else
+                    None,
+                    **inputs)
                 # All of the seq_len are 1, use batch_indices_cuda as gather_ids
                 gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
             logits = mtp_layers[0].shared_head(hidden_states[gather_ids],
