@@ -2,6 +2,7 @@ import argparse
 
 import pandas as pd
 import torch
+import yaml
 from utils import load_expert_statistic
 
 
@@ -34,6 +35,7 @@ if __name__ == "__main__":
                         default=False,
                         action="store_true",
                         help="Report the load statistics per expert.")
+    parser.add_argument("--projection_eplb_config_path", type=str, default=None)
     args = parser.parse_args()
 
     meta_info, statistic = load_expert_statistic(args.expert_statistic_path)
@@ -46,6 +48,11 @@ if __name__ == "__main__":
         args.iter_stop = meta_info["iter_stop"]
     num_iters = args.iter_stop - args.iter_start
 
+    eplb_config = None
+    if args.projection_eplb_config_path is not None:
+        with open(args.projection_eplb_config_path, "r") as f:
+            eplb_config = yaml.safe_load(f)
+
     load_stats = {}
     for layer_idx in meta_info["layers"]:
         expert_token_count_iters = [
@@ -55,12 +62,30 @@ if __name__ == "__main__":
         expert_token_count_iters = torch.stack(expert_token_count_iters, dim=0)
         assert expert_token_count_iters.size(0) == num_iters
 
-        if args.per_expert:
-            load_iters = expert_token_count_iters
+        if eplb_config is not None:
+            num_slots = eplb_config["num_slots"]
+            ep_size = eplb_config["ep_size"]
+            layer_initial_global_assignments = eplb_config[
+                "initial_global_assignments"][layer_idx]
+            layer_initial_global_assignments = torch.tensor(
+                layer_initial_global_assignments)
+            expert_replica_count = layer_initial_global_assignments.bincount(
+                minlength=num_experts)
+            slot_token_count_iters = (
+                expert_token_count_iters /
+                expert_replica_count)[:, layer_initial_global_assignments]
         else:
-            load_iters = expert_token_count_iters.reshape(
-                num_iters, meta_info["ep_size"], -1).sum(dim=-1)
-        load_stats[layer_idx] = calculate_load_statistics(load_iters.float())
+            ep_size = meta_info["ep_size"]
+            slot_token_count_iters = expert_token_count_iters
+
+        if args.per_expert:
+            load_stats[layer_idx] = calculate_load_statistics(
+                slot_token_count_iters.float())
+        else:
+            rank_token_count_iters = slot_token_count_iters.reshape(
+                num_iters, ep_size, -1).sum(dim=-1)
+            load_stats[layer_idx] = calculate_load_statistics(
+                rank_token_count_iters.float())
 
     load_stats = pd.DataFrame(load_stats)
     load_stats["average"] = load_stats.mean(axis=1)

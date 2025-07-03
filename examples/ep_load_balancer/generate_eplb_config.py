@@ -102,6 +102,7 @@ if __name__ == "__main__":
 
     eplb_config = {
         "num_slots": args.num_slots,
+        "ep_size": args.ep_size,
         "initial_global_assignments": initial_global_assignments,
         "layer_updates_per_iter": args.layer_updates_per_iter,
     }
