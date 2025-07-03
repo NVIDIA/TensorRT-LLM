@@ -34,6 +34,12 @@ target_link_libraries(
   ${TRTLLM_PYBIND_MODULE}
   PUBLIC ${SHARED_TARGET} ${UNDEFINED_FLAG} ${NO_AS_NEEDED_FLAG}
          ${Python3_LIBRARIES} ${TORCH_LIBRARIES} torch_python)
+
+if(ENABLE_MULTI_DEVICE)
+  target_link_libraries(common_src PRIVATE ${MPI_C_LIBRARIES} ${NCCL_LIB}
+                                           CUDA::nvml)
+endif()
+
 target_compile_definitions(
   ${TRTLLM_PYBIND_MODULE} PUBLIC TRTLLM_PYBIND_MODULE=${TRTLLM_PYBIND_MODULE}
                                  PYBIND11_DETAILED_ERROR_MESSAGES=1)
