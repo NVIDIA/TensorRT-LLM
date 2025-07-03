@@ -337,29 +337,54 @@ class TestAssignReviewers(unittest.TestCase):
             "cpp/main.cpp", "cpp/utils.h", "docs/README.md", "unknown/file.txt"
         ]
 
-        modules = assign_reviewers.map_modules(changed_files, self.module_paths)
+        modules, unmapped_files = assign_reviewers.map_modules(
+            changed_files, self.module_paths)
 
         self.assertEqual(modules, {"Generic Runtime", "Documentation"})
+        self.assertEqual(unmapped_files, ["unknown/file.txt"])
 
     def test_gather_reviewers_function(self):
         """Test the pure gather_reviewers function"""
         modules = {"Generic Runtime", "Documentation"}
 
         # Test without exclusions
-        reviewers = assign_reviewers.gather_reviewers(modules,
-                                                      self.module_owners)
+        reviewers, modules_without_owners = assign_reviewers.gather_reviewers(
+            modules, self.module_owners)
         self.assertEqual(set(reviewers), {"user1", "user2", "user3", "user9"})
+        self.assertEqual(modules_without_owners, set())
 
         # Test with author exclusion
-        reviewers = assign_reviewers.gather_reviewers(modules,
-                                                      self.module_owners,
-                                                      pr_author="user1")
+        reviewers, modules_without_owners = assign_reviewers.gather_reviewers(
+            modules, self.module_owners, pr_author="user1")
         self.assertEqual(set(reviewers), {"user2", "user3", "user9"})
+        self.assertEqual(modules_without_owners, set())
 
         # Test with existing reviewers exclusion
-        reviewers = assign_reviewers.gather_reviewers(
+        reviewers, modules_without_owners = assign_reviewers.gather_reviewers(
             modules, self.module_owners, existing_reviewers={"user2", "user9"})
         self.assertEqual(set(reviewers), {"user1", "user3"})
+        self.assertEqual(modules_without_owners, set())
+
+    def test_modules_without_owners(self):
+        """Test modules that have no owners defined"""
+        modules = {"Generic Runtime", "NonExistent Module"}
+
+        reviewers, modules_without_owners = assign_reviewers.gather_reviewers(
+            modules, self.module_owners)
+
+        self.assertEqual(set(reviewers), {"user1", "user2", "user3"})
+        self.assertEqual(modules_without_owners, {"NonExistent Module"})
+
+    def test_all_files_unmapped(self):
+        """Test when all files are unmapped"""
+        changed_files = ["unmapped/file1.txt", "another/file2.py"]
+
+        modules, unmapped_files = assign_reviewers.map_modules(
+            changed_files, self.module_paths)
+
+        self.assertEqual(modules, set())
+        self.assertEqual(set(unmapped_files),
+                         {"unmapped/file1.txt", "another/file2.py"})
 
     @patch('assign_reviewers.load_json')
     @patch('subprocess.run')
