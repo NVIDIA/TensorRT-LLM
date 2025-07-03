@@ -4,10 +4,12 @@ End-to-end tests for assign_reviewers.py script.
 Tests various scenarios without requiring GitHub API access or tokens.
 """
 
+import io
 import os
 import subprocess
 import sys
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -332,36 +334,44 @@ class TestAssignReviewers(unittest.TestCase):
         self.assertEqual(cm.exception.code, 1)
 
     def test_map_modules_function(self):
-        """Test the pure map_modules function"""
+        """Test the pure get_modules_from_files function"""
         changed_files = [
             "cpp/main.cpp", "cpp/utils.h", "docs/README.md", "unknown/file.txt"
         ]
 
-        modules, unmapped_files = assign_reviewers.map_modules(
+        # Test the categorize_files function instead
+        codeowners_files, module_files, unmapped_files = assign_reviewers.categorize_files(
             changed_files, self.module_paths)
 
-        self.assertEqual(modules, {"Generic Runtime", "Documentation"})
+        # Verify categorization
+        self.assertEqual(module_files,
+                         ["cpp/main.cpp", "cpp/utils.h", "docs/README.md"])
         self.assertEqual(unmapped_files, ["unknown/file.txt"])
 
+        # Test get_modules_from_files
+        modules = assign_reviewers.get_modules_from_files(
+            module_files, self.module_paths)
+        self.assertEqual(modules, {"Generic Runtime", "Documentation"})
+
     def test_gather_reviewers_function(self):
-        """Test the pure gather_reviewers function"""
+        """Test the pure get_reviewers_for_modules function"""
         modules = {"Generic Runtime", "Documentation"}
 
         # Test without exclusions
-        reviewers, modules_without_owners = assign_reviewers.gather_reviewers(
+        reviewers, modules_without_owners = assign_reviewers.get_reviewers_for_modules(
             modules, self.module_owners)
         self.assertEqual(set(reviewers), {"user1", "user2", "user3", "user9"})
         self.assertEqual(modules_without_owners, set())
 
         # Test with author exclusion
-        reviewers, modules_without_owners = assign_reviewers.gather_reviewers(
+        reviewers, modules_without_owners = assign_reviewers.get_reviewers_for_modules(
             modules, self.module_owners, pr_author="user1")
         self.assertEqual(set(reviewers), {"user2", "user3", "user9"})
         self.assertEqual(modules_without_owners, set())
 
         # Test with existing reviewers exclusion
-        reviewers, modules_without_owners = assign_reviewers.gather_reviewers(
-            modules, self.module_owners, existing_reviewers={"user2", "user9"})
+        reviewers, modules_without_owners = assign_reviewers.get_reviewers_for_modules(
+            modules, self.module_owners, existing={"user2", "user9"})
         self.assertEqual(set(reviewers), {"user1", "user3"})
         self.assertEqual(modules_without_owners, set())
 
@@ -369,7 +379,7 @@ class TestAssignReviewers(unittest.TestCase):
         """Test modules that have no owners defined"""
         modules = {"Generic Runtime", "NonExistent Module"}
 
-        reviewers, modules_without_owners = assign_reviewers.gather_reviewers(
+        reviewers, modules_without_owners = assign_reviewers.get_reviewers_for_modules(
             modules, self.module_owners)
 
         self.assertEqual(set(reviewers), {"user1", "user2", "user3"})
@@ -379,10 +389,11 @@ class TestAssignReviewers(unittest.TestCase):
         """Test when all files are unmapped"""
         changed_files = ["unmapped/file1.txt", "another/file2.py"]
 
-        modules, unmapped_files = assign_reviewers.map_modules(
+        codeowners_files, module_files, unmapped_files = assign_reviewers.categorize_files(
             changed_files, self.module_paths)
 
-        self.assertEqual(modules, set())
+        self.assertEqual(codeowners_files, [])
+        self.assertEqual(module_files, [])
         self.assertEqual(set(unmapped_files),
                          {"unmapped/file1.txt", "another/file2.py"})
 
@@ -484,6 +495,51 @@ class TestAssignReviewers(unittest.TestCase):
         with self.assertRaises(KeyError):
             with patch('sys.argv', ['assign_reviewers.py']):
                 assign_reviewers.main()
+
+    @patch('assign_reviewers.load_json')
+    @patch('assign_reviewers.parse_codeowners')
+    @patch('subprocess.run')
+    def test_codeowners_coverage_handling(self, mock_run, mock_parse_codeowners,
+                                          mock_load_json):
+        """Test that files covered by CODEOWNERS are handled correctly"""
+        # Setup mocks
+        self.mock_changed_files = "tests/unittest/api_stability/test_llm_api.py\ncpp/file1.cpp\n"
+        self.mock_existing_users = ""
+        self.mock_existing_teams = ""
+        self.assign_reviewers_called = False
+
+        # Mock CODEOWNERS patterns
+        mock_parse_codeowners.return_value = [
+            ("/tests/unittest/api_stability/",
+             ["@NVIDIA/trt-llm-noncommitted-api-review-committee"]),
+            ("/tensorrt_llm/_torch", ["@NVIDIA/trt-llm-torch-devs"])
+        ]
+
+        mock_run.side_effect = self._mock_subprocess_run
+        mock_load_json.side_effect = lambda path: (
+            self.module_paths
+            if "module-paths" in str(path) else self.module_owners)
+
+        # Capture output
+        f = io.StringIO()
+        with redirect_stdout(f):
+            with patch('sys.argv', ['assign_reviewers.py']):
+                assign_reviewers.main()
+
+        output = f.getvalue()
+
+        # Verify reviewers assigned only for cpp file
+        self.assertTrue(self.assign_reviewers_called)
+        self.assertTrue(
+            all(r in ["user1", "user2", "user3"]
+                for r in self.assigned_reviewers))
+
+        # Verify CODEOWNERS messaging
+        self.assertIn("Files covered by CODEOWNERS:", output)
+        self.assertIn("tests/unittest/api_stability/test_llm_api.py", output)
+        self.assertIn("CODEOWNERS mechanism", output)
+        self.assertIn("Files covered by module-paths.json:", output)
+        self.assertIn("cpp/file1.cpp", output)
 
 
 if __name__ == "__main__":
