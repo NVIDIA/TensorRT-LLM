@@ -6,6 +6,7 @@ trtllm-bench is a comprehensive benchmarking tool for TensorRT-LLM engines. It p
 **Common Options for All Commands:**
 
 **Usage:**
+
 .. code-block:: bash
 
     trtllm-bench [OPTIONS] <subcommand> [OPTIONS]
@@ -31,6 +32,7 @@ build
 Build TensorRT-LLM engines optimized for benchmarking.
 
 **Usage:**
+
 .. code-block:: bash
 
     trtllm-bench -m <model_name> build [OPTIONS]
