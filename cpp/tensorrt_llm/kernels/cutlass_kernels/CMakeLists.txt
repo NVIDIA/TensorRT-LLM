@@ -210,38 +210,48 @@ if(USING_OSS_CUTLASS_FP4_GEMM)
   # add_instantiations(fp4_gemm_src ${INSTANTIATION_GENERATION_DIR}/fp4_gemm)
 endif()
 
-if(USING_OSS_CUTLASS_MOE_GEMM)
-  file(GLOB MOE_GEMM_SRC_CU "${CMAKE_CURRENT_SOURCE_DIR}/moe_gemm/*.cu")
-  set(MOE_GEMM_SRC_CU_LAUNCHER ${MOE_GEMM_SRC_CU})
-  list(FILTER MOE_GEMM_SRC_CU_LAUNCHER EXCLUDE REGEX ".*moe_gemm_kernels_.*")
-  list(FILTER MOE_GEMM_SRC_CU INCLUDE REGEX ".*moe_gemm_kernels_.*")
-  set(MOE_GEMM_SRC_CU_FP4 ${MOE_GEMM_SRC_CU})
-  list(FILTER MOE_GEMM_SRC_CU_FP4 INCLUDE REGEX ".*fp4.*")
-  list(FILTER MOE_GEMM_SRC_CU EXCLUDE REGEX ".*fp4.*")
-  set(MOE_GEMM_SRC_CU_FP8 ${MOE_GEMM_SRC_CU})
-  list(FILTER MOE_GEMM_SRC_CU_FP8 INCLUDE REGEX ".*fp8.*")
-  list(FILTER MOE_GEMM_SRC_CU EXCLUDE REGEX ".*fp8.*")
+# We always compile public MOE since some implementations only support public MOE
+file(GLOB MOE_GEMM_SRC_CU "${CMAKE_CURRENT_SOURCE_DIR}/moe_gemm/*.cu")
+set(MOE_GEMM_SRC_CU_LAUNCHER ${MOE_GEMM_SRC_CU})
+list(FILTER MOE_GEMM_SRC_CU_LAUNCHER EXCLUDE REGEX ".*moe_gemm_kernels_.*")
+list(FILTER MOE_GEMM_SRC_CU INCLUDE REGEX ".*moe_gemm_kernels_.*")
+set(MOE_GEMM_SRC_CU_FP4 ${MOE_GEMM_SRC_CU})
+list(FILTER MOE_GEMM_SRC_CU_FP4 INCLUDE REGEX ".*fp4.*")
+list(FILTER MOE_GEMM_SRC_CU EXCLUDE REGEX ".*fp4.*")
+set(MOE_GEMM_SRC_CU_FP8 ${MOE_GEMM_SRC_CU})
+list(FILTER MOE_GEMM_SRC_CU_FP8 INCLUDE REGEX ".*fp8.*")
+list(FILTER MOE_GEMM_SRC_CU EXCLUDE REGEX ".*fp8.*")
 
-  add_library(moe_gemm_src STATIC ${MOE_GEMM_SRC_CU} ${GROUPED_SRC_CPP})
+add_library(moe_gemm_src STATIC ${MOE_GEMM_SRC_CU} ${GROUPED_SRC_CPP})
+# Must be private
+target_compile_definitions(moe_gemm_src PRIVATE USING_OSS_CUTLASS_MOE_GEMM)
 
-  add_library(_moe_gemm_launcher OBJECT ${MOE_GEMM_SRC_CU_LAUNCHER})
-  add_cuda_architectures(_moe_gemm_launcher 89)
+add_library(_moe_gemm_launcher OBJECT ${MOE_GEMM_SRC_CU_LAUNCHER})
+add_cuda_architectures(_moe_gemm_launcher 89)
+# Must be private
+target_compile_definitions(_moe_gemm_launcher PRIVATE USING_OSS_CUTLASS_MOE_GEMM)
 
-  add_library(_moe_gemm_fp4 OBJECT ${MOE_GEMM_SRC_CU_FP4})
-  set_cuda_architectures(_moe_gemm_fp4 100f 120f)
-  process_target(_moe_gemm_fp4 false true)
+add_library(_moe_gemm_fp4 OBJECT ${MOE_GEMM_SRC_CU_FP4})
+set_cuda_architectures(_moe_gemm_fp4 100f 120f)
+process_target(_moe_gemm_fp4 false true)
+# Must be private
+target_compile_definitions(_moe_gemm_fp4 PRIVATE USING_OSS_CUTLASS_MOE_GEMM)
 
-  add_library(_moe_gemm_fp8 OBJECT ${MOE_GEMM_SRC_CU_FP8})
-  set_cuda_architectures(_moe_gemm_fp8 89 90 100f 120f)
-  process_target(_moe_gemm_fp8 true true)
+add_library(_moe_gemm_fp8 OBJECT ${MOE_GEMM_SRC_CU_FP8})
+set_cuda_architectures(_moe_gemm_fp8 89 90 100f 120f)
+process_target(_moe_gemm_fp8 true true)
+# Must be private
+target_compile_definitions(_moe_gemm_fp8 PRIVATE USING_OSS_CUTLASS_MOE_GEMM)
 
-  add_instantiations(moe_gemm_src ${INSTANTIATION_GENERATION_DIR}/gemm_grouped)
-  target_link_libraries(moe_gemm_src PRIVATE _moe_gemm_launcher _moe_gemm_fp4
-                                             _moe_gemm_fp8)
-  target_include_directories(
-    moe_gemm_src
-    PUBLIC ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include)
-endif()
+add_instantiations(moe_gemm_src ${INSTANTIATION_GENERATION_DIR}/gemm_grouped)
+target_link_libraries(moe_gemm_src PRIVATE _moe_gemm_launcher _moe_gemm_fp4
+                                            _moe_gemm_fp8)
+target_include_directories(
+  moe_gemm_src
+  PUBLIC ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include)
+
+
+
 
 if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
   add_library(

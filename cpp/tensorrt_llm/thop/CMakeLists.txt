@@ -28,6 +28,13 @@ else() # Windows
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4")
 endif()
 
+# Always builds against public MOE
+add_library(moe_util_op OBJECT moeUtilOp.cpp)
+target_compile_definitions(moe_util_op PRIVATE USING_OSS_CUTLASS_MOE_GEMM)
+set_property(TARGET moe_util_op PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_property(TARGET moe_util_op PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+target_link_libraries(moe_util_op PRIVATE moe_gemm_src)
+
 add_library(th_utils STATIC thUtils.cpp)
 set_property(TARGET th_utils PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET th_utils PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
@@ -66,7 +73,6 @@ add_library(
   logitsBitmaskOp.cpp
   mambaConv1dOp.cpp
   moeOp.cpp
-  moeUtilOp.cpp
   moeCommOp.cpp
   moeLoadBalanceOp.cpp
   fp8BlockScaleMoe.cpp
@@ -88,7 +94,7 @@ add_library(
   loraOp.cpp
   finegrained_mixed_dtype_gemm_thop.cpp)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(th_common PRIVATE ${TORCH_LIBRARIES} th_utils
+target_link_libraries(th_common PRIVATE ${TORCH_LIBRARIES} th_utils moe_util_op
                                         ${Python3_LIBRARIES} ${SHARED_TARGET})
 
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
