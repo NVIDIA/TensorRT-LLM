@@ -936,9 +936,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         parameters += [
                             'enableFailFast': enableFailFast,
                             'testFilter': testFilterJson,
-                            'dockerImage': LLM_DOCKER_IMAGE,
-                            'wheelDockerImagePy310': LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE,
-                            'wheelDockerImagePy312': LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
+                            'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
+                            'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
+                            'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
                             'globalVars': globalVarsJson,
                         ]
 
