@@ -591,6 +591,30 @@ class BaseLLM:
                                              self.llm_build_stats))
         self._engine_dir, self._hf_model_dir = model_loader()
 
+    def _construct_checkpoint_loader(self) -> "BaseCheckpointLoader":
+        from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
+            BaseCheckpointLoader
+        from tensorrt_llm._torch.models.modeling_utils import (
+            get_checkpoint_weight_loader, get_config_loader)
+
+        checkpoint_loader = self.args.checkpoint_loader
+        if checkpoint_loader is None:
+            checkpoint_weight_loader = get_checkpoint_weight_loader(
+                self.args.checkpoint_format)()
+            config_loader = get_config_loader(self.args.checkpoint_format)()
+
+            checkpoint_loader = BaseCheckpointLoader.get(
+                checkpoint_format=self.args.checkpoint_format,
+                weight_loader=checkpoint_weight_loader,
+                weight_mapper=None,
+                config_loader=config_loader)
+        else:
+            checkpoint_loader.ensure_fully_initialized()
+
+        checkpoint_loader.weight_loader.ensure_mapping(
+            self.args.parallel_config.to_mapping())
+        return checkpoint_loader
+
     @property
     def _on_trt_backend(self) -> bool:
         return isinstance(self.args, TrtLlmArgs)
@@ -952,6 +976,9 @@ class _TorchLLM(BaseLLM):
             hf_model_dir=self._hf_model_dir,
             max_input_len=self.args.max_input_len,
             max_seq_len=max_seq_len)
+
+        self._executor_config.checkpoint_loader = self._construct_checkpoint_loader(
+        )
 
         # TODO: revisit gather_context_logits
         return_logits = self.args.gather_generation_logits
