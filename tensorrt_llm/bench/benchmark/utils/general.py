@@ -14,7 +14,6 @@ from tensorrt_llm.bench.build.build import (get_benchmark_engine_settings,
                                             get_model_config)
 from tensorrt_llm.bench.dataclasses.general import (DatasetMetadata,
                                                     InferenceRequest)
-from tensorrt_llm.llmapi.llm_args import CudaGraphConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -146,41 +145,17 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
             )
             max_num_tokens = dataset_metadata.max_isl + max_batch_size
 
-    # We need to check if the cuda_graph_config is provided in the extra_llm_api_options file.
-    # It can be provided with settings or as None (to disable cuda graphs)
-    # We need to check for both its value and existence.
-    cuda_graph_config = llm_args_dict.get("cuda_graph_config", None)
-    cuda_graph_in_options = "cuda_graph_config" in llm_args_dict
-    cuda_graph_batch_sizes = None
-    cuda_mbs_default = CudaGraphConfig.model_fields["max_batch_size"].default
-    # If it's not None, we need to check if the max_batch_sizes is provided.
-    if cuda_graph_config is not None:
-        cuda_graph_batch_sizes = \
-            llm_args_dict["cuda_graph_config"].get("batch_sizes", None)
-
-    # We now have two cases:
-    # 1. cuda_graph_config is provided in the extra_llm_api_options file and is None (disabled)
-    if cuda_graph_in_options and cuda_graph_config is None:
-        logger.warning(
-            "'cuda_graph_config' is forced to be disabled in the extra_llm_api_options file."
-        )
-        cuda_graph_config = None
-    # 2. cuda_graph_config is provided in the extra_llm_api_options or is not provided (enabled)
-    else:
-        cuda_graph_config = {
-            "padding_enabled":
-            True,
-            "max_batch_size":
-            max_batch_size
-            if cuda_graph_batch_sizes is None else cuda_mbs_default,
-        }
+    cuda_graph_config = {
+        "padding_enabled": True,
+        "max_batch_size": max_batch_size
+    }
 
     pyt_options = {
         "cuda_graph_config": cuda_graph_config,
         "kv_cache_dtype": kv_cache_dtype,
     }
-    backend = params.get("backend", "pytorch")
 
+    backend = params.get("backend", "pytorch")
     return {
         "sw_version": version("tensorrt_llm"),
         "model_path": model_path,
