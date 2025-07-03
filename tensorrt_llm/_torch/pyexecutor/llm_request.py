@@ -1,3 +1,4 @@
+import copy
 from dataclasses import dataclass
 from typing import List, Optional, Union
 
@@ -310,9 +311,14 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             mpi_world_rank=0) -> tensorrt_llm.bindings.executor.Response | None:
         result, is_final = super().create_serialized_result(
             use_fast_logits, mpi_world_rank)
+        py_result = None
+        if response:
+            py_result = copy.copy(self.py_result)
+            if self.py_result._log_probs:
+                self.py_result._log_probs = LogProbStorage()
         return LlmResponse(
             request_id=self.py_request_id,
-            result=LlmResult(result, self.py_result, is_final),
+            result=LlmResult(result, py_result, is_final),
             client_id=self.py_client_id) if len(result) > 0 else None
 
     @property

@@ -322,7 +322,7 @@ class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
         for is_thop in [True, False]:
             mtpworker.is_thop = is_thop
             # TODO: add unit tests for relaxed acceptance
-            accepted_tokens, num_accepted_tokens = mtpworker.sample_and_accept_draft_tokens(
+            accepted_tokens, num_accepted_tokens, log_probs = mtpworker.sample_and_accept_draft_tokens(
                 None, logits, spec_metadata, attn_metadata)
 
             torch.testing.assert_close(num_accepted_tokens,

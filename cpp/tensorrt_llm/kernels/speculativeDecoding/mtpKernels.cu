@@ -182,7 +182,7 @@ template void invokeMTPPrepareDrafterInputs<__nv_bfloat16>(MTPPrepareDrafterInpu
 
 template <typename T, int BLOCK_SIZE>
 __global__ void mtpGreedySampling(int const numMTPModules, int const batchSize, int const numContextRequest,
-    int const vocabSize, T const* logits, int* targetTokens)
+    int const vocabSize, T const* logits, int* targetTokens, float* targetTokenLogprobs)
 {
     /*
         In a batch of request: context request (at the beginning) + generation requests
@@ -196,6 +196,7 @@ __global__ void mtpGreedySampling(int const numMTPModules, int const batchSize, 
 
     __shared__ T maxValueCache[BLOCK_SIZE];
     __shared__ int maxValueIndexCache[BLOCK_SIZE];
+    __shared__ float sumExpCache[BLOCK_SIZE];
 
     int const bid = static_cast<int>(blockIdx.x);
     int const tid = static_cast<int>(threadIdx.x);
@@ -206,19 +207,23 @@ __global__ void mtpGreedySampling(int const numMTPModules, int const batchSize, 
 
     T tmpMaxValue = curLogitsPtr[0];
     int tmpMaxValueIndex = 0;
+    float tmpNorm = 0.0f;
     int ii = tid;
     while (ii < vocabSize)
     {
         if (curLogitsPtr[ii] >= tmpMaxValue)
         {
+            tmpNorm *= expf(tmpMaxValue - curLogitsPtr[ii]);
             // Find the first top-1
             tmpMaxValueIndex = (curLogitsPtr[ii] == tmpMaxValue) ? min(tmpMaxValueIndex, ii) : ii;
             tmpMaxValue = curLogitsPtr[ii];
         }
+        tmpNorm += expf(curLogitsPtr[ii] - tmpMaxValue);
         ii += blockDim.x;
     }
     maxValueCache[tid] = tmpMaxValue;
     maxValueIndexCache[tid] = tmpMaxValueIndex;
+    sumExpCache[tid] = tmpNorm;
 
     __syncthreads();
 
@@ -230,11 +235,17 @@ __global__ void mtpGreedySampling(int const numMTPModules, int const batchSize, 
         {
             if (maxValueCache[tid] <= maxValueCache[tid + ii])
             {
+                sumExpCache[tid] *= expf(maxValueCache[tid] - maxValueCache[tid + ii]);
                 maxValueIndexCache[tid] = (maxValueCache[tid] == maxValueCache[tid + ii])
                     ? min(maxValueIndexCache[tid], maxValueIndexCache[tid + ii])
                     : maxValueIndexCache[tid + ii];
                 maxValueCache[tid] = maxValueCache[tid + ii];
             }
+            else
+            {
+                sumExpCache[tid + ii] *= expf(maxValueCache[tid + ii] - maxValueCache[tid]);
+            }
+            sumExpCache[tid] += sumExpCache[tid + ii];
         }
         __syncthreads();
         ii /= 2;
@@ -243,11 +254,12 @@ __global__ void mtpGreedySampling(int const numMTPModules, int const batchSize, 
     if (tid == 0)
     {
         targetTokens[bid] = maxValueIndexCache[tid];
+        targetTokenLogprobs[bid] = logf(1.0f / sumExpCache[tid]);
     }
 }
 
 __global__ void mtpAcceptDraftToken(int const numMTPModules, int const batchSize, int const numContextRequest,
-    int const* draftTokens, int* targetTokens, int* acceptedTokens, int* numAcceptedTokens)
+    int const* draftTokens, int* targetTokens, float* targetTokenLogprobs, int* acceptedTokens, int* numAcceptedTokens, float* logprobs)
 {
     /*
         In a batch of request: context request (at the beginning) + generation requests
@@ -303,9 +315,11 @@ __global__ void mtpAcceptDraftToken(int const numMTPModules, int const batchSize
 
         // Write back to acceptedTokens
         auto curAcceptedTokensPtr = acceptedTokens + tid * (numMTPModules + 1);
+        auto curLogprobsPtr = logprobs + tid * (numMTPModules + 1);
         for (int jj = 0; jj < curAcceptedLen; jj++)
         {
             curAcceptedTokensPtr[jj] = targetTokens[targetTokensStartOffset + jj];
+            curLogprobsPtr[jj] = targetTokenLogprobs[targetTokensStartOffset + jj];
         }
     }
 }
@@ -319,12 +333,12 @@ void invokeMTPSampleAndAcceptDraftTokens(MTPSampleAndAcceptDraftTokensParam& par
     int greedyBlockSize = min(BLOCK_SIZE, params.vocabSize);
 
     mtpGreedySampling<T, BLOCK_SIZE><<<numLogits, greedyBlockSize, 0, stream>>>(params.numMTPModules, params.batchSize,
-        params.numContextRequest, params.vocabSize, reinterpret_cast<T*>(params.logits), params.targetTokens);
+        params.numContextRequest, params.vocabSize, reinterpret_cast<T*>(params.logits), params.targetTokens, params.targetTokenLogprobs);
     sync_check_cuda_error(stream);
 
     mtpAcceptDraftToken<<<divUp(params.batchSize, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(params.numMTPModules,
-        params.batchSize, params.numContextRequest, params.draftTokens, reinterpret_cast<int*>(params.targetTokens),
-        params.acceptedTokens, params.numAcceptedTokens);
+        params.batchSize, params.numContextRequest, params.draftTokens, reinterpret_cast<int*>(params.targetTokens), reinterpret_cast<float*>(params.targetTokenLogprobs),
+        params.acceptedTokens, params.numAcceptedTokens, params.logprobs);
     sync_check_cuda_error(stream);
 }
 
