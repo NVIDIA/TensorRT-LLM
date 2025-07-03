@@ -31,6 +31,9 @@ layernorm_type_map = {i.name: i.value for i in LayerNormType}
 layernorm_position_map = {i.name: i.value for i in LayerNormPositionType}
 mlp_type_map = {i.name: i.value for i in MLPType}
 
+# Constants for specific model configurations
+ECLAIR_RADIO_MAX_POSITION_EMBEDDINGS = 20000
+
 
 def copy_args_to_component_config(component_config, args):
     for arg in vars(args):
@@ -772,6 +775,10 @@ def parse_bart_config(args, hf_model):
     if not (args.nougat or args.eclair_radio):
         encoder_config = parse_bart_config_by_component(config, "encoder", args)
     decoder_config = parse_bart_config_by_component(config, "decoder", args)
+
+    # Override n_positions for eclair_radio model
+    if args.eclair_radio:
+        decoder_config.n_positions = ECLAIR_RADIO_MAX_POSITION_EMBEDDINGS
 
     return encoder_config, decoder_config
 
@@ -1599,7 +1606,7 @@ def get_model(args):
                                                  "model.safetensors"),
                                              strict=False)
             model.decoder.model.decoder.embed_positions = MBartLearnedPositionalEmbedding(
-                20_000, d_model)
+                ECLAIR_RADIO_MAX_POSITION_EMBEDDINGS, d_model)
             model.decoder.model.decoder.embed_positions.weight.data.zero_()
             model.decoder.model.decoder.embed_positions.weight.requires_grad_(
                 True)
@@ -1717,26 +1724,16 @@ def convert_checkpoint(args):
         encoder_convert_args = dict(params=model.state_dict(),
                                     component="encoder")
     tllm_decoder_config = {
-        'architecture':
-        "DecoderModel",
-        'dtype':
-        args.dtype,
-        'logits_dtype':
-        decoder_config.logits_dtype,
-        'num_hidden_layers':
-        decoder_config.n_layer,
-        'num_attention_heads':
-        decoder_config.n_head,
-        'hidden_size':
-        decoder_config.hidden_size,
-        'norm_epsilon':
-        decoder_config.layernorm_eps,
-        'vocab_size':
-        decoder_config.vocab_size,
-        'position_embedding_type':
-        decoder_config.position_embedding_type,
-        'hidden_act':
-        decoder_config.hidden_act,
+        'architecture': "DecoderModel",
+        'dtype': args.dtype,
+        'logits_dtype': decoder_config.logits_dtype,
+        'num_hidden_layers': decoder_config.n_layer,
+        'num_attention_heads': decoder_config.n_head,
+        'hidden_size': decoder_config.hidden_size,
+        'norm_epsilon': decoder_config.layernorm_eps,
+        'vocab_size': decoder_config.vocab_size,
+        'position_embedding_type': decoder_config.position_embedding_type,
+        'hidden_act': decoder_config.hidden_act,
         'quantization': {
             'quant_algo': quant_algo,
             'kv_cache_quant_algo': kv_cache_quant_algo,
@@ -1746,64 +1743,35 @@ def convert_checkpoint(args):
             'tp_size': args.tp_size,
             'pp_size': args.pp_size,
         },
-        'use_parallel_embedding':
-        args.use_parallel_embedding,
-        'embedding_sharding_dim':
-        args.embedding_sharding_dim,
-        'max_position_embeddings':
-        decoder_config.n_positions if not args.eclair_radio else 20000,
-        'head_size':
-        decoder_config.head_size,
-        'has_position_embedding':
-        decoder_config.has_position_embedding,
-        'layernorm_type':
-        decoder_config.layernorm_type,
-        'has_attention_qkvo_bias':
-        decoder_config.has_attention_qkvo_bias,
-        'has_mlp_bias':
-        decoder_config.has_mlp_bias,
-        'has_model_final_layernorm':
-        decoder_config.has_model_final_layernorm,
-        'has_embedding_layernorm':
-        decoder_config.has_embedding_layernorm,
-        'has_embedding_scale':
-        decoder_config.has_embedding_scale,
-        'intermediate_size':
-        decoder_config.ffn_hidden_size,
-        'q_scaling':
-        decoder_config.q_scaling,
-        'layernorm_position':
-        decoder_config.layernorm_position,
-        'mlp_type':
-        decoder_config.mlp_type,
-        'relative_attention':
-        decoder_config.relative_attention,
-        'max_distance':
-        decoder_config.max_distance,
-        'num_buckets':
-        decoder_config.num_buckets,
-        'model_type':
-        decoder_config.model_type,
-        'rescale_before_lm_head':
-        decoder_config.rescale_before_lm_head,
-        'encoder_hidden_size':
-        decoder_config.encoder_hidden_size,
-        'encoder_num_heads':
-        decoder_config.encoder_num_heads,
-        'encoder_head_size':
-        decoder_config.encoder_head_size,
-        'skip_cross_kv':
-        args.skip_cross_kv,
-        'use_implicit_relative_attention':
-        args.use_implicit_relative_attention,
-        'decoder_start_token_id':
-        decoder_config.decoder_start_token_id,
-        'eos_token_id':
-        decoder_config.eos_token_id,
-        'bos_token_id':
-        decoder_config.bos_token_id,
-        'pad_token_id':
-        decoder_config.pad_token_id,
+        'use_parallel_embedding': args.use_parallel_embedding,
+        'embedding_sharding_dim': args.embedding_sharding_dim,
+        'max_position_embeddings': decoder_config.n_positions,
+        'head_size': decoder_config.head_size,
+        'has_position_embedding': decoder_config.has_position_embedding,
+        'layernorm_type': decoder_config.layernorm_type,
+        'has_attention_qkvo_bias': decoder_config.has_attention_qkvo_bias,
+        'has_mlp_bias': decoder_config.has_mlp_bias,
+        'has_model_final_layernorm': decoder_config.has_model_final_layernorm,
+        'has_embedding_layernorm': decoder_config.has_embedding_layernorm,
+        'has_embedding_scale': decoder_config.has_embedding_scale,
+        'intermediate_size': decoder_config.ffn_hidden_size,
+        'q_scaling': decoder_config.q_scaling,
+        'layernorm_position': decoder_config.layernorm_position,
+        'mlp_type': decoder_config.mlp_type,
+        'relative_attention': decoder_config.relative_attention,
+        'max_distance': decoder_config.max_distance,
+        'num_buckets': decoder_config.num_buckets,
+        'model_type': decoder_config.model_type,
+        'rescale_before_lm_head': decoder_config.rescale_before_lm_head,
+        'encoder_hidden_size': decoder_config.encoder_hidden_size,
+        'encoder_num_heads': decoder_config.encoder_num_heads,
+        'encoder_head_size': decoder_config.encoder_head_size,
+        'skip_cross_kv': args.skip_cross_kv,
+        'use_implicit_relative_attention': args.use_implicit_relative_attention,
+        'decoder_start_token_id': decoder_config.decoder_start_token_id,
+        'eos_token_id': decoder_config.eos_token_id,
+        'bos_token_id': decoder_config.bos_token_id,
+        'pad_token_id': decoder_config.pad_token_id,
     }
     for additional_setting in additional_settings:
         if hasattr(decoder_config, additional_setting):
