@@ -64,7 +64,7 @@ public:
         T const* attention_input = nullptr;
         T const* qkv_bias = nullptr;
         // Attention mask input, which has shape of [batch_size, attention_mask_stride].
-        bool const* attention_mask = nullptr;    // @B: How is this different from attention_packed_mask?
+        bool const* attention_mask = nullptr;
         // Rotary inv_freq cache buffer to avoid re-computing.
         float const* rotary_inv_freq = nullptr;
         // Rotary cos sin cache buffer to avoid re-computing.

@@ -14,7 +14,7 @@ from ..utils import (Fp4QuantizedTensor, compute_swizzled_sf_shape,
 from .interface import (AttentionBackend, AttentionInputType, AttentionMask,
                         AttentionMetadata, KVCacheParams, MLAParams,
                         PositionalEmbeddingParams, PredefinedAttentionMask,
-                        RopeParams)
+                        CustomAttentionMask, RopeParams)
 
 
 @dataclass(kw_only=True, init=False)
@@ -256,6 +256,7 @@ class TrtllmAttentionWrapper:
         is_fused_qkv: bool = True,
         update_kv_cache: bool = True,
         attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
+        custom_mask: Optional[torch.Tensor] = None,
     ):
         """
         Run the attention operation.
@@ -267,6 +268,7 @@ class TrtllmAttentionWrapper:
             is_fused_qkv (bool): Whether QKV tensor is provided.
             update_kv_cache (bool): Whether KV cache is updated.
             attention_mask (AttentionMask): Attention mask. See definition of AttentionMask for accepted types. Defaults to predefined causal mask.
+            custom_mask (Optional[torch.Tensor]): Custom attention mask. Must be provided if attention_mask is CustomAttentionMask.CUSTOM.
         Returns:
             torch.Tensor with shape (num_tokens, num_heads * head_dim).
         """
@@ -299,13 +301,15 @@ class TrtllmAttentionWrapper:
             assert self.context_lengths.shape[0] == batch_size
             assert self.host_context_lengths.shape[0] == batch_size
             assert self.host_request_types.shape[0] == batch_size
-
             if attention_mask == PredefinedAttentionMask.CAUSAL:
                 mask_type = AttentionMaskType.causal
             elif attention_mask == PredefinedAttentionMask.FULL:
                 mask_type = AttentionMaskType.padding
+            elif attention_mask == CustomAttentionMask.CUSTOM:
+                assert custom_mask is not None, "custom_mask must be provided if attention_mask is of type CustomAttentionMask.CUSTOM."
+                mask_type = AttentionMaskType.custom_mask
             else:
-                raise ValueError("Unexpected attention mask type")
+                raise ValueError("Unexpected attention mask type.")
         else:
             assert is_fused_qkv
             if self.attention_input_type == AttentionInputType.context_only:
@@ -435,6 +439,7 @@ class TrtllmAttentionWrapper:
             self.mla_context_paged_kv,
             self.mla_context_kv_cache_block_offsets,
             self.attention_chunk_size,
+            custom_mask,
         )
 
         # reset the planned states (especially tensors) to avoid memory leak
@@ -828,6 +833,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         out_scale_sf: Optional[torch.Tensor] = None,
         *,
         attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
+        custom_mask: Optional[torch.Tensor] = None,
         attention_input_type: AttentionInputType = AttentionInputType.mixed,
         latent_cache: Optional[torch.Tensor] = None,
         q_pe: Optional[torch.Tensor] = None,

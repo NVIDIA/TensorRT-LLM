@@ -276,6 +276,7 @@ struct TllmGenFmhaRunnerParams
     // set the attention mask type
     TllmGenFmhaRunnerParams& setAttentionMaskType(std::int8_t maskType)
     {
+        printf("[trtllmGenKernels::fmha::fmhaRunnerParams] setAttentionMaskType: %d\n", maskType);
         // maskType is the enum of tensorrt_llm::kernels::ContextAttentionMaskType
         // convert ContextAttentionMaskType to TrtllmGenAttentionMaskType
         switch (maskType)

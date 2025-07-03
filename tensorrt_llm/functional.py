@@ -5534,6 +5534,8 @@ def gpt_attention(
         The tensor produced by that layer.
     '''
 
+    assert False, "Intentional error."
+
     assert host_request_types is not None
     assert (alibi_slopes is not None) == (position_embedding_type.is_alibi())
     assert (mrope_rotary_cos_sin
