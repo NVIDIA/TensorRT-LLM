@@ -1198,31 +1198,27 @@ class PyTorchModelEngine(ModelEngine):
             past_seen_token_num = begin_compute
             num_cached_tokens_per_seq.append(past_seen_token_num)
 
-            if request.multimodal_embedding is not None:
+            multimodal_embedding = request.multimodal_embedding
+            if multimodal_embedding is not None:
                 # TODO: Visit later once we have the SharedTensor.
-                request.multimodal_embedding = torch.tensor(
-                    request.multimodal_embedding,
-                    dtype=torch.float32,
-                    pin_memory=True)
-                request.multimodal_embedding = request.multimodal_embedding.to(
+                multimodal_embedding = multimodal_embedding.pin_memory(
+                ) if multimodal_embedding.device == 'cpu' else multimodal_embedding
+                multimodal_embedding = multimodal_embedding.to(
                     'cuda', non_blocking=True)
 
-            if request.mrope_rotary_cos_sin is not None:
+            mrope_rotary_cos_sin = request.mrope_rotary_cos_sin
+            if mrope_rotary_cos_sin is not None:
                 # TODO: Visit later once we have the SharedTensor.
-                mrope_rotary_cos_sin_tensor = torch.tensor(
-                    request.mrope_rotary_cos_sin,
-                    dtype=torch.float32,
-                    pin_memory=True)
-                mrope_rotary_cos_sin_tensor = mrope_rotary_cos_sin_tensor.to(
+                mrope_rotary_cos_sin = mrope_rotary_cos_sin.pin_memory(
+                ) if mrope_rotary_cos_sin.device == 'cpu' else mrope_rotary_cos_sin
+                mrope_rotary_cos_sin = mrope_rotary_cos_sin.to(
                     'cuda', non_blocking=True)
-            else:
-                mrope_rotary_cos_sin_tensor = None
+
             # Create MultimodalParams from request data
             multimodal_params = MultimodalParams(
-                multimodal_embedding=request.multimodal_embedding,
-                mrope_config={
-                    'mrope_rotary_cos_sin': mrope_rotary_cos_sin_tensor
-                } if mrope_rotary_cos_sin_tensor is not None else None,
+                multimodal_embedding=multimodal_embedding,
+                mrope_config={'mrope_rotary_cos_sin': mrope_rotary_cos_sin}
+                if mrope_rotary_cos_sin is not None else {},
                 multimodal_data=request.py_multimodal_data,
             )
 

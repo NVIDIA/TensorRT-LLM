@@ -568,11 +568,8 @@ class Qwen2VLModelBase(PreTrainedModel):
         mrope_config = {}
 
         if len(multimodal_params) > 0:
-            assert len(
-                multimodal_params
-            ) == num_context_requests, f"Number of multimodal tensors ({len(multimodal_params)}) should be equal to number of context requests ({num_context_requests}) in the batch."
-
-            mm_embeds = self.mm_encoder.forward(multimodal_params)
+            mm_embeds = self.mm_encoder.forward(
+                multimodal_params[:num_context_requests])
             mrope_config = self._parse_mrope_config(multimodal_params)
 
         input_ids, input_embeds = fuse_input_embeds(self.llm.model.embed_tokens,
