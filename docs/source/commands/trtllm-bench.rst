@@ -273,7 +273,65 @@ trtllm-bench is designed to work with the ``prepare_dataset.py`` script, which g
    * - ``token_unif_dist``
      - Generate synthetic datasets with uniform token distribution
 
+**Dataset Subcommand Options:**
+
+.. list-table::
+   :widths: 20 80
+   :header-rows: 1
+
+   * - Option
+     - Description
+   * - ``--input``
+     - Input dataset file or directory (required)
+   * - ``--max-input-length``
+     - Maximum input sequence length (default: 2048)
+   * - ``--max-output-length``
+     - Maximum output sequence length (default: 512)
+   * - ``--num-samples``
+     - Number of samples to process (default: all)
+   * - ``--format``
+     - Input format: json, jsonl, csv, or txt (default: auto-detect)
+
+**Token Normal Distribution Subcommand Options:**
+
+.. list-table::
+   :widths: 20 80
+   :header-rows: 1
+
+   * - Option
+     - Description
+   * - ``--num-requests``
+     - Number of requests to be generated (required)
+   * - ``--input-mean``
+     - Normal distribution mean for input tokens (required)
+   * - ``--input-stdev``
+     - Normal distribution standard deviation for input tokens (required)
+   * - ``--output-mean``
+     - Normal distribution mean for output tokens (required)
+   * - ``--output-stdev``
+     - Normal distribution standard deviation for output tokens (required)
+
+**Token Uniform Distribution Subcommand Options:**
+
+.. list-table::
+   :widths: 20 80
+   :header-rows: 1
+
+   * - Option
+     - Description
+   * - ``--num-requests``
+     - Number of requests to be generated (required)
+   * - ``--input-min``
+     - Uniform distribution minimum for input tokens (required)
+   * - ``--input-max``
+     - Uniform distribution maximum for input tokens (required)
+   * - ``--output-min``
+     - Uniform distribution minimum for output tokens (required)
+   * - ``--output-max``
+     - Uniform distribution maximum for output tokens (required)
+
 **Usage Example:**
+
 .. code-block:: bash
 
     python prepare_dataset.py --tokenizer meta-llama/Meta-Llama-3.3-8B --stdout dataset --output benchmark_data.jsonl
