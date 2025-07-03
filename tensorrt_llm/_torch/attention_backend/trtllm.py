@@ -591,6 +591,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        # Set a default value, as max_num_sequences is not always set.
+        if self.max_num_sequences is None:
+            self.max_num_sequences = self.max_num_requests
+
         self.prompt_lens_cuda = torch.empty(
             (self.max_num_sequences, ),
             device='cuda',
