@@ -22,7 +22,6 @@ from ..bindings.executor import (BatchingType, CapacitySchedulerPolicy,
                                  KvCacheRetentionConfig, SchedulerConfig)
 # yapf: enable
 from ..builder import BuildConfig, Engine, build
-from ..llmapi.llm_args import TrtLlmArgs
 from ..logger import logger
 from ..mapping import Mapping
 from ..models.automodel import MODEL_MAP, AutoConfig, AutoModelForCausalLM
@@ -30,7 +29,7 @@ from ..models.modeling_utils import PretrainedConfig, QuantAlgo, QuantConfig
 from ..module import Module
 from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
                           get_build_cache_config_from_env)
-from .llm_args import (CalibConfig, CudaGraphConfig, DraftTargetDecodingConfig,
+from .llm_args import (CudaGraphConfig, DraftTargetDecodingConfig,
                        EagleDecodingConfig, KvCacheConfig, LlmArgs,
                        LookaheadDecodingConfig, MedusaDecodingConfig,
                        MTPDecodingConfig, NGramDecodingConfig, _ModelFormatKind,
@@ -103,6 +102,9 @@ class ModelLoader:
                  llm_args: LlmArgs,
                  workspace: Optional[str | tempfile.TemporaryDirectory] = None,
                  llm_build_stats: Optional["LlmBuildStats"] = None):
+        from .._tensorrt_engine.llm_args import \
+            TrtLlmArgs  # avoid circular import
+
         self.llm_args = llm_args
         self._workspace = workspace or tempfile.TemporaryDirectory()
         self.llm_build_stats = llm_build_stats or LlmBuildStats()
@@ -881,7 +883,6 @@ __all__ = [
     'BuildConfig',
     'BuildCacheConfig',
     'QuantConfig',
-    'CalibConfig',
     'CudaGraphConfig',
     'KvCacheConfig',
     'CachedModelLoader',
