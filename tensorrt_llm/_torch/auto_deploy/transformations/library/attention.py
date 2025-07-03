@@ -11,7 +11,7 @@ from ...utils.node_utils import is_op
 from .._graph import canonicalize_graph
 
 
-def match_repeat_kv(gm: GraphModule) -> GraphModule:
+def match_repeat_kv(gm: GraphModule) -> None:
     """
     Match and replace the repeat_kv pattern in fx graphs.
 
@@ -36,13 +36,11 @@ def match_repeat_kv(gm: GraphModule) -> GraphModule:
 
     # Clean up the graph if we made any replacements
     if num_kv_patterns:
-        gm = canonicalize_graph(gm)
+        canonicalize_graph(gm)
     ad_logger.info(f"Found {num_kv_patterns} repeat_kv patterns")
 
-    return gm
 
-
-def match_eager_attention(gm: GraphModule) -> GraphModule:
+def match_eager_attention(gm: GraphModule) -> None:
     """
     Match and replace the eager attention pattern in fx graphs.
 
@@ -68,12 +66,11 @@ def match_eager_attention(gm: GraphModule) -> GraphModule:
 
     # Clean up the graph if we made any replacements
     if num_eager_patterns:
-        gm = canonicalize_graph(gm)
+        canonicalize_graph(gm)
     ad_logger.info(f"Found {num_eager_patterns} eager attention patterns")
-    return gm
 
 
-def match_grouped_attention(gm: GraphModule) -> GraphModule:
+def match_grouped_attention(gm: GraphModule) -> None:
     """
     Match and replace the grouped attention pattern in fx graphs.
 
@@ -101,12 +98,11 @@ def match_grouped_attention(gm: GraphModule) -> GraphModule:
 
     # Clean up the graph if we made any replacements
     if num_grouped_patterns:
-        gm = canonicalize_graph(gm)
+        canonicalize_graph(gm)
     ad_logger.info(f"Found {num_grouped_patterns} grouped attention patterns")
-    return gm
 
 
-def match_causal_attn_mask(gm: GraphModule) -> GraphModule:
+def match_causal_attn_mask(gm: GraphModule) -> None:
     """
     Match attention operations with causal attention masks and optimize them.
 
@@ -174,9 +170,8 @@ def match_causal_attn_mask(gm: GraphModule) -> GraphModule:
 
     # Clean up the graph if we made any replacements
     if num_causal_patterns:
-        gm = canonicalize_graph(gm)
+        canonicalize_graph(gm)
     ad_logger.info(f"Found {num_causal_patterns} causal mask attention patterns")
-    return gm
 
 
 def _match_repeat_kv_pattern(reshape_node: Node) -> Optional[Dict[str, Node]]:
@@ -748,7 +743,7 @@ def _has_triu_ancestor(node: Node, offset: int = 1, depth: int = 0, max_depth: i
     return False
 
 
-def match_attention_layout(gm: GraphModule, attention_op: Type[AttentionDescriptor]) -> GraphModule:
+def match_attention_layout(gm: GraphModule, attention_op: Type[AttentionDescriptor]) -> None:
     """
     Match and transform attention operations to match the layout expected by the attention backend.
 
@@ -832,9 +827,7 @@ def match_attention_layout(gm: GraphModule, attention_op: Type[AttentionDescript
 
     # Clean up the graph if we made any replacements
     if num_bsnd_patterns:
-        gm = canonicalize_graph(gm)
+        canonicalize_graph(gm)
         ad_logger.debug(f"Transformed graph for bsnd layout: {gm}")
 
     ad_logger.info(f"Found and matched {num_bsnd_patterns} attention layouts")
-
-    return gm

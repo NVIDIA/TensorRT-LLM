@@ -218,7 +218,7 @@ def piecewise_optimizer(
     input_num_tokens: Union[int | torch.SymInt],
     cuda_graph_batch_sizes: Sequence[int],
     graph_pool_handle: tuple[int, int],
-) -> GraphModule:
+) -> None:
     graph_pool_handle = torch.cuda.graph_pool_handle()
     graph = gm.graph
 
@@ -261,5 +261,3 @@ def piecewise_optimizer(
         exclude_modules_id,
         graph_pool_handle,
     ).run(*example_inputs)
-
-    return gm

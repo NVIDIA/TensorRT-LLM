@@ -81,7 +81,7 @@ def _insert_quantized_linear(
     node.kwargs = {**node.kwargs, **scales}
 
 
-def quantize(gm: GraphModule, quant_config: Dict[str, Any]):
+def quantize(gm: GraphModule, quant_config: Dict[str, Any]) -> None:
     """Quantize the GraphModule and replace linear with quantized linear."""
     # extract info from quant_config
     is_quant_graph = is_quantized_graph(gm)
@@ -91,7 +91,7 @@ def quantize(gm: GraphModule, quant_config: Dict[str, Any]):
     # no quantization to do
     if not (is_quant_graph or quant_config):
         ad_logger.info("No quantization to do.")
-        return gm
+        return
 
     # tracking quantized linears in the graph
     quantized_nodes: Dict[str, int] = defaultdict(lambda: 0)
@@ -112,9 +112,7 @@ def quantize(gm: GraphModule, quant_config: Dict[str, Any]):
     if is_quant_graph:
         remove_output_quantizers(gm)
 
-    gm = canonicalize_graph(gm)
+    canonicalize_graph(gm)
     for quant_algo in quantized_nodes:
         ad_logger.info(f"Found {quantized_nodes[quant_algo]} {quant_algo} quantized nodes.")
     ad_logger.debug("After quantization: " + str(gm))
-
-    return gm

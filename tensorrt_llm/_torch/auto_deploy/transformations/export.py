@@ -245,8 +245,6 @@ def add_missing_load_hooks(gm: fx.GraphModule, model: nn.Module) -> fx.GraphModu
     assert not (bool(hooks)), f"""Mismatch in names of exported and source modules with hooks.
         The following module names were not found in exported module {list(hooks.keys())}"""
 
-    return gm
-
 
 def add_load_hook_for_aliased_params(gm: fx.GraphModule, model: nn.Module):
     """
@@ -269,9 +267,6 @@ def add_load_hook_for_aliased_params(gm: fx.GraphModule, model: nn.Module):
 
     # Filter to only groups with multiple aliases
     aliased_groups = [names for names in param_to_names.values() if len(names) > 1]
-
-    if not aliased_groups:
-        return gm  # No aliases to handle
 
     def find_valid_param_value(
         state_dict: Dict[str, torch.Tensor], param_names: List[str]

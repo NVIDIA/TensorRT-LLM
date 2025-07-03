@@ -44,13 +44,12 @@ class HFWrapper(nn.Module):
         return self.model(x)[0]
 
 
-def _joint_transform(gm: GraphModule) -> GraphModule:
-    gm = match_repeat_kv(gm)
-    gm = match_eager_attention(gm)
-    gm = match_grouped_attention(gm)
-    gm = match_causal_attn_mask(gm)
-    gm = match_attention_layout(gm, MockAttentionDescriptor())
-    return gm
+def _joint_transform(gm: GraphModule) -> None:
+    match_repeat_kv(gm)
+    match_eager_attention(gm)
+    match_grouped_attention(gm)
+    match_causal_attn_mask(gm)
+    match_attention_layout(gm, MockAttentionDescriptor())
 
 
 @pytest.mark.parametrize(

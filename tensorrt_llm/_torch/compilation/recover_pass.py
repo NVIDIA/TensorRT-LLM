@@ -6,7 +6,7 @@ from torch.fx import GraphModule
 from .utils import get_arg, is_call_function
 
 
-def recover_pass(gm: GraphModule):
+def recover_pass(gm: GraphModule) -> None:
     # Unfuse specific op to make the fusion pass can work properly
     graph = gm.graph
     nodes_to_remove = []
@@ -37,4 +37,3 @@ def recover_pass(gm: GraphModule):
         graph.erase_node(node)
 
     gm.recompile()
-    return gm

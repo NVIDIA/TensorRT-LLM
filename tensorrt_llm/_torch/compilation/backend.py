@@ -81,7 +81,7 @@ class Backend:
         self,
         gm: GraphModule,
         example_inputs: List[torch.Tensor],
-    ):
+    ) -> None:
         graph = gm.graph
         for custom_pass in self.custom_passes:
             self.match_count.append(custom_pass.apply(graph))
@@ -104,7 +104,7 @@ class Backend:
         elif self.enable_inductor:
             return compile_fx(gm, example_inputs)
         else:
-            return gm
+            return
 
     def __call__(self, gm: GraphModule,
                  example_inputs: List[torch.Tensor]) -> callable:
@@ -113,7 +113,7 @@ class Backend:
             logger.warning(
                 "Bypassing torch.compile optimization and fallback to eager execution!"
             )
-            return gm
+            return
 
         for node in gm.graph.nodes:
             if node.op == "placeholder":

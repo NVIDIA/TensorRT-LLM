@@ -41,10 +41,9 @@ print(PatternPrettyPrinter.run(pattern))
 torch._dynamo.mark_dynamic(x, 0)
 
 
-def print_aten(gm: GraphModule, _):
+def print_aten(gm: GraphModule, _) -> None:
     print("asdas", type(gm))
     gm.graph.print_tabular()
-    return gm
 
 
 func = torch.compile(source_pattern, backend=print_aten)

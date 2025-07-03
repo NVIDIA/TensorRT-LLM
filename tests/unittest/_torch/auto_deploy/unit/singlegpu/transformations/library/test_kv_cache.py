@@ -137,13 +137,11 @@ def test_sdpa_with_kv_cache(dtype, attn_descriptor, gqa_config):
     cache_config = CacheConfig()
 
     # Get input node(s)
-    gm_transformed = update_in_out_nodes(gm, cm)
+    update_in_out_nodes(gm, cm)
 
     # Apply the transformation
-    gm_transformed = insert_cached_attention(
-        gm_transformed, cm, attn_descriptor=attn_descriptor, cache_config=cache_config
-    )
-    gm_transformed.to("cuda")
+    insert_cached_attention(gm, cm, attn_descriptor=attn_descriptor, cache_config=cache_config)
+    gm.to("cuda")
     cm.initialize_caches()
 
     # Helper function to call the model with proper sequence nesting
@@ -152,7 +150,7 @@ def test_sdpa_with_kv_cache(dtype, attn_descriptor, gqa_config):
         cm.info.nest_sequences(x)
 
         # Use the cm.args as is - it already contains the correct position_ids
-        y = gm_transformed(*cm.args)
+        y = gm(*cm.args)
 
         # Unnest the output sequences
         return torch.stack(cm.info.unnest_sequences(y))
@@ -187,6 +185,6 @@ def test_sdpa_with_kv_cache(dtype, attn_descriptor, gqa_config):
     assert all_close(y_model, y_with_cache, atol=atol, rtol=rtol)
 
     # Test 4: Exportability of the transformed model
-    torch_export(gm_transformed, args=cm.args)
-    exported_gm = torch_export_to_gm(gm_transformed, args=cm.args)
+    torch_export(gm, args=cm.args)
+    exported_gm = torch_export_to_gm(gm, args=cm.args)
     assert exported_gm is not None
