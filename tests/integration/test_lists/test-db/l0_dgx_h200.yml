@@ -89,6 +89,7 @@ l0_dgx_h200:
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding_4gpus[llguidance]
   - test_e2e.py::test_trtllm_bench_llmapi_launch[pytorch_backend-llama-v3-llama3-8b]
   - test_e2e.py::test_trtllm_bench_mgmn
+  - unittest/_torch/multi_gpu -m "post_merge" TIMEOUT (90)
 - condition:
     ranges:
       system_gpu_count:

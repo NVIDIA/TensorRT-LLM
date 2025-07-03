@@ -1905,11 +1905,14 @@ class TorchLlmArgs(BaseLlmArgs):
             extra_resource_managers=self.extra_resource_managers,
             use_cuda_graph=bool(self.cuda_graph_config is not None),
             cuda_graph_batch_sizes=self.cuda_graph_config.batch_sizes
-            if self.cuda_graph_config else None,
+            if self.cuda_graph_config else
+            CudaGraphConfig.model_fields['batch_sizes'].default,
             cuda_graph_max_batch_size=self.cuda_graph_config.max_batch_size
-            if self.cuda_graph_config else 0,
+            if self.cuda_graph_config else
+            CudaGraphConfig.model_fields['max_batch_size'].default,
             cuda_graph_padding_enabled=self.cuda_graph_config.padding_enabled
-            if self.cuda_graph_config else False,
+            if self.cuda_graph_config else
+            CudaGraphConfig.model_fields['padding_enabled'].default,
             disable_overlap_scheduler=self.disable_overlap_scheduler,
             moe_max_num_tokens=self.moe_max_num_tokens,
             moe_load_balancer=self.moe_load_balancer,
@@ -1923,15 +1926,18 @@ class TorchLlmArgs(BaseLlmArgs):
             print_iter_log=self.print_iter_log,
             torch_compile_enabled=bool(self.torch_compile_config is not None),
             torch_compile_fullgraph=self.torch_compile_config.enable_fullgraph
-            if self.torch_compile_config is not None else True,
+            if self.torch_compile_config is not None else
+            TorchCompileConfig.model_fields['enable_fullgraph'].default,
             torch_compile_inductor_enabled=self.torch_compile_config.
-            enable_inductor if self.torch_compile_config is not None else False,
+            enable_inductor if self.torch_compile_config is not None else
+            TorchCompileConfig.model_fields['enable_inductor'].default,
             torch_compile_piecewise_cuda_graph=self.torch_compile_config.
             enable_piecewise_cuda_graph
-            if self.torch_compile_config is not None else False,
+            if self.torch_compile_config is not None else TorchCompileConfig.
+            model_fields['enable_piecewise_cuda_graph'].default,
             torch_compile_enable_userbuffers=self.torch_compile_config.
-            enable_userbuffers
-            if self.torch_compile_config is not None else True,
+            enable_userbuffers if self.torch_compile_config is not None else
+            TorchCompileConfig.model_fields['enable_userbuffers'].default,
             autotuner_enabled=self.autotuner_enabled,
             enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
             load_format=self.load_format,

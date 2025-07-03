@@ -25,6 +25,7 @@ LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
 ExecutorRequest = tllm_executor.Request
 ExecutorResponse = tllm_executor.Response
 ExecutorSamplingConfig = tllm_executor.SamplingConfig
+FinishReason = tllm_executor.FinishReason
 
 REQUEST_TYPE_MAPPING = {
     tllm_executor.RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION:
@@ -318,6 +319,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
     @property
     def is_dummy(self):
         return self.is_attention_dp_dummy or self.is_cuda_graph_dummy or self.is_dummy_request
+
+    def finish_by(self, reason: FinishReason, beam: int) -> None:
+        """CPP finish by reason does not support beam_width > 1"""
+        self.state = LlmRequestState.GENERATION_COMPLETE
+        self.set_finished_reason(reason, beam)
 
 
 def convert_wordlist(word_list) -> List[List[int]]:

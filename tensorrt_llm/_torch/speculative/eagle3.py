@@ -472,12 +472,14 @@ class Eagle3OneModelWorker(nn.Module):
                 Draft token ids. Flattened.
         '''
 
-        draft_tokens = torch.argmax(logits, dim=-1).type(torch.int32)
+        draft_tokens = torch.argmax(logits, dim=-1)
 
         # Apply d2t (offsets between draft model dictionary and main model dictionary).
         if hasattr(draft_model.model,
                    "d2t") and draft_model.model.d2t is not None:
             draft_tokens = draft_model.model.d2t[draft_tokens] + draft_tokens
+
+        draft_tokens = draft_tokens.type(torch.int32)
 
         return draft_tokens
 

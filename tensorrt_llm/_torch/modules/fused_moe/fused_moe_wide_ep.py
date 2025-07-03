@@ -794,6 +794,8 @@ class WideEPMoE(MoE):
                         router_logits,
                         all_rank_num_tokens=all_rank_num_tokens_list[idx_chunk]
                         if self.use_dp else None,
+                        all_rank_max_num_tokens=all_rank_max_num_tokens_list[
+                            idx_chunk] if self.use_dp else None,
                         repeating_info=(is_first_call, is_last_call))
 
                 outputs_list.append(outputs)
