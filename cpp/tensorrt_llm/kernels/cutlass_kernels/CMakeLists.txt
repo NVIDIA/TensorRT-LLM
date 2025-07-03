@@ -204,6 +204,12 @@ function(process_target target_name enable_hopper enable_blackwell)
       target_compile_definitions(${target_name}
                                  PRIVATE COMPILE_BLACKWELL_TMA_GROUPED_GEMMS)
     endif()
+    if("120" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
+      target_compile_definitions(${target_name}
+                                 PRIVATE COMPILE_BLACKWELL_SM120_TMA_GEMMS)
+      target_compile_definitions(
+        ${target_name} PRIVATE COMPILE_BLACKWELL_SM120_TMA_GROUPED_GEMMS)
+    endif()
   endif()
 
   # Suppress GCC note: the ABI for passing parameters with 64-byte alignment has
