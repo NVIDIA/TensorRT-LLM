@@ -1539,8 +1539,9 @@ class PyExecutor:
                     ResourceManagerType.SEQ_SLOT_MANAGER,
                     ResourceManagerType.SPEC_RESOURCE_MANAGER,
                     ResourceManagerType.DRAFT_KV_CACHE_MANAGER):
-                if (resource_mgr_type in self.resource_manager.resource_managers and
-                    self.resource_manager.resource_managers[resource_mgr_type] is not None):
+                if (resource_mgr_type in self.resource_manager.resource_managers
+                        and self.resource_manager.
+                        resource_managers[resource_mgr_type] is not None):
                     self.resource_manager.resource_managers[
                         resource_mgr_type].prepare_resources(
                             disagg_gen_init_to_prepare)
