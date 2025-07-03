@@ -64,7 +64,7 @@ public:
         T const* attention_input = nullptr;
         T const* qkv_bias = nullptr;
         // Attention mask input, which has shape of [batch_size, attention_mask_stride].
-        bool const* attention_mask = nullptr;
+        bool const* attention_mask = nullptr;    // @B: How is this different from attention_packed_mask?
         // Rotary inv_freq cache buffer to avoid re-computing.
         float const* rotary_inv_freq = nullptr;
         // Rotary cos sin cache buffer to avoid re-computing.
@@ -113,7 +113,7 @@ public:
     {
     public:
         // Attention packed mask input (used by context FMHA).
-        uint32_t const* attention_packed_mask = nullptr;
+        uint32_t const* attention_packed_mask = nullptr;    // @B: We need to fill this.
         kernels::KVBlockArray::DataType* host_block_offsets = nullptr;
         int32_t batch_size = 0;
         float2 const* mrope_rotary_cos_sin = nullptr;
@@ -194,7 +194,7 @@ public:
         int32_t const* mrope_position_deltas = nullptr;
 
         // optional when speculative decoding is used.
-        bool const* spec_decoding_mask = nullptr;
+        bool const* spec_decoding_mask = nullptr;    // @B: Can we follow how this is used?
         int32_t const* spec_decoding_packed_mask = nullptr;
         int32_t const* spec_decoding_position_offsets = nullptr;
         int32_t const* spec_decoding_generation_lengths = nullptr;
