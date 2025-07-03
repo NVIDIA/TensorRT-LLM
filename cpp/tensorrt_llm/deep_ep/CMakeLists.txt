@@ -54,7 +54,8 @@ set(DEEP_EP_SOURCE_DIR ${deep_ep_download_SOURCE_DIR})
 set(DEEP_EP_PYTHON_DEST ${CMAKE_CURRENT_BINARY_DIR}/python/deep_ep)
 file(REMOVE_RECURSE ${DEEP_EP_PYTHON_DEST})
 file(MAKE_DIRECTORY ${DEEP_EP_PYTHON_DEST})
-file(COPY ${DEEP_EP_SOURCE_DIR}/LICENSE DESTINATION ${DEEP_EP_PYTHON_DEST})
+configure_file(${DEEP_EP_SOURCE_DIR}/LICENSE ${DEEP_EP_PYTHON_DEST}/LICENSE
+               COPYONLY)
 set(_files __init__.py buffer.py utils.py)
 foreach(_f IN LISTS _files)
   set(_src "${DEEP_EP_SOURCE_DIR}/deep_ep/${_f}")
@@ -68,19 +69,22 @@ foreach(_f IN LISTS _files)
     "# Adapted from https://github.com/deepseek-ai/DeepEP/blob/${DEEP_EP_COMMIT}/deep_ep/${_f}\n"
   )
   file(WRITE "${_dst}" "${_content}")
+  set_property(
+    DIRECTORY
+    APPEND
+    PROPERTY CMAKE_CONFIGURE_DEPENDS ${_src})
 endforeach()
 
 # Delete stale nvshmem on patch update
 set(NVSHMEM_STAMP_FILE ${CMAKE_CURRENT_BINARY_DIR}/nvshmem_stamp.txt)
-file(COPY ${DEEP_EP_SOURCE_DIR}/third-party/nvshmem.patch
-     DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
-file(SHA256 ${CMAKE_CURRENT_BINARY_DIR}/nvshmem.patch NVSHMEM_PATCH_HASH)
+file(SHA256 ${DEEP_EP_SOURCE_DIR}/third-party/nvshmem.patch NVSHMEM_PATCH_HASH)
 file(SHA256 ${CMAKE_CURRENT_SOURCE_DIR}/nvshmem_fast_build.patch
      NVSHMEM_PATCH_2_HASH)
 set(NVSHMEM_STAMP_CONTENT "${NVSHMEM_URL_HASH}")
-string(APPEND NVSHMEM_STAMP_CONTENT " patch ${NVSHMEM_PATCH_HASH}")
-string(APPEND NVSHMEM_STAMP_CONTENT " TRANSPORT_VERSION_MAJOR 103")
-string(APPEND NVSHMEM_STAMP_CONTENT " patch ${NVSHMEM_PATCH_2_HASH}")
+string(APPEND NVSHMEM_STAMP_CONTENT " PATCH_COMMAND v1")
+string(APPEND NVSHMEM_STAMP_CONTENT " ${NVSHMEM_PATCH_HASH}")
+string(APPEND NVSHMEM_STAMP_CONTENT " 103")
+string(APPEND NVSHMEM_STAMP_CONTENT " ${NVSHMEM_PATCH_2_HASH}")
 set(OLD_NVSHMEM_STAMP_CONTENT "")
 if(EXISTS ${NVSHMEM_STAMP_FILE})
   file(READ ${NVSHMEM_STAMP_FILE} OLD_NVSHMEM_STAMP_CONTENT)
@@ -89,6 +93,11 @@ if(NOT OLD_NVSHMEM_STAMP_CONTENT STREQUAL NVSHMEM_STAMP_CONTENT)
   file(REMOVE_RECURSE ${CMAKE_CURRENT_BINARY_DIR}/nvshmem_project-prefix)
   file(WRITE ${NVSHMEM_STAMP_FILE} "${NVSHMEM_STAMP_CONTENT}")
 endif()
+set_property(
+  DIRECTORY APPEND
+  PROPERTY CMAKE_CONFIGURE_DEPENDS
+           ${DEEP_EP_SOURCE_DIR}/third-party/nvshmem.patch
+           ${CMAKE_CURRENT_SOURCE_DIR}/nvshmem_fast_build.patch)
 
 # Add NVSHMEM
 # ===========
@@ -120,7 +129,7 @@ ExternalProject_Add(
   URL file://${CMAKE_CURRENT_SOURCE_DIR}/nvshmem_src_3.2.5-1.txz
   URL_HASH ${NVSHMEM_URL_HASH}
   PATCH_COMMAND patch -p1 --forward --batch -i
-                ${CMAKE_CURRENT_BINARY_DIR}/nvshmem.patch
+                ${DEEP_EP_SOURCE_DIR}/third-party/nvshmem.patch
   COMMAND sed "s/TRANSPORT_VERSION_MAJOR 3/TRANSPORT_VERSION_MAJOR 103/" -i
           src/CMakeLists.txt
   COMMAND patch -p1 --forward --batch -i
