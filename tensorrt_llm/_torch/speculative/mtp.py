@@ -304,7 +304,7 @@ class MTPSampler(TorchSampler):
             self._request_common_handling(req, next_draft_tokens_list)
 
     def sample_async(self, scheduled_requests: ScheduledRequests,
-                     outputs) -> SampleStateMTP:
+                     outputs: dict[str, torch.Tensor]) -> SampleStateMTP:
         # new_tokens_device: accepted tokens, device tensor, shape: batch_size, nextn + 1
         # new_tokens_lens_device: accepted lengths, device tensor, shape: batch_size
         # next_draft_tokens_device: predicted draft tokens, device tensor, shape: batch_size, nextn
@@ -316,8 +316,10 @@ class MTPSampler(TorchSampler):
 
         o_new_tokens = outputs['new_tokens'][:len(requests)]
         o_new_tokens_lens = outputs['new_tokens_lens'][:len(requests)]
-        o_next_draft_tokens = outputs['next_draft_tokens'][:len(requests)]
-        o_next_new_tokens = outputs['next_new_tokens'][:len(requests)]
+        o_next_draft_tokens = outputs['next_draft_tokens'][:len(requests)].to(
+            dtype=torch.int, non_blocking=True)
+        o_next_new_tokens = outputs['next_new_tokens'][:len(requests)].to(
+            dtype=torch.int, non_blocking=True)
 
         new_tokens = self.store.new_tokens
         next_new_tokens = self.store.next_new_tokens
