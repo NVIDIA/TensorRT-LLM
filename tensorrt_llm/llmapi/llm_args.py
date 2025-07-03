@@ -1400,22 +1400,6 @@ class BaseLlmArgs(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def validate_checkpoint_format(self):
-        if self.checkpoint_format is not None and self.checkpoint_loader is not None:
-            logger.warning(
-                "checkpoint_format and checkpoint_loader are both provided, "
-                "checkpoint_loader will be ignored.")
-            self.checkpoint_loader = None
-
-        if self.checkpoint_format is None and self.checkpoint_loader is None:
-            logger.warning(
-                "checkpoint_format and checkpoint_loader are both not provided, "
-                "checkpoint_format will be set to HF.")
-            self.checkpoint_format = "HF"
-
-        return self
-
-    @model_validator(mode="after")
     def validate_lora_config_consistency(self):
         if self.lora_config:
             if self.max_lora_rank is not None:
@@ -1856,6 +1840,22 @@ class TorchLlmArgs(BaseLlmArgs):
         if self.stream_interval <= 0:
             raise ValueError(
                 f"stream_interval must be positive, got {self.stream_interval}")
+        return self
+
+    @model_validator(mode="after")
+    def validate_checkpoint_format(self):
+        if self.checkpoint_format is not None and self.checkpoint_loader is not None:
+            logger.warning(
+                "checkpoint_format and checkpoint_loader are both provided, "
+                "checkpoint_loader will be ignored.")
+            self.checkpoint_loader = None
+
+        if self.checkpoint_format is None and self.checkpoint_loader is None:
+            logger.warning(
+                "checkpoint_format and checkpoint_loader are both not provided, "
+                "checkpoint_format will be set to HF.")
+            self.checkpoint_format = "HF"
+
         return self
 
     @staticmethod
