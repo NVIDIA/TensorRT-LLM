@@ -12,7 +12,7 @@ from ...distributed import allgather, reducescatter
 from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
 from ...utils import (EventType, Fp4QuantizedTensor, disable_fp4_allgather,
-                      swizzle_sf, unswizzle_sf)
+                      swizzle_sf)
 from .deep_ep_utils import buffer_pool, deep_ep_installed
 from .interface import MoE
 from .moe_load_balancer import get_moe_load_balancer
@@ -535,19 +535,13 @@ class WideEPMoE(MoE):
         quant_scales = self.quant_scales
 
         if self.use_postquant_alltoall:
+            if x_sf is not None and self.has_nvfp4:
+                assert not x_is_sf_swizzled, "Fp4 scaling factor should not be swizzled before Alltoall"
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
                 x, x_sf = self.alltoall_postquant_dispatch(
-                    x,
-                    x_sf,
-                    x_row,
-                    x_col,
-                    alltoall_info,
-                    is_sf_swizzle=x_is_sf_swizzled)
+                    x, x_sf, alltoall_info)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
                 if x_sf is not None:
-                    if self.has_nvfp4 and x_is_sf_swizzled:
-                        x_sf = unswizzle_sf(x_sf, x_row, x_col,
-                                            self.scaling_vector_size)
                     # Adapter between `x_sf` and DeepEP
                     # TODO: remove the adapter by adding dtype support to DeepEP
                     x_sf_dtype = x_sf.dtype
@@ -869,22 +863,13 @@ class WideEPMoE(MoE):
 
         return x, token_selected_slots, token_final_scales, gathered_local_statistic_tensor, alltoall_info
 
-    def alltoall_postquant_dispatch(self,
-                                    x: torch.Tensor,
-                                    x_sf: torch.Tensor,
-                                    x_row: int,
-                                    x_col: int,
-                                    alltoall_info: MoEAlltoallInfo,
-                                    is_sf_swizzle: bool = True):
+    def alltoall_postquant_dispatch(self, x: torch.Tensor, x_sf: torch.Tensor,
+                                    alltoall_info: MoEAlltoallInfo):
         x = MnnvlMoe.mnnvl_moe_alltoallv(x, alltoall_info,
                                          self.alltoall_workspace, self.ep_rank,
                                          self.ep_size)
 
         if x_sf is not None:
-            if self.has_nvfp4 and is_sf_swizzle:
-                x_sf = unswizzle_sf(x_sf, x_row, x_col,
-                                    self.scaling_vector_size)
-
             x_sf = MnnvlMoe.mnnvl_moe_alltoallv(x_sf, alltoall_info,
                                                 self.alltoall_workspace,
                                                 self.ep_rank, self.ep_size)
