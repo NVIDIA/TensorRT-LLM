@@ -3099,8 +3099,7 @@ def get_cubin_header(kernel_traits, specs_names):
                     'alibi_', '').replace('softmax_', '').replace(
                         'sliding_or_chunked_', '').replace(
                             'custom_mask_', '').replace('qkv_', '').replace(
-                                'q_kv_',
-                                '').replace('q_paged_kv_', '').replace(
+                                'q_kv_', '').replace('q_paged_kv_', '').replace(
                                     'q_k_v_', '').replace('ws_', '').replace(
                                         'softcapping_',
                                         '').replace('sage_',
@@ -3784,7 +3783,6 @@ def enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype='fp16'):
                 return_softmax_stats=return_softmax,
                 scheduling_mode=scheduling_mode,
                 input_layout=input_layout))
-
         '''
         smem size = (q_step * d * q_buffers * NUM_COMPUTE_GROUPS
                     + (kv_step * d + kv_step * dv) * kv_buffers) * ele_size

@@ -91,7 +91,10 @@ struct Kernel_traits
         VALID_D = D_
     };
 
-    enum { VALID_DV = (DV_ == 0 ? D_ : DV_) };
+    enum
+    {
+        VALID_DV = (DV_ == 0 ? D_ : DV_)
+    };
 
     // Bootstrap GMMA_K from dummy Instruction_traits where FP16/BF16 K = 16, FP8 K = 32.
     enum
@@ -112,14 +115,14 @@ struct Kernel_traits
     };
 
     // The padded head dimension.
-    enum {
-        D = std::min<int>(Round_up<VALID_D, 128 / ELEMENT_BYTES>::VALUE,
-                          Next_power_of_two<VALID_D>::VALUE)
+    enum
+    {
+        D = std::min<int>(Round_up<VALID_D, 128 / ELEMENT_BYTES>::VALUE, Next_power_of_two<VALID_D>::VALUE)
     };
 
-    enum {
-        DV = std::min<int>(Round_up<VALID_DV, 128 / ELEMENT_BYTES>::VALUE,
-                           Next_power_of_two<VALID_DV>::VALUE)
+    enum
+    {
+        DV = std::min<int>(Round_up<VALID_DV, 128 / ELEMENT_BYTES>::VALUE, Next_power_of_two<VALID_DV>::VALUE)
     };
 
     // The number of smem buffers for Q tiles.
@@ -336,10 +339,16 @@ struct Kernel_traits
     };
 
     // The bytes of head dimension of V.
-    enum { DV_BYTES = DV * ELEMENT_BYTES };
+    enum
+    {
+        DV_BYTES = DV * ELEMENT_BYTES
+    };
 
     // The number of head_dimension groups of V.
-    enum { DV_GROUPS = fmha::Div_up<DV_BYTES, 128>::VALUE };
+    enum
+    {
+        DV_GROUPS = fmha::Div_up<DV_BYTES, 128>::VALUE
+    };
 
     // QGMMA: BMM2 will be split into multiple K groups as we explicitly transpose v (128 * D) in the smem.
     // HGMMA: BMM2 will load from row-major (K * N) smem_v, so we don't need to explicitly split K.

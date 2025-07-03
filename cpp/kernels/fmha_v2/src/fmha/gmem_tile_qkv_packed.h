@@ -1070,8 +1070,7 @@ struct Gmem_tile_paged_kv
         // Do not load/store if the thread is in the padded area
         col_in_bytes_ = cta_col_offset_in_bytes + col * BYTES_PER_LDG;
 
-        int64_t kv_stride_in_bytes =
-            qkv_offset == 1 ? params.k_stride_in_bytes : params.v_stride_in_bytes;
+        int64_t kv_stride_in_bytes = qkv_offset == 1 ? params.k_stride_in_bytes : params.v_stride_in_bytes;
         // The head offset.
         head_stride_in_bytes_ = (int64_t) (binfo.bidh / params.h_q_per_kv) * kv_stride_in_bytes;
         // When V is padded (like MLA), we cannot use VALID_BYTES_PER_ROW
