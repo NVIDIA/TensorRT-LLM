@@ -170,7 +170,7 @@ class SpecMetadata:
     all_rank_max_num_tokens: Optional[int] = None
 
     # The number of sequences for speculative model/layer of different rank
-    all_tp_rank_num_seqs: Optional[List[int]] = None
+    all_rank_num_seqs: Optional[List[int]] = None
     # The number of extra kv tokens
     # Some speculative decoding methods need to use different kv lengths for the
     # draft/target layers. But KVCacheManager can only support kv caches with the
@@ -230,3 +230,13 @@ class SpecMetadata:
     def all_tp_rank_num_tokens(self, value: Optional[List[int]]):
         # this is just an alias for all_rank_num_tokens
         self.all_rank_num_tokens = value
+
+    @property
+    def all_tp_rank_num_seqs(self) -> Optional[List[int]]:
+        # this is just an alias for all_rank_num_seqs
+        return self.all_rank_num_seqs
+
+    @all_tp_rank_num_seqs.setter
+    def all_tp_rank_num_seqs(self, value: Optional[List[int]]):
+        # this is just an alias for all_rank_num_seqs
+        self.all_rank_num_seqs = value
