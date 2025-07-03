@@ -50,7 +50,6 @@ class Scenario:
     qk_rope_head_dim: int = 64
     v_head_dim: int = 128
     hidden_size: int = 2560
-    max_position_embeddings: int = 4096
     rope_theta: float = 10000.0
     rope_scaling: bool = False
     rope_beta_fast: int = 32
@@ -69,47 +68,42 @@ class Scenario:
     gen_steps: int = 260
     ref_steps: int = 4
 
+    @property
+    def max_position_embeddings(self) -> int:
+        # ensure that max_position_embeddings is set large enough for every scenario
+        return self.seq_len + 1
+
 
 all_scenarios = [
-    Scenario(batch=1, seq_len=1024),
-    Scenario(batch=1, seq_len=2048),
     Scenario(batch=1, seq_len=4096),
     Scenario(batch=1, seq_len=8192),
     Scenario(batch=1, seq_len=16384),
     Scenario(batch=1, seq_len=32768),
     Scenario(batch=1, seq_len=65536),
     Scenario(batch=1, seq_len=131072),
-    Scenario(batch=8, seq_len=1024),
-    Scenario(batch=8, seq_len=2048),
     Scenario(batch=8, seq_len=4096),
     Scenario(batch=8, seq_len=8192),
     Scenario(batch=8, seq_len=16384),
     Scenario(batch=8, seq_len=32768),
     Scenario(batch=8, seq_len=65536),
     Scenario(batch=8, seq_len=131072),
-    Scenario(batch=16, seq_len=1024),
-    Scenario(batch=16, seq_len=2048),
     Scenario(batch=16, seq_len=4096),
     Scenario(batch=16, seq_len=8192),
     Scenario(batch=16, seq_len=16384),
     Scenario(batch=16, seq_len=32768),
     Scenario(batch=16, seq_len=65536),
-    Scenario(batch=16, seq_len=131072),
+    # this goes OOM
+    # Scenario(batch=16, seq_len=131072),
 ]
-
-# ensure that max_position_embeddings is set large enough for every scenario
-for scenario in all_scenarios:
-    scenario.max_position_embeddings = max(scenario.max_position_embeddings,
-                                           scenario.seq_len + 1)
 
 # limit the number of test scenarios to avoid taking too long
 test_scenarios = [
     all_scenarios[1],
     all_scenarios[5],
-    all_scenarios[8],
-    all_scenarios[12],
-    all_scenarios[18],
-    all_scenarios[19],
+    all_scenarios[6],
+    all_scenarios[10],
+    all_scenarios[14],
+    all_scenarios[15],
 ]
 
 
@@ -450,6 +444,11 @@ def test_mla_helix_distributed(scenario: Scenario):
 
 
 if __name__ == "__main__":
-    for scenario in all_scenarios:
+    for i, scenario in enumerate(all_scenarios):
+        next_batch = all_scenarios[i +
+                                   1].batch if i < len(all_scenarios) - 1 else 0
+        # only run the last scenario for each batch size: most interesting cases
+        if scenario.batch == next_batch:
+            continue
         print(f"Running scenario: {scenario}")
         test_mla_helix_distributed(scenario)
