@@ -361,7 +361,7 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
         // Init random host uint32_t masks for reference codes.
         for (uint32_t kvPosIdx = 0; kvPosIdx < qSeqLen; kvPosIdx++)
         {
-#if IS_MLA
+#if IS_MLA || SPEC_Q_SEQ_LEN
             hostMask[tokenIdx * qSeqLen + kvPosIdx] = (tokenIdx >= kvPosIdx);
 #else
             hostMask[tokenIdx * qSeqLen + kvPosIdx] = maskDist(rng);
@@ -1014,7 +1014,11 @@ TEST(RefCheck, mla)
 }
 #else
 #define HEAD_GROUP_SIZE HEAD_GRP_SIZE
+#ifdef SPEC_Q_SEQ_LEN
+#define Q_SEQ_LEN SPEC_Q_SEQ_LEN
+#else
 #define Q_SEQ_LEN 62
+#endif
 
 TEST(RefCheck, llama_V2_70b_3)
 {

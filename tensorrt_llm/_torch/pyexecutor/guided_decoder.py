@@ -1,4 +1,3 @@
-import itertools
 import math
 from typing import List, Optional
 
@@ -52,8 +51,7 @@ class GuidedDecoder:
 
     def build(self, scheduled_requests: ScheduledRequests,
               resource_manager: SeqSlotManager) -> None:
-        for llm_req in itertools.chain(scheduled_requests.context_requests,
-                                       scheduled_requests.generation_requests):
+        for llm_req in scheduled_requests.all_requests():
             if llm_req.guided_decoding_params is None:
                 continue
             slot = resource_manager.slot_manager.get_slot(llm_req.request_id)
@@ -84,9 +82,7 @@ class GuidedDecoder:
         torch.cuda.current_stream().wait_stream(self._stream)
 
         batched_logits, batched_bitmask = [], []
-        for i, llm_req in enumerate(
-                itertools.chain(scheduled_requests.context_requests,
-                                scheduled_requests.generation_requests)):
+        for i, llm_req in enumerate(scheduled_requests.all_requests()):
             if llm_req.guided_decoding_params is None:
                 continue
             if llm_req.is_context_init_state and not llm_req.is_last_context_chunk:

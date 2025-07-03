@@ -180,6 +180,7 @@ class TestMistral_Nemo_12B_Base(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mistral-Nemo-Base-2407"
     MODEL_PATH = f"{llm_models_root()}/Mistral-Nemo-Base-2407"
 
+    @skip_pre_ada
     def test_fp8(self):
         quant_config = QuantConfig(quant_algo=QuantAlgo.FP8,
                                    kv_cache_quant_algo=QuantAlgo.FP8)

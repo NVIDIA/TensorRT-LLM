@@ -133,6 +133,7 @@ Welcome to TensorRT-LLM's Documentation!
    reference/precision.md
    reference/memory.md
    reference/ci-overview.md
+   reference/dev-containers.md
 
 
 .. toctree::

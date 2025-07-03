@@ -67,6 +67,12 @@ using MaskType = uint32_t;
 #endif
 #endif
 
+// Enables SWAP AB optimization for speculative decoding when using a small, fixed Q_SEQ_LEN.
+// NOTE: Requires a uniform input sequence length for the entire batch.
+#ifdef SPEC_Q_SEQ_LEN
+static_assert(SPEC_DEC, "SPEC_Q_SEQ_LEN should only be used when SPEC_DEC is enabled.");
+#endif
+
 // 0: half/bf16 based on INPUT_FP16; 1: int8_t; 2: __nv_fp8_e4m3
 #ifndef CACHE_ELEM_ENUM
 #define CACHE_ELEM_ENUM 2

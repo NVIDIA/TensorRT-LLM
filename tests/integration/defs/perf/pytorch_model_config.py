@@ -30,7 +30,7 @@ def get_model_yaml_config(model_label: str,
     base_config = {
         'print_iter_log': True,
         'cuda_graph_config': {
-            'cuda_graph_padding_enabled': True,
+            'padding_enabled': True,
         },
     }
     if 'kv_cache_dtype' in model_label:
@@ -86,9 +86,16 @@ def get_model_yaml_config(model_label: str,
             'config': {
                 'print_iter_log': True,
                 'cuda_graph_config': {
-                    'cuda_graph_padding_enabled': True,
-                    'cuda_graph_batch_sizes': [1, 512, 1024, 2048]
+                    'padding_enabled': True,
+                    'batch_sizes': [1, 512, 1024, 2048]
                 }
+            }
+        },
+        # Deepseek default cases
+        {
+            'patterns': 'deepseek_r1',
+            'config': {
+                'enable_attention_dp': True,
             }
         },
         # Llama Nemotron models with attention_dp disabled to prevent hangs
