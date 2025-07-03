@@ -81,13 +81,9 @@ class KvCacheCreator:
                 config.hidden_size // config.num_attention_heads,
             ) * num_key_value_heads // tp_size
 
-        if is_nemotron_hybrid(config):
-            num_attention_layers = config.hybrid_override_pattern.count("*")
-        else:
-            num_attention_layers = config.num_hidden_layers
         # provide at least 1 layer to prevent division by zero cache size
-        num_attention_layers = max(len(mapping.pp_layers(num_attention_layers)),
-                                   1)
+        num_attention_layers = max(
+            len(mapping.pp_layers(model_config.get_num_attention_layers())), 1)
         mem_per_token *= num_attention_layers * head_dim
         # K and V
         mem_per_token *= kv_factor
