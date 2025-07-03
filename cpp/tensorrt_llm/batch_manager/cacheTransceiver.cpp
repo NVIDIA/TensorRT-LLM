@@ -37,7 +37,7 @@
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/contextProgress.h"
-#include "tensorrt_llm/batch_manager/dataTransceiverImpl.h"
+#include "tensorrt_llm/batch_manager/dataTransceiver.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/mlaCacheFormatter.h"
@@ -182,10 +182,8 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         auto makeFormatter = [cacheManager, isMLA, this]()
         { return createCacheFormatter(cacheManager, mCacheTransBufferManager.get(), isMLA); };
 
-        mDataResponder = std::make_unique<DataResponder>(
-            std::make_unique<DataSenderImpl>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter()));
-        mDataRequester = std::make_unique<DataRequester>(
-            std::make_unique<DataReceiverImpl>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter()));
+        mDataResponder = std::make_unique<DataResponder>(mManager.get(), *mCacheState, makeFormatter());
+        mDataRequester = std::make_unique<DataRequester>(mManager.get(), *mCacheState, makeFormatter());
     }
     else
     {

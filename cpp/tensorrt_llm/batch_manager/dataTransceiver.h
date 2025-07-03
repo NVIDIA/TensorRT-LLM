@@ -16,23 +16,35 @@
  */
 
 #pragma once
-#include <fstream>
-#include <future>
-#include <map>
-#include <string>
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
-#include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/envUtils.h"
-#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/cacheCommunicator.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/serializeUtils.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include <future>
+#include <map>
+#include <string>
 
 namespace tensorrt_llm::batch_manager
 {
+
+namespace kv_cache_manager
+{
+class BaseCacheFormatter;
+} // namespace kv_cache_manager
+
+struct TransceiverTag
+{
+    static constexpr int32_t kID_TAG{19};
+    static constexpr int32_t kDATA_TAG{43};
+};
+
+// TODO: unify the following class into namespace tensorrt_llm::transmission
+using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
+using Connection = tensorrt_llm::executor::kv_cache::Connection;
+using ConnectionManager = tensorrt_llm::executor::kv_cache::ConnectionManager;
 
 // Used to store the information that needs to be sent to the context executor to ensure the generation
 // executor smoothly receives the data.
@@ -89,48 +101,145 @@ private:
     executor::DataTransceiverState mTransState;
 };
 
+class TransferSession
+{
+public:
+    TransferSession(std::vector<Connection const*> connections, DataContext dataContext,
+        executor::DataTransceiverState const& selfState, executor::DataTransceiverState otherState,
+        runtime::BufferManager& bufferManager)
+        : mConnections(std::move(connections))
+        , mDataContext(dataContext)
+        , mSelfState(&selfState)
+        , mOtherState(std::move(otherState))
+        , mBufferManager(&bufferManager)
+    {
+        TLLM_CHECK(!mConnections.empty());
+    }
+
+    [[nodiscard]] std::vector<Connection const*> const& getConnections() const noexcept
+    {
+        return mConnections;
+    }
+
+    // TODO: set up connections at session creation
+    [[nodiscard]] std::vector<Connection const*>& getConnectionsMutable() noexcept
+    {
+        return mConnections;
+    }
+
+    [[nodiscard]] DataContext const& getDataContext() const noexcept
+    {
+        return mDataContext;
+    }
+
+    [[nodiscard]] executor::DataTransceiverState const& getSelfState() const noexcept
+    {
+        return *mSelfState;
+    }
+
+    [[nodiscard]] executor::DataTransceiverState const& getOtherState() const noexcept
+    {
+        return mOtherState;
+    }
+
+    [[nodiscard]] runtime::BufferManager& getBufferManager() noexcept
+    {
+        return *mBufferManager;
+    }
+
+    void send(size_t connIdx, void const* data, size_t size)
+    {
+        mConnections[connIdx]->send(mDataContext, data, size);
+    }
+
+    void recv(size_t connIdx, void* data, size_t size)
+    {
+        mConnections[connIdx]->recv(mDataContext, data, size);
+    }
+
+private:
+    std::vector<Connection const*> mConnections;
+    DataContext mDataContext;
+    // self state is stored in DataSender/Receiver and is always valid
+    executor::DataTransceiverState const* mSelfState;
+    // the other state is temporary and should be copied from the ContextPhaseParams/RequestInfo
+    executor::DataTransceiverState mOtherState;
+    runtime::BufferManager* mBufferManager;
+};
+
 // Operators required for data transmission in specific communication protocols.
 class DataSender
 {
 public:
+    using SizeType32 = tensorrt_llm::runtime::SizeType32;
+
+    DataSender(ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
+        std::unique_ptr<kv_cache_manager::BaseCacheFormatter> formatter);
+
     /// @brief Receive the request information.
     /// @return The request information.
-    [[nodiscard]] virtual RequestInfo recvRequestInfo() = 0;
+    [[nodiscard]] RequestInfo recvRequestInfo();
 
     /// @brief Synchronously send data.
     /// @param llmRequest The request object to which the data belongs.
-    virtual void sendSync(LlmRequest const& llmRequest) = 0;
+    void sendSync(LlmRequest const& llmRequest);
 
     /// @brief Return the internal communicator status.
     /// @return The communicator status.
-    [[nodiscard]] virtual executor::kv_cache::CommState const& getCommState() const = 0;
+    [[nodiscard]] executor::kv_cache::CommState const& getCommState() const;
 
-    /// @brief Reset the internal communicator status.
-    /// @param commState The communicator status.
-    virtual void setCommState(executor::kv_cache::CommState commState) = 0;
+    [[nodiscard]] size_t getCounterpartsCount(LlmRequest::RequestIdType requestId) const;
 
-    [[nodiscard]] virtual size_t getCounterpartsCount(LlmRequest::RequestIdType requestId) const = 0;
+    void release(LlmRequest::RequestIdType requestId);
 
-    virtual void release(LlmRequest::RequestIdType requestId) = 0;
+    ~DataSender(); // = default;
 
-    /// @brief Destructor.
-    virtual ~DataSender() = default;
+private:
+    ConnectionManager* mManager;
+    std::map<LlmRequest::RequestIdType, TransferSession> mRequestToSession;
+    executor::DataTransceiverState mSelfState;
+    std::unique_ptr<kv_cache_manager::BaseCacheFormatter> mFormatter;
+    std::mutex mMtxForMap;
+    runtime::BufferManager mBufferManager;
 };
 
 // Operators required for data transmission in specific communication protocols.
 class DataReceiver
 {
 public:
+    using SizeType32 = tensorrt_llm::runtime::SizeType32;
+
+    DataReceiver(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
+        std::unique_ptr<kv_cache_manager::BaseCacheFormatter> formatter);
+
     /// @brief Send the request information.
     /// @param llmRequest The request object to which the information belongs.
-    virtual void sendRequestInfo(LlmRequest const& llmRequest) = 0;
+    void sendRequestInfo(LlmRequest const& llmRequest);
 
     /// @brief Synchronously receive data.
     /// @param llmRequest The request object to which the data belongs.
-    virtual void receiveSync(LlmRequest const& llmRequest) = 0;
+    void receiveSync(LlmRequest const& llmRequest);
 
-    /// @brief Destructor.
-    virtual ~DataReceiver() = default;
+private:
+    struct ReceiveCacheResource
+    {
+        runtime::BufferManager mBufferManager;
+        runtime::CudaEvent mCudaEvent;
+
+        ReceiveCacheResource(runtime::BufferManager&& bufferManager, runtime::CudaEvent&& cudaEvent)
+            : mBufferManager(bufferManager)
+            , mCudaEvent(std::move(cudaEvent))
+        {
+        }
+    };
+
+    [[nodiscard]] std::unique_ptr<ReceiveCacheResource> const& getReceiveCacheResource(LlmRequest const& llmRequest);
+
+    executor::kv_cache::ConnectionManager* mManager;
+    executor::DataTransceiverState mSelfState;
+    std::unique_ptr<kv_cache_manager::BaseCacheFormatter> mFormatter;
+    std::unordered_map<std::string, std::unique_ptr<ReceiveCacheResource>> mProcessToResources;
+    std::mutex mProcessIoResouceMutex;
 };
 
 class DataResponder
@@ -138,7 +247,8 @@ class DataResponder
 public:
     /// @brief Constructor.
     /// @param sender The sender used at the underlying level.
-    explicit DataResponder(std::unique_ptr<DataSender> sender);
+    explicit DataResponder(ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
+        std::unique_ptr<kv_cache_manager::BaseCacheFormatter> formatter);
 
     /// @brief Asynchronously respond to the request and send data.
     /// @param llmRequest Request object. Its data should be ready when called, and the data for this request
@@ -149,10 +259,6 @@ public:
     /// @brief Return the internal communicator status.
     /// @return The communicator status.
     [[nodiscard]] executor::kv_cache::CommState const& getCommState() const;
-
-    /// @brief Reset the internal communicator status.
-    /// @param commState The communicator status.
-    void setCommState(executor::kv_cache::CommState commState);
 
     /// @brief Destructor.
     ~DataResponder();
@@ -167,7 +273,8 @@ class DataRequester
 public:
     /// @brief Constructor.
     /// @param receiver The receiver used at the underlying level.
-    explicit DataRequester(std::unique_ptr<DataReceiver> receiver);
+    explicit DataRequester(ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
+        std::unique_ptr<kv_cache_manager::BaseCacheFormatter> formatter);
 
     /// @brief Asynchronously send a request to receive data.
     /// @param llmRequest Request object. Its data should be in an allocated but unwritten state when called, and the
