@@ -55,6 +55,8 @@ class ExpertStatistic:
         self.stop = stop
         self._meta_info = None
         self._records = {}
+        self._cooccurrence = {}
+        self._token_selected_experts = {}
 
     @property
     def should_record(self) -> bool:
@@ -62,10 +64,11 @@ class ExpertStatistic:
 
     def _set_iter(self, iter_id: int) -> bool:
         self.current_iter_id = iter_id
-        if iter_id == self.stop:
+        if iter_id == self.start or iter_id == self.stop:
             logger.info(
-                f'[ExpertStatistic] Rank={self.rank_id}, saving iter={iter_id}, start={self.start}, stop={self.stop}'
+                f'[ExpertStatistic] Rank={self.rank_id}, iter={iter_id}, start={self.start}, stop={self.stop}'
             )
+        if iter_id == self.stop:
             path = os.environ.get('EXPERT_STATISTIC_PATH', 'expert_statistic')
             if not os.path.exists(path):
                 os.makedirs(path, exist_ok=True)
@@ -74,6 +77,12 @@ class ExpertStatistic:
                     json.dump(self._meta_info, f)
             safetensors.torch.save_file(
                 self._records, f"{path}/rank{self.rank_id}.safetensors")
+            safetensors.torch.save_file(
+                self._cooccurrence,
+                f"{path}/cooccurrence_rank{self.rank_id}.safetensors")
+            safetensors.torch.save_file(
+                self._token_selected_experts,
+                f"{path}/token_selected_experts_rank{self.rank_id}.safetensors")
         return self.should_record
 
     def _set_layer(self, layer: int) -> None:
@@ -89,10 +98,34 @@ class ExpertStatistic:
                 "num_experts": expert_count,
                 "num_experts_per_token": token_selected_experts.size(-1)
             }
-        counts = torch.bincount(token_selected_experts.flatten(),
-                                minlength=expert_count)
+
         key = f"{self.current_iter_id}_{self.current_layer}"
+        counts = token_selected_experts.flatten().bincount(
+            minlength=expert_count).to(torch.int32)
         if key not in self._records:
             self._records[key] = counts.cpu()
         else:
             self._records[key] += counts.cpu()
+
+        cooccurrence = torch.zeros(expert_count,
+                                   expert_count,
+                                   dtype=torch.int32,
+                                   device=token_selected_experts.device)
+        for i in range(token_selected_experts.size(0)):
+            rows, cols = torch.meshgrid(token_selected_experts[i],
+                                        token_selected_experts[i],
+                                        indexing="ij")
+            cooccurrence[rows, cols] += 1
+        if key not in self._cooccurrence:
+            self._cooccurrence[key] = cooccurrence.cpu()
+        else:
+            self._cooccurrence[key] += cooccurrence.cpu()
+
+        if key not in self._token_selected_experts:
+            self._token_selected_experts[key] = token_selected_experts.cpu()
+        else:
+            self._token_selected_experts[key] = torch.cat([
+                self._token_selected_experts[key],
+                token_selected_experts.cpu()
+            ],
+                                                          dim=0)

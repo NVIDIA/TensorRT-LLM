@@ -27,11 +27,14 @@ class MoeLoadBalancerConfig:
     layer_updates_per_iter: int = 0
 
     ep_rank: Optional[int] = field(default=None, init=False)
-    ep_size: Optional[int] = field(default=None, init=False)
+    ep_size: Optional[int] = None
 
     def setup(self, ep_rank: int, ep_size: int) -> None:
         self.ep_rank = ep_rank
-        self.ep_size = ep_size
+        if self.ep_size is None:
+            self.ep_size = ep_size
+        else:
+            assert self.ep_size == ep_size
         assert self.num_slots is not None
 
     @property

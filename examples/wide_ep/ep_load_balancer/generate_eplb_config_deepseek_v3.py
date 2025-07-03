@@ -1,12 +1,32 @@
 import argparse
 
 import torch
-from utils import load_expert_statistic, save_eplb_config
+from utils import (do_placement_with_cooccurrence, load_expert_statistic,
+                   save_eplb_config)
 
 from tensorrt_llm.bindings.internal.runtime import (MoeLoadBalanceMetaInfo,
                                                     MoePlacementCpuInfo,
-                                                    do_placement,
                                                     do_replication)
+
+
+def create_cooccurrence_matrix(expert_load_factor: torch.Tensor,
+                               expert_replica_count: torch.Tensor,
+                               num_groups: int = 32):
+    num_experts = expert_replica_count.size(0)
+    num_experts_per_group = num_experts // num_groups
+    slot_load_factor = expert_load_factor / expert_replica_count
+    cooccurrence_matrix = slot_load_factor.unsqueeze(
+        1) * slot_load_factor / slot_load_factor.sum()
+    expert_ids = torch.arange(num_experts)
+    expert_group_ids = expert_ids // num_experts_per_group
+    cooccurrence_matrix = cooccurrence_matrix.masked_fill(
+        expert_group_ids.unsqueeze(1) != expert_group_ids, 0)
+    cooccurrence_matrix = cooccurrence_matrix.masked_fill(
+        expert_ids.unsqueeze(1) == expert_ids, -1e9)
+    assert (cooccurrence_matrix
+            > 0).sum() == num_experts_per_group**2 * num_groups - num_experts
+    return cooccurrence_matrix
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -37,6 +57,11 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="The total number of expert slots after load rebalance.")
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=0.8,
+        help="The alpha value for the load balancing algorithm.")
     parser.add_argument("--layer_updates_per_iter",
                         type=int,
                         default=0,
@@ -79,10 +104,20 @@ if __name__ == "__main__":
                                           for _ in range(args.ep_size)]
 
         do_replication(moelb_info, expert_load_factor.tolist(), placement_info)
-        do_placement(moelb_info, expert_load_factor.tolist(), placement_info)
+
+        num_groups = 32
+        expert_replica_count = torch.tensor(placement_info.expert_replica_count)
+        cooccurrence_matrix = create_cooccurrence_matrix(expert_load_factor,
+                                                         expert_replica_count,
+                                                         num_groups=num_groups)
+        rank_expert_ids = do_placement_with_cooccurrence(expert_load_factor,
+                                                         expert_replica_count,
+                                                         cooccurrence_matrix,
+                                                         ep_size=args.ep_size,
+                                                         alpha=args.alpha)
 
         initial_global_assignments[layer_idx] = []
-        for local_expert_ids in placement_info.rank_expert_ids:
+        for local_expert_ids in rank_expert_ids:
             initial_global_assignments[layer_idx].extend(local_expert_ids)
 
     eplb_config = {
