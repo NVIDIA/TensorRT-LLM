@@ -137,8 +137,7 @@ def main() -> None:
         print(f"Changed files: {changed_files}")
 
         module_paths = load_json(Path(".github") / "module-paths.json")
-        module_owners = load_json(
-            Path(".github/workflows") / "module-owners.json")
+        module_owners = load_json(Path(".github") / "module-owners.json")
 
         modules = map_modules(changed_files, module_paths)
         reviewers = gather_reviewers(
