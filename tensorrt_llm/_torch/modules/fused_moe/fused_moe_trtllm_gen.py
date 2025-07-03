@@ -10,6 +10,7 @@ from .interface import MoE, MoEWeightLoadingMode
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            NVFP4TRTLLMGenFusedMoEMethod,
                            W4A8MXFP4FP8TRTLLMGenFusedMoEMethod,
+                           W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod,
                            W4A16MXFP4TRTLLMGenFusedMoEMethod)
 from .routing import BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod
 
@@ -100,7 +101,7 @@ class TRTLLMGenFusedMoE(MoE):
     def _check_configs(self):
         assert self.has_deepseek_fp8_block_scales \
             or self.has_nvfp4 or self.has_w4a16_mxfp4 \
-            or self.has_w4a8_mxfp4_fp8, "TRTLLMGenFusedMoE only supports fp8_block_scaling, nvfp4, w4a16_mxfp4 and w4a8_mxfp4_fp8 dtypes."
+            or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8, "TRTLLMGenFusedMoE only supports fp8_block_scaling, nvfp4, w4a16_mxfp4, w4a8_mxfp4_fp8 and w4a8_mxfp4_mxfp8 dtypes."
 
         if self.bias or self.swiglu_alpha is not None or self.swiglu_beta is not None:
             assert self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8, "TRTLLMGenFusedMoE only supports w4a16_mxfp4 and w4a8_mxfp4_fp8 dtypes with bias, swiglu_alpha and swiglu_beta."
@@ -128,6 +129,8 @@ class TRTLLMGenFusedMoE(MoE):
                 return W4A16MXFP4TRTLLMGenFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8():
                 return W4A8MXFP4FP8TRTLLMGenFusedMoEMethod()
+            elif self.quant_config.layer_quant_mode.has_w4a8_mxfp4_mxfp8():
+                return W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod()
             else:
                 raise NotImplementedError(
                     f"Unsupported quantization method by TRTLLMGenFusedMoE: {self.quant_config.quant_mode}"
@@ -165,7 +168,8 @@ class TRTLLMGenFusedMoE(MoE):
         self._check_configs()
 
         # TODO: FIX this.
-        if (self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8) and not self.bias:
+        if (self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8
+                or self.has_w4a8_mxfp4_mxfp8) and not self.bias:
             self.w3_w1_bias = nn.Parameter(torch.zeros(
                 (self.w3_w1_weight.shape[0], self.w3_w1_weight.shape[1]),
                 dtype=torch.float32),
@@ -358,6 +362,43 @@ class TRTLLMGenFusedMoE(MoE):
                 tile_tokens_dim,
                 self.routing_method.routing_method_type,
                 0 if self.swiglu_alpha is None else 2,  # act_type
+            )
+        elif self.has_w4a8_mxfp4_mxfp8:
+            # TRTLLM-Gen uses linear SF layout for the mxfp8 input.
+            mxfp8_x, sf = torch.ops.trtllm.mxfp8_quantize(x, False)
+
+            # FIXME: tile_tokens_dim is hardcoded for now
+            tile_tokens_dim = 8
+
+            # TODO: remove bias / act_type
+            final_hidden_states = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
+                router_logits,
+                routing_bias,
+                mxfp8_x,
+                sf,
+                self.w3_w1_weight,
+                self.w3_w1_weight_scale,
+                self.w3_w1_bias,
+                None,  # swiglu_alpha
+                None,  # swiglu_beta
+                self.w2_weight,
+                self.w2_weight_scale,
+                self.w2_bias,
+                self.fc31_input_dequant,  # output1_scales_scalar
+                self.fc31_input_dequant,  # output1_scales_gate_scalar
+                self.fc2_input_dequant,  # output2_scales_scalar always 1.0
+                self.num_slots,
+                top_k,
+                n_group,
+                topk_group,
+                self.intermediate_size_per_partition,
+                self.
+                slot_start,  # local_expert_start;  use ep_rank if stride!=1
+                self.expert_size_per_partition,  # local_expert_size
+                routed_scaling_factor,
+                tile_tokens_dim,
+                self.routing_method.routing_method_type,
+                0,  # act_type
             )
         else:
             raise NotImplementedError(

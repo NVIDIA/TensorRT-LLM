@@ -1957,10 +1957,6 @@ class W4A16MXFP4TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
     pass
 
 
-class W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
-    pass
-
-
 class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
     # Cache the permute indices during weight loading to avoid recompute
     # This assumes the same input shape always results in the same permute indices
@@ -2027,7 +2023,21 @@ class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
             self.load_expert_fc2_input_scale_w4a8_mxfp4_fp8(
                 w2_input_scale, tmp_fc2_input_scale[expert_id])
 
-        module.fc31_input_dequant.data.copy_(tmp_fc31_input_scale.max())
+        module.fc31_input_dequant.fill_(1.0)
+        # TRTLLMGen uses dynamic MXFP8 for fc2 so we need to set scales to 1.0.
+        module.fc2_input_dequant.fill_(1.0)
+
+        # Step2: Load weight block scales.
+        super().load_quant_scales(module, weights)
+
+
+class W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod(W4A8MXFP4FP8TRTLLMGenFusedMoEMethod
+                                            ):
+
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+        # Step1: Load input scales.
+        # MXFP8 block scales are handled by the MMA.
+        module.fc31_input_dequant.fill_(1.0)
         # TRTLLMGen uses dynamic MXFP8 for fc2 so we need to set scales to 1.0.
         module.fc2_input_dequant.fill_(1.0)
 
