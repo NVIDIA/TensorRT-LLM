@@ -188,14 +188,36 @@ class MnnvlMemory:
         else:
             all_handles_data = comm.allgather(exported_fabric_handle)
             all_pids = comm.allgather(os.getpid())
-            syscall = ctypes.CDLL(None).syscall
+            libc = ctypes.CDLL(None, use_errno=True)
+            syscall = libc.syscall
             SYS_pidfd_open = 434
             SYS_pidfd_getfd = 438
-            pidfds = [syscall(SYS_pidfd_open, pid, 0) for pid in all_pids]
-            remote_fds = [
-                syscall(SYS_pidfd_getfd, pidfd, fd, 0)
-                for pidfd, fd in zip(pidfds, all_handles_data)
-            ]
+            pidfds = []
+            for i, pid in enumerate(all_pids):
+                pidfd = syscall(SYS_pidfd_open, pid, 0)
+                if pidfd < 0:
+                    err = ctypes.get_errno()
+                    raise RuntimeError(
+                        f"pidfd_open({pid}) failed with errno {err}: {os.strerror(err)}"
+                    )
+                pidfds.append(pidfd)
+
+            remote_fds = []
+            for i, (pidfd, fd) in enumerate(zip(pidfds, all_handles_data)):
+                remote_fd = syscall(SYS_pidfd_getfd, pidfd, fd, 0)
+                if remote_fd < 0:
+                    err = ctypes.get_errno()
+                    error_msg = f"pidfd_getfd(pidfd={pidfd}, fd={fd}) failed with errno {err}: {os.strerror(err)}."
+                    if err == 1:  # EPERM
+                        error_msg += (
+                            " Permission denied. If running in a container, try adding --cap-add=SYS_PTRACE "
+                            "to your docker run command."
+                        )
+                    else:
+                        error_msg += " This may be due to kernel version (requires Linux 5.6+)."
+                    raise RuntimeError(error_msg)
+                remote_fds.append(remote_fd)
+
             all_handles_data = remote_fds
         # all_handles_data like b'\x00\x00\x00 \x00\x00\x00\x00\x8f\xec\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\t\x00\x00\x00\x00\x00\x1d\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'  # noqa: E501
         # can use buf = memoryview(data) to import if using plain buffer for data.
