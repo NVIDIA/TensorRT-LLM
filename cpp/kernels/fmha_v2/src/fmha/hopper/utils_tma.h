@@ -105,19 +105,15 @@ inline __device__ void utmastg(cudaTmaDesc const* p_desc, // TMA desc
     int32_t const (&coord)[DIM]);                         // coord
 
 // 3D, TILED
-template<>
-inline __device__ void utmastg<3, fmha::cudaTmaDescType::TILED>(const cudaTmaDesc *p_desc,
-                                                                uint32_t smem_ptr,
-                                                                const int32_t (&coord)[3]) {
+template <>
+inline __device__ void utmastg<3, fmha::cudaTmaDescType::TILED>(
+    cudaTmaDesc const* p_desc, uint32_t smem_ptr, const int32_t (&coord)[3])
+{
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    asm volatile(
-        "cp.async.bulk.tensor.3d.global.shared::cta.bulk_group [%0, {%1, %2, %3}], [%4];\n" ::"l"(
-            reinterpret_cast<uint64_t>(p_desc)),
-        "r"(coord[0]),
-        "r"(coord[1]),
-        "r"(coord[2]),
-        "r"(smem_ptr)
-        : "memory");
+    asm volatile("cp.async.bulk.tensor.3d.global.shared::cta.bulk_group [%0, {%1, %2, %3}], [%4];\n" ::"l"(
+                     reinterpret_cast<uint64_t>(p_desc)),
+                 "r"(coord[0]), "r"(coord[1]), "r"(coord[2]), "r"(smem_ptr)
+                 : "memory");
 #endif
 }
 

@@ -220,9 +220,9 @@ struct Fused_multihead_attention_params_v2 : Fused_multihead_attention_params_ba
     // Contiguous Q buffer pointer [B, S, H, D].
     void* q_ptr;
     // The separate K matrice.
-    void *k_ptr;
+    void* k_ptr;
     // The separate V matrice.
-    void *v_ptr;
+    void* v_ptr;
     // Contiguous KV buffer pointer [B, 2, H, S, D].
     void* kv_ptr;
     // Paged KV Cache buffer.

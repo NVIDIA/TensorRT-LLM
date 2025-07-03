@@ -251,9 +251,9 @@ static inline void set_params(bert::Fused_multihead_attention_params_v2& params,
     // contiguous q.
     void* q_d,
     // separate k.
-    void *k_d,
+    void* k_d,
     // separate v.
-    void *v_d,
+    void* v_d,
     // contiguous kv.
     void* kv_d,
     // start address of the paged kv pool.
@@ -280,7 +280,8 @@ static inline void set_params(bert::Fused_multihead_attention_params_v2& params,
         params.o_stride_in_bytes = total;
     }
 
-    if( input_layout == Attention_input_layout::PACKED_QKV ) {
+    if (input_layout == Attention_input_layout::PACKED_QKV)
+    {
         // For grouped- or multi-query attention (h denotes num_q_heads; h' denotes h_kv):
         //   qkv_layout = [b, s, [q_hd, k_h'd, v_h'd]]
         //   qkv_stride = (h+2*h')d * bytes_per_elt
@@ -288,30 +289,32 @@ static inline void set_params(bert::Fused_multihead_attention_params_v2& params,
         //   qkv_layout = [b, s, 3, h, d] or [b, s, h, 3, d]
         //   qkv_stride = 3hd * bytes_per_elt
         params.qkv_ptr = qkv_packed_d;
-        params.q_stride_in_bytes = params.k_stride_in_bytes = params.v_stride_in_bytes =
-            get_size_in_bytes(h * d + h_kv * d + h_kv * dv, data_type);
-    } else {
+        params.q_stride_in_bytes = params.k_stride_in_bytes = params.v_stride_in_bytes
+            = get_size_in_bytes(h * d + h_kv * d + h_kv * dv, data_type);
+    }
+    else
+    {
         // Layout [B, S, H, D].
         params.q_ptr = q_d;
         params.q_stride_in_bytes = get_size_in_bytes(h * d, data_type);
 
-        if( input_layout == Attention_input_layout::CONTIGUOUS_Q_KV ) {
+        if (input_layout == Attention_input_layout::CONTIGUOUS_Q_KV)
+        {
             // Layout [B, S, 2, H, D].
             params.kv_ptr = kv_d;
-            params.k_stride_in_bytes = params.v_stride_in_bytes =
-                get_size_in_bytes(h_kv * (d + dv), data_type);
-        } else if( input_layout == Attention_input_layout::Q_PAGED_KV ) {
+            params.k_stride_in_bytes = params.v_stride_in_bytes = get_size_in_bytes(h_kv * (d + dv), data_type);
+        }
+        else if (input_layout == Attention_input_layout::Q_PAGED_KV)
+        {
             int max_blocks_per_sequence = (s_kv + tokens_per_block - 1) / tokens_per_block;
-            params.paged_kv_cache = Kv_block_array(
-                b,
-                max_blocks_per_sequence,
-                tokens_per_block,
-                get_size_in_bytes(tokens_per_block * h_kv * std::gcd(d, dv), data_type),
-                paged_kv_pool_ptr);
+            params.paged_kv_cache = Kv_block_array(b, max_blocks_per_sequence, tokens_per_block,
+                get_size_in_bytes(tokens_per_block * h_kv * std::gcd(d, dv), data_type), paged_kv_pool_ptr);
             params.paged_kv_cache.mBlockOffsets = paged_block_offsets;
             params.k_stride_in_bytes = get_size_in_bytes(tokens_per_block * d, data_type);
             params.v_stride_in_bytes = get_size_in_bytes(tokens_per_block * dv, data_type);
-        } else if( input_layout == Attention_input_layout::SEPARATE_Q_K_V ) {
+        }
+        else if (input_layout == Attention_input_layout::SEPARATE_Q_K_V)
+        {
             // Layout [B, S, H_kv, D].
             params.k_ptr = k_d;
             // Layout [B, S, H_kv, Dv].
@@ -772,7 +775,7 @@ int main(int argc, char** argv)
         {
             input_layout = Attention_input_layout::Q_PAGED_KV;
         }
-        else if( !strcmp(argv[ii], "-separate-q-k-v") )
+        else if (!strcmp(argv[ii], "-separate-q-k-v"))
         {
             input_layout = Attention_input_layout::SEPARATE_Q_K_V;
         }
@@ -1105,12 +1108,12 @@ int main(int argc, char** argv)
     FMHA_CHECK_CUDA(cudaMalloc(&q_d, get_size_in_bytes(q_size, data_type)));
 
     // K has [B, S, H_kv, D] with separate kv cache.
-    void *k_d;
+    void* k_d;
     const size_t k_size = s * b * h_kv * d;
     FMHA_CHECK_CUDA(cudaMalloc(&k_d, get_size_in_bytes(k_size, data_type)));
 
     // V has [B, S, H_kv, Dv] with separate kv cache.
-    void *v_d;
+    void* v_d;
     const size_t v_size = s * b * h_kv * dv;
     FMHA_CHECK_CUDA(cudaMalloc(&v_d, get_size_in_bytes(v_size, data_type)));
 
@@ -1672,9 +1675,10 @@ int main(int argc, char** argv)
     set_params(params_v2, launch_params, data_type, acc_type, output_dtype, input_layout, b, s_q, s, h, h_kv, d, dv,
         total, num_grouped_heads, sliding_window_size, chunked_attention_size,
         // Paged kv cache.
-        tokens_per_block, qkv_d_view, q_d, k_d, v_d, contiguous_kv_d, kv_cache_pool_ptr, kv_cache_block_offsets_d, packed_mask_d,
-        cu_mask_rows_d, cu_seqlens_d, cu_q_seqlens_d, o_d_view, p_d, s_d, softmax_stats_ptr, scale_bmm2_d, scale_bmm1,
-        scale_softmax, scale_bmm2, softcapping_scale_bmm1, use_int8_scale_max, interleaved, is_s_padded, has_alibi);
+        tokens_per_block, qkv_d_view, q_d, k_d, v_d, contiguous_kv_d, kv_cache_pool_ptr, kv_cache_block_offsets_d,
+        packed_mask_d, cu_mask_rows_d, cu_seqlens_d, cu_q_seqlens_d, o_d_view, p_d, s_d, softmax_stats_ptr,
+        scale_bmm2_d, scale_bmm1, scale_softmax, scale_bmm2, softcapping_scale_bmm1, use_int8_scale_max, interleaved,
+        is_s_padded, has_alibi);
 
     // total number of tokens is needed to set TMA desc on the host.
     launch_params.total_q_seqlen = q_seqlens[b];
@@ -1796,8 +1800,8 @@ int main(int argc, char** argv)
 #endif
         // no need to free old params_v2.qkv_ptr, it will be released in the end
         params_v2.qkv_ptr = quant_qkv;
-        params_v2.q_stride_in_bytes = params_v2.k_stride_in_bytes = params_v2.v_stride_in_bytes =
-            get_size_in_bytes((h + 2 * h_kv) * d, DATA_TYPE_E4M3);
+        params_v2.q_stride_in_bytes = params_v2.k_stride_in_bytes = params_v2.v_stride_in_bytes
+            = get_size_in_bytes((h + 2 * h_kv) * d, DATA_TYPE_E4M3);
     }
 
 #if defined(DEBUG_HAS_PRINT_BUFFER)

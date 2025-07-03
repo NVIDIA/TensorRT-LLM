@@ -78,9 +78,9 @@ struct Fused_multihead_attention_params_v2
     // The separate Q matrice.
     void* q_ptr;
     // The separate K matrice.
-    void *k_ptr;
+    void* k_ptr;
     // The separate V matrice.
-    void *v_ptr;
+    void* v_ptr;
     // The separate KV matrice (contiguous KV).
     void* kv_ptr;
     // The separate paged kv cache.

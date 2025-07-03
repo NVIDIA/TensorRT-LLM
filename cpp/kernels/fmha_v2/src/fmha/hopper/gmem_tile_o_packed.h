@@ -846,7 +846,7 @@ struct Gmem_tile_o_gmma_32bit_8bit
 #pragma unroll
                 for (int di = 0; di < N_GROUPS; ++di)
                 {
-                    const int32_t coords[3] = { di * N_PER_GROUP, bidh_, row_tma_ };
+                    const int32_t coords[3] = {di * N_PER_GROUP, bidh_, row_tma_};
                     fmha::utmastg<3, fmha::cudaTmaDescType::TILED>(
                         desc_o_, smem_base_ + di * 16 * N_BYTES_PER_GROUP, coords);
                 }
