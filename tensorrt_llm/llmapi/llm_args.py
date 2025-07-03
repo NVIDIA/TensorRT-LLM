@@ -1953,7 +1953,6 @@ def update_llm_args_with_extra_dict(
         "enable_build_cache": BuildCacheConfig,
         "speculative_config": DecodingBaseConfig,
         "lora_config": LoraConfig,
-        "cuda_graph_config": CudaGraphConfig,
     }
     for field_name, field_type in field_mapping.items():
         if field_name in llm_args_dict:
