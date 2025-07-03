@@ -11,7 +11,8 @@ from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import (AttentionInputType, AttentionMetadata,
                                  TrtllmAttention, TrtllmAttentionMetadata)
-from ..attention_backend.interface import (PositionalEmbeddingParams,
+from ..attention_backend.interface import (AttentionMask,
+                                           PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
 from ..attention_backend.utils import create_attention, get_attention_backend
 from ..distributed import AllReduceParams
@@ -225,12 +226,12 @@ class Attention(nn.Module):
         position_ids: Optional[torch.IntTensor],
         hidden_states: Union[torch.Tensor, Fp4QuantizedTensor],
         attn_metadata: AttentionMetadata,
-        attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
-        CAUSAL,
+        attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
         mrope_config: Optional[dict] = None,
         all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,
         attention_window_size: Optional[int] = None,
+        attention_mask_data: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -240,12 +241,12 @@ class Attention(nn.Module):
             position_ids (Optional[torch.IntTensor]): The position IDs.
             hidden_states (torch.Tensor): The hidden states.
             attn_metadata (AttentionMetadata): The attention metadata.
-            attention_mask (PredefinedAttentionMask): The attention mask type.
+            attention_mask (AttentionMask): The attention mask type.
             mrope_config (Optional[dict]): The MROPE configuration.
             all_reduce_params (Optional[AllReduceParams]): The all reduce parameters.
             lora_params (Optional[dict]): The LoRA parameters.
             attention_window_size (Optional[int]): The attention window size.
-
+            attention_mask_data (Optional[torch.Tensor]): The attention mask data.
         Returns:
             torch.Tensor: The output tensor.
         """
@@ -283,7 +284,8 @@ class Attention(nn.Module):
             out_scale_sf=out_scale_sf,
             attention_mask=attention_mask,
             mrope_config=mrope_config,
-            attention_window_size=attention_window_size)
+            attention_window_size=attention_window_size,
+            attention_mask_data=attention_mask_data)
         hidden_states = attn_output
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params,

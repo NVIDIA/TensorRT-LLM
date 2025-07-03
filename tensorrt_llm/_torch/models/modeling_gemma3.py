@@ -7,11 +7,12 @@ from tqdm import tqdm
 from transformers import Gemma3TextConfig
 from transformers.activations import ACT2FN
 
-from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import (PositionalEmbeddingParams,
+from ..attention_backend import AttentionMetadata, FlashInferAttentionMetadata
+from ..attention_backend.interface import (AttentionMask, CustomAttentionMask,
+                                           PositionalEmbeddingParams,
                                            PredefinedAttentionMask, RopeParams)
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
@@ -64,7 +65,9 @@ class Gemma3Attention(Attention):
         rope_params = RopeParams.from_config(config)
         self.attention_window_size = None
         if is_sliding:
-            rope_params.theta = 10000
+            rope_params.theta = config.rope_local_base_freq
+            rope_params.scale_type = RotaryScalingType.none
+            rope_params.scale = 1.0
             self.attention_window_size = config.sliding_window - 1  # Gemma3 sliding window isn't inclusive.
         pos_embd_params = PositionalEmbeddingParams(
             type=PositionEmbeddingType.rope_gpt_neox,
@@ -99,14 +102,24 @@ class Gemma3Attention(Attention):
         position_ids: Optional[torch.IntTensor],
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
-        CAUSAL,
+        attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
         mrope_config: Optional[dict] = None,
         all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,
+        attention_mask_data: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
 
+        # Setting attention_window_size to None for custom attention mask is important.
+        # Otherwise, FlashInfer proceeds to use SWA regardless of attention_mask_data.
+        if attention_mask_data is not None:
+            assert isinstance(
+                attn_metadata, FlashInferAttentionMetadata
+            ), "Only FlashInfer backend supports custom attention mask currently."
+            assert attention_mask == CustomAttentionMask.CUSTOM
+            attention_window_size = None
+        else:
+            attention_window_size = self.attention_window_size
         return super().forward(position_ids=position_ids,
                                hidden_states=hidden_states,
                                attn_metadata=attn_metadata,
@@ -114,7 +127,8 @@ class Gemma3Attention(Attention):
                                mrope_config=mrope_config,
                                all_reduce_params=all_reduce_params,
                                lora_params=lora_params,
-                               attention_window_size=self.attention_window_size,
+                               attention_window_size=attention_window_size,
+                               attention_mask_data=attention_mask_data,
                                **kwargs)
 
     def apply_qk_norm(self, q, k):
@@ -212,6 +226,7 @@ class Gemma3DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = None,
+        attention_mask_data: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -221,6 +236,9 @@ class Gemma3DecoderLayer(DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
+            attention_mask=CustomAttentionMask.CUSTOM if attention_mask_data
+            is not None else PredefinedAttentionMask.CAUSAL,
+            attention_mask_data=attention_mask_data,
             **kwargs,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -265,6 +283,8 @@ class Gemma3TextModel(DecoderModel):
         input_ids: Optional[torch.IntTensor] = None,
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        local_attention_mask_data: Optional[torch.Tensor] = None,
+        global_attention_mask_data: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -278,9 +298,13 @@ class Gemma3TextModel(DecoderModel):
         hidden_states = inputs_embeds.to(self.dtype)
 
         for decoder_layer in self.layers:
-            hidden_states = decoder_layer(position_ids=position_ids,
-                                          hidden_states=hidden_states,
-                                          attn_metadata=attn_metadata)
+            hidden_states = decoder_layer(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                attention_mask_data=local_attention_mask_data
+                if decoder_layer.self_attn.is_sliding else
+                global_attention_mask_data)
 
         hidden_states = self.norm(hidden_states)
         return hidden_states
@@ -306,6 +330,8 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: bool = False,
+        local_attention_mask_data: Optional[torch.Tensor] = None,
+        global_attention_mask_data: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -314,6 +340,8 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
             attn_metadata=attn_metadata,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
+            local_attention_mask_data=local_attention_mask_data,
+            global_attention_mask_data=global_attention_mask_data,
         )
 
         return self.logits_processor.forward(
