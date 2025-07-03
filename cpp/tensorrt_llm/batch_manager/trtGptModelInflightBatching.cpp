@@ -1798,7 +1798,7 @@ void TrtGptModelInflightBatching::setupDecoderStep(
     {
         auto const logitsType = mRuntime->getEngine().getTensorDataType("logits");
 
-        auto [batchSlots, samplingConfigs, lookaheadPrompt, lookaheadAlgoConfigs]
+        auto [batchSlots, samplingConfig, lookaheadPrompt, lookaheadAlgoConfigs]
             = (*mCreateNewDecoderRequests)(mModelConfig, mWorldConfig, mDecodingConfig, contextRequests,
                 mRuntime->getBufferManager(), logitsType, inputBuffers, *mDecoderState, mRuntime->getStream(),
                 *mDecoder->getDecoderStream(), getMaxSequenceLen(), mOperatingBeamWidth, buffers.mMedusaBuffers);
@@ -1806,14 +1806,13 @@ void TrtGptModelInflightBatching::setupDecoderStep(
         auto const localBatchSize = batchSlots->getSize();
         if (localBatchSize > 0)
         {
-            auto samplingConfig = SamplingConfig(samplingConfigs);
-            mDecoder->getUnderlyingDecoder().setup(samplingConfig, localBatchSize, batchSlots,
+            mDecoder->getUnderlyingDecoder().setup(samplingConfig.value(), localBatchSize, batchSlots,
                 {mDecoderState->getJointDecodingOutput()}, mModelConfig.getDataType(), lookaheadPrompt,
                 lookaheadAlgoConfigs);
 
-            auto const& stream = mDecoder->getDecoderStream();
+            auto const& decoderStream = mDecoder->getDecoderStream();
             CudaEvent event{};
-            stream->record(event);
+            decoderStream->record(event);
             mRuntime->getStreamPtr()->wait(event);
         }
     }
@@ -2452,6 +2451,24 @@ void TrtGptModelInflightBatching::changeBeamWidth(SizeType32 beamWidth)
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
+void TrtGptModelInflightBatching::disableLookaheadDecoder(
+    RequestVector const& genRequests, DecoderInputBuffers& inputBuffers)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    auto batchSlots = CreateNewDecoderRequests::fillBatchSlots(genRequests, inputBuffers);
+    auto samplingConfig = CreateNewDecoderRequests::fuseSamplingConfigs(genRequests);
+
+    mDecoder->getUnderlyingDecoder().disableLookahead(samplingConfig, batchSlots->getSize(), batchSlots);
+
+    auto const& decoderStream = mDecoder->getDecoderStream();
+    CudaEvent event{};
+    decoderStream->record(event);
+    mRuntime->getStreamPtr()->wait(event);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
 void TrtGptModelInflightBatching::changeSpecDecMode(ScheduledRequests const& scheduledRequests)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -2539,11 +2556,16 @@ void TrtGptModelInflightBatching::changeSpecDecMode(ScheduledRequests const& sch
         mDecodingConfig.setDecodingMode(executor::DecodingMode::Auto());
         mBuffers.at(bufferId)->mLookaheadBuffers->disableLookaheadDecoding();
         mDecoderOutputBuffers.at(getFusedBufferId()).disableLookaheadDecoding(getMaxNumSequences());
-        mDecoder->disableLookahead(
-            scheduledRequests.generationRequests, mDecoderInputBuffers.at(getFusedBufferId()).setupBatchSlots);
-        mDecoderState->disableLookahead(scheduledRequests.generationRequests);
+        disableLookaheadDecoder(scheduledRequests.generationRequests, mDecoderInputBuffers.at(getFusedBufferId()));
+        mDecoderState->disableLookahead();
+
         for (auto const& llmReq : scheduledRequests.generationRequests)
         {
+            if (llmReq->mSeqSlot)
+            {
+                mDecoderState->setNumDecodingEngineTokens(llmReq->mSeqSlot.value(), 1);
+            }
+
             if (llmReq->getNumDraftTokens() > 0)
             {
                 llmReq->discardDraftTokens(llmReq->getNumDraftTokens());
