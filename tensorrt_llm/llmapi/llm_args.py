@@ -1960,9 +1960,8 @@ def update_llm_args_with_extra_dict(
                 llm_args_dict[field_name] = field_type.from_dict(
                     llm_args_dict[field_name])
             else:
-                if llm_args_dict[field_name] is not None:
-                    llm_args_dict[field_name] = field_type(
-                        **llm_args_dict[field_name])
+                llm_args_dict[field_name] = field_type(
+                    **llm_args_dict[field_name])
             extra_llm_str = f"because it's specified in {extra_llm_api_options}" if extra_llm_api_options else ""
             logger.warning(f"Overriding {field_name} {extra_llm_str}")
 
