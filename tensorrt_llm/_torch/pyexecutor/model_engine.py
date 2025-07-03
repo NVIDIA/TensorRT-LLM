@@ -18,6 +18,7 @@ import psutil
 import safetensors
 import torch
 import torch._dynamo.config
+import tqdm
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -48,7 +49,7 @@ from ..metadata import KVCacheParams
 from ..model_config import ModelConfig, MoeLoadBalancerConfig
 from ..models import AutoModelForCausalLM
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
-                                     timing)
+                                     run_concurrently, timing)
 from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, MoeLoadBalancerIterContext, maybe_create_moe_load_balancer)
 from ..speculative import SpecConfig, SpecMetadata, get_spec_metadata
@@ -180,10 +181,19 @@ def load_weights(checkpoint_dir: str):
                 f"Prefetching {prefetch_size / (1024**3):.2f}GB checkpoint files."
             )
             prefetch_files(weight_files)
-        for file in weight_files:
-            logger.info(f"Loading {file}")
-            part_weights = safetensors.torch.load_file(file)
-            weights.update(part_weights)
+
+        def load_safetensors_file(file):
+            return safetensors.torch.load_file(file)
+
+        pbar = tqdm.tqdm(total=len(weight_files),
+                         desc="Loading safetensors weights in parallel")
+
+        # Note that the function is called with a tuple of arguments, hence we need to wrap the arguments in a tuple via [(w,) for w in weight_files]
+        # specifically the comma right after the w is important to make it a tuple.
+        run_concurrently(load_safetensors_file, [(w, ) for w in weight_files],
+                         reduce_func=weights.update,
+                         pbar=pbar)
+
         return weights
 
     weight_files = glob.glob(f"{checkpoint_dir}/*.bin")
@@ -191,8 +201,8 @@ def load_weights(checkpoint_dir: str):
         weight_files = glob.glob(f"{checkpoint_dir}/*.pth")
 
     if weight_files:
-        for file in weight_files:
-            # try mmap first, if failed, turn off mmap
+
+        def load_bin_or_path_file(file):
             try:
                 part_weights = torch.load(file,
                                           weights_only=True,
@@ -206,7 +216,16 @@ def load_weights(checkpoint_dir: str):
                                           weights_only=True,
                                           map_location='cpu',
                                           mmap=False)
-            weights.update(part_weights)
+            finally:
+                return part_weights
+
+        pbar = tqdm.tqdm(total=len(weight_files),
+                         desc="Loading bin weights in parallel")
+        # Note that the function is called with a tuple of arguments, hence we need to wrap the arguments in a tuple via [(w,) for w in weight_files]
+        # specifically the comma right after the w is important to make it a tuple.
+        run_concurrently(load_bin_or_path_file, [(w, ) for w in weight_files],
+                         reduce_func=weights.update,
+                         pbar=pbar)
         return weights
 
     raise RuntimeError(f"No weight files found in {checkpoint_dir}.")
