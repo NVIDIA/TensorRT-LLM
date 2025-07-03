@@ -101,7 +101,22 @@ class MultimodalParams:
                                              Union[torch.Tensor,
                                                    List[Any]]]]] = field(
                                                        default_factory=dict)
-    """Raw multimodal data by modality (e.g., image pixels, video frames)."""
+    """Processed multimodal data after AutoProcessor's process() by modality (e.g., image pixels, video pixel values).
+    It should be in the form of {modality: {item_str: item_data}}
+    e.g.
+    {
+        "image": {
+            "pixel_values": torch.Tensor(),
+            "image_height": torch.Tensor() or List[int],
+            "image_width": torch.Tensor() or List[int]
+        },
+        "video": {
+            "pixel_values": torch.Tensor(),
+            "video_height": torch.Tensor() or List[int],
+            "video_width": torch.Tensor() or List[int]
+        },
+    }
+    """
 
     # Model-specific configurations
     mrope_config: Optional[Dict[str, Any]] = None
