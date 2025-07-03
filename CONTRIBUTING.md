@@ -104,6 +104,27 @@ Developer workflow for code contributions is as follows:
   * Once changes are approved, CI will be launched to validate the change. When CI passes, the reviewer will merge the PR.
   * If CI reports any failures, it's up to the requester to fix any CI failures before requesting another review.
 
+### Automatic Reviewer Assignment
+
+Reviewers are automatically assigned to PRs through a GitHub Action that:
+
+* **Triggers**: Runs automatically when PRs are opened, synchronized, or reopened
+* **Module-based assignment**: Maps changed files to modules using `.github/module-paths.json` and assigns reviewers based on module ownership defined in `.github/module-owners.json`
+* **Respects existing assignments**: Won't assign additional reviewers if any reviewers are already assigned (unless forced)
+* **Excludes PR author**: Automatically excludes the PR author from reviewer assignments
+* **Limits reviewer count**: Randomly samples up to 3 reviewers if more are eligible (configurable via `REVIEWER_LIMIT`)
+* **Coexists with CODEOWNERS**: Works alongside GitHub's CODEOWNERS file (`.github/CODEOWNERS`) which enforces mandatory approvals for specific paths (e.g., API stability tests, release branches)
+
+The auto-assignment system analyzes all files changed in your PR, maps them to the appropriate code modules, and assigns reviewers from the module owner lists. This ensures domain experts review relevant changes while avoiding over-assignment.
+
+**Testing the assignment locally**: You can test reviewer assignment with the `--dry-run` flag:
+  ```bash
+  GH_TOKEN=<token> PR_NUMBER=<pr> PR_AUTHOR=<username> \
+    python3 .github/scripts/assign_reviewers.py --dry-run
+  ```
+
+**Manual assignment**: You can also manually trigger reviewer assignment via GitHub's workflow dispatch with options for dry-run mode and force-assignment.
+
 ### PR Submission Policies
 
 The naming of the merge requests in TensorRT-LLM follows the [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/). If the PR includes an API change that might break user code/API usage, consider adding "BREAKING CHANGE" in the title so that reviewers know what to expect. Additionally, if the PR is not related to any bug and task, consider using "chore" or None as the placeholder.
