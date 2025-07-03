@@ -202,10 +202,11 @@ class NGramDrafter(Drafter):
         self,
         scheduled_requests: ScheduledRequests,
     ) -> None:
-
-        for request in sorted(scheduled_requests.generation_requests,
-                              key=lambda r: r.py_batch_idx):
-            # Add new token to a copy of the generated tokens to find new daft tokens
+        for request in sorted(
+            scheduled_requests.generation_requests,
+            key=lambda r: (r.py_batch_idx is None, r.py_batch_idx or r.request_id),
+        ):
+            # Add new token to a copy of the generated tokens to find new draft tokens
             prefix = list(request.get_tokens()[0])  # Get a copy
 
             # Generate draft tokens

@@ -974,7 +974,8 @@ class PyExecutor:
             # and scheduler aware of them.
             for req in self.active_requests:
                 # TODO: enable draft tokens in context phase
-                if req.state != LlmRequestState.GENERATION_IN_PROGRESS:
+                if req.state not in (LlmRequestState.GENERATION_IN_PROGRESS,
+                                     LlmRequestState.DISAGG_GENERATION_INIT):
                     continue
                 req.py_last_draft_tokens = req.py_draft_tokens
                 max_draft_len = self.model_engine.spec_config.max_draft_tokens
@@ -1533,12 +1534,16 @@ class PyExecutor:
             disagg_gen_init_to_prepare.generation_requests = []
             disagg_gen_init_to_prepare.paused_requests = []
 
-            self.resource_manager.resource_managers[
-                ResourceManagerType.KV_CACHE_MANAGER].prepare_resources(
-                    disagg_gen_init_to_prepare)
-            self.resource_manager.resource_managers[
-                ResourceManagerType.SEQ_SLOT_MANAGER].prepare_resources(
-                    disagg_gen_init_to_prepare)
+            for resource_mgr_type in (
+                    ResourceManagerType.KV_CACHE_MANAGER,
+                    ResourceManagerType.SEQ_SLOT_MANAGER,
+                    ResourceManagerType.SPEC_RESOURCE_MANAGER,
+                    ResourceManagerType.DRAFT_KV_CACHE_MANAGER):
+                if (resource_mgr_type in self.resource_manager.resource_managers and
+                    self.resource_manager.resource_managers[resource_mgr_type] is not None):
+                    self.resource_manager.resource_managers[
+                        resource_mgr_type].prepare_resources(
+                            disagg_gen_init_to_prepare)
 
             # Trigger KV cache exchange for new disagg_gen_init_requests
             self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
