@@ -275,7 +275,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                   speculative_config=spec_config)
 
         with llm:
-            task = MMLU(self.MODEL_NAME)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
