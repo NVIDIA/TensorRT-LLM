@@ -9,7 +9,7 @@ from tensorrt_llm.bindings.executor import FinishReason
 from ..attention_backend import AttentionMetadata
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
-from ..pyexecutor.sampler import SampleState, SampleStateTensors, TorchSampler
+from ..pyexecutor.sampler import SampleState, SampleStateTensors, TorchSampler, greedy_search_sampling_batch, sampling_batch
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
 
@@ -862,7 +862,7 @@ class MTPWorker(nn.Module):
                     mtp_num_modules, batch_size, num_contexts, logits.shape[-1])
             else:
                 # Do greedy sampling for the input logits
-                target_tokens = torch.argmax(logits, dim=-1)
+                target_tokens, target_log_probs = sampling_batch(logits, spec_metadata.temperatures, spec_metadata.top_k, spec_metadata.top_p, spec_metadata.min_p)
 
                 # context
                 accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
