@@ -117,7 +117,7 @@ class CutlassFusedMoE(MoE):
         self.has_been_profiled_min_latency = False
 
         # Alltoall support for single-node inference
-        self._enable_alltoall = False  # TODO: Hard coding temporarily.
+        self._enable_alltoall = False  # TODO: Hard coding temporarily for now.
         self.alltoall_workspace = None
         if (model_config.mapping.enable_attention_dp
                 and model_config.mapping.tp_size > 1
