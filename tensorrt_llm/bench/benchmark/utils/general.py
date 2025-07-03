@@ -14,6 +14,7 @@ from tensorrt_llm.bench.build.build import (get_benchmark_engine_settings,
                                             get_model_config)
 from tensorrt_llm.bench.dataclasses.general import (DatasetMetadata,
                                                     InferenceRequest)
+from tensorrt_llm.llmapi.llm_args import CudaGraphConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -151,6 +152,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
     cuda_graph_config = llm_args_dict.get("cuda_graph_config", None)
     cuda_graph_in_options = "cuda_graph_config" in llm_args_dict
     cuda_graph_batch_sizes = None
+    cuda_mbs_default = CudaGraphConfig.model_fields["max_batch_size"].default
     # If it's not None, we need to check if the max_batch_sizes is provided.
     if cuda_graph_config is not None:
         cuda_graph_batch_sizes = \
@@ -169,7 +171,8 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
             "padding_enabled":
             True,
             "max_batch_size":
-            max_batch_size if cuda_graph_batch_sizes is None else 0,
+            max_batch_size
+            if cuda_graph_batch_sizes is None else cuda_mbs_default,
         }
 
     pyt_options = {
