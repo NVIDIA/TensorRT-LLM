@@ -14,6 +14,7 @@ import yaml
 from pydantic import (BaseModel, Field, PrivateAttr, field_validator,
                       model_validator)
 from strenum import StrEnum
+from transformers import AutoConfig as HFAutoConfig
 from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm.lora_manager import (LoraConfig,
@@ -1185,6 +1186,41 @@ class BaseLlmArgs(BaseModel):
 
         # Store the model format in the values
         self._model_format = model_format
+        return self
+
+    @model_validator(mode="after")
+    def validate_sliding_window_config(self):
+        """Update configurations to align with the model config."""
+        if self.backend == 'pytorch':
+            # Set sliding window attention size to KV cache config (SWA or VSWA)
+            hf_config = HFAutoConfig.from_pretrained(self.model)
+            sliding_window = getattr(hf_config, "sliding_window", None)
+            sliding_window_pattern = getattr(hf_config,
+                                             "sliding_window_pattern", 1)
+            if sliding_window is not None:
+                # FIXME: Enable KV Cache reuse for VSWA after https://github.com/NVIDIA/TensorRT-LLM/pull/4983.
+                if (self.kv_cache_config.enable_block_reuse
+                        and sliding_window_pattern > 1):
+                    logger.info(
+                        "Disabling KV Cache reuse for VSWA since it is not yet supported."
+                    )
+                    self.kv_cache_config.enable_block_reuse = False
+
+                if self.kv_cache_config.max_attention_window is None:
+                    max_attention_window = [sliding_window
+                                            ] * sliding_window_pattern
+                    if sliding_window_pattern > 1:
+                        # The window size of a global layer is set to max_seq_len.
+                        # If not provided, the largest sequence length (2^31-1) is
+                        # used and will be adjusted at KVCacheManager init.
+                        max_attention_window[
+                            -1] = self.max_seq_len or 2147483647
+                    logger.info(
+                        f"Setting `kv_cache_config.max_attention_window` to "
+                        f"{max_attention_window} from the model config. The "
+                        f"size of global window size will be adjusted after "
+                        f"loading a model engine.")
+                    self.kv_cache_config.max_attention_window = max_attention_window
         return self
 
     @model_validator(mode="after")
