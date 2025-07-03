@@ -255,8 +255,7 @@ class MTPSampler(TorchSampler):
 
     def _draft_meet_max_token_stop_criteria(self, request: LlmRequest,
                                             num_tokens: int, beam_idx: int):
-        if self._meet_max_token_stop_criteria(request,
-                                              num_tokens + self.draft_len):
+        if self._meet_max_token_stop_criteria(request, num_tokens):
             request.state = LlmRequestState.GENERATION_COMPLETE
             request.set_finished_reason(FinishReason.LENGTH, beam_idx)
 

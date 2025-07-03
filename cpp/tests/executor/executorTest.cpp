@@ -1901,7 +1901,7 @@ namespace
 void runTest(Executor& executor, fs::path const& inputPath, ModelIds const& modelIds,
     FlakyTestInfo const& flakyTestInfo, bool streaming, SizeType32 const vocabSizePadded, BeamResult const& beamResult,
     OutputConfig const& outConfig, bool isSpeculativeDecoding, int maxWaitMs, bool returnAllGeneratedTokens,
-    SizeType32 const numReturnSequences, bool isNonGreedySampling)
+    SizeType32 const numReturnSequences, bool isNonGreedySampling, SizeType32 const modelParallelism)
 {
     auto const beamWidth = beamResult.beamWidth;
 
@@ -1948,7 +1948,6 @@ void runTest(Executor& executor, fs::path const& inputPath, ModelIds const& mode
 
     auto& comm = tensorrt_llm::mpi::MpiComm::world();
     auto const worldRank = comm.getRank();
-    auto const worldSize = comm.getSize();
 
     // Expected return sizes.
     auto const numSequences = beamWidth > 1 ? 1 : numReturnSequences;
@@ -2021,15 +2020,18 @@ void runTest(Executor& executor, fs::path const& inputPath, ModelIds const& mode
 
                     if (!isNonGreedySampling)
                     {
+                        float const logitsAtol = modelParallelism > 1 ? 1e-1 : 1e-2;
+                        float const logitsRtol = modelParallelism > 1 ? 1e-2 : 1e-3;
+
                         testData.verifyLogProbs(outConfig.returnLogProbs, streaming, outConfig.excludeInputFromOutput,
                             givenInputLengths.at(batchId), beamWidth, beamTokens, cumLogProbs, logProbs, batchId,
                             flakyTestInfo);
                         testData.validateContextLogits(outConfig.returnContextLogits, givenInputLengths.at(batchId),
-                            beamWidth, contextLogits, vocabSizePadded, batchId);
+                            beamWidth, contextLogits, vocabSizePadded, batchId, logitsAtol, logitsRtol);
                         testData.validateGenerationLogits(outConfig.returnGenerationLogits, result.isSequenceFinal,
                             streaming, outConfig.excludeInputFromOutput, givenInputLengths.at(batchId),
                             reqMaxNewTokens.at(batchId), beamWidth, beamTokens, genLogits, vocabSizePadded, batchId,
-                            returnAllGeneratedTokens);
+                            returnAllGeneratedTokens, logitsAtol, logitsRtol);
                     }
 
                     // Ignore first iteration as it doesn't use draft tokens
@@ -2063,12 +2065,14 @@ void runTest(Executor& executor, fs::path const& inputPath, ModelIds const& mode
 void runTest(fs::path const& modelPath, ExecutorConfig const& executorConfig, fs::path const& inputPath,
     ModelIds const& modelIds, FlakyTestInfo const& flakyTestInfo, bool streaming, SizeType32 const vocabSizePadded,
     BeamResult const& beamResult, OutputConfig const& outConfig, bool isSpeculativeDecoding, int maxWaitMs,
-    bool returnAllGeneratedTokens, SizeType32 const numReturnSequences, bool isNonGreedySampling)
+    bool returnAllGeneratedTokens, SizeType32 const numReturnSequences, bool isNonGreedySampling,
+    SizeType32 const modelParallelism)
 {
     auto executor = Executor{modelPath, ModelType::kDECODER_ONLY, executorConfig};
 
     runTest(executor, inputPath, modelIds, flakyTestInfo, streaming, vocabSizePadded, beamResult, outConfig,
-        isSpeculativeDecoding, maxWaitMs, returnAllGeneratedTokens, numReturnSequences, isNonGreedySampling);
+        isSpeculativeDecoding, maxWaitMs, returnAllGeneratedTokens, numReturnSequences, isNonGreedySampling,
+        modelParallelism);
 }
 
 ExecutorConfig createExecutorConfig(SizeType32 maxBeamWidth, bool useOrchestratorMode, bool gatherGenerationLogits,
@@ -2193,6 +2197,12 @@ TEST_P(AllParamsTest, TokenComparison)
             beamResult.resultsFile = resultsPath / PathUtil::FP16_PLUGIN_PACKED_PAGED_RESULT_TP2_PP2_FILE();
             modelPath = LLAMA_MODEL_PATH / PathUtil::FP16_GPT_ATTENTION_PACKED_PAGED_DIR() / "tp2-pp2-cp1-gpu";
         }
+        beamResult.genLogitsFile = resultsPath / PathUtil::FP16_PLUGIN_PACKED_PAGED_GENERATION_LOGITS_TP4_PP1_FILE();
+        if (outConfig.returnLogProbs)
+        {
+            beamResult.cumLogProbsFile = resultsPath / PathUtil::FP16_PLUGIN_PACKED_PAGED_CUM_LOG_PROBS_TP4_PP1_FILE();
+            beamResult.logProbsFile = resultsPath / PathUtil::FP16_PLUGIN_PACKED_PAGED_LOG_PROBS_TP4_PP1_FILE();
+        }
     }
     else if (modelName == "medusa")
     {
@@ -2283,9 +2293,9 @@ TEST_P(AllParamsTest, TokenComparison)
             GTEST_SKIP() << "Skipping Llama test";
         }
 
-        if (outConfig.returnLogProbs || outConfig.returnContextLogits || outConfig.returnGenerationLogits)
+        if (outConfig.returnContextLogits)
         {
-            GTEST_SKIP() << "Skipping logits and log probs tests for mpi runs";
+            GTEST_SKIP() << "Skipping context logits tests for mpi runs";
         }
 
         // Check that it was launched with right number of MPI ranks
@@ -2302,11 +2312,12 @@ TEST_P(AllParamsTest, TokenComparison)
     }
     auto decoderJsonConfig = tensorrt_llm::runtime::GptJsonConfig::parse(modelPath / "config.json");
 
-    auto modelTP = decoderJsonConfig.getTensorParallelism();
-    auto modelPP = decoderJsonConfig.getPipelineParallelism();
+    auto const modelTP = decoderJsonConfig.getTensorParallelism();
+    auto const modelPP = decoderJsonConfig.getPipelineParallelism();
+    auto const modelParallelism = modelTP * modelPP;
     int deviceCount = -1;
     TLLM_CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
-    std::optional<std::vector<SizeType32>> deviceIds = std::vector<SizeType32>(modelTP * modelPP);
+    std::optional<std::vector<SizeType32>> deviceIds = std::vector<SizeType32>(modelParallelism);
     for (auto i = 0; i < deviceIds->size(); i++)
     {
         deviceIds->at(i) = i % deviceCount;
@@ -2354,7 +2365,8 @@ TEST_P(AllParamsTest, TokenComparison)
         std::move(deviceIds), std::move(participantIds));
 
     runTest(modelPath, executorConfig, inputPath, modelIds, flakyTestInfo, streaming, vocabSizePadded, beamResult,
-        outConfig, isSpeculativeDecoding, mMaxWaitMs, returnAllGeneratedTokens, numReturnSequences, false);
+        outConfig, isSpeculativeDecoding, mMaxWaitMs, returnAllGeneratedTokens, numReturnSequences, false,
+        modelParallelism);
 }
 
 TEST_F(GptExecutorTest, ChangeBeamWidth)
@@ -2455,7 +2467,7 @@ void doTokenComparisonChangeBeamWidth(bool enableReuse, SizeType32 maxWaitMs)
         beamResult.genLogitsFile = resultsPath / PathUtil::FP16_PLUGIN_PACKED_PAGED_GENERATION_LOGITS_FILE();
 
         runTest(executor, inputPath, modelIds, flakyTestInfo, streaming, vocabSizePadded, beamResult, outConfig,
-            isSpeculativeDecoding, maxWaitMs, false, 1, false);
+            isSpeculativeDecoding, maxWaitMs, false, 1, false, 1);
     }
 }
 
@@ -2497,7 +2509,7 @@ TEST_F(GptExecutorTest, NReturnRandomness)
     beamResult.genLogitsFile = resultsPath / PathUtil::FP16_PLUGIN_PACKED_PAGED_GENERATION_LOGITS_FILE();
 
     runTest(executor, inputPath, modelIds, flakyTestInfo, streaming, vocabSizePadded, beamResult, outConfig,
-        isSpeculativeDecoding, mMaxWaitMs, false, 1, true);
+        isSpeculativeDecoding, mMaxWaitMs, false, 1, true, 1);
 }
 
 TEST_F(GptExecutorTest, TimedOut)
@@ -4526,10 +4538,10 @@ INSTANTIATE_TEST_SUITE_P(LlamaExecutorTest, AllParamsTest,
     testing::Combine(                                                                   //
         testing::Values(false, true),                                                   // streaming
         testing::Values(1, 2),                                                          // beamWidth
-        testing::Values(false),                                                         // computeLogProbs
+        testing::Values(true),                                                          // computeLogProbs
         testing::Values(false, true),                                                   // excludeInputInOutput
         testing::Values(false),                                                         // returnContextLogits
-        testing::Values(false),                                                         // returnGenerationLogits
+        testing::Values(true),                                                          // returnGenerationLogits
         testing::Values("llama_tp1_pp4_cp1", "llama_tp4_pp1_cp1", "llama_tp2_pp2_cp1"), // modelName
         testing::Values(false, true),                                                   // useOrchestratorMode
         testing::Values(false),                                                         // returnAllGeneratedTokens
