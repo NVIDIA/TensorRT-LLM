@@ -1289,7 +1289,7 @@ def test_executor_lookahead_decoding_config():
     assert sampling_params.lookahead_config.max_verification_set_size == 8
 
 
-def llama_v2_13b_lora_test_harness(**llm_kwargs):
+def llama_v2_13b_lora_from_dir_test_harness(**llm_kwargs):
     # Shahar- perhaps disable build config
     hf_model_dir = get_model_path("llama-models-v2/llama-v2-13b-hf")
     hf_lora_dir = get_model_path("llama-models-v2/chinese-llama-2-lora-13b")
@@ -1321,7 +1321,7 @@ def llama_v2_13b_lora_test_harness(**llm_kwargs):
         assert similar(output.outputs[0].text, ref)
 
 
-def llama_7b_multi_lora_test_harness(**llm_kwargs):
+def llama_7b_multi_lora_from_request_test_harness(**llm_kwargs):
     hf_model_dir = get_model_path("llama-models/llama-7b-hf")
     hf_lora_dir1 = get_model_path("llama-models/luotuo-lora-7b-0.1")
     hf_lora_dir2 = get_model_path("llama-models/Japanese-Alpaca-LoRA-7b-v0")
@@ -1376,12 +1376,12 @@ def llama_7b_multi_lora_test_harness(**llm_kwargs):
 
 @skip_gpu_memory_less_than_40gb
 def test_llama_v2_13b_lora():
-    llama_v2_13b_lora_test_harness()
+    llama_v2_13b_lora_from_dir_test_harness()
 
 
 @skip_gpu_memory_less_than_40gb
 def test_llama_7b_multi_lora():
-    llama_7b_multi_lora_test_harness(max_loras=1, max_cpu_loras=8)
+    llama_7b_multi_lora_from_request_test_harness(max_loras=1, max_cpu_loras=8)
 
 
 def llama_v2_7b_prompt_adapter_test_harness(**llm_kwargs):

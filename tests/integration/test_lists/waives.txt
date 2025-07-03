@@ -438,6 +438,7 @@ examples/test_gpt.py::test_starcoder_fp8_quantization_2gpu[starcoderplus] SKIP (
 examples/test_multimodal.py::test_llm_multimodal_general[fuyu-8b-pp:1-tp:1-float16-bs:8-cpp_e2e:True-nb:1] SKIP (https://nvbugs/5360086)
 examples/test_multimodal.py::test_llm_multimodal_general[llava-1.5-7b-hf-pp:1-tp:1-float16-bs:8-cpp_e2e:True-nb:1] SKIP (https://nvbugs/5360086)
 test_e2e.py::test_ptp_scaffolding[DeepSeek-R1-Distill-Qwen-7B-DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B] SKIP (https://nvbugs/5365714)
-accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[4gpu_latency_moe_cutlass] SKIP (https://nvbugs/5369420)
+accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[4gpu_latency_moe_cutlass] SKIP (https://nvbugs/5369010)
 examples/test_multimodal.py::test_llm_multimodal_general[VILA1.5-3b-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1] SKIP (https://nvbugs/5371538)
 test_e2e.py::test_trtllm_bench_llmapi_launch[trt_backend-llama-v3-llama3-8b] SKIP (https://nvbugs/5320234)
+examples/test_granite.py::test_granite_bf16_lora[granite-3.0-1b-a400m-instruct] SKIP (https://nvbugs/5374145)
