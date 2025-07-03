@@ -23,25 +23,6 @@ def save_eplb_config(config: dict, path: str):
         yaml.dump(config, f, width=float('inf'))
 
 
-def create_cooccurrence_matrix(expert_load_factor: torch.Tensor,
-                               expert_replica_count: torch.Tensor,
-                               num_groups: int = 32):
-    num_experts = expert_replica_count.size(0)
-    num_experts_per_group = num_experts // num_groups
-    slot_load_factor = expert_load_factor / expert_replica_count
-    cooccurrence_matrix = slot_load_factor.unsqueeze(
-        1) * slot_load_factor / slot_load_factor.sum()
-    expert_ids = torch.arange(num_experts)
-    expert_group_ids = expert_ids // num_experts_per_group
-    cooccurrence_matrix = cooccurrence_matrix.masked_fill(
-        expert_group_ids.unsqueeze(1) != expert_group_ids, 0)
-    cooccurrence_matrix = cooccurrence_matrix.masked_fill(
-        expert_ids.unsqueeze(1) == expert_ids, -1e9)
-    assert (cooccurrence_matrix
-            > 0).sum() == num_experts_per_group**2 * num_groups - num_experts
-    return cooccurrence_matrix
-
-
 def select_expert(sorted_expert_ids, expert_replica_assigned,
                   expert_replica_count):
     for expert_id in sorted_expert_ids.tolist():
@@ -142,7 +123,8 @@ if __name__ == "__main__":
                         help="The number of layers to update per iteration.")
     args = parser.parse_args()
 
-    meta_info, statistic, _ = load_expert_statistic(args.expert_statistic_path)
+    meta_info, statistic, cooccurrence = load_expert_statistic(
+        args.expert_statistic_path)
     num_experts = meta_info["num_experts"]
     num_experts_per_token = meta_info["num_experts_per_token"]
 
@@ -179,11 +161,19 @@ if __name__ == "__main__":
 
         do_replication(moelb_info, expert_load_factor.tolist(), placement_info)
 
-        num_groups = 32
         expert_replica_count = torch.tensor(placement_info.expert_replica_count)
-        cooccurrence_matrix = create_cooccurrence_matrix(expert_load_factor,
-                                                         expert_replica_count,
-                                                         num_groups=num_groups)
+
+        cooccurrence_iters = [
+            data for key, data in cooccurrence.items() if
+            args.iter_start <= key[0] < args.iter_stop and key[1] == layer_idx
+        ]
+        cooccurrence_iters = torch.stack(cooccurrence_iters, dim=0)
+        assert cooccurrence_iters.size(0) == num_iters
+        cooccurrence_matrix = cooccurrence_iters.sum(dim=0).float()
+        expert_ids = torch.arange(num_experts)
+        cooccurrence_matrix = cooccurrence_matrix.masked_fill(
+            expert_ids.unsqueeze(1) == expert_ids, 0)
+
         rank_expert_ids = do_placement(expert_load_factor,
                                        expert_replica_count,
                                        cooccurrence_matrix,

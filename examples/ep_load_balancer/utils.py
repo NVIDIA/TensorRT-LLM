@@ -18,11 +18,21 @@ def load_expert_statistic(path: str):
                 statistic[key] = torch.zeros_like(data)
             statistic[key] += data
 
+    cooccurrence_files = glob.glob(f"{path}/cooccurrence_rank*.safetensors")
+    cooccurrence = {}
+    for cooccurrence_file in cooccurrence_files:
+        rank_cooccurrence = safetensors.torch.load_file(cooccurrence_file)
+        for key, data in rank_cooccurrence.items():
+            if key not in cooccurrence:
+                cooccurrence[key] = torch.zeros_like(data)
+            cooccurrence[key] += data
+
     def parse_key(key: str) -> tuple[int, int]:
         iter_idx, layer_idx = key.split("_")
         return int(iter_idx), int(layer_idx)
 
     statistic = {parse_key(key): data for key, data in statistic.items()}
+    cooccurrence = {parse_key(key): data for key, data in cooccurrence.items()}
 
     iters = sorted(list(set(iter_idx for iter_idx, _ in statistic)))
     layers = sorted(list(set(layer_idx for _, layer_idx in statistic)))
@@ -34,4 +44,4 @@ def load_expert_statistic(path: str):
     meta_info["iter_start"] = iters[0]
     meta_info["iter_stop"] = iters[-1] + 1
     meta_info["layers"] = layers
-    return meta_info, statistic
+    return meta_info, statistic, cooccurrence
