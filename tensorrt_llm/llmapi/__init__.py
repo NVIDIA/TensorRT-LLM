@@ -4,14 +4,13 @@ from ..sampling_params import GuidedDecodingParams, SamplingParams
 from .build_cache import BuildCacheConfig
 from .llm import LLM, RequestOutput
 # yapf: disable
-from .llm_args import (BatchingType, CacheTransceiverConfig, CalibConfig,
-                       CapacitySchedulerPolicy, ContextChunkingPolicy,
-                       CudaGraphConfig, DraftTargetDecodingConfig,
-                       DynamicBatchConfig, EagleDecodingConfig,
-                       ExtendedRuntimePerfKnobConfig, KvCacheConfig, LlmArgs,
+from .llm_args import (CacheTransceiverConfig, CapacitySchedulerPolicy,
+                       ContextChunkingPolicy, CudaGraphConfig,
+                       DraftTargetDecodingConfig, DynamicBatchConfig,
+                       EagleDecodingConfig, KvCacheConfig, LlmArgs,
                        LookaheadDecodingConfig, MedusaDecodingConfig, MoeConfig,
                        MTPDecodingConfig, NGramDecodingConfig, SchedulerConfig,
-                       TorchCompileConfig, TorchLlmArgs, TrtLlmArgs,
+                       TorchCompileConfig, TorchLlmArgs,
                        UserProvidedDecodingConfig)
 from .llm_utils import (BuildConfig, KvCacheRetentionConfig, QuantAlgo,
                         QuantConfig)
@@ -37,12 +36,9 @@ __all__ = [
     'BuildConfig',
     'QuantConfig',
     'QuantAlgo',
-    'CalibConfig',
     'BuildCacheConfig',
     'RequestError',
     'MpiCommSession',
-    'ExtendedRuntimePerfKnobConfig',
-    'BatchingType',
     'ContextChunkingPolicy',
     'DynamicBatchConfig',
     'CacheTransceiverConfig',
@@ -52,5 +48,4 @@ __all__ = [
     'DraftTargetDecodingConfig',
     'LlmArgs',
     'TorchLlmArgs',
-    'TrtLlmArgs',
 ]
