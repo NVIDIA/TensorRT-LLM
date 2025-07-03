@@ -56,7 +56,8 @@ extensions = [
     'sphinxarg.ext',
     'sphinx_click',
     'sphinx_copybutton',
-    'sphinxcontrib.autodoc_pydantic'
+    'sphinxcontrib.autodoc_pydantic',
+    'sphinx_togglebutton',
 ]
 
 autodoc_pydantic_model_show_json = True
@@ -77,7 +78,29 @@ myst_heading_anchors = 4
 
 myst_enable_extensions = [
     "deflist",
+    "substitution",
 ]
+
+myst_substitutions = {
+    "version":
+    version,
+    "version_quote":
+    f"`{version}`",
+    "container_tag_admonition":
+    r"""
+```{admonition} Container image tags
+:class: dropdown note
+In the example shell commands, `x.y.z` corresponds to the TensorRT-LLM container
+version to use. If omitted, `IMAGE_TAG` will default to `tensorrt_llm.__version__`
+(e.g., this documentation was generated from the {{version_quote}} source tree).
+If this does not work, e.g., because a container for the version you are
+currently working with has not been released yet, you can try using a
+container published for a previous
+[GitHub pre-release or release](https://github.com/NVIDIA/TensorRT-LLM/releases)
+(see also [NGC Catalog](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags)).
+```
+    """,
+}
 
 autosummary_generate = True
 copybutton_exclude = '.linenos, .gp, .go'

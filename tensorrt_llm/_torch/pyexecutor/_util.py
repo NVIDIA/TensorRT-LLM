@@ -340,6 +340,13 @@ class KvCacheCreator:
                 spec_config=spec_config,
             )
         else:
+            # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_from_cpp in KVCahceManager
+            is_vswa = executor_config.kv_cache_config.max_attention_window is not None and len(
+                set(executor_config.kv_cache_config.max_attention_window)) > 1
+            binding_model_config = model_engine.model.model_config.get_bindings_model_config(
+                tokens_per_block=executor_config.tokens_per_block
+            ) if is_vswa else None
+
             kv_cache_manager = KVCacheManager(
                 executor_config.kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
@@ -352,7 +359,8 @@ class KvCacheCreator:
                 mapping=mapping,
                 dtype=kv_cache_dtype,
                 spec_config=spec_config,
-            )
+                max_num_tokens=executor_config.max_num_tokens,
+                model_config=binding_model_config)
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to executor_config
         if model_engine.kv_cache_manager_key == ResourceManagerType.KV_CACHE_MANAGER:
             executor_config.max_seq_len = kv_cache_manager.max_seq_len
@@ -391,6 +399,7 @@ def create_py_executor_instance(
         draft_model_engine,
         start_worker,
         sampler,
+        drafter,
         lora_config: Optional[LoraConfig] = None,
         garbage_collection_gen0_threshold: Optional[int] = None) -> PyExecutor:
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
@@ -510,6 +519,7 @@ def create_py_executor_instance(
         scheduler,
         model_engine=model_engine,
         sampler=sampler,
+        drafter=drafter,
         dist=dist,
         max_num_sequences=max_num_sequences,
         disable_overlap_scheduler=pytorch_backend_config.

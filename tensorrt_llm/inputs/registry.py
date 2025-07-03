@@ -3,6 +3,7 @@ from typing import (Any, Callable, Dict, List, Optional, Protocol, Tuple, Type,
 
 from torch import nn
 
+from .._utils import nvtx_range_debug
 from ..logger import logger
 from ..sampling_params import SamplingParams
 from .data import TextPrompt
@@ -61,16 +62,18 @@ class DefaultInputProcessor(InputProcessor):
             kwargs = dict(truncation=True,
                           max_length=sampling_params.truncate_prompt_tokens)
 
-        token_ids = self.tokenizer.encode(
-            inputs["prompt"],
-            add_special_tokens=sampling_params.add_special_tokens,
-            **kwargs)
-
-        if "query" in inputs:
-            query_token_ids = self.tokenizer.encode(
-                inputs["query"],
+        with nvtx_range_debug("tokenize prompt"):
+            token_ids = self.tokenizer.encode(
+                inputs["prompt"],
                 add_special_tokens=sampling_params.add_special_tokens,
                 **kwargs)
+
+        if "query" in inputs:
+            with nvtx_range_debug("tokenize query"):
+                query_token_ids = self.tokenizer.encode(
+                    inputs["query"],
+                    add_special_tokens=sampling_params.add_special_tokens,
+                    **kwargs)
             return token_ids, {"query_token_ids": query_token_ids}
 
         return token_ids, None

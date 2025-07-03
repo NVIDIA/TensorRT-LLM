@@ -8,7 +8,9 @@
 #SBATCH -e logs/llmapi-distributed.err
 #SBATCH -J llmapi-distributed-task
 
-### Run LLM-API with pytorch backend on Slurm
+### :section Slurm
+### :title Run LLM-API with pytorch backend on Slurm
+### :order 0
 
 # NOTE, this feature is experimental and may not work on all systems.
 # The trtllm-llmapi-launch is a script that launches the LLM-API code on

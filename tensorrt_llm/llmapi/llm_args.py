@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from enum import Enum, EnumMeta
 from pathlib import Path
 from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Literal, Optional,
-                    Union)
+                    TypeAlias, Union)
 
 import torch
 import yaml
@@ -54,10 +54,37 @@ from ..models.modeling_utils import (PretrainedConfig, QuantAlgo, QuantConfig,
 from ..sampling_params import BatchedLogitsProcessor
 from .build_cache import BuildCacheConfig
 from .tokenizer import TokenizerBase, tokenizer_factory
-from .utils import (generate_api_docs_as_docstring, get_type_repr,
-                    print_traceback_on_error)
+from .utils import generate_api_docs_as_docstring, get_type_repr
 
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
+
+
+class CudaGraphConfig(BaseModel):
+    """
+    Configuration for CUDA graphs.
+    """
+    # List of batch sizes to create CUDA graphs for.
+    batch_sizes: Optional[List[int]] = Field(
+        default=None,
+        description="List of batch sizes to create CUDA graphs for.")
+
+    max_batch_size: int = Field(
+        default=0, description="Maximum batch size for CUDA graphs.")
+
+    padding_enabled: bool = Field(
+        default=False,
+        description=
+        "If true, batches are rounded up to the nearest cuda_graph_batch_size. This is usually a net win for performance."
+    )
+
+    @field_validator('max_batch_size')
+    @classmethod
+    def validate_cuda_graph_max_batch_size(cls, v):
+        """Validate cuda_graph_config.max_batch_size is non-negative."""
+        if v < 0:
+            raise ValueError(
+                "cuda_graph_config.max_batch_size must be non-negative")
+        return v
 
 
 @dataclass
@@ -599,6 +626,16 @@ class LookaheadDecodingConfig(DecodingBaseConfig, PybindMirror):
     decoding_type: ClassVar[str] = "Lookahead"
 
 
+SpeculativeConfig: TypeAlias = Optional[Union[
+    DraftTargetDecodingConfig,
+    EagleDecodingConfig,
+    LookaheadDecodingConfig,
+    MedusaDecodingConfig,
+    MTPDecodingConfig,
+    NGramDecodingConfig,
+]]
+
+
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(BaseModel, PybindMirror):
     """
@@ -658,6 +695,8 @@ class KvCacheConfig(BaseModel, PybindMirror):
         description=
         "Whether partially matched blocks that are in use can be reused after copying them."
     )
+    use_uvm: bool = Field(default=False,
+                          description="Whether to use UVM for the KV cache.")
 
     def _to_pybind(self):
         return _KvCacheConfig(
@@ -672,7 +711,8 @@ class KvCacheConfig(BaseModel, PybindMirror):
             secondary_offload_min_priority=self.secondary_offload_min_priority,
             event_buffer_max_size=self.event_buffer_max_size,
             enable_partial_reuse=self.enable_partial_reuse,
-            copy_on_partial_reuse=self.copy_on_partial_reuse)
+            copy_on_partial_reuse=self.copy_on_partial_reuse,
+            use_uvm=self.use_uvm)
 
 
 @PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)
@@ -861,13 +901,6 @@ class BaseLlmArgs(BaseModel):
     lora_config: Optional[LoraConfig] = Field(
         default=None, description="LoRA configuration for the model.")
 
-    # Prompt adapter arguments
-    enable_prompt_adapter: bool = Field(default=False,
-                                        description="Enable prompt adapter.")
-
-    max_prompt_adapter_token: int = Field(
-        default=0, description="The maximum number of prompt adapter tokens.")
-
     # Quantization and calibration configurations
     quant_config: Optional[QuantConfig] = Field(
         default=None, description="Quantization config.", validate_default=True)
@@ -911,11 +944,8 @@ class BaseLlmArgs(BaseModel):
         default=None, description="Cache transceiver config.")
 
     # Speculative decoding parameters
-    speculative_config: Optional[
-        Union[LookaheadDecodingConfig, MedusaDecodingConfig,
-              EagleDecodingConfig, MTPDecodingConfig, NGramDecodingConfig,
-              DraftTargetDecodingConfig]] = Field(
-                  default=None, description="Speculative decoding config.")
+    speculative_config: SpeculativeConfig = Field(
+        default=None, description="Speculative decoding config.")
 
     batching_type: Optional[BatchingType] = Field(default=None,
                                                   description="Batching type.")
@@ -956,12 +986,6 @@ class BaseLlmArgs(BaseModel):
     reasoning_parser: Optional[str] = Field(
         default=None,
         description="The parser to separate reasoning content from output.")
-
-    garbage_collection_gen0_threshold: int = Field(
-        default=20000,
-        description=
-        "Threshold for Python garbage collection of generation 0 objects."
-        "Lower values trigger more frequent garbage collection.")
 
     # TODO[Superjomn]: To deprecate this config.
     decoding_config: Optional[object] = Field(
@@ -1262,7 +1286,8 @@ class BaseLlmArgs(BaseModel):
             if self.max_lora_rank is not None:
                 self.build_config.lora_config.max_lora_rank = self.max_lora_rank
 
-        if self.enable_prompt_adapter:
+        if hasattr(self,
+                   'enable_prompt_adapter') and self.enable_prompt_adapter:
             self.build_config.max_prompt_embedding_table_size = self.max_prompt_adapter_token * self.build_config.max_batch_size
 
         if self.max_beam_width is None:
@@ -1533,6 +1558,13 @@ class TrtLlmArgs(BaseLlmArgs):
         description="Build config.",
         json_schema_extra={"type": f"Optional[{get_type_repr(BuildConfig)}]"})
 
+    # Prompt adapter arguments
+    enable_prompt_adapter: bool = Field(default=False,
+                                        description="Enable prompt adapter.")
+
+    max_prompt_adapter_token: int = Field(
+        default=0, description="The maximum number of prompt adapter tokens.")
+
     # Private attributes
     _auto_parallel_config: Optional[AutoParallelConfig] = PrivateAttr(
         default=None)
@@ -1624,7 +1656,6 @@ class TorchCompileConfig(BaseModel):
 
 
 class TorchLlmArgs(BaseLlmArgs):
-
     # Just a dummy BuildConfig to allow code reuse with the TrtLlmArgs
     build_config: Optional[object] = Field(
         default=None,
@@ -1633,25 +1664,20 @@ class TorchLlmArgs(BaseLlmArgs):
         json_schema_extra={"type": f"Optional[{get_type_repr(BuildConfig)}]"})
 
     # PyTorch backend specific configurations
-
-    use_cuda_graph: bool = Field(
-        default=False,
+    garbage_collection_gen0_threshold: int = Field(
+        default=20000,
         description=
-        "If true, use CUDA graphs for decoding. CUDA graphs are only created for the batch sizes in cuda_graph_batch_sizes, and are enabled for batches that consist of decoding requests *only* (the reason is that it's hard to capture a single graph with prefill requests since the input shapes are a function of the sequence lengths). Note that each CUDA graph can use up to 200 MB of extra memory."
-    )
+        "Threshold for Python garbage collection of generation 0 objects."
+        "Lower values trigger more frequent garbage collection.")
 
-    cuda_graph_batch_sizes: Optional[List[int]] = Field(
+    cuda_graph_config: Optional[CudaGraphConfig] = Field(
         default=None,
-        description="List of batch sizes to create CUDA graphs for.")
-
-    cuda_graph_max_batch_size: int = Field(
-        default=0, description="Maximum batch size for CUDA graphs.")
-
-    cuda_graph_padding_enabled: bool = Field(
-        default=False,
-        description=
-        "If true, batches are rounded up to the nearest cuda_graph_batch_size. This is usually a net win for performance."
-    )
+        description="CUDA graph config.If true, use CUDA graphs for decoding. \
+        CUDA graphs are only created for the batch sizes in cuda_graph_config.batch_sizes, \
+        and are enabled for batches that consist of decoding requests *only* \
+        (the reason is that it's hard to capture a single graph with prefill requests \
+        since the input shapes are a function of the sequence lengths).\
+         Note that each CUDA graph can use up to 200 MB of extra memory.")
 
     disable_overlap_scheduler: bool = Field(
         default=False, description="Disable the overlap scheduler.")
@@ -1733,6 +1759,17 @@ class TorchLlmArgs(BaseLlmArgs):
         "Set this to a larger value when the batch size is large, which helps reduce the streaming overhead.",
     )
 
+    force_dynamic_quantization: bool = Field(
+        default=False,
+        description="If true, force dynamic quantization. Defaults to False.",
+    )
+
+    allreduce_strategy: Optional[
+        Literal['AUTO', 'NCCL', 'UB', 'MINLATENCY', 'ONESHOT', 'TWOSHOT',
+                'LOWPRECISION',
+                'MNNVL']] = Field(default='AUTO',
+                                  description="Allreduce strategy to use.")
+
     # TODO: remove backend later
     @field_validator('backend', mode='before')
     def init_backend(cls, v):
@@ -1792,85 +1829,6 @@ class TorchLlmArgs(BaseLlmArgs):
                 f"stream_interval must be positive, got {self.stream_interval}")
         return self
 
-    # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
-    def get_pytorch_backend_config(self) -> "PyTorchConfig":
-        from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-
-        return PyTorchConfig(
-            extra_resource_managers=self.extra_resource_managers,
-            use_cuda_graph=self.use_cuda_graph,
-            cuda_graph_batch_sizes=self.cuda_graph_batch_sizes,
-            cuda_graph_max_batch_size=self.cuda_graph_max_batch_size,
-            cuda_graph_padding_enabled=self.cuda_graph_padding_enabled,
-            disable_overlap_scheduler=self.disable_overlap_scheduler,
-            moe_max_num_tokens=self.moe_max_num_tokens,
-            moe_load_balancer=self.moe_load_balancer,
-            attn_backend=self.attn_backend,
-            moe_backend=self.moe_backend,
-            mixed_sampler=self.mixed_sampler,
-            enable_trtllm_sampler=self.enable_trtllm_sampler,
-            kv_cache_dtype=self.kv_cache_dtype,
-            enable_iter_perf_stats=self.enable_iter_perf_stats,
-            enable_iter_req_stats=self.enable_iter_req_stats,
-            print_iter_log=self.print_iter_log,
-            torch_compile_enabled=bool(self.torch_compile_config is not None),
-            torch_compile_fullgraph=self.torch_compile_config.enable_fullgraph
-            if self.torch_compile_config is not None else True,
-            torch_compile_inductor_enabled=self.torch_compile_config.
-            enable_inductor if self.torch_compile_config is not None else False,
-            torch_compile_piecewise_cuda_graph=self.torch_compile_config.
-            enable_piecewise_cuda_graph
-            if self.torch_compile_config is not None else False,
-            torch_compile_enable_userbuffers=self.torch_compile_config.
-            enable_userbuffers
-            if self.torch_compile_config is not None else True,
-            autotuner_enabled=self.autotuner_enabled,
-            enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
-            load_format=self.load_format,
-            enable_min_latency=self.enable_min_latency,
-            stream_interval=self.stream_interval)
-
-    @field_validator('cuda_graph_max_batch_size')
-    @classmethod
-    def validate_cuda_graph_max_batch_size(cls, v):
-        """Validate cuda_graph_max_batch_size is non-negative."""
-        if v < 0:
-            raise ValueError("cuda_graph_max_batch_size must be non-negative")
-        return v
-
-    @model_validator(mode='after')
-    def validate_cuda_graph_config(self) -> 'TorchLlmArgs':
-        """Validate CUDA graph configuration.
-
-        Ensures that:
-        1. If cuda_graph_batch_sizes is provided, cuda_graph_max_batch_size must be 0
-        2. If cuda_graph_batch_sizes is not provided, it is generated based on cuda_graph_max_batch_size
-        3. If both are provided, cuda_graph_batch_sizes must match the generated values
-        """
-        if self.cuda_graph_batch_sizes:
-            self.cuda_graph_batch_sizes = sorted(self.cuda_graph_batch_sizes)
-            if self.cuda_graph_max_batch_size != 0:
-                if self.cuda_graph_batch_sizes != self._generate_cuda_graph_batch_sizes(
-                        self.cuda_graph_max_batch_size,
-                        self.cuda_graph_padding_enabled):
-                    raise ValueError(
-                        "Please don't set both cuda_graph_batch_sizes "
-                        "and cuda_graph_max_batch_size.\n"
-                        f"cuda_graph_batch_sizes: {self.cuda_graph_batch_sizes}, "
-                        f"cuda_graph_max_batch_size: {self.cuda_graph_max_batch_size}"
-                    )
-            else:
-                self.cuda_graph_max_batch_size = max(
-                    self.cuda_graph_batch_sizes)
-        else:
-            max_batch_size = self.cuda_graph_max_batch_size or 128
-            generated_sizes = self._generate_cuda_graph_batch_sizes(
-                max_batch_size, self.cuda_graph_padding_enabled)
-            self.cuda_graph_batch_sizes = generated_sizes
-            self.cuda_graph_max_batch_size = max_batch_size
-
-        return self
-
     @staticmethod
     def _generate_cuda_graph_batch_sizes(max_batch_size: int,
                                          padding_enabled: bool) -> List[int]:
@@ -1903,114 +1861,89 @@ class TorchLlmArgs(BaseLlmArgs):
 
         return batch_sizes
 
+    @model_validator(mode='after')
+    def validate_cuda_graph_config(self) -> 'TorchLlmArgs':
+        """Validate CUDA graph configuration.
 
-class _AutoDeployLlmArgs(TorchLlmArgs):
-    """LLM arguments specifically for AutoDeploy backend.
+        Ensures that:
+        1. If cuda_graph_config.batch_sizes is provided, cuda_graph_config.max_batch_size must be 0
+        2. If cuda_graph_config.batch_sizes is not provided, it is generated based on cuda_graph_config.max_batch_size
+        3. If both are provided, cuda_graph_config.batch_sizes must match the generated values
+        """
+        if self.cuda_graph_config is None:
+            return self
 
-    This class extends TorchLlmArgs with AutoDeploy-specific configuration options.
-    AutoDeploy provides automatic deployment and optimization of language models
-    with various attention backends and optimization strategies.
-    """
+        config = self.cuda_graph_config
 
-    model_factory: Literal[
-        "AutoModelForCausalLM", "AutoModelForImageTextToText"] = Field(
-            default="AutoModelForCausalLM",
-            description="The model factory to use for loading the model.",
-        )
+        if config.batch_sizes:
+            config.batch_sizes = sorted(config.batch_sizes)
+            if config.max_batch_size != 0:
+                if config.batch_sizes != self._generate_cuda_graph_batch_sizes(
+                        config.max_batch_size, config.padding_enabled):
+                    raise ValueError(
+                        "Please don't set both cuda_graph_config.batch_sizes "
+                        "and cuda_graph_config.max_batch_size.\n"
+                        f"cuda_graph_config.batch_sizes: {self.cuda_graph_config.batch_sizes}, "
+                        f"cuda_graph_config.max_batch_size: {self.cuda_graph_config.max_batch_size}"
+                    )
+            else:
+                config.max_batch_size = max(config.batch_sizes)
+        else:
+            max_batch_size = config.max_batch_size or 128
+            generated_sizes = self._generate_cuda_graph_batch_sizes(
+                max_batch_size, config.padding_enabled)
+            config.batch_sizes = generated_sizes
+            config.max_batch_size = max_batch_size
 
-    model_kwargs: Dict[str, Any] = Field(
-        default_factory=dict,
-        description=
-        "Extra kwargs for the model config class to customize the model config. "
-        "These arguments take precedence over default values or config values in the model config "
-        "file. Arguments are resolved in order: 1) Default values in model config class, 2) Values "
-        "in model config file, 3) Values in model_kwargs. Note: if a kwarg doesn't exist in the "
-        "model config class, it will be ignored.",
-    )
-
-    mla_backend: Literal["MultiHeadLatentAttention"] = Field(
-        default="MultiHeadLatentAttention",
-        description="The Multi-Head Latent Attention backend to use.",
-    )
-
-    skip_loading_weights: bool = Field(
-        default=False,
-        description=
-        "Whether to skip loading model weights during initialization. "
-        "If True, only the model architecture is loaded.",
-    )
-
-    free_mem_ratio: float = Field(
-        default=0.8,
-        description="The fraction of available memory to allocate for cache. "
-        "Must be between 0.0 and 1.0.",
-    )
-
-    simple_shard_only: bool = Field(
-        default=False,
-        description=
-        "If True, force simple sharding (all_gather) in tensor parallelism. "
-        "If False, auto-detect and use column+row (all_reduce) sharding when possible.",
-    )
-
-    # TODO: Remove this field once tokens_per_block is properly passed through
-    attn_page_size: int = Field(
-        default=64,
-        description=
-        "Page size for attention (tokens_per_block). For TritonWithFlattenedInputs "
-        "backend, this should equal max_seq_len. Temporary field until tokens_per_block gets "
-        "properly passed through.",
-    )
-
-    checkpoint_device: Optional[str] = Field(
-        default=None,
-        description="Device on which to load the model checkpoint. "
-        "Defaults to the same device as the rest of the pipeline.",
-    )
-
-    @field_validator("free_mem_ratio")
-    @classmethod
-    def validate_free_mem_ratio(cls, v):
-        """Validate that free_mem_ratio is between 0.0 and 1.0."""
-        if not 0.0 <= v <= 1.0:
-            raise ValueError(
-                f"free_mem_ratio must be between 0.0 and 1.0, got {v}")
-        return v
-
-    @print_traceback_on_error
-    def model_post_init(self, __context):
-        # Modify default values that differ from TorchLlmArgs
-        new_defaults = {
-            "max_batch_size": 8,
-            "max_seq_len": 512,
-            "attn_backend": "FlashInfer",
-            # TODO: Remove this when overlap scheduler is supported (https://github.com/NVIDIA/TensorRT-LLM/issues/4364)
-            "disable_overlap_scheduler": True,
-        }
-        for k, v_default in new_defaults.items():
-            if k not in self.__pydantic_fields_set__:
-                setattr(self, k, v_default)
-
-        # NOTE: Only call super() after setting the default values since default values should be
-        # set first.
-        super().model_post_init(__context)
-
-        # Handle attn_page_size for TritonWithFlattenedInputs backend
-        if self.attn_backend == "TritonWithFlattenedInputs":
-            self.attn_page_size = self.max_seq_len
-
-        # Add max_position_embeddings to model_kwargs
-        # TODO (lucaslie): this is more HF specific than a generic model_kwargs. Ideally, we can
-        # move this to the HF model factory but we don't have access to max_seq_len there right now.
-        self.model_kwargs["max_position_embeddings"] = min(
-            self.max_seq_len,
-            self.model_kwargs.get("max_position_embeddings", self.max_seq_len),
-        )
+        return self
 
     # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
-    def get_pytorch_backend_config(self) -> "_AutoDeployLlmArgs":
-        """Return the _AutoDeployLlmArgs (self) object."""
-        return self
+    def get_pytorch_backend_config(self) -> "PyTorchConfig":
+        from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
+
+        return PyTorchConfig(
+            extra_resource_managers=self.extra_resource_managers,
+            use_cuda_graph=bool(self.cuda_graph_config is not None),
+            cuda_graph_batch_sizes=self.cuda_graph_config.batch_sizes
+            if self.cuda_graph_config else
+            CudaGraphConfig.model_fields['batch_sizes'].default,
+            cuda_graph_max_batch_size=self.cuda_graph_config.max_batch_size
+            if self.cuda_graph_config else
+            CudaGraphConfig.model_fields['max_batch_size'].default,
+            cuda_graph_padding_enabled=self.cuda_graph_config.padding_enabled
+            if self.cuda_graph_config else
+            CudaGraphConfig.model_fields['padding_enabled'].default,
+            disable_overlap_scheduler=self.disable_overlap_scheduler,
+            moe_max_num_tokens=self.moe_max_num_tokens,
+            moe_load_balancer=self.moe_load_balancer,
+            attn_backend=self.attn_backend,
+            moe_backend=self.moe_backend,
+            mixed_sampler=self.mixed_sampler,
+            enable_trtllm_sampler=self.enable_trtllm_sampler,
+            kv_cache_dtype=self.kv_cache_dtype,
+            enable_iter_perf_stats=self.enable_iter_perf_stats,
+            enable_iter_req_stats=self.enable_iter_req_stats,
+            print_iter_log=self.print_iter_log,
+            torch_compile_enabled=bool(self.torch_compile_config is not None),
+            torch_compile_fullgraph=self.torch_compile_config.enable_fullgraph
+            if self.torch_compile_config is not None else
+            TorchCompileConfig.model_fields['enable_fullgraph'].default,
+            torch_compile_inductor_enabled=self.torch_compile_config.
+            enable_inductor if self.torch_compile_config is not None else
+            TorchCompileConfig.model_fields['enable_inductor'].default,
+            torch_compile_piecewise_cuda_graph=self.torch_compile_config.
+            enable_piecewise_cuda_graph
+            if self.torch_compile_config is not None else TorchCompileConfig.
+            model_fields['enable_piecewise_cuda_graph'].default,
+            torch_compile_enable_userbuffers=self.torch_compile_config.
+            enable_userbuffers if self.torch_compile_config is not None else
+            TorchCompileConfig.model_fields['enable_userbuffers'].default,
+            autotuner_enabled=self.autotuner_enabled,
+            enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
+            load_format=self.load_format,
+            enable_min_latency=self.enable_min_latency,
+            stream_interval=self.stream_interval,
+            force_dynamic_quantization=self.force_dynamic_quantization)
 
 
 def update_llm_args_with_extra_dict(
@@ -2022,15 +1955,9 @@ def update_llm_args_with_extra_dict(
         "quant_config": QuantConfig,
         "calib_config": CalibConfig,
         "build_config": BuildConfig,
-        "kv_cache_config": KvCacheConfig,
         "decoding_config": DecodingConfig,
         "enable_build_cache": BuildCacheConfig,
-        "peft_cache_config": PeftCacheConfig,
-        "scheduler_config": SchedulerConfig,
         "speculative_config": DecodingBaseConfig,
-        "batching_type": BatchingType,
-        "extended_runtime_perf_knob_config": ExtendedRuntimePerfKnobConfig,
-        "cache_transceiver_config": CacheTransceiverConfig,
         "lora_config": LoraConfig,
     }
     for field_name, field_type in field_mapping.items():
