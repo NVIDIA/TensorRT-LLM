@@ -14,15 +14,15 @@ import safetensors
 from helper import (convert_weight_to_dtype, fairseq_sin_pos_embedding,
                     fuse_qkv_one_layer, reshape, split)
 from transformers import (AutoModelForSeq2SeqLM, Blip2ForConditionalGeneration,
-                          MBartForConditionalGeneration,
+                          MBartForConditionalGeneration, NougatProcessor,
                           Pix2StructForConditionalGeneration,
-                          T5ForConditionalGeneration, VisionEncoderDecoderModel, NougatProcessor)
+                          T5ForConditionalGeneration, VisionEncoderDecoderModel)
 
+from tensorrt_llm._utils import pad_vocab_size
 from tensorrt_llm.functional import (LayerNormPositionType, LayerNormType,
                                      MLPType)
 from tensorrt_llm.layers import LanguageAdapterConfig
 from tensorrt_llm.models import PretrainedConfig
-from tensorrt_llm._utils import pad_vocab_size
 
 dir_path = os.path.dirname(os.path.realpath(__file__))
 LOGGER = logging.getLogger(__name__)
@@ -629,9 +629,8 @@ def parse_bart_config(args, hf_model):
     config["decoder"]["q_scaling"] = '1'
     config["decoder"]["rescale_before_lm_head"] = str(False)
     config['decoder']['has_model_final_layernorm'] = str(
-        args.nougat or args.eclair_radio or isinstance(hf_model, MBartForConditionalGeneration))
-    # Set has_position_embedding to False for Eclair, i.e., use NoPE
-    config['decoder']['has_position_embedding'] = str(not args.eclair_radio)
+        args.nougat or args.eclair_radio
+        or isinstance(hf_model, MBartForConditionalGeneration))
 
     if args.nougat or args.eclair_radio:
         # These flags are true for mbart decoders, but missing in HF config
@@ -960,8 +959,8 @@ def convert_bart_weights_to_tllm_safetensors(config, component, params):
 
     if component == 'decoder':
         import torch
-        lm_head_weights=params['lm_head.weight'].clone().detach()
-        vocab_size=config.vocab_size
+        lm_head_weights = params['lm_head.weight'].clone().detach()
+        vocab_size = config.vocab_size
         if params['lm_head.weight'].shape[0] % mapping.tp_size != 0:
             vocab_size_padded = pad_vocab_size(config.vocab_size,
                                                mapping.tp_size)
@@ -971,12 +970,10 @@ def convert_bart_weights_to_tllm_safetensors(config, component, params):
                                                       (0, 0, 0, pad_width),
                                                       'constant',
                                                       value=0)
-            vocab_size=vocab_size_padded
+            vocab_size = vocab_size_padded
         weights['lm_head.weight'] = reshape(
-            split(lm_head_weights,
-                mapping.tp_size,
-                mapping.tp_rank,
-                dim=0), (vocab_size // mapping.tp_size, hidden_size))
+            split(lm_head_weights, mapping.tp_size, mapping.tp_rank, dim=0),
+            (vocab_size // mapping.tp_size, hidden_size))
 
     if config.has_model_final_layernorm:
         weights['transformer.ln_f.weight'] = params[
@@ -1500,22 +1497,35 @@ def get_model(args):
             model = VisionEncoderDecoderModel.from_pretrained(args.model_dir)
             model = model.get_decoder()
         elif args.eclair_radio:
+            import torch
+
             class RadioWithNeck(torch.nn.Module):
+
                 def __init__(self):
                     super().__init__()
 
-                    torch.hub._validate_not_a_forked_repo= lambda a, b, c: True # avoid HTTP 403 error
-                    self.model_encoder = torch.hub.load("NVlabs/RADIO", "radio_model", version="radio_v2.5-h")
+                    torch.hub._validate_not_a_forked_repo = lambda a, b, c: True  # avoid HTTP 403 error
+                    self.model_encoder = torch.hub.load("NVlabs/RADIO",
+                                                        "radio_model",
+                                                        version="radio_v2.5-h")
                     self.model_encoder.summary_idxs = torch.tensor(4)
 
                     self.conv1 = torch.nn.Conv1d(1280, 1024, 1)
-                    self.layer_norm1 = torch.nn.LayerNorm(1024, eps=1e-6, elementwise_affine=True)
-                    self.conv2 = torch.nn.Conv2d(1024, 1024, kernel_size=(1, 4), stride=(1, 4), padding=0, bias=False)
-                    self.layer_norm2 = torch.nn.LayerNorm(1024, eps=1e-6, elementwise_affine=True)
-                
+                    self.layer_norm1 = torch.nn.LayerNorm(
+                        1024, eps=1e-6, elementwise_affine=True)
+                    self.conv2 = torch.nn.Conv2d(1024,
+                                                 1024,
+                                                 kernel_size=(1, 4),
+                                                 stride=(1, 4),
+                                                 padding=0,
+                                                 bias=False)
+                    self.layer_norm2 = torch.nn.LayerNorm(
+                        1024, eps=1e-6, elementwise_affine=True)
+
                 def forward(self, pixel_values):
                     _, feature = self.model_encoder(pixel_values)
-                    output = self.conv1(feature.permute(0, 2, 1)).permute(0, 2, 1)
+                    output = self.conv1(feature.permute(0, 2,
+                                                        1)).permute(0, 2, 1)
                     output = self.layer_norm1(output).permute(0, 2, 1)
 
                     b, d, _ = output.shape
@@ -1527,7 +1537,9 @@ def get_model(args):
                     return output
 
             def get_processor():
-                processor = NougatProcessor.from_pretrained("facebook/nougat-base")
+                processor = NougatProcessor.from_pretrained(
+                    "facebook/nougat-base")
+
                 special_tokens = {
                     "output_plain_index": "<output_plain>",
                     "output_markdown_index": "<output_markdown>",
@@ -1535,46 +1547,65 @@ def get_model(args):
                     "output_ocr_index": "<output_ocr>",
                     "predict_bbox_index": "<predict_bbox>",
                     "no_bbox_index": "<no_bbox>",
-                    "bbox_start_index": "<bbox>", # not used but can keep
+                    "bbox_start_index": "<bbox>",  # not used but can keep
                     # "bbox_end_index": "</bbox>",  # not used but can keep
                     "no_class_index": "<no_classes>",
                     "predict_classes_index": "<predict_classes>",
                 }
                 for key, special_t in special_tokens.items():
-                    processor.tokenizer.add_special_tokens({"additional_special_tokens": [special_t]})
-                    setattr(processor.tokenizer, key, processor.tokenizer.encode(special_t)[1])
+                    processor.tokenizer.add_special_tokens(
+                        {"additional_special_tokens": [special_t]})
+                    setattr(processor.tokenizer, key,
+                            processor.tokenizer.encode(special_t)[1])
+
                 # Add regular tokens for boxes
-                processor.tokenizer.add_tokens([f"<x_{x_i}>" for x_i in range(1024)])
-                processor.tokenizer.add_tokens([f"<y_{y_i}>" for y_i in range(1280)])
+                processor.tokenizer.add_tokens(
+                    [f"<x_{x_i}>" for x_i in range(1024)])
+                processor.tokenizer.add_tokens(
+                    [f"<y_{y_i}>" for y_i in range(1280)])
                 # Add regular tokens for classes
                 #"<class_{class_i}>"
                 possible_classes = [
-                    "Text",
-                    "Title",
-                    "Section-header",
-                    "List-item",
-                    "TOC",
-                    "Bibliography",
-                    "Footnote",
-                    "Page-header",
-                    "Page-footer",
-                    "Picture",
-                    "Formula",
-                    "Page-number",
-                    "Table",
-                    "Caption"
+                    "Text", "Title", "Section-header", "List-item", "TOC",
+                    "Bibliography", "Footnote", "Page-header", "Page-footer",
+                    "Picture", "Formula", "Page-number", "Table", "Caption"
                 ]
-                processor.tokenizer.add_tokens([f"<class_{cls}>" for cls in possible_classes])
+                processor.tokenizer.add_tokens(
+                    [f"<class_{cls}>" for cls in possible_classes])
                 return processor
 
             processor = get_processor()
-            model = VisionEncoderDecoderModel.from_pretrained("facebook/nougat-base")
+            model = VisionEncoderDecoderModel.from_pretrained(
+                "facebook/nougat-base")
             model.encoder = RadioWithNeck()
-            model.decoder.resize_token_embeddings(len(processor.tokenizer))
-            model.config.decoder_start_token_id = processor.tokenizer.eos_token_id # 2
+            model.decoder.resize_token_embeddings(len(processor.tokenizer),
+                                                  pad_to_multiple_of=64)
+            model.config.decoder_start_token_id = processor.tokenizer.eos_token_id  # 2
             model.config.pad_token_id = processor.tokenizer.pad_token_id  # 1
+            from transformers.models.mbart.modeling_mbart import \
+                MBartLearnedPositionalEmbedding
+            device, d_model = model.device, model.config.decoder.d_model
+
             with torch.inference_mode():
-                safetensors.torch.load_model(model, os.path.join(args.model_dir, "model.safetensors"))
+                # Inspect checkpoint shapes
+                checkpoint_path = os.path.join(args.model_dir,
+                                               "model.safetensors")
+                # with safetensors.safe_open(checkpoint_path, framework="pt") as f:
+                #     if "decoder.model.decoder.embed_tokens.weight" in f.keys():
+                #         embed_shape = f.get_tensor("decoder.model.decoder.embed_tokens.weight").shape
+                safetensors.torch.load_model(model,
+                                             os.path.join(
+                                                 args.model_dir,
+                                                 "model.safetensors"),
+                                             strict=False)
+            model.decoder.model.decoder.embed_positions = MBartLearnedPositionalEmbedding(
+                20_000, d_model)
+            model.decoder.model.decoder.embed_positions.weight.data.zero_()
+            model.decoder.model.decoder.embed_positions.weight.requires_grad_(
+                True)
+            model.decoder.lm_head.weight = model.decoder.get_input_embeddings(
+            ).weight
+
             model.eval()
             model = model.get_decoder()
 
@@ -1628,7 +1659,8 @@ def convert_checkpoint(args):
     if model_type == 'language_adapter':
         additional_settings += ["residual_scaling", "language_adapter_config"]
 
-    if not (args.nougat or args.eclair_radio) and args.model_type != "pix2struct":
+    if not (args.nougat
+            or args.eclair_radio) and args.model_type != "pix2struct":
         tllm_encoder_config = {
             'architecture': "EncoderModel",
             'dtype': args.dtype,
@@ -1685,16 +1717,26 @@ def convert_checkpoint(args):
         encoder_convert_args = dict(params=model.state_dict(),
                                     component="encoder")
     tllm_decoder_config = {
-        'architecture': "DecoderModel",
-        'dtype': args.dtype,
-        'logits_dtype': decoder_config.logits_dtype,
-        'num_hidden_layers': decoder_config.n_layer,
-        'num_attention_heads': decoder_config.n_head,
-        'hidden_size': decoder_config.hidden_size,
-        'norm_epsilon': decoder_config.layernorm_eps,
-        'vocab_size': decoder_config.vocab_size,
-        'position_embedding_type': decoder_config.position_embedding_type,
-        'hidden_act': decoder_config.hidden_act,
+        'architecture':
+        "DecoderModel",
+        'dtype':
+        args.dtype,
+        'logits_dtype':
+        decoder_config.logits_dtype,
+        'num_hidden_layers':
+        decoder_config.n_layer,
+        'num_attention_heads':
+        decoder_config.n_head,
+        'hidden_size':
+        decoder_config.hidden_size,
+        'norm_epsilon':
+        decoder_config.layernorm_eps,
+        'vocab_size':
+        decoder_config.vocab_size,
+        'position_embedding_type':
+        decoder_config.position_embedding_type,
+        'hidden_act':
+        decoder_config.hidden_act,
         'quantization': {
             'quant_algo': quant_algo,
             'kv_cache_quant_algo': kv_cache_quant_algo,
@@ -1704,35 +1746,64 @@ def convert_checkpoint(args):
             'tp_size': args.tp_size,
             'pp_size': args.pp_size,
         },
-        'use_parallel_embedding': args.use_parallel_embedding,
-        'embedding_sharding_dim': args.embedding_sharding_dim,
-        'max_position_embeddings': decoder_config.n_positions,
-        'head_size': decoder_config.head_size,
-        'has_position_embedding': decoder_config.has_position_embedding,
-        'layernorm_type': decoder_config.layernorm_type,
-        'has_attention_qkvo_bias': decoder_config.has_attention_qkvo_bias,
-        'has_mlp_bias': decoder_config.has_mlp_bias,
-        'has_model_final_layernorm': decoder_config.has_model_final_layernorm,
-        'has_embedding_layernorm': decoder_config.has_embedding_layernorm,
-        'has_embedding_scale': decoder_config.has_embedding_scale,
-        'intermediate_size': decoder_config.ffn_hidden_size,
-        'q_scaling': decoder_config.q_scaling,
-        'layernorm_position': decoder_config.layernorm_position,
-        'mlp_type': decoder_config.mlp_type,
-        'relative_attention': decoder_config.relative_attention,
-        'max_distance': decoder_config.max_distance,
-        'num_buckets': decoder_config.num_buckets,
-        'model_type': decoder_config.model_type,
-        'rescale_before_lm_head': decoder_config.rescale_before_lm_head,
-        'encoder_hidden_size': decoder_config.encoder_hidden_size,
-        'encoder_num_heads': decoder_config.encoder_num_heads,
-        'encoder_head_size': decoder_config.encoder_head_size,
-        'skip_cross_kv': args.skip_cross_kv,
-        'use_implicit_relative_attention': args.use_implicit_relative_attention,
-        'decoder_start_token_id': decoder_config.decoder_start_token_id,
-        'eos_token_id': decoder_config.eos_token_id,
-        'bos_token_id': decoder_config.bos_token_id,
-        'pad_token_id': decoder_config.pad_token_id,
+        'use_parallel_embedding':
+        args.use_parallel_embedding,
+        'embedding_sharding_dim':
+        args.embedding_sharding_dim,
+        'max_position_embeddings':
+        decoder_config.n_positions if not args.eclair_radio else 20000,
+        'head_size':
+        decoder_config.head_size,
+        'has_position_embedding':
+        decoder_config.has_position_embedding,
+        'layernorm_type':
+        decoder_config.layernorm_type,
+        'has_attention_qkvo_bias':
+        decoder_config.has_attention_qkvo_bias,
+        'has_mlp_bias':
+        decoder_config.has_mlp_bias,
+        'has_model_final_layernorm':
+        decoder_config.has_model_final_layernorm,
+        'has_embedding_layernorm':
+        decoder_config.has_embedding_layernorm,
+        'has_embedding_scale':
+        decoder_config.has_embedding_scale,
+        'intermediate_size':
+        decoder_config.ffn_hidden_size,
+        'q_scaling':
+        decoder_config.q_scaling,
+        'layernorm_position':
+        decoder_config.layernorm_position,
+        'mlp_type':
+        decoder_config.mlp_type,
+        'relative_attention':
+        decoder_config.relative_attention,
+        'max_distance':
+        decoder_config.max_distance,
+        'num_buckets':
+        decoder_config.num_buckets,
+        'model_type':
+        decoder_config.model_type,
+        'rescale_before_lm_head':
+        decoder_config.rescale_before_lm_head,
+        'encoder_hidden_size':
+        decoder_config.encoder_hidden_size,
+        'encoder_num_heads':
+        decoder_config.encoder_num_heads,
+        'encoder_head_size':
+        decoder_config.encoder_head_size,
+        'skip_cross_kv':
+        args.skip_cross_kv,
+        'use_implicit_relative_attention':
+        args.use_implicit_relative_attention,
+        'decoder_start_token_id':
+        decoder_config.decoder_start_token_id,
+        'eos_token_id':
+        decoder_config.eos_token_id,
+        'bos_token_id':
+        decoder_config.bos_token_id,
+        'pad_token_id':
+        decoder_config.pad_token_id,
     }
     for additional_setting in additional_settings:
         if hasattr(decoder_config, additional_setting):
@@ -1763,7 +1834,8 @@ def convert_checkpoint(args):
         decoder_convert_args["sin_pos_embedding"] = sin_pos_embedding
 
     if args.workers == 1:
-        if not (args.nougat or args.eclair_radio) and args.model_type != "pix2struct":
+        if not (args.nougat
+                or args.eclair_radio) and args.model_type != "pix2struct":
             convert(0, world_size, args, tllm_encoder_config,
                     encoder_convert_args, encoder_saved_dir)
         convert(0, world_size, args, tllm_decoder_config, decoder_convert_args,
@@ -1773,7 +1845,8 @@ def convert_checkpoint(args):
             args.workers = world_size
         LOGGER.info(f'Convert checkpoint using {args.workers} workers.')
         import torch.multiprocessing as mp
-        if not (args.nougat or args.eclair_radio) and args.model_type != "pix2struct":
+        if not (args.nougat
+                or args.eclair_radio) and args.model_type != "pix2struct":
             mp.spawn(convert,
                      nprocs=args.workers,
                      args=(world_size, args, tllm_encoder_config,
