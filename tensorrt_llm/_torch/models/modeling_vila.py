@@ -1163,7 +1163,7 @@ class VilaModel(PreTrainedModel):
         num_context_requests, num_generation_requests = attn_metadata.num_contexts, attn_metadata.num_generations
         multimodal_params = kwargs.get("multimodal_params", [])
         mm_embed = [
-            multimodal_param.mm_embedding
+            multimodal_param.multimodal_embedding
             for multimodal_param in multimodal_params
         ]
 

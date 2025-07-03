@@ -163,7 +163,7 @@ class Gemma3Model(PreTrainedModel):
 
         multimodal_params = kwargs.get("multimodal_params", [])
         mm_embed = [
-            multimodal_param.mm_embedding
+            multimodal_param.multimodal_embedding
             for multimodal_param in multimodal_params
         ]
         assert mm_embed == [] or len(
