@@ -1965,6 +1965,9 @@ def update_llm_args_with_extra_dict(
             extra_llm_str = f"because it's specified in {extra_llm_api_options}" if extra_llm_api_options else ""
             logger.warning(f"Overriding {field_name} {extra_llm_str}")
 
+    llm_args = llm_args | llm_args_dict
+    return llm_args
+
 
 def update_llm_args_with_extra_options(llm_args: Dict,
                                        extra_llm_api_options: str) -> Dict:
