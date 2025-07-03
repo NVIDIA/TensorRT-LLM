@@ -456,7 +456,12 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
     kv_cache_config = KvCacheConfig(enable_block_reuse=False)
 
     def test_auto_dtype(self):
-        with LLM(self.MODEL_PATH, kv_cache_config=self.kv_cache_config) as llm:
+        # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=False,
+            enable_partial_reuse=False,
+        )
+        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
