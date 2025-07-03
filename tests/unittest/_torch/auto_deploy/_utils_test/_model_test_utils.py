@@ -357,6 +357,21 @@ _SMALL_MODEL_CONFIGS = {
         "model_kwargs": {
             "num_hidden_layers": 2,
             "intermediate_size": 256,
+            "hidden_size": 64,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "num_local_experts": 2,
+        },
+    },
+    "Qwen/Qwen3-30B-A3B": {
+        "model": _hf_model_dir_or_hub_id(
+            f"{llm_models_root()}/Qwen3/Qwen3-30B-A3B",
+            "Qwen/Qwen3-30B-A3B",
+        ),
+        "model_kwargs": {
+            "num_hidden_layers": 2,
+            "intermediate_size": 256,
+            "hidden_size": 64,
             "num_attention_heads": 4,
             "num_key_value_heads": 2,
             "num_local_experts": 2,
