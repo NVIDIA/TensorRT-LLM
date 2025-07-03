@@ -38,7 +38,7 @@ See details below for each supported subcommand.
 
 <details>
 
-`run  [--disable-fail-fast --skip-test --stage-list "A10-PyTorch-1, xxx" --gpu-type "A30, H100_PCIe" --test-backend "pytorch, cpp" --add-multi-gpu-test --only-multi-gpu-test --disable-multi-gpu-test --post-merge --extra-stage --detailed-log "H100_PCIe-TensorRT-Post-Merge-1, xxx"]`
+`run  [--disable-fail-fast --skip-test --stage-list "A10-PyTorch-1, xxx" --gpu-type "A30, H100_PCIe" --test-backend "pytorch, cpp" --add-multi-gpu-test --only-multi-gpu-test --disable-multi-gpu-test --post-merge --extra-stage "H100_PCIe-TensorRT-Post-Merge-1, xxx" --detailed-log]`
 
 Launch build/test pipelines. All previously running jobs will be killed.
 
