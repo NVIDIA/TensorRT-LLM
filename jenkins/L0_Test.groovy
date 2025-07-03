@@ -2021,6 +2021,9 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install requests")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y tensorrt")
+                        if (values[5] != DLFW_IMAGE) {
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install cuda-toolkit")
+                        }
 
                         // Extra PyTorch CUDA 12.8 install
                         if (values[6]) {
