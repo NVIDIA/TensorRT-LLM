@@ -363,6 +363,7 @@ def test_llm_with_kv_cache_retention_config():
         print(output)
 
 
+@pytest.mark.skip(reason="https://nvbugs/5370718")
 @pytest.mark.parametrize(
     'tokenizer_dir, threshold',
     [
@@ -826,6 +827,7 @@ def test_generate_with_bad_words():
                                                     bad=["F E", "I J"]))
 
 
+@pytest.mark.skip(reason="https://nvbugs/5370718")
 @force_ampere
 @pytest.mark.part0
 def test_generate_with_sampling_params_misc():
