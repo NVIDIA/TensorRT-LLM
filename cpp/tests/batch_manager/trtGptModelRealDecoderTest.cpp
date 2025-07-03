@@ -1306,7 +1306,7 @@ INSTANTIATE_TEST_SUITE_P(GptChunkedLongContextTests, ParamTest,
         testing::Values(std::nullopt),                     // hostCacheSize
         testing::Values(false),                            // useRandomEndId
         testing::Values(std::vector<SizeType32>{1, 2, 8}), // batchSizes
-        testing::Values(std::nullopt)                      // maxNumTokens
+        testing::Values(64)                                // maxNumTokens
         ),
     generateTestName);
 
