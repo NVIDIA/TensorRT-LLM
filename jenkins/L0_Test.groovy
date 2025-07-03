@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@dev-yuanjingx-exclude_007_node_in_b200_slurm_job', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -1818,6 +1818,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     fullSet += SBSATestConfigs.keySet()
 
     SBSASlurmTestConfigs = [
+        "GB200-4_GPUs-PyTorch-1": ["gb200-4-gpus", "l0_gb200", 1, 1, 4],
         "GB200-4_GPUs-PyTorch-[Post-Merge]-1": ["gb200-4-gpus", "l0_gb200", 1, 1, 4],
     ]
     fullSet += SBSASlurmTestConfigs.keySet()
