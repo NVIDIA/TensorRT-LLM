@@ -168,15 +168,16 @@ if(USING_OSS_CUTLASS_FP4_GEMM)
   set_property(TARGET fp4_gemm_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 endif()
 
-if(USING_OSS_CUTLASS_MOE_GEMM)
-  file(GLOB MOE_GEMM_SRC_CU "${CMAKE_CURRENT_SOURCE_DIR}/moe_gemm/*.cu")
-  add_library(moe_gemm_src STATIC ${MOE_GEMM_SRC_CU} ${GROUPED_SRC_CPP}
-                                  ${GROUPED_CU_INSTANTIATIONS})
-  target_include_directories(
-    moe_gemm_src
-    PUBLIC ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include)
-  set_property(TARGET moe_gemm_src PROPERTY POSITION_INDEPENDENT_CODE ON)
-endif()
+# Always compile public MOE
+file(GLOB MOE_GEMM_SRC_CU "${CMAKE_CURRENT_SOURCE_DIR}/moe_gemm/*.cu")
+add_library(moe_gemm_src STATIC ${MOE_GEMM_SRC_CU} ${GROUPED_SRC_CPP}
+                                ${GROUPED_CU_INSTANTIATIONS})
+# Must be private
+target_compile_definitions(moe_gemm_src PRIVATE USING_OSS_CUTLASS_MOE_GEMM)
+target_include_directories(
+  moe_gemm_src
+  PUBLIC ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include)
+set_property(TARGET moe_gemm_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
   add_library(
