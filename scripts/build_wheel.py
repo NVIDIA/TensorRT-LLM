@@ -601,6 +601,7 @@ def main(*,
         deep_ep_dir.unlink()
     elif deep_ep_dir.is_dir():
         clear_folder(deep_ep_dir)
+        deep_ep_dir.rmdir()
 
     bin_dir = pkg_dir / "bin"
     if bin_dir.exists():

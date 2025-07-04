@@ -9,7 +9,7 @@ add_custom_target(deep_ep)
 
 # Filter CUDA arch >= 9.0
 set(DEEP_EP_CUDA_ARCHITECTURES "")
-foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES_NORMALIZED)
+foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
   string(REGEX MATCHALL "^([1-9][0-9]*)[0-9][af]?(-real|-virtual)?$" MATCHES
                ${CUDA_ARCH})
   if(NOT CMAKE_MATCH_0)
@@ -157,10 +157,6 @@ set_target_properties(
 
 # Add DeepEP cpp
 # ==============
-
-# Remove -gencode, use CUDA_ARCHITECTURES
-string(REGEX REPLACE "-gencode arch=[^ ]+ " "" CMAKE_CUDA_FLAGS
-                     "${CMAKE_CUDA_FLAGS}")
 
 # Let CMake generate `fatbinData` for CUDA separable compilation. Set to FALSE
 # or TRUE are both OK, but it generates `code=lto_90a` rather than `code=sm_90a`
