@@ -107,7 +107,8 @@ struct Gmem_tile_tma_qkv
     template <typename Params, typename Block_info>
     inline __device__ Gmem_tile_tma_qkv(Params const& params, cudaTmaDesc const* p_desc, int qkv_offset,
         Block_info const& block_info, int tidx, int cta_row_offset = 0)
-        : params_qkv_stride_in_bytes_(params.qkv_stride_in_bytes)
+        // in PACKED_QKV, q_stride = k_stride = v_stride
+        : params_qkv_stride_in_bytes_(params.q_stride_in_bytes)
         , actual_seqlen_(block_info.actual_seqlen)
         , qkv_ptr_(reinterpret_cast<char*>(params.qkv_ptr))
         , p_desc_(p_desc)
