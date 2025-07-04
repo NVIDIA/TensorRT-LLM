@@ -27,7 +27,7 @@ else
     nsys_file=${work_dir}/nsys_worker_proc_${SLURM_PROCID}
     export TLLM_PROFILE_RECORD_GC=1
     export TLLM_NVTX_DEBUG=1
-    if [ ${SLURM_PROCID} -ge ${ctx_gpus} ]; then
+    if [ "${SLURM_PROCID}" -ge "${ctx_gpus}" ]; then
         export TLLM_PROFILE_START_STOP=200-250
         nsys_prefix="nsys profile -e \"NSYS_MPI_STORE_TEAMS_PER_RANK=1\" -o ${nsys_file} -f true -t cuda,nvtx,python-gil -c cudaProfilerApi --cuda-graph-trace node --capture-range-end=stop --gpu-metrics-devices=none"
         echo "nsys_prefix: ${nsys_prefix}"
