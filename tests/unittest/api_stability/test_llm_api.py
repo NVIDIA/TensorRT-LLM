@@ -197,5 +197,3 @@ class TestQuantConfig(ApiStabilityTestHarness):
 class TestCalibConfig(ApiStabilityTestHarness):
     TEST_CLASS = CalibConfig
     REFERENCE_FILE = "calib_config.yaml"
-# Touch this file and see if the code owners is invoked but should automatically assign the @NVIDIA/trt-llm-noncommitted-api-review-committee as reviewers for the PR.
-# and also see if the GitHub action to auto-assign PR reviews respects this assignment and does not override it or do something else.
