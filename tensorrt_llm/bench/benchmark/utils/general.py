@@ -90,8 +90,8 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
         with open(extra_llm_api_options, 'r') as f:
             llm_args_dict = yaml.safe_load(f)
 
-    if "kv_cache_dtype" in llm_args_dict:
-        kv_cache_dtype = llm_args_dict["kv_cache_dtype"]
+            if "kv_cache_dtype" in llm_args_dict:
+                kv_cache_dtype = llm_args_dict["kv_cache_dtype"]
 
     enable_chunked_prefill = llm_args_dict.get("enable_chunked_prefill",
                                                enable_chunked_prefill)
