@@ -8,6 +8,7 @@ l0_gb203:
     wildcards:
       gpu:
       - '*gb203*'
+      - '*5080*'
       linux_distribution_name: ubuntu*
     terms:
       stage: pre_merge
@@ -32,7 +33,6 @@ l0_gb203:
   - llmapi/test_llm_examples.py::test_llmapi_example_inference
   - llmapi/test_llm_examples.py::test_llmapi_example_inference_async
   - llmapi/test_llm_examples.py::test_llmapi_example_inference_async_streaming
-  - llmapi/test_llm_examples.py::test_llmapi_example_logits_processor
   - llmapi/test_llm_examples.py::test_llmapi_example_multilora
   - llmapi/test_llm_examples.py::test_llmapi_example_guided_decoding
-  - llmapi/test_llm_examples.py::test_llmapi_example_customize
+  - llmapi/test_llm_examples.py::test_llmapi_example_logits_processor

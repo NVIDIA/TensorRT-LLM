@@ -22,6 +22,7 @@ from utils.util import (skip_blackwell_geforce, skip_pre_blackwell_unittest,
                         unittest_name_func)
 
 import tensorrt_llm
+import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 
 
 # Used by the (fp16 -> int4) quant layer + int4 gemm network.
@@ -78,8 +79,9 @@ class TestFunctional(unittest.TestCase):
                                                       1 / b_global_sf,
                                                       sf_vec_size)
 
-        c = (torch.ops.trtllm.fp4_gemm(a_fp4, b_fp4, a_sf, b_sf, ab_global_sf,
-                                       False).float().cpu())
+        c = (torch.ops.trtllm.fp4_gemm(
+            a_fp4, b_fp4, a_sf, b_sf, ab_global_sf,
+            fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4).float().cpu())
 
         torch.cuda.synchronize()
         c_pt = torch.nn.functional.linear(a_pt, b_pt)
@@ -255,8 +257,9 @@ class TestProfiling(unittest.TestCase):
                                                       1 / b_global_sf,
                                                       sf_vec_size)
 
-        c_ref = torch.ops.trtllm.fp4_gemm(a_fp4, b_fp4, a_sf, b_sf,
-                                          ab_global_sf, False)
+        c_ref = torch.ops.trtllm.fp4_gemm(
+            a_fp4, b_fp4, a_sf, b_sf, ab_global_sf,
+            fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4)
 
         best_config_idx = profiler.get_best_config_id(m, n, k)
         c_actual = profiler.run_gemm(a_fp4, b_fp4, a_sf, b_sf, ab_global_sf,

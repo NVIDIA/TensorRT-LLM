@@ -1,7 +1,7 @@
 version: "3.9"
 services:
   tensorrt_llm-dev:
-    image: urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.04-py3-x86_64-ubuntu24.04-trt10.10.0.31-skip-tritondevel-202506021004-9420
+    image: ${DEV_CONTAINER_IMAGE}
     network_mode: host
     ipc: host
 
@@ -22,7 +22,8 @@ services:
               capabilities: [gpu]
 
     volumes:
-      - ..:/workspaces/tensorrt_llm:cached
+      - ${SOURCE_DIR}:/workspaces/tensorrt_llm
+      - ${LOCAL_HF_HOME}:/huggingface  # HF cache
 
     environment:
       - CCACHE_DIR=/workspaces/tensorrt_llm/cpp/.ccache

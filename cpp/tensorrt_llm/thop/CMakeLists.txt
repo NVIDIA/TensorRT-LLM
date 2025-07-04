@@ -56,6 +56,7 @@ add_library(
   fp4BatchedQuantize.cpp
   fp8BlockScalingGemm.cpp
   fp8Quantize.cpp
+  dsv3FusedAGemmOp.cpp
   fusedQKNormRopeOp.cpp
   fusedTopkSoftmax.cpp
   gatherTreeOp.cpp
@@ -64,6 +65,7 @@ add_library(
   logitsBitmaskOp.cpp
   mambaConv1dOp.cpp
   moeOp.cpp
+  moeUtilOp.cpp
   moeCommOp.cpp
   moeLoadBalanceOp.cpp
   fp8BlockScaleMoe.cpp
@@ -75,16 +77,32 @@ add_library(
   redrafterCurandOp.cpp
   reducescatterOp.cpp
   relativeAttentionBiasOp.cpp
+  dsv3RouterGemmOp.cpp
   renormMoeRoutingOp.cpp
   selectiveScanOp.cpp
   userbuffersFinalizeOp.cpp
   userbuffersTensor.cpp
   weightOnlyQuantOp.cpp
   mtpOp.cpp
-  loraOp.cpp)
+  loraOp.cpp
+  finegrained_mixed_dtype_gemm_thop.cpp)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(th_common PRIVATE ${TORCH_LIBRARIES} th_utils
                                         ${Python3_LIBRARIES} ${SHARED_TARGET})
+
+if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
+  target_compile_definitions(th_common
+                             PUBLIC "USING_OSS_CUTLASS_LOW_LATENCY_GEMM")
+  message(STATUS "Enable open source Cutlass low latency gemm kernel")
+endif()
+
+if(USING_OSS_CUTLASS_FP4_GEMM)
+  target_compile_definitions(th_common PUBLIC USING_OSS_CUTLASS_FP4_GEMM)
+endif()
+
+if(USING_OSS_CUTLASS_MOE_GEMM)
+  target_compile_definitions(th_common PUBLIC USING_OSS_CUTLASS_MOE_GEMM)
+endif()
 
 if(ENABLE_MULTI_DEVICE)
   target_include_directories(th_common PUBLIC ${MPI_C_INCLUDE_DIRS})

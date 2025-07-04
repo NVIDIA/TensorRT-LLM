@@ -691,6 +691,11 @@ int AttentionOp::getHeadSize(bool checkInit) const
 size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t max_num_seq, int32_t input_seq_length,
     int32_t cross_kv_length, int32_t max_num_tokens) const noexcept
 {
+    if (max_num_tokens == 0)
+    {
+        return 0;
+    }
+
     int const local_hidden_units_qo = mNumAttnHeads * getHeadSize();
     int const local_hidden_units_kv = mNumAttnKVHeads * getHeadSize();
 
@@ -771,6 +776,11 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
 size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32_t max_num_seq,
     int32_t max_attention_window_size, int32_t max_num_tokens) const noexcept
 {
+    if (max_num_tokens == 0)
+    {
+        return 0;
+    }
+
     auto const size = tensorrt_llm::runtime::BufferDataType(type).getSize();
     int const batch_beam = max_num_seq;
 
@@ -1703,6 +1713,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         fmhaParams.oSfScalePtr = params.attention_output_sf_scale;
         fmhaParams.stream = stream;
         fmhaParams.forceFp32Acc = mFMHAForceFP32Acc;
+        fmhaParams.softmaxStatsPtr = params.softmaxStatsPtr;
 
         if (mAttentionChunkSize)
         {
@@ -2030,7 +2041,7 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
     int const max_distance = mMaxDistance;
     bool const* finished = nullptr;
 
-    auto const quant_option = tc::QuantMode::fromDescription();
+    auto const quant_option = tc::QuantMode{};
     float const* qkv_scale_out = nullptr;
 
     int const* ia3_tasks = nullptr;
@@ -2412,7 +2423,8 @@ int AttentionOp::initialize() noexcept
 
     // Check requirements for FP4 output.
     TLLM_CHECK_WITH_INFO(!mFuseFp4Quant || mEnableContextFMHA, "Context FMHA must enable if fuse_fp4_quant is enabled");
-    TLLM_CHECK_WITH_INFO(!mFuseFp4Quant || mSM == 100, "fuse_fp4_quant only supports SM100 devices.");
+    TLLM_CHECK_WITH_INFO(
+        !mFuseFp4Quant || mSM == 100 || mSM == 120, "fuse_fp4_quant only supports SM100 or SM120 devices.");
 
     TLLM_CHECK(isRoPE() == (mRotaryEmbeddingDim != 0));
     TLLM_CHECK_WITH_INFO((mSM >= 80) || (mType != nvinfer1::DataType::kBF16),

@@ -8,7 +8,9 @@
 #SBATCH -e logs/trtllm-bench.err
 #SBATCH -J trtllm-bench
 
-### Run trtllm-bench with pytorch backend on Slurm
+### :title Run trtllm-bench with pytorch backend on Slurm
+### :order 1
+### :section Slurm
 
 # NOTE, this feature is experimental and may not work on all systems.
 # The trtllm-llmapi-launch is a script that launches the LLM-API code on
@@ -74,8 +76,6 @@ srun -l \
 
         # This is optional
         cat > /tmp/pytorch_extra_args.txt << EOF
-use_cuda_graph: false
-cuda_graph_padding_enabled: false
 print_iter_log: true
 enable_attention_dp: false
 EOF

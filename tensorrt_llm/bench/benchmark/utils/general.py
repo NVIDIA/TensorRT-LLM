@@ -140,21 +140,26 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
         )
 
         # If chunked prefill is disabled, we need to ensure that the max_num_tokens is at least the max_isl
-        if not enable_chunked_prefill and max_num_tokens < dataset_metadata.max_isl:
+        if not enable_chunked_prefill:
             logger.warning(
                 f"Chunked prefill is disabled, but max_num_tokens ({max_num_tokens}) is less than the max ISL ({dataset_metadata.max_isl}). "
-                f"Forcing max_num_tokens to {dataset_metadata.max_isl}.")
-            max_num_tokens = dataset_metadata.max_isl
+                f"Forcing max_num_tokens to {dataset_metadata.max_isl + max_batch_size}."
+            )
+            max_num_tokens = max(max_num_tokens,
+                                 dataset_metadata.max_isl + max_batch_size)
+        else:
+            # TODO: Figure out how to handle chunked block size.
+            # Expecting this to be the max of chunk block and max_num_tokens.
+            pass
 
     pyt_options = {
-        "use_cuda_graph":
-        True,
-        "cuda_graph_padding_enabled":
-        True,
-        "kv_cache_dtype":
-        kv_cache_dtype,
-        "cuda_graph_max_batch_size":
-        max_batch_size if cuda_graph_batch_sizes is None else 0,
+        "cuda_graph_config": {
+            "padding_enabled":
+            True,
+            "max_batch_size":
+            max_batch_size if cuda_graph_batch_sizes is None else 0,
+        },
+        "kv_cache_dtype": kv_cache_dtype,
     }
     backend = params.get("backend", "pytorch")
 

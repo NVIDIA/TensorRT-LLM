@@ -72,6 +72,7 @@ target_include_directories(
   PUBLIC
     $<TARGET_PROPERTY:${INTERNAL_CUTLASS_KERNELS_TARGET},INTERFACE_INCLUDE_DIRECTORIES>
 )
+add_cuda_architectures(kernels_src 89)
 
 add_subdirectory(cutlass_kernels)
 add_subdirectory(flashMLA)
@@ -83,4 +84,5 @@ add_subdirectory(trtllmGenKernels)
 add_subdirectory(fusedLayernormKernels)
 add_subdirectory(groupRmsNormKernels)
 add_subdirectory(llama4MinLatencyKernels)
+add_subdirectory(dsv3MinLatencyKernels)
 add_subdirectory(causalConv1d)

@@ -64,24 +64,22 @@ class OPTDecoderLayer(DecoderLayer):
             config.hidden_size,
             elementwise_affine=config.layer_norm_elementwise_affine,
             dtype=config.torch_dtype)
-        self.fc1 = Linear(
-            config.hidden_size,
-            config.ffn_dim,
-            bias=config.enable_bias,
-            dtype=config.torch_dtype,
-            mapping=model_config.mapping,
-            tensor_parallel_mode=TensorParallelMode.COLUMN,
-            quant_config=model_config.get_quant_config(),
-        )
-        self.fc2 = Linear(
-            config.ffn_dim,
-            config.hidden_size,
-            bias=config.enable_bias,
-            dtype=config.torch_dtype,
-            mapping=model_config.mapping,
-            tensor_parallel_mode=TensorParallelMode.ROW,
-            quant_config=model_config.get_quant_config(),
-        )
+        self.fc1 = Linear(config.hidden_size,
+                          config.ffn_dim,
+                          bias=config.enable_bias,
+                          dtype=config.torch_dtype,
+                          mapping=model_config.mapping,
+                          tensor_parallel_mode=TensorParallelMode.COLUMN,
+                          quant_config=model_config.get_quant_config(),
+                          allreduce_strategy=model_config.allreduce_strategy)
+        self.fc2 = Linear(config.ffn_dim,
+                          config.hidden_size,
+                          bias=config.enable_bias,
+                          dtype=config.torch_dtype,
+                          mapping=model_config.mapping,
+                          tensor_parallel_mode=TensorParallelMode.ROW,
+                          quant_config=model_config.get_quant_config(),
+                          allreduce_strategy=model_config.allreduce_strategy)
         self.final_layer_norm = LayerNorm(
             config.hidden_size,
             elementwise_affine=config.layer_norm_elementwise_affine,
@@ -241,7 +239,7 @@ class OPTForCausalLM(DecoderModelForCausalLM[OPTModel, OPTConfig]):
 
     def load_weights(self, weights: dict):
         tp_size = self.model_config.mapping.tp_size
-        head_dim = self.config.hidden_size // self.config.num_attention_heads
+        num_kv_heads = self.model_config.pretrained_config.num_attention_heads
 
         def filter_weights(prefix: str, weights: dict):
             result = {}
@@ -282,7 +280,7 @@ class OPTForCausalLM(DecoderModelForCausalLM[OPTModel, OPTConfig]):
                                 k:
                                 duplicate_kv_weight(
                                     weight=v[:],
-                                    head_dim=head_dim,
+                                    num_kv_heads=num_kv_heads,
                                     tensor_parallel_size=tp_size)
                                 if k in ['weight', 'bias'] else v
                                 for k, v in fw.items()

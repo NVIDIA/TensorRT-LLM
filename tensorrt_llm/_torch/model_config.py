@@ -8,6 +8,9 @@ import transformers
 
 from tensorrt_llm import logger
 from tensorrt_llm._utils import torch_dtype_to_binding
+from tensorrt_llm.bindings import LayerType as LayerTypeCpp
+from tensorrt_llm.functional import AllReduceStrategy
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -77,9 +80,15 @@ class ModelConfig(Generic[TConfig]):
 
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
+    allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO
 
     # If true, enable min-latency mode. Currently only used for Llama4.
     enable_min_latency: bool = False
+
+    # Allow models to select op according to whether CUDA Graphs are used.
+    use_cuda_graph: bool = False
+
+    force_dynamic_quantization: bool = False
 
     extra_attrs: Dict = field(default_factory=dict, repr=False, init=False)
 
@@ -105,6 +114,24 @@ class ModelConfig(Generic[TConfig]):
                                               "architectures"):
             self.is_generation = self.is_generation_model(
                 self.pretrained_config.architectures)
+
+        def get_all_reduce_strategy(strategy: str = "AUTO"):
+            maps = {
+                "AUTO": AllReduceStrategy.AUTO,
+                "NCCL": AllReduceStrategy.NCCL,
+                "UB": AllReduceStrategy.UB,
+                "MINLATENCY": AllReduceStrategy.MIN_LATENCY,
+                "ONESHOT": AllReduceStrategy.ONESHOT,
+                "TWOSHOT": AllReduceStrategy.TWOSHOT,
+                "LOWPRECISION": AllReduceStrategy.LOWPRECISION,
+                "MNNVL": AllReduceStrategy.MNNVL
+            }
+            key = strategy.upper()
+            return maps[key] if key in maps else AllReduceStrategy.AUTO
+
+        if isinstance(self.allreduce_strategy, str):
+            self.allreduce_strategy = get_all_reduce_strategy(
+                self.allreduce_strategy)
 
     @property
     def fuse_pos_embd(self):
@@ -246,11 +273,19 @@ class ModelConfig(Generic[TConfig]):
         model_config._frozen = True
         return model_config
 
-    def get_bindings_model_config(self) -> "ModelConfigCpp":
+    def get_bindings_model_config(self,
+                                  tokens_per_block: Optional[int] = None
+                                  ) -> "ModelConfigCpp":
         """
         This method is used to construct the bindings config for the model.
         Currently it adheres to gptJsonConfig.cpp::createModelConfig, which assumes
         that an engine has been created.
+
+        Args:
+            tokens_per_block: The number of tokens per block. Please note that in PyTorch flow tokens_per_block is not available in the model config, instead it is defined in the executor config.
+
+        Returns:
+            The bindings model config.
         """
         # TODO smor- this isn't robust, and currently tested for LlamaConfig only
         # TODO smor- currently assuming no rnn layers, no MOE
@@ -258,6 +293,7 @@ class ModelConfig(Generic[TConfig]):
 
         num_heads = self.pretrained_config.num_attention_heads // (
             self.mapping.tp_size * self.mapping.cp_size)
+        hidden_size = self.pretrained_config.hidden_size // self.mapping.tp_size
 
         model_config_cpp = ModelConfigCpp(
             vocab_size=self.pretrained_config.vocab_size,
@@ -265,9 +301,15 @@ class ModelConfig(Generic[TConfig]):
             num_attention_layers=self.pretrained_config.num_hidden_layers,
             num_rnn_layers=0,
             num_heads=num_heads,
-            hidden_size=self.pretrained_config.hidden_size,
+            hidden_size=hidden_size,
             data_type=torch_dtype_to_binding(
                 self.pretrained_config.torch_dtype))
+        if tokens_per_block is None:
+            logger.warning(
+                f"tokens_per_block is not set, using default value {model_config_cpp.tokens_per_block}"
+            )
+        else:
+            model_config_cpp.tokens_per_block = tokens_per_block
 
         mlp_hidden_size = None
         if self.pretrained_config.intermediate_size is not None:
@@ -293,10 +335,15 @@ class ModelConfig(Generic[TConfig]):
         if "head_size" in self.pretrained_config:
             head_size = self.pretrained_config.head_size
         else:
-            head_size = self.pretrained_config.hidden_size // num_heads
+            head_size = hidden_size // num_heads
 
         model_config_cpp.mlp_hidden_size = mlp_hidden_size
         model_config_cpp.size_per_head = head_size
+
+        # NOTE: this method is not robust, for Gemma3ForCausalLM only
+        layer_types = self.get_layer_types()
+        if layer_types is not None:
+            model_config_cpp.layer_types = layer_types
 
         return model_config_cpp
 
@@ -314,3 +361,18 @@ class ModelConfig(Generic[TConfig]):
             biggest_ffn_mult, self.pretrained_config.hidden_size)
 
         return mlp_hidden_size
+
+    def get_layer_types(self) -> Optional[List[LayerTypeCpp]]:
+        """
+        This method is a hack to support the effort to switch to KvCacheManagerCpp.
+        Currently, it is only tested for Gemma3ForCausalLM. For other models, it will return None.
+        """
+        if self.pretrained_config.architectures[0] in ["Gemma3ForCausalLM"]:
+            logger.debug(
+                f"Setting layer types for {self.pretrained_config.architectures}"
+            )
+            return [
+                LayerTypeCpp.ATTENTION,
+            ] * self.pretrained_config.num_hidden_layers
+        else:
+            return None

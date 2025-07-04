@@ -13,7 +13,6 @@ from torch._subclasses import FakeTensor, FakeTensorMode
 from torch.fx import Graph, GraphModule, Node
 from torch.fx.passes.fake_tensor_prop import FakeTensorProp
 from torch.fx.passes.shape_prop import _extract_tensor_metadata
-from torch.fx.passes.tools_common import legalize_graph
 from torch.utils._pytree import _LEAF_SPEC
 
 from ..utils.logger import ad_logger
@@ -165,7 +164,6 @@ def _canonicalize_single_gm(
 
     # clean up graph module
     gm.delete_all_unused_submodules()
-    gm = legalize_graph(gm)
 
     # NOTE: shape_prop can be a littly finicky & slow, so we only run it optionally...
     if shape_prop:

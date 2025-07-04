@@ -554,7 +554,7 @@ class PluginConfig(metaclass=PluginConfigMeta):
     def set_fp8_rowwise_quant_plugins(self, dtype: str = "auto"):
         self.fp8_rowwise_gemm_plugin = dtype
         self.rmsnorm_quantization_plugin = dtype
-        # self.layernorm_quantization_plugin = dtype
+        self.layernorm_quantization_plugin = dtype
         self.quantize_per_token_plugin = True
         self.quantize_tensor_plugin = True
         return self

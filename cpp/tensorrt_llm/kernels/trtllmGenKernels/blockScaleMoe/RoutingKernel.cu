@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,12 +26,16 @@
 
 #include <type_traits>
 
+#include "tensorrt_llm/kernels/archCondition.h"
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace moe::dev
 {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static constexpr bool TLLM_GEN_HAS_FAST_REDUX = tensorrt_llm::kernels::arch::is_major_v<10>;
 
 namespace routing
 {
@@ -45,22 +49,14 @@ namespace cg = cooperative_groups;
 
 static constexpr int NumThreads = 256;
 static constexpr int NumBlocksPerCluster = 8;
-static constexpr int NumThreadsGemm = 128;
 static constexpr int WarpSize = 32;
 static constexpr int NumWarps = NumThreads / WarpSize;
-static constexpr int NumTopGroups = 4;
-static constexpr int NumExpertsPerGroup = 32;
 static constexpr int NumTopGroupScores = 2;
-static constexpr int NumTopExperts = 8;
+static constexpr int MaxNumTopExperts = 8;
+static constexpr int MaxNumTopGroups = 4;
 
 // Performance tuning knob.
 static constexpr int NumEltsPerOffsetTilePerThread = 8;
-
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000 && defined(__CUDA_ARCH_FEAT_SM100_ALL))
-#define TLLM_GEN_ENABLE_FAST_REDUX
-#endif
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -123,12 +119,7 @@ struct TopKRedType
 
     __device__ inline TypeCmp reduce(cg::thread_block_tile<WarpSize> const& warp)
     {
-#if defined(TLLM_GEN_ENABLE_FAST_REDUX)
-        static constexpr bool UseCg = false;
-#else
-        static constexpr bool UseCg = true;
-#endif
-        if constexpr (UseCg || sizeof(TypeExpW) >= 4)
+        if constexpr (!TLLM_GEN_HAS_FAST_REDUX || sizeof(TypeExpW) >= 4)
         {
             return cg::reduce(warp, compVal, cg::greater<TypeCmp>{});
         }
@@ -140,20 +131,6 @@ struct TopKRedType
         }
     }
 };
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-static __device__ inline float tanh_fast(float x)
-{
-    float res;
-    asm volatile("{ tanh.approx.f32 %0, %1; }\n" : "=f"(res) : "f"(x));
-    return res;
-}
-
-static __device__ inline float sigmoid_fast(float x)
-{
-    return 0.5f * tanh_fast(0.5f * x) + 0.5f;
-}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -223,6 +200,7 @@ __device__ void reduceTopK(cg::thread_block_tile<WarpSize> const& warp, Type (&o
         topK[nn] = RedType{value[nn], idx[nn]};
     if constexpr (!IsSorted)
     {
+        static_assert(N <= 4, "Unsorted topK expects N <= 4");
         TOPK_SWAP(0, 2);
         TOPK_SWAP(1, 3);
 
@@ -248,65 +226,6 @@ __device__ void reduceTopK(cg::thread_block_tile<WarpSize> const& warp, Type (&o
 };
 
 #undef TOPK_SWAP
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <typename KernelParams>
-__global__ void routingKernelGemm(KernelParams params)
-{
-    // naive Gemm, to be replaced by performant kernel
-    using Type = typename KernelParams::Type;
-    using TypeExpW = typename KernelParams::TypeExpW;
-    // each thread has space for the dot product of each expert here
-    extern __shared__ char __attribute((aligned(128))) smemBase[];
-    auto* smemDotPartial = reinterpret_cast<float*>(smemBase);
-    static constexpr int SmemStride = NumThreadsGemm + 1;
-
-    auto tokenOff = int64_t{blockIdx.x} * int64_t{params.mHiddenDim};
-
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-    // immediately trigger the secondary kernel when using PDL
-    if constexpr (KernelParams::UsePdl)
-    {
-        cudaTriggerProgrammaticLaunchCompletion();
-    }
-#endif
-
-    // dot product for all experts
-    // entire block must go into this loop
-    for (int32_t dd = threadIdx.x; dd < params.mHiddenDim; dd += NumThreadsGemm)
-    {
-        Type act = params.mPtrIn[tokenOff + dd];
-
-        for (int32_t expertIdx = 0; expertIdx < params.mNumExperts; ++expertIdx)
-        {
-            auto weightOff = int64_t{expertIdx} * int64_t{params.mHiddenDim};
-            TypeExpW weight = params.mPtrRoutingWeights[weightOff + dd];
-            auto val = float{act} * float{weight};
-            if (dd == threadIdx.x)
-            {
-                smemDotPartial[expertIdx * SmemStride + threadIdx.x] = val;
-            }
-            else
-            {
-                smemDotPartial[expertIdx * SmemStride + threadIdx.x] += val;
-            }
-        }
-    }
-    // make all partial dot products available to all threads
-    __syncthreads();
-
-    // finalize dot product and write to output
-    for (int32_t expertIdx = threadIdx.x; expertIdx < params.mNumExperts; expertIdx += NumThreadsGemm)
-    {
-        float dot = 0.F;
-        for (int32_t ii = 0; ii < NumThreadsGemm; ++ii)
-        {
-            dot += smemDotPartial[expertIdx * SmemStride + ii];
-        }
-        params.mPtrScores[int64_t{blockIdx.x} * int64_t{params.mNumExperts} + expertIdx] = dot;
-    }
-}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -343,7 +262,7 @@ __global__ void routingMainKernel(KernelParams params)
     // declare shared memory structure
     // number of experts is bounded by number of threads
     __shared__ float __attribute((aligned(128))) smemScoreSigmoid[NumThreads];
-    __shared__ float __attribute((aligned(128))) smemScoreBias[NumExpertsPerGroup * NumThreads];
+    __shared__ float __attribute((aligned(128))) smemScoreBias[NumThreads];
     // number of expert groups is bounded by number of warps
     __shared__ float __attribute((aligned(128))) smemGroupScores[NumWarps];
 
@@ -354,9 +273,12 @@ __global__ void routingMainKernel(KernelParams params)
     int32_t laneIdx = threadIdx.x % WarpSize;
     int32_t warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
     // warps outside the range of expert groups do not participate
-    if (warpIdx >= params.mNumExpertGroups)
+    if constexpr (KernelParams::UseGroups)
     {
-        return;
+        if (warpIdx >= params.mNumExpertGroups)
+        {
+            return;
+        }
     }
 
     // note that for invalid scores, we simply use a negative value:
@@ -366,8 +288,13 @@ __global__ void routingMainKernel(KernelParams params)
     const TypeExpW invalidScore = TypeExpW{invalidScoreFloat};
 
     // load bias already; each warp represents one expert group
-    auto threadExpert = warpIdx * params.mNumExpertsPerGroup + laneIdx;
-    auto expertSelected = laneIdx < params.mNumExpertsPerGroup;
+    auto threadExpert = threadIdx.x;
+    bool expertSelected = threadExpert < params.mNumExperts;
+    if constexpr (KernelParams::UseGroups)
+    {
+        threadExpert = warpIdx * params.mNumExpertsPerGroup + laneIdx;
+        expertSelected = laneIdx < params.mNumExpertsPerGroup;
+    }
     auto scoreIdx = int64_t{blockIdx.x} * int64_t{params.mNumExperts} + threadExpert;
     auto biasVal = expertSelected ? params.mPtrRoutingBias[threadExpert] : invalidScore;
 
@@ -394,9 +321,8 @@ __global__ void routingMainKernel(KernelParams params)
     // get the score with bias
     // note that with invalid values, because sigmoid is < 1 and bias is -1,
     // we must get a negative value, which is smaller than any valid value
-    // TODO: verify bf16 scoreBias accuracy before changing it back to bf16
-    // auto scoreBias = TypeExpW{scoreSigmoid + float{biasVal}}; // TypeExpW is bf16
     auto scoreBias = float{scoreSigmoid + float{biasVal}};
+
     if (expertSelected)
     {
         smemScoreBias[threadExpert] = scoreBias;
@@ -405,42 +331,69 @@ __global__ void routingMainKernel(KernelParams params)
     // registers for top group score reduction
     float topExpGroupScores[NumTopGroupScores];
     [[maybe_unused]] int32_t topExpGroupIdx[NumTopGroupScores];
-    reduceTopK(warp, topExpGroupScores, topExpGroupIdx, scoreBias, threadExpert,
-        /* minValue */ invalidScoreFloat);
+    float topGroups[MaxNumTopGroups]; // bound of params.mNumLimitedGroups
+    int32_t topGroupIdx[MaxNumTopGroups];
+    float expertScoreGroup[MaxNumTopGroups];
+    int32_t expertIdxGroup[MaxNumTopGroups];
+    float topScores[MaxNumTopExperts]; // bound of params.mTopK
+    int32_t topExperts[MaxNumTopExperts];
 
-    // get the final group score and write it to shared
-    if (cute::elect_one_sync())
+    if constexpr (KernelParams::UseGroups)
     {
-        auto groupScore = topExpGroupScores[0] + topExpGroupScores[1];
-        smemGroupScores[warpIdx] = groupScore;
+        reduceTopK(warp, topExpGroupScores, topExpGroupIdx, scoreBias, threadExpert,
+            /* minValue */ invalidScoreFloat);
+
+        // get the final group score and write it to shared
+        if (cute::elect_one_sync())
+        {
+            auto groupScore = topExpGroupScores[0] + topExpGroupScores[1];
+            smemGroupScores[warpIdx] = groupScore;
+        }
     }
 
     // make group scores available to all warps
     __syncthreads();
 
-    float topGroups[NumTopGroups]; // params.mNumLimitedGroups
-    int32_t topGroupIdx[NumTopGroups];
-    float expertScoreGroup[NumTopGroups];
-    int32_t expertIdxGroup[NumTopGroups];
-    float topScores[NumTopExperts]; // params.mTopK
-    int32_t topExperts[NumTopExperts];
     auto localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
     if (warpIdx == 0)
     {
         // a single warp performs the selection of top groups, and goes on to select the final experts
-        float groupScore = laneIdx < params.mNumExpertGroups ? smemGroupScores[laneIdx] : float{};
+        if constexpr (KernelParams::UseGroups)
+        {
+            float groupScore = laneIdx < params.mNumExpertGroups ? smemGroupScores[laneIdx] : invalidScoreFloat;
 
-        reduceTopK(warp, topGroups, topGroupIdx, groupScore, laneIdx,
-            /* minValue */ invalidScoreFloat);
+            reduceTopK(warp, topGroups, topGroupIdx, groupScore, laneIdx,
+                /* minValue */ invalidScoreFloat);
 
-        // final expert selection: get relevant indexes and scores from shared
+            // final expert selection: get relevant indexes and scores from shared
 
 #pragma unroll
-        for (int ii = 0; ii < NumTopGroups; ++ii)
-        { // params.mNumLimitedGroups
-            auto groupIdx = topGroupIdx[ii];
-            expertIdxGroup[ii] = groupIdx * params.mNumExpertsPerGroup + laneIdx;
-            expertScoreGroup[ii] = expertSelected ? smemScoreBias[expertIdxGroup[ii]] : invalidScoreFloat;
+            for (int ii = 0; ii < MaxNumTopGroups; ++ii)
+            { // bound of params.mNumLimitedGroups
+                auto groupIdx = topGroupIdx[ii];
+                expertIdxGroup[ii] = groupIdx * params.mNumExpertsPerGroup + laneIdx;
+                // note: expertSelected implies laneIdx < params.mNumExpertsPerGroup.
+                // we have params.mNumExpertsPerGroup == params.mNumExperts / params.mNumExpertGroups,
+                // thus groupIdx <= params.mNumExpertGroups - 1 =>
+                // groupIdx * params.mNumExpertsPerGroup <= params.mNumExperts - params.mNumExpertsPerGroup
+                // => expertIdxGroup[ii] < params.mNumExperts <= NumThreads,
+                // so the access is safe here
+                expertScoreGroup[ii] = groupIdx < params.mNumExpertGroups && expertSelected
+                    ? smemScoreBias[expertIdxGroup[ii]]
+                    : invalidScoreFloat;
+            }
+        }
+        else
+        {
+            // without groups, each thread just takes `MaxNumTopGroups` experts
+
+#pragma unroll
+            for (int ii = 0; ii < MaxNumTopGroups; ++ii)
+            {
+                auto expertIdx = ii * WarpSize + laneIdx;
+                expertIdxGroup[ii] = expertIdx;
+                expertScoreGroup[ii] = expertIdx < params.mNumExperts ? smemScoreBias[expertIdx] : invalidScoreFloat;
+            }
         }
 
         reduceTopK(warp, topScores, topExperts, expertScoreGroup, expertIdxGroup,
@@ -449,8 +402,8 @@ __global__ void routingMainKernel(KernelParams params)
         // determine our lane's expert index and write to output
         int32_t expertIdx = 0;
 #pragma unroll
-        for (int ii = 0; ii < NumTopExperts; ++ii)
-        { // params.mTopK
+        for (int ii = 0; ii < MaxNumTopExperts; ++ii)
+        { // bound of params.mTopK
             expertIdx = laneIdx == ii ? topExperts[ii] : expertIdx;
         }
         // determine whether our expert is local to this GPU
@@ -459,27 +412,25 @@ __global__ void routingMainKernel(KernelParams params)
             && (localExpertIdx & params.mLocalExpertsStrideLog2) == 0;
 
         // write expert idx out already
-        auto idxTopK = blockIdx.x * NumTopExperts + laneIdx; // params.mTopK
-        if (laneIdx < NumTopExperts && params.mPtrExpertIdx != nullptr)
-        {                                                    // params.mTopK
+        auto idxTopK = blockIdx.x * params.mTopK + laneIdx;
+        if (laneIdx < params.mTopK && params.mPtrExpertIdx != nullptr)
+        {
             params.mPtrExpertIdx[idxTopK] = expertIdx;
         }
-        float scoreNorm = laneIdx < NumTopExperts ? smemScoreSigmoid[expertIdx] : 0.F;
+        float scoreNorm = laneIdx < params.mTopK ? smemScoreSigmoid[expertIdx] : 0.F;
         auto redNorm = cg::reduce(warp, scoreNorm, cg::plus<float>{});
         auto finalScore = TypeExpW{scoreNorm * params.mRouteScale / redNorm};
-        if (laneIdx < NumTopExperts && params.mPtrExpertWeights != nullptr)
-        { // params.mTopK
+        if (laneIdx < params.mTopK && params.mPtrExpertWeights != nullptr)
+        {
             params.mPtrExpertWeights[idxTopK] = finalScore;
         }
-        if (laneIdx < NumTopExperts && params.mPtrExpertWeightsFull != nullptr && isLocalExpert)
-        { // params.mTopK
+        if (laneIdx < params.mTopK && params.mPtrExpertWeightsFull != nullptr && isLocalExpert)
+        {
             auto idxWeightsFull = localExpertIdx * gridDim.x + blockIdx.x;
             params.mPtrExpertWeightsFull[idxWeightsFull] = finalScore;
         }
     }
 }
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -500,15 +451,15 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
     // is bounded by 16384 * TopK.
     // TODO: if we only use this kernel up to 1024 tokens, we could use 1024 here.
     static constexpr int MaxExpandedIdxPerThread
-        = (16384 * NumTopExperts + NumThreadsPerCluster - 1) / NumThreadsPerCluster;
+        = (16384 * MaxNumTopExperts + NumThreadsPerCluster - 1) / NumThreadsPerCluster;
 
     // Initialize cluster.
-    uint32_t const clusterBlockRank = blockIdx.x;
-    uint32_t const clusterThreadIdx = NumThreads * clusterBlockRank + threadIdx.x;
+    int32_t const clusterBlockRank = blockIdx.x;
+    int32_t const clusterThreadIdx = NumThreads * clusterBlockRank + threadIdx.x;
 
     int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
 
-    auto expandedIdxSize = params.mNumTokens * NumTopExperts;
+    auto expandedIdxSize = params.mNumTokens * params.mTopK;
 
     // pre-fill the counts with 0
     smemExpertCount[threadIdx.x] = 0;
@@ -679,7 +630,7 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
         auto localExpertIdx = static_cast<int32_t>(expertIdx) - params.mLocalExpertsStartIdx;
         auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent
             && (localExpertIdx & params.mLocalExpertsStrideLog2) == 0;
-        auto tokenIdx = expandedIdx / NumTopExperts;
+        auto tokenIdx = expandedIdx / params.mTopK;
         auto permutedIdx = isLocalExpert ? int32_t{smemExpertOffset[expertIdx]} + expertOffsets[ii] : int32_t{-1};
         if (params.mPtrExpandedIdxToPermutedIdx != nullptr)
         {
@@ -716,14 +667,14 @@ __global__ void __launch_bounds__(NumThreads) routingIndicesCoopKernel(KernelPar
     // Initialize grid.
     cg::grid_group grid = cg::this_grid();
     // Note: the following is more efficient than grid.block_index() because we don't use y and z.
-    uint32_t const gridBlockIdx = blockIdx.x;
-    uint32_t const gridThreadIdx = NumThreads * gridBlockIdx + threadIdx.x;
-    uint32_t const numBlocks = gridDim.x;
-    uint32_t const numThreadsPerGrid = numBlocks * NumThreads;
+    int32_t const gridBlockIdx = blockIdx.x;
+    int32_t const gridThreadIdx = NumThreads * gridBlockIdx + threadIdx.x;
+    int32_t const numBlocks = gridDim.x;
+    int32_t const numThreadsPerGrid = numBlocks * NumThreads;
 
     int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
 
-    auto expandedIdxSize = params.mNumTokens * NumTopExperts;
+    auto expandedIdxSize = params.mNumTokens * params.mTopK;
 
     // pre-fill the counts with 0
     smemExpertCount[threadIdx.x] = 0;
@@ -873,7 +824,7 @@ __global__ void __launch_bounds__(NumThreads) routingIndicesCoopKernel(KernelPar
         auto localExpertIdx = static_cast<int32_t>(expertIdx) - params.mLocalExpertsStartIdx;
         auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent
             && (localExpertIdx & params.mLocalExpertsStrideLog2) == 0;
-        auto tokenIdx = expandedIdx / NumTopExperts;
+        auto tokenIdx = expandedIdx / params.mTopK;
         auto permutedIdx = isLocalExpert ? int32_t{smemExpertOffset[expertIdx]} + expertOffsets[ii] : int32_t{-1};
         if (params.mPtrExpandedIdxToPermutedIdx != nullptr)
         {
@@ -904,31 +855,32 @@ __global__ void routingIndicesCoopKernel(KernelParams params)
 // inefficient if we have one CTA per token doing a single global atomic.
 
 template <typename KernelParams>
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 __global__ void __launch_bounds__(NumThreads) routingIndicesHistogramKernel(KernelParams params)
 {
     // number of experts is bounded by number of threads
     __shared__ int32_t __attribute((aligned(128))) smemExpertCount[NumThreads];
 
     // For unrolling.
-    uint32_t constexpr NumEltsPerThread = 8;
+    int32_t constexpr NumEltsPerThread = 8;
 
     // Pre-fill the counts with 0
     smemExpertCount[threadIdx.x] = 0;
     __syncthreads();
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // Wait on primary grid and trigger secondary kernel.
     if constexpr (KernelParams::UsePdl)
     {
         cudaGridDependencySynchronize();
         cudaTriggerProgrammaticLaunchCompletion();
     }
+#endif
 
-    uint32_t const expandedIdxSize = params.mNumTokens * NumTopExperts;
-    uint32_t const localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
+    int32_t const expandedIdxSize = params.mNumTokens * params.mTopK;
+    int32_t const localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
 
-    uint32_t const gridBlockOffset = blockIdx.x * NumThreads;
-    uint32_t const gridStride = gridDim.x * NumThreads;
+    int32_t const gridBlockOffset = blockIdx.x * NumThreads;
+    int32_t const gridStride = gridDim.x * NumThreads;
 
     // Define a lambda to avoid code duplication in branches.
     auto loopBody = [&](int expandedIdx)
@@ -945,22 +897,22 @@ __global__ void __launch_bounds__(NumThreads) routingIndicesHistogramKernel(Kern
     };
 
     // Grid-stride loop.
-    for (uint32_t expandedIdx0 = gridBlockOffset * NumEltsPerThread; expandedIdx0 < expandedIdxSize;
+    for (int32_t expandedIdx0 = gridBlockOffset * NumEltsPerThread; expandedIdx0 < expandedIdxSize;
          expandedIdx0 += gridStride * NumEltsPerThread)
     {
         // Fast path if bound checks aren't necessary
         if (expandedIdx0 + NumEltsPerThread * NumThreads <= expandedIdxSize)
         {
 #pragma unroll
-            for (uint32_t ii = 0; ii < NumEltsPerThread; ii++)
+            for (int32_t ii = 0; ii < NumEltsPerThread; ii++)
             {
-                uint32_t expandedIdx = expandedIdx0 + ii * NumThreads + threadIdx.x;
+                int32_t expandedIdx = expandedIdx0 + ii * NumThreads + threadIdx.x;
                 loopBody(expandedIdx);
             }
         }
         else
         {
-            for (uint32_t expandedIdx = expandedIdx0 + threadIdx.x; expandedIdx < expandedIdxSize;
+            for (int32_t expandedIdx = expandedIdx0 + threadIdx.x; expandedIdx < expandedIdxSize;
                  expandedIdx += NumThreads)
             {
                 loopBody(expandedIdx);
@@ -977,17 +929,10 @@ __global__ void __launch_bounds__(NumThreads) routingIndicesHistogramKernel(Kern
     int32_t const localExpertCount = smemExpertCount[threadIdx.x];
     atomicAdd(&params.mPtrExpertCounts[threadIdx.x], localExpertCount);
 }
-#else
-__global__ void routingIndicesHistogramKernel(KernelParams params)
-{
-    assert(false && "routingIndicesHistogramKernel is only supported on SM90+ architectures");
-}
-#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename KernelParams>
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 __global__ void __launch_bounds__(NumThreads) routingIndicesOffsetsKernel(KernelParams params)
 {
     // number of experts is bounded by number of threads
@@ -1002,14 +947,16 @@ __global__ void __launch_bounds__(NumThreads) routingIndicesOffsetsKernel(Kernel
 
     int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
 
-    uint32_t const expandedIdxSize = params.mNumTokens * NumTopExperts;
-    uint32_t const numTiles = (expandedIdxSize + MaxExpandedIdxPerBlock - 1) / (MaxExpandedIdxPerBlock);
+    int32_t const expandedIdxSize = params.mNumTokens * params.mTopK;
+    int32_t const numTiles = (expandedIdxSize + MaxExpandedIdxPerBlock - 1) / (MaxExpandedIdxPerBlock);
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // Wait on primary grid.
     if constexpr (KernelParams::UsePdl)
     {
         cudaGridDependencySynchronize();
     }
+#endif
 
     // The expert offsets are common to all tiles of all blocks.
     // Load the histogram, scan it and write offsets to shared memory.
@@ -1058,7 +1005,7 @@ __global__ void __launch_bounds__(NumThreads) routingIndicesOffsetsKernel(Kernel
     //
 
     // Grid-stride loop on 1D "tiles" of input indices.
-    for (uint32_t tileIdx = blockIdx.x; tileIdx < numTiles; tileIdx += gridDim.x)
+    for (int32_t tileIdx = blockIdx.x; tileIdx < numTiles; tileIdx += gridDim.x)
     {
         if (tileIdx > 0)
         {
@@ -1169,7 +1116,7 @@ __global__ void __launch_bounds__(NumThreads) routingIndicesOffsetsKernel(Kernel
             auto localExpertIdx = static_cast<int32_t>(expertIdx) - params.mLocalExpertsStartIdx;
             auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent
                 && (localExpertIdx & params.mLocalExpertsStrideLog2) == 0;
-            auto tokenIdx = expandedIdx / NumTopExperts;
+            auto tokenIdx = expandedIdx / params.mTopK;
             auto permutedIdx = isLocalExpert ? (expertOffsets[ii] + smemExpertTileOffset[expertIdx]) : int32_t{-1};
             if (params.mPtrExpandedIdxToPermutedIdx != nullptr)
             {
@@ -1208,17 +1155,13 @@ __global__ void __launch_bounds__(NumThreads) routingIndicesOffsetsKernel(Kernel
     // Trigger secondary kernel.
     // Note: this does not guarantee the visibility of prior writes unless the consumer executes a
     // dependency sync.
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     if constexpr (KernelParams::UsePdl)
     {
         cudaTriggerProgrammaticLaunchCompletion();
     }
-}
-#else
-__global__ void routingIndicesOffsetsKernel(KernelParams params)
-{
-    assert(false && "routingIndicesOffsetsKernel is only supported on SM90+ architectures");
-}
 #endif
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -1231,31 +1174,42 @@ void run(Data const& data, void* stream)
         TLLM_CHECK_WITH_INFO(data.mPtrExpertIdx != nullptr && data.mPtrPermutedIdxSize,
             "If permuted index is required, `mPtrExpertIdx` is also required");
     TLLM_CHECK_WITH_INFO(!data.mUseRoutingSoftmax, "Routing with softmax not implemented yet");
-    TLLM_CHECK_WITH_INFO(
-        data.mNumLimitedGroups == NumTopGroups, "Routing kernel expects %d groups (for now)", NumTopGroups);
-    TLLM_CHECK_WITH_INFO(
-        data.mTopK == NumTopExperts, "Routing kernel expects %d topK experts (for now)", NumTopExperts);
+    TLLM_CHECK_WITH_INFO(data.mNumLimitedGroups <= MaxNumTopGroups, "Routing kernel expects <= %d top groups, got %d",
+        MaxNumTopGroups, data.mNumLimitedGroups);
+    TLLM_CHECK_WITH_INFO(data.mTopK <= MaxNumTopExperts, "Routing kernel expects topK experts <= %d, got %d",
+        MaxNumTopExperts, data.mTopK);
     TLLM_CHECK_WITH_INFO(data.mTopK <= WarpSize, "Routing kernel expects top K <= warp size, got %d", data.mTopK);
     TLLM_CHECK_WITH_INFO(data.mTopK * data.mNumLimitedGroups <= WarpSize,
         "Routing kernel expects top K * top groups <= warp size (for now), got %d * %d", data.mTopK,
         data.mNumLimitedGroups);
-    TLLM_CHECK_WITH_INFO(data.mNumExperts >= NumTopExperts, "Routing kernel expects %d to be at most #experts %d",
-        NumTopExperts, data.mNumExperts);
-    TLLM_CHECK_WITH_INFO(data.mNumExperts <= NumThreads, "Routing kernel expects #experts %d <= #threads %d",
+    TLLM_CHECK_WITH_INFO(data.mNumExperts >= MaxNumTopExperts, "Routing kernel expects %d to be at most #experts %d",
+        MaxNumTopExperts, data.mNumExperts);
+    TLLM_CHECK_WITH_INFO(data.mNumExperts <= NumThreads, "Routing kernel expects #experts %d  <= #threads %d",
         data.mNumExperts, NumThreads);
-    TLLM_CHECK_WITH_INFO(data.mNumExpertGroups <= NumWarps, "Routing kernel expects #experts groups %d <= #warps %d",
-        data.mNumExpertGroups, NumWarps);
-    TLLM_CHECK_WITH_INFO(data.mNumExperts % data.mNumExpertGroups == 0,
-        "Routing kernel expects #experts %d to be a multiple of #expert groups %d", data.mNumExperts,
+    TLLM_CHECK_WITH_INFO(data.mNumExpertGroups >= data.mNumLimitedGroups,
+        "Routing kernel expects top groups %d to be limited by #expert groups %d", data.mNumLimitedGroups,
         data.mNumExpertGroups);
-    TLLM_CHECK_WITH_INFO(data.mNumExperts / data.mNumExpertGroups <= WarpSize,
-        "Routing kernel expects #experts per group <= warp size, got %d", data.mNumExperts / data.mNumExpertGroups);
+    if (data.mNumExpertGroups > 1)
+    {
+        TLLM_CHECK_WITH_INFO(data.mNumExpertGroups <= NumWarps,
+            "Routing kernel expects #experts groups %d to be <= #warps %d", data.mNumExpertGroups, NumWarps);
+        TLLM_CHECK_WITH_INFO(data.mNumExperts % data.mNumExpertGroups == 0,
+            "Routing kernel expects #experts %d to be a multiple of #expert groups %d", data.mNumExperts,
+            data.mNumExpertGroups);
+        TLLM_CHECK_WITH_INFO(data.mNumExperts / data.mNumExpertGroups <= WarpSize,
+            "Routing kernel expects #experts per group <= warp size, got %d", data.mNumExperts / data.mNumExpertGroups);
+    }
+    else
+    {
+        TLLM_CHECK_WITH_INFO(data.mNumExperts <= WarpSize * MaxNumTopGroups,
+            "Routing kernel expects #experts %d <= WarpSize * MaxNumTopGroups %d", data.mNumExperts,
+            WarpSize * MaxNumTopGroups);
+        TLLM_CHECK_WITH_INFO(
+            data.mTopK <= NumWarps, "Routing kernel expects top K %d to be <= #warps %d", data.mTopK, NumWarps);
+    }
     TLLM_CHECK_WITH_INFO(
         data.mNumExperts % 4 == 0, "Routing kernel expects #experts %d to be a multiple of 4.", data.mNumExperts);
     TLLM_CHECK_WITH_INFO(data.mPaddingLog2 < 8, "Routing kernel expects padding log2 < 8, got %d", data.mPaddingLog2);
-    TLLM_CHECK_WITH_INFO(data.mNumExperts / data.mNumExpertGroups <= NumExpertsPerGroup,
-        "Routing kernel expects number of experts per group <= %d, got %d", NumExpertsPerGroup,
-        data.mNumExperts / data.mNumExpertGroups);
     int const numBlocks = data.mNumTokens;
 
     if (data.mPtrExpertWeightsFull != nullptr)
@@ -1285,13 +1239,15 @@ void run(Data const& data, void* stream)
     {
         // Reset the global histograms (not used in single-cluster code path).
         // Cover both for the cooperative and two-kernel code paths.
+        TLLM_CHECK_WITH_INFO(
+            data.mPtrExpertCounts != nullptr, "When #tokens is large, `mPtrExpertCounts` is a required input.");
         TLLM_CUDA_CHECK(cudaMemsetAsync(
             data.mPtrExpertCounts, 0, static_cast<size_t>(2 * NumThreads) * sizeof(int32_t), (cudaStream_t) stream));
     }
 
     // Number of blocks we can use in the cooperative kernel
     // The number of blocks must be:
-    //   >= ⌈(numTokens * NumTopExperts) / (MaxExpandedIdxPerThread * NumThreads)⌉
+    //   >= ⌈(numTokens * topK) / (MaxExpandedIdxPerThread * NumThreads)⌉
     //   <= numSms, assuming an occupancy of 1 block/SM
     //
     // If too small for the given numTokens, fall back to the less performant two-step method.
@@ -1302,8 +1258,8 @@ void run(Data const& data, void* stream)
     int const numBlocksCoop = 128;
 
     // Maximum number of tokens supported by the kernel using a cooperative launch.
-    int const maxTokensCoop = (numBlocksCoop * NumThreads * 64) / NumTopExperts;
-    LAUNCH_EXPW_ONLY(data,
+    int const maxTokensCoop = (numBlocksCoop * NumThreads * 64) / data.mTopK;
+    LAUNCH_EXPW_ONLY_GROUPS(data,
         /*coopLaunch=*/false, routingMainKernel, numBlocks, NumThreads,
         /*smemSize=*/0, // No dynamic smem
         stream);
@@ -1312,38 +1268,38 @@ void run(Data const& data, void* stream)
     {
         if (useSingleCluster)
         {
-            LAUNCH_EXPW_ONLY(data,
+            LAUNCH_EXPW_ONLY_GROUPS(data,
                 /*coopLaunch=*/false, routingIndicesClusterKernel, NumBlocksPerCluster, NumThreads,
                 /*smemSize=*/0, // No dynamic smem
                 stream);
         }
         else if (data.mNumTokens <= maxTokensCoop)
         {
-            LAUNCH_EXPW_ONLY(data,
+            LAUNCH_EXPW_ONLY_GROUPS(data,
                 /*coopLaunch=*/true, routingIndicesCoopKernel, numBlocksCoop, NumThreads,
                 /*smemSize=*/0, // No dynamic smem
                 stream);
         }
         else
         {
-            const uint32_t expandedIdxSize = data.mNumTokens * NumTopExperts;
+            const int32_t expandedIdxSize = data.mNumTokens * data.mTopK;
 
-            const uint32_t histogramEltsPerBlock = 8 * NumThreads;
-            const uint32_t offsetEltsPerBlock = NumEltsPerOffsetTilePerThread * NumThreads;
+            const int32_t histogramEltsPerBlock = 8 * NumThreads;
+            const int32_t offsetEltsPerBlock = NumEltsPerOffsetTilePerThread * NumThreads;
 
             // Limit grid size (both kernels use a grid-stride loop).
-            const uint32_t maxNumBlocks = 1024;
+            const int32_t maxNumBlocks = 1024;
 
             int const numBlocksHistogram
                 = std::min((expandedIdxSize + histogramEltsPerBlock - 1) / histogramEltsPerBlock, maxNumBlocks);
             int const numBlocksOffsets
                 = std::min((expandedIdxSize + offsetEltsPerBlock - 1) / offsetEltsPerBlock, maxNumBlocks);
 
-            LAUNCH_EXPW_ONLY(data,
+            LAUNCH_EXPW_ONLY_GROUPS(data,
                 /*coopLaunch=*/false, routingIndicesHistogramKernel, numBlocksHistogram, NumThreads,
                 /*smemSize=*/0, // No dynamic smem
                 stream);
-            LAUNCH_EXPW_ONLY(data,
+            LAUNCH_EXPW_ONLY_GROUPS(data,
                 /*coopLaunch=*/false, routingIndicesOffsetsKernel, numBlocksOffsets, NumThreads,
                 /*smemSize=*/0, // No dynamic smem
                 stream);
@@ -1385,10 +1341,6 @@ static constexpr int WarpKernelMaxNumTokens = 4;
 
 // Performance tuning knob.
 static constexpr int NumEltsPerOffsetTilePerThread = 8;
-
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000 && defined(__CUDA_ARCH_FEAT_SM100_ALL))
-#define TLLM_GEN_ENABLE_FAST_REDUX
-#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -1451,12 +1403,7 @@ struct TopKRedType
 
     __device__ inline TypeCmp reduce(cg::thread_block_tile<WarpSize> const& warp)
     {
-#if defined(TLLM_GEN_ENABLE_FAST_REDUX)
-        static constexpr bool UseCg = false;
-#else
-        static constexpr bool UseCg = true;
-#endif
-        if constexpr (UseCg || sizeof(TypeExpW) >= 4)
+        if constexpr (!TLLM_GEN_HAS_FAST_REDUX || sizeof(TypeExpW) >= 4)
         {
             return cg::reduce(warp, compVal, cg::greater<TypeCmp>{});
         }
@@ -1611,7 +1558,6 @@ __host__ __device__ constexpr void setBits(int32_t& value, int32_t newBits, int 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename KernelParams>
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParams params)
 {
     // types used in this kernel
@@ -1648,11 +1594,13 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     }
     __syncwarp();
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // then wait on primary grid
     if constexpr (KernelParams::UsePdl)
     {
         cudaGridDependencySynchronize();
     }
+#endif
 
     if (params.mPtrScores != nullptr)
     {
@@ -1778,12 +1726,14 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
         params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
     }
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 #if !defined(PDL_PROFILE) || PDL_PROFILE == 0
     // we can trigger the next kernel at this point
     if constexpr (KernelParams::UsePdl)
     {
         cudaTriggerProgrammaticLaunchCompletion();
     }
+#endif
 #endif
 
     // at this point, all values for offsets are ready, except the final offsets
@@ -1840,13 +1790,6 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
         }
     }
 }
-#else
-__global__ void routingIndicesWarpKernel(KernelParams params)
-{
-    assert(false && "routingIndicesWarpKernel is only supported on SM90+ architectures");
-}
-#endif
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename KernelParams>
@@ -2110,7 +2053,6 @@ __global__ void routingIndicesClusterKernel(KernelParams params)
 
 // this kernel is needed in case we have scores as input for the histogram kernel
 template <typename KernelParams>
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramScoresKernel(KernelParams params)
 {
     using TypeExpW = typename KernelParams::TypeExpW;
@@ -2128,12 +2070,14 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramScoresK
     auto block = cg::this_thread_block();
     auto warp = cg::tiled_partition<WarpSize>(block);
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // Wait on primary grid and trigger secondary kernel.
     if constexpr (KernelParams::UsePdl)
     {
         cudaGridDependencySynchronize();
         cudaTriggerProgrammaticLaunchCompletion();
     }
+#endif
 
     // in this case, each warp represents a token, and we use a grid-stride loop
     // over all warps/tokens
@@ -2166,12 +2110,6 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramScoresK
         }
     }
 }
-#else
-__global__ void routingIndicesHistogramScoresKernel(KernelParams params)
-{
-    assert(false && "routingIndicesHistogramScoresKernel is only supported on SM90+ architectures");
-}
-#endif
 
 // Two-step approach (if number of tokens exceed limits of what cluster / cooperative launch
 // variants can handle): in order to minimize the amount of data to exchange through global memory,
@@ -2182,7 +2120,6 @@ __global__ void routingIndicesHistogramScoresKernel(KernelParams params)
 // Note: the histogram calculation could also be fused with routingMainKernel, but this might be
 // inefficient if we have one CTA per token doing a single global atomic.
 template <typename KernelParams>
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramKernel(KernelParams params)
 {
     using TypeExpW = typename KernelParams::TypeExpW;
@@ -2200,12 +2137,14 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramKernel(
     }
     __syncthreads();
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // Wait on primary grid and trigger secondary kernel.
     if constexpr (KernelParams::UsePdl)
     {
         cudaGridDependencySynchronize();
         cudaTriggerProgrammaticLaunchCompletion();
     }
+#endif
 
     uint32_t const expandedIdxSize = params.mNumTokens * NumTopExperts;
     uint32_t const localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
@@ -2268,17 +2207,10 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramKernel(
         atomicAdd(&params.mPtrExpertCounts[threadIdx.x], localExpertCount);
     }
 }
-#else
-__global__ void routingIndicesHistogramKernel(KernelParams params)
-{
-    assert(false && "routingIndicesHistogramKernel is only supported on SM90+ architectures");
-}
-#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename KernelParams>
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 __global__ void __launch_bounds__(NumThreadsHist) routingIndicesOffsetsKernel(KernelParams params)
 {
     using TypeExpW = typename KernelParams::TypeExpW;
@@ -2298,11 +2230,13 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesOffsetsKernel(Ke
     uint32_t const expandedIdxSize = params.mNumTokens * NumTopExperts;
     uint32_t const numTiles = (expandedIdxSize + MaxExpandedIdxPerBlock - 1) / (MaxExpandedIdxPerBlock);
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // Wait on primary grid.
     if constexpr (KernelParams::UsePdl)
     {
         cudaGridDependencySynchronize();
     }
+#endif
 
     // The expert offsets are common to all tiles of all blocks.
     // Load the histogram, scan it and write offsets to shared memory.
@@ -2518,6 +2452,7 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesOffsetsKernel(Ke
         }
     }
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 // Trigger secondary kernel.
 // Note: this does not guarantee the visibility of prior writes unless the consumer executes a
 // dependency sync.
@@ -2527,13 +2462,8 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesOffsetsKernel(Ke
         cudaTriggerProgrammaticLaunchCompletion();
     }
 #endif
-}
-#else
-__global__ void routingIndicesOffsetsKernel(KernelParams params)
-{
-    assert(false && "routingIndicesOffsetsKernel is only supported on SM90+ architectures");
-}
 #endif
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -2633,7 +2563,7 @@ void run(Data const& data, void* stream)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-namespace routingQwen3
+namespace routingRenormalize
 {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -2655,10 +2585,6 @@ static constexpr int MaxNumTokensSingleClusterScores = NumBlocksPerCluster * Num
 
 // Performance tuning knob.
 static constexpr int NumEltsPerOffsetTilePerThread = 8;
-
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000 && defined(__CUDA_ARCH_FEAT_SM100_ALL))
-#define TLLM_GEN_ENABLE_FAST_REDUX
-#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -2721,12 +2647,7 @@ struct TopKRedType
 
     __device__ inline TypeCmp reduce(cg::thread_block_tile<WarpSize> const& warp)
     {
-#if defined(TLLM_GEN_ENABLE_FAST_REDUX)
-        static constexpr bool UseCg = false;
-#else
-        static constexpr bool UseCg = true;
-#endif
-        if constexpr (UseCg || sizeof(TypeExpW) >= 4)
+        if constexpr (!TLLM_GEN_HAS_FAST_REDUX || sizeof(TypeExpW) >= 4)
         {
             return cg::reduce(warp, compVal, cg::greater<TypeCmp>{});
         }
@@ -3264,13 +3185,13 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramScoresK
     auto block = cg::this_thread_block();
     auto warp = cg::tiled_partition<WarpSize>(block);
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // Wait on primary grid.
     if constexpr (KernelParams::UsePdl)
     {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         cudaGridDependencySynchronize();
-#endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     }
+#endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 
     // initialize the mPtrPermutedIdxToTokenIdx
     int32_t globalThreadIdx = globalWarpIdx * WarpSize + laneIdx;
@@ -3295,13 +3216,13 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramScoresK
         }
     }
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // Trigger secondary kernel.
     if constexpr (KernelParams::UsePdl)
     {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         cudaTriggerProgrammaticLaunchCompletion();
-#endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     }
+#endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 
     // in this case, each warp represents a token, and we use a grid-stride loop
     // over all warps/tokens
@@ -3394,14 +3315,14 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramKernel(
     }
     __syncthreads();
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // Wait on primary grid and trigger secondary kernel.
     if constexpr (KernelParams::UsePdl)
     {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         cudaGridDependencySynchronize();
         cudaTriggerProgrammaticLaunchCompletion();
-#endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     }
+#endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 
     uint32_t const expandedIdxSize = params.mNumTokens * NumTopExperts;
     uint32_t const localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
@@ -3488,13 +3409,13 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesOffsetsKernel(Ke
     uint32_t const expandedIdxSize = params.mNumTokens * NumTopExperts;
     uint32_t const numTiles = (expandedIdxSize + MaxExpandedIdxPerBlock - 1) / (MaxExpandedIdxPerBlock);
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // Wait on primary grid.
     if constexpr (KernelParams::UsePdl)
     {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         cudaGridDependencySynchronize();
-#endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     }
+#endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 
     // The expert offsets are common to all tiles of all blocks.
     // Load the histogram, scan it and write offsets to shared memory.
@@ -3710,17 +3631,17 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesOffsetsKernel(Ke
         }
     }
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 // Trigger secondary kernel.
 // Note: this does not guarantee the visibility of prior writes unless the consumer executes a
 // dependency sync.
 #if !defined(PDL_PROFILE) || PDL_PROFILE == 0
     if constexpr (KernelParams::UsePdl)
     {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         cudaTriggerProgrammaticLaunchCompletion();
-#endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     }
 #endif
+#endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -3779,10 +3700,10 @@ void run(Data const& data, void* stream)
                 /*smemSize=*/0, // No dynamic smem
                 stream);
         }
-        LAUNCH_EXPW_ONLY(data, false, routingIndicesHistogramKernel, numBlocksHistogram, NumThreadsHist,
+        LAUNCH_EXPW_ONLY_QWEN3(data, false, routingIndicesHistogramKernel, numBlocksHistogram, NumThreadsHist,
             /*smemSize=*/0, // No dynamic smem
             stream);
-        LAUNCH_EXPW_ONLY(data, false, routingIndicesOffsetsKernel, numBlocksOffsets, NumThreadsHist,
+        LAUNCH_EXPW_ONLY_QWEN3(data, false, routingIndicesOffsetsKernel, numBlocksOffsets, NumThreadsHist,
             /*smemSize=*/0, // No dynamic smem
             stream);
     }
@@ -3790,7 +3711,7 @@ void run(Data const& data, void* stream)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-} // namespace routingQwen3
+} // namespace routingRenormalize
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

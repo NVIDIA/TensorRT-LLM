@@ -29,6 +29,8 @@
 #include <cuda_runtime.h>
 #endif
 
+#define USE_REG_Q 1
+
 __constant__ constexpr XQAKernelType kernelType = XQAKernelType::kSM120_MLA;
 
 inline constexpr bool allowMultipleInputTokens = true;
@@ -77,9 +79,9 @@ struct KVTilePartLoader
     // if greater than 1, then we need unrolling for the loading loop. Seems 1 is fine for latency.
     static inline constexpr uint32_t nbPageBuffers = 1;
 #if USE_PAGED_KV_CACHE
-    uint32_t const nbPages; // for bound check
+    uint32_t const nbPages;    // for bound check
     Vec<KVCachePageIndex, nbPagesPerTile> pageBuffers[nbPageBuffers];
-    uint32_t idxTileRef;    // idxTile used to load the pages
+    uint32_t idxTileRef = ~0U; // idxTile used to load the pages
 #endif
     uint32_t const baseOffset;
 
@@ -115,6 +117,11 @@ __device__ inline KVTilePartLoader::KVTilePartLoader(
     , baseOffset{(idxReq * beamWidth) * 2}
 #endif
 {
+#pragma unroll
+    for (auto& pageBuffer : pageBuffers)
+    {
+        pageBuffer.fill(kBAD_PAGE_INDEX);
+    }
 }
 
 // tensorMap is for one whole page ([nbKHeads*tokensPerPage][headElems]) or whole cache
@@ -210,13 +217,13 @@ public:
         return ret;
     }
 
-    __device__ inline LdGrain const* const getPtr(uint32_t idxInstM) const
+    __device__ inline LdGrain const* getPtr(uint32_t idxInstM) const
     {
         return checkedVal(basePtr + idxInstM * qmmaShape.m * srcCols, getPtrRef(idxInstM));
     }
 
 private:
-    __device__ inline LdGrain const* const getPtrRef(uint32_t idxInstM) const
+    __device__ inline LdGrain const* getPtrRef(uint32_t idxInstM) const
     {
         return &src.template at<true>(
             baseRow + idxInstM * qmmaShape.m + r, idxInstK * exactDiv(qmmaShape.k, grainElems) + c);
@@ -238,6 +245,7 @@ struct CgaXBuffer
 {
     XBuffer x;
     Vec<float, headGrpSize> rowSum;
+    Vec<float, headGrpSize> rowMaxLog2e;
 };
 
 struct PingPongMutex
@@ -245,6 +253,7 @@ struct PingPongMutex
     using ShmStorage = CtaBarrier[2];
     ShmStorage& barriers;
     uint32_t const idxGrp;
+    bool skipWait = false;
 
     static __device__ inline void initStorage(ShmStorage& barriers, uint32_t thrdsPerGrp)
     {
@@ -259,14 +268,23 @@ struct PingPongMutex
     {
     }
 
+    __device__ inline void test_lock(uint32_t iter)
+    {
+        skipWait = barriers[idxGrp].test_wait_parity(toParity<1>(iter));
+    }
+
     __device__ inline void lock(uint32_t iter)
     {
-        barriers[idxGrp].wait_parity(toParity<1>(iter));
+        if (!skipWait)
+        {
+            barriers[idxGrp].wait_parity(toParity<1>(iter));
+        }
     }
 
     __device__ inline void unlock()
     {
         barriers[idxGrp ^ 1U].arrive();
+        skipWait = false;
     }
 };
 
@@ -292,17 +310,14 @@ constexpr uint32_t nbMathWarpsB = 8;
 
 constexpr uint32_t nbMultiBlockBufs = 2;
 constexpr uint32_t multiBlockMathWarps = 8;
-#define USE_REG_Q 1
+
+constexpr bool useRegQ = USE_REG_Q;
 
 struct SharedMemA
 {
-    static inline constexpr uint32_t nbKBufs = 4;
-    static inline constexpr uint32_t nbXBufs = 2;
-#if USE_REG_Q
-    static inline constexpr uint32_t regQParts = 2;
-#else
-    static inline constexpr uint32_t regQParts = 0;
-#endif
+    static inline constexpr uint32_t nbKBufs = 12;
+
+    static inline constexpr uint32_t regQParts = (useRegQ ? 4 : 0);
     static inline constexpr uint32_t shmQParts = nbQParts - regQParts;
 
     using ShmQPart = Array2D<LdGrain, headGrpSize, grainsPerPartK>;
@@ -310,10 +325,9 @@ struct SharedMemA
 
     Vec<ShmQPart, shmQParts> q;
     ShmKPart k[nbKBufs];
-    XBuffer x[nbXBufs];
-    Vec<float, headGrpSize> rowSum[nbXBufs];
 
-    Vec<uint32_t, warp_size> drain; // data does not matter. Used to help avoid fence.
+    // single buffer reused by two groups. sendX() warp will arbitrate the order of x buffer access via two xBars.
+    CgaXBuffer x;
 
     // scaled by log2e. Write by last CGA iteration (from the other producer CTA) and read by current producer CTA.
     Vec<float, headGrpSize> rowMaxLog2e;
@@ -324,26 +338,23 @@ struct SharedMemA
     PingPongMutex::ShmStorage tensorCoreMutex;
 
     CtaBarrierPair kBars[nbKBufs];
-    CtaBarrierPair xBars[nbXBufs];
+    static inline constexpr uint32_t nbXBars = nbMathGrpsA;
+    CtaBarrierPair xBars[nbXBars];
 #if USE_REG_Q
-    static constexpr uint32_t nbRegQBars = 2;
-    CtaBarrierPair regQBars[nbRegQBars];
+    CtaBarrierPair regQBar;
 #endif
     CtaBarrier shmQBar;
-    CgaBarrier cgaXBufConsumed;                    // for X
-
-    PingPongMutex::ShmStorage rowMaxTransferMutex; // protect the order of rowMax transfer to consumers
-    CgaBarrier consumerRowMaxConsumedBar;          // arrive by consumer CTAs.
+    CgaBarrier cgaXBufConsumed; // for X
 
     CtaBarrierPair multiBlockBars[nbMultiBlockBufs];
 
     __device__ inline void invalidateBarriers(uint32_t thrdIdx)
     {
-        constexpr uint32_t nbBars = USE_REG_Q ? 25 : 21;
+        constexpr uint32_t nbBars = (useRegQ ? 12 : 10) + 2 * (nbKBufs + nbXBars);
 #ifndef __CUDACC_RTC__
         constexpr uint32_t nbBarsRef
             = exactDiv(offsetof(SharedMemA, qkScaleLog2e) - offsetof(SharedMemA, rowMaxLog2eBar), 8);
-        assert(nbBars == nbBarsRef);
+        static_assert(nbBars == nbBarsRef);
 #endif
         if (thrdIdx < nbBars)
         {
@@ -376,16 +387,16 @@ struct SharedMemB
     // in the future.
     struct XVBuffer
     {
-        XBuffer x;
         VBuffer v;
-        XBuffer pad; // for output swizzling
+        CgaXBuffer x;
+        uint8_t pad[headGrpSize * 128 * 2 - sizeof(VBuffer) - sizeof(CgaXBuffer)]; // for output swizzling
     };
 
     XVBuffer xv[nbXVBufs];
 
     __device__ inline XBuffer& x(uint32_t idx)
     {
-        return xv[idx].x;
+        return xv[idx].x.x;
     }
 
     __device__ inline VBuffer& v(uint32_t idx)
@@ -393,14 +404,19 @@ struct SharedMemB
         return xv[idx].v;
     }
 
-    Vec<float, headGrpSize> xRowSum[nbXBufs];
+    __device__ inline Vec<float, headGrpSize>& xRowSum(uint32_t idx)
+    {
+        return xv[idx].x.rowSum;
+    }
+
+    __device__ inline Vec<float, headGrpSize>& xRowMaxLog2e(uint32_t idx)
+    {
+        return xv[idx].x.rowMaxLog2e;
+    }
 
     static inline constexpr uint32_t nbAccRowMaxSumCopies = 2;
     Vec<float, headGrpSize> accRowMaxLog2e[nbAccRowMaxSumCopies];
     Vec<float, headGrpSize> accRowSum[nbAccRowMaxSumCopies];
-
-    Vec<float, headGrpSize> xRowMaxLog2e[nbProducerCtasPerCga];
-    CgaBarrier xRowMaxLog2eProducedBar[nbProducerCtasPerCga];
 
     CtaBarrierPair xBars[nbXBufs];
     CtaBarrierPair vBars[nbVBufs];
@@ -412,23 +428,21 @@ struct SharedMemB
 
     __device__ inline void invalidateBarriers(uint32_t thrdIdx)
     {
-        constexpr uint32_t nbBars = 17;
+        constexpr uint32_t nbBars = 15;
 #ifndef __CUDACC_RTC__
-        constexpr uint32_t nbBarsRef
-            = exactDiv(offsetof(SharedMemB, isLastSubSeq) - offsetof(SharedMemB, xRowMaxLog2eProducedBar), 8);
-        assert(nbBars == nbBarsRef);
+        constexpr uint32_t nbBarsRef = exactDiv(offsetof(SharedMemB, isLastSubSeq) - offsetof(SharedMemB, xBars), 8);
+        static_assert(nbBars == nbBarsRef);
 #endif
         if (thrdIdx < nbBars)
         {
-            reinterpret_cast<CtaBarrier*>(&xRowMaxLog2eProducedBar[0])[thrdIdx].~CtaBarrier();
+            reinterpret_cast<CtaBarrier*>(&xBars[0])[thrdIdx].~CtaBarrier();
         }
     }
 
     __device__ inline Vec<PartialResult::Chunk, nbMultiBlockBufs>& getMultiBlockBufs()
     {
 #ifndef __CUDACC_RTC__
-        static_assert(
-            sizeof(Vec<PartialResult::Chunk, nbMultiBlockBufs>) < offsetof(SharedMemB, xRowMaxLog2eProducedBar));
+        static_assert(sizeof(Vec<PartialResult::Chunk, nbMultiBlockBufs>) < offsetof(SharedMemB, xBars));
 #endif
         return *reinterpret_cast<Vec<PartialResult::Chunk, nbMultiBlockBufs>*>(this);
     }
@@ -519,18 +533,16 @@ struct Producer
                 b.initialize(1, thrdsPerGrp);
                 b.consumed.arrive<Scope::CTA, ArriveOrder::RELAXED>(thrdsPerGrp);
             }
-            if (warpRank < SharedMemA::nbXBufs)
+            if (warpRank < SharedMemA::nbXBars)
             {
                 auto& b = smem.xBars[warpRank];
                 b.initialize(thrdsPerGrp, 1);
-                b.consumed.arrive<Scope::CTA, ArriveOrder::RELAXED>(1);
             }
 #if USE_REG_Q
-            if (warpRank < SharedMemA::nbRegQBars)
+            if (warpRank == 0)
             {
-                auto& b = smem.regQBars[warpRank];
-                b.initialize(1, nbMathThrds);
-                b.consumed.arrive<Scope::CTA, ArriveOrder::RELAXED>(nbMathThrds);
+                smem.regQBar.initialize(1, nbMathThrds);
+                smem.regQBar.consumed.arrive<Scope::CTA, ArriveOrder::RELAXED>(nbMathThrds);
             }
 #endif
             if (warpRank < nbMathGrpsA)
@@ -548,10 +560,6 @@ struct Producer
                 init(&smem.cgaXBufConsumed, 1 * nbVSplit);
                 smem.cgaXBufConsumed.arrive<Scope::CTA, ArriveOrder::RELAXED>(1 * nbVSplit);
                 PingPongMutex::initStorage(smem.tensorCoreMutex, thrdsPerGrp);
-                PingPongMutex::initStorage(smem.rowMaxTransferMutex, thrdsPerGrp);
-                init(&smem.consumerRowMaxConsumedBar, warp_size * nbComputeWarpsB * nbVSplit);
-                smem.consumerRowMaxConsumedBar.arrive<Scope::CTA, ArriveOrder::RELAXED>(
-                    warp_size * nbComputeWarpsB * nbVSplit);
             }
             if (nbSubSeq > 1 && warpRank < nbMultiBlockBufs)
             {
@@ -624,21 +632,25 @@ private:
         return *mapa(reinterpret_cast<SharedMemB*>(&smem), nbProducerCtasPerCga + idxConsumer);
     };
 
+    static constexpr uint32_t regQPartShmBeg = SharedMemA::shmQParts - SharedMemA::regQParts;
+
     __device__ inline void loadQ()
     {
 #if USE_REG_Q
+        static_assert(SharedMemA::regQParts <= SharedMemA::shmQParts);
+        smem.regQBar.consumed.wait_parity(toParity<1>(0));
 #pragma unroll 1
         for (uint32_t i = 0; i < SharedMemA::regQParts; i++)
         {
-            uint32_t const idxBuf = i % SharedMemA::nbRegQBars;
-            auto& bar = smem.regQBars[idxBuf];
-            bar.consumed.wait_parity(toParity<SharedMemA::nbRegQBars>(i));
             if (warpElectSync())
             {
-                tma::loadAsync(&smem.q[idxBuf], args.tensorMapQ,
-                    DimsLE<2>{partElemsK * i, headGrpSize * idxInputTokenGlobal}, bar.produced);
-                bar.produced.arrive_tx(sizeof(SharedMemA::ShmQPart));
+                tma::loadAsync(&smem.q[regQPartShmBeg + i], args.tensorMapQ,
+                    DimsLE<2>{partElemsK * i, headGrpSize * idxInputTokenGlobal}, smem.regQBar.produced);
             }
+        }
+        if (warpElectSync())
+        {
+            smem.regQBar.produced.arrive_tx(sizeof(SharedMemA::ShmQPart) * SharedMemA::regQParts);
         }
 #endif
 #pragma unroll 1
@@ -646,13 +658,9 @@ private:
         {
             uint32_t const idxPart = SharedMemA::regQParts + i;
 #if USE_REG_Q
-            if (i < SharedMemA::nbRegQBars)
+            if (i == regQPartShmBeg)
             {
-                static_assert(SharedMemA::regQParts % SharedMemA::nbRegQBars == 0);
-                uint32_t const idxBuf = idxPart % SharedMemA::nbRegQBars;
-                assert(idxBuf == i);
-                auto& bar = smem.regQBars[idxBuf];
-                bar.consumed.wait_parity(toParity<SharedMemA::nbRegQBars>(idxPart));
+                smem.regQBar.consumed.wait_parity(toParity<1>(1));
             }
 #endif
             if (warpElectSync())
@@ -673,111 +681,60 @@ private:
 
     __device__ inline void compute()
     {
-        class KBarWaiter
-        {
-        public:
-            __device__ inline KBarWaiter(SharedMemA& smem, uint32_t ctaIter, uint32_t const idxPartInit)
-                : smem{smem}
-                , idxPartGlobalNext{nbKParts * ctaIter + idxPartInit}
-                , idxBufNext{idxPartGlobalNext % SharedMemA::nbKBufs}
-            {
-                testWaitNext();
-            }
-
-            __device__ inline void testWaitNext()
-            {
-#if 0
-                skipKBarWaitNext =
-                smem.kBars[idxBufNext].produced.test_wait_parity(toParity<SharedMemA::nbKBufs>(idxPartGlobalNext));
-#else
-                skipKBarWaitNext = false;
-#endif
-            }
-
-            __device__ inline void wait()
-            {
-                if (!skipKBarWait)
-                {
-                    getKBar().produced.wait_parity(toParity<SharedMemA::nbKBufs>(idxPartGlobal));
-                }
-            }
-
-            __device__ inline bool next()
-            {
-                idxPartGlobal = idxPartGlobalNext;
-                idxBuf = idxBufNext;
-                idxPartGlobalNext = idxPartGlobal + 1;
-                idxBufNext = idxPartGlobalNext % SharedMemA::nbKBufs;
-                skipKBarWait = skipKBarWaitNext;
-                return skipKBarWait;
-            }
-
-            __device__ inline void arrive()
-            {
-                getKBar().consumed.arrive();
-            }
-
-            __device__ inline SharedMemA::ShmKPart& getK()
-            {
-                return smem.k[idxBuf];
-            }
-
-        private:
-            __device__ inline CtaBarrierPair& getKBar()
-            {
-                return smem.kBars[idxBuf];
-            }
-
-            __device__ inline CtaBarrierPair& getKBarNext()
-            {
-                return smem.kBars[idxBufNext];
-            }
-
-        private:
-            SharedMemA& smem;
-            uint32_t idxPartGlobal;
-            uint32_t idxBuf;
-            bool skipKBarWait;
-            uint32_t idxPartGlobalNext;
-            uint32_t idxBufNext;
-            bool skipKBarWaitNext;
-        };
-
         uint32_t const grpIdx = warpIdx.y;
         uint32_t const tileBaseRow = warpTile.y * warpIdx.x;
         PingPongMutex tensorCoreMutex{smem.tensorCoreMutex, grpIdx};
-        PingPongMutex rowMaxTransferMutex{smem.rowMaxTransferMutex, grpIdx};
 
+        constexpr uint32_t partNbInstK = exactDiv(partElemsK, qmmaShape.k);
         using AtomA = Vec<uint32_t, 4>; // for 16x32 data, working as mat A of QMMA.16832
         using RegQPartCol = Vec<AtomA, exactDiv(warpTile.y, qmmaShape.m)>;
-        using RegQPart = Vec<RegQPartCol, exactDiv(partElemsK, qmmaShape.k)>;
+        using RegQPart = Vec<RegQPartCol, partNbInstK>;
         using RegQ = Vec<RegQPart, SharedMemA::regQParts>;
+        constexpr uint32_t tileNbAtomBx2 = exactDiv(tokensPerTile, qmmaShape.n * 2);
+        using AtomBx2 = Vec<uint32_t, 4>; // one AtomB is 8x32 and AtomBx2 is 16x32
+        using RegKPartCol = Vec<AtomBx2, tileNbAtomBx2>;
+        using RegKPart = Vec<RegKPartCol, partNbInstK>;
 
         uint32_t const lane = laneId();
         uint32_t const rA = lane % 16;
         uint32_t const cA = lane / 16;
         uint32_t const rB = (lane / 16) * 8 + lane % 8;
         uint32_t const cB = (lane % 16) / 8;
+        auto loadRegQCol = [&](SharedMemA::ShmQPart const& q, uint32_t idxInstK) -> RegQPartCol
+        {
+            Mat16x32Loader const loaderQ(q, tileBaseRow, idxInstK, rA, cA);
+            return loaderQ.loadWholeCol<warpTile.y>();
+        };
+        auto loadRegKCol = [&](SharedMemA::ShmKPart const& k, uint32_t idxInstK) -> RegKPartCol
+        {
+            Mat16x32Loader const loaderK(k, 0, idxInstK, rB, cB);
+            return loaderK.loadWholeCol<warpTile.x>();
+        };
+        auto loadPart = [&](auto const& loadCol, auto const& shmPart)
+        {
+            mha::conditional_t<mha::is_same_v<SharedMemA::ShmQPart, mha::decay_t<decltype(shmPart)>>, RegQPart,
+                RegKPart>
+                regPart;
+#pragma unroll
+            for (uint32_t idxInstK = 0; idxInstK < partNbInstK; idxInstK++)
+            {
+                regPart[idxInstK] = loadCol(shmPart, idxInstK);
+            }
+            return regPart;
+        };
 
 #if USE_REG_Q
         // load regQ
+        smem.regQBar.produced.wait_parity(toParity<1>(0));
         RegQ regQ;
 #pragma unroll
         for (uint32_t idxPart = 0; idxPart < SharedMemA::regQParts; idxPart++)
         {
-            uint32_t const idxBuf = idxPart % SharedMemA::nbRegQBars;
-            auto& bar = smem.regQBars[idxBuf];
-            bar.produced.wait_parity(toParity<SharedMemA::nbRegQBars>(idxPart));
-#pragma unroll
-            for (uint32_t j = 0; j < RegQPart::size; j++)
-            {
-                Mat16x32Loader const loader(smem.q[idxBuf], tileBaseRow, j, rA, cA);
-                regQ[idxPart][j] = loader.loadWholeCol<warpTile.y>();
-            }
-            bar.consumed.arrive();
+            uint32_t const idxBuf = regQPartShmBeg + idxPart;
+            regQ[idxPart] = loadPart(loadRegQCol, smem.q[idxBuf]);
         }
+        smem.regQBar.consumed.arrive();
 #endif
-        smem.shmQBar.wait_parity(false);
 // main loop
 #pragma unroll 1
         for (uint32_t grpIter = 0; true; grpIter++)
@@ -789,28 +746,67 @@ private:
                 break;
             }
             WarpAcc acc{};
-            using AtomBx2 = Vec<uint32_t, 4>; // one AtomB is 8x32 and AtomBx2 is 16x32
             // wait until it's our turn
             tensorCoreMutex.lock(grpIter);
-            KBarWaiter kBarWaiter{smem, ctaIter, 0};
+            BarWaiter kBarWaiter(smem.kBars, ctaIter * nbKParts + 0);
+            kBarWaiter.testWait();
+            RegQPart regQBuf;
+#if USE_REG_Q
+            static_assert(SharedMemA::regQParts > 0);
+            regQBuf[0] = regQ[0][0];
+#else
+            regQBuf[0] = loadRegQCol(smem.q[0], 0);
+#endif
+            kBarWaiter.wait();
+            RegKPart regKBuf;
+            regKBuf[0] = loadRegKCol(smem.k[kBarWaiter.idxBuf], 0);
+
+            auto shouldTestWait = [](uint32_t idxInstK, uint32_t idxAtomBx2)
+            { return idxInstK == partNbInstK - 1 && idxAtomBx2 == tileNbAtomBx2 - 2; };
+            BarWaiter kBarWaiterNext = kBarWaiter.next();
 #if USE_REG_Q
 #pragma unroll
             for (uint32_t idxPart = 0; idxPart < SharedMemA::regQParts; idxPart++)
             {
-                kBarWaiter.next();
-                kBarWaiter.wait();
 #pragma unroll
-                for (uint32_t idxInstK = 0; idxInstK < exactDiv(partElemsK, qmmaShape.k); idxInstK++)
+                for (uint32_t idxInstK = 0; idxInstK < partNbInstK; idxInstK++)
                 {
-                    Mat16x32Loader const loaderK(kBarWaiter.getK(), 0, idxInstK, rB, cB);
-#pragma unroll
-                    for (uint32_t idxAtomBx2 = 0; idxAtomBx2 < exactDiv(tokensPerTile, qmmaShape.n * 2); idxAtomBx2++)
+                    bool const prefetchNextPart = (idxInstK == partNbInstK - 1);
+                    uint32_t const idxPartPrefetch = prefetchNextPart ? idxPart + 1 : idxPart;
+                    uint32_t const idxInstKPrefetch = prefetchNextPart ? 0 : idxInstK + 1;
+                    bool const prefetch = (!prefetchNextPart || (idxPart < nbKParts - 1));
+
+                    if (prefetchNextPart)
                     {
-                        AtomBx2 const atomBx2 = loaderK.load(idxAtomBx2);
-                        if (idxInstK == exactDiv(partElemsK, qmmaShape.k) - 1
-                            && idxAtomBx2 == exactDiv(tokensPerTile, qmmaShape.n * 2) - 2 && idxPart != nbQParts - 1)
+                        kBarWaiter = kBarWaiterNext;
+                        kBarWaiterNext = kBarWaiter.next();
+                        if (prefetch)
                         {
-                            kBarWaiter.testWaitNext();
+                            kBarWaiter.wait();
+                        }
+                    }
+
+                    Mat16x32Loader const loaderK(smem.k[kBarWaiter.idxBuf], 0, idxInstKPrefetch, rB, cB);
+#pragma unroll
+                    for (uint32_t idxAtomBx2 = 0; idxAtomBx2 < tileNbAtomBx2; idxAtomBx2++)
+                    {
+                        if (idxAtomBx2 == 2 && prefetch)
+                        {
+                            if (idxPartPrefetch < SharedMemA::regQParts)
+                            {
+                                regQBuf[idxInstKPrefetch] = regQ[idxPartPrefetch][idxInstKPrefetch];
+                            }
+                            else
+                            {
+                                regQBuf[idxInstKPrefetch]
+                                    = loadRegQCol(smem.q[idxPartPrefetch - SharedMemA::regQParts], idxInstKPrefetch);
+                            }
+                        }
+                        AtomBx2 const& atomBx2 = regKBuf[idxInstK][idxAtomBx2];
+                        regKBuf[idxInstKPrefetch][idxAtomBx2] = loaderK.load(idxAtomBx2);
+                        if (shouldTestWait(idxInstKPrefetch, idxAtomBx2) && prefetch)
+                        {
+                            kBarWaiterNext.testWait();
                         }
 #pragma unroll
                         for (uint32_t i = 0; i < WarpAcc::rows; i++)
@@ -819,35 +815,61 @@ private:
                             for (uint32_t j = 0; j < 2; j++)
                             {
                                 mma<__nv_fp8_e4m3>(reinterpret_cast<float(&)[2][2]>(acc(i, 2 * idxAtomBx2 + j)),
-                                    reinterpret_cast<uint32_t const(&)[2][2]>(regQ[idxPart][idxInstK][i]),
+                                    reinterpret_cast<uint32_t const(&)[2][2]>(regQBuf[idxInstK][i]),
                                     reinterpret_cast<uint32_t const(&)[2][1]>(atomBx2[2 * j]));
                             }
                         }
+                        if (prefetch)
+                        {
+                            regKBuf[idxInstKPrefetch][idxAtomBx2] = loaderK.load(idxAtomBx2);
+                        }
+                    }
+                    if (idxInstKPrefetch == partNbInstK - 1)
+                    {
+                        assert(prefetch);
+                        kBarWaiter.consumed();
                     }
                 }
-                kBarWaiter.arrive();
             }
 #endif
-#pragma unroll 1
+            if (ctaIter == 0)
+            {
+                smem.shmQBar.wait_parity(false);
+            }
+#pragma unroll
             for (uint32_t idxPart = SharedMemA::regQParts; idxPart < nbQParts; idxPart++)
             {
-                kBarWaiter.next();
-                kBarWaiter.wait();
 #pragma unroll
-                for (uint32_t idxInstK = 0; idxInstK < exactDiv(partElemsK, qmmaShape.k); idxInstK++)
+                for (uint32_t idxInstK = 0; idxInstK < partNbInstK; idxInstK++)
                 {
-                    Mat16x32Loader const loaderQ(
-                        smem.q[idxPart - SharedMemA::regQParts], tileBaseRow, idxInstK, rA, cA);
-                    auto const qPart = loaderQ.loadWholeCol<warpTile.y>();
-                    Mat16x32Loader const loaderK(kBarWaiter.getK(), 0, idxInstK, rB, cB);
-#pragma unroll
-                    for (uint32_t idxAtomBx2 = 0; idxAtomBx2 < exactDiv(tokensPerTile, qmmaShape.n * 2); idxAtomBx2++)
+                    bool const prefetchNextPart = (idxInstK == partNbInstK - 1);
+                    uint32_t const idxPartPrefetch = prefetchNextPart ? idxPart + 1 : idxPart;
+                    uint32_t const idxInstKPrefetch = prefetchNextPart ? 0 : idxInstK + 1;
+                    bool const prefetch = (!prefetchNextPart || (idxPart < nbKParts - 1));
+
+                    if (prefetchNextPart)
                     {
-                        AtomBx2 const atomBx2 = loaderK.load(idxAtomBx2);
-                        if (idxInstK == exactDiv(partElemsK, qmmaShape.k) - 1
-                            && idxAtomBx2 == exactDiv(tokensPerTile, qmmaShape.n * 2) - 2 && idxPart != nbQParts - 1)
+                        kBarWaiter = kBarWaiterNext;
+                        kBarWaiterNext = kBarWaiter.next();
+                        if (prefetch)
                         {
-                            kBarWaiter.testWaitNext();
+                            kBarWaiter.wait();
+                        }
+                    }
+
+                    Mat16x32Loader const loaderK(smem.k[kBarWaiter.idxBuf], 0, idxInstKPrefetch, rB, cB);
+#pragma unroll
+                    for (uint32_t idxAtomBx2 = 0; idxAtomBx2 < tileNbAtomBx2; idxAtomBx2++)
+                    {
+                        if (idxAtomBx2 == 2 && prefetch)
+                        {
+                            regQBuf[idxInstKPrefetch]
+                                = loadRegQCol(smem.q[idxPartPrefetch - SharedMemA::regQParts], idxInstKPrefetch);
+                        }
+                        AtomBx2 const& atomBx2 = regKBuf[idxInstK][idxAtomBx2];
+                        if (shouldTestWait(idxInstKPrefetch, idxAtomBx2) && prefetch)
+                        {
+                            kBarWaiterNext.testWait();
                         }
 #pragma unroll
                         for (uint32_t i = 0; i < WarpAcc::rows; i++)
@@ -856,22 +878,36 @@ private:
                             for (uint32_t j = 0; j < 2; j++)
                             {
                                 mma<__nv_fp8_e4m3>(reinterpret_cast<float(&)[2][2]>(acc(i, 2 * idxAtomBx2 + j)),
-                                    reinterpret_cast<uint32_t const(&)[2][2]>(qPart[i]),
+                                    reinterpret_cast<uint32_t const(&)[2][2]>(regQBuf[idxInstK][i]),
                                     reinterpret_cast<uint32_t const(&)[2][1]>(atomBx2[2 * j]));
                             }
                         }
+                        if (prefetch)
+                        {
+                            regKBuf[idxInstKPrefetch][idxAtomBx2] = loaderK.load(idxAtomBx2);
+                        }
+                    }
+                    if (idxInstKPrefetch == partNbInstK - 1)
+                    {
+                        assert(prefetch);
+                        kBarWaiter.consumed();
+                        if (idxPartPrefetch == nbKParts - 1)
+                        {
+                            tensorCoreMutex.unlock(); // let the other group to use tensor cores
+                        }
                     }
                 }
-                kBarWaiter.arrive();
             }
-            tensorCoreMutex.unlock(); // let the other group to use tensor cores
             uint32_t const validTokens = seqLen - tokensPerTile * idxTile;
             if (validTokens < tokensPerTile)
             {
                 applyMask(this_warp(), acc, 0, validTokens);
             }
+            ThrdRegRowMax rowMaxLog2e;
+            WarpAcc const xF32 = scaleAndSoftmax(rowMaxLog2e, acc, grpIdx, grpIter, tileBaseRow);
 
-            WarpAcc const xF32 = scaleAndSoftmax(acc, grpIdx, grpIter, tileBaseRow, rowMaxTransferMutex);
+            auto& xBar = smem.xBars[grpIdx];
+            bool const skipXBarWait = xBar.consumed.test_wait_parity(toParity<1>(grpIter));
             // convert to fp8
             WarpAcc const xF32Quant = xF32 * rcpXScale;
             // 0, 1, 8, 9,  2, 3, 10, 11,  4, 5, 12, 13,  6, 7, 14, 15
@@ -897,19 +933,21 @@ private:
                 : computeRowSumF32<warpTile.y, warpTile.x>(this_warp(), xF32);
 
             // store xF8 and rowSum into L2 scratch buffer
-            uint32_t const idxXBuf = checkedVal(grpIdx, ctaIter % SharedMemA::nbXBufs);
-            auto& xBar = smem.xBars[idxXBuf];
-            xBar.consumed.wait_parity(checkedVal<bool>(grpIter % 2, toParity<SharedMemA::nbXBufs>(ctaIter)));
-            storeRowMax<warpTile.y>(smem.rowSum[idxXBuf], rowSum, tileBaseRow, lane);
-            storeXToShm(smem.x[idxXBuf], xF8, tileBaseRow, lane);
+            if (!skipXBarWait)
+            {
+                xBar.consumed.wait_parity(toParity<1>(grpIter));
+            }
+            storeRowMax<warpTile.y>(smem.x.rowMaxLog2e, rowMaxLog2e, tileBaseRow, lane);
+            storeRowMax<warpTile.y>(smem.x.rowSum, rowSum, tileBaseRow, lane);
+            storeOrderedXToShm(smem.x.x, xF8, tileBaseRow, lane);
             xBar.produced.arrive();
         }
     }
 
-    __device__ inline WarpAcc scaleAndSoftmax(WarpAcc const& acc, uint32_t grpIdx, uint32_t grpIter,
-        uint32_t tileBaseRow, PingPongMutex& rowMaxTransferMutex);
+    __device__ inline WarpAcc scaleAndSoftmax(
+        ThrdRegRowMax& rowMaxLog2e, WarpAcc const& acc, uint32_t grpIdx, uint32_t grpIter, uint32_t tileBaseRow);
 
-    __device__ inline void storeXToShm(XBuffer& dst,
+    __device__ inline void storeOrderedXToShm(XBuffer& dst,
         Array2D<Array2D<uint32_t, 2, 1>, WarpAcc::rows, exactDiv(WarpAcc::cols, 2)> const& src,
         uint32_t const tileBaseRow, uint32_t const lane = laneId());
 };
@@ -925,6 +963,7 @@ __device__ inline void Producer::loadK()
 #endif
     };
 
+#pragma unroll 1
     for (uint32_t iter = 0; true; iter++)
     {
         uint32_t const idxTile = idxTileBeg() + iterStride() * iter;
@@ -934,6 +973,7 @@ __device__ inline void Producer::loadK()
         }
         uint32_t const idxPageBuf = iter % KVTilePartLoader::nbPageBuffers;
         loader.loadPages(idxTile, idxPageBuf);
+#pragma unroll 1
         for (uint32_t idxPart = 0; idxPart < nbKParts; idxPart++)
         {
             uint32_t const idxPartGlobal = iter * nbKParts + idxPart;
@@ -951,6 +991,11 @@ __device__ inline void Producer::loadK()
 
 __device__ inline void Producer::sendX()
 {
+    // let group 0 to produce first.
+    if (warpElectSync())
+    {
+        smem.xBars[0].consumed.arrive();
+    }
     for (uint32_t iter = 0; true; iter++)
     {
         uint32_t const idxTile = idxTileBeg() + iterStride() * iter;
@@ -958,18 +1003,20 @@ __device__ inline void Producer::sendX()
         {
             break;
         }
-        uint32_t const idxBuf = iter % SharedMemA::nbXBufs;
-        auto& xBar = smem.xBars[idxBuf];
-        xBar.produced.wait_parity(toParity<SharedMemA::nbXBufs>(iter));
+        uint32_t const idxBar = iter % SharedMemA::nbXBars;
+        auto& xBar = smem.xBars[idxBar];
+        xBar.produced.wait_parity(toParity<SharedMemA::nbXBars>(iter));
         smem.cgaXBufConsumed.wait_parity(toParity<1>(iter));
         if (warpElectSync())
         {
             auto& dst = args.cgaXBuf[nbSubSeq * idxInputTokenGlobal + idxSubSeq][ctaRank];
-            tma::store1DAsync(&dst.x, &smem.x[idxBuf], sizeof(XBuffer));
-            tma::store1DAsync(&dst.rowSum, &smem.rowSum[idxBuf], sizeof(smem.rowSum[0]));
+            tma::store1DAsync(&dst, &smem.x, sizeof(CgaXBuffer));
             tma::commitGroup();
             tma::waitGroup<0>();
-            xBar.consumed.arrive();
+            // it's turn for the other math group to produce.
+            uint32_t const idxBarNext = (iter + 1) % SharedMemA::nbXBars;
+            auto& xBarNext = smem.xBars[idxBarNext];
+            xBarNext.consumed.arrive();
             asm volatile("fence.release.cluster;\n");
 #pragma unroll
             for (uint32_t i = 0; i < nbVSplit; i++)
@@ -982,7 +1029,7 @@ __device__ inline void Producer::sendX()
 }
 
 __device__ inline Producer::WarpAcc Producer::scaleAndSoftmax(
-    WarpAcc const& acc, uint32_t grpIdx, uint32_t grpIter, uint32_t tileBaseRow, PingPongMutex& rowMaxTransferMutex)
+    ThrdRegRowMax& rowMaxLog2e, WarpAcc const& acc, uint32_t grpIdx, uint32_t grpIter, uint32_t tileBaseRow)
 {
     uint32_t const ctaIter = grpIdx + grpIter * nbMathGrps;
     uint32_t const cgaIter = ctaRank + ctaIter * nbProducerCtasPerCga;
@@ -991,9 +1038,9 @@ __device__ inline Producer::WarpAcc Producer::scaleAndSoftmax(
     uint32_t const idxProducer = ctaRank;
     assert(ctaRank < nbProducerCtasPerCga);
 
-    auto const accLog2e = acc * smem.qkScaleLog2e;
+    float const qkScaleLog2e = smem.qkScaleLog2e;
     bool const skipWaitLastShmRowMax = smem.rowMaxLog2eBar[grpIdx].test_wait_parity(toParity<1>(grpIter));
-    QuadRegRowMax const tileRowMaxLog2e = computeRowMax<warpTile.y, warpTile.x>(accLog2e);
+    QuadRegRowMax const tileRowMaxLog2e = computeRowMax<warpTile.y, warpTile.x>(acc) * qkScaleLog2e;
     // get max with previous CTA's rowMax
     if (!skipWaitLastShmRowMax)
     {
@@ -1007,21 +1054,9 @@ __device__ inline Producer::WarpAcc Producer::scaleAndSoftmax(
     SharedMemA& smemNext = mapa(smem, ctaRank ^ 1U);
     CgaBarrier& nextRowMaxLog2eBar
         = smemNext.rowMaxLog2eBar[(cgaIter + 1) % (nbMathGrps * nbProducerCtasPerCga) / nbMathGrps];
-    ThrdRegRowMax const rowMaxLog2e = dedupFromQuad(warp, quadRowMaxLog2e);
+    rowMaxLog2e = dedupFromQuad(warp, quadRowMaxLog2e);
     storeRowMaxAsync<warpTile.y>(nextRowMaxLog2eBar, smemNext.rowMaxLog2e, rowMaxLog2e, tileBaseRow, lane);
     nextRowMaxLog2eBar.arrive_tx_relaxed(sizeof(rowMaxLog2e)); // notify that the next CTA can read rowMax now.
-
-    // transfer rowMax to consumers.
-    rowMaxTransferMutex.lock(grpIter); // @fixme: use test_wait_parity() early to avoid latency.
-    smem.consumerRowMaxConsumedBar.wait_parity(checkedVal<bool>(grpIdx, toParity<1>(ctaIter)));
-    for (uint32_t idxConsumer = 0; idxConsumer < nbVSplit; idxConsumer++)
-    {
-        auto& smemB = getConsumerShm(idxConsumer);
-        storeRowMaxAsync<warpTile.y>(smemB.xRowMaxLog2eProducedBar[idxProducer], smemB.xRowMaxLog2e[idxProducer],
-            rowMaxLog2e, tileBaseRow, lane);
-        smemB.xRowMaxLog2eProducedBar[idxProducer].arrive_tx_relaxed(sizeof(rowMaxLog2e));
-    }
-    rowMaxTransferMutex.unlock();
 
     WarpAcc x;
 // apply softmax
@@ -1038,9 +1073,9 @@ __device__ inline Producer::WarpAcc Producer::scaleAndSoftmax(
 #pragma unroll
                 for (uint32_t j = 0; j < InstAcc::cols; j++)
                 {
-                    float elem = accLog2e(m, n)(i, j);
-                    assert(maxVal >= elem);
-                    x(m, n)(i, j) = exp2f(elem - maxVal);
+                    float elem = acc(m, n)(i, j);
+                    assert(maxVal >= elem * qkScaleLog2e);
+                    x(m, n)(i, j) = exp2f(elem * qkScaleLog2e - maxVal);
                 }
             }
         }
@@ -1049,21 +1084,40 @@ __device__ inline Producer::WarpAcc Producer::scaleAndSoftmax(
     return x;
 }
 
-__device__ inline void Producer::storeXToShm(XBuffer& dst,
+__device__ inline void Producer::storeOrderedXToShm(XBuffer& dst,
     Array2D<Array2D<uint32_t, 2, 1>, WarpAcc::rows, exactDiv(WarpAcc::cols, 2)> const& src, uint32_t const tileBaseRow,
     uint32_t const lane)
 {
     uint32_t const r = lane % 16;
     uint32_t const c = lane / 16;
+    using Src = mha::decay_t<decltype(src)>;
+    LdGrain* ptrs[exactDiv(Src::cols, 2)][Src::rows];
 #pragma unroll
-    for (uint32_t idxInstK = 0; idxInstK < exactDiv(src.cols, 2); idxInstK++)
+    for (uint32_t idxInstK = 0; idxInstK < exactDiv(Src::cols, 2); idxInstK++)
     {
         Mat16x32Loader const loader(dst, tileBaseRow, idxInstK, r, c);
 #pragma unroll
-        for (uint32_t idxInstM = 0; idxInstM < src.rows; idxInstM++)
+        for (uint32_t idxInstM = 0; idxInstM < Src::rows; idxInstM++)
         {
-            stmatrix<false, 4>(const_cast<LdGrain*>(loader.getPtr(idxInstM)),
-                reinterpret_cast<LdGrain const&>(src(idxInstM, idxInstK * 2)));
+            auto const p = const_cast<LdGrain*>(loader.getPtr(idxInstM));
+            stmatrix<false, 4>(p, reinterpret_cast<LdGrain const&>(src(idxInstM, idxInstK * 2)));
+            ptrs[idxInstK][idxInstM] = p;
+        }
+    }
+    // reorder from 0, 1, 8, 9,  2, 3, 10, 11,  4, 5, 12, 13,  6, 7, 14, 15
+    // to 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+    __syncwarp();
+#pragma unroll
+    for (uint32_t idxInstK = 0; idxInstK < exactDiv(Src::cols, 2); idxInstK++)
+    {
+#pragma unroll
+        for (uint32_t idxInstM = 0; idxInstM < Src::rows; idxInstM++)
+        {
+            auto const p = ptrs[idxInstK][idxInstM];
+            auto const i = *p;
+            LdGrain const o = {prmt(i[0], i[1], PermuteOrder{0, 1, 4, 5}), prmt(i[2], i[3], PermuteOrder{0, 1, 4, 5}),
+                prmt(i[0], i[1], PermuteOrder{2, 3, 6, 7}), prmt(i[2], i[3], PermuteOrder{2, 3, 6, 7})};
+            *p = o;
         }
     }
 }
@@ -1153,7 +1207,6 @@ struct Consumer
         {
             if (warpRank < nbProducerCtasPerCga)
             {
-                init(&smem.xRowMaxLog2eProducedBar[warpRank], Producer::thrdsPerGrp);
                 init(&smem.cgaXBufProduced[warpRank], 1);
             }
             if (warpRank < SharedMemB::nbXBufs)
@@ -1244,16 +1297,19 @@ __device__ inline void Consumer::compute()
     uint2 const tileIdx = {warpIdx.y, warpIdx.x};
     uint2 const tileBase = {tileIdx.x * warpTile.x, tileIdx.y * warpTile.y};
 
+    constexpr uint32_t tileNbInstK = exactDiv(tokensPerTile, qmmaShape.k);
+    constexpr uint32_t warpTileNbAtomBx2 = exactDiv(warpTile.x, qmmaShape.n * 2);
+
     uint32_t const lane = laneId();
     uint32_t const idxHalf = lane / 16;
     uint32_t const laneInHalf = lane % 16;
     uint32_t const rA = laneInHalf;
     uint32_t const cA = idxHalf;
-    uint32_t const rB = idxHalf * 16 + laneInHalf / 4 * 2 + laneInHalf % 4 / 2 * 8 + lane % 2;
+    uint32_t const rB = lane;
     uint32_t const cB = 0;
 
     WarpAcc acc{};
-    uint32_t idxXVBufLast;
+    uint32_t idxXVBufLast{};
     for (uint32_t iter = 0; true; iter++)
     {
         uint32_t const idxTile = iterToTile(iter);
@@ -1265,17 +1321,19 @@ __device__ inline void Consumer::compute()
         ThrdRegRowMax accRowMaxLog2e = loadShmRowMax<warpTile.y>(smem.accRowMaxLog2e[tileIdx.x], tileBase.y, lane);
         ThrdRegRowMax accRowSum = loadShmRowMax<warpTile.y>(smem.accRowSum[tileIdx.x], tileBase.y, lane);
 
-        uint32_t const idxProducer = iter % nbProducerCtasPerCga;
-        smem.xRowMaxLog2eProducedBar[idxProducer].wait_parity(toParity<nbProducerCtasPerCga>(iter));
-        ThrdRegRowMax const xRowMaxLog2e = loadShmRowMax<warpTile.y>(smem.xRowMaxLog2e[idxProducer], tileBase.y, lane);
-        auto& prodSmem = getProducerShm(idxProducer);
-        uint32_t const drainData = hashRegData(xRowMaxLog2e);
-        tma::storeAsync(&prodSmem.drain[lane], drainData, prodSmem.consumerRowMaxConsumedBar);
-        prodSmem.consumerRowMaxConsumedBar.template arrive_tx<Scope::CGA, ArriveOrder::RELAXED>(sizeof(drainData));
+        uint32_t const idxXBuf = iter % SharedMemB::nbXBufs;
+        uint32_t const idxVBuf = iter % SharedMemB::nbVBufs;
+        auto& xBar = smem.xBars[idxXBuf];
+        auto& vBar = smem.vBars[idxVBuf];
+        // @fixme: merge these two barriers and use test_wait_parity() early to avoid latency.
+        bool const skipVBarWait = vBar.produced.test_wait_parity(toParity<SharedMemB::nbVBufs>(iter));
+        xBar.produced.wait_parity(toParity<SharedMemB::nbXBufs>(iter));
+
+        ThrdRegRowMax const xRowMaxLog2e = loadShmRowMax<warpTile.y>(smem.xRowMaxLog2e(idxXBuf), tileBase.y, lane);
         assert(all(accRowMaxLog2e <= xRowMaxLog2e));
 
         auto const needRescaleVec = (xRowMaxLog2e > accRowMaxLog2e);
-        UniformNeedRescaleMask rescaleMask;
+        UniformNeedRescaleMask rescaleMask{};
 #pragma unroll
         for (uint32_t i = 0; i < rescaleMask.size; i++)
         {
@@ -1312,28 +1370,24 @@ __device__ inline void Consumer::compute()
         }
         accRowMaxLog2e = xRowMaxLog2e;
         storeRowMax<warpTile.y>(smem.accRowMaxLog2e[tileIdx.x], accRowMaxLog2e, tileBase.y, lane);
-
-        uint32_t const idxXBuf = iter % SharedMemB::nbXBufs;
-        uint32_t const idxVBuf = iter % SharedMemB::nbVBufs;
-        auto& xBar = smem.xBars[idxXBuf];
-        auto& vBar = smem.vBars[idxVBuf];
-        // @fixme: merge these two barriers and use test_wait_parity() early to avoid latency.
-        vBar.produced.wait_parity(toParity<SharedMemB::nbVBufs>(iter));
-        xBar.produced.wait_parity(toParity<SharedMemB::nbXBufs>(iter));
+        if (!skipVBarWait)
+        {
+            vBar.produced.wait_parity(toParity<SharedMemB::nbVBufs>(iter));
+        }
         auto const& xBuf = smem.x(idxXBuf);
         auto const& vBuf = smem.v(idxVBuf)[tileIdx.x];
-        auto const xRowSum = loadShmRowMax<warpTile.y>(smem.xRowSum[idxXBuf], tileBase.y, lane);
+        auto const xRowSum = loadShmRowMax<warpTile.y>(smem.xRowSum(idxXBuf), tileBase.y, lane);
         accRowSum = accRowSum + xRowSum;
         storeRowMax<warpTile.y>(smem.accRowSum[tileIdx.x], accRowSum, tileBase.y, lane);
 
 #pragma unroll
-        for (uint32_t idxInstK = 0; idxInstK < exactDiv(tokensPerTile, qmmaShape.k); idxInstK++)
+        for (uint32_t idxInstK = 0; idxInstK < tileNbInstK; idxInstK++)
         {
             Mat16x32Loader const loaderX(xBuf, tileBase.y, idxInstK, rA, cA);
             Vec<Mat16x32, exactDiv(warpTile.y, qmmaShape.m)> const x = loaderX.loadWholeCol<warpTile.y>();
             using AtomB = Vec<uint32_t, 2>;
 #pragma unroll
-            for (uint32_t idxAtomBx2 = 0; idxAtomBx2 < exactDiv(warpTile.x, qmmaShape.n * 2); idxAtomBx2++)
+            for (uint32_t idxAtomBx2 = 0; idxAtomBx2 < warpTileNbAtomBx2; idxAtomBx2++)
             {
                 auto const data
                     = ldmatrix_16x16_trans<2>(&vBuf.template at<true>(qmmaShape.k * idxInstK + rB, idxAtomBx2 + cB));
@@ -1424,11 +1478,9 @@ __device__ inline void Consumer::loadX()
         if (warpElectSync())
         {
             auto& src = args.cgaXBuf[nbSubSeq * idxInputTokenGlobal + idxSubSeq][idxScratchXBuf];
-            auto& dstX = smem.x(idxXBuf);
-            auto& dstRowSum = smem.xRowSum[idxXBuf];
-            tma::load1DAsync(&dstX, &src.x, sizeof(smem.x(0)), xBar.produced);
-            tma::load1DAsync(&dstRowSum, &src.rowSum, sizeof(smem.xRowSum[0]), xBar.produced);
-            xBar.produced.arrive_tx(sizeof(smem.x(0)) + sizeof(smem.xRowSum[0]));
+            auto& dst = smem.xv[idxXBuf].x;
+            tma::loadLinearAsync(&dst, &src.x, sizeof(CgaXBuffer), xBar.produced);
+            xBar.produced.arrive_tx(sizeof(CgaXBuffer));
             xBar.produced.wait_parity(toParity<SharedMemB::nbXBufs>(iter));
             uint32_t const idxProducer = idxScratchXBuf;
             // @fixme: check if this works. If it doesn't, randomly pick some data from dstX and dstRowSum and use
@@ -1608,7 +1660,7 @@ __device__ inline void mergePartialOutputs(uint32_t& semaphore, Vec<OutputHead, 
                 bar.consumed.wait_parity(toParity<nbShmBufs>(idxSubSeq));
                 if (warpElectSync())
                 {
-                    tma::load1DAsync(&shmBufs[idxBuf], &reqPartialResults[idxSubSeq].chunks[ctaRank],
+                    tma::loadLinearAsync(&shmBufs[idxBuf], &reqPartialResults[idxSubSeq].chunks[ctaRank],
                         sizeof(PartialResult::Chunk), bar.produced);
                     bar.produced.arrive_tx(sizeof(PartialResult::Chunk));
                 }
