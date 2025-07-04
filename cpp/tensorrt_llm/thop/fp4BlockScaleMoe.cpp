@@ -328,9 +328,7 @@ public:
     [[nodiscard]] std::vector<int64_t> getValidConfigs(
         int64_t topK, int64_t hiddenSize, int64_t intermediateSize, int64_t numLocalExperts, int64_t numTokens) const
     {
-        // TODO hidden size is actually 2 * hiddenSize because we pack 2 e2m1 into 1 byte.
-        // Decide whether to handle this on the python side or here.
-        return mRunner->getValidConfigIndices(topK, 2 * hiddenSize, intermediateSize, numLocalExperts, numTokens);
+        return mRunner->getValidConfigIndices(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens);
     }
 
 private:

@@ -27,7 +27,7 @@ class FP4BlockScaleMoEInputs:
     output2_scale_scalar: torch.Tensor
 
 
-class FP4BlockScaleMoERunner:
+class FP4BlockScaleMoERunner(TunableRunner):
 
     runner_dict = dict()
     tuning_config = None
@@ -49,6 +49,9 @@ class FP4BlockScaleMoERunner:
         self.tile_tokens_dim = tile_tokens_dim
         self.routing_method_type = routing_method_type
         self.do_finalize = do_finalize
+
+        FP4BlockScaleMoERunner.tuning_config = FP4BlockScaleMoERunner.get_tuning_config(
+        )
 
         instance_key = (
             self.top_k,
@@ -83,6 +86,100 @@ class FP4BlockScaleMoERunner:
             self.local_num_experts, self.routed_scaling_factor,
             self.routing_method_type, self.do_finalize, tactic)
 
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+    ) -> List[int]:
+
+        args = FP4BlockScaleMoEInputs(*inputs)
+
+        num_tokens = args.hidden_states.shape[0]
+
+        # The hidden size is actually 2 * hidden_size because we pack 2x e2m1
+        # into 1 byte.
+        hidden_size = args.hidden_states.shape[1] * 2
+
+        tactics = self.kernel_runner.get_valid_configs(self.top_k, hidden_size,
+                                                       self.intermediate_size,
+                                                       self.local_num_experts,
+                                                       num_tokens)
+
+        return tactics
+
+    @classmethod
+    def get_dynamic_tensor_specs(cls) -> Tuple[DynamicTensorSpec, ...]:
+        HIDDEN_STATES_IDX = 2
+        TUNED_DIM = 0
+        MAX_PROFILE_BUCKET = 4096
+
+        m_values = get_last_power_of_2_num_tokens_buckets(MAX_PROFILE_BUCKET)
+        round_rule = lambda x: min(last_positive_power_of_2(x),
+                                   MAX_PROFILE_BUCKET)
+
+        specs = (DynamicTensorSpec(HIDDEN_STATES_IDX, TUNED_DIM, m_values,
+                                   round_rule), )
+
+        return specs
+
+    @classmethod
+    def get_constraint_specs(cls) -> Tuple[ConstraintSpec, ...]:
+
+        def _constrain_to_num_tokens(shapes: Tuple[torch.Size]) -> int:
+            HIDDEN_STATES_IDX = 2
+            NUM_TOKENS_DIM = 0
+
+            num_tokens = shapes[HIDDEN_STATES_IDX][NUM_TOKENS_DIM]
+
+            return num_tokens
+
+        def _constrain_fp4_linear_layout(shapes: Tuple[torch.Size]) -> int:
+            HIDDEN_STATES_IDX = 2
+            NUM_TOKENS_DIM = 0
+            HIDDEN_SIZE_DIM = 1
+
+            num_tokens = shapes[HIDDEN_STATES_IDX][NUM_TOKENS_DIM]
+
+            # The hidden size is actually 2 * hidden_size because we pack 2x e2m1
+            hidden_size = shapes[HIDDEN_STATES_IDX][HIDDEN_SIZE_DIM] * 2
+
+            sf_linear_size = num_tokens * (hidden_size // 16)
+
+            return sf_linear_size
+
+        HIDDEN_STATES_SCALE_IDX = 3
+        CONSTRAINED_HS_SCALE_DIM = 0
+
+        constraint_hidden_states_scale = ConstraintSpec(
+            HIDDEN_STATES_SCALE_IDX, CONSTRAINED_HS_SCALE_DIM,
+            _constrain_fp4_linear_layout)
+
+        ROUTER_LOGITS_IDX = 0
+        CONSTRAINED_RL_DIM = 0
+
+        constraint_routing_logits = ConstraintSpec(ROUTER_LOGITS_IDX,
+                                                   CONSTRAINED_RL_DIM,
+                                                   _constrain_to_num_tokens)
+
+        constraint_specs_tuple = (
+            constraint_hidden_states_scale,
+            constraint_routing_logits,
+        )
+
+        return constraint_specs_tuple
+
+    @classmethod
+    @lru_cache(maxsize=None)
+    def get_tuning_config(cls) -> TuningConfig:
+
+        dynamic_tensor_specs = cls.get_dynamic_tensor_specs()
+        constraint_specs = cls.get_constraint_specs()
+
+        tuning_config = TuningConfig(dynamic_tensor_specs=dynamic_tensor_specs,
+                                     constraint_specs=constraint_specs)
+
+        return tuning_config
+
 
 @torch.library.custom_op("trtllm::fp4_block_scale_moe_runner", mutates_args=())
 def fp4_block_scale_moe_runner(routing_logits: torch.Tensor,
@@ -105,6 +202,8 @@ def fp4_block_scale_moe_runner(routing_logits: torch.Tensor,
                                tile_tokens_dim: int, routing_method_type: int,
                                do_finalize: bool) -> List[torch.Tensor]:
 
+    tuner = AutoTuner.get()
+
     kernel_runner = FP4BlockScaleMoERunner(
         num_experts, top_k, n_group, topk_group, intermediate_size,
         local_expert_offset, local_num_experts, routed_scaling_factor,
@@ -124,7 +223,14 @@ def fp4_block_scale_moe_runner(routing_logits: torch.Tensor,
         output2_scale_scalar,
     ]
 
-    return kernel_runner.forward(inputs)
+    _, best_tactic = tuner.choose_one(
+        "trtllm::fp4_block_scale_moe_runner",
+        [kernel_runner],
+        kernel_runner.tuning_config,
+        inputs,
+    )
+
+    return kernel_runner(inputs, tactic=best_tactic)
 
 
 @dataclass(frozen=True)
