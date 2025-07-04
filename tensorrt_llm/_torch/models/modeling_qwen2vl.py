@@ -28,11 +28,19 @@ class Qwen2VLInputProcessorBase(InputProcessor):
                  trust_remote_code: bool = True):
         self.model_config = model_config
         self.tokenizer = tokenizer
-        self.use_fast = True if "Reason1" in model_path else False
-        self.processor = AutoProcessor.from_pretrained(
-            model_path,
-            use_fast=self.use_fast,
-            trust_remote_code=trust_remote_code)
+        try:
+            self.use_fast = False
+            self.processor = AutoProcessor.from_pretrained(
+                model_path,
+                use_fast=self.use_fast,
+                trust_remote_code=trust_remote_code)
+        except TypeError:
+            logger.info("Switching processor to use_fast=True")
+            self.use_fast = True
+            self.processor = AutoProcessor.from_pretrained(
+                model_path,
+                use_fast=self.use_fast,
+                trust_remote_code=trust_remote_code)
 
         # NOTE: Using attn_implementation='flash_attention_2' to avoid the issue of vision model's GPU OOM.
         model = self.get_model_class().from_pretrained(
