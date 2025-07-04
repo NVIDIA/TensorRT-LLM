@@ -180,8 +180,10 @@ def main():
     env_files = [
         JENKINS_PROPS_PATH,
         DEV_CONTAINER_ENV_PATH,
-        DEV_CONTAINER_USER_ENV_PATH,
     ]
+
+    if DEV_CONTAINER_USER_ENV_PATH.exists():
+        env_files.append(DEV_CONTAINER_USER_ENV_PATH)
 
     env = _load_env(env_files)
     _handle_rootless(env_inout=env)
