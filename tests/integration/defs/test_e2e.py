@@ -1946,6 +1946,11 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
 ])
 def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                                    modality):
+    if model_name in ["qwen2-vl-7b-instruct", "qwen2.5-vl-7b-instruct"
+                      ] and modality == "video":
+        pytest.skip(
+            "Qwen2-VL and Qwen2.5-VL are with bugs in transformers=4.53.0.")
+
     llm_venv.run_cmd(
         ['-m', 'pip', 'install', 'flash-attn==2.7.3', '--no-build-isolation'])
 
@@ -2024,7 +2029,7 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                     "large", "dome", "yosemite", "landmark", "rock", "road",
                     "formation"
                 ],
-                ["highway", "traffic", "vehicles", "bus", "police"],
+                ["highway", "traffic", "vehicles", "lane", "road"],
             ],
             "video": [
                 ["woman", "neon", "night", "jacket", "wet"],

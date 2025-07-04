@@ -359,8 +359,9 @@ class RopeParams:
         # get rotary parameters.
         hidden_size = config.hidden_size
         num_attention_heads = config.num_attention_heads
-        head_dim = getattr(config, 'head_dim',
-                           hidden_size // num_attention_heads)
+        head_dim = getattr(config, 'head_dim', None)
+        if not isinstance(head_dim, int):
+            head_dim = hidden_size // num_attention_heads
         rope_scaling = getattr(config, 'rope_scaling', None)
         rope_params.max_positions = config.max_position_embeddings
         rope_params.theta = getattr(config, 'rope_theta', 10000.0)

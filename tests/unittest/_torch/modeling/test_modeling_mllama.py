@@ -1,3 +1,4 @@
+import re
 import unittest
 from copy import deepcopy
 
@@ -255,6 +256,24 @@ LLAMA_3_2_11B_VISION_CONFIG = {
 }
 
 
+def convert_weights_names(weights: dict) -> dict:
+    # Since transformers version >= 4.52.0, the default model architecture is changed.
+    # We need to convert the weight names accordingly to match TRTLLM naming.
+    _checkpoint_conversion_mapping = {
+        "^model.language_model": "language_model.model",
+        "^model.vision_model": "vision_model",
+        "^model.multi_modal_projector": "multi_modal_projector",
+        "^lm_head": "language_model.lm_head",
+    }
+    converted_weights = {}
+    for weight_name, weight_value in weights.items():
+        new_name = weight_name
+        for pattern, replacement in _checkpoint_conversion_mapping.items():
+            new_name = re.sub(pattern, replacement, new_name)
+        converted_weights[new_name] = weight_value
+    return converted_weights
+
+
 class TestMLlama(unittest.TestCase):
 
     @parameterized.expand([
@@ -301,7 +320,8 @@ class TestMLlama(unittest.TestCase):
         mllama = MllamaForConditionalGeneration(
             ModelConfig(pretrained_config=mllama_config,
                         attn_backend=backend)).to(dtype).to(device)
-        mllama.load_weights(hf_mllama.state_dict())
+        weights = convert_weights_names(hf_mllama.state_dict())
+        mllama.load_weights(weights)
 
         # KV cache setup
         num_blocks = 1

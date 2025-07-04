@@ -68,9 +68,16 @@ def example_root():
 def test_trtllm_serve_examples(exe: str, script: str,
                                server: RemoteOpenAIServer, example_root: str):
     client_script = os.path.join(example_root, script)
+
+    # Set environment variable to skip video inference for Qwen2.5-VL
+    # since transformers=4.53.0 has a bug for Qwen-VL visual attention.
+    env = os.environ.copy()
+    env["SKIP_VIDEO_INFERENCE_FOR_QWEN2_5_VL"] = "1"
+
     # CalledProcessError will be raised if any errors occur
     subprocess.run([exe, client_script],
                    stdout=subprocess.PIPE,
                    stderr=subprocess.PIPE,
                    text=True,
-                   check=True)
+                   check=True,
+                   env=env)
