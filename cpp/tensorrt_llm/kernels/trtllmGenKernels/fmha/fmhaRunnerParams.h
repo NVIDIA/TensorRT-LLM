@@ -35,7 +35,7 @@ enum class TrtllmGenAttentionMaskType
     // Sliding window or chunked causal mask.
     SlidingOrChunkedCausal,
     // Custom mask.
-    Custom
+    Custom    // @B: Do we ever hit this?
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -199,9 +199,9 @@ struct TllmGenFmhaRunnerParams
     // The scaling factor pointer of V.
     void const* vSfBasePtr;
     // The custom mask ptr.
-    uint32_t const* customMaskPtr;
+    uint32_t const* customMaskPtr;      // @B: Do we ever hit this?
     // The packed custom mask's offsets of each sequence.
-    int64_t const* customMaskOffsetsPtr;
+    int64_t const* customMaskOffsetsPtr;    // @B: Do we ever hit this?
     // The first sparseMask offsets in the Kv sequence dimension.
     int32_t const* firstSparseMaskOffsetsKvPtr;
     // The counter for the multiCtasKv mode.
@@ -276,6 +276,7 @@ struct TllmGenFmhaRunnerParams
     // set the attention mask type
     TllmGenFmhaRunnerParams& setAttentionMaskType(std::int8_t maskType)
     {
+        printf("[trtllmGenKernels::fmha::fmhaRunnerParams] setAttentionMaskType: %d\n", maskType);
         // maskType is the enum of tensorrt_llm::kernels::ContextAttentionMaskType
         // convert ContextAttentionMaskType to TrtllmGenAttentionMaskType
         switch (maskType)

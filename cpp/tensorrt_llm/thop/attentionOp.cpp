@@ -77,7 +77,8 @@ public:
         torch::optional<torch::Tensor> q_pe, torch::optional<torch::Tensor> block_ids_per_seq,
         torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas,
         torch::optional<torch::Tensor> mla_context_paged_kv,
-        torch::optional<torch::Tensor> mla_context_kv_cache_block_offsets) const
+        torch::optional<torch::Tensor> mla_context_kv_cache_block_offsets,
+        torch::optional<torch::Tensor> custom_mask) const
         = 0;
 };
 
@@ -113,6 +114,7 @@ public:
         return std::max(context_workspace_size, generation_workspace_size);
     }
 
+    // @B: We'll need to add support for custom mask here.
     void run(AttentionOp& op, bool const is_context, int32_t const seq_offset, int32_t const num_seqs,
         int32_t const token_offset, int32_t const num_tokens, int32_t const predicted_tokens_per_seq,
         torch::Tensor workspace, torch::Tensor output, torch::optional<torch::Tensor> output_sf, torch::Tensor qkv,
@@ -127,7 +129,8 @@ public:
         torch::optional<torch::Tensor> q_pe, torch::optional<torch::Tensor> block_ids_per_seq,
         torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas,
         torch::optional<torch::Tensor> mla_context_paged_kv,
-        torch::optional<torch::Tensor> mla_context_kv_cache_block_offsets) const override
+        torch::optional<torch::Tensor> mla_context_kv_cache_block_offsets,
+        torch::optional<torch::Tensor> custom_mask) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv.get_device());
         T* attention_input = static_cast<T*>(qkv.slice(0, token_offset).data_ptr());
@@ -241,6 +244,11 @@ public:
             kv_scale_orig_quant_ptr = kv_scale_orig_quant.value().data_ptr<float>();
             kv_scale_quant_orig_ptr = kv_scale_quant_orig.value().data_ptr<float>();
         }
+        printf("[trtllm::thop::attention_inplace] op.useFullCustomMask(): %d\n", op.useFullCustomMask());
+        bool const* custom_mask_ptr = nullptr;
+        if (op.useFullCustomMask() && custom_mask.has_value()) {
+            custom_mask_ptr = custom_mask.value().data_ptr<bool>();
+        }
         // For FP8 output, out_scale represents the output scale.
         float const* out_scale_ptr
             = (op.mFP8ContextFMHA && !op.mFuseFp4Quant) ? out_scale.value().data_ptr<float>() : nullptr;
@@ -272,7 +280,7 @@ public:
         common_enqueue_params.context_lengths = context_lengths_ptr;
         common_enqueue_params.host_context_lengths = host_context_lengths.data_ptr<int32_t>();
         common_enqueue_params.workspace = workspace_ptr;
-
+        common_enqueue_params.attention_mask = custom_mask_ptr;
         if (is_context) // context stage
         {
             common_enqueue_params.input_seq_length = max_context_q_len;
@@ -290,6 +298,7 @@ public:
                 enqueue_params.mrope_rotary_cos_sin
                     = static_cast<float2 const*>(mrope_rotary_cos_sin.value().data_ptr());
             }
+            printf("[trtllm::thop::attention_inplace] Call to context stage op.enqueueContext().\n");
             op.enqueueContext<T, KVBlockArray>(enqueue_params, stream);
         }
         else // generation stage
@@ -385,7 +394,7 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
     std::optional<int64_t> qk_rope_head_dim, std::optional<int64_t> v_head_dim,
     torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas,
     std::optional<torch::Tensor> mla_context_paged_kv, std::optional<torch::Tensor> mla_context_kv_cache_block_offsets,
-    std::optional<int64_t> attention_chunk_size)
+    std::optional<int64_t> attention_chunk_size, torch::optional<torch::Tensor> custom_mask)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -464,6 +473,12 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
     op->mNumKVHeads = num_kv_heads;
     op->mHeadSize = head_size;
     op->mMaskType = static_cast<tensorrt_llm::kernels::AttentionMaskType>(int32_t(mask_type));
+    printf("[trtllm::thop::attention_inplace] op->mMaskType: %d\n", op->mMaskType);
+    if (op->mMaskType == tensorrt_llm::kernels::AttentionMaskType::CUSTOM_MASK) {
+        printf("[trtllm::thop::attention_inplace] CUSTOM MASK DETECTED.\n");
+        assert(custom_mask.has_value() && "[trtllm::thop::attention_inplace] CUSTOM MASK DETECTED BUT NOT PROVIDED.");
+        op->mHasFullAttentionMask = true;
+    }
     op->mKVCacheQuantMode = tensorrt_llm::common::QuantMode(uint32_t(quant_mode));
     op->mUseKVCache = use_kv_cache;
     op->mPagedKVCache = op->mPagedKVCache && use_kv_cache; // update mPagedKVCache based on use_kv_cache
@@ -555,6 +570,7 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
     int32_t const num_ctx_tokens = host_context_lengths.slice(0, 0, num_contexts).sum().item<int32_t>();
     int32_t const num_gen_tokens = is_gen_only ? num_tokens : num_tokens - num_ctx_tokens;
 
+    printf("[trtllm::thop::attention_inplace] num_contexts: %d, num_generations: %d\n", num_contexts, num_generations);
     for (int32_t idx = num_contexts; idx < num_seqs; idx++)
     {
         TLLM_CHECK(request_types[idx] == RequestType::kGENERATION);
@@ -593,6 +609,7 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
 
     if ((num_contexts > 0) && (attn_input_type != AttentionInputType::GenerationOnly))
     {
+        printf("[trtllm::thop::attention_inplace] Call to context stage runner->run().\n");
         auto seq_offset = 0;
         auto token_offset = 0;
         runner->run(*op,
@@ -603,12 +620,12 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
             host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, cache_indirection,
             kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
             block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, mla_context_paged_kv,
-            mla_context_kv_cache_block_offsets);
+            mla_context_kv_cache_block_offsets, custom_mask);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
     {
-
+        printf("[trtllm::thop::attention_inplace] Call to generation stage runner->run().\n");
         auto seq_offset = num_contexts;
         auto token_offset = is_gen_only ? 0 : num_ctx_tokens;
         runner->run(*op,
@@ -619,7 +636,7 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
             host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, cache_indirection,
             kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
             block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, mla_context_paged_kv,
-            mla_context_kv_cache_block_offsets);
+            mla_context_kv_cache_block_offsets, custom_mask);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);
@@ -742,6 +759,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", Tensor? mla_context_paged_kv"
         ", Tensor? mla_context_kv_cache_block_offsets"
         ", int? attention_chunk_size"
+        ", Tensor? custom_mask"
         ") -> ()");
 
     m.def("attention_supports_nvfp4_output", &torch_ext::attention_supports_nvfp4_output);

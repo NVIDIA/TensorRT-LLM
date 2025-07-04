@@ -476,8 +476,18 @@ class PredefinedAttentionMask(str, Enum):
     FULL = "full"
 
 
+class CustomAttentionMask(str, Enum):
+    """
+    Custom attention mask types
+
+    Attributes:
+        CUSTOM: Use custom mask.
+    """
+    CUSTOM = "custom"
+
+
 # May extend to custom attention mask type
-AttentionMask = Union[PredefinedAttentionMask]
+AttentionMask = Union[PredefinedAttentionMask, CustomAttentionMask]
 
 
 class AttentionBackend(Generic[TMetadata]):
@@ -539,6 +549,7 @@ class AttentionBackend(Generic[TMetadata]):
                                         or None if QKV tensor is provided, or there's no new kv token.
             metadata (AttentionMetadata): Metadata for the attention operation.
             attention_mask (AttentionMask): Attention mask. See definition of `AttentionMask` for accepted types. Defaults to predefined causal mask.
+            custom_mask (Optional[torch.Tensor]): Custom attention mask. Must be provided if attention_mask is CustomAttentionMask.CUSTOM.
         Returns:
             torch.Tensor with shape (num_q_tokens, num_heads * head_dim)
         """

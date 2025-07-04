@@ -1265,6 +1265,7 @@ MLA_FUNC_DEFINE(__nv_bfloat16)
 template <typename T, typename KVCacheBuffer>
 int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStream_t stream)
 {
+    printf("[trtllm::common::op::AttentionOp::enqueueContext()] Call to function.\n");
     int const headSize = getHeadSize();
 
     int const local_hidden_units_qo = mNumHeads * headSize;
@@ -1314,8 +1315,13 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
 #endif
 
     size_t const kv_seq_length = (isCrossAttention() ? params.cross_kv_length : params.input_seq_length);
+    printf("[trtllm::common::op::AttentionOp::enqueueContext()] kv_seq_length: %d\n", kv_seq_length);
+    printf("[trtllm::common::op::AttentionOp::enqueueContext()] params.input_seq_length: %d\n", params.input_seq_length);
+    printf("[trtllm::common::op::AttentionOp::enqueueContext()] params.batch_size: %d\n", params.batch_size);
+    printf("[trtllm::common::op::AttentionOp::enqueueContext()] mEnableContextFMHA: %d\n", mEnableContextFMHA);
     size_t const attention_mask_size
         = mEnableContextFMHA ? 0 : sizeof(T) * params.batch_size * params.input_seq_length * kv_seq_length;
+    printf("[trtllm::common::op::AttentionOp::enqueueContext()] attention_mask_size: %d\n", attention_mask_size);
     size_t const cu_seqlens_size = sizeof(int) * (params.batch_size + 1);
     size_t const rotary_inv_freq_size = sizeof(float) * params.batch_size * mRotaryEmbeddingDim / 2;
     size_t q_buf_2_size = 0;
@@ -1366,10 +1372,14 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     int8_t* workspace_byte_ptr = reinterpret_cast<int8_t*>(params.workspace);
     size_t offset = CUBLAS_WORKSPACE_SIZE;
 
+    printf("[trtllm::common::op::AttentionOp::enqueueContext()] BEFORE READING ATTENTION MASK\n");
     T* attention_mask = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, attention_mask_size));
+    printf("[trtllm::common::op::AttentionOp::enqueueContext()] AFTER READING ATTENTION MASK\n");
     int* cu_q_seqlens = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, cu_seqlens_size));
     int* cu_kv_seqlens = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, cu_seqlens_size));
+    printf("[trtllm::common::op::AttentionOp::enqueueContext()] BEFORE READING CU KV SEQLENS\n");
     int* cu_mask_rows = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, cu_seqlens_size));
+    printf("[trtllm::common::op::AttentionOp::enqueueContext()] AFTER READING CU MASK ROWS\n");
     float* rotary_inv_freq_buf
         = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, rotary_inv_freq_size));
     T* q_buf_2_ = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, q_buf_2_size));
@@ -1510,6 +1520,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     // We update mEnableContextFMHA in constructor to check these conditions
     if (mEnableContextFMHA)
     {
+        printf("[trtllm::common::op::AttentionOp::enqueueContext()] Calling mEnableContextFMHA.\n");
         // do all-to-all for params.attention_input, need to split on kv head
         // [token_num // cp_size, kv_heads, head_size] -> [token_num, kv_heads // cp_size, head_size]
         T* attention_input = const_cast<T*>(params.attention_input);
@@ -1720,8 +1731,10 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         }
 
         // Run the fmha kernel.
+        printf("[trtllm::common::op::AttentionOp::enqueueContext()] Before calling mFmhaDispatcher->run().\n");
         mFmhaDispatcher->run(fmhaParams);
         sync_check_cuda_error(stream);
+        printf("[trtllm::common::op::AttentionOp::enqueueContext()] After calling mFmhaDispatcher->run().\n");
         // The kv cache might need to be updated after FMHA (only when sliding window attention + chunked context is
         // used together). Reuse the preprocessingParams.
         invokeKvCachePostprocessing(preprocessingParams, stream);

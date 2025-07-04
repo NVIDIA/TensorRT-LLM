@@ -43,7 +43,7 @@ enum class AttentionMaskType
     // For Phi-3-small model
     BLOCKSPARSE = 5,
     // The custom mask input.
-    CUSTOM_MASK = 6,
+    CUSTOM_MASK = 6,        // @B: We need to pass this.
 };
 
 enum class PositionEmbeddingType : int8_t

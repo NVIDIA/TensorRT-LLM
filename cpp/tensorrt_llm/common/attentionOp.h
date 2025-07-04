@@ -113,7 +113,7 @@ public:
     {
     public:
         // Attention packed mask input (used by context FMHA).
-        uint32_t const* attention_packed_mask = nullptr;
+        uint32_t const* attention_packed_mask = nullptr;    // @B: We need to fill this.
         kernels::KVBlockArray::DataType* host_block_offsets = nullptr;
         int32_t batch_size = 0;
         float2 const* mrope_rotary_cos_sin = nullptr;
@@ -194,7 +194,7 @@ public:
         int32_t const* mrope_position_deltas = nullptr;
 
         // optional when speculative decoding is used.
-        bool const* spec_decoding_mask = nullptr;
+        bool const* spec_decoding_mask = nullptr;    // @B: Can we follow how this is used?
         int32_t const* spec_decoding_packed_mask = nullptr;
         int32_t const* spec_decoding_position_offsets = nullptr;
         int32_t const* spec_decoding_generation_lengths = nullptr;
@@ -304,11 +304,13 @@ public:
 
     [[nodiscard]] bool useFullCustomMask() const
     {
+        assert(false && "[trtllm::common::op::AttentionOp::useFullCustomMask()] WHO CALLED ME?");
         return useCustomMask() && mHasFullAttentionMask;
     }
 
     [[nodiscard]] bool usePackedCustomMask() const
     {
+        assert(false && "[trtllm::common::op::AttentionOp::usePackedCustomMask()] WHO CALLED ME?");
         return useCustomMask() && mEnableContextFMHA;
     }
 
