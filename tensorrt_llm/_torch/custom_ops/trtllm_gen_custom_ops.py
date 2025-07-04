@@ -188,8 +188,8 @@ def fp8_block_scale_moe_runner(routing_logits: torch.Tensor,
     _, best_tactic = tuner.choose_one(
         "trtllm::fp8_block_scale_moe_runner",
         [kernel_runner],
-        kernel_runner.tuning_config,
         inputs,
+        tuning_config=kernel_runner.tuning_config,
     )
 
     return kernel_runner(inputs, tactic=best_tactic)
