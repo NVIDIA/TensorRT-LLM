@@ -2026,6 +2026,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                             def platform = values[2] == X86_64_TRIPLE ? "x86_64" : "aarch64"
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://developer.download.nvidia.com/compute/cuda/repos/${ubuntu_version}/${platform}/cuda-keyring_1.0-1_all.deb")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "dpkg -i cuda-keyring_1.0-1_all.deb")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install cuda-toolkit-12-9")
                         }
 
