@@ -164,8 +164,6 @@ deepseek-ai/DeepSeek-R1:
 Qwen3/Qwen3-8B:
   - quant_algo: W4A8_MXFP4_FP8
     accuracy: 72.70
-  - quant_algo: W4A8_MXFP4_MXFP8
-    accuracy: 72.70
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 76.12
   - accuracy: 76.12
@@ -181,8 +179,6 @@ Qwen3/Qwen3-30B-A3B:
     kv_cache_quant_algo: FP8
     accuracy: 80.65
   - quant_algo: W4A8_MXFP4_FP8
-    accuracy: 79.78
-  - quant_algo: W4A8_MXFP4_MXFP8
     accuracy: 79.78
   - quant_algo: W4A16_MXFP4
     accuracy: 79.80

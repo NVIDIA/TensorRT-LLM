@@ -32,7 +32,7 @@ namespace torch_ext
 // isSfSwizzledLayout: bool, if true, the scale factors are stored in swizzled layout, otherwise in linear layout.
 // See QuantizationSFLayout enum for more details about the two layouts.
 // returns self_mxfp8, self_block_scale_factors
-// self_mxfp8: [M, K], Float8_e4m3fn
+// self_mxfp8: [M, K], FLOAT8_E4M3
 // self_block_scale_factors: ceil(M / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE
 std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor const& self, bool isSfSwizzledLayout)
 {
@@ -57,8 +57,7 @@ std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor const& self, bool i
     std::vector<int64_t> outputShape(inputShape.begin(), inputShape.end());
     outputShape[rank - 1] = k;
 
-    at::Tensor valMxFP8
-        = at::detail::empty_cuda(outputShape, at::ScalarType::Float8_e4m3fn, self.device(), /* stride */ std::nullopt);
+    at::Tensor valMxFP8 = at::detail::empty_cuda(outputShape, FLOAT8_E4M3, self.device(), /* stride */ std::nullopt);
 
     int64_t SFSize = isSfSwizzledLayout ? tensorrt_llm::computeSwizzledLayoutSFSize(m, k / SF_VEC_SIZE)
                                         : tensorrt_llm::computeLinearLayoutSFSize(m, k / SF_VEC_SIZE);
