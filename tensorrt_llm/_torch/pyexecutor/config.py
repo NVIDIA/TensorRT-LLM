@@ -48,7 +48,7 @@ class PyTorchConfig:
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'
 
-    mixed_sampler: bool = False
+    enable_mixed_sampler: bool = False
     """
     If true, will iterate over sampling_params of each request and use the
     corresponding sampling strategy, e.g. top-k, top-p, etc.
