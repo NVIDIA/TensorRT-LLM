@@ -259,7 +259,7 @@ class CompletionPostprocArgs(PostprocArgs):
     prompt_idx: int = 0
     prompt: Optional[str] = None
     stream_options: Optional[StreamOptions] = None
-    detokenize: Optional[bool] = True
+    detokenize: bool = True
 
     @classmethod
     def from_request(cls, request: CompletionRequest):
@@ -289,7 +289,8 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase, args:
             delta_text = args.prompt + delta_text
         choice = CompletionResponseStreamChoice(
             index=args.prompt_idx * args.num_choices + output.index,
-            text=delta_text if args.detokenize else output.token_ids_diff,
+            text=delta_text if args.detokenize else "",
+            token_ids=None if args.detokenize else output.token_ids_diff,
             finish_reason = output.finish_reason,
             stop_reason = output.stop_reason,
         )
@@ -329,7 +330,8 @@ def completion_response_post_processor(rsp: GenerationResult, args: CompletionPo
             text = args.prompt + text
         disaggregated_params = to_disaggregated_params(output.disaggregated_params)
         choice = CompletionResponseChoice(
-            text=text if args.detokenize else output.token_ids,
+            text=text if args.detokenize else "",
+            token_ids=None if args.detokenize else output.token_ids,
             index=args.prompt_idx * args.num_choices + output.index,
             disaggregated_params=disaggregated_params,
             context_logits=None if rsp.context_logits is None else rsp.context_logits.tolist(),
