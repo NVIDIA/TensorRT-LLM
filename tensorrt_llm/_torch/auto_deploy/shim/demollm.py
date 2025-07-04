@@ -11,6 +11,7 @@ from ....executor import GenerationExecutor
 from ....executor.request import GenerationRequest
 from ....executor.result import CompletionOutput, GenerationResult
 from ....sampling_params import SamplingParams
+from ...pyexecutor.sampler import greedy_search_sampling_batch, top_k_sampling_batch
 from ..distributed import common as dist_ad
 from ..utils.logger import ad_logger
 from .ad_executor import ADEngine
@@ -201,11 +202,12 @@ class DemoEngine(ADEngine):
     def _sample(
         cls, logits: torch.Tensor, sampling_params: SamplingParams
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        from tensorrt_llm._torch.pyexecutor.sampler import top_k_sampling_batch
-
         logits_shape = logits.shape
-        logits = logits.view(-1, logits_shape[-1])  # top_k_sampling_batch expects 2D logits
-        idx_next, probs = top_k_sampling_batch(logits, sampling_params.top_k)
+        logits = logits.view(-1, logits_shape[-1])  # sampling_batch expects 2D logits
+        if isinstance(sampling_params.top_k, int):
+            idx_next, probs = top_k_sampling_batch(logits, sampling_params.top_k)
+        else:
+            idx_next, probs = greedy_search_sampling_batch(logits)
         idx_next = idx_next.view(logits_shape[:-1])
         return idx_next, probs
 
@@ -213,10 +215,6 @@ class DemoEngine(ADEngine):
         self, logits_last: torch.Tensor, sampling_params: SamplingParams
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Returns a sampled token per input sequence and associating probability."""
-        if sampling_params.top_k == 1:  # greedy decoding
-            # idx_next is the index of the max logit for each sequence
-            idx_next = logits_last.argmax(dim=-1, keepdim=False)
-            return idx_next, logits_last.squeeze(-1)
         # run sampling
         return self._sample(logits_last, sampling_params)
 
