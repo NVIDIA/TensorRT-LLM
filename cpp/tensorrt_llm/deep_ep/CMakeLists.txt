@@ -183,7 +183,7 @@ set_target_properties(
              CUDA_STANDARD 17
              CUDA_SEPARABLE_COMPILATION ON
              CUDA_ARCHITECTURES "${DEEP_EP_CUDA_ARCHITECTURES}"
-             INSTALL_RPATH "$ORIGIN/libs/nvshmem"
+             INSTALL_RPATH "$ORIGIN/libs/nvshmem;${TORCH_INSTALL_PREFIX}/lib"
              BUILD_WITH_INSTALL_RPATH TRUE)
 target_compile_options(
   deep_ep_cpp_tllm
