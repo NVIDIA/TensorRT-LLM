@@ -210,6 +210,8 @@ class WideEPMoE(MoE):
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
+        self.enable_dummy_allreduce = os.environ.get(
+            "TRTLLM_ENABLE_DUMMY_ALLREDUCE", "0") == "1"
 
     def _check_configs(self):
         assert self._weights_created
@@ -302,6 +304,11 @@ class WideEPMoE(MoE):
         self._weights_created = True
         self._check_configs()
 
+    def dummy_allreduce(self):
+        dummy_tensor = torch.zeros(4, dtype=torch.float32, device='cuda')
+        dummy_tensor = self.all_reduce(dummy_tensor)
+        return dummy_tensor
+
     def reducescatter_or_allreduce(
         self,
         inputs,
@@ -311,6 +318,8 @@ class WideEPMoE(MoE):
         outputs = inputs
         if self.parallel_size > 1 and not self.enable_alltoall:
             if self.use_dp:
+                if self.enable_dummy_allreduce:
+                    self.dummy_allreduce()
                 outputs = reducescatter(
                     inputs,
                     self.mapping,
@@ -398,6 +407,8 @@ class WideEPMoE(MoE):
 
         if self.enable_alltoall:
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
+                if self.enable_dummy_allreduce:
+                    self.dummy_allreduce()
                 token_count = x.shape[0]
                 alltoall_info = None
                 x, token_selected_slots, token_final_scales, gathered_loadbalancer_local_statistic_info, alltoall_info = \
@@ -484,6 +495,8 @@ class WideEPMoE(MoE):
 
         if self.use_dp and self.parallel_size > 1 and not disable_fp4_allgather(
         ) and not self.enable_alltoall:
+            if self.enable_dummy_allreduce:
+                self.dummy_allreduce()
             x, x_sf, token_selected_slots, token_final_scales, gathered_token_selected_experts_for_statistic = allgather(
                 [
                     x,
@@ -632,6 +645,8 @@ class WideEPMoE(MoE):
 
         if self.enable_alltoall:
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
+                if self.enable_dummy_allreduce:
+                    self.dummy_allreduce()
                 final_hidden_states = self.alltoall_combine(
                     final_hidden_states, alltoall_info, token_count)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
