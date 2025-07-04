@@ -185,25 +185,28 @@ void MLACacheFormatter::formatOutput(LlmRequest const& llmRequest,
         NVTX3_SCOPED_RANGE(sendBufferFun);
 
         TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
+        auto startTime = std::chrono::steady_clock::now();
         auto cacheIdx = processIdx % pPDomainSize;
+        size_t size;
         if (cacheIdx < bufferCoverTargetNum)
         {
-
+            size = outputSplitCaches.at(cacheIdx)->getSizeInBytes();
             TransferHelper::sendBuffer(*connections.at(processIdx), *outputSplitCaches.at(cacheIdx), reqId);
         }
         else if (bufferCoverTargetNum > 0)
         {
             // copy buffer allocated by cudaMallocAsync to buffer allocated by cudaMalloc before sending
             auto sendBufferIdx = cacheIdx % bufferCoverTargetNum;
+            size = outputSplitCaches.at(sendBufferIdx)->getSizeInBytes();
             bufferManager.copy(*outputSplitCaches.at(cacheIdx), *outputSplitCaches.at(sendBufferIdx));
             bufferManager.getStream().synchronize();
             TransferHelper::sendBuffer(*connections.at(processIdx), *outputSplitCaches.at(sendBufferIdx), reqId);
         }
         else
         {
-
             // bufferCoverTargetNum=0, mSendBuffer size < one outputSlice
             // send multiple times
+            size = targetBufferSize;
             size_t remainSendSize = targetBufferSize;
             while (remainSendSize > 0)
             {
@@ -220,6 +223,10 @@ void MLACacheFormatter::formatOutput(LlmRequest const& llmRequest,
                 remainSendSize -= sendSize;
             }
         }
+        auto endTime = std::chrono::steady_clock::now();
+        double cacheTransferTime
+            = std::max(0.0, std::chrono::duration<double, std::milli>(endTime - startTime).count());
+        kvCacheMeasureHelper.appendKVCacheTransfer(llmRequest.mRequestId, cacheTransferTime, size);
     };
 
     if (connections.size() > 1)
