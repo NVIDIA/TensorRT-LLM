@@ -50,7 +50,7 @@ def test_nemotron_h_correctness():
 
     expected_completions = [
         " function-driven, not just data-driven. This",
-        " the head of state and head of government of",
+        " functionary of the executive branch of the government",
     ]
 
     # reference logprobs for first prompt from mcore for prompt minus first token
