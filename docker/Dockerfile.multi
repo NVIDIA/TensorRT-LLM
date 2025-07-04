@@ -75,6 +75,9 @@ RUN pip3 install opencv-python-headless --force-reinstall --no-deps --no-cache-d
 # * https://github.com/advisories/GHSA-vqfr-h8mv-ghfj
 # * https://github.com/advisories/GHSA-7cx3-6m66-7c5m
 # * https://github.com/advisories/GHSA-5rjg-fvgr-3xxf
+# * https://github.com/advisories/GHSA-8qvm-5x2c-j2w7
+# * https://github.com/advisories/GHSA-33p9-3p43-82vq
+# * https://github.com/advisories/GHSA-xg8h-j46f-w952
 RUN pip3 install --upgrade --no-cache-dir \
     "h11>=0.16" \
     "tornado>=6.5.0" \
