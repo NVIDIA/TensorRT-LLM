@@ -1024,6 +1024,7 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
             {
                 prepareDistGenBufferAndDecoder(currRequests.generationRequests);
             }
+            sync_check_cuda_error(mRuntime->getStream().get());
 
             executeBatch(currRequests);
             if (mWorldConfig.isLastPipelineParallelRank() && mGuidedDecoder)
@@ -1062,6 +1063,8 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
             decoderFinishedEvent = mWorldConfig.isLastPipelineParallelRank()
                 ? std::make_optional(decoderStepAsync(currRequests))
                 : std::nullopt;
+
+            sync_check_cuda_error(mRuntime->getStream().get());
 
             mLastIterationStatsIFB = fillIterationStats(currRequests, requestsToPause);
             for (auto const& requests : {currRequests.contextRequests, currRequests.generationRequests})
