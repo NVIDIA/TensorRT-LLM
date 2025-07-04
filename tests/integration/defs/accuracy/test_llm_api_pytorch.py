@@ -347,6 +347,7 @@ class TestLlama3_2_3B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+@pytest.mark.timeout(7200)
 class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.3-70B-Instruct"
 
@@ -1797,6 +1798,7 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_blackwell
+    @pytest.mark.skip_less_device(8)
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend",
         [(8, 1, 8, True, True, True, "CUTLASS"),
