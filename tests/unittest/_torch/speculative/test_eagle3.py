@@ -20,6 +20,7 @@ from utils.llm_data import llm_models_root
     ], [True, "FLASHINFER", True, False, False],
      [False, "FLASHINFER", True, False, False],
      [False, "TRTLLM", False, True, True], [True, "TRTLLM", False, True, True]])
+@pytest.mark.high_cuda_memory
 def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
                       disable_overlap_scheduler: bool, enable_block_reuse: bool,
                       use_one_model: bool):
