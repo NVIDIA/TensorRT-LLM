@@ -15,9 +15,7 @@ def model_name():
     return "llama-models-v3/llama-v3-8b-instruct-hf"
 
 
-@pytest.fixture(scope="module",
-                params=[None, 'pytorch'],
-                ids=["trt", "pytorch"])
+@pytest.fixture(scope="module", params=['tensorrt', 'pytorch'])
 def backend(request):
     return request.param
 
@@ -55,13 +53,10 @@ def temp_extra_llm_api_options_file(request):
 def server(model_name: str, backend: str, extra_llm_api_options: bool,
            temp_extra_llm_api_options_file: str):
     model_path = get_model_path(model_name)
-    args = ["--tp_size", "2", "--max_beam_width", "1"]
-    if backend is not None:
-        args.append("--backend")
-        args.append(backend)
+    args = ["--tp_size", "2", "--max_beam_width", "1", "--backend", backend]
     if extra_llm_api_options:
-        args.append("--extra_llm_api_options")
-        args.append(temp_extra_llm_api_options_file)
+        args.extend(
+            ["--extra_llm_api_options", temp_extra_llm_api_options_file])
     with RemoteOpenAIServer(model_path, args) as remote_server:
         yield remote_server
 
