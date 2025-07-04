@@ -10,14 +10,17 @@ add_custom_target(deep_ep)
 # Filter CUDA arch >= 9.0
 set(DEEP_EP_CUDA_ARCHITECTURES "")
 foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
-  string(REGEX MATCHALL "^([1-9][0-9]*)[0-9][af]?(-real|-virtual)?$" MATCHES
+  string(REGEX MATCHALL "^([1-9][0-9]*)([0-9])[af]?(-real|-virtual)?$" MATCHES
                ${CUDA_ARCH})
   if(NOT CMAKE_MATCH_0)
     message(FATAL_ERROR "Invalid CUDA arch format: \"${CUDA_ARCH}\"")
   endif()
   set(CUDA_ARCH_MAJOR ${CMAKE_MATCH_1})
+  set(CUDA_ARCH_MINOR ${CMAKE_MATCH_2})
+  set(CUDA_ARCH_POSTFIX ${CMAKE_MATCH_3})
   if(${CUDA_ARCH_MAJOR} GREATER_EQUAL 9)
-    list(APPEND DEEP_EP_CUDA_ARCHITECTURES ${CMAKE_MATCH_0})
+    list(APPEND DEEP_EP_CUDA_ARCHITECTURES
+         "${CUDA_ARCH_MAJOR}${CUDA_ARCH_MINOR}${CUDA_ARCH_POSTFIX}")
   endif()
 endforeach()
 
@@ -144,7 +147,9 @@ ExternalProject_Add(
     -DNVSHMEM_USE_GDRCOPY:BOOL=0
     -DNVSHMEM_USE_NCCL:BOOL=0
   INSTALL_COMMAND ""
-  BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/nvshmem-build)
+  BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/nvshmem-build
+  BUILD_BYPRODUCTS
+    ${CMAKE_CURRENT_BINARY_DIR}/nvshmem-build/src/lib/libnvshmem.a)
 add_library(nvshmem_project::nvshmem STATIC IMPORTED)
 add_dependencies(nvshmem_project::nvshmem nvshmem_project)
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/nvshmem-build/src/include)
