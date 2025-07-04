@@ -100,7 +100,7 @@ def generate_urls(ctx_or_gen: str,
                 f"For {ctx_or_gen} instance {instance}, there are not enough tasks available. task_nodes_offset: {task_nodes_offset}, tasks_needed: {tasks_needed}, len(task_nodes): {len(task_nodes)}"
             )
 
-        min_node = (tasks_needed + max_tasks_per_node - 1) / max_tasks_per_node
+        min_node = (tasks_needed + max_tasks_per_node - 1) // max_tasks_per_node
         instance_nodes = set(task_nodes[task_nodes_offset:task_nodes_offset +
                                         tasks_needed])
         if len(instance_nodes) > min_node:
@@ -162,8 +162,6 @@ def gen_config_file(config_path: str,
     ]
 
     gen_moe_backend = "WIDEEP"
-    # if not gen_enable_attention_dp:
-    #     gen_moe_backend = "TRTLLM"
 
     config = {
         'model': model_path,

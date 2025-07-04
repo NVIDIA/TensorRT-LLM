@@ -9,7 +9,7 @@ unset UCX_TLS
 echo "config_file: ${config_file}, concurrency: ${concurrency}, enable_pdl: ${enable_pdl}, ctx_gpus: ${ctx_gpus}, work_dir: ${work_dir}"
 
 export TLLM_LOG_LEVEL=INFO
-export TRTLLM_USE_MPI_KVCACHE=1
+export TRTLLM_USE_UCX_KVCACHE=1
 export TLLM_BENCHMARK_REQ_QUEUES_SIZE=${concurrency}
 export TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1
 export TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER=1
@@ -32,10 +32,7 @@ else
         nsys_prefix="nsys profile -e \"NSYS_MPI_STORE_TEAMS_PER_RANK=1\" -o ${nsys_file} -f true -t cuda,nvtx,python-gil -c cudaProfilerApi --cuda-graph-trace node --capture-range-end=stop --gpu-metrics-devices=none"
         echo "nsys_prefix: ${nsys_prefix}"
     else
-        # export TLLM_PROFILE_START_STOP=10-30
         echo "nsys is not enabled on ctx_gpus"
     fi
-    # nsys_prefix="nsys profile -e \"NSYS_MPI_STORE_TEAMS_PER_RANK=1\" -o ${nsys_file} -f true -t cuda,nvtx,python-gil -c cudaProfilerApi --cuda-graph-trace node --capture-range-end=stop --gpu-metrics-devices=all"
-    # echo "nsys_prefix: ${nsys_prefix}"
     ${nsys_prefix} trtllm-serve disaggregated_mpi_worker -c ${config_file}
 fi

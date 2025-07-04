@@ -24,18 +24,18 @@ def process_files(dir_prefix):
             continue
 
         # Directly use the second format parsing logic
-        dp_tep = match.group(1)
+        attn_type = match.group(1)
         rank_num = int(match.group(2))
         concurrency = int(match.group(3))
         eplb_num = int(match.group(4))
         mtp_num = int(match.group(5)) if match.group(5) else 0
 
         # Determine tp_rank and ep_rank based on folder name
-        if dp_tep == 'tep':
+        if attn_type == 'tep':
             ep_rank = rank_num
         else:  # dep
             ep_rank = rank_num
-        name = f"{dp_tep}_{rank_num}_eplb{eplb_num}_mtp{mtp_num}"
+        name = f"{attn_type}_{rank_num}_eplb{eplb_num}_mtp{mtp_num}"
 
         # Read and parse log file
         try:
@@ -95,11 +95,11 @@ def process_files(dir_prefix):
             df = df[df['num_ctx_tokens'] == 0]
 
             df = df.iloc[50:-10]
-            if dp_tep == 'tep':
+            if attn_type == 'tep':
                 df = df[df['num_scheduled_requests'] == int(concurrency)]
                 df = df[df['num_generation_tokens'] == int(concurrency *
                                                            (mtp_num + 1))]
-            elif dp_tep == 'dep':
+            elif attn_type == 'dep':
                 df = df[df['num_scheduled_requests'] == int(concurrency /
                                                             ep_rank)]
                 df = df[df['num_generation_tokens'] == int(concurrency /

@@ -2,6 +2,17 @@
 
 This directory contains scripts for benchmarking TensorRT-LLM wide-ep performance using SLURM job scheduler.
 
+## ⚠️ DISCLAIMER
+
+**These scripts are currently not QA'ed and are provided for demonstration purposes only.**
+
+Please note that:
+
+- These scripts have not undergone formal quality assurance testing
+- They are intended for demonstration and educational purposes
+- Use at your own risk in production environments
+- Always review and test scripts thoroughly before running in your specific environment
+
 ## Scripts Overview
 
 ### Core Scripts
@@ -54,14 +65,14 @@ model_dir=${model_dir}                 # Model directory path
 
 ### `submit.sh`
 Main entry script that submits multiple SLURM jobs with different configurations:
-- **DEP8**: 8-way tensor parallelism for decode servers
-- **DEP16**: 16-way tensor parallelism with different EPLB slot configurations
-- **DEP32**: 32-way tensor parallelism for high-throughput scenarios
+- **DEP8**: 8-way parallelism for decode servers
+- **DEP16**: 16-way parallelism with different EPLB slot configurations
+- **DEP32**: 32-way parallelism for high-throughput scenarios
 
 Parameters tested:
 - Concurrency levels: 1x, 64x, 1024x multipliers
 - EPLB slots: 0, 256, 288
-- Different tensor parallel sizes
+- Different parallelism sizes
 
 ### `disaggr_torch.slurm`
 SLURM job script that:
