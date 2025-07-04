@@ -1200,8 +1200,7 @@ class PyTorchModelEngine(ModelEngine):
 
             # Multimodal
             multimodal_params = MultimodalParams(
-                multimodal_data=request.py_multimodal_data, )
-            multimodal_params.strip_for_context()
+                multimodal_data=request.py_multimodal_data)
             multimodal_params.to_device("multimodal_data",
                                         "cuda",
                                         pin_memory=True)
@@ -1238,7 +1237,7 @@ class PyTorchModelEngine(ModelEngine):
                 generation_requests.append(request)
             # Multimodal
             multimodal_params = MultimodalParams(
-                multimodal_data=request.py_multimodal_data, )
+                multimodal_data=request.py_multimodal_data)
             multimodal_params.strip_for_generation()
             multimodal_params.to_device("multimodal_data",
                                         "cuda",
