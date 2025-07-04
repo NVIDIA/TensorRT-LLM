@@ -133,10 +133,6 @@ LayoutDetails getLayoutDetailsForTransform(QuantType quant_type, int arch)
     {
         return getLayoutDetailsForArch<cutlass::arch::Sm90>(quant_type);
     }
-    else if (arch == 120)
-    {
-        return getLayoutDetailsForArch<cutlass::arch::Sm80>(quant_type);
-    }
     else if (arch >= 100)
     {
         return getLayoutDetailsForArch<cutlass::arch::Sm80>(quant_type);
