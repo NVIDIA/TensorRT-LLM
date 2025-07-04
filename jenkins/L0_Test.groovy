@@ -437,6 +437,8 @@ def DEBUG_MODE = "debug"
 @Field
 def DETAILED_LOG = "detailed_log"
 @Field
+def ONLY_DOCS_FILE_CHANGED = "only_docs_file_changed"
+@Field
 def testFilter = [
     (REUSE_STAGE_LIST): null,
     (ENABLE_SKIP_TEST): false,
@@ -453,6 +455,7 @@ def testFilter = [
     (DEBUG_MODE): false,
     (AUTO_TRIGGER_TAG_LIST): [],
     (DETAILED_LOG): false,
+    (ONLY_DOCS_FILE_CHANGED): false,
 ]
 
 @Field
@@ -2148,6 +2151,12 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             parallelJobsFiltered = parallelJobsFiltered.findAll { !it.key.contains("-CPP-") && !it.key.contains("-TensorRT-") }
             println parallelJobsFiltered.keySet()
         }
+    }
+
+    if (testFilter[(ONLY_DOCS_FILE_CHANGED)]) {
+        echo "Only docs files are changed, run doc build stage only."
+        parallelJobsFiltered = docBuildJobs
+        println parallelJobsFiltered.keySet()
     }
 
     // Check --stage-list, only run the stages in stage-list.
