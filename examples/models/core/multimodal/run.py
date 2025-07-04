@@ -105,7 +105,33 @@ if __name__ == '__main__':
     logger.set_level(args.log_level)
 
     model = MultimodalModelRunner(args)
-    visual_data = model.load_test_data(args.image_path, args.video_path)
+
+    def process_image_path(image_path):
+        """Uniformly handle single-image and multi-image inputs"""
+        if image_path is None:
+            return None
+        if isinstance(image_path, str):
+            # Process path separators (compatible with path1,path2 or path1:path2 formats)
+            if ',' in image_path:
+                return [p.strip() for p in image_path.split(',')]
+            elif ':' in image_path and not image_path.startswith('/'):
+                return [p.strip() for p in image_path.split(':')]
+            return [image_path]
+        elif isinstance(image_path, (list, tuple)):
+            return list(image_path)
+        else:
+            raise ValueError(f"Unsupported image_path type: {type(image_path)}")
+
+    # Process image input
+    image_paths = process_image_path(args.image_path)
+    if image_paths:
+        visual_data = [model.load_test_data(p, args.video_path) for p in image_paths]
+        # If it's a single-input model, take the first element
+        if len(visual_data) == 1 and not getattr(model, 'supports_multi_image', False):
+            visual_data = visual_data[0]
+    else:
+        visual_data = None
+        
     audio_data = model.load_test_audio(args.audio_path)
 
     if args.run_profiling:
