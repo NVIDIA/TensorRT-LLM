@@ -71,7 +71,7 @@ torch::Tensor fp8_rowwise_gemm_launch(torch::Tensor const& mat1, torch::Tensor c
     auto const k = mat1.sizes()[1];
 
     static_assert(std::is_same<OutputType, half>::value || std::is_same<OutputType, __nv_bfloat16>::value,
-        "Output type must be half, or bfloat16");
+        "Output type must be half or bfloat16");
     static constexpr auto outType
         = std::is_same<OutputType, half>::value ? at::ScalarType::Half : at::ScalarType::BFloat16;
     at::Tensor out;
