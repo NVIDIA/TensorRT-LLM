@@ -13,7 +13,7 @@ from typing import (TYPE_CHECKING, AsyncIterable, Generator, List, Optional,
 import numpy as np
 import torch
 
-from tensorrt_llm.inputs.multimodal import MultimodalInput
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger, set_level
 from tensorrt_llm.lora_manager import LoraConfig
 
@@ -109,20 +109,17 @@ class GenerationExecutor(ABC):
         pass
 
     def generate_async(
-            self,
-            prompt_token_ids: List[int],
-            sampling_params: SamplingParams,
-            query_token_ids: Optional[Union[torch.Tensor, np.ndarray,
-                                            list]] = None,
-            lora_request: Optional[LoRARequest] = None,
-            prompt_adapter_request: Optional[PromptAdapterRequest] = None,
-            streaming: bool = False,
-            multimodal_input: Optional[MultimodalInput] = None,
-            multimodal_embedding: Optional[list] = None,
-            mrope_config: Optional[dict] = None,
-            kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
-            disaggregated_params: Optional[DisaggregatedParams] = None,
-            postproc_params: Optional[PostprocParams] = None
+        self,
+        prompt_token_ids: List[int],
+        sampling_params: SamplingParams,
+        query_token_ids: Optional[Union[torch.Tensor, np.ndarray, list]] = None,
+        lora_request: Optional[LoRARequest] = None,
+        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        streaming: bool = False,
+        kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
+        disaggregated_params: Optional[DisaggregatedParams] = None,
+        postproc_params: Optional[PostprocParams] = None,
+        multimodal_params: Optional[MultimodalParams] = None,
     ) -> GenerationResult:
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -144,11 +141,9 @@ class GenerationExecutor(ABC):
                 lora_request=lora_request,
                 prompt_adapter_request=prompt_adapter_request,
                 streaming=streaming,
-                multimodal_input=multimodal_input,
-                multimodal_embedding=multimodal_embedding,
-                mrope_config=mrope_config,
                 kv_cache_retention_config=kv_cache_retention_config,
-                disaggregated_params=disaggregated_params))
+                disaggregated_params=disaggregated_params,
+                multimodal_params=multimodal_params))
         return result
 
     def generate(
