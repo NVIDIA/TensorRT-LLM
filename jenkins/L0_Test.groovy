@@ -1181,6 +1181,9 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
         }
     }
 
+    // Sed for Pytest result
+    sh "cd ${WORKSPACE}/${stageName} && sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' *.xml || true"
+
     // generate rerun report
     inputFiles = ["${WORKSPACE}/${stageName}/results.xml",
                   "${WORKSPACE}/${stageName}/rerun_results_1.xml",
