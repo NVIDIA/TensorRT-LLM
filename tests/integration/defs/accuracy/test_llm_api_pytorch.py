@@ -1088,8 +1088,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             pytest.skip("https://nvbugs/5252313")
         if torch_compile and pp_size > 1:
             pytest.skip("PP with torch.compile is not supported yet.")
-        if not attention_dp and (tp_size > 1 or ep_size > 1):
-            pytest.skip("https://nvbugs/5336321")
+
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         # Picewise Cuda Graph cannot be enabled for nvfp4 attention dp.
         torch_compile_config = TorchCompileConfig(
