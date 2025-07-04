@@ -29,7 +29,6 @@ namespace moe_prepare
 {
 
 #define STEP_DEPTH 2
-#define PACKET_PER_STEP 16
 #define THREADS_PER_UNIT 1
 #define UNIT_PER_PIPELINE 128
 #define PIPELINE_PER_CTA 4
@@ -39,21 +38,26 @@ namespace moe_prepare
 #define BYTES_COUNTER 8
 #define CUMSUM_THREADS_PER_BLOCK 128
 
-#define UNIT_SIZE 4
 #define UNIT_PER_ITER 256
 #define STATIC_COPY_PER_ITER 128
-#define MAX_TOKEN_SIZE 8192
 
-static constexpr int UNIT_BYTES_SIZE = EXPERT_BYTES_PER_UNIT + SCALE_BYTES_PER_UNIT;
 static constexpr int THREADS_PER_PIPELINE = THREADS_PER_UNIT * UNIT_PER_PIPELINE;
 static constexpr int THREADS_PER_CTA = THREADS_PER_PIPELINE * PIPELINE_PER_CTA;
 
-static constexpr int SCALE_OFFSET = UNIT_SIZE * UNIT_PER_ITER * sizeof(int);
-static constexpr int STATIC_COPY_OFFSET = UNIT_SIZE * UNIT_PER_ITER * (sizeof(int) + sizeof(float));
-static constexpr int PACKET_SIZE
-    = UNIT_SIZE * UNIT_PER_ITER * (sizeof(int) + sizeof(float)) + STATIC_COPY_PER_ITER * 4 * sizeof(int);
-static constexpr int PACKET_SIZE_IN_U64 = (PACKET_SIZE / 8);
-static constexpr int FIFO_SIZE_IN_U64 = PACKET_SIZE_IN_U64 * PACKET_PER_STEP * STEP_DEPTH;
+template <int UNIT_SIZE_INPUT, int PACKET_PER_STEP_INPUT>
+struct PipelineConfig
+{
+    static constexpr int UNIT_SIZE = UNIT_SIZE_INPUT;
+    static constexpr int PACKET_PER_STEP = PACKET_PER_STEP_INPUT;
+    static constexpr int UNIT_BYTES_SIZE = UNIT_SIZE * UNIT_PER_ITER * (sizeof(int) + sizeof(float));
+    static constexpr int SCALE_OFFSET = UNIT_SIZE * UNIT_PER_ITER * sizeof(int);
+    static constexpr int STATIC_COPY_OFFSET = UNIT_SIZE * UNIT_PER_ITER * (sizeof(int) + sizeof(float));
+    static constexpr int PACKET_SIZE = UNIT_BYTES_SIZE + STATIC_COPY_PER_ITER * 4 * sizeof(int);
+    static constexpr int PACKET_SIZE_IN_U64 = (PACKET_SIZE / 8);
+};
+
+// 1MB FIFO size
+static constexpr int FIFO_SIZE_IN_U64 = 1024 * 1024 / 8;
 
 #ifdef __CUDACC__
 #define ALIGN_256 __align__(256)
