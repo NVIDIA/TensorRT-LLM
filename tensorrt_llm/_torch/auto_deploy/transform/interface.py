@@ -102,6 +102,7 @@ class Stages(Enum):
     POST_LOAD_FUSION = "post_load_fusion"  # post-loading fusion and perf optimizations of the graph
     CACHE_INIT = "cache_init"  # initialization of cached attention + (KV) cache initialization
     VISUALIZE = "visualize"  # visualization of the graph
+    EXPORT_ONNX = "export_onnx"  # export the graph to onnx
     COMPILE = "compile"  # graph compilation stage using low-level compilers like torch.compile
 
     def __lt__(self, other):

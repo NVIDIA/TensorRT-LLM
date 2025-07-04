@@ -56,7 +56,7 @@ class TorchAttentionReference:
         v_flat = v.reshape(1, batch_size * seq_len, -1)
 
         # Call torch backend via custom op registry
-        output_flat = torch.ops.auto_deploy.torch_cached_attention_with_cache(
+        output_flat = torch.ops.auto_deploy.torch_cached_attention_with_cache.default(
             q_flat,
             k_flat,
             v_flat,
@@ -97,7 +97,7 @@ class TorchAttentionReference:
 
         This function directly calls the torch backend implementation via custom op registry.
         """
-        return torch.ops.auto_deploy.torch_cached_attention_with_cache(
+        return torch.ops.auto_deploy.torch_cached_attention_with_cache.default(
             q,
             k,
             v,
@@ -148,7 +148,7 @@ class TorchAttentionReference:
         batch_info_host = torch.tensor([0, 0, batch_size], device=q.device, dtype=torch.int32)
 
         # Call torch backend via custom op registry
-        output_flat = torch.ops.auto_deploy.torch_cached_attention_with_cache(
+        output_flat = torch.ops.auto_deploy.torch_cached_attention_with_cache.default(
             q_flat,
             k_flat,
             v_flat,
@@ -185,7 +185,7 @@ class TorchAttentionReference:
 
         This demonstrates how to use the torch backend with additional features.
         """
-        return torch.ops.auto_deploy.torch_cached_attention_with_cache(
+        return torch.ops.auto_deploy.torch_cached_attention_with_cache.default(
             q,
             k,
             v,
