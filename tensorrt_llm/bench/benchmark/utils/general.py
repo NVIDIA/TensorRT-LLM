@@ -90,8 +90,9 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
     if extra_llm_api_options:
         with open(extra_llm_api_options, 'r') as f:
             llm_args_dict = yaml.safe_load(f)
-            if "kv_cache_dtype" in llm_args_dict:
-                kv_cache_dtype = llm_args_dict["kv_cache_dtype"]
+            if "kv_cache_config" in llm_args_dict:
+                kv_cache_dtype = llm_args_dict["kv_cache_config"].get(
+                    "dtype", "auto")
             if "cuda_graph_batch_sizes" in llm_args_dict:
                 cuda_graph_batch_sizes = llm_args_dict["cuda_graph_batch_sizes"]
 
@@ -159,7 +160,9 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
             "max_batch_size":
             max_batch_size if cuda_graph_batch_sizes is None else 0,
         },
-        "kv_cache_dtype": kv_cache_dtype,
+        "kv_cache_config": {
+            "dtype": kv_cache_dtype,
+        }
     }
     backend = params.get("backend", "pytorch")
 
