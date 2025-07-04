@@ -61,14 +61,10 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(32000)
     @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
     def test_chunked_prefill(self, attn_backend):
-        pytorch_config = dict(
-            attn_backend=attn_backend,
-            # https://nvbugspro.nvidia.com/bug/5345391
-            disable_overlap_scheduler=True)
         llm = LLM(self.MODEL_PATH,
+                  attn_backend=attn_backend,
                   enable_chunked_prefill=True,
-                  max_num_tokens=512,
-                  **pytorch_config)
+                  max_num_tokens=512)
         with llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
