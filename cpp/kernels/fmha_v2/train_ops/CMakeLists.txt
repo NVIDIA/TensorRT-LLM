@@ -26,7 +26,7 @@ find_package(Torch REQUIRED PATHS "${TORCH_ROOT}/torch/share/cmake/Torch")
 find_library(TORCH_PYTHON_LIBRARY torch_python
              PATHS "${TORCH_INSTALL_PREFIX}/lib")
 # see https://github.com/pytorch/pytorch/issues/38122
-find_package(pybind11 PATHS "${TORCH_ROOT}/pybind11")
+find_package(nanobind PATHS "${TORCH_ROOT}/nanobind")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -89,16 +89,15 @@ set(KERNEL_SRC_FP8 hopper/fmha_dgrad_fp8_512_sm90.cu
 
 add_library(fmha_fp8_obj OBJECT ${KERNEL_SRC_FP8})
 
-pybind11_add_module(bert_mha_train MODULE bert_mha_train_api.cpp
-                    $<TARGET_OBJECTS:fmha_fp16_obj>)
+nb_add_module(bert_mha_train MODULE bert_mha_train_api.cpp
+              $<TARGET_OBJECTS:fmha_fp16_obj>)
 
 target_link_libraries(bert_mha_train PRIVATE ${TORCH_LIBRARIES}
                                              ${TORCH_PYTHON_LIBRARY})
 target_compile_definitions(bert_mha_train
                            PUBLIC TORCH_EXTENSION_NAME=bert_mha_train)
 
-pybind11_add_module(fp8_mha_api MODULE fp8_mha_api.cpp
-                    $<TARGET_OBJECTS:fmha_fp8_obj>)
+nb_add_module(fp8_mha_api MODULE fp8_mha_api.cpp $<TARGET_OBJECTS:fmha_fp8_obj>)
 
 target_link_libraries(fp8_mha_api PRIVATE ${TORCH_LIBRARIES}
                                           ${TORCH_PYTHON_LIBRARY})

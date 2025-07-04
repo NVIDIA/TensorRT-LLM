@@ -6,6 +6,7 @@ mako
 oyaml
 parameterized
 pre-commit
+nanobind
 pybind11
 pybind11-stubgen
 pytest

@@ -571,9 +571,8 @@ class BuildConfig:
         opt_batch_size = config.pop('opt_batch_size', 8)
         max_prompt_embedding_table_size = config.pop(
             'max_prompt_embedding_table_size', 0)
-
-        kv_cache_type = KVCacheType(
-            config.pop('kv_cache_type')) if 'plugin_config' in config else None
+        kv_cache_type = KVCacheType.from_string(
+            config.pop('kv_cache_type')) if 'kv_cache_type' in config else None
         gather_context_logits = config.pop('gather_context_logits', False)
         gather_generation_logits = config.pop('gather_generation_logits', False)
         strongly_typed = config.pop('strongly_typed', True)

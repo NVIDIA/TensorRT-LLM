@@ -18,13 +18,12 @@
 #pragma once
 
 #include "tensorrt_llm/pybind/common/customCasters.h"
-#include <pybind11/pybind11.h>
 
 namespace tensorrt_llm::batch_manager
 {
 class CacheTransceiverBindings
 {
 public:
-    static void initBindings(pybind11::module_& m);
+    static void initBindings(nanobind::module_& m);
 };
 } // namespace tensorrt_llm::batch_manager

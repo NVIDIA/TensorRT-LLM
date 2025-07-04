@@ -152,7 +152,6 @@ class BaseLLM:
                 revision=revision,
                 tokenizer_revision=tokenizer_revision,
                 **kwargs)
-
         except Exception as e:
             logger.error(
                 f"Failed to parse the arguments for the LLM constructor: {e}")

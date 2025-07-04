@@ -191,7 +191,7 @@ set(TRT_LIB TensorRT::NvInfer)
 get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
 
 set(3RDPARTY_DIR ${TRT_LLM_ROOT_DIR}/3rdparty)
-add_subdirectory(${3RDPARTY_DIR}/pybind11 ${CMAKE_CURRENT_BINARY_DIR}/pybind11)
+add_subdirectory(${3RDPARTY_DIR}/nanobind ${CMAKE_CURRENT_BINARY_DIR}/nanobind)
 
 # include as system to suppress warnings
 include_directories(
@@ -203,7 +203,7 @@ include_directories(
   ${3RDPARTY_DIR}/cutlass/tools/util/include
   ${3RDPARTY_DIR}/NVTX/include
   ${3RDPARTY_DIR}/json/include
-  ${3RDPARTY_DIR}/pybind11/include)
+  ${3RDPARTY_DIR}/nanobind/include)
 
 if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "11")
   add_definitions("-DENABLE_BF16")

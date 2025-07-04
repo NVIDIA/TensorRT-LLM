@@ -18,11 +18,10 @@
 #pragma once
 
 #include "tensorrt_llm/pybind/common/customCasters.h"
-#include <pybind11/pybind11.h>
 
 namespace tensorrt_llm::pybind::batch_manager
 {
 
-void initBindings(pybind11::module_& m);
+void initBindings(nanobind::module_& m);
 
 }
