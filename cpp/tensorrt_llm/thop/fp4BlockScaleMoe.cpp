@@ -342,25 +342,6 @@ private:
     int64_t mTileTokensDim;
 };
 
-std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routing_logits,
-    torch::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
-    torch::Tensor const& hidden_states_scale, torch::Tensor const& gemm1_weights,
-    torch::Tensor const& gemm1_weights_scale, torch::Tensor const& gemm2_weights,
-    torch::Tensor const& gemm2_weights_scale, torch::Tensor const& output1_scales_scalar,
-    torch::Tensor const& output1_scales_gate_scalar, torch::Tensor const& output2_scales_scalar,
-    int64_t const num_experts, int64_t const top_k, std::optional<int64_t> const n_group,
-    std::optional<int64_t> const topk_group, int64_t const intermediate_size, int64_t const local_expert_offset,
-    int64_t const local_num_experts, std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim,
-    int64_t const routing_method_type, bool const do_finalize)
-{
-    auto runner = FP4BlockScaleMoeRunner(tile_tokens_dim);
-
-    return runner.run(routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
-        gemm1_weights_scale, gemm2_weights, gemm2_weights_scale, output1_scales_scalar, output1_scales_gate_scalar,
-        output2_scales_scalar, num_experts, top_k, n_group, topk_group, intermediate_size, local_expert_offset,
-        local_num_experts, routed_scaling_factor, routing_method_type, do_finalize, -1);
-}
-
 torch::Tensor shuffleMatrix(torch::Tensor matrix, torch::Tensor permuteIndices)
 {
     return torch::index_select(matrix, 0, permuteIndices);
@@ -370,36 +351,10 @@ torch::Tensor shuffleMatrix(torch::Tensor matrix, torch::Tensor permuteIndices)
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def(
-        "fp4_block_scale_moe_runner("
-        "Tensor routing_logits,"
-        "Tensor? routing_bias,"
-        "Tensor hidden_states,"
-        "Tensor hidden_states_scale,"
-        "Tensor gemm1_weights,"
-        "Tensor gemm1_weights_scale,"
-        "Tensor gemm2_weights,"
-        "Tensor gemm2_weights_scale,"
-        "Tensor output1_scale_scalar,"
-        "Tensor output1_scale_gate_scalar,"
-        "Tensor output2_scale_scalar,"
-        "int num_experts,"
-        "int top_k,"
-        "int? n_group,"
-        "int? topk_group,"
-        "int intermediate_size,"
-        "int local_expert_offset,"
-        "int local_num_experts,"
-        "float? routed_scaling_factor,"
-        "int tile_tokens_dim,"
-        "int routing_method_type,"
-        "bool do_finalize) -> Tensor[]");
-}
-
-// Accepts CUDA tensor only
-TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
-{
-    m.impl("fp4_block_scale_moe_runner", &torch_ext::fp4_block_scale_moe_runner);
+    m.class_<torch_ext::FP4BlockScaleMoeRunner>("FP4BlockScaleMoERunner")
+        .def(torch::init<int64_t>())
+        .def("get_valid_configs", &torch_ext::FP4BlockScaleMoeRunner::getValidConfigs)
+        .def("run_moe", &torch_ext::FP4BlockScaleMoeRunner::run);
 }
 
 // Accepts both CPU and CUDA tensors
