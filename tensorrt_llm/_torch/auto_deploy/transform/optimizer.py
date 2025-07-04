@@ -1,6 +1,7 @@
 """High-level entrypoint to transform a model into an efficient inference model."""
 
 import gc
+import os
 from typing import Optional
 
 import torch
@@ -10,6 +11,7 @@ import torch.nn as nn
 from ..distributed import common as dist_ad
 from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
+from .graph_module_visualizer import to_dot
 from .interface import (
     InferenceOptimizerConfig,
     SharedConfig,
@@ -64,11 +66,24 @@ class InferenceOptimizer:
             mod = nn.Module()
 
         # iterate over all transforms sorted by stage in the config
-        for t_name, t_config in self.config.items():
+        for idx, (t_name, t_config) in enumerate(self.config.items()):
             # instantiate transform
             transform = TransformRegistry.get(t_name)(t_config)
             # run transform
             mod = transform(mod, cm, self.factory, self.shared_config)
+
+            if isinstance(mod, torch.fx.GraphModule):
+                # Generate a graphviz diagram if the environment variable AD_DEBUG_VISUALIZE_DIR is set
+                visualize_dir = os.environ.get("AD_DEBUG_VISUALIZE_DIR", None)
+                if visualize_dir:
+                    if not os.path.exists(visualize_dir):
+                        os.makedirs(visualize_dir)
+                    name_stem = f"gm_{idx + 1:02d}_{t_name}"
+                    visualize_path = os.path.join(visualize_dir, f"{name_stem}")
+                    to_dot(mod, name=name_stem, save_path=visualize_path, format="svg")
+                    print(
+                        f"[{idx + 1:02d}/{len(self.config)}] Visualized {name_stem} to {visualize_path}"
+                    )
 
         ############################################################################################
         # RETURN OPTIMIZED MODEL
