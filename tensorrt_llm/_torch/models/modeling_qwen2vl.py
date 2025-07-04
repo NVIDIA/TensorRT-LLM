@@ -459,8 +459,6 @@ class Qwen2VisionModelBase:
 
         mm_content_data, mm_extra_data = self._parse_and_batch_multimodal_data(
             multimodal_params)
-        print(f"mm_content_data: {mm_content_data}")
-        print(f"mm_extra_data: {mm_extra_data}")
         pixel_values = mm_content_data.get("pixel_values", None)
         pixel_values_videos = mm_content_data.get("pixel_values_videos", None)
 
@@ -523,35 +521,47 @@ class Qwen2VLModelBase(PreTrainedModel):
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
 
-    def _parse_mrope_config(
-            self, multimodal_params: List[MultimodalParams]
-    ) -> dict[str, torch.Tensor]:
-        mrope_config = {}
-        mrope_rotary_cos_sin_list = []
-        mrope_position_deltas_list = []
-        for multimodal_param in multimodal_params:
-            if multimodal_param.multimodal_data and multimodal_param.multimodal_data.get(
-                    'mrope_config'):
-                if multimodal_param.multimodal_data['mrope_config'].get(
-                        'mrope_rotary_cos_sin') is not None:
-                    mrope_rotary_cos_sin_list.append(
-                        multimodal_param.multimodal_data['mrope_config']
-                        ['mrope_rotary_cos_sin'])
-                if multimodal_param.multimodal_data['mrope_config'].get(
-                        'mrope_position_deltas') is not None:
-                    mrope_position_deltas_list.append(
-                        multimodal_param.multimodal_data['mrope_config']
-                        ['mrope_position_deltas'])
+    def _parse_and_concat_mrope_config(
+            self, multimodal_params: List[MultimodalParams],
+            num_context_requests: int,
+            num_generation_requests: int) -> dict[str, torch.Tensor]:
+        """
+        Parse and concatenate mrope configuration from multimodal parameters.
+        """
 
-        if mrope_rotary_cos_sin_list:
-            mrope_config['mrope_rotary_cos_sin'] = torch.cat(
-                mrope_rotary_cos_sin_list, dim=0)
+        mrope_configs = [
+            param.multimodal_data.get('mrope_config')
+            for param in multimodal_params if param.multimodal_data
+            and param.multimodal_data.get('mrope_config')
+        ]
+        if not mrope_configs:
+            return {}
 
-        if mrope_position_deltas_list:
-            mrope_config['mrope_position_deltas'] = torch.cat(
-                mrope_position_deltas_list, dim=0)
-        print(f"mrope_config: {mrope_config}")
-        return mrope_config
+        batched_mrope_config = {}
+        if num_context_requests > 0:
+            cos_sin_tensors = [
+                config['mrope_rotary_cos_sin']
+                for config in mrope_configs[:num_context_requests]
+                if config.get('mrope_rotary_cos_sin') is not None
+            ]
+            if cos_sin_tensors:
+                batched_mrope_config['mrope_rotary_cos_sin'] = torch.cat(
+                    cos_sin_tensors, dim=0)
+
+        if num_generation_requests > 0:
+            generation_mrope_configs = mrope_configs[
+                -num_generation_requests:] if len(
+                    mrope_configs) >= num_generation_requests else mrope_configs
+            position_delta_tensors = [
+                config['mrope_position_deltas']
+                for config in generation_mrope_configs
+                if config.get('mrope_position_deltas') is not None
+            ]
+            if position_delta_tensors:
+                batched_mrope_config['mrope_position_deltas'] = torch.cat(
+                    position_delta_tensors, dim=0)
+
+        return batched_mrope_config
 
     @torch.inference_mode()
     def forward(
@@ -584,7 +594,9 @@ class Qwen2VLModelBase(PreTrainedModel):
                     multimodal_param.multimodal_data["multimodal_embedding"]
                     for multimodal_param in multimodal_params
                 ]
-            mrope_config = self._parse_mrope_config(multimodal_params)
+            mrope_config = self._parse_and_concat_mrope_config(
+                multimodal_params, num_context_requests,
+                num_generation_requests)
 
         input_ids, input_embeds = fuse_input_embeds(self.llm.model.embed_tokens,
                                                     input_ids, mm_embeds)
