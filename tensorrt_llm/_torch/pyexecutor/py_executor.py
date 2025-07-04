@@ -1963,7 +1963,8 @@ class PyExecutor:
                 gather_responses = {}
                 if responses_list is not None:
                     for resp in responses_list:
-                        gather_responses.update(resp)
+                        if resp is not None:
+                            gather_responses.update(resp)
                     responses = gather_responses
         logger.debug(
             f'after gather, rank = {self.dist.rank}, responses = {responses}')

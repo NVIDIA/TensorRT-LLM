@@ -142,19 +142,19 @@ Below is a non-exhaustive list of common config options:
 | Configuration Key | Description |
 |-------------------|-------------|
 | `--model` | The HF model card or path to a HF checkpoint folder |
-| `--args.model_factory` | Choose model factory implementation (`"AutoModelForCausalLM"`, ...) |
-| `--args.skip_loading_weights` | Only load the architecture, not the weights |
-| `--args.model_kwargs` | Extra kwargs that are being passed to the model initializer in the model factory |
-| `--args.tokenizer_kwargs` | Extra kwargs that are being passed to the tokenizer initializer in the model factory |
-| `--args.world_size` | The number of GPUs for Tensor Parallel |
+| `--args.model-factory` | Choose model factory implementation (`"AutoModelForCausalLM"`, ...) |
+| `--args.skip-loading-weights` | Only load the architecture, not the weights |
+| `--args.model-kwargs` | Extra kwargs that are being passed to the model initializer in the model factory |
+| `--args.tokenizer-kwargs` | Extra kwargs that are being passed to the tokenizer initializer in the model factory |
+| `--args.world-size` | The number of GPUs for Tensor Parallel |
 | `--args.runtime` | Specifies which type of Engine to use during runtime (`"demollm"` or `"trtllm"`) |
-| `--args.compile_backend` | Specifies how to compile the graph at the end |
-| `--args.attn_backend` | Specifies kernel implementation for attention |
-| `--args.mla_backend` | Specifies implementation for multi-head latent attention |
-| `--args.max_seq_len` | Maximum sequence length for inference/cache |
-| `--args.max_batch_size` | Maximum dimension for statically allocated KV cache |
-| `--args.attn_page_size` | Page size for attention |
-| `--prompt.batch_size` | Number of queries to generate |
+| `--args.compile-backend` | Specifies how to compile the graph at the end |
+| `--args.attn-backend` | Specifies kernel implementation for attention |
+| `--args.mla-backend` | Specifies implementation for multi-head latent attention |
+| `--args.max-seq-len` | Maximum sequence length for inference/cache |
+| `--args.max-batch-size` | Maximum dimension for statically allocated KV cache |
+| `--args.attn-page-size` | Page size for attention |
+| `--prompt.batch-size` | Number of queries to generate |
 | `--benchmark.enabled` | Whether to run the built-in benchmark (true/false) |
 
 For default values and additional configuration options, refer to the `ExperimentConfig` class in [build_and_run_ad.py](./build_and_run_ad.py) file.
@@ -165,10 +165,10 @@ Here is a more complete example of using the script:
 cd examples/auto_deploy
 python build_and_run_ad.py \
 --model "TinyLlama/TinyLlama-1.1B-Chat-v1.0" \
---args.world_size 2 \
+--args.world-size 2 \
 --args.runtime "demollm" \
---args.compile_backend "torch-compile" \
---args.attn_backend "flashinfer" \
+--args.compile-backend "torch-compile" \
+--args.attn-backend "flashinfer" \
 --benchmark.enabled True
 ```
 
@@ -214,7 +214,7 @@ Refer to [NVIDIA TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Mo
 
 ```bash
 cd examples/auto_deploy
-python build_and_run_ad.py --model "<MODELOPT_CKPT_PATH>" --args.world_size 1
+python build_and_run_ad.py --model "<MODELOPT_CKPT_PATH>" --args.world-size 1
 ```
 
 ### Incorporating `auto_deploy` into your own workflow

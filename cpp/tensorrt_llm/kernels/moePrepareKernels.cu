@@ -552,6 +552,18 @@ __global__ void allToAllMetadataDevice(int* sendExperts, int* recvExperts, float
     }
 }
 
+__global__ void memsetExpertIdsDevice(
+    int* expertIds, int* recvCountsCumsum, int maxTokenCountPerRank, int topK, int slotCount, int rankCount)
+{
+    int maxTokenCount = maxTokenCountPerRank * rankCount;
+    int totalRecvTokenCount = *(recvCountsCumsum + rankCount - 1);
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i + totalRecvTokenCount * topK < maxTokenCount * topK;
+         i += gridDim.x * blockDim.x)
+    {
+        *(expertIds + i + totalRecvTokenCount * topK) = slotCount;
+    }
+}
+
 void computeCountAndIndice(int* experts, int* sendCounts, int* recvCounts, int* sendIndiceWorkspace,
     int* backwardIndiceWorkspace, int* recvIndiceWorkspace, MoeCommWorkspace workspace, int tokenCount,
     int maxTokenCountPerRank, int topK, int expert_count, int rankId, int rankCount, cudaStream_t stream)
@@ -613,11 +625,15 @@ void allToAllMetadata(int* sendExperts, int* recvExperts, float* sendScales, flo
     int block_size = localExpertStatics == nullptr ? UNIT_PER_ITER : UNIT_PER_ITER + STATIC_COPY_PER_ITER;
     dim3 block(block_size);
     dim3 grid(rankCount, 2);
-    assert(topK == 8);
+
     allToAllMetadataDevice<StepCommunicatorBase><<<grid, block, 0, stream>>>(sendExperts, recvExperts, sendScales,
         recvScales, localExpertStatics, gatheredExpertStatics, workspace, sendCountsCumsum, localSendIndice,
         recvCountsCumsum, localRecvIndice, tokenCount, maxTokenCountPerRank, topK, expertCount, slotCount, rankId,
         rankCount);
+
+    int smCount = tensorrt_llm::common::getMultiProcessorCount();
+    memsetExpertIdsDevice<<<smCount, 256, 0, stream>>>(
+        recvExperts, recvCountsCumsum, maxTokenCountPerRank, topK, slotCount, rankCount);
 }
 
 size_t getMoePrepareWorkspaceSize(int epSize)

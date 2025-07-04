@@ -52,6 +52,11 @@ def _check_ad_config(experiment_config: ExperimentConfig, ad_config: LlmArgs):
             compile_backend="torch-simple",
         ),
         get_small_model_config(
+            "Qwen/Qwen3-30B-A3B",
+            attn_backend="triton",
+            compile_backend="torch-simple",
+        ),
+        get_small_model_config(
             "microsoft/Phi-3-mini-4k-instruct",
             attn_backend="triton",
             compile_backend="torch-simple",

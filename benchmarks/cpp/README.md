@@ -41,7 +41,7 @@ python3 prepare_dataset.py \
 ```
 
 For datasets that don't have prompt key, set --dataset-prompt instead.
-Take [cnn_dailymail dataset](https://huggingface.co/datasets/cnn_dailymail) for example:
+Take [cnn_dailymail dataset](https://huggingface.co/datasets/abisee/cnn_dailymail) for example:
 ```
 python3 prepare_dataset.py \
     --tokenizer <path/to/tokenizer> \

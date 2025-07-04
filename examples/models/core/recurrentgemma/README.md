@@ -11,7 +11,7 @@ The TensorRT-LLM RecurrentGemma implementation can be found in [`tensorrt_llm/mo
 In addition, there are two shared files in the parent folder [`examples`](../../../) for inference and evaluation:
 
 * [`run.py`](../../../run.py) to run the inference on an input text;
-* [`summarize.py`](../../../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
+* [`summarize.py`](../../../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset.
 
 ## Support Matrix
 |    Checkpoint type    | FP16  | BF16  | FP8 | INT8 SQ | INT4 AWQ | TP  |
@@ -171,7 +171,7 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_2B_IT_FLAX_PATH} \
 
 We provide three examples to run inference `run.py`, `summarize.py` and `mmlu.py`. `run.py` only run inference with `input_text` and show the output.
 
-`summarize.py` runs summarization on [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset and evaluate the model by [ROUGE](https://en.wikipedia.org/wiki/ROUGE_(metric)) scores and use the `ROUGE-1` score to validate the implementation.
+`summarize.py` runs summarization on [cnn_dailymail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset and evaluate the model by [ROUGE](https://en.wikipedia.org/wiki/ROUGE_(metric)) scores and use the `ROUGE-1` score to validate the implementation.
 
 `mmlu.py` runs MMLU to evaluate the model by accuracy.
 

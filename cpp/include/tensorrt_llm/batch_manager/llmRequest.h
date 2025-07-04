@@ -1506,14 +1506,6 @@ public:
         }
     }
 
-    /// To determine whether the context is unchunked. When a context is chunked into only a part, it
-    /// is still different from the unchunked state, which indicates the initial status.
-    [[nodiscard]] bool isFullContextRequest() const noexcept
-    {
-        return (isContextInitState() || isDisaggGenerationInitState() || isDisaggGenerationTransmissionComplete())
-            && !mContextChunkSize;
-    }
-
     [[nodiscard]] bool isContextOnlyRequest() const noexcept
     {
         return mLlmRequestType == LlmRequestType::LLMREQUEST_TYPE_CONTEXT_ONLY;

@@ -96,6 +96,12 @@ class LlmArgs(BaseLlmArgs):
 
     device: str = Field(default="cuda", description="The device to use for the model.", frozen=True)
 
+    kv_cache_dtype: str = Field(
+        default="auto",
+        description="Data type for KV cache. This is a temporary field until kv_cache_dtype is "
+        "supported in AutoDeploy.",
+    )
+
     # INFERENCE OPTIMIZER CONFIG ###################################################################
     attn_backend: Literal["flashinfer", "triton"] = Field(
         default="flashinfer", description="Attention backend to use."

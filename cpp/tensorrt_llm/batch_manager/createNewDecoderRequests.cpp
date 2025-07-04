@@ -136,8 +136,11 @@ CreateNewDecoderRequests::operator()(runtime::ModelConfig const& modelConfig, ru
     std::copy_if(contextRequests.begin(), contextRequests.end(), std::back_inserter(finishedContextRequests),
         [](auto const& llmReq) { return llmReq->isLastContextChunk(); });
 
-    copySequenceLengths(finishedContextRequests, inputBuffers, *decoderState.getSequenceLengths(), beamWidth,
-        bufferManager, runtimeStream);
+    if (!finishedContextRequests.empty())
+    {
+        copySequenceLengths(finishedContextRequests, inputBuffers, *decoderState.getSequenceLengths(), beamWidth,
+            bufferManager, runtimeStream);
+    }
 
     auto [lookaheadPrompt, lookaheadAlgoConfigs] = createDecoderRequests(finishedContextRequests,
         inputBuffers.inputsIds, decodingConfig, decoderState, bufferManager, logitsType, modelConfig, worldConfig,

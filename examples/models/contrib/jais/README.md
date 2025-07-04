@@ -23,7 +23,7 @@ The TensorRT-LLM support for Jais is based on the GPT model, the implementation 
 In addition, there are two shared files in the parent folder [`examples`](../) for inference and evaluation:
 
 * [`../../../run.py`](../../../run.py) to run the inference on an input text;
-* [`../../../summarize.py`](../../../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
+* [`../../../summarize.py`](../../../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset.
 
 ## Support Matrix
 The tested configurations are:
