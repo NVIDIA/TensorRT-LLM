@@ -1932,7 +1932,9 @@ class PyExecutor:
             return
 
         cancelled_responses = {}
+        cancelled_req_ids = []
         left_requests = []
+        num_cancel_reqs = len(self.canceled_req_ids)
         # Tracks canceled requests for proper handling in overlap mode during `sampler.update_requests`.
         self.canceled_requests = []
         for request in self.active_requests:
@@ -1943,6 +1945,7 @@ class PyExecutor:
                 request.decoding_iter = request.py_decoding_iter
                 cancelled_responses[req_id] = request.create_response(
                     False, self.dist.rank)
+                cancelled_req_ids.append(req_id)
                 self.canceled_requests.append(request)
                 self.canceled_req_ids.erase(req_id)
             else:
@@ -1951,7 +1954,21 @@ class PyExecutor:
 
         # When enable attention dp, each rank does not have full copy of requests
         # so we need to remove the cancel requests not in the local rank
-        self.canceled_req_ids.clear()
+        if self.enable_attention_dp:
+            # Padding the cancelled_req_ids to the same length
+            for i in range(num_cancel_reqs - len(cancelled_req_ids)):
+                cancelled_req_ids.append(-1)
+
+            cancelled_req_ids = self.dist.allgather(cancelled_req_ids)
+            # Remove the -1 placeholders
+            cancelled_req_ids = [
+                req_id for req_id in cancelled_req_ids if req_id != -1
+            ]
+
+            if self.dist.rank == 0:
+                for req_id in cancelled_req_ids:
+                    if req_id in self.canceled_req_ids:
+                        self.canceled_req_ids.erase(req_id)
 
         # enqueue the cancelled requests' responses as they are not
         # active_requests and be discarded in the sampler loop.
