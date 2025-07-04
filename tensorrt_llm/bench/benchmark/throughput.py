@@ -19,6 +19,7 @@ from tensorrt_llm.bench.benchmark.utils.general import (
 # isort: on
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
@@ -370,6 +371,12 @@ def throughput_command(
                     "Ignore extended_runtime_perf_knob_config for pytorch backend."
                 )
             llm = PyTorchLLM(**kwargs)
+        elif runtime_config.backend == "_autodeploy":
+            if kwargs.pop("extended_runtime_perf_knob_config", None):
+                logger.warning(
+                    "Ignore extended_runtime_perf_knob_config for _autodeploy backend."
+                )
+            llm = AutoDeployLLM(**kwargs)
         else:
             llm = LLM(**kwargs)
 

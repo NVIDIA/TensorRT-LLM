@@ -401,7 +401,7 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
             # send a dummy request for initialization
             dummy_request = {
                 "model": self.model_name,
-                "prompt": [3] * 200,
+                "prompt": [3] * 2000,
                 "max_tokens": 1,
                 "ignore_eos": True,
                 "temperature": 0.0,
@@ -426,15 +426,16 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
                                                prompt=dummy_request["prompt"])
             server, info = await self.gen_router.get_next_server(openai_request)
             first_match = info["matches"][0]
+            logger.info(f"Matched blocks: {first_match}")
             assert first_match > 0
             await self.gen_router.finish_request(openai_request)
 
             # flood requests until eviction
-            batch_size = 8
+            batch_size = 64
             blocks_per_request = 32
             requests = [copy.copy(dummy_request) for _ in range(batch_size)]
             has_evicted = False
-            for i in range(0, block_pool_size // blocks_per_request + 10,
+            for i in range(0, block_pool_size // blocks_per_request * 2,
                            batch_size):
                 logger.info(f"Flooding request {i} ~ {i + batch_size - 1}")
                 prompt_len = self.gen_router._tokens_per_block * blocks_per_request - 10
@@ -454,6 +455,8 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
 
             # the dummy request's reusable length decreases after eviction
             server, info = await self.gen_router.get_next_server(openai_request)
+            logger.info(
+                f"Matched blocks: {first_match} -> {info['matches'][0]}")
             assert info["matches"][0] < first_match
 
 
