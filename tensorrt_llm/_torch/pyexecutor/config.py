@@ -61,6 +61,7 @@ class PyTorchConfig:
 
     kv_cache_dtype: str = "auto"
     enable_iter_perf_stats: bool = False
+    iter_perf_latest_stats_size: Optional[int] = None
     # If true, enables per request stats per iteration
     # Must also set enable_iter_perf_stats to true to get request stats
     enable_iter_req_stats: bool = False
