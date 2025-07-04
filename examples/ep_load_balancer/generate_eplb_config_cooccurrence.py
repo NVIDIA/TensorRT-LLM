@@ -96,10 +96,16 @@ if __name__ == "__main__":
         assert cooccurrence_iters.size(0) == num_iters
         cooccurrence_matrix = cooccurrence_iters.sum(dim=0).float()
 
+        # import matplotlib.pyplot as plt
+        # plt.imshow(cooccurrence_matrix.clip(max=cooccurrence_matrix.quantile(0.95)))
+        # plt.savefig(f"fig/cooccurrence_matrix_{layer_idx}.png")
+        # import IPython; IPython.embed()
+
         expert_ids = torch.arange(num_experts)
         cooccurrence_matrix = cooccurrence_matrix.masked_fill(
-            expert_ids.unsqueeze(1) == expert_ids, 0)
+            expert_ids.unsqueeze(1) == expert_ids, -1e9)
 
+        breakpoint()
         rank_expert_ids = do_placement_with_cooccurrence(expert_load_factor,
                                                          expert_replica_count,
                                                          cooccurrence_matrix,
