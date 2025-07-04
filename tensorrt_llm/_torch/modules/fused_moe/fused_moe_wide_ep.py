@@ -302,6 +302,11 @@ class WideEPMoE(MoE):
         self._weights_created = True
         self._check_configs()
 
+    def dummy_allreduce(self):
+        dummy_tensor = torch.zeros(1, dtype=torch.float32, device='cuda')
+        dummy_tensor = self.all_reduce(dummy_tensor)
+        return dummy_tensor
+
     def reducescatter_or_allreduce(
         self,
         inputs,
@@ -311,6 +316,7 @@ class WideEPMoE(MoE):
         outputs = inputs
         if self.parallel_size > 1 and not self.enable_alltoall:
             if self.use_dp:
+                self.dummy_allreduce()
                 outputs = reducescatter(
                     inputs,
                     self.mapping,
@@ -400,6 +406,7 @@ class WideEPMoE(MoE):
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
                 token_count = x.shape[0]
                 alltoall_info = None
+                self.dummy_allreduce()
                 x, token_selected_slots, token_final_scales, gathered_loadbalancer_local_statistic_info, alltoall_info = \
                     self.alltoall_prepare_maybe_dispatch(all_rank_max_num_tokens,
                                                          x,
@@ -484,6 +491,7 @@ class WideEPMoE(MoE):
 
         if self.use_dp and self.parallel_size > 1 and not disable_fp4_allgather(
         ) and not self.enable_alltoall:
+            self.dummy_allreduce()
             x, x_sf, token_selected_slots, token_final_scales, gathered_token_selected_experts_for_statistic = allgather(
                 [
                     x,
@@ -632,6 +640,7 @@ class WideEPMoE(MoE):
 
         if self.enable_alltoall:
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
+                self.dummy_allreduce()
                 final_hidden_states = self.alltoall_combine(
                     final_hidden_states, alltoall_info, token_count)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
