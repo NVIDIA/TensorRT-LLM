@@ -186,6 +186,7 @@ class WideEPMoE(MoE):
                 self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
                     model_config.mapping)
                 if self.enable_alltoall_without_allgather:
+                    top_k = self.routing_method.experts_per_token
                     self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
                         model_config.mapping)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
