@@ -60,13 +60,15 @@ def test_remote_mpi_session(task_type: Literal["submit", "submit_sync"]):
     """Test RemoteMpiPoolSessionClient and RemoteMpiPoolSessionServer interaction"""
     command = ["bash", "_test_remote_mpi_session.sh", task_type]
     print(' '.join(command))
+
     with Popen(command,
                env=os.environ,
                stdout=PIPE,
                stderr=PIPE,
                bufsize=1,
                start_new_session=True,
-               universal_newlines=True) as process:
+               universal_newlines=True,
+               cwd=os.path.dirname(os.path.abspath(__file__))) as process:
 
         # Function to read from a stream and write to output
         def read_stream(stream, output_stream):
