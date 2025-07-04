@@ -29,6 +29,8 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
                       disable_overlap_scheduler: bool, enable_block_reuse: bool,
                       use_one_model: bool, enable_chunked_prefill: bool):
+    if use_one_model:
+        pytest.skip("Skipped due to triton version mismatch.")
     # Eagle3 one model works with overlap scheduler and block reuse.
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
