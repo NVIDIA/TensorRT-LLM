@@ -201,9 +201,12 @@ class Llama4Attention(Attention):
                 **kwargs,
             )
         else:
-            return self._forward_nope(position_ids, hidden_states,
-                                      attn_metadata, attention_mask,
-                                      mrope_config, all_reduce_params)
+            return self._forward_nope(position_ids=position_ids,
+                                      hidden_states=hidden_states,
+                                      attn_metadata=attn_metadata,
+                                      attention_mask=attention_mask,
+                                      mrope_config=mrope_config,
+                                      all_reduce_params=all_reduce_params)
 
 
 class LlamaAttention(Attention):
@@ -277,11 +280,13 @@ class Llama4MoE(nn.Module):
             apply_router_weight_on_input=True,
             layer_idx=layer_idx)
 
-        self.router = Linear(hidden_size,
-                             num_experts,
-                             bias=False,
-                             dtype=config.torch_dtype,
-                             quant_config=None)
+        self.router = Linear(
+            hidden_size,
+            num_experts,
+            bias=False,
+            dtype=config.torch_dtype,
+            quant_config=None,
+            force_dynamic_quantization=model_config.force_dynamic_quantization)
 
         self.mapping = model_config.mapping
         self.all_reduce = AllReduce(
@@ -292,22 +297,22 @@ class Llama4MoE(nn.Module):
         self.aux_stream = aux_stream
 
     def compute_routed_output(self, hidden_states, all_rank_num_tokens,
+                              all_rank_max_num_tokens,
                               cutlass_min_latency_mode):
         use_dp_padding = False
         if self.enable_attention_dp and self.mapping.tp_size > 1:
             # Use padding here to keep the behavior unchanged
             use_dp_padding = True
-            max_num_token_across_dp_ranks = max(all_rank_num_tokens)
             hidden_states = torch.nn.functional.pad(
                 hidden_states,
-                (0, 0, 0,
-                 max_num_token_across_dp_ranks - hidden_states.shape[0]))
+                (0, 0, 0, all_rank_max_num_tokens - hidden_states.shape[0]))
         router_logits = self.router(hidden_states)
         routed_output = self.experts(
             hidden_states,
             router_logits,
             do_finalize=not cutlass_min_latency_mode,
             all_rank_num_tokens=all_rank_num_tokens,
+            all_rank_max_num_tokens=all_rank_max_num_tokens,
             use_dp_padding=use_dp_padding,
         )
         return routed_output
@@ -316,6 +321,7 @@ class Llama4MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         all_rank_num_tokens=None,
+        all_rank_max_num_tokens=None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         cutlass_min_latency_mode: Optional[bool] = False,
     ) -> torch.Tensor:
@@ -323,7 +329,8 @@ class Llama4MoE(nn.Module):
         # This design is mainly for low latency use case. Need to improve for max throughput use case.
         fn0 = lambda: self.shared_expert(hidden_states)
         fn1 = lambda: self.compute_routed_output(
-            hidden_states, all_rank_num_tokens, cutlass_min_latency_mode)
+            hidden_states, all_rank_num_tokens, all_rank_max_num_tokens,
+            cutlass_min_latency_mode)
         shared_output, routed_output = maybe_execute_in_parallel(
             fn0, fn1, self.moe_event[0], self.moe_event[1], self.aux_stream)
         if cutlass_min_latency_mode:
@@ -479,6 +486,7 @@ class Llama4DecoderLayer(DecoderLayer):
         hidden_states = self.feed_forward(
             hidden_states,
             all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+            all_rank_max_num_tokens=attn_metadata.all_rank_max_num_tokens,
             final_all_reduce_params=AllReduceParams(enable_allreduce=not (
                 self.fusion_config.POST_MOE_FUSION
                 or self.fusion_config.POST_MLP_FUSION
@@ -609,7 +617,6 @@ class Llama4Model(DecoderModel):
     def __init__(self, model_config: ModelConfig[LlamaConfig]):
         super().__init__(model_config)
         config = self.model_config.pretrained_config
-        self.padding_idx = config.pad_token_id
         self.num_hidden_layers = config.num_hidden_layers
         self.aux_stream = torch.cuda.Stream()
         self.mapping = model_config.mapping
@@ -687,7 +694,6 @@ class LlamaModel(DecoderModel):
     def __init__(self, model_config: ModelConfig[LlamaConfig]):
         super().__init__(model_config)
         config = self.model_config.pretrained_config
-        self.padding_idx = config.pad_token_id
         self.num_hidden_layers = config.num_hidden_layers
 
         vocab_size = config.vocab_size

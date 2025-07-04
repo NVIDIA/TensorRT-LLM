@@ -57,13 +57,13 @@
 #include <math.h>
 #include <sstream>
 
+namespace tensorrt_llm::kernels::cutlass_kernels
+{
+
 namespace tk = tensorrt_llm::common;
 namespace tkc = tensorrt_llm::cutlass_extensions;
 
 using namespace cute;
-
-namespace tensorrt_llm::kernels::cutlass_kernels
-{
 
 template <typename T, typename WeightType, typename GemmOutputType, typename EpilogueTag, typename CTAShape,
     typename ClusterShape>

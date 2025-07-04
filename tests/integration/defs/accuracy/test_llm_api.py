@@ -58,16 +58,18 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    def test_guided_decoding(self):
-        llm = LLM(self.MODEL_PATH, guided_decoding_backend="xgrammar")
+    @pytest.mark.parametrize("backend", ["xgrammar"])
+    def test_guided_decoding(self, backend: str):
+        llm = LLM(self.MODEL_PATH, guided_decoding_backend=backend)
         with llm:
             task = JsonModeEval(self.MODEL_NAME)
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
-    def test_guided_decoding_4gpus(self):
+    @pytest.mark.parametrize("backend", ["xgrammar"])
+    def test_guided_decoding_4gpus(self, backend: str):
         llm = LLM(self.MODEL_PATH,
-                  guided_decoding_backend="xgrammar",
+                  guided_decoding_backend=backend,
                   tensor_parallel_size=2,
                   pipeline_parallel_size=2)
         with llm:
@@ -178,6 +180,7 @@ class TestMistral_Nemo_12B_Base(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mistral-Nemo-Base-2407"
     MODEL_PATH = f"{llm_models_root()}/Mistral-Nemo-Base-2407"
 
+    @skip_pre_ada
     def test_fp8(self):
         quant_config = QuantConfig(quant_algo=QuantAlgo.FP8,
                                    kv_cache_quant_algo=QuantAlgo.FP8)

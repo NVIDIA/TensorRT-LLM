@@ -104,3 +104,5 @@ speakleash/Bielik-11B-v2.2-Instruct:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 40.41
+google/gemma-3-1b-it:
+  - accuracy: 25.52 # score getting from lm-eval with HF implementation

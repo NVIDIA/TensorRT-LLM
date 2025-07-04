@@ -2989,6 +2989,7 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 #endif // EXCLUDE_SM_100
 };
 // clang-format on
+
 } // namespace kernels
 } // namespace tensorrt_llm
 } // namespace gemm

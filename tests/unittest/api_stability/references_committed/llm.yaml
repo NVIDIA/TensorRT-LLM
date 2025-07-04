@@ -50,19 +50,12 @@ methods:
       lora_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.LoraConfig]
         default: null
-      # Prompt tuning
-      enable_prompt_adapter:
-        annotation: bool
-        default: false
-      max_prompt_adapter_token:
-        annotation: int
-        default: 0
       # Logits processor and guided decoding
       batched_logits_processor:
         annotation: Optional[tensorrt_llm.sampling_params.BatchedLogitsProcessor]
         default: null
       guided_decoding_backend:
-        annotation: Optional[str]
+        annotation: Optional[Literal["xgrammar", "llguidance"]]
         default: null
       # Quantization and calibration
       quant_config:

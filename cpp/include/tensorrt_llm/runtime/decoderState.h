@@ -48,20 +48,22 @@ public:
     using DecodingInputPtr = std::unique_ptr<DecodingInput>;
     using DecodingOutputPtr = std::unique_ptr<DecodingOutput>;
 
-    DecoderState(nvinfer1::DataType dtype, BufferManager const& bufferManager);
+    DecoderState();
 
-    //! @brief Allocate buffers for speculative decoding.
-    void allocateSpeculativeDecodingBuffers(
-        SpeculativeDecodingMode speculativeDecodingMode, nvinfer1::DataType dtype, BufferManager const& bufferManager);
-
+    //! @brief Setup buffers for the decoder excluding speculative decoding.
     void setup(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
-        SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, ModelConfig const& modelConfig,
-        WorldConfig const& worldConfig, BufferManager const& bufferManager);
+        SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, nvinfer1::DataType dtype,
+        ModelConfig const& modelConfig, WorldConfig const& worldConfig, BufferManager const& bufferManager);
+
+    //! @brief Setup buffers for the cache indirection.
+    //! @details This is used for beam search on pipeline parallel ranks without a decoder.
+    void setupCacheIndirection(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
+        BufferManager const& bufferManager);
 
     //! @brief Setup buffers for speculative decoding.
     void setupSpeculativeDecoding(SpeculativeDecodingMode const& speculativeDecodingMode,
-        SizeType32 maxTokensPerEngineStep, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
-        BufferManager const& bufferManager);
+        SizeType32 maxTokensPerEngineStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig,
+        WorldConfig const& worldConfig, BufferManager const& bufferManager);
 
     //! @brief Disable lookahead decoding.
     void disableLookahead(RequestVector const& genRequests);
@@ -174,6 +176,12 @@ public:
     //! @brief Workspace for beam search in streaming mode.
     [[nodiscard]] BeamSearchBuffers const& getBeamSearchBuffers() const;
 
+    //! @brief Cache indirection input for beam search.
+    [[nodiscard]] TensorPtr getCacheIndirectionInput() const;
+
+    //! @brief Cache indirection output for beam search.
+    [[nodiscard]] TensorPtr getCacheIndirectionOutput() const;
+
     //! @brief Stateful inputs for the decoder. Allocated for maxBatchSize slots.
     [[nodiscard]] DecodingInput& getJointDecodingInput() const;
 
@@ -181,6 +189,21 @@ public:
     [[nodiscard]] DecodingOutput& getJointDecodingOutput() const;
 
 private:
+    void setupBuffers(nvinfer1::DataType dtype, BufferManager const& bufferManager);
+    void reshapeBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
+        SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, ModelConfig const& modelConfig,
+        WorldConfig const& worldConfig, BufferManager const& bufferManager);
+
+    void setupCacheIndirectionBuffers(BufferManager const& bufferManager);
+    void reshapeCacheIndirectionBuffers(
+        SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow);
+
+    void setupSpeculativeDecodingBuffers(
+        SpeculativeDecodingMode speculativeDecodingMode, nvinfer1::DataType dtype, BufferManager const& bufferManager);
+    void reshapeSpeculativeDecodingBuffers(SpeculativeDecodingMode const& speculativeDecodingMode,
+        SizeType32 maxTokensPerEngineStep, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
+        BufferManager const& bufferManager);
+
     SizeType32 mMaxBatchSize{};
     SizeType32 mMaxBeamWidth{};
     SizeType32 mMaxSequenceLength{};

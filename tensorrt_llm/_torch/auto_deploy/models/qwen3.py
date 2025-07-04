@@ -1,10 +1,24 @@
+"""A patch for Qwen3 MoE to make it compatible with torch.export and reduce export time."""
+
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeSparseMoeBlock
 
 
-# patch for MoE to reduce torch.export time
 def _forward_moe(self: Qwen3MoeSparseMoeBlock, hidden_states: torch.Tensor):
+    # check if we can apply the patch
+    use_original_forward = False
+    if not all(isinstance(expert.act_fn, nn.SiLU) for expert in self.experts):
+        use_original_forward = True
+
+    if any(getattr(mod, "bias", None) is not None for mod in self.experts.modules()):
+        use_original_forward = True
+
+    # rely on original forward instead
+    if use_original_forward:
+        return self._original_forward(hidden_states)
+
     batch_size, sequence_length, hidden_dim = hidden_states.shape
     hidden_states = hidden_states.view(-1, hidden_dim)
     # router_logits: (batch * sequence_length, n_experts)
@@ -17,7 +31,7 @@ def _forward_moe(self: Qwen3MoeSparseMoeBlock, hidden_states: torch.Tensor):
     # we cast back to the input dtype
     routing_weights = routing_weights.to(hidden_states.dtype)
 
-    final_hidden_states = torch.ops.moe.torch_moe(
+    final_hidden_states = torch.ops.auto_deploy.torch_moe(
         hidden_states,
         selected_experts,
         routing_weights,

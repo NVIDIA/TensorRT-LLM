@@ -47,7 +47,7 @@ class SpeculativeDecodingMode(IntEnum):
         return self.is_mtp() or self.is_eagle3_one_model()
 
     def needs_kv_cache_rewind(self):
-        return self.is_mtp() or self.is_eagle3_one_model()
+        return self.is_mtp() or self.is_eagle3_one_model() or self.is_ngram()
 
     def support_overlap_scheduler(self):
         return self.is_mtp() or self.is_eagle3_one_model()
@@ -73,6 +73,9 @@ class SpeculativeDecodingMode(IntEnum):
     def has_spec_decoder(self):
         return self.is_mtp() or self.is_eagle3() or self.is_eagle3_one_model()
 
+    def has_spec_drafter(self):
+        return self.is_ngram()
+
     def extend_ctx(self, attention_backend: Type[AttentionBackend]):
         """
         If true, treat generation requests with draft tokens as
@@ -84,6 +87,12 @@ class SpeculativeDecodingMode(IntEnum):
         return ((self.is_eagle3() or self.is_draft_target())
                 and not (isinstance(attention_backend, TrtllmAttention)
                          and get_sm_version() == 100)) or self.is_ngram()
+
+    def attention_need_spec_dec_mode(self):
+        """
+        If true, the attention backend kernel needs to run in spec-dec mode (multi-token query mode).
+        """
+        return self.is_eagle3_one_model()
 
     @staticmethod
     def from_string(name: Optional[str]) -> "SpeculativeDecodingMode":
@@ -153,7 +162,13 @@ class SpecMetadata:
     # The number of tokens for speculative model/layer
     num_tokens: int = 0
     # The number of tokens for speculative model/layer of different rank
-    all_rank_num_tokens: Optional[List[int]] = None
+    _all_rank_num_tokens: Optional[List[int]] = field(init=False,
+                                                      default=None,
+                                                      repr=False)
+    all_rank_num_tokens: Optional[List[int]]
+    # The max number of tokens among all ranks.
+    all_rank_max_num_tokens: Optional[int] = None
+
     # The number of sequences for speculative model/layer of different rank
     all_rank_num_seqs: Optional[List[int]] = None
     # The number of extra kv tokens
@@ -164,6 +179,11 @@ class SpecMetadata:
     num_extra_kv_tokens: Optional[int] = 0  # Number of layers in target model
     # The number of layers
     num_layers: int = 0
+
+    # if spec-dec tree is a tree or a chain (linear tree)
+    is_spec_dec_tree: bool = False
+    # if spec-dec tree wouldn't be changed at all, the mask won't be computed every step.
+    is_spec_dec_dynamic_tree: bool = False
 
     def prepare(self):
         """
@@ -190,3 +210,13 @@ class SpecMetadata:
         Some spec decode algorithms require hidden states from the target
         model. Use this method to record them. By default, does nothing.
         """
+
+    @property
+    def all_rank_num_tokens(self) -> Optional[List[int]]:
+        return self._all_rank_num_tokens
+
+    @all_rank_num_tokens.setter
+    def all_rank_num_tokens(self, value: Optional[List[int]]):
+        value = value if value is not SpecMetadata.all_rank_num_tokens else None
+        self._all_rank_num_tokens = value
+        self.all_rank_max_num_tokens = max(value) if value is not None else None

@@ -17,7 +17,7 @@ add_dependencies(nvrtc_wrapper_src xqa_sources_h)
 target_include_directories(nvrtc_wrapper_src
                            PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/xqa_build)
 target_link_libraries(
-  nvrtc_wrapper_src PUBLIC ${NVRTC_LIB} ${NVRTC_BUILTINS_LIB} ${CUDA_DRV_LIB}
-                           ${CUDA_RT_LIB})
+  nvrtc_wrapper_src PUBLIC ${NVPTX_LIB} ${NVRTC_LIB} ${NVRTC_BUILTINS_LIB}
+                           ${CUDA_DRV_LIB} ${CUDA_RT_LIB})
 set_property(TARGET nvrtc_wrapper_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET nvrtc_wrapper_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)

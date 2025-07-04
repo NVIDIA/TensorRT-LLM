@@ -96,6 +96,31 @@ def test_llm_reward_model():
     assert not outputs[0].outputs[0].text
 
 
+def test_llm_perf_metrics():
+    llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
+    sampling_params = SamplingParams(max_tokens=10, return_perf_metrics=True)
+    outputs = llm.generate(prompts, sampling_params)
+    assert outputs[0].outputs[0].request_perf_metrics is not None
+
+    perf_metrics = outputs[0].outputs[0].request_perf_metrics
+
+    timing_metrics = perf_metrics.timing_metrics
+    assert timing_metrics.arrival_time < timing_metrics.first_scheduled_time
+    assert timing_metrics.first_scheduled_time < timing_metrics.first_token_time
+    assert timing_metrics.first_token_time < timing_metrics.last_token_time
+
+    kv_cache_metrics = perf_metrics.kv_cache_metrics
+    assert kv_cache_metrics.num_total_allocated_blocks == 1
+    assert kv_cache_metrics.num_new_allocated_blocks == 1
+    assert kv_cache_metrics.num_reused_blocks == 0
+    assert kv_cache_metrics.num_missed_blocks == 1
+    assert kv_cache_metrics.kv_cache_hit_rate == 0
+
+    assert perf_metrics.first_iter is not None
+    assert perf_metrics.iter - perf_metrics.first_iter == sampling_params.max_tokens - 1
+    assert perf_metrics.last_iter == perf_metrics.iter
+
+
 @pytest.mark.parametrize("streaming", [True, False])
 def test_llm_with_postprocess_parallel_and_result_handler(streaming):
     run_llm_with_postprocess_parallel_and_result_handler(streaming,
@@ -103,25 +128,23 @@ def test_llm_with_postprocess_parallel_and_result_handler(streaming):
                                                          tp_size=1)
 
 
-def llama_v2_13b_lora_test_harness(**llm_kwargs) -> None:
-    lora_config = LoraConfig(lora_dir=[
-        f"{llm_models_root()}/llama-models-v2/chinese-llama-2-lora-13b"
-    ],
-                             max_lora_rank=64)
-    llm = LLM(model=f"{llm_models_root()}/llama-models-v2/llama-v2-13b-hf",
+def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
+    lora_config = LoraConfig(
+        lora_dir=[f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"],
+        max_lora_rank=8)
+    llm = LLM(model=f"{llm_models_root()}/llama-models/llama-7b-hf",
               lora_config=lora_config,
               **llm_kwargs)
 
     prompts = [
-        "今天天气很好，我到公园的时候，",
+        "美国的首都在哪里? \n答案:",
     ]
     references = [
-        "发现公园里到处都是人，有的在跑步，有的在打羽毛球，还有的",
+        "美国的首都是华盛顿。\n\n美国的",
     ]
-    sampling_params = SamplingParams(max_tokens=20, add_special_tokens=False)
+    sampling_params = SamplingParams(max_tokens=20)
     lora_req = LoRARequest(
-        "task-0", 0,
-        f"{llm_models_root()}/llama-models-v2/chinese-llama-2-lora-13b")
+        "task-0", 0, f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1")
     lora_request = [lora_req]
 
     outputs = llm.generate(prompts, sampling_params, lora_request=lora_request)
@@ -129,7 +152,7 @@ def llama_v2_13b_lora_test_harness(**llm_kwargs) -> None:
     assert similar(outputs[0].outputs[0].text, references[0])
 
 
-def llama_7b_multi_lora_test_harness(**llm_kwargs) -> None:
+def llama_7b_multi_lora_from_request_test_harness(**llm_kwargs) -> None:
     hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
     hf_lora_dir1 = f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"
     hf_lora_dir2 = f"{llm_models_root()}/llama-models/Japanese-Alpaca-LoRA-7b-v0"
@@ -139,6 +162,7 @@ def llama_7b_multi_lora_test_harness(**llm_kwargs) -> None:
     # (2) provide a lora_dir to infer the lora_target_modules.
     lora_config = LoraConfig(lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
                              max_lora_rank=8)
+
     llm = LLM(hf_model_dir, lora_config=lora_config, **llm_kwargs)
 
     prompts = [
@@ -169,8 +193,8 @@ def llama_7b_multi_lora_test_harness(**llm_kwargs) -> None:
 
 
 @skip_gpu_memory_less_than_40gb
-def test_llama_v2_13b_lora():
-    llama_v2_13b_lora_test_harness()
+def test_llama_7b_lora():
+    llama_7b_lora_from_dir_test_harness()
 
 
 @skip_gpu_memory_less_than_40gb
@@ -199,7 +223,7 @@ def test_llama_7b_lora_default_modules() -> None:
 
 @skip_gpu_memory_less_than_40gb
 def test_llama_7b_multi_lora():
-    llama_7b_multi_lora_test_harness()
+    llama_7b_multi_lora_from_request_test_harness()
 
 
 # TODO smor: currently Nemotron-Super-49B-v1 with LoRA memory consumption is overly high

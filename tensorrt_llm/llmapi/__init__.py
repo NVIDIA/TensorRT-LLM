@@ -6,13 +6,12 @@ from .llm import LLM, RequestOutput
 # yapf: disable
 from .llm_args import (BatchingType, CacheTransceiverConfig, CalibConfig,
                        CapacitySchedulerPolicy, ContextChunkingPolicy,
-                       DraftTargetDecodingConfig, DynamicBatchConfig,
-                       EagleDecodingConfig, ExtendedRuntimePerfKnobConfig,
-                       KvCacheConfig, LlmArgs, LookaheadDecodingConfig,
-                       MedusaDecodingConfig, MTPDecodingConfig,
-                       NGramDecodingConfig, SchedulerConfig, TorchCompileConfig,
-                       TorchLlmArgs, TrtLlmArgs)
-# yapf: enable
+                       CudaGraphConfig, DraftTargetDecodingConfig,
+                       DynamicBatchConfig, EagleDecodingConfig,
+                       ExtendedRuntimePerfKnobConfig, KvCacheConfig, LlmArgs,
+                       LookaheadDecodingConfig, MedusaDecodingConfig,
+                       MTPDecodingConfig, NGramDecodingConfig, SchedulerConfig,
+                       TorchCompileConfig, TorchLlmArgs, TrtLlmArgs)
 from .llm_utils import (BuildConfig, KvCacheRetentionConfig, QuantAlgo,
                         QuantConfig)
 from .mpi_session import MpiCommSession
@@ -26,6 +25,7 @@ __all__ = [
     'DisaggregatedParams',
     'KvCacheConfig',
     'KvCacheRetentionConfig',
+    'CudaGraphConfig',
     'LookaheadDecodingConfig',
     'MedusaDecodingConfig',
     'EagleDecodingConfig',

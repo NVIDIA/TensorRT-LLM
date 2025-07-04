@@ -65,7 +65,7 @@ class Gemma3Attention(Attention):
         self.attention_window_size = None
         if is_sliding:
             rope_params.theta = 10000
-            self.attention_window_size = config.sliding_window
+            self.attention_window_size = config.sliding_window - 1  # Gemma3 sliding window isn't inclusive.
         pos_embd_params = PositionalEmbeddingParams(
             type=PositionEmbeddingType.rope_gpt_neox,
             rope=rope_params,
@@ -107,7 +107,6 @@ class Gemma3Attention(Attention):
         **kwargs,
     ) -> torch.Tensor:
 
-        attention_window_size = self.attention_window_size or attn_metadata.max_seq_len
         return super().forward(position_ids=position_ids,
                                hidden_states=hidden_states,
                                attn_metadata=attn_metadata,
@@ -115,7 +114,7 @@ class Gemma3Attention(Attention):
                                mrope_config=mrope_config,
                                all_reduce_params=all_reduce_params,
                                lora_params=lora_params,
-                               attention_window_size=attention_window_size,
+                               attention_window_size=self.attention_window_size,
                                **kwargs)
 
     def apply_qk_norm(self, q, k):
@@ -241,7 +240,6 @@ class Gemma3TextModel(DecoderModel):
         super().__init__(model_config)
         config = self.model_config
         self.hidden_size = config.pretrained_config.hidden_size
-        self.padding_idx = config.pretrained_config.pad_token_id
 
         self.embed_tokens = Gemma3TextScaledWordEmbedding(
             config.pretrained_config.vocab_size,
@@ -329,9 +327,7 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
     # minor change for Gemma3 RMSNorm.
     def load_weights(self, weights: Dict):
         tp_size = self.model_config.mapping.tp_size
-        head_dim = getattr(
-            self.config, "head_dim",
-            self.config.hidden_size // self.config.num_attention_heads)
+        num_kv_heads = self.config.num_key_value_heads
 
         params_map = {
             'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
@@ -365,7 +361,7 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
                                 k:
                                 duplicate_kv_weight(
                                     weight=v[:],
-                                    head_dim=head_dim,
+                                    num_kv_heads=num_kv_heads,
                                     tensor_parallel_size=tp_size)
                                 if k in ["weight", "bias"] else v
                                 for k, v in fw.items()
