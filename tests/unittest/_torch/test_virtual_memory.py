@@ -123,11 +123,11 @@ def test_basic(memory_info_available):
         assert memory_usage_begin == memory_usage_end
 
 
-def test_backed():
+def test_restore():
     alloc_size = 1024 * 1024
     mark = "test_mark"
 
-    with virtual_memory.scope(mark, virtual_memory.BackedMode.PINNED) as pool:
+    with virtual_memory.scope(mark, virtual_memory.RestoreMode.PINNED) as pool:
         tensor = torch.full([alloc_size], 42, dtype=torch.int8, device='cuda')
 
     assert tensor[0].item() == 42
