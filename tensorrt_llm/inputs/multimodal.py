@@ -90,21 +90,26 @@ class MultimodalParams:
     providing a clean interface for handling multimodal inputs across different models.
     """
 
-    # Core multimodal data
     multimodal_input: Optional[MultimodalInput] = None
-    """Multimodal input data with hashing information for caching and deduplication."""
+    """Multimodal input data with hashing information."""
 
-    multimodal_embedding: Optional[torch.Tensor] = None
-    """Pre-computed multimodal embeddings from vision encoder."""
+    multimodal_data: Optional[Dict[str, Any]] = field(default_factory=dict)
+    """Processed multimodal data after AutoProcessor's process() by modality, multimodal_embedding and mrope_config.
+    It should be in the form of {"mrope_config": {"mrope_rotary_cos_sin": torch.Tensor, "mrope_position_deltas": torch.Tensor},
+                                 "multimodal_embedding": torch.Tensor,
+                                 "modality": {item_str: item_data}}
 
-    multimodal_data: Optional[Dict[str, Dict[str,
-                                             Union[torch.Tensor,
-                                                   List[Any]]]]] = field(
-                                                       default_factory=dict)
-    """Processed multimodal data after AutoProcessor's process() by modality (e.g., image pixels, video pixel values).
-    It should be in the form of {modality: {item_str: item_data}}
+    mrope_config: Optional[Dict[str, Any]]: Multimodal rotary position embedding config (used by Qwen2/2.5-VL).
+    multimodal_embedding: Optional[torch.Tensor]: Pre-computed multimodal embeddings from vision encoder.
+    modality: Optional[Dict[str, Any]]: Multimodal data by modality. For example, image, video, etc.
+
     e.g.
     {
+        "mrope_config": {
+            "mrope_rotary_cos_sin": torch.Tensor(),
+            "mrope_position_deltas": torch.Tensor(),
+        },
+        "multimodal_embedding": torch.Tensor(),
         "image": {
             "pixel_values": torch.Tensor(),
             "image_height": torch.Tensor() or List[int],
@@ -115,25 +120,74 @@ class MultimodalParams:
             "video_height": torch.Tensor() or List[int],
             "video_width": torch.Tensor() or List[int]
         },
+        ...
     }
     """
-
-    # Model-specific configurations
-    mrope_config: Optional[Dict[str, Any]] = None
-    """Multimodal rotary position embedding config (used by Qwen2-VL)."""
 
     def __post_init__(self):
         """Ensure default values are properly set."""
         if self.multimodal_data is None:
             self.multimodal_data = {}
-        if self.mrope_config is None:
-            self.mrope_config = {}
+
+    def to_device(self, element: str, device: str, pin_memory: bool = False):
+
+        def _to_device(
+            input_tensor: Union[torch.Tensor, List, dict, None],
+            pin_memory: bool = False,
+        ) -> Union[torch.Tensor, List, dict, None]:
+            if input_tensor is None:
+                return None
+            elif isinstance(input_tensor, list):
+                return [_to_device(item) for item in input_tensor]
+            elif isinstance(input_tensor, dict):
+                return {
+                    key: _to_device(value)
+                    for key, value in input_tensor.items()
+                }
+            elif isinstance(input_tensor, torch.Tensor):
+                if pin_memory:
+                    return input_tensor.pin_memory().to(device)
+                else:
+                    return input_tensor.to(device)
+
+        if element == "multimodal_data":
+            self.multimodal_data = _to_device(self.multimodal_data)
+        elif element == "multimodal_input":
+            self.multimodal_input = _to_device(self.multimodal_input)
+        else:
+            print("MultimodalParams: Unsupported element to move to device: ",
+                  element)
+
+    def strip_for_context(self):
+        """Strip multimodal data for context mode - remove only mrope_position_deltas."""
+        if self.multimodal_data and 'mrope_config' in self.multimodal_data:
+            mrope_config = self.multimodal_data['mrope_config']
+            if 'mrope_position_deltas' in mrope_config:
+                # Remove only mrope_position_deltas, keep everything else
+                del mrope_config['mrope_position_deltas']
+
+    def strip_for_generation(self):
+        """Strip multimodal data for generation mode - keep only mrope_position_deltas."""
+        if self.multimodal_data:
+            # In generation mode, only keep mrope_config['mrope_position_deltas']
+            # and erase everything else
+            mrope_position_deltas = None
+            if 'mrope_config' in self.multimodal_data:
+                mrope_config = self.multimodal_data['mrope_config']
+                if 'mrope_position_deltas' in mrope_config:
+                    mrope_position_deltas = mrope_config[
+                        'mrope_position_deltas']
+
+            # Clear all multimodal_data and only keep mrope_position_deltas if it exists
+            self.multimodal_data = {}
+            if mrope_position_deltas is not None:
+                self.multimodal_data['mrope_config'] = {
+                    'mrope_position_deltas': mrope_position_deltas
+                }
 
     def has_content(self) -> bool:
         """Check if this object contains any multimodal data."""
-        return bool(self.multimodal_input
-                    or self.multimodal_embedding is not None
-                    or self.multimodal_data or self.mrope_config)
+        return bool(self.multimodal_input or self.multimodal_data)
 
 
 # adopt from vllm : https://github.com/vllm-project/vllm/blob/main/vllm/vllm/multimodal/hash.py

@@ -386,20 +386,12 @@ class GenerationExecutorWorker(GenerationExecutor):
             prompt_token_ids = list(range(
                 vocab_size, vocab_size + pa_length)) + prompt_token_ids
 
-        # Multimodal related fields - simplified handling
+        # MULTIMODAL
+        # NOTE: Since, we only support PyTorch backend for multimodal, we will send multimodal_data through the 'py_multimodal_data' field
+        # except `multimodal_input` as it needs to go through the C++ runtime.
+        multimodal_input = None
         if request.multimodal_params is not None and request.multimodal_params.has_content(
         ):
-            # Create mrope_config if needed
-            mrope_config = None
-            if request.multimodal_params.mrope_config:
-                mrope_config = tllm.MropeConfig(
-                    mrope_rotary_cos_sin=request.multimodal_params.mrope_config.
-                    get('mrope_rotary_cos_sin'),
-                    mrope_position_deltas=request.multimodal_params.
-                    mrope_config.get('mrope_position_deltas'))
-
-            # Create multimodal_input for C++ if needed
-            multimodal_input = None
             if request.multimodal_params.multimodal_input is not None:
                 multimodal_input = tllm.MultimodalInput(
                     multimodal_hashes=request.multimodal_params.
@@ -408,13 +400,8 @@ class GenerationExecutorWorker(GenerationExecutor):
                     multimodal_input.multimodal_positions,
                     multimodal_lengths=request.multimodal_params.
                     multimodal_input.multimodal_lengths)
-            multimodal_embedding = None
-            if request.multimodal_params.multimodal_embedding is not None:
-                multimodal_embedding = request.multimodal_params.multimodal_embedding
-        else:
-            multimodal_embedding = None
-            mrope_config = None
-            multimodal_input = None
+            # NOTE: Setting to None here to avoid sending multimodal_input again through the 'py_multimodal_data' field
+            request.multimodal_params.multimodal_input = None
 
         context_phase_params = None
         request_type = tllm.RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION
@@ -482,8 +469,8 @@ class GenerationExecutorWorker(GenerationExecutor):
                 lora_config=lora_config,
                 prompt_tuning_config=prompt_tuning_config,
                 multimodal_input=multimodal_input,
-                multimodal_embedding=multimodal_embedding,
-                mrope_config=mrope_config,
+                multimodal_embedding=None,
+                mrope_config=None,
                 logits_post_processor_name=(
                     tllm.Request.BATCHED_POST_PROCESSOR_NAME
                     if request.sampling_params.apply_batched_logits_processor
@@ -494,9 +481,8 @@ class GenerationExecutorWorker(GenerationExecutor):
                 context_phase_params=context_phase_params,
                 type=request_type)
 
-            if self._is_pytorch_backend:
-                # For PyTorch backend, attach the raw multimodal data
-                if request.multimodal_params is not None and request.multimodal_params.multimodal_data:
+            if self._is_pytorch_backend and request.multimodal_params is not None:
+                if request.multimodal_params.multimodal_data is not None:
                     executor_request.py_multimodal_data = request.multimodal_params.multimodal_data
 
             if self._is_pytorch_backend and request.sampling_params.logits_processor:

@@ -386,9 +386,6 @@ class BaseLLM:
                 query_token_ids = extra_processed_inputs.get('query_token_ids')
                 # Create unified MultimodalParams
                 multimodal_params = MultimodalParams(
-                    multimodal_embedding=extra_processed_inputs.get(
-                        'mm_embedding'),
-                    mrope_config=extra_processed_inputs.get('mrope_config'),
                     multimodal_input=extra_processed_inputs.get(
                         'multimodal_input'),
                     multimodal_data=extra_processed_inputs.get(

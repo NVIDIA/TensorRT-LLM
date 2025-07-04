@@ -1197,30 +1197,15 @@ class PyTorchModelEngine(ModelEngine):
             prompt_lengths.append(len(prompt_tokens))
             past_seen_token_num = begin_compute
             num_cached_tokens_per_seq.append(past_seen_token_num)
+            request.py_batch_idx = py_batch_idx(request)
 
-            multimodal_embedding = request.multimodal_embedding
-            if multimodal_embedding is not None:
-                # TODO: Visit later once we have the SharedTensor.
-                multimodal_embedding = multimodal_embedding.pin_memory(
-                ) if multimodal_embedding.device == 'cpu' else multimodal_embedding
-                multimodal_embedding = multimodal_embedding.to(
-                    'cuda', non_blocking=True)
-
-            mrope_rotary_cos_sin = request.mrope_rotary_cos_sin
-            if mrope_rotary_cos_sin is not None:
-                # TODO: Visit later once we have the SharedTensor.
-                mrope_rotary_cos_sin = mrope_rotary_cos_sin.pin_memory(
-                ) if mrope_rotary_cos_sin.device == 'cpu' else mrope_rotary_cos_sin
-                mrope_rotary_cos_sin = mrope_rotary_cos_sin.to(
-                    'cuda', non_blocking=True)
-
-            # Create MultimodalParams from request data
+            # Multimodal
             multimodal_params = MultimodalParams(
-                multimodal_embedding=multimodal_embedding,
-                mrope_config={'mrope_rotary_cos_sin': mrope_rotary_cos_sin}
-                if mrope_rotary_cos_sin is not None else {},
-                multimodal_data=request.py_multimodal_data,
-            )
+                multimodal_data=request.py_multimodal_data, )
+            multimodal_params.strip_for_context()
+            multimodal_params.to_device("multimodal_data",
+                                        "cuda",
+                                        pin_memory=True)
 
             if multimodal_params.has_content():
                 multimodal_params_list.append(multimodal_params)
@@ -1252,20 +1237,15 @@ class PyTorchModelEngine(ModelEngine):
                     extend_requests.append(request)
             else:
                 generation_requests.append(request)
-
-            # Handle generation request multimodal params
-            mrope_position_deltas = request.mrope_position_deltas
-            if mrope_position_deltas is not None:
-                mrope_position_deltas_tensor = torch.tensor(
-                    [mrope_position_deltas], dtype=torch.int32, pin_memory=True)
-                multimodal_params = MultimodalParams(
-                    mrope_config={
-                        'mrope_position_deltas':
-                        mrope_position_deltas_tensor.to('cuda',
-                                                        non_blocking=True)
-                    })
-                if multimodal_params.has_content():
-                    multimodal_params_list.append(multimodal_params)
+            # Multimodal
+            multimodal_params = MultimodalParams(
+                multimodal_data=request.py_multimodal_data, )
+            multimodal_params.strip_for_generation()
+            multimodal_params.to_device("multimodal_data",
+                                        "cuda",
+                                        pin_memory=True)
+            if multimodal_params.has_content():
+                multimodal_params_list.append(multimodal_params)
         extend_requests += extend_dummy_requests
 
         if not self._disable_overlap_scheduler and self.is_spec_decode:
