@@ -27,7 +27,7 @@
 #include <string>
 #include <vector>
 
-#include "ada_blockwise_gemm/ada_blockwise_gemm.cuh"
+#include "ada_blockwise_gemm/sm89_fp8_gemm_1d1d.cuh"
 #include "fp8_blockscale_mma_utils.cuh"
 #include "fp8_blockscale_tma_utils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -1172,7 +1172,7 @@ template <typename InputType, typename OutputType, typename ScaleType = float>
 __global__ void scale_1x128_reshape_kernel(
     OutputType* output, ScaleType* scales, InputType const* const input, int dim_x, int dim_h, int dim_y, int stride_x)
 {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890))
     size_t scales_along_dim_x = div_up(dim_x, 128);
     size_t scales_along_dim_y = div_up(dim_y, 1);
     size_t scales_along_dim_h = div_up(dim_h, 1);
@@ -1582,30 +1582,30 @@ void gemm_dispatch_sm89(void* mat_a, void* mat_b, void* mat_d, float* scales_a, 
     using ElementOutput = cute::bfloat16_t;
     using ElementAccum = float;
     using ElementBlockScale = float;
-    static constexpr int Stages = 4;
-    using TileShape = cutlass::gemm::GemmShape<32, 128, 128>; // only support 32x128x128 for now
+    static constexpr int Stages = 3;
+    using TileShape = cutlass::gemm::GemmShape<32, 128, 128>;
     using KT = ada_blockwise_gemm::AdaBlockwiseGemmTraits<ElementInput, ElementOutput, ElementAccum, ElementBlockScale,
         Stages, TileShape::kM, TileShape::kN, TileShape::kK>;
-    using Gemm = ada_blockwise_gemm::AdaBlockwiseGemm<KT>;
+    using GemmKernel = ada_blockwise_gemm::AdaBlockwiseGemmKernel<KT>;
 
-    int gemm_m = shape_m;
-    int gemm_n = shape_n;
-    int gemm_k = shape_k;
-    typename KT::Arguments args({gemm_m, gemm_n, gemm_k}, mat_a, mat_b, mat_d, scales_a, scales_b);
+    static constexpr int kSmemSize = KT::kSmemSize;
+    static constexpr int kThreadCount = KT::kThreadCount;
+    int grid_m = (shape_m + KT::kTileM - 1) / KT::kTileM;
+    int grid_n = (shape_n + KT::kTileN - 1) / KT::kTileN;
+    int grid_k = 1;
+    dim3 grid = dim3(grid_m, grid_n, grid_k);
+    dim3 block = dim3(kThreadCount, 1, 1);
 
-    Gemm gemm{};
+    if (kSmemSize > (48 << 10))
+    {
+        cudaFuncSetAttribute(ada_blockwise_gemm::sm89_fp8_gemm_1d1d_impl<GemmKernel>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize);
+        auto result = cudaGetLastError();
+        TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm89 gemm kernel cannot launch: %s", cudaGetErrorString(result));
+    }
 
-    auto status = gemm.can_implement(args);
-    TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "This kernel is not supported. Last CUDA error is: %s",
-        cutlassGetStatusString(status));
-
-    status = gemm.initialize(args);
-    TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess,
-        "Failed to initialize the CUTLASS kernel. Last CUDA error is: %s", cutlassGetStatusString(status));
-
-    status = gemm.run(stream);
-    TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess,
-        "Failed to run the CUTLASS kernel. Last CUDA error is: %s", cutlassGetStatusString(status));
+    ada_blockwise_gemm::sm89_fp8_gemm_1d1d_impl<GemmKernel>
+        <<<grid, block, kSmemSize, stream>>>(shape_m, shape_n, shape_k, mat_a, mat_b, mat_d, scales_a, scales_b);
 }
 
 void fp8_gemm_run(__nv_fp8_e4m3* mat_a, int ld_a, __nv_fp8_e4m3* mat_b, int ld_b, __nv_bfloat16* mat_d, int ld_d,
@@ -1787,6 +1787,48 @@ void strided_batch_gemm_dispatch(__nv_fp8_e4m3* mat_a, int ld_a, int stride_a, _
         static_cast<uint32_t>(best_smem_size));
 }
 
+void strided_batch_gemm_dispatch_sm89(__nv_fp8_e4m3* mat_a, int ld_a, int stride_a, __nv_fp8_e4m3* mat_b, int ld_b,
+    int stride_b, __nv_bfloat16* mat_d, int ld_d, int stride_d, float* scales_a, int stride_scales_a, float* scales_b,
+    uint32_t num_problems, uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, cudaStream_t stream,
+    int num_device_sms = kNumDeviceSMs)
+{
+
+    if (num_device_sms < 0)
+    {
+        num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
+    }
+    using ElementInput = cute::float_e4m3_t;
+    using ElementOutput = cute::bfloat16_t;
+    using ElementAccum = float;
+    using ElementBlockScale = float;
+    static constexpr int Stages = 3;
+    using TileShape = cutlass::gemm::GemmShape<32, 128, 128>;
+    using KT = ada_blockwise_gemm::AdaBlockwiseGemmTraits<ElementInput, ElementOutput, ElementAccum, ElementBlockScale,
+        Stages, TileShape::kM, TileShape::kN, TileShape::kK>;
+    using GemmKernel = ada_blockwise_gemm::AdaBlockwiseGemmKernel<KT>;
+
+    static constexpr int kSmemSize = KT::kSmemSize;
+    static constexpr int kThreadCount = KT::kThreadCount;
+    int grid_m = (shape_m + KT::kTileM - 1) / KT::kTileM;
+    int grid_n = (shape_n + KT::kTileN - 1) / KT::kTileN;
+    int grid_k = num_problems;
+    dim3 grid = dim3(grid_m, grid_n, grid_k);
+    dim3 block = dim3(kThreadCount, 1, 1);
+
+    int stride_scales_b = ((shape_n + 128 - 1) / 128) * ((shape_k + 128 - 1) / 128);
+
+    if (kSmemSize > (48 << 10))
+    {
+        cudaFuncSetAttribute(ada_blockwise_gemm::sm89_fp8_bmm_1d1d_impl<GemmKernel>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize);
+        auto result = cudaGetLastError();
+        TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm89 gemm kernel cannot launch: %s", cudaGetErrorString(result));
+    }
+    ada_blockwise_gemm::sm89_fp8_bmm_1d1d_impl<GemmKernel><<<grid, block, kSmemSize, stream>>>(shape_m, shape_n,
+        shape_k, mat_a, mat_b, mat_d, scales_a, scales_b, stride_a, stride_b, stride_d, stride_scales_a,
+        stride_scales_b);
+}
+
 void fp8_stride_batch_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, float* scales_a, int ld_a,
     int stride_a, int stride_scales_a, __nv_bfloat16 const* mat_b, __nv_fp8_e4m3* fp8_mat_b, float* scales_b, int ld_b,
     int stride_b, __nv_bfloat16* mat_d, int ld_d, int stride_d, uint32_t num_problems, uint32_t shape_m,
@@ -1813,6 +1855,13 @@ void fp8_stride_batch_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_ma
             fp8_mat_b, scales_b, mat_b, shape_k, shape_n * num_problems);
     }
 
+    int arch = tensorrt_llm::common::getSMVersion();
+    if (arch == 89)
+    {
+        strided_batch_gemm_dispatch_sm89(fp8_mat_a, ld_a, stride_a, fp8_mat_b, ld_b, stride_b, mat_d, ld_d, stride_d,
+            scales_a, stride_scales_a, scales_b, num_problems, shape_m, shape_n, shape_k, stream);
+        return;
+    }
     if (kDeepGemmEnabled)
     {
         strided_batch_gemm_dispatch(fp8_mat_a, ld_a, stride_a, fp8_mat_b, ld_b, stride_b, mat_d, ld_d, stride_d,
