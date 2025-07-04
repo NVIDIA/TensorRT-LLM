@@ -1429,7 +1429,7 @@ class BaseLlmArgs(BaseModel):
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
             else:
                 raise ValueError(
-                    f"Unregonized speculative config type {type(self.speculative_config)}"
+                    f"Unrecognized speculative config type {type(self.speculative_config)}"
                 )
         else:
             self.decoding_config = None
