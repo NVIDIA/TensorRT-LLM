@@ -821,6 +821,10 @@ class KvCacheConfig(BaseModel, PybindMirror):
     use_uvm: bool = Field(default=False,
                           description="Whether to use UVM for the KV cache.")
 
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    dtype: str = Field(default="auto",
+                       description="The data type to use for the KV cache.")
+
     def _to_pybind(self):
         return _KvCacheConfig(
             enable_block_reuse=self.enable_block_reuse,
@@ -1737,6 +1741,11 @@ class TrtLlmArgs(BaseLlmArgs):
                 f"Invalid build_cache_config: {self.enable_build_cache}")
         return self
 
+    @model_validator(mode="after")
+    def validate_kv_cache_dtype(self):
+        assert self.kv_cache_config.dtype == "auto", "KvCacheConfig.dtype is not supported by the TensorRT backend."
+        return self
+
 
 class LoadFormat(Enum):
     AUTO = 0
@@ -1809,9 +1818,6 @@ class TorchLlmArgs(BaseLlmArgs):
         description=
         "If true, will use the TRTLLM sampler instead of the PyTorch sampler. The TRTLLM sampler has a wide coverage of sampling strategies."
     )
-
-    kv_cache_dtype: str = Field(default="auto",
-                                description="Data type for KV cache.")
 
     enable_iter_perf_stats: bool = Field(
         default=False, description="Enable iteration performance statistics.")
@@ -2016,7 +2022,7 @@ class TorchLlmArgs(BaseLlmArgs):
             moe_backend=self.moe_config.backend,
             enable_mixed_sampler=self.enable_mixed_sampler,
             enable_trtllm_sampler=self.enable_trtllm_sampler,
-            kv_cache_dtype=self.kv_cache_dtype,
+            kv_cache_dtype=self.kv_cache_config.dtype,
             enable_iter_perf_stats=self.enable_iter_perf_stats,
             enable_iter_req_stats=self.enable_iter_req_stats,
             print_iter_log=self.print_iter_log,
