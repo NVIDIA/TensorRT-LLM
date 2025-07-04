@@ -1197,7 +1197,6 @@ class PyTorchModelEngine(ModelEngine):
             prompt_lengths.append(len(prompt_tokens))
             past_seen_token_num = begin_compute
             num_cached_tokens_per_seq.append(past_seen_token_num)
-            request.py_batch_idx = py_batch_idx(request)
 
             # Multimodal
             multimodal_params = MultimodalParams(
