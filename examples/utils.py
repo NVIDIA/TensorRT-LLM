@@ -581,4 +581,3 @@ def add_common_args(parser):
     parser.add_argument('--backend', type=str, default=None)
 
     return parser
-  # touch
