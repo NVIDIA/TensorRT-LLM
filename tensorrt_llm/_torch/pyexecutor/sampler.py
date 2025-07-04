@@ -18,7 +18,8 @@ from tensorrt_llm.bindings.executor import (DecodingConfig, DecodingMode,
                                             ExecutorConfig, FinishReason)
 from tensorrt_llm.bindings.internal.algorithms import CreateNewDecoderRequests
 from tensorrt_llm.bindings.internal.batch_manager import DecoderInputBuffers
-from tensorrt_llm.bindings.internal.runtime import (BufferManager, DecoderState,
+from tensorrt_llm.bindings.internal.runtime import (BufferManager, CudaEvent,
+                                                    DecoderState,
                                                     GptDecoderBatched)
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.mapping import Mapping
@@ -54,6 +55,9 @@ class Sampler(ABC):
 
     def setup_sampler_step(self, scheduled_requests: ScheduledRequests):
         pass
+
+    def get_cache_indirection(self) -> torch.Tensor | None:
+        return None
 
     @abstractmethod
     def sample_async(self, scheduled_requests: ScheduledRequests,
@@ -598,11 +602,31 @@ class TRTLLMSampler(Sampler):
             return req.sampling_config.beam_width
         return 0
 
+    def get_cache_indirection(self) -> torch.Tensor | None:
+        return self.store["decoder_state"].cache_indirection_output
+
+    def _update_cache_indirection_buffer(self,
+                                         scheduled_requests: ScheduledRequests):
+        # Copy cache indirection output to input
+        for request in scheduled_requests.generation_requests:
+            self.store["decoder_state"].cache_indirection_input[
+                request.seq_slot].copy_(
+                    self.store["decoder_state"].cache_indirection_output[
+                        request.seq_slot],
+                    non_blocking=True)
+
     @torch.inference_mode()
     def sample_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs) -> SampleStateTRTLLM:
         batch_size = scheduled_requests.batch_size
-
+        all_requests = scheduled_requests.all_requests()
+        beam_width = self.beam_width(all_requests)
+        if (batch_size > 1 and beam_width > 1
+                and any(request.py_return_log_probs
+                        for request in all_requests)):
+            raise ValueError(
+                "Beam search is not supported for multiple prompts and logprobs"
+            )
         self.setup_sampler_step(scheduled_requests.context_requests)
 
         num_context_logits = [1] * batch_size
@@ -620,6 +644,10 @@ class TRTLLMSampler(Sampler):
             model_outputs["logits"], logits_index)
 
         self.store["decoder_input_buffers"].logits = decoder_logits
+
+        # For beam search, cache indirection needs to be updated
+        if (beam_width > 1):
+            self._update_cache_indirection_buffer(scheduled_requests)
 
         decoding_input = self.algs.make_decoding_batch_input_output(
             scheduled_requests.context_requests,
@@ -683,6 +711,8 @@ class TRTLLMSampler(Sampler):
         finished_sum_host = state.host.finished_sum
         sequence_lengths_host_data = state.host.sequence_lengths
 
+        finalize_events = {}
+
         for request in requests:
             if request.is_context_init_state:
                 continue
@@ -692,12 +722,11 @@ class TRTLLMSampler(Sampler):
             current_num_of_tokens = request.max_beam_num_tokens
             num_new_tokens = [0] * beam_width
 
-            log_probs = []
+            log_probs = [[] for _ in range(beam_width)]
             cum_log_probs = []
 
             for beam in range(beam_width):
-                seq_len = sequence_lengths_host_data[seq_slot * beam_width +
-                                                     beam].item()
+                seq_len = sequence_lengths_host_data[seq_slot, beam].item()
                 seq_len = seq_len + 1 if self.is_trt_overlap else seq_len
                 num_new_tokens[beam] = min(
                     num_generated_tokens,
@@ -715,29 +744,26 @@ class TRTLLMSampler(Sampler):
                         begin_log_probs_offset = request.prompt_len if request.sampling_config.beam_width == 1 else 0
                         current_token = seq_len - request.prompt_len - num_new_tokens[
                             beam] + step
-
-                        log_probs.append({
+                        log_probs[beam].append({
                             new_token:
-                            Logprob(logprob=state.host.log_probs[seq_slot][beam]
+                            Logprob(logprob=state.host.log_probs[seq_slot, beam]
                                     [begin_log_probs_offset +
                                      current_token].item(),
                                     rank=1)
                         })
 
                 if request.py_return_log_probs:
-                    cum_log_probs.append(
-                        state.host.cum_log_probs[seq_slot * beam_width +
-                                                 beam].item())
+                    cum_log_probs.append(state.host.cum_log_probs[seq_slot,
+                                                                  beam].item())
 
                 finished_state = FinishedState(
-                    state.host.finish_reasons[seq_slot * beam_width +
-                                              beam].item())
+                    state.host.finish_reasons[seq_slot, beam].item())
                 if finished_state.is_finished:
                     finish_reason = finished_state.to_finish_reason()
                     request.set_finished_reason(finish_reason, beam)
 
             if request.py_return_log_probs:
-                request.py_result.append_log_probs([log_probs], cum_log_probs)
+                request.py_result.append_log_probs(log_probs, cum_log_probs)
 
             # Set number of tokens predicted per runtime iteration. Will be > 1 for speculative decoding.
             request.update_num_tokens_per_iteration(
@@ -750,3 +776,78 @@ class TRTLLMSampler(Sampler):
 
             if finished_sum_host[seq_slot] == beam_width:
                 request.state = LlmRequestState.GENERATION_COMPLETE
+                if beam_width > 1:
+                    finalize_events[
+                        request.request_id] = self._finalize_request(
+                            request, False)
+            elif request.streaming and beam_width > 1:
+                finalize_events[request.request_id] = self._finalize_request(
+                    request, True)
+        # post process all requests if necessary
+        if beam_width > 1:
+            for request in requests:
+                if request.request_id in finalize_events:
+                    self._post_process_request(
+                        request, finalize_events[request.request_id])
+
+    def _finalize_request(self, request: LlmRequest, streaming: bool):
+        """ Finalizes the request. This is necessary for beam search. """
+        seq_slot = request.seq_slot
+        event = self.algs.decoder.finalize(self.store["decoder_state"],
+                                           seq_slot, request.sampling_config,
+                                           streaming)
+        return event
+
+    def _post_process_request(self, request: LlmRequest,
+                              finalize_event: CudaEvent):
+        """ Post Process the request. Updates the sequence according to the beam search results.
+        request: LlmRequest which shall be post processed
+        finalize_event: CudaEvent to wait for the finalize step to finish
+        """
+        seq_slot = request.seq_slot
+        beam_width = request.sampling_config.beam_width
+        # synchronize on the finalize event before continuing the post processing.
+        finalize_event.synchronize()
+
+        # Get these values again, as they might have changed during the finalize step
+        output_ids_host = self.store["decoder_state"].gathered_ids.to('cpu')
+        sequence_lengths_host = self.store["decoder_state"].sequence_lengths.to(
+            'cpu')
+
+        if request.py_return_log_probs:
+            log_probs_host = self.store["decoder_state"].log_probs.to('cpu')
+            cum_log_probs_host = self.store["decoder_state"].cum_log_probs.to(
+                'cpu')
+
+        generated_tokens = [[0]] * beam_width
+        log_probs = [[] for _ in range(beam_width)]
+        cum_log_probs = []
+
+        for beam in range(beam_width):
+            # get the correct generated tokens for beam search
+            begin = request.py_prompt_len
+            generated_length = sequence_lengths_host[
+                seq_slot, beam].item() - request.py_prompt_len
+            end = begin + generated_length
+            generated_tokens[beam] = output_ids_host[seq_slot, beam,
+                                                     begin:end].tolist()
+
+            # get the correct log probs for beam search
+            if request.py_return_log_probs:
+                cum_log_probs.append(cum_log_probs_host[seq_slot, beam].item())
+
+                begin_log_probs_offset = request.prompt_len if request.sampling_config.beam_width == 1 else 0
+                for current_token, token in enumerate(generated_tokens[beam]):
+                    log_probs[beam].append({
+                        token:
+                        Logprob(
+                            logprob=log_probs_host[seq_slot,
+                                                   beam][begin_log_probs_offset
+                                                         +
+                                                         current_token].item(),
+                            rank=1)
+                    })
+        if request.py_return_log_probs:
+            request.py_result.set_log_probs(log_probs, cum_log_probs)
+
+        request.set_generated_tokens(generated_tokens)
