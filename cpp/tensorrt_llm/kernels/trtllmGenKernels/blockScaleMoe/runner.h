@@ -73,12 +73,13 @@ inline int32_t getMaxPermutedPaddedCount(
     return common::roundUp(expandedRowCount + maxPaddingRequired, padding);
 }
 
-inline int32_t getMaxNumCtasInBatchDim(int32_t numTokens, int32_t topK, int32_t numExperts, int32_t tileTokensDim)
+inline int32_t getMaxNumCtasInBatchDim(
+    int32_t numTokens, int32_t expertsPerToken, int32_t numExperts, int32_t tileTokensDim)
 {
     // Get maximum number of CTAs in batch dim per expert.
     auto const maxCtasInBatchDimPerExpert = common::ceilDiv(numTokens, tileTokensDim);
     // Get maximum enabled experts.
-    auto const maxEnabledExperts = std::min(numTokens * topK, numExperts);
+    auto const maxEnabledExperts = std::min(numTokens * expertsPerToken, numExperts);
     // Get maximum number of CTAs in batch dim.
     auto maxNumCtasInBatchDim = maxEnabledExperts * maxCtasInBatchDimPerExpert;
 
@@ -86,8 +87,8 @@ inline int32_t getMaxNumCtasInBatchDim(int32_t numTokens, int32_t topK, int32_t 
     // be routed to all the enabled experts. Instead we can essentially bound the number of CTAs
     // by permuted buffer size. However, this method will be overly pessimistic for low-token
     // counts
-    auto const tilesForPermutedBuffer
-        = common::ceilDiv(getMaxPermutedPaddedCount(numTokens, topK, numExperts, tileTokensDim), tileTokensDim);
+    auto const tilesForPermutedBuffer = common::ceilDiv(
+        getMaxPermutedPaddedCount(numTokens, expertsPerToken, numExperts, tileTokensDim), tileTokensDim);
 
     // Set maxNumCtasInBatchDim to be the minimum of the two methods
     maxNumCtasInBatchDim = std::min(maxNumCtasInBatchDim, tilesForPermutedBuffer);
@@ -103,12 +104,13 @@ public:
     explicit Runner(int32_t tileTokensDim);
 
     void run(void* routingLogits, void* routingBias, int32_t numTokens, int32_t numExperts, int32_t topK,
-        int32_t nGroups, int32_t topkGroups, int32_t localExpertOffset, int32_t localNumExperts,
-        float routedScalingFactor, int32_t* routingExpertIndexes, int32_t* expertCountHistogram,
-        int32_t* permutedIdxSize, int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx,
-        int32_t* permutedIdxToTokenIdx, void* expertWeights, int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx,
-        int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas, batchedGemm::trtllm::gen::Dtype dtypeElt,
-        bool useRoutingScalesOnInput, bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream);
+        int32_t numFusedSharedExpert, int32_t nGroups, int32_t topkGroups, int32_t localExpertOffset,
+        int32_t localNumExperts, float routedScalingFactor, int32_t* routingExpertIndexes,
+        int32_t* expertCountHistogram, int32_t* permutedIdxSize, int32_t* expandedIdxToPermutedIdx,
+        int32_t* permutedIdxToExpandedIdx, int32_t* permutedIdxToTokenIdx, void* expertWeights,
+        int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit,
+        int32_t* numNonExitingCtas, batchedGemm::trtllm::gen::Dtype dtypeElt, bool useRoutingScalesOnInput,
+        bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream);
 
 private:
     int32_t mTileTokensDim{8};
@@ -201,17 +203,25 @@ struct MoERunnerArgs
     void* gemm2_weights_scale = nullptr;
 
     int32_t num_tokens{0};
-    int32_t num_experts{0};
     int32_t hidden_size{0};
+    int32_t intermediate_size{0};
+
+    // The number of routed experts
+    int32_t num_experts{0};
+    // Will the shared expert be fused in batched gemms?
+    int32_t num_fused_shared_expert{0};
+    // The number of routed experts on this device
+    int32_t local_num_experts{0};
+    // The starting index of experts on this device
+    int32_t local_expert_offset{0};
+    // The number of routed experts per token
     // TODO: only compiled routing kernel supports top_k = 8
     int32_t top_k{0};
     int32_t n_group{0};
     // TODO: only compiled routing kernel supports topk_group = 4
     int32_t topk_group{0};
     float routed_scaling_factor{0.0f};
-    int32_t intermediate_size{0};
-    int32_t local_expert_offset{0};
-    int32_t local_num_experts{0};
+
     // TODO: support other types
     btg::Dtype mDtypeElt{btg::Dtype::Void};
     btg::Dtype mDtypeExpW{btg::Dtype::Bfloat16};

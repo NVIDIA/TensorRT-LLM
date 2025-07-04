@@ -32,10 +32,11 @@ std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routi
     torch::Tensor const& gemm1_weights_scale, torch::Tensor const& gemm2_weights,
     torch::Tensor const& gemm2_weights_scale, torch::Tensor const& output1_scales_scalar,
     torch::Tensor const& output1_scales_gate_scalar, torch::Tensor const& output2_scales_scalar,
-    int64_t const num_experts, int64_t const top_k, std::optional<int64_t> const n_group,
-    std::optional<int64_t> const topk_group, int64_t const intermediate_size, int64_t const local_expert_offset,
-    int64_t const local_num_experts, std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim,
-    int64_t const routing_method_type, bool const do_finalize)
+    int64_t const num_experts, int64_t const top_k, std::optional<int64_t> const num_fused_shared_expert,
+    std::optional<int64_t> const n_group, std::optional<int64_t> const topk_group, int64_t const intermediate_size,
+    int64_t const local_expert_offset, int64_t const local_num_experts,
+    std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim, int64_t const routing_method_type,
+    bool const do_finalize)
 {
     auto const sm = tensorrt_llm::common::getSMVersion();
     TORCH_CHECK(sm == 100, "Only SM100 is supported by FP4 block scale MOE");
@@ -80,6 +81,13 @@ std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routi
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::MoERunnerArgs args;
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::MoEWorkspace workspace;
 
+    int64_t const num_total_experts
+        = num_experts + (num_fused_shared_expert.value_or(0) > 0 ? num_fused_shared_expert.value() : 0);
+    int64_t const total_experts_per_token
+        = top_k + (num_fused_shared_expert.value_or(0) > 0 ? num_fused_shared_expert.value() : 0);
+    int64_t const num_total_local_experts
+        = local_num_experts + (num_fused_shared_expert.value_or(0) > 0 ? num_fused_shared_expert.value() : 0);
+
     // setup args
     // note: the assumption is that output data type is always Bfloat16 (the default)
     auto const routing_bias_dtype
@@ -99,6 +107,7 @@ std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routi
     // * 2 to compensate for the fact that sizeof(hidden_states.dtype) is 1 because we pack 2 e2m1 into 1 byte.
     args.hidden_size = hidden_states.sizes()[1] * 2;
     args.top_k = top_k;
+    args.num_fused_shared_expert = num_fused_shared_expert.value_or(0);
     args.n_group = n_group.value_or(1);
     args.topk_group = topk_group.value_or(top_k);
     args.local_expert_offset = local_expert_offset;
@@ -111,18 +120,18 @@ std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routi
         = at::detail::empty_cuda({num_experts}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
     int32_t max_num_padded_tokens
         = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getMaxPermutedPaddedCount(
-            args.num_tokens, top_k, num_experts, tile_tokens_dim);
+            args.num_tokens, total_experts_per_token, num_total_experts, tile_tokens_dim);
     at::Tensor total_num_padded_tokens
         = at::empty({}, at::TensorOptions().device(routing_logits.device()).dtype(at::ScalarType::Int));
     at::Tensor expanded_idx_to_permuted_idx = at::detail::empty_cuda(
-        {args.num_tokens, args.top_k}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
+        {args.num_tokens, total_experts_per_token}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
 
     at::Tensor permuted_idx_to_token_idx
         = at::detail::empty_cuda({max_num_padded_tokens}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
     at::Tensor expert_weights = at::detail::empty_cuda(
-        {args.num_tokens, args.top_k}, routing_bias_dtype, routing_logits.device(), std::nullopt);
+        {args.num_tokens, total_experts_per_token}, routing_bias_dtype, routing_logits.device(), std::nullopt);
     at::Tensor expert_indexes = at::detail::empty_cuda(
-        {args.num_tokens, args.top_k}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
+        {args.num_tokens, total_experts_per_token}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
     int64_t const size_of_expert_count_histogram = std::max(num_experts * 2, int64_t(256 * 2));
     at::Tensor expert_count_histogram = at::detail::empty_cuda({size_of_expert_count_histogram},
         at::ScalarType::Int, // 256 is the max number of threads per block and max number of experts
@@ -139,7 +148,7 @@ std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routi
         {max_num_padded_tokens, args.hidden_size}, at::ScalarType::BFloat16, hidden_states.device(), std::nullopt);
 
     int32_t max_num_ctas = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getMaxNumCtasInBatchDim(
-        args.num_tokens, args.top_k, args.num_experts, tile_tokens_dim);
+        args.num_tokens, total_experts_per_token, num_total_experts, tile_tokens_dim);
     at::Tensor cta_idx_xy_to_batch_idx
         = at::detail::empty_cuda({max_num_ctas}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
     at::Tensor cta_idx_xy_to_mn_limit
@@ -159,10 +168,11 @@ std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routi
 
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::Runner routing_runner(tile_tokens_dim);
     auto const& stream = at::cuda::getCurrentCUDAStream(routing_logits.get_device());
-    routing_runner.run(args.routing_logits, args.routing_bias, args.num_tokens, args.num_experts, args.top_k,
-        args.n_group, args.topk_group, args.local_expert_offset, args.local_num_experts, args.routed_scaling_factor,
-        expert_indexes.data_ptr<int>(), expert_count_histogram.data_ptr<int>(), total_num_padded_tokens.data_ptr<int>(),
-        expanded_idx_to_permuted_idx.data_ptr<int>(), nullptr, /*permuted_idx_to_expanded_idx.data_ptr<int>(),*/
+    routing_runner.run(args.routing_logits, args.routing_bias, args.num_tokens, num_experts, top_k,
+        args.num_fused_shared_expert, args.n_group, args.topk_group, args.local_expert_offset, args.local_num_experts,
+        args.routed_scaling_factor, expert_indexes.data_ptr<int>(), expert_count_histogram.data_ptr<int>(),
+        total_num_padded_tokens.data_ptr<int>(), expanded_idx_to_permuted_idx.data_ptr<int>(),
+        nullptr, /*permuted_idx_to_expanded_idx.data_ptr<int>(),*/
         permuted_idx_to_token_idx.data_ptr<int>(), expert_weights.data_ptr(), num_tokens_per_expert.data_ptr<int>(),
         cta_idx_xy_to_batch_idx.data_ptr<int>(), cta_idx_xy_to_mn_limit.data_ptr<int>(),
         num_non_exiting_ctas.data_ptr<int>(), args.mDtypeElt, false /* use_routing_scales_on_input */,
@@ -183,6 +193,7 @@ std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routi
     TORCH_CHECK(gemm1_weights.scalar_type() == FLOAT4_E2M1X2, "gemm1_weights must be byte.");
 
     TORCH_CHECK(gemm1_weights.dim() == 3, "gemm1_weights must be 3D.");
+    TORCH_CHECK(gemm1_weights.sizes()[0] == num_total_local_experts, "gemm1_weights has incorrect shape.");
     TORCH_CHECK(gemm1_weights.sizes()[1] % 2 == 0, "the second dimension of weights must be even.");
     TORCH_CHECK(intermediate_size == gemm1_weights.sizes()[1] / 2, "intermediate_size has incorrect dim 1.");
     // This check passes even though the actual shape of the weights[2] and hidden_states[1] is
@@ -193,7 +204,7 @@ std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routi
     TORCH_CHECK(gemm1_weights_scale.scalar_type() == at::ScalarType::Float8_e4m3fn, "gemm1_weights_scale must be fp8.");
 
     TORCH_CHECK(gemm1_weights_scale.dim() == 3, "gemm1_weights_scale must be 3D.");
-    TORCH_CHECK(gemm1_weights_scale.sizes()[0] == local_num_experts, "gemm1_weights_scale has incorrect dim 0.");
+    TORCH_CHECK(gemm1_weights_scale.sizes()[0] == num_total_local_experts, "gemm1_weights_scale has incorrect dim 0.");
     TORCH_CHECK(intermediate_size % 16 == 0, "the second dimension of weights must be a multiple of 16.");
     TORCH_CHECK(gemm1_weights_scale.sizes()[1] == 2 * intermediate_size, "gemm1_weights_scale has incorrect dim 1.");
     TORCH_CHECK(gemm1_weights_scale.sizes()[2] == args.hidden_size / 16, "gemm1_weights_scale has incorrect dim 2.");
@@ -201,6 +212,7 @@ std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routi
     TORCH_CHECK(gemm2_weights.scalar_type() == FLOAT4_E2M1X2, "gemm2_weights must be byte.");
 
     TORCH_CHECK(gemm2_weights.dim() == 3, "gemm2_weights must be 3D.");
+    TORCH_CHECK(gemm2_weights.sizes()[0] == num_total_local_experts, "gemm2_weights has incorrect shape.");
     // / 2 to compensate for the fact that we pack 2 e2m1 into 1 byte.
     TORCH_CHECK(gemm2_weights.sizes()[2] == intermediate_size / 2,
         "the third dimension of weights must be equal to intermediate_size.");
@@ -208,23 +220,25 @@ std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routi
     TORCH_CHECK(gemm2_weights_scale.scalar_type() == at::ScalarType::Float8_e4m3fn, "gemm2_weights_scale must be fp8.");
 
     TORCH_CHECK(gemm2_weights_scale.dim() == 3, "gemm2_weights_scale must be 3D.");
-    TORCH_CHECK(gemm2_weights_scale.sizes()[0] == local_num_experts, "gemm2_weights_scale has incorrect dim 0.");
+    TORCH_CHECK(gemm2_weights_scale.sizes()[0] == num_total_local_experts, "gemm2_weights_scale has incorrect dim 0.");
     TORCH_CHECK(gemm2_weights_scale.sizes()[1] == args.hidden_size, "gemm2_weights_scale has incorrect dim 1.");
     TORCH_CHECK(gemm2_weights_scale.sizes()[2] == intermediate_size / 16, "gemm2_weights_scale has incorrect dim 2.");
 
     TORCH_CHECK(output1_scales_scalar.scalar_type() == at::ScalarType::Float, "output1_scales_scalar must be float.");
     TORCH_CHECK(output1_scales_scalar.dim() == 1, "output1_scales_scalar must be 1D.");
-    TORCH_CHECK(output1_scales_scalar.sizes()[0] == local_num_experts, "output1_scales_scalar has incorrect dim 0.");
+    TORCH_CHECK(
+        output1_scales_scalar.sizes()[0] == num_total_local_experts, "output1_scales_scalar has incorrect dim 0.");
 
     TORCH_CHECK(
         output1_scales_gate_scalar.scalar_type() == at::ScalarType::Float, "output1_scales_gate_scalar must be float.");
     TORCH_CHECK(output1_scales_gate_scalar.dim() == 1, "output1_scales_gate_scalar must be 1D.");
-    TORCH_CHECK(
-        output1_scales_gate_scalar.sizes()[0] == local_num_experts, "output1_scales_gate_scalar has incorrect dim 0.");
+    TORCH_CHECK(output1_scales_gate_scalar.sizes()[0] == num_total_local_experts,
+        "output1_scales_gate_scalar has incorrect dim 0.");
 
     TORCH_CHECK(output2_scales_scalar.scalar_type() == at::ScalarType::Float, "output2_scales_scalar must be float.");
     TORCH_CHECK(output2_scales_scalar.dim() == 1, "output2_scales_scalar must be 1D.");
-    TORCH_CHECK(output2_scales_scalar.sizes()[0] == local_num_experts, "output2_scales_scalar has incorrect dim 0.");
+    TORCH_CHECK(
+        output2_scales_scalar.sizes()[0] == num_total_local_experts, "output2_scales_scalar has incorrect dim 0.");
 
     // allocate output
     at::Tensor output = at::detail::empty_cuda(
@@ -310,6 +324,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor output2_scale_scalar,"
         "int num_experts,"
         "int top_k,"
+        "int? num_fused_shared_expert,"
         "int? n_group,"
         "int? topk_group,"
         "int intermediate_size,"

@@ -47,23 +47,29 @@ struct Data
     // optional: if `nullptr`, it is not filled
     // dim: [mNumTokens, mTopK]
     int32_t* mPtrExpertIdx{nullptr};
+
     // optional: only used as an intermediate buffer when the number of tokens is large.
     // dim: [2*NumThreads] = [512]
     int32_t* mPtrExpertCounts{nullptr};
+
     // optional: if `nullptr`, it is not filled
     // dim: [1]
     int32_t* mPtrPermutedIdxSize{nullptr};
+
     // optional: if `nullptr`, it is not filled
-    // dim: [mNumTokens * mTopK]
+    // dim: [mNumTokens * mTotalExpertsPerToken]
     int32_t* mPtrExpandedIdxToPermutedIdx{nullptr};
+
     // optional: if `nullptr`, it is not filled
-    // dim: [mNumTokens * mTopK + (mNumExperts << mPaddingLog2) - mNumExperts]
+    // dim: [mNumTokens * mTotalExpertsPerToken + (mNumExperts << mPaddingLog2) - mNumExperts]
     int32_t* mPtrPermutedIdxToTokenIdx{nullptr};
+
     // optional: if `nullptr`, it is not filled
     // dim: [mNumLocalExperts * (2 ^ mLocalExpertsStrideLog2), mNumTokens]
     void* mPtrExpertWeightsFull{nullptr};
+
     // optional: if `nullptr`, it is not filled
-    // dim: [mNumTokens, mTopK]
+    // dim: [mNumTokens, mTotalExpertsPerToken]
     void* mPtrExpertWeights{nullptr};
 
     //
@@ -82,14 +88,36 @@ struct Data
 
     int32_t mNumTokens;
     int32_t mHiddenDim;
+
+    // The number of routed experts
     int32_t mNumExperts;
-    int32_t mNumExpertGroups;
-    int32_t mNumLimitedGroups;
-    int32_t mTopK;
-    int32_t mPaddingLog2;
-    int32_t mLocalExpertsStartIdx;
-    int32_t mLocalExpertsStrideLog2;
+    // The number of shared experts to fuse into batched gemm
+    int32_t mNumFusedSharedExperts;
+    // The number of routed experts on this device
     int32_t mNumLocalExperts;
+    // The starting index of this devices local experts
+    int32_t mLocalExpertsStartIdx;
+    // The log2 of the stride between experts on this device
+    int32_t mLocalExpertsStrideLog2;
+    // The token offset for shared expert
+    //
+    // When using expert parallelism with a fused shared expert, all devices will include the shared expect; however,
+    // only a subset of tokens will be assigned to the shared expert on each device.
+    //
+    int32_t mSharedExpertTokenOffset;
+    // The number of tokens for shared expert on this device
+    int32_t mSharedExpertNumTokens;
+    // The number of routed experts per token
+    int32_t mTopK;
+    // The total number of experts per token (potentially including fused shared expert)
+    int32_t mTotalExpertsPerToken;
+    // The number of expert groups
+    int32_t mNumExpertGroups;
+    // The number of groups selected
+    int32_t mNumLimitedGroups;
+    // The log2 of the padding in the permuted buffer
+    int32_t mPaddingLog2;
+
     float mRouteScale;
     bool mUseRoutingSoftmax;
 
@@ -122,17 +150,22 @@ struct KernelParams
     TypeExpW const* mPtrRoutingBias;
     float const* mPtrScores;
 
+    int32_t mNumTokens;
     int32_t mHiddenDim;
+
     int32_t mNumExperts;
+    int32_t mNumFusedSharedExperts;
+    int32_t mNumLocalExperts;
+    int32_t mLocalExpertsStartIdx;
+    int32_t mLocalExpertsStrideLog2;
+    int32_t mSharedExpertTokenOffset;
+    int32_t mSharedExpertNumTokens;
+    trtllm::dev::IntFastDiv mTopK;
+    int32_t mTotalExpertsPerToken;
     int32_t mNumExpertGroups;
     int32_t mNumExpertsPerGroup;
     int32_t mNumLimitedGroups;
-    trtllm::dev::IntFastDiv mTopK;
     int32_t mPaddingLog2;
-    int32_t mLocalExpertsStartIdx;
-    int32_t mLocalExpertsStrideLog2;
-    int32_t mNumLocalExperts;
-    int32_t mNumTokens;
     float mRouteScale;
     bool mAllToAllRouteAct;
 
@@ -159,16 +192,21 @@ struct KernelParams
         params.mPtrScores = data.mPtrScores;
 
         params.mHiddenDim = data.mHiddenDim;
+        params.mNumTokens = data.mNumTokens;
+
         params.mNumExperts = data.mNumExperts;
+        params.mNumFusedSharedExperts = data.mNumFusedSharedExperts;
+        params.mNumLocalExperts = data.mNumLocalExperts;
+        params.mLocalExpertsStartIdx = data.mLocalExpertsStartIdx;
+        params.mLocalExpertsStrideLog2 = data.mLocalExpertsStrideLog2;
+        params.mSharedExpertTokenOffset = data.mSharedExpertTokenOffset;
+        params.mSharedExpertNumTokens = data.mSharedExpertNumTokens;
+        params.mTopK = trtllm::dev::IntFastDiv(data.mTopK);
+        params.mTotalExpertsPerToken = data.mTotalExpertsPerToken;
         params.mNumExpertGroups = data.mNumExpertGroups;
         params.mNumExpertsPerGroup = data.mNumExperts / data.mNumExpertGroups;
         params.mNumLimitedGroups = data.mNumLimitedGroups;
-        params.mTopK = trtllm::dev::IntFastDiv(data.mTopK);
         params.mPaddingLog2 = data.mPaddingLog2;
-        params.mLocalExpertsStartIdx = data.mLocalExpertsStartIdx;
-        params.mLocalExpertsStrideLog2 = data.mLocalExpertsStrideLog2;
-        params.mNumLocalExperts = data.mNumLocalExperts;
-        params.mNumTokens = data.mNumTokens;
         params.mRouteScale = data.mRouteScale;
         params.mAllToAllRouteAct = data.mAllToAllRouteAct;
         return params;

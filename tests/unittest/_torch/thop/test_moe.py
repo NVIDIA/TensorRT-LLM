@@ -76,30 +76,53 @@ class moe_args_dequant:
         self.use_routing_scales_on_input = use_routing_scales_on_input
 
 
-def routing_reference(expertLogits, topK, padding):
+def routing_reference(expertLogits, topK, padding, num_fused_shared_experts=0):
     originalDevice = expertLogits.device
     expertLogits = expertLogits.cpu()
     numTokens, numExperts = expertLogits.shape
     assert topK <= numExperts
 
-    numTokensPerExpert = torch.zeros(numExperts, dtype=torch.int64)
-    expandedTokenIdxToExpert = -torch.ones(numTokens * topK, dtype=torch.int64)
-    expandedTokenIdxToIdxInExpert = -torch.ones(numTokens * topK,
-                                                dtype=torch.int64)
+    numTotalExperts = numExperts + num_fused_shared_experts
+    totalExpertsPerToken = topK + num_fused_shared_experts
+
+    numTokensPerExpert = torch.zeros(numTotalExperts, dtype=torch.int64)
+    expandedTokenIdxToExpert = -torch.ones(numTokens * totalExpertsPerToken,
+                                           dtype=torch.int64)
+    expandedTokenIdxToIdxInExpert = -torch.ones(
+        numTokens * totalExpertsPerToken, dtype=torch.int64)
 
     topKLogits, topKIndices = torch.topk(expertLogits, topK, dim=1)
+    if num_fused_shared_experts > 0:
+        # Shared experts will use weight of 1.0
+        sharedLogits = torch.ones(numTokens,
+                                  num_fused_shared_experts,
+                                  dtype=topKLogits.dtype)
+        topKLogits = torch.cat((topKLogits, sharedLogits), dim=1)
+        assert numTokens == topKLogits.shape[0]
+        assert totalExpertsPerToken == topKLogits.shape[1]
+
+        # Shared experts will have index starting at number of local experts
+        sharedIndices = torch.range(numExperts,
+                                    numExperts + num_fused_shared_experts - 1,
+                                    dtype=topKIndices.dtype)
+        sharedIndices = torch.unsqueeze(sharedIndices, 0)
+        sharedIndices = sharedIndices.repeat(numTokens, 1)
+        topKIndices = torch.cat((topKIndices, sharedIndices), dim=1)
+        assert numTokens == topKIndices.shape[0]
+        assert totalExpertsPerToken == topKIndices.shape[1]
+
     for tokenIdx in range(numTokens):
-        for k in range(topK):
-            expandedIdx = tokenIdx * topK + k
+        for k in range(totalExpertsPerToken):
+            expandedIdx = tokenIdx * totalExpertsPerToken + k
             expertIndex = topKIndices[tokenIdx, k]
             expandedTokenIdxToExpert[expandedIdx] = expertIndex
             expandedTokenIdxToIdxInExpert[expandedIdx] = numTokensPerExpert[
                 expertIndex]
             numTokensPerExpert[expertIndex] += 1
 
-    paddedTokensPerExpertPrefixSum = torch.zeros(numExperts + 1,
+    paddedTokensPerExpertPrefixSum = torch.zeros(numTotalExperts + 1,
                                                  dtype=torch.int64)
-    for ii in range(numExperts):
+    for ii in range(numTotalExperts):
 
         def divUpMul(a, b):
             return (a + b - 1) // b * b
@@ -107,16 +130,16 @@ def routing_reference(expertLogits, topK, padding):
         paddedTokensPerExpertPrefixSum[
             ii + 1] = paddedTokensPerExpertPrefixSum[ii] + divUpMul(
                 numTokensPerExpert[ii], padding)
-    permutedBufferSize = paddedTokensPerExpertPrefixSum[numExperts]
+    permutedBufferSize = paddedTokensPerExpertPrefixSum[numTotalExperts]
 
-    expandedTokenIdxToPermutedIdx = -torch.ones(numTokens * topK,
-                                                dtype=torch.int64)
+    expandedTokenIdxToPermutedIdx = -torch.ones(
+        numTokens * totalExpertsPerToken, dtype=torch.int64)
     permutedIdxToExpandedIdx = -torch.ones(permutedBufferSize,
                                            dtype=torch.int64)
     permutedIdxToTokenIdx = -torch.ones(permutedBufferSize, dtype=torch.int64)
     for tokenIdx in range(numTokens):
-        for k in range(topK):
-            expandedIdx = tokenIdx * topK + k
+        for k in range(totalExpertsPerToken):
+            expandedIdx = tokenIdx * totalExpertsPerToken + k
             expert = expandedTokenIdxToExpert[expandedIdx]
             offsetWithinExpert = expandedTokenIdxToIdxInExpert[expandedIdx]
             offsetForExpert = paddedTokensPerExpertPrefixSum[expert]
@@ -194,7 +217,8 @@ def routing_reference_no_aux(expert_logits,
                              top_k_groups,
                              routed_scaling,
                              padding,
-                             use_routing_scales_on_input=False):
+                             use_routing_scales_on_input=False,
+                             num_fused_shared_experts=0):
     routing_logits = expert_logits.to(dtype=torch.float, device='cuda')
     if use_routing_scales_on_input:
         # if using routing scales on input, topK == 1 and the score is a plain sigmoid
@@ -202,7 +226,8 @@ def routing_reference_no_aux(expert_logits,
     else:
         scores = noaux_tc_ref(routing_logits, routing_bias, n_groups,
                               top_k_groups, top_k, routed_scaling)
-    permute_info = routing_reference(scores, top_k, padding)
+    permute_info = routing_reference(scores, top_k, padding,
+                                     num_fused_shared_experts)
     return permute_info, scores
 
 
@@ -571,8 +596,11 @@ def quant_dequant_per_tensor_fp8(a):
     getSMVersion(),
 )
 @pytest.mark.parametrize("num_tokens", [16, 64, 1024, 4096])
-@pytest.mark.parametrize("expert_info", [(32, 8, 4, 8), (32, 1, 1, 5),
-                                         (72, 1, 1, 6), (256, 8, 4, 8)])
+@pytest.mark.parametrize("expert_info", [(32, 8, 4, 8, 0), (32, 1, 1, 5, 0),
+                                         (72, 1, 1, 6, 0), (256, 8, 4, 8, 0),
+                                         (32, 8, 4, 8, 1), (32, 1, 1, 5, 1),
+                                         (72, 1, 1, 6, 1), (32, 8, 4, 8, 2),
+                                         (32, 1, 1, 5, 2)])
 @pytest.mark.parametrize("hidden_size", [512])
 @pytest.mark.parametrize("intermediate_size", [512])
 @pytest.mark.parametrize("use_autotune", [True, False],
@@ -584,7 +612,7 @@ def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size,
     #
     # Data Generation
     #
-    num_experts, n_groups, top_k_groups, top_k = expert_info
+    num_experts, n_groups, top_k_groups, top_k, num_fused_shared_experts = expert_info
     padding = 8
     routed_scaling = 2.5
     routing_method_type = RoutingMethodType.DeepSeekV3
@@ -598,6 +626,9 @@ def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size,
     assert num_experts % 4 == 0
     assert top_k < (top_k_groups * num_experts / n_groups)
 
+    total_experts_per_token = top_k + num_fused_shared_experts
+    num_experts_total = num_experts + num_fused_shared_experts
+
     expert_logits = torch.randn((num_tokens, num_experts),
                                 device='cuda').to(torch.float)
     routing_bias = torch.randn(num_experts, device='cuda', dtype=torch.bfloat16)
@@ -608,33 +639,41 @@ def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size,
         (hidden_size // 128, num_tokens), device='cuda').to(torch.float)
 
     gemm1_weights = torch.randn(
-        (num_experts, 2 * intermediate_size, hidden_size),
+        (num_experts_total, 2 * intermediate_size, hidden_size),
         device='cuda').to(torch.float8_e4m3fn)
     gemm1_scales = 2 * torch.rand(
-        (num_experts, 2 * intermediate_size // 128, hidden_size // 128),
+        (num_experts_total, 2 * intermediate_size // 128, hidden_size // 128),
         device='cuda').to(torch.float)
-    gemm2_weights = torch.randn((num_experts, hidden_size, intermediate_size),
-                                device='cuda').to(torch.float8_e4m3fn)
+    gemm2_weights = torch.randn(
+        (num_experts_total, hidden_size, intermediate_size),
+        device='cuda').to(torch.float8_e4m3fn)
     gemm2_scales = 2 * torch.rand(
-        (num_experts, hidden_size // 128, intermediate_size // 128),
+        (num_experts_total, hidden_size // 128, intermediate_size // 128),
         device='cuda').to(torch.float)
 
-    permute_info, scores = routing_reference_no_aux(expert_logits, routing_bias,
-                                                    top_k, n_groups,
-                                                    top_k_groups,
-                                                    routed_scaling, padding)
+    permute_info, scores = routing_reference_no_aux(
+        expert_logits,
+        routing_bias,
+        top_k,
+        n_groups,
+        top_k_groups,
+        routed_scaling,
+        padding,
+        num_fused_shared_experts=num_fused_shared_experts)
 
-    args = moe_args(num_tokens, num_experts, hidden_size, intermediate_size,
-                    top_k, padding, hidden_states, hidden_states_scale, None,
-                    scores, gemm1_weights, gemm1_scales, None, gemm2_weights,
+    args = moe_args(num_tokens, num_experts_total, hidden_size,
+                    intermediate_size, total_experts_per_token, padding,
+                    hidden_states, hidden_states_scale, None, scores,
+                    gemm1_weights, gemm1_scales, None, gemm2_weights,
                     gemm2_scales, None, permute_info, False)
 
     with autotune(use_autotune):
         output = torch.ops.trtllm.fp8_block_scale_moe_runner(
             expert_logits, routing_bias, hidden_states, hidden_states_scale,
             gemm1_weights, gemm1_scales, gemm2_weights, gemm2_scales,
-            num_experts, top_k, n_groups, top_k_groups, intermediate_size, 0,
-            num_experts, routed_scaling, tile_tokens_dim, routing_method_type)
+            num_experts, top_k, num_fused_shared_experts, n_groups,
+            top_k_groups, intermediate_size, 0, num_experts, routed_scaling,
+            tile_tokens_dim, routing_method_type)
 
     output_dequant_actual = output.to(torch.float)
     #
@@ -686,6 +725,7 @@ def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size,
                 "top_k_groups": 4,
                 "routed_scaling": 2.5,
                 "has_routing_bias": True,
+                "num_fused_shared_experts": 0,
                 "routing_method_type": RoutingMethodType.DeepSeekV3
             },
             id="RoutingDSv3"),
@@ -698,9 +738,36 @@ def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size,
                 "top_k_groups": 1,
                 "routed_scaling": 2.5,
                 "has_routing_bias": True,
+                "num_fused_shared_experts": 0,
                 "routing_method_type": RoutingMethodType.DeepSeekV3
             },
             id="RoutingDSlite"),
+        pytest.param(
+            {
+                "num_experts": 72,
+                "top_k": 6,
+                "padding": 8,
+                "n_groups": 1,
+                "top_k_groups": 1,
+                "routed_scaling": 2.5,
+                "has_routing_bias": True,
+                "num_fused_shared_experts": 1,
+                "routing_method_type": RoutingMethodType.DeepSeekV3
+            },
+            id="RoutingDSliteSharedExpert1"),
+        pytest.param(
+            {
+                "num_experts": 72,
+                "top_k": 6,
+                "padding": 8,
+                "n_groups": 1,
+                "top_k_groups": 1,
+                "routed_scaling": 2.5,
+                "has_routing_bias": True,
+                "num_fused_shared_experts": 2,
+                "routing_method_type": RoutingMethodType.DeepSeekV3
+            },
+            id="RoutingDSliteSharedExpert2"),
         pytest.param(
             {
                 "num_experts": 128,
@@ -710,6 +777,7 @@ def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size,
                 "top_k_groups": None,
                 "routed_scaling": None,
                 "has_routing_bias": False,
+                "num_fused_shared_experts": 0,
                 "routing_method_type": RoutingMethodType.Renormalize
             },
             id="RoutingRenormalize"),
@@ -722,6 +790,7 @@ def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size,
                 "top_k_groups": None,
                 "routed_scaling": None,
                 "has_routing_bias": False,
+                "num_fused_shared_experts": 0,
                 "routing_method_type": RoutingMethodType.RenormalizeNaive
             },
             id="RoutingRenormalizeNaive"),
@@ -741,6 +810,7 @@ def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
     top_k_groups = routing_info["top_k_groups"]
     routed_scaling = routing_info["routed_scaling"]
     num_experts = routing_info["num_experts"]
+    num_fused_shared_experts = routing_info["num_fused_shared_experts"]
     routing_method_type = routing_info["routing_method_type"]
     tile_tokens_dim = 8
 
@@ -752,6 +822,9 @@ def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
         assert num_experts % n_groups == 0
         assert num_experts % 4 == 0
         assert top_k < (top_k_groups * num_experts / n_groups)
+
+    total_experts_per_token = top_k + num_fused_shared_experts
+    num_experts_total = num_experts + num_fused_shared_experts
 
     if routing_method_type == RoutingMethodType.DeepSeekV3:
         expert_logits = torch.randn((num_tokens, num_experts),
@@ -770,12 +843,13 @@ def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
     hidden_states = 2 * torch.randn(
         (num_tokens, hidden_size), device='cuda', dtype=torch.bfloat16)
     gemm1_weights = torch.randn(
-        (num_experts, 2 * intermediate_size, hidden_size),
+        (num_experts_total, 2 * intermediate_size, hidden_size),
         device='cuda',
         dtype=torch.bfloat16)
-    gemm2_weights = torch.randn((num_experts, hidden_size, intermediate_size),
-                                device='cuda',
-                                dtype=torch.bfloat16)
+    gemm2_weights = torch.randn(
+        (num_experts_total, hidden_size, intermediate_size),
+        device='cuda',
+        dtype=torch.bfloat16)
 
     use_ue8m0 = False
     # Quantize hidden states. Produces scales for activations in 128x4 layout for ref impl.
@@ -793,37 +867,42 @@ def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
 
     # Quantize the weights for FC1. Produces scales for weights in 128x4 layout for ref impl.
     gemm1_weights_fp4_bytes, gemm1_scales_fp4_bytes, gemm1_scales_global = quant_fp4_batches(
-        gemm1_weights, num_experts, use_ue8m0, True)
+        gemm1_weights, num_experts_total, use_ue8m0, True)
     # We do it twice to get the linear layout for scales for the FP4 kernels.
     _, gemm1_scales_linear_fp4_bytes, _ = quant_fp4_batches(
-        gemm1_weights, num_experts, use_ue8m0, False)
+        gemm1_weights, num_experts_total, use_ue8m0, False)
 
     gemm1_weights_fp4 = gemm1_weights_fp4_bytes.view(
-        torch.float8_e4m3fn).reshape(num_experts, 2 * intermediate_size,
+        torch.float8_e4m3fn).reshape(num_experts_total, 2 * intermediate_size,
                                      hidden_size // 2)  # packed fp4
     gemm1_scales_linear_fp4 = gemm1_scales_linear_fp4_bytes.view(
-        torch.float8_e4m3fn).reshape(num_experts, 2 * intermediate_size,
+        torch.float8_e4m3fn).reshape(num_experts_total, 2 * intermediate_size,
                                      hidden_size // 16)  # fp8 scaling factors
 
     # Quantize the weights for FC2. Produces scales for weights in 128x4 layout for ref impl.
     gemm2_weights_fp4_bytes, gemm2_scales_fp4_bytes, gemm2_scales_global = quant_fp4_batches(
-        gemm2_weights, num_experts, use_ue8m0, True)
+        gemm2_weights, num_experts_total, use_ue8m0, True)
     # We do it twice to get the linear layout for scales for the FP4 kernels.
     _, gemm2_scales_linear_fp4_bytes, _ = quant_fp4_batches(
-        gemm2_weights, num_experts, use_ue8m0, False)
+        gemm2_weights, num_experts_total, use_ue8m0, False)
 
     gemm2_weights_fp4 = gemm2_weights_fp4_bytes.view(
-        torch.float8_e4m3fn).reshape(num_experts, hidden_size,
+        torch.float8_e4m3fn).reshape(num_experts_total, hidden_size,
                                      intermediate_size // 2)  # packed fp4
     gemm2_scales_linear_fp4 = gemm2_scales_linear_fp4_bytes.view(
-        torch.float8_e4m3fn).reshape(num_experts, hidden_size,
+        torch.float8_e4m3fn).reshape(num_experts_total, hidden_size,
                                      intermediate_size //
                                      16)  # fp8 scaling factors
     if routing_method_type == RoutingMethodType.DeepSeekV3:
-        permute_info, scores = routing_reference_no_aux(expert_logits,
-                                                        routing_bias, top_k,
-                                                        n_groups, top_k_groups,
-                                                        routed_scaling, padding)
+        permute_info, scores = routing_reference_no_aux(
+            expert_logits,
+            routing_bias,
+            top_k,
+            n_groups,
+            top_k_groups,
+            routed_scaling,
+            padding,
+            num_fused_shared_experts=num_fused_shared_experts)
     elif routing_method_type == RoutingMethodType.Renormalize:
         permute_info, scores = routing_reference_renormalize(
             expert_logits, top_k, num_experts, padding)
@@ -831,13 +910,13 @@ def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
         permute_info, scores = routing_reference_renormalize_naive(
             expert_logits, top_k, num_experts, padding)
 
-    args = moe_args(num_tokens, num_experts, hidden_size, intermediate_size,
-                    top_k, padding, hidden_states_fp4_bytes,
-                    hidden_states_scale_fp4_bytes, hidden_states_scale_global,
-                    scores, gemm1_weights_fp4_bytes, gemm1_scales_fp4_bytes,
-                    gemm1_scales_global, gemm2_weights_fp4_bytes,
-                    gemm2_scales_fp4_bytes, gemm2_scales_global, permute_info,
-                    False)
+    args = moe_args(num_tokens, num_experts_total, hidden_size,
+                    intermediate_size, total_experts_per_token, padding,
+                    hidden_states_fp4_bytes, hidden_states_scale_fp4_bytes,
+                    hidden_states_scale_global, scores, gemm1_weights_fp4_bytes,
+                    gemm1_scales_fp4_bytes, gemm1_scales_global,
+                    gemm2_weights_fp4_bytes, gemm2_scales_fp4_bytes,
+                    gemm2_scales_global, permute_info, False)
     #
     # Run the reference implementations
     #
@@ -851,7 +930,7 @@ def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
     # Reorder rows of W1 and scales for fused gated activation
     gemm1_weights_fp4_interleaved = []
     gemm1_scales_fp4_interleaved = []
-    for i in range(num_experts):
+    for i in range(num_experts_total):
         gemm1_weights_fp4_interleaved.append(
             reorder_rows_for_gated_act_gemm(gemm1_weights_fp4[i].clone()))
         gemm1_scales_fp4_interleaved.append(
@@ -859,11 +938,11 @@ def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
 
     # Stack weights and scales for all experts
     gemm1_weights_fp4_interleaved = torch.stack(
-        gemm1_weights_fp4_interleaved).reshape(num_experts,
+        gemm1_weights_fp4_interleaved).reshape(num_experts_total,
                                                2 * intermediate_size,
                                                hidden_size // 2)
     gemm1_scales_fp4_interleaved = torch.stack(
-        gemm1_scales_fp4_interleaved).reshape(num_experts,
+        gemm1_scales_fp4_interleaved).reshape(num_experts_total,
                                               2 * intermediate_size,
                                               hidden_size // 16)
 
@@ -872,7 +951,7 @@ def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
     gemm1_scales_fp4_shuffled = []
     gemm2_weights_fp4_shuffled = []
     gemm2_scales_fp4_shuffled = []
-    for i in range(num_experts):
+    for i in range(num_experts_total):
         gemm1_weights_fp4_shuffled.append(
             shuffle_matrix_a(gemm1_weights_fp4_interleaved[i].view(torch.uint8),
                              epilogue_tile_m))
@@ -891,12 +970,12 @@ def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
     # Stack weights for all experts
     gemm1_weights_fp4_shuffled = torch.stack(gemm1_weights_fp4_shuffled)
     gemm1_scales_fp4_shuffled = torch.stack(gemm1_scales_fp4_shuffled).view(
-        torch.float8_e4m3fn).reshape(num_experts, 2 * intermediate_size,
+        torch.float8_e4m3fn).reshape(num_experts_total, 2 * intermediate_size,
                                      hidden_size // 16)
 
     gemm2_weights_fp4_shuffled = torch.stack(gemm2_weights_fp4_shuffled)
     gemm2_scales_fp4_shuffled = torch.stack(gemm2_scales_fp4_shuffled).view(
-        torch.float8_e4m3fn).reshape(num_experts, hidden_size,
+        torch.float8_e4m3fn).reshape(num_experts_total, hidden_size,
                                      intermediate_size // 16)
 
     #
@@ -930,6 +1009,7 @@ def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
         scale_c_fc2,
         num_experts,
         top_k,
+        num_fused_shared_experts,
         n_groups,
         top_k_groups,
         intermediate_size,
@@ -1082,12 +1162,13 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
                                                       args.gemm2_scales_global)
 
     output = torch.ops.trtllm.fp8_per_tensor_scale_moe_runner(
-        expert_logits.to(torch.bfloat16) if use_routing_scales_on_input else
-        expert_logits, routing_bias, hidden_states_quant,
-        gemm1_weights_fp8_shuffled, scale_c_fc1, scale_gate_fc1,
-        gemm2_weights_fp8_shuffled, scale_c_fc2, num_experts, top_k, n_groups,
-        top_k_groups, intermediate_size, 0, num_experts, routed_scaling,
-        use_routing_scales_on_input, tile_tokens_dim, routing_method_type)
+        expert_logits.to(torch.bfloat16)
+        if use_routing_scales_on_input else expert_logits, routing_bias,
+        hidden_states_quant, gemm1_weights_fp8_shuffled, scale_c_fc1,
+        scale_gate_fc1, gemm2_weights_fp8_shuffled, scale_c_fc2, num_experts,
+        top_k, 0, n_groups, top_k_groups, intermediate_size, 0, num_experts,
+        routed_scaling, use_routing_scales_on_input, tile_tokens_dim,
+        routing_method_type)
 
     output_dequant_actual = output.to(torch.float)
 
