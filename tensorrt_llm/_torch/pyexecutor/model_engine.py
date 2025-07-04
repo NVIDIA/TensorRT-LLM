@@ -1456,8 +1456,7 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.kv_cache_params = KVCacheParams(
             use_cache=True,
             num_cached_tokens_per_seq=num_cached_tokens_per_seq,
-            num_extra_kv_tokens=0 if self.spec_config is None else
-            get_num_extra_kv_tokens(self.spec_config))
+            num_extra_kv_tokens=get_num_extra_kv_tokens(self.spec_config))
         attn_metadata.kv_cache_manager = kv_cache_manager
 
         attn_metadata.prepare()

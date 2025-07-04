@@ -176,8 +176,7 @@ class KVCacheManager(BaseResourceManager):
         # draft/target layers. Add extra tokens to haddle this issue.
         # Import here to avoid circular imports
         from ..speculative import get_num_extra_kv_tokens
-        self.num_extra_kv_tokens = 0 if spec_config is None else get_num_extra_kv_tokens(
-            spec_config)
+        self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
         self.max_num_tokens = max_num_tokens
 

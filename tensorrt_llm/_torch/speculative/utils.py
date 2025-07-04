@@ -106,7 +106,8 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
 def get_spec_decoder(sampler_args: TorchSampler.Args,
                      spec_config: "DecodingBaseConfig"):
     if spec_config.spec_dec_mode.is_mtp():
-        return MTPSampler(sampler_args, nextn=spec_config.max_draft_len)
+        return MTPSampler(sampler_args,
+                          nextn=spec_config.num_nextn_predict_layers)
     if spec_config.spec_dec_mode.is_eagle3():
         # TorchSampler handles Eagle3 gracefully, by integrating d2t into the sampling process
         return TorchSampler(sampler_args)
@@ -127,7 +128,7 @@ def get_spec_drafter(model_engine, spec_resource_manager=None):
 
 def get_num_spec_layers(spec_config):
     if spec_config.spec_dec_mode.is_mtp():
-        return spec_config.max_draft_len
+        return spec_config.num_nextn_predict_layers
     if spec_config.spec_dec_mode.is_eagle3_one_model():
         return 1
     return 0
@@ -160,6 +161,8 @@ def get_num_extra_kv_tokens(spec_config):
     Implementation detail for one model implementations of speculative decoding. Extra
     KV cache tokens are required.
     """
+    if spec_config is None:
+        return 0
     if spec_config.spec_dec_mode.is_eagle3_one_model(
     ) or spec_config.spec_dec_mode.is_mtp_eagle():
         return spec_config.max_draft_len - 1
