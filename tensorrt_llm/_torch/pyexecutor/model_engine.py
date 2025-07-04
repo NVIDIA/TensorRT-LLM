@@ -18,9 +18,9 @@ import psutil
 import safetensors
 import torch
 import torch._dynamo.config
+import tqdm
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
 from tensorrt_llm._torch.speculative.mtp import SampleStateTensorsMTP
 from tensorrt_llm._utils import (is_trace_enabled, local_mpi_rank,
@@ -48,7 +48,7 @@ from ..metadata import KVCacheParams
 from ..model_config import ModelConfig, MoeLoadBalancerConfig
 from ..models import AutoModelForCausalLM
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
-                                     timing)
+                                     run_concurrently, timing)
 from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, MoeLoadBalancerIterContext, maybe_create_moe_load_balancer)
 from ..speculative import SpecConfig, SpecMetadata, get_spec_metadata
@@ -180,10 +180,19 @@ def load_weights(checkpoint_dir: str):
                 f"Prefetching {prefetch_size / (1024**3):.2f}GB checkpoint files."
             )
             prefetch_files(weight_files)
-        for file in weight_files:
-            logger.info(f"Loading {file}")
-            part_weights = safetensors.torch.load_file(file)
-            weights.update(part_weights)
+
+        def load_safetensors_file(file):
+            return safetensors.torch.load_file(file)
+
+        pbar = tqdm.tqdm(total=len(weight_files),
+                         desc="Loading safetensors weights in parallel")
+
+        # Note that the function is called with a tuple of arguments, hence we need to wrap the arguments in a tuple via [(w,) for w in weight_files]
+        # specifically the comma right after the w is important to make it a tuple.
+        run_concurrently(load_safetensors_file, [(w, ) for w in weight_files],
+                         reduce_func=weights.update,
+                         pbar=pbar)
+
         return weights
 
     weight_files = glob.glob(f"{checkpoint_dir}/*.bin")
@@ -191,8 +200,8 @@ def load_weights(checkpoint_dir: str):
         weight_files = glob.glob(f"{checkpoint_dir}/*.pth")
 
     if weight_files:
-        for file in weight_files:
-            # try mmap first, if failed, turn off mmap
+
+        def load_bin_or_path_file(file):
             try:
                 part_weights = torch.load(file,
                                           weights_only=True,
@@ -206,7 +215,16 @@ def load_weights(checkpoint_dir: str):
                                           weights_only=True,
                                           map_location='cpu',
                                           mmap=False)
-            weights.update(part_weights)
+            finally:
+                return part_weights
+
+        pbar = tqdm.tqdm(total=len(weight_files),
+                         desc="Loading bin weights in parallel")
+        # Note that the function is called with a tuple of arguments, hence we need to wrap the arguments in a tuple via [(w,) for w in weight_files]
+        # specifically the comma right after the w is important to make it a tuple.
+        run_concurrently(load_bin_or_path_file, [(w, ) for w in weight_files],
+                         reduce_func=weights.update,
+                         pbar=pbar)
         return weights
 
     raise RuntimeError(f"No weight files found in {checkpoint_dir}.")
@@ -1155,16 +1173,6 @@ class PyTorchModelEngine(ModelEngine):
         draft_lens = []
         mrope_config = defaultdict(list)
 
-        mtp_batch_idx = 0  # Temporary: MTP (and Eagle3OneModel) remain the only samplers to index new_tokens serially
-
-        def py_batch_idx(request: LlmRequest) -> int:
-            if not self.without_logits:
-                return request.seq_slot
-            nonlocal mtp_batch_idx
-            batch_idx = mtp_batch_idx
-            mtp_batch_idx += 1
-            return batch_idx
-
         for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
             all_prompt_tokens = request.get_tokens(0)
@@ -1194,7 +1202,7 @@ class PyTorchModelEngine(ModelEngine):
                 ) if mrope_rotary_cos_sin.device == 'cpu' else mrope_rotary_cos_sin
                 mrope_config['mrope_rotary_cos_sin'].append(
                     mrope_rotary_cos_sin.to('cuda', non_blocking=True))
-            request.py_batch_idx = py_batch_idx(request)
+            request.py_batch_idx = request.seq_slot
 
         num_ctx_requests = len(scheduled_requests.context_requests)
         num_ctx_tokens = len(input_ids)
@@ -1276,11 +1284,11 @@ class PyTorchModelEngine(ModelEngine):
                 num_cached_tokens_per_seq.append(past_seen_token_num)
                 request_ids.append(request.py_request_id)
                 # update batch index
-                request.py_batch_idx = py_batch_idx(request)
+                request.py_batch_idx = request.seq_slot
             else:
                 # update batch index
                 previous_batch_idx = request.py_batch_idx
-                request.py_batch_idx = py_batch_idx(request)
+                request.py_batch_idx = request.seq_slot
                 # inputs
                 # overlap scheduler can only support the speculative decoding
                 # methods with a fixed number of draft tokens
@@ -1331,7 +1339,7 @@ class PyTorchModelEngine(ModelEngine):
             prompt_lengths.append(request.py_prompt_len)
             draft_lens.append(0)
 
-            request.py_batch_idx = py_batch_idx(request)
+            request.py_batch_idx = request.seq_slot
 
         previous_batch_len = len(previous_batch_indices)
 
@@ -1368,7 +1376,8 @@ class PyTorchModelEngine(ModelEngine):
                 # previous input ids
                 previous_batch_tokens = previous_batch_len * (
                     1 + self.max_draft_len)
-                new_tokens = new_tokens_device[previous_slots, :].flatten()
+                new_tokens = new_tokens_device.transpose(
+                    0, 1)[previous_slots, :].flatten()
                 self.input_ids_cuda[num_tokens:num_tokens +
                                     previous_batch_tokens].copy_(
                                         new_tokens, non_blocking=True)
