@@ -36,3 +36,8 @@ add_library(common_src OBJECT ${SRCS} ${CU_SRCS})
 add_cuda_architectures(common_src 89)
 set_property(TARGET common_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET common_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
+if(ENABLE_MULTI_DEVICE)
+  target_link_libraries(common_src PRIVATE ${MPI_C_LIBRARIES} ${NCCL_LIB}
+                                           CUDA::nvml)
+endif()
