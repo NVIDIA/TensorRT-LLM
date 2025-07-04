@@ -1,87 +1,12 @@
 import argparse
-from queue import PriorityQueue
 
 import torch
-import yaml
-from utils import load_expert_statistic
+from utils import (do_placement_with_cooccurrence, load_expert_statistic,
+                   save_eplb_config)
 
 from tensorrt_llm.bindings.internal.runtime import (MoeLoadBalanceMetaInfo,
                                                     MoePlacementCpuInfo,
                                                     do_replication)
-
-
-def save_eplb_config(config: dict, path: str):
-
-    def represent_list_inline(dumper, data):
-        return dumper.represent_sequence('tag:yaml.org,2002:seq',
-                                         data,
-                                         flow_style=True)
-
-    yaml.add_representer(list, represent_list_inline)
-
-    with open(path, "w") as f:
-        yaml.dump(config, f, width=float('inf'))
-
-
-def select_expert(sorted_expert_ids, expert_replica_assigned,
-                  expert_replica_count):
-    for expert_id in sorted_expert_ids.tolist():
-        if expert_replica_assigned[expert_id] < expert_replica_count[expert_id]:
-            return expert_id
-    raise ValueError("No available expert replica.")
-
-
-def do_placement(expert_load_factor: torch.Tensor,
-                 expert_replica_count: torch.Tensor,
-                 cooccurrence_matrix: torch.Tensor,
-                 ep_size=36,
-                 alpha=0.8):
-    num_experts = expert_replica_count.size(0)
-    num_slots = expert_replica_count.sum().item()
-    num_slots_per_rank = num_slots // ep_size
-
-    slot_load_factor = expert_load_factor / expert_replica_count
-    sorted_expert_ids = slot_load_factor.sort(descending=True).indices
-
-    average_rank_load_factor = expert_load_factor.sum().item() / ep_size
-    rank_expert_ids = [[] for _ in range(ep_size)]
-    rank_load_factor = [0.0 for _ in range(ep_size)]
-    expert_replica_assigned = [0 for _ in range(num_experts)]
-    # Step 1
-    for rank in range(ep_size):
-        current_sorted_expert_ids = sorted_expert_ids
-        while True:
-            expert_id = select_expert(current_sorted_expert_ids,
-                                      expert_replica_assigned,
-                                      expert_replica_count)
-            rank_expert_ids[rank].append(expert_id)
-            rank_load_factor[rank] += slot_load_factor[expert_id].item()
-            expert_replica_assigned[expert_id] += 1
-            if len(rank_expert_ids[rank]) >= num_slots_per_rank * alpha:
-                break
-            if rank_load_factor[rank] >= average_rank_load_factor * alpha:
-                break
-            current_sorted_expert_ids = cooccurrence_matrix[
-                rank_expert_ids[rank]].sum(dim=0).sort(descending=True).indices
-
-    # Step 2
-    pq = PriorityQueue()
-    for rank in range(ep_size):
-        if len(rank_expert_ids[rank]) < num_slots_per_rank:
-            pq.put((rank_load_factor[rank], rank))
-
-    for expert_id in sorted_expert_ids.tolist():
-        while expert_replica_assigned[expert_id] < expert_replica_count[
-                expert_id]:
-            _, rank = pq.get()
-            rank_expert_ids[rank].append(expert_id)
-            rank_load_factor[rank] += slot_load_factor[expert_id].item()
-            expert_replica_assigned[expert_id] += 1
-            if len(rank_expert_ids[rank]) < num_slots_per_rank:
-                pq.put((rank_load_factor[rank], rank))
-
-    return rank_expert_ids
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -170,15 +95,16 @@ if __name__ == "__main__":
         cooccurrence_iters = torch.stack(cooccurrence_iters, dim=0)
         assert cooccurrence_iters.size(0) == num_iters
         cooccurrence_matrix = cooccurrence_iters.sum(dim=0).float()
+
         expert_ids = torch.arange(num_experts)
         cooccurrence_matrix = cooccurrence_matrix.masked_fill(
             expert_ids.unsqueeze(1) == expert_ids, 0)
 
-        rank_expert_ids = do_placement(expert_load_factor,
-                                       expert_replica_count,
-                                       cooccurrence_matrix,
-                                       ep_size=args.ep_size,
-                                       alpha=args.alpha)
+        rank_expert_ids = do_placement_with_cooccurrence(expert_load_factor,
+                                                         expert_replica_count,
+                                                         cooccurrence_matrix,
+                                                         ep_size=args.ep_size,
+                                                         alpha=args.alpha)
 
         initial_global_assignments[layer_idx] = []
         for local_expert_ids in rank_expert_ids:

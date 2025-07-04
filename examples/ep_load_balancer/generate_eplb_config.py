@@ -1,27 +1,12 @@
 import argparse
 
 import torch
-import yaml
-from utils import load_expert_statistic
+from utils import load_expert_statistic, save_eplb_config
 
 from tensorrt_llm.bindings.internal.runtime import (MoeLoadBalanceMetaInfo,
                                                     MoePlacementCpuInfo,
                                                     do_placement,
                                                     do_replication)
-
-
-def save_eplb_config(config: dict, path: str):
-
-    def represent_list_inline(dumper, data):
-        return dumper.represent_sequence('tag:yaml.org,2002:seq',
-                                         data,
-                                         flow_style=True)
-
-    yaml.add_representer(list, represent_list_inline)
-
-    with open(path, "w") as f:
-        yaml.dump(config, f, width=float('inf'))
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
