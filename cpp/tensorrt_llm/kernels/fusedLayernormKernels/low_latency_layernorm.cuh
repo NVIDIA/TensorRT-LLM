@@ -22,6 +22,7 @@
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
+#include "tensorrt_llm/kernels/archCondition.h"
 #include "tensorrt_llm/kernels/fusedLayernormKernels/ws_layernorm.cuh"
 
 using namespace tensorrt_llm::common;
@@ -170,11 +171,13 @@ struct LowLatencyLayerNorm
         {
             load_to_register(param.beta, r_beta, param.n);
         }
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDACC_VER_MAJOR__ >= 12))
-#if (defined(__CUDA_ARCH_FEAT_SM90_ALL) || defined(__CUDA_ARCH_FEAT_SM100_ALL))
-        asm volatile("griddepcontrol.wait;\n");
-        asm volatile("griddepcontrol.launch_dependents;\n");
-#endif
+
+#if (defined(__CUDA_ARCH__) && (__CUDACC_VER_MAJOR__ >= 12))
+        if constexpr (arch::is_major_v<9> || arch::is_major_v<10>)
+        {
+            asm volatile("griddepcontrol.wait;\n");
+            asm volatile("griddepcontrol.launch_dependents;\n");
+        }
 #endif
         load_to_register(&param.input[work_id * param.n], data, param.n);
 

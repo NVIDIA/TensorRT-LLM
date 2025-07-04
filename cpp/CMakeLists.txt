@@ -39,6 +39,7 @@ option(FAST_BUILD "Skip compiling some kernels to accelerate compiling" OFF)
 option(FAST_MATH "Compiling in fast math mode" OFF)
 option(INDEX_RANGE_CHECK "Compiling with index range checks" OFF)
 option(COMPRESS_FATBIN "Compress everything in fatbin" ON)
+option(TIMING_NVCC "Enable nvcc build timing report" OFF)
 option(ENABLE_MULTI_DEVICE
        "Enable building with multi device support (requires NCCL, MPI,...)" ON)
 option(ENABLE_UCX "Enable building with UCX (Uniform Communication X) support"
@@ -135,9 +136,14 @@ configure_file(
   ${CMAKE_CURRENT_SOURCE_DIR}/include/tensorrt_llm/executor/version.h)
 
 setup_cuda_compiler()
-setup_cuda_architectures()
 
 enable_language(C CXX CUDA)
+
+# Configure CUDA Architectures after enabling CUDA.
+
+# Old CMake rejects family conditional architectures during enable_language, But
+# after that CMake handles it just fine.
+setup_cuda_architectures()
 
 find_package(CUDAToolkit 11.2 REQUIRED COMPONENTS cudart_static cuda_driver
                                                   cublas cublasLt curand nvml)
@@ -323,6 +329,10 @@ endif()
 if(COMPRESS_FATBIN)
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --fatbin-options -compress-all")
 endif()
+if(NVCC_TIMING)
+  set(CMAKE_CUDA_FLAGS
+      "${CMAKE_CUDA_FLAGS} --time ${CMAKE_CURRENT_BINARY_DIR}/nvcc-timing.csv")
+endif()
 message("CMAKE_CUDA_FLAGS: ${CMAKE_CUDA_FLAGS}")
 
 set(COMMON_HEADER_DIRS ${PROJECT_SOURCE_DIR} ${CUDAToolkit_INCLUDE_DIR})
@@ -345,15 +355,6 @@ if(NOT WIN32 AND NOT DEFINED USE_CXX11_ABI)
 endif()
 
 if(BUILD_PYT)
-  # Build TORCH_CUDA_ARCH_LIST
-  set(TORCH_CUDA_ARCH_LIST "")
-  foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
-    string(REGEX REPLACE "^([1-9][0-9]*)([0-9]a?)-real$" "\\1.\\2" TORCH_ARCH
-                         ${CUDA_ARCH})
-    list(APPEND TORCH_CUDA_ARCH_LIST ${TORCH_ARCH})
-  endforeach()
-
-  message(STATUS "TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST}")
   # ignore values passed from the environment
   if(DEFINED ENV{TORCH_CUDA_ARCH_LIST})
     message(
@@ -362,6 +363,20 @@ if(BUILD_PYT)
     )
   endif()
   unset(ENV{TORCH_CUDA_ARCH_LIST})
+  # Torch maintains custom logic to add CUDA architecture flags into
+  # CMAKE_CUDA_FLAGS based on TORCH_CUDA_ARCH_LIST variable, instead of using
+  # the native support introduced in newer CMake versions. And it always tries
+  # to add some flags, even given empty TORCH_CUDA_ARCH_LIST.
+
+  # We prefer CMake's native support to be able to easily customize the CUDA
+  # architectures to be compiled for, for each kernel individually. So we set
+  # TORCH_CUDA_ARCH_LIST to a placeholder value and remove the generated flags
+  # then to effectively prevent Torch from adding CUDA architecture flags.
+  message(
+    STATUS
+      "Set TORCH_CUDA_ARCH_LIST to placeholder value \"8.0\" to make Torch happy. "
+      "This is NOT the list of architectures that will be compiled for.")
+  set(TORCH_CUDA_ARCH_LIST "8.0")
 
   find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
   message(STATUS "Found Python executable at ${Python3_EXECUTABLE}")
@@ -391,7 +406,22 @@ print(os.path.dirname(torch.__file__),end='');"
   list(APPEND CMAKE_PREFIX_PATH ${TORCH_DIR})
   set(USE_SYSTEM_NVTX ON)
   set(nvtx3_dir ${3RDPARTY_DIR}/NVTX/include)
+  set(CMAKE_CUDA_ARCHITECTURES_BACKUP ${CMAKE_CUDA_ARCHITECTURES})
   find_package(Torch REQUIRED)
+  set(CMAKE_CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES_BACKUP})
+  message(
+    STATUS
+      "Removing Torch generated placeholder CUDA architecture flags: -gencode arch=compute_80,code=sm_80."
+  )
+  string(REPLACE "-gencode arch=compute_80,code=sm_80 " "" CMAKE_CUDA_FLAGS_NEW
+                 "${CMAKE_CUDA_FLAGS}")
+  if("${CMAKE_CUDA_FLAGS_NEW}" STREQUAL "${CMAKE_CUDA_FLAGS}")
+    message(
+      FATAL_ERROR
+        "Torch didn't generate expected placeholder CUDA architecture flags.")
+  endif()
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS_NEW}")
+
   add_compile_definitions(TORCH_CUDA=1)
 
   if(DEFINED TORCH_CXX_FLAGS)
