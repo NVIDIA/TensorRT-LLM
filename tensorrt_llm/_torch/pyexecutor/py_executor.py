@@ -919,7 +919,7 @@ class PyExecutor:
 
                     if self.drafter is not None:
                         self.drafter.prepare_draft_tokens(
-                            scheduled_batch, sample_state)
+                            scheduled_batch, sample_state, iter_stats)
 
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
