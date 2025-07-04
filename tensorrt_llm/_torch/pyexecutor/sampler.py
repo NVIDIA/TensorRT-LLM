@@ -510,6 +510,7 @@ class TRTLLMSampler(Sampler):
         self.max_num_sequences = mapping.pp_size * self.executor_config.max_batch_size
         self.max_seq_idle_microseconds = 180 * 1000 * 1000
         self.is_trt_overlap = not disable_overlap_scheduler
+        self.is_disagg = False
         self.num_micro_batches = mapping.pp_size if mapping.pp_size > 1 else (
             2 if self.is_trt_overlap else 1)
         self.micro_batch_idx = 0
@@ -821,7 +822,7 @@ class TRTLLMSampler(Sampler):
             for beam in range(beam_width):
                 seq_len = sequence_lengths_host_data[seq_slot * beam_width +
                                                      beam]
-                seq_len = seq_len + 1 if self.is_trt_overlap else seq_len
+                seq_len = seq_len + 1 if self.is_trt_overlap and self.is_disagg else seq_len
                 num_new_tokens[beam] = min(
                     num_generated_tokens,
                     seq_len - request.get_num_tokens(beam))
