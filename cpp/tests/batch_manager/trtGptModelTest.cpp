@@ -870,6 +870,11 @@ public:
     {
         return TrtGptModelInflightBatching::getKVCacheManager();
     }
+
+    [[nodiscard]] SizeType32 getMaxAttentionWindow() const
+    {
+        return TrtGptModelInflightBatching::getMaxAttentionWindow();
+    }
 };
 
 TEST_F(TrtGptModelTest, KVCacheReuseChunked)
@@ -1199,6 +1204,28 @@ TEST_F(LlamaModelLADTest, SeamlessLookaheadDecoding)
         forwardRequestsToCompletion(trtGptModel, requestList, maxNumIterations);
         requestList.clear();
     }
+}
+
+TEST_F(TrtGptModelTest, ClampSeqLenToAttentionWindow)
+{
+    auto constexpr maxAttentionWindow = 65536;
+    auto constexpr maxSequenceLen = maxAttentionWindow + 1;
+
+    executor::KvCacheConfig kvCacheConfig;
+    kvCacheConfig.setMaxAttentionWindowVec(std::vector<SizeType32>{maxAttentionWindow});
+    kvCacheConfig.setFreeGpuMemoryFraction(0.0001); // minuscule amount of memory to force a clamp
+
+    executor::ExecutorConfig executorConfig;
+    executorConfig.setKvCacheConfig(kvCacheConfig);
+    executorConfig.setMaxBeamWidth(mBeamWidth);
+
+    auto modelConfig = mModelConfig;
+    modelConfig.setMaxSequenceLen(maxSequenceLen);
+
+    auto trtGptModel = std::make_shared<TrtGptModelIfbHelper>(
+        mLogger, modelConfig, mWorldConfig, *mRawEngine, true, executorConfig, false);
+    EXPECT_LT(trtGptModel->getMaxAttentionWindow(), maxAttentionWindow);
+    EXPECT_EQ(trtGptModel->getMaxSequenceLen(), trtGptModel->getMaxAttentionWindow());
 }
 
 } // namespace tensorrt_llm::batch_manager
