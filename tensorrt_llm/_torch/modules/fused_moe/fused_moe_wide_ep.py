@@ -210,6 +210,8 @@ class WideEPMoE(MoE):
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
+
+        # Debug function for performance analysis.
         self.enable_dummy_allreduce = os.environ.get(
             "TRTLLM_ENABLE_DUMMY_ALLREDUCE", "0") == "1"
 
@@ -305,6 +307,11 @@ class WideEPMoE(MoE):
         self._check_configs()
 
     def dummy_allreduce(self):
+        """
+        Debug function for performance analysis.
+        Creates a small dummy tensor and performs allreduce to help with timing measurements
+        and performance profiling of communication patterns.
+        """
         dummy_tensor = torch.zeros(4, dtype=torch.float32, device='cuda')
         dummy_tensor = self.all_reduce(dummy_tensor)
         return dummy_tensor
