@@ -30,7 +30,7 @@ class MTPHiddenStatesManager(BaseResourceManager):
     def __init__(self, config: "MTPDecodingConfig", dtype: torch.dtype,
                  hidden_size: int, max_num_requests: int):
         self.dtype = dtype
-        self.num_nextn_predict_layers = config.max_draft_len
+        self.num_nextn_predict_layers = config.num_nextn_predict_layers
         self.hidden_size = hidden_size
         self.max_num_requests = max_num_requests
         self.use_relaxed_acceptance_for_thinking = config.use_relaxed_acceptance_for_thinking
