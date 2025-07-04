@@ -22,6 +22,8 @@
 #include "tensorrt_llm/layers/defaultDecodingParams.h"
 #include "tensorrt_llm/layers/layerUtils.h"
 
+#include <utility>
+
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::kernels::speculative_decoding;
@@ -33,7 +35,7 @@ namespace tensorrt_llm::layers
 template <typename T>
 EagleDecodingLayer<T>::EagleDecodingLayer(
     DecoderDomain const& decoderDomain, std::shared_ptr<BufferManager> bufferManager)
-    : BaseLayer(decoderDomain, bufferManager)
+    : BaseLayer(decoderDomain, std::move(bufferManager))
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -60,10 +62,9 @@ void EagleDecodingLayer<T>::allocateBuffer()
     mEagleNetGenContextLengths = mBufferManager->gpu(batchSizeShape, TRTDataType<SizeType32>::value);
     mEagleNetGenPastKeyValueLengths = mBufferManager->gpu(batchSizeShape, TRTDataType<SizeType32>::value);
 
-    SizeType32 constexpr NUM_BUFFERS{2};
+    SizeType32 constexpr NUM_BUFFERS{1};
     size_t workspaces[NUM_BUFFERS];
     workspaces[0] = mDecoderDomain.getBatchSize() * sizeof(SizeType32);
-    workspaces[1] = mDecoderDomain.getBatchSize() * sizeof(SizeType32);
     mWorkspaceSize = calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -152,20 +153,17 @@ void EagleDecodingLayer<T>::augmentBatchSlots(EagleOutputs const& outputs, Eagle
     auto const batchSize = inputs.localBatchSize;
     auto const engineBatchSize = inputs.nextDraftLens->getDimension<0>();
 
-    int8_t* workspaceBytePtr = reinterpret_cast<int8_t*>(workspace->getRawWorkspaceDevicePtr());
+    auto* workspaceBytePtr = reinterpret_cast<int8_t*>(workspace->getRawWorkspaceDevicePtr());
     size_t offset{0};
 
-    SizeType32* augmentedSeqSlots = reinterpret_cast<SizeType32*>(
-        nextWorkspacePtr(workspaceBytePtr, offset, engineBatchSize * sizeof(SizeType32)));
-    SizeType32* augmentedBatchSlots = reinterpret_cast<SizeType32*>(
+    auto* augmentedSeqSlots = reinterpret_cast<SizeType32*>(
         nextWorkspacePtr(workspaceBytePtr, offset, engineBatchSize * sizeof(SizeType32)));
 
-    auto chunkedContextNextTokens = bufferCast<SizeType32>(*inputs.chunkedContextNextTokens);
-    auto lastDraftLens = bufferCast<SizeType32>(*inputs.lastDraftLens);
+    auto const* chunkedContextNextTokens = bufferCast<SizeType32>(*inputs.chunkedContextNextTokens);
+    auto const* lastDraftLens = bufferCast<SizeType32>(*inputs.lastDraftLens);
 
-    invokeAugmentBatchSlots(augmentedSeqSlots, augmentedBatchSlots, chunkedContextNextTokens, lastDraftLens,
-        bufferCast<SizeType32>(*inputs.seqSlots), workspace->getDeviceBatchSlotsPtr(), engineBatchSize, batchSize,
-        getStream());
+    invokeAugmentBatchSlots(augmentedSeqSlots, chunkedContextNextTokens, lastDraftLens,
+        bufferCast<SizeType32>(*inputs.seqSlots), engineBatchSize, batchSize, getStream());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -179,10 +177,10 @@ void EagleDecodingLayer<T>::unpackData(EagleOutputs const& outputs, EagleInputs 
     auto const engineBatchSize = inputs.nextDraftLens->getDimension<0>();
     auto const maxSeqLen = outputs.outputIds->getDimension<-1>();
 
-    int8_t* workspaceBytePtr = reinterpret_cast<int8_t*>(workspace->getRawWorkspaceDevicePtr());
+    auto* workspaceBytePtr = reinterpret_cast<int8_t*>(workspace->getRawWorkspaceDevicePtr());
     size_t offset{0};
 
-    SizeType32* augmentedSeqSlots = reinterpret_cast<SizeType32*>(
+    auto const* augmentedSeqSlots = reinterpret_cast<SizeType32*>(
         nextWorkspacePtr(workspaceBytePtr, offset, engineBatchSize * sizeof(SizeType32)));
 
     UnpackEagleDataParams params;
@@ -254,14 +252,14 @@ void EagleDecodingLayer<T>::convertToPackedMask(EagleOutputs const& outputs, Eag
     auto const maxDecodingTokens = mDecoderDomain.getSpeculativeDecodingModule()->getMaxDecodingTokens();
     auto const maxPathLen = mDecoderDomain.getSpeculativeDecodingModule()->getMaxPathLen();
 
-    int8_t* workspaceBytePtr = reinterpret_cast<int8_t*>(workspace->getRawWorkspaceDevicePtr());
+    auto* workspaceBytePtr = reinterpret_cast<int8_t*>(workspace->getRawWorkspaceDevicePtr());
     size_t offset{0};
-    SizeType32* augmentedSeqSlots = reinterpret_cast<SizeType32*>(
+    auto const* augmentedSeqSlots = reinterpret_cast<SizeType32*>(
         nextWorkspacePtr(workspaceBytePtr, offset, engineBatchSize * sizeof(SizeType32)));
 
-    auto batchSlots = augmentedSeqSlots;
-    auto packedMasksDevice = bufferCast<SizeType32>(*outputs.packedMasks);
-    auto nextDraftPaths = bufferCast<SizeType32>(*outputs.nextDraftPaths);
+    auto const* batchSlots = augmentedSeqSlots;
+    auto* packedMasksDevice = bufferCast<SizeType32>(*outputs.packedMasks);
+    auto const* nextDraftPaths = bufferCast<SizeType32>(*outputs.nextDraftPaths);
 
     invokeGetPackedMaskFromPath(
         packedMasksDevice, batchSlots, nextDraftPaths, engineBatchSize, maxDecodingTokens, maxPathLen, getStream());
@@ -278,27 +276,24 @@ void EagleDecodingLayer<T>::packAcceptedPaths(EagleOutputs const& outputs, Eagle
     auto const batchSize = inputs.localBatchSize;
     auto const engineBatchSize = inputs.nextDraftLens->getDimension<0>();
 
-    int8_t* workspaceBytePtr = reinterpret_cast<int8_t*>(workspace->getRawWorkspaceDevicePtr());
+    auto* workspaceBytePtr = reinterpret_cast<int8_t*>(workspace->getRawWorkspaceDevicePtr());
     size_t offset{0};
-    SizeType32* augmentedSeqSlots = reinterpret_cast<SizeType32*>(
-        nextWorkspacePtr(workspaceBytePtr, offset, engineBatchSize * sizeof(SizeType32)));
-    SizeType32* augmentedBatchSlots = reinterpret_cast<SizeType32*>(
+    auto const* augmentedSeqSlots = reinterpret_cast<SizeType32*>(
         nextWorkspacePtr(workspaceBytePtr, offset, engineBatchSize * sizeof(SizeType32)));
 
-    auto numNewTokens = bufferCast<SizeType32>(*outputs.numNewTokens.value());
-    auto numNewTokensCumSum = bufferCast<SizeType32>(*outputs.numNewTokensCumSum);
-    auto pathsOffsets = bufferCast<SizeType32>(*outputs.pathsOffsets);
-    auto batchSlots = augmentedBatchSlots;
-    auto seqSlots = augmentedSeqSlots;
-    auto bestPathIndicesSlotsPtr = bufferCast<SizeType32>(*inputs.acceptedPathIds);
-    auto lastDraftPathsSlotsPtr = bufferCast<SizeType32>(*inputs.lastDraftPaths);
+    auto const* numNewTokens = bufferCast<SizeType32>(*outputs.numNewTokens.value());
+    auto* numNewTokensCumSum = bufferCast<SizeType32>(*outputs.numNewTokensCumSum);
+    auto* pathsOffsets = bufferCast<SizeType32>(*outputs.pathsOffsets);
+    auto const* batchSlots = augmentedSeqSlots;
+    auto const* bestPathIndicesSlotsPtr = bufferCast<SizeType32>(*inputs.acceptedPathIds);
+    auto const* lastDraftPathsSlotsPtr = bufferCast<SizeType32>(*inputs.lastDraftPaths);
 
     TLLM_CHECK_WITH_INFO(batchSlots != nullptr, "Batch slots must be provided for EagleDecodingLayer");
     TLLM_CHECK_WITH_INFO(numNewTokens != nullptr, "Accepted lengths must be provided for EagleDecodingLayer");
     TLLM_CHECK_WITH_INFO(numNewTokensCumSum != nullptr, "numNewTokensCumSum must be provided for EagleDecodingLayer");
     TLLM_CHECK_WITH_INFO(pathsOffsets != nullptr, "pathsOffsets must be provided for EagleDecodingLayer");
     invokePackAcceptedPaths(numNewTokensCumSum, pathsOffsets, numNewTokens, bestPathIndicesSlotsPtr,
-        lastDraftPathsSlotsPtr, batchSlots, seqSlots, batchSize, engineBatchSize,
+        lastDraftPathsSlotsPtr, batchSlots, batchSize, engineBatchSize,
         mDecoderDomain.getSpeculativeDecodingModule()->getMaxNumPaths(),
         mDecoderDomain.getSpeculativeDecodingModule()->getMaxPathLen(), true, getStream());
 
