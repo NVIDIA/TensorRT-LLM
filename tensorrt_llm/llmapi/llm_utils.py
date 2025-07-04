@@ -30,7 +30,8 @@ from ..models.modeling_utils import PretrainedConfig, QuantAlgo, QuantConfig
 from ..module import Module
 from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
                           get_build_cache_config_from_env)
-from .llm_args import (CalibConfig, EagleDecodingConfig, KvCacheConfig, LlmArgs,
+from .llm_args import (CalibConfig, CudaGraphConfig, DraftTargetDecodingConfig,
+                       EagleDecodingConfig, KvCacheConfig, LlmArgs,
                        LookaheadDecodingConfig, MedusaDecodingConfig,
                        MTPDecodingConfig, NGramDecodingConfig, _ModelFormatKind,
                        _ModelWrapper, _ParallelConfig, get_model_format,
@@ -624,6 +625,9 @@ class CachedModelLoader:
         if self.llm_args.model_format is _ModelFormatKind.TLLM_ENGINE:
             return Path(self.llm_args.model), None
 
+        if self.llm_args.backend == "_autodeploy":
+            return None, ""
+
         self.engine_cache_stage: Optional[CachedStage] = None
 
         self._hf_model_dir = None
@@ -871,12 +875,14 @@ __all__ = [
     'MedusaDecodingConfig',
     'MTPDecodingConfig',
     'NGramDecodingConfig',
+    'DraftTargetDecodingConfig',
     'ContextChunkingPolicy',
     'CapacitySchedulerPolicy',
     'BuildConfig',
     'BuildCacheConfig',
     'QuantConfig',
     'CalibConfig',
+    'CudaGraphConfig',
     'KvCacheConfig',
     'CachedModelLoader',
     'EagleDecodingConfig',

@@ -54,10 +54,10 @@ def _init(log_level: object = None) -> None:
         logger.set_level(log_level)
 
     if os.getenv("TRT_LLM_NO_LIB_INIT", "0") == "1":
-        logger.info('Skipping TensorRT-LLM init.')
+        logger.info("Skipping TensorRT-LLM init.")
         return
 
-    logger.info('Starting TensorRT-LLM init.')
+    logger.info("Starting TensorRT-LLM init.")
 
     # load plugin lib
     _load_plugin_lib()
@@ -65,24 +65,30 @@ def _init(log_level: object = None) -> None:
     # load FT decoder layer and torch custom ops
     project_dir = str(Path(__file__).parent.absolute())
     if platform.system() == "Windows":
-        ft_decoder_lib = project_dir + '/libs/th_common.dll'
+        ft_decoder_lib = project_dir + "/libs/th_common.dll"
     else:
-        ft_decoder_lib = project_dir + '/libs/libth_common.so'
+        ft_decoder_lib = project_dir + "/libs/libth_common.so"
     try:
         torch.classes.load_library(ft_decoder_lib)
         from ._torch.custom_ops import _register_fake
+
         _register_fake()
     except Exception as e:
-        msg = '\nFATAL: Decoding operators failed to load. This may be caused by the incompatibility between PyTorch and TensorRT-LLM. Please rebuild and install TensorRT-LLM.'
+        msg = (
+            "\nFATAL: Decoding operators failed to load. This may be caused by an incompatibility "
+            "between PyTorch and TensorRT-LLM. Please rebuild and install TensorRT-LLM."
+        )
         raise ImportError(str(e) + msg)
 
     MpiComm.local_init()
 
-    logger.info('TensorRT-LLM inited.')
+    logger.info("TensorRT-LLM inited.")
 
 
 def default_net() -> Network:
-    assert net, "Use builder to create network first, and use `set_network` or `net_guard` to set it to default"
+    assert net, (
+        "Use builder to create network first, and use `set_network` or `net_guard` to set it to default"
+    )
     return net
 
 
@@ -111,29 +117,29 @@ def precision(dtype):
 
 
 def serialize_engine(engine, path):
-    logger.info(f'Serializing engine to {path}...')
+    logger.info(f"Serializing engine to {path}...")
     tik = time.time()
     if isinstance(engine, trt.ICudaEngine):
         engine = engine.serialize()
-    with open(path, 'wb') as f:
+    with open(path, "wb") as f:
         f.write(engine)
     tok = time.time()
-    t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
-    logger.info(f'Engine serialized. Total time: {t}')
+    t = time.strftime("%H:%M:%S", time.gmtime(tok - tik))
+    logger.info(f"Engine serialized. Total time: {t}")
 
 
 def deserialize_engine(path):
     runtime = trt.Runtime(logger.trt_logger)
-    with open(path, 'rb') as f:
-        logger.info(f'Loading engine from {path}...')
+    with open(path, "rb") as f:
+        logger.info(f"Loading engine from {path}...")
         tik = time.time()
 
         engine = runtime.deserialize_cuda_engine(f.read())
         assert engine is not None
 
         tok = time.time()
-        t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
-        logger.info(f'Engine loaded. Total time: {t}')
+        t = time.strftime("%H:%M:%S", time.gmtime(tok - tik))
+        logger.info(f"Engine loaded. Total time: {t}")
     return engine
 
 
@@ -149,33 +155,32 @@ _field_dtype_to_np_dtype_dict = {
 
 def field_dtype_to_np_dtype(dtype):
     ret = _field_dtype_to_np_dtype_dict.get(dtype)
-    assert ret is not None, f'Unsupported dtype: {dtype}'
+    assert ret is not None, f"Unsupported dtype: {dtype}"
     return ret
 
 
 def convert_capsule_to_void_p(capsule):
     ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
-    ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [
-        ctypes.py_object, ctypes.c_char_p
-    ]
+    ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
     return ctypes.pythonapi.PyCapsule_GetPointer(capsule, None)
 
 
 def get_nparray_from_void_p(void_pointer, elem_size, field_dtype):
     ctypes.pythonapi.PyMemoryView_FromMemory.restype = ctypes.py_object
     ctypes.pythonapi.PyMemoryView_FromMemory.argtypes = [
-        ctypes.c_char_p, ctypes.c_ssize_t, ctypes.c_int
+        ctypes.c_char_p,
+        ctypes.c_ssize_t,
+        ctypes.c_int,
     ]
-    logger.info(
-        f'get_nparray: pointer = {void_pointer}, elem_size = {elem_size}')
+    logger.info(f"get_nparray: pointer = {void_pointer}, elem_size = {elem_size}")
     char_pointer = ctypes.cast(void_pointer, ctypes.POINTER(ctypes.c_char))
     np_dtype = field_dtype_to_np_dtype(field_dtype)
     buf_bytes = elem_size * np.dtype(np_dtype).itemsize
-    logger.info(f'get_nparray: buf_bytes = {buf_bytes}')
+    logger.info(f"get_nparray: buf_bytes = {buf_bytes}")
     mem_view = ctypes.pythonapi.PyMemoryView_FromMemory(
-        char_pointer, buf_bytes, 0)  # number 0 represents PyBUF_READ
-    logger.info(
-        f'get_nparray: mem_view = {mem_view}, field_dtype = {field_dtype}')
+        char_pointer, buf_bytes, 0
+    )  # number 0 represents PyBUF_READ
+    logger.info(f"get_nparray: mem_view = {mem_view}, field_dtype = {field_dtype}")
     buf = np.frombuffer(mem_view, np_dtype)
     return buf
 
@@ -187,18 +192,17 @@ def get_scalar_from_field(field):
 
 
 class _BuildingFlag:
-
     def __enter__(self):
-        os.environ['IS_BUILDING'] = '1'
+        os.environ["IS_BUILDING"] = "1"
 
     def __exit__(self, type, value, tb):
-        del os.environ['IS_BUILDING']
+        del os.environ["IS_BUILDING"]
 
 
 def _is_building(f):
-    '''Use this to decorate functions which are called during engine building/refitting process,
+    """Use this to decorate functions which are called during engine building/refitting process,
     otherwise, the plugin registration will fail.
-    '''
+    """
 
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -208,15 +212,25 @@ def _is_building(f):
     return decorated
 
 
-def check_max_num_tokens(max_num_tokens, opt_num_tokens, max_batch_size,
-                         max_input_len, max_seq_len, max_beam_width,
-                         remove_input_padding, enable_context_fmha,
-                         tokens_per_block, multiple_profiles):
+def check_max_num_tokens(
+    max_num_tokens,
+    opt_num_tokens,
+    max_batch_size,
+    max_input_len,
+    max_seq_len,
+    max_beam_width,
+    remove_input_padding,
+    enable_context_fmha,
+    tokens_per_block,
+    multiple_profiles,
+):
     if not remove_input_padding:
         if max_num_tokens is not None or opt_num_tokens is not None:
             max_num_tokens = max_batch_size * max_seq_len
-            logger.warning("remove_input_padding is not enabled, the specified "
-                           "max_num_tokens/opt_num_tokens will be ignored.")
+            logger.warning(
+                "remove_input_padding is not enabled, the specified "
+                "max_num_tokens/opt_num_tokens will be ignored."
+            )
         return max_num_tokens, opt_num_tokens
     else:
         if max_num_tokens is None:
@@ -228,20 +242,22 @@ def check_max_num_tokens(max_num_tokens, opt_num_tokens, max_batch_size,
                 "when remove_input_padding is enabled, because the number "
                 "of packed input tokens are very likely to be smaller, "
                 "we strongly recommend to set max_num_tokens according "
-                "to your workloads.")
+                "to your workloads."
+            )
         if opt_num_tokens is None and not multiple_profiles:
-            opt_num_tokens = min(max_batch_size * max_beam_width,
-                                 max_num_tokens)
+            opt_num_tokens = min(max_batch_size * max_beam_width, max_num_tokens)
             logger.warning(
                 "remove_input_padding is enabled, while opt_num_tokens "
-                "is not set, setting to max_batch_size*max_beam_width. \n")
+                "is not set, setting to max_batch_size*max_beam_width. \n"
+            )
         if max_num_tokens > 16384:
             logger.warning(
                 "Specifying a `max_num_tokens` larger than 16384 is usually "
                 "not recommended, we do not expect perf gain with that and too "
                 "large `max_num_tokens` could possibly exceed the TensorRT "
                 "tensor volume, causing runtime errors. "
-                f"Got `max_num_tokens` = {max_num_tokens}")
+                f"Got `max_num_tokens` = {max_num_tokens}"
+            )
     if max_num_tokens > max_seq_len * max_batch_size:
         logger.warning(
             f"max_num_tokens ({max_num_tokens}) shouldn't be greater than "
@@ -253,21 +269,24 @@ def check_max_num_tokens(max_num_tokens, opt_num_tokens, max_batch_size,
         logger.warning(
             f"When enable_context_fmha is not turned on, max_num_tokens ({max_num_tokens}) "
             f"should be at least max_input_len ({max_input_len}), specifying to "
-            f"max_input_len ({max_input_len}).")
+            f"max_input_len ({max_input_len})."
+        )
         max_num_tokens = max_input_len
     elif max_num_tokens < tokens_per_block and enable_context_fmha:
         logger.warning(
             f"When enable_context_fmha is turned on, max_num_tokens ({max_num_tokens}) "
             f"should be at least tokens_per_block ({tokens_per_block}), specifying to "
             f"tokens_per_block ({tokens_per_block}). At this time, you also need to enable "
-            f"context chunking at runtime, otherwise you may encounter errors.")
+            f"context chunking at runtime, otherwise you may encounter errors."
+        )
         max_num_tokens = tokens_per_block
 
     if opt_num_tokens is not None and opt_num_tokens > max_num_tokens:
         logger.warning(
             f"opt_num_tokens ({opt_num_tokens}) shouldn't be greater than "
             f"max_num_tokens ({max_num_tokens}), "
-            f"specifying to max_num_tokens ({max_num_tokens}).")
+            f"specifying to max_num_tokens ({max_num_tokens})."
+        )
         opt_num_tokens = max_num_tokens
 
     return max_num_tokens, opt_num_tokens

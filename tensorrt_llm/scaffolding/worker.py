@@ -4,8 +4,8 @@ from typing import Callable
 import openai
 from transformers import AutoTokenizer
 
+from tensorrt_llm import LLM
 from tensorrt_llm.executor import GenerationExecutor
-from tensorrt_llm.llmapi.llm import LLM
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -150,7 +150,6 @@ class TRTLLMWorker(Worker):
         )
 
         llm = LLM(model_dir,
-                  backend=backend,
                   tokenizer=tokenizer,
                   mixed_sampler=True,
                   disable_overlap_scheduler=disable_overlap_scheduler,

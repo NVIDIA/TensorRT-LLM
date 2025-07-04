@@ -1,11 +1,10 @@
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List
 
 import torch
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm.bindings.internal.runtime import (DecoderBatchInput,
-                                                    DecoderBatchOutput)
+from tensorrt_llm.bindings.internal.runtime import DecoderBatchInput
 
 
 @dataclass
@@ -18,12 +17,12 @@ class MakeDecodingBatchInputOutput:
 
     @staticmethod
     def create_decoder_batch_inputs(
+        *,
         active_slots: List[int],
         decoder_state,
         logits: List[torch.Tensor],
         max_num_sequences: int,
         batch_slots: List[torch.Tensor],
-        cache_indirection_input: Optional[torch.Tensor] = None
     ) -> DecoderBatchInput:
         """Create decoder batch inputs from active slots and logits.
 
@@ -33,7 +32,6 @@ class MakeDecodingBatchInputOutput:
             logits: List of logit tensors for each slot
             max_num_sequences: Maximum number of sequences to process
             batch_slots: List of batch slot tensors for each decoding step
-            cache_indirection_input: Optional cache indirection input tensor
 
         Returns:
             DecoderBatchInput containing the prepared inputs
@@ -83,22 +81,23 @@ class MakeDecodingBatchInputOutput:
         # Create decoder batch input
         decoding_input = DecoderBatchInput(logits_vec, max_active_decoder_steps)
         decoding_input.batch_slots = batch_slots
-        decoding_input.cache_indirection = cache_indirection_input
 
         return decoding_input
 
     def __call__(
-            self, context_requests: List[LlmRequest],
-            generation_requests: List[LlmRequest], decoder_buffers,
-            decoder_input_buffers, decoder_state, model_config,
-            max_num_sequences: int
-    ) -> Tuple[DecoderBatchInput, DecoderBatchOutput]:
+        self,
+        context_requests: List[LlmRequest],
+        generation_requests: List[LlmRequest],
+        decoder_input_buffers,
+        decoder_state,
+        model_config,
+        max_num_sequences: int,
+    ) -> DecoderBatchInput:
         """Create decoder batch inputs and outputs for the given requests.
 
         Args:
             context_requests: List of context requests
             generation_requests: List of generation requests
-            decoder_buffers: Decoder buffers
             decoder_input_buffers: Decoder input buffers
             decoder_state: Current decoder state
             model_config: Model configuration
@@ -106,7 +105,7 @@ class MakeDecodingBatchInputOutput:
             fused_runtime_buffers: Optional fused runtime buffers
 
         Returns:
-            Tuple of (DecoderBatchInput, DecoderBatchOutput)
+            DecoderBatchInput
         """
         # Get active slots and generation steps
         active_slots = []
@@ -126,16 +125,17 @@ class MakeDecodingBatchInputOutput:
 
         # Create decoder batch inputs
         decoding_input = self.create_decoder_batch_inputs(
-            active_slots, decoder_state, decoder_buffers.logits,
-            max_num_sequences, decoder_input_buffers.forward_batch_slots,
-            decoder_buffers.cache_indirection_input)
+            active_slots=active_slots,
+            decoder_state=decoder_state,
+            logits=decoder_input_buffers.logits,
+            max_num_sequences=max_num_sequences,
+            batch_slots=decoder_input_buffers.forward_batch_slots,
+        )
         decoding_input.generation_steps = generation_steps
 
-        # Handle speculative decoding modes
-        if model_config.speculative_decoding_mode.has_draft_logits:
-            decoding_input.predicted_draft_logits = decoder_buffers.draft_buffers.predicted_draft_logits
+        # TODO: Handle speculative decoding modes.
+        # fused_runtime_buffers is not created in the pytorch framework.
 
-        # TODO: fused_runtime_buffers is not created in the pytorch framework.
         # if model_config.speculative_decoding_mode.is_explicit_draft_tokens:
         #     if fused_runtime_buffers is None:
         #         raise RuntimeError("Fused runtime buffers required for explicit draft tokens")
@@ -149,8 +149,4 @@ class MakeDecodingBatchInputOutput:
         #     decoding_input.eagle_inputs = fused_runtime_buffers.eagle_buffers.engine_outputs
         #     decoding_input.eagle_last_inputs = fused_runtime_buffers.eagle_buffers.engine_inputs
 
-        # Create decoder batch output
-        decoding_output = DecoderBatchOutput()
-        decoding_output.cache_indirection = decoder_buffers.cache_indirection_output
-
-        return decoding_input, decoding_output
+        return decoding_input

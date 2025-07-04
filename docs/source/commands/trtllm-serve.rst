@@ -100,7 +100,7 @@ You can query Completions API with any http clients, a typical example is OpenAI
 
 Another example uses ``curl``:
 
-.. literalinclude:: ../../../examples/serve/curl_completion_client_for_multimodal.sh
+.. literalinclude:: ../../../examples/serve/curl_chat_client_for_multimodal.sh
     :language: bash
     :linenos:
 

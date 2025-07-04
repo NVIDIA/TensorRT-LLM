@@ -4,6 +4,7 @@ Utilities for registering and applying Torch-Inductor FX-based pattern matchers.
 Work with `torch._inductor.pattern_matcher` in PyTorch ≥ 2.7.0.
 """
 
+import contextlib
 import inspect
 import itertools
 import operator
@@ -14,6 +15,7 @@ from typing import Any, Callable, Iterable, NoReturn, Optional, Union
 import torch
 import torch.fx
 import torch.utils._pytree as pytree
+from torch._inductor import lowering
 from torch._inductor.pattern_matcher import (
     CallFunction,
     ExclusiveKeywordArg,
@@ -31,7 +33,39 @@ from torch.fx import GraphModule
 from tensorrt_llm._torch.auto_deploy.transformations.export import torch_export_to_gm
 
 
-class WrapperModule(torch.nn.Module):
+@contextlib.contextmanager
+def _patch_unsupported_input_tensor():
+    """Context manager that patches `unsupported_input_tensor` to bypass meta tensor checks.
+
+    NOTE (lucaslie): Since https://github.com/pytorch/pytorch/pull/150137 the inductor pattern
+    matcher will skip over patterns that contain meta tensors. This is a problem for us because we
+    use meta tensors for our graph. This patch skips over the check for meta tensors.
+    """
+    original_fn = lowering.unsupported_input_tensor
+
+    def patched_fn(t: torch.Tensor, parent=None, node=None):
+        """Bypass meta tensor check."""
+        if t.is_meta:
+            return False
+        return original_fn(t, parent, node)
+
+    lowering.unsupported_input_tensor = patched_fn
+    try:
+        yield
+    finally:
+        lowering.unsupported_input_tensor = original_fn
+
+
+class ADPatternMatcherPass(PatternMatcherPass):
+    """The off-the-shelf PatternMatcherPass from PyTorch Inductor with some hacks for AutoDeploy."""
+
+    def apply(self, graph: Union[torch.fx.Graph, GraphModule]) -> int:
+        """Apply pattern matcher with unsupported_input_tensor patch to bypass meta tensor check."""
+        with _patch_unsupported_input_tensor():
+            return super().apply(graph)
+
+
+class _WrapperModule(torch.nn.Module):
     """
     Wraps a stand-alone function into a torch.nn.Module so it can be exported.
     """
@@ -44,11 +78,11 @@ class WrapperModule(torch.nn.Module):
         return self.fn(*args, **kwargs)
 
 
-def trace_to_gm(fn: Callable, args: Sequence[torch.Tensor]) -> GraphModule:
+def _trace_to_gm(fn: Callable, args: Sequence[torch.Tensor]) -> GraphModule:
     """
     Exports a function or Module into a GraphModule via torch_export_to_gm.
     """
-    module = fn if isinstance(fn, torch.nn.Module) else WrapperModule(fn)
+    module = fn if isinstance(fn, torch.nn.Module) else _WrapperModule(fn)
     return torch_export_to_gm(module, tuple(args))
 
 
@@ -60,12 +94,12 @@ def _return_true(match: Match) -> bool:
     return True
 
 
-def register_pattern(
+def register_ad_pattern(
     search_fn: Callable,
     replace_fn: Callable,
     patterns: PatternMatcherPass,
     dummy_args: Iterable[Any],
-    trace_fn: Callable[[Callable, Sequence[torch.Tensor]], GraphModule] = trace_to_gm,
+    trace_fn: Callable[[Callable, Sequence[torch.Tensor]], GraphModule] = _trace_to_gm,
     # optional args input to our variants of `fx_to_pattern`
     ignore_types: Sequence[type[Any]] = (),
     op_ignore_types: Optional[Mapping[Callable[..., Any], Sequence[type[Any]]]] = None,
@@ -123,7 +157,7 @@ def register_pattern(
     """
     argnames = list(inspect.signature(search_fn).parameters.keys())
     specific_gm = trace_fn(search_fn, dummy_args)
-    pattern = fx_to_pattern_with_op_ignore(
+    pattern = _fx_to_ad_pattern_with_op_ignore(
         specific_gm,
         argnames=argnames,
         ignore_types=ignore_types,
@@ -149,7 +183,7 @@ def register_pattern(
 #   When a shape dimension is materialized as a literal argument to an aten op (e.g., slice or view);
 #   it's helpful to ignore matching args of these ops, so that the corresponding dimension of your dummy_args
 #   doesn't need to match the real runtime value
-def fx_to_pattern_with_op_ignore(
+def _fx_to_ad_pattern_with_op_ignore(
     gm: Union[torch.fx.GraphModule, torch.fx.Graph],
     ignore_types: Sequence[type[Any]] = (),
     op_ignore_types: Optional[Mapping[Callable[..., Any], Sequence[type[Any]]]] = None,

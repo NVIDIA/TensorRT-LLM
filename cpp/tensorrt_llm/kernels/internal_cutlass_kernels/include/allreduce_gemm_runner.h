@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 #pragma once
 
 #include <cuda_runtime_api.h>
@@ -26,22 +25,14 @@
 #include "cutlass_extensions/gemm_configs.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 
+namespace tensorrt_llm::kernels::cutlass_kernels
+{
 using namespace cute;
 using namespace tensorrt_llm::cutlass_extensions;
 
-namespace tensorrt_llm::kernels::cutlass_kernels
-{
 enum GemmAllReduceImpl
 {
     kNVLS_2SHOT
-};
-
-// Specifies whether to use SM or switch for allreduce.
-// SM is more efficient for GPUs=2 and switch for GPUs>2.
-enum ReduceLocationType
-{
-    kSM,
-    kSWITCH
 };
 
 // Decouples IPluginResource from the GemmAllReduce runner interface.
@@ -51,6 +42,7 @@ public:
     virtual ~PersistentWorkspaceInterface() = default;
     virtual void allocate() = 0;
     virtual int free() = 0;
+    virtual size_t size() = 0;
 };
 
 class GemmAllReduceImplInterface
@@ -63,7 +55,6 @@ public:
     {
         GemmAllReduceImpl impl;
         MainloopScheduleType schedule;
-        ReduceLocationType reduce_location;
         TileShape tile_shape;
         ClusterShape cluster_shape;
         int MMA_SMs;
@@ -80,21 +71,10 @@ public:
                 return "";
             };
 
-            auto get_reduction_name = [&]()
-            {
-                switch (reduce_location)
-                {
-                case ReduceLocationType::kSM: return "SM";
-                case ReduceLocationType::kSWITCH: return "Switch";
-                }
-                return "";
-            };
-
             std::stringstream ss;
             ss << "LaunchConfig(";
             ss << get_impl_name();
             ss << ", Schedule_" << get_mainloop_schedule_name(schedule);
-            ss << ", Reduction_" << get_reduction_name();
             ss << ", TileShape_" << get_tile_shape_name(tile_shape);
             ss << ", ClusterShape_" << get_cluster_shape_name(cluster_shape);
             ss << ", MmaSms_" << MMA_SMs;
@@ -104,8 +84,8 @@ public:
 
         bool operator<(LaunchConfig const& other) const
         {
-            return std::tie(impl, schedule, reduce_location, tile_shape, cluster_shape, MMA_SMs) < std::tie(other.impl,
-                       other.schedule, other.reduce_location, other.tile_shape, other.cluster_shape, other.MMA_SMs);
+            return std::tie(impl, schedule, tile_shape, cluster_shape, MMA_SMs)
+                < std::tie(other.impl, other.schedule, other.tile_shape, other.cluster_shape, other.MMA_SMs);
         }
     };
 

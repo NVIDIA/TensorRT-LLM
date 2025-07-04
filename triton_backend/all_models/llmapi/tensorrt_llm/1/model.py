@@ -33,6 +33,7 @@ import threading
 from contextlib import asynccontextmanager
 
 import numpy as np
+import pandas as pd
 import triton_python_backend_utils as pb_utils
 import yaml
 from helpers import (get_input_tensor_by_name, get_output_config_from_request,
@@ -41,10 +42,10 @@ from helpers import (get_input_tensor_by_name, get_output_config_from_request,
 from mpi4py.futures import MPICommExecutor
 from mpi4py.MPI import COMM_WORLD
 
+from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm import SamplingParams
-from tensorrt_llm._torch.llm import LLM as PyTorchLLM
-from tensorrt_llm._utils import global_mpi_rank
-from tensorrt_llm.llmapi import LLM
+from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm._utils import global_mpi_rank, global_mpi_size
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 
 
@@ -112,6 +113,8 @@ class TritonPythonModel:
             - `initialize` is called only once when the model is being loaded.
             - Implementing `initialize` function is optional.
         """
+        from tensorrt_llm.llmapi import MpiCommSession
+
         self.model_config = json.loads(args["model_config"])
         triton_config = get_model_config(os.environ.get('LLM_CONFIG_PATH',
                                                         'model.yaml'),
@@ -136,6 +139,11 @@ class TritonPythonModel:
             self.logger.log_info(
                 f"[trtllm] rank{global_mpi_rank()} is starting trtllm engine with args: {self.llm_engine_args}"
             )
+
+            if global_mpi_size() > 1:
+                mpi_session = MpiCommSession(comm=COMM_WORLD,
+                                             n_workers=COMM_WORLD.Get_size())
+                self.llm_engine_args["_mpi_session"] = mpi_session
 
             # Starting the TRT-LLM engine with LLM API and its event thread running the AsyncIO event loop.
             self._init_engine()
@@ -442,6 +450,92 @@ class TritonPythonModel:
                 response.append(
                     pb_utils.Tensor(output_name,
                                     np.asarray(tensor_data, dtype=np.object_)))
+
+        if hasattr(request_output.outputs[0], 'request_perf_metrics'
+                   ) and request_output.outputs[0].request_perf_metrics:
+
+            perf_metrics = request_output.outputs[0].request_perf_metrics
+
+            # kv cache perf metrics per request
+            kv_metrics = perf_metrics.kv_cache_metrics
+
+            response.append(
+                pb_utils.Tensor(
+                    "kv_cache_reused_block",
+                    np.asarray([kv_metrics.num_reused_blocks],
+                               dtype=self.output_dtype)))
+            response.append(
+                pb_utils.Tensor(
+                    "kv_cache_hit_rate",
+                    np.asarray([kv_metrics.kv_cache_hit_rate],
+                               dtype=self.output_dtype)))
+            response.append(
+                pb_utils.Tensor(
+                    "kv_cache_alloc_new_blocks",
+                    np.asarray([kv_metrics.num_new_allocated_blocks],
+                               dtype=self.output_dtype)))
+            response.append(
+                pb_utils.Tensor(
+                    "kv_cache_alloc_total_blocks",
+                    np.asarray([kv_metrics.num_total_allocated_blocks],
+                               dtype=self.output_dtype)))
+            response.append(
+                pb_utils.Tensor(
+                    "kv_cache_missed_block",
+                    np.asarray([kv_metrics.num_missed_blocks],
+                               dtype=self.output_dtype)))
+
+            # timing perf metrics per request
+            timing_metrics = perf_metrics.timing_metrics
+            response.append(
+                pb_utils.Tensor(
+                    "arrival_time_ns",
+                    np.asarray(
+                        [pd.Timedelta(timing_metrics.arrival_time).value],
+                        dtype=self.output_dtype)))
+
+            response.append(
+                pb_utils.Tensor(
+                    "first_scheduled_time_ns",
+                    np.asarray([
+                        pd.Timedelta(timing_metrics.first_scheduled_time).value
+                    ],
+                               dtype=self.output_dtype)))
+
+            response.append(
+                pb_utils.Tensor(
+                    "first_token_time_ns",
+                    np.asarray(
+                        [pd.Timedelta(timing_metrics.first_token_time).value],
+                        dtype=self.output_dtype)))
+
+            response.append(
+                pb_utils.Tensor(
+                    "last_token_time_ns",
+                    np.asarray(
+                        [pd.Timedelta(timing_metrics.last_token_time).value],
+                        dtype=self.output_dtype)))
+
+            #spec dec perf metrics per request
+            spec_dec_metrics = perf_metrics.speculative_decoding
+
+            response.append(
+                pb_utils.Tensor(
+                    "acceptance_rate",
+                    np.asarray([spec_dec_metrics.acceptance_rate],
+                               dtype=self.output_dtype)))
+
+            response.append(
+                pb_utils.Tensor(
+                    "total_accepted_draft_tokens",
+                    np.asarray([spec_dec_metrics.total_accepted_draft_tokens],
+                               dtype=self.output_dtype)))
+
+            response.append(
+                pb_utils.Tensor(
+                    "total_draft_tokens",
+                    np.asarray([spec_dec_metrics.total_draft_tokens],
+                               dtype=self.output_dtype)))
 
         return pb_utils.InferenceResponse(output_tensors=response)
 

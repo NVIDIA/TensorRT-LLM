@@ -43,6 +43,15 @@ option(ENABLE_MULTI_DEVICE
        "Enable building with multi device support (requires NCCL, MPI,...)" ON)
 option(ENABLE_UCX "Enable building with UCX (Uniform Communication X) support"
        ON)
+option(NVRTC_DYNAMIC_LINKING "Link against the dynamic NVRTC libraries" OFF)
+option(USING_OSS_CUTLASS_LOW_LATENCY_GEMM
+       "Using open sourced Cutlass low latency gemm kernel" ON)
+option(USING_OSS_CUTLASS_FP4_GEMM "Using open sourced Cutlass fp4 gemm kernel"
+       ON)
+option(USING_OSS_CUTLASS_MOE_GEMM "Using open sourced Cutlass moe gemm kernel"
+       ON)
+option(USING_OSS_CUTLASS_ALLREDUCE_GEMM
+       "Using open sourced Cutlass AR gemm kernel" ON)
 
 if(NVTX_DISABLE)
   add_compile_definitions("NVTX_DISABLE")
@@ -139,9 +148,16 @@ set(CURAND_LIB CUDA::curand)
 set(CUDA_DRV_LIB CUDA::cuda_driver)
 set(CUDA_NVML_LIB CUDA::nvml)
 set(CUDA_RT_LIB CUDA::cudart_static)
-set(NVRTC_LIB CUDA::nvrtc_static)
-set(NVRTC_BUILTINS_LIB CUDA::nvrtc_builtins_static)
+set(NVPTX_LIB CUDA::nvptxcompiler_static)
 set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
+
+if(NVRTC_DYNAMIC_LINKING)
+  set(NVRTC_LIB CUDA::nvrtc)
+  set(NVRTC_BUILTINS_LIB CUDA::nvrtc_builtins)
+else()
+  set(NVRTC_LIB CUDA::nvrtc_static)
+  set(NVRTC_BUILTINS_LIB CUDA::nvrtc_builtins_static)
+endif()
 
 resolve_dirs(CUDAToolkit_INCLUDE_DIRS "${CUDAToolkit_INCLUDE_DIRS}")
 
@@ -369,27 +385,29 @@ if(BUILD_PYT)
 print(os.path.dirname(torch.__file__),end='');"
     RESULT_VARIABLE _PYTHON_SUCCESS
     OUTPUT_VARIABLE TORCH_DIR)
-  if(NOT _PYTHON_SUCCESS MATCHES 0)
+  if(NOT _PYTHON_SUCCESS EQUAL 0)
     message(FATAL_ERROR "Torch config Error.")
   endif()
   list(APPEND CMAKE_PREFIX_PATH ${TORCH_DIR})
   set(USE_SYSTEM_NVTX ON)
   set(nvtx3_dir ${3RDPARTY_DIR}/NVTX/include)
   find_package(Torch REQUIRED)
-
-  message(STATUS "TORCH_CXX_FLAGS: ${TORCH_CXX_FLAGS}")
-  add_compile_options(${TORCH_CXX_FLAGS})
   add_compile_definitions(TORCH_CUDA=1)
 
-  if(DEFINED USE_CXX11_ABI)
-    parse_make_options(${TORCH_CXX_FLAGS} "TORCH_CXX_FLAGS")
-    if(DEFINED TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI
-       AND NOT ${TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI} EQUAL ${USE_CXX11_ABI})
-      message(
-        WARNING
-          "The libtorch compilation options _GLIBCXX_USE_CXX11_ABI=${TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI} "
-          "found by CMake conflict with the project setting USE_CXX11_ABI=${USE_CXX11_ABI}, and the project "
-          "setting will be discarded.")
+  if(DEFINED TORCH_CXX_FLAGS)
+    message(STATUS "TORCH_CXX_FLAGS: ${TORCH_CXX_FLAGS}")
+    add_compile_options(${TORCH_CXX_FLAGS})
+    if(DEFINED USE_CXX11_ABI)
+      parse_make_options(${TORCH_CXX_FLAGS} "TORCH_CXX_FLAGS")
+      if(DEFINED TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI
+         AND NOT ${TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI} EQUAL
+             ${USE_CXX11_ABI})
+        message(
+          WARNING
+            "The libtorch compilation options _GLIBCXX_USE_CXX11_ABI=${TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI} "
+            "found by CMake conflict with the project setting USE_CXX11_ABI=${USE_CXX11_ABI}, and the project "
+            "setting will be discarded.")
+      endif()
     endif()
   endif()
 

@@ -29,6 +29,7 @@
 #include <fstream>
 #include <future>
 #include <limits>
+#include <nvtx3/nvToolsExt.h>
 #include <random>
 #include <thread>
 
@@ -39,7 +40,6 @@
 #endif
 
 void warmup(cudaDeviceProp const& prop, float ms, cudaStream_t stream = nullptr);
-
 bool const isTracing = []()
 {
     auto const v = std::getenv("XQA_IS_TRACING");
@@ -361,7 +361,7 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
         // Init random host uint32_t masks for reference codes.
         for (uint32_t kvPosIdx = 0; kvPosIdx < qSeqLen; kvPosIdx++)
         {
-#if IS_MLA
+#if IS_MLA || SPEC_Q_SEQ_LEN
             hostMask[tokenIdx * qSeqLen + kvPosIdx] = (tokenIdx >= kvPosIdx);
 #else
             hostMask[tokenIdx * qSeqLen + kvPosIdx] = maskDist(rng);
@@ -592,6 +592,7 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
         (useQGMMA ? ioHeadBytes : paddedInputHeadBytes) * headGrpSize
             * beamWidth)); // 8 is sufficient for qgmma kernel.
 #endif
+
 #if IS_MLA
     auto runKernel = [&]()
     {
@@ -675,12 +676,18 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
             printf("testing\n");
         }
     }
+    if (isTracing)
+    {
+        printf("Tracing is enabled\n");
+    }
     checkCuda(cudaEventRecord(tic, stream));
-    int32_t const nbIters = (USE_SMALL_IO || isTracing || !testPerf ? 1 : 100);
+    int32_t const nbIters = ((USE_SMALL_IO || isTracing || !testPerf) ? 1 : 100);
+    nvtxRangePushA("test");
     for (int32_t i = 0; i < nbIters; i++)
     {
         runKernel();
     }
+    nvtxRangePop();
     checkCuda(cudaEventRecord(toc, stream));
     prefetchToDevice(cudaCpuDeviceId);
     checkCuda(cudaStreamSynchronize(stream));
@@ -1007,7 +1014,11 @@ TEST(RefCheck, mla)
 }
 #else
 #define HEAD_GROUP_SIZE HEAD_GRP_SIZE
+#ifdef SPEC_Q_SEQ_LEN
+#define Q_SEQ_LEN SPEC_Q_SEQ_LEN
+#else
 #define Q_SEQ_LEN 62
+#endif
 
 TEST(RefCheck, llama_V2_70b_3)
 {
@@ -1051,7 +1062,8 @@ TEST(Perf, mla)
 #ifndef NDEBUG
     GTEST_SKIP() << "Skipping perf tests for debug build";
 #endif
-    runTest<1>(38, 4096, true, false);
+    // runTest<1>(38, 4096, true, false);
+    runTest<1>(46, 4096, true, false);
 }
 
 TEST(Perf, mla_real)
@@ -1062,6 +1074,13 @@ TEST(Perf, mla_real)
     runTest<1>(64, 4096, true, false);
 }
 
+TEST(Perf, mla_tracing)
+{
+#ifndef NDEBUG
+    GTEST_SKIP() << "Skipping perf tests for debug build";
+#endif
+    runTest<1>(1, 64 * 4 * 4, true, false);
+}
 #else
 TEST(RefCheck, llama_V2_70b)
 {

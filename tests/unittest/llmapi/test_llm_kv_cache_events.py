@@ -1,11 +1,14 @@
 import asyncio
 import time
 
+import pytest
+
 import tensorrt_llm
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import KVCacheEventSerializer
-from tensorrt_llm.llmapi import LLM, KvCacheConfig
+from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -100,6 +103,7 @@ def test_kv_cache_event_data_serialization():
     serialized_event = KVCacheEventSerializer.serialize(events)
 
 
+@pytest.mark.skip(reason="https://nvbugs/5362412")
 def test_expected_kv_cache_events():
     llm = create_llm()
     sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
@@ -118,6 +122,7 @@ def test_expected_kv_cache_events():
                 assert event["data"]["type"] == "stored"
 
 
+@pytest.mark.skip(reason="https://nvbugs/5362412")
 def test_kv_cache_event_async_api():
     llm = create_llm()
     sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
@@ -145,6 +150,7 @@ def test_kv_cache_event_async_api():
     asyncio.run(main())
 
 
+@pytest.mark.skip(reason="https://nvbugs/5362412")
 def test_llm_kv_events_api():
     llm = create_llm()
     sampling_params = SamplingParams(max_tokens=6, temperature=0.01)

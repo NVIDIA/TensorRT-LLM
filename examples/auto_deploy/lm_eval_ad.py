@@ -1,13 +1,13 @@
 from typing import Any, Dict, List, Tuple
 
 import torch.nn.functional as F
-from build_and_run_ad import build_llm_from_config
+from build_and_run_ad import ExperimentConfig, build_llm_from_config
 from lm_eval.__main__ import cli_evaluate
 from lm_eval.api.model import TemplateLM
 from lm_eval.api.registry import register_model
-from simple_config import SimpleConfig
 from tqdm import tqdm
 
+from tensorrt_llm._torch.auto_deploy import LlmArgs
 from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
 from tensorrt_llm.llmapi import RequestOutput
 from tensorrt_llm.sampling_params import SamplingParams
@@ -24,7 +24,7 @@ class AutoDeployEval(TemplateLM):
         if "batch_size" in kwargs:
             kwargs["batch_size"] = int(kwargs["batch_size"])
 
-        self.config = SimpleConfig(**kwargs)
+        self.config = ExperimentConfig(args=LlmArgs(**kwargs))
         self.chunk_size = chunk_size
 
         ad_logger.info(f"AutoDeploy config: {self.config}")

@@ -1,4 +1,6 @@
-### Distributed LLM Generation
+### :section Basics
+### :title Distributed LLM Generation
+### :order 3
 from tensorrt_llm import LLM, SamplingParams
 
 

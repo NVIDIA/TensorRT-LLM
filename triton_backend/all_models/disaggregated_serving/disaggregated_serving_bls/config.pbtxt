@@ -328,6 +328,18 @@ input [
     dims: [ 1 ]
     optional: true
     allow_ragged_batch: true
+  },
+  {
+    name: "return_num_output_tokens"
+    data_type: TYPE_BOOL
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "return_num_input_tokens"
+    data_type: TYPE_BOOL
+    dims: [ 1 ]
+    optional: true
   }
 ]
 output [
@@ -418,6 +430,16 @@ output [
   },
   {
     name: "total_draft_tokens"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+  },
+  {
+    name: "num_output_tokens"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+  },
+  {
+    name: "num_input_tokens"
     data_type: TYPE_INT32
     dims: [ 1 ]
   }

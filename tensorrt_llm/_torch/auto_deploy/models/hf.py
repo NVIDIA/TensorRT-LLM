@@ -62,21 +62,25 @@ def hf_load_state_dict_with_device(device: DeviceLikeType):
 
 @ModelFactoryRegistry.register("AutoModelForCausalLM")
 class AutoModelForCausalLMFactory(ModelFactory):
-    def __init__(
-        self,
-        model_kwargs: Optional[Dict[str, Any]] = None,
-        tokenizer_kwargs: Optional[Dict[str, Any]] = None,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
-        self.model_kwargs = model_kwargs or {}
-        self.tokenizer_kwargs = tokenizer_kwargs or {}
-        self.tokenizer_kwargs.setdefault("trust_remote_code", True)
-        self._quant_config = None
+        self._quant_config: Optional[Dict] = None
+
+        # Relevant default tokenizer kwargs for HF-style tokenizer
+        defaults = {
+            "legacy": False,
+            "padding_side": "left",
+            "truncation_side": "left",
+            "trust_remote_code": True,
+            "use_fast": True,
+        }
+        self.tokenizer_kwargs = {**defaults, **self.tokenizer_kwargs}
 
         # NEVER use cache
         self.model_kwargs["use_cache"] = False
+        # Ensure max_seq_len is propagated to model_kwargs
+        self.model_kwargs["max_position_embeddings"] = self.max_seq_len
 
         # special handling for torch_dtype in model_kwargs since HF does not correctly update
         # torch_dtype string to an actual torch.dtype object (only with default)
@@ -86,11 +90,6 @@ class AutoModelForCausalLMFactory(ModelFactory):
                 dtype = getattr(torch, self.model_kwargs["torch_dtype"])
             assert isinstance(dtype, torch.dtype), f"Invalid dtype: {dtype}"
             self.model_kwargs["torch_dtype"] = dtype
-
-        # prefetch the model+checkpoint
-        self.prefetch_checkpoint()
-        # load the quantization config
-        self._load_quantization_config()
 
     @property
     def autoconfig_from_pretrained(self):
@@ -142,7 +141,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
         return config
 
-    def build_model(self, device: DeviceLikeType) -> nn.Module:
+    def _build_model(self, device: DeviceLikeType) -> nn.Module:
         """Build the model on the desired device."""
         # We only support fp16 to fp4 conversion.
         if self._quant_config and self._quant_config.get("quant_algo", None) == "NVFP4":
@@ -293,17 +292,12 @@ class AutoModelForCausalLMFactory(ModelFactory):
         # at this point it should be a directory (either the original one or the download dir)
         assert os.path.isdir(fetched_dir), f"Checkpoint path {fetched_dir} is not a directory."
 
+        self._load_quantization_config()
+
         return fetched_dir
 
     def _load_checkpoint(self, model: nn.Module, device: DeviceLikeType):
         """Load the checkpoint into the model."""
-        # check if we skip loading weights
-        if self.skip_loading_weights:
-            return
-
-        # prefetch if needed
-        self.prefetch_checkpoint()
-
         # identify the most relevant checkpoint file
         ckpt_file = self._get_checkpoint_file(self.model)
         # reuse the load checkpoint utility from accelerate
@@ -311,6 +305,10 @@ class AutoModelForCausalLMFactory(ModelFactory):
             load_checkpoint_in_model(model, checkpoint=ckpt_file)
 
     def _load_quantization_config(self):
+        """Load the quantization config from the model directory if not done already."""
+        if self._quant_config is not None:
+            return
+
         assert self.model
         hf_quant_config_file = os.path.join(self.model, "hf_quant_config.json")
         if os.path.exists(hf_quant_config_file):

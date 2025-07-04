@@ -8,6 +8,8 @@ import subprocess
 import sys
 import time
 import warnings
+from collections.abc import Generator
+from typing import List, Optional
 
 import psutil
 
@@ -177,7 +179,7 @@ elif is_windows():
 def popen(*popenargs,
           start_new_session=True,
           suppress_output_info=False,
-          **kwargs):
+          **kwargs) -> Generator[subprocess.Popen]:
     if not suppress_output_info:
         print(f"Start subprocess with popen({popenargs}, {kwargs})")
 
@@ -197,10 +199,13 @@ def popen(*popenargs,
 
 
 def call(*popenargs,
-         timeout=None,
+         timeout: Optional[float] = None,
          start_new_session=True,
          suppress_output_info=False,
+         spin_time: float = 1.0,
+         poll_procs: Optional[List[subprocess.Popen]] = None,
          **kwargs):
+    poll_procs = poll_procs or []
     if not suppress_output_info:
         print(f"Start subprocess with call({popenargs}, {kwargs})")
     actual_timeout = get_pytest_timeout(timeout)
@@ -208,7 +213,18 @@ def call(*popenargs,
                start_new_session=start_new_session,
                suppress_output_info=True,
                **kwargs) as p:
-        return p.wait(timeout=actual_timeout)
+        elapsed_time = 0
+        while True:
+            try:
+                return p.wait(timeout=spin_time)
+            except subprocess.TimeoutExpired:
+                elapsed_time += spin_time
+                if actual_timeout is not None and elapsed_time >= actual_timeout:
+                    raise
+            for p_poll in poll_procs:
+                if p_poll.poll() is None:
+                    continue
+                raise RuntimeError("A sub-process has exited.")
 
 
 def check_call(*popenargs, **kwargs):

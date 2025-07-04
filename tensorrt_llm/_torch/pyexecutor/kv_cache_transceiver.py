@@ -123,4 +123,4 @@ class CacheTransBufferManager:
     def pre_alloc_buffer_size(max_num_tokens: int,
                               kv_cache_size_per_token: int):
         return CacheTransBufferManagerCpp.pre_alloc_buffer_size(
-            max_num_tokens, kv_cache_size_per_token)
+            max_num_tokens) * kv_cache_size_per_token

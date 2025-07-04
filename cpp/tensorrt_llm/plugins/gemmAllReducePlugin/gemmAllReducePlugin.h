@@ -1,12 +1,11 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,17 +15,25 @@
  */
 #pragma once
 
+#if defined(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
+#include "tensorrt_llm/kernels/cutlass_kernels/include/allreduce_gemm_runner.h"
+#else
 #include "allreduce_gemm_runner.h"
+#endif
+
 #include "gemmAllReducePluginProfiler.h"
 #include "gemmAllReducePluginResource.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 using namespace nvinfer1;
-using namespace tensorrt_llm::kernels::cutlass_kernels;
 
 using nvinfer1::DataType;
-
+#if defined(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
+namespace cutlass_kernels = ::tensorrt_llm::kernels::opened_cutlass_kernels;
+#else
+namespace cutlass_kernels = ::tensorrt_llm::kernels::cutlass_kernels;
+#endif
 namespace tensorrt_llm::plugins
 {
 struct GemmAllReducePluginOptions
@@ -120,7 +127,7 @@ private:
 
     // Params that are initialized during constructor
     using KeyType = std::tuple<DataType, DataType, DataType>;
-    using ValueType = std::function<GemmAllReduceImplInterface*()>;
+    using ValueType = std::function<cutlass_kernels::GemmAllReduceImplInterface*()>;
     GemmAllReducePluginOptions mOptions;
     int mRank = 0;
 
@@ -143,7 +150,7 @@ private:
 
     std::map<KeyType, ValueType> mTypedInstantiators;
     char const* mWorkspaceKey = "gemm_allreduce_workspace";
-    std::shared_ptr<GemmAllReduceImplInterface> mGemm;
+    std::shared_ptr<cutlass_kernels::GemmAllReduceImplInterface> mGemm;
     // Params that are initialized during configurePlugin()
     GemmAllReducePersistentWorkspace* mWorkspace = nullptr;
 

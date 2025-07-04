@@ -240,6 +240,7 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(MoeReductionAl
     float4 clear_vec = get_neg_zero();
 
     cudaGridDependencySynchronize();
+    cudaTriggerProgrammaticLaunchCompletion();
     LamportComm<NRanks> comm(params.workspace, params.rank);
     int clear_access = comm.clear_size / kElemsPerAccess;
 
@@ -371,7 +372,6 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(MoeReductionAl
         fused_op<ResidualOut, NormOut, QuantOut, DType>(sum_val, idx, tidx, access_id_in_token, params);
     }
     comm.update(params.size * NRanks);
-    cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -516,6 +516,7 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(MoeFinalizeA
     float4 clear_vec = get_neg_zero();
 
     cudaGridDependencySynchronize();
+    cudaTriggerProgrammaticLaunchCompletion();
     LamportComm<NRanks> comm(params.workspace, params.rank);
     int clear_access = comm.clear_size / kElemsPerAccess;
 
@@ -654,7 +655,7 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(MoeFinalizeA
         fused_op<ResidualOut, NormOut, QuantOut, DType>(sum_val, idx, tidx, access_id_in_token, params);
     }
     comm.update(params.size * NRanks);
-    cudaTriggerProgrammaticLaunchCompletion();
+
 #endif
 }
 

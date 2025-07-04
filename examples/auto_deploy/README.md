@@ -10,12 +10,6 @@ AutoDeploy is designed to simplify and accelerate the deployment of PyTorch mode
 
 ______________________________________________________________________
 
-## Latest News 🔥
-
-- \[2025/02/14\] Initial experimental release of `auto_deploy` backend for TensorRT-LLM
-
-______________________________________________________________________
-
 ## Motivation & Approach
 
 Deploying large language models (LLMs) can be challenging, especially when balancing ease of use with high performance. Teams need simple, intuitive deployment solutions that reduce engineering effort, speed up the integration of new models, and support rapid experimentation without compromising performance.
@@ -52,7 +46,7 @@ The general entrypoint to run the auto-deploy demo is the `build_and_run_ad.py` 
 
 ```bash
 cd examples/auto_deploy
-python build_and_run_ad.py --config '{"model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0"}'
+python build_and_run_ad.py --model "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 ```
 
 ______________________________________________________________________
@@ -74,7 +68,7 @@ Additionally, we have officially verified support for the following models:
 
 | Model Series | HF Model Card | Model Factory | Precision | World Size | Runtime | Compile Backend ||| Attention Backend |||
 |--------------|----------------------|----------------|-----------|------------|---------|-----------------|--------------------|--------------------|--------------------|----------|----------|
-|              |               |            |           |            |         | torch-simple    | torch-compile    | torch-opt          | TritonWithFlattenedInputs | FlashInfer | MultiHeadLatentAttention |
+|              |               |            |           |            |         | torch-simple    | torch-compile    | torch-opt          | triton | flashinfer | MultiHeadLatentAttention |
 | LLaMA        | meta-llama/Llama-2-7b-chat-hf<br>meta-llama/Meta-Llama-3.1-8B-Instruct<br>meta-llama/Llama-3.1-70B-Instruct<br>codellama/CodeLlama-13b-Instruct-hf | AutoModelForCausalLM | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | ✅ | n/a |
 | LLaMA-4      | meta-llama/Llama-4-Scout-17B-16E-Instruct<br>meta-llama/Llama-4-Maverick-17B-128E-Instruct | AutoModelForImageTextToText | BF16 | 1,2,4,8 | demollm, trtllm | ✅ | ✅ | ❌ | ✅ | ✅ | n/a |
 | Nvidia Minitron | nvidia/Llama-3_1-Nemotron-51B-Instruct<br>nvidia/Llama-3.1-Minitron-4B-Width-Base<br>nvidia/Llama-3.1-Minitron-4B-Depth-Base | AutoModelForCausalLM | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | ✅ | n/a |
@@ -114,8 +108,8 @@ Optimize attention operations using different attention kernel implementations:
 
 | `"attn_backend"` | Description |
 |----------------------|-------------|
-| `TritonWithFlattenedInputs` | Custom fused multi-head attention (MHA) with KV Cache kernels for efficient attention processing. |
-| `FlashInfer`         | Uses off-the-shelf optimized attention kernels with KV Cache from the [`flashinfer`](https://github.com/flashinfer-ai/flashinfer.git) library. |
+| `triton` | Custom fused multi-head attention (MHA) with KV Cache kernels for efficient attention processing. |
+| `flashinfer`         | Uses off-the-shelf optimized attention kernels with KV Cache from the [`flashinfer`](https://github.com/flashinfer-ai/flashinfer.git) library. |
 
 ### Precision Support
 
@@ -128,57 +122,55 @@ ______________________________________________________________________
 
 ## Advanced Usage
 
-### Example Build Script ([`build_and_run_ad.py`](./build_and_run_ad.py))
+### Example Run Script ([`build_and_run_ad.py`](./build_and_run_ad.py))
 
-#### Base Command
+To build and run AutoDeploy example, use the [`build_and_run_ad.py`](./build_and_run_ad.py) script:
 
-To build and run AutoDeploy example, use the following command with the [`build_and_run_ad.py`](./build_and_run_ad.py) script:
+```bash
+cd examples/auto_deploy
+python build_and_run_ad.py --model "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+```
 
-In the below example:
+You can arbitrarily configure your experiment. Use the `-h/--help` flag to see available options:
+
+```bash
+python build_and_run_ad.py --help
+```
+
+Below is a non-exhaustive list of common config options:
 
 | Configuration Key | Description |
 |-------------------|-------------|
-| `"model"` | The HF model card or path to a HF checkpoint folder |
-| `"model_factory"` | Choose model factory implementation (`"hf"` or `"llama4"`) |
-| `"skip_loading_weights"` | Only load the architecture, not the weights |
-| `"customize_tokenizer"` | Use tokenizer from model factory (true) or from LLM API (false) |
-| `"model_kwargs"` | Extra kwargs for the model config class to customize the model config |
-| `"tokenizer_kwargs"` | Extra kwargs for the tokenizer class to customize the tokenizer |
-| `"world_size"` | The number of GPUs for Tensor Parallel |
-| `"runtime"` | Specifies which type of Engine to use during runtime |
-| `"compile_backend"` | Specifies how to compile the graph at the end |
-| `"attn_backend"` | Specifies kernel implementation for attention |
-| `"mla_backend"` | Specifies implementation for multi-head latent attention |
-| `"max_seq_len"` | Maximum sequence length for inference/cache |
-| `"max_batch_size"` | Maximum dimension for statically allocated KV cache |
-| `"attn_page_size"` | Page size for attention |
-| `"benchmark"` | Indicates whether to run the built-in benchmark for token generation |
+| `--model` | The HF model card or path to a HF checkpoint folder |
+| `--args.model_factory` | Choose model factory implementation (`"AutoModelForCausalLM"`, ...) |
+| `--args.skip_loading_weights` | Only load the architecture, not the weights |
+| `--args.model_kwargs` | Extra kwargs that are being passed to the model initializer in the model factory |
+| `--args.tokenizer_kwargs` | Extra kwargs that are being passed to the tokenizer initializer in the model factory |
+| `--args.world_size` | The number of GPUs for Tensor Parallel |
+| `--args.runtime` | Specifies which type of Engine to use during runtime (`"demollm"` or `"trtllm"`) |
+| `--args.compile_backend` | Specifies how to compile the graph at the end |
+| `--args.attn_backend` | Specifies kernel implementation for attention |
+| `--args.mla_backend` | Specifies implementation for multi-head latent attention |
+| `--args.max_seq_len` | Maximum sequence length for inference/cache |
+| `--args.max_batch_size` | Maximum dimension for statically allocated KV cache |
+| `--args.attn_page_size` | Page size for attention |
+| `--prompt.batch_size` | Number of queries to generate |
+| `--benchmark.enabled` | Whether to run the built-in benchmark (true/false) |
 
-For default values and additional configuration options, refer to the [simple_config.py](./simple_config.py) file.
+For default values and additional configuration options, refer to the `ExperimentConfig` class in [build_and_run_ad.py](./build_and_run_ad.py) file.
+
+Here is a more complete example of using the script:
 
 ```bash
 cd examples/auto_deploy
 python build_and_run_ad.py \
---config '{"model": {HF_modelcard_or_path_to_local_folder}, "world_size": {num_GPUs}, "runtime": {"demollm"|"trtllm"}, "compile_backend": {"torch-simple"|"torch-opt"}, "attn_backend": {"TritonWithFlattenedInputs"|"FlashInfer"}, "benchmark": {true|false} }'
+--model "TinyLlama/TinyLlama-1.1B-Chat-v1.0" \
+--args.world_size 2 \
+--args.runtime "demollm" \
+--args.compile_backend "torch-compile" \
+--args.attn_backend "flashinfer" \
+--benchmark.enabled True
 ```
-
-#### Experiment Configuration
-
-The experiment configuration `dataclass` is defined in
-[simple_config.py](./simple_config.py). Check it out for detailed documentation on each
-available configuration.
-
-Arguments can be overwritten during runtime by specifying the `--config` argument on the command
-line and providing a valid config dictionary in `json` format. For example, to run any experiment
-with benchmarking enabled, use:
-
-```bash
-cd examples/auto_deploy
-python build_and_run_ad.py --config '{"benchmark": true}'
-```
-
-The `model_kwargs` and `tokenizer_kwargs` dictionaries can be supplied on the command line via
-`--model-kwargs '{}'` and `--tokenizer-kwargs '{}'`.
 
 #### Logging Level
 
@@ -222,7 +214,7 @@ Refer to [NVIDIA TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Mo
 
 ```bash
 cd examples/auto_deploy
-python build_and_run_ad.py --config '{"world_size": 1, "model": "{<MODELOPT_CKPT_PATH>}"}'
+python build_and_run_ad.py --model "<MODELOPT_CKPT_PATH>" --args.world_size 1
 ```
 
 ### Incorporating `auto_deploy` into your own workflow
@@ -235,18 +227,16 @@ Here is an example of how you can build an LLM object with AutoDeploy integratio
 <summary>Click to expand the example</summary>
 
 ```
-from tensorrt_llm import LLM
+from tensorrt_llm._torch.auto_deploy import LLM
 
 
 # Construct the LLM high-level interface object with autodeploy as backend
 llm = LLM(
     model=<HF_MODEL_CARD_OR_DIR>,
-    backend="_autodeploy",
-    tensor_parallel_size=<NUM_WORLD_RANK>,
-    use_cuda_graph=True, # set True if using "torch-opt" as compile backend
-    torch_compile_enabled=True, # set True if using "torch-opt" as compile backend
-    model_kwargs={"use_cache": False}, # AutoDeploy uses its own cache implementation
-    attn_backend="TritonWithFlattenedInputs", # choose between "TritonWithFlattenedInputs" and "FlashInfer"
+    world_size=<NUM_WORLD_RANK>,
+    compile_backend="torch-compile",
+    model_kwargs={"num_hidden_layers": 2}, # test with smaller model configuration
+    attn_backend="flashinfer", # choose between "triton" and "flashinfer"
     attn_page_size=64, # page size for attention (tokens_per_block, should be == max_seq_len for triton)
     skip_loading_weights=False,
     model_factory="AutoModelForCausalLM", # choose appropriate model factory

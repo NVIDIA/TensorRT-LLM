@@ -230,22 +230,17 @@ CacheTransBufferManager::CacheTransBufferManager(
     allocateBuffer();
 }
 
-size_t CacheTransBufferManager::preAllocBufferSize(
-    std::optional<size_t> maxNumTokens, std::optional<size_t> kvCacheSizePerToken)
+size_t CacheTransBufferManager::preAllocBufferSize(std::optional<size_t> maxNumTokens)
 {
     bool to_allocate = common::getEnvUseMPIKvCache() || common::getEnvUseUCXKvCache() || common::getEnvUseNixlKvCache();
     if (!to_allocate)
     {
         return 0;
     }
-    if (maxNumTokens.has_value())
-    {
-        TLLM_CHECK(kvCacheSizePerToken.has_value());
-    }
     size_t TransferBufferSize = common::getEnvMemSizeForKVCacheTransferBuffer();
     if (maxNumTokens.has_value())
     {
-        TransferBufferSize = maxNumTokens.value() * kvCacheSizePerToken.value();
+        TransferBufferSize = maxNumTokens.value();
     }
     bool useFabricMemory = FabricMemory::supportFbaricMemory()
         && (!(common::getEnvKVCacheTransferUseSyncBuffer() || common::getEnvKVCacheTransferUseAsyncBuffer()));

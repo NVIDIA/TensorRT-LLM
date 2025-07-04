@@ -59,7 +59,7 @@ template <uint32_t n>
 __device__ inline QuadRegRowMaxT<n * warp_size> replicateForQuad(Warp const& warp, Vec<float, n> const& src)
 {
     assertWarpConverged();
-    QuadRegRowMaxT<n * warp_size> dst;
+    QuadRegRowMaxT<n * warp_size> dst{};
 #pragma unroll
     for (uint32_t i = 0; i < src.size; i++)
     {
@@ -82,7 +82,7 @@ __device__ inline ThrdRegRowMaxT<warp_size * exactDiv(n, 4)> dedupFromQuad(Warp 
         assert(src[i] == __shfl_sync(~0U, src[i], laneId() / 4 * 4));
     }
 #endif
-    ThrdRegRowMaxT<warp_size * exactDiv(n, 4)> dst;
+    ThrdRegRowMaxT<warp_size * exactDiv(n, 4)> dst{};
     uint32_t const lane = laneId();
     uint32_t const idxMat = lane / 8;
     uint32_t const idxRow = lane % 8;

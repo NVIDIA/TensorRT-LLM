@@ -267,8 +267,8 @@ def generate_fmha_cu(project_dir, venv_python):
     build_run("python3 setup.py", env=env)
 
     # Copy generated header file when cu path is active and cubins are deleted.
-    # cubin_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin"
-    # build_run(f"mv generated/fmha_cubin.h {cubin_dir}")
+    cubin_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin"
+    build_run(f"mv generated/fmha_cubin.h {cubin_dir}")
 
     for cu_file in (fmha_v2_dir / "generated").glob("*sm*.cu"):
         build_run(f"mv {cu_file} {fmha_v2_cu_dir}")
@@ -304,7 +304,8 @@ def main(*,
          nvtx: bool = False,
          skip_stubs: bool = False,
          generate_fmha: bool = False,
-         no_venv: bool = False):
+         no_venv: bool = False,
+         nvrtc_dynamic_linking: bool = False):
 
     if clean:
         clean_wheel = True
@@ -403,6 +404,9 @@ def main(*,
 
     if fast_build:
         cmake_def_args.append(f"-DFAST_BUILD=ON")
+
+    if nvrtc_dynamic_linking:
+        cmake_def_args.append(f"-DNVRTC_DYNAMIC_LINKING=ON")
 
     targets = ["tensorrt_llm", "nvinfer_plugin_tensorrt_llm"]
 
@@ -786,6 +790,11 @@ def add_arguments(parser: ArgumentParser):
         action="store_true",
         help=
         "Use the current Python interpreter without creating a virtual environment."
+    )
+    parser.add_argument(
+        "--nvrtc_dynamic_linking",
+        action="store_true",
+        help="Link against the dynamic NVRTC libraries and not the static ones."
     )
 
 

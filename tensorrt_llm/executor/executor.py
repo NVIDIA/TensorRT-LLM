@@ -350,6 +350,7 @@ class GenerationExecutor(ABC):
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
+        garbage_collection_gen0_threshold: Optional[int] = None,
     ) -> Union["GenerationExecutorProxy", "GenerationExecutorWorker"]:
         # local imports to avoid cyclic importing
         from .proxy import GenerationExecutorProxy
@@ -393,7 +394,9 @@ class GenerationExecutor(ABC):
                 model_world_size=model_world_size,
                 mpi_session=mpi_session,
                 postproc_worker_config=postproc_worker_config,
-                is_llm_executor=is_llm_executor)
+                is_llm_executor=is_llm_executor,
+                garbage_collection_gen0_threshold=
+                garbage_collection_gen0_threshold)
 
         # WAR: For the performance of gathering logits, we use single process worker
         # for TP1 to avoid the large overhead of IPC.
@@ -404,7 +407,9 @@ class GenerationExecutor(ABC):
                 "Using single process worker for TP1, this may hurt streaming generation performance."
             )
             return GenerationExecutorWorker(**worker_kwargs,
-                                            is_llm_executor=is_llm_executor)
+                                            is_llm_executor=is_llm_executor,
+                                            garbage_collection_gen0_threshold=
+                                            garbage_collection_gen0_threshold)
 
         # For single-gpu case:
         # Partition the workload to multiple process for streaming performance.
@@ -416,7 +421,9 @@ class GenerationExecutor(ABC):
                 model_world_size=model_world_size,
                 mpi_session=None,  # use mpi4py
                 postproc_worker_config=postproc_worker_config,
-                is_llm_executor=is_llm_executor)
+                is_llm_executor=is_llm_executor,
+                garbage_collection_gen0_threshold=
+                garbage_collection_gen0_threshold)
         else:
             ctx = multiprocessing.get_context("spawn")
             # The ProcessPoolExecutorSession is used to support Windows, as mpi4py cannot.
@@ -427,7 +434,9 @@ class GenerationExecutor(ABC):
                 model_world_size=model_world_size,
                 mpi_session=mpi_session,
                 postproc_worker_config=postproc_worker_config,
-                is_llm_executor=is_llm_executor)
+                is_llm_executor=is_llm_executor,
+                garbage_collection_gen0_threshold=
+                garbage_collection_gen0_threshold)
 
     def wait_first_completed(
         self, futures: List[GenerationResult]

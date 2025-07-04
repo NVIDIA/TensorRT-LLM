@@ -7,8 +7,7 @@ import torch
 from utils.llm_data import llm_models_root
 from utils.util import getSMVersion
 
-from tensorrt_llm import SamplingParams
-from tensorrt_llm._torch import LLM
+from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 
@@ -64,7 +63,6 @@ def test_deepseek_streaming(model_name, backend, quant, tp_size):
 
     pytorch_config = dict(
         disable_overlap_scheduler=True,
-        use_cuda_graph=False,
         kv_cache_dtype="auto",
         attn_backend=backend,
         moe_max_num_tokens=moe_max_num_tokens,

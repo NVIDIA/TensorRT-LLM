@@ -35,6 +35,8 @@ GuidedDecoder::GuidedDecoder(executor::GuidedDecodingConfig const& guidedDecodin
     , mLogitsDtype{logitsDtype}
     , mCopyBufferManager{std::make_shared<CudaStream>()}
 {
+    TLLM_CHECK_WITH_INFO(mGuidedDecodingBackend != executor::GuidedDecodingConfig::GuidedDecodingBackend::kLLGUIDANCE,
+        "LLGuidance is not supported for guided decoding in C++ runtime.");
     if (mGuidedDecodingBackend == executor::GuidedDecodingConfig::GuidedDecodingBackend::kXGRAMMAR)
     {
         mXGrammarMatchers.resize(mMaxNumSequences);
