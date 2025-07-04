@@ -436,6 +436,7 @@ examples/test_phi.py::test_llm_phi_quantization_1gpu[Phi-3.5-mini-instruct-fp8-f
 accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_fp8 SKIP (https://nvbugs/5355054)
 accuracy/test_cli_flow.py::TestLlama3_1_8BInstruct::test_fp8_prequantized SKIP (https://nvbugs/5355054)
 accuracy/test_cli_flow.py::TestLlama3_1_8BInstruct::test_medusa_fp8_prequantized SKIP (https://nvbugs/5355054)
+disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tllm_gen_helix[DeepSeek-V3-Lite-fp8] SKIP (temporary, work in progress)
 examples/test_gpt.py::test_starcoder_fp8_quantization_2gpu[starcoder] SKIP (https://nvbugs/5355128)
 examples/test_gpt.py::test_starcoder_fp8_quantization_2gpu[starcoderplus] SKIP (https://nvbugs/5355128)
 examples/test_multimodal.py::test_llm_multimodal_general[fuyu-8b-pp:1-tp:1-float16-bs:8-cpp_e2e:True-nb:1] SKIP (https://nvbugs/5360086)

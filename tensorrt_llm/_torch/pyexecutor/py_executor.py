@@ -28,6 +28,7 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
 from ..speculative.drafter import Drafter
@@ -1445,17 +1446,38 @@ class PyExecutor:
 
         return result
 
+    def _merge_helix_requests(self, new_requests: list[RequestQueueItem]):
+
+        def make_fake_data(req_item: RequestQueueItem):
+            # similar to _merge_star_attention_requests, we need fake data for scheduler
+            # we simply partition by cp_size
+            input_tokens = req_item.request.input_token_ids
+            tokens_per_rank = (len(input_tokens) + self.dist.cp_size -
+                               1) // self.dist.cp_size
+            tokens_this_rank_start = tokens_per_rank * self.dist.cp_rank
+            tokens_this_rank_end = min(tokens_this_rank_start + tokens_per_rank,
+                                       len(input_tokens))
+            return req_item.id, req_item.request, [0] * (tokens_this_rank_end -
+                                                         tokens_this_rank_start)
+
+        return [
+            executor_request_to_llm_request(*make_fake_data(req_item))
+            for req_item in new_requests
+        ]
+
     @nvtx_range("_merge_requests")
     def _merge_requests(self, new_requests: list[RequestQueueItem]):
         cp_config = self.dist.cp_config
         if 'cp_type' in cp_config:
             cp_type = cp_config['cp_type']
-            if cp_type == 'star_attention':
+            if cp_type == CpType.STAR:
                 return self._merge_star_attention_requests(new_requests)
-            elif cp_type == 'ring_attention':
+            elif cp_type == CpType.HELIX:
+                return self._merge_helix_requests(new_requests)
+            elif cp_type == CpType.RING:
                 raise NotImplementedError("ring attention not implemented yet")
             else:
-                raise NotImplementedError(f'unsupport cp type {cp_type}')
+                raise NotImplementedError(f'Unsupported cp type {cp_type.name}')
         else:
             return [
                 executor_request_to_llm_request(
@@ -1670,12 +1692,13 @@ class PyExecutor:
     @nvtx_range("_update_request_states")
     def _update_request_states(self, scheduled_requests: ScheduledRequests):
         cp_config = self.dist.cp_config
-        if 'cp_type' in cp_config:
+        # note: helix parallelism uses the same logic as tp parallelism here
+        if 'cp_type' in cp_config and cp_config['cp_type'] != CpType.HELIX:
             cp_type = cp_config['cp_type']
-            if cp_type == 'star_attention':
+            if cp_type == CpType.STAR:
                 self._update_request_states_star_attention(scheduled_requests)
             else:
-                assert False, f'Unsupport cp_type {cp_type}'
+                assert False, f'Unsupported cp type {cp_type.name}'
         else:
             self._update_request_states_tp(scheduled_requests)
 

@@ -7,14 +7,15 @@ from torch import nn
 
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import CpType, Mapping
 
 from ..attention_backend import (AttentionInputType, AttentionMetadata,
                                  TrtllmAttention, TrtllmAttentionMetadata)
-from ..attention_backend.interface import (PositionalEmbeddingParams,
+from ..attention_backend.interface import (AttentionBackend,
+                                           PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
 from ..attention_backend.utils import create_attention, get_attention_backend
-from ..distributed import AllReduceParams
+from ..distributed import AllReduceParams, cp_allgather
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import Fp4QuantizedTensor, get_model_extra_attrs
@@ -102,9 +103,11 @@ class Attention(nn.Module):
             tp_size = 1
 
         mapping = Mapping(
-            world_size=tp_size * pp_size,
+            world_size=tp_size * pp_size * config.mapping.cp_size,
             tp_size=tp_size,
             pp_size=pp_size,
+            cp_size=config.mapping.cp_size,
+            cp_config=config.mapping.cp_config,
             rank=config.mapping.rank,
             gpus_per_node=config.mapping.gpus_per_node,
             enable_attention_dp=config.mapping.enable_attention_dp,
@@ -475,18 +478,24 @@ class MLA(nn.Module):
 
         # tensor parallel
         config = config or ModelConfig()
-        tp_size = config.mapping.tp_size
-        pp_size = config.mapping.pp_size
-        if config.mapping.enable_attention_dp:
+        self.mapping = config.mapping
+        tp_size = self.mapping.tp_size
+        pp_size = self.mapping.pp_size
+        cp_size = self.mapping.cp_size
+        if self.mapping.enable_attention_dp:
             tp_size = 1
+        if self.mapping.has_cp_ulysses():
+            raise NotImplementedError("MLA doesn't support CP Ulyssees yet")
 
         mapping = Mapping(
-            world_size=tp_size * pp_size,
+            world_size=tp_size * pp_size * cp_size,
             tp_size=tp_size,
             pp_size=pp_size,
-            rank=config.mapping.rank,
-            gpus_per_node=config.mapping.gpus_per_node,
-            enable_attention_dp=config.mapping.enable_attention_dp,
+            cp_size=cp_size,
+            cp_config=self.mapping.cp_config,
+            rank=self.mapping.rank,
+            gpus_per_node=self.mapping.gpus_per_node,
+            enable_attention_dp=self.mapping.enable_attention_dp,
         )
 
         assert self.num_heads % tp_size == 0
@@ -494,7 +503,7 @@ class MLA(nn.Module):
         self.num_key_value_heads = (self.num_key_value_heads + tp_size -
                                     1) // tp_size
 
-        rms_norm_eps = config.pretrained_config.rms_norm_eps
+        rms_norm_eps = getattr(config.pretrained_config, "rms_norm_eps", 1e-6)
         quant_config = config.get_quant_config()
         self.quant_config = quant_config
 
@@ -715,6 +724,57 @@ class MLA(nn.Module):
         q[..., self.qk_nope_head_dim:] = q_pe.view(-1, self.num_heads,
                                                    self.qk_rope_head_dim)
         return k_pe
+
+    def _attn_forward(self, attn_instance: AttentionBackend, q: torch.Tensor,
+                      k: torch.Tensor, v: torch.Tensor,
+                      attn_metadata: AttentionMetadata, **kwargs):
+        if self.mapping.cp_size > 1 and self.mapping.cp_config.get(
+                "cp_type") == CpType.HELIX:
+            # partial_o: [num_tokens, num_heads * v_head_dim]
+            # softmax_stats: [num_tokens, num_heads, 2]
+            softmax_stats = torch.empty(q.shape[0],
+                                        self.num_heads,
+                                        2,
+                                        device=q.device,
+                                        dtype=torch.float32)
+            partial_o = attn_instance.forward(
+                q,
+                k,
+                v,
+                attn_metadata,
+                softmax_stats_tensor=softmax_stats,
+                **kwargs)
+            # this is the post-processing of helix parallel attention,
+            # similar to the post-processing of ring attention
+            v_head_dim = partial_o.shape[-1] // self.num_heads
+            all_gathered = cp_allgather([partial_o, softmax_stats],
+                                        self.mapping,
+                                        dim=0)
+            # [num_tokens, num_heads * v_head_dim] -> [cp_size, num_tokens, num_heads * v_head_dim]
+            gathered_o = all_gathered[0].view(self.mapping.cp_size,
+                                              *partial_o.shape)
+            # [num_tokens, num_heads, 2] -> [cp_size, num_tokens, num_heads, 2]
+            gathered_stats = all_gathered[1].view(self.mapping.cp_size,
+                                                  *softmax_stats.shape)
+            # [cp_size, num_tokens, num_heads] -> [1, num_tokens, num_heads]
+            global_max = torch.max(gathered_stats[..., 0], dim=0,
+                                   keepdim=True)[0]
+            # [cp_size, num_tokens, num_heads]
+            corrected_max = gathered_stats[..., 0] - global_max
+            corrected_max_exp = torch.exp(corrected_max)
+            corrected_sum = gathered_stats[..., 1] * corrected_max_exp
+            # [cp_size, num_tokens, num_heads] -> [1, num_tokens, num_heads]
+            global_sum = torch.sum(corrected_sum, dim=0, keepdim=True)
+            # [cp_size, num_tokens, num_heads] -> [cp_size, num_tokens, num_heads, 1]
+            correction = torch.unsqueeze(corrected_max_exp / global_sum, -1)
+            # [cp_size, num_tokens, num_heads, v_head_dim]
+            corrected_o = gathered_o.view(*correction.shape[:-1],
+                                          v_head_dim) * correction
+            # [cp_size, num_tokens, num_heads, v_head_dim] -> [num_tokens, num_heads * v_head_dim]
+            attn_output = torch.sum(corrected_o.view(*gathered_o.shape), dim=0)
+            return attn_output.to(dtype=gathered_o.dtype)
+        else:
+            return attn_instance.forward(q, k, v, attn_metadata, **kwargs)
 
     def create_output(self, hidden_states: torch.Tensor):
         num_tokens = hidden_states.shape[0]
@@ -1209,7 +1269,8 @@ class MLA(nn.Module):
         # out_scale = getattr(self.o_proj, "inv_input_scale", None)
         out_scale = None  # Although we use FP8 MLA for generation phase, the output is still in BF16
 
-        attn_out_latent = self.mqa.forward(
+        attn_out_latent = self._attn_forward(
+            self.mqa,
             fused_q,
             None,
             None,

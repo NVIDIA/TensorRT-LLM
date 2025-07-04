@@ -220,3 +220,23 @@ class SpecMetadata:
         value = value if value is not SpecMetadata.all_rank_num_tokens else None
         self._all_rank_num_tokens = value
         self.all_rank_max_num_tokens = max(value) if value is not None else None
+
+    @property
+    def all_tp_rank_num_tokens(self) -> Optional[List[int]]:
+        # this is just an alias for all_rank_num_tokens
+        return self.all_rank_num_tokens
+
+    @all_tp_rank_num_tokens.setter
+    def all_tp_rank_num_tokens(self, value: Optional[List[int]]):
+        # this is just an alias for all_rank_num_tokens
+        self.all_rank_num_tokens = value
+
+    @property
+    def all_tp_rank_num_seqs(self) -> Optional[List[int]]:
+        # this is just an alias for all_rank_num_seqs
+        return self.all_rank_num_seqs
+
+    @all_tp_rank_num_seqs.setter
+    def all_tp_rank_num_seqs(self, value: Optional[List[int]]):
+        # this is just an alias for all_rank_num_seqs
+        self.all_rank_num_seqs = value

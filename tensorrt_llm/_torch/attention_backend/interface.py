@@ -118,13 +118,15 @@ class AttentionMetadata:
     runtime_features: AttentionRuntimeFeatures = field(
         default_factory=AttentionRuntimeFeatures)
 
-    # The number of tokens in each rank.
+    # The number of tokens in each (TP) rank.
     _all_rank_num_tokens: Optional[List[int]] = field(init=False,
                                                       default=None,
                                                       repr=False)
     all_rank_num_tokens: Optional[List[int]]
     # The max number of tokens among all ranks.
     all_rank_max_num_tokens: Optional[int] = None
+    # The number of tokens in each CP rank.
+    all_cp_rank_num_tokens: Optional[List[int]] = None
 
     # These fields are set when changing seq_lens and _num_contexts to avoid computation
     # during execution. If the calculation happens during execution, torch compile treats it
@@ -164,6 +166,16 @@ class AttentionMetadata:
         value = value if value is not AttentionMetadata.all_rank_num_tokens else None
         self._all_rank_num_tokens = value
         self.all_rank_max_num_tokens = max(value) if value is not None else None
+
+    @property
+    def all_tp_rank_num_tokens(self) -> Optional[List[int]]:
+        # for now, this is just an alias for all_rank_num_tokens
+        return self.all_rank_num_tokens
+
+    @all_tp_rank_num_tokens.setter
+    def all_tp_rank_num_tokens(self, value: Optional[List[int]]):
+        # for now, this is just an alias for all_rank_num_tokens
+        self.all_rank_num_tokens = value
 
     @property
     def seq_lens(self) -> Optional[torch.Tensor]:
