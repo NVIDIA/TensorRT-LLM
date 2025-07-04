@@ -493,7 +493,7 @@ class FP8RowwiseLinearMethod(LinearMethodBase):
                                        module.tp_rank, module.tp_mode)
         right_scale = load_weight_shard(weights[1][scale_name], module.tp_size,
                                         module.tp_rank, module.tp_mode)
-        fused_scale = torch.cat([left_scale, right_scale], dim=0)
+        fused_scale = torch.cat((left_scale, right_scale))
         copy_weight(module.weight_scale, fused_scale)
 
 
