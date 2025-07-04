@@ -906,10 +906,81 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
 
                 }
-                def testStageName = "[Test-x86_64] Run"
+                def testStageName = "[Test-x86_64-Single-GPU] Run"
                 if (env.localJobCredentials) {
-                    testStageName = "[Test-x86_64] Remote Run"
+                    testStageName = "[Test-x86_64-Single-GPU] Remote Run"
                 }
+                testJobName = "L0_Test-x86_64-Single-GPU"
+                def willRunMultiGpuTest = false
+                stage(testStageName) {
+                    if (X86_TEST_CHOICE == STAGE_CHOICE_SKIP) {
+                        echo "x86_64 test job is skipped due to Jenkins configuration"
+                        return
+                    }
+                    try {
+                        parameters = getCommonParameters()
+
+                        String testFilterJson = writeJSON returnText: true, json: testFilter
+                        String globalVarsJson = writeJSON returnText: true, json: globalVars
+                        parameters += [
+                            'enableFailFast': enableFailFast,
+                            'testFilter': testFilterJson,
+                            'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
+                            'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
+                            'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
+                            'globalVars': globalVarsJson,
+                        ]
+
+                        if (env.alternativeTRT) {
+                            parameters += [
+                                'alternativeTRT': env.alternativeTRT,
+                            ]
+                        }
+
+                        if (env.testPhase2StageName) {
+                            parameters += [
+                                'testPhase2StageName': env.testPhase2StageName,
+                            ]
+                        }
+
+                        echo "trigger x86_64 test job, params: ${parameters}"
+
+                        def status = triggerJob(
+                            testJobName,
+                            parameters,
+                        )
+                        willRunMultiGpuTest = currentBuild.description?.contains("Will run multi-GPU tests") ?: false
+                        echo "willRunMultiGpuTest: ${willRunMultiGpuTest}"
+
+                        if (status != "SUCCESS") {
+                            error "Downstream job did not succeed"
+                        }
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        if (X86_TEST_CHOICE == STAGE_CHOICE_IGNORE) {
+                            catchError(
+                                buildResult: 'SUCCESS',
+                                stageResult: 'FAILURE') {
+                                error "x86_64 test failed but ignored due to Jenkins configuration"
+                            }
+                        } else if (JOB_NAME ==~ /.*PostMerge.*/) {
+                            catchError(
+                                buildResult: 'FAILURE',
+                                stageResult: 'FAILURE') {
+                                error "x86_64 single-GPU test failed"
+                            }
+                        } else {
+                            throw e
+                        }
+                    }
+                }
+                if (!willRunMultiGpuTest && !(env.JOB_NAME ==~ /.*PostMerge.*/)) {
+                    echo "Not postMerge job and willRunMultiGpuTest: ${willRunMultiGpuTest}"
+                    return
+                }
+                testStageName = "[Test-x86_64-Multi-GPU] Run"
+                testJobName = "L0_Test-x86_64-Multi-GPU"
                 stage(testStageName) {
                     if (X86_TEST_CHOICE == STAGE_CHOICE_SKIP) {
                         echo "x86_64 test job is skipped due to Jenkins configuration"
@@ -943,7 +1014,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         echo "trigger x86_64 test job, params: ${parameters}"
 
                         def status = triggerJob(
-                            "L0_Test-x86_64",
+                            testJobName,
                             parameters,
                         )
 
