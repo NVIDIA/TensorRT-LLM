@@ -25,6 +25,8 @@
     "python.testing.pytestArgs": [
         "./tests/unittest/_torch/auto_deploy",
         "--no-cov",
+        "-n=auto",
+        "--dist=worksteal",
     ],
     "files.exclude": {
         "build": true,

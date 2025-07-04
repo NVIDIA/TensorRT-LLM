@@ -4,7 +4,7 @@ from typing import Callable
 import openai
 from transformers import AutoTokenizer
 
-from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm import LLM
 from tensorrt_llm.executor import GenerationExecutor
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.sampling_params import SamplingParams
@@ -73,9 +73,25 @@ class OpenaiWorker(Worker):
             "model": self.model,
             "prompt": task.input_str,
         }
+        add_param_if_not_none(params, "best_of", [task.best_of])
+        add_param_if_not_none(params, "echo", [task.echo])
+        add_param_if_not_none(params, "frequency_penalty",
+                              [task.frequency_penalty])
+        add_param_if_not_none(params, "logit_bias", [task.logit_bias])
+        add_param_if_not_none(params, "logprobs", [task.num_logprobs])
         add_param_if_not_none(params, "max_tokens", [task.max_tokens])
+        add_param_if_not_none(params, "n", [task.n])
+        add_param_if_not_none(params, "presence_penalty",
+                              [task.presence_penalty])
+        add_param_if_not_none(params, "seed", [task.seed])
+        add_param_if_not_none(params, "stop", [task.stop])
+        add_param_if_not_none(params, "stream", [task.stream])
+        add_param_if_not_none(params, "stream_options", [task.stream_options])
+        add_param_if_not_none(params, "suffix", [task.suffix])
         add_param_if_not_none(params, "temperature", [task.temperature])
         add_param_if_not_none(params, "top_p", [task.top_p])
+        add_param_if_not_none(params, "user", [task.user])
+
         return params
 
     def fill_generation_task_with_response(self, task: GenerationTask,
@@ -150,7 +166,6 @@ class TRTLLMWorker(Worker):
         )
 
         llm = LLM(model_dir,
-                  backend=backend,
                   tokenizer=tokenizer,
                   mixed_sampler=True,
                   disable_overlap_scheduler=disable_overlap_scheduler,
