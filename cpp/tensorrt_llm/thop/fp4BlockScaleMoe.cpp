@@ -25,8 +25,9 @@ namespace torch_ext
 {
 namespace btg = batchedGemm::trtllm::gen;
 using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::RoutingMethodType;
+using MoeRunnerType = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner;
 
-std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routing_logits,
+std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::Tensor const& routing_logits,
     torch::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
     torch::Tensor const& hidden_states_scale, torch::Tensor const& gemm1_weights,
     torch::Tensor const& gemm1_weights_scale, torch::Tensor const& gemm2_weights,
@@ -35,7 +36,7 @@ std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routi
     int64_t const num_experts, int64_t const top_k, std::optional<int64_t> const n_group,
     std::optional<int64_t> const topk_group, int64_t const intermediate_size, int64_t const local_expert_offset,
     int64_t const local_num_experts, std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim,
-    int64_t const routing_method_type, bool const do_finalize)
+    int64_t const routing_method_type, bool const do_finalize, MoeRunnerType& moe_runner, int64_t const moeConfigIndex)
 {
     auto const sm = tensorrt_llm::common::getSMVersion();
     TORCH_CHECK(sm == 100, "Only SM100 is supported by FP4 block scale MOE");
@@ -43,6 +44,8 @@ std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routi
             || routing_logits.scalar_type() == at::ScalarType::BFloat16,
         "routing_logits must be float or bfloat16.");
     TORCH_CHECK(routing_logits.dim() == 2, "routing_logits must be 2D.");
+    TORCH_CHECK(routing_logits.sizes()[0] == hidden_states.sizes()[0],
+        "routing_logits and hidden_states must have the same number of tokens.");
     TORCH_CHECK(routing_logits.sizes()[1] == num_experts, "routing_logits has incorrect shape.");
     if (routing_bias.has_value())
     {
@@ -261,13 +264,7 @@ std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routi
     args.output2_scales_scalar = output2_scales_scalar.data_ptr<float>();
     args.do_finalize = do_finalize;
 
-    tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner moe_runner(
-        args.mDtypeElt, args.mUseDeepSeekFp8, tile_tokens_dim);
-
-    auto const moeConfigIndex = moe_runner.getDefaultValidConfigIndex(
-        args.top_k, args.hidden_size, args.intermediate_size, args.local_num_experts, args.num_tokens);
-
-    auto workspace_sizes = moe_runner.getWorkspaceSizeInBytes(args, moeConfigIndex);
+    auto const workspace_sizes = moe_runner.getWorkspaceSizeInBytes(args, moeConfigIndex);
 
     at::Tensor workspace_fc1 = at::detail::empty_cuda(
         {std::get<0>(workspace_sizes)}, at::ScalarType::Char, hidden_states.device(), std::nullopt);
@@ -284,6 +281,84 @@ std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routi
     }
 
     return {output};
+}
+
+// Wrapped the TRTLLM-Gen kernel runner in a Torch custom class to allow
+// use with the torch workflow autotuner class.
+class FP4BlockScaleMoeRunner : public torch::CustomClassHolder
+{
+public:
+    explicit FP4BlockScaleMoeRunner(int64_t tileTokensDim)
+        : mTileTokensDim(tileTokensDim)
+    {
+        mRunner = std::make_unique<RunnerType>(mDtypeElt, mUseDeepSeekFp8, mTileTokensDim);
+    }
+
+    [[nodiscard]] std::vector<torch::Tensor> run(torch::Tensor const& routing_logits,
+        torch::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
+        torch::Tensor const& hidden_states_scale, torch::Tensor const& gemm1_weights,
+        torch::Tensor const& gemm1_weights_scale, torch::Tensor const& gemm2_weights,
+        torch::Tensor const& gemm2_weights_scale, torch::Tensor const& output1_scales_scalar,
+        torch::Tensor const& output1_scales_gate_scalar, torch::Tensor const& output2_scales_scalar,
+        int64_t const num_experts, int64_t const top_k, std::optional<int64_t> const n_group,
+        std::optional<int64_t> const topk_group, int64_t const intermediate_size, int64_t const local_expert_offset,
+        int64_t const local_num_experts, std::optional<double> const routed_scaling_factor,
+        int64_t const routing_method_type, bool const do_finalize, int64_t moeConfigIndex)
+    {
+
+        // Autotuner has requested a default or 'fallback' config index
+        if (moeConfigIndex == -1)
+        {
+            auto const num_tokens = hidden_states.sizes()[0];
+
+            // 2x FP4 per byte element
+            auto const hidden_size = 2 * hidden_states.sizes()[1];
+
+            moeConfigIndex = mRunner->getDefaultValidConfigIndex(
+                top_k, hidden_size, intermediate_size, local_num_experts, num_tokens);
+        }
+
+        return run_fp4_block_scale_moe_runner(routing_logits, routing_bias, hidden_states, hidden_states_scale,
+            gemm1_weights, gemm1_weights_scale, gemm2_weights, gemm2_weights_scale, output1_scales_scalar,
+            output1_scales_gate_scalar, output2_scales_scalar, num_experts, top_k, n_group, topk_group,
+            intermediate_size, local_expert_offset, local_num_experts, routed_scaling_factor, mTileTokensDim,
+            routing_method_type, do_finalize, *mRunner, moeConfigIndex);
+    }
+
+    [[nodiscard]] std::vector<int64_t> getValidConfigs(
+        int64_t topK, int64_t hiddenSize, int64_t intermediateSize, int64_t numLocalExperts, int64_t numTokens) const
+    {
+        // TODO hidden size is actually 2 * hiddenSize because we pack 2 e2m1 into 1 byte.
+        // Decide whether to handle this on the python side or here.
+        return mRunner->getValidConfigIndices(topK, 2 * hiddenSize, intermediateSize, numLocalExperts, numTokens);
+    }
+
+private:
+    using RunnerType = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner;
+
+    std::unique_ptr<RunnerType> mRunner;
+    btg::Dtype mDtypeElt{btg::Dtype::E2m1};
+    bool mUseDeepSeekFp8{false};
+    int64_t mTileTokensDim;
+};
+
+std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routing_logits,
+    torch::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
+    torch::Tensor const& hidden_states_scale, torch::Tensor const& gemm1_weights,
+    torch::Tensor const& gemm1_weights_scale, torch::Tensor const& gemm2_weights,
+    torch::Tensor const& gemm2_weights_scale, torch::Tensor const& output1_scales_scalar,
+    torch::Tensor const& output1_scales_gate_scalar, torch::Tensor const& output2_scales_scalar,
+    int64_t const num_experts, int64_t const top_k, std::optional<int64_t> const n_group,
+    std::optional<int64_t> const topk_group, int64_t const intermediate_size, int64_t const local_expert_offset,
+    int64_t const local_num_experts, std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim,
+    int64_t const routing_method_type, bool const do_finalize)
+{
+    auto runner = FP4BlockScaleMoeRunner(tile_tokens_dim);
+
+    return runner.run(routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
+        gemm1_weights_scale, gemm2_weights, gemm2_weights_scale, output1_scales_scalar, output1_scales_gate_scalar,
+        output2_scales_scalar, num_experts, top_k, n_group, topk_group, intermediate_size, local_expert_offset,
+        local_num_experts, routed_scaling_factor, routing_method_type, do_finalize, -1);
 }
 
 torch::Tensor shuffleMatrix(torch::Tensor matrix, torch::Tensor permuteIndices)
