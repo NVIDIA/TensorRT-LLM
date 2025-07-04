@@ -1,5 +1,7 @@
 meta-llama/Llama-3.1-8B-Instruct:
   - accuracy: 74.20
+  - spec_dec_algo: NGRAM
+    accuracy: 74.20
   - quant_algo: FP8
     accuracy: 74.30
   - quant_algo: FP8
