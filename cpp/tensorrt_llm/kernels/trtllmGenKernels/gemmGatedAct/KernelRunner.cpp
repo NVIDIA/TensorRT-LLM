@@ -27,6 +27,8 @@ namespace tensorrt_llm
 namespace kernels
 {
 
+static gemmGatedAct::GemmGatedActInterface::ModuleCache globalTrtllmGenGemmGatedActModuleCache;
+
 TrtllmGenGemmGatedActRunner::TrtllmGenGemmGatedActRunner(TrtllmGenGemmGatedActRunnerOptions const& options_)
     : mOptions(options_)
 {
@@ -104,7 +106,8 @@ void TrtllmGenGemmGatedActRunner::run(int32_t m, int32_t n, int32_t k, void cons
     // FIXME once we start using all-reduce in the epilogue of the gemm this can be moved elsewhere
     gemm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
 
-    auto const err = gemm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount);
+    auto const err = gemm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount,
+        globalTrtllmGenGemmGatedActModuleCache);
 
     TLLM_CHECK_WITH_INFO(err == 0, "Error occurred when running GEMM!");
 }
