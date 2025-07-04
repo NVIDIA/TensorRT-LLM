@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/kernels/archCondition.h"
 #include "tensorrt_llm/kernels/renormMoeRoutingKernels.h"
 #include <climits> // For INT_MAX
 #include <cooperative_groups.h>
@@ -37,9 +38,7 @@ static constexpr int WARPS_PER_BLOCK = BLOCK_SIZE / WARP_SIZE;
 namespace reduce_topk
 {
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000 && defined(__CUDA_ARCH_FEAT_SM100_ALL))
-#define TLLM_GEN_ENABLE_FAST_REDUX
-#endif
+static constexpr bool TLLM_GEN_HAS_FAST_REDUX = tensorrt_llm::kernels::arch::is_major_v<10>;
 
 template <typename T_>
 struct TopKRedType
@@ -88,12 +87,7 @@ struct TopKRedType
 
     __device__ inline TypeCmp reduce(cg::thread_block_tile<WARP_SIZE> const& warp)
     {
-#if defined(TLLM_GEN_ENABLE_FAST_REDUX)
-        static constexpr bool UseCg = false;
-#else
-        static constexpr bool UseCg = true;
-#endif
-        if constexpr (UseCg || sizeof(TypeCmp) == 8)
+        if constexpr (!TLLM_GEN_HAS_FAST_REDUX || sizeof(TypeCmp) == 8)
         {
             return cg::reduce(warp, compValIdx, cg::greater<TypeCmp>{});
         }

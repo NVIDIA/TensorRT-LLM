@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
+#include "tensorrt_llm/kernels/archCondition.h"
 #include "tensorrt_llm/kernels/fusedLayernormKernels/ws_layernorm.h"
 
 using namespace tensorrt_llm::common;
@@ -797,31 +798,34 @@ struct WarpSpecializedLayerNorm
         shared->init(threadIdx.x == 0);
 
         __syncthreads();
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDACC_VER_MAJOR__ >= 12))
+#if (defined(__CUDA_ARCH__) && (__CUDACC_VER_MAJOR__ >= 12))
 #if (defined(__CUDA_ARCH_FEAT_SM90_ALL) || defined(__CUDA_ARCH_FEAT_SM100_ALL))
-        auto block_id = blockIdx.x;
-        auto warp_id = threadIdx.x / 32;
-        auto lane_id = threadIdx.x % 32;
-        auto tid_in_wg = threadIdx.x % 128;
+        if constexpr (arch::is_major_v<9> || arch::is_major_v<10>)
+        {
+            auto block_id = blockIdx.x;
+            auto warp_id = threadIdx.x / 32;
+            auto lane_id = threadIdx.x % 32;
+            auto tid_in_wg = threadIdx.x % 128;
 
-        if (warp_id < 4)
-        {
-            asm volatile("{setmaxnreg.dec.sync.aligned.u32 56; \n\t}");
-            if (warp_id == 0)
+            if (warp_id < 4)
             {
-                scheduler(lane_id, gridDim.x * gridDim.y * gridDim.z, param, shared);
-                // PRE-EXIT after all tiles have been scheduled.
-                asm volatile("griddepcontrol.launch_dependents;\n");
+                asm volatile("{setmaxnreg.dec.sync.aligned.u32 56; \n\t}");
+                if (warp_id == 0)
+                {
+                    scheduler(lane_id, gridDim.x * gridDim.y * gridDim.z, param, shared);
+                    // PRE-EXIT after all tiles have been scheduled.
+                    asm volatile("griddepcontrol.launch_dependents;\n");
+                }
+                else if (warp_id == 1)
+                {
+                    dma(block_id, lane_id, param, shared);
+                }
             }
-            else if (warp_id == 1)
+            else
             {
-                dma(block_id, lane_id, param, shared);
+                asm volatile("{setmaxnreg.inc.sync.aligned.u32 224; \n\t}");
+                compute(block_id, threadIdx.x / 128 - 1, tid_in_wg, param, shared);
             }
-        }
-        else
-        {
-            asm volatile("{setmaxnreg.inc.sync.aligned.u32 224; \n\t}");
-            compute(block_id, threadIdx.x / 128 - 1, tid_in_wg, param, shared);
         }
 #endif
 #endif

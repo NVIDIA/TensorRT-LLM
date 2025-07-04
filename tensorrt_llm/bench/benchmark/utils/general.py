@@ -140,12 +140,17 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
         )
 
         # If chunked prefill is disabled, we need to ensure that the max_num_tokens is at least the max_isl
-        if not enable_chunked_prefill and max_num_tokens < dataset_metadata.max_isl:
+        if not enable_chunked_prefill:
             logger.warning(
                 f"Chunked prefill is disabled, but max_num_tokens ({max_num_tokens}) is less than the max ISL ({dataset_metadata.max_isl}). "
                 f"Forcing max_num_tokens to {dataset_metadata.max_isl + max_batch_size}."
             )
-            max_num_tokens = dataset_metadata.max_isl + max_batch_size
+            max_num_tokens = max(max_num_tokens,
+                                 dataset_metadata.max_isl + max_batch_size)
+        else:
+            # TODO: Figure out how to handle chunked block size.
+            # Expecting this to be the max of chunk block and max_num_tokens.
+            pass
 
     pyt_options = {
         "cuda_graph_config": {

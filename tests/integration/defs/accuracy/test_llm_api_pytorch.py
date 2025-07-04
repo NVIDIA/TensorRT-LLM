@@ -347,6 +347,7 @@ class TestLlama3_2_3B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+@pytest.mark.timeout(7200)
 class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.3-70B-Instruct"
 
@@ -456,7 +457,12 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
     kv_cache_config = KvCacheConfig(enable_block_reuse=False)
 
     def test_auto_dtype(self):
-        with LLM(self.MODEL_PATH, kv_cache_config=self.kv_cache_config) as llm:
+        # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=False,
+            enable_partial_reuse=False,
+        )
+        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
@@ -1792,6 +1798,7 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_blackwell
+    @pytest.mark.skip_less_device(8)
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend",
         [(8, 1, 8, True, True, True, "CUTLASS"),

@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import gc
 import json
 import os
 import sys
@@ -547,7 +548,6 @@ def llm_for_sampling_params():
     llm.shutdown()
 
 
-@pytest.mark.skip(reason="https://nvbugs/5362398")
 @pytest.mark.part0
 def test_user_specify_workspace():
     user_specified_ws_path = '/tmp/specified_workspace'
@@ -2078,6 +2078,20 @@ def _test_llm_capture_request_error(tp_size: int = 1):
 
 def test_llm_capture_request_error():
     _test_llm_capture_request_error(tp_size=1)
+
+
+def test_llm_shutdown_executor():
+    llm = LLM(
+        model=llama_model_path,
+        kv_cache_config=global_kvcache_config,
+        fast_build=True,
+    )
+
+    llm.generate("A")
+    llm.shutdown()
+
+    with pytest.raises(RuntimeError):
+        llm.generate("A")
 
 
 def test_llm_api_jupyter_scenario():
