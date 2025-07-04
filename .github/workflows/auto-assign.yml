@@ -22,7 +22,7 @@ jobs:
             const fs = require('fs');
 
             // Read configuration file
-            const config = JSON.parse(fs.readFileSync('.github/workflows/module-owners.json', 'utf8'));
+            const config = JSON.parse(fs.readFileSync('.github/module-owners.json', 'utf8'));
 
             // Find matching label in config
             for (const [configLabel, users] of Object.entries(config)) {
