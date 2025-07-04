@@ -1181,7 +1181,6 @@ class PyTorchModelEngine(ModelEngine):
         mrope_config = defaultdict(list)
         gen_request_seq_slots = []  # per generation request
 
-
         for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
             all_prompt_tokens = request.get_tokens(0)
