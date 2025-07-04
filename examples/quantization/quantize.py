@@ -30,7 +30,7 @@ if __name__ == "__main__":
         "--device_map",
         help="How to map the model on the devices",
         default="auto",
-        choices=["auto", "sequential", "cpu", "gpu"],
+        type=str,
     )
     parser.add_argument(
         '--calib_dataset',
@@ -142,7 +142,16 @@ if __name__ == "__main__":
         help="Effective bits constraint for auto quantization. If not set, "
         "regular quantization without auto quantization search will be applied."
         "You can't set it lower than the num_bits of most aggressive quantization format."
-        "For example, if 'int4_awq' is in autoq_format, it can't be lower than 4.0."
+        "For example, if 'int4_awq' is in autoq_format, it can't be lower than 4.0.",
+    )
+    parser.add_argument(
+        "--export_format",
+        type=str,
+        default="tensorrt_llm",
+        choices=["tensorrt_llm", "hf"],
+        help="The format to export the quantized model to."
+        "tensorrt_llm: export the quantized model to tensorrt_llm format."
+        "hf: export the quantized model to HuggingFace format.",
     )
 
     args = parser.parse_args()
@@ -183,7 +192,9 @@ if __name__ == "__main__":
             quant_medusa_head=args.quant_medusa_head,
             auto_quantize_bits=args.auto_quantize_bits,
             device_map=args.device_map,
-            quantize_lm_head=args.quantize_lm_head)
+            quantize_lm_head=args.quantize_lm_head,
+            export_format=args.export_format,
+        )
     elif args.nemo_ckpt_path is not None:
         quantize_nemo_and_export(nemo_ckpt_path=args.nemo_ckpt_path,
                                  decoder_type=args.decoder_type,
