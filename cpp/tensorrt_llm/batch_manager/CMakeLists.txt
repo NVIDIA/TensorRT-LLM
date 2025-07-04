@@ -38,6 +38,7 @@ set(SRCS
     loraBuffers.cpp
     makeDecodingBatchInputOutput.cpp
     medusaBuffers.cpp
+    metaTransceiver.cpp
     microBatchScheduler.cpp
     pauseRequests.cpp
     peftCacheManager.cpp
@@ -94,6 +95,10 @@ set_property(TARGET ${BATCH_MANAGER_STATIC_TARGET}
 set(TOP_LEVEL_DIR "${PROJECT_SOURCE_DIR}/..")
 target_compile_definitions(${BATCH_MANAGER_STATIC_TARGET}
                            PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
+
+target_include_directories(${BATCH_MANAGER_STATIC_TARGET}
+                           PUBLIC ${ZeroMQ_INCLUDE_DIRS})
+target_link_libraries(${BATCH_MANAGER_STATIC_TARGET} PUBLIC ${ZeroMQ_LIBRARIES})
 
 if(ENABLE_CUFILE)
   target_link_libraries(${BATCH_MANAGER_STATIC_TARGET} PUBLIC ${CUFILE_LIBRARY})
