@@ -26,7 +26,7 @@ Run 32-way expert parallelism inference on the prepared dataset. Please refer to
 ```bash
 cat > ./extra_llm_api_options.yaml <<EOF
 enable_attention_dp: true
-use_cuda_graph: true
+cuda_graph_config: {}
 moe_backend: WideEP
 moe_max_num_tokens: 8192
 EOF
@@ -116,7 +116,7 @@ Run 36-way expert parallelism inference with the EPLB configuration incorporated
 ```bash
 cat > ./extra_llm_api_options_eplb.yaml <<EOF
 enable_attention_dp: true
-use_cuda_graph: true
+cuda_graph_config: {}
 moe_backend: WideEP
 moe_max_num_tokens: 9216
 moe_load_balancer: ./moe_load_balancer.yaml
@@ -182,7 +182,7 @@ Run 36-way expert parallelism inference with the EPLB configuration incorporated
 ```bash
 cat > ./extra_llm_api_options_eplb.yaml <<EOF
 enable_attention_dp: true
-use_cuda_graph: true
+cuda_graph_config: {}
 moe_backend: WideEP
 moe_max_num_tokens: 9216
 moe_load_balancer: ./moe_load_balancer.yaml

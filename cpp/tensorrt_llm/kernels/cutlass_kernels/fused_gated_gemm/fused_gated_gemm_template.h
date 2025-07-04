@@ -292,12 +292,14 @@ size_t CutlassFusedGatedGemmRunner<T>::dispatchToArch(void* D, void const* A, vo
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
     if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
     {
+#ifndef PLACEHOLDER_KERNELS
         if (mSm == 90)
         {
             return dispatchGemmToCutlassSm90<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, scale_output,
                 gemmConfig, workspace, workspaceBytes, stream, occupancy);
         }
         else
+#endif
         {
             throw std::runtime_error(
                 "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner][GEMM Dispatch] Arch unsupported for CUTLASS fused "

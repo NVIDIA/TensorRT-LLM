@@ -350,9 +350,8 @@ def main(*,
         if "70-real" in cuda_architectures:
             raise RuntimeError("Volta architecture is deprecated support.")
 
-    cmake_cuda_architectures = (
-        f'"-DCMAKE_CUDA_ARCHITECTURES={cuda_architectures}"'
-        if cuda_architectures is not None else "")
+    cuda_architectures = cuda_architectures or 'all'
+    cmake_cuda_architectures = f'"-DCMAKE_CUDA_ARCHITECTURES={cuda_architectures}"'
 
     cmake_def_args = []
     cmake_generator = ""
