@@ -105,7 +105,6 @@ if __name__ == "__main__":
         cooccurrence_matrix = cooccurrence_matrix.masked_fill(
             expert_ids.unsqueeze(1) == expert_ids, -1e9)
 
-        breakpoint()
         rank_expert_ids = do_placement_with_cooccurrence(expert_load_factor,
                                                          expert_replica_count,
                                                          cooccurrence_matrix,
