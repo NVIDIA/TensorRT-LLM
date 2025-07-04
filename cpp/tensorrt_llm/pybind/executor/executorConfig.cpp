@@ -26,6 +26,7 @@
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/pair.h>
 #include <nanobind/stl/set.h>
+#include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/unordered_map.h>
 #include <nanobind/stl/unordered_set.h>
@@ -163,7 +164,7 @@ void initConfigBindings(nanobind::module_& m)
 
     nb::class_<tle::OrchestratorConfig>(m, "OrchestratorConfig")
         .def(nb::init<bool, std::string, std::shared_ptr<mpi::MpiComm>, bool>(), nb::arg("is_orchestrator") = true,
-            nb::arg("worker_executable_path") = "", nb::arg("orch_leader_comm") = nullptr,
+            nb::arg("worker_executable_path") = "", nb::arg("orch_leader_comm").none() = nullptr,
             nb::arg("spawn_processes") = true)
         .def_prop_rw(
             "is_orchestrator", &tle::OrchestratorConfig::getIsOrchestrator, &tle::OrchestratorConfig::setIsOrchestrator)

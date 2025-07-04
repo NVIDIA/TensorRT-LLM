@@ -241,7 +241,17 @@ void initBindings(nanobind::module_& m)
         .def_ro("data", &tle::KVCacheEvent::data);
 
     nb::class_<tle::KVCacheEventManager>(executor_kv_cache, "KVCacheEventManager")
-        .def("get_latest_events", &tle::KVCacheEventManager::getLatestEvents, nb::arg("timeout") = std::nullopt);
+        .def(
+            "get_latest_events",
+            [](tle::KVCacheEventManager& self, std::optional<double> timeout_ms = std::nullopt)
+            {
+                if (timeout_ms)
+                {
+                    return self.getLatestEvents(std::chrono::milliseconds(static_cast<int64_t>(*timeout_ms)));
+                }
+                return self.getLatestEvents(std::nullopt);
+            },
+            nb::arg("timeout_ms") = std::nullopt);
 
     tensorrt_llm::pybind::executor::initRequestBindings(m);
     tensorrt_llm::pybind::executor::initConfigBindings(m);

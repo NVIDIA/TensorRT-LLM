@@ -139,8 +139,8 @@ Executor::Executor(std::filesystem::path const& encoderModelPath, std::filesyste
     mExecutor = std::make_unique<tle::Executor>(encoderModelPath, decoderModelPath, modelType, executorConfig);
 }
 
-Executor::Executor(nb::ndarray<nb::numpy, uint8_t> const& engineBuffer, std::string const& jsonConfigStr,
-    tle::ModelType modelType, tle::ExecutorConfig const& executorConfig, std::optional<nb::dict> managedWeights)
+Executor::Executor(nb::bytes const& engineBuffer, std::string const& jsonConfigStr, tle::ModelType modelType,
+    tle::ExecutorConfig const& executorConfig, std::optional<nb::dict> managedWeights)
 {
     uint8_t const* data = static_cast<uint8_t const*>(engineBuffer.data());
     size_t size = engineBuffer.size();
@@ -204,8 +204,7 @@ void Executor::initBindings(nb::module_& m)
                  tle::ExecutorConfig const&>(),
             nb::arg("encoder_model_path"), nb::arg("decoder_model_path"), nb::arg("model_type"),
             nb::arg("executor_config"))
-        .def(nb::init<nb::ndarray<nb::numpy, uint8_t>, std::string const&, tle::ModelType, tle::ExecutorConfig const&,
-                 nb::dict>(),
+        .def(nb::init<nb::bytes, std::string const&, tle::ModelType, tle::ExecutorConfig const&, nb::dict>(),
             nb::arg("engine_buffer"), nb::arg("json_config_str"), nb::arg("model_type"), nb::arg("executor_config"),
             nb::arg("managed_weights") = nb::dict())
         .def(nb::init<std::string const&, std::string const&, std::string const&, std::string const&, tle::ModelType,

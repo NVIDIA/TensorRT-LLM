@@ -38,8 +38,8 @@ public:
     Executor(std::filesystem::path const& encoderModelPath, std::filesystem::path const& decoderModelPath,
         tle::ModelType modelType, tle::ExecutorConfig const& executorConfig);
 
-    Executor(nb::ndarray<nb::numpy, uint8_t> const& engineBuffer, std::string const& jsonConfigStr,
-        tle::ModelType modelType, tle::ExecutorConfig const& executorConfig, std::optional<nb::dict> managedWeights);
+    Executor(nb::bytes const& engineBuffer, std::string const& jsonConfigStr, tle::ModelType modelType,
+        tle::ExecutorConfig const& executorConfig, std::optional<nb::dict> managedWeights);
 
     Executor(std::string const& encoderEngineBuffer, std::string const& encoderJsonConfigStr,
         std::string const& decoderEngineBuffer, std::string const& decoderJsonConfigStr, tle::ModelType modelType,
