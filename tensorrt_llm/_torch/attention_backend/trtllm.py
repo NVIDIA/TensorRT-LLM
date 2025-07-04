@@ -927,7 +927,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             out_dtype=out_dtype,
             is_fused_qkv=not metadata.is_cross and k is None,
             update_kv_cache=not metadata.is_cross or k is not None,
-            attention_mask=attention_mask)
+            attention_mask=attention_mask,
+            custom_mask=custom_mask)
 
         if out_dtype == torch.uint8:
             assert output_sf is not None

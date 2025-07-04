@@ -11,7 +11,7 @@ from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import (PositionalEmbeddingParams,
+from ..attention_backend.interface import (PositionalEmbeddingParams, CustomAttentionMask,
                                            PredefinedAttentionMask, RopeParams)
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
@@ -107,14 +107,22 @@ class Gemma3Attention(Attention):
         **kwargs,
     ) -> torch.Tensor:
 
+        ###############################################################################
+        custom_mask_type = CustomAttentionMask.CUSTOM
+        seq_len = hidden_states.shape[0]
+        custom_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=hidden_states.device))
+        print("[Gemma3Attention] custom_mask: \n", custom_mask)
+        ###############################################################################
+
         return super().forward(position_ids=position_ids,
                                hidden_states=hidden_states,
                                attn_metadata=attn_metadata,
-                               attention_mask=attention_mask,
+                               attention_mask=custom_mask_type,
                                mrope_config=mrope_config,
                                all_reduce_params=all_reduce_params,
                                lora_params=lora_params,
-                               attention_window_size=self.attention_window_size,
+                                #    attention_window_size=self.attention_window_size,
+                               custom_mask=custom_mask,
                                **kwargs)
 
     def apply_qk_norm(self, q, k):

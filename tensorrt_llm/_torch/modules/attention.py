@@ -228,6 +228,7 @@ class Attention(nn.Module):
         all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,
         attention_window_size: Optional[int] = None,
+        custom_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -242,7 +243,7 @@ class Attention(nn.Module):
             all_reduce_params (Optional[AllReduceParams]): The all reduce parameters.
             lora_params (Optional[dict]): The LoRA parameters.
             attention_window_size (Optional[int]): The attention window size.
-
+            custom_mask (Optional[torch.Tensor]): Custom attention mask. Must be provided if attention_mask is CustomAttentionMask.CUSTOM.
         Returns:
             torch.Tensor: The output tensor.
         """
@@ -280,7 +281,9 @@ class Attention(nn.Module):
             out_scale_sf=out_scale_sf,
             attention_mask=attention_mask,
             mrope_config=mrope_config,
-            attention_window_size=attention_window_size)
+            attention_window_size=attention_window_size,
+            custom_mask=custom_mask,
+        )
         hidden_states = attn_output
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params,

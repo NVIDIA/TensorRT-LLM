@@ -304,11 +304,13 @@ public:
 
     [[nodiscard]] bool useFullCustomMask() const
     {
+        assert(false && "[trtllm::common::op::AttentionOp::useFullCustomMask()] WHO CALLED ME?");
         return useCustomMask() && mHasFullAttentionMask;
     }
 
     [[nodiscard]] bool usePackedCustomMask() const
     {
+        assert(false && "[trtllm::common::op::AttentionOp::usePackedCustomMask()] WHO CALLED ME?");
         return useCustomMask() && mEnableContextFMHA;
     }
 
