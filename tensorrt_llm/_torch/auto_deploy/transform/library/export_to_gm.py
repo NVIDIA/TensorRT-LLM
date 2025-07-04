@@ -131,6 +131,9 @@ class ExportToGM(BaseTransform):
     ) -> Tuple[nn.Module, TransformInfo]:
         # set the example sequence
         cm.info.set_example_sequence(**factory.get_example_inputs())
+        # Keep the model config, it will be set back after the export.
+        assert mod.config is not None, "Model config is not set"
+        model_config = mod.config
 
         export_infos = factory.get_export_infos(mod)
 
@@ -199,4 +202,5 @@ class ExportToGM(BaseTransform):
             skipped=False, num_matches=len(sub_keys), is_clean=True, has_valid_shapes=True
         )
 
+        mod.config = model_config
         return mod, info
