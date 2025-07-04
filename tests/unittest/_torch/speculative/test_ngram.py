@@ -38,6 +38,7 @@ def test_llama_ngram(disable_overlap_scheduler: bool, use_cuda_graph: bool,
     )
 
     spec_config = NGramDecodingConfig(
+        max_draft_len=4,
         prompt_lookup_num_tokens=4,
         max_matching_ngram_size=2,
         is_keep_all=True,
