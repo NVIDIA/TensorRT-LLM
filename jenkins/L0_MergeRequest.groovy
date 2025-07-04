@@ -986,12 +986,13 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     testStageName = "[Test-SBSA] Remote Run"
                 }
 
+                if (testFilter[(ONLY_DOCS_FILE_CHANGED)]) {
+                    echo "SBSA build job is skipped due to Jenkins configuration or conditional pipeline run"
+                    return
+                }
+
                 def stageName = "Build"
                 stage(stageName) {
-                    if (testFilter[(ONLY_DOCS_FILE_CHANGED)]) {
-                        echo "SBSA build job is skipped due to Jenkins configuration or conditional pipeline run"
-                        return
-                    }
                     def parameters = getCommonParameters()
                     String globalVarsJson = writeJSON returnText: true, json: globalVars
                     parameters += [
@@ -1024,8 +1025,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                 }
                 stage(testStageName) {
-                    if (SBSA_TEST_CHOICE == STAGE_CHOICE_SKIP || testFilter[(ONLY_DOCS_FILE_CHANGED)]) {
-                        echo "SBSA test job is skipped due to Jenkins configuration or conditional pipeline run"
+                    if (SBSA_TEST_CHOICE == STAGE_CHOICE_SKIP) {
+                        echo "SBSA test job is skipped due to Jenkins configuration"
                         return
                     }
                     try {
