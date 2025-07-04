@@ -112,7 +112,7 @@ class PerformanceOptions:
     def get_autodeploy_perf_config(self) -> Dict:
         AutoDeployPerfConfig = dict
         ad_config = AutoDeployPerfConfig()
-        ad_config["kv_cache_dtype"] = "auto"
+        ad_config["kv_cache_config"] = KvCacheConfig(dtype="auto")
         ad_config["attn_backend"] = "flashinfer"
         return ad_config
 
