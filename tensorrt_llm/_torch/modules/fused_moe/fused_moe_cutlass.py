@@ -193,7 +193,7 @@ class CutlassFusedMoE(MoE):
         use_dp_padding: Optional[bool] = None,
     ):
         outputs = inputs
-        if self.parallel_size > 1:
+        if self.parallel_size > 1 and not self._enable_alltoall:
             if self.use_dp:
                 outputs = reducescatter(
                     inputs,
