@@ -1,5 +1,6 @@
 import copy
 import math
+import os
 from functools import partial
 from itertools import chain
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -24,6 +25,8 @@ from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_siglip import SiglipVisionModel
 from .modeling_utils import register_auto_model
+
+DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
 
 
 # Copied from HyperCLOVAX-SEED-Vision-Instruct-3B/modeling_hyperclovax.py
@@ -969,8 +972,8 @@ class HCXVisionForCausalLM(PreTrainedModel):
         self.model_config = model_config
         if hasattr(self, "llm"):
             return
-
-        self.mm_encoder = HCXVisionModel(model_config)
+        if not DISAGG:
+            self.mm_encoder = HCXVisionModel(model_config)
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = PretrainedConfig.from_dict(
             llm_model_config.pretrained_config.language_config)
@@ -1026,7 +1029,13 @@ class HCXVisionForCausalLM(PreTrainedModel):
             assert len(multimodal_params) == num_context_requests == len(
                 multimodal_params
             ), f"Number of multimodal tensors ({len(multimodal_params)}) should be equal to number of context requests ({num_context_requests}) in the batch."
-            mm_embeds = self.mm_encoder.forward(multimodal_params)
+            if not DISAGG:
+                mm_embeds = self.mm_encoder.forward(multimodal_params)
+            else:
+                mm_embeds = [
+                    multimodal_param.multimodal_data["multimodal_embedding"]
+                    for multimodal_param in multimodal_params
+                ]
 
         input_ids, input_embeds = fuse_input_embeds(self.llm.model.embed_tokens,
                                                     input_ids, mm_embeds)

@@ -1107,8 +1107,10 @@ class VilaInputProcessor(InputProcessor):
         )  # use_fast uses Pytorch GPU preprocessing, otherwise uses PIL CPU preprocessing
         mm_features = self._process(mm_tensor, block_sizes)
         fused_input_ids, mm_features = self._postprocess(input_ids, mm_features)
+        multimodal_data = {}
+        multimodal_data["multimodal_embedding"] = mm_features
         return fused_input_ids.to(torch.int32).tolist(), {
-            "mm_embedding": mm_features
+            "multimodal_data": multimodal_data
         }
 
 
@@ -1163,7 +1165,7 @@ class VilaModel(PreTrainedModel):
         num_context_requests, num_generation_requests = attn_metadata.num_contexts, attn_metadata.num_generations
         multimodal_params = kwargs.get("multimodal_params", [])
         mm_embed = [
-            multimodal_param.multimodal_embedding
+            multimodal_param.multimodal_data["multimodal_embedding"]
             for multimodal_param in multimodal_params
         ]
 

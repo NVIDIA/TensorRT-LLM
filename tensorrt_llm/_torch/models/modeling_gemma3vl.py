@@ -100,8 +100,10 @@ class Gemma3InputProcessor(InputProcessor):
             "pixel_values"]
         input_ids = preprocess_outputs[0]["mm_processor_kwargs"]["input_ids"]
         mm_features = self._process(pixel_values)
+        multimodal_data = {}
+        multimodal_data["multimodal_embedding"] = mm_features
         return input_ids[0].to(torch.int32).tolist(), {
-            "mm_embedding": mm_features
+            "multimodal_data": multimodal_data
         }
 
 
@@ -163,7 +165,7 @@ class Gemma3Model(PreTrainedModel):
 
         multimodal_params = kwargs.get("multimodal_params", [])
         mm_embed = [
-            multimodal_param.multimodal_embedding
+            multimodal_param.multimodal_data["multimodal_embedding"]
             for multimodal_param in multimodal_params
         ]
         assert mm_embed == [] or len(

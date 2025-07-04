@@ -210,8 +210,10 @@ class LlavaNextInputProcessor(InputProcessor):
         mm_features = torch.stack(
             [self._process(tensor) for tensor in mm_tensor])
         fused_input_ids, mm_features = self._postprocess(input_ids, mm_features)
+        multimodal_data = {}
+        multimodal_data["multimodal_embedding"] = mm_features
         return fused_input_ids.to(torch.int32).tolist(), {
-            "mm_embedding": mm_features
+            "multimodal_data": multimodal_data
         }
 
 
@@ -273,7 +275,7 @@ class LlavaNextModel(PreTrainedModel):
 
         multimodal_params = kwargs.get("multimodal_params", [])
         mm_embed = [
-            multimodal_param.multimodal_embedding
+            multimodal_param.multimodal_data["multimodal_embedding"]
             for multimodal_param in multimodal_params
         ]
         assert mm_embed == [] or len(
