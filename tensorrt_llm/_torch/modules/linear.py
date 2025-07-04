@@ -1555,8 +1555,6 @@ class Linear(nn.Module):
             return NVFP4LinearMethod()
         if quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8():
             return W4A8MXFP4FP8LinearMethod()
-        if quant_config.layer_quant_mode.has_w4a8_mxfp4_mxfp8():
-            return W4A8MXFP4MXFP8LinearMethod()
         raise ValueError(f'unsupported quant mode: {quant_config.quant_mode}')
 
     def create_weights(self):
