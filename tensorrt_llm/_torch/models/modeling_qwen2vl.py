@@ -477,6 +477,10 @@ class Qwen2VLModelBase(PreTrainedModel):
                     'mrope_position_deltas'):
                 mrope_config['mrope_position_deltas'] = torch.cat(
                     mrope_position_deltas, dim=0)
+        # input mrope_position_deltas directly for cuda graph
+        elif 'mrope_position_deltas' in kwargs:
+            mrope_config['mrope_position_deltas'] = kwargs[
+                'mrope_position_deltas']
 
         output_prob = self.llm.forward(
             attn_metadata=attn_metadata,

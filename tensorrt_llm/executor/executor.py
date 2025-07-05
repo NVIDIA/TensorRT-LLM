@@ -135,20 +135,26 @@ class GenerationExecutor(ABC):
         if postproc_params:
             postproc_params.postproc_args.num_prompt_tokens = len(
                 prompt_token_ids)
-        result = self.submit(
-            GenerationRequest(
-                prompt_token_ids,
-                sampling_params=sampling_params,
-                postproc_params=postproc_params,
-                query_token_ids=query_token_ids,
-                lora_request=lora_request,
-                prompt_adapter_request=prompt_adapter_request,
-                streaming=streaming,
-                multimodal_input=multimodal_input,
-                multimodal_embedding=multimodal_embedding,
-                mrope_config=mrope_config,
-                kv_cache_retention_config=kv_cache_retention_config,
-                disaggregated_params=disaggregated_params))
+        request = GenerationRequest(
+            prompt_token_ids,
+            sampling_params=sampling_params,
+            postproc_params=postproc_params,
+            query_token_ids=query_token_ids,
+            lora_request=lora_request,
+            prompt_adapter_request=prompt_adapter_request,
+            streaming=streaming,
+            multimodal_input=multimodal_input,
+            multimodal_embedding=multimodal_embedding,
+            mrope_config=mrope_config,
+            kv_cache_retention_config=kv_cache_retention_config,
+            disaggregated_params=disaggregated_params)
+        result = self.submit(request)
+        # release memory in time
+        if hasattr(request, "multimodal_embedding"):
+            del request.multimodal_embedding
+        if hasattr(request, "mrope_config"):
+            del request.mrope_config
+        torch.cuda.empty_cache()
         return result
 
     def generate(
