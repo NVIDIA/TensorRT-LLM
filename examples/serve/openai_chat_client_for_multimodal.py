@@ -1,5 +1,7 @@
 ### :title OpenAI Chat Client for Multimodal
 
+import os
+
 from openai import OpenAI
 
 from tensorrt_llm.inputs import encode_base64_content_from_url
@@ -63,29 +65,30 @@ response = client.chat.completions.create(
 )
 print(response)
 
-# SINGLE VIDEO INFERENCE
-response = client.chat.completions.create(
-    model="Qwen2.5-VL-3B-Instruct",
-    messages=[{
-        "role": "system",
-        "content": "you are a helpful assistant"
-    }, {
-        "role":
-        "user",
-        "content": [{
-            "type": "text",
-            "text": "Tell me what you see in the video briefly."
+# TODO: Add it back once transformers lib fixed Qwen2.5-VL flash_attn_2 issue.
+if not os.getenv("SKIP_VIDEO_INFERENCE_FOR_QWEN2_5_VL"):
+    response = client.chat.completions.create(
+        model="Qwen2.5-VL-3B-Instruct",
+        messages=[{
+            "role": "system",
+            "content": "you are a helpful assistant"
         }, {
-            "type": "video_url",
-            "video_url": {
-                "url":
-                "https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/OAI-sora-tokyo-walk.mp4"
-            }
-        }]
-    }],
-    max_tokens=64,
-)
-print(response)
+            "role":
+            "user",
+            "content": [{
+                "type": "text",
+                "text": "Tell me what you see in the video briefly."
+            }, {
+                "type": "video_url",
+                "video_url": {
+                    "url":
+                    "https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/OAI-sora-tokyo-walk.mp4"
+                }
+            }]
+        }],
+        max_tokens=64,
+    )
+    print(response)
 
 # IMAGE EMBED INFERENCE
 image64 = encode_base64_content_from_url(

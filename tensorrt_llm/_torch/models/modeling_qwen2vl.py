@@ -35,10 +35,11 @@ class Qwen2VLInputProcessorBase(InputProcessor):
             trust_remote_code=trust_remote_code)
 
         # NOTE: Using attn_implementation='flash_attention_2' to avoid the issue of vision model's GPU OOM.
+        # NOTE: Use eager attn_impl since transformers=4.53.0 has a bug for Qwen-VL visual attention.
         model = self.get_model_class().from_pretrained(
             model_path,
             torch_dtype=model_config.torch_dtype,
-            attn_implementation='flash_attention_2')
+            attn_implementation='eager')
         self.device = 'cuda'
         self.visual = model.visual.to(self.device)
         self._post_init_()
@@ -276,6 +277,8 @@ class Qwen2VLInputProcessorBase(InputProcessor):
             do_rescale = False
         if videos and isinstance(videos[0][0], torch.Tensor):
             do_rescale = False
+            # Update it once transformers video processor can support GPU video tensors.
+            videos = [[frame.to("cpu") for frame in video] for video in videos]
         return self.processor(text=[text],
                               images=images,
                               videos=videos,

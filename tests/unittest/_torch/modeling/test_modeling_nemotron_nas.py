@@ -3,6 +3,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
+import pytest
 import torch
 from parameterized import parameterized
 from transformers import AutoConfig
@@ -356,6 +357,8 @@ class TestNemotronNAS(unittest.TestCase):
         Scenario(backend="TRTLLM"),
     ], lambda testcase_func, param_num, param:
                           f"{testcase_func.__name__}[{param.args[0]}]")
+    @pytest.mark.skip(
+        reason="NemotronNAS is not compatible with transformers=4.53.0")
     @torch.no_grad()
     def test_nemotron_nas_allclose_to_hf(self, scenario: Scenario) -> None:
         """
