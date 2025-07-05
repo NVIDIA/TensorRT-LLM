@@ -23,7 +23,7 @@ struct Kv_block_array
 {
     using PtrType = int32_t;
 
-    // Current number of sequences
+    // Maximum number of sequences supported by the kv-cache.
     int32_t mMaxSeqs;
     // Max number of blocks per sequence
     int32_t mMaxBlocksPerSeq;
