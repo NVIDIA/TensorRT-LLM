@@ -16,7 +16,7 @@ AARCH64_TRIPLE = "aarch64-linux-gnu"
 
 LLM_DOCKER_IMAGE = env.dockerImage
 
-AGENT_IMAGE = env.dockerImage
+AGENT_IMAGE = env.dockerImage.replace("aarch64", "x86_64")
 
 POD_TIMEOUT_SECONDS = env.podTimeoutSeconds ? env.podTimeoutSeconds : "21600"
 POD_TIMEOUT_SECONDS_TMP = env.podTimeoutSeconds ? env.podTimeoutSeconds : "43200"
