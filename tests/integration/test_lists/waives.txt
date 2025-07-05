@@ -346,7 +346,6 @@ triton_server/test_triton.py::test_triton_extensive[triton-extensive] SKIP
 triton_server/test_triton.py::test_qwen2_vl[qwen2_vl] SKIP
 triton_server/test_triton.py::test_gpt_ib_speculative_decoding_bls[gpt-ib-speculative-decoding-bls] SKIP
 triton_server/test_triton_llm.py::test_mistral_v1_multi_models[False-1---False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap--max_utilization-4096--1-1-1-False-ensemble] SKIP
-accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_ngram SKIP (https://nvbugspro.nvidia.com/bug/5324239)
 examples/test_gpt.py::test_llm_gpt2_starcoder_weight_only[starcoder2-int4-float16] SKIP (https://nvbugs/5289523)
 examples/test_gpt.py::test_llm_gpt2_starcoder_weight_only[starcoder2-int8-float16] SKIP (https://nvbugs/5289523)
 perf/test_perf.py::test_perf[llama_v3.1_70b-bench-bfloat16-input_output_len:512,200-quant:fp8-tp:4] SKIP (https://nvbugspro.nvidia.com/bug/5304388)

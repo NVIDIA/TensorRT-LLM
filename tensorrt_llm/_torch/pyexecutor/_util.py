@@ -400,6 +400,7 @@ class KvCacheCreator:
 
 
 def create_py_executor_instance(
+        *,
         dist,
         resources,
         mapping,
