@@ -131,7 +131,7 @@ class MakeDecodingBatchInputOutput:
             max_num_sequences=max_num_sequences,
             batch_slots=decoder_input_buffers.forward_batch_slots,
         )
-        decoding_input.generation_steps = generation_steps
+        decoder_state.generation_steps = generation_steps
 
         # TODO: Handle speculative decoding modes.
         # fused_runtime_buffers is not created in the pytorch framework.
