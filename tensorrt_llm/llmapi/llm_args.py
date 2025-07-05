@@ -1702,7 +1702,7 @@ class TorchLlmArgs(BaseLlmArgs):
     moe_backend: str = Field(default='CUTLASS',
                              description="MoE backend to use.")
 
-    mixed_sampler: bool = Field(
+    enable_mixed_sampler: bool = Field(
         default=False,
         description=
         "If true, will iterate over sampling_params of each request and use the corresponding sampling strategy, e.g. top-k, top-p, etc."
@@ -1918,7 +1918,7 @@ class TorchLlmArgs(BaseLlmArgs):
             moe_load_balancer=self.moe_load_balancer,
             attn_backend=self.attn_backend,
             moe_backend=self.moe_backend,
-            mixed_sampler=self.mixed_sampler,
+            enable_mixed_sampler=self.enable_mixed_sampler,
             enable_trtllm_sampler=self.enable_trtllm_sampler,
             kv_cache_dtype=self.kv_cache_dtype,
             enable_iter_perf_stats=self.enable_iter_perf_stats,

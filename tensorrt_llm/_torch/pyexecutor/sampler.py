@@ -225,11 +225,11 @@ class TorchSampler(Sampler):
         max_draft_tokens: int
         max_num_sequences: int
         max_beam_width: int
-        mixed_sampler: bool
+        enable_mixed_sampler: bool
 
     def __init__(self, args: Args):
         self.max_seq_len = args.max_seq_len
-        self.mixed_sampler = args.mixed_sampler
+        self.enable_mixed_sampler = args.enable_mixed_sampler
         self.max_tokens = args.max_draft_tokens + 1
         assert args.max_beam_width == self.MAX_BEAM_WIDTH, "TorchSampler only supports beam_width = 1"
         self.num_seq_slots = args.max_num_sequences
@@ -406,7 +406,7 @@ class TorchSampler(Sampler):
         num_steps = [1 + len(req.py_draft_tokens) for req in requests]
         sum_steps = sum(num_steps)
         no_draft_tokens = len(requests) == sum_steps
-        fast_path = not self.mixed_sampler and no_draft_tokens and gen_logits_host is None and log_probs_host is None
+        fast_path = not self.enable_mixed_sampler and no_draft_tokens and gen_logits_host is None and log_probs_host is None
 
         seq_slots = torch.as_tensor([r.seq_slot for r in requests])
         seq_slots = seq_slots.to(device="cuda", non_blocking=True)
@@ -423,7 +423,7 @@ class TorchSampler(Sampler):
         strategies = sampling_strategies(requests)
         batched_next_tokens, batched_softmax = None, None
         batched_strategy: Strategy | None = GREEDY
-        if self.mixed_sampler:
+        if self.enable_mixed_sampler:
             assert "d2t" not in model_outputs, "eagle3 does not yet support non-greedy sampling"
             if len(set(strategies)) == 1:
                 batched_strategy = strategies[0]

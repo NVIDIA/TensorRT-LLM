@@ -81,7 +81,7 @@ methods:
       moe_backend:
         annotation: str
         default: CUTLASS
-      mixed_sampler:
+      enable_mixed_sampler:
         annotation: bool
         default: False
       enable_trtllm_sampler:

@@ -167,7 +167,7 @@ class TRTLLMWorker(Worker):
 
         llm = LLM(model_dir,
                   tokenizer=tokenizer,
-                  mixed_sampler=True,
+                  enable_mixed_sampler=True,
                   disable_overlap_scheduler=disable_overlap_scheduler,
                   kv_cache_config=kv_cache_config,
                   max_batch_size=max_batch_size,
