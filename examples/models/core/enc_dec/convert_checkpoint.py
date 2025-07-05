@@ -13,7 +13,7 @@ from pathlib import Path
 import safetensors
 from helper import (convert_weight_to_dtype, fairseq_sin_pos_embedding,
                     fuse_qkv_one_layer, reshape, split)
-from transformers import (AutoModelForSeq2SeqLM, Blip2ForConditionalGeneration,
+from transformers import (AutoModelForSeq2SeqLM, AutoModelForCausalLM, Blip2ForConditionalGeneration,
                           MBartForConditionalGeneration,
                           Pix2StructForConditionalGeneration,
                           T5ForConditionalGeneration, VisionEncoderDecoderModel)
@@ -966,6 +966,8 @@ def convert_bart_weights_to_tllm_safetensors(config, component, params):
 
     return weights
 
+convert_florence2_weights_to_tllm_safetensors = convert_bart_weights_to_tllm_safetensors  # func alias
+
 
 def parse_pix2struct_config(args, hf_model):
     # manually set q_scaling to offset attention scaling's effect.
@@ -1487,6 +1489,11 @@ def get_model(args):
     elif args.model_type == "blip2":
         model = Blip2ForConditionalGeneration.from_pretrained(
             args.model_dir).language_model
+    elif args.model_type == "florence2":
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_dir,
+            trust_remote_code=True,
+        ).language_model
     elif args.model_type == "language_adapter":
         import torch
 
@@ -1522,6 +1529,7 @@ def convert_checkpoint(args):
     quant_algo = None
 
     model_type = args.model_type if args.model_type != "blip2" else "t5"
+    model_type = model_type if model_type != "florence2" else "bart"
     encoder_config, decoder_config = globals()[f'parse_{model_type}_config'](
         args, model)
 
@@ -1705,7 +1713,7 @@ if __name__ == "__main__":
         type=str,
         default='t5',
         choices=[
-            't5', 'nmt', 'bart', 'pix2struct', 'blip2', 'language_adapter'
+            't5', 'nmt', 'bart', 'florence2', 'pix2struct', 'blip2', 'language_adapter'
         ],
         help=
         'Multimodal type when this script is used for multimodal conversion.')
