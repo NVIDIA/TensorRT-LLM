@@ -147,9 +147,7 @@ def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
         "task-0", 0, f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1")
     lora_request = [lora_req]
 
-    outputs = llm.generate(prompts,
-                            sampling_params,
-                            lora_request=lora_request)
+    outputs = llm.generate(prompts, sampling_params, lora_request=lora_request)
 
     assert similar(outputs[0].outputs[0].text, references[0])
 
