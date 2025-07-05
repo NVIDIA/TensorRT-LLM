@@ -1083,23 +1083,9 @@ class PyExecutor:
                         scheduled_batch.context_requests
                     ) if self.kv_cache_transceiver else []
 
-                    has_previous_batch = self.previous_batch is not None
-                    if has_previous_batch:
-                        previous_batch_size = self.previous_batch.sample_state.scheduled_requests.batch_size
-                        if previous_batch_size > 0:  # first previous batch size is 0
-                            self._process_previous_batch()
+                    if self.previous_batch is not None:
+                        self._process_previous_batch()
                         self.previous_batch: Optional[BatchState] = None
-
-                    # Separate chunked requests so we can handle them in _update_requests w/o relying on the request state.
-                    # This is necessary because _forward_step updates the state before _update_requests is executed.
-                    scheduled_batch.chunked_requests = [
-                        r for r in scheduled_batch.context_requests
-                        if r.context_remaining_length != 0
-                    ]
-                    scheduled_batch.context_requests = [
-                        r for r in scheduled_batch.context_requests
-                        if r.context_remaining_length == 0
-                    ]
 
                     if self.enable_iter_perf_stats:
                         iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[

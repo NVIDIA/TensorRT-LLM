@@ -277,9 +277,9 @@ class TorchSampler(Sampler):
             } for token, logprob in zip(tokens, log_probs.tolist())]
             request.py_result.append_log_probs([token_log_probs])
 
-        if hasattr(scheduled_requests, 'chunked_requests'):
-            request_idx += len(scheduled_requests.chunked_requests)
-            token_idx += len(scheduled_requests.chunked_requests)
+        num_chunked_requests = len(scheduled_requests.chunked_requests)
+        request_idx += num_chunked_requests
+        token_idx += num_chunked_requests
 
         for request in scheduled_requests.context_requests:
             if request.context_remaining_length != 0:
@@ -346,10 +346,13 @@ class TorchSampler(Sampler):
     def _mixed_sample(self, scheduled_requests: ScheduledRequests,
                       model_outputs) -> SampleState:
         logits = model_outputs["logits"]
-        log_probs = []
-        new_tokens_device_array = []
 
-        idx = 0
+        num_chunked_requests = len(scheduled_requests.chunked_requests)
+        log_probs = [None] * num_chunked_requests
+        new_tokens_device_array = [
+            torch.empty([-1], dtype=torch.float, device='cpu')
+        ] * num_chunked_requests
+        idx = num_chunked_requests
 
         for request in scheduled_requests.context_requests:
             assert not request.py_return_context_logits, "Return context logits not supported"
@@ -402,10 +405,23 @@ class TorchSampler(Sampler):
 
     def sample_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs) -> SampleState:
+        sample_requests = ScheduledRequests()
+        # Separate chunked requests so we can handle them in update_requests w/o relying on the request state.
+        # This is necessary in overlap scheduler because the request state is updated before update_requests is executed.
+        sample_requests.chunked_requests = [
+            r for r in scheduled_requests.context_requests
+            if not r.is_last_context_chunk
+        ]
+        sample_requests.context_requests = [
+            r for r in scheduled_requests.context_requests
+            if r.is_last_context_chunk
+        ]
+        sample_requests.generation_requests = scheduled_requests.generation_requests
+
         if self.mixed_sampler:
-            return self._mixed_sample(scheduled_requests, model_outputs)
+            return self._mixed_sample(sample_requests, model_outputs)
         else:
-            return self._batch_sample(scheduled_requests, model_outputs)
+            return self._batch_sample(sample_requests, model_outputs)
 
 
 class TorchStarAttentionSampler(TorchSampler):
@@ -680,7 +696,20 @@ class TRTLLMSampler(Sampler):
         sampler_event = torch.cuda.Event()
         sampler_event.record()
 
-        return SampleStateTRTLLM(scheduled_requests=scheduled_requests,
+        sample_requests = ScheduledRequests()
+        # Separate chunked requests so we can handle them in update_requests w/o relying on the request state.
+        # This is necessary in overlap scheduler because the request state is updated before update_requests is executed.
+        sample_requests.chunked_requests = [
+            r for r in scheduled_requests.context_requests
+            if not r.is_last_context_chunk
+        ]
+        sample_requests.context_requests = [
+            r for r in scheduled_requests.context_requests
+            if r.is_last_context_chunk
+        ]
+        sample_requests.generation_requests = scheduled_requests.generation_requests
+
+        return SampleStateTRTLLM(scheduled_requests=sample_requests,
                                  logits=model_outputs["logits"],
                                  device=device,
                                  host=host,
@@ -690,7 +719,9 @@ class TRTLLMSampler(Sampler):
         assert isinstance(state, SampleStateTRTLLM)
 
         scheduled_requests = state.scheduled_requests
-        assert scheduled_requests.batch_size > 0
+        if scheduled_requests.batch_size == 0:
+            return
+
         beam_width = self.beam_width(scheduled_requests.all_requests)
         sampler_event = state.sampler_event
 
@@ -703,8 +734,6 @@ class TRTLLMSampler(Sampler):
         sequence_lengths_host_data = state.host.sequence_lengths
 
         for request in scheduled_requests.all_requests:
-            if request.is_context_init_state:
-                continue
 
             seq_slot = request.seq_slot
             num_generated_tokens = request.num_draft_tokens + 1
