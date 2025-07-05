@@ -53,6 +53,7 @@ init_ubuntu() {
     llvm \
     libclang-rt-dev \
     libffi-dev \
+    libibverbs-dev \
     libnuma1 \
     libnuma-dev \
     python3-dev \
@@ -115,6 +116,7 @@ install_gcctoolset_rockylinux() {
   # https://catalog.ngc.nvidia.com/orgs/nvidia/containers/cuda
   echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> "${ENV}"
   dnf install \
+    patch \
 	  vim \
 	  wget \
 	  git-lfs \
@@ -125,6 +127,7 @@ install_gcctoolset_rockylinux() {
 	  openmpi \
 	  openmpi-devel \
 	  pigz \
+    rdma-core-devel \
 	  -y
   echo "source scl_source enable gcc-toolset-11" >> "${ENV}"
   echo 'export PATH=/usr/lib64/openmpi/bin:$PATH' >> "${ENV}"
