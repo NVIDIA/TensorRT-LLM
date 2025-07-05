@@ -138,6 +138,14 @@ install_tensorrt() {
     pip3 install --no-cache-dir /usr/local/tensorrt/python/tensorrt-*-cp${PARSED_PY_VERSION}-*.whl
     rm -rf /tmp/TensorRT.tar
     echo 'export LD_LIBRARY_PATH=/usr/local/tensorrt/lib:$LD_LIBRARY_PATH' >> "${ENV}"
+
+    rm -f /usr/local/tensorrt/lib/libnvinfer_vc_plugin_static.a \
+          /usr/local/tensorrt/lib/libnvinfer_plugin_static.a \
+          /usr/local/tensorrt/lib/libnvinfer_static.a \
+          /usr/local/tensorrt/lib/libnvinfer_dispatch_static.a \
+          /usr/local/tensorrt/lib/libnvinfer_lean_static.a \
+          /usr/local/tensorrt/lib/libnvonnxparser_static.a \
+          /usr/local/tensorrt/lib/libnvinfer_builder_resource_win.so.10.10.0
 }
 
 # Install base packages depending on the base OS
