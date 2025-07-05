@@ -3,6 +3,7 @@ port: 8000
 model: DeepSeek-V3-Lite/fp8
 free_gpu_memory_fraction: 0.25
 backend: "pytorch"
+cuda_graph_config: None
 disable_overlap_scheduler: True
 context_servers:
   num_instances: 1
