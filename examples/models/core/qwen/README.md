@@ -652,7 +652,7 @@ trtllm-eval --model=Qwen3-30B-A3B/ --tokenizer=Qwen3-30B-A3B/ --backend=pytorch 
 
 ```
 
-### Model Quantization to FP4
+### Model Quantization
 
 To quantize the Qwen3 model for use with the PyTorch backend, we'll use NVIDIA's Model Optimizer (ModelOpt) tool. Follow these steps:
 
@@ -665,11 +665,14 @@ pushd TensorRT-Model-Optimizer
 pip install -e .
 
 # Quantize the Qwen3-235B-A22B model by nvfp4
+# By default, the checkpoint would be stored in `TensorRT-Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-235B-A22B_nvfp4_hf/`.
 ./examples/llm_ptq/scripts/huggingface_example.sh --model Qwen3-235B-A22B/ --quant nvfp4 --export_fmt hf
+
+# Quantize the Qwen3-32B model by fp8_pc_pt
+# By default, the checkpoint would be stored in `TensorRT-Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-32B_fp8_pc_pt_hf/`.
+./examples/llm_ptq/scripts/huggingface_example.sh --model Qwen3-32B/ --quant fp8_pc_pt --export_fmt hf
 popd
 ```
-
-By default, the checkpoint would be stored in `TensorRT-Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-235B-A22B_nvfp4_hf/`.
 
 ### Benchmark
 

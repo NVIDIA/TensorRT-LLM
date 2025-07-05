@@ -55,6 +55,7 @@ add_library(
   fp4Quantize.cpp
   fp4BatchedQuantize.cpp
   fp8BlockScalingGemm.cpp
+  fp8RowwiseGemm.cpp
   fp8Quantize.cpp
   dsv3FusedAGemmOp.cpp
   fusedQKNormRopeOp.cpp
