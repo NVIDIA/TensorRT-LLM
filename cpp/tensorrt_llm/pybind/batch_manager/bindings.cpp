@@ -27,6 +27,7 @@
 #include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
 #include "tensorrt_llm/pybind/common/bindTypes.h"
 #include "tensorrt_llm/runtime/gptDecoderBatched.h"
+#include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/torch.h"
 #include "tensorrt_llm/runtime/torchView.h"
 
@@ -451,7 +452,8 @@ void initBindings(pybind11::module_& m)
         "make_decoding_batch_input",
         [](std::vector<std::shared_ptr<tb::LlmRequest>>& contextRequests,
             std::vector<std::shared_ptr<tb::LlmRequest>>& genRequests, tr::ITensor::SharedPtr logits, int beamWidth,
-            std::vector<int> const& numContextLogitsPrefixSum, tb::DecoderInputBuffers const& decoderInputBuffers)
+            std::vector<int> const& numContextLogitsPrefixSum, tb::DecoderInputBuffers const& decoderInputBuffers,
+            tr::BufferManager const& manager)
         {
             std::vector<int> activeSlots;
             std::vector<int> generationSteps;
@@ -463,13 +465,25 @@ void initBindings(pybind11::module_& m)
                 {
                     activeSlots.push_back(*contextRequests[i]->mSeqSlot);
                     generationSteps.push_back(contextRequests[i]->getDecodingIter());
+                    auto contextLogitsOffset = numContextLogitsPrefixSum[i + 1] - 1;
+                    tr::ITensor::SharedPtr logitsView = ITensor::slice(logits, contextLogitsOffset, 1);
 
-                    auto contextLogitsOffset = numContextLogitsPrefixSum[i];
-                    auto numberOfContextLogits = numContextLogitsPrefixSum[i + 1] - contextLogitsOffset;
-                    tr::ITensor::SharedPtr logitsView
-                        = ITensor::slice(logits, contextLogitsOffset, numberOfContextLogits);
-                    logitsView->unsqueeze(1);
-                    logitsVec[0].push_back(std::move(logitsView));
+                    if (beamWidth > 1)
+                    {
+                        // Tile logits of context requests
+                        auto const logitsShape = logitsView->getShape();
+                        auto const logitsType = logitsView->getDataType();
+                        auto decoderLogits = manager.gpu(ITensor::makeShape({beamWidth, logitsShape.d[1]}), logitsType);
+                        tensorrt_llm::runtime::kernels::tileTensor(
+                            *decoderLogits, *logitsView, beamWidth, manager.getStream());
+                        decoderLogits->unsqueeze(0);
+                        logitsVec[0].push_back(std::move(decoderLogits));
+                    }
+                    else
+                    {
+                        logitsView->unsqueeze(1);
+                        logitsVec[0].push_back(std::move(logitsView));
+                    }
                 }
             }
 
@@ -504,7 +518,8 @@ void initBindings(pybind11::module_& m)
             return decodingInput;
         },
         py::arg("context_requests"), py::arg("generation_requests"), py::arg("logits"), py::arg("beam_width"),
-        py::arg("num_context_logits_prefix_sum"), py::arg("decoder_input_buffers"), "Make decoding batch input.");
+        py::arg("num_context_logits_prefix_sum"), py::arg("decoder_input_buffers"), py::arg("buffer_manager"),
+        "Make decoding batch input.");
 }
 
 } // namespace tensorrt_llm::pybind::batch_manager

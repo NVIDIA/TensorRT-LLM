@@ -666,7 +666,8 @@ class TRTLLMSampler(Sampler):
                 scheduled_requests.context_requests,
                 scheduled_requests.generation_requests, model_outputs["logits"],
                 beam_width, num_context_logits_prefix_sum,
-                self.store["decoder_input_buffers"][self.micro_batch_idx])
+                self.store["decoder_input_buffers"][self.micro_batch_idx],
+                self.store["buffer_manager"])
 
         self.algs.decoder.forward_async(
             self.store["decoder_state"],
