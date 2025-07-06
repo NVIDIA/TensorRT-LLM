@@ -1732,16 +1732,20 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend",
         [
-            (1, 1, 1, True, True, True, "CUTLASS"),
+            (1, 1, 1, False, True, True, "CUTLASS"),
             (1, 1, 1, False, True, True, "TRTLLM"),
+            (4, 1, 4, True, True, True, "CUTLASS"),
+            (4, 1, 4, True, True, True, "TRTLLM"),
             (4, 1, 4, False, True, True, "CUTLASS"),
             (4, 1, 4, False, True, True, "TRTLLM"),
         ],
         ids=[
             "latency_moe_cutlass",
             "latency_moe_trtllm",
-            "4gpu_latency_moe_cutlass",
-            "4gpu_latency_moe_trtllm",
+            "dep4_latency_moe_cutlass",
+            "dep4_latency_moe_trtllm",
+            "tep4_latency_moe_cutlass",
+            "tep4_latency_moe_trtllm",
         ],
     )
     def test_nvfp4(
@@ -1834,7 +1838,7 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend",
         [(8, 1, 8, True, True, True, "CUTLASS"),
-         (8, 1, 8, False, True, True, "TRTLLM")],
+         (8, 1, 8, True, True, True, "TRTLLM")],
         ids=["latency_moe_cutlass", "latency_moe_trtllm"],
     )
     def test_nvfp4(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
