@@ -1363,8 +1363,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
 #ifndef MMHA_USE_FP32_ACCUM_FOR_LOGITS
     if (sizeof(Tk) != 4)
     {
-        auto const max_timesteps
-            = min(timestep, min(static_cast<unsigned>(cyclic_kv_cache_len), chunked_attention_size));
+        auto const max_timesteps = min(timestep, cyclic_kv_cache_len);
         logits_smem_ += divUp(max_timesteps + 1, 4u) * 16;
     }
     Tk* logits_smem = reinterpret_cast<Tk*>(logits_smem_);
@@ -1682,6 +1681,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     case PositionEmbeddingType::kROPE_M:
     case PositionEmbeddingType::kROPE_GPT_NEOX:
     case PositionEmbeddingType::kYARN:
+    case PositionEmbeddingType::kYARN:
     {
         bool const do_rotary = is_valid_qk_vec && QK_VEC_SIZE * tidx < params.rotary_embedding_dim;
 
@@ -1718,13 +1718,20 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
             float rotary_embedding_m_scale = tlength <= params.rotary_embedding_original_max_positions
                 ? params.rotary_embedding_short_m_scale
                 : params.rotary_embedding_long_m_scale;
+            // The rotary cos_sin cache for the current timestep
+            float2 const* cos_sin_cache = params.rotary_embedding_cos_sin_cache;
+            if (cos_sin_cache)
+            {
+                cos_sin_cache += (static_cast<int64_t>(position_idx) * params.rotary_embedding_dim / 2);
+            }
+
             mmha::vec_from_smem_transpose(q, q_smem_, transpose_idx, smem_pitch);
             if (HANDLE_KV)
             {
                 mmha::vec_from_smem_transpose(k, k_smem_, transpose_idx, smem_pitch);
 
                 mmha::apply_rotary_embedding(q, k, transpose_idx / tidx_factor, params.rotary_embedding_dim,
-                    rotary_embedding_base, rotary_embedding_scale, position_idx, rotary_embedding_inv_freq_cache,
+                    rotary_embedding_base, rotary_embedding_scale, current_pos_idx, rotary_embedding_inv_freq_cache,
                     rotary_embedding_m_scale, params.rotary_cogvlm_vision_start, params.rotary_cogvlm_vision_length);
 
                 mmha::write_smem_transpose(k, k_smem_, transpose_idx, smem_pitch);
@@ -1732,7 +1739,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
             else
             {
                 mmha::apply_rotary_embedding(q, transpose_idx / tidx_factor, params.rotary_embedding_dim,
-                    rotary_embedding_base, rotary_embedding_scale, position_idx, rotary_embedding_inv_freq_cache,
+                    rotary_embedding_base, rotary_embedding_scale, current_pos_idx, rotary_embedding_inv_freq_cache,
                     rotary_embedding_m_scale, params.rotary_cogvlm_vision_start, params.rotary_cogvlm_vision_length);
             }
             mmha::write_smem_transpose(q, q_smem_, transpose_idx, smem_pitch);
@@ -2247,7 +2254,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     // It has been moved to the end of the kernel if the multi-block mode is enabled.
     if (!MULTI_BLOCK_FLAG && params.attention_sinks != nullptr)
     {
-        sum += expf(params.attention_sinks[tidx] - qk_max);
+        sum += expf(params.attention_sinks[hi] - qk_max);
     }
 
 // Normalize the logits.

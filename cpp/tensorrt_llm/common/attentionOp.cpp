@@ -72,6 +72,7 @@ struct FusedQKVMaskedAttentionDispatchParams
     RotaryScalingType rotary_embedding_scale_type;
     float rotary_embedding_scale;
     float const* rotary_embedding_inv_freq_cache;
+    float2 const* rotary_embedding_cos_sin_cache;
     float rotary_embedding_short_m_scale;
     float rotary_embedding_long_m_scale;
     int rotary_embedding_max_positions;
@@ -598,6 +599,7 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
     params.rotary_embedding_scale_type = input_params.rotary_embedding_scale_type;
     params.rotary_embedding_scale = input_params.rotary_embedding_scale;
     params.rotary_embedding_inv_freq_cache = input_params.rotary_embedding_inv_freq_cache;
+    params.rotary_embedding_cos_sin_cache = input_params.rotary_embedding_cos_sin_cache;
     params.rotary_embedding_short_m_scale = input_params.rotary_embedding_short_m_scale;
     params.rotary_embedding_long_m_scale = input_params.rotary_embedding_long_m_scale;
     params.rotary_embedding_max_positions = input_params.rotary_embedding_max_positions;
@@ -2274,6 +2276,7 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
     dispatch_params.rotary_embedding_scale_type = mRotaryEmbeddingScaleType;
     dispatch_params.rotary_embedding_scale = mRotaryEmbeddingScale;
     dispatch_params.rotary_embedding_inv_freq_cache = params.rotary_inv_freq;
+    dispatch_params.rotary_embedding_cos_sin_cache = params.rotary_cos_sin;
     dispatch_params.rotary_embedding_short_m_scale = mRotaryEmbeddingShortMscale;
     dispatch_params.rotary_embedding_long_m_scale = mRotaryEmbeddingLongMscale;
     dispatch_params.rotary_embedding_max_positions = mRotaryEmbeddingMaxPositions;

@@ -428,6 +428,7 @@ __device__ RegColWiseVec computeWarpColSum(Gemm0Acc& src);
 __device__ void storeGemm0AccToShm(
     uint32_t warpRank, uint32_t lane, SharedMem::XBuffer& smemX, CtaBarrier& barConsumed, Gemm0Acc const& acc);
 __device__ RegColWiseVec loadShmColWiseVecWithDup(ShmQWiseVec const& smemVec);
+__device__ RegColWiseVec loadGmemColWiseVecWithDup(ShmQWiseVec const& gmemVec, uint32_t bound);
 #else
 __device__ RegRowWiseVec computeWarpGrpRowMax_sync(uint32_t warpRank, ShmQWiseVec& smemColMax, Gemm0Acc const& src);
 __device__ void warpGrpApplyMask(Gemm0Acc& acc, uint32_t validColBeg, uint32_t validColEnd);
@@ -453,8 +454,8 @@ __device__ void rescaleGemm1AccForNewColMax_sync(uint32_t warpRank, ShmQWiseVec 
 template <bool dstIsStrided = false, typename DstHead>
 __device__ void finalizeAndWriteOut_sync(uint32_t threadRank, uint32_t warpRank, DstHead* dst,
     SharedMem::OutSwizzleBuf& swizzleBuf, Gemm1Acc& acc, float xvoScale, CtaBarrier& warpGrpBar,
-    ShmQWiseVec const& accColSum, uint32_t nbKHeads = 0 /* only for final result in spec dec. */,
-    ShmQWiseVec const& accColMax, ShmQWiseVec const* attentionSinksVec);
+    ShmQWiseVec const& accColSum, ShmQWiseVec const& accColMax, ShmQWiseVec const* attentionSinksVec,
+    uint32_t nbKHeads = 0 /* only for final result in spec dec. */);
 #else
 __device__ void transposeVTile(
     uint32_t warpRank, uint32_t lane, SharedMem::VTBuffer& dst, SharedMem::VBuffer const& src);
@@ -1272,8 +1273,8 @@ CUBIN_EXPORT __global__
                     }
 #if SWAP_AB
                     finalizeAndWriteOut_sync<SPEC_DEC>(threadIdx.x, warpRank, dst, smem.outSwizzleBuf(idxXBuf), acc,
-                        xvoScale, smem.gemm1WarpGrpBar, smem.gemm1AccColSum, nbKHeads, smem.gemm1AccColMax,
-                        attentionSinksVec);
+                        xvoScale, smem.gemm1WarpGrpBar, smem.gemm1AccColSum, smem.gemm1AccColMax, attentionSinksVec,
+                        nbKHeads);
 #else
                     finalizeAndWriteOut_sync(warpRank, dst, smem.outSwizzleBuf(idxXBuf), acc, xvoScale,
                         smem.gemm1AccColSum, nbKHeads, ctaNbValidTokens);
@@ -1601,7 +1602,7 @@ CUBIN_EXPORT __global__
                 {
                     uint32_t const idxHead = wid + nbMathWarps * i;
                     float sink = expf(
-                        attentionSinks[min(idxHead, headGrpSize - 1) + idxHeadGrp * headGrpSize] - states[i].max);
+                        attentionSinks[mha::min(idxHead, headGrpSize - 1) + idxHeadGrp * headGrpSize] - states[i].max);
                     states[i].sum += sink;
                 }
             }
@@ -2045,6 +2046,22 @@ __device__ inline RegColWiseVec loadShmColWiseVecWithDup(ShmQWiseVec const& smem
         ret[i] = reinterpret_cast<
             Vec<Vec<float, GmmaAccCoreMat::cols>, exactDiv(ShmQWiseVec::size, GmmaAccCoreMat::cols)> const&>(
             smemVec)[i * nbThrdsPerInstNBase + idx];
+    }
+    return ret;
+}
+
+__device__ inline RegColWiseVec loadGmemColWiseVecWithDup(ShmQWiseVec const& gmemVec, uint32_t bound)
+{
+    RegColWiseVec ret;
+    constexpr uint32_t nbThrdsPerInstNBase = exactDiv(gmma::instNBase, GmmaAccCoreMat::cols);
+    auto const idx = laneId() % nbThrdsPerInstNBase;
+#pragma unroll
+    for (uint32_t i = 0; i < exactDiv(ShmQWiseVec::size, gmma::instNBase); i++)
+    {
+        static_assert(nbThrdsPerInstNBase * RegColWiseVec::size == exactDiv(ShmQWiseVec::size, GmmaAccCoreMat::cols));
+        ret[i] = reinterpret_cast<
+            Vec<Vec<float, GmmaAccCoreMat::cols>, exactDiv(ShmQWiseVec::size, GmmaAccCoreMat::cols)> const&>(
+            gmemVec)[mha::min(i * nbThrdsPerInstNBase + idx, bound)];
     }
     return ret;
 }
@@ -2898,7 +2915,7 @@ __device__ inline void saveTransposedOutput(uint32_t threadRank, uint32_t warpRa
 template <bool dstIsStrided, typename DstHead>
 __device__ inline void finalizeAndWriteOut_sync(uint32_t threadRank, uint32_t warpRank, DstHead* dst,
     SharedMem::OutSwizzleBuf& swizzleBuf, Gemm1Acc& acc, float xvoScale, CtaBarrier& warpGrpBar,
-    ShmQWiseVec const& accColSum, uint32_t nbKHeads, ShmQWiseVec const& accColMax, ShmQWiseVec const* attentionSinksVec)
+    ShmQWiseVec const& accColSum, ShmQWiseVec const& accColMax, ShmQWiseVec const* attentionSinksVec, uint32_t nbKHeads)
 {
     // @fixme: if ctaNbQHeads is large, use loadShmColWiseVecNoDup + rcp + shfl to avoid 8x waste of mufu.rcp
     // static_assert(ctaNbQHeads <= 8, "Warning: consider using loadShmColWiseVecNoDup + rcp + shfl to avoid 8x waste of
@@ -2907,7 +2924,7 @@ __device__ inline void finalizeAndWriteOut_sync(uint32_t threadRank, uint32_t wa
     if (attentionSinksVec != nullptr)
     {
         auto const regAccColMax = loadShmColWiseVecWithDup(accColMax);
-        auto const regAttentionSinks = loadShmColWiseVecWithDup(attentionSinksVec[0]);
+        auto const regAttentionSinks = loadGmemColWiseVecWithDup(attentionSinksVec[0], headGrpSize - 1);
         auto regColSinks = expf(regAttentionSinks - regAccColMax);
         regColSum = regColSum + regColSinks;
     }
