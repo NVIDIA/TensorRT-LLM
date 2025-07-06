@@ -653,7 +653,7 @@ class TRTLLMSampler(Sampler):
                                     self.max_num_sequences, beam_width)
 
         # For beam search, cache indirection needs to be updated
-        if (beam_width > 1):
+        if beam_width > 1:
             self._update_cache_indirection_buffer(scheduled_requests)
 
         # TODO: Enable this back once nanobind is merged and/or llm request is a pure python object
