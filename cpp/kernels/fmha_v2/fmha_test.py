@@ -50,7 +50,7 @@ def getSMVersion():
                          ids=["fp16", "bf16", "fp16-fp32", "e4m3"])
 @pytest.mark.parametrize('flag', [
     "-s-q 128 -paged-kv", "-s-q 63 -paged-kv", "-paged-kv",
-    "-softcapping-scale-bmm1 30", "-contiguous-q-kv"
+    "-softcapping-scale-bmm1 30", "-contiguous-q-kv", "-use-attention-sinks"
 ])
 @pytest.mark.parametrize('tiled_kernel', ["", "-force-non-tiled"])
 def test_trtllm_flash_attention_fmha(d, s, dtype, flag, tiled_kernel):
@@ -117,8 +117,8 @@ def test_trtllm_flash_attention_fmha(d, s, dtype, flag, tiled_kernel):
             f"bin/fmha.exe -d {d} -h 16 -b 8 -s {s} -min-s 128 -custom-mask -gqa 2 -v {verbose} {dtype} {epsilon} {flag} {tiled_kernel}",
             shell=True,
             check=True)
-    # alibi and softcapping-scale-bmm1 are mutually exclusive.
-    if '-softcapping-scale-bmm1' not in flag:
+    # alibi doesn't work with softcapping-scale-bmm1/use-attention-sinks.
+    if '-softcapping-scale-bmm1' not in flag and '-use-attention-sinks' not in flag:
         subprocess.run(
             f"bin/fmha.exe -d {d} -h 16 -b 8 -s {s} -min-s 128 -causal-mask -alibi -v {verbose} {dtype} {epsilon} {flag} {tiled_kernel}",
             shell=True,

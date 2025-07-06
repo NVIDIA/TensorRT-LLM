@@ -87,6 +87,8 @@ struct Fused_multihead_attention_params_v2
     fmha::Kv_block_array paged_kv_cache;
     // The mask to implement drop-out.
     void* packed_mask_ptr;
+    // The attention sinks (per head).
+    float* attention_sinks;
     // The O matrix (output).
     void* o_ptr;
     // The Softmax stats vector of layout [2, B, S, H], including softmax_sum and softmax_max

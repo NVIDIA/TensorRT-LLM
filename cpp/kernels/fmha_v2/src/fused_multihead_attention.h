@@ -197,6 +197,9 @@ struct Fused_multihead_attention_params_v2 : Fused_multihead_attention_params_ba
     // The stride between rows of softmax_stats_ptr
     int64_t softmax_stats_stride_in_bytes;
 
+    // The attention sinks (per head).
+    float* attention_sinks;
+
     // array of length b+1 holding prefix sum of actual q sequence lengths.
     int* cu_q_seqlens;
     // array of length b+1 holding prefix sum of actual kv sequence lengths.

@@ -326,9 +326,6 @@ struct Compute
         uint32_t smem_v = __cvta_generic_to_shared(&shared->smem_v[0]);
         Compute_tile_o ctile_o(0, smem_v);
 
-        // BMM2 epilogue
-        Tile_o_epilogue tile_o_epilogue(params);
-
         // Mutex between two compute groups.
         OrderedMutexAccessor mutex_accessor(shared->compute_mutex, warpgroup_id, SYNC_BARRIER);
         // Notify warpgroup 0 to execute HGMMA first (overlap HGMMA and Softmax Math Instructions).
@@ -367,6 +364,9 @@ struct Compute
             {
                 sage_scale_row = head_info.bidb * params.h + head_info.bidh;
             }
+
+            // BMM2 epilogue
+            Tile_o_epilogue tile_o_epilogue(params, head_info);
 
             int q_step_idx = warpgroup_id;
 
@@ -490,7 +490,7 @@ struct Compute
                 if (valid_run)
                 {
                     // Final step's update.
-                    tile_o_epilogue.scale(ctile_o, p_sum);
+                    tile_o_epilogue.scale(ctile_o, p_max, p_sum);
                     // Store o_tile to gmem.
                     gmem_o.store(ctile_o.acc_);
                 }
