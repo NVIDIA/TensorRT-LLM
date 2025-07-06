@@ -93,8 +93,28 @@ struct TmaWarpSpecializedGroupedGemmInput
     using NVFP4BlockScaledConfig = cutlass::detail::Sm1xxBlockScaledConfig<NVFP4BlockScaleVectorSize>;
     using MXFPXBlockScaledConfig = cutlass::detail::Sm1xxBlockScaledConfig<MXFPXBlockScaleVectorSize>;
 
-    constexpr static int MinNumRowsAlignmentNVFP4 = cute::size<0>(NVFP4BlockScaledConfig::SfAtom{});
-    constexpr static int MinNumRowsAlignmentMXFPX = cute::size<0>(MXFPXBlockScaledConfig::SfAtom{});
+    // 128
+    // This is the alignment of the weight matrix the fully padded SF will refer to.
+    // We require the SFs to be aligned to this value (zero padded as needed)
+    // The weights do not need to be aligned to this value, CUTLASS will handle extra padding
+    // N here is a short hand for the outer dimension of the GEMM, this applies to both M & N dimension of the GEMM
+    constexpr static int MinNDimAlignmentNVFP4 = cute::size<0>(NVFP4BlockScaledConfig::SfAtom{});
+    constexpr static int MinNDimAlignmentMXFPX = cute::size<0>(MXFPXBlockScaledConfig::SfAtom{});
+
+    // Block scale vector size * 4
+    // This is the alignment of the weight matrix the fully padded SF will refer to.
+    // We should never actually need to pad a buffer to this alignment
+    // The weights only need to be aligned to BlockScaleVectorSize, CUTLASS will handle extra padding
+    // The SFs only need to be aligned to 4 (zero padded as needed)
+    // K here is a short hand for the inner dimension of the GEMM
+    constexpr static int MinKDimAlignmentNVFP4 = cute::size<1>(NVFP4BlockScaledConfig::SfAtom{});
+    constexpr static int MinKDimAlignmentMXFPX = cute::size<1>(MXFPXBlockScaledConfig::SfAtom{});
+
+    // Helper function to align a dimension to the SF alignment
+    constexpr static int64_t alignToSfDim(int64_t dim, int64_t alignment)
+    {
+        return (dim + alignment - 1) / alignment * alignment;
+    }
 
     using StrideA
         = std::remove_pointer_t<cutlass::detail::TagToStrideB_t<LayoutA*>>; // Use B because they will be swapped
