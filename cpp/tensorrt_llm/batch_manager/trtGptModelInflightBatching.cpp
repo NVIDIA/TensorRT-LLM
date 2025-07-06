@@ -1997,19 +1997,19 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
     NVTX3_SCOPED_RANGE(decoderStepAsync);
 
     auto& decoderInputBuffers = mDecoderInputBuffers.at(getFusedBufferId());
-    auto& seqSlotLogits = decoderInputBuffers.logits;
+    auto seqSlotLogits = std::vector<TensorPtr>(getMaxNumSequences());
 
     auto const contextBufferId = mCtxGenFusion ? getFusedBufferId() : getContextBufferId();
     auto& contextRuntimeBuffers = mBuffers.at(contextBufferId);
-    auto const logitsIndex = (*mHandleContextLogits)(decoderInputBuffers, scheduledRequests.contextRequests,
-        contextRuntimeBuffers->logits, contextRuntimeBuffers->numContextLogits, mModelConfig,
-        mRuntime->getBufferManager(), contextRuntimeBuffers->mMedusaBuffers);
+    auto const logitsIndex = (*mHandleContextLogits)(seqSlotLogits, decoderInputBuffers,
+        scheduledRequests.contextRequests, contextRuntimeBuffers->logits, contextRuntimeBuffers->numContextLogits,
+        mModelConfig, mRuntime->getBufferManager(), contextRuntimeBuffers->mMedusaBuffers);
 
     auto const genLogitsIndex = mCtxGenFusion ? logitsIndex : 0;
     auto const genBufferId = mCtxGenFusion ? getFusedBufferId() : getGenerationBufferId();
     auto& genRuntimeBuffers = mBuffers.at(genBufferId);
-    (*mHandleGenerationLogits)(decoderInputBuffers, scheduledRequests.generationRequests, genRuntimeBuffers->logits,
-        genLogitsIndex, mModelConfig, mRuntime->getBufferManager(), *genRuntimeBuffers,
+    (*mHandleGenerationLogits)(seqSlotLogits, decoderInputBuffers, scheduledRequests.generationRequests,
+        genRuntimeBuffers->logits, genLogitsIndex, mModelConfig, mRuntime->getBufferManager(), *genRuntimeBuffers,
         genRuntimeBuffers->mMedusaBuffers);
 
     if (mOperatingBeamWidth > 1)
@@ -2025,6 +2025,8 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
     {
         mGuidedDecoder->execute(scheduledRequests, mRuntime->getBufferManager(), seqSlotLogits);
     }
+
+    decoderInputBuffers.logits = std::move(seqSlotLogits);
 
     auto const fusedBufferId = getFusedBufferId();
     auto& fusedRuntimeBuffers = mBuffers.at(fusedBufferId);

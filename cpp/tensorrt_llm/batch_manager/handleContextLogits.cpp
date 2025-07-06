@@ -68,10 +68,10 @@ void setupMedusaLogits(std::vector<TensorPtr>& medusaLogitsHeads, TensorPtr cons
 
 } // namespace
 
-SizeType32 HandleContextLogits::operator()(DecoderInputBuffers& inputBuffers, RequestVector const& contextRequests,
-    tr::ITensor::SharedPtr const& logits, std::vector<tr::SizeType32> const& numContextLogitsVec,
-    tr::ModelConfig const& modelConfig, tr::BufferManager const& manager,
-    OptionalRef<MedusaBuffers> medusaBuffers) const
+SizeType32 HandleContextLogits::operator()(std::vector<TensorPtr>& seqSlotLogits, DecoderInputBuffers& inputBuffers,
+    RequestVector const& contextRequests, TensorPtr const& logits,
+    std::vector<tr::SizeType32> const& numContextLogitsVec, tr::ModelConfig const& modelConfig,
+    tr::BufferManager const& manager, OptionalRef<MedusaBuffers> medusaBuffers) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(HandleContextLogits);
@@ -115,7 +115,7 @@ SizeType32 HandleContextLogits::operator()(DecoderInputBuffers& inputBuffers, Re
         // Get the logits from the last context token and draft tokens
         auto const numDecoderLogits = 1 + draftLength;
         auto const seqSlot = llmReq->mSeqSlot.value();
-        auto& decoderLogits = inputBuffers.logits.at(seqSlot);
+        auto& decoderLogits = seqSlotLogits.at(seqSlot);
         TensorPtr logitsView = ITensor::slice(logits, logitsIndex - numDecoderLogits, numDecoderLogits);
 
         if (modelConfig.getSpeculativeDecodingMode().hasDraftLogits())
