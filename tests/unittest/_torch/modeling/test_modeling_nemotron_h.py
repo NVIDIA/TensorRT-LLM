@@ -29,8 +29,11 @@ def extract_decode_logprobs(result: RequestOutput,
     return get_logprobs(token_ids, logits)
 
 
-def create_nemotron_h_llm(use_cuda_graph, disable_overlap_scheduler,
-                          max_batch_size):
+def create_nemotron_h_llm(use_cuda_graph,
+                          disable_overlap_scheduler,
+                          max_batch_size,
+                          enable_chunked_prefill=False,
+                          max_num_tokens=None):
     """Create LLM with specific overlap scheduler setting"""
     model_dir = f"{llm_models_root(check=True)}/Nemotron-H-8B-Base-8K"
     return LLM(
@@ -41,6 +44,8 @@ def create_nemotron_h_llm(use_cuda_graph, disable_overlap_scheduler,
         disable_overlap_scheduler=disable_overlap_scheduler,
         kv_cache_config=KvCacheConfig(enable_block_reuse=False),
         enable_trtllm_sampler=True,
+        enable_chunked_prefill=enable_chunked_prefill,
+        max_num_tokens=max_num_tokens,
     )
 
 
@@ -300,3 +305,36 @@ def test_nemotron_h_cuda_graph_overlap_scheduler():
             with_cg_with_overlap.outputs[0].generation_logits,
             atol=0.05,
             rtol=0.05)
+
+
+def test_nemotron_h_chunked_prefill():
+    # Long prompts (~100 tokens) to make sure chunked prefill is enabled
+    prompts = [
+        "Artificial Intelligence in Healthcare: Artificial intelligence (AI) is transforming healthcare by improving diagnostics, treatment plans, and patient care. AI algorithms can analyze medical images with high accuracy, assist in early disease detection, and personalize treatment plans based on patient data. Additionally, AI-powered chatbots and virtual assistants provide support to patients, enhancing accessibility and efficiency in healthcare services. As AI technology continues to advance, its integration into healthcare systems promises to deliver better outcomes and reduce costs. With continuous research and development, AI in healthcare is poised to",
+        "The Role of Cloud Computing: Cloud computing has revolutionized the way businesses operate by providing scalable, on-demand access to computing resources. This technology allows organizations to store and process data remotely, reducing the need for physical infrastructure and enabling greater flexibility. Cloud services facilitate collaboration, enhance data security, and support the deployment of innovative applications. As businesses increasingly adopt cloud solutions, they benefit from improved efficiency, cost savings, and the ability to rapidly adapt to changing market conditions. Companies leveraging cloud computing are better positioned to",
+        "Advancements in Renewable Energy: Renewable energy technologies, such as solar and wind power, are crucial for addressing climate change and reducing dependence on fossil fuels. Advances in energy storage, grid integration, and efficiency are making renewable energy sources more viable and cost-effective. Innovations in materials science and engineering are also driving the development of next-generation renewable technologies. As global efforts to combat climate change intensify, the continued advancement of renewable energy will play a pivotal role in achieving a sustainable future. Governments and industries are increasingly investing in",
+        "The Importance of Cybersecurity: In today's digital age, cybersecurity has become essential to protect sensitive information and maintain the integrity of systems. With the rise of cyber threats such as hacking, phishing, and ransomware, organizations must implement robust security measures to safeguard their data. Cybersecurity involves a combination of technologies, processes, and practices designed to defend against unauthorized access and attacks. By staying vigilant and updating security protocols, businesses can mitigate risks and ensure the safety of their digital assets. Proactive cybersecurity strategies are crucial in",
+        "The Impact of Artificial Intelligence on Education: Artificial intelligence is reshaping education by providing personalized learning experiences and automating administrative tasks. AI-driven educational tools can adapt to individual student needs, offering tailored feedback and resources to enhance learning outcomes. Additionally, AI can streamline administrative processes, allowing educators to focus more on teaching and student engagement. As AI continues to evolve, its role in education will expand, offering new opportunities for innovation and efficiency. The integration of AI in classrooms promises to revolutionize how students learn and how educators manage their",
+    ]
+    sampling_config = SamplingParams(max_tokens=12,
+                                     temperature=0.0,
+                                     return_generation_logits=True)
+
+    with create_nemotron_h_llm(use_cuda_graph=False,
+                               disable_overlap_scheduler=True,
+                               max_batch_size=16) as llm:
+        outputs = llm.generate(prompts,
+                               sampling_params=sampling_config,
+                               use_tqdm=True)
+
+    with create_nemotron_h_llm(use_cuda_graph=False,
+                               disable_overlap_scheduler=True,
+                               max_batch_size=16,
+                               enable_chunked_prefill=True,
+                               max_num_tokens=64) as llm:
+        chunked_prefill_outputs = llm.generate(prompts,
+                                               sampling_params=sampling_config,
+                                               use_tqdm=True)
+
+    for output, chunked_prefill_output in zip(outputs, chunked_prefill_outputs):
+        assert output.outputs[0].text == chunked_prefill_output.outputs[0].text
