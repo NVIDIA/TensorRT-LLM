@@ -11,143 +11,75 @@ Welcome to TensorRT-LLM's Documentation!
    :caption: Getting Started
    :name: Getting Started
 
-   overview.md
-   quick-start-guide.md
-   key-features.md
-   torch.md
-   release-notes.md
+   1.0/overview.md
+   1.0/quick-start-guide.md
+   1.0/installation/index
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Developer Guide
+
+   1.0/examples/index.rst
+   1.0/examples/llm_api_examples
+   1.0/examples/trtllm_serve_examples
+   1.0/examples/dynamo_k8s_example
 
 
 .. toctree::
    :maxdepth: 2
-   :caption: Installation
-   :name: Installation
+   :caption: CLI Reference
 
-   .. installation/overview.md
-
-   installation/containers.md
-   installation/linux.md
-   installation/build-from-source-linux.md
+   1.0/cli-reference/trtllm-serve.md
+   1.0/cli-reference/trtllm-bench.md
+   1.0/cli-reference/trtllm-eval.md
 
 
 .. toctree::
    :maxdepth: 2
-   :caption: LLM API
-   :hidden:
-   :glob:
-
-   llm-api/*
-
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Examples
+   :caption: API Reference
    :hidden:
 
-   examples/index.rst
-   examples/customization.md
-   examples/llm_api_examples
-   examples/trtllm_serve_examples
+   1.0/llm-api/*
+   1.0/examples/index.rst
+   1.0/examples/customization.md
+   1.0/examples/llm_api_examples
 
 
 .. toctree::
    :maxdepth: 2
-   :caption: Model Definition API
+   :caption: Software Architecture
+   :name: Software Architecture
+
+   1.0/architecture/overview.md
+   1.0/architecture/key-components
+   1.0.architecture/developer-guide
+
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Features
+   :name: Features
+
+   1.0/features/attention.md
+   1.0/features/disagg-serving.md
+   1.0/features/intro-inference-features.md
+   1.0/features/kvcache.md
+   1.0/features/long-sequence.md
+   1.0/features/lora.md
+   1.0/features/multi-modality.md
+   1.0/features/paged-attention-ifb-scheduling.md
+   1.0/features/parallel-strategy.md
+   1.0/features/quantization.md
+   1.0/features/sampling.md
+   1.0/features/speculative-decoding.md
+
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Quick Links
    :hidden:
 
-   python-api/tensorrt_llm.layers.rst
-   python-api/tensorrt_llm.functional.rst
-   python-api/tensorrt_llm.models.rst
-   python-api/tensorrt_llm.plugin.rst
-   python-api/tensorrt_llm.quantization.rst
-   python-api/tensorrt_llm.runtime.rst
-
-
-.. toctree::
-   :maxdepth: 2
-   :caption: C++ API
-   :hidden:
-
-   _cpp_gen/executor.rst
-   _cpp_gen/runtime.rst
-
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Command-Line Reference
-   :hidden:
-
-   commands/trtllm-build
-   commands/trtllm-serve
-
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Architecture
-   :name: Architecture
-
-   architecture/overview.md
-   architecture/core-concepts.md
-   architecture/checkpoint.md
-   architecture/workflow.md
-   architecture/add-model.md
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Advanced
-   :name: Advanced
-
-   advanced/gpt-attention.md
-   advanced/gpt-runtime.md
-   advanced/executor.md
-   advanced/graph-rewriting.md
-   advanced/inference-request.md
-   advanced/lora.md
-   advanced/expert-parallelism.md
-   advanced/kv-cache-management.md
-   advanced/kv-cache-reuse.md
-   advanced/speculative-decoding.md
-   advanced/disaggregated-service.md
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Performance
-   :name: Performance
-
-   performance/perf-overview.md
-   Benchmarking <performance/perf-benchmarking.md>
-   performance/performance-tuning-guide/index
-   performance/perf-analysis.md
-
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Reference
-   :name: Reference
-
-   reference/troubleshooting.md
-   reference/support-matrix.md
-
-   .. reference/upgrading.md
-
-   reference/precision.md
-   reference/memory.md
-   reference/ci-overview.md
-
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Blogs
-   :hidden:
-
-   blogs/H100vsA100.md
-   blogs/H200launch.md
-   blogs/Falcon180B-H200.md
-   blogs/quantization-in-TRT-LLM.md
-   blogs/XQA-kernel.md
-   blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md
-   blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.md
-
+   blogs/index.rst
 
 Indices and tables
 ==================

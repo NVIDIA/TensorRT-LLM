@@ -22,10 +22,10 @@ def generate_title(filename: str) -> str:
 def generate_examples():
     root_dir = Path(__file__).parent.parent.parent.resolve()
     ignore_list = {'__init__.py', 'quickstart_example.py'}
-    doc_dir = root_dir / "docs/source/examples"
+    doc_dir = root_dir / "docs/source/1.0/examples"
 
     # Source paths for LLMAPI examples
-    llmapi_script_dir = root_dir / "examples/llm-api"
+    llmapi_script_dir = root_dir / "1.0/examples/llm-api"
     llmapi_script_paths = sorted(
         llmapi_script_dir.glob("*.py"),
         # The autoPP example should be at the end since it is a preview example
@@ -42,7 +42,7 @@ def generate_examples():
     llmapi_script_base_url = "https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llm-api"
 
     # Path for trtllm-serve examples
-    serve_script_dir = root_dir / "examples/serve"
+    serve_script_dir = root_dir / "1.0/examples/serve"
     serve_script_paths = sorted(
         chain(serve_script_dir.glob("*.py"), serve_script_dir.glob("*.sh")))
     serve_script_paths = [
@@ -139,7 +139,7 @@ def generate_llmapi():
     root_dir = Path(__file__).parent.parent.parent.resolve()
 
     # Destination paths
-    doc_dir = root_dir / "docs/source/llm-api"
+    doc_dir = root_dir / "docs/source/1.0/llm-api"
     doc_dir.mkdir(exist_ok=True)
     doc_path = doc_dir / "reference.rst"
 
