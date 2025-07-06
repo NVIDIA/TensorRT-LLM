@@ -494,7 +494,7 @@ pipeline {
                 }
             }
         }
-        stage("Register Images") {
+        stage("Register Images for Security Checks") {
             when {
                 expression {
                     return params.nspect_id && params.action == "push"
@@ -503,8 +503,8 @@ pipeline {
             steps {
                 script {
                     container("python3") {
-                        sh "pip3 install --upgrade pip"
-                        sh "pip3 install --upgrade requests"
+                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install --upgrade pip")
+                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install --upgrade requests")
                         def nspect_commit = "170c09aa35d5dacdc40611dd907f8801742fd5e4"
                         withCredentials([string(credentialsId: "TRTLLM_NSPECT_REPO", variable: "NSPECT_REPO")]) {
                             trtllm_utils.checkoutSource("${NSPECT_REPO}", nspect_commit, "nspect")
