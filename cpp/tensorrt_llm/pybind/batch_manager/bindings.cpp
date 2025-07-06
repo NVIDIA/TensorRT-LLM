@@ -498,7 +498,7 @@ void initBindings(pybind11::module_& m)
                     auto logitsOffset = genLogitsOffset + i * beamWidth;
                     auto numberOfLogits = beamWidth;
                     tr::ITensor::SharedPtr logitsView = ITensor::slice(logits, logitsOffset, numberOfLogits);
-                    logitsView->unsqueeze(1);
+                    logitsView->unsqueeze(0);
                     logitsVec[0].push_back(std::move(logitsView));
                 }
             }

@@ -49,7 +49,13 @@ class HandleLogits:
             if llm_req.py_return_generation_logits and llm_req.is_last_context_chunk:
                 # Get the logits from the last context token and draft tokens
                 logits_view = logits[logits_end - 1:logits_end]
-                llm_req.py_result.append_generation_logits(logits_view)
+                if beam_width > 1:
+                    # Replicate logits across all beams
+                    llm_req.py_result.append_generation_logits(
+                        torch.tile(logits_view, (1, beam_width, 1)))
+                else:
+                    llm_req.py_result.append_generation_logits(
+                        logits_view.unsqueeze(1))
 
         total_context_logits = num_context_logits_prefix_sum[-1]
         for batch_index, llm_req in enumerate(generation_requests):
@@ -57,5 +63,7 @@ class HandleLogits:
             logits_end = logits_begin + beam_width
 
             if llm_req.py_return_generation_logits:
-                logits_view = logits[logits_begin:logits_end]
+                logits_view = logits[logits_begin:logits_end].reshape(
+                    1, beam_width, -1)
+                print("gen req logits_view.shape", logits_view.shape)
                 llm_req.py_result.append_generation_logits(logits_view)

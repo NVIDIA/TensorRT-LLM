@@ -196,7 +196,7 @@ def add_token(request: LlmRequest,
               step: int = 0) -> int:
     seq_slot = request.seq_slot
     assert seq_slot is not None
-    new_token = int(new_tokens[step, request.seq_slot, beam])
+    new_token = int(new_tokens[step, seq_slot, beam])
     request.add_new_token(new_token, beam)
     return new_token
 
@@ -631,7 +631,7 @@ class TRTLLMSampler(Sampler):
         beam_width = self.beam_width(scheduled_requests.all_requests())
         if (batch_size > 1 and beam_width > 1
                 and any(request.py_return_log_probs
-                        for request in all_requests)):
+                        for request in scheduled_requests.all_requests())):
             raise ValueError(
                 "Beam search is not supported for multiple prompts and logprobs"
             )
@@ -789,13 +789,16 @@ class TRTLLMSampler(Sampler):
     def update_requests_multiple_beams_or_drafting(self,
                                                    state: SampleStateTRTLLM,
                                                    beam_width: int):
-        new_tokens_host = state.host.new_tokens.tolist()
+        new_tokens_host = state.host.new_tokens
         finished_sum_host = state.host.finished_sum.tolist()
         finish_reasons = state.host.finish_reasons.flatten().tolist()
         sequence_lengths_host_data = state.host.sequence_lengths.flatten(
         ).tolist()
-        cum_log_probs_host = state.host.cum_log_probs.tolist()
-        log_probs_host = state.host.log_probs.tolist()
+        cum_log_probs_host = state.host.cum_log_probs.tolist(
+        ) if state.host.cum_log_probs is not None else None
+        log_probs_host = state.host.log_probs.tolist(
+        ) if state.host.log_probs is not None else None
+        finalize_events = {}
 
         reqs = [
             r for r in state.scheduled_requests.context_requests
@@ -874,7 +877,7 @@ class TRTLLMSampler(Sampler):
                     request, True)
         # post process all requests if necessary
         if beam_width > 1:
-            for request in requests:
+            for request in reqs:
                 if request.request_id in finalize_events:
                     self._post_process_request(
                         request, finalize_events[request.request_id])
