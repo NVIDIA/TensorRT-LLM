@@ -20,17 +20,15 @@ class HandleLogits:
         max_num_sequences: int,
         beam_width: int,
     ):
-        """Handle context logits for a batch of requests.
+        """Handles context and generation logits for a batch of requests.
 
         Args:
             context_requests: List of context requests to process
+            generation_requests: List of generation requests to process
             logits: Input logits tensor
             num_context_logits_prefix_sum: Prefix sum of context logits for each request
             max_num_sequences: Maximum number of sequences to process
-
-        Returns:
-            List[torch.Tensor]: List of logits tensors for each request
-            int: Index into logits tensor after processing all requests
+            beam_width: Beam width for the generation requests
         """
         # Copy logits into decoderBuffers.logits
         for batch_index, llm_req in enumerate(context_requests):
@@ -65,5 +63,4 @@ class HandleLogits:
             if llm_req.py_return_generation_logits:
                 logits_view = logits[logits_begin:logits_end].reshape(
                     1, beam_width, -1)
-                print("gen req logits_view.shape", logits_view.shape)
                 llm_req.py_result.append_generation_logits(logits_view)
