@@ -13,15 +13,50 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import torch
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 
 
+def cu_seqlens_to_chunk_indices_offsets(cu_seqlens: torch.Tensor,
+                                        chunk_size: int, total_seqlens: int):
+
+    cu_seqlens = cu_seqlens[1:]  # remove prepended 0
+
+    # outputs will have length expansion of chunks that do not divide
+    # chunk_size
+    N = math.ceil(total_seqlens / chunk_size) + (cu_seqlens[:-1] % chunk_size
+                                                 > 0).sum()
+    chunk_indices = torch.arange(N, dtype=torch.int, device=cu_seqlens.device)
+    chunk_offsets = torch.zeros((N, ),
+                                dtype=torch.int,
+                                device=cu_seqlens.device)
+
+    p = 0  # num of insertions
+    for s, e in zip(cu_seqlens[:-1], cu_seqlens[1:]):
+
+        # if does not divide chunk_size, then there is one chunk insertion
+        p += (s % chunk_size > 0)
+
+        # get the dimensions
+        # - the + 1 for _e is to shift the boundary by one chunk
+        # - this shifting is not needed if chunk_size divides e
+        _s, _e = s // chunk_size + p, e // chunk_size + p + (e % chunk_size > 0)
+
+        # adjust inidces and offsets
+        chunk_indices[_s:_e] -= p
+        chunk_offsets[_s] = s % chunk_size
+
+    return chunk_indices, chunk_offsets
+
+
 class Mamba2Metadata:
 
-    def __init__(self, max_batch_size: int):
+    def __init__(self, max_batch_size: int, chunk_size: int):
         self.max_batch_size = max_batch_size
+        self.chunk_size = chunk_size
 
         # cumulative sequence lengths for prefill requests [batch_size+1]
         self.cu_seqlens = torch.zeros(max_batch_size + 1,
@@ -31,9 +66,18 @@ class Mamba2Metadata:
         # sequence index for prefill requests [num_prefill_tokens] - specifies which request each token belongs to
         self.seq_idx: torch.Tensor = None
 
+        # helper tensors for chunked prefill
+        self.has_initial_states = torch.zeros(max_batch_size,
+                                              dtype=torch.bool,
+                                              device="cuda")
+        self.use_initial_states = False
+        self.chunk_indices: torch.Tensor = None
+        self.chunk_offsets: torch.Tensor = None
+
     def prepare(self, attn_metadata: AttentionMetadata):
         num_contexts = attn_metadata.num_contexts
         context_lens = attn_metadata.seq_lens_cuda[:num_contexts]
+        num_ctx_tokens = attn_metadata.num_ctx_tokens
         if num_contexts > 0:
             torch.cumsum(context_lens,
                          dim=0,
@@ -44,4 +88,15 @@ class Mamba2Metadata:
                              dtype=torch.int,
                              device=self.cu_seqlens.device),
                 repeats=context_lens,
-                output_size=self.cu_seqlens[num_contexts]).unsqueeze(0)
+                output_size=num_ctx_tokens).unsqueeze(0)
+
+            num_cached_tokens_per_seq = attn_metadata.kv_cache_params.num_cached_tokens_per_seq
+            self.has_initial_states[:num_contexts] = torch.tensor(
+                num_cached_tokens_per_seq[:num_contexts]) > 0
+            # precomputed bool to avoid host<->device syncs during forward pass
+            self.use_initial_states = torch.any(
+                self.has_initial_states[:num_contexts]).item()
+            if self.use_initial_states:
+                self.chunk_indices, self.chunk_offsets = cu_seqlens_to_chunk_indices_offsets(
+                    self.cu_seqlens[:num_contexts], self.chunk_size,
+                    num_ctx_tokens)
