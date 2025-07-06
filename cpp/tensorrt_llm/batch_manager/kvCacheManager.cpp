@@ -407,7 +407,7 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
     SizeType32 sinkBubbleLength, bool onboardBlocks, CacheType cacheType,
     std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
     std::shared_ptr<KVCacheEventManager> eventManager, bool enableHashKey, bool enablePartialReuse,
-    bool copyOnPartialReuse)
+    bool copyOnPartialReuse, bool multiThreadReuse)
     : mNumLayers{static_cast<SizeType32>(numKvHeadsPerLayer.size())}
     , mTokensPerBlock{tokensPerBlock}
     , mEventManager{std::move(eventManager)}
@@ -415,7 +415,7 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
     , mCacheType{cacheType}
 {
     mAgentName = std::string("GDSAgent");
-    BaseAgentConfig config{mAgentName, true};
+    BaseAgentConfig config{mAgentName, true, multiThreadReuse};
     mLoopbackAgent = makeLoopbackAgent("nixl", &config);
 
     auto const uniqueWindowSizeToLayers
