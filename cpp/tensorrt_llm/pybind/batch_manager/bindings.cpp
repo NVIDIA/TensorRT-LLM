@@ -453,7 +453,7 @@ void initBindings(pybind11::module_& m)
         [](std::vector<std::shared_ptr<tb::LlmRequest>>& contextRequests,
             std::vector<std::shared_ptr<tb::LlmRequest>>& genRequests, tr::ITensor::SharedPtr logits, int beamWidth,
             std::vector<int> const& numContextLogitsPrefixSum, tb::DecoderInputBuffers const& decoderInputBuffers,
-            tr::BufferManager const& manager)
+            runtime::decoder::DecoderState& decoderState, tr::BufferManager const& manager)
         {
             std::vector<int> activeSlots;
             std::vector<int> generationSteps;
@@ -513,13 +513,19 @@ void initBindings(pybind11::module_& m)
 
             auto decodingInput = std::make_unique<tr::decoder_batch::Input>(logitsVec, 1);
             decodingInput->batchSlots = batchSlots;
-            decodingInput->generationSteps = generationSteps;
+
+            auto const maxBeamWidth = decoderState.getMaxBeamWidth();
+            if (maxBeamWidth > 1)
+            {
+                // For Variable-Beam-Width-Search
+                decoderState.getJointDecodingInput().generationSteps = generationSteps;
+            }
 
             return decodingInput;
         },
         py::arg("context_requests"), py::arg("generation_requests"), py::arg("logits"), py::arg("beam_width"),
-        py::arg("num_context_logits_prefix_sum"), py::arg("decoder_input_buffers"), py::arg("buffer_manager"),
-        "Make decoding batch input.");
+        py::arg("num_context_logits_prefix_sum"), py::arg("decoder_input_buffers"), py::arg("decoder_state"),
+        py::arg("buffer_manager"), "Make decoding batch input.");
 }
 
 } // namespace tensorrt_llm::pybind::batch_manager
