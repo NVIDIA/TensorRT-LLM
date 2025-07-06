@@ -156,6 +156,13 @@ def _register_fake():
         n = b.shape[0]
         return a.new_empty((m, n), dtype=torch.bfloat16)
 
+    @torch.library.register_fake("trtllm::weight_only_quant_gemm")
+    def _(a, b, b_type, b_scale, out_dtype=None):
+        m = a.shape[0]
+        n = b.shape[1]
+        dtype = out_dtype if out_dtype is not None else a.dtype
+        return a.new_empty((m, n), dtype=dtype)
+
     @torch.library.register_fake(
         "tensorrt_llm::static_quantize_e4m3_per_tensor")
     def _(input: torch.Tensor, scale: torch.Tensor):
