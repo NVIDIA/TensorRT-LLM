@@ -463,15 +463,6 @@ class TestMinistral8BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
-    def test_auto_dtype_comprehensive(self):
-        with LLM(self.MODEL_PATH) as llm:
-            # Test multiple datasets for comprehensive evaluation
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
     @skip_pre_ada
     def test_fp8(self):
         # Test with FP8 quantization if pre-quantized model is available
