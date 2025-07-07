@@ -2,7 +2,7 @@ hostname: localhost
 port: 8000
 model: DeepSeek-V3-Lite/bf16
 backend: "pytorch"
-cuda_graph_config: None
+cuda_graph_config: null
 disable_overlap_scheduler: True
 enable_autotuner: False
 context_servers:
