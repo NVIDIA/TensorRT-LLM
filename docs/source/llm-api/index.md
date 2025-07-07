@@ -6,23 +6,10 @@ It supports a broad range of use cases, from single-GPU setups to multi-GPU and 
 
 While the LLM API simplifies inference workflows with a high-level interface, it is also designed with flexibility in mind. Under the hood, it uses a PyTorch-native and modular backend, making it easy to customize, extend, or experiment with the runtime.
 
-
-## Supported Models
-
-* DeepSeek variants
-* Llama (including variants Mistral, Mixtral, InternLM)
-* GPT (including variants Starcoder-1/2, Santacoder)
-* Gemma-1/2/3
-* Phi-1/2/3/4
-* ChatGLM (including variants glm-10b, chatglm, chatglm2, chatglm3, glm4)
-* QWen-1/1.5/2/3
-* Falcon
-* Baichuan-1/2
-* GPT-J
-* Mamba-1/2
-
-
-> **Note:** For the most up-to-date list of supported models, you may refer to the [TensorRT-LLM model definitions](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/models).
+## Table of Contents
+- [Quick Start Example](#quick-start-example)
+- [Supported Models](#supported-models)
+- [Tips and Troubleshooting](#tips-and-troubleshooting)
 
 ## Quick Start Example
 A simple inference example with TinyLlama using the LLM API:
@@ -31,7 +18,8 @@ A simple inference example with TinyLlama using the LLM API:
     :language: python
     :linenos:
 ```
-More examples can be found [here]().
+
+For more advanced usage including distributed inference, multimodal, and speculative decoding, please refer to this [README](../../../examples/llm-api/README.md).
 
 ## Model Input
 
@@ -64,6 +52,38 @@ llm = LLM(model=<local_path_to_model>)
 
 > **Note:** Some models require accepting specific [license agreements]((https://ai.meta.com/resources/models-and-libraries/llama-downloads/)). Make sure you have agreed to the terms and authenticated with Hugging Face before downloading.
 
+
+## Supported Models
+
+
+| Models                                                    |                [Model Class Name](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/models)                | HuggingFace Model ID Example                                                                                                          | Modality |
+| :-------------------------------------------------------------- | :----------------------------------: | :------------------------------------------------------------------------------------------------------------------------------------ | :------: |
+| BERT-based                                                      |    `BertForSequenceClassification`   | `textattack/bert-base-uncased-yelp-polarity`                                                                                          |     L    |
+| DeepSeek-V3                                                     |        `DeepseekV3ForCausalLM`       | `deepseek-ai/DeepSeek-V3 `                                                                                                            |     L    |
+| Gemma3                                                          |          `Gemma3ForCausalLM`         | `google/gemma-3-1b-it`                                                                                                                |     L    |
+| HyperCLOVAX-SEED-Vision                                         |        `HCXVisionForCausalLM`        | `naver-hyperclovax/HyperCLOVAX-SEED-Vision-Instruct-3B`                                                                               |   L + V  |
+| VILA                                                            |           `LlavaLlamaModel`          | `Efficient-Large-Model/NVILA-8B`                                                                                                      |   L + V  |
+| LLaVA-NeXT                                                      |  `LlavaNextForConditionalGeneration` | `llava-hf/llava-v1.6-mistral-7b-hf`                                                                                                   |   L + V  |
+| Llama 3 <br> Llama 3.1 <br> Llama 2 <br> LLaMA                  |          `LlamaForCausalLM`          | `meta-llama/Meta-Llama-3.1-70B`                                                                                                       |     L    |
+| Llama 4 Scout <br> Llama 4 Maverick                             |   `Llama4ForConditionalGeneration`   | `meta-llama/Llama-4-Scout-17B-16E-Instruct` <br> `meta-llama/Llama-4-Maverick-17B-128E-Instruct`                                      |   L + V  |
+| Mistral                                                         |         `MistralForCausalLM`         | `mistralai/Mistral-7B-v0.1`                                                                                                           |     L    |
+| Mixtral                                                         |         `MixtralForCausalLM`         | `mistralai/Mixtral-8x7B-v0.1`                                                                                                         |     L    |
+| Llama 3.2                                                       |   `MllamaForConditionalGeneration`   | `meta-llama/Llama-3.2-11B-Vision`                                                                                                     |     L    |
+| Nemotron-3 <br> Nemotron-4 <br> Minitron                        |         `NemotronForCausalLM`        | `nvidia/Minitron-8B-Base`                                                                                                             |     L    |
+| Nemotron-H                                                      |        `NemotronHForCausalLM`        | `nvidia/Nemotron-H-8B-Base-8K` <br> `nvidia/Nemotron-H-47B-Base-8K` <br> `nvidia/Nemotron-H-56B-Base-8K`                              |     L    |
+| LLamaNemotron <br> LlamaNemotron Super <br> LlamaNemotron Ultra |       `NemotronNASForCausalLM`       | `nvidia/Llama-3_1-Nemotron-51B-Instruct` <br> `nvidia/Llama-3_3-Nemotron-Super-49B-v1` <br> `nvidia/Llama-3_1-Nemotron-Ultra-253B-v1` |     L    |
+| QwQ, Qwen2                                                      |          `Qwen2ForCausalLM`          | `Qwen/Qwen2-7B-Instruct`                                                                                                              |     L    |
+| Qwen2-based                                                     |     `Qwen2ForProcessRewardModel`     | `Qwen/Qwen2.5-Math-PRM-7B`                                                                                                            |     L    |
+| Qwen2-based                                                     |         `Qwen2ForRewardModel`        | `Qwen/Qwen2.5-Math-RM-72B`                                                                                                            |     L    |
+| Qwen2-VL                                                        |   `Qwen2VLForConditionalGeneration`  | `Qwen/Qwen2-VL-7B-Instruct`                                                                                                           |   L + V  |
+| Qwen2.5-VL                                                      | `Qwen2_5_VLForConditionalGeneration` | `Qwen/Qwen2.5-VL-7B-Instruct`                                                                                                         |   L + V  |
+
+
+- **L**: Language model only
+- **L + V**: Language and Vision multimodal support
+- Llama 3.2 accepts vision input, but our support currently limited to text only.
+
+> **Note:** For the most up-to-date list of supported models, you may refer to the [TensorRT-LLM model definitions](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/models).
 
 
 ## Tips and Troubleshooting
