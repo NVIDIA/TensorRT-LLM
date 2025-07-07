@@ -95,6 +95,7 @@ class GenerationRequest:
         disaggregated_params: Optional[DisaggregatedParams] = None,
         postproc_params: Optional[PostprocParams] = None,
         multimodal_params: Optional[MultimodalParams] = None,
+        return_perf_metrics: Optional[bool] = False,
     ):
         if isinstance(prompt_token_ids, list):
             self.prompt_token_ids = prompt_token_ids
@@ -119,6 +120,7 @@ class GenerationRequest:
         self.kv_cache_retention_config = kv_cache_retention_config
         self.id: Optional[int] = None
         self.disaggregated_params = disaggregated_params
+        self.return_perf_metrics = return_perf_metrics
 
     def set_id(self, id):
         assert self.id is None, f"Request ID is already set: {self.id}"
