@@ -1,5 +1,7 @@
 # Supported Models
 
+The following is a table of supported models for the PyTorch backend:
+
 | Architecture                         | Model                              | HuggingFace Example                          | Modality |
 | ------------------------------------ | ---------------------------------- | -------------------------------------------- | -------- |
 | `BertForSequenceClassification`      | BERT-based                         | `textattack/bert-base-uncased-yelp-polarity` | L        |
