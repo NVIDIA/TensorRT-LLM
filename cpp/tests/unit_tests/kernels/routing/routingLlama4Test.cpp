@@ -83,7 +83,7 @@ private:
                 [](PackedFloat const& a, PackedFloat const& b)
                 {
                     return (
-                        (a.score > b.score) || (a.score == b.score && a.idx > b.idx)); //@TODO: check if this is correct
+                        (a.score > b.score) || (a.score == b.score && a.idx < b.idx)); //@TODO: check if this is correct
                 });
 
             // Apply sigmoid to the top-k scores
@@ -127,9 +127,9 @@ private:
     void callTestedFunction(
         RoutingKernelTestParam const& param, tensorrt_llm::runtime::ITensor::SharedPtr& workspaceDevice) override
     {
-        moe::dev::routingLlama4::Data routingData;
+        moe::dev::routing::routingLlama4::Data routingData;
         setParams(param, routingData);
-        moe::dev::routingLlama4::run(routingData, mStream->get());
+        moe::dev::routing::routingLlama4::run(routingData, mStream->get());
     }
 };
 
