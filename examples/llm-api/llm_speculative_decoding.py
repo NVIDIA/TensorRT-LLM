@@ -1,7 +1,13 @@
+### :title Speculative Decoding
+### :order 5
+### :section Customization
+from typing import Optional
+
 import click
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import MTPDecodingConfig
+from tensorrt_llm.llmapi import (EagleDecodingConfig, MTPDecodingConfig,
+                                 NGramDecodingConfig)
 
 prompts = [
     "What is the capital of France?",
@@ -9,52 +15,37 @@ prompts = [
 ]
 
 
-def run_MTP():
+def run_MTP(model: Optional[str] = None):
     spec_config = MTPDecodingConfig(num_nextn_predict_layers=1,
                                     use_relaxed_acceptance_for_thinking=True,
                                     relaxed_topk=10,
                                     relaxed_delta=0.01)
 
     llm = LLM(
-        model_dir="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        # You can change this to a local model path if you have the model downloaded
+        model=model or "nvidia/DeepSeek-R1-FP4",
         speculative_config=spec_config,
     )
 
     for prompt in prompts:
         response = llm.generate(prompt, SamplingParams(max_tokens=10))
-        print(response.text)
+        print(response.outputs[0].text)
 
 
 def run_Eagle3():
     spec_config = EagleDecodingConfig(
         max_draft_len=3,
-        pytorch_weights_path="models/eagle3-8b-instruct",
+        pytorch_weights_path="yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
         eagle3_one_model=True)
 
     llm = LLM(
-        model_dir="models/llama-3.1-8b-instruct",
+        model="meta-llama/Llama-3.1-8B-Instruct",
         speculative_config=spec_config,
     )
 
     for prompt in prompts:
         response = llm.generate(prompt, SamplingParams(max_tokens=10))
-        print(response.text)
-
-
-def run_draft_target():
-    spec_config = DraftTargetDecodingConfig(
-        max_draft_len=3,
-        pytorch_weights_path="models/draft-target-8b-instruct",
-    )
-
-    llm = LLM(
-        model_dir="models/llama-3.1-8b-instruct",
-        speculative_config=spec_config,
-    )
-
-    for prompt in prompts:
-        response = llm.generate(prompt, SamplingParams(max_tokens=10))
-        print(response.text)
+        print(response.outputs[0].text)
 
 
 def run_ngram():
@@ -67,26 +58,30 @@ def run_ngram():
     )
 
     llm = LLM(
-        model_dir="models/llama-3.1-8b-instruct",
+        model="meta-llama/Llama-3.1-8B-Instruct",
         speculative_config=spec_config,
+        # ngram doesn't work with overlap_scheduler
+        disable_overlap_scheduler=True,
     )
 
     for prompt in prompts:
         response = llm.generate(prompt, SamplingParams(max_tokens=10))
-        print(response.text)
+        print(response.outputs[0].text)
 
 
 @click.command()
 @click.argument("algo",
                 type=click.Choice(["MTP", "EAGLE3", "DRAFT_TARGET", "NGRAM"]))
-def main(algo: str):
+@click.option("--model",
+              type=str,
+              default=None,
+              help="Path to the model or model name.")
+def main(algo: str, model: Optional[str] = None):
     algo = algo.upper()
     if algo == "MTP":
-        run_MTP()
+        run_MTP(model)
     elif algo == "EAGLE3":
         run_Eagle3()
-    elif algo == "DRAFT_TARGET":
-        run_draft_target()
     elif algo == "NGRAM":
         run_ngram()
     else:
