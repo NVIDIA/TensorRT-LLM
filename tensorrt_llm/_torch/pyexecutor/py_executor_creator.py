@@ -230,6 +230,7 @@ def create_py_executor(
             checkpoint_dir,
             pytorch_backend_config,
             batch_size=executor_config.max_batch_size,
+            max_beam_width=executor_config.max_beam_width,
             max_num_tokens=executor_config.max_num_tokens,
             max_seq_len=executor_config.max_seq_len,
             mapping=mapping,
@@ -252,6 +253,7 @@ def create_py_executor(
                 spec_config.draft_model_path,
                 pytorch_backend_config,
                 batch_size=executor_config.max_batch_size,
+                max_beam_width=executor_config.max_beam_width,
                 max_num_tokens=executor_config.max_num_tokens,
                 # Note: The draft model engine will infer its own max_seq_len.
                 # We'll stop drafting when we hit the max.

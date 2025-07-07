@@ -39,36 +39,38 @@ The TensorRT-LLM Qwen implementation can be found in [models/qwen](../../../../t
 In addition, there are two shared files in the parent folder [`examples`](../../../) for inference and evaluation:
 
 * [`run.py`](../../../run.py) to run the inference on an input text;
-* [`summarize.py`](../../../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
+* [`summarize.py`](../../../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset.
 
 ## Support Matrix
-|   Model Name       | FP16/BF16  |  FP8  |  WO   |  AWQ  | GPTQ  |  SQ   |  TP   |  PP   |  Arch   |
-| :-------------:    |   :---:    | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :-----: |
-| Qwen-1_8B(-Chat)   |     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen-7B(-Chat)     |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen-14B(-Chat)    |     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen-72B(-Chat)    |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-0.5B(-Chat)|     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-1.8B(-Chat)|     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-4B(-Chat)  |     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-7B(-Chat)  |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-14B(-Chat) |     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-32B(-Chat) |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-72B(-Chat) |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-110B(-Chat)|     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-MoE-A2.7B(-Chat)|   Y   |   -   |   Y   |   -   |   -   |   -   |   Y   |   Y   | Ampere+ |
-| Qwen2-0.5B(-Instruct)|     Y    |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen2-1.5B(-Instruct)|     Y    |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen2-7B(-Instruct)|     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen2-57B-A14B(-Instruct)|  Y   |   -   |   Y   |   -   |   -   |   -   |   Y   |   Y   | Ampere+ |
-| Qwen2-72B(-Instruct)|     Y     |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen2.5-0.5B(-Instruct)|     Y  |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen2.5-3B(-Instruct)|     Y    |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen2.5-1.5B(-Instruct)|     Y  |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen2.5-7B(-Instruct)|     Y    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen2.5-32B(-Instruct)|     Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen2.5-72B(-Instruct)|     Y   |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| QwQ-32B            |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+|   Model Name       | FP16/BF16  |  FP8  |  nvfp4  |  WO   |  AWQ  | GPTQ  |  SQ   |  TP   |  PP   |  EP   |  Arch   |
+| :-------------:    |   :---:    | :---: | :-----: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :-----: |
+| Qwen-1_8B(-Chat)   |     Y      |   Y   |    -    |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen-7B(-Chat)     |     Y      |   Y   |    -    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen-14B(-Chat)    |     Y      |   Y   |    -    |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen-72B(-Chat)    |     Y      |   Y   |    -    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen1.5-0.5B(-Chat)|     Y      |   Y   |    -    |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen1.5-1.8B(-Chat)|     Y      |   Y   |    -    |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen1.5-4B(-Chat)  |     Y      |   Y   |    -    |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen1.5-7B(-Chat)  |     Y      |   Y   |    -    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen1.5-14B(-Chat) |     Y      |   Y   |    -    |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen1.5-32B(-Chat) |     Y      |   Y   |    -    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen1.5-72B(-Chat) |     Y      |   Y   |    -    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen1.5-110B(-Chat)|     Y      |   Y   |    -    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen1.5-MoE-A2.7B(-Chat)|   Y   |   -   |    -    |   Y   |   -   |   -   |   -   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen2-0.5B(-Instruct)|     Y    |   Y   |    -    |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen2-1.5B(-Instruct)|     Y    |   Y   |    -    |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen2-7B(-Instruct)|     Y      |   Y   |    -    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen2-57B-A14B(-Instruct)|  Y   |   -   |    -    |   Y   |   -   |   -   |   -   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen2-72B(-Instruct)|     Y     |   Y   |    -    |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen2.5-0.5B(-Instruct)|     Y  |   Y   |    -    |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen2.5-3B(-Instruct)|     Y    |   Y   |    -    |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen2.5-1.5B(-Instruct)|     Y  |   Y   |    -    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen2.5-7B(-Instruct)|     Y    |   Y   |    -    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen2.5-32B(-Instruct)|     Y   |   Y   |    -    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen2.5-72B(-Instruct)|     Y   |   Y   |    -    |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| QwQ-32B            |     Y      |   Y   |    -    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen3-32B          |     Y      |   Y   |    Y    |   -   |   -   |   -   |   -   |   Y   |   -   |   Y   | Hopper+ |
+| Qwen3-235B-A3B     |     Y      |   Y   |    Y    |   -   |   -   |   -   |   -   |   Y   |   -   |   Y   | Hopper+ |
 
 Please note that Y* sign means that the model does not support all the AWQ + TP combination.
 
@@ -81,6 +83,8 @@ Please note that Y* sign means that the model does not support all the AWQ + TP 
 * PP: Pipeline Parallel
 
 Currently Qwen1 models does not support dynamic NTK and logn attention. Therefore, accuracy on long sequence input for the Qwen-7B and Qwen-14B model is not promised.
+
+For Qwen3 models, we only list the largest models for dense and MoE architectures, but models of other sizes follow similar patterns.
 
 ## Usage
 
@@ -692,7 +696,11 @@ concurrency=128
 path_data=./aa_prompt_isl_1k_osl_2k_qwen3_10000samples.txt
 
 # Setup the extra configuration for llm-api
-echo -e "disable_overlap_scheduler: false\nuse_cuda_graph: true\nprint_iter_log: true\ncuda_graph_batch_sizes: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,32,64,128]\nenable_attention_dp: true " > ${path_config}
+echo -e "disable_overlap_scheduler: false
+print_iter_log: true
+cuda_graph_config:
+  batch_sizes: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,32,64,128]
+enable_attention_dp: true " > ${path_config}
 
 # Run trtllm-bench with pytorch backend
 mpirun --allow-run-as-root --oversubscribe -n 1 \

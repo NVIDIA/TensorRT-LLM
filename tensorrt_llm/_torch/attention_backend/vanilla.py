@@ -1,3 +1,4 @@
+import math
 from typing import Optional
 
 import torch
@@ -39,6 +40,23 @@ def generate_causal_mask(batch_size: int, target_length: int,
     return causal_mask
 
 
+def generate_sliding_window_mask(batch_size: int, target_length: int,
+                                 cache_position: torch.Tensor,
+                                 device: torch.device,
+                                 attention_window_size: int):
+    # TRTLLM's sliding window attention is inclusive.
+    effective_window_size = attention_window_size + 1
+    attention_mask_1 = torch.arange(
+        target_length,
+        device=device).unsqueeze(0) <= cache_position.unsqueeze(-1)
+    attention_mask_2 = torch.arange(target_length, device=device).unsqueeze(
+        0) > cache_position.unsqueeze(-1) - effective_window_size
+    attention_mask = attention_mask_1 & attention_mask_2
+    attention_mask = attention_mask[None,
+                                    None, :, :].expand(batch_size, 1, -1, -1)
+    return attention_mask
+
+
 class VanillaAttentionMetadata(AttentionMetadata):
 
     def prepare(self) -> None:
@@ -66,11 +84,17 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         head_dim: int,
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
+        q_scaling: Optional[float] = None,
         **kwargs,
     ):
-        super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
-                         quant_config, **kwargs)
+        super().__init__(layer_idx,
+                         num_heads,
+                         head_dim,
+                         num_kv_heads=num_kv_heads,
+                         quant_config=quant_config,
+                         **kwargs)
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
+        self.q_scaling = q_scaling
 
     def _single_request_update_kv_cache(self, k, v, kv_cache_tensor, seq_len,
                                         cache_idx, cache_position):
@@ -86,8 +110,15 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
 
         return k_out[:, :seq_len, :, :], v_out[:, :seq_len, :, :]
 
-    def _single_request_forward(self, q, k, v, attention_mask: AttentionMask,
-                                kv_cache_tensor, past_seen_token, cache_idx):
+    def _single_request_forward(self,
+                                q,
+                                k,
+                                v,
+                                attention_mask: AttentionMask,
+                                kv_cache_tensor,
+                                past_seen_token,
+                                cache_idx,
+                                attention_window_size: Optional[int] = None):
 
         bsz = 1
         q_len = q.size(0)
@@ -129,7 +160,12 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         is_causal = False
         attn_mask = None
         if attention_mask == PredefinedAttentionMask.CAUSAL:
-            if past_seen_token == 0:
+            # Create custom sliding window mask as sdpa doesn't natively support it.
+            if attention_window_size is not None:
+                attn_mask = generate_sliding_window_mask(
+                    bsz, target_seq_len, cache_position, q.device,
+                    attention_window_size)
+            elif past_seen_token == 0:
                 is_causal = True
             elif q_len != 1:
                 # attn_mask: 4-D tensor (batch_size, 1, query_seq_len, seq_len)
@@ -140,12 +176,17 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         else:
             raise ValueError("Unexpected attention mask type")
 
+        qk_scale = None
+        if self.q_scaling is not None:
+            qk_scale = 1 / (math.sqrt(self.head_dim) * self.q_scaling)
+
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             q,
             key_states,
             value_states,
             is_causal=is_causal,
             attn_mask=attn_mask,
+            scale=qk_scale,
         )
 
         attn_output = attn_output.squeeze(0)
@@ -229,6 +270,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 metadata: VanillaAttentionMetadata,
                 *,
                 attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
+                attention_window_size: Optional[int] = None,
                 **kwargs) -> torch.Tensor:
         if metadata.kv_cache_manager is None:
             # NOTE: WAR for no kv cache attn e.g. BERT,
@@ -270,11 +312,9 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             past_seen_token = past_seen_tokens[i]
             cache_idx = cache_indices[i]
 
-            attn_output = self._single_request_forward(single_q, single_k,
-                                                       single_v, attention_mask,
-                                                       kv_cache_tensor,
-                                                       past_seen_token,
-                                                       cache_idx)
+            attn_output = self._single_request_forward(
+                single_q, single_k, single_v, attention_mask, kv_cache_tensor,
+                past_seen_token, cache_idx, attention_window_size)
             attn_outputs.append(attn_output)
 
             offset += seq_len
