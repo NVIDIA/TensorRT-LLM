@@ -150,7 +150,7 @@ def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
         outputs = llm.generate(prompts,
                                sampling_params,
                                lora_request=lora_request)
-
+        # TODO: remove this once we have a proper fix for CUDA graph in LoRA
         # assert similar(outputs[0].outputs[0].text, references[0])
         print(f"lora output: {outputs[0].outputs[0].text}")
         print(f"ref output: {references[0]}")
@@ -168,8 +168,12 @@ def llama_7b_multi_lora_from_request_test_harness(**llm_kwargs) -> None:
     # (2) provide a lora_dir to infer the lora_target_modules.
     lora_config = LoraConfig(lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
                              max_lora_rank=8)
-
-    llm = LLM(hf_model_dir, lora_config=lora_config, **llm_kwargs)
+    # Disable CUDA graph
+    # TODO: remove this once we have a proper fix for CUDA graph in LoRA
+    llm = LLM(hf_model_dir,
+              lora_config=lora_config,
+              cuda_graph_config=None,
+              **llm_kwargs)
 
     try:
         prompts = [
@@ -198,9 +202,7 @@ def llama_7b_multi_lora_from_request_test_harness(**llm_kwargs) -> None:
                                    lora_req2
                                ])
         for output, ref in zip(outputs, references):
-            # assert similar(output.outputs[0].text, ref)
-            print(f"lora output: {output.outputs[0].text}")
-            print(f"ref output: {ref}")
+            assert similar(output.outputs[0].text, ref)
     finally:
         llm.shutdown()
 
