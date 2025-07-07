@@ -1176,10 +1176,9 @@ class PyTorchModelEngine(ModelEngine):
         gather_ids = []
         position_ids = []  # per sequence
         num_cached_tokens_per_seq = []  # per sequence
-        multi_modal_data = []
         draft_tokens = []
         draft_lens = []
-        mrope_config = defaultdict(list)
+        multimodal_params_list = []
         gen_request_seq_slots = []  # per generation request
 
         for request in scheduled_requests.context_requests:
