@@ -884,8 +884,8 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
     ) -> torch.Tensor:
         mm_embed = kwargs.get("multi_modal_data", [])
         if mm_embed:
-            _, inputs_embeds = fuse_input_embeds(self.model.embed_tokens,
-                                                 input_ids, mm_embed)
+            input_ids, inputs_embeds = fuse_input_embeds(
+                self.model.embed_tokens, input_ids, mm_embed)
         return super().forward(attn_metadata,
                                input_ids,
                                position_ids,
