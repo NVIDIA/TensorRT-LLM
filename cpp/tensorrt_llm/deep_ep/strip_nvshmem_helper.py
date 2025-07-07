@@ -9,11 +9,11 @@ deep_ep_obj_dir = project_dir / "cpp/build/tensorrt_llm/deep_ep/CMakeFiles/deep_
 assert deep_ep_obj_dir.is_dir()
 
 # Run `find cpp/build | grep host/bootstrap/bootstrap.cpp.o$` to get the directory
-# Please set to `nvshmem.dir` rather than `nvshmem_host.dir`
+# Please set it to `nvshmem.dir` rather than `nvshmem_host.dir`
 nvshmem_obj_dir = project_dir / "cpp/build/tensorrt_llm/deep_ep/nvshmem-build/src/CMakeFiles/nvshmem.dir"
 assert nvshmem_obj_dir.is_dir()
 
-# Parse -gencode arguments
+# Parse the `-gencode` arguments
 with (project_dir /
       "cpp/build/tensorrt_llm/deep_ep/cuda_architectures.txt").open() as f:
     cuda_architectures = f.read()
@@ -40,7 +40,7 @@ if ranlib.exists():
 deep_ep_obj_list = sorted(deep_ep_obj_dir.glob("kernels/**/*.o"))
 nvshmem_obj_set = set(nvshmem_obj_dir.glob("**/*.o"))
 for exclude_obj in sorted(nvshmem_obj_set):
-    # Create liba.a with one object file less
+    # Create liba.a with one fewer object file
     subprocess.check_call(
         ["ar", "rcs", ranlib, *(nvshmem_obj_set - {exclude_obj})])
     # Test whether there are undefined symbols
@@ -48,8 +48,8 @@ for exclude_obj in sorted(nvshmem_obj_set):
         "/usr/local/cuda/bin/nvcc", *gencode_args, "-Xlinker", "--no-undefined",
         "-shared", *deep_ep_obj_list, ranlib, "-o", temp_dir / "a.out"
     ])
-    # If there is no undefined symbols, then print "-" indicating the file could be omitted.
+    # If there are no undefined symbols, print "-" to indicate the file could be omitted.
     print("-" if res == 0 else "+",
           str(exclude_obj.relative_to(nvshmem_obj_dir))[:-2])
-    # Unlink the ranlib because `ar` does append
+    # Unlink the ranlib because `ar` appends existing archives
     ranlib.unlink()
