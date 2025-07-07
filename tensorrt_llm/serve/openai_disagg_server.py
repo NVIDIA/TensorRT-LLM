@@ -13,6 +13,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.status import HTTP_429_TOO_MANY_REQUESTS
 
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
@@ -40,6 +41,7 @@ class OpenAIDisaggServer:
                  gen_servers: List[str],
                  req_timeout_secs: int = 180,
                  server_start_timeout_secs: int = 180,
+                 max_retries: int = 3,
                  ctx_router_config: Optional[RouterConfig] = None,
                  gen_router_config: Optional[RouterConfig] = None,
                  conditional_disagg_config: Optional[ConditionalDisaggConfig] = None,
@@ -52,6 +54,10 @@ class OpenAIDisaggServer:
         self.gen_router = create_router(gen_router_config, gen_servers, metadata_server_cfg, self.metadata_server)
         self.conditional_disagg_config = conditional_disagg_config
 
+        if max_retries < 0:
+            raise ValueError(f"Max retries {max_retries} must be greater than or equal to 0")
+        self.max_retries = max_retries
+        logger.info(f"Server max retries: {self.max_retries}")
 
         if (len(self.gen_servers) == 0):
             raise ValueError("At least one generation server must be provided")
@@ -323,20 +329,31 @@ class OpenAIDisaggServer:
                            endpoint: str,
                            response_type: Type[Union[CompletionResponse, ChatCompletionResponse]],
                            create_generator: callable) -> Union[CompletionResponse, ChatCompletionResponse, StreamingResponse]:
-        if request.stream:
-            response_generator = create_generator(url, request)
-            return StreamingResponse(content=response_generator, media_type="text/event-stream")
-        else:
-            async with self.session.post(url + endpoint, json=request.model_dump(exclude_unset=True)) as response:
-                content_type = response.headers.get("Content-Type", "")
-                if "text/event-stream" in content_type:
-                    raise ValueError("Received an event-stream although request stream was False")
+        for attempt in range(self.max_retries + 1):
+            try:
+                if request.stream:
+                    response_generator = create_generator(url, request)
+                    return StreamingResponse(content=response_generator, media_type="text/event-stream")
+                else:
+                    async with self.session.post(url + endpoint, json=request.model_dump(exclude_unset=True)) as response:
+                        content_type = response.headers.get("Content-Type", "")
+                        if "text/event-stream" in content_type:
+                            raise ValueError("Received an event-stream although request stream was False")
 
-                response_dict = await response.json()
-                if not response.ok:
-                    logger.error(f"Received failed response {response_dict}")
-                    response.raise_for_status()
-                return response_type(**response_dict)
+                        response_dict = await response.json()
+                        if not response.ok:
+                            logger.error(f"Received failed response {response_dict}")
+                            response.raise_for_status()
+                        return response_type(**response_dict)
+            except (aiohttp.ClientError, OSError) as e:
+                if attempt == 2:
+                    raise HTTPException(status_code=HTTP_429_TOO_MANY_REQUESTS, detail=f"Too many requests") from e
+                logger.error(f"Client error: {e} - retry {attempt} of {self.max_retries}")
+                await asyncio.sleep(1)
+            except Exception as e:
+                logger.error(f"Error encountered while processing request to {url+endpoint}: {e}")
+                raise
+
 
     async def send_completion_request(self, url: str, request: CompletionRequest) -> Union[CompletionResponse, StreamingResponse]:
         return await self.send_request(url, request, "/v1/completions", CompletionResponse, self.create_completion_generator)
