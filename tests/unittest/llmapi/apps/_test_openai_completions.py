@@ -320,7 +320,7 @@ def test_detokenize_single(client: openai.OpenAI, model_name):
         prompt="Hello, my name is",
         max_tokens=5,
         temperature=0.0,
-        detokenize=False,
+        extra_body=dict(detokenize=False),
     )
 
     choice = completion.choices[0]
@@ -334,7 +334,7 @@ def test_detokenize_single(client: openai.OpenAI, model_name):
         prompt=[0, 0, 0, 0, 0],
         max_tokens=5,
         temperature=0.0,
-        detokenize=True,
+        extra_body=dict(detokenize=True),
     )
 
     assert completion.choices[0].token_ids is None
@@ -342,7 +342,7 @@ def test_detokenize_single(client: openai.OpenAI, model_name):
 
 @pytest.mark.asyncio(loop_scope="module")
 async def test_completion_streaming(async_client: openai.AsyncOpenAI,
-                                    model_name: str, echo: bool):
+                                    model_name: str):
     prompt = "Hello, my name is"
 
     single_completion = await async_client.completions.create(
@@ -350,7 +350,7 @@ async def test_completion_streaming(async_client: openai.AsyncOpenAI,
         prompt=prompt,
         max_tokens=5,
         temperature=0.0,
-        detokenize=False,
+        extra_body=dict(detokenize=False),
     )
     single_output = single_completion.choices[0].token_ids
     stream = await async_client.completions.create(
@@ -359,7 +359,7 @@ async def test_completion_streaming(async_client: openai.AsyncOpenAI,
         max_tokens=5,
         temperature=0.0,
         stream=True,
-        detokenize=False,
+        extra_body=dict(detokenize=False),
     )
     tokens: List[int] = []
 
