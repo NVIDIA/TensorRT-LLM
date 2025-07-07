@@ -79,10 +79,11 @@ DecoderXQAImpl* DecoderXQARunner::getImplFromXQAParams(XQAParams const& xqaParam
     {
         auto const grpSize = xqaParams.num_q_heads / xqaParams.num_kv_heads;
         // Ampere XQA supports spec dec with pre-compiled cubins (may also work with JIT but not implemented yet)
-        // Hopper XQA supports spec dec with JIT, but only for E4M3 kv cache data type. Only allow 64%grpSize==0 for
-        // now.
+        // Hopper XQA supports spec dec with JIT, but only for E4M3 kv cache data type with fp8 quantized weights.
+        // Only allow 64%grpSize==0 for now.
         bool const supportedByHopperXqa
-            = (smVersion == 90 && xqaParams.kv_cache_data_type == XQADataType::DATA_TYPE_E4M3 && 64 % grpSize == 0);
+            = (smVersion == 90 && xqaParams.kv_cache_data_type == XQADataType::DATA_TYPE_E4M3 && 64 % grpSize == 0
+                && xqaParams.is_fp8_output == true);
         bool const supportedBySm120Mla
             = (smVersion == 120 && xqaParams.isMLA() && xqaParams.kv_cache_data_type == XQADataType::DATA_TYPE_E4M3);
         return (supportedByHopperXqa || supportedBySm120Mla) ? mJITImpl.get() : mPrecompiledImpl.get();
