@@ -455,13 +455,13 @@ void LookaheadDecodingLayerTest::newRequests(std::vector<SizeType32> requestIds)
     ////////////////////////////////
     auto setupParams = std::make_shared<LookaheadSetupParams>();
     setupParams->prompt.resize(0);
-    setupParams->algoConfigs.resize(0);
+    setupParams->lookaheadConfigs.resize(0);
     for (SizeType32 bi = 0; bi < requestSize; bi++)
     {
         SizeType32 gbi = requestIds[bi];
         setupParams->prompt.emplace_back(mPrompt[gbi]);
-        setupParams->algoConfigs.emplace_back(mTestParam.w, mTestParam.n, mTestParam.g);
-        PRINT_TOKENS(setupParams->prompt[bi]);
+        setupParams->lookaheadConfigs.emplace_back(mTestParam.w, mTestParam.n, mTestParam.g);
+        PRINT_TOKEN(setupParams->prompt[bi]);
         setupParams->generationLengths = mGenerationLengths;
         setupParams->positionOffsets = mPositionOffsets;
         setupParams->attentionPackedMasks = mPackedMasks;
@@ -469,18 +469,18 @@ void LookaheadDecodingLayerTest::newRequests(std::vector<SizeType32> requestIds)
     std::vector<uint64_t> seed(requestIds.begin(), requestIds.end());
     setupParams->randomSeed = std::make_optional(seed);
     TensorPtr newRequestSlots = ITensor::slice(mBatchSlotsMax, batchSize, requestSize);
-    PRINT_VALUES(newRequestSlots);
-    PRINT_VALUES(mBatchSlotsMax);
+    PRINT_VALUE(newRequestSlots);
+    PRINT_VALUE(mBatchSlotsMax);
     mBatchSlots = ITensor::slice(mBatchSlotsMax, 0, batchSize);
     mDecodingWorkspace->setDeviceBatchSlots(newRequestSlots);
     mDecoder->setup(requestSize, beamSize, newRequestSlots, setupParams, mDecodingWorkspace);
 
-    PRINT_VALUES(mPositionOffsets);
+    PRINT_VALUE(mPositionOffsets);
 
     batchSize += requestIds.size();
     mBatchSlots = ITensor::slice(mBatchSlotsMax, 0, batchSize);
-    TLLM_LOG_DEBUG("new Requests mBatchSlots %s", D(mBatchSlots).values<int32_t>().c_str());
-    PRINT_VALUES(mSequenceLengths);
+    TLLM_LOG_DEBUG("new Requests mBatchSlots %s", D(mBatchSlots).value<int32_t>().c_str());
+    PRINT_VALUE(mSequenceLengths);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -494,14 +494,14 @@ void LookaheadDecodingLayerTest::manageBatch()
     {
         newRequests(requests);
     }
-    PRINT_VALUES(mSequenceLengths);
+    PRINT_VALUE(mSequenceLengths);
 
     auto batchSize = ITensor::volume(mBatchSlots->getShape());
     BufferRange<SizeType32> batchSlotsRange(*mBatchSlots);
     auto batchShape1D = ITensor::makeShape({batchSize});
     auto batchShape2D = ITensor::makeShape({batchSize, mMaxTokensPerStep});
     auto newBatchSize = 0;
-    PRINT_VALUES(mBatchSlots);
+    PRINT_VALUE(mBatchSlots);
     for (SizeType32 bi = 0; bi < batchSize; bi++)
     {
         SizeType32 gbi = batchSlotsRange[bi];
@@ -514,7 +514,7 @@ void LookaheadDecodingLayerTest::manageBatch()
 
         TensorPtr generated = ITensor::slice(theSequence, 0, theSequenceLength);
 
-        PRINT_TOKENS(generated);
+        PRINT_TOKEN(generated);
         EXPECT_TRUE(mLlm[gbi]->verify(0, generated));
 
         BufferRange<SizeType32>(*mHistogram[gbi])[theNumNewTokens] += 1;
@@ -522,7 +522,7 @@ void LookaheadDecodingLayerTest::manageBatch()
         if (BufferLocation<TokenIdType>(*theSequence).at(theSequenceLength - 1) == mAscii->getEndToken())
         {
             TLLM_LOG_DEBUG("request[%d] ends: '%s'", gbi, D(theSequence).string().c_str());
-            mScoreBoard[gbi] << "[" << gbi << "] ends. " << D(mHistogram[gbi]).values<SizeType32>();
+            mScoreBoard[gbi] << "[" << gbi << "] ends. " << D(mHistogram[gbi]).value<SizeType32>();
             mReports.push_back(mScoreBoard[gbi].str());
             mScoreBoard[gbi].str("");
             mScoreBoard[gbi].clear();
@@ -549,11 +549,11 @@ void LookaheadDecodingLayerTest::manageBatch()
             mTestParam.maxG, mTestParam.w, mTestParam.n, mTestParam.g, theDraftLen);
 
         auto len = BufferRange<SizeType32>(*mTokensPerStep)[gbi];
-        PRINT_TOKENS(ITensor::slice(mInputTokensBatch, {nbi, 0}, len));
-        PRINT_VALUES(ITensor::slice(mPositionIdsBatch, {nbi, 0}, len));
+        PRINT_TOKEN(ITensor::slice(mInputTokensBatch, {nbi, 0}, len));
+        PRINT_VALUE(ITensor::slice(mPositionIdsBatch, {nbi, 0}, len));
     }
     mBatchSlots = ITensor::slice(mBatchSlotsMax, 0, newBatchSize);
-    PRINT_VALUES(mBatchSlots);
+    PRINT_VALUE(mBatchSlots);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -617,8 +617,8 @@ void LookaheadDecodingLayerTest::llmForward()
 
         BufferRange<SizeType32> idRange(*ITensor::slice(mPositionIdsBatch, {bi, 0}, len));
         BufferRange<SizeType32> offsetRange(*ITensor::slice(mPositionOffsets, {gbi, 0}, len));
-        PRINT_VALUES(ITensor::slice(mPositionIdsBatch, {bi, 0}));
-        PRINT_VALUES(ITensor::slice(mPositionOffsets, {bi, 0}));
+        PRINT_VALUE(ITensor::slice(mPositionIdsBatch, {bi, 0}));
+        PRINT_VALUE(ITensor::slice(mPositionOffsets, {bi, 0}));
         for (auto i = 0; i < idRange.size(); i++)
         {
             TLLM_CHECK(idRange[i] == start + offsetRange[i]);
@@ -643,7 +643,7 @@ void LookaheadDecodingLayerTest::llmForward()
         }
 
         mAscii->logitsToTensor(golden, output);
-        TLLM_LOG_DEBUG("batch[%d] LLM golden: '%s'", gbi, D(golden).tokens().c_str());
+        TLLM_LOG_DEBUG("batch[%d] LLM golden: '%s'", gbi, D(golden).value(true).c_str());
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -654,7 +654,7 @@ void LookaheadDecodingLayerTest::decodeForward()
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto batchSize = ITensor::volume(mBatchSlots->getShape());
-    PRINT_VALUES(mBatchSlots);
+    PRINT_VALUE(mBatchSlots);
 
     auto inputParams = std::make_shared<LookaheadDecodingInputs>(mEndIds, mBatchSlots);
     inputParams->localBatchSize = batchSize;
@@ -664,7 +664,7 @@ void LookaheadDecodingLayerTest::decodeForward()
 
     auto outputParams = std::make_shared<LookaheadDecodingOutputs>(mOutputIds);
 
-    PRINT_VALUES(mSequenceLengths);
+    PRINT_VALUE(mSequenceLengths);
     outputParams->sequenceLength = mSequenceLengths;
     outputParams->nextDraftLengths = mDraftLengths;
     outputParams->prevDraftLengths = mPrevDraftLengths;
@@ -679,7 +679,7 @@ void LookaheadDecodingLayerTest::decodeForward()
     outputParams->positionIds = mPositionIds;
     outputParams->packedMasks = mPackedMasks;
 
-    PRINT_VALUES(mTokensPerStep);
+    PRINT_VALUE(mTokensPerStep);
 
     mDecodingWorkspace->setDeviceBatchSlots(mBatchSlots);
     mDecoder->forwardAsync(outputParams, inputParams, mDecodingWorkspace);
@@ -719,7 +719,7 @@ void LookaheadDecodingLayerTest::verifyDecode()
 
     BufferRange<SizeType32> cumSumRange(*mNumNewTokensCumSum);
     BufferRange<SizeType32> pathOffsetsRange(*mPathsOffsets);
-    PRINT_VALUES(mNumNewTokensCumSum);
+    PRINT_VALUE(mNumNewTokensCumSum);
     for (SizeType32 bi = 0; bi < batchSize; bi++)
     {
         auto gbi = BufferRange<SizeType32>(*mBatchSlots)[bi];

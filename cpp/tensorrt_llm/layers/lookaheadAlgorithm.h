@@ -17,7 +17,16 @@
 #pragma once
 
 #include "lookaheadPoolManager.h"
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/executor/executor.h"
+#include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/iTensor.h"
+
+#include <cstddef>
+#include <memory>
+#include <tuple>
 
 namespace tensorrt_llm::layers
 {
@@ -28,9 +37,12 @@ class LookaheadAlgorithm
 public:
     using TensorPtr = runtime::ITensor::SharedPtr;
     using TensorConstPtr = runtime::ITensor::SharedConstPtr;
+    using SizeType32 = runtime::SizeType32;
+    using TokenIdType = runtime::TokenIdType;
 
     //! @brief Currently the resource management is to be aligned with batch manager.
     //! @param w, n, g is the Jacobi window, n-gram level and guess set size respectively.
+    //! wili: argument `id` is useless?
     LookaheadAlgorithm(
         runtime::SizeType32 maxW, runtime::SizeType32 maxN, runtime::SizeType32 maxG, runtime::SizeType32 id = 0);
 
@@ -50,8 +62,7 @@ public:
     //! output @param attentionMask holds the draft tokens dependency mask, and attentionMaskOffset is the index offset
     //! in attentionMask.
     void prepare(TensorPtr const& draftTokens, TensorPtr const& positionIds, TensorPtr const& draftLengthPtr,
-        TensorPtr const& attentionMask, runtime::SizeType32 attentionMaskOffset,
-        TensorConstPtr const& lastPositionIdPtr, TensorConstPtr const& lastTokenPtr);
+        TensorPtr const& attentionMask, SizeType32 const offset, TokenIdType const lastToken);
 
     //! @brief update the internal states and generate accepted tokens from @param outputTokens.
     //! input @param sampledTokens is the all the tokens from the language model.
@@ -67,6 +78,9 @@ public:
     //! in @param encodeMap.
     static runtime::SizeType32 treeEncode(
         TensorPtr const& tokens, TensorPtr const& posIds, TensorPtr const& masks, TensorPtr const& encodeMap);
+
+    //! @brief print content of the LookaheadAlgorithm
+    void print(char const* functionName, int const lineNumber) const noexcept;
 
 private:
     //! @brief generate lookahead branch information.
@@ -95,26 +109,30 @@ private:
 
 private:
     LookaheadPoolManager mPoolManager;
-    //! the random prefill tokens,
-    TensorPtr mPrefillsMax; // shape [mMaxN-2]
-    TensorPtr mPrefills;    // shape [mN-2]
-    //! the look ahead branch window
-    TensorPtr mPastTokensMax; // shape [mMaxW * (mMaxN-1)]
-    TensorPtr mPastTokens;    // shape [mW, (mN-1)]
-    //! the shifted mPastTokens as key tokens;
-    TensorPtr mKeyTokensMax; // shape [mMaxW]
-    TensorPtr mKeyTokens;    // shape [mW]
-    //! all the moving tail golden tokens
-    TensorPtr mGoldenTokensMax; // shape[mMaxN*2-1]
-    TensorPtr mGoldenTokens;    // shape[mN*2-1]
-    //! the same guess tokens from `guess` and used in `verify`
-    TensorPtr mGuessTokensMax; // shape [mMaxG*(mMaxN-1)]
-    TensorPtr mGuessTokens;    // shape [mG*(mN-1)]
+    //! Random prefill tokens, shapes are [mMaxN-2] and [mN-2] respectively
+    TensorPtr mPrefillsMax;
+    TensorPtr mPrefills;
+    //! Look ahead branch window, [mMaxW * (mMaxN-1)] and [mW, (mN-1)]
+    TensorPtr mPastTokensMax;
+    TensorPtr mPastTokens;
+    //! Shifted mPastTokens as key tokens, [mMaxW] and [mW]
+    TensorPtr mKeyTokensMax;
+    TensorPtr mKeyTokens;
+    //! all the moving tail golden tokens, [mMaxN*2-1] and [mN*2-1]
+    TensorPtr mGoldenTokensMax;
+    TensorPtr mGoldenTokens;
+    //! Tokens provided by `guess` and used in `verify`, [mMaxG*(mMaxN-1)] and [mG*(mN-1)]
+    TensorPtr mGuessTokensMax;
+    TensorPtr mGuessTokens;
+    //! All draft tokens (mPastTokens + mGuessTokens), [maxDraftLen]
     TensorPtr mDraftTokensMax;
     TensorPtr mDraftTokens;
+    //! [maxDraftLen, maxDraftLen]
     TensorPtr mAttentionMask;
+    //! [maxDraftLen]
     TensorPtr mEncodeMapMax;
     TensorPtr mEncodeMap;
+    //! [maxGeneratedLen]
     TensorPtr mSampledTokensMax;
     TensorPtr mSampledTokens;
 
