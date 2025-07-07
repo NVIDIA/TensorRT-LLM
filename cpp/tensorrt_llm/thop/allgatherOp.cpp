@@ -97,13 +97,21 @@ public:
     {
         std::vector<torch::Tensor> output_list;
         output_list.reserve(input_list.size());
-        ncclGroupStart();
+        // NCCL Groups cannot be nested.
+        // Skips NCCL grouping when allgather v calls ncclGroupStart/ncclGroupEnd.
+        if (!sizes.has_value())
+        {
+            ncclGroupStart();
+        }
         for (auto const& input : input_list)
         {
             auto output = run(input, sizes);
             output_list.push_back(output);
         }
-        ncclGroupEnd();
+        if (!sizes.has_value())
+        {
+            ncclGroupEnd();
+        }
         return output_list;
     }
 
