@@ -1818,12 +1818,16 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     fullSet += SBSATestConfigs.keySet()
 
     SBSASlurmTestConfigs = [
+        "GB200-4_GPUs-PyTorch-1": ["gb200-4-gpus", "l0_gb200", 1, 1, 4],
         "GB200-4_GPUs-PyTorch-[Post-Merge]-1": ["gb200-4-gpus", "l0_gb200", 1, 1, 4],
     ]
     fullSet += SBSASlurmTestConfigs.keySet()
 
     multiNodesSBSAConfigs = [
-        "GB200-8_GPUs-2_Nodes-PyTorch-[Post-Merge]-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 1, 8, 2],
+        // Each stage test 1 testcase with 8 GPUs and 2 nodes.
+        "GB200-8_GPUs-2_Nodes-PyTorch-[Post-Merge]-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 3, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-[Post-Merge]-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 3, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-[Post-Merge]-3": ["gb200-multi-node", "l0_gb200_multi_nodes", 3, 3, 8, 2],
     ]
     fullSet += multiNodesSBSAConfigs.keySet()
 

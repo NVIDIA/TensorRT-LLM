@@ -869,8 +869,9 @@ class PyExecutor:
 
                 self._pad_attention_dp_dummy_request()
 
-                if self.draft_model_engine is not None or is_ngram:
-                    self._prepare_draft_requests()
+                if self.draft_model_engine is not None or is_ngram or hasattr(
+                        self, 'drafter') and self.drafter is not None:
+                    self._prepare_draft_requests(self.active_requests)
 
                 scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
                 )
@@ -966,13 +967,13 @@ class PyExecutor:
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
 
-    def _prepare_draft_requests(self):
+    def _prepare_draft_requests(self, requests):
         try:
             # Set draft tokens here to make the KV cache manager
             # and scheduler aware of them.
-            for req in self.active_requests:
-                # TODO: enable draft tokens in context phase
-                if req.state != LlmRequestState.GENERATION_IN_PROGRESS:
+            for req in requests:
+                if req.state not in (LlmRequestState.GENERATION_IN_PROGRESS,
+                                     LlmRequestState.DISAGG_GENERATION_INIT):
                     continue
                 req.py_last_draft_tokens = req.py_draft_tokens
                 max_draft_len = self.model_engine.spec_config.max_draft_tokens
@@ -1528,9 +1529,16 @@ class PyExecutor:
             disagg_gen_init_to_prepare.generation_requests = []
             disagg_gen_init_to_prepare.paused_requests = []
 
-            self.resource_manager.resource_managers[
-                ResourceManagerType.KV_CACHE_MANAGER].prepare_resources(
-                    disagg_gen_init_to_prepare)
+            for resource_mgr_type in (
+                    ResourceManagerType.KV_CACHE_MANAGER,
+                    ResourceManagerType.SEQ_SLOT_MANAGER,
+                    ResourceManagerType.SPEC_RESOURCE_MANAGER,
+                    ResourceManagerType.DRAFT_KV_CACHE_MANAGER):
+                if resource_mgr_type in self.resource_manager.resource_managers and self.resource_manager.resource_managers[
+                        resource_mgr_type] is not None:
+                    self.resource_manager.resource_managers[
+                        resource_mgr_type].prepare_resources(
+                            disagg_gen_init_to_prepare)
 
             # Trigger KV cache exchange for new disagg_gen_init_requests
             self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
@@ -1790,7 +1798,6 @@ class PyExecutor:
                     # This is the first time the draft model is seeing this request.
                     # Prepare a context request. We discard the first token and take
                     # the newly decoded one - this is the convention for EAGLE 2 and 3.
-                    assert num_draft_tokens == 0
                     new_request = LlmRequest(
                         request_id=request.py_request_id,
                         max_new_tokens=request.py_max_new_tokens,

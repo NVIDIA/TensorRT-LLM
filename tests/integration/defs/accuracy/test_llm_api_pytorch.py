@@ -389,11 +389,14 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
                                                          (8, 1, 8)],
                              ids=["tp8", "tp8ep4", "tp8ep8"])
     def test_auto_dtype(self, cuda_graph, tp_size, pp_size, ep_size):
-        with LLM(self.MODEL_PATH,
-                 tensor_parallel_size=tp_size,
-                 pipeline_parallel_size=pp_size,
-                 moe_expert_parallel_size=ep_size,
-                 use_cuda_graph=cuda_graph) as llm:
+        with LLM(
+                self.MODEL_PATH,
+                tensor_parallel_size=tp_size,
+                # Keep this low to avoid warmup OOM in CI
+                max_seq_len=8192,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                use_cuda_graph=cuda_graph) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
@@ -411,11 +414,14 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
                                                          (8, 1, 8)],
                              ids=["tp8", "tp8ep4", "tp8ep8"])
     def test_auto_dtype(self, cuda_graph, tp_size, pp_size, ep_size):
-        with LLM(self.MODEL_PATH,
-                 tensor_parallel_size=tp_size,
-                 pipeline_parallel_size=pp_size,
-                 moe_expert_parallel_size=ep_size,
-                 use_cuda_graph=cuda_graph) as llm:
+        with LLM(
+                self.MODEL_PATH,
+                tensor_parallel_size=tp_size,
+                # Keep this low to avoid warmup OOM in CI
+                max_seq_len=8192,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                use_cuda_graph=cuda_graph) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
@@ -437,7 +443,12 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-1b-it/"
 
     def test_auto_dtype(self):
-        with LLM(self.MODEL_PATH) as llm:
+        # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=False,
+            enable_partial_reuse=False,
+        )
+        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -871,8 +882,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             pytest.skip("https://nvbugs/5252559")
         if torch_compile and pp_size > 1:
             pytest.skip("PP with torch.compile is not supported yet.")
-        if not attention_dp and (tp_size > 1 or ep_size > 1):
-            pytest.skip("https://nvbugs/5336321")
+
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
@@ -1457,13 +1467,15 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
                               use_cuda_graph=cuda_graph)
 
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
         llm = LLM(
             f"{llm_models_root()}/Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
             tensor_parallel_size=tp_size,
             pipeline_parallel_size=pp_size,
             moe_expert_parallel_size=ep_size,
             **pytorch_config,
-            enable_attention_dp=attention_dp)
+            enable_attention_dp=attention_dp,
+            kv_cache_config=kv_cache_config)
         with llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)

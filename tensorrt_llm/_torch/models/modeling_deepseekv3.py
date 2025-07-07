@@ -38,6 +38,7 @@ from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
 
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.llmapi.utils import enable_llm_debug
 from tensorrt_llm.mapping import Mapping
@@ -193,7 +194,8 @@ class DeepseekV3Linear(Linear):
                      lora_params: Optional[dict] | None = None,
                      layer_idx: Optional[int] | None = None):
         num_tokens = input.shape[0]
-        if (not self.has_any_quant) and num_tokens >= 1 and num_tokens <= 16:
+        if (not self.has_any_quant and 1 <= num_tokens <= 16
+                and get_sm_version() != 120):
             output = torch.ops.trtllm.dsv3_fused_a_gemm_op(
                 input, self.weight.t(), bias, None)
         else:
@@ -722,10 +724,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         return mlp_tp_size
 
     def _enable_min_latency_mode(self, num_tokens: int):
-        return (num_tokens <= 128 and self.fusion_config.POST_MOE_FUSION
-                and self.is_nvfp4 and self.model_config.moe_backend == 'CUTLASS'
-                and not self.mapping.is_multi_node()
-                and self.allreduce.mnnvl_allreduce is None)
+        # Disable cutlass min latency mode since it will cause illegal memory access
+        # Will use trtllm-gen moe in future
+        return False
 
     def forward(
         self,
