@@ -75,11 +75,10 @@ class KvCacheCreator:
             head_dim = config.kv_lora_rank + config.qk_rope_head_dim
             kv_factor = 1
         else:
-            head_dim = getattr(
-                config,
-                "head_dim",
-                config.hidden_size // config.num_attention_heads,
-            ) * num_key_value_heads // tp_size
+            _head_dim = getattr(config, 'head_dim', None)
+            if not isinstance(_head_dim, int):
+                _head_dim = config.hidden_size // config.num_attention_heads
+            head_dim = _head_dim * num_key_value_heads // tp_size
 
         # provide at least 1 layer to prevent division by zero cache size
         num_hidden_layers = max(
@@ -281,8 +280,9 @@ class KvCacheCreator:
         num_attention_heads = config.num_attention_heads
         num_key_value_heads = getattr(config, 'num_key_value_heads',
                                       num_attention_heads)
-        head_dim = getattr(config, "head_dim",
-                           hidden_size // num_attention_heads)
+        head_dim = getattr(config, "head_dim", None)
+        if not isinstance(head_dim, int):
+            head_dim = hidden_size // num_attention_heads
 
         if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
         ):
