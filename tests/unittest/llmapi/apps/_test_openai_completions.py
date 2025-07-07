@@ -312,3 +312,35 @@ async def test_completion_stream_options(async_client: openai.AsyncOpenAI,
             temperature=0.0,
             stream=False,
             stream_options={"continuous_usage_stats": True})
+
+@pytest.mark.asyncio
+async def test_completion_with_logit_bias(async_client: openai.AsyncOpenAI, 
+                                         model_name: str):
+    """Test logit_bias with valid token IDs"""
+    logit_bias = {
+        "1000": 80, 
+        "2000": -80,
+    }
+    
+    completion = await async_client.completions.create(
+        model=model_name,
+        prompt="The capital of France is",
+        max_tokens=10,
+        logit_bias=logit_bias,
+        temperature=0.0,
+    )
+    
+    assert completion.choices[0].text
+
+@pytest.mark.asyncio
+async def test_completion_with_invalid_logit_bias(async_client: openai.AsyncOpenAI,
+                                                 model_name: str):
+    """Test with invalid token IDs (non-integer keys)"""
+    with pytest.raises(openai.BadRequestError):
+        await async_client.completions.create(
+            model=model_name,
+            prompt="Hello world",
+            logit_bias={"invalid_token": 1.0},  # Non-integer key
+            max_tokens=5,
+        )
+
