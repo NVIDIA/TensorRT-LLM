@@ -11,7 +11,7 @@ The TensorRT-LLM support for Smaug-72B-v0.1 is based on the LLaMA model, the imp
 In addition, there are two shared files in the parent folder [`examples`](../../../) for inference and evaluation:
 
 * [`../../../run.py`](../../../run.py) to run the inference on an input text;
-* [`../../../summarize.py`](../../../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
+* [`../../../summarize.py`](../../../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset.
 
 ## Support Matrix
 
@@ -43,7 +43,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_8gpu_tp8 \
 
 ### Run Summarization
 
-After building TRT engine, we can use it to perform various tasks. TensorRT-LLM provides handy code to run summarization on [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset and get [ROUGE](https://en.wikipedia.org/wiki/ROUGE_(metric)) scores. The `ROUGE-1` score can be used to validate model implementations.
+After building TRT engine, we can use it to perform various tasks. TensorRT-LLM provides handy code to run summarization on [cnn_dailymail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset and get [ROUGE](https://en.wikipedia.org/wiki/ROUGE_(metric)) scores. The `ROUGE-1` score can be used to validate model implementations.
 
 ```bash
 mpirun -n 8 -allow-run-as-root python ../../../summarize.py \
