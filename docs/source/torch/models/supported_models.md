@@ -27,4 +27,4 @@
 Note:
 - L: Language only
 - L + V: Language and Vision multimodal support
-- Llama 3.2 accepts vision input, but our support currently limited to text only.
+- Llama 3.2 accepts Vision input, but our support is currently limited to Language only.
