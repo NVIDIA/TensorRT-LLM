@@ -809,8 +809,7 @@ private:
                     && fc1_weight_block.sizes()[2] * FP8_PER_INT32
                             * TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize
                         == TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
-                               hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX)
-                            * TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX,
+                            hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX),
                 "fc1 weight block size must be (num_experts_on_rank, inter_size * 2, hidden_size // 4 // "
                 "block_scale_vector_size)");
             TORCH_CHECK(fc1_global.sizes()[0] == num_experts_on_rank, "fc1 global size must be (num_experts_on_rank,)");
