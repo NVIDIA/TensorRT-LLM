@@ -33,7 +33,7 @@ using TensorPtr = MakeDecodingBatchInputOutput::TensorPtr;
 
 void MakeDecodingBatchInputOutput::createDecoderBatchInputs(DecoderInputBuffers& inputBuffers,
     std::vector<SizeType32> const& activeSlots, runtime::decoder::DecoderState const& decoderState,
-    std::vector<TensorPtr> const& logits, SizeType32 maxNumSequences)
+    std::vector<TensorPtr> const& logits)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -46,7 +46,7 @@ void MakeDecodingBatchInputOutput::createDecoderBatchInputs(DecoderInputBuffers&
 
     for (SizeType32 step = 0; step < maxDecoderSteps; ++step)
     {
-        batchSlots.at(step)->resize(maxNumSequences);
+        batchSlots.at(step)->resize(activeSlots.size());
     }
 
     std::vector<SizeType32> batchIdx(maxDecoderSteps);
@@ -181,14 +181,13 @@ void setEagleInputs(tr::DecodingInput& dInput, RuntimeBuffers const& fusedRuntim
 void MakeDecodingBatchInputOutput::operator()(DecoderInputBuffers& inputBuffers,
     runtime::decoder::DecoderState& decoderState, RequestVector const& contextRequests,
     RequestVector const& generationRequests, std::vector<TensorPtr> const& logits,
-    runtime::ModelConfig const& modelConfig, SizeType32 maxNumSequences,
-    OptionalRef<RuntimeBuffers> fusedRuntimeBuffers) const
+    runtime::ModelConfig const& modelConfig, OptionalRef<RuntimeBuffers> fusedRuntimeBuffers) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto [activeSlots, generationSteps] = getActiveSlots(contextRequests, generationRequests);
 
-    createDecoderBatchInputs(inputBuffers, activeSlots, decoderState, logits, maxNumSequences);
+    createDecoderBatchInputs(inputBuffers, activeSlots, decoderState, logits);
 
     auto const maxBeamWidth = decoderState.getMaxBeamWidth();
     if (maxBeamWidth > 1)

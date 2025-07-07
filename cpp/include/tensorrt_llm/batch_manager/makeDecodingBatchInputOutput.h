@@ -48,12 +48,11 @@ public:
 
     void operator()(DecoderInputBuffers& inputBuffers, runtime::decoder::DecoderState& decoderState,
         RequestVector const& contextRequests, RequestVector const& generationRequests,
-        std::vector<TensorPtr> const& logits, runtime::ModelConfig const& modelConfig, SizeType32 maxNumSequences,
+        std::vector<TensorPtr> const& logits, runtime::ModelConfig const& modelConfig,
         OptionalRef<RuntimeBuffers> fusedRuntimeBuffers) const;
 
     static void createDecoderBatchInputs(DecoderInputBuffers& inputBuffers, std::vector<SizeType32> const& activeSlots,
-        runtime::decoder::DecoderState const& decoderState, std::vector<TensorPtr> const& logits,
-        SizeType32 maxNumSequences);
+        runtime::decoder::DecoderState const& decoderState, std::vector<TensorPtr> const& logits);
 };
 
 } // namespace tensorrt_llm::batch_manager
