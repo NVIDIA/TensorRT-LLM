@@ -517,6 +517,11 @@ class TrtllmAttentionWrapper:
 class TrtllmAttentionMetadata(AttentionMetadata):
     workspace: Optional[torch.Tensor] = None
 
+    # TrtllmAttention needs to know the beam width and access to the cache indirection buffer,
+    # when beam search is enabled.
+    beam_width: int = 1
+    cache_indirection: Optional[torch.Tensor] = None
+
     # TrtllmAttention needs to know the max sequence length.
     # Implemented as a property to support no cache mode.
     max_seq_len: Optional[int]
@@ -586,8 +591,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        # Set a default value, as max_num_sequences is not always set.
+        if self.max_num_sequences is None:
+            self.max_num_sequences = self.max_num_requests
+
         self.prompt_lens_cuda = torch.empty(
-            (self.max_num_requests, ),
+            (self.max_num_sequences, ),
             device='cuda',
             dtype=torch.int,
         )
@@ -612,7 +621,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.kv_cache_manager is not None:
             self.kv_cache_block_offsets = torch.empty(
                 [
-                    self.kv_cache_manager.num_pools, self.max_num_requests, 2,
+                    self.kv_cache_manager.num_pools, self.max_num_sequences, 2,
                     self.kv_cache_manager.max_blocks_per_seq
                 ],
                 dtype=torch.int32,
@@ -733,8 +742,15 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # kv block offsets
         assert self.request_ids is not None
         if self.kv_cache_manager is not None:
+            # Copy blocks for all context requests
             self.kv_cache_manager.impl.copy_batch_block_offsets(
-                self.host_kv_cache_block_offsets, self.request_ids)
+                self.host_kv_cache_block_offsets,
+                self.request_ids[:self.num_contexts], 1, 0)
+            # Copy blocks for all generation requests
+            self.kv_cache_manager.impl.copy_batch_block_offsets(
+                self.host_kv_cache_block_offsets,
+                self.request_ids[self.num_contexts:], self.beam_width,
+                self.num_contexts)
             self.kv_cache_block_offsets[:, :self.num_seqs].copy_(
                 self.host_kv_cache_block_offsets[:, :self.num_seqs],
                 non_blocking=True)
@@ -1046,6 +1062,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.has_fp8_qdq = self.quant_config.layer_quant_mode.has_fp8_qdq()
             self.has_fp8_block_wise = self.quant_config.layer_quant_mode.has_fp8_block_scales(
             )
+            self.has_fp8_rowwise = self.quant_config.layer_quant_mode.has_fp8_rowwise(
+            )
             self.has_nvfp4 = self.quant_config.layer_quant_mode.has_nvfp4()
 
     def get_local_layer_idx(self, metadata: TrtllmAttentionMetadata) -> int:
@@ -1111,7 +1129,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                    metadata.max_num_tokens),
             attention_window_size=attention_window_size,
             sink_token_length=0,
-            beam_width=1,
+            beam_width=metadata.beam_width,
             sequence_length=metadata.kv_lens_cuda_runtime,
             host_past_key_value_lengths=metadata.kv_lens_runtime,
             context_lengths=metadata.prompt_lens_cuda_runtime,
@@ -1122,8 +1140,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             host_kv_cache_pool_pointers=metadata.host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping=metadata.host_kv_cache_pool_mapping,
             block_ids_per_seq=metadata.block_ids_per_seq,
-            workspace=None,
-            cache_indirection=None,
+            workspace=metadata.workspace,
+            cache_indirection=metadata.cache_indirection,
             kv_scale_orig_quant=self.kv_scale_orig_quant,
             kv_scale_quant_orig=self.kv_scale_quant_orig,
             out_scale=out_scale,
@@ -1151,8 +1169,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             if use_nvfp4_output:
                 # Use UINT8 as the container dtype for NVFP4.
                 out_dtype = torch.uint8
-            elif (self.has_fp8_qdq or self.has_nvfp4
-                  or self.has_fp8_block_wise) and self.has_fp8_kv_cache:
+            elif (self.has_fp8_qdq or self.has_nvfp4 or self.has_fp8_block_wise
+                  or self.has_fp8_rowwise) and self.has_fp8_kv_cache:
                 # TODO(qijun): revisit fp8_context_fmha logic
                 out_dtype = torch.float8_e4m3fn
 

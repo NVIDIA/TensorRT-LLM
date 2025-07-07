@@ -1709,12 +1709,14 @@ using KVCacheEventData = std::variant<KVCacheCreatedData, KVCacheStoredData, KVC
 struct KVCacheEvent
 {
 
-    KVCacheEvent(IdType eventId, KVCacheEventData data);
+    KVCacheEvent(IdType eventId, KVCacheEventData data, SizeType32 windowSize);
 
     /// @brief The unique id of this event
     IdType eventId;
     /// @brief The data corresponding to this event
     KVCacheEventData data;
+    /// @brief The sliding window size
+    SizeType32 windowSize;
 };
 
 /// @brief Exposes a limited set of KV cache manager functionalities

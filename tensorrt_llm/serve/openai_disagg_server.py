@@ -3,6 +3,7 @@ import asyncio
 import copy
 import os
 import signal
+import traceback
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import List, Optional, Type, Union
@@ -168,12 +169,12 @@ class OpenAIDisaggServer:
 
     async def _handle_exception(self, exception):
         if isinstance(exception, CppExecutorError):
-            logger.error(exception)
+            logger.error(traceback.format_exc())
             signal.raise_signal(signal.SIGINT)
         elif isinstance(exception, HTTPException):
             raise exception  # Re-raise HTTP exceptions properly
         else:
-            logger.error(exception)
+            logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=f"Internal server error {str(exception)}")
 
     async def _send_context_request(self, ctx_server: str, ctx_req: Union[CompletionRequest, ChatCompletionRequest]):

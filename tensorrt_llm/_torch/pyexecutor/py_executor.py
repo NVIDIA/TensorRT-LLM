@@ -168,12 +168,13 @@ class PyExecutor:
                  sampler: Sampler,
                  dist: Distributed,
                  max_num_sequences: int,
-                 drafter: Drafter = None,
+                 drafter: Optional[Drafter] = None,
                  disable_overlap_scheduler: bool = False,
                  max_input_len: int = 2048,
                  max_batch_size: int = 8,
+                 max_beam_width: int = 1,
                  max_draft_tokens: int = 0,
-                 kv_cache_transceiver: KvCacheTransceiver = None,
+                 kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
                  draft_model_engine: Optional[ModelEngine] = None,
                  garbage_collection_gen0_threshold: Optional[int] = None,
                  start_worker: bool = True):
@@ -205,6 +206,7 @@ class PyExecutor:
         self.enqueue_lock = threading.Lock()
         self.active = True
         self.next_req_id = max_batch_size  # The first max_batch_size request IDs are reserved for dummy requests
+        self.max_beam_width = max_beam_width
         self.max_draft_tokens = max_draft_tokens
         self.print_log = model_engine.pytorch_backend_config.print_iter_log
         self.enable_iter_perf_stats = model_engine.pytorch_backend_config.enable_iter_perf_stats
@@ -268,7 +270,9 @@ class PyExecutor:
             self.event_loop = self._executor_loop_pp
         else:
             self.event_loop = self._executor_loop if disable_overlap_scheduler else self._executor_loop_overlap
-
+        if not disable_overlap_scheduler and model_engine.max_beam_width > 1:
+            raise NotImplementedError(
+                "Overlap scheduler is not supported for beam search.")
         if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
             self.event_loop = trace_func(self.event_loop)
 
@@ -918,8 +922,7 @@ class PyExecutor:
                         self._prepare_draft_tokens(scheduled_batch)
 
                     if self.drafter is not None:
-                        self.drafter.prepare_draft_tokens(
-                            scheduled_batch, sample_state)
+                        self.drafter.prepare_draft_tokens(scheduled_batch)
 
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
@@ -1094,12 +1097,6 @@ class PyExecutor:
                             self._process_previous_batch()
                         self.previous_batch: Optional[BatchState] = None
 
-                    # Separate chunked requests so we can handle them in _update_requests w/o relying on the request state.
-                    # This is necessary because _forward_step updates the state before _update_requests is executed.
-                    scheduled_batch.chunked_requests = [
-                        r for r in scheduled_batch.context_requests
-                        if r.context_remaining_length != 0
-                    ]
                     scheduled_batch.context_requests = [
                         r for r in scheduled_batch.context_requests
                         if r.context_remaining_length == 0
@@ -1230,6 +1227,9 @@ class PyExecutor:
                 break
             else:
                 valid_new_requests.append(req_item)
+        # Check if the beam width of the requests is equal to the max_beam_width
+        for req_item in valid_new_requests:
+            assert req_item.request.sampling_config.beam_width == self.max_beam_width, f"Request beam width {req_item.request.sampling_config.beam_width} is not equal to max_beam_width {self.max_beam_width}. This is not supported!"
         new_requests = valid_new_requests
 
         if py_request_objects and (self.dist.tp_size > 1
@@ -1619,19 +1619,22 @@ class PyExecutor:
             f"[Executor] _forward_step {self.model_engine.iter_counter}: {len(scheduled_requests.context_requests)} ctx reqs, {len(scheduled_requests.generation_requests)} gen reqs"
         )
         def forward(scheduled_requests, resource_manager, new_tensors_device,
-                    gather_context_logits):
+                    gather_context_logits, cache_indirection_buffer):
             return self.model_engine.forward(
                 scheduled_requests,
                 resource_manager,
                 new_tensors_device,
-                gather_context_logits=gather_context_logits)
+                gather_context_logits=gather_context_logits,
+                cache_indirection_buffer=cache_indirection_buffer)
 
         try:
             gather_context_logits = any(
                 a.py_return_context_logits
                 for a in scheduled_requests.context_requests)
+            cache_indirection_buffer = self.sampler.get_cache_indirection()
             outputs = forward(scheduled_requests, self.resource_manager,
-                              new_tensors_device, gather_context_logits)
+                              new_tensors_device, gather_context_logits,
+                              cache_indirection_buffer)
             return outputs
         except Exception as e:
             traceback.print_exc()
@@ -1963,7 +1966,8 @@ class PyExecutor:
                 gather_responses = {}
                 if responses_list is not None:
                     for resp in responses_list:
-                        gather_responses.update(resp)
+                        if resp is not None:
+                            gather_responses.update(resp)
                     responses = gather_responses
         logger.debug(
             f'after gather, rank = {self.dist.rank}, responses = {responses}')

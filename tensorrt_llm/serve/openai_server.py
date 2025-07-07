@@ -310,9 +310,11 @@ class OpenAIServer:
                 response = await create_chat_response(promise, postproc_params, disaggregated_params)
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
+            logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
+            logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
 
     async def openai_completion(self, request: CompletionRequest, raw_request: Request) -> Response:
@@ -436,10 +438,11 @@ class OpenAIServer:
                     generator, disaggregated_params)
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
+            logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
-            traceback.print_exc()
+            logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
 
     async def __call__(self, host, port):

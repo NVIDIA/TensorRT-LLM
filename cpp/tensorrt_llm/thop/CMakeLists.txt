@@ -34,6 +34,7 @@ set_property(TARGET th_utils PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 target_link_libraries(th_utils PUBLIC ${TORCH_LIBRARIES} ${CUBLAS_LIB}
                                       ${CURAND_LIB})
 
+# TODO This does not compile with internal cutlass MOE gemm
 add_library(
   th_common SHARED
   mlaPreprocessOp.cpp
@@ -55,6 +56,7 @@ add_library(
   fp4Quantize.cpp
   fp4BatchedQuantize.cpp
   fp8BlockScalingGemm.cpp
+  fp8RowwiseGemm.cpp
   fp8Quantize.cpp
   dsv3FusedAGemmOp.cpp
   fusedQKNormRopeOp.cpp

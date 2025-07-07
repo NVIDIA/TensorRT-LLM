@@ -40,6 +40,9 @@ tensorrt_llm/libs
 tensorrt_llm/bindings.*.so
 tensorrt_llm/bindings.pyi
 tensorrt_llm/bindings/**/*.pyi
+tensorrt_llm/deep_ep/
+tensorrt_llm/deep_ep_cpp_tllm.*.so
+tensorrt_llm/deep_ep_cpp_tllm.pyi
 *docs/cpp_docs*
 *docs/source/_cpp_gen*
 docs/source/**/*.rst
@@ -55,6 +58,7 @@ llm-test-workspace/
 *.safetensors
 */tllm_debug/**
 *.patch
+!cpp/tensorrt_llm/deep_ep/*.patch
 
 # Generated files
 cpp/include/tensorrt_llm/executor/version.h

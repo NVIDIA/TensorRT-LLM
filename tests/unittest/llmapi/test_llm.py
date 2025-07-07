@@ -1,11 +1,9 @@
 import asyncio
 import datetime
+import gc
 import json
 import os
 import sys
-
-sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
-from gc_utils import assert_resource_freed
 
 # Required for test_generate_with_seed to pass.
 # See the discussion in https://github.com/NVIDIA/TensorRT-LLM/pull/4264#issuecomment-2943269891
@@ -26,7 +24,6 @@ import datasets
 import pytest
 import torch
 import transformers
-from utils.util import skip_single_gpu
 
 from tensorrt_llm import LLM as LLM_torch
 from tensorrt_llm._tensorrt_engine import LLM
@@ -50,6 +47,9 @@ from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
                                           LogitsProcessor, SamplingParams)
 
 # isort: off
+sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
+from gc_utils import assert_resource_freed
+from utils.util import skip_single_gpu
 from utils.llm_data import llm_models_root
 from utils.util import force_ampere, similar, skip_gpu_memory_less_than_40gb, skip_pre_hopper
 # isort: on
@@ -547,7 +547,6 @@ def llm_for_sampling_params():
     llm.shutdown()
 
 
-@pytest.mark.skip(reason="https://nvbugs/5362398")
 @pytest.mark.part0
 def test_user_specify_workspace():
     user_specified_ws_path = '/tmp/specified_workspace'
@@ -616,7 +615,6 @@ def test_generate_with_SamplingConfig(llm_for_sampling_params: LLM,
         assert len(output.outputs) == sampling_params.n
 
 
-@pytest.mark.skip(reason="https://nvbugs/5368507")
 @force_ampere
 @pytest.mark.part0
 def test_generate_with_seed(llm_for_sampling_params: LLM):
@@ -2078,6 +2076,20 @@ def _test_llm_capture_request_error(tp_size: int = 1):
 
 def test_llm_capture_request_error():
     _test_llm_capture_request_error(tp_size=1)
+
+
+def test_llm_shutdown_executor():
+    llm = LLM(
+        model=llama_model_path,
+        kv_cache_config=global_kvcache_config,
+        fast_build=True,
+    )
+
+    llm.generate("A")
+    llm.shutdown()
+
+    with pytest.raises(RuntimeError):
+        llm.generate("A")
 
 
 def test_llm_api_jupyter_scenario():

@@ -220,6 +220,7 @@ class ADEngine(ModelEngine):
         resource_manager: ResourceManager,
         new_tokens_device: Optional[torch.Tensor] = None,
         gather_context_logits: bool = False,
+        cache_indirection_buffer: Optional[torch.Tensor] = None,
     ):
         """Run forward from scheduled requests; main entrypoint that gets called by the executor."""
         # convert requests and store in sequence info object
@@ -256,6 +257,7 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
     msg = "pytorch_backend_config must be an AD LlmArgs object"
     assert isinstance(executor_config.pytorch_backend_config, LlmArgs), msg
     ad_config: LlmArgs = executor_config.pytorch_backend_config
+    assert ad_config.max_beam_width <= 1, "_autodeploy + beam_search is not supported"
 
     max_num_sequences = ad_config.max_batch_size * dist_mapping.pp_size
     # some derivative properties
@@ -291,7 +293,7 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
     scheduler = SimpleScheduler(capacitor_scheduler, mb_scheduler)
 
     # search sampler with speculative decoding
-    # TODO (lucaslie, fridah-nv): some models require mixed_sampler=True to have good outputs, see
+    # TODO (lucaslie, fridah-nv): some models require enable_mixed_sampler=True to have good outputs, see
     # https://github.com/NVIDIA/TensorRT-LLM/issues/5254
     # We should expose mixed_sample to our build_and_run_ad script so we can configure this
     # correctly for models as needed.
@@ -300,7 +302,7 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
         max_draft_tokens=max_draft_tokens,
         max_num_sequences=max_num_sequences,
         max_beam_width=executor_config.max_beam_width,
-        mixed_sampler=ad_config.mixed_sampler,
+        enable_mixed_sampler=ad_config.enable_mixed_sampler,
     )
     sampler = TorchSampler(sampler_args)
 
@@ -316,5 +318,6 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
         max_input_len=ad_config.max_input_len,
         max_batch_size=ad_config.max_batch_size,
         max_draft_tokens=max_draft_tokens,
+        max_beam_width=ad_config.max_beam_width,
     )
     return py_executor
