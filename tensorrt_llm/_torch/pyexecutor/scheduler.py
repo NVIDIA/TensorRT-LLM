@@ -21,6 +21,7 @@ class ScheduledRequests:
         self.context_requests: RequestList = []
         self.generation_requests: RequestList = []
         self.paused_requests: RequestList = []
+        self.chunked_requests: RequestList = []
 
     @property
     def is_generation_only(self) -> bool:
@@ -33,7 +34,8 @@ class ScheduledRequests:
 
     @property
     def batch_size(self) -> int:
-        return len(self.context_requests) + len(self.generation_requests)
+        return len(self.context_requests) + len(self.generation_requests) + len(
+            self.chunked_requests)
 
     def all_requests(self) -> list[LlmRequest]:
         return self.context_requests + self.generation_requests
