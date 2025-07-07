@@ -400,7 +400,8 @@ public:
     // Launch the cubin from the provided config. It calls all necessary memsets for internal buffers.
     // Provided config must be validated with isValidConfig before the call.
     int32_t run(BatchedGemmConfig const& config, void* workspace, BatchedGemmData const& options, void* cudaStream,
-        int32_t multiProcessorCount, std::optional<std::reference_wrapper<ModuleCache>> moduleCache = std::nullopt, bool usePdl = true);
+        int32_t multiProcessorCount, std::optional<std::reference_wrapper<ModuleCache>> moduleCache = std::nullopt,
+        bool usePdl = true);
 
     // Initializes the buffers before the world sync. Must be called before run.
     int32_t runInitBeforeWorldSync(
