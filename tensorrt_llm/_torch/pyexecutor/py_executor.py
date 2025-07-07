@@ -1957,31 +1957,20 @@ class PyExecutor:
         if len(self.canceled_req_ids) == 0:
             return
 
-        cancelled_responses = {}
-        left_requests = []
-        # Tracks canceled requests for proper handling in overlap mode during `sampler.update_requests`.
-        self.canceled_requests = []
         for request in self.active_requests:
             req_id = request.py_request_id
             if req_id in self.canceled_req_ids:
-                self._terminate_request(request)
+                # Mark requests as finished, then, we reuse all existing code
+                # to clean up the KV cache resources.
                 request.finish_by_reason(FinishReason.CANCELLED)
                 request.decoding_iter = request.py_decoding_iter
-                cancelled_responses[req_id] = request.create_response(
-                    False, self.dist.rank)
-                self.canceled_requests.append(request)
                 self.canceled_req_ids.erase(req_id)
-            else:
-                left_requests.append(request)
-        self.active_requests = left_requests
 
-        # When enable attention dp, each rank does not have full copy of requests
-        # so we need to remove the cancel requests not in the local rank
-        self.canceled_req_ids.clear()
-
-        # enqueue the cancelled requests' responses as they are not
-        # active_requests and be discarded in the sampler loop.
-        self._enqueue_responses(cancelled_responses)
+        if self.enable_attention_dp:
+            # TODO: revisit the cancel logic of attention dp
+            # When enable attention dp, each rank does not have full copy of requests
+            # so we need to remove the cancel requests not in the local rank
+            self.canceled_req_ids.clear()
 
     @nvtx_range("_enqueue_responses")
     def _enqueue_responses(self, responses: Dict[int, LlmResponse]):
