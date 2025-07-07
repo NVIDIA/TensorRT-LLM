@@ -36,22 +36,33 @@ def add_arguments(parser: ArgumentParser):
                         "-u",
                         required=True,
                         help="Upload path")
+    parser.add_argument("--timeout",
+                        "-t",
+                        type=int,
+                        default=60,
+                        help="Timeout in minutes")
 
 
-def get_wheel_from_package(arch, upload_path):
+def get_wheel_from_package(arch, upload_path, timeout):
     if arch == "x86_64":
         tarfile_name = "TensorRT-LLM.tar.gz"
     else:
         tarfile_name = "TensorRT-LLM-GH200.tar.gz"
 
     tarfile_link = f"https://urm.nvidia.com/artifactory/{upload_path}/{tarfile_name}"
-    while True:
+    for attempt in range(timeout):
         try:
             subprocess.run(["wget", "-nv", tarfile_link], check=True)
             print(f"Tarfile is available at {tarfile_link}")
             break
         except Exception:
-            print("Tarfile not ready yet, waiting 60 seconds...")
+            if attempt == timeout - 1:
+                raise TimeoutError(
+                    f"Failed to download file after {timeout} attempts: {tarfile_link}"
+                )
+            print(
+                f"Tarfile not ready yet, waiting 60 seconds... (attempt {attempt + 1}/{timeout})"
+            )
             time.sleep(60)
 
     llm_root = get_project_dir()
