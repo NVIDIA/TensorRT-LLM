@@ -82,6 +82,7 @@ class GenerationRequest:
         lora_request: Optional[LoRARequest] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         streaming: bool = False,
+        attention_dp_rank: Optional[int] = None,
         multimodal_input: Optional[MultimodalInput] = None,
         multimodal_embedding: Optional[list] = None,
         mrope_config: Optional[dict] = None,
@@ -111,6 +112,7 @@ class GenerationRequest:
         self.mrope_config = mrope_config
         self.kv_cache_retention_config = kv_cache_retention_config
         self.id: Optional[int] = None
+        self.attention_dp_rank = attention_dp_rank
         self.disaggregated_params = disaggregated_params
 
     def set_id(self, id):
