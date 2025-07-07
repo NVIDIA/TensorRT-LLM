@@ -26,6 +26,8 @@
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
 #include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
 #include "tensorrt_llm/pybind/common/bindTypes.h"
+#include "tensorrt_llm/runtime/gptDecoderBatched.h"
+#include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/torch.h"
 #include "tensorrt_llm/runtime/torchView.h"
 
@@ -170,6 +172,7 @@ void initBindings(pybind11::module_& m)
         .def_property_readonly("context_phase_params", &GenLlmReq::getContextPhaseParams)
         .def_property_readonly("is_context_only_request", &GenLlmReq::isContextOnlyRequest)
         .def_property_readonly("is_generation_only_request", &GenLlmReq::isGenerationOnlyRequest)
+        .def_property_readonly("is_generation_complete_state", &GenLlmReq::isGenerationCompleteState)
         .def_property_readonly("is_context_finished", &GenLlmReq::isContextFinished)
         .def_property_readonly("is_disagg_generation_init_state", &GenLlmReq::isDisaggGenerationInitState)
         .def_property_readonly(
@@ -428,6 +431,101 @@ void initBindings(pybind11::module_& m)
                  runtime::TllmRuntime const&>(),
             py::arg("max_beam_width"), py::arg("max_seq_len"), py::arg("buffer_manager"), py::arg("model_config"),
             py::arg("world_config"), py::arg("decoding_config"), py::arg("runtime"));
+
+    m.def(
+        "add_new_tokens_to_requests",
+        [](std::vector<std::shared_ptr<tb::LlmRequest>>& requests,
+            std::vector<tb::LlmRequest::TokenIdType> const& tokens, int beam_idx)
+        {
+            TLLM_CHECK_WITH_INFO(requests.size() == tokens.size(), "Expected the same number of requests and tokens.");
+
+            for (int i = 0; i < requests.size(); ++i)
+            {
+                requests[i]->addNewToken(tokens[i], beam_idx);
+            }
+        },
+        py::arg("requests"), py::arg("tokens"), py::arg("beam_idx"),
+        "Add new tokens to multiple LLM requests. The tokens vector should contain tokens for beam beam_idx of all "
+        "requests in order.");
+
+    m.def(
+        "make_decoding_batch_input",
+        [](std::vector<std::shared_ptr<tb::LlmRequest>>& contextRequests,
+            std::vector<std::shared_ptr<tb::LlmRequest>>& genRequests, tr::ITensor::SharedPtr logits, int beamWidth,
+            std::vector<int> const& numContextLogitsPrefixSum, tb::DecoderInputBuffers const& decoderInputBuffers,
+            runtime::decoder::DecoderState& decoderState, tr::BufferManager const& manager)
+        {
+            std::vector<int> activeSlots;
+            std::vector<int> generationSteps;
+            std::vector<std::vector<tr::ITensor::SharedConstPtr>> logitsVec = {{}};
+
+            for (int i = 0; i < contextRequests.size(); ++i)
+            {
+                if (contextRequests[i]->isLastContextChunk())
+                {
+                    activeSlots.push_back(*contextRequests[i]->mSeqSlot);
+                    generationSteps.push_back(contextRequests[i]->getDecodingIter());
+                    auto contextLogitsOffset = numContextLogitsPrefixSum[i + 1] - 1;
+                    tr::ITensor::SharedPtr logitsView = ITensor::slice(logits, contextLogitsOffset, 1);
+
+                    if (beamWidth > 1)
+                    {
+                        // Tile logits of context requests
+                        auto const logitsShape = logitsView->getShape();
+                        auto const logitsType = logitsView->getDataType();
+                        auto decoderLogits = manager.gpu(ITensor::makeShape({beamWidth, logitsShape.d[1]}), logitsType);
+                        tensorrt_llm::runtime::kernels::tileTensor(
+                            *decoderLogits, *logitsView, beamWidth, manager.getStream());
+                        decoderLogits->unsqueeze(0);
+                        logitsVec[0].push_back(std::move(decoderLogits));
+                    }
+                    else
+                    {
+                        logitsView->unsqueeze(1);
+                        logitsVec[0].push_back(std::move(logitsView));
+                    }
+                }
+            }
+
+            auto genLogitsOffset = numContextLogitsPrefixSum.back();
+            for (int i = 0; i < genRequests.size(); ++i)
+            {
+                if (genRequests[i]->isGenerationInProgressState())
+                {
+                    activeSlots.push_back(*genRequests[i]->mSeqSlot);
+                    generationSteps.push_back(genRequests[i]->getDecodingIter());
+
+                    auto logitsOffset = genLogitsOffset + i * beamWidth;
+                    auto numberOfLogits = beamWidth;
+                    tr::ITensor::SharedPtr logitsView = ITensor::slice(logits, logitsOffset, numberOfLogits);
+                    logitsView->unsqueeze(0);
+                    logitsVec[0].push_back(std::move(logitsView));
+                }
+            }
+
+            auto& batchSlots = decoderInputBuffers.forwardBatchSlots;
+            batchSlots[0]->resize(activeSlots.size());
+            auto batchSlotsRange = tr::BufferRange<SizeType32>(*batchSlots[0]);
+            for (int i = 0; i < activeSlots.size(); ++i)
+            {
+                batchSlotsRange[i] = activeSlots[i];
+            }
+
+            auto decodingInput = std::make_unique<tr::decoder_batch::Input>(logitsVec, 1);
+            decodingInput->batchSlots = batchSlots;
+
+            auto const maxBeamWidth = decoderState.getMaxBeamWidth();
+            if (maxBeamWidth > 1)
+            {
+                // For Variable-Beam-Width-Search
+                decoderState.getJointDecodingInput().generationSteps = generationSteps;
+            }
+
+            return decodingInput;
+        },
+        py::arg("context_requests"), py::arg("generation_requests"), py::arg("logits"), py::arg("beam_width"),
+        py::arg("num_context_logits_prefix_sum"), py::arg("decoder_input_buffers"), py::arg("decoder_state"),
+        py::arg("buffer_manager"), "Make decoding batch input.");
 }
 
 } // namespace tensorrt_llm::pybind::batch_manager
