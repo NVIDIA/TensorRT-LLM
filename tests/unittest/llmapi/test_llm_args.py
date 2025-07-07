@@ -272,7 +272,7 @@ class TestTorchLlmArgsCudaGraphSettings:
             cuda_graph_config=CudaGraphConfig(
                 batch_sizes=CudaGraphConfig._generate_cuda_graph_batch_sizes(
                     128, True),
-                padding_enabled=True,
+                enable_padding=True,
                 max_batch_size=128))
         assert args.cuda_graph_config.batch_sizes == CudaGraphConfig._generate_cuda_graph_batch_sizes(
             128, True)
@@ -282,14 +282,14 @@ class TestTorchLlmArgsCudaGraphSettings:
         # set cuda_graph_batch_sizes only
         args = TorchLlmArgs(model=llama_model_path,
                             cuda_graph_config=CudaGraphConfig(
-                                batch_sizes=[1, 2, 4], padding_enabled=True))
+                                batch_sizes=[1, 2, 4], enable_padding=True))
         assert args.cuda_graph_config.batch_sizes == [1, 2, 4]
 
     def test_cuda_graph_batch_sizes_case_2(self):
         # set cuda_graph_config.max_batch_size only
         args = TorchLlmArgs(model=llama_model_path,
                             cuda_graph_config=CudaGraphConfig(
-                                max_batch_size=128, padding_enabled=True))
+                                max_batch_size=128, enable_padding=True))
         assert args.cuda_graph_config.batch_sizes == CudaGraphConfig._generate_cuda_graph_batch_sizes(
             128, True)
         assert args.cuda_graph_config.max_batch_size == 128
