@@ -690,7 +690,9 @@ class TRTLLMSampler(Sampler):
         assert isinstance(state, SampleStateTRTLLM)
 
         scheduled_requests = state.scheduled_requests
-        assert scheduled_requests.batch_size > 0
+        if scheduled_requests.batch_size == 0:
+            return
+
         beam_width = self.beam_width(scheduled_requests.all_requests)
         sampler_event = state.sampler_event
 
