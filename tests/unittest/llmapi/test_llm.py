@@ -5,9 +5,6 @@ import json
 import os
 import sys
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
-from gc_utils import assert_resource_freed
-
 # Required for test_generate_with_seed to pass.
 # See the discussion in https://github.com/NVIDIA/TensorRT-LLM/pull/4264#issuecomment-2943269891
 # The following line must be ahead of any tensorrt_llm imports,
@@ -27,7 +24,6 @@ import datasets
 import pytest
 import torch
 import transformers
-from utils.util import skip_single_gpu
 
 from tensorrt_llm import LLM as LLM_torch
 from tensorrt_llm._tensorrt_engine import LLM
@@ -51,6 +47,9 @@ from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
                                           LogitsProcessor, SamplingParams)
 
 # isort: off
+sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
+from gc_utils import assert_resource_freed
+from utils.util import skip_single_gpu
 from utils.llm_data import llm_models_root
 from utils.util import force_ampere, similar, skip_gpu_memory_less_than_40gb, skip_pre_hopper
 # isort: on
@@ -616,7 +615,6 @@ def test_generate_with_SamplingConfig(llm_for_sampling_params: LLM,
         assert len(output.outputs) == sampling_params.n
 
 
-@pytest.mark.skip(reason="https://nvbugs/5368507")
 @force_ampere
 @pytest.mark.part0
 def test_generate_with_seed(llm_for_sampling_params: LLM):
