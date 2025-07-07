@@ -27,6 +27,8 @@ LLM_DEFAULT_TAG = env.defaultTag ?: "${LLM_SHORT_COMMIT}-${LLM_BRANCH_TAG}-${BUI
 
 TRIGGER_TYPE = env.triggerType ?: "manual"
 
+WAIT_TIME_FOR_BUILD_STAGE = 60  // minutes
+
 BUILD_JOBS = "32"
 BUILD_JOBS_RELEASE_X86_64 = "32"
 BUILD_JOBS_RELEASE_SBSA = "32"
@@ -202,7 +204,7 @@ def prepareWheelFromBuildStage(dockerfileStage, arch) {
     }
 
     def wheelScript = 'scripts/get_wheel_from_package.py'
-    def wheelArgs = "--arch ${arch} --upload_path " + env.uploadPath
+    def wheelArgs = "--arch ${arch} --timeout ${WAIT_TIME_FOR_BUILD_STAGE} --upload_path " + env.uploadPath
     return " BUILD_WHEEL_SCRIPT=${wheelScript} BUILD_WHEEL_ARGS='${wheelArgs}'"
 }
 
