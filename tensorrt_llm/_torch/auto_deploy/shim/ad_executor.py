@@ -293,7 +293,7 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
     scheduler = SimpleScheduler(capacitor_scheduler, mb_scheduler)
 
     # search sampler with speculative decoding
-    # TODO (lucaslie, fridah-nv): some models require mixed_sampler=True to have good outputs, see
+    # TODO (lucaslie, fridah-nv): some models require enable_mixed_sampler=True to have good outputs, see
     # https://github.com/NVIDIA/TensorRT-LLM/issues/5254
     # We should expose mixed_sample to our build_and_run_ad script so we can configure this
     # correctly for models as needed.
@@ -302,7 +302,7 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
         max_draft_tokens=max_draft_tokens,
         max_num_sequences=max_num_sequences,
         max_beam_width=executor_config.max_beam_width,
-        mixed_sampler=ad_config.mixed_sampler,
+        enable_mixed_sampler=ad_config.enable_mixed_sampler,
     )
     sampler = TorchSampler(sampler_args)
 
