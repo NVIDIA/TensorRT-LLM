@@ -1,0 +1,14 @@
+# The customized container for personal development purpose.
+# Only used if `$CUSTOMIZE_CONTAINER` and `LOCAL_USER` are set to 1.
+#
+# Tip: use `git update-index --skip-worktree ./docker/Dockerfile.custom`
+# to skip the file from git tracking **locally** if you have customized your container config.
+# Use `git update-index --no-skip-worktree ./docker/Dockerfile.custom` to unskip.
+
+ARG IMAGE_TAG_WITH_SUFFIX
+
+FROM ${IMAGE_TAG_WITH_SUFFIX} AS base
+
+# Below are the instructions for the customized container.
+# The instructions in this file shall be kept empty in the official repo.
+# RUN sudo apt-get update && sudo apt-get install -y zsh

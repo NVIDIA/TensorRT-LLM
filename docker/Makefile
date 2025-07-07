@@ -67,6 +67,16 @@ define add_local_user
 		..
 endef
 
+# Customize the container for personal development use.
+define customize_container
+	docker build \
+		--progress $(DOCKER_PROGRESS) \
+		--build-arg IMAGE_TAG_WITH_SUFFIX=$(1) \
+		--file Dockerfile.custom \
+		--tag $(1) \
+		..
+endef
+
 # Rewrite `/tensorrt-llm:` in image tag with `/tensorrt-llm-staging:` to avoid directly overwriting
 define rewrite_tag
 $(shell echo $(IMAGE_WITH_TAG) | sed "s/\/tensorrt-llm:/\/tensorrt-llm-staging:/g")
@@ -144,6 +154,13 @@ ifeq ($(DOCKER_PULL),1)
 endif
 ifeq ($(LOCAL_USER),1)
 	$(call add_local_user,$(IMAGE_WITH_TAG))
+endif
+ifeq ($(CUSTOMIZE_CONTAINER),1)
+  ifeq ($(LOCAL_USER),1)
+	  $(call customize_container,$(IMAGE_WITH_TAG)$(IMAGE_TAG_SUFFIX))
+  else
+	  $(warning "CUSTOMIZE_CONTAINER=1" is ignored because LOCAL_USER is not set to 1)
+endif
 endif
 	docker run $(DOCKER_RUN_OPTS) $(DOCKER_RUN_ARGS) \
     		$(GPU_OPTS) \
