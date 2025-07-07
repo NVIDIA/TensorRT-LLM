@@ -117,18 +117,18 @@ install_gcctoolset_rockylinux() {
   echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> "${ENV}"
   dnf install \
     patch \
-	  vim \
-	  wget \
-	  git-lfs \
-	  gcc-toolset-11 \
-	  libffi-devel \
-	  -y
+    vim \
+    wget \
+    git-lfs \
+    gcc-toolset-11 \
+    libffi-devel \
+    -y
   dnf install \
-	  openmpi \
-	  openmpi-devel \
-	  pigz \
+    openmpi \
+    openmpi-devel \
+    pigz \
     rdma-core-devel \
-	  -y
+    -y
   echo "source scl_source enable gcc-toolset-11" >> "${ENV}"
   echo 'export PATH=/usr/lib64/openmpi/bin:$PATH' >> "${ENV}"
 }
