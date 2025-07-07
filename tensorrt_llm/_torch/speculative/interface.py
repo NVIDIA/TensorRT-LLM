@@ -17,6 +17,7 @@ class SpeculativeDecodingMode(IntEnum):
     EAGLE3_ONE_MODEL = auto()
     NGRAM = auto()
     DRAFT_TARGET = auto()
+    USER_PROVIDED = auto()
     NONE = auto()
 
     def is_mtp(self):
@@ -36,6 +37,9 @@ class SpeculativeDecodingMode(IntEnum):
 
     def is_ngram(self):
         return self == SpeculativeDecodingMode.NGRAM
+
+    def is_user_provided(self):
+        return self == SpeculativeDecodingMode.USER_PROVIDED
 
     def is_none(self):
         return self == SpeculativeDecodingMode.NONE
@@ -74,7 +78,7 @@ class SpeculativeDecodingMode(IntEnum):
         return self.is_mtp() or self.is_eagle3() or self.is_eagle3_one_model()
 
     def has_spec_drafter(self):
-        return self.is_ngram()
+        return self.is_ngram() or self.is_user_provided()
 
     def extend_ctx(self, attention_backend: Type[AttentionBackend]):
         """
@@ -86,7 +90,8 @@ class SpeculativeDecodingMode(IntEnum):
         # Fixme: only trtllm attention backend supports eagle3 generation-phase kernels on blackwell.
         return ((self.is_eagle3() or self.is_draft_target())
                 and not (isinstance(attention_backend, TrtllmAttention)
-                         and get_sm_version() == 100)) or self.is_ngram()
+                         and get_sm_version() == 100)
+                ) or self.is_ngram() or self.is_user_provided()
 
     def attention_need_spec_dec_mode(self):
         """
@@ -184,6 +189,9 @@ class SpecMetadata:
     is_spec_dec_tree: bool = False
     # if spec-dec tree wouldn't be changed at all, the mask won't be computed every step.
     is_spec_dec_dynamic_tree: bool = False
+
+    def __post_init__(self):
+        pass
 
     def prepare(self):
         """
