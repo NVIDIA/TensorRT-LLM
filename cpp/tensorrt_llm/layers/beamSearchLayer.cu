@@ -280,6 +280,7 @@ void BeamSearchLayer<T>::setup(SizeType32 const batchSize, SizeType32 const beam
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(BeamSearchLayer_setup);
 
     SizeType32 const maxBamWidth{mDecoderDomain.getBeamWidth()};
     TLLM_CHECK_WITH_INFO(beamWidth <= maxBamWidth, "Beam width is larger than the constructed for (%d > %d).",

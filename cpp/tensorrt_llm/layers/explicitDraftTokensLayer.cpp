@@ -74,6 +74,7 @@ void ExplicitDraftTokensLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWid
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(ExplicitDraftTokensLayer_setup);
 
     auto setupParams = std::dynamic_pointer_cast<ExplicitDraftTokensSetupParams>(baseSetupParams);
     workspace->initializeDeviceCurandStates(
