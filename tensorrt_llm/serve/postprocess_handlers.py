@@ -257,9 +257,9 @@ class CompletionPostprocArgs(PostprocArgs):
     model: str = None
     num_choices: int = 1
     prompt_idx: int = 0
+    detokenize: bool = True
     prompt: Optional[str] = None
     stream_options: Optional[StreamOptions] = None
-    detokenize: bool = True
 
     @classmethod
     def from_request(cls, request: CompletionRequest):
