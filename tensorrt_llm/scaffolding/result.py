@@ -17,35 +17,33 @@ class ScaffoldingResult:
     def __init__(self, streaming_event: Optional[asyncio.Event] = None):
         super().__init__()
         self.aqueue = asyncio.Queue()
-        self.output = None
+        self.cur_output = None
         self._done = False
         self.task_collections = None
         self.streaming_event = streaming_event
 
     def set_output(self, output: GenerationResult):
-        print("[set_output] called")
         self.aqueue.put_nowait(output)
         self._done = True
-        print("[set_output] put")
 
     async def set_output_async(self, output: GenerationResult):
-        print("[set_output_async] called")
         await self.aqueue.put(output)
-        print("[set_output_async] put")
 
     def set_task_collections(self, task_collections: Mapping[str,
                                                              "TaskCollection"]):
         self.task_collections = task_collections
 
     @property
+    def outputs(self):
+        return self.cur_output.outputs if self.cur_output else None
+
+    @property
     def finished(self) -> bool:
-        return self.output is not None and self.output.finished
+        return self.cur_output is not None and self.cur_output.finished
 
     async def _aresult_step(self):
-        print("[_aresult_step] waiting for response")
         # TODO: error handling or raise exception?
         response = await self.aqueue.get()
-        print("[_aresult_step] response received")
         if response is None:
             raise Exception("ScaffoldingLlm execution failed")
         self._handle_response(response)
@@ -79,7 +77,6 @@ class ScaffoldingResult:
 
     async def __anext__(self):
         if self.finished:
-            print("[_aresult_step] streaming_event set")
             self.streaming_event.set() if self.streaming_event else None
         if self._done and self.finished:
             raise StopAsyncIteration
@@ -88,4 +85,4 @@ class ScaffoldingResult:
         return self
 
     def _handle_response(self, response: GenerationResult):
-        self.output = response  # .outputs[0].text
+        self.cur_output = response

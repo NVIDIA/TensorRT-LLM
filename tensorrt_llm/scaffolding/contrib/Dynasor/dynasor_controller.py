@@ -102,8 +102,6 @@ class DynasorGenerationController(Controller):
             probe_task.input_str = current_prompt + self.probe_suffix
 
             # For the probe task, append the suffix to force a chain-of-thought leading to an answer.
-            print("[DynasorGenerationController] probe_task")
-            # yield [probe_task, proposer_task]
             yield [proposer_task, probe_task]
 
             # Retrieve the output from the probe task.
@@ -141,10 +139,7 @@ class DynasorGenerationController(Controller):
                                            probe_answers[-1] + "}\n\\]")
                     return
 
-            # if not confident, do another round of generation
-            # print("[DynasorGenerationController] proposer_task")
-            # yield [proposer_task]
-
+            # If not confident, do another round of generation
             # Append the newly generated text from the proposer to the current prompt for the next iteration.
             current_prompt += proposer_task.output_str
 

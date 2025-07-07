@@ -11,8 +11,6 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.scaffolding.math_utils import get_digit_majority_vote_result
 from tensorrt_llm.scaffolding.task import GenerationTask, Task
 
-# from .result import ScaffoldingOutput
-
 
 class Controller(ABC):
 
@@ -27,7 +25,6 @@ class Controller(ABC):
 
         yield from self.process([task], **kwargs)
 
-        # print("[Controller.generate] task.output in generate", task.result)
         return task.create_scaffolding_output()
 
     def process(self, tasks: List[Task], **kwargs):

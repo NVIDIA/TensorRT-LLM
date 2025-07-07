@@ -30,7 +30,6 @@ class ScaffoldingLlm:
         self.workers = workers
 
         self.loop = self._get_loop()
-        print("own_loop:", self.own_loop)
         asyncio.set_event_loop(self.loop)
         self.task_queue = asyncio.Queue()
         self.main_loop_stop_event = asyncio.Event()
@@ -85,7 +84,6 @@ class ScaffoldingLlm:
         for task in tasks:
             if task.streaming:
                 await request.result.set_output_async(task.result)
-                print("[_handle_task_list] streaming_event wait")
                 self.streaming_event.clear()
                 await self.streaming_event.wait()
 
@@ -113,8 +111,6 @@ class ScaffoldingLlm:
         finally:
             self.running_req_count -= 1
             self._maybe_schedule()
-            print(f"[Request finished] running_req_count: "
-                  f"{self.running_req_count}")
 
     def _create_controller_generator(self, request: ScaffoldingRequest):
         """Create a generator wrapper for the controller."""
@@ -141,7 +137,6 @@ class ScaffoldingLlm:
 
         while (self.running_req_count < self.max_parallel_requests
                and self.pending_queue):
-            print(f"[Scheduling] running_req_count: {self.running_req_count}")
             next_request = self.pending_queue.popleft()
             self._schedule_request(next_request)
 

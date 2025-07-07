@@ -43,7 +43,7 @@ class GenerationTask(Task):
     frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[Dict[str, float]] = None
     num_logprobs: Optional[int] = None
-    max_tokens: Optional[int] = 2048
+    max_tokens: Optional[int] = None
     n: int = 1
     presence_penalty: Optional[float] = 0.0
     seed: Optional[int] = None

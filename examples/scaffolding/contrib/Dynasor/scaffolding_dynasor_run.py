@@ -58,13 +58,13 @@ def test(prompts, proposer_worker, args):
             async for result in llm.generate_async(prompt):
                 i += 1
                 print(">>>", i, result)
-                async for output in result.output:
+                async for output in result.cur_output:
                     print(">>>", i, len(output.outputs[0].token_ids), "\n",
                           output.outputs[0].text)
-            print(
-                f">>> final output {len(result.output.outputs[0].token_ids)}\n",
-                result.output.outputs[0].text)
+            print(f">>> final output {len(result.outputs[0].token_ids)}\n",
+                  result.outputs[0].text)
 
+        # Need to provide LLM's event loop to get results in the middle of the whole process.
         asyncio.run_coroutine_threadsafe(task(prompts[0]), llm.loop).result()
     else:
         results = llm.generate(prompts)
@@ -83,8 +83,8 @@ def main():
 
     prompts = [
         "Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?\r\n\r\n",
-        # "There exist real numbers $x$ and $y$, both greater than 1, such that $\\log_x\\left(y^x\\right)=\\log_y\\left(x^{4y}\\right)=10$. Find $xy$.",
-        # "Find the largest possible real part of \\[(75+117i)z+\\frac{96+144i}{z}\\]where $z$ is a complex number with $|z|=4$.",
+        "There exist real numbers $x$ and $y$, both greater than 1, such that $\\log_x\\left(y^x\\right)=\\log_y\\left(x^{4y}\\right)=10$. Find $xy$.",
+        "Find the largest possible real part of \\[(75+117i)z+\\frac{96+144i}{z}\\]where $z$ is a complex number with $|z|=4$.",
     ]
 
     llm_worker = TRTLLMWorker.init_with_new_llm(

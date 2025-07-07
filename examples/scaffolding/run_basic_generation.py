@@ -19,8 +19,10 @@ def parse_arguments():
 
 
 def test_sync(prompts, proposer_worker):
-    prototype_controller = NativeGenerationController(
-        sampling_params={"temperature": 0.9})
+    prototype_controller = NativeGenerationController(sampling_params={
+        "temperature": 0.9,
+        "max_tokens": 1024,
+    })
 
     llm = ScaffoldingLlm(
         prototype_controller,
@@ -28,7 +30,8 @@ def test_sync(prompts, proposer_worker):
     )
     results = llm.generate(prompts)
     for result in results:
-        print(result.output.outputs[0].text)
+        print(len(result.outputs[0].token_ids))
+        print(result.outputs[0].text)
     print(f'main shutting down...')
     llm.shutdown()
     print(f'worker shutting down...')
@@ -42,7 +45,7 @@ def test_async(prompt, proposer_worker):
         prototype_controller = NativeGenerationController(
             sampling_params={
                 "temperature": 0.9,
-                "max_tokens": 64
+                "max_tokens": 1024,
             },
             streaming=True,
         )
@@ -55,11 +58,11 @@ def test_async(prompt, proposer_worker):
         async for result in llm.generate_async(prompt):
             i += 1
             print(">>>", i, result)
-            async for output in result.output:
+            async for output in result.cur_output:
                 print(">>>", i, len(output.outputs[0].token_ids), "\n",
                       output.outputs[0].text)
-        print(f">>> final output {len(output.outputs[0].token_ids)}\n",
-              output.outputs[0].text)
+        print(f">>> final output {len(result.outputs[0].token_ids)}\n",
+              result.outputs[0].text)
 
         print(f'main shutting down...')
         llm.shutdown()

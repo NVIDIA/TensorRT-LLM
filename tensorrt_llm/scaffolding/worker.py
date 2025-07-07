@@ -187,10 +187,9 @@ class TRTLLMWorker(Worker):
     async def generation_handler(self, task: GenerationTask) -> TaskStatus:
         sampling_params = self.convert_task_params(task)
 
-        print("[generation_handler] task.streaming:", task.streaming)
+        # If the task is streaming, we will return result directly for
+        # async iteration outside. Otherwise, we will wait.
         if task.streaming:
-            # If the task is streaming, we need to use the async generate method
-            # and handle the streaming output.
             result = self.llm.generate_async(task.input_str,
                                              sampling_params=sampling_params,
                                              streaming=True)
@@ -198,7 +197,6 @@ class TRTLLMWorker(Worker):
             result = await self.llm.generate_async(
                 task.input_str, sampling_params=sampling_params)
         task.result = result
-        # print("[generation_handler] task.result:", task.result)
 
         # TODO: error handle
         return TaskStatus.SUCCESS
