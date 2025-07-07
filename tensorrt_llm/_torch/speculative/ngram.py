@@ -202,6 +202,9 @@ class NGramDrafter(Drafter):
         self,
         scheduled_requests: ScheduledRequests,
     ) -> None:
+        # Sort by request_id when py_batch_idx is None as a fallback.
+        # This happens in the disagg case: for a set of new requests, we draft
+        # before forward_step, so py_batch_idx is not assigned.
         for request in sorted(
                 scheduled_requests.generation_requests,
                 key=lambda r:
