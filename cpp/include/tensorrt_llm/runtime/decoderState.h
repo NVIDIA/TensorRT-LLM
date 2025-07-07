@@ -182,6 +182,14 @@ public:
     //! @brief Cache indirection output for beam search.
     [[nodiscard]] TensorPtr getCacheIndirectionOutput() const;
 
+    //! @brief Get the generation steps for all requests in the batch.
+    //! @returns The generation steps for all requests in the batch.
+    [[nodiscard]] std::optional<std::vector<SizeType32>> const& getGenerationSteps() const;
+
+    //! @brief Set the generation steps for all requests in the batch.
+    //! @param generationSteps The generation steps for all requests in the batch.
+    void setGenerationSteps(std::vector<SizeType32> const& generationSteps);
+
     //! @brief Stateful inputs for the decoder. Allocated for maxBatchSize slots.
     [[nodiscard]] DecodingInput& getJointDecodingInput() const;
 
