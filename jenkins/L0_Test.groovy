@@ -2023,7 +2023,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y tensorrt")
                         if (values[5] != DLFW_IMAGE) {
                             def ubuntu_version = key.contains("UB2404") ? "ubuntu2404" : "ubuntu2204"
-                            def platform = values[2] == X86_64_TRIPLE ? "x86_64" : "aarch64"
+                            def platform = values[2] == X86_64_TRIPLE ? "x86_64" : "arm64"
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://developer.download.nvidia.com/compute/cuda/repos/${ubuntu_version}/${platform}/cuda-keyring_1.0-1_all.deb")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "dpkg -i cuda-keyring_1.0-1_all.deb")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
