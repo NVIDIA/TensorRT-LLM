@@ -1258,9 +1258,19 @@ class PyExecutor:
             max(all_ranks_num_active_requests),
         )
 
+        # Prioritize requests who have attention_dp_rank set.
+        new_requests_cur_rank = [
+            req for req in new_requests
+            if req.request.attention_dp_rank == self.dist.tp_rank
+        ]
+        new_requests_without_attention_dp_rank = [
+            req for req in new_requests if req.request.attention_dp_rank is None
+        ]
+
+        all_ranks_num_active_requests[self.dist.tp_rank] += len(
+            new_requests_cur_rank)
         self.has_context_request = False
-        new_requests_cur_rank = []
-        if new_requests != [] and self.expected_num_active_requests > all_ranks_num_active_requests[
+        if new_requests_without_attention_dp_rank != [] and self.expected_num_active_requests > all_ranks_num_active_requests[
                 self.dist.tp_rank]:
             # Balance context tokens across ranks
             HeapVal = namedtuple(
@@ -1276,6 +1286,9 @@ class PyExecutor:
                 HeapVal(0, self.expected_num_active_requests - val, tp_rank, [])
                 for tp_rank, val in enumerate(all_ranks_num_active_requests)
             ]
+
+            all_ranks_new_requests_heap[self.dist.tp_rank].request_list.extend(
+                new_requests_cur_rank)
             new_requests_cur_rank = all_ranks_new_requests_heap[
                 self.dist.tp_rank].request_list
             all_ranks_new_requests_heap = [
@@ -1283,10 +1296,11 @@ class PyExecutor:
                 if val.num_requests > 0
             ]
             heapq.heapify(all_ranks_new_requests_heap)
-            new_requests = sorted(new_requests,
-                                  key=lambda x: len(x.request.input_token_ids),
-                                  reverse=True)
-            for req_item in new_requests:
+            new_requests_without_attention_dp_rank = sorted(
+                new_requests_without_attention_dp_rank,
+                key=lambda x: len(x.request.input_token_ids),
+                reverse=True)
+            for req_item in new_requests_without_attention_dp_rank:
                 val = heapq.heappop(all_ranks_new_requests_heap)
                 val = val._replace(
                     num_tokens=val.num_tokens +
