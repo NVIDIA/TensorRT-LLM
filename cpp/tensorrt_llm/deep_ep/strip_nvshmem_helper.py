@@ -1,3 +1,9 @@
+# A helper script to detect unused NVSHMEM object files.
+#
+# The script links NVSHMEM to DeepEP with one object file removed at a time and
+# checks whether there are any undefined symbols. See README.md for details.
+# This script is not tested or QA'ed, so you may need to update this script if
+# the project structure changes or compilation options change.
 import pathlib
 import re
 import subprocess
@@ -40,7 +46,7 @@ if ranlib.exists():
 deep_ep_obj_list = sorted(deep_ep_obj_dir.glob("kernels/**/*.o"))
 nvshmem_obj_set = set(nvshmem_obj_dir.glob("**/*.o"))
 for exclude_obj in sorted(nvshmem_obj_set):
-    # Create liba.a with one fewer object file
+    # Create liba.a with one object file removed
     subprocess.check_call(
         ["ar", "rcs", ranlib, *(nvshmem_obj_set - {exclude_obj})])
     # Test whether there are undefined symbols
@@ -48,8 +54,8 @@ for exclude_obj in sorted(nvshmem_obj_set):
         "/usr/local/cuda/bin/nvcc", *gencode_args, "-Xlinker", "--no-undefined",
         "-shared", *deep_ep_obj_list, ranlib, "-o", temp_dir / "a.out"
     ])
-    # If there are no undefined symbols, print "-" to indicate the file could be omitted.
+    # If there are no undefined symbols, print "-" to indicate the file can be omitted
     print("-" if res == 0 else "+",
           str(exclude_obj.relative_to(nvshmem_obj_dir))[:-2])
-    # Unlink the ranlib because `ar` appends existing archives
+    # Unlink the archive file because `ar` appends existing archives
     ranlib.unlink()
