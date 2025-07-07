@@ -191,8 +191,9 @@ target_compile_options(
   deep_ep_cpp_tllm
   PRIVATE ${TORCH_CXX_FLAGS} -O3 $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-O3>
           $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=--register-usage-level=10>)
-target_compile_definitions(deep_ep_cpp_tllm
-                           PRIVATE TORCH_EXTENSION_NAME=deep_ep_cpp_tllm)
+target_compile_definitions(
+  deep_ep_cpp_tllm PRIVATE DISABLE_AGGRESSIVE_PTX_INSTRS
+                           TORCH_EXTENSION_NAME=deep_ep_cpp_tllm)
 target_link_libraries(
   deep_ep_cpp_tllm PRIVATE nvshmem_project::nvshmem ${TORCH_LIBRARIES}
                            ${TORCH_PYTHON_LIB})
