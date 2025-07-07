@@ -21,6 +21,7 @@ from ..modules.fused_moe import (MoE, MoEWeightLoadingMode,
                                  create_renormalize_expert_load_balanced_logits)
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
+from ..speculative import SpecMetadata
 from ..utils import Fp4QuantizedTensor
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              filter_weights, register_auto_model)
@@ -274,6 +275,8 @@ class Transformer(DecoderModel):
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             gather_output=True,
         )
+        # For modeling_speculative, different name expected
+        self.embed_tokens = self.embedding
         self.block = nn.ModuleList([
             TransformerBlock(
                 model_config,
@@ -292,6 +295,7 @@ class Transformer(DecoderModel):
         input_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
         mrope_config: Optional[Tuple[torch.Tensor, int]] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -303,7 +307,7 @@ class Transformer(DecoderModel):
         hidden_states = inputs_embeds or self.embedding(input_ids)
 
         residual = None
-        for block in self.block:
+        for i, block in enumerate(self.block):
             # TODO: apply rms_norm/residual_add fusion
             # hidden_states, residual = block(
             #     position_ids=position_ids,
@@ -320,6 +324,11 @@ class Transformer(DecoderModel):
                 mrope_config=mrope_config,
             )
             residual = None
+
+            if spec_metadata is not None:
+
+                spec_metadata.maybe_capture_hidden_states(
+                    i, hidden_states, residual)
 
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
@@ -348,6 +357,7 @@ class OranginaForCausalLM(DecoderModelForCausalLM[Transformer,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: bool = False,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         output = self.model(
@@ -355,6 +365,7 @@ class OranginaForCausalLM(DecoderModelForCausalLM[Transformer,
             attn_metadata=attn_metadata,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
+            spec_metadata=spec_metadata,
         )
 
         return self.logits_processor.forward(
