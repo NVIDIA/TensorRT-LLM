@@ -17,12 +17,19 @@ Welcome to TensorRT-LLM's Documentation!
 
 .. toctree::
    :maxdepth: 2
-   :caption: Developer Guide
+   :caption: Deployment Guide
 
-   1.0/examples/index.rst
-   1.0/examples/llm_api_examples
+   1.0/examples/llm_api_examples.rst
    1.0/examples/trtllm_serve_examples
    1.0/examples/dynamo_k8s_example
+
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Models
+
+   1.0/models/support-models.md
+   1.0/models/adding-new-model.md
 
 
 .. toctree::
@@ -37,22 +44,9 @@ Welcome to TensorRT-LLM's Documentation!
 .. toctree::
    :maxdepth: 2
    :caption: API Reference
-   :hidden:
 
-   1.0/llm-api/*
-   1.0/examples/index.rst
-   1.0/examples/customization.md
-   1.0/examples/llm_api_examples
-
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Software Architecture
-   :name: Software Architecture
-
-   1.0/architecture/overview.md
-   1.0/architecture/key-components
-   1.0.architecture/developer-guide
+   1.0/llm-api/index.md
+   1.0/llm-api/reference.rst
 
 
 .. toctree::
@@ -72,6 +66,15 @@ Welcome to TensorRT-LLM's Documentation!
    1.0/features/quantization.md
    1.0/features/sampling.md
    1.0/features/speculative-decoding.md
+
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Developer Guide
+
+   1.0/architecture/overview.md
+   1.0/architecture/key-components
+   1.0.architecture/developer-guide
 
 
 .. toctree::
