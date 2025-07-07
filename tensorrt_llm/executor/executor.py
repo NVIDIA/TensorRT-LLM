@@ -1,4 +1,5 @@
 import atexit
+from collections.abc import Mapping
 import faulthandler
 import multiprocessing
 import platform
@@ -122,6 +123,7 @@ class GenerationExecutor(ABC):
             mrope_config: Optional[dict] = None,
             kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
             disaggregated_params: Optional[DisaggregatedParams] = None,
+            trace_headers: Optional[Mapping[str, str]] = None,
             postproc_params: Optional[PostprocParams] = None,
             return_perf_metrics: Optional[bool] = False
     ) -> GenerationResult:
@@ -150,7 +152,8 @@ class GenerationExecutor(ABC):
                 mrope_config=mrope_config,
                 kv_cache_retention_config=kv_cache_retention_config,
                 disaggregated_params=disaggregated_params,
-                return_perf_metrics=return_perf_metrics))
+                return_perf_metrics=return_perf_metrics,
+                trace_headers=trace_headers))
         return result
 
     def generate(

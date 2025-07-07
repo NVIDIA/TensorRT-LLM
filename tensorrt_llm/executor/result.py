@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Mapping
 import json
 import weakref
 from dataclasses import dataclass, field
@@ -7,6 +8,7 @@ from typing import (TYPE_CHECKING, Any, Callable, List, Literal, NamedTuple,
                     Optional, TypeAlias, Union)
 from weakref import WeakMethod
 
+from tensorrt_llm.llmapi.otel_tracing import SpanAttributes, SpanKind, extract_trace_context, global_otlp_tracer
 import torch
 import torch.nn.functional as F
 
@@ -160,6 +162,7 @@ class GenerationResultBase:
         self.decoding_iter = 0
         self._done = False
         self.metrics_dict = {}
+        self.trace_headers = None
 
         if has_event_loop():
             self.aqueue = AsyncQueue()
@@ -283,6 +286,7 @@ class GenerationResultBase:
                 raise ValueError(
                     f"Unknown finish reason: {finish_reasons[src_idx]}")
             self.record_stats(output, req_perf_metrics_dict)
+            self.do_tracing(output, req_perf_metrics_dict,req_perf_metrics_dict)
 
     @nvtx_range_debug("handle_response",
                       color="red",
@@ -366,6 +370,71 @@ class GenerationResultBase:
         if processed_metrics_stat:
             metrics_stats.update(processed_metrics_stat)
         self.metrics_dict = metrics_stats
+
+    def do_tracing(
+        self,
+        output: CompletionOutput,
+        req_perf_metrics_dict: Optional[dict[str, float]] = None,
+    ):
+        if not global_otlp_tracer():
+            return
+
+        metrics_dict = self.metrics_dict
+        if not metrics_dict:
+            # Insufficient request metrics available; trace generation aborted.
+            return
+
+        trace_context = extract_trace_context(self.trace_headers)
+        sampling_params = self.sampling_params
+        with global_otlp_tracer().start_as_current_span(
+            "llm_request",
+            kind=SpanKind.SERVER,
+            context=trace_context,
+            start_time=int(
+                req_perf_metrics_dict.get(RequestEventTiming.ARRIVAL_TIME, 0)
+            ),
+        ) as span:
+
+            def safe_set_attr(span, attr, value):
+                if value is not None:
+                    span.set_attribute(attr, value)
+
+            e2e_time = metrics_dict.get(SupportedMetricNames.E2E, -1)
+            safe_set_attr(
+                span,
+                SpanAttributes.GEN_AI_REQUEST_TEMPERATURE,
+                sampling_params.temperature,
+            )
+            safe_set_attr(
+                span, SpanAttributes.GEN_AI_REQUEST_TOP_P, sampling_params.top_p
+            )
+            safe_set_attr(
+                span,
+                SpanAttributes.GEN_AI_REQUEST_MAX_TOKENS,
+                sampling_params.max_tokens,
+            )
+            safe_set_attr(span, SpanAttributes.GEN_AI_REQUEST_N, sampling_params.n)
+            safe_set_attr(
+                span,
+                SpanAttributes.GEN_AI_USAGE_PROMPT_TOKENS,
+                self.postproc_params.postproc_args.num_prompt_tokens,
+            )
+            safe_set_attr(
+                span, SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS, output.length
+            )
+            safe_set_attr(
+                span,
+                SpanAttributes.GEN_AI_LATENCY_TIME_TO_FIRST_TOKEN,
+                metrics_dict.get(SupportedMetricNames.TTFT, -1),
+            )
+            safe_set_attr(span, SpanAttributes.GEN_AI_LATENCY_E2E, e2e_time)
+            safe_set_attr(span, SpanAttributes.GEN_AI_REQUEST_ID, self.id)
+            safe_set_attr(
+                span,
+                SpanAttributes.GEN_AI_LATENCY_TIME_IN_QUEUE,
+                metrics_dict.get(SupportedMetricNames.REQUEST_QUEUE_TIME, -1),
+            )
+
 
 class DetokenizedGenerationResultBase(GenerationResultBase):
     ''' The base class for the generation result with detokenization support. '''
@@ -453,6 +522,7 @@ class GenerationResult(GenerationResultBase):
         self.disaggregated_params = disaggregated_params
         # minimal sampling params needed for logprob calculation
         self._logprob_params = logprob_params
+        self.trace_headers = generation_request.trace_headers
 
         # for aborting the request
         self._executor: Optional[weakref.ReferenceType[

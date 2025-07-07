@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 import os
 from dataclasses import dataclass
 from typing import List, Optional, Union
@@ -87,6 +88,7 @@ class GenerationRequest:
         mrope_config: Optional[dict] = None,
         kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
+        trace_headers: Optional[Mapping[str, str]] = None,
         postproc_params: Optional[PostprocParams] = None,
         return_perf_metrics: Optional[bool] = False,
     ):
@@ -114,6 +116,7 @@ class GenerationRequest:
         self.id: Optional[int] = None
         self.disaggregated_params = disaggregated_params
         self.return_perf_metrics = return_perf_metrics
+        self.trace_headers = trace_headers
 
     def set_id(self, id):
         assert self.id is None, f"Request ID is already set: {self.id}"

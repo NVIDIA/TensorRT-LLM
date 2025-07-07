@@ -1001,6 +1001,11 @@ class BaseLlmArgs(BaseModel):
         json_schema_extra={"type": "Optional[MpiSession]"},
         exclude=True,
         alias="_mpi_session")
+    
+    otlp_traces_endpoint: Optional[str] = Field(
+        default=None,
+        description="Target URL to which OpenTelemetry traces will be sent.",
+        alias="otlp_traces_endpoint")
 
     backend: Optional[str] = Field(
         default=None,

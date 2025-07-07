@@ -1,4 +1,5 @@
 import atexit
+from collections.abc import Mapping
 import json
 import os
 import shutil
@@ -14,6 +15,7 @@ from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm.inputs.data import TextPrompt
 from tensorrt_llm.inputs.registry import DefaultInputProcessor
+from tensorrt_llm.llmapi.otel_tracing import init_tracer
 
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
@@ -207,6 +209,13 @@ class BaseLLM:
                 self.mpi_session.shutdown()
             raise
 
+        try:
+            if self.args.otlp_traces_endpoint:
+                init_tracer("trt.llm",self.args.otlp_traces_endpoint)
+                logger.info(f"Initialize otlp tracer success, endpont: {self.args.otlp_traces_endpoint}")
+        except Exception as e:
+            logger.error(f"Failed to initialize otlp tracer: {e}")
+
         exception_handler.register(self, 'shutdown')
         atexit.register(LLM._shutdown_wrapper, weakref.ref(self))
 
@@ -305,6 +314,7 @@ class BaseLLM:
         streaming: bool = False,
         kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
+        trace_headers: Optional[Mapping[str, str]] = None,
         _postproc_params: Optional[PostprocParams] = None,
     ) -> RequestOutput:
         """Generate output for the given prompt in the asynchronous mode.
@@ -413,6 +423,7 @@ class BaseLLM:
             mrope_config=mrope_config,
             kv_cache_retention_config=kv_cache_retention_config,
             disaggregated_params=disaggregated_params,
+            trace_headers=trace_headers,
             postproc_params=_postproc_params,
             return_perf_metrics=self.args.return_perf_metrics,
         )

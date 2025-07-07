@@ -31,3 +31,9 @@ ruff==0.9.4
 lm_eval[api]==0.4.8
 docstring_parser
 genai-perf==0.0.13
+typing_extensions
+# observation.tracing
+opentelemetry-sdk
+opentelemetry-api
+opentelemetry-exporter-otlp
+opentelemetry-semantic-conventions-ai
