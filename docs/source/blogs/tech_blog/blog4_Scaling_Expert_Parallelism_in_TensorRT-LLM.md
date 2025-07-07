@@ -541,8 +541,7 @@ Run 32-way expert parallelism inference on the prepared dataset. Please refer to
 ```bash
 cat > ./extra_llm_api_options.yaml <<EOF
 enable_attention_dp: true
-cuda_graph_config:
-    max_batch_size: 128
+cuda_graph_config: {}
 EOF
 
 trtllm-llmapi-launch \
