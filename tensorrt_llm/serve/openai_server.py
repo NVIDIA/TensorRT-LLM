@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import asyncio
 import os
+import re
 import signal
 import traceback
 from contextlib import asynccontextmanager
@@ -13,6 +14,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.routing import Mount
 from transformers import AutoConfig, AutoProcessor
 
 from tensorrt_llm._tensorrt_engine import LLM
@@ -151,6 +153,31 @@ class OpenAIServer:
         self.app.add_api_route("/v1/chat/completions",
                                self.openai_chat,
                                methods=["POST"])
+        # register /prometheus/metrics
+        self.mount_metrics()
+
+    def mount_metrics(self):
+        # Lazy import for prometheus multiprocessing.
+        # We need to set PROMETHEUS_MULTIPROC_DIR environment variable
+        # before prometheus_client is imported.
+        # See https://prometheus.github.io/client_python/multiprocess/
+        from prometheus_client import (CollectorRegistry, make_asgi_app,
+                                       multiprocess)
+        from prometheus_fastapi_instrumentator import Instrumentator
+        registry = CollectorRegistry()
+        multiprocess.MultiProcessCollector(registry)
+        Instrumentator(
+            should_group_status_codes=False,
+            should_respect_env_var=True,
+            excluded_handlers=[
+                ".*"
+            ],
+            registry=registry,
+        ).add().instrument(self.app).expose(self.app)
+        metrics_app = make_asgi_app(registry=registry)
+        metrics_route = Mount("/prometheus/metrics", metrics_app)
+        metrics_route.path_regex = re.compile("^/prometheus/metrics(?P<path>.*)$")
+        self.app.routes.append(metrics_route)
 
     async def health(self) -> Response:
         return Response(status_code=200)

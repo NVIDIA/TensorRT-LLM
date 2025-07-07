@@ -25,6 +25,7 @@ from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             clear_sched_affinity, print_colored_debug,
                             print_traceback_on_error)
 from ..lora_manager import LoraConfig, LoraManager
+from ..metrics import RequestEventTiming
 from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig
 from ..runtime.model_runner import _engine_config_to_model_config
@@ -472,7 +473,7 @@ class GenerationExecutorWorker(GenerationExecutor):
                 request.sampling_params.end_id,
                 pad_id=request.sampling_params.pad_id,
                 output_config=request.sampling_params._get_output_config(
-                    is_pytorch_backend=self._is_pytorch_backend),
+                    is_pytorch_backend=self._is_pytorch_backend, return_perf_metrics=request.return_perf_metrics),
                 # Beam search enforces return_all_generated_tokens=True regardless of the passed value
                 return_all_generated_tokens=False,
                 # convert python config into pybind config
@@ -901,8 +902,9 @@ class AwaitResponseHelper:
 
             logprobs_result = _get_logprobs(self.worker, response,
                                             self.worker._is_pytorch_backend)
-            if logprobs_result:
-                response = ResponseWrapper(response, logprobs_result)
+            req_perf_metrics = _get_req_perf_metrics(response)
+            if logprobs_result or req_perf_metrics:
+                response = ResponseWrapper(response, logprobs_result, req_perf_metrics)
 
             # For AsyncQueue.sync_q, we will batch the events to avoid too many
             # event notifications, thus put without wait here.
@@ -942,8 +944,9 @@ class AwaitResponseHelper:
             else:
                 logprobs_result = _get_logprobs(self.worker, response,
                                                 self.worker._is_pytorch_backend)
-                if logprobs_result:
-                    response = ResponseWrapper(response, logprobs_result)
+                req_perf_metrics = _get_req_perf_metrics(response)
+                if logprobs_result or req_perf_metrics:
+                    response = ResponseWrapper(response, logprobs_result, req_perf_metrics)
 
             _send_rsp(self.worker,
                       response,
@@ -1051,3 +1054,16 @@ def _send_rsp(
         worker._pop_result(response.client_id)
     else:
         raise ValueError(f"Unknown response type: {response}")
+
+def _get_req_perf_metrics(response: tllm.Response) -> Optional[dict[str, float]]:
+    req_perf_metrics, metrics_dict = None, {}
+    if response.result:
+        req_perf_metrics = response.result.request_perf_metrics
+        if req_perf_metrics and req_perf_metrics.timing_metrics:
+            metrics_dict = {
+                RequestEventTiming.ARRIVAL_TIME:  req_perf_metrics.timing_metrics.arrival_time.total_seconds(),
+                RequestEventTiming.FIRST_TOKEN_TIME: req_perf_metrics.timing_metrics.first_token_time.total_seconds(),
+                RequestEventTiming.FIRST_SCHEDULED_TIME:
+                    req_perf_metrics.timing_metrics.first_scheduled_time.total_seconds(),
+                RequestEventTiming.LAST_TOKEN_TIME: req_perf_metrics.timing_metrics.last_token_time.total_seconds()}
+    return metrics_dict
