@@ -38,11 +38,10 @@ if __name__ == "__main__":
     parser.add_argument("--projection_eplb_config_path", type=str, default=None)
     args = parser.parse_args()
 
-    meta_info, statistic, cooccurrence, _ = load_expert_statistic(
+    meta_info, statistic, cooccurrence, token_selected_experts_stats = load_expert_statistic(
         args.expert_statistic_path)
     num_experts = meta_info["num_experts"]
     num_experts_per_token = meta_info["num_experts_per_token"]
-
     if args.iter_start is None:
         args.iter_start = meta_info["iter_start"]
     if args.iter_stop is None:
@@ -54,7 +53,7 @@ if __name__ == "__main__":
         with open(args.projection_eplb_config_path, "r") as f:
             eplb_config = yaml.safe_load(f)
 
-    load_cooccurrence_stats = {}
+    stats = {}
     for layer_idx in meta_info["layers"]:
         expert_token_count_iters = [
             data for key, data in statistic.items() if
@@ -63,17 +62,17 @@ if __name__ == "__main__":
         expert_token_count_iters = torch.stack(expert_token_count_iters, dim=0)
         assert expert_token_count_iters.size(0) == num_iters
 
-        cooccurrence_iters = [
-            data for key, data in cooccurrence.items() if
+        token_selected_experts_iters = [
+            data for key, data in token_selected_experts_stats.items() if
             args.iter_start <= key[0] < args.iter_stop and key[1] == layer_idx
         ]
-        cooccurrence_iters = torch.stack(cooccurrence_iters, dim=0)
-        assert cooccurrence_iters.size(0) == num_iters
-        cooccurrence_matrix = cooccurrence_iters.sum(dim=0).float()
-
-        expert_ids = torch.arange(num_experts)
-        cooccurrence_matrix = cooccurrence_matrix.masked_fill(
-            expert_ids.unsqueeze(1) == expert_ids, 0)
+        token_selected_experts = torch.cat(token_selected_experts_iters,
+                                           dim=0).cuda()
+        token_selected_experts = torch.zeros(
+            (token_selected_experts.size(0), num_experts),
+            dtype=torch.int32,
+            device=token_selected_experts.device).scatter(
+                -1, token_selected_experts.to(torch.int64), 1)
 
         if eplb_config is not None:
             num_slots = eplb_config["num_slots"]
@@ -81,39 +80,28 @@ if __name__ == "__main__":
             layer_initial_global_assignments = eplb_config[
                 "initial_global_assignments"][layer_idx]
             layer_initial_global_assignments = torch.tensor(
-                layer_initial_global_assignments)
+                layer_initial_global_assignments,
+                device=token_selected_experts.device)
             expert_replica_count = layer_initial_global_assignments.bincount(
                 minlength=num_experts)
-            cooccurrence_matrix = cooccurrence_matrix / expert_replica_count / expert_replica_count.unsqueeze(
-                -1)
-            cooccurrence_matrix = cooccurrence_matrix[
-                layer_initial_global_assignments][:,
-                                                  layer_initial_global_assignments]
+            token_selected_experts = token_selected_experts / expert_replica_count
+            token_selected_experts = token_selected_experts[:,
+                                                            layer_initial_global_assignments]
             num_slots_per_rank = num_slots // ep_size
-            slot_ids = torch.arange(num_slots)
         else:
             ep_size = meta_info["ep_size"]
             num_slots_per_rank = num_experts // ep_size
-            slot_ids = expert_ids
 
-        rank_ids = slot_ids // num_slots_per_rank
-        within_rank_cnt = cooccurrence_matrix[rank_ids.unsqueeze(1) ==
-                                              rank_ids].sum().item()
-        between_rank_cnt = cooccurrence_matrix[rank_ids.unsqueeze(1) !=
-                                               rank_ids].sum().item()
-
-        load_cooccurrence_stats[layer_idx] = {
-            'within_rank_cnt': within_rank_cnt,
-            'between_rank_cnt': between_rank_cnt
+        token_selected_experts = token_selected_experts.view(
+            -1, ep_size, num_slots_per_rank)
+        num_send_ranks_per_token = (
+            1 - (1 - token_selected_experts).prod(dim=-1)).sum(
+                dim=-1).float().mean().item()
+        stats[layer_idx] = {
+            'num_send_ranks_per_token': num_send_ranks_per_token
         }
 
-    load_cooccurrence_stats = pd.DataFrame(load_cooccurrence_stats)
-    load_cooccurrence_stats = load_cooccurrence_stats.T
-    load_cooccurrence_stats['total_cnt'] = load_cooccurrence_stats[
-        'within_rank_cnt'] + load_cooccurrence_stats['between_rank_cnt']
-    load_cooccurrence_stats['within_rank_ratio'] = load_cooccurrence_stats[
-        'within_rank_cnt'] / load_cooccurrence_stats['total_cnt']
-    load_cooccurrence_stats = load_cooccurrence_stats.T
-    load_cooccurrence_stats["average"] = load_cooccurrence_stats.mean(axis=1)
-    load_cooccurrence_stats = load_cooccurrence_stats.T
-    print(f"Load cooccurrence statistics:\n{load_cooccurrence_stats}")
+    stats = pd.DataFrame(stats)
+    stats["average"] = stats.mean(axis=1)
+    stats = stats.T
+    print(f"Load statistics:\n{stats}")

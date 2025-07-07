@@ -29,12 +29,29 @@ def load_expert_statistic(path: str):
                 cooccurrence[key] = torch.zeros_like(data)
             cooccurrence[key] += data
 
+    token_selected_experts_files = glob.glob(
+        f"{path}/token_selected_experts_rank*.safetensors")
+    token_selected_experts = {}
+    for token_selected_experts_file in token_selected_experts_files:
+        rank_token_selected_experts = safetensors.torch.load_file(
+            token_selected_experts_file)
+        for key, data in rank_token_selected_experts.items():
+            if key not in token_selected_experts:
+                token_selected_experts[key] = data
+            else:
+                token_selected_experts[key] = torch.cat(
+                    [token_selected_experts[key], data], dim=0)
+
     def parse_key(key: str) -> tuple[int, int]:
         iter_idx, layer_idx = key.split("_")
         return int(iter_idx), int(layer_idx)
 
     statistic = {parse_key(key): data for key, data in statistic.items()}
     cooccurrence = {parse_key(key): data for key, data in cooccurrence.items()}
+    token_selected_experts = {
+        parse_key(key): data
+        for key, data in token_selected_experts.items()
+    }
 
     iters = sorted(list(set(iter_idx for iter_idx, _ in statistic)))
     layers = sorted(list(set(layer_idx for _, layer_idx in statistic)))
@@ -46,7 +63,7 @@ def load_expert_statistic(path: str):
     meta_info["iter_start"] = iters[0]
     meta_info["iter_stop"] = iters[-1] + 1
     meta_info["layers"] = layers
-    return meta_info, statistic, cooccurrence
+    return meta_info, statistic, cooccurrence, token_selected_experts
 
 
 def select_expert(sorted_expert_ids, expert_replica_assigned,

@@ -48,7 +48,7 @@ if __name__ == "__main__":
                         help="The number of layers to update per iteration.")
     args = parser.parse_args()
 
-    meta_info, statistic, cooccurrence = load_expert_statistic(
+    meta_info, statistic, cooccurrence, _ = load_expert_statistic(
         args.expert_statistic_path)
     num_experts = meta_info["num_experts"]
     num_experts_per_token = meta_info["num_experts_per_token"]
