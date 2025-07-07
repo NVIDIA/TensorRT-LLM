@@ -84,21 +84,30 @@ add_custom_command(
 add_custom_target(xqa_sources_h DEPENDS ${XQA_SOURCES_H})
 
 if(BUILD_XQA_TESTS)
-  # GoogleTest Preparation - Code block copied from
-  # https://google.github.io/googletest/quickstart-cmake.html
-  include(FetchContent)
-  FetchContent_Declare(
-    googletest
-    GIT_REPOSITORY https://github.com/google/googletest.git
-    GIT_TAG v1.15.2)
-  include(GoogleTest)
+  # Try to find system installed GTest first
+  find_package(GTest QUIET)
+  if(NOT GTest_FOUND)
+    message(STATUS "System GTest not found, fetching from repository")
+    include(FetchContent)
+    FetchContent_Declare(
+      googletest
+      GIT_REPOSITORY https://github.com/google/googletest.git
+      GIT_TAG v1.15.2)
+    FetchContent_MakeAvailable(googletest)
+    include(GoogleTest)
+  endif()
 
-  # Add Eigen via FetchContent
-  FetchContent_Declare(
-    eigen
-    GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
-    GIT_TAG 3.4.0)
-  FetchContent_MakeAvailable(googletest eigen)
+  # Try to find system installed Eigen first
+  find_package(Eigen3 3.4 QUIET)
+  if(NOT Eigen3_FOUND)
+    message(STATUS "System Eigen not found, fetching from repository")
+    include(FetchContent)
+    FetchContent_Declare(
+      eigen
+      GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
+      GIT_TAG 3.4.0)
+    FetchContent_MakeAvailable(eigen)
+  endif()
 
   enable_testing()
   add_executable(

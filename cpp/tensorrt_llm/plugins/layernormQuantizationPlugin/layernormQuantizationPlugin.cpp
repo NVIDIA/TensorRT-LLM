@@ -29,13 +29,22 @@ static char const* LAYERNORM_QUANTIZATION_PLUGIN_NAME{"LayernormQuantization"};
 PluginFieldCollection LayernormQuantizationPluginCreator::mFC{};
 std::vector<nvinfer1::PluginField> LayernormQuantizationPluginCreator::mPluginAttributes;
 
-LayernormQuantizationPlugin::LayernormQuantizationPlugin(
-    float eps, bool useDiffOfSquares, bool dynamicActivationScaling, nvinfer1::DataType type)
+LayernormQuantizationPlugin::LayernormQuantizationPlugin(float eps, bool useDiffOfSquares,
+    bool dynamicActivationScaling, bool sumPerToken, bool clampValEnabled, tensorrt_llm::common::QuantMode quantMode,
+    nvinfer1::DataType type, nvinfer1::DataType outputType)
     : mEps(eps)
     , mUseDiffOfSquares(useDiffOfSquares)
     , mDynActScaling(dynamicActivationScaling)
     , mType(type)
+    , mOutputType(outputType)
+    , mClampValEnabled(clampValEnabled)
+    , mQuantMode(quantMode)
+    , mSumPerToken(sumPerToken)
 {
+    TLLM_CHECK_WITH_INFO(mOutputType == nvinfer1::DataType::kINT8 || mOutputType == nvinfer1::DataType::kFP8,
+        "Only int8 or fp8 output type is allowed.");
+    // Check if the quant mode is valid.
+    TLLM_CHECK_WITH_INFO(mQuantMode.hasPerTokenScaling(), "The quant mode is not valid.");
 }
 
 // Parameterized constructor
@@ -45,7 +54,11 @@ LayernormQuantizationPlugin::LayernormQuantizationPlugin(void const* data, size_
     read(d, mEps);
     read(d, mUseDiffOfSquares);
     read(d, mDynActScaling);
+    read(d, mSumPerToken);
+    read(d, mClampValEnabled);
+    read(d, mQuantMode);
     read(d, mType);
+    read(d, mOutputType);
     TLLM_CHECK_WITH_INFO(d == a + length,
         "Expected length (%d) != real length (%d). This is often "
         "caused by using different TensorRT-LLM version to build "
@@ -56,7 +69,8 @@ LayernormQuantizationPlugin::LayernormQuantizationPlugin(void const* data, size_
 // IPluginV2DynamicExt Methods
 nvinfer1::IPluginV2DynamicExt* LayernormQuantizationPlugin::clone() const noexcept
 {
-    auto* plugin = new LayernormQuantizationPlugin(mEps, mUseDiffOfSquares, mDynActScaling, mType);
+    auto* plugin = new LayernormQuantizationPlugin(
+        mEps, mUseDiffOfSquares, mDynActScaling, mSumPerToken, mClampValEnabled, mQuantMode, mType, mOutputType);
     plugin->setPluginNamespace(mNamespace.c_str());
     return plugin;
 }
@@ -70,10 +84,21 @@ nvinfer1::DimsExprs LayernormQuantizationPlugin::getOutputDimensions(
         return inputs[outputIndex];
     }
 
-    // Dynamic scaling output if enabled
+    // Dynamic scaling or per-token sum if enabled
     try
     {
-        TLLM_CHECK(outputIndex == 1);
+        if (outputIndex == 1)
+        {
+            TLLM_CHECK(mDynActScaling);
+        }
+        else if (outputIndex == 2)
+        {
+            TLLM_CHECK(mSumPerToken);
+        }
+        else
+        {
+            TLLM_CHECK(false);
+        }
         DimsExprs ret;
         ret.nbDims = inputs[0].nbDims;
         for (int di = 0; di < ret.nbDims - 1; ++di)
@@ -93,26 +118,51 @@ nvinfer1::DimsExprs LayernormQuantizationPlugin::getOutputDimensions(
 bool LayernormQuantizationPlugin::supportsFormatCombination(
     int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept
 {
-    int const totalPoses = 6 + static_cast<int>(mDynActScaling);
+    int const totalPoses
+        = 6 + static_cast<int>(mClampValEnabled) + static_cast<int>(mDynActScaling) + static_cast<int>(mSumPerToken);
     TLLM_CHECK(0 <= pos && pos < totalPoses);
-    TLLM_CHECK(nbInputs == 4);
+    TLLM_CHECK(nbInputs == 4 + static_cast<int>(mClampValEnabled));
     if (pos < nbInputs)
     {
-        switch (pos)
+        if (pos < 3)
         {
-        case 0:
-        case 1:
-        case 2: return (inOut[pos].type == mType) && (inOut[pos].format == TensorFormat::kLINEAR);
-        case 3: return (inOut[pos].type == nvinfer1::DataType::kFLOAT) && (inOut[pos].format == TensorFormat::kLINEAR);
+            // activatation, weight, bias
+            return (inOut[pos].type == mType) && (inOut[pos].format == TensorFormat::kLINEAR);
+        }
+        else if (pos == 3)
+        {
+            // scale
+            return (inOut[pos].type == nvinfer1::DataType::kFLOAT) && (inOut[pos].format == TensorFormat::kLINEAR);
+        }
+        else if (pos == 4 && mClampValEnabled)
+        {
+            // clamp_max_v
+            return (inOut[pos].type == nvinfer1::DataType::kFLOAT) && (inOut[pos].format == TensorFormat::kLINEAR);
         }
     }
-    if (pos == 4)
+    else
     {
-        // Quantized output
-        return (inOut[pos].type == nvinfer1::DataType::kINT8) && (inOut[pos].format == TensorFormat::kLINEAR);
+        auto const output_pos = pos - nbInputs;
+        if (output_pos == 0)
+        {
+            // Quantized output
+            return (inOut[pos].type == mOutputType) && (inOut[pos].format == TensorFormat::kLINEAR);
+        }
+        else if (output_pos == 1 && mDynActScaling)
+        {
+            // Dynamic scaling if enabled
+            return (inOut[pos].type == nvinfer1::DataType::kFLOAT) && (inOut[pos].format == TensorFormat::kLINEAR);
+        }
+        else if (output_pos == 2 && static_cast<int>(mClampValEnabled))
+        {
+            // Clamp value
+            return (inOut[pos].type == nvinfer1::DataType::kFLOAT) && (inOut[pos].format == TensorFormat::kLINEAR);
+        }
     }
-    // Dynamic scaling if enabled
-    return (inOut[pos].type == nvinfer1::DataType::kFLOAT) && (inOut[pos].format == TensorFormat::kLINEAR);
+
+    // We should never reach this point
+    TLLM_CHECK_WITH_INFO(false, "The input/output is not supported.");
+    return false;
 }
 
 void LayernormQuantizationPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int nbInputs,
@@ -135,9 +185,11 @@ int LayernormQuantizationPlugin::enqueue(nvinfer1::PluginTensorDesc const* input
     //     weight [N, ]
     //     bias [N, ]
     //     scale_to_int [1]
+    //     clamp_max_v  [2], contains min val, and max val (optional)
     // outputs
-    //     output [M(*), N]
-    //     dynamic_scaling [M(*), 1] (optional output)
+    //     output           [M(*), N]   Normalized activations, potentially with quantization applied.
+    //     dynamic_scaling  [M(*), 1]   (Optional) Per-token scales if quantization is enabled.
+    //     token_sums       [M(*), 1]   (Optional) Per-token sums of all the channels (before quantization).
 
     int64_t m64 = 1;
     for (int i = 0; i < inputDesc[0].dims.nbDims - 1; ++i)
@@ -147,51 +199,103 @@ int LayernormQuantizationPlugin::enqueue(nvinfer1::PluginTensorDesc const* input
     int const m = TLLM_INT32_CAST(m64);
     int const n = TLLM_INT32_CAST(inputDesc[1].dims.d[0]);
 
-    float const* scale = reinterpret_cast<float const*>(inputs[3]);
-    int8_t* output = reinterpret_cast<int8_t*>(outputs[0]);
-    float* dynamic_scale = mDynActScaling ? reinterpret_cast<float*>(outputs[1]) : nullptr;
+    void const* input = inputs[0];
+    void const* weight = inputs[1];
+    void const* bias = inputs[2];
+    void const* scale = inputs[3];
+    void const* clampValPtr = mClampValEnabled ? inputs[4] : nullptr;
+    void* output = outputs[0];
+    void* dynamic_scale = mDynActScaling ? outputs[1] : nullptr;
+    void* sum_per_token = mSumPerToken ? outputs[2] : nullptr;
 
-    if (mType == DataType::kHALF)
+    if (inputDesc[0].type == DataType::kFLOAT && mOutputType == DataType::kINT8)
     {
-        half const* input = reinterpret_cast<half const*>(inputs[0]);
-        half const* weight = reinterpret_cast<half const*>(inputs[1]);
-        half const* bias = reinterpret_cast<half const*>(inputs[2]);
-        invokeGeneralLayerNorm(
-            (half*) nullptr, input, weight, bias, mEps, m, n, stream, mUseDiffOfSquares, scale, dynamic_scale, output);
+        dispatchDataType<float, int8_t>(nullptr, input, weight, bias, mEps, m, n, stream, mUseDiffOfSquares,
+            clampValPtr, scale, dynamic_scale, sum_per_token, output);
     }
-    else if (mType == DataType::kFLOAT)
+#ifdef ENABLE_FP8
+    else if (inputDesc[0].type == DataType::kFLOAT && mOutputType == DataType::kFP8)
     {
-        float const* input = reinterpret_cast<float const*>(inputs[0]);
-        float const* weight = reinterpret_cast<float const*>(inputs[1]);
-        float const* bias = reinterpret_cast<float const*>(inputs[2]);
-        invokeGeneralLayerNorm(
-            (float*) nullptr, input, weight, bias, mEps, m, n, stream, mUseDiffOfSquares, scale, dynamic_scale, output);
+        dispatchDataType<float, __nv_fp8_e4m3>(nullptr, input, weight, bias, mEps, m, n, stream, mUseDiffOfSquares,
+            clampValPtr, scale, dynamic_scale, sum_per_token, output);
     }
+#endif // ENABLE_FP8
+    else if (inputDesc[0].type == DataType::kHALF && mOutputType == DataType::kINT8)
+    {
+        dispatchDataType<half, int8_t>(nullptr, input, weight, bias, mEps, m, n, stream, mUseDiffOfSquares, clampValPtr,
+            scale, dynamic_scale, sum_per_token, output);
+    }
+#ifdef ENABLE_FP8
+    else if (inputDesc[0].type == DataType::kHALF && mOutputType == DataType::kFP8)
+    {
+        dispatchDataType<half, __nv_fp8_e4m3>(nullptr, input, weight, bias, mEps, m, n, stream, mUseDiffOfSquares,
+            clampValPtr, scale, dynamic_scale, sum_per_token, output);
+    }
+#endif // ENABLE_FP8
 #ifdef ENABLE_BF16
-    else if (mType == DataType::kBF16)
+    else if (inputDesc[0].type == DataType::kBF16 && mOutputType == DataType::kINT8)
     {
-        __nv_bfloat16 const* input = reinterpret_cast<__nv_bfloat16 const*>(inputs[0]);
-        __nv_bfloat16 const* weight = reinterpret_cast<__nv_bfloat16 const*>(inputs[1]);
-        __nv_bfloat16 const* bias = reinterpret_cast<__nv_bfloat16 const*>(inputs[2]);
-        invokeGeneralLayerNorm((__nv_bfloat16*) nullptr, input, weight, bias, mEps, m, n, stream, mUseDiffOfSquares,
-            scale, dynamic_scale, output);
+        dispatchDataType<__nv_bfloat16, int8_t>(nullptr, input, weight, bias, mEps, m, n, stream, mUseDiffOfSquares,
+            clampValPtr, scale, dynamic_scale, sum_per_token, output);
     }
-#endif
+#ifdef ENABLE_FP8
+    else if (inputDesc[0].type == DataType::kBF16 && mOutputType == DataType::kFP8)
+    {
+        dispatchDataType<__nv_bfloat16, __nv_fp8_e4m3>(nullptr, input, weight, bias, mEps, m, n, stream,
+            mUseDiffOfSquares, clampValPtr, scale, dynamic_scale, sum_per_token, output);
+    }
+#endif // ENABLE_FP8
+#endif // ENABLE_BF16
     sync_check_cuda_error(stream);
     return 0;
+}
+
+template <typename T, typename QuantT>
+void LayernormQuantizationPlugin::dispatchDataType(void* out, void const* input, void const* gamma, void const* beta,
+    float const eps, int const tokens, int const hidden_dim, cudaStream_t stream, bool use_diff_of_squares,
+    void const* clampValPtr, void const* scale, void* dynamic_scale, void* sum_per_token,
+    void* normed_output_quant) noexcept
+{
+    // inputs
+    //     activation     [dim0(*), dim1]
+    //     clamp_value    [2], contains min val, and max val (optional)
+    // outputs
+    //     quant          [dim0(*), dim1]
+    //     scale_tokens   [dim0(*), 1]
+
+    invokeGeneralLayerNorm(reinterpret_cast<T*>(out), reinterpret_cast<T const*>(input),
+        reinterpret_cast<T const*>(gamma), reinterpret_cast<T const*>(beta), eps, tokens, hidden_dim, mQuantMode,
+        stream, use_diff_of_squares, reinterpret_cast<float const*>(clampValPtr), reinterpret_cast<float const*>(scale),
+        reinterpret_cast<float*>(dynamic_scale), reinterpret_cast<float*>(sum_per_token),
+        reinterpret_cast<QuantT*>(normed_output_quant));
 }
 
 // IPluginV2Ext Methods
 nvinfer1::DataType LayernormQuantizationPlugin::getOutputDataType(
     int index, nvinfer1::DataType const* inputTypes, int nbInputs) const noexcept
 {
-    assert((mDynActScaling && index < 2) || (!mDynActScaling && index == 0));
+    assert(index <= 2);
+
     if (index == 0)
     {
         // Output 0 quantized output of layer norm
-        return nvinfer1::DataType::kINT8;
+        return mOutputType;
     }
-    // Output 1 dynamic act scaling
+    else if (index == 1)
+    {
+        assert(mDynActScaling);
+        // Output 1 dynamic act scaling
+        return nvinfer1::DataType::kFLOAT;
+    }
+    else if (index == 2)
+    {
+        assert(mDynActScaling && mSumPerToken);
+        // Output 2 per-token sums
+        return nvinfer1::DataType::kFLOAT;
+    }
+
+    // We should never reach this point
+    TLLM_CHECK_WITH_INFO(false, "The output index is not supported.");
     return nvinfer1::DataType::kFLOAT;
 }
 
@@ -209,7 +313,7 @@ char const* LayernormQuantizationPlugin::getPluginVersion() const noexcept
 
 int LayernormQuantizationPlugin::getNbOutputs() const noexcept
 {
-    return 1 + static_cast<int>(mDynActScaling);
+    return 1 + static_cast<int>(mDynActScaling) + static_cast<int>(mSumPerToken);
 }
 
 int LayernormQuantizationPlugin::initialize() noexcept
@@ -221,7 +325,8 @@ void LayernormQuantizationPlugin::terminate() noexcept {}
 
 size_t LayernormQuantizationPlugin::getSerializationSize() const noexcept
 {
-    return sizeof(mEps) + sizeof(mUseDiffOfSquares) + sizeof(mDynActScaling) + sizeof(mType);
+    return sizeof(mEps) + sizeof(mUseDiffOfSquares) + sizeof(mDynActScaling) + sizeof(mSumPerToken)
+        + sizeof(mClampValEnabled) + sizeof(mQuantMode) + sizeof(mType) + sizeof(mOutputType);
 }
 
 void LayernormQuantizationPlugin::serialize(void* buffer) const noexcept
@@ -230,7 +335,11 @@ void LayernormQuantizationPlugin::serialize(void* buffer) const noexcept
     write(d, mEps);
     write(d, mUseDiffOfSquares);
     write(d, mDynActScaling);
+    write(d, mSumPerToken);
+    write(d, mClampValEnabled);
+    write(d, mQuantMode);
     write(d, mType);
+    write(d, mOutputType);
     TLLM_CHECK(d == a + getSerializationSize());
 }
 
@@ -249,7 +358,11 @@ LayernormQuantizationPluginCreator::LayernormQuantizationPluginCreator()
     mPluginAttributes.emplace_back(PluginField("eps", nullptr, PluginFieldType::kFLOAT32));
     mPluginAttributes.emplace_back(PluginField("use_diff_of_squares", nullptr, PluginFieldType::kINT32));
     mPluginAttributes.emplace_back(PluginField("dyn_act_scaling", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("sum_per_token", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("clamp_val_enabled", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("quant_mode", nullptr, PluginFieldType::kINT32));
     mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("out_type_id", nullptr, PluginFieldType::kINT32));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
@@ -272,10 +385,15 @@ PluginFieldCollection const* LayernormQuantizationPluginCreator::getFieldNames()
 IPluginV2* LayernormQuantizationPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
     PluginField const* fields = fc->fields;
+    tensorrt_llm::common::QuantMode quantMode{};
     float eps{};
     nvinfer1::DataType type{};
+    nvinfer1::DataType outputType{};
     bool useDiffOfSquares{};
     bool dynamicActivationScaling{};
+    bool sumPerToken{};
+    bool clampValEnabled{};
+
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {
@@ -300,10 +418,31 @@ IPluginV2* LayernormQuantizationPluginCreator::createPlugin(char const* name, Pl
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             useDiffOfSquares = static_cast<bool>(*(static_cast<bool const*>(fields[i].data)));
         }
+        else if (!strcmp(attrName, "sum_per_token"))
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
+            sumPerToken = static_cast<bool>(*(static_cast<bool const*>(fields[i].data)));
+        }
+        else if (!strcmp(attrName, "clamp_val_enabled"))
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
+            clampValEnabled = static_cast<bool>(*(static_cast<bool const*>(fields[i].data)));
+        }
+        else if (!strcmp(attrName, "quant_mode"))
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
+            quantMode = QuantMode(*(static_cast<int32_t const*>(fields[i].data)));
+        }
+        else if (!strcmp(attrName, "out_type_id"))
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
+            outputType = static_cast<nvinfer1::DataType>(*(static_cast<nvinfer1::DataType const*>(fields[i].data)));
+        }
     }
     try
     {
-        auto* obj = new LayernormQuantizationPlugin(eps, useDiffOfSquares, dynamicActivationScaling, type);
+        auto* obj = new LayernormQuantizationPlugin(
+            eps, useDiffOfSquares, dynamicActivationScaling, sumPerToken, clampValEnabled, quantMode, type, outputType);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }

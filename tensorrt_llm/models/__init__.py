@@ -60,7 +60,7 @@ from .phi3.model import Phi3ForCausalLM, Phi3Model
 from .phi.model import PhiForCausalLM, PhiModel
 from .qwen.model import QWenForCausalLM
 from .recurrentgemma.model import RecurrentGemmaForCausalLM
-from .redrafter.model import ReDrafterForCausalLM
+from .redrafter.model import ReDrafterForLLaMALM, ReDrafterForQWenLM
 from .stdit.model import STDiT3Model
 
 __all__ = [
@@ -93,7 +93,8 @@ __all__ = [
     'LlavaNextVisionConfig',
     'MedusaConfig',
     'MedusaForCausalLm',
-    'ReDrafterForCausalLM',
+    'ReDrafterForLLaMALM',
+    'ReDrafterForQWenLM',
     'GPTJConfig',
     'GPTJModel',
     'GPTJForCausalLM',
@@ -179,7 +180,8 @@ MODEL_MAP = {
     'GraniteMoeForCausalLM': LLaMAForCausalLM,
     'MedusaForCausalLM': MedusaForCausalLm,
     'MedusaLlamaForCausalLM': MedusaForCausalLm,
-    'ReDrafterForCausalLM': ReDrafterForCausalLM,
+    'ReDrafterForLLaMALM': ReDrafterForLLaMALM,
+    'ReDrafterForQWenLM': ReDrafterForQWenLM,
     'BaichuanForCausalLM': BaichuanForCausalLM,
     'BaiChuanForCausalLM': BaichuanForCausalLM,
     'SkyworkForCausalLM': LLaMAForCausalLM,

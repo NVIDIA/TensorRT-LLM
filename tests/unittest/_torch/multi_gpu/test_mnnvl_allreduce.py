@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
 import pickle
 import sys
 import traceback
@@ -27,6 +26,7 @@ from utils.util import skip_pre_blackwell
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams)
+from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -97,7 +97,6 @@ def row_linear_residual_norm_fusion_forward(
     reference_output = tuple(t.cuda() for t in reference_output)
 
     MPI.COMM_WORLD.barrier()
-    os.environ["TRTLLM_MNNVL_AR_ENABLED"] = "1"
 
     allreduce = AllReduce(
         mapping=Mapping(
@@ -105,6 +104,7 @@ def row_linear_residual_norm_fusion_forward(
             tp_size=tensor_parallel_size,
             rank=tensor_parallel_rank,
         ),
+        strategy=AllReduceStrategy.MNNVL,
         dtype=dtype,
     )
 

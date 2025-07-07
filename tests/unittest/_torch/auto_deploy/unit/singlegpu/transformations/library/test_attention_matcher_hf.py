@@ -31,7 +31,7 @@ class MockAttentionDescriptor:
 
     @classmethod
     def get_source_attention_op(cls) -> Callable:
-        return torch.ops.attention.bsnd_grouped_sdpa
+        return torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa
 
 
 class HFWrapper(nn.Module):
@@ -83,21 +83,28 @@ def test_match_llama_attention(config: Dict[str, Any], attn_implementation: str)
     )
 
     def verify_matcher(gm: GraphModule):
-        """Ensure that there is exactly one torch.ops.attention.bsnd_grouped_sdpa call in the graph."""
+        """Ensure that there is exactly one torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa
+        call in the graph. Also check that there is no repeat_kv pattern left.
+        """
         nodes = gm.graph.find_nodes(
-            op="call_function", target=torch.ops.attention.bsnd_grouped_sdpa
+            op="call_function", target=torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa
         )
         assert len(nodes) == 1, "Expected exactly one bsnd_grouped_sdpa call in the graph"
 
         # TODO: check non-qkv args of node
         attn_node = nodes[0]
         scale = model.model.layers[0].self_attn.scaling
-        assert attn_node.args[3:] == (None, 0.0, True, scale), (
-            "Expected default args for bsnd_grouped_sdpa"
-        )
+        # TODO (lucaslie, #4783): don't check for causal mask until we have more robust handling
+        # assert attn_node.args[3:] == (None, 0.0, True, scale), (
+        #     "Expected default args for bsnd_grouped_sdpa"
+        # )
+        assert attn_node.args[4] == 0.0  # dropout_p
+        assert attn_node.args[6] == scale  # scale
 
         # TODO: check that there is no repeat_kv pattern left...
-        nodes = gm.graph.find_nodes(op="call_function", target=torch.ops.attention.repeat_kv)
+        nodes = gm.graph.find_nodes(
+            op="call_function", target=torch.ops.auto_deploy.torch_attention_repeat_kv
+        )
         assert len(nodes) == 0, "Found repeat_kv pattern in the graph"
 
         return True

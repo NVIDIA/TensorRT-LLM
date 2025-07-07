@@ -25,6 +25,7 @@ class MixtralMoE(nn.Module):
         self,
         model_config: ModelConfig[PretrainedConfig],
         aux_stream: torch.cuda.Stream,
+        layer_idx: Optional[int] = None,
     ):
         super().__init__()
         config = model_config.pretrained_config
@@ -51,7 +52,8 @@ class MixtralMoE(nn.Module):
             aux_stream=aux_stream,
             dtype=config.torch_dtype,
             reduce_results=reduce_results,
-            model_config=model_config)
+            model_config=model_config,
+            layer_idx=layer_idx)
 
     def forward(
         self,
@@ -59,19 +61,20 @@ class MixtralMoE(nn.Module):
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        all_rank_max_num_tokens = attn_metadata.all_rank_max_num_tokens
         use_dp_padding = False
         if self.enable_attention_dp and len(all_rank_num_tokens) > 1:
             # Use padding here to keep the behavior unchanged
             use_dp_padding = True
-            max_num_token = max(all_rank_num_tokens)
             hidden_states = torch.nn.functional.pad(
                 hidden_states,
-                (0, 0, 0, max_num_token - hidden_states.shape[0]))
+                (0, 0, 0, all_rank_max_num_tokens - hidden_states.shape[0]))
         router_logits = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states,
             router_logits,
             all_rank_num_tokens=all_rank_num_tokens,
+            all_rank_max_num_tokens=all_rank_max_num_tokens,
             use_dp_padding=use_dp_padding)
         return final_hidden_states
 
@@ -108,7 +111,9 @@ class MixtralDecoderLayer(DecoderLayer):
 
         self.self_attn = MixtralAttention(model_config, layer_idx=layer_idx)
 
-        self.block_sparse_moe = MixtralMoE(model_config, aux_stream)
+        self.block_sparse_moe = MixtralMoE(model_config,
+                                           aux_stream,
+                                           layer_idx=layer_idx)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -155,7 +160,6 @@ class MixtralModel(DecoderModel):
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__(model_config)
         config = model_config.pretrained_config
-        self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.aux_stream = torch.cuda.Stream()
 

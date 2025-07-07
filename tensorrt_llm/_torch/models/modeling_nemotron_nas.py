@@ -4,7 +4,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
@@ -44,14 +44,22 @@ def _create_linear_from_configs(model_config: ModelConfig[PretrainedConfig],
         gather_output=True,
         quant_config=model_config.get_quant_config(),
         skip_create_weights_in_init=model_config.skip_create_weights_in_init,
-    )
+        allreduce_strategy=model_config.allreduce_strategy)
 
 
 class NemotronNASAttention(Attention):
+    NON_NEOX_TYPES = ("mistral_yarn", "rope_llama4")
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig],
                  layer_idx: int):
         config = model_config.pretrained_config
+        is_neox = getattr(model_config.pretrained_config,
+                          "position_embedding_type",
+                          None) not in self.NON_NEOX_TYPES
+        rope = RopeParams.from_config(config)
+        if rope.scale_type == RotaryScalingType.yarn:
+            rope.mscale_all_dim = 0.0
+
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
@@ -59,8 +67,9 @@ class NemotronNASAttention(Attention):
             max_position_embeddings=config.max_position_embeddings,
             bias=False,
             pos_embd_params=PositionalEmbeddingParams(
-                type=PositionEmbeddingType.rope_gpt_neox,
-                rope=RopeParams.from_config(config),
+                type=PositionEmbeddingType.rope_gpt_neox
+                if is_neox else PositionEmbeddingType.rope_gptj,
+                rope=rope,
             ),
             layer_idx=layer_idx,
             dtype=config.torch_dtype,

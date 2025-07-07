@@ -5,7 +5,6 @@ backend: "pytorch"
 free_gpu_memory_fraction: 0.15
 conditional_disagg_config:
   max_local_prefill_length: 100
-use_cuda_graph: False
 disable_overlap_scheduler: True
 autotuner_enabled: False
 context_servers:

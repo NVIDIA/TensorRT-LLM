@@ -13,6 +13,7 @@ from typing import (TYPE_CHECKING, AsyncIterable, Generator, List, Optional,
 import numpy as np
 import torch
 
+from tensorrt_llm.inputs.multimodal import MultimodalInput
 from tensorrt_llm.logger import logger, set_level
 from tensorrt_llm.lora_manager import LoraConfig
 
@@ -116,6 +117,7 @@ class GenerationExecutor(ABC):
             lora_request: Optional[LoRARequest] = None,
             prompt_adapter_request: Optional[PromptAdapterRequest] = None,
             streaming: bool = False,
+            multimodal_input: Optional[MultimodalInput] = None,
             multimodal_embedding: Optional[list] = None,
             mrope_config: Optional[dict] = None,
             kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
@@ -142,6 +144,7 @@ class GenerationExecutor(ABC):
                 lora_request=lora_request,
                 prompt_adapter_request=prompt_adapter_request,
                 streaming=streaming,
+                multimodal_input=multimodal_input,
                 multimodal_embedding=multimodal_embedding,
                 mrope_config=mrope_config,
                 kv_cache_retention_config=kv_cache_retention_config,
@@ -268,6 +271,9 @@ class GenerationExecutor(ABC):
             # We can catch some exceptions here.
             raise e
 
+    def is_shutdown(self) -> bool:
+        return self.doing_shutdown
+
     @abstractmethod
     def shutdown(self):
         pass
@@ -347,6 +353,7 @@ class GenerationExecutor(ABC):
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
+        garbage_collection_gen0_threshold: Optional[int] = None,
     ) -> Union["GenerationExecutorProxy", "GenerationExecutorWorker"]:
         # local imports to avoid cyclic importing
         from .proxy import GenerationExecutorProxy
@@ -390,7 +397,9 @@ class GenerationExecutor(ABC):
                 model_world_size=model_world_size,
                 mpi_session=mpi_session,
                 postproc_worker_config=postproc_worker_config,
-                is_llm_executor=is_llm_executor)
+                is_llm_executor=is_llm_executor,
+                garbage_collection_gen0_threshold=
+                garbage_collection_gen0_threshold)
 
         # WAR: For the performance of gathering logits, we use single process worker
         # for TP1 to avoid the large overhead of IPC.
@@ -401,7 +410,9 @@ class GenerationExecutor(ABC):
                 "Using single process worker for TP1, this may hurt streaming generation performance."
             )
             return GenerationExecutorWorker(**worker_kwargs,
-                                            is_llm_executor=is_llm_executor)
+                                            is_llm_executor=is_llm_executor,
+                                            garbage_collection_gen0_threshold=
+                                            garbage_collection_gen0_threshold)
 
         # For single-gpu case:
         # Partition the workload to multiple process for streaming performance.
@@ -413,7 +424,9 @@ class GenerationExecutor(ABC):
                 model_world_size=model_world_size,
                 mpi_session=None,  # use mpi4py
                 postproc_worker_config=postproc_worker_config,
-                is_llm_executor=is_llm_executor)
+                is_llm_executor=is_llm_executor,
+                garbage_collection_gen0_threshold=
+                garbage_collection_gen0_threshold)
         else:
             ctx = multiprocessing.get_context("spawn")
             # The ProcessPoolExecutorSession is used to support Windows, as mpi4py cannot.
@@ -424,7 +437,9 @@ class GenerationExecutor(ABC):
                 model_world_size=model_world_size,
                 mpi_session=mpi_session,
                 postproc_worker_config=postproc_worker_config,
-                is_llm_executor=is_llm_executor)
+                is_llm_executor=is_llm_executor,
+                garbage_collection_gen0_threshold=
+                garbage_collection_gen0_threshold)
 
     def wait_first_completed(
         self, futures: List[GenerationResult]

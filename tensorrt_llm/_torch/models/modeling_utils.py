@@ -1,5 +1,6 @@
 import contextlib
 import math
+import os
 import time
 from dataclasses import dataclass
 from typing import Dict, Generic, List, Optional, Tuple, Type, TypeVar, Union
@@ -93,10 +94,8 @@ class MetaInitMode(TorchDispatchMode):
         return func(*args, **kwargs)
 
 
-def duplicate_kv_weight(weight: torch.Tensor, head_dim: int,
+def duplicate_kv_weight(weight: torch.Tensor, num_kv_heads: int,
                         tensor_parallel_size: int):
-
-    num_kv_heads = weight.shape[0] // head_dim
 
     if num_kv_heads >= tensor_parallel_size:
         assert num_kv_heads % tensor_parallel_size == 0
@@ -109,11 +108,15 @@ def duplicate_kv_weight(weight: torch.Tensor, head_dim: int,
     if weight.ndim == 1:
         return weight.repeat_interleave(reps)
 
-    # weight
-    weight = weight.reshape(num_kv_heads, head_dim,
+    # weight and scale
+    assert weight.shape[0] % num_kv_heads == 0
+    size_per_kv_head = weight.shape[0] // num_kv_heads
+    weight = weight.reshape(num_kv_heads, size_per_kv_head,
                             -1)[:, None, :, :].expand(num_kv_heads, reps,
-                                                      head_dim, weight.shape[1])
-    return weight.reshape(num_kv_heads * reps * head_dim, -1).clone().detach()
+                                                      size_per_kv_head,
+                                                      weight.shape[1])
+    return weight.reshape(num_kv_heads * reps * size_per_kv_head,
+                          -1).clone().detach()
 
 
 def iter_modules(
@@ -219,7 +222,6 @@ class PPInitCaller(type):
 
     def __call__(cls, *args, **kwargs):
         obj = type.__call__(cls, *args, **kwargs)
-        obj.__pp_init__()
         return obj
 
 
@@ -235,6 +237,7 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
         self.model_config = model_config
         self.prologue = []
         self.epilogue = []
+        self.keep_embed_tokens = False
 
     def forward(
         self,
@@ -278,7 +281,7 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
             )
             return
 
-        if hasattr(self, "embed_tokens"):
+        if hasattr(self, "embed_tokens") and not self.keep_embed_tokens:
             self.prologue.append(self.embed_tokens)
         if hasattr(self, "norm"):
             self.epilogue.append(self.norm)
@@ -394,6 +397,8 @@ class DecoderModelForCausalLM(nn.Module,
             assert self.lm_head.tp_mode == self.model.embed_tokens.tp_mode, (
                 "lm_head and vocab embedding should use the same TP mode")
             self.lm_head.weight = self.model.embed_tokens.weight
+            if config.mapping.is_last_pp_rank():
+                self.model.keep_embed_tokens = True
 
         self.logits_processor = LogitsProcessor()
 
@@ -631,6 +636,42 @@ def filter_weights(prefix, weights: Dict):
     return result
 
 
+def run_concurrently(func,
+                     args_list,
+                     reduce_func=None,
+                     pbar=None,
+                     num_workers=None):
+    """
+    Run a function concurrently with a list of arguments.
+    func: the function to run concurrently.
+    args_list: a list of tuples of arguments for the function.
+    reduce_func: an optional function to reduce the results.
+    pbar: an optional tqdm progress bar.
+    """
+    from concurrent import futures
+    with futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+        # Submit all tasks
+        future_to_result = {
+            executor.submit(func, *arg): arg
+            for arg in args_list
+        }
+
+        # Process completed tasks as they finish
+        for result in futures.as_completed(future_to_result):
+            arg = future_to_result[result]
+            try:
+                part_weights = result.result()
+                if reduce_func:
+                    reduce_func(part_weights)
+                if pbar:
+                    pbar.update(1)
+            except Exception as e:
+                logger.error(
+                    f"Error executing {func.__name__} with args {arg}: {str(e)}"
+                )
+                raise
+
+
 def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                        weights: Dict,
                        skip_modules: List[str] = [],
@@ -646,52 +687,56 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
         logger.info(f"Renamed weights with params_map: {params_map}")
 
     tp_size = 1 if model.model_config.mapping.enable_attention_dp else model.model_config.mapping.tp_size
-    head_dim = getattr(
-        model.config, "head_dim",
-        model.config.hidden_size // model.config.num_attention_heads)
+    num_kv_heads = model.config.num_key_value_heads if hasattr(
+        model.config, 'num_key_value_heads'
+    ) and model.config.num_key_value_heads is not None else model.config.num_attention_heads
 
     params_map = {
         'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
         'gate_up_proj': ['gate_proj', 'up_proj']
     }
 
-    for name, module in tqdm(list(model.named_modules()),
-                             desc="Loading weights"):
+    def load_single_module(name, module):
         if len(module._parameters) > 0:
             # skip load weights if module is in skip_modules
             if any(skip_module in name for skip_module in skip_modules):
-                continue
+                return
 
             # skip load weights if tie word embeddings is enabled and layer is lm_head
             if model.config.tie_word_embeddings and name.startswith("lm_head"):
-                continue
+                return
 
             # Skip loading weights for embedding and lm_head if LoRA is enabled and has custom values
             if hasattr(model, "model") and hasattr(
                     model.model, 'has_custom_embed_tokens'
             ) and model.model.has_custom_embed_tokens and name == "model.embed_tokens":
-                continue
+                return
             if hasattr(model, 'has_custom_lm_head'
                        ) and model.has_custom_lm_head and name == "lm_head":
-                continue
+                return
 
             names = name.split('.')
             # WAR: better solution is that llama has its own load_weights function.
             if names[-1] == 'next_layer_layernorm':
-                continue
+                return
             if names[-1] in params_map:
                 module_weights = []
                 for new_name in params_map[names[-1]]:
                     fw = filter_weights('.'.join(names[:-1] + [new_name]),
                                         weights)
                     if new_name in ['k_proj', 'v_proj']:
+                        num_kv_heads_list = [num_kv_heads
+                                             ] * len(fw) if isinstance(
+                                                 num_kv_heads,
+                                                 int) else num_kv_heads
                         fw = {
                             k:
-                            duplicate_kv_weight(weight=v[:],
-                                                head_dim=head_dim,
-                                                tensor_parallel_size=tp_size)
+                            duplicate_kv_weight(
+                                weight=v[:],
+                                num_kv_heads=num_kv_heads_list[i],
+                                tensor_parallel_size=tp_size)
                             if k in ["weight", "bias"] else v
-                            for k, v in fw.items()
+                            for i, (k, v) in enumerate(fw.items())
                         }
 
                     module_weights.append(fw)
@@ -704,3 +749,14 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                     for n, p in module._parameters.items():
                         if p is not None:
                             p.data.copy_(module_weights[n][:])
+
+    if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
+                      False) in ["True", "true", "1", "yes", "y"]:
+        for name, module in tqdm(list(model.named_modules()),
+                                 desc="Loading weights"):
+            load_single_module(name, module)
+    else:
+        pbar = tqdm(list(model.named_modules()),
+                    desc="Loading weights concurrently")
+        args_list = [(name, module) for name, module in model.named_modules()]
+        run_concurrently(load_single_module, args_list, pbar=pbar)

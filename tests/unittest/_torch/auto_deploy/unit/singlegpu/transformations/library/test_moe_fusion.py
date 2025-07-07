@@ -100,7 +100,7 @@ def test_moe_matching():
         model,
         x,
         match_moe_pattern,
-        lambda gm: any(is_op(n, torch.ops.moe.torch_moe) for n in gm.graph.nodes),
+        lambda gm: any(is_op(n, torch.ops.auto_deploy.torch_moe) for n in gm.graph.nodes),
         lambda num_p_og: num_p_og,
         atol=1e-3,
         rtol=1e-3,
@@ -119,7 +119,9 @@ def test_moe_fusion():
         x,
         fuse_moe,
         lambda gm: any(
-            is_op(n, {torch.ops.moe.torch_fused_moe, torch.ops.moe.trtllm_fused_moe})
+            is_op(
+                n, {torch.ops.auto_deploy.torch_moe_fused, torch.ops.auto_deploy.trtllm_moe_fused}
+            )
             for n in gm.graph.nodes
         ),
         lambda num_p_og: num_p_og,

@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "tensorrt_llm/kernels/moeLoadBalance/moeLoadBalanceKernels.h"
+#include "tensorrt_llm/runtime/moeLoadBalancer/hostAccessibleDeviceAllocator.h"
 #include "tensorrt_llm/runtime/moeLoadBalancer/moeLoadBalancer.h"
 
 namespace torch_ext
@@ -85,6 +86,60 @@ void moeLoadBalanceStatistic(torch::Tensor gatheredRawExpertIds, torch::Tensor e
         static_cast<bool>(isFirstStage), static_cast<bool>(isLastStage), gatheredRawExpertIds.data_ptr<int>(), stream);
 }
 
+void moeHierarchicalStatisticLocalDevice(torch::Tensor localRawExpertIds, torch::Tensor localExpertTokenCount,
+    torch::Tensor enabled, int64_t singleLayerLoadBalancerPtr, int64_t isFirstStage, int64_t isLastStage)
+{
+    CHECK_INPUT(localRawExpertIds, torch::kInt32);
+    CHECK_INPUT(localExpertTokenCount, torch::kInt32);
+    CHECK_INPUT(enabled, torch::kInt32);
+    TORCH_CHECK(localRawExpertIds.dim() == 2, "localRawExpertIds must be a 2D tensor");
+    TORCH_CHECK(localExpertTokenCount.dim() == 1, "localExpertTokenCount must be a 1D tensor");
+    int topK = localRawExpertIds.size(1);
+    TORCH_CHECK(enabled.dim() == 1, "enabled must be a 1D tensor");
+    TORCH_CHECK(enabled.size(0) == 1, "enabled must have 1 element");
+    TORCH_CHECK(isFirstStage == 0 || isFirstStage == 1, "isFirstStage must be 0 or 1");
+    TORCH_CHECK(isLastStage == 0 || isLastStage == 1, "isLastStage must be 0 or 1");
+    TORCH_CHECK(singleLayerLoadBalancerPtr != 0, "singleLayerLoadBalancerPtr must be non-null");
+
+    auto* loadBalancer
+        = reinterpret_cast<tensorrt_llm::runtime::SingleLayerMoeLoadBalancer*>(singleLayerLoadBalancerPtr);
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo = loadBalancer->getMetaInfo();
+
+    TORCH_CHECK(localExpertTokenCount.size(0) == metaInfo.expertCount, "localExpertTokenCount should have shape (%d,)",
+        metaInfo.expertCount);
+    TORCH_CHECK(topK == metaInfo.topK, "topK must be equal to metaInfo.topK");
+
+    int numTotalTokens = localRawExpertIds.size(0);
+
+    tensorrt_llm::kernels::moeHierarchicalStatisticLocalDevice(metaInfo, numTotalTokens,
+        localExpertTokenCount.data_ptr<int>(), enabled.data_ptr<int>(), static_cast<bool>(isFirstStage),
+        static_cast<bool>(isLastStage), localRawExpertIds.data_ptr<int>(), stream);
+}
+
+void moeHierarchicalStatisticUpdate(
+    torch::Tensor globalExpertTokenCount, torch::Tensor enabled, int64_t singleLayerLoadBalancerPtr)
+{
+    CHECK_INPUT(globalExpertTokenCount, torch::kInt32);
+    CHECK_INPUT(enabled, torch::kInt32);
+    TORCH_CHECK(globalExpertTokenCount.dim() == 1, "globalExpertTokenCount must be a 1D tensor");
+    TORCH_CHECK(enabled.dim() == 1, "enabled must be a 1D tensor");
+    TORCH_CHECK(enabled.size(0) == 1, "enabled must have 1 element");
+    TORCH_CHECK(singleLayerLoadBalancerPtr != 0, "singleLayerLoadBalancerPtr must be non-null");
+    auto* loadBalancer
+        = reinterpret_cast<tensorrt_llm::runtime::SingleLayerMoeLoadBalancer*>(singleLayerLoadBalancerPtr);
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo = loadBalancer->getMetaInfo();
+    auto statisticInfo = loadBalancer->getStatisticInfo();
+
+    TORCH_CHECK(globalExpertTokenCount.size(0) == metaInfo.expertCount,
+        "globalExpertTokenCount should have shape (%d,)", metaInfo.expertCount);
+    tensorrt_llm::kernels::moeHierarchicalStatisticUpdate(
+        metaInfo, *statisticInfo, globalExpertTokenCount.data_ptr<int>(), enabled.data_ptr<int>(), stream);
+}
+
 torch::Tensor moeLoadBalanceRouting(
     torch::Tensor tokenSelectedExperts, bool offsetByEpRank, int64_t singleLayerLoadBalancerPtr)
 {
@@ -105,38 +160,34 @@ torch::Tensor moeLoadBalanceRouting(
 
     auto tokenRoutedSlotIds = torch::empty_like(tokenSelectedExperts);
 
-    tensorrt_llm::kernels::moeComputeRouteDevice(metaInfo, loadBalancer->getPlacementCpuInfo()->placementInfoForGPU,
+    tensorrt_llm::kernels::moeComputeRouteDevice(metaInfo, loadBalancer->getGpuPlacementInfo(),
         tokenSelectedExperts.data_ptr<int>(), tokenRoutedSlotIds.data_ptr<int>(), tokenCount, offsetByEpRank, stream);
 
     return tokenRoutedSlotIds;
 }
 
-void migrateToManaged(at::Tensor& tensor)
+void migrateToHostAccessible(at::Tensor& tensor)
 {
     TORCH_CHECK(tensor.device().is_cuda(), "only support CUDA Tensor");
+
+    TLLM_CHECK_WITH_INFO(tensorrt_llm::runtime::HostAccessibleDeviceAllocator::getInstance().isSupported(),
+        "host accessible allocator is not supported on system, please install GDRCopy.");
 
     // 1) compute total bytes
     size_t byte_size = tensor.numel() * tensor.element_size();
 
-    // 2) allocate UVM
-    void* managed_ptr = nullptr;
-    cudaError_t err = cudaMallocManaged(&managed_ptr, byte_size);
-    TORCH_CHECK(err == cudaSuccess, "cudaMallocManaged failed");
+    // 2) allocate host accessible memory
+    void* devPtr = tensorrt_llm::runtime::HostAccessibleDeviceAllocator::getInstance().allocate(byte_size);
 
-    // 3) advise to place on current GPU
-    int cur_dev;
-    TLLM_CUDA_CHECK(cudaGetDevice(&cur_dev));
-    TLLM_CUDA_CHECK(cudaMemAdvise(managed_ptr, byte_size, cudaMemAdviseSetPreferredLocation, cur_dev));
-    TLLM_CUDA_CHECK(cudaMemAdvise(managed_ptr, byte_size, cudaMemAdviseSetAccessedBy, cur_dev));
-    TLLM_CUDA_CHECK(cudaMemAdvise(managed_ptr, byte_size, cudaMemAdviseSetAccessedBy, cudaCpuDeviceId));
+    // 3) copy old data to new memory
+    TLLM_CUDA_CHECK(cudaMemcpy(devPtr, tensor.data_ptr(), byte_size, cudaMemcpyDeviceToDevice));
 
-    // 4) copy old data to UVM
-    TLLM_CUDA_CHECK(cudaMemcpy(managed_ptr, tensor.data_ptr(), byte_size, cudaMemcpyDeviceToDevice));
-
-    // 5) use new DataPtr/StorageImpl to construct storage
+    // 4) use new DataPtr/StorageImpl to construct storage
     //    here managed_ptr is data，and also context，use cudaFree as deleter
     c10::DataPtr dp(
-        managed_ptr, managed_ptr, [](void* ptr) { cudaFree(ptr); }, tensor.device());
+        devPtr, devPtr,
+        [](void* ptr) { tensorrt_llm::runtime::HostAccessibleDeviceAllocator::getInstance().free(ptr); },
+        tensor.device());
     auto allocator = c10::GetAllocator(tensor.device().type());
     auto storage_impl = c10::make_intrusive<c10::StorageImpl>(c10::StorageImpl::use_byte_size_t(), byte_size,
         std::move(dp), allocator,
@@ -185,6 +236,31 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
+        "moe_hierarchical_statistic_local_device(Tensor local_raw_expert_ids, Tensor local_expert_token_count, Tensor "
+        "enabled, int "
+        "single_layer_load_balancer_ptr, int is_first_stage, int is_last_stage) -> ()");
+}
+
+TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
+{
+    m.impl("moe_hierarchical_statistic_local_device", &torch_ext::moeHierarchicalStatisticLocalDevice);
+}
+
+TORCH_LIBRARY_FRAGMENT(trtllm, m)
+{
+    m.def(
+        "moe_hierarchical_statistic_update(Tensor global_expert_token_count, Tensor enabled, int "
+        "single_layer_load_balancer_ptr) -> ()");
+}
+
+TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
+{
+    m.impl("moe_hierarchical_statistic_update", &torch_ext::moeHierarchicalStatisticUpdate);
+}
+
+TORCH_LIBRARY_FRAGMENT(trtllm, m)
+{
+    m.def(
         "moe_load_balance_routing(Tensor token_selected_experts, bool offset_by_ep_rank, "
         "int single_layer_load_balancer_ptr) -> Tensor");
 }
@@ -196,10 +272,10 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("migrate_to_managed(Tensor tensor) -> ()");
+    m.def("migrate_to_host_accessible(Tensor tensor) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("migrate_to_managed", &torch_ext::migrateToManaged);
+    m.impl("migrate_to_host_accessible", &torch_ext::migrateToHostAccessible);
 }

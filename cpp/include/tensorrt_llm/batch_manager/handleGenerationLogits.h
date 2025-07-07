@@ -30,10 +30,9 @@ class BufferManager;
 namespace tensorrt_llm::batch_manager
 {
 
+class DecoderInputBuffers;
 class RuntimeBuffers;
-class DecoderBuffers;
-
-namespace tr = tensorrt_llm::runtime;
+class MedusaBuffers;
 
 class HandleGenerationLogits : Algorithm
 {
@@ -45,9 +44,10 @@ public:
 
     HandleGenerationLogits() = default;
 
-    void operator()(tr::SizeType32 logitsIndex, RequestVector const& generationRequests, DecoderBuffers& decoderBuffers,
-        tr::ModelConfig const& modelConfig, tr::BufferManager const& manager, tr::ITensor::SharedPtr const& logits,
-        OptionalRef<RuntimeBuffers> genRuntimeBuffers) const;
+    void operator()(DecoderInputBuffers& inputBuffers, RequestVector const& generationRequests,
+        runtime::ITensor::SharedPtr const& logits, runtime::SizeType32 logitsIndex,
+        runtime::ModelConfig const& modelConfig, runtime::BufferManager const& manager,
+        OptionalRef<RuntimeBuffers> genRuntimeBuffers, OptionalRef<MedusaBuffers> medusaBuffers) const;
 };
 
 } // namespace tensorrt_llm::batch_manager

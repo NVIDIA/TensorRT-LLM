@@ -1,8 +1,11 @@
-### Generate text with multiple LoRA adapters
+### :section Customization
+### :title Generate text with multiple LoRA adapters
+### :order 5
 from huggingface_hub import snapshot_download
 
-from tensorrt_llm import LLM, BuildConfig
+from tensorrt_llm import LLM
 from tensorrt_llm.executor import LoRARequest
+from tensorrt_llm.llmapi import BuildConfig
 from tensorrt_llm.lora_manager import LoraConfig
 
 

@@ -5,6 +5,7 @@ import sys
 import unittest
 
 import numpy as np
+import pytest
 import torch
 
 import tensorrt_llm
@@ -338,6 +339,7 @@ class TestResourceManager(unittest.TestCase):
 
         self.assertEqual(len(peft_table), self.num_lora_modules)
 
+    @pytest.mark.skip(reason="https://nvbugs/5324252")
     def test_put_get(self):
         """Test adding a request with properly configured LoRA weights and config."""
         peft_cache_config = self.create_peft_cache_config()

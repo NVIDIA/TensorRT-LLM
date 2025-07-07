@@ -41,17 +41,16 @@
 #include <algorithm>
 #include <vector>
 
-namespace tk = tensorrt_llm::common;
-namespace tkc = tensorrt_llm::cutlass_extensions;
-
-using namespace cute;
-
 namespace tensorrt_llm
 {
 namespace kernels
 {
 namespace cutlass_kernels
 {
+namespace tk = tensorrt_llm::common;
+namespace tkc = tensorrt_llm::cutlass_extensions;
+
+using namespace cute;
 
 template <typename Gemm>
 size_t typedGemmGatedKernelLauncher(Gemm gemm, typename Gemm::Arguments args, void* D, void const* A, void const* B,
@@ -293,12 +292,14 @@ size_t CutlassFusedGatedGemmRunner<T>::dispatchToArch(void* D, void const* A, vo
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
     if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
     {
+#ifndef PLACEHOLDER_KERNELS
         if (mSm == 90)
         {
             return dispatchGemmToCutlassSm90<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, scale_output,
                 gemmConfig, workspace, workspaceBytes, stream, occupancy);
         }
         else
+#endif
         {
             throw std::runtime_error(
                 "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner][GEMM Dispatch] Arch unsupported for CUTLASS fused "

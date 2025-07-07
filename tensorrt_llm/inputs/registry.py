@@ -1,10 +1,15 @@
-from typing import Any, Dict, List, Optional, Protocol, Tuple, Type, TypeVar
+from typing import (Any, Callable, Dict, List, Optional, Protocol, Tuple, Type,
+                    TypeVar)
 
 from torch import nn
 
+from .._utils import nvtx_range_debug
 from ..logger import logger
 from ..sampling_params import SamplingParams
 from .data import TextPrompt
+from .multimodal import (MultimodalInput, apply_mm_hashes, default_hasher,
+                         find_mm_token_lengths, find_mm_token_positions,
+                         hexdigest_to_int32, validate_mm_inputs)
 from .utils import ALL_SUPPORTED_MULTIMODAL_MODELS
 
 N = TypeVar("N", bound=Type[nn.Module])
@@ -57,16 +62,18 @@ class DefaultInputProcessor(InputProcessor):
             kwargs = dict(truncation=True,
                           max_length=sampling_params.truncate_prompt_tokens)
 
-        token_ids = self.tokenizer.encode(
-            inputs["prompt"],
-            add_special_tokens=sampling_params.add_special_tokens,
-            **kwargs)
-
-        if "query" in inputs:
-            query_token_ids = self.tokenizer.encode(
-                inputs["query"],
+        with nvtx_range_debug("tokenize prompt"):
+            token_ids = self.tokenizer.encode(
+                inputs["prompt"],
                 add_special_tokens=sampling_params.add_special_tokens,
                 **kwargs)
+
+        if "query" in inputs:
+            with nvtx_range_debug("tokenize query"):
+                query_token_ids = self.tokenizer.encode(
+                    inputs["query"],
+                    add_special_tokens=sampling_params.add_special_tokens,
+                    **kwargs)
             return token_ids, {"query_token_ids": query_token_ids}
 
         return token_ids, None
@@ -139,3 +146,58 @@ def create_input_processor(model_path_or_dir: str, tokenizer):
                                        trust_remote_code=True)
 
     return DefaultInputProcessor(None, None, tokenizer)
+
+
+def create_input_processor_with_hash(
+    input_processor: InputProcessor,
+    hash_lib=default_hasher,
+) -> Callable[[TextPrompt, SamplingParams], Tuple[
+        List[int], Optional[ExtraProcessedInputs]]]:
+    """Creates a modified processor that applies additional logic like (hashing, find mm chunk positions) to the input processor
+
+    Args:
+        original_processor: The original input processor to wrap.
+        hash_lib: hasher to use (default: blake3)
+
+    Returns:
+        A wrapped processor that modifies prompts before processing.
+    """
+
+    def input_processor_wrapper(
+        inputs: TextPrompt, sampling_params: SamplingParams
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        try:
+            assert 'multi_modal_data' in inputs, "multi_modal_data must be provided for hashing support."
+            mm_data = inputs['multi_modal_data']
+            num_mm_tokens = find_mm_token_lengths(mm_data, input_processor)
+            if len(num_mm_tokens) > 0:
+                mm_hashes = apply_mm_hashes(mm_data, hash_lib)
+                prompt_token_ids, extra_processed_inputs = input_processor(
+                    inputs, sampling_params)
+                start_positions = find_mm_token_positions(
+                    input_ids=prompt_token_ids,  # token sequence
+                    num_mm_tokens=
+                    num_mm_tokens,  # list of lengths of each chunk of visual tokens
+                    vocab_size=input_processor.model_config.vocab_size,
+                )
+                # flatten the hashes from dict to a single list
+                mm_hashes = [h for hashes in mm_hashes.values() for h in hashes]
+                validate_mm_inputs(prompt_token_ids, mm_hashes, start_positions,
+                                   num_mm_tokens)
+                mm_hashes_int32 = [hexdigest_to_int32(h) for h in mm_hashes
+                                   ]  # nested list w/ multiple int32 per hash
+
+                extra_processed_inputs[
+                    "multimodal_input"] = MultimodalInput.from_components(
+                        mm_hashes_int32, start_positions, num_mm_tokens)
+                return prompt_token_ids, extra_processed_inputs
+            else:
+                return input_processor(inputs, sampling_params)
+        except Exception as e:
+            # Fall back to basic input processor if multimodal processing fails
+            logger.warning(
+                f"Multimodal hashing failed: {e}. Falling back to basic input processor."
+            )
+            return input_processor(inputs, sampling_params)
+
+    return input_processor_wrapper

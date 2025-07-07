@@ -20,6 +20,8 @@ from torch import nn
 from torch.nn import functional as F
 from transformers import AutoConfig, PretrainedConfig
 
+from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
@@ -71,6 +73,7 @@ class MLPLayer(MLP):
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        **kwargs,
     ) -> torch.Tensor:
         return super().forward(hidden_states)
 
@@ -99,6 +102,7 @@ class TransformerLayer(Attention):
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        **kwargs,
     ) -> torch.Tensor:
         return super().forward(position_ids=None,
                                hidden_states=hidden_states,
@@ -153,12 +157,13 @@ class NemotronHLayer(DecoderLayer):
         position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        **kwargs,
     ) -> torch.Tensor:
 
         residual = hidden_states
 
         hidden_states = self.norm(hidden_states)
-        hidden_states = self.mixer(hidden_states, attn_metadata)
+        hidden_states = self.mixer(hidden_states, attn_metadata, **kwargs)
         hidden_states = torch.add(hidden_states, residual)
 
         return hidden_states
@@ -190,6 +195,8 @@ class NemotronHModel(DecoderModel):
             dtype=config.torch_dtype,
         )
 
+        self.mamba_metadata: Optional[Mamba2Metadata] = None
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -203,13 +210,20 @@ class NemotronHModel(DecoderModel):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
 
+        if self.mamba_metadata is None or self.mamba_metadata.max_batch_size != attn_metadata.max_num_requests:
+            self.mamba_metadata = Mamba2Metadata(attn_metadata.max_num_requests)
+        self.mamba_metadata.prepare(attn_metadata)
+
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
         hidden_states = inputs_embeds
 
         for layer in self.layers:
-            hidden_states = layer(position_ids, hidden_states, attn_metadata)
+            hidden_states = layer(position_ids,
+                                  hidden_states,
+                                  attn_metadata,
+                                  mamba_metadata=self.mamba_metadata)
 
         hidden_states = self.norm_f(hidden_states)
 

@@ -9,9 +9,8 @@ from _model_test_utils import (
 from torch.export import Dim
 
 from tensorrt_llm._torch.auto_deploy.transformations.library.rope import (
-    match_complex_rope,
-    match_explicit_rope,
     match_rope_layout,
+    match_rope_pattern,
     optimize_rope,
 )
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import extract_output_tuple, is_op
@@ -74,7 +73,7 @@ class RoPEModel(torch.nn.Module):
         q = self.linear_q(x)
         k = self.linear_k(x)
 
-        if self.variant == "explicit":
+        if self.variant == "explicit" or self.variant == "explicit_pm":
             # reshape and permute if BNSD layout
             q = q.view(b, s, self.num_heads, self.head_dim)
             k = k.view(b, s, self.num_kv_heads, self.head_dim)
@@ -92,7 +91,7 @@ class RoPEModel(torch.nn.Module):
             if self.mode == "match":
                 q_out, k_out = apply_rotary_pos_emb_explicit(q, k, cos, sin, unsq_dim)
             else:  # optimize
-                q_out, k_out = torch.ops.rope.torch_apply_rope_with_explicit_cos_sin(
+                q_out, k_out = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(
                     q, k, cos, sin, unsq_dim
                 )
 
@@ -120,7 +119,7 @@ class RoPEModel(torch.nn.Module):
             if self.mode == "match":
                 q_out, k_out = apply_rotary_pos_emb_complex(q, k, freqs, unsq_dim)
             else:
-                q_out, k_out = torch.ops.rope.torch_apply_rope_with_complex_freqs(
+                q_out, k_out = torch.ops.auto_deploy.torch_rope_with_complex_freqs(
                     q, k, freqs, unsq_dim
                 )
 
@@ -211,11 +210,11 @@ def test_rope_variants(
     dyn = model.get_dynamic_shapes()
 
     if transformation == "match":
-        fn = match_explicit_rope if variant == "explicit" else match_complex_rope
+        fn = match_rope_pattern
         check_op = (
-            torch.ops.rope.torch_apply_rope_with_explicit_cos_sin
-            if variant == "explicit"
-            else torch.ops.rope.torch_apply_rope_with_complex_freqs
+            torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin
+            if variant == "explicit" or variant == "explicit_pm"
+            else torch.ops.auto_deploy.torch_rope_with_complex_freqs
         )
 
         def checker(gm):
@@ -229,8 +228,8 @@ def test_rope_variants(
                 if is_op(
                     n,
                     {
-                        torch.ops.rope.torch_apply_rope_with_explicit_cos_sin,
-                        torch.ops.rope.torch_apply_rope_with_complex_freqs,
+                        torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin,
+                        torch.ops.auto_deploy.torch_rope_with_complex_freqs,
                     },
                 ):
                     q_arg, k_arg, *rest = n.args
@@ -255,9 +254,9 @@ def test_rope_variants(
         fn = optimize_rope
 
         def checker(gm):
-            return any(is_op(n, torch.ops.rope.flashinfer) for n in gm.graph.nodes)
+            return any(is_op(n, torch.ops.auto_deploy.flashinfer_rope) for n in gm.graph.nodes)
 
-    if target_layout:
+    if transformation == "match_layout":
         _ = run_test(
             model,
             x,
@@ -269,7 +268,22 @@ def test_rope_variants(
             True,  # test_load_hook
             True,  # strict_loading
             dyn,  # dynamic_shapes
+            None,  # check_num_matches
             target_layout,
+        )
+    elif transformation == "match":
+        _ = run_test(
+            model,
+            x,
+            fn,
+            checker,
+            lambda n: n,
+            atol,  # atol
+            rtol,  # rtol
+            True,  # test_load_hook
+            True,  # strict_loading
+            dyn,  # dynamic_shapes
+            1,  # check_num_matches
         )
     else:
         _ = run_test(
@@ -283,6 +297,7 @@ def test_rope_variants(
             True,  # test_load_hook
             True,  # strict_loading
             dyn,  # dynamic_shapes
+            None,  # check_num_matches
         )
 
 
@@ -331,7 +346,7 @@ class DSModel(torch.nn.Module):
         else:
             cos = cos[pos_ids]
             sin = sin[pos_ids]
-            q_out, k_out = torch.ops.rope.torch_apply_rope_with_qk_interleaving(
+            q_out, k_out = torch.ops.auto_deploy.torch_rope_with_qk_interleaving(
                 q, k, cos, sin, unsq_dim
             )
         if self.layout == "BNSD":
@@ -368,11 +383,11 @@ def test_match_and_layout_deepseek(layout, num_heads, num_kv_heads, mode, target
     dynamic_shapes = model.get_dynamic_shapes()
 
     if mode == "match":
-        transform = match_explicit_rope
+        transform = match_rope_pattern
 
         def checker(gm):
             return any(
-                is_op(n, torch.ops.rope.torch_apply_rope_with_qk_interleaving)
+                is_op(n, torch.ops.auto_deploy.torch_rope_with_qk_interleaving)
                 for n in gm.graph.nodes
             )
 
@@ -381,7 +396,7 @@ def test_match_and_layout_deepseek(layout, num_heads, num_kv_heads, mode, target
 
         def checker(gm):
             for n in gm.graph.nodes:
-                if is_op(n, torch.ops.rope.torch_apply_rope_with_qk_interleaving):
+                if is_op(n, torch.ops.auto_deploy.torch_rope_with_qk_interleaving):
                     q_arg, k_arg, *rest = n.args
                     if not (
                         is_op(q_arg, torch.ops.aten.contiguous)
@@ -400,7 +415,7 @@ def test_match_and_layout_deepseek(layout, num_heads, num_kv_heads, mode, target
 
             return matched if layout != target_layout else not matched
 
-    if target_layout:
+    if mode == "match_layout":
         _ = run_test(
             model,
             x,
@@ -412,6 +427,7 @@ def test_match_and_layout_deepseek(layout, num_heads, num_kv_heads, mode, target
             True,  # test_load_hook
             True,  # strict_loading
             dynamic_shapes,  # dynamic_shapes
+            None,  # check_num_matches
             target_layout,
         )
     else:
@@ -426,4 +442,5 @@ def test_match_and_layout_deepseek(layout, num_heads, num_kv_heads, mode, target
             True,  # test_load_hook
             True,  # strict_loading
             dynamic_shapes,  # dynamic_shapes
+            1,  # check_num_matches
         )

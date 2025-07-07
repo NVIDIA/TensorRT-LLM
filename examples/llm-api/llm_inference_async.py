@@ -1,4 +1,6 @@
-### Generate Text Asynchronously
+### :section Basics
+### :title Generate text asynchronously
+### :order 1
 import asyncio
 
 from tensorrt_llm import LLM, SamplingParams

@@ -23,7 +23,6 @@ class TRTLLMGenFusedMoE(MoE):
         dtype (Optional[torch.dtype]): Data type for the weights.
         reduce_results (bool): Whether to reduce the results across devices.
         model_config (ModelConfig): Configuration object for the model.
-        enable_alltoall (bool): whether to enable alltoall instead of allgather/reducescatter
 
     MoE torch custom op:
         Only support min-latency mode now (SM100 Blackwell only).
@@ -69,7 +68,6 @@ class TRTLLMGenFusedMoE(MoE):
         )
 
         assert not self.smart_router, "Smart router is not supported in TRTLLMGenFusedMoE."
-        assert not self.use_dp, "AttentionDP is not supported in TRTLLMGenFusedMoE."
 
         self.num_slots = self.num_experts
         self.expert_size_per_partition = self.num_experts // self.ep_size
@@ -128,7 +126,9 @@ class TRTLLMGenFusedMoE(MoE):
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
-        *args,
+        do_finalize: bool = True,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        use_dp_padding: Optional[bool] = None,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -151,6 +151,7 @@ class TRTLLMGenFusedMoE(MoE):
         # TODO: since routing kernel is integrated into moe_runner for fp8,
         #       here we just route the I/Os for moe_runner
         if self.has_deepseek_fp8_block_scales:
+            assert do_finalize, "fp8_block_scale_moe_runner does not support do_finalize=False"
             x_val, x_scale = torch.ops.trtllm.fp8_quantize_1x128(x)
 
             # FIXME: tile_tokens_dim is hardcoded for now
@@ -191,7 +192,7 @@ class TRTLLMGenFusedMoE(MoE):
             # FIXME: tile_tokens_dim is hardcoded for now
             tile_tokens_dim = 8
 
-            final_hidden_states = torch.ops.trtllm.fp4_block_scale_moe_runner(
+            outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
                 router_logits,
                 routing_bias,
                 hidden_states_fp4,
@@ -214,7 +215,14 @@ class TRTLLMGenFusedMoE(MoE):
                 routed_scaling_factor,
                 tile_tokens_dim,
                 self.routing_method.routing_method_type,
+                do_finalize=do_finalize,
             )
+
+            if not do_finalize:
+                assert not self.reduce_results, "reduce_results must be False when do_finalize is False"
+                return outputs
+            else:
+                final_hidden_states = outputs[0]
         else:
             raise NotImplementedError(
                 "TRTLLMGenFusedMoE only supports fp8_block_scaling and nvfp4 dtypes."
@@ -223,4 +231,8 @@ class TRTLLMGenFusedMoE(MoE):
         if self.reduce_results and self.parallel_size > 1:
             final_hidden_states = self.all_reduce(final_hidden_states)
 
+        if use_dp_padding:
+            rank = self.mapping.tp_rank
+            final_hidden_states = final_hidden_states[:
+                                                      all_rank_num_tokens[rank]]
         return final_hidden_states

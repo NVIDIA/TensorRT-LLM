@@ -439,8 +439,8 @@ public:
     int tot_access;
 };
 
-template <AllReduceFusionPattern Pattern, typename DType, int NRanks, bool Fp32Acc>
-__global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams params)
+template <AllReduceFusionPattern Pattern, typename DType, int NRanks, bool Fp32Acc, bool TriggerCompletionAtEnd = true>
+__global__ void __launch_bounds__(1024) allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams params)
 {
     IndexHelper<DType> index_helper(params);
     int token_id = index_helper.token_id;
@@ -451,8 +451,13 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams pa
     int tot_access = index_helper.tot_access;
     float4 clear_vec = get_neg_zero();
     FusedOp<Pattern, DType> fused_op(params, access_id, access_id_in_token);
+
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
+    if constexpr (!TriggerCompletionAtEnd)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
 #endif
     LamportComm<NRanks> comm(params.workspace, params.rank);
     int clear_access = comm.clear_size / kElemsPerAccess<DType>;
@@ -503,9 +508,14 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams pa
         float4 sum_val = allreduce_sum<DType, NRanks, Fp32Acc>(vals);
         fused_op(sum_val, tidx);
     }
+
     comm.update(params.size * NRanks);
+
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaTriggerProgrammaticLaunchCompletion();
+    if constexpr (TriggerCompletionAtEnd)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
 #endif
 }
 
@@ -591,11 +601,11 @@ int get_sm_count()
     return sm_count;
 }
 
-template <AllReduceFusionPattern Pattern, typename DType, int NRanks, bool Fp32Acc>
+template <AllReduceFusionPattern Pattern, typename DType, int NRanks, bool Fp32Acc, bool TriggerCompletionAtEnd = true>
 void launch_oneshot_lamport(AllReduceFusionParams const& params, cudaLaunchConfig_t& cfg)
 {
-    TLLM_CUDA_CHECK(
-        cudaLaunchKernelEx(&cfg, allreduce_fusion_kernel_oneshot_lamport<Pattern, DType, NRanks, Fp32Acc>, params));
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&cfg,
+        allreduce_fusion_kernel_oneshot_lamport<Pattern, DType, NRanks, Fp32Acc, TriggerCompletionAtEnd>, params));
 }
 
 template <AllReduceFusionPattern Pattern, typename DType, int NRanks, bool Fp32Acc>
@@ -656,10 +666,16 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
         threads_per_block *= 2;
         cluster_size /= 2;
     }
+    int sm_count = get_sm_count();
+    while (cluster_num * cluster_size > sm_count && cluster_size > 1 && threads_per_block <= 512)
+    {
+        threads_per_block *= 2;
+        cluster_size /= 2;
+    }
     TLLM_CHECK(oneshot || threads_per_block >= params.nranks);
     int block_size = threads_per_block;
     TLLM_CHECK(block_size <= 1024 && cluster_size > 0);
-    int sm_count = get_sm_count();
+
     int grid_size = (std::min(sm_count, cluster_num * cluster_size) / cluster_size) * cluster_size;
     cudaLaunchConfig_t cfg;
     cudaLaunchAttribute attribute[2];
@@ -677,7 +693,15 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
     cfg.numAttrs = SM >= 90 ? 2 : 0;
     if (oneshot)
     {
-        launch_oneshot_lamport<Pattern, DType, NRanks, Fp32Acc>(params, cfg);
+        bool trigger_completion_at_end = params.trigger_completion_at_end;
+        if (trigger_completion_at_end)
+        {
+            launch_oneshot_lamport<Pattern, DType, NRanks, Fp32Acc, true>(params, cfg);
+        }
+        else
+        {
+            launch_oneshot_lamport<Pattern, DType, NRanks, Fp32Acc, false>(params, cfg);
+        }
     }
     else
     {

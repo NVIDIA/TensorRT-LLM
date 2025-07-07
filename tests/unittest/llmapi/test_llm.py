@@ -3,6 +3,20 @@ import datetime
 import gc
 import json
 import os
+import sys
+
+sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
+from gc_utils import assert_resource_freed
+
+# Required for test_generate_with_seed to pass.
+# See the discussion in https://github.com/NVIDIA/TensorRT-LLM/pull/4264#issuecomment-2943269891
+# The following line must be ahead of any tensorrt_llm imports,
+# since currently env util functions like getEnvForceDeterministic are implemented using static variables,
+# which means they are only initialized once the CPP translation unit is loaded (should be refactored to be non static later).
+os.environ['TRTLLM_FORCE_XQA'] = '1'
+# Note that we cannot use os.environ['FORCE_DETERMINISTIC'] = '1' here,
+# since it will disable KV cache reuse and make test_llm_api_draft_target fail.
+
 import random
 import shutil
 import sys
@@ -13,20 +27,21 @@ import datasets
 import pytest
 import torch
 import transformers
-from pydantic import BaseModel
 from utils.util import skip_single_gpu
 
+from tensorrt_llm import LLM as LLM_torch
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor import (GenerationExecutorWorker, LoRARequest,
                                    PromptAdapterRequest, RequestError)
-from tensorrt_llm.llmapi import (LLM, BuildCacheConfig, EagleDecodingConfig,
-                                 GuidedDecodingParams, KvCacheConfig,
-                                 KvCacheRetentionConfig,
+from tensorrt_llm.llmapi import (BuildCacheConfig, EagleDecodingConfig,
+                                 KvCacheConfig, KvCacheRetentionConfig,
                                  LookaheadDecodingConfig, MedusaDecodingConfig,
                                  RequestOutput)
+from tensorrt_llm.llmapi import TrtLlmArgs as LlmArgs
 from tensorrt_llm.llmapi.llm_args import DynamicBatchConfig, SchedulerConfig
-from tensorrt_llm.llmapi.llm_utils import (BuildConfig, LlmArgs, QuantAlgo,
-                                           QuantConfig, _ParallelConfig)
+from tensorrt_llm.llmapi.llm_utils import (BuildConfig, QuantAlgo, QuantConfig,
+                                           _ParallelConfig)
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 from tensorrt_llm.lora_manager import LoraConfig
@@ -109,18 +124,13 @@ def llm_test_harness(model_dir: str,
     if tokenizer is None:
         tokenizer = model_dir
 
-    if backend == "pytorch":
-        from tensorrt_llm._torch import LLM as LLM_torch
-        llm = LLM_torch(model_dir, tokenizer=tokenizer, **llm_kwargs)
-    else:
-        llm = LLM(model_dir, tokenizer=tokenizer, **llm_kwargs)
-    outputs = llm.generate(inputs, sampling_params=sampling_params)
-    print(outputs)
-    check_output(outputs, references, similar_threshold=similar_threshold)
+    llm_cls = LLM_torch if backend == "pytorch" else LLM
 
-    assert gc.is_tracked(llm)
-    assert len(
-        gc.get_referrers(llm)) == 0, f"the references: {gc.get_referrers(llm)}"
+    with assert_resource_freed(llm_cls, model_dir, tokenizer,
+                               **llm_kwargs) as llm:
+        outputs = llm.generate(inputs, sampling_params=sampling_params)
+        print(outputs)
+        check_output(outputs, references, similar_threshold=similar_threshold)
 
 
 def llm_check_output(llm: LLM,
@@ -227,7 +237,6 @@ def test_llm_loading_from_hf():
                      kv_cache_config=global_kvcache_config)
 
 
-@pytest.mark.skip(reason="https://nvbugs/5266240")
 @force_ampere
 @pytest.mark.part0
 def test_llm_loading_from_ckpt():
@@ -355,6 +364,7 @@ def test_llm_with_kv_cache_retention_config():
         print(output)
 
 
+@pytest.mark.skip(reason="https://nvbugs/5370718")
 @pytest.mark.parametrize(
     'tokenizer_dir, threshold',
     [
@@ -606,6 +616,7 @@ def test_generate_with_SamplingConfig(llm_for_sampling_params: LLM,
         assert len(output.outputs) == sampling_params.n
 
 
+@pytest.mark.skip(reason="https://nvbugs/5368507")
 @force_ampere
 @pytest.mark.part0
 def test_generate_with_seed(llm_for_sampling_params: LLM):
@@ -816,6 +827,7 @@ def test_generate_with_bad_words():
                                                     bad=["F E", "I J"]))
 
 
+@pytest.mark.skip(reason="https://nvbugs/5370718")
 @force_ampere
 @pytest.mark.part0
 def test_generate_with_sampling_params_misc():
@@ -1056,62 +1068,6 @@ def test_tinyllama_logits_processor_batched():
     tinyllama_logits_processor_batched_test_harness()
 
 
-def tinyllama_guided_decoding_test_harness(**llm_kwargs):
-    prompts = [
-        "What is 1+1? Answer formatted in a dict in json format: ",
-        "What is the year after 2024? Answer: ",
-    ]
-
-    class Answer(BaseModel):
-        answer: int
-
-    json_schema = json.dumps(Answer.model_json_schema())
-    regex = r"\d+"
-    ebnf_grammar = "root ::= [0-9]+"
-
-    sampling_params = [
-        SamplingParams(max_tokens=10),
-        SamplingParams(max_tokens=10,
-                       guided_decoding=GuidedDecodingParams(json_object=True)),
-        SamplingParams(max_tokens=10,
-                       guided_decoding=GuidedDecodingParams(json=json_schema)),
-        SamplingParams(max_tokens=10,
-                       guided_decoding=GuidedDecodingParams(regex=regex)),
-        SamplingParams(
-            max_tokens=10,
-            guided_decoding=GuidedDecodingParams(grammar=ebnf_grammar)),
-    ]
-
-    num_prompts, num_sampling_params = len(prompts), len(sampling_params)
-    prompts = [p for p in prompts for _ in range(num_sampling_params)]
-    sampling_params = [sp for _ in range(num_prompts) for sp in sampling_params]
-    references = [
-        '\n\n```\n{\n    "1":',
-        '{"1": "1", "2": "',
-        '{"answer": 1}',
-        '1',
-        '1',
-        '2025\n\nQuestion 3:',
-        '[2025]',
-        '{"answer": 202',
-        '2025',
-        '2025',
-    ]
-    llm_test_harness(llama_model_path,
-                     prompts,
-                     references,
-                     sampling_params=sampling_params,
-                     guided_decoding_backend='xgrammar',
-                     similar_threshold=0.7,
-                     **llm_kwargs)
-
-
-@force_ampere
-@pytest.mark.part0
-def test_tinyllama_guided_decoding():
-    tinyllama_guided_decoding_test_harness()
-
-
 @pytest.mark.part0
 def test_llm_api_medusa():
     prompts = [
@@ -1333,7 +1289,7 @@ def test_executor_lookahead_decoding_config():
     assert sampling_params.lookahead_config.max_verification_set_size == 8
 
 
-def llama_v2_13b_lora_test_harness(**llm_kwargs):
+def llama_v2_13b_lora_from_dir_test_harness(**llm_kwargs):
     # Shahar- perhaps disable build config
     hf_model_dir = get_model_path("llama-models-v2/llama-v2-13b-hf")
     hf_lora_dir = get_model_path("llama-models-v2/chinese-llama-2-lora-13b")
@@ -1365,7 +1321,7 @@ def llama_v2_13b_lora_test_harness(**llm_kwargs):
         assert similar(output.outputs[0].text, ref)
 
 
-def llama_7b_multi_lora_test_harness(**llm_kwargs):
+def llama_7b_multi_lora_from_request_test_harness(**llm_kwargs):
     hf_model_dir = get_model_path("llama-models/llama-7b-hf")
     hf_lora_dir1 = get_model_path("llama-models/luotuo-lora-7b-0.1")
     hf_lora_dir2 = get_model_path("llama-models/Japanese-Alpaca-LoRA-7b-v0")
@@ -1420,12 +1376,12 @@ def llama_7b_multi_lora_test_harness(**llm_kwargs):
 
 @skip_gpu_memory_less_than_40gb
 def test_llama_v2_13b_lora():
-    llama_v2_13b_lora_test_harness()
+    llama_v2_13b_lora_from_dir_test_harness()
 
 
 @skip_gpu_memory_less_than_40gb
 def test_llama_7b_multi_lora():
-    llama_7b_multi_lora_test_harness(max_loras=1, max_cpu_loras=8)
+    llama_7b_multi_lora_from_request_test_harness(max_loras=1, max_cpu_loras=8)
 
 
 def llama_v2_7b_prompt_adapter_test_harness(**llm_kwargs):
@@ -1642,12 +1598,11 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
                                      streaming=False,
                                      backend=None):
     LLM_CLASS = LLM
-    llm_extra_kwargs = {}
-    if backend == "pytorch":
-        from tensorrt_llm._torch import LLM as LLM_torch
+    llm_args_extra = {}
+    if backend in ["pytorch", "autodeploy"]:
         LLM_CLASS = LLM_torch
     else:
-        llm_extra_kwargs["fast_build"] = True
+        llm_args_extra["fast_build"] = True
 
     llm = LLM_CLASS(
         llama_model_path,
@@ -1655,7 +1610,7 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
         build_config=BuildConfig(gather_context_logits=True),
         tensor_parallel_size=tp_size,
         gather_generation_logits=True,
-        **llm_extra_kwargs,
+        **llm_args_extra,
     )
 
     prompts = ["A B C D E F G H I J K"]
@@ -1887,7 +1842,6 @@ def llm_get_stats_test_harness(tp_size: int = 1,
         sampling_args_extra["return_context_logits"] = True
 
     if pytorch_backend:
-        from tensorrt_llm._torch import LLM as LLM_torch
         llm_args_extra.update(
             dict(enable_iter_perf_stats=True,
                  enable_iter_req_stats=enable_iter_req_stats,
@@ -1896,10 +1850,12 @@ def llm_get_stats_test_harness(tp_size: int = 1,
     else:
         LLM_CLASS = LLM
 
+    if not pytorch_backend:
+        llm_args_extra["fast_build"] = True
+
     llm = LLM_CLASS(model=llama_model_path,
                     kv_cache_config=global_kvcache_config,
                     tensor_parallel_size=tp_size,
-                    fast_build=True,
                     **llm_args_extra)
 
     max_tokens = 5
@@ -1930,7 +1886,6 @@ def test_llm_get_stats(return_context_logits, enable_iter_req_stats):
 
 
 def test_llm_get_queued_stats():
-    pytest.skip("https://nvbugspro.nvidia.com/bug/5325642")
     enable_iter_req_stats = True
     use_overlap = False
     tp_size = 1
@@ -1940,8 +1895,6 @@ def test_llm_get_queued_stats():
 
     llm_args_extra = {}
     sampling_args_extra = {}
-
-    from tensorrt_llm._torch import LLM as LLM_torch
 
     llm_args_extra.update(
         dict(enable_iter_perf_stats=True,
@@ -2014,7 +1967,6 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
         sampling_args_extra["return_context_logits"] = True
 
     if pytorch_backend:
-        from tensorrt_llm._torch import LLM as LLM_torch
         llm_args_extra.update(
             dict(enable_iter_perf_stats=True,
                  enable_iter_req_stats=enable_iter_req_stats,
@@ -2022,11 +1974,11 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
         LLM_CLASS = LLM_torch
     else:
         LLM_CLASS = LLM
+        llm_args_extra["fast_build"] = True
 
     llm = LLM_CLASS(model=llama_model_path,
                     kv_cache_config=global_kvcache_config,
                     tensor_parallel_size=tp_size,
-                    fast_build=True,
                     **llm_args_extra)
 
     max_tokens = 6
@@ -2128,6 +2080,20 @@ def test_llm_capture_request_error():
     _test_llm_capture_request_error(tp_size=1)
 
 
+def test_llm_shutdown_executor():
+    llm = LLM(
+        model=llama_model_path,
+        kv_cache_config=global_kvcache_config,
+        fast_build=True,
+    )
+
+    llm.generate("A")
+    llm.shutdown()
+
+    with pytest.raises(RuntimeError):
+        llm.generate("A")
+
+
 def test_llm_api_jupyter_scenario():
 
     with LLM(
@@ -2160,8 +2126,8 @@ def test_llm_dynamic_batch_config():
 def run_llm_with_postprocess_parallel(tp_size: int = 1):
     sampling_params = SamplingParams(max_tokens=6)
 
-    postproc_settings = dict(_num_postprocess_workers=2,
-                             _postprocess_tokenizer_dir=llama_model_path)
+    postproc_settings = dict(num_postprocess_workers=2,
+                             postprocess_tokenizer_dir=llama_model_path)
 
     llm_test_harness(llama_model_path,
                      prompts, ["D E F G H I J K"],
@@ -2188,13 +2154,20 @@ def run_llm_with_postprocess_parallel_and_result_handler(
     post_proc_params = PostprocParams(
         post_processor=perform_faked_oai_postprocess,
         postproc_args=post_proc_args)
-    llm = LLM(model=llama_model_path,
-              backend=backend,
-              kv_cache_config=global_kvcache_config,
-              tensor_parallel_size=tp_size,
-              _num_postprocess_workers=2,
-              _postprocess_tokenizer_dir=llama_model_path,
-              fast_build=True)
+    kwargs = {}
+    if backend not in ["pytorch", "autodeploy"]:
+        kwargs["fast_build"] = True
+        LLM_CLASS = LLM
+    else:
+        LLM_CLASS = LLM_torch
+
+    llm = LLM_CLASS(model=llama_model_path,
+                    backend=backend,
+                    kv_cache_config=global_kvcache_config,
+                    tensor_parallel_size=tp_size,
+                    num_postprocess_workers=2,
+                    postprocess_tokenizer_dir=llama_model_path,
+                    **kwargs)
     golden_result = "DEFGHI"
     for i, output in enumerate(
             llm.generate_async(prompts[0],

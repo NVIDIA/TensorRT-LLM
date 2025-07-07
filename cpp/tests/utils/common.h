@@ -101,6 +101,10 @@ public:
     static std::string FP16_PLUGIN_PACKED_PAGED_RESULT_TP1_PP4_FILE();
     static std::string FP16_PLUGIN_PACKED_PAGED_RESULT_TP1_PP2_FILE();
     static std::string FP16_PLUGIN_PACKED_PAGED_RESULT_TP2_PP1_FILE();
+    static std::string FP16_PLUGIN_PACKED_PAGED_CONTEXT_LOGITS_TP4_PP1_FILE();
+    static std::string FP16_PLUGIN_PACKED_PAGED_GENERATION_LOGITS_TP4_PP1_FILE();
+    static std::string FP16_PLUGIN_PACKED_PAGED_CUM_LOG_PROBS_TP4_PP1_FILE();
+    static std::string FP16_PLUGIN_PACKED_PAGED_LOG_PROBS_TP4_PP1_FILE();
     // GptExecutorTest.GenerationLogitsEarlyStop requires to use context_fmha_fp32_acc flag in runtime for better
     // accuracy
     static std::string FP16_PLUGIN_PACKED_PAGED_GATHER_CONTEXTFMHAFP32ACC_RESULT_FILE();
@@ -187,9 +191,8 @@ public:
         tr::BufferManager& manager, executor::OutputConfig const& outConfig, ModelIds const& modelIds);
 
     void verifyOutput(std::unordered_map<SizeType32, std::vector<executor::BeamTokens>> const& resultTokens,
-        std::vector<SizeType32> const& givenInputLengths, SizeType32 nbGivenInputs, bool streaming,
-        bool excludeInputFromOutput, FlakyTestInfo flakyTestInfo, bool isSpeculativeDecoding,
-        bool returnAllGeneratedTokens, SizeType32 reqBeamWidth, SizeType32 numReturnSequences,
+        std::vector<SizeType32> const& givenInputLengths, bool streaming, bool excludeInputFromOutput,
+        FlakyTestInfo flakyTestInfo, bool isSpeculativeDecoding, SizeType32 reqBeamWidth, SizeType32 numReturnSequences,
         bool isNonGreedySampling);
 
     void verifyLogProbs(bool computeLogProbs, bool streaming, bool excludeInputFromOutput, SizeType32 inputLength,
@@ -199,12 +202,13 @@ public:
         FlakyTestInfo flakyTestInfo);
 
     void validateContextLogits(bool getContextLogits, SizeType32 inputLength, SizeType32 beamWidth,
-        std::optional<executor::Tensor> const& contextLogits, SizeType32 vocabSizePadded, SizeType32 batchId);
+        std::optional<executor::Tensor> const& contextLogits, SizeType32 vocabSizePadded, SizeType32 batchId,
+        float atol = 1e-2, float rtol = 1e-3);
 
     void validateGenerationLogits(bool getGenLogits, bool isFinal, bool streaming, bool excludeInputFromOutput,
         SizeType32 inputLength, SizeType32 maxOutputLen, SizeType32 beamWidth, executor::BeamTokens const& beamTokens,
         std::optional<executor::Tensor> const& genLogits, SizeType32 vocabSizePadded, SizeType32 batchId,
-        bool returnAllGeneratedTokens);
+        bool returnAllGeneratedTokens, float atol = 1e-2, float rtol = 1e-3);
 
     SizeType32 nbGivenInputs{};
     SizeType32 beamWidth{};

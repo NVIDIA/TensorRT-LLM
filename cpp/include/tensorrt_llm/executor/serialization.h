@@ -71,6 +71,11 @@ public:
     static void serialize(PromptTuningConfig const& config, std::ostream& os);
     [[nodiscard]] static size_t serializedSize(PromptTuningConfig const& config);
 
+    // MultimodalInput
+    [[nodiscard]] static MultimodalInput deserializeMultimodalInput(std::istream& is);
+    static void serialize(MultimodalInput const& multimodalInput, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(MultimodalInput const& multimodalInput);
+
     // MropeConfig
     [[nodiscard]] static MropeConfig deserializeMropeConfig(std::istream& is);
     static void serialize(MropeConfig const& config, std::ostream& os);
@@ -260,8 +265,8 @@ public:
 
     // SpecDecodingStats
     static SpecDecodingStats deserializeSpecDecodingStats(std::istream& is);
-    static void serialize(SpecDecodingStats const& specDecStats, std::ostream& os);
-    static size_t serializedSize(SpecDecodingStats const& specDecStats);
+    static void serialize(SpecDecodingStats const& specDecodingStats, std::ostream& os);
+    static size_t serializedSize(SpecDecodingStats const& specDecodingStats);
 
     // IterationStats
     static IterationStats deserializeIterationStats(std::vector<char>& buffer);
