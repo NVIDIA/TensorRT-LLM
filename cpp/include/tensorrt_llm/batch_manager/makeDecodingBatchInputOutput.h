@@ -47,11 +47,10 @@ public:
     MakeDecodingBatchInputOutput() = default;
 
     void operator()(DecoderInputBuffers& inputBuffers, runtime::decoder::DecoderState& decoderState,
-        runtime::ModelConfig const& modelConfig, SizeType32 maxNumSequences,
-        OptionalRef<RuntimeBuffers> fusedRuntimeBuffers) const;
+        runtime::ModelConfig const& modelConfig, OptionalRef<RuntimeBuffers> fusedRuntimeBuffers) const;
 
     static void createDecoderBatchInputs(DecoderInputBuffers& inputBuffers, std::vector<SizeType32> const& activeSlots,
-        runtime::decoder::DecoderState const& decoderState, SizeType32 maxNumSequences);
+        runtime::decoder::DecoderState const& decoderState);
 };
 
 } // namespace tensorrt_llm::batch_manager
