@@ -172,6 +172,7 @@ class CompletionRequest(OpenAIBaseModel):
     top_p: Optional[float] = 1.0
     user: Optional[str] = None
     lora_request: Optional[LoRARequest] = None
+    attention_dp_rank: Optional[int] = None
 
     # doc: begin-completion-sampling-params
     use_beam_search: bool = False
@@ -432,6 +433,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     tool_choice: Optional[Union[Literal["none"],
                                 ChatCompletionNamedToolChoiceParam]] = "none"
     user: Optional[str] = None
+    attention_dp_rank: Optional[int] = None
 
     # doc: begin-chat-completion-sampling-params
     best_of: Optional[int] = None

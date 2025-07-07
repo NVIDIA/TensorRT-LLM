@@ -294,6 +294,7 @@ class OpenAIServer:
                 sampling_params=sampling_params,
                 _postproc_params=postproc_params if self.postproc_worker_enabled else None,
                 streaming=request.stream,
+                attention_dp_rank=request.attention_dp_rank,
                 lora_request=request.lora_request,
                 disaggregated_params=disaggregated_params
             )
@@ -417,6 +418,7 @@ class OpenAIServer:
                     sampling_params=sampling_params,
                     _postproc_params=postproc_params,
                     streaming=request.stream,
+                    attention_dp_rank=request.attention_dp_rank,
                     lora_request=request.lora_request,
                     disaggregated_params=disaggregated_params
                 )
