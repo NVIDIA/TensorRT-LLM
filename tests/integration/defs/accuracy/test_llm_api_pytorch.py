@@ -646,8 +646,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_device_not_contain(["H100"])
     @parametrize_with_ids("mtp_nextn", [0, 2])
     def test_fp8_block_scales_cuda_graph_padding(self, mtp_nextn):
-        # OOM on H100 with default free_gpu_memory_fraction=0.9
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         mtp_config = None
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
