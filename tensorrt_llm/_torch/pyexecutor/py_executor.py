@@ -168,13 +168,13 @@ class PyExecutor:
                  sampler: Sampler,
                  dist: Distributed,
                  max_num_sequences: int,
-                 drafter: Drafter = None,
+                 drafter: Optional[Drafter] = None,
                  disable_overlap_scheduler: bool = False,
                  max_input_len: int = 2048,
                  max_batch_size: int = 8,
                  max_beam_width: int = 1,
                  max_draft_tokens: int = 0,
-                 kv_cache_transceiver: KvCacheTransceiver = None,
+                 kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
                  draft_model_engine: Optional[ModelEngine] = None,
                  garbage_collection_gen0_threshold: Optional[int] = None,
                  start_worker: bool = True):
@@ -922,8 +922,7 @@ class PyExecutor:
                         self._prepare_draft_tokens(scheduled_batch)
 
                     if self.drafter is not None:
-                        self.drafter.prepare_draft_tokens(
-                            scheduled_batch, sample_state)
+                        self.drafter.prepare_draft_tokens(scheduled_batch)
 
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
@@ -1098,12 +1097,6 @@ class PyExecutor:
                             self._process_previous_batch()
                         self.previous_batch: Optional[BatchState] = None
 
-                    # Separate chunked requests so we can handle them in _update_requests w/o relying on the request state.
-                    # This is necessary because _forward_step updates the state before _update_requests is executed.
-                    scheduled_batch.chunked_requests = [
-                        r for r in scheduled_batch.context_requests
-                        if r.context_remaining_length != 0
-                    ]
                     scheduled_batch.context_requests = [
                         r for r in scheduled_batch.context_requests
                         if r.context_remaining_length == 0
