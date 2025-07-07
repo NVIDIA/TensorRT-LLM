@@ -18,10 +18,11 @@
 #include "tensorrt_llm/kernels/beamSearchKernels/beamSearchKernelsTemplate.h"
 
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/stringUtils.h"
+#include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/kernels/beamSearchKernels.h"
 #include "tensorrt_llm/layers/defaultDecodingParams.h"
 #include "tensorrt_llm/layers/layerUtils.h"
+
 #include <limits>
 
 using namespace tensorrt_llm::runtime;
@@ -313,6 +314,7 @@ void BeamSearchLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(BeamSearchLayer_forwardAsync);
 
     auto ip = std::dynamic_pointer_cast<DecodingInputs>(baseInputs);
     auto op = std::dynamic_pointer_cast<BeamSearchOutputs>(baseOutputs);
