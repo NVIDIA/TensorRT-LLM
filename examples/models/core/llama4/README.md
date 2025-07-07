@@ -105,7 +105,7 @@ trtllm-serve nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
 ### 3. Run performance benchmark
 TensorRT-LLM provides a benchmark tool to benchmark trtllm-serve
 ```bash
-python3 TensorRT-LLM/tensorrt_llm/serve/scripts/benchmark_serving.py \
+python -m tensorrt_llm.serve.scripts.benchmark_serving \
         --model nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
         --dataset-name random \
         --ignore-eos \
