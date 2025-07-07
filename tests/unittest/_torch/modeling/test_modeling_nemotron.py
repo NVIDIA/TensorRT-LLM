@@ -7,7 +7,7 @@ import torch
 from parameterized import parameterized
 from transformers import NemotronConfig
 from transformers import NemotronForCausalLM as HFNemotronForCausalLM
-from utils.util import getSMVersion
+from utils.util import default_dtype, getSMVersion
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
@@ -88,10 +88,11 @@ class TestNemotron(unittest.TestCase):
         dtype = nemotron_config.torch_dtype
         device = torch.device('cuda')
 
-        model_config = ModelConfig(pretrained_config=nemotron_config,
-                                   quant_config=quant_config,
-                                   attn_backend="TRTLLM")
-        nemotron = NemotronForCausalLM(model_config).to(device)
+        with torch.device(device), default_dtype(dtype):
+            model_config = ModelConfig(pretrained_config=nemotron_config,
+                                       quant_config=quant_config,
+                                       attn_backend="TRTLLM")
+            nemotron = NemotronForCausalLM(model_config)
 
         input_ids = torch.tensor([100, 200, 300, 100, 200, 100, 400, 500],
                                  dtype=torch.int,
@@ -210,13 +211,13 @@ class TestNemotron(unittest.TestCase):
         dtype = nemotron_config.torch_dtype
         device = torch.device('cuda')
 
-        hf_nemotron = HFNemotronForCausalLM(nemotron_config).to(dtype).to(
-            device).eval()
+        with torch.device(device), default_dtype(dtype):
+            hf_nemotron = HFNemotronForCausalLM(nemotron_config).eval()
 
-        model_config = ModelConfig(pretrained_config=nemotron_config,
-                                   attn_backend=backend)
-        nemotron = NemotronForCausalLM(model_config).to(dtype).to(device)
-        nemotron.load_weights(hf_nemotron.state_dict())
+            model_config = ModelConfig(pretrained_config=nemotron_config,
+                                       attn_backend=backend)
+            nemotron = NemotronForCausalLM(model_config)
+            nemotron.load_weights(hf_nemotron.state_dict())
 
         num_blocks = 1
         tokens_per_block = 128

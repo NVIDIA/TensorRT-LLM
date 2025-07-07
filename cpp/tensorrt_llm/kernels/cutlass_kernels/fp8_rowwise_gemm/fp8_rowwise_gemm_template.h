@@ -48,17 +48,16 @@
 #include <algorithm>
 #include <vector>
 
-namespace tk = tensorrt_llm::common;
-namespace tkc = tensorrt_llm::cutlass_extensions;
-
-using namespace cute;
-
 namespace tensorrt_llm
 {
 namespace kernels
 {
 namespace cutlass_kernels
 {
+namespace tk = tensorrt_llm::common;
+namespace tkc = tensorrt_llm::cutlass_extensions;
+
+using namespace cute;
 
 template <typename Gemm>
 size_t typedFp8RowwiseGemmKernelLauncher(Gemm gemm, typename Gemm::Arguments args, void* D, void const* A,
@@ -503,6 +502,7 @@ size_t CutlassFp8RowwiseGemmRunner<T>::dispatchToArch(void* D, void const* A, vo
     tkc::CutlassGemmConfig gemmConfig, char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+#ifndef PLACEHOLDER_KERNELS
     if (mSm == 90)
     {
         return dispatchGemmToCutlassSm90<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, gemmConfig,
@@ -514,6 +514,7 @@ size_t CutlassFp8RowwiseGemmRunner<T>::dispatchToArch(void* D, void const* A, vo
             workspace, workspaceBytes, stream, occupancy);
     }
     else
+#endif
     {
         throw std::runtime_error(
             "[TensorRT-LLM Error][CutlassFp8RowwiseGemmRunner][GEMM Dispatch] Arch unsupported for CUTLASS "

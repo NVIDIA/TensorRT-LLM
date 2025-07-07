@@ -361,7 +361,7 @@ struct IterationStats
     /// @brief Stats specific to inflight batching
     std::optional<InflightBatchingStats> inflightBatchingStats;
     /// @brief Stats specific to speculative decoding
-    std::optional<SpecDecodingStats> specDecStats;
+    std::optional<SpecDecodingStats> specDecodingStats;
 };
 
 /// @brief Enum class that represents the state of a request

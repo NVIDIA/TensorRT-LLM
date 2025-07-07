@@ -38,6 +38,7 @@ from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
 
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.llmapi.utils import enable_llm_debug
 from tensorrt_llm.mapping import Mapping
@@ -198,7 +199,8 @@ class DeepseekV3Linear(Linear):
                      lora_params: Optional[dict] | None = None,
                      layer_idx: Optional[int] | None = None):
         num_tokens = input.shape[0]
-        if (not self.has_any_quant) and num_tokens >= 1 and num_tokens <= 16:
+        if (not self.has_any_quant and 1 <= num_tokens <= 16
+                and get_sm_version() != 120):
             output = torch.ops.trtllm.dsv3_fused_a_gemm_op(
                 input, self.weight.t(), bias, None)
         else:
@@ -505,7 +507,8 @@ class Deepseekv3MoE(nn.Module):
         return shared_tp_size, shared_output_scale
 
     def compute_routed_output(self, hidden_states, hidden_states_fp4,
-                              all_rank_num_tokens, do_finalize):
+                              all_rank_num_tokens, all_rank_max_num_tokens,
+                              do_finalize):
         # max-throughput
         use_dp_padding = False
         if self.use_dp and self.mapping.tp_size > 1:
@@ -520,10 +523,9 @@ class Deepseekv3MoE(nn.Module):
                     not self.experts.has_fp8_qdq and self.experts.has_nvfp4):
                 # Use padding when not using the cutlass path or when x_sf in self.experts is not None
                 use_dp_padding = True
-                max_num_token = max(all_rank_num_tokens)
                 hidden_states = torch.nn.functional.pad(
                     hidden_states,
-                    (0, 0, 0, max_num_token - hidden_states.shape[0]))
+                    (0, 0, 0, all_rank_max_num_tokens - hidden_states.shape[0]))
 
         router_logits = self.gate(hidden_states)
 
@@ -533,6 +535,7 @@ class Deepseekv3MoE(nn.Module):
             do_finalize=do_finalize,
             output_dtype=hidden_states.dtype,
             all_rank_num_tokens=all_rank_num_tokens,
+            all_rank_max_num_tokens=all_rank_max_num_tokens,
             use_dp_padding=use_dp_padding,
         )
 
@@ -543,6 +546,7 @@ class Deepseekv3MoE(nn.Module):
         hidden_states: torch.Tensor,
         hidden_states_fp4: Optional[Fp4QuantizedTensor] = None,
         all_rank_num_tokens: Optional[list[int]] = None,
+        all_rank_max_num_tokens: Optional[int] = None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         do_finalize: Optional[bool] = True,
     ) -> torch.Tensor:
@@ -560,6 +564,7 @@ class Deepseekv3MoE(nn.Module):
             routed_output = self.compute_routed_output(hidden_states,
                                                        hidden_states_fp4,
                                                        all_rank_num_tokens,
+                                                       all_rank_max_num_tokens,
                                                        do_finalize)
             return routed_output
 
@@ -772,6 +777,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 hidden_states,
                 hidden_states_fp4,
                 all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+                all_rank_max_num_tokens=attn_metadata.all_rank_max_num_tokens,
                 final_all_reduce_params=AllReduceParams(
                     enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
                                           or self.mapping.tp_size == 1)),
@@ -932,6 +938,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         embed_tokens: Embedding,
         attn_metadata: AttentionMetadata,
         all_rank_num_tokens: Optional[List[int]] = None,
+        all_rank_max_num_tokens: Optional[int] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
@@ -973,6 +980,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         hidden_states = self.mlp(
             hidden_states,
             all_rank_num_tokens=all_rank_num_tokens,
+            all_rank_max_num_tokens=all_rank_max_num_tokens,
             final_all_reduce_params=AllReduceParams(
                 enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
                                       or self.mapping.tp_size == 1)),

@@ -1,8 +1,8 @@
 # Description
 
-TensorRT-LLM provides users with an easy-to-use Python API to define Large Language Models (LLMs) and support
+TensorRT-LLM provides users with an easy-to-use Python API to define Large Language Models (LLMs) and supports
 state-of-the-art optimizations to perform inference efficiently on NVIDIA GPUs. TensorRT-LLM also contains components to
-create Python and C++ runtimes that orchestrate the inference execution in performant way.
+create Python and C++ runtimes that orchestrate the inference execution in a performant way.
 
 # Overview
 
@@ -18,10 +18,10 @@ A typical command to launch the container is:
 
 ```bash
 docker run --rm -it --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 --gpus=all \
-    		nvcr.io/nvidia/tensorrt-llm/release:x.xx.x
+    		nvcr.io/nvidia/tensorrt-llm/release:x.y.z
 ```
 
-where x.xx.x is the version of the TensorRT-LLM container to use. To sanity check, run the following command:
+where x.y.z is the version of the TensorRT-LLM container to use (cf. [release history on GitHub](https://github.com/NVIDIA/TensorRT-LLM/releases) and [tags in NGC Catalog](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags)). To sanity check, run the following command:
 
 ```bash
 python3 -c "import tensorrt_llm"
@@ -34,7 +34,7 @@ Alternatively, if you have already cloned the TensorRT-LLM repository, you can u
 run the container:
 
 ```bash
-make -C docker ngc-release_run LOCAL_USER=1 DOCKER_PULL=1 IMAGE_TAG=x.xx.x
+make -C docker ngc-release_run LOCAL_USER=1 DOCKER_PULL=1 IMAGE_TAG=x.y.z
 ```
 
 This command pulls the specified container from the NVIDIA NGC registry, sets up the local user's account within the

@@ -5,6 +5,7 @@ import pytest
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm.llmapi import CudaGraphConfig
 from tensorrt_llm.llmapi import KvCacheConfig as TRT_KvCacheConfig
 
 
@@ -22,8 +23,7 @@ def model_path():
 
 def create_llm(model_dir, disable_overlap_scheduler, enable_trtllm_sampler):
     """Create LLM with specific overlap scheduler setting"""
-    pytorch_config = dict(use_cuda_graph=True,
-                          disable_overlap_scheduler=disable_overlap_scheduler,
+    pytorch_config = dict(disable_overlap_scheduler=disable_overlap_scheduler,
                           enable_trtllm_sampler=enable_trtllm_sampler)
 
     trt_kv_cache_config = TRT_KvCacheConfig(enable_block_reuse=False)
@@ -33,6 +33,7 @@ def create_llm(model_dir, disable_overlap_scheduler, enable_trtllm_sampler):
         tensor_parallel_size=1,
         trust_remote_code=True,
         enable_chunked_prefill=True,
+        cuda_graph_config=CudaGraphConfig(),
         **pytorch_config,
         kv_cache_config=trt_kv_cache_config,
         max_num_tokens=

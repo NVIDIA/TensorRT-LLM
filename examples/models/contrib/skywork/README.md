@@ -12,7 +12,7 @@ The TensorRT-LLM Skywork example code lies in [`examples/models/contrib/skywork`
 In addition, there are two shared files in the parent folder [`examples`](../../../) for inference and evaluation:
 
 * [`../../../run.py`](../../../run.py) to run the inference on an input text;
-* [`../../../summarize.py`](../../../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
+* [`../../../summarize.py`](../../../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset.
 
 ## Support Matrix
     * FP16 & BF16
@@ -78,7 +78,7 @@ trtllm-build --checkpoint_dir ./skywork-13b-base/trt_ckpt/bf16 \
 
 ### 4. Summarization using the Engines
 
-After building TRT engines, we can use them to perform various tasks. TensorRT-LLM provides handy code to run summarization on [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset and get [ROUGE](https://en.wikipedia.org/wiki/ROUGE_(metric)) scores. The `ROUGE-1` score can be used to validate model implementations.
+After building TRT engines, we can use them to perform various tasks. TensorRT-LLM provides handy code to run summarization on [cnn_dailymail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset and get [ROUGE](https://en.wikipedia.org/wiki/ROUGE_(metric)) scores. The `ROUGE-1` score can be used to validate model implementations.
 
 ```bash
 # fp16

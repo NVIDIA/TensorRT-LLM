@@ -19,7 +19,6 @@ import cloudpickle
 import pytest
 import torch
 from mpi4py import MPI
-from mpi4py.futures import MPIPoolExecutor
 
 from tensorrt_llm._torch.distributed import AllReduceStrategy
 
@@ -29,6 +28,9 @@ MPI.pickle.__init__(
     cloudpickle.loads,
     pickle.HIGHEST_PROTOCOL,
 )
+
+# needed since we reuse the mpi executor pool, first test running will leak a thread
+pytestmark = pytest.mark.threadleak(enabled=False)
 
 
 def run_single_rank(dtype, strategy, message_size):
@@ -243,18 +245,20 @@ def run_single_rank(dtype, strategy, message_size):
     [1024 * 1024 * x for x in [2, 4, 16, 32, 64, 132, 144]] + [64 * 70000],
     ids=lambda x: f"size{x}")
 @pytest.mark.parametrize(
-    "tp_size",
+    "mpi_pool_executor",
     [2, 4],  # 8
-    ids=["tp_size_2", "tp_size_4"])  # "tp_size_8"
-def test_lowprecision_allreduce_acc(dtype, strategy, message_size, tp_size):
+    ids=["tp_size_2", "tp_size_4"],
+    indirect=True)  # "tp_size_8"
+def test_lowprecision_allreduce_acc(dtype, strategy, message_size,
+                                    mpi_pool_executor):
     """
     Only test for accuracy. For performance testing,
     manually call TestLowPrecisionAllreduce(...).test('perf')
     """
-    with MPIPoolExecutor(max_workers=tp_size) as executor:
-        results = executor.map(
-            run_single_rank,
-            *zip(*[(dtype, strategy, message_size)] * tp_size),
-        )
-        for r in results:
-            assert r is True
+    tp_size = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(
+        run_single_rank,
+        *zip(*[(dtype, strategy, message_size)] * tp_size),
+    )
+    for r in results:
+        assert r is True

@@ -249,6 +249,12 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
             device='cuda',
         )
 
+        # currently Eagle3 only supports linear tree
+        self.is_spec_dec_tree = False
+
+        # currently Eagle3 only supports static tree
+        self.is_spec_dec_dynamic_tree = False
+
     def is_layer_capture(self, layer_id: int):
         return layer_id in self.layers_to_capture
 
@@ -329,6 +335,13 @@ class Eagle3OneModelWorker(nn.Module):
         next_draft_tokens = []
         for i in range(self.max_draft_tokens):
             hidden_states, hidden_states_to_save = draft_model.model(**inputs)
+
+            # FIXME (jhaotingc): Currently we disable use_spec_decoding mode for Eagle engine nth steps except 1st step.
+            # Eagle engine takes in draft_len tokens from the previous step, run spec-dec mode with those tokens,
+            # then the following step can use regular decoding mode to generate 1 tokens per step.
+            # Currently the spec-dec mask for chained tree is not implemented yet.
+            # When token tree is supported, this can be removed and all steps may use spec-dec mode as well.
+            attn_metadata.use_spec_decoding = False
             if i == 0:
                 start_ids_gen = (spec_metadata.batch_indices_cuda[:num_gens] *
                                  (self.max_draft_tokens + 1)).long()
@@ -391,6 +404,8 @@ class Eagle3OneModelWorker(nn.Module):
         next_new_tokens = torch.concat([next_new_tokens, next_draft_tokens],
                                        dim=1)
 
+        attn_metadata.use_spec_decoding = True
+
         return {
             'logits': raw_logits,
             'new_tokens': accepted_tokens,
@@ -422,7 +437,6 @@ class Eagle3OneModelWorker(nn.Module):
 
         # Do greedy sampling for the input logits
         target_tokens = torch.argmax(logits, dim=-1)
-
         # context
         accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
 
@@ -435,7 +449,6 @@ class Eagle3OneModelWorker(nn.Module):
         num_accepted_tokens[num_contexts:] += torch.cumprod((
             draft_tokens == gen_target_tokens[:, :self.max_draft_tokens]).int(),
                                                             dim=-1).sum(1)
-
         return accepted_tokens, num_accepted_tokens
 
     def draft_decoder(
@@ -459,12 +472,14 @@ class Eagle3OneModelWorker(nn.Module):
                 Draft token ids. Flattened.
         '''
 
-        draft_tokens = torch.argmax(logits, dim=-1).type(torch.int32)
+        draft_tokens = torch.argmax(logits, dim=-1)
 
         # Apply d2t (offsets between draft model dictionary and main model dictionary).
         if hasattr(draft_model.model,
                    "d2t") and draft_model.model.d2t is not None:
             draft_tokens = draft_model.model.d2t[draft_tokens] + draft_tokens
+
+        draft_tokens = draft_tokens.type(torch.int32)
 
         return draft_tokens
 

@@ -8,7 +8,7 @@ template <uint32_t tileM, uint32_t totalNbRows>
 __device__ inline ThrdRegRowMaxT<tileM> loadShmRowMax(
     Vec<float, totalNbRows> const& shm, uint32_t tileBaseRow, uint32_t lane = laneId())
 {
-    ThrdRegRowMaxT<tileM> result;
+    ThrdRegRowMaxT<tileM> result{};
 #pragma unroll
     for (uint32_t i = 0; i < result.size; i++)
     {
@@ -42,7 +42,7 @@ __device__ inline void storeRowMaxAsync(CgaBarrier& bar, Vec<float, totalNbRows>
 template <uint32_t tileM, uint32_t tileN>
 __device__ inline QuadRegRowMaxT<tileM> computeRowMax(WarpAccT<tileM, tileN> const& acc)
 {
-    QuadRegRowMaxT<tileM> rowMaxLog2e;
+    QuadRegRowMaxT<tileM> rowMaxLog2e{};
 // compute per-thread row max
 #pragma unroll
     for (uint32_t n = 0; n < acc.cols; n++)

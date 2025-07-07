@@ -63,18 +63,9 @@ methods:
       build_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.BuildConfig]
         default: null
-      use_cuda_graph:
-        annotation: bool
-        default: False
-      cuda_graph_batch_sizes:
-        annotation: Optional[List[int]]
+      cuda_graph_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.CudaGraphConfig]
         default: null
-      cuda_graph_max_batch_size:
-        annotation: int
-        default: 0
-      cuda_graph_padding_enabled:
-        annotation: bool
-        default: False
       disable_overlap_scheduler:
         annotation: bool
         default: False
@@ -120,6 +111,12 @@ methods:
       enable_min_latency:
         annotation: bool
         default: False
+      force_dynamic_quantization:
+        annotation: bool
+        default: False
+      allreduce_strategy:
+        annotation: Optional[Literal['AUTO', 'NCCL', 'UB', 'MINLATENCY', 'ONESHOT', 'TWOSHOT', 'LOWPRECISION', 'MNNVL']]
+        default: AUTO
     return_annotation: None
   generate:
     parameters:

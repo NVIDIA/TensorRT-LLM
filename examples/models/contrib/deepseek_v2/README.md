@@ -34,7 +34,7 @@ The TensorRT-LLM Deepseek-v2 implementation can be found in [tensorrt_llm/models
 In addition, there are three shared files in the parent folder [`examples`](../../../) can be used for inference and evaluation:
 
 * [`../../../run.py`](../../../run.py) to run the model inference output by given an input text.
-* [`../../../summarize.py`](../../../summarize.py) to summarize the article from [cnn_dailmail](https://huggingface.co/datasets/cnn_dailymail) dataset, it can running the summarize from HF model and TensorRT-LLM model.
+* [`../../../summarize.py`](../../../summarize.py) to summarize the article from [cnn_dailmail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset, it can running the summarize from HF model and TensorRT-LLM model.
 * [`../../../mmlu.py`](../../../mmlu.py) to running score script from https://github.com/declare-lab/instruct-eval to compare HF model and TensorRT-LLM model on the MMLU dataset.
 
 ## Support Matrix

@@ -25,6 +25,7 @@ LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
 ExecutorRequest = tllm_executor.Request
 ExecutorResponse = tllm_executor.Response
 ExecutorSamplingConfig = tllm_executor.SamplingConfig
+FinishReason = tllm_executor.FinishReason
 
 REQUEST_TYPE_MAPPING = {
     tllm_executor.RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION:
@@ -138,6 +139,18 @@ class LogProbStorage:
                 self.cum_log_probs[beam_idx] += sum(
                     next(iter(prob.values())).logprob for prob in probs)
 
+    def set_log_probs(self, log_probs: list[TokenLogprobs],
+                      cum_log_probs: list[float]):
+        """
+        Reset the storage and refill it with new values
+        log_probs: [beam_width, num_tokens]
+        cum_log_probs: [beam_width]
+        """
+        # reinitialize the storage to clear the lists
+        self._init(log_probs)
+        # append the new values
+        self.append(log_probs, cum_log_probs)
+
 
 class PyResult:
     """PyResult reimplements some features of `bindings.executor.Result` in Python"""
@@ -172,6 +185,16 @@ class PyResult:
                          cum_log_probs: Optional[list[float]] = None):
         if self._log_probs:
             self._log_probs.append(log_probs, cum_log_probs)
+
+    def set_log_probs(self, log_probs: list[TokenLogprobs],
+                      cum_log_probs: list[float]):
+        """
+        Set log_probs and cum_log_probs to the new values
+        log_probs: [beam_width, num_tokens]
+        cum_log_probs: [beam_width]
+        """
+        if self._log_probs:
+            self._log_probs.set_log_probs(log_probs, cum_log_probs)
 
     @property
     def context_logits(self) -> torch.Tensor | None:
@@ -252,6 +275,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             return_generation_logits: bool = False,
             return_logits_device_memory: bool = True,
             exclude_last_generation_logits: bool = False,
+            return_perf_metrics: bool = False,
             stop_words_list: list[list[int]] | None = None,
             is_draft: bool = False,
             **kwargs):
@@ -263,6 +287,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             return_log_probs=return_log_probs,
             return_context_logits=False,
             return_generation_logits=False,
+            return_perf_metrics=return_perf_metrics,
             stop_words_list=torch.tensor(stop_words_list, dtype=torch.int32)
             if stop_words_list else None,
             **kwargs)
@@ -316,6 +341,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
     @property
     def is_dummy(self):
         return self.is_attention_dp_dummy or self.is_cuda_graph_dummy or self.is_dummy_request
+
+    def finish_by(self, reason: FinishReason, beam: int) -> None:
+        """CPP finish by reason does not support beam_width > 1"""
+        self.state = LlmRequestState.GENERATION_COMPLETE
+        self.set_finished_reason(reason, beam)
 
 
 def convert_wordlist(word_list) -> List[List[int]]:
@@ -410,6 +440,7 @@ def executor_request_to_llm_request(
         return_log_probs=executor_request.output_config.return_log_probs,
         return_context_logits=executor_request.output_config.
         return_context_logits,
+        return_perf_metrics=executor_request.output_config.return_perf_metrics,
         return_generation_logits=executor_request.output_config.
         return_generation_logits,
         exclude_last_generation_logits=exclude_last_generation_logits,

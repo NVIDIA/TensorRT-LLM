@@ -126,6 +126,7 @@ class Qwen3MoE(nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_dim)
         use_dp_padding = False
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        all_rank_max_num_tokens = attn_metadata.all_rank_max_num_tokens
 
         if not do_finalize:
             assert not self.enable_attention_dp
@@ -142,16 +143,16 @@ class Qwen3MoE(nn.Module):
                     not self.experts.has_fp8_qdq and self.experts.has_nvfp4):
                 # Use padding when not using the cutlass path or when x_sf in self.experts is not None
                 use_dp_padding = True
-                max_num_token = max(all_rank_num_tokens)
                 hidden_states = torch.nn.functional.pad(
                     hidden_states,
-                    (0, 0, 0, max_num_token - hidden_states.shape[0]))
+                    (0, 0, 0, all_rank_max_num_tokens - hidden_states.shape[0]))
 
         router_logits = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states,
             router_logits,
             all_rank_num_tokens=all_rank_num_tokens,
+            all_rank_max_num_tokens=all_rank_max_num_tokens,
             use_dp_padding=use_dp_padding,
             do_finalize=do_finalize,
         )
@@ -394,9 +395,7 @@ class Qwen3MoeForCausalLM(SpecDecOneEngineForCausalLM[Qwen3MoEModel,
         tp_size = self.model_config.mapping.tp_size
         enable_attention_dp = self.model_config.mapping.enable_attention_dp
 
-        head_dim = getattr(
-            self.config, "head_dim",
-            self.config.hidden_size // self.config.num_attention_heads)
+        num_kv_heads = self.config.num_key_value_heads
 
         params_map = {
             "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -419,11 +418,14 @@ class Qwen3MoeForCausalLM(SpecDecOneEngineForCausalLM[Qwen3MoEModel,
                         tensors_need_duplication = ["weight", "bias"]
                         if module.quant_config.quant_mode.has_nvfp4():
                             tensors_need_duplication.append("weight_scale")
+                        if module.quant_config.quant_mode.has_fp8_block_scales(
+                        ):
+                            tensors_need_duplication.append("weight_scale_inv")
                         if new_name in ["k_proj", "v_proj"]:
                             fw = {
                                 k: (duplicate_kv_weight(
                                     weight=v[:],
-                                    head_dim=head_dim,
+                                    num_kv_heads=num_kv_heads,
                                     tensor_parallel_size=tp_size
                                     if not enable_attention_dp else 1)
                                     if k in tensors_need_duplication else v)

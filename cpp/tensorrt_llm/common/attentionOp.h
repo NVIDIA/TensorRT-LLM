@@ -124,6 +124,9 @@ public:
         int32_t num_encoder_tokens = 0;
         kernels::MlaParams<T>* mla_param = nullptr;
 
+        // For MLA chunked prefill
+        void* softmaxStatsPtr = nullptr;
+
         std::string enqueueContextParamsToString() const
         {
             // variables from the params coming from the runtime
@@ -173,6 +176,7 @@ public:
             ss << "cross_kv_length: " << this->cross_kv_length << std::endl;
             ss << "encoder_input_lengths: " << this->encoder_input_lengths << std::endl;
             ss << "num_encoder_tokens: " << this->num_encoder_tokens << std::endl;
+            ss << "softmaxStatsPtr: " << this->softmaxStatsPtr << std::endl;
             return ss.str();
         }
     };

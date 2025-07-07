@@ -1,8 +1,4 @@
 %EXAMPLE_NAME%
 =================================
 
-.. toctree::
-   :maxdepth: 2
-   :caption: Scripts
-
-   %EXAMPLE_DOCS%
+%EXAMPLE_DOCS%

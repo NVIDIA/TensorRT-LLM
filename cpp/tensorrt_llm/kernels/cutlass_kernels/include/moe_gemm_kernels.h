@@ -15,18 +15,19 @@
  */
 
 #pragma once
-#include "tensorrt_llm/common/cudaFp8Utils.h"
-#include "tensorrt_llm/common/workspace.h"
-#include "tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm_configs.h"
 #include <array>
 #include <cuda_runtime_api.h>
 #include <optional>
 #include <vector>
 
 #include "cute/tensor.hpp"
+#include "cutlass/detail/sm100_blockscaled_layout.hpp"
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/gemm/group_array_problem_shape.hpp"
 #include "cutlass/layout/layout.h"
+#include "tensorrt_llm/common/cudaFp8Utils.h"
+#include "tensorrt_llm/common/workspace.h"
+#include "tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm_configs.h"
 
 #include "./common.h"
 
@@ -86,36 +87,33 @@ struct TmaWarpSpecializedGroupedGemmInput
     using LayoutB = TransposeLayoutTag<cutlass::layout::ColumnMajor>; // Layout type for B matrix operand
     using LayoutC = TransposeLayoutTag<cutlass::layout::RowMajor>;    // Layout type for C matrix operand
 
-    constexpr static int BlockScaleVectorSize = 16;
-    using SfAtom = cute::Layout<
-        cute::Shape<cute::Shape<cute::_32, cute::_4>, cute::Shape<cute::Int<BlockScaleVectorSize>, cute::_4>>,
-        cute::Stride<cute::Stride<cute::_16, cute::_4>, cute::Stride<cute::_0, cute::_1>>>;
-    // using Sm1xxBlkScaledConfig = cutlass::detail::Sm100BlockScaledConfig<BlockScaleVectorSize>;
-    constexpr static int MinNumRowsAlignmentFP4 = cute::size<0>(SfAtom{});
-    // A & B are swapped for transpose
-    using LayoutSF = decltype(cute::blocked_product(SfAtom{},
-        cute::make_layout(cute::make_shape(int32_t(0), int32_t(0), int32_t(0)),
-            cute::make_stride(int32_t(0), cute::_1{}, int32_t(0)))));
-    using LayoutScalingFactorsA = LayoutSF;
-    using LayoutScalingFactorsB = LayoutSF;
-    static_assert(std::is_same_v<LayoutScalingFactorsA, LayoutScalingFactorsB>,
-        "Scaling factor layout should be the same for weights and activations");
+    constexpr static int NVFP4BlockScaleVectorSize = 16;
+    constexpr static int MXFPXBlockScaleVectorSize = 32;
 
-    template <class ProblemShape>
-    CUTE_HOST_DEVICE static constexpr auto tile_atom_to_shape_SFA(ProblemShape problem_shape)
-    {
-        auto problem_shape_MNKL = cute::append<4>(problem_shape, 1);
-        auto [M, N, K, L] = problem_shape_MNKL;
-        return tile_to_shape(SfAtom{}, cute::make_shape(M, K, L), cute::Step<cute::_2, cute::_1, cute::_3>{});
-    }
+    using NVFP4BlockScaledConfig = cutlass::detail::Sm1xxBlockScaledConfig<NVFP4BlockScaleVectorSize>;
+    using MXFPXBlockScaledConfig = cutlass::detail::Sm1xxBlockScaledConfig<MXFPXBlockScaleVectorSize>;
 
-    // The following function is provided for user fill dynamic problem size to the layout_SFB.
-    template <class ProblemShape>
-    CUTE_HOST_DEVICE static constexpr auto tile_atom_to_shape_SFB(ProblemShape problem_shape)
+    // 128
+    // This is the alignment of the weight matrix the fully padded SF will refer to.
+    // We require the SFs to be aligned to this value (zero padded as needed)
+    // The weights do not need to be aligned to this value, CUTLASS will handle extra padding
+    // N here is a short hand for the outer dimension of the GEMM, this applies to both M & N dimension of the GEMM
+    constexpr static int MinNDimAlignmentNVFP4 = cute::size<0>(NVFP4BlockScaledConfig::SfAtom{});
+    constexpr static int MinNDimAlignmentMXFPX = cute::size<0>(MXFPXBlockScaledConfig::SfAtom{});
+
+    // Block scale vector size * 4
+    // This is the alignment of the weight matrix the fully padded SF will refer to.
+    // We should never actually need to pad a buffer to this alignment
+    // The weights only need to be aligned to BlockScaleVectorSize, CUTLASS will handle extra padding
+    // The SFs only need to be aligned to 4 (zero padded as needed)
+    // K here is a short hand for the inner dimension of the GEMM
+    constexpr static int MinKDimAlignmentNVFP4 = cute::size<1>(NVFP4BlockScaledConfig::SfAtom{});
+    constexpr static int MinKDimAlignmentMXFPX = cute::size<1>(MXFPXBlockScaledConfig::SfAtom{});
+
+    // Helper function to align a dimension to the SF alignment
+    constexpr static int64_t alignToSfDim(int64_t dim, int64_t alignment)
     {
-        auto problem_shape_MNKL = cute::append<4>(problem_shape, 1);
-        auto [M, N, K, L] = problem_shape_MNKL;
-        return tile_to_shape(SfAtom{}, cute::make_shape(N, K, L), cute::Step<cute::_2, cute::_1, cute::_3>{});
+        return (dim + alignment - 1) / alignment * alignment;
     }
 
     using StrideA
@@ -194,11 +192,21 @@ struct TmaWarpSpecializedGroupedGemmInput
     float const** alpha_scale_ptr_array = nullptr;
 
     using ElementSF = uint8_t;
-    ElementSF const** fp4_block_scaling_factors_A = nullptr;
-    ElementSF const** fp4_block_scaling_factors_B = nullptr;
+    using MXFPXElementSF = ElementSF; // Just an alias for now
+    using NVFP4ElementSF = ElementSF; // Just an alias for now
+    ElementSF const** fpX_block_scaling_factors_A = nullptr;
+    ElementSF const** fpX_block_scaling_factors_B = nullptr;
 
-    LayoutScalingFactorsA* fp4_block_scaling_factors_stride_A = nullptr;
-    LayoutScalingFactorsB* fp4_block_scaling_factors_stride_B = nullptr;
+    void* fpX_block_scaling_factors_stride_A = nullptr;
+    void* fpX_block_scaling_factors_stride_B = nullptr;
+
+    enum class FpXBlockScalingType
+    {
+        MXFPX,
+        NVFP4,
+        NONE
+    };
+    FpXBlockScalingType fpX_block_scaling_type = FpXBlockScalingType::NONE;
 
     struct INT4GroupwiseParams
     {
@@ -225,11 +233,12 @@ struct TmaWarpSpecializedGroupedGemmInput
     uint8_t* gemm_workspace = nullptr;
     size_t gemm_workspace_size = 0;
 
-    static std::array<size_t, 17> workspaceBuffers(int num_experts);
+    static std::array<size_t, 17> workspaceBuffers(int num_experts, FpXBlockScalingType scaling_type);
 
-    static size_t workspaceSize(int num_experts);
+    static size_t workspaceSize(int num_experts, FpXBlockScalingType scaling_type);
 
-    void configureWorkspace(int8_t* start_ptr, int num_experts, void* gemm_workspace, size_t gemm_workspace_size);
+    void configureWorkspace(int8_t* start_ptr, int num_experts, void* gemm_workspace, size_t gemm_workspace_size,
+        FpXBlockScalingType scaling_type);
 
     bool isValid() const
     {
@@ -259,19 +268,27 @@ public:
     MoeGemmRunner();
 
 #if defined(ENABLE_FP8)
-    static constexpr bool use_fp8 = (std::is_same_v<T, __nv_fp8_e4m3>
-        || std::is_same_v<T, __nv_fp8_e5m2>) &&!std::is_same_v<WeightType, cutlass::uint4b_t>;
+    static constexpr bool use_fp8
+        = (std::is_same_v<T, __nv_fp8_e4m3>
+              || std::is_same_v<T, __nv_fp8_e5m2>) &&!std::is_same_v<WeightType, cutlass::uint4b_t>
+#if defined(ENABLE_FP4)
+        && !std::is_same_v<WeightType, __nv_fp4_e2m1>
+#endif
+        ;
     static constexpr bool use_w4afp8
         = std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, cutlass::uint4b_t>;
 #else
     static constexpr bool use_fp8 = false;
     static constexpr bool use_w4afp8 = false;
+    static constexpr bool use_wfp4afp4 = false;
 #endif
 
 #if defined(ENABLE_FP4)
     static constexpr bool use_fp4 = std::is_same_v<T, __nv_fp4_e2m1>;
+    static constexpr bool use_wfp4afp4 = std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp4_e2m1>;
 #else
     static constexpr bool use_fp4 = false;
+    static constexpr bool use_wfp4afp4 = false;
 #endif
 
     void moeGemmBiasAct(GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
@@ -313,4 +330,5 @@ private:
     mutable size_t gemm_workspace_size_ = 0;
     size_t calcMaxWorkspaceSize(int num_experts) const;
 };
+
 } // namespace tensorrt_llm::kernels::cutlass_kernels

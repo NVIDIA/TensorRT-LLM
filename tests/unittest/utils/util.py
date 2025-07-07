@@ -1,5 +1,6 @@
 import os
 import unittest
+from contextlib import contextmanager
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -368,3 +369,31 @@ def similar(a, b, threshold=0.8):
 def get_project_root(test_file: str) -> Path:
     return next(p for p in Path(test_file).resolve().parents
                 if (p / 'tests').is_dir() and (p / "tensorrt_llm").is_dir())
+
+
+@contextmanager
+def default_dtype(dtype: torch.dtype):
+    cur_default = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    yield
+    torch.set_default_dtype(cur_default)
+
+
+def woq_assert_near_eq(ref, act, wTypeId):
+    # match the scale in cpp/tensorrt_llm/kernels/cutlass_kernels/cutlass_preprocessors.cpp
+    if wTypeId == 1:
+        bits_in_type = 8
+    else:
+        bits_in_type = 4
+    quant_range_scale = 1.0 / float(1 << (bits_in_type - 1))
+
+    max_val = torch.max(abs(ref)).item()
+    atol = (max_val * quant_range_scale) * 1.5  # allow for rounding
+    torch.testing.assert_close(ref, act, atol=atol, rtol=1e-7)
+
+
+def woq_groupwise_gt_matmul(mat1, ref_torch_weights, bias=None):
+    ref = torch.matmul(mat1, ref_torch_weights)
+    if bias is not None:
+        ref += bias
+    return ref

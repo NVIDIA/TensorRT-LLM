@@ -122,6 +122,7 @@ class KvCacheCreator:
             self, input_seq_len: int) -> List[trtllm.Request]:
         vocab_size = self._model_engine.model.model_config.pretrained_config.vocab_size
         max_num_tokens = self._executor_config.max_num_tokens
+        max_beam_width = self._executor_config.max_beam_width
 
         requests = []
         input_seq_len = min(max_num_tokens, input_seq_len)
@@ -134,7 +135,8 @@ class KvCacheCreator:
             request = trtllm.Request(input_tokens,
                                      max_tokens=1,
                                      streaming=False,
-                                     sampling_config=trtllm.SamplingConfig(),
+                                     sampling_config=trtllm.SamplingConfig(
+                                         beam_width=max_beam_width, ),
                                      output_config=trtllm.OutputConfig(),
                                      end_id=-1)
             requests.append(request)
@@ -167,7 +169,9 @@ class KvCacheCreator:
             num_cache_blocks += (num_req_tokens +
                                  executor_config.tokens_per_block -
                                  1) // executor_config.tokens_per_block
-        return num_cache_blocks * executor_config.tokens_per_block
+        # Multiply by beam width, to prevent rescaling of the max_seq_len caused by the influence of beam width during the preparation for kv_cache_estimation
+        return num_cache_blocks * executor_config.tokens_per_block * self._dummy_reqs[
+            0].sampling_config.beam_width
 
     def try_prepare_estimation(self) -> bool:
         """Prepare for possible KV cache capacity estimation.
@@ -303,8 +307,13 @@ class KvCacheCreator:
                 mapping=mapping,
                 dtype=kv_cache_dtype,
                 spec_config=spec_config,
+                max_beam_width=executor_config.max_beam_width,
             )
         elif is_nemotron_hybrid(config):
+            if executor_config.max_beam_width > 1:
+                raise ValueError(
+                    "MambaHybridCacheManager + beam search is not supported yet."
+                )
             config = model_engine.model.model_config.pretrained_config
             num_layers = config.hybrid_override_pattern.count("*")
             layer_mask = [
@@ -340,6 +349,13 @@ class KvCacheCreator:
                 spec_config=spec_config,
             )
         else:
+            # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_from_cpp in KVCahceManager
+            is_vswa = executor_config.kv_cache_config.max_attention_window is not None and len(
+                set(executor_config.kv_cache_config.max_attention_window)) > 1
+            binding_model_config = model_engine.model.model_config.get_bindings_model_config(
+                tokens_per_block=executor_config.tokens_per_block
+            ) if is_vswa else None
+
             kv_cache_manager = KVCacheManager(
                 executor_config.kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
@@ -352,6 +368,9 @@ class KvCacheCreator:
                 mapping=mapping,
                 dtype=kv_cache_dtype,
                 spec_config=spec_config,
+                max_num_tokens=executor_config.max_num_tokens,
+                model_config=binding_model_config,
+                max_beam_width=executor_config.max_beam_width,
             )
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to executor_config
         if model_engine.kv_cache_manager_key == ResourceManagerType.KV_CACHE_MANAGER:
@@ -391,6 +410,7 @@ def create_py_executor_instance(
         draft_model_engine,
         start_worker,
         sampler,
+        drafter,
         lora_config: Optional[LoraConfig] = None,
         garbage_collection_gen0_threshold: Optional[int] = None) -> PyExecutor:
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
@@ -510,11 +530,13 @@ def create_py_executor_instance(
         scheduler,
         model_engine=model_engine,
         sampler=sampler,
+        drafter=drafter,
         dist=dist,
         max_num_sequences=max_num_sequences,
         disable_overlap_scheduler=pytorch_backend_config.
         disable_overlap_scheduler,
         max_batch_size=executor_config.max_batch_size,
+        max_beam_width=executor_config.max_beam_width,
         max_draft_tokens=spec_config.max_draft_tokens
         if spec_config is not None else 0,
         kv_cache_transceiver=kv_cache_transceiver,

@@ -38,10 +38,10 @@ from .backend_request_func import (ASYNC_REQUEST_FUNCS,
                                    OPENAI_COMPATIBLE_BACKENDS, RequestFuncInput,
                                    RequestFuncOutput, get_tokenizer)
 from .benchmark_dataset import (AIMODataset, BurstGPTDataset,
-                                ConversationDataset, HuggingFaceDataset,
-                                InstructCoderDataset, RandomDataset,
-                                SampleRequest, ShareGPTDataset, SonnetDataset,
-                                VisionArenaDataset)
+                                ConversationDataset, CustomDataset,
+                                HuggingFaceDataset, InstructCoderDataset,
+                                RandomDataset, SampleRequest, ShareGPTDataset,
+                                SonnetDataset, VisionArenaDataset)
 from .benchmark_utils import convert_to_pytorch_benchmark_format, write_to_json
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
@@ -250,37 +250,41 @@ async def benchmark(
     lora_modules: Optional[Iterable[str]],
     extra_body: Optional[dict],
     streaming: bool,
+    no_test_input: bool = False,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
-    print("Starting initial single prompt test run...")
-    test_prompt, test_prompt_len, test_output_len = \
-        input_requests[0].prompt, input_requests[0].prompt_len, \
-        input_requests[0].expected_output_len
+    if not no_test_input:
+        print("Starting initial single prompt test run...")
+        test_prompt, test_prompt_len, test_output_len = \
+            input_requests[0].prompt, input_requests[0].prompt_len, \
+            input_requests[0].expected_output_len
 
-    test_input = RequestFuncInput(
-        model=model_id,
-        model_name=model_name,
-        prompt=test_prompt,
-        api_url=api_url,
-        prompt_len=test_prompt_len,
-        output_len=test_output_len,
-        logprobs=logprobs,
-        ignore_eos=ignore_eos,
-        extra_body=extra_body,
-    )
+        test_input = RequestFuncInput(
+            model=model_id,
+            model_name=model_name,
+            prompt=test_prompt,
+            api_url=api_url,
+            prompt_len=test_prompt_len,
+            output_len=test_output_len,
+            logprobs=logprobs,
+            ignore_eos=ignore_eos,
+            extra_body=extra_body,
+        )
 
-    test_output = await request_func(request_func_input=test_input,
-                                     streaming=streaming)
-    if not test_output.success:
-        raise ValueError(
-            "Initial test run failed - Please make sure benchmark arguments "
-            f"are correctly specified. Error: {test_output.error}")
+        test_output = await request_func(request_func_input=test_input,
+                                         streaming=streaming)
+        if not test_output.success:
+            raise ValueError(
+                "Initial test run failed - Please make sure benchmark arguments "
+                f"are correctly specified. Error: {test_output.error}")
+        else:
+            print("Initial test run completed. Starting main benchmark run...")
     else:
-        print("Initial test run completed. Starting main benchmark run...")
+        print("Skipping initial test run. Starting main benchmark run...")
 
     if lora_modules:
         # For each input request, choose a LoRA module at random.
@@ -613,6 +617,13 @@ def main(args: argparse.Namespace):
             output_len=args.hf_output_len,
         )
 
+    elif args.dataset_name == "trtllm_custom":
+        input_requests = CustomDataset(dataset_path=args.dataset_path,
+                                       random_seed=args.seed).sample(
+                                           num_requests=args.num_prompts,
+                                           tokenizer=tokenizer,
+                                       )
+
     else:
         # For datasets that follow a similar structure, use a mapping.
         dataset_mapping = {
@@ -699,6 +710,7 @@ def main(args: argparse.Namespace):
             lora_modules=args.lora_modules,
             extra_body=sampling_params,
             streaming=not args.non_streaming,
+            no_test_input=args.no_test_input,
         ))
 
     # Save config and results to json
@@ -783,7 +795,9 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf"],
+        choices=[
+            "sharegpt", "burstgpt", "sonnet", "random", "hf", "trtllm_custom"
+        ],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument("--dataset-path",
@@ -1101,6 +1115,12 @@ if __name__ == "__main__":
                         help="A subset of LoRA module names passed in when "
                         "launching the server. For each request, the "
                         "script chooses a LoRA module at random.")
+
+    parser.add_argument(
+        "--no-test-input",
+        action="store_true",
+        help="Skip initial test run with a single prompt.",
+    )
 
     args = parser.parse_args()
 

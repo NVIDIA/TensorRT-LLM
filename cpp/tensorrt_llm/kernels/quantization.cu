@@ -226,18 +226,22 @@ void invokeBatchedFP4Quantization(int b, int m, int n, T const* input, float con
     }
 }
 
-__global__ void nvfp4_block_scale_interleave_kernel(
-    int numbatches, int numRows, int numCols, uint8_t const* SFIn, uint8_t* SFOutput)
+__global__ void nvfp4_block_scale_interleave_kernel(int numBatches, int numRows, int numRowsPadded, int numCols,
+    int numColsPadded, uint8_t const* SFIn, uint8_t* SFOutput)
 {
     constexpr int SF_VEC_SIZE = 16;
-    for (int rowIdx = blockIdx.x; rowIdx < numRows; rowIdx += gridDim.x)
+    for (int rowIdx = blockIdx.x; rowIdx < numRowsPadded; rowIdx += gridDim.x)
     {
-        for (int batchIdx = 0; batchIdx < numbatches; batchIdx++)
+        for (int batchIdx = 0; batchIdx < numBatches; batchIdx++)
         {
-            for (int colIdx = threadIdx.x; colIdx < numCols; colIdx += blockDim.x)
+            for (int colIdx = threadIdx.x; colIdx < numColsPadded; colIdx += blockDim.x)
             {
-                int64_t inOffset = batchIdx * numRows * numCols + rowIdx * numCols + colIdx;
-                auto sf = SFIn[inOffset];
+                uint8_t sf = 0;
+                if (rowIdx < numRows && colIdx < numCols)
+                {
+                    int64_t inOffset = batchIdx * numRows * numCols + rowIdx * numCols + colIdx;
+                    sf = SFIn[inOffset];
+                }
 
                 std::optional<int> batchIdxOpt = batchIdx;
                 std::optional<int> numRowsOpt = numRows;
@@ -246,16 +250,55 @@ __global__ void nvfp4_block_scale_interleave_kernel(
                 // int const numSfTilesK = (numCols + 4 - 1) / 4;
                 // int const tileOffset = ((mi / 128) * numSfTilesK + ki / 4) * 512;
                 // int const dstIdx = tileOffset + (mi % 32) * 16 + ((mi % 128) / 32) * 4 + ki % 4;
-                auto dstIdx
-                    = get_sf_out_offset_128x4<SF_VEC_SIZE>(batchIdxOpt, rowIdx, colIdx, numRowsOpt, numCols * 16);
+                auto dstIdx = get_sf_out_offset_128x4<SF_VEC_SIZE>(
+                    batchIdxOpt, rowIdx, colIdx, numRowsOpt, numCols * SF_VEC_SIZE);
                 SFOutput[dstIdx] = sf;
             }
         }
     }
 }
 
+__global__ void nvfp4_block_scale_interleave_reverse_kernel(
+    int numBatches, int numRows, int numCols, uint8_t const* SFIn, uint8_t* SFOutput)
+{
+    constexpr int SF_VEC_SIZE = 16;
+    for (int rowIdx = blockIdx.x; rowIdx < numRows; rowIdx += gridDim.x)
+    {
+        for (int batchIdx = 0; batchIdx < numBatches; batchIdx++)
+        {
+            for (int colIdx = threadIdx.x; colIdx < numCols; colIdx += blockDim.x)
+            {
+                std::optional<int> batchIdxOpt = batchIdx;
+                std::optional<int> numRowsOpt = numRows;
+
+                // Get the swizzled input index using the same swizzling pattern
+                auto srcIdx = get_sf_out_offset_128x4<SF_VEC_SIZE>(
+                    batchIdxOpt, rowIdx, colIdx, numRowsOpt, numCols * SF_VEC_SIZE);
+                auto sf = SFIn[srcIdx];
+
+                // Output goes to linear layout
+                int64_t outOffset = batchIdx * numRows * numCols + rowIdx * numCols + colIdx;
+                SFOutput[outOffset] = sf;
+            }
+        }
+    }
+}
+
 // This is intended for weight loading, so m and n are large, b <= 256
-void invokeNVFP4BlockScaleInterleave(
+void invokeNVFP4BlockScaleInterleave(int b, int m, int m_padded, int n, int n_padded, uint8_t const* SFIn,
+    uint8_t* SFOutput, int multiProcessorCount, cudaStream_t stream)
+{
+    // Each thread reads 1 int8 value
+    dim3 block(std::min(n_padded, 1024));
+    // Get number of blocks per SM (assume we can fully utilize the SM).
+    int const numBlocksPerSM = std::max(1u, 4096u / block.x);
+    dim3 grid(std::min(m_padded, multiProcessorCount * numBlocksPerSM));
+
+    nvfp4_block_scale_interleave_kernel<<<grid, block, 0, stream>>>(b, m, m_padded, n, n_padded, SFIn, SFOutput);
+}
+
+// This is intended for weight loading, so m and n are large, b <= 256
+void invokeNVFP4BlockScaleInterleaveReverse(
     int b, int m, int n, uint8_t const* SFIn, uint8_t* SFOutput, int multiProcessorCount, cudaStream_t stream)
 {
     // Each thread reads 1 int8 value
@@ -264,7 +307,7 @@ void invokeNVFP4BlockScaleInterleave(
     int const numBlocksPerSM = std::max(1u, 4096u / block.x);
     dim3 grid(std::min(m, multiProcessorCount * numBlocksPerSM));
 
-    nvfp4_block_scale_interleave_kernel<<<grid, block, 0, stream>>>(b, m, n, SFIn, SFOutput);
+    nvfp4_block_scale_interleave_reverse_kernel<<<grid, block, 0, stream>>>(b, m, n, SFIn, SFOutput);
 }
 
 // Instantiate the function.

@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "allreduce_gemm_impl_sm100.h"
-#include "allreduce_gemm_impl_sm90.h"
+#include "./allreduce_gemm_impl_sm100.h"
+#include "./allreduce_gemm_impl_sm90.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
 #include "cutlass/bfloat16.h"

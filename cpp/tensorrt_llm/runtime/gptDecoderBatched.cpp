@@ -100,51 +100,6 @@ void GptDecoderBatched::setup(executor::DecodingMode const& mode, SizeType32 max
 
 namespace
 {
-//! @brief Sets inputs for explicit draft tokens.
-void setExplicitDraftTokensInputs(DecodingInput& dInput, decoder_batch::Input const& input)
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    dInput.explicitDraftTokensInputs = DecodingInput::ExplicitDraftTokensInputs();
-    TLLM_CHECK(input.explicitDraftTokensInputs.has_value());
-    TLLM_CHECK(input.explicitDraftTokensLastInputs.has_value());
-
-    dInput.explicitDraftTokensInputs->nextDraftTokens = input.explicitDraftTokensInputs->nextDraftTokens;
-    dInput.explicitDraftTokensInputs->nextFlatTokens = input.explicitDraftTokensInputs->nextFlatTokens;
-    dInput.explicitDraftTokensInputs->nextDraftIndices = input.explicitDraftTokensInputs->nextDraftIndices;
-    dInput.explicitDraftTokensInputs->nextDraftProbs = input.explicitDraftTokensInputs->nextDraftProbs;
-    dInput.explicitDraftTokensInputs->lastDraftTokens = input.explicitDraftTokensLastInputs->draftTokens;
-    dInput.explicitDraftTokensInputs->lastDraftIndices = input.explicitDraftTokensLastInputs->draftIndices;
-    dInput.explicitDraftTokensInputs->lastPositionIdsBase = input.explicitDraftTokensLastInputs->positionIdsBase;
-    dInput.explicitDraftTokensInputs->masks = input.explicitDraftTokensInputs->masks;
-    dInput.explicitDraftTokensInputs->packedPositionIds = input.explicitDraftTokensInputs->packedPositionIds;
-    dInput.explicitDraftTokensInputs->bestPathLengths = input.explicitDraftTokensInputs->bestPathLengths;
-    dInput.explicitDraftTokensInputs->bestPathIndices = input.explicitDraftTokensInputs->bestPathIndices;
-    dInput.explicitDraftTokensInputs->nextGenerationLengths = input.explicitDraftTokensInputs->nextGenerationLengths;
-    dInput.explicitDraftTokensInputs->lastGenerationLengths = input.explicitDraftTokensLastInputs->generationLengths;
-    dInput.explicitDraftTokensInputs->maxGenLengthDevice = input.explicitDraftTokensInputs->maxGenToken;
-    dInput.explicitDraftTokensInputs->seqSlots = input.batchSlotsRequestOrder;
-
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
-//! @brief Sets inputs for eagle decoding.
-void setEagleInputs(DecodingInput& dInput, decoder_batch::Input const& input)
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    TLLM_CHECK(input.eagleInputs.has_value());
-    TLLM_CHECK(input.eagleLastInputs.has_value());
-
-    dInput.eagleInputs = DecodingInput::EagleInputs(input.eagleInputs->nextDraftTokens,
-        input.eagleInputs->nextDraftLens, input.eagleInputs->nextDraftPaths, input.eagleLastInputs->draftTokens,
-        input.eagleLastInputs->draftLens, input.eagleLastInputs->draftPaths, input.eagleInputs->acceptedTokens,
-        input.eagleInputs->acceptedLens, input.eagleInputs->acceptedPaths, input.eagleInputs->chunkedContextNextTokens,
-        input.batchSlotsRequestOrder);
-
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
 //! @brief Prepare Input and Output for decoder step.
 // TODO: produce new input and output objects
 void prepareForward(decoder::DecoderState const& decoderState, SizeType32 step, decoder_batch::Input const& input,
@@ -152,25 +107,10 @@ void prepareForward(decoder::DecoderState const& decoderState, SizeType32 step, 
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto const maxBeamWidth = decoderState.getMaxBeamWidth();
     auto const speculativeDecodingMode = decoderState.getSpeculativeDecodingMode();
 
     auto& dInput = decoderState.getJointDecodingInput();
     auto& dOutput = decoderState.getJointDecodingOutput();
-
-    if (maxBeamWidth > 1)
-    {
-        dInput.generationSteps = input.generationSteps; // For Variable-Beam-Width-Search
-    }
-
-    if (speculativeDecodingMode.isExplicitDraftTokens())
-    {
-        setExplicitDraftTokensInputs(dInput, input);
-    }
-    else if (speculativeDecodingMode.isEagle())
-    {
-        setEagleInputs(dInput, input);
-    }
 
     dInput.batchSlots = input.batchSlots.at(step);
     dInput.batchSize = static_cast<SizeType32>(dInput.batchSlots->getSize());
@@ -185,11 +125,6 @@ void prepareForward(decoder::DecoderState const& decoderState, SizeType32 step, 
         = ITensor::slice(dOutput.newTokensSteps, step, decoderState.getMaxDecodingDecoderTokens());
 
     dInput.finishReasons = finishedStepsInput;
-
-    if (speculativeDecodingMode.isMedusa())
-    {
-        dInput.medusaInputs->medusaLogits = input.predictedDraftLogits;
-    }
 
     if (speculativeDecodingMode.isDraftTokensExternal())
     {

@@ -297,8 +297,8 @@ def prepare_fused_mha_metadata_fake(
     )
 
 
-@AttentionRegistry.register("TritonWithFlattenedInputs")
-class TritonWithFlattenedInputs(AttentionDescriptor):
+@AttentionRegistry.register("triton")
+class TritonAttention(AttentionDescriptor):
     @classmethod
     def is_paged(cls) -> bool:
         """Return if the attention op is paged or not."""
@@ -338,7 +338,7 @@ class TritonWithFlattenedInputs(AttentionDescriptor):
         v_head_dim = v_fake.shape[3]
 
         def _get_k_cache(si: SequenceInfo):
-            assert not si.is_paged, "Paged cache not supported for TritonWithFlattenedInputs"
+            assert not si.is_paged, "Paged cache not supported for triton"
             return torch.empty(
                 si.num_pages,
                 si.page_size,
@@ -349,7 +349,7 @@ class TritonWithFlattenedInputs(AttentionDescriptor):
             )
 
         def _get_v_cache(si: SequenceInfo):
-            assert not si.is_paged, "Paged cache not supported for TritonWithFlattenedInputs"
+            assert not si.is_paged, "Paged cache not supported for triton"
             return torch.empty(
                 si.num_pages,
                 si.page_size,

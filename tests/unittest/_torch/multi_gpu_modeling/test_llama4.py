@@ -5,7 +5,7 @@ import torch
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import KvCacheConfig
+from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
 
 
 @pytest.mark.parametrize(
@@ -57,7 +57,7 @@ def test_llama4(model_name, backend, tp_size, use_cuda_graph,
         " white. What is the color of the background of"
     ]
 
-    pytorch_config = dict(attn_backend=backend, use_cuda_graph=use_cuda_graph)
+    pytorch_config = dict(attn_backend=backend)
     model_dir = str(llm_models_root() / "llama4-models" / model_name)
 
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.25, )
@@ -66,6 +66,7 @@ def test_llama4(model_name, backend, tp_size, use_cuda_graph,
         tensor_parallel_size=tp_size,
         moe_expert_parallel_size=ep_size,
         moe_tensor_parallel_size=tp_size // ep_size,
+        cuda_graph_config=CudaGraphConfig() if use_cuda_graph else None,
         **pytorch_config,
         pipeline_parallel_size=pp_size,
         enable_attention_dp=enable_attention_dp,

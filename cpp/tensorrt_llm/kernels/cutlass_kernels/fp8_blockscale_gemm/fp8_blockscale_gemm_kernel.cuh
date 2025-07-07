@@ -1615,7 +1615,7 @@ void fp8_gemm_run(__nv_fp8_e4m3* mat_a, int ld_a, __nv_fp8_e4m3* mat_b, int ld_b
     {
         return;
     }
-
+#ifndef PLACEHOLDER_KERNELS
     int arch = tensorrt_llm::common::getSMVersion();
     if (arch == 89)
     {
@@ -1631,6 +1631,7 @@ void fp8_gemm_run(__nv_fp8_e4m3* mat_a, int ld_a, __nv_fp8_e4m3* mat_b, int ld_b
         gemm_dispatch_old(mat_a, ld_a, mat_b, ld_b, mat_d, ld_d, scales_a, scales_b, static_cast<int>(shape_m),
             static_cast<int>(shape_n), static_cast<int>(shape_k), stream);
     }
+#endif
 }
 
 void fp8_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, int ld_a, float* scales_a,

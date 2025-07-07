@@ -331,7 +331,7 @@ def flashinfer_mha_with_cache_fake(
     return torch.empty_like(q.contiguous())
 
 
-@AttentionRegistry.register("FlashInfer")
+@AttentionRegistry.register("flashinfer")
 class FlashInferAttention(AttentionDescriptor):
     @classmethod
     def _get_planner(cls) -> _FlashInferPlanner:

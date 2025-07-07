@@ -32,10 +32,7 @@ namespace tensorrt_llm::batch_manager
 {
 
 class DecoderInputBuffers;
-class DraftBuffers;
 class MedusaBuffers;
-
-namespace tr = tensorrt_llm::runtime;
 
 class HandleContextLogits : Algorithm
 {
@@ -47,9 +44,9 @@ public:
 
     HandleContextLogits() = default;
 
-    tr::SizeType32 operator()(DecoderInputBuffers& inputBuffers, RequestVector const& contextRequests,
-        tr::ITensor::SharedPtr const& logits, std::vector<tr::SizeType32> const& numContextLogitsVec,
-        tr::ModelConfig const& modelConfig, tr::BufferManager const& manager, OptionalRef<DraftBuffers> draftBuffers,
+    runtime::SizeType32 operator()(DecoderInputBuffers& inputBuffers, RequestVector const& contextRequests,
+        runtime::ITensor::SharedPtr const& logits, std::vector<runtime::SizeType32> const& numContextLogitsVec,
+        runtime::ModelConfig const& modelConfig, runtime::BufferManager const& manager,
         OptionalRef<MedusaBuffers> medusaBuffers) const;
 };
 

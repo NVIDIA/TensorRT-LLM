@@ -1235,11 +1235,11 @@ public:
         return mPerfMetrics;
     }
 
-    void setFirstScheduledTime(executor::RequestPerfMetrics::TimePoint const& time)
+    void setFirstScheduledTime()
     {
         if (mPerfMetrics.timingMetrics.firstScheduledTime == executor::RequestPerfMetrics::TimePoint{})
         {
-            mPerfMetrics.timingMetrics.firstScheduledTime = time;
+            mPerfMetrics.timingMetrics.firstScheduledTime = std::chrono::steady_clock::now();
         }
     }
 
@@ -1504,14 +1504,6 @@ public:
             break;
         default: TLLM_LOG_ERROR("Unexpected request state."); return executor::RequestStage::kGENERATION_COMPLETE;
         }
-    }
-
-    /// To determine whether the context is unchunked. When a context is chunked into only a part, it
-    /// is still different from the unchunked state, which indicates the initial status.
-    [[nodiscard]] bool isFullContextRequest() const noexcept
-    {
-        return (isContextInitState() || isDisaggGenerationInitState() || isDisaggGenerationTransmissionComplete())
-            && !mContextChunkSize;
     }
 
     [[nodiscard]] bool isContextOnlyRequest() const noexcept

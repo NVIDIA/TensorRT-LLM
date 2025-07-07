@@ -107,7 +107,7 @@ class SequenceInfo:
         if self.page_size < 1:
             self.page_size = self.max_seq_len
 
-        # NOTE (lucaslie): WAR to address issue when using FlashInfer attention with
+        # NOTE (lucaslie): WAR to address issue when using flashinfer attention with
         # (max_batch_size, max_seq_len) input in trtllm runtime.
         # see https://github.com/NVIDIA/TensorRT-LLM/issues/4504
         max_seq_len_adjusted = self.max_seq_len + 1

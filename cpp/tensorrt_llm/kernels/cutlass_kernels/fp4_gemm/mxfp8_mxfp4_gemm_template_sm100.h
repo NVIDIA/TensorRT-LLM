@@ -31,6 +31,7 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/kernels/archCondition.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 
 #ifndef _WIN32
@@ -82,6 +83,21 @@ struct MXSMTypeAdapter<__2SM>
     using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized2SmMxf8f6f4Sm100;
 };
 
+#ifdef PLACEHOLDER_KERNELS
+
+template <typename T, typename CTA_M, typename CTA_N, typename CTA_K, typename CGA_M, typename CGA_N, typename CGA_K,
+    typename XSM_>
+size_t genericMXFP8xMXFP4GemmKernelLauncher(void* D, void const* A, void const* B, void const* input_sf,
+    void const* weight_sf, float const* global_sf, int m, int n, int k, int batch_count,
+    tkc::CutlassGemmConfig gemmConfig, char* workspace, const size_t workspaceBytes, cudaStream_t stream,
+    int* occupancy)
+{
+    throw std::runtime_error(
+        "[TensorRT-LLM Error][FP4 gemm Runner] TensorRT-LLM is not compiled with support for this Architecture.");
+}
+
+#else
+
 template <typename T, typename CTA_M, typename CTA_N, typename CTA_K, typename CGA_M, typename CGA_N, typename CGA_K,
     typename XSM>
 struct DeviceGemmMXFP8xMXFP4GemmSm100
@@ -100,7 +116,7 @@ struct DeviceGemmMXFP8xMXFP4GemmSm100
     /* // Input C */
     using ElementC = void;
     using LayoutC = cutlass::layout::RowMajor;
-    static constexpr int AlignmentC = 4;
+    static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<OutElementType>::value;
 
     using SFType = cutlass::float_ue8m0_t;
     using ElementCompute = float;
@@ -123,8 +139,31 @@ struct DeviceGemmMXFP8xMXFP4GemmSm100
                 sizeof(typename CollectiveEpilogue::SharedStorage))>,
             MainloopSchedule>::CollectiveOp;
 
-    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>, CollectiveMainloop,
-        CollectiveEpilogue, TileScheduler>;
+    template <typename Base>
+    struct Sm10xOnly : Base
+    {
+        using typename Base::Params;
+
+        CUTLASS_DEVICE
+        void operator()(Params const& params, char* smem_buf)
+        {
+            if constexpr (tensorrt_llm::kernels::arch::is_major_v<10>)
+            {
+                this->Base::operator()(params, smem_buf);
+            }
+            else
+            {
+                if (cute::thread0())
+                {
+                    printf("%s : This kernel shall only run on SM10x devices.\n", __PRETTY_FUNCTION__);
+                    __trap();
+                }
+            }
+        }
+    };
+
+    using GemmKernel = Sm10xOnly<cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>,
+        CollectiveMainloop, CollectiveEpilogue, TileScheduler>>;
 
     using Gemm = typename cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 };
@@ -247,6 +286,9 @@ size_t genericMXFP8xMXFP4GemmKernelLauncher(void* D, void const* A, void const* 
     }
     return gemm.get_workspace_size(args);
 }
+
+#endif
+
 } // namespace cutlass_kernels
 } // namespace kernels
 } // namespace tensorrt_llm

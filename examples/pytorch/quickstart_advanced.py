@@ -1,9 +1,10 @@
 import argparse
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import (DraftTargetDecodingConfig, EagleDecodingConfig,
-                                 KvCacheConfig, MTPDecodingConfig,
-                                 NGramDecodingConfig, TorchCompileConfig)
+from tensorrt_llm.llmapi import (CudaGraphConfig, DraftTargetDecodingConfig,
+                                 EagleDecodingConfig, KvCacheConfig,
+                                 MTPDecodingConfig, NGramDecodingConfig,
+                                 TorchCompileConfig)
 
 example_prompts = [
     "Hello, my name is",
@@ -104,6 +105,7 @@ def add_llm_args(parser):
     parser.add_argument("--top_k", type=int, default=None)
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument('--load_format', type=str, default='auto')
+    parser.add_argument('--max_beam_width', type=int, default=1)
 
     # Speculative decoding
     parser.add_argument('--spec_decode_algo', type=str, default=None)
@@ -185,6 +187,10 @@ def setup_llm(args):
     else:
         spec_config = None
 
+    cuda_graph_config = CudaGraphConfig(
+        batch_sizes=args.cuda_graph_batch_sizes,
+        padding_enabled=args.cuda_graph_padding_enabled,
+    ) if args.use_cuda_graph else None
     llm = LLM(
         model=args.model_dir,
         backend='pytorch',
@@ -192,9 +198,7 @@ def setup_llm(args):
         kv_cache_dtype=args.kv_cache_dtype,
         kv_cache_config=kv_cache_config,
         attn_backend=args.attention_backend,
-        use_cuda_graph=args.use_cuda_graph,
-        cuda_graph_padding_enabled=args.cuda_graph_padding_enabled,
-        cuda_graph_batch_sizes=args.cuda_graph_batch_sizes,
+        cuda_graph_config=cuda_graph_config,
         load_format=args.load_format,
         print_iter_log=args.print_iter_log,
         enable_iter_perf_stats=args.print_iter_log,
@@ -218,7 +222,8 @@ def setup_llm(args):
         enable_chunked_prefill=args.enable_chunked_prefill,
         speculative_config=spec_config,
         trust_remote_code=args.trust_remote_code,
-        gather_generation_logits=args.return_generation_logits)
+        gather_generation_logits=args.return_generation_logits,
+        max_beam_width=args.max_beam_width)
 
     sampling_params = SamplingParams(
         max_tokens=args.max_tokens,
@@ -227,7 +232,9 @@ def setup_llm(args):
         top_p=args.top_p,
         return_context_logits=args.return_context_logits,
         return_generation_logits=args.return_generation_logits,
-        logprobs=args.logprobs)
+        logprobs=args.logprobs,
+        n=args.max_beam_width,
+        use_beam_search=args.max_beam_width > 1)
     return llm, sampling_params
 
 
@@ -240,17 +247,23 @@ def main():
 
     for i, output in enumerate(outputs):
         prompt = output.prompt
-        generated_text = output.outputs[0].text
-        print(f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
-
-        if args.return_context_logits:
-            print(f"[{i}] Context logits: {output.context_logits}")
-        if args.return_generation_logits:
+        for beam_idx, beam in enumerate(output.outputs):
+            generated_text = beam.text
+            # Skip printing the beam_idx if no beam search was used
+            beam_id_text = f"[{beam_idx}]" if args.max_beam_width > 1 else ""
             print(
-                f"[{i}] Generation logits: {output.outputs[0].generation_logits}"
+                f"[{i}]{beam_id_text} Prompt: {prompt!r}, Generated text: {generated_text!r}"
             )
-        if args.logprobs:
-            print(f"[{i}] Logprobs: {output.outputs[0].logprobs}")
+            if args.return_context_logits:
+                print(
+                    f"[{i}]{beam_id_text} Context logits: {output.context_logits}"
+                )
+            if args.return_generation_logits:
+                print(
+                    f"[{i}]{beam_id_text} Generation logits: {beam.generation_logits}"
+                )
+            if args.logprobs:
+                print(f"[{i}]{beam_id_text} Logprobs: {beam.logprobs}")
 
 
 if __name__ == '__main__':

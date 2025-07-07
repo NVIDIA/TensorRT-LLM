@@ -151,7 +151,9 @@ void DataReceiverImpl::sendRequestInfo(LlmRequest const& llmRequest)
 
     RequestInfo requestInfo(requestId, mSelfState);
 
-    if (!common::getEnvDisableSelectiveCacheTransfer())
+    auto disableSelectiveCacheTransfer = common::getEnvDisableSelectiveCacheTransfer()
+        || (mFormatter->getCacheManager()->getBlockManager().getNumPools() > 1);
+    if (!disableSelectiveCacheTransfer)
     {
         auto* cacheManager = mFormatter->getCacheManager();
         auto blockRange
