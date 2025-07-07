@@ -358,17 +358,18 @@ def create_py_executor(
                 if estimating_kv_cache else _ExecutorCreationStage.KV_CACHE):
             kv_cache_creator.build_managers(resources)
 
-    # Drafter for speculative decoding
-    with mem_monitor.observe_creation_stage(_ExecutorCreationStage.DRAFTER):
-        drafter = get_spec_drafter(model_engine)
-
     # Resource managers for speculative decoding
+    # For user-specified drafters, use extra_resource_managers in PyTorchBackend config
+    # to provide a resource manager if required.
     spec_resource_manager = get_spec_resource_manager(model_engine,
-                                                      draft_model_engine,
-                                                      drafter)
+                                                      draft_model_engine)
     if spec_resource_manager is not None:
         resources[
             ResourceManagerType.SPEC_RESOURCE_MANAGER] = spec_resource_manager
+
+    # Drafter for speculative decoding
+    with mem_monitor.observe_creation_stage(_ExecutorCreationStage.DRAFTER):
+        drafter = get_spec_drafter(model_engine, spec_resource_manager)
 
     with mem_monitor.observe_creation_stage(
             _ExecutorCreationStage.INIT_EXTRA_RESOURCES
