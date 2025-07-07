@@ -255,8 +255,7 @@ def test_llm_loading_from_ckpt():
 
 @pytest.mark.parametrize('model_format', [
     'hf',
-    pytest.param('ckpt',
-                 marks=pytest.mark.skip(reason="https://nvbugs/5266240"))
+    'ckpt',
 ])
 @pytest.mark.part0
 def test_llm_with_dummy_weights(model_format):
