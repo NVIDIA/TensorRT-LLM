@@ -62,6 +62,8 @@ void BanWordsLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, TensorC
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(BanWordsLayer_setup);
+
     auto setupParams = std::dynamic_pointer_cast<DynamicDecodeSetupParams>(baseSetupParams);
     auto const& banWordsParams = setupParams->banWordsParams;
     TLLM_CHECK_WITH_INFO(banWordsParams, "banWordsParams for setup is not set");

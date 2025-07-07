@@ -68,6 +68,7 @@ void TopKSamplingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, Ten
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(TopKSamplingLayer_setup);
 
     auto setupParams = std::dynamic_pointer_cast<SamplingSetupParams>(baseSetupParams);
     mNormalizeLogProbs = setupParams->normalizeLogProbs.value_or(false);
