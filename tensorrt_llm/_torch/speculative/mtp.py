@@ -814,6 +814,8 @@ class MTPWorker(nn.Module):
             ctx_slot_ids = spec_metadata.slot_ids[:num_contexts]
             mtp_relaxed_delta_pool.index_copy_(0, ctx_slot_ids, ctx_delta)
 
+            # print("AMEYN: before process_generation_logits (softmax) logits.shape:", logits.shape)
+
             # generation
             gen_logprobs = self.process_generation_logits(logits, num_contexts)
             topk_value, topk_indices, draft_tokens = self.topk_kernel(
