@@ -28,8 +28,6 @@ project(tensorrt_llm LANGUAGES CXX)
 
 # Build options
 option(BUILD_PYT "Build in PyTorch TorchScript class mode" ON)
-option(BUILD_PYBIND "Build Python bindings for C++ runtime and batch manager"
-       ON)
 option(BUILD_TESTS "Build Google tests" ON)
 option(BUILD_BENCHMARKS "Build benchmarks" ON)
 option(BUILD_MICRO_BENCHMARKS "Build C++ micro benchmarks" OFF)
@@ -67,6 +65,11 @@ endif()
 # Add TensorRT-LLM Gen export interface and CUDA support
 add_compile_definitions("TLLM_GEN_EXPORT_INTERFACE")
 add_compile_definitions("TLLM_ENABLE_CUDA")
+
+set(BINDING_TYPE
+    "pybind"
+    CACHE STRING
+          "Binding type of Python bindings for C++ runtime and batch manager")
 
 set(INTERNAL_CUTLASS_KERNELS_PATH
     ""
@@ -196,6 +199,7 @@ get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
 
 set(3RDPARTY_DIR ${TRT_LLM_ROOT_DIR}/3rdparty)
 add_subdirectory(${3RDPARTY_DIR}/pybind11 ${CMAKE_CURRENT_BINARY_DIR}/pybind11)
+add_subdirectory(${3RDPARTY_DIR}/nanobind ${CMAKE_CURRENT_BINARY_DIR}/nanobind)
 
 # include as system to suppress warnings
 include_directories(
@@ -207,7 +211,8 @@ include_directories(
   ${3RDPARTY_DIR}/cutlass/tools/util/include
   ${3RDPARTY_DIR}/NVTX/include
   ${3RDPARTY_DIR}/json/include
-  ${3RDPARTY_DIR}/pybind11/include)
+  ${3RDPARTY_DIR}/pybind11/include
+  ${3RDPARTY_DIR}/nanobind/include)
 
 if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "11")
   add_definitions("-DENABLE_BF16")
