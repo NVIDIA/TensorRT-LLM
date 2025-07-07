@@ -414,6 +414,7 @@ class BaseLLM:
             kv_cache_retention_config=kv_cache_retention_config,
             disaggregated_params=disaggregated_params,
             postproc_params=_postproc_params,
+            return_perf_metrics=self.args.return_perf_metrics,
         )
 
         return RequestOutput._from_generation_result(result, prompt,

@@ -1009,6 +1009,11 @@ class BaseLlmArgs(BaseModel):
         validate_default=True,
     )
 
+    return_perf_metrics: Optional[bool] = Field(
+        default=False,
+        description="optionally returns perf metrics",
+    )
+
     _parallel_config: Optional[object] = PrivateAttr(default=None)
     _model_format: Optional[_ModelFormatKind] = PrivateAttr(default=None)
     _speculative_model: Optional[str] = PrivateAttr(default=None)
