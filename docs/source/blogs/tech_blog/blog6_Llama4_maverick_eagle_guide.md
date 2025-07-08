@@ -68,7 +68,7 @@ docker run -d --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
     -p 8000:8000 --gpus=all -e "TRTLLM_ENABLE_PDL=1" \
     -v /path/to/maverick:/config/models/maverick -v /path/to/eagle:/config/models/eagle \
     docker.io/<username>/tensorrt_llm:main sh \
-        -c "echo -e 'enable_attention_dp: false\nenable_min_latency: true\ncuda_graph_config:\n  max_batch_size: 8\nspeculative_config:\n  decoding_type: Eagle\n  max_draft_len: 3\n  pytorch_weights_path: /config/models/eagle\nkv_cache_config:\n  enable_block_reuse: false' > c.yaml && \
+        -c "echo -e 'enable_attention_dp: false\nenable_min_latency: true\nautotuner_enabled: false\ncuda_graph_config:\n  max_batch_size: 8\nspeculative_config:\n  decoding_type: Eagle\n  max_draft_len: 3\n  pytorch_weights_path: /config/models/eagle\nkv_cache_config:\n  enable_block_reuse: false' > c.yaml && \
         TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL=True \
         trtllm-serve /config/models/maverick \
             --host 0.0.0.0 --port 8000 \
