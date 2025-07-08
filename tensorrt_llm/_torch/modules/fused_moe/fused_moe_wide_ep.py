@@ -211,6 +211,10 @@ class WideEPMoE(MoE):
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
 
+        # Debug function for eliminating imbalance during performance analysis.
+        self.enable_dummy_allreduce = os.environ.get(
+            "TRTLLM_ENABLE_DUMMY_ALLREDUCE", "0") == "1"
+
     def _check_configs(self):
         assert self._weights_created
 
@@ -302,6 +306,16 @@ class WideEPMoE(MoE):
         self._weights_created = True
         self._check_configs()
 
+    def dummy_allreduce(self):
+        """
+        Debug function for eliminating imbalance during performance analysis.
+        Creates a small dummy tensor and performs allreduce to synchronize processes
+        and eliminate timing imbalances for more accurate profiling measurements.
+        """
+        dummy_tensor = torch.zeros(4, dtype=torch.float32, device='cuda')
+        dummy_tensor = self.all_reduce(dummy_tensor)
+        return dummy_tensor
+
     def reducescatter_or_allreduce(
         self,
         inputs,
@@ -311,6 +325,8 @@ class WideEPMoE(MoE):
         outputs = inputs
         if self.parallel_size > 1 and not self.enable_alltoall:
             if self.use_dp:
+                if self.enable_dummy_allreduce:
+                    self.dummy_allreduce()
                 outputs = reducescatter(
                     inputs,
                     self.mapping,
@@ -398,6 +414,8 @@ class WideEPMoE(MoE):
 
         if self.enable_alltoall:
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
+                if self.enable_dummy_allreduce:
+                    self.dummy_allreduce()
                 token_count = x.shape[0]
                 alltoall_info = None
                 x, token_selected_slots, token_final_scales, gathered_loadbalancer_local_statistic_info, alltoall_info = \
@@ -416,30 +434,28 @@ class WideEPMoE(MoE):
                     deep_ep_topk_weights = token_final_scales
                     x, recv_expert_count, deep_ep_handle = \
                         self.deep_ep_buffer.low_latency_dispatch(x, deep_ep_topk_idx, self.deep_ep_max_num_tokens, self.num_slots)
-                    # x shape: [#local experts, #max recv tokens, hidden_size]
+                    # x shape: [#local experts, EP size * deep_ep_max_num_tokens, hidden_size]
                     # recv_expert_count shape: [#local experts]
 
                     # Adapter between `torch.ops.trtllm.fused_moe` and DeepEP
                     # TODO: remove the adapter by changing `torch.ops.trtllm.fused_moe` API
+                    x = x[:, :self.mapping.moe_ep_size *
+                          all_rank_max_num_tokens]
                     mask = torch.arange(
                         x.shape[1], dtype=torch.int32, device=x.device).expand(
                             x.shape[0],
                             x.shape[1]) < recv_expert_count.unsqueeze(1)
-                    token_selected_slots = torch.full(
-                        (x.shape[0], x.shape[1], self.routing_method.top_k),
-                        self.num_slots,
-                        dtype=torch.int32,
-                        device=x.device)
-                    token_selected_slots[:, :, 0] = torch.where(
+                    token_selected_slots = torch.where(
                         mask,
                         torch.arange(
                             x.shape[0] * self.mapping.moe_ep_rank,
                             x.shape[0] * (self.mapping.moe_ep_rank + 1),
                             dtype=torch.int32,
                             device=x.device).unsqueeze(1), self.num_slots)
-                    x = x.view(x.shape[0] * x.shape[1], x.shape[2])
+                    x = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
+                    # Cheat the fused_moe API with fake top_k=1
                     token_selected_slots = token_selected_slots.view(
-                        x.shape[0], self.routing_method.top_k)
+                        x.shape[0], 1)
                     token_final_scales = torch.ones_like(
                         token_selected_slots, dtype=token_final_scales.dtype)
             else:
@@ -484,6 +500,8 @@ class WideEPMoE(MoE):
 
         if self.use_dp and self.parallel_size > 1 and not disable_fp4_allgather(
         ) and not self.enable_alltoall:
+            if self.enable_dummy_allreduce:
+                self.dummy_allreduce()
             x, x_sf, token_selected_slots, token_final_scales, gathered_token_selected_experts_for_statistic = allgather(
                 [
                     x,
@@ -632,6 +650,8 @@ class WideEPMoE(MoE):
 
         if self.enable_alltoall:
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
+                if self.enable_dummy_allreduce:
+                    self.dummy_allreduce()
                 final_hidden_states = self.alltoall_combine(
                     final_hidden_states, alltoall_info, token_count)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
@@ -640,12 +660,27 @@ class WideEPMoE(MoE):
                 final_hidden_states = self.deep_ep_buffer.combine(
                     final_hidden_states, deep_ep_handle)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
-                final_hidden_states = self.deep_ep_buffer.low_latency_combine(
-                    final_hidden_states.view(
+                num_tokens_per_expert_for_fused_moe = self.mapping.moe_ep_size * all_rank_max_num_tokens
+                num_tokens_per_expert_for_deep_ep = self.deep_ep_max_num_tokens * self.mapping.moe_ep_size
+                final_hidden_states = final_hidden_states.view(
+                    self.expert_size_per_partition,
+                    num_tokens_per_expert_for_fused_moe, self.hidden_size)
+                if num_tokens_per_expert_for_deep_ep != num_tokens_per_expert_for_fused_moe:
+                    # Adapter between fused_moe num_tokens and DeepEP num_tokens
+                    # This adapter can be removed if fused_moe accepts DeepEP num_tokens without overhead
+                    final_hidden_states_for_fused_moe = final_hidden_states
+                    final_hidden_states = torch.empty(
                         self.expert_size_per_partition,
                         self.deep_ep_max_num_tokens * self.mapping.moe_ep_size,
-                        final_hidden_states.shape[1]), deep_ep_topk_idx,
-                    deep_ep_topk_weights, deep_ep_handle)
+                        self.hidden_size,
+                        dtype=final_hidden_states.dtype,
+                        device=final_hidden_states.device)
+                    final_hidden_states[:, :
+                                        num_tokens_per_expert_for_fused_moe] = final_hidden_states_for_fused_moe
+                    del final_hidden_states_for_fused_moe  # Release memory
+                final_hidden_states = self.deep_ep_buffer.low_latency_combine(
+                    final_hidden_states, deep_ep_topk_idx, deep_ep_topk_weights,
+                    deep_ep_handle)
             else:
                 raise NotImplementedError(
                     f"Not available alltoall method type: {self.alltoall_method_type!r}"

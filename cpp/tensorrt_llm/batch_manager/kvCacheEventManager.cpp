@@ -42,12 +42,13 @@ KVCacheEventManager::~KVCacheEventManager()
     mWorkerThread.join();
 }
 
-void KVCacheEventManager::enqueueCreatedEvent(std::vector<SizeType32> const& numBlocksPerCacheLevel)
+void KVCacheEventManager::enqueueCreatedEvent(
+    std::vector<SizeType32> const& numBlocksPerCacheLevel, SizeType32 windowSize)
 {
-    enqueueEvent({mEventId++, tle::KVCacheCreatedData{numBlocksPerCacheLevel}});
+    enqueueEvent({mEventId++, tle::KVCacheCreatedData{numBlocksPerCacheLevel}, windowSize});
 }
 
-void KVCacheEventManager::enqueueStoredEvent(std::vector<BlockPtr> const& blocks)
+void KVCacheEventManager::enqueueStoredEvent(std::vector<BlockPtr> const& blocks, SizeType32 windowSize)
 {
     if (blocks.empty())
     {
@@ -67,24 +68,26 @@ void KVCacheEventManager::enqueueStoredEvent(std::vector<BlockPtr> const& blocks
             block->isPrimary() ? kPrimaryLevel : kSecondaryLevel, block->getPriority());
     }
 
-    enqueueEvent({mEventId++, data});
+    enqueueEvent({mEventId++, data, windowSize});
 }
 
-void KVCacheEventManager::enqueueRemovedEvent(BlockPtr const& block)
+void KVCacheEventManager::enqueueRemovedEvent(BlockPtr const& block, SizeType32 windowSize)
 {
-    if (!mEventQueue.empty() && std::holds_alternative<tle::KVCacheRemovedData>(mEventQueue.back().data))
+    // We can only batch the removed block events if the same sliding window size is used.
+    if (!mEventQueue.empty() && mEventQueue.back().windowSize == windowSize
+        && std::holds_alternative<tle::KVCacheRemovedData>(mEventQueue.back().data))
     {
         std::get<tle::KVCacheRemovedData>(mEventQueue.back().data).blockHashes.push_back(block->getHash());
     }
     else
     {
-        enqueueEvent({mEventId++, tle::KVCacheRemovedData{{block->getHash()}}});
+        enqueueEvent({mEventId++, tle::KVCacheRemovedData{{block->getHash()}}, windowSize});
     }
 }
 
-void KVCacheEventManager::enqueueUpdatedEvent(tle::KVCacheUpdatedData const& data)
+void KVCacheEventManager::enqueueUpdatedEvent(tle::KVCacheUpdatedData const& data, SizeType32 windowSize)
 {
-    enqueueEvent({mEventId++, data});
+    enqueueEvent({mEventId++, data, windowSize});
 }
 
 void KVCacheEventManager::enqueueEvent(tle::KVCacheEvent&& event)

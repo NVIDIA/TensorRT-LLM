@@ -288,3 +288,40 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+@pytest.mark.timeout(3600)
+class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "google/gemma-3-1b-it"
+    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-1b-it/"
+
+    @pytest.mark.parametrize("overlap_scheduler", [False, True])
+    def test_auto_dtype(self, overlap_scheduler):
+        ctx_server_config = {"disable_overlap_scheduler": True}
+        gen_server_config = {"disable_overlap_scheduler": overlap_scheduler}
+        ctx_server_config["kv_cache_config"] = {
+            "max_attention_window": [512, 512, 512, 512, 512, 32768],
+            "enable_block_reuse": False
+        }
+        gen_server_config["kv_cache_config"] = {
+            "max_attention_window": [512, 512, 512, 512, 512, 32768],
+            "enable_block_reuse": False
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)

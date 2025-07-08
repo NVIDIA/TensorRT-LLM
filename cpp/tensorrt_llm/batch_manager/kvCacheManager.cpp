@@ -552,7 +552,7 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
         mAllBlocksById, {blocksInPrimaryPool, blocksInSecondaryPool}, secondaryOffloadMinPriority);
     if (mEventManager)
     {
-        mEventManager->enqueueCreatedEvent({blocksInPrimaryPool, blocksInSecondaryPool});
+        mEventManager->enqueueCreatedEvent({blocksInPrimaryPool, blocksInSecondaryPool}, mWindowSize);
     }
 }
 
@@ -741,7 +741,7 @@ void WindowBlockManager::freeChildren(
     // Free block
     if (mEventManager && blockInRadixTree(block))
     {
-        mEventManager->enqueueRemovedEvent(block);
+        mEventManager->enqueueRemovedEvent(block, mWindowSize);
     }
 
     claimLeafBlock(block, priority, durationMs);
@@ -776,7 +776,8 @@ BlockPtr WindowBlockManager::getFreeBlock(
         if (mEventManager && blockInRadixTree(block))
         {
             mEventManager->enqueueUpdatedEvent(
-                tle::KVCacheUpdatedData(block->getHash()).cacheLevelUpdated(kPrimaryLevel, kSecondaryLevel));
+                tle::KVCacheUpdatedData(block->getHash()).cacheLevelUpdated(kPrimaryLevel, kSecondaryLevel),
+                mWindowSize);
         }
         mEvictionPolicy->releaseBlock(block); // append offload block to mFreeSecondaryBlocks queue
         block = offloadBlock;
@@ -881,7 +882,8 @@ void WindowBlockManager::onboardBlock(BlockPtr const& offloadBlock)
         if (mEventManager)
         {
             mEventManager->enqueueUpdatedEvent(
-                tle::KVCacheUpdatedData(offloadBlock->getHash()).cacheLevelUpdated(kSecondaryLevel, kPrimaryLevel));
+                tle::KVCacheUpdatedData(offloadBlock->getHash()).cacheLevelUpdated(kSecondaryLevel, kPrimaryLevel),
+                mWindowSize);
         }
         mEvictionPolicy->releaseBlock(block); // append block to offload queue
                                               // offloadBlock is now in primary memory pool
@@ -908,7 +910,8 @@ void WindowBlockManager::offloadBlock(BlockPtr const& block)
         if (mEventManager && blockInRadixTree(block))
         {
             mEventManager->enqueueUpdatedEvent(
-                tle::KVCacheUpdatedData(block->getHash()).cacheLevelUpdated(kPrimaryLevel, kSecondaryLevel));
+                tle::KVCacheUpdatedData(block->getHash()).cacheLevelUpdated(kPrimaryLevel, kSecondaryLevel),
+                mWindowSize);
         }
         mEvictionPolicy->releaseBlock(offloadBlock); // append offloadBlock to mFreePrimaryBlocks queue
                                                      // block is now in secondary memory
@@ -980,7 +983,8 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
             {
                 mEventManager->enqueueUpdatedEvent(
                     tle::KVCacheUpdatedData(matchingBlock->getHash())
-                        .priorityUpdated(matchingBlock->getPriority(), *perBlockRetentions[bi].retentionPriority));
+                        .priorityUpdated(matchingBlock->getPriority(), *perBlockRetentions[bi].retentionPriority),
+                    mWindowSize);
             }
             if (partialMatch)
             {
@@ -1275,7 +1279,7 @@ void WindowBlockManager::storeBlocks(
     }
     if (mEventManager)
     {
-        mEventManager->enqueueStoredEvent(storedBlocks);
+        mEventManager->enqueueStoredEvent(storedBlocks, mWindowSize);
     }
 }
 

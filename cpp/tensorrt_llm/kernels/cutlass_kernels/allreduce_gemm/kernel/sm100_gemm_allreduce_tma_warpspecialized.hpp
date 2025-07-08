@@ -55,6 +55,8 @@
 
 #include "gemm_universal_allreduce.hpp"
 
+#include "tensorrt_llm/kernels/archCondition.h"
+
 ///////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass::gemm::kernel
@@ -418,7 +420,23 @@ public:
     CUTLASS_DEVICE
     void operator()(Params const& params, char* smem_buf)
     {
+        if constexpr (tensorrt_llm::kernels::arch::is_major_v<10>)
+        {
+            _invoke(params, smem_buf);
+        }
+        else
+        {
+            if (cute::thread0())
+            {
+                printf("%s : This kernel shall only run on SM10x devices.\n", __PRETTY_FUNCTION__);
+                __trap();
+            }
+        }
+    }
 
+    CUTLASS_DEVICE
+    void _invoke(Params const& params, char* smem_buf)
+    {
         using namespace cute;
         using X = Underscore;
 

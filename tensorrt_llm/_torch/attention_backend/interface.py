@@ -45,6 +45,8 @@ class AttentionMetadata:
     max_num_requests: int
     # The max number of tokens in all requests in a single batch.
     max_num_tokens: int
+    # The max number of sequences in a single batch.
+    max_num_sequences: Optional[int] = None
     # The KV cache manager.
     kv_cache_manager: KVCacheManager
     mapping: Optional[Mapping] = None

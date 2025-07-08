@@ -97,8 +97,10 @@ using sizeof_bits = cutlass::sizeof_bits<typename cutlass_kernels::TllmToCutlass
 
 #ifdef ENABLE_FP8
 using SafeFP8 = __nv_fp8_e4m3;
+using SafeFP8E8 = __nv_fp8_e8m0;
 #else
 using SafeFP8 = void;
+using SafeFP8E8 = void;
 #endif
 #ifdef ENABLE_FP4
 using SafeFP4 = __nv_fp4_e2m1;
@@ -124,33 +126,43 @@ protected:
     using GemmDataType = typename TypeTuple_::DataType;
     using WeightType = typename TypeTuple_::WeightType;
     using OutputType = typename TypeTuple_::OutputType;
-    constexpr static bool MX_QUANT = TypeTuple_::UseMxQuant;
+    using ActivationScale = typename TypeTuple_::ActivationScale;
+    using WeightScale = typename TypeTuple_::WeightScale;
     constexpr static bool INT4 = std::is_same_v<WeightType, cutlass::uint4b_t>;
-    constexpr static bool FP8 = std::is_same_v<GemmDataType, SafeFP8> && std::is_same_v<WeightType, SafeFP8>;
+    constexpr static bool ACT_FP8 = std::is_same_v<GemmDataType, SafeFP8>;
+    constexpr static bool WEIGHT_FP8 = std::is_same_v<WeightType, SafeFP8>;
+    constexpr static bool FP8 = ACT_FP8 && WEIGHT_FP8;
     constexpr static bool ACT_FP4 = std::is_same_v<GemmDataType, SafeFP4>;
     constexpr static bool WEIGHT_FP4 = std::is_same_v<WeightType, SafeFP4>;
-    constexpr static bool NVFP4 = ACT_FP4 && WEIGHT_FP4;
-    static_assert(!NVFP4 || !MX_QUANT, "NVFP4 and MX_QUANT are be mutually exclusive");
-    constexpr static bool MIXED_FP4 = !ACT_FP4 && WEIGHT_FP4;
-    static_assert(MIXED_FP4 || !MX_QUANT, "MIXED_FP4 is only supported with MX_QUANT");
+
+    constexpr static bool MX_QUANT_ACT = std::is_same_v<ActivationScale, SafeFP8E8>;
+    constexpr static bool MX_QUANT_WEIGHT = std::is_same_v<WeightScale, SafeFP8E8>;
+    static_assert(!MX_QUANT_ACT || MX_QUANT_WEIGHT, "MX quantized act implies MX quantized weight");
+
+    constexpr static bool NVFP4 = ACT_FP4 && WEIGHT_FP4 && !MX_QUANT_ACT && !MX_QUANT_WEIGHT;
+    static_assert(!ACT_FP4 || NVFP4, "FP4 activations is only supported with NVFP4");
+
+    constexpr static bool MXFP8_MXFP4 = ACT_FP8 && WEIGHT_FP4 && MX_QUANT_ACT && MX_QUANT_WEIGHT;
+    constexpr static bool FP8_MXFP4 = ACT_FP8 && WEIGHT_FP4 && !MX_QUANT_ACT && MX_QUANT_WEIGHT;
 
     constexpr static bool ANY_FP4 = WEIGHT_FP4 || ACT_FP4;
     constexpr static bool ANY_FPX = ANY_FP4 || FP8;
 
-    constexpr static bool INT_QUANT = !std::is_same_v<GemmDataType, WeightType> && !MIXED_FP4;
+    constexpr static bool INT_QUANT = !std::is_same_v<GemmDataType, WeightType> && std::is_integral_v<WeightType>;
     constexpr static int WEIGHT_ELEM_PER_BYTE = (INT4 || WEIGHT_FP4) ? 2 : 1;
-    using InputType = std::conditional_t<NVFP4, OutputType, GemmDataType>;
+    using InputType = std::conditional_t<NVFP4 || MXFP8_MXFP4, OutputType, GemmDataType>;
     using WeightStorage = std::conditional_t<WEIGHT_ELEM_PER_BYTE == 2, uint8_t, WeightType>;
     constexpr static int64_t HIDDEN_SIZE_MULTIPLIER = 16;
-    constexpr static int64_t MINIMUM_BYTE_ALIGNMENT = 64;
+    constexpr static int64_t MINIMUM_BYTE_ALIGNMENT
+        = MX_QUANT_WEIGHT ? 64 : 128 / 8; // TMA requires 128 bits alignment, MX quant requires 64 bytes
     constexpr static int64_t MINIMUM_ALIGNMENT = MINIMUM_BYTE_ALIGNMENT * WEIGHT_ELEM_PER_BYTE / sizeof(WeightStorage);
     constexpr static int64_t DEFAULT_HIDDEN_SIZE = HIDDEN_SIZE_MULTIPLIER * MINIMUM_ALIGNMENT;
 
     // FP4 uses the unquantized data type for inputs and quantizes on the fly
-    using DataType = std::conditional_t<NVFP4, OutputType, GemmDataType>;
+    using DataType = std::conditional_t<NVFP4 || MXFP8_MXFP4, OutputType, GemmDataType>;
 
-    // MIXED_FP4 quantizes just the weights on the fly
-    using WeightRawType = std::conditional_t<MIXED_FP4, OutputType, DataType>;
+    // FP8_MXFP4 quantizes just the weights on the fly
+    using WeightRawType = std::conditional_t<FP8_MXFP4, OutputType, DataType>;
 
     static BufferManager::CudaStreamPtr mStream;
     static std::unique_ptr<BufferManager> mBufferManager;
@@ -165,14 +177,15 @@ protected:
 
     float getTolerance(float scale = 1.f)
     {
-        bool loose_fp8 = mActType != ActivationType::Relu;
+        bool loose_tol = mActType != ActivationType::Relu || mUseBias;
         float tol = std::is_same_v<WeightType, uint8_t>     ? 0.1
             : std::is_same_v<WeightType, cutlass::uint4b_t> ? 0.1
             : std::is_same_v<GemmDataType, float>           ? 0.001
             : std::is_same_v<GemmDataType, half>            ? 0.005
             : std::is_same_v<GemmDataType, __nv_bfloat16>   ? 0.05
-            : std::is_same_v<GemmDataType, SafeFP8>         ? (loose_fp8 ? 0.06 : 0.001)
-            : std::is_same_v<GemmDataType, SafeFP4>         ? 0.05
+            : (MXFP8_MXFP4 || FP8_MXFP4)                    ? (loose_tol ? 0.1 : 0.01)
+            : std::is_same_v<GemmDataType, SafeFP8>         ? (loose_tol ? 0.06 : 0.001)
+            : NVFP4                                         ? 0.05
                                                             : 0.0;
 
         // Keep the scale in a sane range
@@ -221,6 +234,7 @@ protected:
     {
         managed_buffers.clear();
         ASSERT_EQ(cudaStreamSynchronize(mStream->get()), cudaSuccess);
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
         ASSERT_EQ(cudaGetLastError(), cudaSuccess);
     }
 
@@ -282,10 +296,21 @@ protected:
     float* mExpertFP4WeightGlobalScale2{};
 
     using ElementSF = TmaWarpSpecializedGroupedGemmInput::ElementSF;
-    constexpr static int FP4VecSize = MX_QUANT ? TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize
-                                               : TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize;
-    constexpr static int MinAlignmentFP4 = MX_QUANT ? TmaWarpSpecializedGroupedGemmInput::MinNumRowsAlignmentMXFPX
-                                                    : TmaWarpSpecializedGroupedGemmInput::MinNumRowsAlignmentNVFP4;
+    constexpr static int FP4VecSize = MX_QUANT_WEIGHT ? TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize
+                                                      : TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize;
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
+    constexpr static int MinNDimAlignmentFP4 = MX_QUANT_WEIGHT
+        ? TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX
+        : TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentNVFP4;
+    constexpr static int MinKDimAlignmentFP4 = MX_QUANT_WEIGHT
+        ? TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX
+        : TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4;
+#else
+    constexpr static int MinNDimAlignmentFP4 = MX_QUANT_WEIGHT
+        ? TmaWarpSpecializedGroupedGemmInput::MinNumRowsAlignmentMXFPX
+        : TmaWarpSpecializedGroupedGemmInput::MiNumRowsAlignmentNVFP4;
+    constexpr static int MinKDimAlignmentFP4 = FP4VecSize * 4; // Hardcode the correct value
+#endif
     ElementSF* mFP4ScalingFactorsW1 = nullptr;
     ElementSF* mFP4ScalingFactorsW2 = nullptr;
 
@@ -460,16 +485,20 @@ protected:
         }
         else if constexpr (ANY_FP4)
         {
-            // TODO We populate these on the fly, so we can probably reduce these by moe_parallel_size
             mExpertWeight1 = allocBuffer<WeightStorage>(
                 expert_matrix_size * mGatedMultiplier / WEIGHT_ELEM_PER_BYTE / moe_parallel_size);
             mExpertWeight2 = allocBuffer<WeightStorage>(expert_matrix_size / WEIGHT_ELEM_PER_BYTE / moe_parallel_size);
 
-            size_t const padded_fc1_size = mNumExperts * mHiddenSize
-                * cute::ceil_div(mInterSize * mGatedMultiplier / parallelism_config.tp_size, MinAlignmentFP4)
-                * MinAlignmentFP4 / parallelism_config.ep_size;
-            size_t const padded_fc2_size = mNumExperts * mInterSize * cute::ceil_div(mHiddenSize, MinAlignmentFP4)
-                * MinAlignmentFP4 / moe_parallel_size;
+            size_t const padded_fc1_size = mNumExperts
+                * TmaWarpSpecializedGroupedGemmInput::alignToSfDim(mHiddenSize, MinKDimAlignmentFP4)
+                * TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+                    mInterSize / parallelism_config.tp_size, MinNDimAlignmentFP4)
+                * mGatedMultiplier / parallelism_config.ep_size;
+            size_t const padded_fc2_size = mNumExperts
+                * TmaWarpSpecializedGroupedGemmInput::alignToSfDim(mInterSize, MinKDimAlignmentFP4)
+                * TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+                    mHiddenSize / parallelism_config.tp_size, MinNDimAlignmentFP4)
+                / parallelism_config.ep_size;
             mFP4ScalingFactorsW1 = allocBuffer<ElementSF>(padded_fc1_size / FP4VecSize);
             mFP4ScalingFactorsW2 = allocBuffer<ElementSF>(padded_fc2_size / FP4VecSize);
         }
@@ -572,58 +601,50 @@ protected:
     void doFP4Quant(WeightRawType const* raw_weights, WeightStorage* quant_weights, float const* global_scales,
         ElementSF* scaling_factors, int in_shape, int out_shape, int num_experts)
     {
-        int const mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
-        int padded_stride = cute::ceil_div(out_shape, MinAlignmentFP4) * MinAlignmentFP4;
+        int64_t const mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
+        int64_t padded_out_dim = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(out_shape, MinNDimAlignmentFP4);
+        int64_t padded_in_dim = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(in_shape, MinKDimAlignmentFP4);
         check_cuda_error(cudaMemsetAsync(scaling_factors, 0x00,
-            num_experts * padded_stride * cutlass::ceil_div(in_shape, FP4VecSize) * sizeof(ElementSF), mStream->get()));
+            num_experts * padded_out_dim * padded_in_dim / FP4VecSize * sizeof(ElementSF), mStream->get()));
         invokeBatchedFP4Quantization<WeightRawType, FP4VecSize>(num_experts, out_shape, in_shape, raw_weights,
             global_scales, reinterpret_cast<int64_t*>(quant_weights), reinterpret_cast<int32_t*>(scaling_factors),
-            MX_QUANT, mMultiProcessorCount, mStream->get());
-        // for (int i = 0; i < num_experts; i++)
-        // {
-        //     auto* weight_start = raw_weights + i * in_shape * out_shape;
-        //     auto* quant_weight_start = quant_weights + i * in_shape * out_shape / WEIGHT_ELEM_PER_BYTE;
-        //     auto* scaling_factor_start
-        //         = scaling_factors + i * (int64_t) padded_stride * cutlass::ceil_div(in_shape, FP4VecSize);
-        //     printf("Expert %d: Weight offset: %lld, quant_weight_offset: %lld, scaling_factor_offset: %lld\n",
-        //         (long long) i, (long long) i * in_shape * out_shape,
-        //         (long long) i * in_shape * out_shape / WEIGHT_ELEM_PER_BYTE,
-        //         (long long) i * (int64_t) padded_stride * cutlass::ceil_div(in_shape, FP4VecSize));
+            MX_QUANT_WEIGHT, mMultiProcessorCount, mStream->get());
 
-        //     check_cuda_error(cudaStreamSynchronize(mStream->get()));
-        //     std::cout << "Quant " << i << " starting" << std::endl;
-        //     auto data = getDataFromDevice(scaling_factor_start, 4 * cutlass::ceil_div(in_shape, FP4VecSize));
-        //     for (auto v : data)
-        //     {
-        //         std::cout << (float) v << ", ";
+        // auto sf_data = getDataFromDevice<ElementSF>(scaling_factors, num_experts * padded_out_dim * padded_in_dim /
+        // FP4VecSize); auto unquant_data = getDataFromDevice<WeightRawType>(raw_weights, num_experts * out_shape *
+        // in_shape); auto quant_data = getDataFromDevice<uint32_t>((uint32_t*)quant_weights, num_experts * out_shape *
+        // in_shape / 8); for(int expert = 0; expert < num_experts; expert++) {
+        //     for(int i = 0; i < out_shape; i++) {
+        //         for(int j = 0; j < in_shape / FP4VecSize; j++) {
+        //             printf("quant_weights[(%d, %d, %d)]: ", expert, i, j * FP4VecSize);
+        //             for(int k = 0; k < FP4VecSize / 8; k++) {
+        //                 printf("0x%08x, ", quant_data[(expert * out_shape * in_shape + i * in_shape + j * FP4VecSize)
+        //                 / 8 + k]);
+        //             }
+        //             printf("scaling_factors: %e, ",
+        //             (float)sf_data[tensorrt_llm::kernels::get_sf_out_offset_128x4<FP4VecSize>(expert, i, j,
+        //             out_shape, in_shape)]); printf("original: "); for(int k = 0; k < FP4VecSize; k++) {
+        //                 printf("%e, ", (float)unquant_data[expert * out_shape * in_shape + i * in_shape + j *
+        //                 FP4VecSize + k]);
+        //             }
+        //             printf("\n");
+        //         }
         //     }
-        //     std::cout << std::endl;
-
-        //     invokeFP4Quantization<WeightRawType, FP4VecSize>(out_shape, in_shape, weight_start, global_scales + i,
-        //         reinterpret_cast<int64_t*>(quant_weight_start), reinterpret_cast<int32_t*>(scaling_factor_start),
-        //         MX_QUANT, tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED, mMultiProcessorCount, mStream->get());
-
-        //     // check_cuda_error(cudaStreamSynchronize(mStream->get()));
-        //     // std::cout << "Quant " << i << " done" << std::endl;
-        //     // auto data = getDataFromDevice(mInputTensor, mHiddenSize);
-        //     // for (auto v : data)
-        //     // {
-        //     //     std::cout << (float)v << ", ";
-        //     // }
-        //     // std::cout << std::endl;
         // }
     }
 
     constexpr static float getFPXActScalar(float in)
     {
-        // Our FP8 x MXFP4 implementation uses a global scale factor. This should be skipped if we use MXFP8 x MXFP4
-        if (FP8 || MIXED_FP4)
+        // Our FP8 x MXFP4 implementation uses a global scale factor
+        if (FP8 || FP8_MXFP4)
             return FP8_MAX / in;
         if (NVFP4)
             // We need to represent the block SF using FP8, so the largest value should be at most FP4_MAX * FP8_MAX
             // return FP8_MAX * FP4_MAX / in;
             // We carefully control precision in FP4. We want to avoid introducing any non-powers of two
             return 2.0f;
+
+        // MX quant does not have a global scale factor
         return 1.0f;
     }
 
@@ -770,8 +791,45 @@ protected:
     template <class T>
     auto populateTokens(std::vector<T>& hidden_states)
     {
-        // Can't use FP8 param because we recurse with a different type, and we also reuse this for MIXED_FP4
-        if constexpr (std::is_same_v<T, SafeFP8>)
+        if constexpr (MX_QUANT_ACT) // MXFP8_MXFP4
+        {
+            int const max_order_of_magnitude = 4;
+            std::vector<float> base(hidden_states.size());
+            std::mt19937 gen(0xD5);
+            // Filthy hack to make GELU/SiLu be not introduce large quantization errors
+            float min = mIsGated ? 4.f : 0;
+            float max = FP8_MAX;
+            std::uniform_int_distribution<int> is_negative(0, 10);
+            std::uniform_real_distribution<float> dist(min, max);
+            std::generate(base.begin(), base.end(),
+                [&]()
+                {
+                    if (is_negative(gen) == 0)
+                    {
+                        return float(__nv_fp8_e4m3(-dist(gen)));
+                    }
+                    else
+                    {
+                        return float(__nv_fp8_e4m3(dist(gen)));
+                    }
+                });
+
+            // Avoid small values for gated activation
+            int adjustment = max_order_of_magnitude / 2;
+            for (int i = 0; i < hidden_states.size() / FP4VecSize; i++)
+            {
+                auto block_scale = mIsGated ? 1.f : exp2f(i % max_order_of_magnitude - adjustment);
+                hidden_states[i * FP4VecSize] = T(FP8_MAX * block_scale);
+                for (int j = 1; j < FP4VecSize; j++)
+                {
+                    hidden_states[i * FP4VecSize + j] = T(base[i * FP4VecSize + j] * block_scale);
+                }
+                mMaxInput = std::max(mMaxInput, FP8_MAX * block_scale);
+            }
+            return hidden_states;
+        }
+        // Use the actual template param because we recurse with a different type
+        else if constexpr (std::is_same_v<T, SafeFP8>) // FP8, FP8_MXFP4
         {
             // Call the standard setup and then perform the quantization manually
             std::vector<OutputType> internal_states(hidden_states.size());
@@ -786,7 +844,7 @@ protected:
                 [scalar](T in) -> OutputType { return static_cast<OutputType>(((float) in) / scalar); });
             return internal_states;
         }
-        else if constexpr (ACT_FP4)
+        else if constexpr (ACT_FP4) // NVFP4
         {
             float const max_scale = 1.0f;
             mMaxInput = FP4_MAX * max_scale;
@@ -796,7 +854,8 @@ protected:
             int stride = FP4VecSize;
             for (int i = 0; i < hidden_states.size(); i += stride)
             {
-                for (int j = 0; j < stride; j++)
+                hidden_states[i] = FP4_MAX * scale;
+                for (int j = 1; j < stride; j++)
                 {
                     hidden_states[i + j] = allowed_values[(i / stride + j) % allowed_values.size()] * scale;
                 }
@@ -809,7 +868,7 @@ protected:
             }
             return hidden_states;
         }
-        else
+        else // FP16, BF16, FP32, (recurse) FP8
         {
             // Generates numbers in increments of 1/max_order_of_magnitude in the range [0, 1)
             constexpr int max_order_of_magnitude = 256;
@@ -1078,13 +1137,21 @@ protected:
             ASSERT_TRUE(mExpertFP4ActGlobalScale1);
             ASSERT_TRUE(mFP4ScalingFactorsW1 && mFP4ScalingFactorsW2);
             ASSERT_TRUE(scale1_ptr && scale2_ptr && scale3_ptr);
-            auto fc1_sf_offset = mUsePerExpertActScale && NVFP4
-                ? mNumExperts / parallelism_config.ep_size * parallelism_config.ep_rank
-                : 0;
-            auto constructor = NVFP4 ? &QuantParams::FP4 : &QuantParams::FP8MXFP4;
-            quant_params = constructor(mExpertFP4ActGlobalScale1 + fc1_sf_offset, mFP4ScalingFactorsW1,
-                static_cast<float const*>(scale1_ptr), static_cast<float const*>(scale2_ptr), mFP4ScalingFactorsW2,
-                static_cast<float const*>(scale3_ptr), mUsePerExpertActScale && NVFP4, mUsePerExpertActScale);
+            if constexpr (NVFP4 || FP8_MXFP4)
+            {
+                auto fc1_sf_offset = mUsePerExpertActScale && NVFP4
+                    ? mNumExperts / parallelism_config.ep_size * parallelism_config.ep_rank
+                    : 0;
+                auto constructor = NVFP4 ? &QuantParams::FP4 : &QuantParams::FP8MXFP4;
+                quant_params = constructor(mExpertFP4ActGlobalScale1 + fc1_sf_offset, mFP4ScalingFactorsW1,
+                    static_cast<float const*>(scale1_ptr), static_cast<float const*>(scale2_ptr), mFP4ScalingFactorsW2,
+                    static_cast<float const*>(scale3_ptr), mUsePerExpertActScale && NVFP4, mUsePerExpertActScale);
+            }
+            else if constexpr (MXFP8_MXFP4)
+            {
+                quant_params = QuantParams::MXFP8MXFP4(mFP4ScalingFactorsW1, static_cast<float const*>(scale1_ptr),
+                    mFP4ScalingFactorsW2, static_cast<float const*>(scale3_ptr));
+            }
         }
 
         if constexpr (WEIGHT_FP4)
@@ -1204,7 +1271,18 @@ protected:
         return in;
     }
 
-    float calcMLPVal(float input, int expert_id, bool final_bias = false)
+    float quantAct(float in, float block_max)
+    {
+        if (MX_QUANT_ACT)
+        {
+            float scale = std::exp2f(std::ceil(std::log2f(block_max / FP8_MAX)));
+            return float(__nv_fp8_e4m3(in / scale)) * scale;
+        }
+        // TODO Handle NVFP4 too so we can test non-relu actfns
+        return in;
+    }
+
+    float calcMLPVal(float input, int expert_id, bool final_bias = false, float block_max = 1.f)
     {
         if (expert_id >= mNumExperts)
             return 0;
@@ -1221,22 +1299,28 @@ protected:
             float gate = input * gated_scalar + gated_bias;
 
             activated = fc1 * actfn(gate);
+
+            block_max = (block_max * scalar + w1_bias) * actfn(block_max * gated_scalar + gated_bias);
         }
         else
         {
             float scalar = applyExpertShift(mExpertWDiag1, expert_id);
             float fc1 = input * scalar + w1_bias;
             activated = actfn(fc1);
+
+            block_max = actfn(block_max * scalar + w1_bias);
         }
+
+        activated = quantAct(activated, block_max);
 
         EXPECT_TRUE(mUseBias || !final_bias);
         float result = activated * applyExpertShift(mExpertWDiag2, expert_id) + (float) (final_bias ? expert_id : 0);
         return result;
     }
 
-    float calcMLPValWithFinalBias(float input, int expert_id)
+    float calcMLPValWithFinalBias(float input, int expert_id, float block_max = 1.f)
     {
-        return calcMLPVal(input, expert_id, mUseBias);
+        return calcMLPVal(input, expert_id, mUseBias, block_max);
     }
 
     template <class T>
@@ -1313,9 +1397,14 @@ protected:
 
         for (int64_t token_id = 0; token_id < mTotalTokens; token_id++)
         {
+            float block_max = 1.f;
             // NOTE: When mInterSize < mHiddenSize, those values get zeroed out by fc1 and lost
             for (int64_t hidden_id = 0; hidden_id < std::min(mHiddenSize, mInterSize); hidden_id++)
             {
+                if (MX_QUANT_ACT && hidden_id % FP4VecSize == 0)
+                {
+                    block_max = input_data[token_id * mHiddenSize + hidden_id];
+                }
                 float sum = 0.0f;
                 // Loop for the number of times each token is duplicated
                 for (int k_idx = 0; k_idx < mK; k_idx++)
@@ -1323,8 +1412,9 @@ protected:
                     int selected_expert = expected_experts[token_id * mK + k_idx];
                     float final_scale_value = token_final_scales[token_id * mK + k_idx];
 
-                    float final_value = float(calcMLPValWithFinalBias(
-                        static_cast<float>(input_data[token_id * mHiddenSize + hidden_id]), selected_expert));
+                    float final_value = float(
+                        calcMLPValWithFinalBias(static_cast<float>(input_data[token_id * mHiddenSize + hidden_id]),
+                            selected_expert, block_max));
                     sum += final_value * final_scale_value;
                 }
 
@@ -1354,13 +1444,12 @@ protected:
     }
 
     // Tensor parallel tests default to inter_size_fraction = 1.0f so that all ranks have interesting values (i.e. a
-    // diagonal non-square matrix would be all zeros for the last rank) Note when debugging we occasionally want to edit
-    // the HIDDEN_SIZE_MULTIPLIER to a smaller value to make inspecting weights easier, so account for this so the test
-    // doesn't fail
+    // diagonal non-square matrix would be all zeros for the last rank)
     void TensorParallelTest(int k = 1, int64_t hidden_size = DEFAULT_HIDDEN_SIZE, int64_t num_experts = 4,
-        int64_t num_tokens = 3, float inter_size_fraction = std::min(1.0f, HIDDEN_SIZE_MULTIPLIER / 8.0f))
+        int64_t num_tokens = 3, float inter_size_fraction = 1.0f)
     {
-        mInterSizeFraction = inter_size_fraction;
+        // Ensure we dont drop below the minimum alignment
+        mInterSizeFraction = std::max(inter_size_fraction, MINIMUM_ALIGNMENT * 8.0f / hidden_size);
         ParallelismTest(k, 2, 1, hidden_size, num_experts, num_tokens);
         ParallelismTest(k, 4, 1, hidden_size, num_experts, num_tokens);
         ParallelismTest(k, 8, 1, hidden_size, num_experts, num_tokens);
@@ -1369,7 +1458,7 @@ protected:
     void MixedParallelTest(int k = 1, int64_t hidden_size = DEFAULT_HIDDEN_SIZE, int64_t num_experts = 4,
         int64_t num_tokens = 3, float inter_size_fraction = 1.0f)
     {
-        mInterSizeFraction = inter_size_fraction;
+        mInterSizeFraction = std::max(inter_size_fraction, MINIMUM_ALIGNMENT * 8.0f / hidden_size);
 
         // 2 experts per rank
         ParallelismTest(k, 2, num_experts / 2, hidden_size, num_experts, num_tokens);
@@ -1387,13 +1476,15 @@ protected:
 template <class WeightParams>
 using LargeMixtureOfExpertsTest = MixtureOfExpertsTest<WeightParams>;
 
-template <class DataType_, class WeightType_ = DataType_, class OutputType_ = DataType_, bool MX_QUANT_ = false>
+template <class DataType_, class WeightType_ = DataType_, class OutputType_ = DataType_, class ActivationScale_ = void,
+    class WeightScale_ = void>
 struct WeightParams
 {
     using DataType = DataType_;
     using WeightType = WeightType_;
     using OutputType = OutputType_;
-    constexpr static bool UseMxQuant = MX_QUANT_;
+    using ActivationScale = ActivationScale_;
+    using WeightScale = WeightScale_;
 };
 
 // TODO Fix int quantized
@@ -1405,7 +1496,12 @@ using Types = ::testing::Types<
     WeightParams<SafeFP8, SafeFP8, half>,
 #endif
 #ifdef ENABLE_FP4
-    WeightParams<SafeFP4, SafeFP4, half>, WeightParams<SafeFP8, SafeFP4, half, true>,
+    WeightParams<SafeFP4, SafeFP4, __nv_bfloat16, SafeFP8, SafeFP8>,
+    WeightParams<SafeFP8, SafeFP4, __nv_bfloat16, void, SafeFP8E8>,
+
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
+    WeightParams<SafeFP8, SafeFP4, __nv_bfloat16, SafeFP8E8, SafeFP8E8>,
+#endif
 #endif
 
     WeightParams<half>, WeightParams<float>
@@ -1651,6 +1747,12 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteDeepSeekV3)
     this->BasicPermuteTest(8, hidden_size, 256, 100);
 }
 
+TYPED_TEST(MixtureOfExpertsTest, MinimumAlignment)
+{
+    this->mInterSizeFraction = 1;
+    this->BasicPermuteTest(1, this->DEFAULT_HIDDEN_SIZE + this->MINIMUM_ALIGNMENT);
+}
+
 template <class TypeParam_>
 std::vector<int> MixtureOfExpertsTest<TypeParam_>::calcPermuteMapExpertParallel(
     std::vector<int> const& expected_experts)
@@ -1684,7 +1786,7 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
     {
         if (mActType != ActivationType::Relu)
         {
-            // FP4 has far too little precision to get any sort of consistency with non-relu actfn
+            // FP4 has too little precision to get any sort of consistency with non-relu actfn
             GTEST_SKIP();
             return;
         }

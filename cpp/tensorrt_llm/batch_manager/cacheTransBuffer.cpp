@@ -194,20 +194,29 @@ CacheTransBufferManager::CacheTransBufferManager(
     , mBufferManager{std::make_shared<runtime::CudaStream>()}
 {
 
+    // TODO: FP4 dataSize
     TLLM_CHECK(mCacheManager);
     mDataType = mCacheManager->getPrimaryPool(0)->getDataType();
 
     auto tokensPerBlock = mCacheManager->getBlockManager().getTokensPerBlock();
+    size_t bufferSizeFromMaxNumToken = 0;
     if (maxNumTokens.has_value())
     {
         TLLM_CHECK(maxNumTokens.value() % tokensPerBlock == 0);
+        auto dataSize = common::getDTypeSize(mDataType);
+        auto kvCacheByteSizePerTokenPerLayer = mCacheManager->getBlockManager().getBlockSize(0) / tokensPerBlock
+            * (mCacheManager->getCacheType() == CacheType::kSELFKONLY ? 1 : 2) * dataSize;
+        for (auto layerId = 0; layerId < mCacheManager->getBlockManager().getNumLayers(); layerId++)
+        {
+            auto poolIdx = mCacheManager->getBlockManager().getLayerPoolIdx(layerId);
+            auto windowSize = static_cast<size_t>(mCacheManager->getBlockManager().getPoolWindowSize(poolIdx));
+            auto validTokenNum = windowSize < maxNumTokens.value() ? windowSize : maxNumTokens.value();
+            bufferSizeFromMaxNumToken += validTokenNum * kvCacheByteSizePerTokenPerLayer;
+        }
     }
-    auto kvCachePerToken
-        = (mCacheManager->getBlockManager().getBlockSize(0) * mCacheManager->getBlockManager().getNumLayers()
-              * (mCacheManager->getCacheType() == CacheType::kSELFKONLY ? 1 : 2))
-        / tokensPerBlock;
-    mTransferBufferSize = maxNumTokens.has_value() ? maxNumTokens.value() * kvCachePerToken
-                                                   : common::getEnvMemSizeForKVCacheTransferBuffer();
+
+    mTransferBufferSize
+        = maxNumTokens.has_value() ? bufferSizeFromMaxNumToken : common::getEnvMemSizeForKVCacheTransferBuffer();
     mOnlyUseDynamicBuffer = mTransferBufferSize == 0;
     mRecvBufferCount = common::getEnvRequestKVCacheConcurrent() ? common::getEnvKVCacheRecvBufferCount() : 1;
     mSendBufferCount = common::getEnvParallelCacheSend() ? common::getEnvKVCacheSendMaxConcurrenceNum() : 1;

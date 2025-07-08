@@ -47,7 +47,7 @@
 #include <random>
 #include <tensorrt_llm/batch_manager/dataTransceiverImpl.h>
 #include <tensorrt_llm/batch_manager/mlaCacheFormatter.h>
-#include <tensorrt_llm/executor/cache_transmission/cacheConcatenate.h>
+#include <tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h>
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 using LlmRequest = tensorrt_llm::batch_manager::LlmRequest;
