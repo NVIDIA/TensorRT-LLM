@@ -26,3 +26,6 @@
 [submodule "3rdparty/cppzmq"]
 	path = 3rdparty/cppzmq
 	url = https://github.com/zeromq/cppzmq.git
+[submodule "3rdparty/dynamic-kernel-generator"]
+	path = 3rdparty/dynamic-kernel-generator
+	url = ssh://git@gitlab-master.nvidia.com:12051/dlarch-fastkernels/dynamic-kernel-generator.git

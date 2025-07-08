@@ -217,7 +217,7 @@ target_include_directories(
           ${CUDA_INCLUDE_DIRS}
           ${CUDNN_ROOT_DIR}/include
           ${NCCL_INCLUDE_DIR}
-          ${3RDPARTY_DIR}/cutlass/include
+          ${3RDPARTY_DIR}/dynamic-kernel-generator/cutlass/include
           ${MPI_INCLUDE_PATH}
           ${COMMON_HEADER_DIR})
 

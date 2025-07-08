@@ -133,12 +133,9 @@ enum class CutlassTileConfigSM100
     CtaShape128x256x128B,
     CtaShape128x128x256B,
     CtaShape128x256x256B,
-
-    // M=256
-    CtaShape256x64x128B,
-    CtaShape256x128x128B,
-    CtaShape256x256x128B,
 };
+
+using CutlassTileConfigSM103 = CutlassTileConfigSM100;
 
 enum class CutlassTileConfigSM120
 {
@@ -461,14 +458,15 @@ struct CutlassGemmConfig
     }
 
     CutlassGemmConfig(CutlassTileConfigSM100 tile_config_sm100, MainloopScheduleType mainloop_schedule,
-        EpilogueScheduleType epilogue_schedule, ClusterShape cluster_shape)
+        EpilogueScheduleType epilogue_schedule, ClusterShape cluster_shape, int sm_version = 100)
         : tile_config_sm100(tile_config_sm100)
         , mainloop_schedule(mainloop_schedule)
         , epilogue_schedule(epilogue_schedule)
         , cluster_shape(cluster_shape)
-        , sm_version(100)
+        , sm_version(sm_version)
         , is_tma_warp_specialized(true)
     {
+        assert(sm_version >= 100 && sm_version < 120 && "Expected SM 10x version");
     }
 
     CutlassGemmConfig(CutlassTileConfigSM120 tile_config_sm120, MainloopScheduleType mainloop_schedule,

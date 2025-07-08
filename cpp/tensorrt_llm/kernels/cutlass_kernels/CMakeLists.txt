@@ -28,7 +28,7 @@ if(NOT Python3_EXECUTABLE)
 endif()
 
 execute_process(
-  WORKING_DIRECTORY ${3RDPARTY_DIR}/cutlass/python/
+  WORKING_DIRECTORY ${3RDPARTY_DIR}/dynamic-kernel-generator/cutlass/python/
   COMMAND ${Python3_EXECUTABLE} setup_library.py develop --user
   RESULT_VARIABLE _CUTLASS_LIBRARY_SUCCESS)
 
@@ -72,16 +72,27 @@ function(process_target target_name enable_hopper enable_blackwell)
 
   if(${enable_blackwell}
      AND ("100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+          OR "103" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
           OR "120" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
-          OR "121" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG))
+          OR "121" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+         ))
 
-    if("100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
+    # Both 100 and 103 support these kernels
+    if("100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+       OR "103" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
       # No kernels should be parsed, unless blackwell is specified. This is a
       # build time improvement
       target_compile_definitions(${target_name}
                                  PUBLIC COMPILE_BLACKWELL_TMA_GEMMS)
       target_compile_definitions(${target_name}
                                  PUBLIC COMPILE_BLACKWELL_TMA_GROUPED_GEMMS)
+    endif()
+    # SM103 only kernels
+    if("103" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
+      target_compile_definitions(${target_name}
+                                 PUBLIC COMPILE_BLACKWELL_SM103_TMA_GEMMS)
+      target_compile_definitions(
+        ${target_name} PUBLIC COMPILE_BLACKWELL_SM103_TMA_GROUPED_GEMMS)
     endif()
     if("120" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
        OR "121" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
@@ -113,6 +124,8 @@ function(add_instantiations library base_dir)
     list(LENGTH INSTANTIATIONS_GENERATED_${ARCH} n)
     if(${n} GREATER 0)
       set(TARGET_NAME "_${library}_instantiations_${ARCH}")
+      message(
+        STATUS "Adding target ${TARGET_NAME} with instantiations for ${ARCH}")
       add_library(${TARGET_NAME} OBJECT ${INSTANTIATIONS_GENERATED_${ARCH}})
       target_link_libraries(${library} PRIVATE ${TARGET_NAME})
       set_cuda_architectures(${TARGET_NAME} ${BUILD_ARCHS})
@@ -128,6 +141,7 @@ function(add_instantiations library base_dir)
   glob_src_create_target(80 "80;86")
   glob_src_create_target(90 90)
   glob_src_create_target(100 100f)
+  glob_src_create_target(103 103)
   glob_src_create_target(120 120f)
 endfunction()
 
@@ -231,7 +245,7 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
   add_cuda_architectures(_moe_gemm_launcher 89)
 
   add_library(_moe_gemm_fp4 OBJECT ${MOE_GEMM_SRC_CU_FP4})
-  set_cuda_architectures(_moe_gemm_fp4 100f 120f)
+  set_cuda_architectures(_moe_gemm_fp4 100f 103 120f)
   process_target(_moe_gemm_fp4 false true)
 
   add_library(_moe_gemm_fp8 OBJECT ${MOE_GEMM_SRC_CU_FP8})

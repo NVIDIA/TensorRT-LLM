@@ -64,8 +64,9 @@
 #include <math.h>
 #include <sstream>
 
-namespace tensorrt_llm::kernels::cutlass_kernels
+namespace tensorrt_llm::kernels::cutlass_kernels_oss
 {
+using tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
 using EpilogueFusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion;
 
 template <typename Arch, typename T, typename WeightType, typename OutputType, typename EpilogueTag,
@@ -101,6 +102,12 @@ void dispatchMoeGemmSelectBiasTmaWarpSpecialized(TmaWarpSpecializedGroupedGemmIn
         TLLM_THROW("Please recompile with support for hopper by passing 90-real as an arch to build_wheel.py.");
     }
 #endif
+#ifndef COMPILE_BLACKWELL_SM103_TMA_GROUPED_GEMMS
+    else if constexpr (Arch::kMinComputeCapability == 103)
+    {
+        TLLM_THROW("Please recompile with support for blackwell by passing 103-real as an arch to build_wheel.py.");
+    }
+#endif
 #ifndef COMPILE_BLACKWELL_TMA_GROUPED_GEMMS
     else if constexpr (Arch::kMinComputeCapability >= 100 && Arch::kMinComputeCapability < 120)
     {
@@ -122,30 +129,35 @@ void dispatchMoeGemmSelectBiasTmaWarpSpecialized(TmaWarpSpecializedGroupedGemmIn
                 TLLM_CHECK_WITH_INFO(hopper_input.fpX_block_scaling_type
                         == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX,
                     "MXFPX is the only supported scaling type for WFP4AFP8");
-                return &kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
-                    WeightType, OutputType, EpilogueTag, FUSION, TileShape, ClusterShape, true, false>;
+                return &tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T, WeightType, OutputType,
+                    EpilogueTag, FUSION, TileShape, ClusterShape, true, false>;
             }
             else
             {
                 TLLM_CHECK_WITH_INFO(hopper_input.fpX_block_scaling_type
                         != TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX,
                     "MXFPX is not supported for the selected weight combination");
-                return &kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
-                    WeightType, OutputType, EpilogueTag, FUSION, TileShape, ClusterShape, false, false>;
+                return &tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T, WeightType, OutputType,
+                    EpilogueTag, FUSION, TileShape, ClusterShape, false, false>;
             }
         };
         getFunc()(hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size);
     }
 }
 
-template <typename ClusterTileShape, typename ClusterShape, typename DataType, typename WeightType>
+template <typename Arch, typename CtaShape, typename ClusterShape, typename DataType, typename WeightType>
 constexpr bool are_tile_shapes_supported_sm100()
 {
     using namespace cute;
-    using CtaShape = decltype(shape_div(ClusterTileShape{}, ClusterShape{}));
     // This is the epilogue shape. The MMA shape will be twice this for 2SM
     constexpr auto TileM = size<0>(CtaShape{});
     constexpr auto TileN = size<1>(CtaShape{});
+
+    if constexpr (Arch::kMinComputeCapability == 103)
+    {
+        return std::is_same_v<DataType, __nv_fp4_e2m1> && std::is_same_v<WeightType, __nv_fp4_e2m1> && TileM == 128
+            && (TileN == 128 || TileN == 256);
+    }
 
     if constexpr (TileM != 64 && TileM != 128)
     {
@@ -224,7 +236,7 @@ constexpr bool are_tile_shapes_supported()
 {
     if constexpr (Arch::kMinComputeCapability >= 100 && Arch::kMinComputeCapability < 120)
     {
-        return are_tile_shapes_supported_sm100<CTAShape, ClusterShape, DataType, WeightType>();
+        return are_tile_shapes_supported_sm100<Arch, CTAShape, ClusterShape, DataType, WeightType>();
     }
     else if constexpr (Arch::kMinComputeCapability == 120 || Arch::kMinComputeCapability == 121)
     {
@@ -347,12 +359,34 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(TmaWarpSpecializedGroupedG
             TLLM_THROW("Unsupported SM90 configuration requested");
         }
     }
+#ifdef ENABLE_FP4
+    // Check this before SM100 because we fall back to SM100 if not NVFP4
+    else if (gemm_config.sm_version == 103
+        && std::is_same_v<T, __nv_fp4_e2m1> && std::is_same_v<WeightType, __nv_fp4_e2m1>)
+    {
+        if constexpr (kernels::cutlass_kernels::isValidBlackwellMOESpecialisation<T, WeightType, EpilogueTag, FUSION>())
+        {
+            switch (gemm_config.tile_config_sm100)
+            {
+                SHAPE_CASE(103, 128, 128, 128)
+                SHAPE_CASE(103, 128, 256, 128)
+
+                DEFAULT_CASE(100) // 100 because we use the same member variable for SM100 and SM103
+            }
+        }
+        else
+        {
+            TLLM_THROW("Unsupported SM103 configuration requested");
+        }
+    }
+#endif
     else if (gemm_config.sm_version >= 100 && gemm_config.sm_version < 120)
     {
         if constexpr (kernels::cutlass_kernels::isValidBlackwellMOESpecialisation<T, WeightType, EpilogueTag, FUSION>())
         {
             switch (gemm_config.tile_config_sm100)
             {
+                SHAPE_CASE(100, 64, 32, 128)
                 SHAPE_CASE(100, 64, 64, 128)
                 SHAPE_CASE(100, 64, 128, 128)
                 SHAPE_CASE(100, 64, 256, 128)
@@ -362,10 +396,6 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(TmaWarpSpecializedGroupedG
                 SHAPE_CASE(100, 128, 64, 128)
                 SHAPE_CASE(100, 128, 128, 128)
                 SHAPE_CASE(100, 128, 256, 128)
-
-                SHAPE_CASE(100, 256, 64, 128)
-                SHAPE_CASE(100, 256, 128, 128)
-                SHAPE_CASE(100, 256, 256, 128)
 
                 // SHAPE_CASE(100, 128, 128, 64)
                 // SHAPE_CASE(100, 128, 256, 64)
@@ -409,4 +439,4 @@ size_t calcMaxWorkspaceSizeTmaWarpSpecialized(int num_experts, cutlass_extension
     return count;
 }
 
-} // namespace tensorrt_llm::kernels::cutlass_kernels
+} // namespace tensorrt_llm::kernels::cutlass_kernels_oss

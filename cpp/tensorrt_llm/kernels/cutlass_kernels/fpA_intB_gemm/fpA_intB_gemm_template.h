@@ -50,6 +50,7 @@ namespace kernels
 {
 namespace cutlass_kernels
 {
+using namespace cute;
 
 template <typename ActivationType, typename WeightType, typename ScaleZeroType, typename BiasType, typename OutputType,
     typename arch, cutlass::WeightOnlyQuantOp QuantOp, typename EpilogueTag, typename ThreadblockShape,
@@ -452,9 +453,9 @@ void CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType
         static_assert(!cutlass::platform::is_same<ActivationType, __nv_fp8_e4m3>::value
                 || cutlass::platform::is_same<ScaleZeroType, half>::value,
             "ScaleZeroType must be half for activation=fp8");
-        sm90_dispatch_gemm_to_cutlass<ActivationType, WeightType, ScaleZeroType, BiasType, OutputType, QuantOp,
-            EpilogueTag>(A, B, weight_scales, weight_zero_points, biases, alpha, C, m, n, k, group_size, workspace_ptr,
-            workspace_bytes, gemm_config, stream, occupancy);
+        cutlass_kernels_oss::sm90_dispatch_gemm_to_cutlass<ActivationType, WeightType, ScaleZeroType, BiasType,
+            OutputType, QuantOp, EpilogueTag>(A, B, weight_scales, weight_zero_points, biases, alpha, C, m, n, k,
+            group_size, workspace_ptr, workspace_bytes, gemm_config, stream, occupancy);
     }
     else
     {

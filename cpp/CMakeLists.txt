@@ -215,8 +215,8 @@ include_directories(
   ${CUDAToolkit_INCLUDE_DIRS}/cccl
   ${CUDNN_ROOT_DIR}/include
   $<TARGET_PROPERTY:TensorRT::NvInfer,INTERFACE_INCLUDE_DIRECTORIES>
-  ${3RDPARTY_DIR}/cutlass/include
-  ${3RDPARTY_DIR}/cutlass/tools/util/include
+  ${3RDPARTY_DIR}/dynamic-kernel-generator/cutlass/include
+  ${3RDPARTY_DIR}/dynamic-kernel-generator/cutlass/tools/util/include
   ${3RDPARTY_DIR}/NVTX/include
   ${3RDPARTY_DIR}/json/include)
 if(BINDING_TYPE STREQUAL "pybind" OR BUILD_DEEP_EP)

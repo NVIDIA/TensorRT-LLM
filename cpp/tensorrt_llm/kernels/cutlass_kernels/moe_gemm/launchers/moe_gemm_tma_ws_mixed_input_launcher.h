@@ -23,15 +23,17 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
-namespace cutlass_kernels
+namespace cutlass_kernels_oss
 {
-
+using tensorrt_llm::kernels::cutlass_kernels::GroupedGemmInput;
+using tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
 template <typename T, typename WeightType, typename GemmOutputType, typename EpilogueTag, typename CTAShape,
     typename ClusterShape, typename MainloopScheduleType, typename EpilogueScheduleType,
     cutlass::WeightOnlyQuantOp QuantOp>
-void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs,
+void sm90_generic_mixed_moe_gemm_kernelLauncher(
+    tensorrt_llm::kernels::cutlass_kernels::GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs,
     TmaWarpSpecializedGroupedGemmInput hopper_inputs, int sm_count_, size_t* workspace_size);
 
-} // namespace cutlass_kernels
+} // namespace cutlass_kernels_oss
 } // namespace kernels
 } // namespace tensorrt_llm
