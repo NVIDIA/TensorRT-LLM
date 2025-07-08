@@ -14,7 +14,7 @@ from ...utils.node_utils import get_all_input_output_nodes, is_op
 from .._graph import add_graph_input, canonicalize_graph
 
 
-def update_in_out_nodes(egm: GraphModule, cm: CachedSequenceInterface) -> GraphModule:
+def update_in_out_nodes(egm: GraphModule, cm: CachedSequenceInterface) -> None:
     """Modify the graph module by adding new input nodes and canonicalizing the graph.
 
     The new input nodes correspond to the extra arguments needed for cached and flattened attention.
@@ -45,9 +45,7 @@ def update_in_out_nodes(egm: GraphModule, cm: CachedSequenceInterface) -> GraphM
         input_nodes.append(add_graph_input(egm, name))
     ad_logger.info(f"Added {len(new_args)} new input nodes for cached attention metadata")
 
-    egm = canonicalize_graph(egm)
-
-    return egm
+    canonicalize_graph(egm)
 
 
 def insert_cached_attention(
@@ -131,14 +129,12 @@ def insert_cached_attention(
         graph.erase_node(attn_node)
         num_cached_attn_replacements += 1
 
-    egm = canonicalize_graph(egm)
+    canonicalize_graph(egm)
     ad_logger.info(
         f"Replaced {num_cached_attn_replacements} {source_op} ops "
         f"with {attn_descriptor.get_cached_attention_op()}"
     )
     ad_logger.debug(f"After inserting {attn_descriptor=} with cache: {egm}")
-
-    return egm
 
 
 def resize_kv_cache(
