@@ -538,11 +538,10 @@ def _test_llm_generate_async(model_name=default_model_name,
 @pytest.mark.part0
 def test_llm_generate_async_with_stream_interval(chunked):
     model_path = f"{llm_models_root()}/nvfp4-quantized/Meta-Llama-3.1-8B"
-    build_config = BuildConfig()
-    build_config.max_num_tokens = 256
+    max_num_tokens = 256
     with LLM_torch(model_path,
+                   max_num_tokens=max_num_tokens,
                    stream_interval=4,
-                   build_config=build_config,
                    enable_chunked_prefill=chunked) as llm:
         sampling_params = SamplingParams(max_tokens=13,
                                          ignore_eos=True,
@@ -551,7 +550,7 @@ def test_llm_generate_async_with_stream_interval(chunked):
         last_step_len = 0
         prompt = "The capital of France is "
         if chunked:
-            prompt = prompt * build_config.max_num_tokens
+            prompt = prompt * max_num_tokens
         for output in llm.generate_async(prompt,
                                          sampling_params=sampling_params,
                                          streaming=True):
