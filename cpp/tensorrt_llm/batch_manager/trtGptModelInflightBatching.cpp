@@ -1040,6 +1040,10 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
                 auto const contextBufferId = mCtxGenFusion ? getFusedBufferId() : getContextBufferId();
                 setupDecoderStep(currRequests.contextRequests, *mBuffers.at(contextBufferId),
                     mDecoderInputBuffers.at(getFusedBufferId()));
+                // WAR: Sync to ensure that the decoder setup is complete before the context phase starts.
+                // Without this, there may be a race condition between the decoder setup and the context phase
+                // which also leads to spurious test failure in trtGptModelRealDecoderTest.
+                mRuntime->getStream().synchronize();
             }
             else
             {
