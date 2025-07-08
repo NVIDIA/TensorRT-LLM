@@ -59,7 +59,10 @@ LLMAPI_SECTIONS = ["Basics", "Customization", "Slurm"]
 
 def generate_examples():
     root_dir = Path(__file__).parent.parent.parent.resolve()
-    ignore_list = {'__init__.py', 'quickstart_example.py'}
+    ignore_list = {
+        '__init__.py', 'quickstart_example.py', 'quickstart_advanced.py',
+        'quickstart_multimodal.py', 'star_attention.py'
+    }
     doc_dir = root_dir / "docs/source/examples"
 
     def collect_script_paths(examples_subdir: str) -> list[Path]:
