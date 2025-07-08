@@ -2,11 +2,11 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from tokenizers.decoders import DecodeStream
 from transformers import (AutoTokenizer, PreTrainedTokenizerBase,
                           PreTrainedTokenizerFast)
 
 from .._utils import nvtx_range_debug
+from ..logger import logger
 
 
 class TokenizerBase(PreTrainedTokenizerBase):
@@ -22,6 +22,14 @@ class TransformersTokenizer(TokenizerBase):
         self._all_special_tokens_set = set(self.tokenizer.all_special_tokens)
         self._disable_hf_decode_incrementally = os.getenv(
             "TLLM_DISABLE_HF_DECODE_INCREMENTALLY", "0") == "1"
+        if not self._disable_hf_decode_incrementally:
+            try:
+                from tokenizers.decoders import DecodeStream  # noqa
+            except ImportError:
+                logger.warning(
+                    f"HF incremental detokenization is unsupported by tokenizer<0.21.0; fallback to TRTLLM incremental detokenization."
+                )
+                self._disable_hf_decode_incrementally = True
 
     def __call__(self, text: str, *args, **kwargs) -> Any:
         return self.tokenizer(text, *args, **kwargs)
@@ -224,6 +232,8 @@ class TransformersTokenizer(TokenizerBase):
         skip_special_tokens: bool = False,
         clean_up_tokenization_spaces: Optional[bool] = None
     ) -> Tuple[str, dict]:
+        from tokenizers.decoders import DecodeStream
+
         if states is None:
             states = {
                 'decode_stream':
