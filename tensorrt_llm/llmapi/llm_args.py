@@ -1522,6 +1522,12 @@ class TrtLlmArgs(BaseLlmArgs):
 
     fast_build: bool = Field(default=False, description="Enable fast build.")
 
+    fail_fast_on_attention_window_too_large: bool = Field(
+        default=False,
+        description=
+        "Fail fast when attention window is too large to fit at least one sequence in KV cache."
+    )
+
     # BuildConfig is introduced to give users a familiar interface to configure the model building.
     build_config: Optional[object] = Field(
         default=None,
@@ -1719,6 +1725,31 @@ class TorchLlmArgs(BaseLlmArgs):
         description=
         "If true, enable min-latency mode. Currently only used for Llama4.",
     )
+
+    # TODO: make this a per-request parameter
+    stream_interval: int = Field(
+        default=1,
+        description=
+        "The iteration interval to create responses under the streaming mode. "
+        "Set this to a larger value when the batch size is large, which helps reduce the streaming overhead.",
+    )
+
+    force_dynamic_quantization: bool = Field(
+        default=False,
+        description="If true, force dynamic quantization. Defaults to False.",
+    )
+
+    fail_fast_on_attention_window_too_large: bool = Field(
+        default=False,
+        description=
+        "Fail fast when attention window is too large to fit at least one sequence in KV cache."
+    )
+
+    allreduce_strategy: Optional[
+        Literal['AUTO', 'NCCL', 'UB', 'MINLATENCY', 'ONESHOT', 'TWOSHOT',
+                'LOWPRECISION',
+                'MNNVL']] = Field(default='AUTO',
+                                  description="Allreduce strategy to use.")
 
     # TODO: remove backend later
     @field_validator('backend', mode='before')

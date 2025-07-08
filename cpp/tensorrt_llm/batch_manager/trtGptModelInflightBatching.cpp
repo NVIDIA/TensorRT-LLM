@@ -270,10 +270,11 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
             auto const crossKvCacheFraction = optionalParams.kvCacheConfig.crossKvCacheFraction.value();
             mKvCacheManager = createKvCacheManager(optionalParams.kvCacheConfig, KvCacheType::kSELF,
                 freePrimaryMemBytes * (1.0f - crossKvCacheFraction),
-                freeSecondaryMemBytes * (1.0f - crossKvCacheFraction), cacheTransPreAllocaSize);
+                freeSecondaryMemBytes * (1.0f - crossKvCacheFraction), cacheTransPreAllocaSize,
+                executorConfig.getFailFastOnAttentionWindowTooLarge());
             mCrossKvCacheManager = createKvCacheManager(optionalParams.kvCacheConfig, KvCacheType::kCROSS,
                 freePrimaryMemBytes * crossKvCacheFraction, freeSecondaryMemBytes * crossKvCacheFraction,
-                cacheTransPreAllocaSize);
+                cacheTransPreAllocaSize, executorConfig.getFailFastOnAttentionWindowTooLarge());
             TLLM_LOG_INFO("This is an Encoder-Decoder model, set %0.1f cross KV cache fraction based on the config.",
                 crossKvCacheFraction);
         }
@@ -281,8 +282,8 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
         {
             TLLM_CHECK_WITH_INFO(!optionalParams.kvCacheConfig.crossKvCacheFraction.has_value(),
                 "Do not set crossKvCacheFraction for decoder-only model");
-            mKvCacheManager = createKvCacheManager(optionalParams.kvCacheConfig, KvCacheType::kSELF,
-                freePrimaryMemBytes, freeSecondaryMemBytes, cacheTransPreAllocaSize);
+            mKvCacheManager = createKvCacheManager(optionalParams.kvCacheConfig, KvCacheType::kSELF, freePrimaryMemBytes,
+                freeSecondaryMemBytes, cacheTransPreAllocaSize, executorConfig.getFailFastOnAttentionWindowTooLarge());
         }
 
         mCacheTransceiver
@@ -517,7 +518,8 @@ void TrtGptModelInflightBatching::reshapeKvTensors(OffsetTableDimensions const& 
 using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
 
 std::pair<BlocksPerWindow, std::vector<SizeType32>>
-TrtGptModelInflightBatching::clampWindowSizesToFitAtLeastOneSequence(BlocksPerWindow const& blocksPerWindow)
+TrtGptModelInflightBatching::clampWindowSizesToFitAtLeastOneSequence(
+    BlocksPerWindow const& blocksPerWindow, bool const failFastOnAttentionWindowTooLarge)
 {
     // At this point, we can only validate that the cheapest sequence in terms of kv-cache resources still fits. More
     // validation is needed on a per-request basis, once the prompt / output lengths and the actual beam width are
@@ -558,6 +560,15 @@ TrtGptModelInflightBatching::clampWindowSizesToFitAtLeastOneSequence(BlocksPerWi
     }
     TLLM_LOG_WARNING("maxAttentionWindowVec too large to fit at least one sequence in kvCache. Old: %s, New: %s",
         common::vec2str(getMaxAttentionWindowVec()).c_str(), common::vec2str(newMaxAttentionWindowVec).c_str());
+
+    if (failFastOnAttentionWindowTooLarge)
+    {
+        throw std::runtime_error(
+            "Attention window too large to fit at least one sequence in KV cache. "
+            "Old: "
+            + common::vec2str(getMaxAttentionWindowVec()) + ", New: " + common::vec2str(newMaxAttentionWindowVec));
+    }
+
     setMaxAttentionWindowVec(newMaxAttentionWindowVec);
     if (getMaxSequenceLen() < getMaxAttentionWindow())
     {
@@ -580,7 +591,7 @@ TrtGptModelInflightBatching::clampWindowSizesToFitAtLeastOneSequence(BlocksPerWi
 
 std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::createKvCacheManager(
     KvCacheConfig const& kvCacheConfig, KvCacheType kvCacheType, uint64_t freePrimaryMemBytes,
-    uint64_t freeSecondaryMemBytes, size_t extraCostMemory)
+    uint64_t freeSecondaryMemBytes, size_t extraCostMemory, bool const failFastOnAttentionWindowTooLarge)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     bool isCrossAttention = kvCacheType == KvCacheType::kCROSS;
@@ -624,7 +635,8 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
     // and user also didn't provide maxAttentionWindow, which leads it to be equal to maxSeqLen
     if (kvCacheType == KvCacheType::kSELF)
     {
-        std::tie(blocksPerWindow, maxAttentionWindowVec) = clampWindowSizesToFitAtLeastOneSequence(blocksPerWindow);
+        std::tie(blocksPerWindow, maxAttentionWindowVec)
+            = clampWindowSizesToFitAtLeastOneSequence(blocksPerWindow, failFastOnAttentionWindowTooLarge);
     }
 
     kv_cache_manager::TempAttentionWindowInputs tempAttentionWindowInputs;
