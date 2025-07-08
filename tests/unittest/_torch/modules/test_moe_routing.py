@@ -168,34 +168,37 @@ def test_load_balanced_moe_routing():
 def test_static_moe_routing():
     routing = StaticMoeRoutingMethod(
         torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=torch.int32).cuda())
-    assert routing.experts_per_token == 4
+    with torch.device('cpu'):
+        assert routing.experts_per_token == 4
 
-    logits = torch.tensor([[0.1, 0.2, 0.3, 0.4], [0.4, 0.3, 0.2, 0.1]],
-                          dtype=torch.float32).cuda()
-    indices, scales = routing.apply(logits)
-    indices = indices.cpu()
+        logits = torch.tensor([[0.1, 0.2, 0.3, 0.4], [0.4, 0.3, 0.2, 0.1]],
+                              dtype=torch.float32).cuda()
+        indices, scales = routing.apply(logits)
+        indices = indices.cpu()
 
-    assert scales is None
-    assert indices.shape == (2, 4)
-    assert indices.dtype == torch.int32
+        assert scales is None
+        assert indices.shape == (2, 4)
+        assert indices.dtype == torch.int32
 
-    assert torch.equal(
-        indices, torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=torch.int32))
+        assert torch.equal(
+            indices,
+            torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=torch.int32))
 
-    routing = StaticMoeRoutingMethod(
-        torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=torch.int32).cuda(),
-        torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]],
-                     dtype=torch.float32).cuda())
-    indices, scales = routing.apply(logits)
-    scales = scales.cpu()
+        routing = StaticMoeRoutingMethod(
+            torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]],
+                         dtype=torch.int32).cuda(),
+            torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]],
+                         dtype=torch.float32).cuda())
+        indices, scales = routing.apply(logits)
+        scales = scales.cpu()
 
-    assert scales is not None
-    assert scales.shape == (2, 4)
-    assert scales.dtype == torch.float32
-    assert torch.equal(
-        scales,
-        torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]],
-                     dtype=torch.float32))
+        assert scales is not None
+        assert scales.shape == (2, 4)
+        assert scales.dtype == torch.float32
+        assert torch.equal(
+            scales,
+            torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]],
+                         dtype=torch.float32))
 
 
 @pytest.mark.parametrize(

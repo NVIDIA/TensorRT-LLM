@@ -188,6 +188,10 @@ class QuantMode(IntFlag):
     def has_w4a16_mxfp4(self):
         return self._any(self.W4A16_MXFP4)
 
+    def has_mxfp4(self):
+        return self._any(self.W4A8_MXFP4_FP8 | self.W4A8_MXFP4_MXFP8
+                         | self.W4A16_MXFP4)
+
     def has_weight_quant(self):
         return self._any(self.INT4_WEIGHTS | self.INT8_WEIGHTS)
 
