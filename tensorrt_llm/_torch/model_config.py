@@ -311,6 +311,11 @@ class ModelConfig(Generic[TConfig]):
         else:
             model_config_cpp.tokens_per_block = tokens_per_block
 
+        num_kv_heads = getattr(
+            self.pretrained_config, "num_key_value_heads",
+            num_heads) // (self.mapping.tp_size * self.mapping.cp_size)
+        model_config_cpp.set_num_kv_heads(num_kv_heads)
+
         mlp_hidden_size = None
         if self.pretrained_config.intermediate_size is not None:
             mlp_hidden_size = self.pretrained_config.intermediate_size // self.mapping.tp_size
