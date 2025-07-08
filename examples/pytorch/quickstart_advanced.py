@@ -35,7 +35,7 @@ def add_llm_args(parser):
     parser.add_argument(
         "--max_num_tokens",
         type=int,
-        default=8192,
+        default=2048,
         help=
         "The maximum total tokens (context + generation) across all sequences in a batch."
     )
@@ -51,7 +51,7 @@ def add_llm_args(parser):
     parser.add_argument('--moe_backend',
                         type=str,
                         default='CUTLASS',
-                        choices=['CUTLASS', 'TRTLLM', 'VANILLA'])
+                        choices=['CUTLASS', 'TRTLLM', 'VANILLA', 'FLUX'])
     parser.add_argument('--enable_attention_dp',
                         default=False,
                         action='store_true')
