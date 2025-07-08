@@ -198,6 +198,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 The mode to run the model-runner, Leader mode by default.
             gather_generation_logits (bool):
                 Enable gathering generation logits.
+            fail_fast_on_attention_window_too_large (bool):
+                Whether to fail fast if the attention window is too large.
         Returns:
             ModelRunnerCpp: An instance of ModelRunnerCpp.
         """
