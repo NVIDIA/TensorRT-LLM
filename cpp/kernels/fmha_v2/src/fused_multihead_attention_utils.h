@@ -489,11 +489,6 @@ static inline void store_q_and_contiguous_kv_cache(void* q_d, // [B, S, H, D]
     FMHA_CHECK_CUDA(cudaMemcpy(q_d, q_tmp, q_sz, cudaMemcpyDefault));
     free(q_tmp);
 
-    // DeepSeek MLA only use paged kv for now, will enable it in the future
-    if (d != dv)
-    {
-        return;
-    }
     // Handle contiguous KV [B, S, 2, H, D].
     // Group head size.
     int h_q_per_kv = h_q / h_kv;
