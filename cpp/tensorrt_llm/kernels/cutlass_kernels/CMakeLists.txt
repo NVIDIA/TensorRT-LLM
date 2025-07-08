@@ -116,7 +116,7 @@ function(add_instantiations library base_dir)
 
       if(${ARCH} EQUAL 90)
         process_target(${TARGET_NAME} true false)
-      elseif(${ARCH} EQUAL 100)
+      elseif(${ARCH} GREATER_EQUAL 100)
         process_target(${TARGET_NAME} false true)
       endif()
     endif()
