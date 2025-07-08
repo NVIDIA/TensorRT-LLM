@@ -30,11 +30,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
 
+import aiohttp
 import numpy as np
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
-from .backend_request_func import (ASYNC_REQUEST_FUNCS,
+from .backend_request_func import (AIOHTTP_TIMEOUT, ASYNC_REQUEST_FUNCS,
                                    OPENAI_COMPATIBLE_BACKENDS, RequestFuncInput,
                                    RequestFuncOutput, get_tokenizer)
 from .benchmark_dataset import (AIMODataset, BurstGPTDataset,
@@ -322,18 +323,29 @@ async def benchmark(
     semaphore = (asyncio.Semaphore(max_concurrency)
                  if max_concurrency else None)
 
-    async def limited_request_func(request_func_input, streaming, pbar):
+    async def limited_request_func(request_func_input, streaming, pbar,
+                                   session):
         if semaphore is None:
             return await request_func(request_func_input=request_func_input,
                                       streaming=streaming,
-                                      pbar=pbar)
+                                      pbar=pbar,
+                                      session=session)
         async with semaphore:
             return await request_func(request_func_input=request_func_input,
                                       streaming=streaming,
-                                      pbar=pbar)
+                                      pbar=pbar,
+                                      session=session)
 
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
+    session = aiohttp.ClientSession(trust_env=True,
+                                    timeout=AIOHTTP_TIMEOUT,
+                                    connector=aiohttp.TCPConnector(
+                                        limit=0,
+                                        limit_per_host=0,
+                                        force_close=True))
+
+    i = 0
     async for request in get_request(input_requests, request_rate, burstiness):
         prompt, prompt_len, output_len = request.prompt, \
             request.prompt_len, request.expected_output_len
@@ -356,7 +368,9 @@ async def benchmark(
             asyncio.create_task(
                 limited_request_func(request_func_input=request_func_input,
                                      streaming=streaming,
-                                     pbar=pbar)))
+                                     pbar=pbar,
+                                     session=session)))
+        i += 1
     outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
 
     if profile:
@@ -370,7 +384,8 @@ async def benchmark(
             logprobs=logprobs,
         )
         profile_output = await request_func(request_func_input=profile_input,
-                                            streaming=streaming)
+                                            streaming=streaming,
+                                            session=session)
         if profile_output.success:
             print("Profiler stopped")
 
@@ -378,6 +393,9 @@ async def benchmark(
         pbar.close()
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
+
+    # Close the session
+    await session.close()
 
     metrics, actual_output_lens = calculate_metrics(
         input_requests=input_requests,
