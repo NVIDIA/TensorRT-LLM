@@ -86,7 +86,7 @@ EOF
 ```
 Explanation:
 - `enable_attention_dp`: Enable attention Data Parallel which is recommend to disable in low concurrency.
-- `enable_min_latency` enables optimizations for low latency scenarios, where concurrency is very small (like 1 or 2). The concurrency threshold needs to be tuned based on your specific ISL/OSL configuration.
+- `enable_min_latency` Enable optimizations for low latency scenarios, where concurrency is very small (like 1 or 2).
 - `stream_interval`: The iteration interval to create responses under the streaming mode.
 - `cuda_graph_config`: CUDA Graph config.
   - `max_batch_size`: Max CUDA graph batch size to capture.
@@ -95,7 +95,7 @@ Explanation:
 
 #### 2. Launch trtllm-serve OpenAI-compatible API server
 TensorRT-LLM supports nvidia TensorRT Model Optimizer quantized FP8 checkpoint.
-Currently parallel weight loading conflicts with min_latency, disable the parallel weight loading to support min_latency for now.
+Currently parallel weight loading conflicts with min_latency, disable the parallel weight loading to enable min_latency for now.
 ``` bash
 TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL=True \
 trtllm-serve nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
