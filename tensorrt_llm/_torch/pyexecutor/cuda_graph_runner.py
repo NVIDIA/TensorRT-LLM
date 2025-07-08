@@ -33,6 +33,7 @@ class DecodingCUDAGraphRunner:
         device: str,
         attn_metadata: AttentionMetadata,
         spec_metadata: Optional[SpecMetadata] = None,
+        use_mrope: bool = False,
     ) -> None:
         """
         Stores a CUDA graph and its associated input buffers.
@@ -61,11 +62,14 @@ class DecodingCUDAGraphRunner:
         self.position_ids = torch.zeros((1, batch_size * token_per_request),
                                         device=device,
                                         dtype=torch.int32)
+        self.mrope_position_deltas = torch.zeros(
+            batch_size, device=device, dtype=torch.int32) if use_mrope else None
 
         self.attn_metadata = attn_metadata
         self.spec_metadata = spec_metadata
         self._output = None
         self._graph = None
+        self.optional_extra_model_inputs = ["mrope_position_deltas"]
 
     def __del__(self):
         self._graph.reset()
@@ -82,6 +86,7 @@ class DecodingCUDAGraphRunner:
             "position_ids": self.position_ids,
             "inputs_embeds": None,
             "spec_metadata": self.spec_metadata,
+            "mrope_position_deltas": self.mrope_position_deltas,
         }
 
         # We have to do warm up runs to initialize PyTorch's
@@ -124,6 +129,9 @@ class DecodingCUDAGraphRunner:
         seqlen = input_ids.shape[0]
         self.input_ids[:seqlen].copy_(input_ids)
         self.position_ids[:, :seqlen].copy_(position_ids)
+        if "mrope_position_deltas" in inputs:
+            self.mrope_position_deltas[:self.batch_size].copy_(
+                inputs["mrope_position_deltas"])
 
         assert self._output is not None and self._graph is not None
         self._graph.replay()

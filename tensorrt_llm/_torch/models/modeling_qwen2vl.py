@@ -600,6 +600,24 @@ class Qwen2VLModelBase(PreTrainedModel):
 
         input_ids, input_embeds = fuse_input_embeds(self.llm.model.embed_tokens,
                                                     input_ids, mm_embeds)
+        # =======
+
+        #         mrope_config = kwargs.get("mrope_config", {})
+        #         if mrope_config:
+        #             if mrope_rotary_cos_sin := mrope_config.get('mrope_rotary_cos_sin'):
+        #                 mrope_config['mrope_rotary_cos_sin'] = torch.cat(
+        #                     mrope_rotary_cos_sin, dim=0)
+
+        #             if mrope_position_deltas := mrope_config.get(
+        #                     'mrope_position_deltas'):
+        #                 mrope_config['mrope_position_deltas'] = torch.cat(
+        #                     mrope_position_deltas, dim=0)
+        #         # input mrope_position_deltas directly for cuda graph
+        #         elif 'mrope_position_deltas' in kwargs:
+        #             mrope_config['mrope_position_deltas'] = kwargs[
+        #                 'mrope_position_deltas']
+
+        # >>>>>>> 5ba9e0e2e (support cuda core gemm; release request; fix cuda graph + mrope)
         output_prob = self.llm.forward(
             attn_metadata=attn_metadata,
             input_ids=input_ids,
