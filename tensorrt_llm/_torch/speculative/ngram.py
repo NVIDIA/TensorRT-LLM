@@ -137,7 +137,7 @@ class NGramPoolManager(BaseResourceManager):
                 pattern = tuple(sequence[l:l + size])
                 new_match = tuple(sequence[l + size:r])
                 if pattern not in pool or \
-                    (not self.is_keep_all and len(match) > pool[pattern][0]):
+                    (not self.is_keep_all and len(new_match) > len(pool[pattern][0])):
                     # Replace the match if
                     # 1. the pattern does not exist in the pool
                     # 2. only one match is kept, and the new match is longer (MRU)
@@ -202,10 +202,15 @@ class NGramDrafter(Drafter):
         self,
         scheduled_requests: ScheduledRequests,
     ) -> None:
-
-        for request in sorted(scheduled_requests.generation_requests,
-                              key=lambda r: r.py_batch_idx):
-            # Add new token to a copy of the generated tokens to find new daft tokens
+        # Sort by request_id when py_batch_idx is None as a fallback.
+        # This happens in the disagg case: for a set of new requests, we draft
+        # before forward_step, so py_batch_idx is not assigned.
+        for request in sorted(
+                scheduled_requests.generation_requests,
+                key=lambda r:
+            (r.py_batch_idx is None, r.py_batch_idx or r.request_id),
+        ):
+            # Add new token to a copy of the generated tokens to find new draft tokens
             prefix = list(request.get_tokens()[0])  # Get a copy
 
             # Generate draft tokens
