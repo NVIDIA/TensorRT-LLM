@@ -86,7 +86,7 @@ std::string getMacroFlag(std::string const& name, std::string const& value)
 std::string getSMFlag(int SM)
 {
     std::string smStr = std::to_string(SM);
-    if (SM == 90 || SM == 120)
+    if (SM == 90 || SM == 120 || SM == 121)
     {
         smStr += "a";
     }
@@ -347,7 +347,7 @@ tllmXqaJitStatus compileProgram(tllmXqaJitProgram prog)
         nvPTXCompilerHandle ptx_compiler;
         CHECK_NVPTX_ERROR(nvPTXCompilerCreate(&ptx_compiler, ptx_size, ptx_data.data()));
 
-        std::vector<char const*> ptx_compile_options = {"--gpu-name=sm_120"};
+        std::vector<char const*> ptx_compile_options = {"--gpu-name=sm_120f"};
         CHECK_NVPTX_ERROR(nvPTXCompilerCompile(ptx_compiler, ptx_compile_options.size(), ptx_compile_options.data()));
 
         size_t cubin_size;
