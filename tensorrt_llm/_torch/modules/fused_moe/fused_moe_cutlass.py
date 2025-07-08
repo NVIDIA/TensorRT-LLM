@@ -119,6 +119,8 @@ class CutlassFusedMoE(MoE):
         # Alltoall support for single-node inference
         self._enable_alltoall = False  # TODO: Hard coding temporarily for now.
         self.alltoall_workspace = None
+        self.enable_alltoall_without_allgather = False
+        self.alltoall_prepare_workspace = None
         if (model_config.mapping.enable_attention_dp
                 and model_config.mapping.tp_size > 1
                 and os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") != "1"):
@@ -127,6 +129,11 @@ class CutlassFusedMoE(MoE):
                 MnnvlMemory.initialize()
                 self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
                     model_config.mapping)
+                self.enable_alltoall_without_allgather = os.environ.get(
+                    "TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER", "1") == "1"
+                if self.enable_alltoall_without_allgather:
+                    self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
+                        model_config.mapping)
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
@@ -301,42 +308,55 @@ class CutlassFusedMoE(MoE):
                 token_final_scales = torch.ones_like(token_selected_experts,
                                                      dtype=torch.float32)
 
-            # Pad tokens if needed
-            if max_num_token > token_selected_experts.shape[0]:
-                token_selected_experts = torch.nn.functional.pad(
-                    token_selected_experts,
-                    (0, 0, 0, max_num_token - token_selected_experts.shape[0]),
-                    'constant', self.num_experts)
-            if max_num_token > token_final_scales.shape[0]:
-                token_final_scales = torch.nn.functional.pad(
-                    token_final_scales,
-                    (0, 0, 0, max_num_token - token_final_scales.shape[0]))
+            if self.enable_alltoall_without_allgather:
+                # TODO: support alltoall without allgather for top_k % 4 != 0
+                assert top_k % 4 == 0, "alltoall without allgather only supports top_k % 4 == 0"
+                assert self.alltoall_prepare_workspace is not None, "alltoall_prepare_workspace should be initialized"
+                alltoall_info, token_selected_experts, token_final_scales, _ = MnnvlMoe.mnnvl_moe_alltoallv_prepare_without_allgather(
+                    token_selected_experts, token_final_scales, None,
+                    self.alltoall_prepare_workspace, max_num_token,
+                    self.ep_rank, self.ep_size, self.num_experts,
+                    self.num_experts, top_k)
+            else:
+                # Pad tokens if needed
+                if max_num_token > token_selected_experts.shape[0]:
+                    token_selected_experts = torch.nn.functional.pad(
+                        token_selected_experts,
+                        (0, 0, 0,
+                         max_num_token - token_selected_experts.shape[0]),
+                        'constant', self.num_experts)
+                if max_num_token > token_final_scales.shape[0]:
+                    token_final_scales = torch.nn.functional.pad(
+                        token_final_scales,
+                        (0, 0, 0, max_num_token - token_final_scales.shape[0]))
 
-            # Gather expert assignments across ranks
-            gathered_token_selected_experts, gathered_token_final_scales = allgather(
-                [token_selected_experts, token_final_scales],
-                self.mapping,
-                dim=0)
-            gathered_token_selected_experts = torch.flatten(
-                gathered_token_selected_experts.contiguous(),
-                start_dim=0,
-                end_dim=-2)
-            gathered_token_final_scales = torch.flatten(
-                gathered_token_final_scales.contiguous(),
-                start_dim=0,
-                end_dim=-2)
+                # Gather expert assignments across ranks
+                gathered_token_selected_experts, gathered_token_final_scales = allgather(
+                    [token_selected_experts, token_final_scales],
+                    self.mapping,
+                    dim=0)
+                gathered_token_selected_experts = torch.flatten(
+                    gathered_token_selected_experts.contiguous(),
+                    start_dim=0,
+                    end_dim=-2)
+                gathered_token_final_scales = torch.flatten(
+                    gathered_token_final_scales.contiguous(),
+                    start_dim=0,
+                    end_dim=-2)
 
-            # Compute target ranks for each token-expert pair
-            gathered_target_rank_ids = MnnvlMoe.compute_target_rank_id(
-                gathered_token_selected_experts, self.num_experts, self.ep_size)
+                # Compute target ranks for each token-expert pair
+                gathered_target_rank_ids = MnnvlMoe.compute_target_rank_id(
+                    gathered_token_selected_experts, self.num_experts,
+                    self.ep_size)
 
-            # Prepare alltoall indices
-            alltoall_info, token_selected_experts, token_final_scales = MnnvlMoe.mnnvl_moe_alltoallv_prepare(
-                gathered_target_rank_ids, None, gathered_token_selected_experts,
-                gathered_token_final_scales, max_num_token, self.num_experts,
-                top_k, self.ep_rank, self.ep_size)
+                # Prepare alltoall indices
+                alltoall_info, token_selected_experts, token_final_scales = MnnvlMoe.mnnvl_moe_alltoallv_prepare(
+                    gathered_target_rank_ids, None,
+                    gathered_token_selected_experts,
+                    gathered_token_final_scales, max_num_token,
+                    self.num_experts, top_k, self.ep_rank, self.ep_size)
 
-            # Dispatch alltoall
+            # Dispatch alltoall (common for both paths)
             x = MnnvlMoe.mnnvl_moe_alltoallv(x, alltoall_info,
                                              self.alltoall_workspace,
                                              self.ep_rank, self.ep_size)
