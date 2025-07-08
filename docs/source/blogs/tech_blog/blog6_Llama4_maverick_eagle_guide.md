@@ -24,8 +24,6 @@ In [Step 4: Start the TensorRT-LLM server](#step-4-start-the-tensorrt-llm-server
 
 ### Step 1: Clone the repository
 
-This branch contains optimizations specifically for Llama4 models that aren't in the main branch as of May 29, 2025.
-
 ```
 git clone https://github.com/NVIDIA/TensorRT-LLM.git
 cd TensorRT-LLM
@@ -61,7 +59,7 @@ This command launches the server with Llama4 Maverick as the main model and Eagl
 **Important:** Replace `/path/to/maverick` and `/path/to/eagle` with the actual paths to your Maverick and Eagle3 model checkpoints on your host machine, downloaded in the [Download Artifacts](#download-artifacts) stage
 
 ```
-docker run -d --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 -p 8000:8000 --gpus=all -e "TRTLLM_ENABLE_PDL=1" -v /path/to/maverick:/config/models/maverick -v /path/to/eagle:/config/models/eagle docker.io/<username>/tensorrt_llm:main sh -c "echo -e 'enable_attention_dp: false\ncuda_graph_config:\n  max_batch_size: 8\nspeculative_config:\n  decoding_type: Eagle\n  max_draft_len: 3\n  pytorch_eagle_weights_path: /config/models/eagle\nkv_cache_config:\n  enable_block_reuse: false' > c.yaml && trtllm-serve /config/models/maverick --host 0.0.0.0 --port 8000 --backend pytorch --max_batch_size 8 --max_num_tokens 8192 --max_seq_len 8192 --tp_size 8 --ep_size 1 --trust_remote_code --extra_llm_api_options c.yaml --kv_cache_free_gpu_memory_fraction 0.75"
+docker run -d --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 -p 8000:8000 --gpus=all -e "TRTLLM_ENABLE_PDL=1" -v /path/to/maverick:/config/models/maverick -v /path/to/eagle:/config/models/eagle docker.io/<username>/tensorrt_llm:main sh -c "echo -e 'enable_attention_dp: false\ncuda_graph_config:\n  max_batch_size: 8\nspeculative_config:\n  decoding_type: Eagle\n  max_draft_len: 3\n  pytorch_weights_path: /config/models/eagle\nkv_cache_config:\n  enable_block_reuse: false' > c.yaml && trtllm-serve /config/models/maverick --host 0.0.0.0 --port 8000 --backend pytorch --tp_size 8 --ep_size 1 --trust_remote_code --extra_llm_api_options c.yaml --kv_cache_free_gpu_memory_fraction 0.75"
 ```
 
 This command:
@@ -97,7 +95,6 @@ curl localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d '
 
 The server exposes a standard OpenAI-compatible API endpoint that accepts JSON requests. You can adjust parameters like `max_tokens`, `temperature`, and others according to your needs.
 
-Note that for the moment, the context for this endpoint is limited to 8K tokens. We expect to lift that limitation by early June.
 
 ### Step 6: (Optional) Monitor server logs
 

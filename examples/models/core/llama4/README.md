@@ -72,35 +72,34 @@ This section provides the steps to launch TensorRT-LLM server and run performanc
 All below commands here are assumed to be running inside the container started by `make -C docker run ...` command mentioned in the [Build and run TensorRT-LLM container section](#3-build-and-run-tensorrt-llm-container)
 
 
-### 1. Prepare TensorRT-LLM extra configs 
+### 1. Prepare TensorRT-LLM extra configs
 ```bash
 cat >./extra-llm-api-config.yml <<EOF
 enable_attention_dp: true
-kv_cache_config:
-  enable_block_reuse: false
 cuda_graph_config:
-  max_batch_size: 1024
+  max_batch_size: 512
   padding_enabled: true
 EOF
 ```
-Explanation:  
+Explanation:
 - `enable_attention_dp`: Enable attention Data Parallel which is recommend to enable in high concurrency.
 - `kv_cache_config`: KV cache config
   - `enable_block_reuse`: Whether to enable KV cache reuse. Recommend enable, but disable here for fixed ISL/OSL benchmark.
 - `cuda_graph_config`: CUDA Graph config
   - `max_batch_size`: Max cuda graph batch size to capture.
   - `padding_enabled`: Whether to enable CUDA graph padding.
-### 2. Launch trtllm-serve OpenAI API server
+### 2. Launch trtllm-serve OpenAI-compatible API server
 TensorRT-LLM supports nvidia TensorRT Model Optimizer quantized FP8 checkpoint
 ``` bash
 trtllm-serve nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
     --backend pytorch \
+    --max_batch_size 512 \
     --tp_size 8 \
     --ep_size 8 \
     --trust_remote_code \
     --extra_llm_api_options ./extra-llm-api-config.yml
 ```
-
+With Attention DP one, the whole system's max_batch_size will be max_batch_size*tp_size
 
 ### 3. Run performance benchmark
 TensorRT-LLM provides a benchmark tool to benchmark trtllm-serve
@@ -112,6 +111,7 @@ python -m tensorrt_llm.serve.scripts.benchmark_serving \
         --num-prompts 10000 \
         --random-input-len 1024 \
         --random-output-len 2048 \
+        --random-ids \
         --max-concurrency 1024 \
 ```
 
