@@ -193,11 +193,11 @@ def setup_llm(args):
                            (args.top_p == 0.0 or args.top_p is None)))
     mixed_sampler = not greedy_decoding and not args.enable_trtllm_sampler
 
-
     cuda_graph_config = CudaGraphConfig(
         batch_sizes=args.cuda_graph_batch_sizes,
         padding_enabled=args.cuda_graph_padding_enabled,
     ) if args.use_cuda_graph else None
+
     llm = LLM(
         model=args.model_dir,
         backend='pytorch',
@@ -260,7 +260,7 @@ def main():
     for i, output in enumerate(outputs):
         prompt = output.prompt
         for seq_idx, seq_output in enumerate(output.outputs):
-            # Skip printing the sequnce index if a single sequence is returned.
+            # Skip printing the sequence index if a single sequence is returned.
             seq_id_text = f"[{seq_idx}]" if args.n > 1 else ""
             generated_text = seq_output.text
             print(
