@@ -36,7 +36,7 @@ Explanation:
 - `enable_attention_dp`: Enable attention Data Parallel which is recommend to enable in high concurrency.
 - `stream_interval`: The iteration interval to create responses under the streaming mode.
 - `cuda_graph_config`: CUDA Graph config.
-  - `max_batch_size`: Max cuda graph batch size to capture.
+  - `max_batch_size`: Max CUDA graph batch size to capture.
   - `padding_enabled`: Whether to enable CUDA graph padding.
 
 
@@ -56,6 +56,7 @@ trtllm-serve nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
 
 #### 3. Run performance benchmark
 TensorRT-LLM provides a benchmark tool to benchmark trtllm-serve
+Prepare a new terminal and run `benchmark_serving`
 ```bash
 python -m tensorrt_llm.serve.scripts.benchmark_serving \
         --model nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
@@ -86,7 +87,7 @@ Explanation:
 - `enable_attention_dp`: Enable attention Data Parallel which is recommend to disable in low concurrency.
 - `stream_interval`: The iteration interval to create responses under the streaming mode.
 - `cuda_graph_config`: CUDA Graph config.
-  - `max_batch_size`: Max cuda graph batch size to capture.
+  - `max_batch_size`: Max CUDA graph batch size to capture.
   - `padding_enabled`: Whether to enable CUDA graph padding.
 
 
@@ -105,6 +106,7 @@ trtllm-serve nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
 
 #### 3. Run performance benchmark
 TensorRT-LLM provides a benchmark tool to benchmark trtllm-serve
+Prepare a new terminal and run `benchmark_serving`
 ```bash
 python -m tensorrt_llm.serve.scripts.benchmark_serving \
         --model nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
@@ -126,7 +128,7 @@ python -m tensorrt_llm.serve.scripts.benchmark_serving \
 - `stream_interval` and `num_postprocess_workers` are both used to reduce streaming mode overhead. `stream_interval` controls the iteration interval to create responses under streaming mode, which benefits performance across all concurrency levels. `num_postprocess_workers` controls the number of processes used for postprocessing generated tokens, which provides benefits in high concurrency scenarios. These values need to be tuned based on your specific ISL/OSL and concurrency configuration.
 - `max_batch_size` and `max_num_tokens` can easily affect the performance. The default values for them are already carefully designed and should deliver good performance on overall cases, however, you may still need to tune it for peak performance.
 - `max_batch_size` should not be too low to bottleneck the throughput. Note with Attention DP, the the whole system's max_batch_size will be `max_batch_size*dp_size`.
-- Cuda grah `max_batch_size` should be same value as TensorRT-LLM server's `max_batch_size`.
+- CUDA grah `max_batch_size` should be same value as TensorRT-LLM server's `max_batch_size`.
 - For more details on `max_batch_size` and `max_num_tokens`, refer to [Tuning Max Batch Size and Max Num Tokens](../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md).
 
 ### Troubleshooting

@@ -1,4 +1,4 @@
-# How to launch Llama4 Maverick + Eagle3 TRTLLM server
+# How to launch Llama4 Maverick + Eagle3 TensorRT-LLM server
 
 Artificial Analysis has benchmarked the Llama4 Maverick with Eagle3 enabled TensorRT-LLM server running at over [1000 tokens per second per user on 8xB200 GPUs](https://developer.nvidia.com/blog/blackwell-breaks-the-1000-tps-user-barrier-with-metas-llama-4-maverick/). This implementation leverages NVIDIA's TensorRT-LLM combined with speculative decoding using the Eagle3 model to further boost performance.
 
@@ -31,16 +31,16 @@ git submodule update --init --recursive
 git lfs pull
 ```
 
-The last command, `git lfs pull`, ensures all large files stored with Git LFS are properly downloaded.
+The last command, `git lfs pull`, ensures all large files stored with Git LFS are properly downloaded. If `git lfs` is not installed, please install following [Install Git LFS](https://docs.github.com/en/repositories/working-with-files/managing-large-files/installing-git-large-file-storage)
 
 ### Step 2: Prepare the TensorRT-LLM release Docker image
 
 
-#### 1. Use weekly release NGC docker image
+#### Option 1. Use weekly release NGC docker image
 TensorRT-LLM provides weekly release [docker image](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release)
 
-#### 2. Build TensorRT-LLM Docker image (Alternative way)
-If you want to compiles specific TensorRT-LLM commit, you can build the docker image. This may take 15-30 minutes depending on your system.
+#### Option 2. Build TensorRT-LLM Docker image (Alternative way)
+If you want to compile a specific TensorRT-LLM commit, you can build the docker image by checking out the specific branch or commit and running a make command. This may take 15-30 minutes depending on your system.
 
 ```
 make -C docker release_build
