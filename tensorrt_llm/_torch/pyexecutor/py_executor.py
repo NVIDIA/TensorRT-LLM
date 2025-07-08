@@ -2026,7 +2026,8 @@ class PyExecutor:
                 request.update_perf_metrics(self.model_engine.iter_counter)
 
             request_done = False
-            if self.model_engine.iter_counter % self.stream_interval == 0 or request.is_finished:
+            if request.py_decoding_iter == 1 or request.is_finished or \
+                    request.py_decoding_iter % self.stream_interval == 0:
                 response = request.create_response(False, self.dist.rank)
                 if response:
                     request_done = response.result.is_final
