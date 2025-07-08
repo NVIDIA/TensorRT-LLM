@@ -138,10 +138,10 @@ def main():
 
     if args.restore_from:
         quant_state_dict = model.state_dict()
-        gm = quantize(gm, {}).to("cuda")
+        quantize(gm, {}).to("cuda")
         gm.load_state_dict(quant_state_dict, strict=False)
 
-    gm = fuse_gemms(gm)
+    fuse_gemms(gm)
 
     gm = compile_and_capture(gm, backend="torch-opt", args=(), kwargs=flux_kwargs)
 

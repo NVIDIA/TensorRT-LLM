@@ -10,7 +10,7 @@ from ...utils.node_utils import bfs, identify_regions_between_residuals, is_line
 from .._graph import canonicalize_graph
 
 
-def match_moe_pattern(gm: GraphModule) -> GraphModule:
+def match_moe_pattern(gm: GraphModule) -> None:
     graph = gm.graph
 
     ad_logger.debug("Before MoE Pattern Matching: " + str(gm))
@@ -88,15 +88,13 @@ def match_moe_pattern(gm: GraphModule) -> GraphModule:
 
         num_moe_patterns += 1
 
-    gm = canonicalize_graph(gm)
+    canonicalize_graph(gm)
 
     ad_logger.info(f"Found {num_moe_patterns} MoE Patterns")
     ad_logger.debug("After MoE Pattern Matching: " + str(gm))
 
-    return gm
 
-
-def fuse_moe(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
+def fuse_moe(gm: torch.fx.GraphModule) -> None:
     """
     Scan the FX graph and replace all calls to torch.ops.moe.torch_moe with
     torch.ops.auto_deploy.trtllm_moe_fused.
@@ -106,11 +104,10 @@ def fuse_moe(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
     with cuda_memory_tracker():
         fused_key_counter = _insert_fused_moe_ops(gm)
         if fused_key_counter:
-            gm = canonicalize_graph(gm)
+            canonicalize_graph(gm)
 
     ad_logger.info(f"Found {fused_key_counter} MoE fusions")
     ad_logger.debug("After MoE fusion: " + str(gm))
-    return gm
 
 
 def _insert_fused_moe_ops(gm: GraphModule) -> int:

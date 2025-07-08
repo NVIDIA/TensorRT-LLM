@@ -215,7 +215,7 @@ def column_row_shard(
     rank: int,
     world_size: int,
     simple_shard_only: bool = False,
-) -> GraphModule:
+) -> None:
     """A transformation to apply sharding to the model following tensor parallelism.
 
     The transformation is based on the following steps:
@@ -236,7 +236,7 @@ def column_row_shard(
 
     if world_size < 2:
         ad_logger.info("Skipping sharding for single device")
-        return gm
+        return
 
     assert isinstance(gm, GraphModule), "Expecting GraphModule"
 
@@ -378,10 +378,9 @@ def column_row_shard(
         gm = canonicalize_graph(gm)
     ad_logger.debug("After sharding: " + str(gm))
     ad_logger.info(f"Found {num_shards} TP shards")
-    return gm
 
 
-def dp_bmm_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
+def dp_bmm_shard(gm: GraphModule, rank: int, world_size: int) -> None:
     """A transformation to apply sharding to batched matrix multiplications in the graph.
 
     We'll shard the BMM nodes by slicing the batch dimension of input tensors into world_size number of slices.
@@ -394,7 +393,7 @@ def dp_bmm_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
 
     if world_size < 2:
         ad_logger.info("Skipping sharding for single device")
-        return gm
+        return
 
     assert isinstance(gm, GraphModule), "Expecting GraphModule"
 
@@ -506,4 +505,3 @@ def dp_bmm_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
         gm = canonicalize_graph(gm)
     ad_logger.debug("After sharding BMM: " + str(gm))
     ad_logger.info(f"Found {num_bmm_shards} BMM shards")
-    return gm
