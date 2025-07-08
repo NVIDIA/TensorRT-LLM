@@ -14,6 +14,8 @@
 # limitations under the License.
 """Module test_exaone test exaone examples."""
 
+import time
+
 import pytest
 from defs.common import (convert_weights, generate_summary_cmd, venv_check_call,
                          venv_mpi_check_call)
@@ -33,10 +35,12 @@ from defs.trt_test_alternative import check_call
 def test_llm_exaone_1gpu(data_type, exaone_example_root, llm_exaone_model_root,
                          llama_example_root, llm_datasets_root, llm_rouge_root,
                          llm_venv, cmodel_dir, engine_dir, num_beams,
-                         use_weight_only):
+                         use_weight_only, timeout_from_marker):
 
     print("Build engines...")
     model_name = "exaone"
+    remaining_timeout = timeout_from_marker
+    convert_start = time.time()
     model_dir = convert_weights(
         llm_venv=llm_venv,
         # NOTE
@@ -46,15 +50,28 @@ def test_llm_exaone_1gpu(data_type, exaone_example_root, llm_exaone_model_root,
         model=model_name,
         model_path=llm_exaone_model_root,
         data_type=data_type,
-        use_weight_only=use_weight_only)
+        use_weight_only=use_weight_only,
+        timeout=remaining_timeout)
+    convert_time = time.time() - convert_start
+    remaining_timeout -= convert_time
+    if remaining_timeout <= 0:
+        raise TimeoutError("Timeout exceeded after convert phase!")
 
+    build_start = time.time()
     build_cmd = [
         "trtllm-build",
         f"--checkpoint_dir={model_dir}",
         f"--output_dir={engine_dir}",
         f"--max_beam_width={num_beams}",
     ]
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+    check_call(" ".join(build_cmd),
+               shell=True,
+               env=llm_venv._new_env,
+               timeout=remaining_timeout)
+    build_time = time.time() - build_start
+    remaining_timeout -= build_time
+    if remaining_timeout <= 0:
+        raise TimeoutError("Timeout exceeded after build phase!")
 
     rouge1_threshold = {
         1: 22,
@@ -75,7 +92,7 @@ def test_llm_exaone_1gpu(data_type, exaone_example_root, llm_exaone_model_root,
         num_beams=num_beams,
     )
 
-    venv_check_call(llm_venv, summary_cmd)
+    venv_check_call(llm_venv, summary_cmd, timeout=remaining_timeout)
 
 
 @pytest.mark.skip_less_device(2)

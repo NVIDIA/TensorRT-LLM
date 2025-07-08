@@ -2347,3 +2347,13 @@ def tritonserver_test_root(llm_root):
                                      "tests/integration/defs/triton_server")
 
     return tritonserver_root
+
+
+@pytest.fixture
+def timeout_from_marker(request):
+    """Extract timeout value from the timeout marker if it exists."""
+    timeout_marker = request.node.get_closest_marker("timeout")
+    timeout = None
+    if timeout_marker and timeout_marker.args:
+        timeout = timeout_marker.args[0]
+    return timeout
