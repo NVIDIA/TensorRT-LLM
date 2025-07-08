@@ -73,11 +73,47 @@ install_from_pypi() {
     pip3 install torch==${TORCH_VERSION} torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 }
 
+# Apply upstream fix for AttributeError: 'NoneType' object has no attribute 'store_cubin'
+# https://github.com/pytorch/pytorch/pull/150860/files
+# Remove this after upgrade pytorch to DLFW 25.08 or later
+apply_patch() {
+    echo "Applying patch for PyTorch..."
+    pushd `python -c 'import torch; print(torch.__path__[0])'`
+    cat > triton_heuristics.patch << 'EOF'
+diff --git a/_inductor/runtime/triton_heuristics.py b/_inductor/runtime/triton_heuristics.py
+index be02d43..daf1afa 100644
+--- a/_inductor/runtime/triton_heuristics.py
++++ b/_inductor/runtime/triton_heuristics.py
+@@ -978,7 +978,15 @@ class CachingAutotuner(KernelInterface):
+                 self.autotune_time_taken_ns + coordesc_time_taken_ns,
+                 found_by_coordesc=True,
+             )
+-        return config2launcher.get(best_config)
++
++        if best_config not in config2launcher:
++            # On a Coordesc cache hit, we might not have loaded the launcher
++            # This can happen because PyCodeCache saves CachingAutotuners in memory,
++            # even for separate compile IDs (which can have different inputs without changing output code)
++            config2launcher[best_config] = self._precompile_config(
++                best_config
++            ).make_launcher()
++        return config2launcher[best_config]
+
+     def run(
+         self,
+EOF
+    git apply triton_heuristics.patch
+    rm triton_heuristics.patch
+    popd
+}
+
 case "$1" in
   "skip")
+    apply_patch
     ;;
   "pypi")
     install_from_pypi
+    apply_patch
     ;;
   "src_cxx11_abi")
     install_from_source 1
