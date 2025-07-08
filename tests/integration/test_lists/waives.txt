@@ -391,7 +391,6 @@ examples/test_multimodal.py::test_llm_multimodal_general[Llama-3.2-11B-Vision-pp
 triton_server/test_triton.py::test_mllama[mllama] SKIP (https://nvbugs/5333818)
 examples/test_multimodal.py::test_llm_multimodal_general[Llama-3.2-11B-Vision-pp:1-tp:2-bfloat16-bs:1-cpp_e2e:False-nb:1] SKIP (https://nvbugs/5333818)
 accuracy/test_cli_flow.py::TestGpt2::test_weight_streaming_ootb SKIP (https://nvbugs/5338552)
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp4-mtp_nextn=0-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False] SKIP (https://nvbugs/5345215)
 triton_server/test_triton.py::test_gpt_ib[gpt-ib] SKIP (https://nvbugs/5348963)
 unittest/llmapi/test_llm_multi_gpu.py -m "gpu4 and part0" SKIP (https://nvbugs/5348958)
 full:B200/test_e2e.py::test_ptp_quickstart_advanced_deepseek_multi_nodes[DeepSeek-R1/DeepSeek-R1-0528-FP4] SKIP (https://nvbugs/5344688)
