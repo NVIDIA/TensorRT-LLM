@@ -621,7 +621,6 @@ class TestMoeFP8:
         padding = 8
         routed_scaling = 2.5
         routing_method_type = RoutingMethodType.DeepSeekV3
-        tile_tokens_dim = 8 if num_tokens < 1024 else 32
 
         assert top_k <= num_experts
         assert top_k <= 8
@@ -670,8 +669,7 @@ class TestMoeFP8:
                 expert_logits, routing_bias, hidden_states, hidden_states_scale,
                 gemm1_weights, gemm1_scales, gemm2_weights, gemm2_scales,
                 num_experts, top_k, n_groups, top_k_groups, intermediate_size,
-                0, num_experts, routed_scaling, tile_tokens_dim,
-                routing_method_type)
+                0, num_experts, routed_scaling, routing_method_type)
 
         output_dequant_actual = output.to(torch.float)
         #
@@ -1033,7 +1031,6 @@ class TestMoeFp4:
                 0,
                 num_experts,
                 routed_scaling,
-                tile_tokens_dim,
                 routing_method_type,
                 do_finalize=True)
 
