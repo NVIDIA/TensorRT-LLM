@@ -62,7 +62,7 @@ def test_llama_user_provided(disable_overlap_scheduler: bool,
     )
 
     spec_config = UserProvidedDecodingConfig(
-        max_draft_len=draft_len,
+        max_draft_len=max_draft_len,
         drafter=drafter,
     )
 

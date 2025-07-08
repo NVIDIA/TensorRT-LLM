@@ -57,7 +57,7 @@ def get_spec_metadata(spec_config,
     if spec_config.spec_dec_mode.is_ngram(
     ) or spec_config.spec_dec_mode.is_user_provided():
         return SpecMetadata(
-            max_draft_tokens=spec_config.max_draft_tokens,
+            max_draft_tokens=spec_config.max_draft_len,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
         )

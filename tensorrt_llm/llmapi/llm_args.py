@@ -322,7 +322,7 @@ class UserProvidedDecodingConfig(DecodingBaseConfig):
     def from_dict(cls, data: dict):
         return cls(**data)
 
-    decoding_type: ClassVar[str] = "UserProvided"
+    decoding_type: ClassVar[str] = "User_Provided"
 
 
 class NGramDecodingConfig(DecodingBaseConfig):
