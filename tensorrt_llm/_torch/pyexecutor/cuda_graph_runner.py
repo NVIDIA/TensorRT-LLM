@@ -63,7 +63,8 @@ class DecodingCUDAGraphRunner:
                                         device=device,
                                         dtype=torch.int32)
         self.mrope_position_deltas = torch.zeros(
-            batch_size, device=device, dtype=torch.int32) if use_mrope else None
+            (batch_size,
+             1), device=device, dtype=torch.int32) if use_mrope else None
 
         self.attn_metadata = attn_metadata
         self.spec_metadata = spec_metadata

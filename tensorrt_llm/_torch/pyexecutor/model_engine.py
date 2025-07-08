@@ -1508,20 +1508,19 @@ class PyTorchModelEngine(ModelEngine):
             self.position_ids_cuda[:total_num_tokens].unsqueeze(0),
             'inputs_embeds': None,
             "multimodal_params": multimodal_params_list,
-            # =======
-            #             'multi_modal_data': multi_modal_data,
-            # >>>>>>> 5ba9e0e2e (support cuda core gemm; release request; fix cuda graph + mrope)
         }
 
-        # # Add mrope inputs
-        # if not attn_metadata.is_cuda_graph:
-        #     # Use Dict mrope_config for non-cuda graph.
-        #     inputs['mrope_config'] = mrope_config
-        # else:
-        #     # Use Tensor mrope_position_deltas for cuda graph, because dictionary could not be captured.
-        #     if 'mrope_position_deltas' in mrope_config:
-        #         inputs['mrope_position_deltas'] = torch.cat(
-        #             mrope_config['mrope_position_deltas'], dim=0)
+        # Directly input mrope_position_deltas as a Tensor for cuda graph, because dictionary could not be captured.
+        if attn_metadata.is_cuda_graph and len(multimodal_params_list) > 0:
+            if 'mrope_position_deltas' in multimodal_params_list[
+                    0].multimodal_data.get('mrope_config', {}):
+                mrope_position_deltas_list = [
+                    multimodal_params.multimodal_data['mrope_config']
+                    ['mrope_position_deltas']
+                    for multimodal_params in multimodal_params_list
+                ]
+                inputs['mrope_position_deltas'] = torch.cat(
+                    mrope_position_deltas_list, dim=0)
 
         if bool(lora_params):
             inputs['lora_params'] = lora_params
