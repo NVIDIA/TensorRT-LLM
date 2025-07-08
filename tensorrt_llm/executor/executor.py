@@ -145,10 +145,8 @@ class GenerationExecutor(ABC):
             multimodal_params=multimodal_params)
         result = self.submit(request)
         # release memory in time
-        if hasattr(request, "multimodal_embedding"):
-            del request.multimodal_embedding
-        if hasattr(request, "mrope_config"):
-            del request.mrope_config
+        if hasattr(request, "multimodal_params"):
+            del request.multimodal_params
         return result
 
     def generate(
