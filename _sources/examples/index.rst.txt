@@ -14,24 +14,7 @@ The LLM API can be used for both offline or online usage. See more examples of t
     :maxdepth: 1
     :caption: LLM API Examples
 
-    llm_medusa_decoding
-    llm_multilora
-    llm_eagle_decoding
-    llm_inference_async
-    llm_inference_distributed
-    llm_logits_processor
-    llm_eagle2_decoding
-    llm_inference_kv_events
-    llm_lookahead_decoding
-    llm_quantization
-    llm_inference_async_streaming
-    llm_guided_decoding
-    llm_inference
-    llm_inference_customize
-    llm_auto_parallel
-    llm_mgmn_llm_distributed
-    llm_mgmn_trtllm_bench
-    llm_mgmn_trtllm_serve
+    %EXAMPLE_DOCS%
 
 For more details on how to fully utilize this API, check out:
 

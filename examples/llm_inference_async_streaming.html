@@ -9,7 +9,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>Generate Text in Streaming &#8212; TensorRT-LLM</title>
+    <title>Generate text in streaming &#8212; TensorRT-LLM</title>
   
   
   
@@ -35,6 +35,7 @@
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=13237357" />
   
   <!-- So that users can add custom icons -->
   <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -47,23 +48,29 @@
     <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../_static/togglebutton.js?v=4a39c7ea"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'examples/llm_inference_async_streaming';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
     <link rel="icon" href="../_static/favicon.png"/>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="Generate text with guided decoding" href="llm_guided_decoding.html" />
-    <link rel="prev" title="Generation with Quantization" href="llm_quantization.html" />
+    <link rel="next" title="Distributed LLM Generation" href="llm_inference_distributed.html" />
+    <link rel="prev" title="Generate text asynchronously" href="llm_inference_async.html" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc1" />
+  <meta name="docsearch:version" content="1.0.0rc2" />
 
 
   </head>
@@ -314,58 +321,32 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/containers.html">Pre-built release container images on NGC</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">LLM API Introduction</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
 <ul class="current nav bd-sidenav">
-<li class="toctree-l1 current active has-children"><a class="reference internal" href="index.html">LLM Examples Introduction</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
-<li class="toctree-l2"><a class="reference internal" href="llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_async.html">Generate Text Asynchronously</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_distributed.html">Distributed LLM Generation</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_logits_processor.html">Control generated text using logits processor</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_eagle2_decoding.html">Generate Text Using Eagle2 Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_kv_events.html">Get KV Cache Events</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_quantization.html">Generation with Quantization</a></li>
-<li class="toctree-l2 current active"><a class="current reference internal" href="#">Generate Text in Streaming</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_guided_decoding.html">Generate text with guided decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference.html">Generate text</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_customize.html">Generate text with customization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="simple">
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="customization.html">LLM Common Customizations</a></li>
 <li class="toctree-l1 current active has-children"><a class="reference internal" href="llm_api_examples.html">LLM Examples</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
-<li class="toctree-l2"><a class="reference internal" href="llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_async.html">Generate Text Asynchronously</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_distributed.html">Distributed LLM Generation</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_logits_processor.html">Control generated text using logits processor</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_eagle2_decoding.html">Generate Text Using Eagle2 Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_kv_events.html">Get KV Cache Events</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_quantization.html">Generation with Quantization</a></li>
-<li class="toctree-l2 current active"><a class="current reference internal" href="#">Generate Text in Streaming</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_guided_decoding.html">Generate text with guided decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm_inference.html">Generate text</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_customize.html">Generate text with customization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2 current active"><a class="current reference internal" href="#">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -376,8 +357,9 @@
 <li class="toctree-l2"><a class="reference internal" href="genai_perf_client.html">Genai Perf Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="openai_chat_client.html">OpenAI Chat Client</a></li>
-<li class="toctree-l2"><a class="reference internal" href="openai_chat_client_for_multimodal.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
 </ul>
 </details></li>
 </ul>
@@ -446,6 +428,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../reference/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/dev-containers.html">Using Dev Containers</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -491,9 +474,9 @@
       </a>
     </li>
     
-    <li class="breadcrumb-item"><a href="index.html" class="nav-link">LLM Examples Introduction</a></li>
+    <li class="breadcrumb-item"><a href="llm_api_examples.html" class="nav-link">LLM Examples</a></li>
     
-    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Generate Text in Streaming</span></li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Generate text in streaming</span></li>
   </ul>
 </nav>
 </div>
@@ -511,72 +494,70 @@
                 <article class="bd-article">
                   
   <section id="generate-text-in-streaming">
-<h1>Generate Text in Streaming<a class="headerlink" href="#generate-text-in-streaming" title="Link to this heading">#</a></h1>
+<h1>Generate text in streaming<a class="headerlink" href="#generate-text-in-streaming" title="Link to this heading">#</a></h1>
 <p>Source <a class="github reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llm-api/llm_inference_async_streaming.py">NVIDIA/TensorRT-LLM</a>.</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="c1">### Generate Text in Streaming</span>
-<span class="linenos"> 2</span><span class="kn">import</span><span class="w"> </span><span class="nn">asyncio</span>
-<span class="linenos"> 3</span>
-<span class="linenos"> 4</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">SamplingParams</span>
-<span class="linenos"> 5</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._tensorrt_engine</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span>
-<span class="linenos"> 6</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="kn">import</span><span class="w"> </span><span class="nn">asyncio</span>
+<span class="linenos"> 2</span>
+<span class="linenos"> 3</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
+<span class="linenos"> 4</span>
+<span class="linenos"> 5</span>
+<span class="linenos"> 6</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
 <span class="linenos"> 7</span>
-<span class="linenos"> 8</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
-<span class="linenos"> 9</span>
-<span class="linenos">10</span>    <span class="c1"># model could accept HF model name or a path to local HF model.</span>
-<span class="linenos">11</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">)</span>
-<span class="linenos">12</span>
-<span class="linenos">13</span>    <span class="c1"># Sample prompts.</span>
-<span class="linenos">14</span>    <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
-<span class="linenos">15</span>        <span class="s2">&quot;Hello, my name is&quot;</span><span class="p">,</span>
-<span class="linenos">16</span>        <span class="s2">&quot;The president of the United States is&quot;</span><span class="p">,</span>
-<span class="linenos">17</span>        <span class="s2">&quot;The capital of France is&quot;</span><span class="p">,</span>
-<span class="linenos">18</span>        <span class="s2">&quot;The future of AI is&quot;</span><span class="p">,</span>
-<span class="linenos">19</span>    <span class="p">]</span>
-<span class="linenos">20</span>
-<span class="linenos">21</span>    <span class="c1"># Create a sampling params.</span>
-<span class="linenos">22</span>    <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">temperature</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span> <span class="n">top_p</span><span class="o">=</span><span class="mf">0.95</span><span class="p">)</span>
-<span class="linenos">23</span>
-<span class="linenos">24</span>    <span class="c1"># Async based on Python coroutines</span>
-<span class="linenos">25</span>    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">task</span><span class="p">(</span><span class="nb">id</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">prompt</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
-<span class="linenos">26</span>
-<span class="linenos">27</span>        <span class="c1"># streaming=True is used to enable streaming generation.</span>
-<span class="linenos">28</span>        <span class="k">async</span> <span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate_async</span><span class="p">(</span><span class="n">prompt</span><span class="p">,</span>
-<span class="linenos">29</span>                                               <span class="n">sampling_params</span><span class="p">,</span>
-<span class="linenos">30</span>                                               <span class="n">streaming</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
-<span class="linenos">31</span>            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Generation for prompt-</span><span class="si">{</span><span class="nb">id</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
-<span class="linenos">32</span>
-<span class="linenos">33</span>    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
-<span class="linenos">34</span>        <span class="n">tasks</span> <span class="o">=</span> <span class="p">[</span><span class="n">task</span><span class="p">(</span><span class="nb">id</span><span class="p">,</span> <span class="n">prompt</span><span class="p">)</span> <span class="k">for</span> <span class="nb">id</span><span class="p">,</span> <span class="n">prompt</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">prompts</span><span class="p">)]</span>
-<span class="linenos">35</span>        <span class="k">await</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">gather</span><span class="p">(</span><span class="o">*</span><span class="n">tasks</span><span class="p">)</span>
+<span class="linenos"> 8</span>    <span class="c1"># model could accept HF model name or a path to local HF model.</span>
+<span class="linenos"> 9</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">)</span>
+<span class="linenos">10</span>
+<span class="linenos">11</span>    <span class="c1"># Sample prompts.</span>
+<span class="linenos">12</span>    <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
+<span class="linenos">13</span>        <span class="s2">&quot;Hello, my name is&quot;</span><span class="p">,</span>
+<span class="linenos">14</span>        <span class="s2">&quot;The president of the United States is&quot;</span><span class="p">,</span>
+<span class="linenos">15</span>        <span class="s2">&quot;The capital of France is&quot;</span><span class="p">,</span>
+<span class="linenos">16</span>        <span class="s2">&quot;The future of AI is&quot;</span><span class="p">,</span>
+<span class="linenos">17</span>    <span class="p">]</span>
+<span class="linenos">18</span>
+<span class="linenos">19</span>    <span class="c1"># Create a sampling params.</span>
+<span class="linenos">20</span>    <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">temperature</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span> <span class="n">top_p</span><span class="o">=</span><span class="mf">0.95</span><span class="p">)</span>
+<span class="linenos">21</span>
+<span class="linenos">22</span>    <span class="c1"># Async based on Python coroutines</span>
+<span class="linenos">23</span>    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">task</span><span class="p">(</span><span class="nb">id</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">prompt</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+<span class="linenos">24</span>
+<span class="linenos">25</span>        <span class="c1"># streaming=True is used to enable streaming generation.</span>
+<span class="linenos">26</span>        <span class="k">async</span> <span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate_async</span><span class="p">(</span><span class="n">prompt</span><span class="p">,</span>
+<span class="linenos">27</span>                                               <span class="n">sampling_params</span><span class="p">,</span>
+<span class="linenos">28</span>                                               <span class="n">streaming</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
+<span class="linenos">29</span>            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Generation for prompt-</span><span class="si">{</span><span class="nb">id</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
+<span class="linenos">30</span>
+<span class="linenos">31</span>    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+<span class="linenos">32</span>        <span class="n">tasks</span> <span class="o">=</span> <span class="p">[</span><span class="n">task</span><span class="p">(</span><span class="nb">id</span><span class="p">,</span> <span class="n">prompt</span><span class="p">)</span> <span class="k">for</span> <span class="nb">id</span><span class="p">,</span> <span class="n">prompt</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">prompts</span><span class="p">)]</span>
+<span class="linenos">33</span>        <span class="k">await</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">gather</span><span class="p">(</span><span class="o">*</span><span class="n">tasks</span><span class="p">)</span>
+<span class="linenos">34</span>
+<span class="linenos">35</span>    <span class="n">asyncio</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">main</span><span class="p">())</span>
 <span class="linenos">36</span>
-<span class="linenos">37</span>    <span class="n">asyncio</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">main</span><span class="p">())</span>
-<span class="linenos">38</span>
-<span class="linenos">39</span>    <span class="c1"># Got output like follows:</span>
-<span class="linenos">40</span>    <span class="c1"># Generation for prompt-0: &#39;\n&#39;</span>
-<span class="linenos">41</span>    <span class="c1"># Generation for prompt-3: &#39;an&#39;</span>
-<span class="linenos">42</span>    <span class="c1"># Generation for prompt-2: &#39;Paris&#39;</span>
-<span class="linenos">43</span>    <span class="c1"># Generation for prompt-1: &#39;likely&#39;</span>
-<span class="linenos">44</span>    <span class="c1"># Generation for prompt-0: &#39;\n\n&#39;</span>
-<span class="linenos">45</span>    <span class="c1"># Generation for prompt-3: &#39;an exc&#39;</span>
-<span class="linenos">46</span>    <span class="c1"># Generation for prompt-2: &#39;Paris.&#39;</span>
-<span class="linenos">47</span>    <span class="c1"># Generation for prompt-1: &#39;likely to&#39;</span>
-<span class="linenos">48</span>    <span class="c1"># Generation for prompt-0: &#39;\n\nJ&#39;</span>
-<span class="linenos">49</span>    <span class="c1"># Generation for prompt-3: &#39;an exciting&#39;</span>
-<span class="linenos">50</span>    <span class="c1"># Generation for prompt-2: &#39;Paris.&#39;</span>
-<span class="linenos">51</span>    <span class="c1"># Generation for prompt-1: &#39;likely to nomin&#39;</span>
-<span class="linenos">52</span>    <span class="c1"># Generation for prompt-0: &#39;\n\nJane&#39;</span>
-<span class="linenos">53</span>    <span class="c1"># Generation for prompt-3: &#39;an exciting time&#39;</span>
-<span class="linenos">54</span>    <span class="c1"># Generation for prompt-1: &#39;likely to nominate&#39;</span>
-<span class="linenos">55</span>    <span class="c1"># Generation for prompt-0: &#39;\n\nJane Smith&#39;</span>
-<span class="linenos">56</span>    <span class="c1"># Generation for prompt-3: &#39;an exciting time for&#39;</span>
-<span class="linenos">57</span>    <span class="c1"># Generation for prompt-1: &#39;likely to nominate a&#39;</span>
-<span class="linenos">58</span>    <span class="c1"># Generation for prompt-0: &#39;\n\nJane Smith.&#39;</span>
-<span class="linenos">59</span>    <span class="c1"># Generation for prompt-3: &#39;an exciting time for us&#39;</span>
-<span class="linenos">60</span>    <span class="c1"># Generation for prompt-1: &#39;likely to nominate a new&#39;</span>
-<span class="linenos">61</span>
-<span class="linenos">62</span>
-<span class="linenos">63</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
-<span class="linenos">64</span>    <span class="n">main</span><span class="p">()</span>
+<span class="linenos">37</span>    <span class="c1"># Got output like follows:</span>
+<span class="linenos">38</span>    <span class="c1"># Generation for prompt-0: &#39;\n&#39;</span>
+<span class="linenos">39</span>    <span class="c1"># Generation for prompt-3: &#39;an&#39;</span>
+<span class="linenos">40</span>    <span class="c1"># Generation for prompt-2: &#39;Paris&#39;</span>
+<span class="linenos">41</span>    <span class="c1"># Generation for prompt-1: &#39;likely&#39;</span>
+<span class="linenos">42</span>    <span class="c1"># Generation for prompt-0: &#39;\n\n&#39;</span>
+<span class="linenos">43</span>    <span class="c1"># Generation for prompt-3: &#39;an exc&#39;</span>
+<span class="linenos">44</span>    <span class="c1"># Generation for prompt-2: &#39;Paris.&#39;</span>
+<span class="linenos">45</span>    <span class="c1"># Generation for prompt-1: &#39;likely to&#39;</span>
+<span class="linenos">46</span>    <span class="c1"># Generation for prompt-0: &#39;\n\nJ&#39;</span>
+<span class="linenos">47</span>    <span class="c1"># Generation for prompt-3: &#39;an exciting&#39;</span>
+<span class="linenos">48</span>    <span class="c1"># Generation for prompt-2: &#39;Paris.&#39;</span>
+<span class="linenos">49</span>    <span class="c1"># Generation for prompt-1: &#39;likely to nomin&#39;</span>
+<span class="linenos">50</span>    <span class="c1"># Generation for prompt-0: &#39;\n\nJane&#39;</span>
+<span class="linenos">51</span>    <span class="c1"># Generation for prompt-3: &#39;an exciting time&#39;</span>
+<span class="linenos">52</span>    <span class="c1"># Generation for prompt-1: &#39;likely to nominate&#39;</span>
+<span class="linenos">53</span>    <span class="c1"># Generation for prompt-0: &#39;\n\nJane Smith&#39;</span>
+<span class="linenos">54</span>    <span class="c1"># Generation for prompt-3: &#39;an exciting time for&#39;</span>
+<span class="linenos">55</span>    <span class="c1"># Generation for prompt-1: &#39;likely to nominate a&#39;</span>
+<span class="linenos">56</span>    <span class="c1"># Generation for prompt-0: &#39;\n\nJane Smith.&#39;</span>
+<span class="linenos">57</span>    <span class="c1"># Generation for prompt-3: &#39;an exciting time for us&#39;</span>
+<span class="linenos">58</span>    <span class="c1"># Generation for prompt-1: &#39;likely to nominate a new&#39;</span>
+<span class="linenos">59</span>
+<span class="linenos">60</span>
+<span class="linenos">61</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
+<span class="linenos">62</span>    <span class="n">main</span><span class="p">()</span>
 </pre></div>
 </div>
 </section>
@@ -592,20 +573,20 @@
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="llm_quantization.html"
+       href="llm_inference_async.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">Generation with Quantization</p>
+        <p class="prev-next-title">Generate text asynchronously</p>
       </div>
     </a>
     <a class="right-next"
-       href="llm_guided_decoding.html"
+       href="llm_inference_distributed.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">Generate text with guided decoding</p>
+        <p class="prev-next-title">Distributed LLM Generation</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -709,9 +690,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 29, 2025.</p>
+  <p>Last updated on July 06, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/de97799">de97799</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/66f299a">66f299a</a>.</p>
   
 </div></div>
       

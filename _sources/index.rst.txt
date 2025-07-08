@@ -25,9 +25,9 @@ Welcome to TensorRT-LLM's Documentation!
 
    .. installation/overview.md
 
+   installation/containers.md
    installation/linux.md
    installation/build-from-source-linux.md
-   installation/grace-hopper.md
 
 
 .. toctree::
@@ -133,6 +133,7 @@ Welcome to TensorRT-LLM's Documentation!
    reference/precision.md
    reference/memory.md
    reference/ci-overview.md
+   reference/dev-containers.md
 
 
 .. toctree::

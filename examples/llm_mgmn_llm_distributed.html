@@ -9,7 +9,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>Llm Mgmn Llm Distributed &#8212; TensorRT-LLM</title>
+    <title>Run LLM-API with pytorch backend on Slurm &#8212; TensorRT-LLM</title>
   
   
   
@@ -35,6 +35,7 @@
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=13237357" />
   
   <!-- So that users can add custom icons -->
   <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -47,23 +48,29 @@
     <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../_static/togglebutton.js?v=4a39c7ea"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'examples/llm_mgmn_llm_distributed';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
     <link rel="icon" href="../_static/favicon.png"/>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="Llm Mgmn Trtllm Bench" href="llm_mgmn_trtllm_bench.html" />
-    <link rel="prev" title="Automatic Parallelism with LLM" href="llm_auto_parallel.html" />
+    <link rel="next" title="Run trtllm-bench with pytorch backend on Slurm" href="llm_mgmn_trtllm_bench.html" />
+    <link rel="prev" title="Generate text with multiple LoRA adapters" href="llm_multilora.html" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc1" />
+  <meta name="docsearch:version" content="1.0.0rc2" />
 
 
   </head>
@@ -314,58 +321,32 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/containers.html">Pre-built release container images on NGC</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">LLM API Introduction</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
 <ul class="current nav bd-sidenav">
-<li class="toctree-l1 current active has-children"><a class="reference internal" href="index.html">LLM Examples Introduction</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
-<li class="toctree-l2"><a class="reference internal" href="llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_async.html">Generate Text Asynchronously</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_distributed.html">Distributed LLM Generation</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_logits_processor.html">Control generated text using logits processor</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_eagle2_decoding.html">Generate Text Using Eagle2 Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_kv_events.html">Get KV Cache Events</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_quantization.html">Generation with Quantization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_guided_decoding.html">Generate text with guided decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference.html">Generate text</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_customize.html">Generate text with customization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
-<li class="toctree-l2 current active"><a class="current reference internal" href="#">Llm Mgmn Llm Distributed</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="simple">
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="customization.html">LLM Common Customizations</a></li>
 <li class="toctree-l1 current active has-children"><a class="reference internal" href="llm_api_examples.html">LLM Examples</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
-<li class="toctree-l2"><a class="reference internal" href="llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_async.html">Generate Text Asynchronously</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_distributed.html">Distributed LLM Generation</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_logits_processor.html">Control generated text using logits processor</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_eagle2_decoding.html">Generate Text Using Eagle2 Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_kv_events.html">Get KV Cache Events</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_quantization.html">Generation with Quantization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_guided_decoding.html">Generate text with guided decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm_inference.html">Generate text</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_customize.html">Generate text with customization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
-<li class="toctree-l2 current active"><a class="current reference internal" href="#">Llm Mgmn Llm Distributed</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2 current active"><a class="current reference internal" href="#">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -376,8 +357,9 @@
 <li class="toctree-l2"><a class="reference internal" href="genai_perf_client.html">Genai Perf Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="openai_chat_client.html">OpenAI Chat Client</a></li>
-<li class="toctree-l2"><a class="reference internal" href="openai_chat_client_for_multimodal.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
 </ul>
 </details></li>
 </ul>
@@ -446,6 +428,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../reference/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/dev-containers.html">Using Dev Containers</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -491,9 +474,9 @@
       </a>
     </li>
     
-    <li class="breadcrumb-item"><a href="index.html" class="nav-link">LLM Examples Introduction</a></li>
+    <li class="breadcrumb-item"><a href="llm_api_examples.html" class="nav-link">LLM Examples</a></li>
     
-    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Llm Mgmn Llm Distributed</span></li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Run LLM-API with pytorch backend on Slurm</span></li>
   </ul>
 </nav>
 </div>
@@ -510,8 +493,8 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="llm-mgmn-llm-distributed">
-<h1>Llm Mgmn Llm Distributed<a class="headerlink" href="#llm-mgmn-llm-distributed" title="Link to this heading">#</a></h1>
+  <section id="run-llm-api-with-pytorch-backend-on-slurm">
+<h1>Run LLM-API with pytorch backend on Slurm<a class="headerlink" href="#run-llm-api-with-pytorch-backend-on-slurm" title="Link to this heading">#</a></h1>
 <p>Source <a class="github reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llm-api/llm_mgmn_llm_distributed.sh">NVIDIA/TensorRT-LLM</a>.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="ch">#!/bin/bash</span>
 <span class="linenos"> 2</span><span class="c1">#SBATCH -A &lt;account&gt;    # parameter</span>
@@ -523,49 +506,48 @@
 <span class="linenos"> 8</span><span class="c1">#SBATCH -e logs/llmapi-distributed.err</span>
 <span class="linenos"> 9</span><span class="c1">#SBATCH -J llmapi-distributed-task</span>
 <span class="linenos">10</span>
-<span class="linenos">11</span><span class="c1">### Run LLM-API with pytorch backend on Slurm</span>
-<span class="linenos">12</span>
-<span class="linenos">13</span><span class="c1"># NOTE, this feature is experimental and may not work on all systems.</span>
-<span class="linenos">14</span><span class="c1"># The trtllm-llmapi-launch is a script that launches the LLM-API code on</span>
-<span class="linenos">15</span><span class="c1"># Slurm-like systems, and can support multi-node and multi-GPU setups.</span>
-<span class="linenos">16</span>
-<span class="linenos">17</span><span class="c1"># Note that, the number of MPI processes should be the same as the model world</span>
-<span class="linenos">18</span><span class="c1"># size. e.g. For tensor_parallel_size=16, you may use 2 nodes with 8 gpus for</span>
-<span class="linenos">19</span><span class="c1"># each, or 4 nodes with 4 gpus for each or other combinations.</span>
-<span class="linenos">20</span>
-<span class="linenos">21</span><span class="c1"># This docker image should have tensorrt_llm installed, or you need to install</span>
-<span class="linenos">22</span><span class="c1"># it in the task.</span>
-<span class="linenos">23</span>
-<span class="linenos">24</span><span class="c1"># The following variables are expected to be set in the environment:</span>
-<span class="linenos">25</span><span class="c1"># You can set them via --export in the srun/sbatch command.</span>
-<span class="linenos">26</span><span class="c1">#   CONTAINER_IMAGE: the docker image to use, you&#39;d better install tensorrt_llm in it, or install it in the task.</span>
-<span class="linenos">27</span><span class="c1">#   MOUNT_DIR: the directory to mount in the container</span>
-<span class="linenos">28</span><span class="c1">#   MOUNT_DEST: the destination directory in the container</span>
-<span class="linenos">29</span><span class="c1">#   WORKDIR: the working directory in the container</span>
-<span class="linenos">30</span><span class="c1">#   SOURCE_ROOT: the path to the TensorRT-LLM source</span>
-<span class="linenos">31</span><span class="c1">#   PROLOGUE: the prologue to run before the script</span>
-<span class="linenos">32</span><span class="c1">#   LOCAL_MODEL: the local model directory to use, NOTE: downloading from HF is</span>
-<span class="linenos">33</span><span class="c1">#      not supported in Slurm mode, you need to download the model and put it in</span>
-<span class="linenos">34</span><span class="c1">#      the LOCAL_MODEL directory.</span>
-<span class="linenos">35</span>
-<span class="linenos">36</span><span class="c1"># Adjust the paths to run</span>
-<span class="linenos">37</span><span class="nb">export</span><span class="w"> </span><span class="nv">script</span><span class="o">=</span><span class="nv">$SOURCE_ROOT</span>/examples/pytorch/quickstart_advanced.py
-<span class="linenos">38</span>
-<span class="linenos">39</span><span class="c1"># Just launch the PyTorch example with trtllm-llmapi-launch command.</span>
-<span class="linenos">40</span>srun<span class="w"> </span>-l<span class="w"> </span><span class="se">\</span>
-<span class="linenos">41</span><span class="w">    </span>--container-image<span class="o">=</span><span class="si">${</span><span class="nv">CONTAINER_IMAGE</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
-<span class="linenos">42</span><span class="w">    </span>--container-mounts<span class="o">=</span><span class="si">${</span><span class="nv">MOUNT_DIR</span><span class="si">}</span>:<span class="si">${</span><span class="nv">MOUNT_DEST</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
-<span class="linenos">43</span><span class="w">    </span>--container-workdir<span class="o">=</span><span class="si">${</span><span class="nv">WORKDIR</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
-<span class="linenos">44</span><span class="w">    </span>--export<span class="o">=</span>ALL<span class="w"> </span><span class="se">\</span>
-<span class="linenos">45</span><span class="w">    </span>--mpi<span class="o">=</span>pmix<span class="w"> </span><span class="se">\</span>
-<span class="linenos">46</span><span class="w">    </span>bash<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;</span>
-<span class="linenos">47</span><span class="s2">        </span><span class="nv">$PROLOGUE</span>
-<span class="linenos">48</span><span class="s2">        export PATH=</span><span class="nv">$PATH</span><span class="s2">:~/.local/bin</span>
-<span class="linenos">49</span><span class="s2">        trtllm-llmapi-launch python3 </span><span class="nv">$script</span><span class="s2"> \</span>
-<span class="linenos">50</span><span class="s2">            --model_dir </span><span class="nv">$LOCAL_MODEL</span><span class="s2"> \</span>
-<span class="linenos">51</span><span class="s2">            --prompt &#39;Hello, how are you?&#39; \</span>
-<span class="linenos">52</span><span class="s2">            --tp_size 2</span>
-<span class="linenos">53</span><span class="s2">    &quot;</span>
+<span class="linenos">11</span>
+<span class="linenos">12</span><span class="c1"># NOTE, this feature is experimental and may not work on all systems.</span>
+<span class="linenos">13</span><span class="c1"># The trtllm-llmapi-launch is a script that launches the LLM-API code on</span>
+<span class="linenos">14</span><span class="c1"># Slurm-like systems, and can support multi-node and multi-GPU setups.</span>
+<span class="linenos">15</span>
+<span class="linenos">16</span><span class="c1"># Note that, the number of MPI processes should be the same as the model world</span>
+<span class="linenos">17</span><span class="c1"># size. e.g. For tensor_parallel_size=16, you may use 2 nodes with 8 gpus for</span>
+<span class="linenos">18</span><span class="c1"># each, or 4 nodes with 4 gpus for each or other combinations.</span>
+<span class="linenos">19</span>
+<span class="linenos">20</span><span class="c1"># This docker image should have tensorrt_llm installed, or you need to install</span>
+<span class="linenos">21</span><span class="c1"># it in the task.</span>
+<span class="linenos">22</span>
+<span class="linenos">23</span><span class="c1"># The following variables are expected to be set in the environment:</span>
+<span class="linenos">24</span><span class="c1"># You can set them via --export in the srun/sbatch command.</span>
+<span class="linenos">25</span><span class="c1">#   CONTAINER_IMAGE: the docker image to use, you&#39;d better install tensorrt_llm in it, or install it in the task.</span>
+<span class="linenos">26</span><span class="c1">#   MOUNT_DIR: the directory to mount in the container</span>
+<span class="linenos">27</span><span class="c1">#   MOUNT_DEST: the destination directory in the container</span>
+<span class="linenos">28</span><span class="c1">#   WORKDIR: the working directory in the container</span>
+<span class="linenos">29</span><span class="c1">#   SOURCE_ROOT: the path to the TensorRT-LLM source</span>
+<span class="linenos">30</span><span class="c1">#   PROLOGUE: the prologue to run before the script</span>
+<span class="linenos">31</span><span class="c1">#   LOCAL_MODEL: the local model directory to use, NOTE: downloading from HF is</span>
+<span class="linenos">32</span><span class="c1">#      not supported in Slurm mode, you need to download the model and put it in</span>
+<span class="linenos">33</span><span class="c1">#      the LOCAL_MODEL directory.</span>
+<span class="linenos">34</span>
+<span class="linenos">35</span><span class="c1"># Adjust the paths to run</span>
+<span class="linenos">36</span><span class="nb">export</span><span class="w"> </span><span class="nv">script</span><span class="o">=</span><span class="nv">$SOURCE_ROOT</span>/examples/pytorch/quickstart_advanced.py
+<span class="linenos">37</span>
+<span class="linenos">38</span><span class="c1"># Just launch the PyTorch example with trtllm-llmapi-launch command.</span>
+<span class="linenos">39</span>srun<span class="w"> </span>-l<span class="w"> </span><span class="se">\</span>
+<span class="linenos">40</span><span class="w">    </span>--container-image<span class="o">=</span><span class="si">${</span><span class="nv">CONTAINER_IMAGE</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="linenos">41</span><span class="w">    </span>--container-mounts<span class="o">=</span><span class="si">${</span><span class="nv">MOUNT_DIR</span><span class="si">}</span>:<span class="si">${</span><span class="nv">MOUNT_DEST</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="linenos">42</span><span class="w">    </span>--container-workdir<span class="o">=</span><span class="si">${</span><span class="nv">WORKDIR</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="linenos">43</span><span class="w">    </span>--export<span class="o">=</span>ALL<span class="w"> </span><span class="se">\</span>
+<span class="linenos">44</span><span class="w">    </span>--mpi<span class="o">=</span>pmix<span class="w"> </span><span class="se">\</span>
+<span class="linenos">45</span><span class="w">    </span>bash<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;</span>
+<span class="linenos">46</span><span class="s2">        </span><span class="nv">$PROLOGUE</span>
+<span class="linenos">47</span><span class="s2">        export PATH=</span><span class="nv">$PATH</span><span class="s2">:~/.local/bin</span>
+<span class="linenos">48</span><span class="s2">        trtllm-llmapi-launch python3 </span><span class="nv">$script</span><span class="s2"> \</span>
+<span class="linenos">49</span><span class="s2">            --model_dir </span><span class="nv">$LOCAL_MODEL</span><span class="s2"> \</span>
+<span class="linenos">50</span><span class="s2">            --prompt &#39;Hello, how are you?&#39; \</span>
+<span class="linenos">51</span><span class="s2">            --tp_size 2</span>
+<span class="linenos">52</span><span class="s2">    &quot;</span>
 </pre></div>
 </div>
 </section>
@@ -581,12 +563,12 @@
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="llm_auto_parallel.html"
+       href="llm_multilora.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">Automatic Parallelism with LLM</p>
+        <p class="prev-next-title">Generate text with multiple LoRA adapters</p>
       </div>
     </a>
     <a class="right-next"
@@ -594,7 +576,7 @@
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">Llm Mgmn Trtllm Bench</p>
+        <p class="prev-next-title">Run trtllm-bench with pytorch backend on Slurm</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -698,9 +680,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 29, 2025.</p>
+  <p>Last updated on July 06, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/de97799">de97799</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/66f299a">66f299a</a>.</p>
   
 </div></div>
       
