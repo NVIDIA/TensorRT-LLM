@@ -2,7 +2,7 @@
 
 ## Introduction
 
-FMHA_v2 is just a bunch of Multi-head Attention kernels that we’ve enabled for known cases. It’s not built as a library (cuBLAS, cuDNN, HazyResearch's MHA, etc) that is supposed to deliver good perf for all cases. End users will get access to FMHA through products or libraries, not directly through FMHA_v2.
+FMHA_v2 is just a bunch of Multi-head Attention kernels that we've enabled for known cases. It's not built as a library (cuBLAS, cuDNN, HazyResearch's MHA, etc) that is supposed to deliver good perf for all cases. End users will get access to FMHA through products or libraries, not directly through FMHA_v2.
 
 ## Launch a container to build the code
 
@@ -80,3 +80,11 @@ Why is the FMHA_v2 slower than public implementation in several cases?
 ```
 Usually, adding new launch configurations suffices. The heuristics of FMHA_v2 are designed to work optimally for known cases. If you encounter an unknown case, first check if FMHA_v2 has a suitable kernel. If there isn't one, feel free to approach us and we'll enable a new configuration
 ```
+
+What's the difference between cubins and cu files?
+
+'''
+Cubins are precompiled (from the internal fmha_v2 repo) binary files and take a lot of space, cu files are generated directly from this repo. Now we replace most of the kernels with cu files and delete unused cubins.
+You can modify code in this repo to change or create your own kernels and run.
+Now there are some kernels still running in cubins. See use_cubin_header(setup.py#L3055) and modify_cubin_header(setup.py#L3413) for details.
+'''
