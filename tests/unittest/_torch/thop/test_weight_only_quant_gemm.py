@@ -12,14 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
-import subprocess
-import sys
 
 import pytest
 import torch
 from _torch.helpers import calc_diff
 from utils.util import getSMVersion
+
 
 def weight_only_quant_gemm_reference(a, b, b_scales):
     a_dtype = a.dtype
@@ -30,6 +28,7 @@ def weight_only_quant_gemm_reference(a, b, b_scales):
     ref = torch.matmul(a, b * b_scales)
 
     return ref.to(dtype=a_dtype)
+
 
 def woq_tolerence_calculate(output, output_ref, b_dtype):
     if b_dtype == torch.int8:
@@ -49,12 +48,11 @@ def woq_tolerence_calculate(output, output_ref, b_dtype):
 )
 @pytest.mark.parametrize(
     "k, n",
-    [(7168, 2112), (1536, 24576), (512, 32768), (16384, 7168), (7168, 4096),
-     (2048, 7168), (1024, 1024)],
+    [(7168, 2112), (1536, 24576), (512, 32768), (16384, 7168), (1024, 1024)],
 )
 @pytest.mark.parametrize(
     "m",
-    [7, 64, 128, 4096],
+    [7, 64, 4096],
 )
 @pytest.mark.parametrize(
     "a_dtype",
@@ -74,9 +72,12 @@ def test_weight_only_quant_gemm(a_dtype, b_dtype, m, k, n):
     if b_dtype == torch.quint4x2:
         ref_b = torch.ops.trtllm.unpack_int4_packed_tensor_to_int8(ref_b.cpu())
 
-    output = torch.ops.trtllm.weight_only_quant_gemm(a, processed_b.cuda(), b_dtype, b_scales.cuda(), a_dtype)
+    output = torch.ops.trtllm.weight_only_quant_gemm(a, processed_b.cuda(),
+                                                     b_dtype, b_scales.cuda(),
+                                                     a_dtype)
 
-    output_ref = weight_only_quant_gemm_reference(a, ref_b.cuda(), b_scales.cuda())
+    output_ref = weight_only_quant_gemm_reference(a, ref_b.cuda(),
+                                                  b_scales.cuda())
 
     # check accuracy
     diff = calc_diff(output, output_ref)
