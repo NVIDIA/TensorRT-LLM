@@ -878,6 +878,45 @@ def triggerJob(jobName, parameters, jenkinsUrl = "", credentials = "")
     return status
 }
 
+def launchJob(jobName, reuseBuild, platform="x86_64", additionalParameters = [:]) {
+    def parameters = getCommonParameters()
+    String globalVarsJson = writeJSON returnText: true, json: globalVars
+    parameters += [
+        'enableFailFast': enableFailFast,
+        'globalVars': globalVarsJson,
+    ] + additionalParameters
+
+    if (env.alternativeTRT && platform == "x86_64") {
+        parameters += [
+            'alternativeTRT': env.alternativeTRT,
+        ]
+    }
+
+    if (env.alternativeTrtSBSA && platform == "SBSA") {
+        parameters += [
+            'alternativeTRT': env.alternativeTrtSBSA,
+        ]
+    }
+
+    if (env.testPhase2StageName) {
+        parameters += [
+            'testPhase2StageName': env.testPhase2StageName,
+        ]
+    }
+
+    if (reuseBuild) {
+        parameters['reuseArtifactPath'] = "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${reuseBuild}"
+    }
+
+    echo "trigger ${jobName} job, params: ${parameters}"
+
+    def status = triggerJob(jobName, parameters)
+    if (status != "SUCCESS") {
+        error "Downstream job did not succeed"
+    }
+    return status
+}
+
 def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 {
     stages = [
@@ -889,83 +928,30 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         "x86_64-linux": {
             script {
                 stage("Build") {
-                    def parameters = getCommonParameters()
-                    String globalVarsJson = writeJSON returnText: true, json: globalVars
-                    parameters += [
-                        'enableFailFast': enableFailFast,
+                    def additionalParameters = [
                         'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
                         'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
                         'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
-                        'globalVars': globalVarsJson,
                     ]
-
-                    if (env.alternativeTRT) {
-                        parameters += [
-                            'alternativeTRT': env.alternativeTRT,
-                        ]
-                    }
-
-                    if (reuseBuild) {
-                        parameters['reuseArtifactPath'] = "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${reuseBuild}"
-                    }
-
-                    echo "trigger x86_64 build job, params: ${parameters}"
-
-                    def status = triggerJob("/LLM/helpers/Build-x86_64", parameters)
-                    if (status != "SUCCESS") {
-                        error "Downstream job did not succeed"
-                    }
-
+                    launchJob("/LLM/helpers/Build-x86_64", reuseBuild, "x86_64", additionalParameters)
                 }
-                def testStageName = "[Test-x86_64-Single-GPU] Run"
-                if (env.localJobCredentials) {
-                    testStageName = "[Test-x86_64-Single-GPU] Remote Run"
-                }
-                testJobName = "L0_Test-x86_64-Single-GPU"
-                def willRunMultiGpuTest = false
+                def testStageName = "[Test-x86_64-Single-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                def singleGpuTestFailed = false
                 stage(testStageName) {
                     if (X86_TEST_CHOICE == STAGE_CHOICE_SKIP) {
                         echo "x86_64 test job is skipped due to Jenkins configuration"
                         return
                     }
                     try {
-                        parameters = getCommonParameters()
-
                         String testFilterJson = writeJSON returnText: true, json: testFilter
-                        String globalVarsJson = writeJSON returnText: true, json: globalVars
-                        parameters += [
-                            'enableFailFast': enableFailFast,
+                        def additionalParameters = [
                             'testFilter': testFilterJson,
                             'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
                             'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
                             'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
-                            'globalVars': globalVarsJson,
                         ]
 
-                        if (env.alternativeTRT) {
-                            parameters += [
-                                'alternativeTRT': env.alternativeTRT,
-                            ]
-                        }
-
-                        if (env.testPhase2StageName) {
-                            parameters += [
-                                'testPhase2StageName': env.testPhase2StageName,
-                            ]
-                        }
-
-                        echo "trigger x86_64 test job, params: ${parameters}"
-
-                        def status = triggerJob(
-                            testJobName,
-                            parameters,
-                        )
-                        willRunMultiGpuTest = currentBuild.description?.contains("Will run multi-GPU tests") ?: false
-                        echo "willRunMultiGpuTest: ${willRunMultiGpuTest}"
-
-                        if (status != "SUCCESS") {
-                            error "Downstream job did not succeed"
-                        }
+                        launchJob("L0_Test-x86_64-Single-GPU", false, "x86_64", additionalParameters)
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
@@ -975,63 +961,55 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 stageResult: 'FAILURE') {
                                 error "x86_64 test failed but ignored due to Jenkins configuration"
                             }
-                        } else if (JOB_NAME ==~ /.*PostMerge.*/) {
+                        } else {
                             catchError(
                                 buildResult: 'FAILURE',
                                 stageResult: 'FAILURE') {
                                 error "x86_64 single-GPU test failed"
                             }
-                        } else {
-                            throw e
+                            singleGpuTestFailed = true
                         }
                     }
                 }
-                if (!willRunMultiGpuTest && !(env.JOB_NAME ==~ /.*PostMerge.*/)) {
-                    echo "Not postMerge job and willRunMultiGpuTest: ${willRunMultiGpuTest}"
+
+                def requireMultiGpuTesting = currentBuild.description?.contains("Require Multi-GPU Testing") ?: false
+                echo "requireMultiGpuTesting: ${requireMultiGpuTesting}"
+                if (!requireMultiGpuTesting) {
                     return
                 }
-                testStageName = "[Test-x86_64-Multi-GPU] Run"
-                testJobName = "L0_Test-x86_64-Multi-GPU"
+
+                if (singleGpuTestFailed) {
+                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+                        echo "For post-merge job, x86_64 single-GPU test failed, multi-GPU test is kept running"
+                    } else {
+                        stage("[Test-x86_64-Multi-GPU] Blocked") {
+                            catchError(
+                                buildResult: 'FAILURE',
+                                stageResult: 'FAILURE') {
+                                error "This job need run multi-GPU test, but x86_64 single-GPU test failed"
+                            }
+                        }
+                        return
+                    }
+                }
+
+                testStageName = "[Test-x86_64-Multi-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
                 stage(testStageName) {
                     if (X86_TEST_CHOICE == STAGE_CHOICE_SKIP) {
                         echo "x86_64 test job is skipped due to Jenkins configuration"
                         return
                     }
                     try {
-                        parameters = getCommonParameters()
-                        String testFilterJson = writeJSON returnText: true, json: testFilter
-                        String globalVarsJson = writeJSON returnText: true, json: globalVars
-                        parameters += [
-                            'enableFailFast': enableFailFast,
+                        def testFilterJson = writeJSON returnText: true, json: testFilter
+                        def additionalParameters = [
                             'testFilter': testFilterJson,
                             'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
                             'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
                             'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
-                            'globalVars': globalVarsJson,
                         ]
 
-                        if (env.alternativeTRT) {
-                            parameters += [
-                                'alternativeTRT': env.alternativeTRT,
-                            ]
-                        }
+                        launchJob("L0_Test-x86_64-Multi-GPU", false, "x86_64", additionalParameters)
 
-                        if (env.testPhase2StageName) {
-                            parameters += [
-                                'testPhase2StageName': env.testPhase2StageName,
-                            ]
-                        }
-
-                        echo "trigger x86_64 test job, params: ${parameters}"
-
-                        def status = triggerJob(
-                            testJobName,
-                            parameters,
-                        )
-
-                        if (status != "SUCCESS") {
-                            error "Downstream job did not succeed"
-                        }
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
@@ -1062,38 +1040,11 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     return
                 }
 
-                def stageName = "Build"
-                stage(stageName) {
-                    def parameters = getCommonParameters()
-                    String globalVarsJson = writeJSON returnText: true, json: globalVars
-                    parameters += [
-                        'enableFailFast': enableFailFast,
+                stage("Build") {
+                    def additionalParameters = [
                         "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
-                        'globalVars': globalVarsJson,
                     ]
-
-                    if (env.alternativeTrtSBSA) {
-                        parameters += [
-                            "alternativeTRT": env.alternativeTrtSBSA,
-                        ]
-                    }
-
-                    if (reuseBuild) {
-                        parameters['reuseArtifactPath'] = "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${reuseBuild}"
-                    }
-
-                    echo "trigger SBSA build job, params: ${parameters}"
-
-                    def status = triggerJob(
-                        "/LLM/helpers/Build-SBSA",
-                        parameters,
-                        jenkinsUrl,
-                        credentials,
-                    )
-
-                    if (status != "SUCCESS") {
-                        error "Downstream job did not succeed"
-                    }
+                    launchJob("/LLM/helpers/Build-SBSA", reuseBuild, "SBSA", additionalParameters)
                 }
                 stage(testStageName) {
                     if (SBSA_TEST_CHOICE == STAGE_CHOICE_SKIP) {
@@ -1101,40 +1052,14 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         return
                     }
                     try {
-                        def parameters = getCommonParameters()
-                        String testFilterJson = writeJSON returnText: true, json: testFilter
-                        String globalVarsJson = writeJSON returnText: true, json: globalVars
-                        parameters += [
-                            'enableFailFast': enableFailFast,
+                        def testFilterJson = writeJSON returnText: true, json: testFilter
+                        def additionalParameters = [
                             'testFilter': testFilterJson,
                             "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
-                            'globalVars': globalVarsJson,
                         ]
 
-                        if (env.alternativeTrtSBSA) {
-                            parameters += [
-                                "alternativeTRT": env.alternativeTrtSBSA,
-                            ]
-                        }
+                        launchJob("L0_Test-SBSA", false, "SBSA", additionalParameters)
 
-                        if (env.testPhase2StageName) {
-                            parameters += [
-                                'testPhase2StageName': env.testPhase2StageName,
-                            ]
-                        }
-
-                        echo "trigger SBSA test job, params: ${parameters}"
-
-                        def status = triggerJob(
-                            "L0_Test-SBSA",
-                            parameters,
-                            jenkinsUrl,
-                            credentials,
-                        )
-
-                        if (status != "SUCCESS") {
-                            error "Downstream job did not succeed"
-                        }
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
@@ -1156,31 +1081,23 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         "Build-Docker-Images": {
             script {
                 stage("[Build-Docker-Images] Remote Run") {
-                    def parameters = getCommonParameters()
-                    String globalVarsJson = writeJSON returnText: true, json: globalVars
                     def branch = env.gitlabBranch ? env.gitlabBranch : "main"
                     if (globalVars[GITHUB_PR_API_URL]) {
                         branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
                     }
 
-                    parameters += [
-                        'enableFailFast': enableFailFast,
+                    def additionalParameters = [
                         'branch': branch,
                         'action': "push",
                         'triggerType': env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge",
-                        'globalVars': globalVarsJson,
                     ]
 
-                    echo "trigger BuildDockerImages job, params: ${parameters}"
-
-                    def status = triggerJob("/LLM/helpers/BuildDockerImages", parameters)
-                    if (status != "SUCCESS") {
-                        error "Downstream job did not succeed"
-                    }
+                    launchJob("/LLM/helpers/BuildDockerImages", false, "x86_64", additionalParameters)
                 }
             }
         }
     ]
+
     if (env.JOB_NAME ==~ /.*PostMerge.*/) {
         stages += dockerBuildJob
     }
