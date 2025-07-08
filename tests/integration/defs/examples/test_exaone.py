@@ -111,11 +111,14 @@ def test_llm_exaone_1gpu(data_type, exaone_example_root, llm_exaone_model_root,
                          indirect=True)
 def test_llm_exaone_2gpu(data_type, exaone_example_root, llm_exaone_model_root,
                          llama_example_root, llm_datasets_root, llm_rouge_root,
-                         llm_venv, cmodel_dir, engine_dir, num_beams):
+                         llm_venv, cmodel_dir, engine_dir, num_beams,
+                         timeout_from_marker):
 
     tp_size = 2
     print("Build engines...")
     model_name = "exaone"
+    remaining_timeout = timeout_from_marker
+    convert_start = time.time()
     model_dir = convert_weights(
         llm_venv=llm_venv,
         # NOTE
@@ -126,13 +129,26 @@ def test_llm_exaone_2gpu(data_type, exaone_example_root, llm_exaone_model_root,
         model_path=llm_exaone_model_root,
         data_type=data_type,
         tp_size=tp_size,
-        pp_size=1)
+        pp_size=1,
+        timeout=remaining_timeout)
+    convert_time = time.time() - convert_start
+    remaining_timeout -= convert_time
+    if remaining_timeout <= 0:
+        raise TimeoutError("Timeout exceeded after convert phase!")
 
+    build_start = time.time()
     build_cmd = [
         "trtllm-build", f"--checkpoint_dir={model_dir}",
         f"--output_dir={engine_dir}", f"--max_beam_width={num_beams}"
     ]
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+    check_call(" ".join(build_cmd),
+               shell=True,
+               env=llm_venv._new_env,
+               timeout=remaining_timeout)
+    build_time = time.time() - build_start
+    remaining_timeout -= build_time
+    if remaining_timeout <= 0:
+        raise TimeoutError("Timeout exceeded after build phase!")
 
     print("Run summarize...")
     summary_cmd = generate_summary_cmd(
@@ -149,4 +165,5 @@ def test_llm_exaone_2gpu(data_type, exaone_example_root, llm_exaone_model_root,
 
     venv_mpi_check_call(llm_venv,
                         ["mpirun", "-n", f"{tp_size}", "--allow-run-as-root"],
-                        summary_cmd)
+                        summary_cmd,
+                        timeout=remaining_timeout)
