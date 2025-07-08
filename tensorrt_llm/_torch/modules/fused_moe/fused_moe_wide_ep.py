@@ -11,8 +11,7 @@ from tensorrt_llm.mapping import Mapping
 from ...distributed import allgather, reducescatter
 from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
-from ...utils import (EventType, Fp4QuantizedTensor, disable_fp4_allgather,
-                      swizzle_sf)
+from ...utils import EventType, Fp4QuantizedTensor, swizzle_sf
 from .deep_ep_utils import buffer_pool, deep_ep_installed
 from .interface import MoE
 from .moe_load_balancer import get_moe_load_balancer
@@ -85,7 +84,6 @@ class WideEPMoE(MoE):
 
         assert self.use_dp, "Attention DP should be used with WideEP."
         assert self.parallel_size > 1, "WideEP should only be enabled with parallel_size > 1"
-        assert self.smart_router is False, "WideEP doesn't support smart router."
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
         assert self.apply_router_weight_on_input is False, "WideEP doesn't support apply_router_weight_on_input."
@@ -367,7 +365,7 @@ class WideEPMoE(MoE):
         ) and is_first_call:
             self.layer_load_balancer.maybe_cudagraph_done_wait()
 
-        use_allgather = not disable_fp4_allgather() and not self.enable_alltoall
+        use_allgather = not self.enable_alltoall
 
         loadbalancer_local_statistic_info = None
         gathered_loadbalancer_local_statistic_info = None
