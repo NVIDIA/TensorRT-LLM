@@ -210,8 +210,10 @@ class LlavaNextInputProcessor(InputProcessor):
         mm_features = torch.stack(
             [self._process(tensor) for tensor in mm_tensor])
         fused_input_ids, mm_features = self._postprocess(input_ids, mm_features)
+        multimodal_data = {}
+        multimodal_data["multimodal_embedding"] = mm_features
         return fused_input_ids.to(torch.int32).tolist(), {
-            "mm_embedding": mm_features
+            "multimodal_data": multimodal_data
         }
 
 
@@ -271,7 +273,11 @@ class LlavaNextModel(PreTrainedModel):
         num_context_requests, num_generation_requests = attn_metadata.num_contexts, attn_metadata.num_generations
         logger.debug(f"{num_context_requests=}, {num_generation_requests=}")
 
-        mm_embed = kwargs.get("multi_modal_data", [])
+        multimodal_params = kwargs.get("multimodal_params", [])
+        mm_embed = [
+            multimodal_param.multimodal_data["multimodal_embedding"]
+            for multimodal_param in multimodal_params
+        ]
         assert mm_embed == [] or len(
             mm_embed
         ) == num_context_requests, "Number of multimodal features (if provided) should be equal to number of context requests"
