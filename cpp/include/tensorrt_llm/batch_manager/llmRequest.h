@@ -1034,6 +1034,8 @@ public:
             // Currently, the runtime process is to apply for cache first and then determine prepopulation.
             // Use the prepopulated length to advance the context position and decrease chunk size if necessary.
             auto chunkSize = getContextChunkSize();
+            // minwei
+            /*
             if (prepopulatedPromptLen + chunkSize < promptLen)
             {
                 // make sure to end at block boundary after current chunk
@@ -1042,6 +1044,9 @@ public:
                 chunkSize = flooredEndPosition - prepopulatedPromptLen;
                 TLLM_CHECK(chunkSize <= getContextChunkSize());
             }
+            */
+            TLLM_CHECK_WITH_INFO(chunkSize >= prepopulatedPromptLen, "minwei chunkSize < prepopulatedPromptLen");
+            chunkSize -= prepopulatedPromptLen;
             setContextCurrentPosition(prepopulatedPromptLen);
             setContextChunkSize(chunkSize);
 
@@ -1491,6 +1496,7 @@ public:
 
     void setContextCurrentPosition(SizeType32 contextCurrentPosition)
     {
+        printf("minwei setContextCurrentPosition: %d\n", contextCurrentPosition);
         mContextCurrentPosition = contextCurrentPosition;
     }
 
@@ -1498,6 +1504,7 @@ public:
     /// or end of the context is returned.
     [[nodiscard]] SizeType32 getContextCurrentPosition() const noexcept
     {
+        printf("minwei getContextCurrentPosition: %d\n", mContextCurrentPosition);
         return mContextCurrentPosition;
     }
 
