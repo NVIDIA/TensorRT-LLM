@@ -983,8 +983,10 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
         if (fittingRequests.empty() && fittingDisaggGenInitRequests.empty())
         {
             TLLM_LOG_WARNING(
-                "CapacityScheduler didn't schedule any requests, probably because of insufficient resources such as KV "
-                "cache, will try wait for KV cache transfer to complete");
+                "CapacityScheduler didn't schedule any requests in iteration %lu, "
+                "probably because of insufficient resources such as KV cache, "
+                "will try wait for KV cache transfer to complete",
+                mIterCounter);
             if (mCacheTransceiver)
             {
                 mCacheTransceiver->checkContextTransferStatus(1);
