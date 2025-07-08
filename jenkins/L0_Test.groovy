@@ -2274,16 +2274,12 @@ pipeline {
             when {
                 expression {
                     // Only run the test list validation when necessary
-                    env.targetArch == X86_64_TRIPLE && testFilter[ONLY_DOCS_FILE_CHANGED] == false
+                    env.targetArch == X86_64_TRIPLE && testFilter[ONLY_DOCS_FILE_CHANGED] == false && !(env.JOB_NAME ==~ /.*Multi-GPU.*/) // Only execute the check if running on x86
                 }
             }
             steps
             {
                 script {
-                    if (env.JOB_NAME ==~ /.*Multi-GPU.*/) {
-                        echo "This check is not needed for multi-GPU tests."
-                        return
-                    }
                     launchTestListCheck(this)
                 }
             }
@@ -2297,7 +2293,7 @@ pipeline {
                     dgxJobs = [:]
 
                     def testPhase2StageName = env.testPhase2StageName
-                    if (testPhase2StageName || env.JOB_NAME ==~ /.*Multi-GPU.*/ || env.JOB_NAME ==~ /.*Single-GPU.*/) {
+                    if (testPhase2StageName) {
                         def dgxSigns = ["DGX_H100", "DGX_H200", "GB200", "DGX_B200"]
                         singleGpuJobs = parallelJobs.findAll{!dgxSigns.any{sign -> it.key.contains(sign)}}
                         dgxJobs = parallelJobs.findAll{dgxSigns.any{sign -> it.key.contains(sign)}}
@@ -2305,37 +2301,30 @@ pipeline {
 
                     if (env.JOB_NAME ==~ /.*Single-GPU.*/) {
                         echo "Only run single-GPU tests."
-                        singleGpuJobs.failFast = params.enableFailFast
-                        parallel singleGpuJobs
-                        if (dgxJobs.size() == 0) {
+                        if (dgxJobs.size() > 0) {
+                            if (globalVars[ACTION_INFO]['parents'].size() > 0) {
+                                def parentJob = globalVars[ACTION_INFO]['parents'][-2]
+                                trtllm_utils.appendBuildDescription(this, parentJob['name'], parentJob['build_number'], "Require Multi-GPU Testing:")
+                            } else {
+                                echo "No parent job to run multi-GPU tests."
+                            }
+                        } else {
                             echo "Skip multi-GPU testing. No test to run."
-                            return
                         }
-                        if (globalVars[ACTION_INFO]['parents'].size() == 0) {
-                            error "No parent job to run multi-GPU tests."
+                        if (singleGpuJobs.size() > 0) {
+                            singleGpuJobs.failFast = params.enableFailFast
+                            parallel singleGpuJobs
+                        } else {
+                            echo "Skip single-GPU testing. No test to run."
                         }
-                        def parentJob = globalVars[ACTION_INFO]['parents'][-2]
-                        trtllm_utils.appendBuildDescription(this, parentJob['name'], parentJob['build_number'], "Will run multi-GPU tests:")
-                        return
-                    }
-                    if (env.JOB_NAME ==~ /.*Multi-GPU.*/) {
+                    } else if (env.JOB_NAME ==~ /.*Multi-GPU.*/) {
                         echo "Only run multi-GPU tests."
-                        dgxJobs.failFast = params.enableFailFast
-                        parallel dgxJobs
-                        return
-                    }
-
-                    if (singleGpuJobs.size() > 0) {
-                        singleGpuJobs.failFast = params.enableFailFast
-                        parallel singleGpuJobs
-                    } else {
-                        echo "Skip single-GPU testing. No test to run."
-                    }
-
-                    if (dgxJobs.size() > 0) {
-                        stage(testPhase2StageName) {
+                        if (dgxJobs.size() > 0) {
                             dgxJobs.failFast = params.enableFailFast
                             parallel dgxJobs
+                        } else {
+                            // For multi-GPU job, if not stage will run, we should not add it into queue.
+                            error "Skip multi-GPU testing. No test to run."
                         }
                     }
                 }
