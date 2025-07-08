@@ -501,8 +501,14 @@ class PredefinedAttentionMask(str, Enum):
     FULL = "full"
 
 
-# May extend to custom attention mask type
-AttentionMask = Union[PredefinedAttentionMask]
+class CustomAttentionMask(str, Enum):
+    """
+    Custom attention mask types
+    """
+    CUSTOM = "custom"
+
+
+AttentionMask = Union[PredefinedAttentionMask, CustomAttentionMask]
 
 
 class AttentionBackend(Generic[TMetadata]):
