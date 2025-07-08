@@ -346,7 +346,7 @@ class OpenAIDisaggServer:
                             response.raise_for_status()
                         return response_type(**response_dict)
             except (aiohttp.ClientError, OSError) as e:
-                if attempt == 2:
+                if attempt == self.max_retries:
                     raise HTTPException(status_code=HTTP_429_TOO_MANY_REQUESTS, detail=f"Too many requests") from e
                 logger.error(f"Client error: {e} - retry {attempt} of {self.max_retries}")
                 await asyncio.sleep(1)
