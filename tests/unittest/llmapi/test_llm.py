@@ -535,6 +535,40 @@ def _test_llm_generate_async(model_name=default_model_name,
     test_non_streaming_usage_wait()
 
 
+@pytest.mark.parametrize("chunked", [True, False])
+@pytest.mark.part0
+def test_llm_generate_async_with_stream_interval(chunked):
+    model_path = f"{llm_models_root()}/nvfp4-quantized/Meta-Llama-3.1-8B"
+    max_num_tokens = 256
+    with LLM_torch(model_path,
+                   max_num_tokens=max_num_tokens,
+                   stream_interval=4,
+                   enable_chunked_prefill=chunked) as llm:
+        sampling_params = SamplingParams(max_tokens=13,
+                                         ignore_eos=True,
+                                         detokenize=False)
+        step = 0
+        last_step_len = 0
+        prompt = "The capital of France is "
+        if chunked:
+            prompt = prompt * max_num_tokens
+        for output in llm.generate_async(prompt,
+                                         sampling_params=sampling_params,
+                                         streaming=True):
+            current_step_len = len(output.outputs[0].token_ids)
+            # The output lens of each step need to be [1, 3, 4, 4, 1]
+            if step == 0:
+                assert current_step_len == 1
+            elif step == 1:
+                assert current_step_len - last_step_len == 3
+            elif step == 2 or step == 3:
+                assert current_step_len - last_step_len == 4
+            else:
+                assert current_step_len - last_step_len == 1
+            step += 1
+            last_step_len = current_step_len
+
+
 @pytest.fixture(scope="module")
 def llm_for_sampling_params():
     build_config = BuildConfig(max_beam_width=3)
