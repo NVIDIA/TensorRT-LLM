@@ -1493,12 +1493,12 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     int const shift_for_cyclic_kv = (enable_use_seq_idx_kv) ? tlength - cyclic_kv_cache_len : kvCacheBuffer.mBubbleLen;
     int const shift_for_cyclic_k = (enable_use_seq_idx_kv) ? tlength - cyclic_kv_cache_len : pastKCache.mBubbleLen;
     // The actual kv cache length.
-    // tlength is the past length actually.
-    int kv_loop_length = min(tlength, cyclic_kv_cache_len);
+    // Minus 1 because the current token is also included in the attention window.
+    int kv_loop_length = min(tlength, cyclic_kv_cache_len - 1);
     // The bound of the kv token idx (tlength = 0 should not happen ideally, but add here for safety).
     int const kv_token_idx_bound = max(tlength - 1, 0);
     // The kv_token_start_offset. All tokens before kv_token_start_offset will be fully masked.
-    int kv_token_start_offset = max(tlength - cyclic_kv_cache_len, 0);
+    int kv_token_start_offset = max(tlength - cyclic_kv_cache_len + 1, 0);
     // Only consider the current attention chunk if the chunked attention is used.
     if (params.chunked_attention_size_log2 > 0)
     {

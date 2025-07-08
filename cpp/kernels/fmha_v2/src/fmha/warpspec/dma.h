@@ -199,7 +199,7 @@ struct DMA
                 // The kv_offset_start.
                 int kv_offset_start = is_chunked_attention
                     ? ((q_step_offset >> params.log2_chunked_attention_size) << params.log2_chunked_attention_size)
-                    : max(0, q_step_offset - params.sliding_window_size);
+                    : max(0, q_step_offset + 1 - params.sliding_window_size);
                 kv_idx_start = kv_offset_start / STEP_KV;
             }
 
