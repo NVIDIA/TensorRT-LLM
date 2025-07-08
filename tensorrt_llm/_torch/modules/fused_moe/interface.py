@@ -151,3 +151,9 @@ class MoE(nn.Module):
         assert self._weights_created
         return self.quant_config is not None and self.quant_config.layer_quant_mode.has_w4a16_mxfp4(
         )
+
+    @property
+    def has_w4a8_mxfp4_mxfp8(self):
+        assert self._weights_created
+        return self.quant_config is not None and self.quant_config.layer_quant_mode.has_w4a8_mxfp4_mxfp8(
+        )

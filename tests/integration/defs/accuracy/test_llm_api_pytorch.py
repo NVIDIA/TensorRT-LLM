@@ -2190,8 +2190,11 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
         if moe_backend in ["CUTLASS", "TRTLLM"] and get_sm_version() < 100:
             pytest.skip(
                 "CUTLASS or TRTLLM moe backend requires Blackwell or newer.")
-        if activation_dtype == "mxfp8" and moe_backend not in ["TRTLLM"]:
-            pytest.skip("Mxfp8 is only supported for TRTLLM moe backend.")
+        if activation_dtype == "mxfp8" and moe_backend not in [
+                "TRTLLM", "CUTLASS"
+        ]:
+            pytest.skip(
+                "Mxfp8 is only supported for TRTLLM or CUTLASS moe backend.")
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,

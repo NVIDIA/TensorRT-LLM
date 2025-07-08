@@ -6,12 +6,14 @@ from ...distributed import allgather, reducescatter
 from ...model_config import ModelConfig
 from ...utils import EventType, Fp4QuantizedTensor, ceil_div, swizzle_sf
 from .interface import MoE
-from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
-                           FP8QDQFusedMoEMethod, MoEWeightLoadingMode,
-                           NVFP4CutlassFusedMoEMethod,
-                           UnquantizedFusedMoEMethod,
-                           W4A8MXFP4FP8CutlassFusedMoEMethod,
-                           WInt4AFP8FusedMoEMethod)
+
+# isort: off
+from .quantization import (
+    DeepSeekFP8BlockScalesFusedMoEMethod, FP8QDQFusedMoEMethod,
+    MoEWeightLoadingMode, NVFP4CutlassFusedMoEMethod, UnquantizedFusedMoEMethod,
+    W4A8MXFP4FP8CutlassFusedMoEMethod, W4A8MXFP4MXFP8CutlassFusedMoEMethod,
+    WInt4AFP8FusedMoEMethod)
+# isort: on
 from .routing import BaseMoeRoutingMethod
 
 
@@ -140,7 +142,8 @@ class CutlassFusedMoE(MoE):
                     | self.quant_config.quant_mode.has_fp8_qdq()
                     | self.quant_config.quant_mode.
                     is_int4_weight_only_per_group()
-                    | self.quant_config.quant_mode.has_w4a8_mxfp4_fp8()):
+                    | self.quant_config.quant_mode.has_w4a8_mxfp4_fp8()
+                    | self.quant_config.quant_mode.has_w4a8_mxfp4_mxfp8()):
                 raise ValueError(
                     f"unsupported quantization mode: {self.quant_config.quant_mode}"
                 )
@@ -165,6 +168,8 @@ class CutlassFusedMoE(MoE):
                 return WInt4AFP8FusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8():
                 return W4A8MXFP4FP8CutlassFusedMoEMethod()
+            elif self.quant_config.layer_quant_mode.has_w4a8_mxfp4_mxfp8():
+                return W4A8MXFP4MXFP8CutlassFusedMoEMethod()
             else:
                 raise ValueError(
                     f"Unsupported quantization mode: {self.quant_config.quant_mode}"
@@ -234,6 +239,7 @@ class CutlassFusedMoE(MoE):
         # quantize inputs
         use_deepseek_fp8_block_scale = False
         use_w4a8_group_scaling = False
+        use_mxfp8_act_scaling = False
         weight_dtype = self.w3_w1_weight.dtype
         x_sf = None
         if self.has_any_quant:
@@ -264,6 +270,9 @@ class CutlassFusedMoE(MoE):
                         x, x_sf = torch.ops.trtllm.fp4_quantize(
                             x, self.fc31_input_scale, self.scaling_vector_size,
                             False, True)
+            elif self.has_w4a8_mxfp4_mxfp8:
+                use_mxfp8_act_scaling = True
+                x, x_sf = torch.ops.trtllm.mxfp8_quantize(x, True)
             else:
                 raise ValueError(
                     f"unsupported quantization mode: {self.quant_config.quant_mode}"
@@ -309,6 +318,7 @@ class CutlassFusedMoE(MoE):
             enable_alltoall=self.enable_alltoall,
             use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
             use_w4a8_group_scaling=use_w4a8_group_scaling,
+            use_mxfp8_act_scaling=use_mxfp8_act_scaling,
             min_latency_mode=False,
             tune_max_num_tokens=self.tune_max_num_tokens,
         )

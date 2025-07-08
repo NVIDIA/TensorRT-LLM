@@ -69,6 +69,13 @@ class FusedMoEQuantScalesW4A8MXFP4FP8(NamedTuple):
     fc2_dequant_scale: torch.Tensor
 
 
+class FusedMoEQuantScalesW4A8MXFP4MXFP8(NamedTuple):
+    fc31_weight_block_scale: torch.Tensor
+    fc31_dequant_scale: torch.Tensor
+    fc2_weight_block_scale: torch.Tensor
+    fc2_dequant_scale: torch.Tensor
+
+
 def trtllmgen_maybe_get_cached_w3_w1_permute_indices(
         dst_w3_w1_weight: torch.Tensor,
         cache_permute_indices: Dict[tuple[int, int, int], torch.Tensor],
@@ -1678,7 +1685,45 @@ class W4A16MXFP4CutlassFusedMoEMethod(MXFP4WeightCutlassFusedMoEMethod):
 
 
 class W4A8MXFP4MXFP8CutlassFusedMoEMethod(MXFP4WeightCutlassFusedMoEMethod):
-    pass
+
+    def create_weights(self, module: torch.nn.Module):
+        fake_input_scale = nn.Parameter(torch.empty(
+            module.expert_size_per_partition, dtype=torch.float32),
+                                        requires_grad=False)
+        module.register_parameter("fake_input_scale", fake_input_scale)
+
+        super().create_weights(module)
+
+        self.setup_quant_scales(module)
+
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+        # Step1: Load input scales.
+        module.fake_input_scale.fill_(1.)
+
+        # Step2: Load weight block scales.
+        super().load_quant_scales(module, weights)
+
+    def setup_quant_scales(self, module: torch.nn.Module):
+        module.quant_scales = FusedMoEQuantScalesW4A8MXFP4MXFP8(
+            fc31_weight_block_scale=module.w3_w1_weight_scale,
+            fc31_dequant_scale=module.fake_input_scale,
+            fc2_weight_block_scale=module.w2_weight_scale,
+            fc2_dequant_scale=module.fake_input_scale,
+        )
+
+    def get_quant_scales(self, module: torch.nn.Module, slot_start,
+                         slot_end) -> tuple[torch.Tensor, ...]:
+        assert module.smart_router
+        return FusedMoEQuantScalesW4A8MXFP4MXFP8(
+            fc31_weight_block_scale=module.w3_w1_weight_scale.narrow(
+                0, slot_start, slot_end - slot_start),
+            fc31_dequant_scale=module.fake_input_scale.narrow(
+                0, slot_start, slot_end - slot_start),
+            fc2_weight_block_scale=module.w2_weight_scale.narrow(
+                0, slot_start, slot_end - slot_start),
+            fc2_dequant_scale=module.fake_input_scale.narrow(
+                0, slot_start, slot_end - slot_start),
+        )
 
 
 class W4A8MXFP4FP8CutlassFusedMoEMethod(MXFP4WeightCutlassFusedMoEMethod):
