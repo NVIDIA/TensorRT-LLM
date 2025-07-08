@@ -1,11 +1,11 @@
 from typing import Dict, Optional, Type
 
-from tensorrt_llm.bench.dataclasses.scenario import (ScenarioSpecification,
-                                                     TuningConstraints,
-                                                     WorldConfig)
-from tensorrt_llm.bench.tuning import HueristicProtocol
-from tensorrt_llm.bench.tuning.pyt import PytMaxThroughputScenario, DefaultPytHeuristic
-from tensorrt_llm.bench.tuning.trt import TrtMaxThroughputScenario, DefaultTrtHeuristic
+from tensorrt_llm.bench.dataclasses.scenario import ScenarioSpecification
+from tensorrt_llm.bench.tuning import HueristicProtocol, DefaultLlmHeuristic
+from tensorrt_llm.bench.tuning.throughput import (
+    PytMaxThroughputScenario,
+    TrtMaxThroughputScenario
+)
 
 
 class HeuristicFactory:
@@ -13,12 +13,12 @@ class HeuristicFactory:
 
     _heuristics: Dict[str, Dict[str, Type[HueristicProtocol]]] = {
         "pytorch": {
-            "default": DefaultPytHeuristic,
-            "max_throughput": PytMaxThroughputScenario,
+            "default": DefaultLlmHeuristic,
+            "throughput": PytMaxThroughputScenario,
         },
         "tensorrt": {
-            "default": DefaultTrtHeuristic,
-            "max_throughput": TrtMaxThroughputScenario,
+            "default": DefaultLlmHeuristic,
+            "throughput": TrtMaxThroughputScenario,
         },
     }
 
