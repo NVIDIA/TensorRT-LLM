@@ -1,8 +1,8 @@
 # How to launch Llama4 Maverick + Eagle3 TRTLLM server
 
-Artificial Analysis has benchmarked the Llama4 Maverick + Eagle3 TRTLLM server running at over [1000 tokens per second per user on 8xB200 GPUs](https://developer.nvidia.com/blog/blackwell-breaks-the-1000-tps-user-barrier-with-metas-llama-4-maverick/). This implementation leverages NVIDIA's TensorRT-LLM combined with speculative decoding using the Eagle3 model to further boost performance.
+Artificial Analysis has benchmarked the Llama4 Maverick with Eagle3 enabled TensorRT-LLM server running at over [1000 tokens per second per user on 8xB200 GPUs](https://developer.nvidia.com/blog/blackwell-breaks-the-1000-tps-user-barrier-with-metas-llama-4-maverick/). This implementation leverages NVIDIA's TensorRT-LLM combined with speculative decoding using the Eagle3 model to further boost performance.
 
-In the guide below, we will walk you through how to launch your own high-performance Llama4 Maverick + Eagle3 TRTLLM server, from build to deployment.  (Note that your specific performance numbers may vary—speculative decoding speedups depend upon the dataset!)
+In the guide below, we will walk you through how to launch your own high-performance Llama4 Maverick with Eagle3 enabled TensorRT-LLM server, from build to deployment.  (Note that your specific performance numbers may vary—speculative decoding speedups depend upon the dataset!)
 
 ## Prerequisites
 
@@ -33,9 +33,14 @@ git lfs pull
 
 The last command, `git lfs pull`, ensures all large files stored with Git LFS are properly downloaded.
 
-### Step 2: Build the TensorRT-LLM release Docker image
+### Step 2: Prepare the TensorRT-LLM release Docker image
 
-This step compiles TensorRT-LLM with all optimizations enabled. This may take 15-30 minutes depending on your system.
+
+#### 1. Use weekly release NGC docker image
+TensorRT-LLM provides weekly release [docker image](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release)
+
+#### 2. Build TensorRT-LLM Docker image (Alternative way)
+If you want to compiles specific TensorRT-LLM commit, you can build the docker image. This may take 15-30 minutes depending on your system.
 
 ```
 make -C docker release_build
@@ -59,7 +64,16 @@ This command launches the server with Llama4 Maverick as the main model and Eagl
 **Important:** Replace `/path/to/maverick` and `/path/to/eagle` with the actual paths to your Maverick and Eagle3 model checkpoints on your host machine, downloaded in the [Download Artifacts](#download-artifacts) stage
 
 ```
-docker run -d --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 -p 8000:8000 --gpus=all -e "TRTLLM_ENABLE_PDL=1" -v /path/to/maverick:/config/models/maverick -v /path/to/eagle:/config/models/eagle docker.io/<username>/tensorrt_llm:main sh -c "echo -e 'enable_attention_dp: false\ncuda_graph_config:\n  max_batch_size: 8\nspeculative_config:\n  decoding_type: Eagle\n  max_draft_len: 3\n  pytorch_weights_path: /config/models/eagle\nkv_cache_config:\n  enable_block_reuse: false' > c.yaml && trtllm-serve /config/models/maverick --host 0.0.0.0 --port 8000 --backend pytorch --tp_size 8 --ep_size 1 --trust_remote_code --extra_llm_api_options c.yaml --kv_cache_free_gpu_memory_fraction 0.75"
+docker run -d --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
+    -p 8000:8000 --gpus=all -e "TRTLLM_ENABLE_PDL=1" \
+    -v /path/to/maverick:/config/models/maverick -v /path/to/eagle:/config/models/eagle \
+    docker.io/<username>/tensorrt_llm:main sh \
+        -c "echo -e 'enable_attention_dp: false\ncuda_graph_config:\n  max_batch_size: 8\nspeculative_config:\n  decoding_type: Eagle\n  max_draft_len: 3\n  pytorch_weights_path: /config/models/eagle\nkv_cache_config:\n  enable_block_reuse: false' > c.yaml && \
+        trtllm-serve /config/models/maverick \
+            --host 0.0.0.0 --port 8000 \
+            --backend pytorch --tp_size 8 --ep_size 1 \
+            --trust_remote_code --extra_llm_api_options c.yaml \
+            --kv_cache_free_gpu_memory_fraction 0.75"
 ```
 
 This command:
