@@ -206,7 +206,7 @@ class PyExecutor:
         # enqueue and _fetch_new_requests used data
         self.enqueue_lock = threading.Lock()
         self.active = True
-        self.next_req_id = max_batch_size  # The first max_batch_size request IDs are reserved for dummy requests
+        self._next_req_id = max_batch_size  # The first max_batch_size request IDs are reserved for dummy requests
         self.max_beam_width = max_beam_width
         self.max_draft_len = max_draft_len
         self.print_log = model_engine.pytorch_backend_config.print_iter_log
@@ -321,9 +321,9 @@ class PyExecutor:
         self.shutdown()
 
     def _get_request_id(self):
-        req_id = self.next_req_id
-        self.next_req_id += 1
-        return req_id
+        # (next_req_id + 1) % UINT64_MAX
+        self._next_req_id = (self._next_req_id + 1) & ((1 << 64) - 1)
+        return self._next_req_id
 
     def enqueue_requests(self, requests: List[ExecutorRequest]):
         """
