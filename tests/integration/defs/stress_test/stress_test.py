@@ -519,7 +519,7 @@ def stress_test(config,
         if config.backend == "pytorch":
             extra_llm_options.update({
                 "cuda_graph_config": {
-                    "enable_padding": True,
+                    "padding_enabled": True,
                     "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128, 256, 384],
                 },
                 "print_iter_log": True,
