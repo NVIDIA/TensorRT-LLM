@@ -267,12 +267,6 @@ class MTPSampler(TorchSampler):
                 request.py_decoding_iter += 1
             idx += 1
 
-        # skip the results of cuda graph dummy requests
-        if idx == 0:
-            num_cuda_graph_dummy_requests = len(new_tokens_list) - len(
-                state.scheduled_requests.generation_requests)
-            idx += num_cuda_graph_dummy_requests
-
         for request in state.scheduled_requests.generation_requests:
             assert not request.py_return_context_logits, "return_context_logits not implemented for MTPSampler"
             assert not request.py_return_generation_logits, "return_generation_logits not implemented for MTPSampler"

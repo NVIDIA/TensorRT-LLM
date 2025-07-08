@@ -1197,16 +1197,16 @@ class PyTorchModelEngine(ModelEngine):
                 new_tokens_lens_device = new_tensors_device.new_tokens_lens  # [batch]
                 next_draft_tokens_device = new_tensors_device.next_draft_tokens  # [batch, draft_len]
 
-        # Requests with draft tokens are treated like extend requests. CUDA graph dummy extend
-        # requests should be at the end of extend_requests.
+        # Requests with draft tokens are treated like extend requests. Dummy extend requests should be
+        # at the end of extend_requests.
         extend_requests = []
-        extend_cuda_graph_dummy_requests = []
+        extend_dummy_requests = []
         generation_requests = []
         for request in scheduled_requests.generation_requests:
             if len(request.py_draft_tokens
                    ) > 0 or next_draft_tokens_device is not None:
-                if request.is_cuda_graph_dummy:
-                    extend_cuda_graph_dummy_requests.append(request)
+                if request.is_dummy:
+                    extend_dummy_requests.append(request)
                 else:
                     extend_requests.append(request)
             else:
@@ -1219,8 +1219,8 @@ class PyTorchModelEngine(ModelEngine):
                                                      pin_memory=True)
                 mrope_config['mrope_position_deltas'].append(
                     mrope_position_deltas.to('cuda', non_blocking=True))
+        extend_requests += extend_dummy_requests
 
-        extend_requests = extend_cuda_graph_dummy_requests + extend_requests
         if not self._disable_overlap_scheduler and self.is_spec_decode:
             spec_dec_mode = self.spec_config.spec_dec_mode
             assert spec_dec_mode.support_overlap_scheduler(
@@ -1229,18 +1229,18 @@ class PyTorchModelEngine(ModelEngine):
         # will contain previous batch incices of generation requests
         previous_batch_indices = []
         previous_pos_indices = []
-        request_ids_with_previous_batch = []
-        num_extend_reqs_wo_previous_batch = 0
         for request in extend_requests:
             # the request has no previous tensor:
             # (1) next_draft_tokens_device is None, which means overlap scheduler is disabled; or
             # (2) a dummy request; or
             # (3) the first step in the generation server of disaggregated serving
             if next_draft_tokens_device is None or request.is_dummy or request.py_batch_idx is None:
-                # get token ids, including input token ids and draft token ids
-                input_ids.append(request.get_last_tokens(0))
-                input_ids.extend(request.py_draft_tokens)
-                draft_tokens.extend(request.py_draft_tokens)
+                # get token ids, including input token ids and draft token ids. For these dummy requests,
+                # no need to copy the token ids.
+                if not request.is_dummy:
+                    input_ids.append(request.get_last_tokens(0))
+                    input_ids.extend(request.py_draft_tokens)
+                    draft_tokens.extend(request.py_draft_tokens)
                 # get other ids and lengths
                 num_draft_tokens = len(request.py_draft_tokens)
                 past_seen_token_num = request.max_beam_num_tokens - 1
@@ -1268,7 +1268,6 @@ class PyTorchModelEngine(ModelEngine):
                 # update batch index
                 request.py_batch_idx = batch_idx
                 batch_idx += 1
-                num_extend_reqs_wo_previous_batch += 1
             else:
                 # update batch index
                 previous_batch_idx = request.py_batch_idx
@@ -1295,10 +1294,7 @@ class PyTorchModelEngine(ModelEngine):
                 num_cached_tokens_per_seq.append(past_seen_token_num +
                                                  self.max_draft_len + 1)
                 prompt_lengths.append(request.py_prompt_len)
-                request_ids_with_previous_batch.append(request.py_request_id)
-
-        # move requests with previous batch to the end of the list
-        request_ids.extend(request_ids_with_previous_batch)
+                request_ids.append(request.py_request_id)
 
         sequence_lengths.extend([1] * len(generation_requests))
         gather_ids.extend(
@@ -1333,6 +1329,7 @@ class PyTorchModelEngine(ModelEngine):
         num_tokens = len(input_ids)
         num_draft_tokens = len(draft_tokens)
         previous_batchs = len(previous_batch_indices)
+        num_requests = len(request_ids)
         total_num_tokens = len(position_ids)
         assert total_num_tokens <= self.max_num_tokens, (
             "total_num_tokens should be less than or equal to max_num_tokens")
@@ -1374,31 +1371,27 @@ class PyTorchModelEngine(ModelEngine):
                                                        non_blocking=True)
                 # prepare data for the preprocess inputs
                 kv_len_offsets_device = new_tokens_lens_device - self.max_draft_len - 1
-                pre_tokens_start_idx = num_extend_reqs_wo_previous_batch * (
-                    1 + self.max_draft_len)
-                pre_tokens_end_idx = pre_tokens_start_idx + previous_batch_tokens
-                pre_batch_start_idx = num_extend_reqs_wo_previous_batch
-                pre_batch_end_idx = pre_batch_start_idx + previous_batchs
                 previous_pos_indices = torch.tensor(previous_pos_indices,
                                                     dtype=torch.int,
                                                     pin_memory=True)
-                self.previous_pos_indices_cuda[
-                    pre_tokens_start_idx:pre_tokens_end_idx].copy_(
-                        previous_pos_indices, non_blocking=True)
+                self.previous_pos_indices_cuda[0:previous_batch_tokens].copy_(
+                    previous_pos_indices, non_blocking=True)
                 self.previous_pos_id_offsets_cuda[
-                    pre_tokens_start_idx:pre_tokens_end_idx].copy_(
+                    0:previous_batch_tokens].copy_(
                         new_tokens_lens_device[self.previous_pos_indices_cuda[
-                            pre_tokens_start_idx:pre_tokens_end_idx]],
+                            0:previous_batch_tokens]],
                         non_blocking=True)
-                self.previous_kv_lens_offsets_cuda[
-                    pre_batch_start_idx:pre_batch_end_idx].copy_(
-                        kv_len_offsets_device[
-                            self.previous_batch_indices_cuda[:previous_batchs]],
-                        non_blocking=True)
+                self.previous_kv_lens_offsets_cuda[0:previous_batchs].copy_(
+                    kv_len_offsets_device[
+                        self.previous_batch_indices_cuda[:previous_batchs]],
+                    non_blocking=True)
                 # for the requests that do not have previous batch, set the previous_pos_id_offsets and
                 # previous_kv_lens_offsets to zeros to skip the value changes in _preprocess_inputs
-                self.previous_pos_id_offsets_cuda[:pre_tokens_start_idx] *= 0
-                self.previous_kv_lens_offsets_cuda[:pre_batch_start_idx] *= 0
+                self.previous_pos_id_offsets_cuda[
+                    previous_batch_tokens:num_requests *
+                    (1 + self.max_draft_len)] *= 0
+                self.previous_kv_lens_offsets_cuda[
+                    previous_batchs:num_requests] *= 0
             else:
                 # change the data to zeros to skip the value changes in _preprocess_inputs
                 self.previous_pos_id_offsets_cuda *= 0
