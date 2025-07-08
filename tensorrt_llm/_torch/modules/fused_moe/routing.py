@@ -404,10 +404,9 @@ def create_renormalize_expert_load_balanced_logits(
     # Reshape to (num_tokens, k) - each row contains k expert indices for that token
     expert_indices = indices.view(num_tokens, k)
 
-    # Generate large random values for selected experts (5-10 range)
+    # Generate large values for selected experts (5-10 range)
     # These high values ensure the selected experts have high probability after softmax
-    large_values = torch.rand(num_tokens, k, device=device,
-                              dtype=dtype) * 5 + 5  # [5, 10]
+    large_values = torch.full((num_tokens, k), 7.5, device=device, dtype=dtype)
 
     # Assign large values to selected expert positions
     # token_indices: [[0,0],[1,1],[2,2],...] for indexing tokens
@@ -415,10 +414,10 @@ def create_renormalize_expert_load_balanced_logits(
                                  device=device).unsqueeze(1).expand(-1, k)
     logits[token_indices, expert_indices] = large_values
 
-    # Fill remaining positions with small random values (0-1 range)
+    # Fill remaining positions with small values (0-1 range)
     # This ensures non-selected experts have low but non-zero probability
     mask = (logits == 0)
-    logits[mask] = torch.rand(mask.sum(), device=device, dtype=dtype)
+    logits[mask] = 0.5
 
     # Apply softmax to get probabilities
     # After softmax, selected experts will have high probability (~0.99)
