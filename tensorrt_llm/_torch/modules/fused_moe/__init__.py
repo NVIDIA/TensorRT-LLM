@@ -17,7 +17,6 @@ from .routing import (BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
                       SparseMixerMoeRoutingMethod, StaticMoeRoutingMethod)
 
 __all__ = [
-<<<<<<< HEAD
     "BaseMoeRoutingMethod",
     "create_moe",
     "CuteDslFusedMoE",
@@ -40,13 +39,5 @@ __all__ = [
     "TRTLLMGenFusedMoE",
     "VanillaMoE",
     "WideEPMoE",
-=======
-    "VanillaMoE", "CutlassFusedMoE", "TRTLLMGenFusedMoE", "FluxFusedMoE",
-    "BaseMoeRoutingMethod", "MoeLoadBalancer", "Qwen3MoeRoutingMethod",
-    "Llama4RenormalizeMoeRoutingMethod", "SparseMixerMoeRoutingMethod",
-    "LoadBalancedMoeRoutingMethod", "StaticMoeRoutingMethod",
-    "DefaultMoeRoutingMethod", "DeepSeekV3MoeRoutingMethod",
-    "RoutingMethodType", "RenormalizeMoeRoutingMethod", "MoE",
-    "MoEWeightLoadingMode", "get_moe_cls", "create_moe"
->>>>>>> 9ae6ae029 (introduce flux op[first version])
+    "FluxFusedMoE",
 ]

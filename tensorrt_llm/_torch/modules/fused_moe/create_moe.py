@@ -43,13 +43,10 @@ def get_moe_cls(
                 f"Check out details in quant_config: {quant_config}"
                 "Using CutlassFusedMoE instead.")
             return CutlassFusedMoE
-<<<<<<< HEAD
     elif moe_backend.upper() == "WIDEEP":
         return WideEPMoE
-=======
     elif moe_backend.upper() == "FLUX":
         return FluxFusedMoE
->>>>>>> 9ae6ae029 (introduce flux op[first version])
     else:
         raise ValueError(f"Unsupported moe backend: {moe_backend}")
 
