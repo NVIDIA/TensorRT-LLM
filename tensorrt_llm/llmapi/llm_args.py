@@ -71,7 +71,7 @@ class CudaGraphConfig(BaseModel):
     max_batch_size: int = Field(
         default=0, description="Maximum batch size for CUDA graphs.")
 
-    padding_enabled: bool = Field(
+    enable_padding: bool = Field(
         default=False,
         description=
         "If true, batches are rounded up to the nearest cuda_graph_batch_size. This is usually a net win for performance."
@@ -235,6 +235,7 @@ class DecodingBaseConfig(BaseModel):
             "Lookahead": LookaheadDecodingConfig,
             "NGram": NGramDecodingConfig,
             "DraftTarget": DraftTargetDecodingConfig,
+            "UserProvided": UserProvidedDecodingConfig,
         }
 
         config_class = config_classes.get(decoding_type)
@@ -274,6 +275,17 @@ class EagleDecodingConfig(DecodingBaseConfig):
         return cls(**data)
 
     decoding_type: ClassVar[str] = "Eagle"
+
+
+class UserProvidedDecodingConfig(DecodingBaseConfig):
+    # Type should be Drafter, but it leads to circular import
+    drafter: object
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+    decoding_type: ClassVar[str] = "UserProvided"
 
 
 class NGramDecodingConfig(DecodingBaseConfig):
@@ -633,6 +645,7 @@ SpeculativeConfig: TypeAlias = Optional[Union[
     MedusaDecodingConfig,
     MTPDecodingConfig,
     NGramDecodingConfig,
+    UserProvidedDecodingConfig,
 ]]
 
 
@@ -1347,9 +1360,9 @@ class BaseLlmArgs(BaseModel):
                         eagle3_one_model=self.speculative_config.
                         eagle3_one_model)
             elif isinstance(self.speculative_config, NGramDecodingConfig):
-                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.NGRAM
                 assert self.backend in ['pytorch', '_autodeploy']
                 assert self.speculative_config.prompt_lookup_num_tokens > 0 and self.speculative_config.max_matching_ngram_size > 0
+                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.NGRAM
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
                 from tensorrt_llm._torch.speculative import NGramConfig
                 self.speculative_config = NGramConfig(
@@ -1382,6 +1395,15 @@ class BaseLlmArgs(BaseModel):
                     relaxed_topk=self.speculative_config.relaxed_topk,
                     relaxed_delta=self.speculative_config.relaxed_delta,
                     use_mtp_vanilla=self.speculative_config.use_mtp_vanilla)
+            elif isinstance(self.speculative_config,
+                            UserProvidedDecodingConfig):
+                assert self.backend in ['pytorch', '_autodeploy']
+                from tensorrt_llm._torch.speculative import UserProvidedConfig
+                self.speculative_config = UserProvidedConfig(
+                    max_draft_tokens=self.speculative_config.max_draft_len,
+                    drafter=self.speculative_config.drafter)
+                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.USER_PROVIDED
+                self.build_config.max_draft_len = self.speculative_config.max_draft_tokens
             else:
                 raise ValueError(
                     f"Speculative config type not recognized: {self.speculative_config}"
@@ -1702,7 +1724,7 @@ class TorchLlmArgs(BaseLlmArgs):
     moe_backend: str = Field(default='CUTLASS',
                              description="MoE backend to use.")
 
-    mixed_sampler: bool = Field(
+    enable_mixed_sampler: bool = Field(
         default=False,
         description=
         "If true, will iterate over sampling_params of each request and use the corresponding sampling strategy, e.g. top-k, top-p, etc."
@@ -1831,17 +1853,17 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @staticmethod
     def _generate_cuda_graph_batch_sizes(max_batch_size: int,
-                                         padding_enabled: bool) -> List[int]:
+                                         enable_padding: bool) -> List[int]:
         """Generate a list of batch sizes for CUDA graphs.
 
         Args:
             max_batch_size: Maximum batch size to generate up to
-            padding_enabled: Whether padding is enabled, which affects the batch size distribution
+            enable_padding: Whether padding is enabled, which affects the batch size distribution
 
         Returns:
             List of batch sizes to create CUDA graphs for
         """
-        if padding_enabled:
+        if enable_padding:
             batch_sizes = [1, 2, 4] + [i * 8 for i in range(1, 17)]
         else:
             batch_sizes = list(range(1, 32)) + [32, 64, 128]
@@ -1879,7 +1901,7 @@ class TorchLlmArgs(BaseLlmArgs):
             config.batch_sizes = sorted(config.batch_sizes)
             if config.max_batch_size != 0:
                 if config.batch_sizes != self._generate_cuda_graph_batch_sizes(
-                        config.max_batch_size, config.padding_enabled):
+                        config.max_batch_size, config.enable_padding):
                     raise ValueError(
                         "Please don't set both cuda_graph_config.batch_sizes "
                         "and cuda_graph_config.max_batch_size.\n"
@@ -1891,7 +1913,7 @@ class TorchLlmArgs(BaseLlmArgs):
         else:
             max_batch_size = config.max_batch_size or 128
             generated_sizes = self._generate_cuda_graph_batch_sizes(
-                max_batch_size, config.padding_enabled)
+                max_batch_size, config.enable_padding)
             config.batch_sizes = generated_sizes
             config.max_batch_size = max_batch_size
 
@@ -1910,15 +1932,15 @@ class TorchLlmArgs(BaseLlmArgs):
             cuda_graph_max_batch_size=self.cuda_graph_config.max_batch_size
             if self.cuda_graph_config else
             CudaGraphConfig.model_fields['max_batch_size'].default,
-            cuda_graph_padding_enabled=self.cuda_graph_config.padding_enabled
+            cuda_graph_padding_enabled=self.cuda_graph_config.enable_padding
             if self.cuda_graph_config else
-            CudaGraphConfig.model_fields['padding_enabled'].default,
+            CudaGraphConfig.model_fields['enable_padding'].default,
             disable_overlap_scheduler=self.disable_overlap_scheduler,
             moe_max_num_tokens=self.moe_max_num_tokens,
             moe_load_balancer=self.moe_load_balancer,
             attn_backend=self.attn_backend,
             moe_backend=self.moe_backend,
-            mixed_sampler=self.mixed_sampler,
+            enable_mixed_sampler=self.enable_mixed_sampler,
             enable_trtllm_sampler=self.enable_trtllm_sampler,
             kv_cache_dtype=self.kv_cache_dtype,
             enable_iter_perf_stats=self.enable_iter_perf_stats,
