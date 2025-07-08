@@ -386,6 +386,38 @@ class TestAssignReviewers(unittest.TestCase):
         self.assertEqual(set(unmapped_files),
                          {"unmapped/file1.txt", "another/file2.py"})
 
+    def test_most_specific_module_mapping(self):
+        """Test that files map to the most specific module match"""
+        # Create overlapping module paths similar to the real config
+        overlapping_paths = {
+            "tensorrt_llm/": "LLM API/Workflow",
+            "tensorrt_llm/_torch/": "Torch Framework",
+            "tensorrt_llm/_torch/models/": "Torch Models",
+            "tensorrt_llm/_torch/models/modeling_llama.py":
+            "Torch Models Llama",
+            "tests/": "General Tests",
+            "tests/integration/": "Integration Tests",
+            "tests/integration/test_lists/": "Test Configuration",
+        }
+
+        # Test individual files mapping to most specific modules
+        test_cases = [
+            ("tensorrt_llm/api.py", "LLM API/Workflow"),
+            ("tensorrt_llm/_torch/utils.py", "Torch Framework"),
+            ("tensorrt_llm/_torch/models/bert.py", "Torch Models"),
+            ("tensorrt_llm/_torch/models/modeling_llama.py",
+             "Torch Models Llama"),
+            ("tests/unit_test.py", "General Tests"),
+            ("tests/integration/test_x.py", "Integration Tests"),
+            ("tests/integration/test_lists/config.json", "Test Configuration"),
+        ]
+
+        for file, expected_module in test_cases:
+            modules, _ = assign_reviewers.map_modules([file], overlapping_paths)
+            self.assertEqual(
+                modules, {expected_module},
+                f"File '{file}' should map to '{expected_module}'")
+
     @patch('assign_reviewers.load_json')
     @patch('subprocess.run')
     def test_module_with_no_owners(self, mock_run, mock_load_json):

@@ -68,19 +68,31 @@ def load_json(path: str):
 
 def map_modules(changed_files: list[str],
                 module_paths: dict[str, str]) -> tuple[set[str], list[str]]:
-    """Map changed files to modules and return both modules and unmapped files"""
+    """Map changed files to modules using MOST SPECIFIC (longest) prefix match"""
     modules: set[str] = set()
     unmapped_files: list[str] = []
 
     for file in changed_files:
-        mapped = False
+        # Find ALL matching prefixes
+        matches = []
         for prefix, module in module_paths.items():
             if file.startswith(prefix):
-                modules.add(module)
-                mapped = True
-                break
+                matches.append((len(prefix), prefix, module))
 
-        if not mapped:
+        if matches:
+            # Sort by prefix length (descending) to get most specific first
+            matches.sort(reverse=True)
+            most_specific_module = matches[0][2]
+            modules.add(most_specific_module)
+
+            # Log if there were multiple matches (for debugging)
+            if len(matches) > 1:
+                matches[0][1]
+                print(f"  File '{file}' has overlapping mappings:")
+                for _, prefix, module in matches:
+                    marker = "→" if module == most_specific_module else " "
+                    print(f"    {marker} {prefix} -> {module}")
+        else:
             unmapped_files.append(file)
 
     return modules, unmapped_files
