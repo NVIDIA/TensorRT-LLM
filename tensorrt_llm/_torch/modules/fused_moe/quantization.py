@@ -1957,14 +1957,7 @@ class W4A16MXFP4TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
     pass
 
 
-class W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
-    pass
-
-
 class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
-    # Cache the permute indices during weight loading to avoid recompute
-    # This assumes the same input shape always results in the same permute indices
-    _cache_permute_indices: Dict[torch.Size, torch.Tensor] = {}
 
     def create_weights(self, module: torch.nn.Module):
         fc31_input_dequant = nn.Parameter(torch.empty(
@@ -1987,36 +1980,18 @@ class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
             w1_input_scale, w3_input_scale), "w1_input_scale != w3_input_scale"
         dst_fc31_input_scale.copy_(w1_input_scale)
 
-    def load_expert_fc2_input_scale_w4a8_mxfp4_fp8(
-            self, w2_input_scale, dst_fc2_input_scale: torch.Tensor):
-        dst_fc2_input_scale.copy_(w2_input_scale[...].reshape([]))
-
-    def setup_quant_scales(self, module: torch.nn.Module):
-        module.quant_scales = tuple()
-
-    def get_quant_scales(self, module: torch.nn.Module, slot_start,
-                         slot_end) -> tuple[torch.Tensor, ...]:
-        """
-        The TRTLLM-Gen backend of FusedMoE does not use FusedMoEQuantScales.
-        """
-        raise NotImplementedError
-
     def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
         # Step1: Load input scales.
         tmp_fc31_input_scale = torch.empty(module.num_experts,
                                            dtype=torch.float32)
-        tmp_fc2_input_scale = torch.empty(module.num_experts,
-                                          dtype=torch.float32)
 
         for expert_id in range(module.num_experts):
             if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
                 w1_input_scale = weights[f"{expert_id}.w1.input_scale"]
                 w3_input_scale = weights[f"{expert_id}.w3.input_scale"]
-                w2_input_scale = weights[f"{expert_id}.w2.input_scale"]
             elif module.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
                 w1_input_scale = weights["gate_up_proj_input_scale"]
                 w3_input_scale = weights["gate_up_proj_input_scale"]
-                w2_input_scale = weights["down_proj_input_scale"]
             else:
                 raise NotImplementedError(
                     f"Unknown weight loading mode in MoE: {module.weight_loading_mode}"
@@ -2024,12 +1999,28 @@ class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
 
             self.load_expert_fc31_input_scale_w4a8_mxfp4_fp8(
                 w1_input_scale, w3_input_scale, tmp_fc31_input_scale[expert_id])
-            self.load_expert_fc2_input_scale_w4a8_mxfp4_fp8(
-                w2_input_scale, tmp_fc2_input_scale[expert_id])
 
         module.fc31_input_dequant.data.copy_(tmp_fc31_input_scale.max())
         # TRTLLMGen uses dynamic MXFP8 for fc2 so we need to set scales to 1.0.
         module.fc2_input_dequant.fill_(1.0)
+
+        # Step2: Load weight block scales.
+        super().load_quant_scales(module, weights)
+
+
+class W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
+
+    def create_weights(self, module: torch.nn.Module):
+        fake_input_scale = nn.Parameter(torch.empty(
+            module.expert_size_per_partition, dtype=torch.float32),
+                                        requires_grad=False)
+        module.register_parameter("fake_input_scale", fake_input_scale)
+
+        super().create_weights(module)
+
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+        # All input scales are handled by the MMA.
+        module.fake_input_scale.fill_(1.0)
 
         # Step2: Load weight block scales.
         super().load_quant_scales(module, weights)

@@ -2018,14 +2018,15 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
         [(1, 1, 1, False, True, True)],
         ids=["latency"])
-    def test_w4a8_mxfp4fp8(self, tp_size, pp_size, ep_size, attention_dp,
-                           cuda_graph, overlap_scheduler):
+    @pytest.mark.parametrize("activation_dtype", ["fp8", "mxfp8"])
+    def test_w4a8_mxfp4(self, tp_size, pp_size, ep_size, attention_dp,
+                        cuda_graph, overlap_scheduler, activation_dtype):
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
         llm = LLM(
-            f"{llm_models_root()}/mxfp4-qwen3/saved_models_Qwen3-8B_w4a8_mxfp4_fp8_kv_none_hf",
+            f"{llm_models_root()}/mxfp4-qwen3/saved_models_Qwen3-8B_w4a8_mxfp4_{activation_dtype}_kv_none_hf",
             tensor_parallel_size=tp_size,
             pipeline_parallel_size=pp_size,
             moe_expert_parallel_size=ep_size,
@@ -2179,19 +2180,25 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
         [(1, 1, 1, False, True, True)],
         ids=["latency"])
-    def test_w4a8_mxfp4fp8(self, moe_backend, tp_size, pp_size, ep_size,
-                           attention_dp, cuda_graph, overlap_scheduler):
+    @pytest.mark.parametrize("activation_dtype", ["static_fp8", "mxfp8"],
+                             ids=["fp8", "mxfp8"])
+    def test_w4a8_mxfp4(self, moe_backend, tp_size, pp_size, ep_size,
+                        attention_dp, cuda_graph, overlap_scheduler,
+                        activation_dtype):
         if moe_backend == "TRITON" and get_sm_version() < 90:
             pytest.skip("TRITON moe backend requires Hopper or newer.")
         if moe_backend in ["CUTLASS", "TRTLLM"] and get_sm_version() < 100:
             pytest.skip(
                 "CUTLASS or TRTLLM moe backend requires Blackwell or newer.")
+        if activation_dtype == "mxfp8" and moe_backend not in ["TRTLLM"]:
+            pytest.skip("Mxfp8 is only supported for TRTLLM moe backend.")
+
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
         llm = LLM(
-            f"{llm_models_root()}/mxfp4-qwen3/saved_models_Qwen3-30B-A3B_w4a8_mxfp4_static_fp8_kv_none_hf_moeonly",
+            f"{llm_models_root()}/mxfp4-qwen3/saved_models_Qwen3-30B-A3B_w4a8_mxfp4_{activation_dtype}_kv_none_hf_moeonly",
             tensor_parallel_size=tp_size,
             pipeline_parallel_size=pp_size,
             moe_expert_parallel_size=ep_size,
