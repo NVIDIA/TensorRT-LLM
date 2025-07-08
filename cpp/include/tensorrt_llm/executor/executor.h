@@ -1484,7 +1484,8 @@ public:
         std::optional<GuidedDecodingConfig> guidedDecodingConfig = std::nullopt,
         std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs = std::nullopt,
         std::optional<CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
-        bool gatherGenerationLogits = false, bool promptTableOffloading = false, bool enableTrtOverlap = false);
+        bool gatherGenerationLogits = false, bool promptTableOffloading = false, bool enableTrtOverlap = false,
+        bool failFastOnAttentionWindowTooLarge = false);
 
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
     [[nodiscard]] SchedulerConfig getSchedulerConfig() const;
@@ -1519,6 +1520,7 @@ public:
     [[nodiscard]] bool getPromptTableOffloading() const;
     [[nodiscard]] std::optional<CacheTransceiverConfig> getCacheTransceiverConfig() const;
     [[nodiscard]] bool getEnableTrtOverlap() const;
+    [[nodiscard]] bool getFailFastOnAttentionWindowTooLarge() const;
 
     void setMaxBeamWidth(SizeType32 maxBeamWidth);
     void setMaxBatchSize(SizeType32 maxBatchSize);
@@ -1548,6 +1550,7 @@ public:
     void setPromptTableOffloading(bool promptTableOffloading);
     void setCacheTransceiverConfig(CacheTransceiverConfig const& cacheTransceiverConfig);
     void setEnableTrtOverlap(bool enableTrtOverlap);
+    void setFailFastOnAttentionWindowTooLarge(bool failFastOnAttentionWindowTooLarge);
 
 private:
     friend class Serialization;
@@ -1634,6 +1637,10 @@ private:
 
     /// @brief Controls whether preparation and TRT engine execution should be overlapped.
     bool mEnableTrtOverlap{false};
+
+    /// @brief Controls whether to fail fast when attention window is too large to fit at least one sequence in KV
+    /// cache.
+    bool mFailFastOnAttentionWindowTooLarge{false};
 };
 
 struct KVCacheCreatedData

@@ -124,6 +124,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
         gather_generation_logits: bool = False,
         use_variable_beam_width_search: bool = False,
         mm_embedding_offloading: bool = False,
+        fail_fast_on_attention_window_too_large: bool = False,
     ) -> 'ModelRunnerCpp':
         """
         Create a ModelRunnerCpp instance from an engine directory.
@@ -398,6 +399,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
         trtllm_config.enable_chunked_context = enable_chunked_context
         trtllm_config.extended_runtime_perf_knob_config = extended_runtime_perf_knob_config
         trtllm_config.mm_embedding_offloading = mm_embedding_offloading
+        trtllm_config.fail_fast_on_attention_window_too_large = fail_fast_on_attention_window_too_large
         if is_orchestrator_mode:
             communication_mode = trtllm.CommunicationMode.ORCHESTRATOR
             path = str(Path(__file__).parent.parent / 'bin' / 'executorWorker')

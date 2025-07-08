@@ -280,7 +280,8 @@ private:
     void createBuffers(executor::DecodingConfig const& decodingConfig,
         std::optional<std::vector<executor::AdditionalModelOutput>> const& additionalModelOutputs);
     std::unique_ptr<KVCacheManager> createKvCacheManager(KvCacheConfig const& kvCacheConfig, KvCacheType kvCacheType,
-        uint64_t freePrimaryMemBytes, uint64_t freeSecondaryMemBytes, size_t extraCostMemory);
+        uint64_t freePrimaryMemBytes, uint64_t freeSecondaryMemBytes, size_t extraCostMemory,
+        bool const failFastOnAttentionWindowTooLarge = false);
     void createRnnStateManager();
     void createCustomAllReduceWorkspace();
     void createRuntimePerfKnobsTensor(executor::ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig);
@@ -380,7 +381,7 @@ private:
     /// @param blocksPerWindow map of window size to number of blocks.
     /// @return pair of new blocks per window and new maxAttentionWindowVec
     [[nodiscard]] std::pair<BlocksPerWindow, std::vector<SizeType32>> clampWindowSizesToFitAtLeastOneSequence(
-        BlocksPerWindow const& blocksPerWindow);
+        BlocksPerWindow const& blocksPerWindow, bool const failFastOnAttentionWindowTooLarge = false);
 
     /// @brief Change the speculative decoding mode.
     void changeSpecDecMode(ScheduledRequests const& scheduledRequests);
