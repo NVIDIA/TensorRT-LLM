@@ -521,7 +521,7 @@ pipeline {
                     collectResultPodSpec = createKubernetesPodConfig("agent")
                     trtllm_utils.launchKubernetesPod(this, collectResultPodSpec, "alpine", {
                         // Install wget
-                        trtllm_utils.llmExecStepWithRetry(this, script: "apk add --no-cache wget")
+                        trtllm_utils.llmExecStepWithRetry(this, script: "apt-get update && apt-get -y install wget")
 
                         // Poll for build artifacts
                         def artifactBaseUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/"
