@@ -7,7 +7,7 @@ In the guide below, we will walk you through how to launch your own high-perform
 ## Prerequisites
 
 - 8x NVIDIA B200 GPUs in a single node (we have a forthcoming guide for getting great performance on H100)
-- CUDA Toolkit 12.1 or later
+- CUDA Toolkit 12.8 or later
 - Docker with NVIDIA Container Toolkit installed
 - Fast SSD storage for model weights
 - Access to Llama4 Maverick and Eagle3 model checkpoints

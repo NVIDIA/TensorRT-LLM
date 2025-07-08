@@ -76,30 +76,33 @@ All below commands here are assumed to be running inside the container started b
 ```bash
 cat >./extra-llm-api-config.yml <<EOF
 enable_attention_dp: true
+stream_interval: 4
 cuda_graph_config:
-  max_batch_size: 512
+  max_batch_size: 1024
   padding_enabled: true
 EOF
 ```
 Explanation:
 - `enable_attention_dp`: Enable attention Data Parallel which is recommend to enable in high concurrency.
-- `kv_cache_config`: KV cache config
-  - `enable_block_reuse`: Whether to enable KV cache reuse. Recommend enable, but disable here for fixed ISL/OSL benchmark.
-- `cuda_graph_config`: CUDA Graph config
+- `stream_interval`: The iteration interval to create responses under the streaming mode.
+- `cuda_graph_config`: CUDA Graph config.
   - `max_batch_size`: Max cuda graph batch size to capture.
   - `padding_enabled`: Whether to enable CUDA graph padding.
+
+
 ### 2. Launch trtllm-serve OpenAI-compatible API server
 TensorRT-LLM supports nvidia TensorRT Model Optimizer quantized FP8 checkpoint
 ``` bash
 trtllm-serve nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
     --backend pytorch \
-    --max_batch_size 512 \
+    --max_batch_size 1024 \
     --tp_size 8 \
     --ep_size 8 \
     --trust_remote_code \
     --extra_llm_api_options ./extra-llm-api-config.yml
 ```
 With Attention DP one, the whole system's max_batch_size will be max_batch_size*tp_size
+
 
 ### 3. Run performance benchmark
 TensorRT-LLM provides a benchmark tool to benchmark trtllm-serve
@@ -108,12 +111,13 @@ python -m tensorrt_llm.serve.scripts.benchmark_serving \
         --model nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
         --dataset-name random \
         --ignore-eos \
-        --num-prompts 10000 \
+        --num-prompts 8192 \
         --random-input-len 1024 \
         --random-output-len 2048 \
         --random-ids \
         --max-concurrency 1024 \
 ```
+
 
 ## Exploring more ISL/OSL combinations
 
