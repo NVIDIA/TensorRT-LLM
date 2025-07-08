@@ -397,129 +397,167 @@ TEST_F(KVCacheManagerTest, BlockManagerTestPartialCopyFP8)
 }
 #endif
 
-TEST_F(KVCacheManagerTest, BlockManagerTestWindowSizeToShare)
+TEST_F(KVCacheManagerTest, MaxNumBlocksCalculationNonVSWA)
 {
-    auto constexpr numPrimaryBlocks = 16384;
-    // Single window size
-    {
-        std::map<SizeType32, std::vector<SizeType32>> windowSizeToLayers{{1024, {0, 1, 2}}};
-        std::map<SizeType32, SizeType32> cacheSizePerTokenPerWindow{{1024, 1}}; // Uniform cache size per token.
+    // Test behavior when memory is very limited
+    std::map<SizeType32, std::vector<SizeType32>> windowSizeToLayers{
+        {1017, {0, 1, 2, 3}}, // 4 layer with max sequence length 1017.
+    };
 
-        auto result = BlockManager::calculateWindowSizeToShare(windowSizeToLayers, cacheSizePerTokenPerWindow);
+    // Model config for testing.
+    auto const dypte = nvinfer1::DataType::kHALF;
+    tr::ModelConfig modelConfig{128, 9, 9, 0, 3, 32, nvinfer1::DataType::kHALF};
+    tr::WorldConfig worldConfig{};
+    KvCacheConfig config{};
+
+    // Cache size of half precision (2bytes) for a single layer.
+    auto cacheBytesPerTokenPerLayer = 2
+        * BaseKVCacheManager::calculateCacheSizePerTokenForSingleWindowSize(
+            modelConfig, {0}, /*isCrossAttention*/ false, 2);
+    TLLM_LOG_DEBUG("Cache size per token: %d", cacheBytesPerTokenPerLayer);
+
+    {
+        // Limited memory cannot fit the max sequence length.
+        // 4 layers * 100 tokens + extra 304 bytes
+        uint64_t allottedPrimaryMemBytes = cacheBytesPerTokenPerLayer * 4 * 100 + 304;
+        uint64_t allottedSecondaryMemBytes = 0;
+        size_t extraCostMemory = 10;
+        SizeType32 kvFactor = 2;
+
+        auto result = BaseKVCacheManager::calculateMaxNumBlocks(config, /*isCrossAttention*/ false, dypte, modelConfig,
+            worldConfig, windowSizeToLayers, allottedPrimaryMemBytes, allottedSecondaryMemBytes, extraCostMemory,
+            kvFactor);
+
         EXPECT_EQ(result.size(), 1);
-        EXPECT_NEAR(result.at(1024), 1.0f, 1e-6f);
-        // With a single window size, the entire share should be allocated to it.
-    }
-    // Variable window size
-    {
-        std::map<SizeType32, std::vector<SizeType32>> windowSizeToLayers{
-            {1024, {1}},       // contribution = 1024*1 = 1024
-            {4096, {0, 4, 5}}, // contribution = 4096*3 = 12288
-            {8192, {2, 3}},    // contribution = 8192*2 = 16384
-        };
-        // Use identical cache size per token across window sizes for simplicity.
-        std::map<SizeType32, SizeType32> cacheSizePerTokenPerWindow{{1024, 1}, {4096, 1}, {8192, 1}};
+        EXPECT_TRUE(result.find(1017) != result.end());
 
-        auto result = BlockManager::calculateWindowSizeToShare(windowSizeToLayers, cacheSizePerTokenPerWindow);
-        EXPECT_EQ(result.size(), 3);
+        auto [primaryBlocks, _] = result.at(1017);
 
-        // Ensure the shares sum to 1.
-        auto const sumShares = std::accumulate(
-            result.begin(), result.end(), 0.0f, [](float sum, auto const& kv) { return sum + kv.second; });
-        EXPECT_NEAR(sumShares, 1.0f, 1e-6f);
-
-        // Calculate expected shares based on contributions.
-        std::map<SizeType32, float> expectedShares;
-        std::map<SizeType32, SizeType32> contributions;
-        for (auto const& [windowSize, layers] : windowSizeToLayers)
-        {
-            contributions[windowSize] = windowSize * static_cast<SizeType32>(layers.size());
-        }
-        auto const totalContribution = std::accumulate(contributions.begin(), contributions.end(), 0.0f,
-            [](float sum, auto const& kv) { return sum + kv.second; });
-
-        for (auto const& [windowSize, contribution] : contributions)
-        {
-            expectedShares[windowSize] = static_cast<float>(contribution) / totalContribution;
-            EXPECT_NEAR(result.at(windowSize), expectedShares[windowSize], 1e-6f);
-        }
-
-        // Verify the exact hard-coded values mentioned in the comment
-        EXPECT_NEAR(result.at(1024), 0.0345f, 1e-4f);
-        EXPECT_NEAR(result.at(4096), 0.4138f, 1e-4f);
-        EXPECT_NEAR(result.at(8192), 0.5517f, 1e-4f);
-
-        // Verify that when shares are converted to actual block counts, they match expected values.
-        auto getRoundedBlocks
-            = [&](float share) { return static_cast<SizeType32>(std::round(share * numPrimaryBlocks)); };
-        EXPECT_EQ(getRoundedBlocks(result.at(1024)), 565);
-        EXPECT_EQ(getRoundedBlocks(result.at(4096)), 6780);
-        EXPECT_EQ(getRoundedBlocks(result.at(8192)), 9039);
+        EXPECT_EQ(primaryBlocks, 2); // ceil(100 tokens / 64)
     }
 
-    // Variable window size with different cache sizes per token per window
     {
-        std::map<SizeType32, std::vector<SizeType32>> windowSizeToLayers{
-            {1024, {1}},       // contribution = 1024*1*2 = 2048 (cache size per token = 2)
-            {4096, {0, 4, 5}}, // contribution = 4096*3*4 = 49152 (cache size per token = 4)
-            {8192, {2, 3}},    // contribution = 8192*2*1 = 16384 (cache size per token = 1)
-        };
-        // Different cache sizes per token per window
-        std::map<SizeType32, SizeType32> cacheSizePerTokenPerWindow{{1024, 2}, {4096, 4}, {8192, 1}};
+        // Enough memory, can support batchSize > 1.
+        // 3 * 4 layers * 1017 tokens + 4 layers * 100 tokens + extra 304 bytes
+        // Since maxSequenceLength is provided via windowSizeToLayers, the max sequence length is 1017 tokens.
+        uint64_t allottedPrimaryMemBytes = cacheBytesPerTokenPerLayer * (3 * 4 * 1017 + 4 * 100) + 304;
+        uint64_t allottedSecondaryMemBytes = 0;
+        size_t extraCostMemory = 0;
+        SizeType32 kvFactor = 2;
 
-        auto result = BlockManager::calculateWindowSizeToShare(windowSizeToLayers, cacheSizePerTokenPerWindow);
+        auto result = BaseKVCacheManager::calculateMaxNumBlocks(config, false, dypte, modelConfig, worldConfig,
+            windowSizeToLayers, allottedPrimaryMemBytes, allottedSecondaryMemBytes, extraCostMemory, kvFactor);
+
+        EXPECT_EQ(result.size(), 1);
+        EXPECT_TRUE(result.find(1017) != result.end());
+
+        auto [primaryBlocks, _] = result.at(1017);
+
+        EXPECT_EQ(primaryBlocks, 48); // 3 * ceil(1017 tokens / 64)
+    }
+}
+
+TEST_F(KVCacheManagerTest, MaxNumBlocksCalculationVSWA)
+{
+    // Test behavior when memory is very limited
+    std::map<SizeType32, std::vector<SizeType32>> windowSizeToLayers{
+        {100, {0, 1, 4, 5}}, // 4 layers with window size 100
+        {200, {2, 6, 8}},    // 3 layer with window size 200
+        {7000, {3, 7}},      // 2 layer with window size 7000
+    };
+
+    // Model config for testing.
+    auto const dypte = nvinfer1::DataType::kHALF;
+    tr::ModelConfig modelConfig{128, 9, 9, 0, 3, 32, nvinfer1::DataType::kHALF};
+    tr::WorldConfig worldConfig{};
+    KvCacheConfig config{};
+
+    // Cache size of half precision (2bytes) for a single layer.
+    auto cacheBytesPerTokenPerLayer = 2
+        * BaseKVCacheManager::calculateCacheSizePerTokenForSingleWindowSize(
+            modelConfig, {0}, /*isCrossAttention*/ false, 2);
+    TLLM_LOG_DEBUG("Cache size per token: %d", cacheBytesPerTokenPerLayer);
+
+    {
+        // Limited memory should only be enough for the smallest window
+        // 9 layers * 100 tokens + 5 layers * 30 tokens + extra 300 bytes
+        uint64_t allottedPrimaryMemBytes = cacheBytesPerTokenPerLayer * (9 * 100 + 5 * 30) + 304;
+        uint64_t allottedSecondaryMemBytes = 0;
+        size_t extraCostMemory = 10;
+        SizeType32 kvFactor = 2;
+
+        auto result = BaseKVCacheManager::calculateMaxNumBlocks(config, /*isCrossAttention*/ false, dypte, modelConfig,
+            worldConfig, windowSizeToLayers, allottedPrimaryMemBytes, allottedSecondaryMemBytes, extraCostMemory,
+            kvFactor);
+
         EXPECT_EQ(result.size(), 3);
+        EXPECT_TRUE(result.find(100) != result.end());
+        EXPECT_TRUE(result.find(200) != result.end());
+        EXPECT_TRUE(result.find(7000) != result.end());
 
-        // Ensure the shares sum to 1.
-        auto const sumShares = std::accumulate(
-            result.begin(), result.end(), 0.0f, [](float sum, auto const& kv) { return sum + kv.second; });
-        EXPECT_NEAR(sumShares, 1.0f, 1e-6f);
+        auto [primaryBlocks100, _] = result.at(100);
+        auto [primaryBlocks200, _2] = result.at(200);
+        auto [primaryBlocks7000, _3] = result.at(7000);
 
-        // Calculate expected shares based on contributions with different cache sizes per token.
-        std::map<SizeType32, float> expectedShares;
-        std::map<SizeType32, SizeType32> contributions;
-        for (auto const& [windowSize, layers] : windowSizeToLayers)
-        {
-            auto const cacheSizePerToken = cacheSizePerTokenPerWindow.at(windowSize);
-            contributions[windowSize] = windowSize * static_cast<SizeType32>(layers.size()) * cacheSizePerToken;
-        }
-        auto const totalContribution = std::accumulate(contributions.begin(), contributions.end(), 0.0f,
-            [](float sum, auto const& kv) { return sum + kv.second; });
-
-        for (auto const& [windowSize, contribution] : contributions)
-        {
-            expectedShares[windowSize] = static_cast<float>(contribution) / totalContribution;
-            EXPECT_NEAR(result.at(windowSize), expectedShares[windowSize], 1e-6f);
-        }
-
-        // Verify the calculated shares for different cache sizes per token
-        EXPECT_NEAR(result.at(1024), 2048.0f / (2048.0f + 49152.0f + 16384.0f), 1e-6f);  // ~0.0303
-        EXPECT_NEAR(result.at(4096), 49152.0f / (2048.0f + 49152.0f + 16384.0f), 1e-6f); // ~0.7273
-        EXPECT_NEAR(result.at(8192), 16384.0f / (2048.0f + 49152.0f + 16384.0f), 1e-6f); // ~0.2424
+        EXPECT_EQ(primaryBlocks100, 2); // ceil(100 tokens / 64)
+        EXPECT_EQ(primaryBlocks200, 3); // ceil(130 tokens / 64)
+        // Since the maximum tokens for the window of size 200 is not reached,
+        // the window of size 7000 will have the same number of blocks as the window of size 200.
+        EXPECT_EQ(primaryBlocks7000, primaryBlocks200);
     }
 
-    // Edge case: Single layer per window with varying cache sizes
     {
-        std::map<SizeType32, std::vector<SizeType32>> windowSizeToLayers{
-            {1024, {0}}, // contribution = 1024*1*8 = 8192 (cache size per token = 8)
-            {4096, {1}}, // contribution = 4096*1*2 = 8192 (cache size per token = 2)
-            {8192, {2}}, // contribution = 8192*1*1 = 8192 (cache size per token = 1)
-        };
-        // Equal contributions but different cache sizes per token
-        std::map<SizeType32, SizeType32> cacheSizePerTokenPerWindow{{1024, 8}, {4096, 2}, {8192, 1}};
+        // Limited memory should only be enough for the smallest window
+        // 9 layers * 100 tokens + 5 layers * 30 tokens + extra 300 bytes
+        uint64_t allottedPrimaryMemBytes = cacheBytesPerTokenPerLayer * (9 * 100 + 5 * 100 + 2 * 511) + 304;
+        uint64_t allottedSecondaryMemBytes = 0;
+        size_t extraCostMemory = 0;
+        SizeType32 kvFactor = 2;
 
-        auto result = BlockManager::calculateWindowSizeToShare(windowSizeToLayers, cacheSizePerTokenPerWindow);
+        auto result = BaseKVCacheManager::calculateMaxNumBlocks(config, false, dypte, modelConfig, worldConfig,
+            windowSizeToLayers, allottedPrimaryMemBytes, allottedSecondaryMemBytes, extraCostMemory, kvFactor);
+
         EXPECT_EQ(result.size(), 3);
+        EXPECT_TRUE(result.find(100) != result.end());
+        EXPECT_TRUE(result.find(200) != result.end());
+        EXPECT_TRUE(result.find(7000) != result.end());
 
-        // All should have equal shares since contributions are equal
-        EXPECT_NEAR(result.at(1024), 1.0f / 3.0f, 1e-6f);
-        EXPECT_NEAR(result.at(4096), 1.0f / 3.0f, 1e-6f);
-        EXPECT_NEAR(result.at(8192), 1.0f / 3.0f, 1e-6f);
+        auto [primaryBlocks100, _] = result.at(100);
+        auto [primaryBlocks200, _2] = result.at(200);
+        auto [primaryBlocks7000, _3] = result.at(7000);
 
-        // Ensure the shares sum to 1.
-        auto const sumShares = std::accumulate(
-            result.begin(), result.end(), 0.0f, [](float sum, auto const& kv) { return sum + kv.second; });
-        EXPECT_NEAR(sumShares, 1.0f, 1e-6f);
+        EXPECT_EQ(primaryBlocks100, 2);   // ceil(100 tokens / 64)
+        EXPECT_EQ(primaryBlocks200, 4);   // ceil(200 tokens / 64)
+        EXPECT_EQ(primaryBlocks7000, 12); // ceil(711 tokens / 64)
+    }
+
+    {
+        // Enough memory, can support batchSize > 1.
+        // 3 * (9 layers * 100 tokens + 5 layers * 100 tokens + 2 layers * 6800 tokens) (2 sequences)
+        // + (9 layers * 100 tokens + 5 layers * 7 tokens)  (3rd sequence of len 107.)
+        // extra 300 bytes
+        // Since maxSequenceLength is provided via windowSizeToLayers, the max sequence length is 7000 tokens.
+        uint64_t allottedPrimaryMemBytes
+            = cacheBytesPerTokenPerLayer * (3 * (9 * 100 + 5 * 100 + 2 * 6800) + (9 * 100 + 5 * 7)) + 304;
+        uint64_t allottedSecondaryMemBytes = 0;
+        size_t extraCostMemory = 0;
+        SizeType32 kvFactor = 2;
+
+        auto result = BaseKVCacheManager::calculateMaxNumBlocks(config, false, dypte, modelConfig, worldConfig,
+            windowSizeToLayers, allottedPrimaryMemBytes, allottedSecondaryMemBytes, extraCostMemory, kvFactor);
+
+        EXPECT_EQ(result.size(), 3);
+        EXPECT_TRUE(result.find(100) != result.end());
+        EXPECT_TRUE(result.find(200) != result.end());
+        EXPECT_TRUE(result.find(7000) != result.end());
+
+        auto [primaryBlocks100, _] = result.at(100);
+        auto [primaryBlocks200, _2] = result.at(200);
+        auto [primaryBlocks7000, _3] = result.at(7000);
+
+        EXPECT_EQ(primaryBlocks100, 6);    // 3 * ceil(100 tokens / 64)
+        EXPECT_EQ(primaryBlocks200, 12);   // 3 * ceil(200 tokens / 64)
+        EXPECT_EQ(primaryBlocks7000, 330); // 3 * ceil(7000 tokens / 64)
     }
 }
 
