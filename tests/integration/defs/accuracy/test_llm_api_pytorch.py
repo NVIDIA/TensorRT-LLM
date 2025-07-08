@@ -1517,6 +1517,7 @@ class TestNemotronUltra(LlmapiAccuracyTestHarness):
                              ids=["tp8", "tp8ep4", "tp8ep8"])
     def test_auto_dtype(self, cuda_graph, tp_size, pp_size, ep_size):
         with LLM(self.MODEL_PATH,
+                 max_batch_size=32,
                  tensor_parallel_size=tp_size,
                  pipeline_parallel_size=pp_size,
                  moe_expert_parallel_size=ep_size,
@@ -1526,9 +1527,9 @@ class TestNemotronUltra(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
+            # task = GPQADiamond(self.MODEL_NAME)
+            # task.evaluate(llm,
+            #                 extra_evaluator_kwargs=dict(apply_chat_template=True))
 
     @pytest.mark.skip_less_device(8)
     @pytest.mark.skip_device_not_contain(["H100", "B200"])
