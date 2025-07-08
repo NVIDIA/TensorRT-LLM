@@ -1,4 +1,5 @@
-from .mm_utils import SharedTensorContainer, _SharedTensorRebuildMethodRegistry
+from .shared_tensor import (SharedTensorContainer,
+                            _SharedTensorRebuildMethodRegistry)
 
 # Initialize the registry when the package is imported
 _SharedTensorRebuildMethodRegistry.initialize()

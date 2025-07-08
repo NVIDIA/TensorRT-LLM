@@ -116,6 +116,11 @@ class SharedTensorContainer:
     Note: Whenever you call reduce_tensor, you must call the corresponding rebuild method at
     consumer process(es), otherwise, the producer process cannot release the memory to caching
     allocator as the inner refcount never reaches zero.
+
+    Note: This module can also be extended to transfer CUDA tensors between different GPUs managed by different processes
+    using CE (Copy Engine) or torch.to() to initiate direct P2P transfers. This requires CUDA P2P support, i.e.,
+    torch.cuda.can_device_access_peer(src_device, dst_device) must return True for the source and destination devices.
+
     """
 
     def __init__(self, method_key: int, tensor_handle: Dict[str, Any]):
