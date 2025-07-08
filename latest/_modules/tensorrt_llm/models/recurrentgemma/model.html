@@ -34,6 +34,7 @@
     <link rel="stylesheet" type="text/css" href="../../../../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
     <link rel="stylesheet" type="text/css" href="../../../../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../../../../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../../../../_static/togglebutton.css?v=13237357" />
   
   <!-- So that users can add custom icons -->
   <script src="../../../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -46,11 +47,17 @@
     <script src="../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../../../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../../../../_static/copybutton.js?v=65e89d2a"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../../../_static/togglebutton.js?v=4a39c7ea"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = '_modules/tensorrt_llm/models/recurrentgemma/model';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -60,7 +67,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc1" />
+  <meta name="docsearch:version" content="1.0.0rc2" />
 
 
   </head>
@@ -311,58 +318,32 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../../../../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../installation/containers.html">Pre-built release container images on NGC</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../../../../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../llm-api/index.html">LLM API Introduction</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../llm-api/reference.html">API Reference</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_eagle2_decoding.html">Generate Text Using Eagle2 Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_quantization.html">Generation with Quantization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_inference.html">Generate text</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_inference_customize.html">Generate text with customization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="simple">
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../examples/customization.html">LLM Common Customizations</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_eagle2_decoding.html">Generate Text Using Eagle2 Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_quantization.html">Generation with Quantization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_inference.html">Generate text</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_inference_customize.html">Generate text with customization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -373,8 +354,9 @@
 <li class="toctree-l2"><a class="reference internal" href="../../../../examples/genai_perf_client.html">Genai Perf Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
 </ul>
 </details></li>
 </ul>
@@ -443,6 +425,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../../reference/precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../reference/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../reference/dev-containers.html">Using Dev Containers</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -1255,9 +1238,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 29, 2025.</p>
+  <p>Last updated on July 06, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/de97799">de97799</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/66f299a">66f299a</a>.</p>
   
 </div></div>
       

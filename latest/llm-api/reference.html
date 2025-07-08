@@ -35,6 +35,7 @@
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=13237357" />
   
   <!-- So that users can add custom icons -->
   <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -47,11 +48,17 @@
     <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../_static/togglebutton.js?v=4a39c7ea"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'llm-api/reference';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -59,11 +66,11 @@
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="LLM Examples Introduction" href="../examples/index.html" />
-    <link rel="prev" title="API Introduction" href="index.html" />
+    <link rel="prev" title="LLM API Introduction" href="index.html" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc1" />
+  <meta name="docsearch:version" content="1.0.0rc2" />
 
 
   </head>
@@ -318,58 +325,32 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/containers.html">Pre-built release container images on NGC</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul class="current nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="index.html">LLM API Introduction</a></li>
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">API Reference</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle2_decoding.html">Generate Text Using Eagle2 Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="simple">
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../examples/customization.html">LLM Common Customizations</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle2_decoding.html">Generate Text Using Eagle2 Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -380,8 +361,9 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
 </ul>
 </details></li>
 </ul>
@@ -450,6 +432,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../reference/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/dev-containers.html">Using Dev Containers</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -557,8 +540,6 @@
 <li><p><strong>load_format</strong> (<em>Union</em><em>[</em><em>str</em><em>, </em><em>tensorrt_llm.llmapi.llm_args.LoadFormat</em><em>]</em>) – How to load the model weights. By default, detect the weight type from the model checkpoint. Defaults to 0.</p></li>
 <li><p><strong>enable_lora</strong> (<em>bool</em>) – Enable LoRA. Defaults to False.</p></li>
 <li><p><strong>lora_config</strong> (<em>Optional</em><em>[</em><em>tensorrt_llm.lora_manager.LoraConfig</em><em>]</em>) – LoRA configuration for the model. Defaults to None.</p></li>
-<li><p><strong>enable_prompt_adapter</strong> (<em>bool</em>) – Enable prompt adapter. Defaults to False.</p></li>
-<li><p><strong>max_prompt_adapter_token</strong> (<em>int</em>) – The maximum number of prompt adapter tokens. Defaults to 0.</p></li>
 <li><p><strong>quant_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.QuantConfig" title="tensorrt_llm.models.modeling_utils.QuantConfig"><em>tensorrt_llm.models.modeling_utils.QuantConfig</em></a><em>]</em>) – Quantization config. Defaults to None.</p></li>
 <li><p><strong>kv_cache_config</strong> (<a class="reference internal" href="#tensorrt_llm.llmapi.KvCacheConfig" title="tensorrt_llm.llmapi.llm_args.KvCacheConfig"><em>tensorrt_llm.llmapi.llm_args.KvCacheConfig</em></a>) – KV cache config. Defaults to None.</p></li>
 <li><p><strong>enable_chunked_prefill</strong> (<em>bool</em>) – Enable chunked prefill. Defaults to False.</p></li>
@@ -584,10 +565,7 @@
 <li><p><strong>backend</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – The backend to use for this LLM instance. Defaults to None.</p></li>
 <li><p><strong>build_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.BuildConfig" title="tensorrt_llm.builder.BuildConfig"><em>tensorrt_llm.builder.BuildConfig</em></a><em>]</em>) – Build config. Defaults to None.</p></li>
 <li><p><strong>garbage_collection_gen0_threshold</strong> (<em>int</em>) – Threshold for Python garbage collection of generation 0 objects.Lower values trigger more frequent garbage collection. Defaults to 20000.</p></li>
-<li><p><strong>use_cuda_graph</strong> (<em>bool</em>) – If true, use CUDA graphs for decoding. CUDA graphs are only created for the batch sizes in cuda_graph_batch_sizes, and are enabled for batches that consist of decoding requests <em>only</em> (the reason is that it’s hard to capture a single graph with prefill requests since the input shapes are a function of the sequence lengths). Note that each CUDA graph can use up to 200 MB of extra memory. Defaults to False.</p></li>
-<li><p><strong>cuda_graph_batch_sizes</strong> (<em>Optional</em><em>[</em><em>List</em><em>[</em><em>int</em><em>]</em><em>]</em>) – List of batch sizes to create CUDA graphs for. Defaults to None.</p></li>
-<li><p><strong>cuda_graph_max_batch_size</strong> (<em>int</em>) – Maximum batch size for CUDA graphs. Defaults to 0.</p></li>
-<li><p><strong>cuda_graph_padding_enabled</strong> (<em>bool</em>) – If true, batches are rounded up to the nearest cuda_graph_batch_size. This is usually a net win for performance. Defaults to False.</p></li>
+<li><p><strong>cuda_graph_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.CudaGraphConfig" title="tensorrt_llm.llmapi.llm_args.CudaGraphConfig"><em>tensorrt_llm.llmapi.llm_args.CudaGraphConfig</em></a><em>]</em>) – CUDA graph config.If true, use CUDA graphs for decoding.         CUDA graphs are only created for the batch sizes in cuda_graph_config.batch_sizes,         and are enabled for batches that consist of decoding requests <em>only</em>         (the reason is that it’s hard to capture a single graph with prefill requests         since the input shapes are a function of the sequence lengths).         Note that each CUDA graph can use up to 200 MB of extra memory. Defaults to None.</p></li>
 <li><p><strong>disable_overlap_scheduler</strong> (<em>bool</em>) – Disable the overlap scheduler. Defaults to False.</p></li>
 <li><p><strong>moe_max_num_tokens</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – If set, at most moe_max_num_tokens tokens will be sent to torch.ops.trtllm.fused_moe at the same time. If the number of tokens exceeds moe_max_num_tokens, the input tensors will be split into chunks and a for loop will be used. Defaults to None.</p></li>
 <li><p><strong>moe_load_balancer</strong> (<em>Union</em><em>[</em><em>tensorrt_llm._torch.model_config.MoeLoadBalancerConfig</em><em>, </em><em>str</em><em>, </em><em>None</em><em>]</em>) – Configuration for MoE load balancing. Defaults to None.</p></li>
@@ -604,6 +582,8 @@
 <li><p><strong>enable_layerwise_nvtx_marker</strong> (<em>bool</em>) – If true, enable layerwise nvtx marker. Defaults to False.</p></li>
 <li><p><strong>enable_min_latency</strong> (<em>bool</em>) – If true, enable min-latency mode. Currently only used for Llama4. Defaults to False.</p></li>
 <li><p><strong>stream_interval</strong> (<em>int</em>) – The iteration interval to create responses under the streaming mode. Set this to a larger value when the batch size is large, which helps reduce the streaming overhead. Defaults to 1.</p></li>
+<li><p><strong>force_dynamic_quantization</strong> (<em>bool</em>) – If true, force dynamic quantization. Defaults to False. Defaults to False.</p></li>
+<li><p><strong>allreduce_strategy</strong> (<em>Optional</em><em>[</em><em>Literal</em><em>[</em><em>'AUTO'</em><em>, </em><em>'NCCL'</em><em>, </em><em>'UB'</em><em>, </em><em>'MINLATENCY'</em><em>, </em><em>'ONESHOT'</em><em>, </em><em>'TWOSHOT'</em><em>, </em><em>'LOWPRECISION'</em><em>, </em><em>'MNNVL'</em><em>]</em><em>]</em>) – Allreduce strategy to use. Defaults to AUTO.</p></li>
 </ul>
 </dd>
 </dl>
@@ -1899,6 +1879,59 @@ The BatchedLogitsProcessor class is recommended for callback creation. The callb
 </dd></dl>
 
 <dl class="py class">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.CudaGraphConfig">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">CudaGraphConfig</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="o"><span class="pre">*</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">batch_sizes</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_batch_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">0</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">padding_enabled</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#CudaGraphConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.CudaGraphConfig" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">BaseModel</span></code></p>
+<p>Configuration for CUDA graphs.</p>
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.CudaGraphConfig.batch_sizes">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">batch_sizes</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.CudaGraphConfig.batch_sizes" title="Link to this definition">#</a></dt>
+<dd><p>List of batch sizes to create CUDA graphs for.</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.CudaGraphConfig.max_batch_size">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">max_batch_size</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.CudaGraphConfig.max_batch_size" title="Link to this definition">#</a></dt>
+<dd><p>Maximum batch size for CUDA graphs.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_max_batch_size</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.CudaGraphConfig.model_config">
+<span class="sig-name descname"><span class="pre">model_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ClassVar</span><span class="p"><span class="pre">[</span></span><span class="pre">ConfigDict</span><span class="p"><span class="pre">]</span></span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">{}</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.CudaGraphConfig.model_config" title="Link to this definition">#</a></dt>
+<dd><p>Configuration for the model, should be a dictionary conforming to [<cite>ConfigDict</cite>][pydantic.config.ConfigDict].</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.CudaGraphConfig.padding_enabled">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">padding_enabled</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.CudaGraphConfig.padding_enabled" title="Link to this definition">#</a></dt>
+<dd><p>If true, batches are rounded up to the nearest cuda_graph_batch_size. This is usually a net win for performance.</p>
+</dd></dl>
+
+<dl class="py method pydantic_validator">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.CudaGraphConfig.validate_cuda_graph_max_batch_size">
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_cuda_graph_max_batch_size</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">max_batch_size</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#CudaGraphConfig.validate_cuda_graph_max_batch_size"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.CudaGraphConfig.validate_cuda_graph_max_batch_size" title="Link to this definition">#</a></dt>
+<dd><p>Validate cuda_graph_config.max_batch_size is non-negative.</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.LookaheadDecodingConfig">
 <em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">LookaheadDecodingConfig</span></span><span class="sig-paren">(</span>
 
@@ -1985,7 +2018,7 @@ validated to form a valid model.</p>
 
 <dl class="py method pydantic_validator">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.LookaheadDecodingConfig.validate_positive_values">
-<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_positive_values</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">max_ngram_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">max_window_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">max_verification_set_size</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#LookaheadDecodingConfig.validate_positive_values"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.validate_positive_values" title="Link to this definition">#</a></dt>
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_positive_values</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">max_ngram_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">max_verification_set_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">max_window_size</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#LookaheadDecodingConfig.validate_positive_values"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.validate_positive_values" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -3422,8 +3455,6 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dd><em class="sig-param"><span class="n"><span class="pre">max_loras:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">4</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_cpu_loras:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">4</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">lora_config:</span> <span class="pre">~tensorrt_llm.lora_manager.LoraConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">enable_prompt_adapter:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">max_prompt_adapter_token:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">0</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">quant_config:</span> <span class="pre">~tensorrt_llm.models.modeling_utils.QuantConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">kv_cache_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.KvCacheConfig</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_chunked_prefill:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
@@ -3452,10 +3483,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dd><em class="sig-param"><span class="n"><span class="pre">backend:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">build_config:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">garbage_collection_gen0_threshold:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">20000</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">use_cuda_graph:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">cuda_graph_batch_sizes:</span> <span class="pre">~typing.List[int]</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">cuda_graph_max_batch_size:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">0</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">cuda_graph_padding_enabled:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">cuda_graph_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.CudaGraphConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">disable_overlap_scheduler:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">moe_max_num_tokens:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">moe_load_balancer:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
@@ -3472,10 +3500,44 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_layerwise_nvtx_marker:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_min_latency:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">stream_interval:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">1</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">force_dynamic_quantization:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">allreduce_strategy:</span> <span class="pre">~typing.Literal['AUTO'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">'NCCL'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">'UB'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">'MINLATENCY'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">'ONESHOT'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">'TWOSHOT'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">'LOWPRECISION'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">'MNNVL']</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">'AUTO'</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TorchLlmArgs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">BaseLlmArgs</span></code></p>
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.allreduce_strategy">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">allreduce_strategy</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">Literal</span><span class="p"><span class="pre">[</span></span><span class="s"><span class="pre">'AUTO'</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="s"><span class="pre">'NCCL'</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="s"><span class="pre">'UB'</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="s"><span class="pre">'MINLATENCY'</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="s"><span class="pre">'ONESHOT'</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="s"><span class="pre">'TWOSHOT'</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="s"><span class="pre">'LOWPRECISION'</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="s"><span class="pre">'MNNVL'</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'AUTO'</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.allreduce_strategy" title="Link to this definition">#</a></dt>
+<dd><p>Allreduce strategy to use.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_stream_interval</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py attribute pydantic_field">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.attn_backend">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">attn_backend</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'TRTLLM'</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.attn_backend" title="Link to this definition">#</a></dt>
@@ -3557,60 +3619,9 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dd></dd></dl>
 
 <dl class="py attribute pydantic_field">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.cuda_graph_batch_sizes">
-<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">cuda_graph_batch_sizes</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.cuda_graph_batch_sizes" title="Link to this definition">#</a></dt>
-<dd><p>List of batch sizes to create CUDA graphs for.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Validated by<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_stream_interval</span></code></p></li>
-</ul>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py attribute pydantic_field">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.cuda_graph_max_batch_size">
-<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">cuda_graph_max_batch_size</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.cuda_graph_max_batch_size" title="Link to this definition">#</a></dt>
-<dd><p>Maximum batch size for CUDA graphs.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Validated by<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_max_batch_size</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_stream_interval</span></code></p></li>
-</ul>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py attribute pydantic_field">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.cuda_graph_padding_enabled">
-<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">cuda_graph_padding_enabled</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.cuda_graph_padding_enabled" title="Link to this definition">#</a></dt>
-<dd><p>If true, batches are rounded up to the nearest cuda_graph_batch_size. This is usually a net win for performance.</p>
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.cuda_graph_config">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">cuda_graph_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#tensorrt_llm.llmapi.CudaGraphConfig" title="tensorrt_llm.llmapi.llm_args.CudaGraphConfig"><span class="pre">CudaGraphConfig</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.cuda_graph_config" title="Link to this definition">#</a></dt>
+<dd><p>CUDA graph config.If true, use CUDA graphs for decoding.         CUDA graphs are only created for the batch sizes in cuda_graph_config.batch_sizes,         and are enabled for batches that consist of decoding requests <em>only</em>         (the reason is that it’s hard to capture a single graph with prefill requests         since the input shapes are a function of the sequence lengths).         Note that each CUDA graph can use up to 200 MB of extra memory.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Validated by<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -3810,6 +3821,31 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.extra_resource_managers">
 <em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">extra_resource_managers</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">Dict</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">object</span><span class="p"><span class="pre">]</span></span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.extra_resource_managers" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.force_dynamic_quantization">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">force_dynamic_quantization</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.force_dynamic_quantization" title="Link to this definition">#</a></dt>
+<dd><p>If true, force dynamic quantization. Defaults to False.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_stream_interval</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
 
 <dl class="py attribute pydantic_field">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.garbage_collection_gen0_threshold">
@@ -4165,45 +4201,14 @@ Whether to use a common pool for all requests, or the pool is private for each r
 </dl>
 </dd></dl>
 
-<dl class="py attribute pydantic_field">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.use_cuda_graph">
-<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">use_cuda_graph</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.use_cuda_graph" title="Link to this definition">#</a></dt>
-<dd><p>If true, use CUDA graphs for decoding. CUDA graphs are only created for the batch sizes in cuda_graph_batch_sizes, and are enabled for batches that consist of decoding requests <em>only</em> (the reason is that it’s hard to capture a single graph with prefill requests since the input shapes are a function of the sequence lengths). Note that each CUDA graph can use up to 200 MB of extra memory.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Validated by<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_stream_interval</span></code></p></li>
-</ul>
-</dd>
-</dl>
-</dd></dl>
-
 <dl class="py method pydantic_validator">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.validate_cuda_graph_config">
 <em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_cuda_graph_config</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TorchLlmArgs.validate_cuda_graph_config"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_cuda_graph_config" title="Link to this definition">#</a></dt>
 <dd><p>Validate CUDA graph configuration.</p>
 <p>Ensures that:
-1. If cuda_graph_batch_sizes is provided, cuda_graph_max_batch_size must be 0
-2. If cuda_graph_batch_sizes is not provided, it is generated based on cuda_graph_max_batch_size
-3. If both are provided, cuda_graph_batch_sizes must match the generated values</p>
-</dd></dl>
-
-<dl class="py method pydantic_validator">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.validate_cuda_graph_max_batch_size">
-<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_cuda_graph_max_batch_size</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">cuda_graph_max_batch_size</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TorchLlmArgs.validate_cuda_graph_max_batch_size"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_cuda_graph_max_batch_size" title="Link to this definition">#</a></dt>
-<dd><p>Validate cuda_graph_max_batch_size is non-negative.</p>
+1. If cuda_graph_config.batch_sizes is provided, cuda_graph_config.max_batch_size must be 0
+2. If cuda_graph_config.batch_sizes is not provided, it is generated based on cuda_graph_config.max_batch_size
+3. If both are provided, cuda_graph_config.batch_sizes must match the generated values</p>
 </dd></dl>
 
 <dl class="py method pydantic_validator">
@@ -4249,8 +4254,6 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dd><em class="sig-param"><span class="n"><span class="pre">max_loras:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">4</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_cpu_loras:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">4</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">lora_config:</span> <span class="pre">~tensorrt_llm.lora_manager.LoraConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">enable_prompt_adapter:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">max_prompt_adapter_token:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">0</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">quant_config:</span> <span class="pre">~tensorrt_llm.models.modeling_utils.QuantConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">kv_cache_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.KvCacheConfig</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_chunked_prefill:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
@@ -4287,6 +4290,8 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dd><em class="sig-param"><span class="n"><span class="pre">embedding_parallel_mode:</span> <span class="pre">str</span> <span class="pre">=</span> <span class="pre">'SHARDING_ALONG_VOCAB'</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">fast_build:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">build_config:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_prompt_adapter:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_prompt_adapter_token:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">0</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TrtLlmArgs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs" title="Link to this definition">#</a></dt>
@@ -4470,6 +4475,31 @@ Whether to use a common pool for all requests, or the pool is private for each r
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.enable_prompt_adapter">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">enable_prompt_adapter</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.enable_prompt_adapter" title="Link to this definition">#</a></dt>
+<dd><p>Enable prompt adapter.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">setup_embedding_parallel_mode</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_auto_parallel</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_enable_build_cache</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.enable_tqdm">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">enable_tqdm</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.enable_tqdm" title="Link to this definition">#</a></dt>
 <dd><p>Enable tqdm for progress bar.</p>
@@ -4621,6 +4651,31 @@ Whether to use a common pool for all requests, or the pool is private for each r
 
 </dd></dl>
 
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.max_prompt_adapter_token">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">max_prompt_adapter_token</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.max_prompt_adapter_token" title="Link to this definition">#</a></dt>
+<dd><p>The maximum number of prompt adapter tokens.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">setup_embedding_parallel_mode</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_auto_parallel</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_enable_build_cache</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py attribute">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.model_config">
 <span class="sig-name descname"><span class="pre">model_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ClassVar</span><span class="p"><span class="pre">[</span></span><span class="pre">ConfigDict</span><span class="p"><span class="pre">]</span></span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">{'arbitrary_types_allowed':</span> <span class="pre">True,</span> <span class="pre">'extra':</span> <span class="pre">'forbid'}</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.model_config" title="Link to this definition">#</a></dt>
@@ -4702,7 +4757,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">API Introduction</p>
+        <p class="prev-next-title">LLM API Introduction</p>
       </div>
     </a>
     <a class="right-next"
@@ -4886,6 +4941,14 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KvCacheRetentionConfig.directory"><code class="docutils literal notranslate"><span class="pre">directory</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KvCacheRetentionConfig.token_range_retention_configs"><code class="docutils literal notranslate"><span class="pre">token_range_retention_configs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KvCacheRetentionConfig.transfer_mode"><code class="docutils literal notranslate"><span class="pre">transfer_mode</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.CudaGraphConfig"><code class="docutils literal notranslate"><span class="pre">CudaGraphConfig</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.CudaGraphConfig.batch_sizes"><code class="docutils literal notranslate"><span class="pre">batch_sizes</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.CudaGraphConfig.max_batch_size"><code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.CudaGraphConfig.model_config"><code class="docutils literal notranslate"><span class="pre">model_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.CudaGraphConfig.padding_enabled"><code class="docutils literal notranslate"><span class="pre">padding_enabled</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.CudaGraphConfig.validate_cuda_graph_max_batch_size"><code class="docutils literal notranslate"><span class="pre">validate_cuda_graph_max_batch_size</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig"><code class="docutils literal notranslate"><span class="pre">LookaheadDecodingConfig</span></code></a><ul class="nav section-nav flex-column">
@@ -5121,13 +5184,12 @@ Whether to use a common pool for all requests, or the pool is private for each r
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LlmArgs"><code class="docutils literal notranslate"><span class="pre">LlmArgs</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs"><code class="docutils literal notranslate"><span class="pre">TorchLlmArgs</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.allreduce_strategy"><code class="docutils literal notranslate"><span class="pre">allreduce_strategy</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.attn_backend"><code class="docutils literal notranslate"><span class="pre">attn_backend</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.autotuner_enabled"><code class="docutils literal notranslate"><span class="pre">autotuner_enabled</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.build_config"><code class="docutils literal notranslate"><span class="pre">build_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.convert_load_format"><code class="docutils literal notranslate"><span class="pre">convert_load_format</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.cuda_graph_batch_sizes"><code class="docutils literal notranslate"><span class="pre">cuda_graph_batch_sizes</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.cuda_graph_max_batch_size"><code class="docutils literal notranslate"><span class="pre">cuda_graph_max_batch_size</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.cuda_graph_padding_enabled"><code class="docutils literal notranslate"><span class="pre">cuda_graph_padding_enabled</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.cuda_graph_config"><code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.decoding_config"><code class="docutils literal notranslate"><span class="pre">decoding_config</span></code></a><ul class="nav section-nav flex-column">
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.msg"><code class="docutils literal notranslate"><span class="pre">msg</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.wrapped_property"><code class="docutils literal notranslate"><span class="pre">wrapped_property</span></code></a></li>
@@ -5141,6 +5203,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.enable_min_latency"><code class="docutils literal notranslate"><span class="pre">enable_min_latency</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.enable_trtllm_sampler"><code class="docutils literal notranslate"><span class="pre">enable_trtllm_sampler</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.extra_resource_managers"><code class="docutils literal notranslate"><span class="pre">extra_resource_managers</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.force_dynamic_quantization"><code class="docutils literal notranslate"><span class="pre">force_dynamic_quantization</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.garbage_collection_gen0_threshold"><code class="docutils literal notranslate"><span class="pre">garbage_collection_gen0_threshold</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.get_pytorch_backend_config"><code class="docutils literal notranslate"><span class="pre">get_pytorch_backend_config()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.init_backend"><code class="docutils literal notranslate"><span class="pre">init_backend</span></code></a></li>
@@ -5173,9 +5236,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.print_iter_log"><code class="docutils literal notranslate"><span class="pre">print_iter_log</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.stream_interval"><code class="docutils literal notranslate"><span class="pre">stream_interval</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_config"><code class="docutils literal notranslate"><span class="pre">torch_compile_config</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.use_cuda_graph"><code class="docutils literal notranslate"><span class="pre">use_cuda_graph</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_cuda_graph_config"><code class="docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_cuda_graph_max_batch_size"><code class="docutils literal notranslate"><span class="pre">validate_cuda_graph_max_batch_size</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_moe_load_balancer"><code class="docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_stream_interval"><code class="docutils literal notranslate"><span class="pre">validate_stream_interval</span></code></a></li>
 </ul>
@@ -5204,6 +5265,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 </li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.embedding_parallel_mode"><code class="docutils literal notranslate"><span class="pre">embedding_parallel_mode</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.enable_build_cache"><code class="docutils literal notranslate"><span class="pre">enable_build_cache</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.enable_prompt_adapter"><code class="docutils literal notranslate"><span class="pre">enable_prompt_adapter</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.enable_tqdm"><code class="docutils literal notranslate"><span class="pre">enable_tqdm</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.extended_runtime_perf_knob_config"><code class="docutils literal notranslate"><span class="pre">extended_runtime_perf_knob_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.fast_build"><code class="docutils literal notranslate"><span class="pre">fast_build</span></code></a></li>
@@ -5226,6 +5288,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id33"><code class="docutils literal notranslate"><span class="pre">field_name</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.max_prompt_adapter_token"><code class="docutils literal notranslate"><span class="pre">max_prompt_adapter_token</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.model_config"><code class="docutils literal notranslate"><span class="pre">model_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.model_post_init"><code class="docutils literal notranslate"><span class="pre">model_post_init()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.setup_embedding_parallel_mode"><code class="docutils literal notranslate"><span class="pre">setup_embedding_parallel_mode</span></code></a></li>
@@ -5328,9 +5391,9 @@ Whether to use a common pool for all requests, or the pool is private for each r
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 29, 2025.</p>
+  <p>Last updated on July 06, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/de97799">de97799</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/66f299a">66f299a</a>.</p>
   
 </div></div>
       

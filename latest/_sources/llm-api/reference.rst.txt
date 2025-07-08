@@ -49,6 +49,12 @@ API Reference
     :show-inheritance:
     :special-members: __init__
 
+.. autoclass:: tensorrt_llm.llmapi.CudaGraphConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+
 .. autoclass:: tensorrt_llm.llmapi.LookaheadDecodingConfig
     :members:
     :undoc-members:

@@ -9,7 +9,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>Installing on Grace Hopper &#8212; TensorRT-LLM</title>
+    <title>Using Dev Containers &#8212; TensorRT-LLM</title>
   
   
   
@@ -35,6 +35,7 @@
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=13237357" />
   
   <!-- So that users can add custom icons -->
   <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -47,23 +48,29 @@
     <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=65e89d2a"></script>
-    <script>DOCUMENTATION_OPTIONS.pagename = 'installation/grace-hopper';</script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../_static/togglebutton.js?v=4a39c7ea"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'reference/dev-containers';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
     <link rel="icon" href="../_static/favicon.png"/>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="API Introduction" href="../llm-api/index.html" />
-    <link rel="prev" title="Building from Source Code on Linux" href="build-from-source-linux.html" />
+    <link rel="next" title="H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token" href="../blogs/H100vsA100.html" />
+    <link rel="prev" title="Continuous Integration Overview" href="ci-overview.html" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc1" />
+  <meta name="docsearch:version" content="1.0.0rc2" />
 
 
   </head>
@@ -207,6 +214,10 @@
   
 
   
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
 </div>
 
     </header>
@@ -313,59 +324,33 @@
 <li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
-<ul class="current nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="linux.html">Installing on Linux</a></li>
-<li class="toctree-l1"><a class="reference internal" href="build-from-source-linux.html">Building from Source Code on Linux</a></li>
-<li class="toctree-l1 current active"><a class="current reference internal" href="#">Installing on Grace Hopper</a></li>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../installation/containers.html">Pre-built release container images on NGC</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">LLM API Introduction</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle2_decoding.html">Generate Text Using Eagle2 Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="simple">
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../examples/customization.html">LLM Common Customizations</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle_decoding.html">Generate Text Using Eagle Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle2_decoding.html">Generate Text Using Eagle2 Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_customize.html">Generate text with customization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Llm Mgmn Llm Distributed</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Llm Mgmn Trtllm Bench</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Llm Mgmn Trtllm Serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -376,8 +361,9 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
 </ul>
 </details></li>
 </ul>
@@ -440,12 +426,13 @@
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
-<ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../reference/troubleshooting.html">Troubleshooting</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../reference/ci-overview.html">Continuous Integration Overview</a></li>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="memory.html">Memory Usage of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Using Dev Containers</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -490,7 +477,7 @@
         <i class="fa-solid fa-home"></i>
       </a>
     </li>
-    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Installing on Grace Hopper</span></li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Using Dev Containers</span></li>
   </ul>
 </nav>
 </div>
@@ -507,50 +494,99 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="installing-on-grace-hopper">
-<span id="grace-hopper"></span><h1>Installing on Grace Hopper<a class="headerlink" href="#installing-on-grace-hopper" title="Link to this heading">#</a></h1>
-<ol class="arabic">
-<li><p>Install TensorRT-LLM (tested on Ubuntu 24.04).</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip3<span class="w"> </span>install<span class="w"> </span><span class="nv">torch</span><span class="o">==</span><span class="m">2</span>.7.1<span class="w"> </span>torchvision<span class="w"> </span>torchaudio<span class="w"> </span>--index-url<span class="w"> </span>https://download.pytorch.org/whl/cu128
-
-sudo<span class="w"> </span>apt-get<span class="w"> </span>-y<span class="w"> </span>install<span class="w"> </span>libopenmpi-dev<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>pip3<span class="w"> </span>install<span class="w"> </span>--upgrade<span class="w"> </span>pip<span class="w"> </span>setuptools<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>pip3<span class="w"> </span>install<span class="w"> </span>tensorrt_llm
-</pre></div>
+  <section id="using-dev-containers">
+<h1>Using Dev Containers<a class="headerlink" href="#using-dev-containers" title="Link to this heading">#</a></h1>
+<p>The TensorRT-LLM repository contains a <a class="reference external" href="https://containers.dev/">Dev Containers</a>
+configuration in <code class="docutils literal notranslate"><span class="pre">.devcontainer</span></code>. These files are intended for
+use with <a class="reference external" href="https://code.visualstudio.com/">Visual Studio Code</a>.</p>
+<p>Due to the various container options supported by TensorRT-LLM (see
+<a class="reference internal" href="../installation/build-from-source-linux.html"><span class="std std-doc">Building from Source Code on Linux</span></a> and
+<a class="github reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/docker">NVIDIA/TensorRT-LLM</a>), the Dev
+Container configuration also offers some degree of customization.</p>
+<p>Generally, the <code class="docutils literal notranslate"><span class="pre">initializeCommand</span></code> in <code class="docutils literal notranslate"><span class="pre">devcontainer.json</span></code> will run
+<code class="docutils literal notranslate"><span class="pre">make_env.py</span></code> to generate an
+<a class="reference external" href="https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation/#env-file-syntax"><code class="docutils literal notranslate"><span class="pre">.env</span></code> file for <code class="docutils literal notranslate"><span class="pre">docker-compose</span></code></a>.
+Most importantly, the <code class="docutils literal notranslate"><span class="pre">docker-compose.yml</span></code> uses <code class="docutils literal notranslate"><span class="pre">${DEV_CONTAINER_IMAGE}</span></code>
+as base image.
+The generated <code class="docutils literal notranslate"><span class="pre">.devcontainer/.env</span></code> is not tracked by Git and combines
+data from the following sources:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">jenkins/current_image_tags.properties</span></code> which contains the image tags
+currently used by CI.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">.devcontainer/devcontainer.env</span></code> which contains common configuration
+settings and is tracked by Git.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">.devcontainer/devcontainer.env.user</span></code> (optional) which is ignored by
+Git and can be edited to customize the Dev Container behavior.</p></li>
+</ul>
+<p>The source files are processed using <code class="docutils literal notranslate"><span class="pre">sh</span></code>, in the order in which they
+are listed above. Thus, features like command substitution are supported.</p>
+<p>The following sections provide more detail on particular Dev Container
+configuration parameters which can be customized.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>After editing any of the configuration files, it may be necessary
+to execute the “Dev Containers: Reopen Folder in SSH” (if applicable) and
+“Dev Containers: Rebuild and Reopen in Container” Visual Studio Code
+commands.</p>
 </div>
-<p>If using the <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch">PyTorch NGC Container</a> image, the prerequisite steps for installing CUDA-enabled PyTorch package and <code class="docutils literal notranslate"><span class="pre">libopenmpi-dev</span></code> are not required.</p>
-</li>
-<li><p>Sanity check the installation by running the following in Python (tested on Python 3.12):</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">SamplingParams</span>
-<span class="linenos"> 2</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._tensorrt_engine</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span>
-<span class="linenos"> 3</span>
-<span class="linenos"> 4</span>
-<span class="linenos"> 5</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
-<span class="linenos"> 6</span>
-<span class="linenos"> 7</span>    <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
-<span class="linenos"> 8</span>        <span class="s2">&quot;Hello, my name is&quot;</span><span class="p">,</span>
-<span class="linenos"> 9</span>        <span class="s2">&quot;The president of the United States is&quot;</span><span class="p">,</span>
-<span class="linenos">10</span>        <span class="s2">&quot;The capital of France is&quot;</span><span class="p">,</span>
-<span class="linenos">11</span>        <span class="s2">&quot;The future of AI is&quot;</span><span class="p">,</span>
-<span class="linenos">12</span>    <span class="p">]</span>
-<span class="linenos">13</span>    <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">temperature</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span> <span class="n">top_p</span><span class="o">=</span><span class="mf">0.95</span><span class="p">)</span>
-<span class="linenos">14</span>
-<span class="linenos">15</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">)</span>
-<span class="linenos">16</span>
-<span class="linenos">17</span>    <span class="n">outputs</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
-<span class="linenos">18</span>
-<span class="linenos">19</span>    <span class="c1"># Print the outputs.</span>
-<span class="linenos">20</span>    <span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">outputs</span><span class="p">:</span>
-<span class="linenos">21</span>        <span class="n">prompt</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">prompt</span>
-<span class="linenos">22</span>        <span class="n">generated_text</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span>
-<span class="linenos">23</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">generated_text</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
-<span class="linenos">24</span>
-<span class="linenos">25</span>
-<span class="linenos">26</span><span class="c1"># The entry point of the program need to be protected for spawning processes.</span>
-<span class="linenos">27</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
-<span class="linenos">28</span>    <span class="n">main</span><span class="p">()</span>
-</pre></div>
-</div>
-</li>
+<section id="container-image-selection">
+<h2>Container image selection<a class="headerlink" href="#container-image-selection" title="Link to this heading">#</a></h2>
+<p>By default, <code class="docutils literal notranslate"><span class="pre">make_env.py</span></code> will attempt to auto-select a suitable container
+image as follows:</p>
+<ol class="arabic simple">
+<li><p>Reuse the development container image used by CI. This requires access
+to the NVIDIA internal artifact repository.</p></li>
+<li><p>Use the most recent
+<a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/devel">NGC Development container image</a>
+associated with a Git tag which is reachable from the currently checked
+out commit.</p></li>
+<li><p>Build a development image locally.</p></li>
 </ol>
+<p>Set <code class="docutils literal notranslate"><span class="pre">DEV_CONTAINER_IMAGE=&lt;some_uri&gt;</span></code> to bypass the aforementioned discovery
+mechanism if desired.</p>
+<p>By setting <code class="docutils literal notranslate"><span class="pre">LOCAL_BUILD=0</span></code>, the local image build can be disabled. In this
+case, execution fails if no suitable pre-built image is found.</p>
+<p>Setting <code class="docutils literal notranslate"><span class="pre">LOCAL_BUILD=1</span></code> forces building of a local image, even if a pre-built
+image is available.</p>
+</section>
+<section id="volume-mounts">
+<h2>Volume Mounts<a class="headerlink" href="#volume-mounts" title="Link to this heading">#</a></h2>
+<p><a class="reference external" href="https://docs.docker.com/engine/storage/volumes/#use-a-volume-with-docker-compose">Docker volume mounts</a> can be customized by editing
+<code class="docutils literal notranslate"><span class="pre">docker-compose.yml</span></code>, which allows using any variables defined in <code class="docutils literal notranslate"><span class="pre">.env</span></code>.</p>
+<p>By default, the Dev Container configuration mounts the VS Code workspace into
+<code class="docutils literal notranslate"><span class="pre">/workspaces/tensorrt_llm</span></code> and <code class="docutils literal notranslate"><span class="pre">~/.cache/huggingface</span></code> into <code class="docutils literal notranslate"><span class="pre">/huggingface</span></code>.
+The source paths can be overridden by setting <code class="docutils literal notranslate"><span class="pre">SOURCE_DIR</span></code> and <code class="docutils literal notranslate"><span class="pre">HOME_DIR</span></code>
+in <code class="docutils literal notranslate"><span class="pre">.devcontainer/devcontainer.env.user</span></code>, respectively. This is of
+particular relevance when using
+<a class="reference external" href="https://docs.docker.com/engine/security/rootless/">Docker Rootless Mode</a>,
+which requires configuring UID/GID translation using a tool like <code class="docutils literal notranslate"><span class="pre">bindfs</span></code>.
+The Dev Container scripts contain heuristics to detect Docker Rootless
+Mode and will issue an error if these variables are not set.
+An analogous logic is applied to <code class="docutils literal notranslate"><span class="pre">HF_HOME</span></code>.</p>
+</section>
+<section id="overriding-docker-compose-configuration">
+<h2>Overriding Docker Compose configuration<a class="headerlink" href="#overriding-docker-compose-configuration" title="Link to this heading">#</a></h2>
+<p>When starting the container, <code class="docutils literal notranslate"><span class="pre">.devcontainer/docker-compose.yml</span></code>
+is <a class="reference external" href="https://docs.docker.com/compose/how-tos/multiple-compose-files/merge/">merged</a> with
+<code class="docutils literal notranslate"><span class="pre">.devcontainer/docker-compose.override.yml</span></code>. The latter file is not
+tracked by Git and will be created by <code class="docutils literal notranslate"><span class="pre">make_env.py</span></code> if it does not exist.</p>
+<p>This mechanism can be used, e.g., to add custom volume mounts:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="c1"># Example .devcontainer/docker-compose.override.yml</span>
+<span class="n">version</span><span class="p">:</span> <span class="s2">&quot;3.9&quot;</span>
+<span class="n">services</span><span class="p">:</span>
+  <span class="n">tensorrt_llm</span><span class="o">-</span><span class="n">dev</span><span class="p">:</span>
+    <span class="n">volumes</span><span class="p">:</span>
+      <span class="c1"># Uncomment the following lines to enable</span>
+      <span class="c1"># # Mount TRTLLM data volume:</span>
+      <span class="c1"># - /home/scratch.trt_llm_data/:/home/scratch.trt_llm_data/:ro</span>
+</pre></div>
+</div>
+<p>It is possible to conditionally mount volumes by combining, e.g.,
+[this method] (https://stackoverflow.com/a/61954812) and shell command
+substitution in <code class="docutils literal notranslate"><span class="pre">.devcontainer/devcontainer.env.user</span></code>.</p>
+<p>If no <code class="docutils literal notranslate"><span class="pre">.devcontainer/docker-compose.override.yml</span></code> file is found, the Dev Container
+initialization script will create one with the contents listed above.</p>
+</section>
 </section>
 
 
@@ -564,20 +600,20 @@ sudo<span class="w"> </span>apt-get<span class="w"> </span>-y<span class="w"> </
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="build-from-source-linux.html"
+       href="ci-overview.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">Building from Source Code on Linux</p>
+        <p class="prev-next-title">Continuous Integration Overview</p>
       </div>
     </a>
     <a class="right-next"
-       href="../llm-api/index.html"
+       href="../blogs/H100vsA100.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">API Introduction</p>
+        <p class="prev-next-title">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -588,9 +624,27 @@ sudo<span class="w"> </span>apt-get<span class="w"> </span>-y<span class="w"> </
             
             
 
-<div class="bd-sidebar-secondary"></div>
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
 
 
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#container-image-selection">Container image selection</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#volume-mounts">Volume Mounts</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overriding-docker-compose-configuration">Overriding Docker Compose configuration</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
               
             
 
@@ -681,9 +735,9 @@ sudo<span class="w"> </span>apt-get<span class="w"> </span>-y<span class="w"> </
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 29, 2025.</p>
+  <p>Last updated on July 06, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/de97799">de97799</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/66f299a">66f299a</a>.</p>
   
 </div></div>
       
