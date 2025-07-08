@@ -583,7 +583,8 @@ class TestMoeFP8:
                                              (72, 1, 1, 6), (256, 8, 4, 8)])
     @pytest.mark.parametrize("hidden_size", [512])
     @pytest.mark.parametrize("intermediate_size", [512])
-    def test_autotune(self, num_tokens: int, expert_info: Tuple[int],
+    def test_autotune(self, num_tokens: int, expert_info: Tuple[int, int, int,
+                                                                int],
                       hidden_size: int, intermediate_size: int):
 
         self.run_moe_fp8_test(num_tokens,
@@ -596,7 +597,8 @@ class TestMoeFP8:
     @pytest.mark.parametrize("expert_info", [(32, 8, 4, 8)])
     @pytest.mark.parametrize("hidden_size", [512])
     @pytest.mark.parametrize("intermediate_size", [512])
-    def test_no_autotune(self, num_tokens: int, expert_info: Tuple[int],
+    def test_no_autotune(self, num_tokens: int, expert_info: Tuple[int, int,
+                                                                   int, int],
                          hidden_size: int, intermediate_size: int):
 
         self.run_moe_fp8_test(num_tokens,
@@ -605,7 +607,8 @@ class TestMoeFP8:
                               intermediate_size,
                               use_autotune=False)
 
-    def run_moe_fp8_test(self, num_tokens: int, expert_info: Tuple[int],
+    def run_moe_fp8_test(self, num_tokens: int, expert_info: Tuple[int, int,
+                                                                   int, int],
                          hidden_size: int, intermediate_size: int,
                          use_autotune: bool):
         torch.random.manual_seed(0)
