@@ -45,7 +45,8 @@ def dump_config_json(dst_dir):
 
 
 @pytest.mark.parametrize("kv_cache", ["fp8", "auto"])
-def test_orangina_trtllmgen(kv_cache):
+@pytest.mark.parametrize("moe_backend", ["TRTLLM", "CUTLASS", "TRITON"])
+def test_orangina_trtllmgen(kv_cache, moe_backend):
     prompts = [
         "How are you?",
         "Hello, my name is",
@@ -60,6 +61,7 @@ def test_orangina_trtllmgen(kv_cache):
         kv_cache_dtype=kv_cache,
         attn_backend="TRTLLM",
         load_format="dummy",
+        moe_backend=moe_backend,
     )
 
     tmp_model_dir = f"/tmp/test_model_trtllm"

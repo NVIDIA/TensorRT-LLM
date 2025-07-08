@@ -339,6 +339,13 @@ class Transformer(DecoderModel):
 class OranginaForCausalLM(DecoderModelForCausalLM[Transformer,
                                                   OranginaModelConfig]):
 
+    params_map = {
+        # TRTLLM module name : Orangina module name
+        "qkv_proj": "qkv",
+        "o_proj": "out",
+        "lm_head": "unembedding",
+    }
+
     def __init__(
         self,
         model_config: ModelConfig[OranginaModelConfig],
@@ -349,6 +356,25 @@ class OranginaForCausalLM(DecoderModelForCausalLM[Transformer,
             hidden_size=model_config.pretrained_config.hidden_size,
             vocab_size=model_config.pretrained_config.vocab_size,
         )
+
+    def __post_init__(self):
+        # Do not call super().__post_init__()
+        params_map_reverse = {v: k for k, v in self.params_map.items()}
+
+        quant_config = self.model_config.quant_config
+        if quant_config.exclude_modules:
+            for i, module in enumerate(quant_config.exclude_modules):
+                names = module.split(".")
+                if names[-1] in params_map_reverse:
+                    names[-1] = params_map_reverse[names[-1]]
+                prefix = [] if names[0] == "model" else ["model"]
+                quant_config.exclude_modules[i] = '.'.join(prefix + names)
+
+        super().apply_quant_config_exclude_modules()
+
+        for name, module in self.named_modules():
+            if callable(getattr(module, "create_weights", None)):
+                module.create_weights()
 
     def forward(
         self,
@@ -380,13 +406,6 @@ class OranginaForCausalLM(DecoderModelForCausalLM[Transformer,
         for k, v in weights.items():
             if v.dtype == torch.float8_e5m2:
                 weights[k] = v.to(self.model.dtype)
-
-        params_map = {
-            # TRTLLM module name : Orangina module name
-            "qkv_proj": "qkv",
-            "o_proj": "out",
-            "lm_head": "unembedding",
-        }
         head_dim = self.config.head_dim
         num_q_head = self.config.num_attention_heads
         num_kv_head = self.config.num_key_value_heads
@@ -397,8 +416,9 @@ class OranginaForCausalLM(DecoderModelForCausalLM[Transformer,
                 continue
             names = name.split(".")
             module_weights = {}
-            if names[-1] in params_map:
-                names[-1] = params_map[names[-1]]
+            if names[-1] in self.params_map:
+                names[-1] = self.params_map[names[-1]]
+
             # Drop the first "model" prefix
             if names[0] == 'model':
                 name = '.'.join(names[1:])
