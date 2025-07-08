@@ -44,6 +44,12 @@ class LlmManager:
         self.request_seen = asyncio.Event()
         self.modality = modality
 
+    def _task_done_callback(self, task: asyncio.Task) -> None:
+        self._tasks.discard(task)
+        if task.exception() is not None and not self._stop.is_set():
+            logger.error("Exception raised during inference - stopping")
+            self.stop()
+
     async def process_request(self, request: InferenceRequest,
                               sampling_params: SamplingParams,
                               post_proc_params: PostprocParams):
@@ -100,7 +106,7 @@ class LlmManager:
                                          sampling_params=sampling_params,
                                          post_proc_params=post_proc_params))
                 self._tasks.add(task)
-                task.add_done_callback(self._tasks.discard)
+                task.add_done_callback(self._task_done_callback)
             except asyncio.CancelledError:
                 logger.info("Worker task cancelled.")
 
@@ -240,6 +246,8 @@ async def async_benchmark(
 
         logger.info("Starting benchmark...")
         pbar = tqdm.tqdm(total=len(requests), desc="Benchmarking")
+        finished_requests = 0
+
         while not submit_finished.is_set() or backend.busy or not outbox.empty(
         ):
             try:
@@ -247,9 +255,11 @@ async def async_benchmark(
                                                              timeout=1.0)
                 statistics.register_request_perf_item(item)
                 pbar.update(1)
+                finished_requests += 1
             except asyncio.TimeoutError:
                 logger.debug("No items in queue. Continuing.")
 
+        assert finished_requests == len(requests), "Benchmark failed"
         logger.info("Benchmark complete.")
 
         return statistics
