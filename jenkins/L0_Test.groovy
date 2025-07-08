@@ -1878,7 +1878,6 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "A10-Build_Docs": [docBuildSpec, {
             sh "rm -rf **/*.xml *.tar.gz"
             runLLMDocBuild(pipeline, config=VANILLA_CONFIG)
-            sh "cd aaa/"
         }],
     ]
 
@@ -2304,6 +2303,8 @@ pipeline {
                         echo "Only run single-GPU tests."
                         if (dgxJobs.size() > 0) {
                             if (globalVars[ACTION_INFO]['parents'].size() > 0) {
+                                // We add "Require Multi-GPU Testing:" to the parent job(L0_MergeRequest)'s description,
+                                // We will use this to determine whether to run multi-GPU test stage
                                 def parentJob = globalVars[ACTION_INFO]['parents'][-2]
                                 trtllm_utils.appendBuildDescription(this, parentJob['name'], parentJob['build_number'], "Require Multi-GPU Testing:")
                             } else {
