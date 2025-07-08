@@ -169,14 +169,16 @@ protected:
     constexpr static bool ANY_FPX = ANY_FP4 || FP8;
 
     constexpr static bool INT_QUANT = !std::is_same_v<GemmDataType, WeightType> && std::is_integral_v<WeightType>;
-    constexpr static int WEIGHT_ELEM_PER_BYTE = (INT4 || WEIGHT_FP4) ? 2 : 1;
+    constexpr static int64_t WEIGHT_ELEM_PER_BYTE = (INT4 || WEIGHT_FP4) ? 2 : 1;
     using InputType = std::conditional_t<NVFP4 || MXFP8_MXFP4, OutputType, GemmDataType>;
     using WeightStorage = std::conditional_t<WEIGHT_ELEM_PER_BYTE == 2, uint8_t, WeightType>;
     constexpr static int64_t HIDDEN_SIZE_MULTIPLIER = 16;
     constexpr static int64_t MINIMUM_BYTE_ALIGNMENT
         = MX_QUANT_WEIGHT ? 64 : 128 / 8; // TMA requires 128 bits alignment, MX quant requires 64 bytes
-    constexpr static int64_t MINIMUM_ALIGNMENT = MINIMUM_BYTE_ALIGNMENT * WEIGHT_ELEM_PER_BYTE / sizeof(WeightStorage);
-    constexpr static int64_t DEFAULT_HIDDEN_SIZE = HIDDEN_SIZE_MULTIPLIER * MINIMUM_ALIGNMENT;
+    constexpr static int64_t MINIMUM_ALIGNMENT_CONST
+        = MINIMUM_BYTE_ALIGNMENT * WEIGHT_ELEM_PER_BYTE / sizeof(WeightStorage);
+    constexpr static int64_t DEFAULT_HIDDEN_SIZE = HIDDEN_SIZE_MULTIPLIER * MINIMUM_ALIGNMENT_CONST;
+    int64_t mDeviceMinimumAlignment = MINIMUM_ALIGNMENT_CONST; // SM103 has different minimum alignment
 
     // FP4 uses the unquantized data type for inputs and quantizes on the fly
     using DataType = std::conditional_t<NVFP4 || MXFP8_MXFP4, OutputType, GemmDataType>;
@@ -249,6 +251,13 @@ protected:
             GTEST_SKIP() << "Skipping due to no/unsupported GPU";
         }
         assert(mBufferManager);
+
+        int sm = getSMVersion();
+        if (sm >= 100 && sm < 120)
+        {
+            mDeviceMinimumAlignment
+                = std::max(MINIMUM_ALIGNMENT_CONST, int64_t(WEIGHT_ELEM_PER_BYTE * 32 / sizeof(WeightStorage)));
+        }
     }
 
     void TearDown() override
@@ -1115,24 +1124,26 @@ protected:
         }
 
         EXPECT_FALSE(tactics.empty());
-
         return tactics;
     }
 
-    auto selectTacticsForArch(int sm)
+    auto selectTacticsForArch(int sm, bool exact_match = false)
     {
         bool is_tma_warp_specialized = sm >= 90 && !INT_QUANT;
         auto epilogue_fusion_type = (is_tma_warp_specialized && mUseFusedFinalize)
             ? tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE
             : tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::NONE;
+        auto smExact = [exact_match, sm](auto& c) { return !exact_match || c.sm_version == sm; };
         auto tactics1 = getFilteredConfigs(sm, MoeGemmId::GEMM_1);
         auto tactics2 = getFilteredConfigs(sm, MoeGemmId::GEMM_2);
         auto it1 = std::find_if(tactics1.begin(), tactics1.end(),
-            [is_tma_warp_specialized](auto& c) { return c.is_tma_warp_specialized == is_tma_warp_specialized; });
+            [is_tma_warp_specialized, smExact](auto& c)
+            { return c.is_tma_warp_specialized == is_tma_warp_specialized && smExact(c); });
         auto it2 = std::find_if(tactics2.begin(), tactics2.end(),
-            [is_tma_warp_specialized, epilogue_fusion_type](auto& c) {
+            [is_tma_warp_specialized, epilogue_fusion_type, smExact](auto& c)
+            {
                 return c.is_tma_warp_specialized == is_tma_warp_specialized
-                    && c.epilogue_fusion_type == epilogue_fusion_type;
+                    && c.epilogue_fusion_type == epilogue_fusion_type && smExact(c);
             });
         if (it1 == tactics1.end() || it2 == tactics2.end())
         {
@@ -1156,11 +1167,17 @@ protected:
         }
 
         int sm = getSMVersion();
-        ConfigsToTestVec tactics = {selectTacticsForArch(sm)};
+        bool needs_exact_match = sm == 103 && NVFP4;
+        ConfigsToTestVec tactics = {selectTacticsForArch(sm, needs_exact_match)};
+        if (sm == 103 && NVFP4)
+        {
+            // SM103 NVFP4 should also test SM100f kernels
+            tactics.push_back(selectTacticsForArch(100, true));
+        }
         if (sm >= 90 && !ANY_FPX)
         {
             // SM90+ should also grab some configs for SM80 to test them
-            tactics.push_back(selectTacticsForArch(80));
+            tactics.push_back(selectTacticsForArch(80, true));
         }
         return tactics;
     }
@@ -1534,7 +1551,7 @@ protected:
         int64_t num_tokens = 3, float inter_size_fraction = 1.0f)
     {
         // Ensure we dont drop below the minimum alignment
-        mInterSizeFraction = std::max(inter_size_fraction, MINIMUM_ALIGNMENT * 8.0f / hidden_size);
+        mInterSizeFraction = std::max(inter_size_fraction, mDeviceMinimumAlignment * 8.0f / hidden_size);
         ParallelismTest(k, 2, 1, hidden_size, num_experts, num_tokens);
         ParallelismTest(k, 4, 1, hidden_size, num_experts, num_tokens);
         ParallelismTest(k, 8, 1, hidden_size, num_experts, num_tokens);
@@ -1543,7 +1560,7 @@ protected:
     void MixedParallelTest(int k = 1, int64_t hidden_size = DEFAULT_HIDDEN_SIZE, int64_t num_experts = 4,
         int64_t num_tokens = 3, float inter_size_fraction = 1.0f)
     {
-        mInterSizeFraction = std::max(inter_size_fraction, MINIMUM_ALIGNMENT * 8.0f / hidden_size);
+        mInterSizeFraction = std::max(inter_size_fraction, mDeviceMinimumAlignment * 8.0f / hidden_size);
 
         // 2 experts per rank
         ParallelismTest(k, 2, num_experts / 2, hidden_size, num_experts, num_tokens);
@@ -1777,9 +1794,9 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteVerySmall)
 {
     for (int i = 1; i <= 3; i++)
     {
-        this->BasicPermuteTest(1, this->MINIMUM_ALIGNMENT * i);
-        this->BasicPermuteTest(2, this->MINIMUM_ALIGNMENT * i);
-        this->BasicPermuteTest(3, this->MINIMUM_ALIGNMENT * i);
+        this->BasicPermuteTest(1, this->mDeviceMinimumAlignment * i);
+        this->BasicPermuteTest(2, this->mDeviceMinimumAlignment * i);
+        this->BasicPermuteTest(3, this->mDeviceMinimumAlignment * i);
     }
 }
 
@@ -1802,7 +1819,7 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteManyExperts)
 {
     this->mIsLongTest = true;
     /* This test is very slow. Only do one k value */
-    this->BasicPermuteTest(2, this->MINIMUM_ALIGNMENT, 512);
+    this->BasicPermuteTest(2, this->mDeviceMinimumAlignment, 512);
 }
 
 TYPED_TEST(MixtureOfExpertsTest, PermuteSwigluVerySmall)
@@ -1810,9 +1827,9 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteSwigluVerySmall)
     this->mActType = ActivationType::Swiglu;
     for (int i = 1; i <= 3; i++)
     {
-        this->BasicPermuteTest(1, this->MINIMUM_ALIGNMENT * i);
-        this->BasicPermuteTest(2, this->MINIMUM_ALIGNMENT * i);
-        this->BasicPermuteTest(3, this->MINIMUM_ALIGNMENT * i);
+        this->BasicPermuteTest(1, this->mDeviceMinimumAlignment * i);
+        this->BasicPermuteTest(2, this->mDeviceMinimumAlignment * i);
+        this->BasicPermuteTest(3, this->mDeviceMinimumAlignment * i);
     }
 }
 
@@ -1844,7 +1861,7 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteDeepSeekV3)
 TYPED_TEST(MixtureOfExpertsTest, MinimumAlignment)
 {
     this->mInterSizeFraction = 1;
-    this->BasicPermuteTest(1, this->DEFAULT_HIDDEN_SIZE + this->MINIMUM_ALIGNMENT);
+    this->BasicPermuteTest(1, this->DEFAULT_HIDDEN_SIZE + this->mDeviceMinimumAlignment);
 }
 
 template <class TypeParam_>
@@ -2113,7 +2130,7 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
     {                                                                                                                  \
         this->mIsLongTest = true;                                                                                      \
         /* This test is very slow. Only do one k value */                                                              \
-        this->ParallelismType##Test(2, this->MINIMUM_ALIGNMENT, 512, 3, this->ANY_FP4 ? 8.0f : 4.0f);                  \
+        this->ParallelismType##Test(2, this->mDeviceMinimumAlignment, 512, 3, this->ANY_FP4 ? 8.0f : 4.0f);            \
     }
 
 PARALLEL_TEST_SUITE(ExpertParallel)
@@ -2178,7 +2195,7 @@ TYPED_TEST(MixtureOfExpertsTest, ConfigSweep)
                     {
                         this->mOverrideSelectedConfig1 = conf1;
                         this->mOverrideSelectedConfig2 = conf2;
-                        this->BasicPermuteTest(k, this->MINIMUM_ALIGNMENT);
+                        this->BasicPermuteTest(k, this->mDeviceMinimumAlignment);
                         if (::testing::Test::HasFailure()) // Throw on test failure so we get the print message
                             throw std::runtime_error("Test k=" + std::to_string(k) + " Failed");
                     }

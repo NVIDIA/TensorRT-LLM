@@ -79,7 +79,9 @@ auto getDispatchFunctionForSM100(
     {
         auto select_dynamic_cga = [epilogue_schedule](auto dynamic_cga_t)
         {
-            if constexpr (!std::is_same_v<T, __nv_fp4_e2m1> && !std::is_same_v<WeightType, __nv_fp4_e2m1>
+            constexpr bool is_block_scaled
+                = std::is_same_v<T, __nv_fp4_e2m1> || std::is_same_v<WeightType, __nv_fp4_e2m1>;
+            if constexpr ((!is_block_scaled || Arch::kMinComputeCapability == 103)
                 && FUSION != EpilogueFusion::FINALIZE)
             {
                 auto func_map = std::array{
@@ -98,6 +100,8 @@ auto getDispatchFunctionForSM100(
             }
             else
             {
+                static_assert(FUSION == EpilogueFusion::FINALIZE || Arch::kMinComputeCapability != 103,
+                    "SM103 should support both epilogue schedules");
                 TLLM_CHECK_WITH_INFO(epilogue_schedule == cutlass_extensions::EpilogueScheduleType::TMA,
                     "No Smem epilogue schedule is not supported for block scaled types or finalize fusion");
                 return &kernels::cutlass_kernels_oss::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,

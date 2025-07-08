@@ -22,7 +22,7 @@
 #include <cutlass_extensions/gemm/kernel/fused_moe_kernel_traits.cuh>
 #include <cutlass_extensions/gemm/kernel/moe_problem_visitor.h>
 
-namespace fused_moe
+namespace fused_moe_oss
 {
 template <typename ElementInput_, typename ElementWeight_, typename ElementOutput_, int MaxTileM_, int TileN_,
     int TileK_, int Stages_, Activation_Type activation_type_>
@@ -215,4 +215,4 @@ static int fused_gemm_maximum_active_blocks(int smem_capacity = -1)
     CUTLASS_TRACE_HOST("  max_active_blocks: " << max_active_blocks);
     return max_active_blocks;
 }
-} // namespace fused_moe
+} // namespace fused_moe_oss
