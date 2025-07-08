@@ -77,6 +77,7 @@ python -m tensorrt_llm.serve.scripts.benchmark_serving \
 ```bash
 cat >./extra-llm-api-config.yml <<EOF
 enable_attention_dp: false
+enable_min_latency: true
 stream_interval: 2
 cuda_graph_config:
   max_batch_size: 8
@@ -85,6 +86,7 @@ EOF
 ```
 Explanation:
 - `enable_attention_dp`: Enable attention Data Parallel which is recommend to disable in low concurrency.
+- `enable_min_latency` enables optimizations for low latency scenarios, where concurrency is very small (like 1 or 2). The concurrency threshold needs to be tuned based on your specific ISL/OSL configuration.
 - `stream_interval`: The iteration interval to create responses under the streaming mode.
 - `cuda_graph_config`: CUDA Graph config.
   - `max_batch_size`: Max CUDA graph batch size to capture.
@@ -92,8 +94,10 @@ Explanation:
 
 
 #### 2. Launch trtllm-serve OpenAI-compatible API server
-TensorRT-LLM supports nvidia TensorRT Model Optimizer quantized FP8 checkpoint
+TensorRT-LLM supports nvidia TensorRT Model Optimizer quantized FP8 checkpoint.
+Currently parallel weight loading conflicts with min_latency, disable the parallel weight loading to support min_latency for now.
 ``` bash
+TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL=True \
 trtllm-serve nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
     --backend pytorch \
     --max_batch_size 8 \
@@ -116,7 +120,7 @@ python -m tensorrt_llm.serve.scripts.benchmark_serving \
         --random-input-len 1024 \
         --random-output-len 2048 \
         --random-ids \
-        --max-concurrency 4 \
+        --max-concurrency 1 \
 ```
 
 ## Advanced Configuration
@@ -125,6 +129,7 @@ python -m tensorrt_llm.serve.scripts.benchmark_serving \
 
 - **Attention DP** only provides throughput gains in high concurrency scenarios. Consider disabling it for low concurrency and enabling it for high concurrency. The concurrency threshold needs to be tuned based on your specific ISL/OSL configuration.
 - **Expert Parallel (EP)** usually benefits in high concurrency scenarios. The `ep_size` needs to be tuned based on your specific ISL/OSL and concurrency configuration.
+- `enable_min_latency` enables optimizations for low latency scenarios, where concurrency is very small (like 1 or 2). The concurrency threshold needs to be tuned based on your specific ISL/OSL configuration.
 - `stream_interval` and `num_postprocess_workers` are both used to reduce streaming mode overhead. `stream_interval` controls the iteration interval to create responses under streaming mode, which benefits performance across all concurrency levels. `num_postprocess_workers` controls the number of processes used for postprocessing generated tokens, which provides benefits in high concurrency scenarios. These values need to be tuned based on your specific ISL/OSL and concurrency configuration.
 - `max_batch_size` and `max_num_tokens` can easily affect the performance. The default values for them are already carefully designed and should deliver good performance on overall cases, however, you may still need to tune it for peak performance.
 - `max_batch_size` should not be too low to bottleneck the throughput. Note with Attention DP, the the whole system's max_batch_size will be `max_batch_size*dp_size`.
