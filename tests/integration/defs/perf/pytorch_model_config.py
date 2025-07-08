@@ -30,7 +30,7 @@ def get_model_yaml_config(model_label: str,
     base_config = {
         'print_iter_log': True,
         'cuda_graph_config': {
-            'padding_enabled': True,
+            'enable_padding': True,
         },
     }
     if 'kv_cache_dtype' in model_label:
@@ -65,9 +65,10 @@ def get_model_yaml_config(model_label: str,
             ],
             'config': {
                 'enable_attention_dp': True,
-                'cuda_graph_padding_enabled': True,
-                'cuda_graph_batch_sizes':
-                [1, 2, 4, 8, 16, 32, 64, 128, 256, 384]
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'batch_sizes': [1, 2, 4, 8, 16, 32, 64, 128, 256, 384]
+                }
             }
         },
         # DeepSeek R1 model with specific batch size 128
@@ -86,7 +87,7 @@ def get_model_yaml_config(model_label: str,
             'config': {
                 'print_iter_log': True,
                 'cuda_graph_config': {
-                    'padding_enabled': True,
+                    'enable_padding': True,
                     'batch_sizes': [1, 512, 1024, 2048]
                 }
             }
