@@ -1595,6 +1595,24 @@ def test_ptp_quickstart(llm_root, llm_venv):
     pytest.param('Qwen3-30B-A3B',
                  'Qwen3/Qwen3-30B-A3B',
                  marks=pytest.mark.skip_less_device_memory(80000)),
+    pytest.param('Llama3.3-70B-FP8',
+                 'modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8',
+                 marks=skip_pre_blackwell),
+    pytest.param('Llama3.3-70B-FP4',
+                 'modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4',
+                 marks=skip_pre_blackwell),
+    pytest.param('Nemotron-Super-49B-v1-BF16',
+                 'nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1',
+                 marks=skip_pre_blackwell),
+    pytest.param('Mixtral-8x7B-BF16',
+                 'Mixtral-8x7B-Instruct-v0.1',
+                 marks=skip_pre_blackwell),
+    pytest.param('Mistral-Nemo-12b-Base',
+                 'Mistral-Nemo-Base-2407',
+                 marks=skip_pre_blackwell),
+    pytest.param('DeepSeek-R1-Distill-Qwen-32B',
+                 'DeepSeek-R1/DeepSeek-R1-Distill-Qwen-32B',
+                 marks=skip_pre_blackwell),
 ])
 def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
     print(f"Testing {model_name}.")
@@ -1857,13 +1875,13 @@ def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
                  marks=skip_pre_hopper),
     pytest.param('Llama3.1-405B-FP8',
                  'llama-3.1-model/Llama-3.1-405B-Instruct-FP8',
-                 marks=skip_pre_hopper),
+                 marks=(skip_pre_hopper, pytest.mark.timeout(7200))),
     pytest.param('Mixtral-8x7B-NVFP4',
                  'nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1',
                  marks=skip_pre_blackwell),
     pytest.param('Nemotron-Ultra-253B',
                  'nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1',
-                 marks=skip_pre_hopper),
+                 marks=(skip_pre_hopper, pytest.mark.timeout(12600))),
 ])
 def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
                                        model_path):
@@ -1940,6 +1958,7 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
 @pytest.mark.parametrize("modality", ["image", "video"])
 @pytest.mark.parametrize("model_name,model_path", [
     ("NVILA-8B-FP16", "vila/NVILA-8B"),
+    ("NVILA-15B-FP16", "NVILA-15B"),
     ("llava-v1.6-mistral-7b", "llava-v1.6-mistral-7b-hf"),
     ("qwen2-vl-7b-instruct", "Qwen2-VL-7B-Instruct"),
     ("qwen2.5-vl-7b-instruct", "Qwen2.5-VL-7B-Instruct"),
