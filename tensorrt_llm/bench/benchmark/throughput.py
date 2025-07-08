@@ -29,6 +29,7 @@ from tensorrt_llm.bench.dataclasses.scenario import (
     BatchingConfiguration, BenchmarkEnvironment, LlmRuntimeSpecification,
     ReportingConfiguration, ScenarioSpecification, TuningConstraints,
     WorldConfig)
+from tensorrt_llm.bench.tuning.factory import HeuristicFactory
 # isort: on
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
@@ -293,6 +294,12 @@ def throughput_command(
         # NOTE: This table is only accurate for non-multimodal models.
         #       The accurate table for multimodal models will be logged after the benchmark is done.
         logger.info(benchmark_specification.get_dataset_summary())
+
+    print(benchmark_specification)
+
+    heuristic_cls = HeuristicFactory.get_heuristic(benchmark_specification.llm_config.backend, "throughput")
+    heuristic_settings = heuristic_cls.get_settings(benchmark_specification)
+
 
     # Engine configuration parsing
     if benchmark_specification.llm_config.backend != "trt":

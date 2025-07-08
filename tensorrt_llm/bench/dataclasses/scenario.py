@@ -50,11 +50,6 @@ class LlmRuntimeSpecification(BaseModel):
         default=.9,
         description=
         "The percentage of memory to use for KV Cache after model load.")
-    max_batch_size: Optional[int] = Field(
-        default=None, description="The maximum batch size to use for tuning.")
-    max_num_tokens: Optional[int] = Field(
-        default=None,
-        description="The maximum number of tokens to use for tuning.")
     pad_id: Optional[int] = Field(
         default=-1, description="The padding token to use for benchmarking.")
 
@@ -284,6 +279,10 @@ class ScenarioSpecification(BaseModel):
 
     _engine_config: Dict[str, Any] = PrivateAttr(default=dict)
 
+    def __post_init__(self) -> None:
+        if self.checkpoint_path is None and self.llm_config.backend != "tensorrt":
+            self.checkpoint_path = snapshot_download(self.environment.model)
+
     class Config:
         validate_assignment = True
 
@@ -355,11 +354,13 @@ class ScenarioSpecification(BaseModel):
             # that the dataset max sequence length is less than the engine max
             # sequence length.
             max_seq_len = self.dataset_metadata.seq_len_stats.maximum
-            if max_seq_len > build_config["max_seq_len"]:
-                raise ValueError(
-                    f"Dataset max sequence length ({max_seq_len}) is greater than "
-                    f"the maximum sequence length for the specified engine with"
-                    f"(max sequence length={build_config['max_seq_len']}).")
+            eng_max_seq_len = build_config["max_seq_len"]
+            if max_seq_len > eng_max_seq_len:
+                raise RuntimeError(
+                    f"Engine supports a max sequence of {eng_max_seq_len}. "
+                    "Provided dataset contains a maximum sequence of "
+                    f"{max_seq_len}. Please rebuild a new engine "
+                    "to support this dataset.")
 
         return self
 
@@ -451,20 +452,15 @@ class BenchmarkEnvironment(BaseModel):
         description=
         "The type of model being used, derived from the model configuration.")
     def model_type(self) -> str:
-        return get_model_config(self.model, self.checkpoint_path).model_type
+        return self.get_bench_model_config().model_type
+
+    def get_tllm_model_config(self) -> ModelConfig:
+        return ModelConfig.from_pretrained(
+            self.model_path,
+            trust_remote_code=True
+        )
+
+    def get_bench_model_config(self) -> ModelConfig:
+        return get_model_config(self.model, self.checkpoint_path)
 
 
-
-class BenchmarkSpecification(BaseModel):
-    environment: BenchmarkEnvironment
-    scenario: ScenarioSpecification = Field(
-        default=None, description="The scenario to use for benchmarking.")
-    world: Optional[WorldConfig] = Field(
-        default=None, description="The world to use for benchmarking.")
-    constraints: Optional[TuningConstraints] = Field(
-        default=None,
-        description="The tuning criteria to use for benchmarking.")
-
-    def __post_init__(self) -> None:
-        if self.checkpoint_path is None and self.scenario.backend != "tensorrt":
-            self.checkpoint_path = snapshot_download(self.model)
