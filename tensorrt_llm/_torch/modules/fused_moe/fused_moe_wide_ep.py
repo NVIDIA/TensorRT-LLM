@@ -886,7 +886,8 @@ class WideEPMoE(MoE):
                     (0, 0, 0,
                      all_rank_max_num_tokens - token_selected_slots.shape[0]),
                     'constant', self.num_slots)
-            if all_rank_max_num_tokens > token_final_scales.shape[0]:
+            if token_final_scales is not None and all_rank_max_num_tokens > token_final_scales.shape[
+                    0]:
                 token_final_scales = torch.nn.functional.pad(
                     token_final_scales,
                     (0, 0, 0,
@@ -902,10 +903,11 @@ class WideEPMoE(MoE):
                 gathered_token_selected_slots.contiguous(),
                 start_dim=0,
                 end_dim=-2)
-            gathered_token_final_scales = torch.flatten(
-                gathered_token_final_scales.contiguous(),
-                start_dim=0,
-                end_dim=-2)
+            if gathered_token_final_scales is not None:
+                gathered_token_final_scales = torch.flatten(
+                    gathered_token_final_scales.contiguous(),
+                    start_dim=0,
+                    end_dim=-2)
             gathered_target_rank_ids = MnnvlMoe.compute_target_rank_id(
                 gathered_token_selected_slots, self.num_slots, self.ep_size)
             alltoall_info, token_selected_slots, token_final_scales = MnnvlMoe.mnnvl_moe_alltoallv_prepare(
