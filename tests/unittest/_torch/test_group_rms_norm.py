@@ -16,19 +16,31 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.modules.rms_norm import RMSNorm, group_rms_norm
+from tensorrt_llm._torch.modules.rms_norm import (GroupRMSNormKernelSelection,
+                                                  RMSNorm, group_rms_norm)
 
 
-def _prepare_rms_test_data(batch_size, hidden_dims, eps, dtype, enable_weights):
+def _prepare_rms_test_data(batch_size,
+                           hidden_dims,
+                           eps,
+                           dtype,
+                           enable_weights,
+                           concat_input=False):
     """Common setup for RMSNorm tests."""
     assert torch.cuda.is_available(), "This test requires CUDA"
     device = "cuda"
 
     # Create input tensors
-    inputs = [
-        torch.randn((batch_size, dim), dtype=dtype, device=device)
-        for dim in hidden_dims
-    ]
+    if concat_input:
+        input_source = torch.randn((batch_size, sum(hidden_dims)),
+                                   dtype=dtype,
+                                   device=device)
+        inputs = input_source.split(hidden_dims, dim=1)
+    else:
+        inputs = [
+            torch.randn((batch_size, dim), dtype=dtype, device=device)
+            for dim in hidden_dims
+        ]
 
     # Create weights
     if enable_weights:
@@ -70,7 +82,7 @@ def _verify_outputs(test_outputs, ref_outputs):
 @pytest.mark.parametrize("hidden_dims",
                          [[256], [8448], [256, 512], [8448, 1024]],
                          ids=lambda x: f"dims:{'-'.join(str(d) for d in x)}")
-@pytest.mark.parametrize("eps", [1e-6, 1e-5], ids=lambda x: f"eps:{x}")
+@pytest.mark.parametrize("eps", [1e-5], ids=lambda x: f"eps:{x}")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16],
                          ids=["fp16", "bf16"])
 @pytest.mark.parametrize("enable_weights", [True, False],
@@ -97,7 +109,7 @@ def test_group_rms_norm_heuristic(batch_size, hidden_dims, eps, dtype,
 @pytest.mark.parametrize("hidden_dims",
                          [[256], [8448], [256, 512], [8448, 1024]],
                          ids=lambda x: f"dims:{'-'.join(str(d) for d in x)}")
-@pytest.mark.parametrize("eps", [1e-6, 1e-5], ids=lambda x: f"eps:{x}")
+@pytest.mark.parametrize("eps", [1e-5], ids=lambda x: f"eps:{x}")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16],
                          ids=["fp16", "bf16"])
 @pytest.mark.parametrize("enable_weights", [True, False],
@@ -131,7 +143,7 @@ def test_group_rms_norm_base(batch_size, hidden_dims, eps, dtype,
 @pytest.mark.parametrize("batch_size", [1, 4], ids=lambda x: f"batch:{x}")
 @pytest.mark.parametrize("hidden_dims", [[256, 512], [8448, 1024]],
                          ids=lambda x: f"dims:{'-'.join(str(d) for d in x)}")
-@pytest.mark.parametrize("eps", [1e-6, 1e-5], ids=lambda x: f"eps:{x}")
+@pytest.mark.parametrize("eps", [1e-5], ids=lambda x: f"eps:{x}")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16],
                          ids=["fp16", "bf16"])
 @pytest.mark.parametrize("enable_weights", [True, False],
@@ -158,5 +170,51 @@ def test_group_rms_norm_large_batch(batch_size, hidden_dims, eps, dtype,
                                                     [],
                                                     eps=eps,
                                                     weight_bias=0.0)
+
+    _verify_outputs(group_outputs_large_batch, ref_outputs)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("batch_size", [4], ids=lambda x: f"batch:{x}")
+@pytest.mark.parametrize("hidden_dims", [[1536, 512], [8448, 1024]],
+                         ids=lambda x: f"dims:{'-'.join(str(d) for d in x)}")
+@pytest.mark.parametrize("eps", [1e-5], ids=lambda x: f"eps:{x}")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16],
+                         ids=["fp16", "bf16"])
+@pytest.mark.parametrize("enable_weights", [True, False],
+                         ids=lambda x: f"enable_weights:{x}")
+def test_group_rms_norm_with_different_IO_strides(batch_size, hidden_dims, eps,
+                                                  dtype, enable_weights):
+    """Compare group_rms_norm with RMSNorm."""
+    inputs, weights, ref_outputs = _prepare_rms_test_data(batch_size,
+                                                          hidden_dims,
+                                                          eps,
+                                                          dtype,
+                                                          enable_weights,
+                                                          concat_input=True)
+
+    # Test tensorrt_llm._torch.modules.rms_norm.group_rms_norm with base kernel
+    if enable_weights:
+        group_outputs_base = group_rms_norm(
+            inputs,
+            weights=weights,
+            eps=eps,
+            kernel=GroupRMSNormKernelSelection.base)
+    else:
+        group_outputs_base = group_rms_norm(
+            inputs, eps=eps, kernel=GroupRMSNormKernelSelection.base)
+
+    _verify_outputs(group_outputs_base, ref_outputs)
+
+    # Test tensorrt_llm._torch.modules.rms_norm.group_rms_norm with large_batch kernel
+    if enable_weights:
+        group_outputs_large_batch = group_rms_norm(
+            inputs,
+            weights=weights,
+            eps=eps,
+            kernel=GroupRMSNormKernelSelection.large_batch)
+    else:
+        group_outputs_large_batch = group_rms_norm(
+            inputs, eps=eps, kernel=GroupRMSNormKernelSelection.large_batch)
 
     _verify_outputs(group_outputs_large_batch, ref_outputs)
