@@ -1792,6 +1792,11 @@ class TorchCompileConfig(BaseModel):
         description=
         "When torch compile is enabled, userbuffers is enabled by default.")
 
+    max_num_streams: int = Field(
+        default=1,
+        description=
+        "The maximum number of CUDA streams to use for torch.compile.")
+
 
 class TorchLlmArgs(BaseLlmArgs):
     # Just a dummy BuildConfig to allow code reuse with the TrtLlmArgs
@@ -2116,6 +2121,9 @@ class TorchLlmArgs(BaseLlmArgs):
             torch_compile_enable_userbuffers=self.torch_compile_config.
             enable_userbuffers if self.torch_compile_config is not None else
             TorchCompileConfig.model_fields['enable_userbuffers'].default,
+            torch_compile_max_num_streams=self.torch_compile_config.
+            max_num_streams if self.torch_compile_config is not None else
+            TorchCompileConfig.model_fields['max_num_streams'].default,
             enable_autotuner=self.enable_autotuner,
             enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
             load_format=self.load_format,

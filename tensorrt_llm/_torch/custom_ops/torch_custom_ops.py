@@ -969,3 +969,45 @@ def _(
         output_sf = torch.empty(())  # Create a placeholder, which is not used.
 
     return output_act, output_sf
+
+
+def get_event(event_idx: int):
+    from ..utils import get_model_extra_attrs
+    extra_attrs = get_model_extra_attrs()
+    assert "events" in extra_attrs, "Missing Event Book"
+    return extra_attrs["events"]()[event_idx]
+
+
+def get_stream(stream_id: int):
+    from ..utils import get_model_extra_attrs
+    extra_attrs = get_model_extra_attrs()
+    if stream_id == 0:
+        return extra_attrs["global_stream"]
+    assert "aux_streams" in extra_attrs, "Missing Aux Streams"
+    return extra_attrs["aux_streams"]()[stream_id - 1]
+
+
+@torch.library.custom_op("trtllm::set_stream", mutates_args=())
+def set_stream(stream_id: int) -> None:
+    stream = get_stream(stream_id)
+    assert stream is not None
+    torch.cuda.set_stream(stream)
+
+
+@torch.library.custom_op("trtllm::record_event", mutates_args=())
+def record_event(event_idx: int) -> None:
+    event = get_event(event_idx)
+    event.record()
+
+
+@torch.library.custom_op("trtllm::wait_event", mutates_args=())
+def wait_event(event_idx: int) -> None:
+    event = get_event(event_idx)
+    event.wait()
+
+
+@torch.library.custom_op("trtllm::record_stream", mutates_args=())
+def record_stream(tensor: torch.Tensor, stream_id: int) -> None:
+    stream = get_stream(stream_id)
+    assert stream is not None
+    tensor.record_stream(stream)
