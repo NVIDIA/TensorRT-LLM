@@ -50,7 +50,7 @@ trt_llm_release_perf_test:
   - perf/test_perf.py::test_perf[ministral_8b_fp8-bench-pytorch-float8-input_output_len:500,2000-reqs:500-con:250]
 
   # Ministral-8B LoRA tests (using dummy Mistral LoRA checkpoint)
-  - perf/test_perf.py::test_perf[ministral_8b-bench-pytorch-bfloat16-input_output_len:128,128-loras:1-reqs:100-con:2]
+  - perf/test_perf.py::test_perf[ministral_8b-bench-pytorch-bfloat16-maxbs:2-maxnt:1024-input_output_len:128,128-loras:1-reqs:8-con:2]
 
   # E2E ENC-DEC
   - perf/test_perf.py::test_perf[bart_large_cnn-cppmanager-exe-plugin_ifb-float16-input_output_len:128,20]
