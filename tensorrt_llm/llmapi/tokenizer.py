@@ -255,7 +255,7 @@ class TransformersTokenizer(TokenizerBase):
             curr_new_text = self.clean_up_tokenization(curr_new_text)
 
         if prev_text is None:
-            return curr_new_text.lstrip(), states
+            return curr_new_text, states
         else:
             return prev_text + curr_new_text, states
 
