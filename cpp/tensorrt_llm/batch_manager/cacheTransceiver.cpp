@@ -517,7 +517,9 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             // Gather the kv cache transfer time from all workers and update to leader rank
             if (!common::getEnvKVCacheTransferOutputPath().empty())
             {
-                updateKVCacheTransferBW(*mMpiGroupComm, it->first);
+                auto syncComm
+                    = mCacheState->getParallelConfig().mEnableAttentionDP ? mMpiGroupDataComm.get() : mMpiGroupComm;
+                updateKVCacheTransferBW(*syncComm, it->first);
             }
             TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
                 "**** it->first->mRequestId: %ld, context request ID: %ld ******** get feature ***",
