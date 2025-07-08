@@ -59,12 +59,15 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @pytest.mark.parametrize("stream_interval", [4, 64],
                              ids=["stream_interval_4", "stream_interval_64"])
-    def test_nvfp4_streaming(self, stream_interval):
-        model_path = f"{llm_models_root()}/nvfp4-quantized/Meta-Llama-3.1-8B"
-
-        # When stream_interval < 32, hf incremental detokenization is used.
-        # When stream_interval >= 32, trtllm implemented incremental detokenization is used.
+    def test_nvfp4_streaming(self, stream_interval, mocker):
+        # When stream_interval < 32, hf incremental detokenization is faster.
+        # When stream_interval >= 32, trtllm implemented incremental detokenization is faster.
         # The behavior is due to perf considerations, while both paths need to be tested.
+        if stream_interval >= 32:
+            mocker.patch.dict(os.environ,
+                              {"TLLM_DISABLE_HF_DECODE_INCREMENTALLY": "1"})
+
+        model_path = f"{llm_models_root()}/nvfp4-quantized/Meta-Llama-3.1-8B"
         with LLM(model_path, stream_interval=stream_interval) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
