@@ -11,5 +11,3 @@ setuptools>=78.1.1
 protobuf>=4.25.8
 # WAR against https://github.com/advisories/GHSA-33p9-3p43-82vq
 jupyter-core>=5.8.1
-# WAR against https://github.com/advisories/GHSA-xg8h-j46f-w952
-pillow==11.3.0
