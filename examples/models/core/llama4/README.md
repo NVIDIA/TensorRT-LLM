@@ -5,11 +5,6 @@ This document shows how to run Llama4-Maverick on B200 with PyTorch workflow and
 
 ## Table of Contents
 
-- [Prerequisites](#prerequisites)
-  - [Install TensorRT-LLM](#install-tensorrt-llm)
-    - [Download TensorRT-LLM](#download-tensorrt-llm)
-    - [Build and run TensorRT-LLM container](#build-and-run-tensorrt-llm-container)
-    - [Compile and Install TensorRT-LLM](#compile-and-install-tensorrt-llm)
 - [Performance Benchmarks](#performance-benchmarks)
   - [B200 Max-throughput](#b200-max-throughput)
   - [B200 Min-latency](#b200-min-latency)
@@ -19,62 +14,10 @@ This document shows how to run Llama4-Maverick on B200 with PyTorch workflow and
     - [Out of memory issues](#out-of-memory-issues)
 
 
-## Prerequisites
-
-This section can be skipped if you already have TensorRT-LLM installed.
-
-### Install TensorRT-LLM
-
-#### Download TensorRT-LLM
-
-**You can also find more comprehensive instructions to install TensorRT-LLM in this [TensorRT-LLM installation guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html), refer to that guide for common issues if you encounter any here.**
-
-``` bash
-# Prerequisites
-apt-get update && apt-get -y install git git-lfs
-git lfs install
-
-# Replace with your actual path
-YOUR_WORK_PATH=<YOUR_WORK_PATH>
-
-# Clone the TensorRT-LLM repository
-cd $YOUR_WORK_PATH
-git clone https://github.com/NVIDIA/TensorRT-LLM.git
-cd TensorRT-LLM
-git submodule update --init --recursive
-git lfs pull
-```
-**Note**: Replace `<*_PATH>` to your actual path.
-
-
-#### Build and run TensorRT-LLM container
-
-``` bash
-cd TensorRT-LLM
-make -C docker run LOCAL_USER=1 DOCKER_RUN_ARGS="-v $YOUR_MODEL_PATH:$YOUR_MODEL_PATH:ro -v $YOUR_WORK_PATH:$YOUR_WORK_PATH"
-```
-Here we set `LOCAL_USER=1` argument to set up the local user instead of root account inside the container, you can remove it if running as root inside container is fine.
-
-#### Compile and Install TensorRT-LLM
-Here we compile the Blackwell only source inside the container:
-
-``` bash
-python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --cuda_architectures "100-real"  --python_bindings --clean
-```
-
-Install and set environment variables:
-
-```bash
-pip install --user build/tensorrt_llm*.whl
-export PATH=${HOME}/.local/bin:${PATH}
-export PYTHONPATH=`pwd`
-```
-
 ## Performance Benchmarks
 
 This section provides the steps to launch TensorRT-LLM server and run performance benchmark for different scenarios.
 
-All below commands here are assumed to be running inside the container started by `make -C docker run ...` command mentioned in the [Build and run TensorRT-LLM container section](#build-and-run-tensorrt-llm-container)
 
 ### B200 Max-throughput
 
@@ -105,10 +48,10 @@ trtllm-serve nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
     --max_batch_size 512 \
     --tp_size 8 \
     --ep_size 8 \
+    --num_postprocess_workers 2 \
     --trust_remote_code \
     --extra_llm_api_options ./extra-llm-api-config.yml
 ```
-With Attention DP on, the whole system's max_batch_size will be max_batch_size*tp_size
 
 
 #### 3. Run performance benchmark
@@ -176,15 +119,15 @@ python -m tensorrt_llm.serve.scripts.benchmark_serving \
 
 ## Advanced Configuration
 
-### Exploring ISL/OSL combinations
+### Configuration tuning
 
-Currently, there are some features that need to be enabled through a user-defined file `extra-llm-api-config.yml`, such as CUDA graph, and attention dp. We're working on to enable those features by default, so that users can get good out-of-the-box performance.
-
-Note that, `max_batch_size` and `max_num_tokens` can easily affect the performance. The default values for them are already carefully designed and should deliver good performance on overall cases, however, you may still need to tune it for peak performance.
-
-Generally, you should make sure that `max_batch_size` is not too low to bottleneck the throughput, and `max_num_tokens` needs to be large enough so that it covers the max input sequence length of the samples in dataset.
-
-For more details on `max_batch_size` and `max_num_tokens`, refer to [Tuning Max Batch Size and Max Num Tokens](../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md).
+- **Attention DP** only provides throughput gains in high concurrency scenarios. Consider disabling it for low concurrency and enabling it for high concurrency. The concurrency threshold needs to be tuned based on your specific ISL/OSL configuration.
+- **Expert Parallel (EP)** usually benefits in high concurrency scenarios. The `ep_size` needs to be tuned based on your specific ISL/OSL and concurrency configuration.
+- `stream_interval` and `num_postprocess_workers` are both used to reduce streaming mode overhead. `stream_interval` controls the iteration interval to create responses under streaming mode, which benefits performance across all concurrency levels. `num_postprocess_workers` controls the number of processes used for postprocessing generated tokens, which provides benefits in high concurrency scenarios. These values need to be tuned based on your specific ISL/OSL and concurrency configuration.
+- `max_batch_size` and `max_num_tokens` can easily affect the performance. The default values for them are already carefully designed and should deliver good performance on overall cases, however, you may still need to tune it for peak performance.
+- `max_batch_size` should not be too low to bottleneck the throughput. Note with Attention DP, the the whole system's max_batch_size will be `max_batch_size*dp_size`.
+- Cuda grah `max_batch_size` should be same value as TensorRT-LLM server's `max_batch_size`.
+- For more details on `max_batch_size` and `max_num_tokens`, refer to [Tuning Max Batch Size and Max Num Tokens](../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md).
 
 ### Troubleshooting
 
