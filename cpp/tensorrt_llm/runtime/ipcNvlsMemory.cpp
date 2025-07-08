@@ -244,6 +244,9 @@ IpcNvlsHandle* ipcNvlsAllocate(size_t size, std::set<int> group)
     CUCHECK(cuDeviceGet(&dev, device_id));
     CUCHECK(cuMulticastAddDevice(handle.mc_handle, dev));
 
+    // This step needs to be completed on all processes controlling devices that should participate in a Multicast Team before memory on any device is bound to the Multicast Object.
+    MPI_group_barrier(group);
+
     // Create multicast VA
     CUCHECK(cuMemAddressReserve(&handle.mc_va, size, mc_align, 0U, 0));
     CUCHECK(cuMemMap(handle.mc_va, size, 0, handle.mc_handle, 0));
