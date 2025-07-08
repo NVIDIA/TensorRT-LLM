@@ -878,7 +878,7 @@ def triggerJob(jobName, parameters, jenkinsUrl = "", credentials = "")
     return status
 }
 
-def launchJob(jobName, reuseBuild, globalVars, platform="x86_64", additionalParameters = [:]) {
+def launchJob(jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64", additionalParameters = [:]) {
     def parameters = getCommonParameters()
     String globalVarsJson = writeJSON returnText: true, json: globalVars
     parameters += [
@@ -933,7 +933,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
                         'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
                     ]
-                    launchJob("/LLM/helpers/Build-x86_64", reuseBuild, globalVars, "x86_64", additionalParameters)
+                    launchJob("/LLM/helpers/Build-x86_64", reuseBuild, enableFailFast, globalVars, "x86_64", additionalParameters)
                 }
                 def testStageName = "[Test-x86_64-Single-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
                 def singleGpuTestFailed = false
@@ -951,7 +951,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
                         ]
 
-                        launchJob("L0_Test-x86_64-Single-GPU", false, globalVars, "x86_64", additionalParameters)
+                        launchJob("L0_Test-x86_64-Single-GPU", false, enableFailFast, globalVars, "x86_64", additionalParameters)
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
@@ -1008,7 +1008,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
                         ]
 
-                        launchJob("L0_Test-x86_64-Multi-GPU", false, globalVars, "x86_64", additionalParameters)
+                        launchJob("L0_Test-x86_64-Multi-GPU", false, enableFailFast, globalVars, "x86_64", additionalParameters)
 
                     } catch (InterruptedException e) {
                         throw e
@@ -1044,7 +1044,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     def additionalParameters = [
                         "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
                     ]
-                    launchJob("/LLM/helpers/Build-SBSA", reuseBuild, "SBSA", additionalParameters)
+                    launchJob("/LLM/helpers/Build-SBSA", reuseBuild, enableFailFast, globalVars, "SBSA", additionalParameters)
                 }
                 stage(testStageName) {
                     if (SBSA_TEST_CHOICE == STAGE_CHOICE_SKIP) {
@@ -1058,7 +1058,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
                         ]
 
-                        launchJob("L0_Test-SBSA", false, globalVars, "SBSA", additionalParameters)
+                        launchJob("L0_Test-SBSA", false, enableFailFast, globalVars, "SBSA", additionalParameters)
 
                     } catch (InterruptedException e) {
                         throw e
@@ -1092,7 +1092,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         'triggerType': env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge",
                     ]
 
-                    launchJob("/LLM/helpers/BuildDockerImages", false, globalVars, "x86_64", additionalParameters)
+                    launchJob("/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
                 }
             }
         }
