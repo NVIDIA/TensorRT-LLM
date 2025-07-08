@@ -16,6 +16,7 @@
 import csv
 import os
 import re
+import time
 from pathlib import Path
 
 import pytest
@@ -637,9 +638,12 @@ def test_llm_gpt3_175b_96layers_build_only(gpt_example_root, llm_venv,
                          ids=["parallel_build", "serial_build"])
 def test_llm_gpt3_175b_1node_8gpus(gpt_example_root, llm_venv, engine_dir,
                                    use_attention_plugin, use_gemm_plugin,
-                                   context_fmha, parallel_build):
+                                   context_fmha, parallel_build,
+                                   timeout_from_marker):
     "Build & Run GPT-3 175B: 96 layer w/ plugins"
     dtype = 'float16'
+    remaining_timeout = timeout_from_marker
+    convert_start = time.time()
     convert_cmd = [
         f"{gpt_example_root}/../../../generate_checkpoint_config.py",
         f"--output_path={engine_dir}/ckpt_config.json",
@@ -647,9 +651,14 @@ def test_llm_gpt3_175b_1node_8gpus(gpt_example_root, llm_venv, engine_dir,
         "--num_hidden_layers=96", "--num_attention_heads=96",
         "--hidden_size=12288", "--vocab_size=51200", "--tp_size=8"
     ]
-    venv_check_call(llm_venv, convert_cmd)
+    venv_check_call(llm_venv, convert_cmd, timeout=remaining_timeout)
+    convert_time = time.time() - convert_start
+    remaining_timeout -= convert_time
+    if remaining_timeout <= 0:
+        raise TimeoutError("Timeout exceeded after convert phase!")
 
     print("Building engines...")
+    build_start = time.time()
     build_cmd = [
         "trtllm-build",
         f"--model_config={engine_dir}/ckpt_config.json",
@@ -677,7 +686,14 @@ def test_llm_gpt3_175b_1node_8gpus(gpt_example_root, llm_venv, engine_dir,
     if parallel_build:
         build_cmd.extend(["--workers=8"])
 
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+    check_call(" ".join(build_cmd),
+               shell=True,
+               env=llm_venv._new_env,
+               timeout=remaining_timeout)
+    build_time = time.time() - build_start
+    remaining_timeout -= build_time
+    if remaining_timeout <= 0:
+        raise TimeoutError("Timeout exceeded after build phase!")
 
     print('Run gpt3-175b...')
     venv_mpi_check_call(
@@ -685,7 +701,8 @@ def test_llm_gpt3_175b_1node_8gpus(gpt_example_root, llm_venv, engine_dir,
         ["mpirun", "--allow-run-as-root", "--oversubscribe", "-np", "8"], [
             f"{gpt_example_root}/../../../run.py", "--max_output_len=8",
             f"--engine_dir={engine_dir}", "--no_add_special_tokens"
-        ])
+        ],
+        timeout=remaining_timeout)
 
 
 @pytest.mark.parametrize("per_token_channel", [True, False],
