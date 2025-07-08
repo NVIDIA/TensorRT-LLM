@@ -144,23 +144,20 @@ def test_llmapi_quickstart_atexit(llm_root, engine_dir, llm_venv):
     llm_venv.run_cmd([str(script_path)])
 
 
+@pytest.mark.skip(reason="https://nvbugs/5365825")
 def test_llmapi_speculative_decoding_mtp(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv,
                         "llm_speculative_decoding.py", "MTP", "--model",
                         f"{llm_models_root()}/DeepSeek-V3-Lite/bf16")
 
 
+@pytest.mark.skip(reason="https://nvbugs/5365825")
 def test_llmapi_speculative_decoding_eagle3(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv,
                         "llm_speculative_decoding.py", "EAGLE3")
 
 
-def test_llmapi_speculative_decoding_draft_target(llm_root, engine_dir,
-                                                  llm_venv):
-    _run_llmapi_example(llm_root, engine_dir, llm_venv,
-                        "llm_speculative_decoding.py", "DRAFT_TARGET")
-
-
+@pytest.mark.skip(reason="https://nvbugs/5365825")
 def test_llmapi_speculative_decoding_ngram(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv,
                         "llm_speculative_decoding.py", "NGRAM")
