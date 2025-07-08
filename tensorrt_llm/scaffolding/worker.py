@@ -85,8 +85,6 @@ class OpenaiWorker(Worker):
                               [task.presence_penalty])
         add_param_if_not_none(params, "seed", [task.seed])
         add_param_if_not_none(params, "stop", [task.stop])
-        add_param_if_not_none(params, "stream", [task.stream])
-        add_param_if_not_none(params, "stream_options", [task.stream_options])
         add_param_if_not_none(params, "suffix", [task.suffix])
         add_param_if_not_none(params, "temperature", [task.temperature])
         add_param_if_not_none(params, "top_p", [task.top_p])
@@ -189,14 +187,16 @@ class TRTLLMWorker(Worker):
     async def generation_handler(self, task: GenerationTask) -> TaskStatus:
         sampling_params = self.convert_task_params(task)
 
-        result = await self.llm.generate_async(task.input_str,
-                                               sampling_params=sampling_params)
-
-        task.output_tokens = result.outputs[0].token_ids
-        task.cumulative_logprob = result.outputs[0].cumulative_logprob
-        task.logprobs = result.outputs[0].logprobs
-        task.output_str = result.outputs[0].text
-        task.context_logits = result.context_logits
+        # If the task is streaming, we will return result directly for
+        # async iteration outside. Otherwise, we will wait.
+        if task.streaming:
+            result = self.llm.generate_async(task.input_str,
+                                             sampling_params=sampling_params,
+                                             streaming=True)
+        else:
+            result = await self.llm.generate_async(
+                task.input_str, sampling_params=sampling_params)
+        task.result = result
 
         # TODO: error handle
         return TaskStatus.SUCCESS

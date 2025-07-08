@@ -15,7 +15,7 @@ generation_servers:
   tensor_parallel_size: 2
   pipeline_parallel_size: 1
   cuda_graph_config:
-    enable_padding: False
+    padding_enabled: False
   disable_overlap_scheduler: False
   urls:
       - "localhost:8002"

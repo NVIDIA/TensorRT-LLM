@@ -71,7 +71,7 @@ class CudaGraphConfig(BaseModel):
     max_batch_size: int = Field(
         default=0, description="Maximum batch size for CUDA graphs.")
 
-    enable_padding: bool = Field(
+    padding_enabled: bool = Field(
         default=False,
         description=
         "If true, batches are rounded up to the nearest cuda_graph_batch_size. This is usually a net win for performance."
@@ -1853,17 +1853,17 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @staticmethod
     def _generate_cuda_graph_batch_sizes(max_batch_size: int,
-                                         enable_padding: bool) -> List[int]:
+                                         padding_enabled: bool) -> List[int]:
         """Generate a list of batch sizes for CUDA graphs.
 
         Args:
             max_batch_size: Maximum batch size to generate up to
-            enable_padding: Whether padding is enabled, which affects the batch size distribution
+            padding_enabled: Whether padding is enabled, which affects the batch size distribution
 
         Returns:
             List of batch sizes to create CUDA graphs for
         """
-        if enable_padding:
+        if padding_enabled:
             batch_sizes = [1, 2, 4] + [i * 8 for i in range(1, 17)]
         else:
             batch_sizes = list(range(1, 32)) + [32, 64, 128]
@@ -1901,7 +1901,7 @@ class TorchLlmArgs(BaseLlmArgs):
             config.batch_sizes = sorted(config.batch_sizes)
             if config.max_batch_size != 0:
                 if config.batch_sizes != self._generate_cuda_graph_batch_sizes(
-                        config.max_batch_size, config.enable_padding):
+                        config.max_batch_size, config.padding_enabled):
                     raise ValueError(
                         "Please don't set both cuda_graph_config.batch_sizes "
                         "and cuda_graph_config.max_batch_size.\n"
@@ -1913,7 +1913,7 @@ class TorchLlmArgs(BaseLlmArgs):
         else:
             max_batch_size = config.max_batch_size or 128
             generated_sizes = self._generate_cuda_graph_batch_sizes(
-                max_batch_size, config.enable_padding)
+                max_batch_size, config.padding_enabled)
             config.batch_sizes = generated_sizes
             config.max_batch_size = max_batch_size
 
@@ -1932,9 +1932,9 @@ class TorchLlmArgs(BaseLlmArgs):
             cuda_graph_max_batch_size=self.cuda_graph_config.max_batch_size
             if self.cuda_graph_config else
             CudaGraphConfig.model_fields['max_batch_size'].default,
-            cuda_graph_padding_enabled=self.cuda_graph_config.enable_padding
+            cuda_graph_padding_enabled=self.cuda_graph_config.padding_enabled
             if self.cuda_graph_config else
-            CudaGraphConfig.model_fields['enable_padding'].default,
+            CudaGraphConfig.model_fields['padding_enabled'].default,
             disable_overlap_scheduler=self.disable_overlap_scheduler,
             moe_max_num_tokens=self.moe_max_num_tokens,
             moe_load_balancer=self.moe_load_balancer,

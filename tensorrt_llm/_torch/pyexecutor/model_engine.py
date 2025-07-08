@@ -309,7 +309,7 @@ def get_rank_model_storage(model):
 def _filter_cuda_graph_batch_sizes(cuda_graph_batch_sizes: list[int],
                                    max_batch_size: int, max_num_tokens: int,
                                    max_draft_len: int,
-                                   enable_padding: bool) -> list[int]:
+                                   padding_enabled: bool) -> list[int]:
     # This is the largest possible batch size for a pure decoding batch.
     max_cuda_graph_bs = min(max_batch_size,
                             int(max_num_tokens / (1 + max_draft_len)))
@@ -326,8 +326,8 @@ def _filter_cuda_graph_batch_sizes(cuda_graph_batch_sizes: list[int],
             # is that if the user is OK padding to a batch size B, they should also
             # be OK with padding to some size B' < B since the performance will generally
             # just be better in the smaller case.
-            if enable_padding and (i == 0
-                                   or result[i - 1] != max_cuda_graph_bs):
+            if padding_enabled and (i == 0
+                                    or result[i - 1] != max_cuda_graph_bs):
                 logger.warning(
                     "CUDA graph padding is enabled, but one of the given CUDA graph "
                     f"batch sizes ({bs}) is larger than the executor's max batch size "
