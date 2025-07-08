@@ -57,10 +57,16 @@ SHUTDOWN_REQUEST_ID = -1
 class RequestQueueItem:
     id: int
     request: Optional[ExecutorRequest] = None
+    is_canceled_request: bool = False
     query: Optional[list] = None  # only used in `StarAttention`
 
+    @property
     def is_shutdown_request(self):
         return self.id == SHUTDOWN_REQUEST_ID
+
+    @property
+    def is_normal_request(self):
+        return not (self.is_shutdown_request or self.is_canceled_request)
 
 
 def _get_from_request_queue(request_queue,
@@ -78,7 +84,7 @@ def _get_from_request_queue(request_queue,
             while req_count < max_req_count:
                 queue_item = request_queue.get_nowait()
                 items.append(queue_item)
-                if not queue_item.is_shutdown_request():
+                if not queue_item.is_normal_request:
                     req_count += 1
     except queue.Empty:
         pass
@@ -368,7 +374,12 @@ class PyExecutor:
         Args:
             id (int): The request id for which to cancel the response
         """
-        self.canceled_req_ids.insert(id)
+        try:
+            self.enqueue_lock.acquire()
+            self.request_queue.put(
+                RequestQueueItem(id, is_canceled_request=True))
+        finally:
+            self.enqueue_lock.release()
 
     def shutdown(self):
         """
@@ -839,7 +850,7 @@ class PyExecutor:
                 if previous_batch is not None:
                     with torch.cuda.nvtx.range("_handle_previous_batch_pp"):
                         self._update_requests(previous_batch.sample_state)
-                        self._handle_cancelled_requests()
+                        self._handle_canceled_requests()
                         finished_requests = self._handle_responses()
                         previous_scheduled_batch = previous_batch.sample_state.scheduled_requests
                         self.resource_manager.update_resources(
@@ -949,7 +960,7 @@ class PyExecutor:
                         for req in ctx_transmission_reqs:
                             req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
 
-                    self._handle_cancelled_requests()
+                    self._handle_canceled_requests()
                     finished_requests = self._handle_responses()
                     self.resource_manager.update_resources(scheduled_batch)
                     if self.enable_kv_cache_events:
@@ -1122,7 +1133,7 @@ class PyExecutor:
             for req in self.previous_batch.ctx_transmission_reqs:
                 req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
 
-        self._handle_cancelled_requests()
+        self._handle_canceled_requests()
         finished_requests = self._handle_responses()
         scheduled_requests = self.previous_batch.sample_state.scheduled_requests
         self.resource_manager.update_resources(scheduled_requests)
@@ -1219,17 +1230,14 @@ class PyExecutor:
             new_requests, py_request_objects = self._broadcast_new_requests(
                 new_requests, py_request_objects)
 
-        #TODO: properly handle canceled ids in pp case
-        if self.dist.has_tp:
-            self.canceled_req_ids = self.dist.broadcast(self.canceled_req_ids,
-                                                        root=0)
-
         # drop requests arriving after shutdown
         valid_new_requests = []
         for req_item in new_requests:
-            if req_item.is_shutdown_request():
+            if req_item.is_shutdown_request:
                 self.is_shutdown = True
                 break
+            elif req_item.is_canceled_request:
+                self.canceled_req_ids.insert(req_item.id)
             else:
                 valid_new_requests.append(req_item)
         # Check if the beam width of the requests is equal to the max_beam_width
@@ -1337,7 +1345,7 @@ class PyExecutor:
         """
         req_id_to_obj = {}
         for item in requests:
-            if item.is_shutdown_request():
+            if not item.is_normal_request:
                 continue
             obj = getattr(item.request, attribute_name, None)
             if obj is not None:
@@ -1919,8 +1927,8 @@ class PyExecutor:
     def _terminate_request(self, request: LlmRequest):
         self.resource_manager.free_resources(request)
 
-    @nvtx_range("_handle_cancelled_requests")
-    def _handle_cancelled_requests(self):
+    @nvtx_range("_handle_canceled_requests")
+    def _handle_canceled_requests(self):
         if len(self.canceled_req_ids) == 0:
             return
 
