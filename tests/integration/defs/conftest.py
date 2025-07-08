@@ -2354,10 +2354,7 @@ def tritonserver_test_root(llm_root):
 
 
 @pytest.fixture
-def timeout_from_marker(request):
-    """Extract timeout value from the timeout marker if it exists."""
-    timeout_marker = request.node.get_closest_marker("timeout")
-    timeout = None
-    if timeout_marker and timeout_marker.args:
-        timeout = timeout_marker.args[0]
-    return timeout
+def timeout_manager(timeout_from_marker):
+    """Create a TimeoutManager instance from timeout_from_marker fixture."""
+    from defs.utils.timeout_manager import TimeoutManager
+    return TimeoutManager(timeout_from_marker)
