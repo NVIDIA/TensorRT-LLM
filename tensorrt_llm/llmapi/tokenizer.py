@@ -20,9 +20,8 @@ class TransformersTokenizer(TokenizerBase):
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
         self._all_special_tokens_set = set(self.tokenizer.all_special_tokens)
-        self.hf_decode_stream = None
-        self.stream_interval_threshold = int(
-            os.getenv("TLLM_STREAM_INTERVAL_THRESHOLD", "32"))
+        self._disable_hf_decode_incrementally = os.getenv(
+            "TLLM_DISABLE_HF_DECODE_INCREMENTALLY", "0") == "1"
 
     def __call__(self, text: str, *args, **kwargs) -> Any:
         return self.tokenizer(text, *args, **kwargs)
@@ -129,7 +128,7 @@ class TransformersTokenizer(TokenizerBase):
             *,
             flush: bool = False,
             skip_special_tokens: bool = False,
-            clean_up_tokenization_spaces: bool = None,
+            clean_up_tokenization_spaces: Optional[bool] = None,
             spaces_between_special_tokens: bool = True) -> Tuple[str, dict]:
         """Incremental detokenization, typically used for streaming generation.
 
@@ -146,16 +145,39 @@ class TransformersTokenizer(TokenizerBase):
             text, states (Tuple[str, dict]): text is the current decoded text, states is the current incremental detokenization states.
             They should be passed to next incremental detokenization iteration, if any.
         """
+        # HF incremental detokenization implementation is faster than TRTLLM
+        # when stream_interval is smaller.
+        if self._disable_hf_decode_incrementally:
+            return self.trtllm_decode_incrementally(
+                token_ids,
+                prev_text,
+                states,
+                flush=flush,
+                skip_special_tokens=skip_special_tokens,
+                clean_up_tokenization_spaces=clean_up_tokenization_spaces,
+                spaces_between_special_tokens=spaces_between_special_tokens)
+        else:
+            return self.hf_decode_incrementally(
+                token_ids,
+                prev_text,
+                states,
+                skip_special_tokens=skip_special_tokens,
+                clean_up_tokenization_spaces=clean_up_tokenization_spaces)
+
+    def trtllm_decode_incrementally(
+            self,
+            token_ids: List[int],
+            prev_text: Optional[str] = None,
+            states: Optional[dict] = None,
+            *,
+            flush: bool = False,
+            skip_special_tokens: bool = False,
+            clean_up_tokenization_spaces: Optional[bool] = None,
+            spaces_between_special_tokens: bool = True) -> Tuple[str, dict]:
         # Adapted from
         # https://github.com/vllm-project/vllm/blob/v0.6.3/vllm/transformers_utils/detokenizer.py#L238
         if prev_text is None:
             prev_text = ""
-
-        # HF incremental detokenization implementation is faster than TRTLLM
-        # when stream_interval is smaller.
-        if len(token_ids) < self.stream_interval_threshold:
-            return self.hf_decode_incrementally(token_ids, prev_text,
-                                                skip_special_tokens)
 
         if states is None:
             states = {}
@@ -193,24 +215,39 @@ class TransformersTokenizer(TokenizerBase):
             curr_new_text = self.clean_up_tokenization(curr_new_text)
         return prev_text + curr_new_text, {'last_new_tokens': pending_tokens}
 
-    @nvtx_range_debug("hf_decode_incrementally")
-    def hf_decode_incrementally(self,
-                                token_ids: List[int],
-                                prev_text: Optional[str] = "",
-                                skip_special_tokens: bool = False) -> str:
-        if self.hf_decode_stream is None:
-            # Lazy initialize DecodeStream since it requires skip_special_tokens
-            self.hf_decode_stream = DecodeStream(
-                skip_special_tokens=skip_special_tokens)
+    def hf_decode_incrementally(
+        self,
+        token_ids: List[int],
+        prev_text: Optional[str] = None,
+        states: Optional[dict] = None,
+        *,
+        skip_special_tokens: bool = False,
+        clean_up_tokenization_spaces: Optional[bool] = None
+    ) -> Tuple[str, dict]:
+        if states is None:
+            states = {
+                'decode_stream':
+                DecodeStream(skip_special_tokens=skip_special_tokens)
+            }
+
+        decode_stream = states.get('decode_stream')
 
         results = []
         for token_id in token_ids:
-            result = self.hf_decode_stream.step(self.tokenizer._tokenizer,
-                                                token_id)
+            result = decode_stream.step(self.tokenizer._tokenizer, token_id)
             if result is not None:
                 results.append(result)
 
-        return prev_text + "".join(results), None
+        curr_new_text = "".join(results)
+        if clean_up_tokenization_spaces is None:
+            clean_up_tokenization_spaces = self.clean_up_tokenization_spaces
+        if clean_up_tokenization_spaces:
+            curr_new_text = self.clean_up_tokenization(curr_new_text)
+
+        if prev_text is None:
+            return curr_new_text.lstrip(), states
+        else:
+            return prev_text + curr_new_text, states
 
 
 def tokenizer_factory(obj: Optional[Union[str, Path, PreTrainedTokenizerBase,

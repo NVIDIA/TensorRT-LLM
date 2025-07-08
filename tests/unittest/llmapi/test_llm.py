@@ -363,22 +363,31 @@ def test_llm_with_kv_cache_retention_config():
         print(output)
 
 
-@pytest.mark.skip(reason="https://nvbugs/5370718")
+@pytest.mark.parametrize('disable_hf_decode_incrementally', [False, True])
 @pytest.mark.parametrize(
-    'tokenizer_dir, threshold',
+    'tokenizer_dir, clean_up_tokenization_spaces, threshold',
     [
-        (get_model_path('gpt2'), 0.95),  # BPE
-        (get_model_path('bert/bert-base-uncased'), 0.95),  # WordPiece
-        (get_model_path('t5-small'), 0.95),  # SentencePiece
-        (get_model_path('starcoder2-3b'), 0.95),
-        (get_model_path('falcon-7b-instruct'), 0.95),
-        (get_model_path('llama-models-v2/llama-v2-7b-hf'), 0.95),
-        (get_model_path('codellama/CodeLlama-7b-Instruct-hf'), 0.95),
-        (llama_model_path, 0.95),
-        (get_model_path(mixtral_model_name), 0.95)
+        (get_model_path('gpt2'), False, 0.95),  # BPE
+        (get_model_path('bert/bert-base-uncased'), True, 0.95),  # WordPiece
+        (get_model_path('t5-small'), True, 0.95),  # SentencePiece
+        (get_model_path('starcoder2-3b'), False, 0.95),
+        (get_model_path('falcon-7b-instruct'), False, 0.95),
+        (get_model_path('llama-models-v2/llama-v2-7b-hf'), False, 0.95),
+        (get_model_path('codellama/CodeLlama-7b-Instruct-hf'), False, 0.95),
+        (llama_model_path, False, 0.95),
+        (get_model_path(mixtral_model_name), False, 0.95),
+        (get_model_path('llama-3.1-model/Meta-Llama-3.1-8B'), False, 0.95),
+        (get_model_path('DeepSeek-R1/DeepSeek-R1'), False, 0.95)
     ])
 @pytest.mark.part0
-def test_tokenizer_decode_incrementally(tokenizer_dir: str, threshold: float):
+def test_tokenizer_decode_incrementally(tokenizer_dir: str,
+                                        clean_up_tokenization_spaces: bool,
+                                        threshold: float,
+                                        disable_hf_decode_incrementally: bool,
+                                        mocker):
+    if disable_hf_decode_incrementally:
+        mocker.patch.dict(os.environ,
+                          {"TLLM_DISABLE_HF_DECODE_INCREMENTALLY": "1"})
     random.seed(42)
 
     num_samples = 100
@@ -398,6 +407,7 @@ def test_tokenizer_decode_incrementally(tokenizer_dir: str, threshold: float):
                                                       truncation_side='left',
                                                       trust_remote_code=True,
                                                       use_fast=True)
+    assert tokenizer._disable_hf_decode_incrementally == disable_hf_decode_incrementally
 
     num_perfect = 0
     for text in dataset:
@@ -410,8 +420,7 @@ def test_tokenizer_decode_incrementally(tokenizer_dir: str, threshold: float):
             decoded_text, states = tokenizer.decode_incrementally(
                 [token_ids[i]], decoded_text, states)
 
-        if tokenizer_dir.endswith(
-                'bert-base-uncased') and tokenizer.clean_up_tokenization_spaces:
+        if clean_up_tokenization_spaces and tokenizer.clean_up_tokenization_spaces:
             decoded_text = tokenizer.clean_up_tokenization(decoded_text)
         reference = tokenizer.decode(token_ids)
         if decoded_text == reference:
