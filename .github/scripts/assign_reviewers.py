@@ -99,31 +99,61 @@ def map_modules(changed_files: list[str],
 
 
 def gather_reviewers(
-        modules: set[str],
-        module_owners: dict[str, list[str]],
-        *,
-        pr_author: str | None = None,
-        existing_reviewers: set[str] | None = None
-) -> tuple[list[str], set[str]]:
-    """Gather reviewers and return both reviewers and modules without owners"""
-    reviewers: set[str] = set()
+    modules: set[str],
+    module_owners: dict[str, list[str]],
+    *,
+    pr_author: str | None = None,
+    existing_reviewers: set[str] | None = None,
+    per_module_limit: int = 2
+) -> tuple[list[str], dict[str, list[str]], set[str]]:
+    """
+    Gather reviewers ensuring each module gets representation.
+
+    Args:
+        modules: Set of module names that were touched
+        module_owners: Dict mapping module names to lists of owners
+        pr_author: PR author to exclude from reviewers
+        existing_reviewers: Set of already assigned reviewers to exclude
+        per_module_limit: Maximum reviewers to assign per module
+
+    Returns:
+        - List of all unique reviewers to assign
+        - Dict mapping modules to their assigned reviewers
+        - Set of modules without owners
+    """
+    all_reviewers: set[str] = set()
+    module_assignments: dict[str, list[str]] = {}
     modules_without_owners: set[str] = set()
 
-    for module in modules:
+    for module in sorted(modules):  # Sort for consistent ordering
         owners = module_owners.get(module, [])
-        if owners:
-            reviewers.update(owners)
-        else:
+        if not owners:
             modules_without_owners.add(module)
+            module_assignments[module] = []
+            continue
 
-    if pr_author:
-        reviewers.discard(pr_author)
+        # Filter out PR author and existing reviewers
+        eligible_owners = [
+            o for o in owners if o != pr_author and (
+                not existing_reviewers or o not in existing_reviewers)
+        ]
 
-    # Remove existing reviewers to avoid duplicate assignments
-    if existing_reviewers:
-        reviewers -= existing_reviewers
+        if not eligible_owners:
+            # All owners are excluded
+            print(
+                f"  ⚠️  Module '{module}': All owners excluded (PR author or already assigned)"
+            )
+            module_assignments[module] = []
+            continue
 
-    return sorted(reviewers), modules_without_owners
+        # Sample up to per_module_limit reviewers for this module
+        num_to_select = min(len(eligible_owners), per_module_limit)
+        selected = random.sample(eligible_owners, num_to_select)
+
+        module_assignments[module] = selected
+        all_reviewers.update(selected)
+
+    return sorted(all_reviewers), module_assignments, modules_without_owners
 
 
 def main() -> None:
@@ -141,10 +171,11 @@ def main() -> None:
     args = parser.parse_args()
 
     pr_number = os.environ["PR_NUMBER"]
-    reviewer_limit = int(os.environ.get("REVIEWER_LIMIT", "0"))
+    per_module_limit = int(os.environ.get("PER_MODULE_REVIEWER_LIMIT", "2"))
     pr_author = os.environ.get("PR_AUTHOR")
 
     print(f"Testing PR #{pr_number} with author: {pr_author}")
+    print(f"Per-module reviewer limit: {per_module_limit}")
 
     # Check existing reviewers
     existing_user_reviewers, existing_team_reviewers = get_existing_reviewers(
@@ -170,19 +201,26 @@ def main() -> None:
         module_owners = load_json(Path(".github") / "module-owners.json")
 
         modules, unmapped_files = map_modules(changed_files, module_paths)
-        reviewers, modules_without_owners = gather_reviewers(
+        reviewers, module_assignments, modules_without_owners = gather_reviewers(
             modules,
             module_owners,
             pr_author=pr_author,
             existing_reviewers=
-            existing_user_reviewers  # Avoid re-assigning existing users
-        )
+            existing_user_reviewers,  # Avoid re-assigning existing users
+            per_module_limit=per_module_limit)
 
-        if reviewer_limit and len(reviewers) > reviewer_limit:
-            reviewers = random.sample(reviewers, reviewer_limit)
+        print(f"\nChanged modules: {sorted(modules)}")
 
-        print(f"Changed modules: {sorted(modules)}")
-        print(f"Potential reviewers: {reviewers}")
+        # Show module-specific assignments
+        if module_assignments:
+            print("\nModule assignments:")
+            for module, assigned in sorted(module_assignments.items()):
+                if assigned:
+                    print(f"  {module}: {assigned}")
+                else:
+                    print(f"  {module}: No eligible reviewers")
+
+        print(f"\nFinal reviewers to assign: {reviewers}")
 
         # Provide detailed feedback about coverage gaps
         if unmapped_files:
