@@ -1423,6 +1423,8 @@ def llama_v2_7b_prompt_adapter_test_harness(**llm_kwargs):
         sampling_params,
         prompt_adapter_request=[None, pa_req, None, pa_req, None, pa_req])
     for output, ref in zip(outputs, references):
+        # Currently, the 5th request may have non-deterministic outputs.
+        # Let the test pass if the generation output matches any of the candidate references.
         assert any(similar(output.outputs[0].text, r) for r in ref)
 
 
