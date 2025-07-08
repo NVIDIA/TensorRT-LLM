@@ -368,4 +368,4 @@ async def test_completion_streaming(async_client: openai.AsyncOpenAI,
         assert isinstance(chunk.choices[0].token_ids, list)
         tokens.extend(chunk.choices[0].token_ids)
 
-    assert tokens == single_output    
+    assert tokens == single_output
