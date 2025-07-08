@@ -64,14 +64,14 @@ def _test_allreduce_fusion(port: int):
     original_outputs, residual_original = gm(x, residual)
 
     # Fuse ops
-    gm_fused = fuse_allreduce_residual_rmsnorm(gm)
+    fuse_allreduce_residual_rmsnorm(gm)
 
     # Run the fused graph
-    fused_outputs, residual_fused = gm_fused(x, residual)
+    fused_outputs, residual_fused = gm(x, residual)
 
     # Check if fused node in the graph
     has_fused_node = False
-    for node in gm_fused.graph.nodes:
+    for node in gm.graph.nodes:
         if is_op(node, torch.ops.dist.fused_allreduce_residual_rmsnorm):
             has_fused_node = True
     assert has_fused_node, "Fused node not found."
@@ -85,8 +85,8 @@ def _test_allreduce_fusion(port: int):
     )
 
     # check if we can still export the model as expected
-    torch_export(gm_fused, args=args)
-    torch_export_to_gm(gm_fused, args=args)
+    torch_export(gm, args=args)
+    torch_export_to_gm(gm, args=args)
 
 
 @pytest.mark.parametrize("device_count", get_device_counts())
