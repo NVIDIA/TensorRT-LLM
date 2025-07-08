@@ -67,9 +67,9 @@ class DummyModelEngine(PyTorchModelEngine):
         mapping = Mapping(world_size=tensorrt_llm.mpi_world_size(),
                           tp_size=tensorrt_llm.mpi_world_size(),
                           rank=tensorrt_llm.mpi_rank())
-        super().__init__("",
-                         pytorch_backend_config,
-                         batch_size,
+        super().__init__(model_path="",
+                         pytorch_backend_config=pytorch_backend_config,
+                         batch_size=batch_size,
                          max_seq_len=max_seq_len,
                          mapping=mapping)
 

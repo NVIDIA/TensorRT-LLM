@@ -1,6 +1,7 @@
+import importlib.metadata
 import math
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -8,6 +9,7 @@ import torch
 import torch.export as te
 import torch.nn as nn
 import torch.nn.functional as F
+from packaging import version
 from torch import fx
 from torch.utils._sympy.value_ranges import ValueRanges
 
@@ -230,6 +232,63 @@ def _torch_modulelist_getitem_patch(self: nn.ModuleList, idx):
 _torch_modulelist_getitem_patch.getitem_original = nn.ModuleList.__getitem__
 
 
+def _torch_tensor_patch(data, **kwargs):
+    """Patch torch.tensor to handle 0.0 on meta device.
+
+    ``torch.tensor(0.0, device="meta")`` does not work and hence we are patching it to use
+    ``torch.zeros((), device="meta")`` instead, which is equivalent.
+    """
+    device = kwargs.get("device", None)
+    if data == 0.0 and device is not None and torch.device(device) == torch.device("meta"):
+        return torch.zeros((), **kwargs)
+    return _torch_tensor_patch.tensor_original(data, **kwargs)
+
+
+_torch_tensor_patch.tensor_original = torch.tensor
+
+
+def _transformers_version() -> str:
+    """Get the version of transformers."""
+    return version.parse(importlib.metadata.version("transformers")).base_version
+
+
+# TODO (@lucaslie): https://github.com/NVIDIA/TensorRT-LLM/issues/5728
+# not great that this patch is here but it's the least invasisve change until we make headway on the
+# above issue.
+@contextmanager
+def _transformers_sdpa_mask_patch():
+    """Patch transformers.masking_utils.sdpa_mask to be export-compatible."""
+    # this patch is only needed+compatible for transformers >= 4.53.0
+    if version.parse(_transformers_version()) < version.parse("4.53.0"):
+        yield  # Just yield without doing anything (like nullcontext)
+        return
+
+    # imports only after version check
+    from transformers import masking_utils
+    from transformers.integrations.executorch import sdpa_mask_without_vmap
+
+    # recall original implementation
+    sdpa_mask_original = masking_utils.sdpa_mask
+
+    # patch function and mask attention interface
+    masking_utils.sdpa_mask = sdpa_mask_without_vmap
+    if "sdpa" in masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._local_mapping:
+        sdpa_local_original = masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._local_mapping["sdpa"]
+    else:
+        sdpa_local_original = None
+    masking_utils.ALL_MASK_ATTENTION_FUNCTIONS["sdpa"] = sdpa_mask_without_vmap
+
+    try:
+        yield
+    finally:
+        # revert patches
+        masking_utils.sdpa_mask = sdpa_mask_original
+        if sdpa_local_original is None:
+            del masking_utils.ALL_MASK_ATTENTION_FUNCTIONS["sdpa"]
+        else:
+            masking_utils.ALL_MASK_ATTENTION_FUNCTIONS["sdpa"] = sdpa_local_original
+
+
 def add_missing_load_hooks(gm: fx.GraphModule, model: nn.Module) -> fx.GraphModule:
     """Adds back the state dict load hooks stripped away during export."""
     hooks = {
@@ -356,24 +415,29 @@ def torch_export_to_gm(
     torch.autocast = lambda *args, **kwargs: nullcontext()
     torch.nn.attention.sdpa_kernel = lambda *args, **kwargs: nullcontext()
 
-    with lift_to_meta(model) as state_dict:
-        # clean up args, kwargs and move to correct device
-        args, kwargs = tree_to((args, kwargs or {}), device="meta")
+    # patch torch.tensor to handle 0.0 on meta device
+    torch.tensor = _torch_tensor_patch
 
-        # NOTE: we always export in non-strict mode for now as it relaxes some
-        # assumptions around tracing. Strict mode uses torchdynamo (symbolic bytecode analysis),
-        # which can be brittle since it relies on the exact bytecode representation of the model.
-        # see here as well: https://pytorch.org/docs/stable/export.html#non-strict-export
-        export_kwargs["strict"] = False
+    # run export with sdpa masking patch and lifted to meta
+    with _transformers_sdpa_mask_patch():
+        with lift_to_meta(model) as state_dict:
+            # clean up args, kwargs and move to correct device
+            args, kwargs = tree_to((args, kwargs or {}), device="meta")
 
-        # run export and extract graph module
-        egm: fx.GraphModule = torch_export(model, args, kwargs, **export_kwargs).module()
+            # NOTE: we always export in non-strict mode for now as it relaxes some
+            # assumptions around tracing. Strict mode uses torchdynamo (symbolic bytecode analysis),
+            # which can be brittle since it relies on the exact bytecode representation of the model
+            # see here as well: https://pytorch.org/docs/stable/export.html#non-strict-export
+            export_kwargs["strict"] = False
 
-        # load state_dict into egm
-        # NOTE: export might have removed unused params/buffers (hence we allow unexpected keys)
-        load_buffers_and_params(
-            egm, state_dict, strict_missing=True, strict_unexpected=False, clone=clone
-        )
+            # run export and extract graph module
+            egm: fx.GraphModule = torch_export(model, args, kwargs, **export_kwargs).module()
+
+            # load state_dict into egm
+            # NOTE: export might have removed unused params/buffers (hence we allow unexpected keys)
+            load_buffers_and_params(
+                egm, state_dict, strict_missing=True, strict_unexpected=False, clone=clone
+            )
 
     # revert sdpa back to original
     F.scaled_dot_product_attention = sdpa_original
@@ -390,6 +454,9 @@ def torch_export_to_gm(
     # revert autocast/sdpa back to original
     torch.autocast = autocast_original
     torch.nn.attention.sdpa_kernel = sdpa_kernel_original
+
+    # revert torch.tensor patch
+    torch.tensor = _torch_tensor_patch.tensor_original
 
     # Export strips away all methods not traced during forward. The model could have
     # load hooks that contain logic for correct state_dict loading. We need to add those

@@ -42,7 +42,7 @@ namespace tc = tensorrt_llm::common;
 namespace tk = tensorrt_llm::kernels;
 namespace trk = tensorrt_llm::runtime::kernels;
 
-using PackedFloat = moe::dev::routingRenormalize::PackedScoreIdx<float>;
+using PackedFloat = moe::dev::routing::PackedScoreIdx<float>;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -197,7 +197,7 @@ inline bool isClose(T* hostData, T* hostTest, int n, std::string const& name, fl
 
 inline auto comp = [](PackedFloat const& a, PackedFloat const& b)
 {
-    return ((a.score > b.score) || (a.score == b.score && a.idx > b.idx)); //@TODO: check if this is correct
+    return ((a.score > b.score) || (a.score == b.score && a.idx < b.idx)); //@TODO: check if this is correct
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -326,7 +326,7 @@ public:
     void runTest(RoutingKernelTestParam const& param);
 
 protected:
-    using PackedType = moe::dev::routingRenormalize::PackedScoreIdx<T>;
+    using PackedType = moe::dev::routing::PackedScoreIdx<T>;
 
     virtual size_t getDeviceWorkspaceSize(RoutingKernelTestParam const& param)
     {

@@ -189,9 +189,9 @@ private:
     void callTestedFunction(
         RoutingKernelTestParam const& param, tensorrt_llm::runtime::ITensor::SharedPtr& workspaceDevice) override
     {
-        moe::dev::routing::Data routingData;
+        moe::dev::routing::routingDeepSeek::Data routingData;
         setParams(param, routingData);
-        moe::dev::routing::run(routingData, mStream->get());
+        moe::dev::routing::routingDeepSeek::run(routingData, mStream->get());
     }
 
     void verifyExpertRoutingIndices(RoutingKernelTestParam const& param)

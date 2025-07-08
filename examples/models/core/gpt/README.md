@@ -44,7 +44,7 @@ The TensorRT-LLM GPT implementation can be found in [`tensorrt_llm/models/gpt/mo
 In addition, there are two shared files in the parent folder [`examples`](../../../) for inference and evaluation:
 
 * [`run.py`](../../../run.py) to run the inference on an input text;
-* [`summarize.py`](../../../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
+* [`summarize.py`](../../../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset.
 
 ## Support Matrix
   * FP16
@@ -222,7 +222,7 @@ Input [Text 0]: "Born in north-east France, Soyer trained as a"
 Output [Text 0 Beam 0]: " chef before moving to London in the early"
 ```
 
-The [`summarize.py`](../../../summarize.py) script can run the built engines to summarize the articles from the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
+The [`summarize.py`](../../../summarize.py) script can run the built engines to summarize the articles from the [cnn_dailymail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset.
 For each summary, the script can compute the
 [ROUGE](https://en.wikipedia.org/wiki/ROUGE_(metric)) scores and use the `ROUGE-1` score to validate the implementation.
 By passing `--test_trt_llm` flag, the script will evaluate TensorRT-LLM engines. You may also pass `--test_hf` flag to evaluate the HF model.
