@@ -3424,43 +3424,7 @@ static const struct TestMetaV2
 # The source code of paged context fmha kernels are not in this repo, but we have cubins for them.
 # Other kernels are for passing CI cases.
 def modify_cubin_header(cubin_header):
-    # for paged context fmha cases
-    target = "#ifndef EXCLUDE_SM_90"
-
-    first_addition = """extern unsigned char cubin_fmha_v2_flash_attention_bf16_64_128_S_qkv_192x128_tma_ws_sm90_cu_cubin[];
-extern unsigned char cubin_fmha_v2_flash_attention_bf16_64_128_S_q_paged_kv_192x128_tma_ws_sm90_cu_cubin[];"""
-
-    second_addition = """extern uint32_t cubin_fmha_v2_flash_attention_bf16_64_128_S_qkv_192x128_tma_ws_sm90_cu_cubin_len;
-extern uint32_t cubin_fmha_v2_flash_attention_bf16_64_128_S_q_paged_kv_192x128_tma_ws_sm90_cu_cubin_len;"""
-
-    third_addition = """{ DATA_TYPE_BF16, DATA_TYPE_BF16, 0, 64, 128, 192, 128, 0, 0, 0, kSM_90, cubin_fmha_v2_flash_attention_bf16_64_128_S_qkv_192x128_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_bf16_64_128_S_qkv_192x128_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_bf16_64_128_S_qkv_192x128_causal_tma_ws_sm90_kernel", 213248, 384, 64, 1, 0, false, true, true, true, false, false, false, false, nullptr},
-{ DATA_TYPE_BF16, DATA_TYPE_BF16, 0, 64, 128, 192, 128, 0, 0, 0, kSM_90, cubin_fmha_v2_flash_attention_bf16_64_128_S_q_paged_kv_192x128_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_bf16_64_128_S_q_paged_kv_192x128_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_bf16_64_128_S_q_paged_kv_192x128_causal_tma_ws_sm90_kernel", 213248, 384, 64, 1, 2, false, true, true, true, false, false, false, false, nullptr},"""
-
     result = cubin_header
-    offset = 0
-    pos = -1
-
-    def add_kernel_line(result, target, addition, pos, offset):
-        if pos == -1:
-            pos = result.find(target)
-        else:
-            pos = result.find(target, pos + len(target) + offset)
-        if pos != -1:
-            end_pos = result.find('\n', pos)
-            if end_pos == -1:
-                end_pos = len(result)
-            result = result[:end_pos + 1] + addition + result[end_pos:]
-            offset += len(addition)
-        return result, offset, pos
-
-    result, offset, pos = add_kernel_line(result, target, first_addition, pos,
-                                          offset)
-
-    result, offset, pos = add_kernel_line(result, target, second_addition, pos,
-                                          offset)
-
-    result, offset, pos = add_kernel_line(result, target, third_addition, pos,
-                                          offset)
 
     # for CI cases
     def add_kernel_line(result, target, addition):
