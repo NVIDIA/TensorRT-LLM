@@ -2,6 +2,9 @@
 import asyncio
 import signal
 import traceback
+import time
+import uuid
+            
 from contextlib import asynccontextmanager
 from datetime import datetime
 from http import HTTPStatus
@@ -102,6 +105,23 @@ class OpenAIServer:
             self.llm.shutdown()
 
         self.app = FastAPI(lifespan=lifespan)
+        
+        @self.app.middleware("http")
+        async def add_process_time_header(request: Request, call_next):
+            start_time = time.perf_counter()
+            request_id = request.headers.get('X-Request-ID')
+            if not request_id:
+                request_id = str(uuid.uuid4())
+
+            # Store in request.state if you want to access later in your endpoints
+            request.state.request_id = request_id
+
+            logger.info(f"Received request {request_id} at {start_time}")
+            response = await call_next(request)
+            end_time = time.perf_counter()
+            logger.info(f"Response started {request_id} at {end_time}")
+            response.headers["X-Request-ID"] = request_id
+            return response
 
         @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(_, exc):
@@ -229,6 +249,7 @@ class OpenAIServer:
                 pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
                 for pp_res in pp_results:
                     yield pp_res
+            logger.info(f"generation completed for request {raw_request.state.request_id}")
             yield "data: [DONE]\n\n"
             nvtx_mark("generation ends")
 
@@ -354,6 +375,7 @@ class OpenAIServer:
                     pp_result = request_output.outputs[0]._postprocess_result
                 for pp_res in pp_result:
                     yield pp_res
+            logger.info(f"generation completed for request {raw_request.state.request_id}")
             yield "data: [DONE]\n\n"
 
         async def create_completion_response(
@@ -452,5 +474,8 @@ class OpenAIServer:
                                 host=host,
                                 port=port,
                                 log_level="info",
-                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
+                                # log_config=None, #"info",
+                                access_log=False,
+                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
+                                use_colors=True)
         await uvicorn.Server(config).serve()

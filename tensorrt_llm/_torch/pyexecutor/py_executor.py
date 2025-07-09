@@ -50,6 +50,10 @@ PROFILE_RECORD_GC_ENV_VAR_NAME = "TLLM_PROFILE_RECORD_GC"
 # Set to a path to save detailed tracing of PyTorch operations.
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 
+# Environment variable to enable logging of individual engine forward step.
+# This can cause significant performance overhead.
+TLLM_LOG_ENGINE_FORWARD_STEP_ENV_VAR_NAME = "TLLM_LOG_ENGINE_FORWARD_STEP"
+
 SHUTDOWN_REQUEST_ID = -1
 
 
@@ -188,6 +192,7 @@ class PyExecutor:
             PROFILE_START_STOP_ENV_VAR_NAME)
         self.gc_nvtx_watcher_handle = _gc_nvtx_watcher()
         self.is_warmup = False  # During warmup, we don't enable the profiler
+        self.log_forward_step = os.environ.get(TLLM_LOG_ENGINE_FORWARD_STEP_ENV_VAR_NAME, "0") == "1"
 
         # related modules
         self.resource_manager = resource_manager
@@ -1626,7 +1631,8 @@ class PyExecutor:
     def _forward_step(self,
                       scheduled_requests,
                       new_tensors_device: Optional[SampleStateTensors] = None):
-
+        if self.log_forward_step:
+            logger.info(f"forward_step {len(scheduled_requests.context_requests)} ctx reqs, {len(scheduled_requests.generation_requests)} gen reqs")
         @nvtx_range(
             f"[Executor] _forward_step {self.model_engine.iter_counter}: {len(scheduled_requests.context_requests)} ctx reqs, {len(scheduled_requests.generation_requests)} gen reqs"
         )
@@ -1647,6 +1653,8 @@ class PyExecutor:
             outputs = forward(scheduled_requests, self.resource_manager,
                               new_tensors_device, gather_context_logits,
                               cache_indirection_buffer)
+            if self.log_forward_step:
+                logger.info(f"completed forward_step {len(scheduled_requests.context_requests)} ctx reqs, {len(scheduled_requests.generation_requests)} gen reqs")
             return outputs
         except Exception as e:
             traceback.print_exc()
