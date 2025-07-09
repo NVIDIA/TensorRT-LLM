@@ -60,8 +60,8 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("stream_interval", [4, 64],
                              ids=["stream_interval_4", "stream_interval_64"])
     def test_nvfp4_streaming(self, stream_interval):
-        # When stream_interval < 32, hf incremental detokenization is used.
-        # When stream_interval >= 32, trtllm implemented incremental detokenization is used.
+        # When stream_interval < TLLM_STREAM_INTERVAL_THRESHOLD, hf incremental detokenization is used.
+        # When stream_interval >= TLLM_STREAM_INTERVAL_THRESHOLD, trtllm implemented incremental detokenization is used.
         # The behavior is due to perf considerations, while both paths need to be tested.
         with LLM(f"{llm_models_root()}/nvfp4-quantized/Meta-Llama-3.1-8B",
                  stream_interval=stream_interval) as llm:

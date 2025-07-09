@@ -11,7 +11,7 @@ from ..logger import logger
 TLLM_INCREMENTAL_DETOKENIZATION_BACKEND = os.environ.get(
     "TLLM_INCREMENTAL_DETOKENIZATION_BACKEND", "HF")
 TLLM_STREAM_INTERVAL_THRESHOLD = int(
-    os.environ.get("TLLM_STREAM_INTERVAL_THRESHOLD", "32"))
+    os.environ.get("TLLM_STREAM_INTERVAL_THRESHOLD", "24"))
 try:
     from tokenizers.decoders import DecodeStream  # noqa
 except ImportError:
@@ -244,13 +244,11 @@ class TransformersTokenizer(TokenizerBase):
             }
 
         decode_stream = states.get('decode_stream')
-
-        results = []
-        for token_id in token_ids:
-            result = decode_stream.step(self.tokenizer._tokenizer, token_id)
-            if result is not None:
-                results.append(result)
-
+        results = [
+            result for tid in token_ids
+            if (result := decode_stream.step(self.tokenizer._tokenizer, tid)
+                ) is not None
+        ]
         curr_new_text = "".join(results)
         if clean_up_tokenization_spaces is None:
             clean_up_tokenization_spaces = self.clean_up_tokenization_spaces
