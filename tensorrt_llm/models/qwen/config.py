@@ -114,7 +114,7 @@ class QWenConfig(PretrainedConfig):
         hidden_act = getattr(hf_config, "hidden_act", "silu")
         if qwen_type == "qwen2_moe":
             hidden_act = "swiglu"
-        
+
         # Qwen3 models have no attention bias, while legacy models have bias
         if qwen_type in ('qwen3', 'qwen3_moe'):
             attn_bias = False  # Qwen3 models have no attn bias

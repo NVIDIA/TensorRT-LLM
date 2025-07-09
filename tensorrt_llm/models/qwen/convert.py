@@ -658,20 +658,30 @@ def convert_hf_qwen(hf_model,
         # Qwen3: Add q_norm and k_norm weight conversion
         if qwen_type in ('qwen3', 'qwen3_moe'):
             # Process q_norm.weight
-            q_norm_weight = get_weight(model_params, prefix + key_list[0] + 'q_norm', dtype)
+            q_norm_weight = get_weight(model_params,
+                                       prefix + key_list[0] + 'q_norm', dtype)
             weights.update(
-                get_tllm_linear_weight(q_norm_weight, tllm_prex + 'attention.q_layernorm.',
-                                       None, False,  # LayerNorm should not be quantized
-                                       plugin_weight_only_quant_type, dtype,
-                                       use_gemm_woq_plugin))
-            
-            # Process k_norm.weight  
-            k_norm_weight = get_weight(model_params, prefix + key_list[0] + 'k_norm', dtype)
+                get_tllm_linear_weight(
+                    q_norm_weight,
+                    tllm_prex + 'attention.q_layernorm.',
+                    None,
+                    False,  # LayerNorm should not be quantized
+                    plugin_weight_only_quant_type,
+                    dtype,
+                    use_gemm_woq_plugin))
+
+            # Process k_norm.weight
+            k_norm_weight = get_weight(model_params,
+                                       prefix + key_list[0] + 'k_norm', dtype)
             weights.update(
-                get_tllm_linear_weight(k_norm_weight, tllm_prex + 'attention.k_layernorm.',
-                                       None, False,  # LayerNorm should not be quantized
-                                       plugin_weight_only_quant_type, dtype,
-                                       use_gemm_woq_plugin))
+                get_tllm_linear_weight(
+                    k_norm_weight,
+                    tllm_prex + 'attention.k_layernorm.',
+                    None,
+                    False,  # LayerNorm should not be quantized
+                    plugin_weight_only_quant_type,
+                    dtype,
+                    use_gemm_woq_plugin))
 
         if qwen_type == "qwen2_moe" and moe_config and moe_config.has_moe():
 
