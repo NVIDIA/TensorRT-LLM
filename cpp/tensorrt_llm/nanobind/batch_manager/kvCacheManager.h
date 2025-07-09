@@ -17,15 +17,14 @@
 
 #pragma once
 
-#include "tensorrt_llm/pybind/common/customCasters.h"
-#include <pybind11/pybind11.h>
+#include "tensorrt_llm/nanobind/common/customCasters.h"
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 class KVCacheManagerBindings
 {
 public:
-    static void initBindings(pybind11::module_& m);
+    static void initBindings(nb::module_& m);
 };
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager
 
@@ -34,6 +33,6 @@ namespace tensorrt_llm::batch_manager
 class BasePeftCacheManagerBindings
 {
 public:
-    static void initBindings(pybind11::module_& m);
+    static void initBindings(nb::module_& m);
 };
 } // namespace tensorrt_llm::batch_manager

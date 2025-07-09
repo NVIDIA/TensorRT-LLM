@@ -1,6 +1,6 @@
-set(TRTLLM_PYBIND_MODULE bindings)
-set(TRTLLM_PYBIND_MODULE
-    ${TRTLLM_PYBIND_MODULE}
+set(TRTLLM_NB_MODULE bindings)
+set(TRTLLM_NB_MODULE
+    ${TRTLLM_NB_MODULE}
     PARENT_SCOPE)
 
 set(SRCS
@@ -23,21 +23,20 @@ set(SRCS
 
 include_directories(${PROJECT_SOURCE_DIR}/include)
 
-pybind11_add_module(${TRTLLM_PYBIND_MODULE} ${SRCS})
+nanobind_add_module(${TRTLLM_NB_MODULE} ${SRCS})
 
-set_property(TARGET ${TRTLLM_PYBIND_MODULE} PROPERTY POSITION_INDEPENDENT_CODE
-                                                     ON)
+set_property(TARGET ${TRTLLM_NB_MODULE} PROPERTY POSITION_INDEPENDENT_CODE ON)
 
-target_link_directories(${TRTLLM_PYBIND_MODULE} PUBLIC
+target_link_directories(${TRTLLM_NB_MODULE} PUBLIC
                         "${TORCH_INSTALL_PREFIX}/lib")
 
 if(ENABLE_NVSHMEM)
-  target_link_libraries(${TRTLLM_PYBIND_MODULE} PUBLIC nvshmem::nvshmem_host
-                                                       nvshmem::nvshmem_device)
+  target_link_libraries(${TRTLLM_NB_MODULE} PUBLIC nvshmem::nvshmem_host
+                                                   nvshmem::nvshmem_device)
 endif()
 
 target_link_libraries(
-  ${TRTLLM_PYBIND_MODULE}
+  ${TRTLLM_NB_MODULE}
   PUBLIC ${SHARED_TARGET}
          ${UNDEFINED_FLAG}
          ${NO_AS_NEEDED_FLAG}
@@ -46,12 +45,12 @@ target_link_libraries(
          torch_python
          ${CUDA_NVML_LIB})
 target_compile_definitions(
-  ${TRTLLM_PYBIND_MODULE} PUBLIC TRTLLM_PYBIND_MODULE=${TRTLLM_PYBIND_MODULE}
-                                 PYBIND11_DETAILED_ERROR_MESSAGES=1)
+  ${TRTLLM_NB_MODULE} PUBLIC TRTLLM_NB_MODULE=${TRTLLM_NB_MODULE}
+                             PYBIND11_DETAILED_ERROR_MESSAGES=1)
 
 if(NOT WIN32)
   set_target_properties(
-    ${TRTLLM_PYBIND_MODULE}
+    ${TRTLLM_NB_MODULE}
     PROPERTIES
       LINK_FLAGS
       "-Wl,-rpath,'$ORIGIN/libs' -Wl,-rpath,'$ORIGIN/../nvidia/nccl/lib' -Wl,-rpath,'${CUDA_TOOLKIT_ROOT_DIR}/targets/x86_64-linux/lib/stubs' ${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}"

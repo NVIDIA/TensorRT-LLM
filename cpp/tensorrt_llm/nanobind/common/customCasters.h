@@ -17,12 +17,6 @@
 
 #pragma once
 
-#include "pybind11/cast.h"
-#include "pybind11/detail/common.h"
-#include "pybind11/detail/descr.h"
-#include "pybind11/pybind11.h"
-#include "pybind11/pytypes.h"
-
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/common/optionalRef.h"
@@ -32,33 +26,82 @@
 #include "tensorrt_llm/runtime/torch.h"
 #include "tensorrt_llm/runtime/torchView.h"
 
+#include <ATen/DLConvertor.h>
+#include <deque>
 #include <filesystem>
-#include <pybind11/stl_bind.h>
+#include <nanobind/nanobind.h>
+#include <nanobind/stl/filesystem.h>
+#include <nanobind/stl/optional.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
+#include <torch/csrc/autograd/python_variable.h>
+#include <torch/csrc/autograd/variable.h>
 #include <torch/extension.h>
+#include <torch/torch.h>
 
 // Pybind requires to have a central include in order for type casters to work.
 // Opaque bindings add a type caster, so they have the same requirement.
 // See the warning in https://pybind11.readthedocs.io/en/stable/advanced/cast/custom.html
 
 // Opaque bindings
-PYBIND11_MAKE_OPAQUE(tensorrt_llm::batch_manager::ReqIdsSet)
-PYBIND11_MAKE_OPAQUE(std::vector<tensorrt_llm::batch_manager::SlotDecoderBuffers>)
+NB_MAKE_OPAQUE(tensorrt_llm::batch_manager::ReqIdsSet)
+NB_MAKE_OPAQUE(std::vector<tensorrt_llm::batch_manager::SlotDecoderBuffers>)
+NB_MAKE_OPAQUE(std::vector<tensorrt_llm::runtime::decoder_batch::Request>)
+NB_MAKE_OPAQUE(std::vector<tensorrt_llm::runtime::SamplingConfig>)
+NB_MAKE_OPAQUE(std::vector<std::vector<tensorrt_llm::runtime::SizeType32>>)
+
+namespace nb = nanobind;
 
 // Custom casters
-namespace PYBIND11_NAMESPACE
+namespace NB_NAMESPACE
 {
 
 namespace detail
 {
+
+template <typename T, typename Alloc>
+struct type_caster<std::deque<T, Alloc>>
+{
+    using Type = std::deque<T, Alloc>;
+    NB_TYPE_CASTER(Type, const_name("List"));
+
+    bool from_python(handle src, uint8_t flags, cleanup_list* cleanup) noexcept
+    {
+        sequence seq(src, nanobind::detail::borrow_t{});
+        value.clear();
+        make_caster<T> caster;
+        for (auto const& item : seq)
+        {
+            if (!caster.from_python(item, flags, cleanup))
+                return false;
+            value.push_back(caster.operator T&());
+        }
+        return true;
+    }
+
+    static handle from_cpp(Type const& deque, rv_policy policy, cleanup_list* cleanup) noexcept
+    {
+        nb::list list;
+
+        for (auto const& item : deque)
+        {
+            nb::object py_item = steal(make_caster<T>::from_cpp(item, policy, cleanup));
+            if (!py_item)
+                return {};
+            list.append(py_item);
+        }
+        return list.release();
+    }
+};
 
 template <typename T>
 struct type_caster<tensorrt_llm::common::OptionalRef<T>>
 {
     using value_conv = make_caster<T>;
 
-    PYBIND11_TYPE_CASTER(tensorrt_llm::common::OptionalRef<T>, value_conv::name);
+    NB_TYPE_CASTER(tensorrt_llm::common::OptionalRef<T>, value_conv::Name);
 
-    bool load(handle src, bool convert)
+    bool from_python(handle src, uint8_t flags, cleanup_list* cleanup)
     {
         if (src.is_none())
         {
@@ -68,7 +111,7 @@ struct type_caster<tensorrt_llm::common::OptionalRef<T>>
         }
 
         value_conv conv;
-        if (!conv.load(src, convert))
+        if (!conv.from_python(src, flags, cleanup))
             return false;
 
         // Create an OptionalRef with a reference to the converted value
@@ -76,12 +119,12 @@ struct type_caster<tensorrt_llm::common::OptionalRef<T>>
         return true;
     }
 
-    static handle cast(tensorrt_llm::common::OptionalRef<T> const& src, return_value_policy policy, handle parent)
+    static handle from_cpp(tensorrt_llm::common::OptionalRef<T> const& src, rv_policy policy, cleanup_list* cleanup)
     {
         if (!src.has_value())
             return none().release();
 
-        return value_conv::cast(*src, policy, parent);
+        return value_conv::from_cpp(*src, policy, cleanup);
     }
 };
 
@@ -101,21 +144,21 @@ private:
     }
 
 public:
-    static handle cast(T const& path, return_value_policy, handle)
+    static handle from_cpp(T const& path, rv_policy, cleanup_list* cleanup)
     {
         if (auto py_str = unicode_from_fs_native(path.native()))
         {
-            return module_::import("pathlib").attr("Path")(reinterpret_steal<object>(py_str)).release();
+            return module_::import_("pathlib").attr("Path")(steal<object>(py_str), cleanup).release();
         }
         return nullptr;
     }
 
-    bool load(handle handle, bool)
+    bool from_python(handle src, uint8_t flags, cleanup_list* cleanup)
     {
         PyObject* native = nullptr;
         if constexpr (std::is_same_v<typename T::value_type, char>)
         {
-            if (PyUnicode_FSConverter(handle.ptr(), &native) != 0)
+            if (PyUnicode_FSConverter(src.ptr(), &native) != 0)
             {
                 if (auto* c_str = PyBytes_AsString(native))
                 {
@@ -127,7 +170,7 @@ public:
         }
         else if constexpr (std::is_same_v<typename T::value_type, wchar_t>)
         {
-            if (PyUnicode_FSDecoder(handle.ptr(), &native) != 0)
+            if (PyUnicode_FSDecoder(src.ptr(), &native) != 0)
             {
                 if (auto* c_str = PyUnicode_AsWideCharString(native, nullptr))
                 {
@@ -146,30 +189,25 @@ public:
         return true;
     }
 
-    PYBIND11_TYPE_CASTER(T, const_name("os.PathLike"));
-};
-
-template <>
-struct type_caster<std::filesystem::path> : public PathCaster<std::filesystem::path>
-{
+    NB_TYPE_CASTER(T, const_name("os.PathLike"));
 };
 
 template <>
 class type_caster<tensorrt_llm::executor::StreamPtr>
 {
 public:
-    PYBIND11_TYPE_CASTER(tensorrt_llm::executor::StreamPtr, _("int"));
+    NB_TYPE_CASTER(tensorrt_llm::executor::StreamPtr, const_name("int"));
 
-    bool load([[maybe_unused]] handle src, bool)
+    bool from_python([[maybe_unused]] handle src, uint8_t flags, cleanup_list* cleanup)
     {
-        auto stream_ptr = src.cast<uintptr_t>();
+        auto stream_ptr = nanobind::cast<uintptr_t>(src);
         value = std::make_shared<tensorrt_llm::runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream_ptr));
 
         return true;
     }
 
-    static handle cast(
-        tensorrt_llm::executor::StreamPtr const& src, return_value_policy /* policy */, handle /* parent */)
+    static handle from_cpp(
+        tensorrt_llm::executor::StreamPtr const& src, rv_policy /* policy */, cleanup_list* /* cleanup */)
     {
         // Return cudaStream_t as integer.
         return PyLong_FromVoidPtr(src->get());
@@ -180,10 +218,10 @@ template <>
 struct type_caster<tensorrt_llm::executor::Tensor>
 {
 public:
-    PYBIND11_TYPE_CASTER(tensorrt_llm::executor::Tensor, _("torch.Tensor"));
+    NB_TYPE_CASTER(tensorrt_llm::executor::Tensor, const_name("torch.Tensor"));
 
     // Convert PyObject(torch.Tensor) -> tensorrt_llm::executor::Tensor
-    bool load(handle src, bool)
+    bool from_python(handle src, uint8_t flags, cleanup_list* cleanup)
     {
         PyObject* obj = src.ptr();
         if (THPVariable_Check(obj))
@@ -196,7 +234,8 @@ public:
     }
 
     // Convert tensorrt_llm::executor::Tensor -> PyObject(torch.Tensor)
-    static handle cast(tensorrt_llm::executor::Tensor const& src, return_value_policy /* policy */, handle /* parent */)
+    static handle from_cpp(
+        tensorrt_llm::executor::Tensor const& src, rv_policy /* policy */, cleanup_list* /* cleanup */)
     {
         return THPVariable_Wrap(tensorrt_llm::runtime::Torch::tensor(tensorrt_llm::executor::detail::toITensor(src)));
     }
@@ -206,10 +245,10 @@ template <>
 struct type_caster<tensorrt_llm::runtime::ITensor::SharedPtr>
 {
 public:
-    PYBIND11_TYPE_CASTER(tensorrt_llm::runtime::ITensor::SharedPtr, _("torch.Tensor"));
+    NB_TYPE_CASTER(tensorrt_llm::runtime::ITensor::SharedPtr, const_name("torch.Tensor"));
 
     // Convert PyObject(torch.Tensor) -> tensorrt_llm::runtime::ITensor::SharedPtr
-    bool load(handle src, bool)
+    bool from_python(handle src, uint8_t, cleanup_list*)
     {
         PyObject* obj = src.ptr();
         if (THPVariable_Check(obj))
@@ -222,8 +261,8 @@ public:
     }
 
     // Convert tensorrt_llm::runtime::ITensor::SharedPtr -> PyObject(torch.Tensor)
-    static handle cast(
-        tensorrt_llm::runtime::ITensor::SharedPtr const& src, return_value_policy /* policy */, handle /* parent */)
+    static handle from_cpp(
+        tensorrt_llm::runtime::ITensor::SharedPtr const& src, rv_policy /* policy */, cleanup_list* /* cleanup */)
     {
         if (src == nullptr)
         {
@@ -237,10 +276,10 @@ template <>
 struct type_caster<tensorrt_llm::runtime::ITensor::SharedConstPtr>
 {
 public:
-    PYBIND11_TYPE_CASTER(tensorrt_llm::runtime::ITensor::SharedConstPtr, _("torch.Tensor"));
+    NB_TYPE_CASTER(tensorrt_llm::runtime::ITensor::SharedConstPtr, const_name("torch.Tensor"));
 
     // Convert PyObject(torch.Tensor) -> tensorrt_llm::runtime::ITensor::SharedConstPtr
-    bool load(handle src, bool)
+    bool from_python(handle src, uint8_t, cleanup_list*)
     {
         PyObject* obj = src.ptr();
         if (THPVariable_Check(obj))
@@ -253,8 +292,8 @@ public:
     }
 
     // Convert tensorrt_llm::runtime::ITensor::SharedConstPtr -> PyObject(torch.Tensor)
-    static handle cast(tensorrt_llm::runtime::ITensor::SharedConstPtr const& src, return_value_policy /* policy */,
-        handle /* parent */)
+    static handle from_cpp(
+        tensorrt_llm::runtime::ITensor::SharedConstPtr const& src, rv_policy /* policy */, cleanup_list* /* cleanup */)
     {
         if (src == nullptr)
         {
@@ -265,5 +304,56 @@ public:
     }
 };
 
+template <>
+struct type_caster<at::Tensor>
+{
+    NB_TYPE_CASTER(at::Tensor, const_name("torch.Tensor"));
+
+    bool from_python(nb::handle src, uint8_t, cleanup_list*) noexcept
+    {
+        try
+        {
+            // Convert Python object to DLPack capsule
+            nb::object capsule = nb::getattr(src, "__dlpack__")();
+            DLManagedTensor* dl_managed
+                = static_cast<DLManagedTensor*>(PyCapsule_GetPointer(capsule.ptr(), "dltensor"));
+            PyCapsule_SetDestructor(capsule.ptr(), nullptr); // Disable capsule's deleter
+            // Convert DLPack to at::Tensor (zero-copy)
+            value = at::fromDLPack(dl_managed).alias();
+            return true;
+        }
+        catch (std::exception const& e)
+        {
+            std::cerr << "Error converting to at::Tensor: " << e.what() << std::endl;
+            return false;
+        }
+    }
+
+    static handle from_cpp(at::Tensor tensor, rv_policy, cleanup_list*) noexcept
+    {
+        // Convert at::Tensor to DLPack
+        DLManagedTensor* dl_managed = at::toDLPack(tensor);
+        if (!dl_managed)
+            return nullptr;
+
+        // Create Python capsule
+        nanobind::object capsule = nb::steal(PyCapsule_New(dl_managed, "dltensor",
+            [](PyObject* obj)
+            {
+                DLManagedTensor* dl = static_cast<DLManagedTensor*>(PyCapsule_GetPointer(obj, "dltensor"));
+                dl->deleter(dl);
+            }));
+        if (!capsule.is_valid())
+        {
+            dl_managed->deleter(dl_managed);
+            return nullptr;
+        }
+        // Convert capsule to torch.Tensor
+        nanobind::module_ torch = nanobind::module_::import_("torch");
+        nanobind::object result = torch.attr("from_dlpack")(capsule);
+        capsule.release();
+        return result.release();
+    }
+};
 } // namespace detail
-} // namespace PYBIND11_NAMESPACE
+} // namespace NB_NAMESPACE

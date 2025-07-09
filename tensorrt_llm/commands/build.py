@@ -38,6 +38,19 @@ from tensorrt_llm.plugin import PluginConfig, add_plugin_argument
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 
+def enum_type(enum_class):
+
+    def parse_enum(value):
+        try:
+            return enum_class[value.upper()]
+        except KeyError:
+            raise argparse.ArgumentTypeError(
+                f"Invalid value '{value}'. Expected one of {[e.name.lower() for e in enum_class]}"
+            )
+
+    return parse_enum
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -56,6 +69,7 @@ def parse_arguments():
         type=str,
         default=None,
         help="The file path that saves TensorRT-LLM build config.")
+
     parser.add_argument(
         '--model_cls_file',
         type=str,
@@ -131,7 +145,7 @@ def parse_arguments():
     parser.add_argument(
         '--kv_cache_type',
         default=argparse.SUPPRESS,
-        type=KVCacheType,
+        type=enum_type(KVCacheType),
         help=
         "Set KV cache type (continuous, paged, or disabled). For disabled case, KV cache is disabled and only context phase is allowed."
     )
