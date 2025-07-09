@@ -33,6 +33,7 @@ class QWenConfig(PretrainedConfig):
                  moe: Optional[Union[MoeConfig, dict]] = None,
                  num_labels: int = 1,
                  **kwargs):
+
         self.mlp_bias = mlp_bias
         self.attn_bias = attn_bias
         self.rotary_base = rotary_base
@@ -40,6 +41,8 @@ class QWenConfig(PretrainedConfig):
         self.disable_weight_only_quant_plugin = disable_weight_only_quant_plugin
         self.num_labels = num_labels
         self.use_logn_attn = use_logn_attn
+        self.fc_after_embed = False
+        
         if moe is None:
             # Legacy MOE config fields
             moe = MoeConfig(num_experts=kwargs.pop('moe_num_experts', 0),
@@ -65,6 +68,7 @@ class QWenConfig(PretrainedConfig):
             'disable_weight_only_quant_plugin'] = self.disable_weight_only_quant_plugin
         output['use_logn_attn'] = self.use_logn_attn
         output['moe'] = self.moe.to_dict()
+        output['fc_after_embed'] = self.fc_after_embed
         return output
 
     @classmethod
@@ -105,7 +109,7 @@ class QWenConfig(PretrainedConfig):
             hf_config.architectures = ['Qwen2ForCausalLM']
 
         valid_types = ('qwen', 'qwen2', 'qwen2_moe', 'qwen2_llava_onevision',
-                       'qwen2_vl', 'qwen2_audio')
+                       'qwen2_vl', 'qwen2_audio','qwen3')
         assert qwen_type in valid_types, f"Unsupported Qwen type: {qwen_type}, only {valid_types} are acceptable."
         num_key_value_heads = getattr(hf_config, "num_key_value_heads",
                                       hf_config.num_attention_heads)
@@ -114,7 +118,12 @@ class QWenConfig(PretrainedConfig):
         hidden_act = getattr(hf_config, "hidden_act", "silu")
         if qwen_type == "qwen2_moe":
             hidden_act = "swiglu"
+
         attn_bias = True  # All existing Qwen models have attn bias
+        if qwen_type == 'qwen3':
+            attn_bias = getattr(hf_config,"attention_bias",attn_bias) # qwen3 dense attn_bias is false
+            head_size = getattr(hf_config,"head_dim", head_size) # qwen3 dense config contains head_dim
+            
         rotary_scaling = getattr(hf_config, "rope_scaling", None)
         seq_length = getattr(hf_config, "seq_length", 8192)
         use_logn_attn = getattr(hf_config, "use_logn_attn", False)
