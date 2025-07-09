@@ -177,7 +177,7 @@ def setup_llm(args):
             speculative_model_dir=args.draft_model_dir)
     elif spec_decode_algo == "NGRAM":
         spec_config = NGramDecodingConfig(
-            prompt_lookup_num_tokens=args.spec_decode_nextn,
+            max_draft_len=args.spec_decode_nextn,
             max_matching_ngram_size=args.max_matching_ngram_size,
             is_keep_all=True,
             is_use_oldest=True,

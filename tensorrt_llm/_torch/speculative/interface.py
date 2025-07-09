@@ -116,7 +116,7 @@ class SpecConfig:
     # The mode of speculative decoding.
     spec_dec_mode: SpeculativeDecodingMode = SpeculativeDecodingMode.NONE
     # The max number of draft tokens
-    max_draft_tokens: int = 1024
+    max_draft_len: int = 1024
     # The path to the draft model
     speculative_model_dir: Optional[str] = None
     # The number of extra kv tokens
@@ -146,7 +146,7 @@ class SpecMetadata:
     # The max number of requests in a single batch.
     max_num_requests: int
     # The max number of draft tokens.
-    max_draft_tokens: int
+    max_draft_len: int
     # The number of gen-phase sequences in the batch.
     num_generations: int = 0
     # Whether CUDA graph is enabled.

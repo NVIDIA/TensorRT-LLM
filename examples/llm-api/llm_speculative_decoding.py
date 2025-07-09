@@ -50,7 +50,7 @@ def run_Eagle3():
 
 def run_ngram():
     spec_config = NGramDecodingConfig(
-        prompt_lookup_num_tokens=3,
+        max_draft_len=3,
         max_matching_ngram_size=3,
         is_keep_all=True,
         is_use_oldest=True,

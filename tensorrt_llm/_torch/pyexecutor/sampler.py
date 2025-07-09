@@ -220,7 +220,7 @@ class TorchSampler(Sampler):
     @dataclass(frozen=True, kw_only=True)
     class Args:
         max_seq_len: int
-        max_draft_tokens: int
+        max_draft_len: int
         max_num_sequences: int
         max_beam_width: int
         enable_mixed_sampler: bool
@@ -228,7 +228,7 @@ class TorchSampler(Sampler):
     def __init__(self, args: Args):
         self.max_seq_len = args.max_seq_len
         self.enable_mixed_sampler = args.enable_mixed_sampler
-        self.max_tokens = args.max_draft_tokens + 1
+        self.max_tokens = args.max_draft_len + 1
         assert args.max_beam_width == self.MAX_BEAM_WIDTH, "TorchSampler only supports beam_width = 1"
         self.num_seq_slots = args.max_num_sequences
 

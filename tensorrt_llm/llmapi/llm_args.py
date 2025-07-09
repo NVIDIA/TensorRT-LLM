@@ -225,6 +225,10 @@ class DecodingBaseConfig(BaseModel):
     max_draft_len: Optional[int] = None
     speculative_model_dir: Optional[Union[str, Path]] = None
 
+    # Keep this for compliance with the old interface.
+    # TODO: remove this later
+    num_extra_kv_tokens: int = 0
+
     @classmethod
     def from_dict(cls, data: dict):
         # dispatch to the correct decoding config
@@ -269,6 +273,17 @@ class DecodingBaseConfig(BaseModel):
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
         return TorchSpeculativeDecodingMode.from_string(
             self.decoding_type.upper())
+
+    # Keep this for compliance with the old interface.
+    # TODO: remove this later
+    def update_from_model_config(self, model_config):
+        pass
+
+    # Keep this for compliance with the old interface.
+    # TODO: remove this later
+    def get_draft_model_prompt(self,
+                               input_tokens: torch.Tensor) -> torch.Tensor:
+        return input_tokens
 
 
 class MedusaDecodingConfig(DecodingBaseConfig):
@@ -330,7 +345,7 @@ class NGramDecodingConfig(DecodingBaseConfig):
     Configuration for NGram drafter speculative decoding.
 
     Arguments:
-        prompt_lookup_num_tokens: int
+        max_draft_len: int
                 The length maximum of draft tokens (can be understood as length maximum of output draft tokens).
 
         max_matching_ngram_size: int
@@ -346,7 +361,6 @@ class NGramDecodingConfig(DecodingBaseConfig):
             Whether to use a common pool for all requests, or the pool is private for each request if False.
     """
 
-    prompt_lookup_num_tokens: int = 2
     max_matching_ngram_size: int = 4
     is_keep_all: bool = True
     is_use_oldest: bool = True
@@ -368,7 +382,7 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
     def from_dict(cls, data: dict):
         return cls(**data)
 
-    decoding_type: ClassVar[str] = "DraftTarget"
+    decoding_type: ClassVar[str] = "Draft_Target"
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
@@ -1387,11 +1401,11 @@ class BaseLlmArgs(BaseModel):
             if isinstance(self.speculative_config, LookaheadDecodingConfig):
                 lookahead_config = self.speculative_config
                 # Update the build config
-                _, _, max_draft_tokens, _ = lookahead_config.calculate_speculative_resource(
+                _, _, max_draft_len, _ = lookahead_config.calculate_speculative_resource(
                 )
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.LOOKAHEAD_DECODING
-                if max_draft_tokens > self.build_config.max_draft_len:
-                    self.build_config.max_draft_len = max_draft_tokens
+                if max_draft_len > self.build_config.max_draft_len:
+                    self.build_config.max_draft_len = max_draft_len
 
                 self.decoding_config = DecodingConfig(
                     decoding_mode=DecodingMode.Lookahead(),
@@ -1424,36 +1438,23 @@ class BaseLlmArgs(BaseModel):
                 else:
                     from tensorrt_llm._torch.speculative import Eagle3Config
                     self.speculative_config = Eagle3Config(
-                        max_draft_tokens=self.speculative_config.max_draft_len,
+                        max_draft_len=self.speculative_config.max_draft_len,
                         speculative_model_dir=self.speculative_config.
                         speculative_model_dir,
                         eagle3_one_model=self.speculative_config.
                         eagle3_one_model)
             elif isinstance(self.speculative_config, NGramDecodingConfig):
                 assert self.backend in ['pytorch', '_autodeploy']
-                assert self.speculative_config.prompt_lookup_num_tokens > 0 and self.speculative_config.max_matching_ngram_size > 0
+                assert self.speculative_config.max_draft_len > 0 and self.speculative_config.max_matching_ngram_size > 0
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.NGRAM
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
-                from tensorrt_llm._torch.speculative import NGramConfig
-                self.speculative_config = NGramConfig(
-                    prompt_lookup_num_tokens=self.speculative_config.
-                    prompt_lookup_num_tokens,
-                    max_matching_ngram_size=self.speculative_config.
-                    max_matching_ngram_size,
-                    is_keep_all=self.speculative_config.is_keep_all,
-                    is_use_oldest=self.speculative_config.is_use_oldest,
-                    is_public_pool=self.speculative_config.is_public_pool,
-                )
+
             elif isinstance(self.speculative_config, DraftTargetDecodingConfig):
-                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.DRAFT_TOKENS_EXTERNAL
                 assert self.backend == 'pytorch'
                 assert self.speculative_config.max_draft_len > 0
+                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.DRAFT_TOKENS_EXTERNAL
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
-                from tensorrt_llm._torch.speculative import DraftTargetConfig
-                self.speculative_config = DraftTargetConfig(
-                    max_draft_tokens=self.speculative_config.max_draft_len,
-                    speculative_model_dir=self.speculative_config.
-                    speculative_model_dir)
+
             elif isinstance(self.speculative_config, MTPDecodingConfig):
                 from tensorrt_llm._torch.speculative import MTPConfig
                 self.speculative_config = MTPConfig(
@@ -1468,12 +1469,8 @@ class BaseLlmArgs(BaseModel):
             elif isinstance(self.speculative_config,
                             UserProvidedDecodingConfig):
                 assert self.backend in ['pytorch', '_autodeploy']
-                from tensorrt_llm._torch.speculative import UserProvidedConfig
-                self.speculative_config = UserProvidedConfig(
-                    max_draft_tokens=self.speculative_config.max_draft_len,
-                    drafter=self.speculative_config.drafter)
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.USER_PROVIDED
-                self.build_config.max_draft_len = self.speculative_config.max_draft_tokens
+                self.build_config.max_draft_len = self.speculative_config.max_draft_len
             else:
                 raise ValueError(
                     f"Unrecognized speculative config type {type(self.speculative_config)}"

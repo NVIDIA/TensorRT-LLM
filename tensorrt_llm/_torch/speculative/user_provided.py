@@ -15,7 +15,7 @@ class UserProvidedConfig(SpecConfig):
     spec_dec_name = "USER_PROVIDED"
 
     num_extra_kv_tokens: int = 0
-    max_draft_tokens: int = 0
+    max_draft_len: int = 0
     drafter: Optional[Drafter] = None
 
     def __post_init__(self) -> None:

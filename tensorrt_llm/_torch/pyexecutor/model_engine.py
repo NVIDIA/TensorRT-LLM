@@ -456,7 +456,7 @@ class PyTorchModelEngine(ModelEngine):
         if self.is_spec_decode:
             self.spec_metadata = None
             self.spec_config.update_from_model_config(self.model.config)
-            max_num_draft_tokens = self.spec_config.max_draft_tokens * batch_size
+            max_num_draft_tokens = self.spec_config.max_draft_len * batch_size
             self.draft_tokens_cuda = torch.empty((max_num_draft_tokens, ),
                                                  dtype=torch.int,
                                                  device='cuda')
@@ -472,7 +472,7 @@ class PyTorchModelEngine(ModelEngine):
                                                              device='cuda')
             self.without_logits = self.spec_config.spec_dec_mode.without_logits(
             )
-            self.max_draft_len = spec_config.max_draft_tokens
+            self.max_draft_len = spec_config.max_draft_len
         else:
             self.without_logits = False
             self.max_draft_len = 0
@@ -963,7 +963,7 @@ class PyTorchModelEngine(ModelEngine):
         if ExpertStatistic.set_iter(self.iter_counter):
             return None
 
-        spec_max_draft_tokens = spec_config.max_draft_tokens if self.is_spec_decode else 0
+        spec_max_draft_tokens = spec_config.max_draft_len if self.is_spec_decode else 0
         can_run_cuda_graph = batch.can_run_cuda_graph
         batch_size = len(batch.generation_requests)
         if self._run_cuda_graphs and self.enable_attention_dp and self.mapping.tp_size > 1:
@@ -2081,7 +2081,7 @@ class PyTorchModelEngine(ModelEngine):
                 spec_metadata.spec_dec_mode.attention_need_spec_dec_mode(),
                 spec_metadata.is_spec_dec_tree,
                 spec_metadata.is_spec_dec_dynamic_tree,
-                spec_metadata.max_draft_tokens)
+                spec_metadata.max_draft_len)
         else:
             spec_metadata = None
 
