@@ -549,6 +549,7 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type>& vec, float SFScaleVal, 
     // maximum value of e2m1 = 6.0.
     // TODO: use half as compute data type.
     float SFValue = SFScaleVal * (vecMax * reciprocal_approximate_ftz(6.0f));
+    float SFValueNarrow;
     // 8 bits representation of the SF.
     uint8_t fp8SFVal;
     // Write the SF to global memory (STG.8).
@@ -556,7 +557,7 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type>& vec, float SFScaleVal, 
     {
         __nv_fp8_e8m0 tmp;
         tmp.__x = __nv_cvt_float_to_e8m0(SFValue, __NV_SATFINITE, cudaRoundPosInf);
-        SFValue = static_cast<float>(tmp);
+        SFValueNarrow = static_cast<float>(tmp);
         fp8SFVal = tmp.__x;
     }
     else
@@ -564,11 +565,11 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type>& vec, float SFScaleVal, 
         // Here SFValue is always positive, so E4M3 is the same as UE4M3.
         __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
         fp8SFVal = tmp.__x;
-        SFValue = static_cast<float>(tmp);
+        SFValueNarrow = static_cast<float>(tmp);
     }
     // Get the output scale.
     // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal))) * reciprocal(SFScaleVal))
-    float outputScale = SFValue != 0 ? SFScaleVal * reciprocal_approximate_ftz(SFValue) : 0.0f;
+    float outputScale = SFValue != 0 ? SFScaleVal * reciprocal_approximate_ftz(SFValueNarrow) : 0.0f;
 
     if (SFout)
     {
@@ -760,8 +761,8 @@ __global__ void
 #else
 quantize_with_block_size(
 #endif
-        int32_t numbatches, int32_t numRows, int32_t numCols, Type const* in, float const* SFScale, uint32_t* out,
-        uint32_t* SFout, QuantizationSFLayout layout)
+        int32_t numbatches, int32_t numRows, int32_t numCols, int32_t numPaddedCols, Type const* in,
+        float const* SFScale, uint32_t* out, uint32_t* SFout, QuantizationSFLayout layout)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 
@@ -782,31 +783,53 @@ quantize_with_block_size(
     bool isSfSwizzledLayout = layout == QuantizationSFLayout::SWIZZLED;
 
     // The number of padded rows considering 128x4 SF layout.
-    int numPaddedRows = isSfSwizzledLayout ? PadUpFn(numRows, 128) : numRows;
-    int numPaddedCols = isSfSwizzledLayout ? PadUpFn(numCols, 4 * SF_VEC_SIZE) : numCols;
+    int numPaddedRowsForSf = isSfSwizzledLayout ? PadUpFn(numRows, 128) : numRows;
+    int numColsForSf = isSfSwizzledLayout ? PadUpFn(numPaddedCols, 4 * SF_VEC_SIZE) : numPaddedCols;
 
-    // The number of threads in the column dimension
+    // The number of threads in the column dimension。
+    // Note that numCols/numPaddedCols/numColsForSf are guaranteed to be multiples of ELTS_PER_THREAD.
     int numColThreads = numCols / ELTS_PER_THREAD;
     int numPaddedColThreads = numPaddedCols / ELTS_PER_THREAD;
+    int numColThreadsForSf = numColsForSf / ELTS_PER_THREAD;
 
     asm volatile("griddepcontrol.wait;");
     // Input tensor batch/row/col loops.
-    for (int rowIdx = blockIdx.x; rowIdx < numPaddedRows; rowIdx += gridDim.x)
+    for (int rowIdx = blockIdx.x; rowIdx < numPaddedRowsForSf; rowIdx += gridDim.x)
     {
         for (int batchIdx = 0; batchIdx < numbatches; batchIdx++)
         {
-            for (int colIdx = threadIdx.x; colIdx < numPaddedColThreads; colIdx += blockDim.x)
+            for (int colIdx = threadIdx.x; colIdx < numColThreadsForSf; colIdx += blockDim.x)
             {
                 std::optional<int> optionalBatchIdx = batchIdx;
                 std::optional<int> optionalNumRows = numRows;
 
                 // The SF output pointer.
                 auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, CVT_NUM_THREADS_PER_SF>(
-                    optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numCols / SF_VEC_SIZE, SFout, layout);
+                    optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numPaddedCols / SF_VEC_SIZE, SFout, layout);
+
+                // The input tensor offset.
+                int64_t inOffset = static_cast<int64_t>(batchIdx * numRows + rowIdx) * numColThreads + colIdx;
+                int64_t outOffset = static_cast<int64_t>(batchIdx * numRows + rowIdx) * numPaddedColThreads + colIdx;
+
+                // Set the values to 0 of those are padded columns.
+                if (rowIdx < numRows && colIdx >= numColThreads && colIdx < numPaddedColThreads)
+                {
+                    // Dispatch the quantization kernel.
+                    if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4)
+                    {
+                        reinterpret_cast<uint32_t*>(out)[outOffset] = 0u;
+                    }
+                    else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4
+                        || quantization_type == BlockScaleQuantizationType::FP16_TO_MXFP8)
+                    {
+                        reinterpret_cast<uint64_t*>(out)[outOffset] = 0ull;
+                    }
+                }
 
                 // Set the SF padding to 0.
                 if (rowIdx >= numRows || colIdx >= numColThreads)
                 {
+                    // Set the SF padding to 0.
                     if (sf_out != nullptr)
                     {
                         sf_out[0] = 0x00;
@@ -814,10 +837,8 @@ quantize_with_block_size(
                 }
                 else
                 {
-                    int64_t inOffset = static_cast<int64_t>(batchIdx * numRows + rowIdx) * numColThreads + colIdx;
+                    // Load the input vector.
                     PackedVec in_vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
-                    // Get the output tensor offset as a packed vector.
-                    int64_t outOffset = inOffset;
 
                     // Dispatch the quantization kernel.
                     if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4)
