@@ -482,6 +482,8 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4[latency_moe_tr
 accuracy/test_llm_api_pytorch.py::TestKanana_Instruct::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestBielik11BInstruct::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestBielik11BInstruct::test_fp8
+accuracy/test_llm_api_pytorch.py::TestMinistral8BInstruct::test_auto_dtype
+accuracy/test_llm_api_pytorch.py::TestMinistral8BInstruct::test_fp8
 
 test_e2e.py::test_llama_e2e[use_cpp_session-remove_input_padding-]
 test_e2e.py::test_llama_e2e[use_py_session-remove_input_padding-]

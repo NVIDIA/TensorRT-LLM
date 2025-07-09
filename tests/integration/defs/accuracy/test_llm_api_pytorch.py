@@ -448,7 +448,7 @@ class TestMinistral8BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Ministral-8B-Instruct-2410"
     MODEL_PATH = f"{llm_models_root()}/Ministral-8B-Instruct-2410"
 
-    def test_auto_dtype_gsm8k(self):
+    def test_auto_dtype(self):
         with LLM(self.MODEL_PATH) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
