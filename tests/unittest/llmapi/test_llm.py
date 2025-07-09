@@ -2143,16 +2143,18 @@ def test_llm_with_postprocess_parallel():
 def run_llm_with_postprocess_parallel_and_result_handler(
         streaming, backend, tp_size: int = 1):
     # avoid import error when running in CI
-    from tensorrt_llm.executor.postproc_worker import (PostprocArgs,
-                                                       PostprocParams)
+    from tensorrt_llm.executor.postproc_worker import PostprocParams
+    from tensorrt_llm.serve.postprocess_handlers import (
+        ChatPostprocArgs, chat_stream_post_processor)
 
-    from .run_llm_with_postproc import perform_faked_oai_postprocess
+    from .run_llm_with_postproc import get_concatenated_content
 
     sampling_params = SamplingParams(max_tokens=6)
-    post_proc_args = PostprocArgs(tokenizer=llama_model_path)
-    post_proc_params = PostprocParams(
-        post_processor=perform_faked_oai_postprocess,
-        postproc_args=post_proc_args)
+    post_proc_args = ChatPostprocArgs(tokenizer=llama_model_path,
+                                      role="assistant",
+                                      model=llama_model_path)
+    post_proc_params = PostprocParams(post_processor=chat_stream_post_processor,
+                                      postproc_args=post_proc_args)
     kwargs = {}
     if backend not in ["pytorch", "autodeploy"]:
         kwargs["fast_build"] = True
@@ -2163,17 +2165,16 @@ def run_llm_with_postprocess_parallel_and_result_handler(
               num_postprocess_workers=2,
               postprocess_tokenizer_dir=llama_model_path,
               **kwargs)
-    golden_result = "DEFGHI"
-    for i, output in enumerate(
-            llm.generate_async(prompts[0],
-                               sampling_params=sampling_params,
-                               _postproc_params=post_proc_params,
-                               streaming=streaming)):
-        if i < len(golden_result) - 1:
-            assert golden_result[i] in output.outputs[0]._postprocess_result[-1]
-        else:
-            assert golden_result[i] in output.outputs[0]._postprocess_result[
-                -2]  # EOS
+    golden_result = "D E F G H I"
+    outputs = []
+    for output in llm.generate_async(prompts[0],
+                                     sampling_params=sampling_params,
+                                     _postproc_params=post_proc_params,
+                                     streaming=streaming):
+        outputs.append(output.outputs[0]._postprocess_result)
+    actual_result = get_concatenated_content(outputs)
+    assert actual_result == golden_result, \
+        f"Expected: {golden_result}, Actual: {actual_result}"
 
 
 @pytest.mark.parametrize("streaming", [True, False])
