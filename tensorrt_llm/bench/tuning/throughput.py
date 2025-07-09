@@ -1,11 +1,10 @@
 from typing import Any, Dict
 
-from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.pyexecutor.model_engine import validate_and_set_kv_cache_quant
 from tensorrt_llm.bench.build.build import get_benchmark_engine_settings
 from tensorrt_llm.bench.dataclasses.scenario import ScenarioSpecification
 from tensorrt_llm.bench.tuning import DefaultLlmHeuristic
-from tensorrt_llm.bench.tuning.utils import get_model_config
+
 
 
 class PytMaxThroughputScenario(DefaultLlmHeuristic):
@@ -15,8 +14,8 @@ class PytMaxThroughputScenario(DefaultLlmHeuristic):
     def get_settings(cls, scenario: ScenarioSpecification) -> Dict[str, Any]:
         # Collect reference information.
         # Configuration classes
-        tllm_model_config = scenario.get_tllm_model_config()
-        bench_model_config = scenario.get_bench_model_config()
+        tllm_model_config = scenario.environment.get_tllm_model_config()
+        bench_model_config = scenario.environment.get_bench_model_config()
 
         # World, dataset, and settings information.
         world = scenario.world
@@ -37,11 +36,14 @@ class PytMaxThroughputScenario(DefaultLlmHeuristic):
         max_batch_size, max_num_tokens = get_benchmark_engine_settings(
             bench_model_config,
             tllm_model_config.quant_config,
-            world.tp_size,
-            world.pp_size,
+            world.tp,
+            world.pp,
             dataset_metadata.avg_isl,
             dataset_metadata.avg_osl,
         )
+
+        max_batch_size = scenario.batching_config.max_batch_size or max_batch_size
+        max_num_tokens = scenario.batching_config.max_num_tokens or max_num_tokens
 
         # Update CUDA graph settings.
         cuda_graph_config = {
@@ -58,9 +60,11 @@ class PytMaxThroughputScenario(DefaultLlmHeuristic):
                 "context_chunking_policy": "FIRST_COME_FIRST_SERVED",
             },
             "cuda_graph_config": cuda_graph_config,
-            "max_num_tokens": max_num_tokens,
             "enable_chunked_prefill": chunked_prefill,
             "kv_cache_dtype": kv_cache_dtype,
+            "max_seq_len": scenario.batching_config.max_seq_len,
+            "max_batch_size": max_batch_size,
+            "max_num_tokens": max_num_tokens,
         }
 
         return llm_args
