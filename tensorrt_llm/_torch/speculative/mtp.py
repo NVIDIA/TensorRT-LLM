@@ -69,8 +69,8 @@ class MTPConfig(SpecConfig):
 
 class MTPHiddenStatesManager(BaseResourceManager):
 
-    def __init__(self, config: MTPConfig, dtype: torch.dtype, hidden_size: int,
-                 max_num_requests: int):
+    def __init__(self, config: "MTPDecodingConfig", dtype: torch.dtype,
+                 hidden_size: int, max_num_requests: int):
         self.dtype = dtype
         self.num_nextn_predict_layers = config.num_nextn_predict_layers
         self.hidden_size = hidden_size
@@ -353,7 +353,7 @@ class MTPSampler(TorchSampler):
 
 class MTPWorker(nn.Module):
 
-    def __init__(self, spec_config: MTPConfig):
+    def __init__(self, spec_config: "MTPDecodingConfig"):
         super().__init__()
         self.spec_config = spec_config
         self.is_thop = False
@@ -1090,7 +1090,7 @@ class MTPWorker(nn.Module):
 
 class MTPEagleWorker(MTPWorker):
 
-    def __init__(self, spec_config: MTPConfig):
+    def __init__(self, spec_config: "MTPDecodingConfig"):
         super().__init__(spec_config)
         self.mtp_num_modules = spec_config.num_nextn_predict_layers
 

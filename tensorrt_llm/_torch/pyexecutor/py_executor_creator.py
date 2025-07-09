@@ -250,7 +250,7 @@ def create_py_executor(
             draft_spec_config.max_draft_tokens = 0
 
             draft_model_engine = PyTorchModelEngine(
-                model_path=spec_config.draft_model_path,
+                model_path=spec_config.speculative_model_dir,
                 pytorch_backend_config=pytorch_backend_config,
                 batch_size=executor_config.max_batch_size,
                 max_beam_width=executor_config.max_beam_width,

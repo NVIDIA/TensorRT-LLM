@@ -10,7 +10,7 @@ class DraftTargetConfig(SpecConfig):
     spec_dec_name: str = "DRAFT_TARGET"
 
     def __post_init__(self):
-        if self.draft_model_path is None:
+        if self.speculative_model_dir is None:
             raise ValueError("Path to Draft weights must be specified.")
 
         self.spec_dec_mode = SpeculativeDecodingMode.from_string(

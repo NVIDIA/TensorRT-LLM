@@ -2,7 +2,7 @@ import enum
 import math
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -21,9 +21,6 @@ if ENABLE_MULTI_DEVICE:
     from mpi4py import MPI
 
     from tensorrt_llm._utils import mpi_comm
-
-if TYPE_CHECKING:
-    from ..speculative.interface import SpecConfig
 
 BufferManagerCpp = tensorrt_llm.bindings.internal.runtime.BufferManager
 KVCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.KVCacheManager
@@ -83,7 +80,7 @@ class BaseResourceManager(ABC):
 def get_pp_layers(
     num_layers: int,
     mapping: Mapping,
-    spec_config: Optional["SpecConfig"] = None,
+    spec_config: Optional["DecodingBaseConfig"] = None,
     layer_mask: Optional[List[bool]] = None,
 ) -> Tuple[List[int], int]:
     from ..speculative.utils import get_num_spec_layers
@@ -127,7 +124,7 @@ class KVCacheManager(BaseResourceManager):
         max_batch_size: int,
         mapping: Mapping,
         dtype: DataType = DataType.HALF,
-        spec_config: Optional["SpecConfig"] = None,
+        spec_config: Optional["DecodingBaseConfig"] = None,
         layer_mask: Optional[List[bool]] = None,
         max_num_tokens: int = 8192,
         model_config: Optional[ModelConfig] = None,

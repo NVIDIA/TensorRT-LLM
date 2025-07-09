@@ -35,7 +35,7 @@ def run_MTP(model: Optional[str] = None):
 def run_Eagle3():
     spec_config = EagleDecodingConfig(
         max_draft_len=3,
-        pytorch_weights_path="yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
+        speculative_model_dir="yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
         eagle3_one_model=True)
 
     llm = LLM(
