@@ -34,13 +34,15 @@ namespace torch_ext
 // returns self_mxfp8, self_block_scale_factors
 // self_mxfp8: [M, K], Float8_e4m3fn
 // self_block_scale_factors: ceil(M / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE
-std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor const& self, bool isSfSwizzledLayout)
+std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(
+    at::Tensor const& self, bool isSfSwizzledLayout, int64_t alignment = 32)
 {
     CHECK_TH_CUDA(self);
     CHECK_CONTIGUOUS(self);
 
     // Fixed SF_VEC_SIZE as 32
     static constexpr int SF_VEC_SIZE = 32;
+    TORCH_CHECK(alignment % SF_VEC_SIZE == 0, "alignment must be divisible by SF_VEC_SIZE = 32");
 
     auto const& inputShape = self.sizes();
     auto const& rank = inputShape.size();
@@ -52,16 +54,17 @@ std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor const& self, bool i
         m *= inputShape[i];
     }
     auto const k = inputShape[rank - 1];
-    TORCH_CHECK(k % SF_VEC_SIZE == 0, "k must be divisible by 32");
+    TORCH_CHECK(k % SF_VEC_SIZE == 0, "k must be divisible by SF_VEC_SIZE = 32");
+    auto const padded_k = ((k + alignment - 1) / alignment) * alignment;
 
     std::vector<int64_t> outputShape(inputShape.begin(), inputShape.end());
-    outputShape[rank - 1] = k;
+    outputShape[rank - 1] = padded_k;
 
     at::Tensor valMxFP8
         = at::detail::empty_cuda(outputShape, at::ScalarType::Float8_e4m3fn, self.device(), /* stride */ std::nullopt);
 
-    int64_t SFSize = isSfSwizzledLayout ? tensorrt_llm::computeSwizzledLayoutSFSize(m, k / SF_VEC_SIZE)
-                                        : tensorrt_llm::computeLinearLayoutSFSize(m, k / SF_VEC_SIZE);
+    int64_t SFSize = isSfSwizzledLayout ? tensorrt_llm::computeSwizzledLayoutSFSize(m, padded_k / SF_VEC_SIZE)
+                                        : tensorrt_llm::computeLinearLayoutSFSize(m, padded_k / SF_VEC_SIZE);
 
     at::Tensor scaleFP8SF
         = at::detail::empty_cuda({SFSize}, SF_DTYPE, self.device(), /* stride */ std::nullopt); // 1D tensor
@@ -72,7 +75,7 @@ std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor const& self, bool i
                                            : tensorrt_llm::QuantizationSFLayout::LINEAR;
 
 #define LAUNCH_MXFP8_QUANTIZE_KERNEL(T)                                                                                \
-    tensorrt_llm::kernels::invokeMxFP8Quantization(1, m, k, reinterpret_cast<T*>(self.data_ptr()),                     \
+    tensorrt_llm::kernels::invokeMxFP8Quantization(1, m, k, padded_k, reinterpret_cast<T*>(self.data_ptr()),           \
         reinterpret_cast<int64_t*>(valMxFP8.data_ptr()), reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), layout,    \
         mMultiProcessorCount, at::cuda::getCurrentCUDAStream(self.get_device()));
 
@@ -102,7 +105,7 @@ std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor const& self, bool i
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "mxfp8_quantize(Tensor input, bool swizzedLayout=True) "
+        "mxfp8_quantize(Tensor input, bool swizzedLayout=True, int alignment=32) "
         "-> (Tensor, Tensor)");
 }
 
