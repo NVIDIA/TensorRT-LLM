@@ -740,7 +740,7 @@ class PyTorchModelEngine(ModelEngine):
                                              resource_manager=resource_manager)
                                 torch.cuda.synchronize()
 
-            if self.pytorch_backend_config.autotuner_enabled:
+            if self.pytorch_backend_config.enable_autotuner:
                 with self.no_cuda_graph(), autotune():
                     result = get_autotune_warmup_request()
                     with release_batch(result) as batch:

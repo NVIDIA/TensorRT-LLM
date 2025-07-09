@@ -1754,7 +1754,7 @@ class TorchLlmArgs(BaseLlmArgs):
     torch_compile_config: Optional[TorchCompileConfig] = Field(
         default=None, description="Torch compile config.")
 
-    autotuner_enabled: bool = Field(
+    enable_autotuner: bool = Field(
         default=True,
         description="Enable autotuner only when torch compile is enabled.")
 
@@ -1960,7 +1960,7 @@ class TorchLlmArgs(BaseLlmArgs):
             torch_compile_enable_userbuffers=self.torch_compile_config.
             enable_userbuffers if self.torch_compile_config is not None else
             TorchCompileConfig.model_fields['enable_userbuffers'].default,
-            autotuner_enabled=self.autotuner_enabled,
+            enable_autotuner=self.enable_autotuner,
             enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
             load_format=self.load_format,
             enable_min_latency=self.enable_min_latency,
