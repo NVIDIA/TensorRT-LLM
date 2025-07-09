@@ -1723,6 +1723,28 @@ class TorchLlmArgs(BaseLlmArgs):
         "If true, enable min-latency mode. Currently only used for Llama4.",
     )
 
+    # Block prediction configuration
+    enable_block_prediction: bool = Field(
+        default=False,
+        description="Enable block prediction for faster generation."
+    )
+    block_size: int = Field(
+        default=8,
+        description="Number of tokens to predict in each block."
+    )
+    keep_threshold: float = Field(
+        default=0.8,
+        description="Confidence threshold for keeping tokens in block prediction."
+    )
+    mask_token_id: int = Field(
+        default=151666,
+        description="Token ID to use as mask in block prediction."
+    )
+    max_iterations: int = Field(
+        default=10,
+        description="Maximum number of iterations for block prediction."
+    )
+
     # TODO: remove backend later
     @field_validator('backend', mode='before')
     def init_backend(cls, v):
@@ -1812,7 +1834,12 @@ class TorchLlmArgs(BaseLlmArgs):
             autotuner_enabled=self.autotuner_enabled,
             enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
             load_format=self.load_format,
-            enable_min_latency=self.enable_min_latency)
+            enable_min_latency=self.enable_min_latency,
+            enable_block_prediction=self.enable_block_prediction,
+            block_size=self.block_size,
+            keep_threshold=self.keep_threshold,
+            mask_token_id=self.mask_token_id,
+            max_iterations=self.max_iterations)
 
     @field_validator('cuda_graph_max_batch_size')
     @classmethod

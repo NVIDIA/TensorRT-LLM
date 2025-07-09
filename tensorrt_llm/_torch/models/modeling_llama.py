@@ -657,6 +657,30 @@ class Llama4Model(DecoderModel):
         lora_params=None,
         **kwargs,
     ) -> torch.Tensor:
+        # Add logging for block prediction verification
+        if input_ids is not None:
+            # Log the input token IDs
+            logger.info(f"[BLOCK_PREDICTION] Llama4Model forward - input_ids shape: {input_ids.shape}")
+            logger.info(f"[BLOCK_PREDICTION] Llama4Model forward - input_ids: {input_ids.tolist()}")
+            
+            # Try to decode tokens if we have a tokenizer available
+            try:
+                # Check if we can access a tokenizer through the model config or other means
+                if hasattr(self, 'config') and hasattr(self.config, 'tokenizer'):
+                    decoded_text = self.config.tokenizer.decode(input_ids[0].tolist())
+                    logger.info(f"[BLOCK_PREDICTION] Llama4Model forward - decoded text: '{decoded_text}'")
+                else:
+                    # Simple token ID to string conversion for debugging
+                    token_str = " ".join([str(tid.item()) for tid in input_ids[0]])
+                    logger.info(f"[BLOCK_PREDICTION] Llama4Model forward - token IDs as string: {token_str}")
+                    
+                    # Check for mask tokens (151666 is the default mask token ID)
+                    mask_count = (input_ids == 151666).sum().item()
+                    logger.info(f"[BLOCK_PREDICTION] Llama4Model forward - mask tokens (151666) count: {mask_count}")
+                    
+            except Exception as e:
+                logger.warning(f"[BLOCK_PREDICTION] Failed to decode tokens: {e}")
+        
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -748,6 +772,30 @@ class LlamaModel(DecoderModel):
         lora_params=None,
         **kwargs,
     ) -> torch.Tensor:
+        # Add logging for block prediction verification
+        if input_ids is not None:
+            # Log the input token IDs
+            logger.info(f"[BLOCK_PREDICTION] LlamaModel forward - input_ids shape: {input_ids.shape}")
+            logger.info(f"[BLOCK_PREDICTION] LlamaModel forward - input_ids: {input_ids.tolist()}")
+            
+            # Try to decode tokens if we have a tokenizer available
+            try:
+                # Check if we can access a tokenizer through the model config or other means
+                if hasattr(self, 'config') and hasattr(self.config, 'tokenizer'):
+                    decoded_text = self.config.tokenizer.decode(input_ids[0].tolist())
+                    logger.info(f"[BLOCK_PREDICTION] LlamaModel forward - decoded text: '{decoded_text}'")
+                else:
+                    # Simple token ID to string conversion for debugging
+                    token_str = " ".join([str(tid.item()) for tid in input_ids[0]])
+                    logger.info(f"[BLOCK_PREDICTION] LlamaModel forward - token IDs as string: {token_str}")
+                    
+                    # Check for mask tokens (151666 is the default mask token ID)
+                    mask_count = (input_ids == 151666).sum().item()
+                    logger.info(f"[BLOCK_PREDICTION] LlamaModel forward - mask tokens (151666) count: {mask_count}")
+                    
+            except Exception as e:
+                logger.warning(f"[BLOCK_PREDICTION] Failed to decode tokens: {e}")
+        
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"

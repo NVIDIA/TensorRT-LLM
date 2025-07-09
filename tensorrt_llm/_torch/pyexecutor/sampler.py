@@ -23,6 +23,7 @@ from tensorrt_llm.bindings.internal.runtime import (BufferManager, DecoderState,
                                                     GptDecoderBatched)
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.logger import logger
 
 from .llm_request import LlmRequest, LlmRequestState
 from .scheduler import ScheduledRequests
@@ -795,7 +796,15 @@ class BlockPredictionSampler(TorchSampler):
         Returns:
             SampleStateBlockPrediction with block prediction results
         """
+        # Add logging to verify block prediction is being called
+        logger.info(f"[BLOCK_PREDICTION] BlockPredictionSampler.sample_async called")
+        logger.info(f"[BLOCK_PREDICTION] Batch size: {scheduled_requests.batch_size}")
+        logger.info(f"[BLOCK_PREDICTION] Block size: {self.block_size}")
+        logger.info(f"[BLOCK_PREDICTION] Keep threshold: {self.keep_threshold}")
+        
         logits = model_outputs["logits"]
+        logger.info(f"[BLOCK_PREDICTION] Logits shape: {logits.shape}")
+        
         batch_size = scheduled_requests.batch_size
         
         # Initialize masked chunks for each request
@@ -803,6 +812,8 @@ class BlockPredictionSampler(TorchSampler):
                                   self.mask_token_id, 
                                   dtype=torch.int, 
                                   device=logits.device)
+        
+        logger.info(f"[BLOCK_PREDICTION] Initial masked_chunks: {masked_chunks.tolist()}")
         
         # Track probabilities and predicted tokens
         block_probs = torch.zeros((batch_size, self.block_size), 
@@ -817,8 +828,11 @@ class BlockPredictionSampler(TorchSampler):
         for iteration in range(self.max_iterations):
             iteration_count = iteration + 1
             
+            logger.info(f"[BLOCK_PREDICTION] Iteration {iteration_count}")
+            
             # Check if all tokens are unmasked
             if torch.all(masked_chunks != self.mask_token_id):
+                logger.info(f"[BLOCK_PREDICTION] All tokens unmasked, breaking")
                 break
                 
             # Extract logits for the block positions

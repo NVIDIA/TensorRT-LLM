@@ -14,47 +14,47 @@ from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 
 
 def main():
-    # Create a PyTorchConfig with block prediction enabled
-    pytorch_config = PyTorchConfig(
+    # Create an LLM with block prediction enabled
+    llm = LLM(
+        model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",  # Using a supported model
+        backend="pytorch",
         enable_block_prediction=True,
         block_size=8,  # Number of tokens to predict in each block
         keep_threshold=0.8,  # Confidence threshold for keeping tokens
-        mask_token_id=151666,  # Token ID to use for masked positions
-        max_iterations=10,  # Maximum iterations for block prediction
-    )
-    
-    # Initialize the LLM with block prediction
-    llm = LLM(
-        model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",  # Use a small model for demo
-        backend='pytorch',
-        pytorch_backend_config=pytorch_config,
-        max_seq_len=2048,
-        max_batch_size=4,
-        max_num_tokens=4096,
-    )
-    
-    # Sample prompts
-    prompts = [
-        "The future of artificial intelligence is",
-        "In the year 2050, technology will",
-        "The most important invention of the 21st century is",
-        "Climate change solutions include",
-    ]
-    
-    # Create sampling parameters
-    sampling_params = SamplingParams(
-        max_tokens=20,
-        temperature=0.7,
-        top_p=0.9,
+        mask_token_id=151666,  # Token ID to use as mask
+        max_iterations=10,  # Maximum number of iterations
+        max_batch_size=1,
+        max_num_tokens=512,
+        max_seq_len=512,
     )
     
     print("=== Block Prediction Example ===\n")
     print("Configuration:")
-    print(f"  Block size: {pytorch_config.block_size}")
-    print(f"  Keep threshold: {pytorch_config.keep_threshold}")
-    print(f"  Mask token ID: {pytorch_config.mask_token_id}")
-    print(f"  Max iterations: {pytorch_config.max_iterations}")
+    # Access block prediction config through the args
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+    if isinstance(llm.args, TorchLlmArgs):
+        print(f"  Block prediction enabled: {llm.args.enable_block_prediction}")
+        print(f"  Block size: {llm.args.block_size}")
+        print(f"  Keep threshold: {llm.args.keep_threshold}")
+        print(f"  Mask token ID: {llm.args.mask_token_id}")
+        print(f"  Max iterations: {llm.args.max_iterations}")
+    else:
+        print("  Block prediction configuration not available")
     print()
+    
+    # Define sample prompts
+    prompts = [
+        "The future of artificial intelligence is",
+        "In a world where technology advances rapidly,",
+        "The most important thing to remember is",
+    ]
+    
+    # Create sampling parameters
+    sampling_params = SamplingParams(
+        max_tokens=50,
+        temperature=0.7,
+        top_p=0.9,
+    )
     
     # Generate text with block prediction
     for i, prompt in enumerate(prompts):
@@ -64,15 +64,18 @@ def main():
         outputs = llm.generate([prompt], sampling_params)
         
         # Print the generated text
-        # Access the first output's text
-        output = outputs[0]
-        generated_text = output.outputs[0].text
-        print(f"Generated: {generated_text}")
-        
-        # Print block prediction statistics if available
-        # Note: Block prediction results are stored internally and may not be directly accessible
-        # through the public API in this version
-        print(f"  Generated {len(generated_text.split())} words")
+        # outputs is a list of RequestOutput objects
+        # Each RequestOutput has an outputs attribute which is a list of CompletionOutput objects
+        if isinstance(outputs, list) and len(outputs) > 0:
+            output = outputs[0]
+            if hasattr(output, 'outputs') and isinstance(output.outputs, list) and len(output.outputs) > 0:
+                generated_text = output.outputs[0].text
+                print(f"Generated: {generated_text}")
+                print(f"  Generated {len(generated_text.split())} words")
+            else:
+                print("No output generated")
+        else:
+            print("No outputs returned")
         print()
     
     print("=== Block Prediction Process Explanation ===")

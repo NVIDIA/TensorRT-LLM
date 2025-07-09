@@ -146,10 +146,9 @@ def _gc_nvtx_watcher():
 @dataclasses.dataclass
 class BatchState:
     sample_state: SampleState
-
     iter_start_time: float = 0
-    iter_stats: IterationStats = None
-    ctx_transmission_reqs: list[LlmRequest] = None
+    iter_stats: Optional[IterationStats] = None
+    ctx_transmission_reqs: Optional[list] = None
 
 
 @dataclasses.dataclass
@@ -169,7 +168,7 @@ class PyExecutor:
                  max_input_len: int = 2048,
                  max_batch_size: int = 8,
                  max_draft_tokens: int = 0,
-                 kv_cache_transceiver: KvCacheTransceiver = None,
+                 kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
                  draft_model_engine: Optional[ModelEngine] = None,
                  garbage_collection_gen0_threshold: Optional[int] = None,
                  start_worker: bool = True):
@@ -188,16 +187,18 @@ class PyExecutor:
         self.resource_manager = resource_manager
         self.scheduler = scheduler
         self.model_engine = model_engine
-        self.enable_attention_dp = model_engine.enable_attention_dp
+        self.enable_attention_dp = getattr(model_engine, 'enable_attention_dp', False)
         self.sampler = sampler
         self.dist = dist
         self.disable_overlap_scheduler = disable_overlap_scheduler
         
         # Initialize block prediction sampler if needed
         self.block_prediction_sampler = None
-        if hasattr(model_engine, 'pytorch_backend_config') and model_engine.pytorch_backend_config.enable_block_prediction:
+        block_prediction_enabled = False
+        pytorch_backend_config = getattr(model_engine, 'pytorch_backend_config', None)
+        if pytorch_backend_config and getattr(pytorch_backend_config, 'enable_block_prediction', False):
             from .sampler import BlockPredictionSampler
-            config = model_engine.pytorch_backend_config
+            config = pytorch_backend_config
             self.block_prediction_sampler = BlockPredictionSampler(
                 max_seq_len=max_input_len,
                 block_size=config.block_size,
@@ -205,6 +206,7 @@ class PyExecutor:
                 mask_token_id=config.mask_token_id,
                 max_iterations=config.max_iterations
             )
+            block_prediction_enabled = True
 
         # Draft model for certain spec decode algorithms, e.g. EAGLE3
         self.draft_model_engine = draft_model_engine
@@ -214,9 +216,9 @@ class PyExecutor:
         self.active = True
         self.next_req_id = max_batch_size  # The first max_batch_size request IDs are reserved for dummy requests
         self.max_draft_tokens = max_draft_tokens
-        self.print_log = model_engine.pytorch_backend_config.print_iter_log
-        self.enable_iter_perf_stats = model_engine.pytorch_backend_config.enable_iter_perf_stats
-        self.enable_iter_req_stats = model_engine.pytorch_backend_config.enable_iter_req_stats
+        self.print_log = pytorch_backend_config and getattr(pytorch_backend_config, 'print_iter_log', False)
+        self.enable_iter_perf_stats = pytorch_backend_config and getattr(pytorch_backend_config, 'enable_iter_perf_stats', False)
+        self.enable_iter_req_stats = pytorch_backend_config and getattr(pytorch_backend_config, 'enable_iter_req_stats', False)
         self.num_fetch_requests_cur_rank = 0
         self.num_fetch_requests = 0
         self.shutdown_event = threading.Event()
@@ -269,7 +271,10 @@ class PyExecutor:
         self.gather_all_responses = False
 
         self.kv_cache_transceiver = kv_cache_transceiver
-        if self.dist.pp_size > 1:
+        # Select the correct event loop
+        if block_prediction_enabled and self.dist.pp_size == 1:
+            self.event_loop = self._executor_loop_block
+        elif self.dist.pp_size > 1:
             self.event_loop = self._executor_loop_pp
         else:
             self.event_loop = self._executor_loop if disable_overlap_scheduler else self._executor_loop_overlap
@@ -350,15 +355,15 @@ class PyExecutor:
         Returns:
             Union[List[tensorrt_llm.bindings.executor.Response], List[List[tensorrt_llm.bindings.executor.Response]]]: Responses
         """
-        timeout = timeout.total_seconds() if timeout is not None else None
+        timeout_secs = timeout.total_seconds() if timeout is not None else None
         if id is None:
-            return self._await_any_response(timeout=timeout)
+            return self._await_any_response(timeout=timeout_secs)
         if isinstance(id, int):
-            return self._await_single_response(id=id, timeout=timeout)
+            return self._await_single_response(id=id, timeout=timeout_secs)
         responses = []
         for req_id in id:
             responses.append(
-                self._await_single_response(id=req_id, timeout=timeout))
+                self._await_single_response(id=req_id, timeout=timeout_secs))
         return responses
 
     def cancel_request(self, id: int):
@@ -1249,22 +1254,23 @@ class PyExecutor:
                     self._terminate_ctx_finished_requests()
 
     def _process_previous_batch(self):
-        self._update_requests(self.previous_batch.sample_state)
+        prev_batch = self.previous_batch
+        self._update_requests(prev_batch.sample_state)
 
-        if self.kv_cache_transceiver and self.previous_batch.ctx_transmission_reqs:
-            for req in self.previous_batch.ctx_transmission_reqs:
+        if self.kv_cache_transceiver and prev_batch.ctx_transmission_reqs:
+            for req in prev_batch.ctx_transmission_reqs:
                 req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
 
         self._handle_cancelled_requests()
         finished_requests = self._handle_responses()
-        scheduled_requests = self.previous_batch.sample_state.scheduled_requests
+        scheduled_requests = prev_batch.sample_state.scheduled_requests
         self.resource_manager.update_resources(scheduled_requests)
         if self.enable_kv_cache_events:
             self._add_kv_cache_events()
 
         if self.enable_iter_perf_stats:
             self._process_iter_stats(finished_requests, self.active_requests,
-                                     self.previous_batch)
+                                     prev_batch)
 
     @nvtx_range("_forward_step_inter_pp")
     def _forward_step_inter_pp(self, scheduled_batch) -> SampleState:
