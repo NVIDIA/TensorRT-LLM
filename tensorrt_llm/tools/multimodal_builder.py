@@ -1756,8 +1756,7 @@ def build_pixtral_engine(args):
 
 
 def build_llama_nemotron_nano_vl_engine(args):
-    from llama_3_1_nemotron_nano_vl_8b_v1.modeling import Llama_Nemotron_Nano_VL
-    model = Llama_Nemotron_Nano_VL.from_pretrained(args.model_path)
+    model = AutoModel.from_pretrained(args.model_path)
 
     class RadioWithNeck(torch.nn.Module):
 
@@ -1814,5 +1813,5 @@ def build_llama_nemotron_nano_vl_engine(args):
         args.output_dir,
         args.max_batch_size,
         dtype=model.dtype,
-        engine_name='visual_encoder.engine',
+        engine_name='model.engine',
     )
