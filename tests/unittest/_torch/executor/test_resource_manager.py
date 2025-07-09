@@ -438,6 +438,7 @@ class TestResourceManager(unittest.TestCase):
             200: [4, 5, 6],
             7000: [7, 8],
         }
+        max_attention_window_vec = [100] * 4 + [200] * 3 + [7000] * 2
 
         model_config = self.MockModelConfig()
         model_config.num_attention_heads = 2
@@ -465,6 +466,7 @@ class TestResourceManager(unittest.TestCase):
                     100: [0, 1, 2, 3],
                     130: [4, 5, 6, 7, 8],
                 },
+                [100] * 4 + [130] * 5,
                 None,
                 "limited_memory_clamped_windows"),
             (
@@ -476,6 +478,7 @@ class TestResourceManager(unittest.TestCase):
                     200: [4, 5, 6],
                     1017: [7, 8],
                 },
+                [100] * 4 + [200] * 3 + [1017] * 2,
                 None,
                 "less_limited_memory_clamped_windows"),
             (
@@ -487,6 +490,7 @@ class TestResourceManager(unittest.TestCase):
                     200: [4, 5, 6],
                     7000: [7, 8],
                 },
+                [100] * 4 + [200] * 3 + [7000] * 2,
                 None,
                 "sufficient_memory_no_clamping"),
             (
@@ -495,6 +499,7 @@ class TestResourceManager(unittest.TestCase):
                 {
                     51: [0, 1, 2, 3, 4, 5, 6, 7, 8],
                 },
+                [51] * 9,
                 None,
                 "very_limited_memory_all_clamped"),
             (
@@ -506,15 +511,17 @@ class TestResourceManager(unittest.TestCase):
                     100: [0, 1, 2, 3],
                     134: [4, 5, 6, 7, 8],
                 },
+                [100] * 4 + [134] * 5,
                 134,
                 "less_limited_memory_but_clamped_by_max_tokens"),
         ]
 
-        for memory_bytes, expected_window_sizes, max_tokens, description in test_cases:
+        for memory_bytes, expected_window_sizes, expected_max_attention_window_vec, max_tokens, description in test_cases:
             with self.subTest(case=description, memory_bytes=memory_bytes):
                 kv_cache_config = tllm.KvCacheConfig(max_tokens=max_tokens)
-                adjusted = KVCacheManager.adjust_window_sizes_for_vswa(
+                adjusted, adjusted_max_attention_window_vec = KVCacheManager.adjust_window_sizes_for_vswa(
                     window_size_to_layers=window_size_to_layers,
+                    max_attention_window_vec=max_attention_window_vec,
                     model_config=model_config,
                     kv_cache_config=kv_cache_config,
                     pool_memory_bytes=memory_bytes,
@@ -529,6 +536,13 @@ class TestResourceManager(unittest.TestCase):
                     f"Memory bytes: {memory_bytes}\n"
                     f"Actual: {adjusted}\n"
                     f"Expected: {expected_window_sizes}")
+                self.assertEqual(
+                    adjusted_max_attention_window_vec,
+                    expected_max_attention_window_vec,
+                    f"Test case '{description}' failed.\n"
+                    f"Memory bytes: {memory_bytes}\n"
+                    f"Actual: {adjusted_max_attention_window_vec}\n"
+                    f"Expected: {expected_max_attention_window_vec}")
 
 
 if __name__ == "__main__":
