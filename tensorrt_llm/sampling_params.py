@@ -111,12 +111,9 @@ class LogitBiasLogitsProcessor(LogitsProcessor):
     def __init__(self, logit_bias: Dict[str, float]) -> None:
         super().__init__()
         self.logit_bias = logit_bias
-        self.tokens_to_adjust = {}
-        try:
-            self.tokens_to_adjust = self.process_logit_bias(logit_bias)
-        except ValueError as e:
-            logger.error(e)
-            raise
+        self.tokens_to_adjust = self.process_logit_bias(logit_bias)
+        if not self.tokens_to_adjust:
+            raise ValueError("Empty logit_bias provided - no tokens to adjust")
                 
     def process_logit_bias(self,logit_bias: Dict[str, float]) -> Dict[int, float]:
         valid = {}
@@ -140,25 +137,24 @@ class LogitBiasLogitsProcessor(LogitsProcessor):
                  token_ids: List[List[int]], stream_ptr: Optional[int],
                  client_id: Optional[int]) -> None:
 
-        if self.tokens_to_adjust:
-            vocab_size = logits.size(-1)
-            token_ids_list = list(self.tokens_to_adjust.keys())
-            bias_values = torch.tensor(
-                list(self.tokens_to_adjust.values())
-            )
-            
-            invalid_token_ids = [tid for tid in token_ids_list if tid >= vocab_size]
-            if invalid_token_ids:
-                raise ValueError(
-                    f"Token ID(s) {invalid_token_ids} exceed vocabulary size (vocab_size={vocab_size})"
-                )
+        vocab_size = logits.size(-1)
+        token_ids_list = list(self.tokens_to_adjust.keys())
+        bias_values = torch.tensor(
+            list(self.tokens_to_adjust.values())
+        )
         
-            stream = None if stream_ptr is None else torch.cuda.ExternalStream(stream_ptr)
-            with torch.cuda.stream(stream):
-                logits[:, :, token_ids_list] += bias_values
+        invalid_token_ids = [tid for tid in token_ids_list if tid >= vocab_size]
+        if invalid_token_ids:
+            raise ValueError(
+                f"Token ID(s) {invalid_token_ids} exceed vocabulary size (vocab_size={vocab_size})"
+            )
+    
+        stream = None if stream_ptr is None else torch.cuda.ExternalStream(stream_ptr)
+        with torch.cuda.stream(stream):
+            logits[:, :, token_ids_list] += bias_values
 
-            if stream is not None:
-                stream.synchronize()
+        if stream is not None:
+            stream.synchronize()
 
 @dataclass(slots=True, kw_only=True)
 class AdditionalModelOutput:
