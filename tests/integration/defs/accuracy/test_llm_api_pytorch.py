@@ -262,7 +262,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
         draft_len = 4
         spec_config = NGramDecodingConfig(
-            prompt_lookup_num_tokens=draft_len,
+            max_draft_len=draft_len,
             max_matching_ngram_size=draft_len,
             is_keep_all=True,
             is_use_oldest=True,

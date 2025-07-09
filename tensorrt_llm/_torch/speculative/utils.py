@@ -3,7 +3,6 @@ import torch
 from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler
 from tensorrt_llm._torch.speculative.interface import SpecMetadata
 
-from .draft_target import DraftTargetSpecMetadata
 from .eagle3 import (Eagle3OneModelSampler, Eagle3OneModelSpecMetadata,
                      Eagle3OneModelWorker, Eagle3ResourceManager,
                      Eagle3SpecMetadata)
@@ -20,7 +19,7 @@ def get_spec_metadata(spec_config,
                       is_draft_model=False):
     if spec_config.spec_dec_mode.is_mtp():
         return MTPSpecMetadata(
-            max_draft_tokens=spec_config.max_draft_tokens,
+            max_draft_len=spec_config.max_draft_len,
             spec_dec_mode=spec_config.spec_dec_mode,
             mtp_num_modules=spec_config.num_nextn_predict_layers,
             max_num_requests=max_num_requests,
@@ -28,7 +27,7 @@ def get_spec_metadata(spec_config,
         )
     if spec_config.spec_dec_mode.is_eagle3():
         return Eagle3SpecMetadata(
-            max_draft_tokens=spec_config.max_draft_tokens,
+            max_draft_len=spec_config.max_draft_len,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
             num_layers=model_config.num_hidden_layers,
@@ -40,23 +39,18 @@ def get_spec_metadata(spec_config,
         )
     if spec_config.spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelSpecMetadata(
-            max_draft_tokens=spec_config.max_draft_tokens,
+            max_draft_len=spec_config.max_draft_len,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
             num_layers=model_config.num_hidden_layers,
             hidden_size=model_config.hidden_size,
             max_num_tokens=max_num_tokens,
         )
-    if spec_config.spec_dec_mode.is_draft_target():
-        return DraftTargetSpecMetadata(
-            max_draft_tokens=spec_config.max_draft_tokens,
-            spec_dec_mode=spec_config.spec_dec_mode,
-            max_num_requests=max_num_requests,
-        )
-    if spec_config.spec_dec_mode.is_ngram(
-    ) or spec_config.spec_dec_mode.is_user_provided():
+    if  spec_config.spec_dec_mode.is_draft_target() or \
+        spec_config.spec_dec_mode.is_ngram() or \
+        spec_config.spec_dec_mode.is_user_provided():
         return SpecMetadata(
-            max_draft_tokens=spec_config.max_draft_tokens,
+            max_draft_len=spec_config.max_draft_len,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
         )

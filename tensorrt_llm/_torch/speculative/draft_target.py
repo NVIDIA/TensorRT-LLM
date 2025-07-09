@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
+from .interface import SpecConfig, SpeculativeDecodingMode
 
 
 @dataclass
@@ -23,13 +23,3 @@ class DraftTargetConfig(SpecConfig):
     def get_draft_model_prompt(self,
                                input_tokens: torch.Tensor) -> torch.Tensor:
         return input_tokens
-
-
-@dataclass
-class DraftTargetSpecMetadata(SpecMetadata):
-
-    def __post_init__(self):
-        pass
-
-    def prepare(self):
-        pass

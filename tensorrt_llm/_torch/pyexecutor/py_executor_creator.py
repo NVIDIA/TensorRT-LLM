@@ -247,7 +247,7 @@ def create_py_executor(
             draft_spec_config = copy.copy(spec_config)
             # The draft model won't have any draft tokens attached to
             # generation requests when we invoke it autoregressively
-            draft_spec_config.max_draft_tokens = 0
+            draft_spec_config.max_draft_len = 0
 
             draft_model_engine = PyTorchModelEngine(
                 model_path=spec_config.speculative_model_dir,
@@ -276,11 +276,11 @@ def create_py_executor(
     if not pytorch_backend_config.disable_overlap_scheduler:
         max_seq_len = model_engine.max_seq_len + 1
         if spec_config is not None:
-            max_seq_len += spec_config.max_draft_tokens
+            max_seq_len += spec_config.max_draft_len
 
     if spec_config is not None:
         max_seq_len += spec_config.num_extra_kv_tokens
-        max_seq_len += spec_config.max_draft_tokens
+        max_seq_len += spec_config.max_draft_len
 
     executor_config.max_seq_len = max_seq_len
     executor_config.max_num_tokens = model_engine.max_num_tokens
