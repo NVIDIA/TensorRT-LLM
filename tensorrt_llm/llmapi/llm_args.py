@@ -328,6 +328,15 @@ class EagleDecodingConfig(DecodingBaseConfig):
             return TorchSpeculativeDecodingMode.EAGLE3_ONE_MODEL
         return TorchSpeculativeDecodingMode.EAGLE3
 
+    # Keep this for compliance with the old interface.
+    # TODO: remove this later
+    def get_draft_model_prompt(self,
+                               input_tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Eagle3 always throws away the first token when processing draft inputs
+        """
+        return input_tokens[1:]
+
 
 class UserProvidedDecodingConfig(DecodingBaseConfig):
     # Type should be Drafter, but it leads to circular import
@@ -422,6 +431,14 @@ class MTPDecodingConfig(DecodingBaseConfig):
         if self.num_nextn_predict_layers_from_model_config == 1 and not self.use_mtp_vanilla:
             return TorchSpeculativeDecodingMode.MTP_EAGLE
         return TorchSpeculativeDecodingMode.MTP
+
+    # Keep this for compliance with the old interface.
+    # TODO: remove this later
+    def update_from_model_config(self, model_config):
+        assert self.num_nextn_predict_layers > 0
+        if model_config.num_nextn_predict_layers == 1 and not self.use_mtp_vanilla:
+            # self.spec_dec_mode = SpeculativeDecodingMode.MTP_EAGLE
+            self.num_extra_kv_tokens = self.num_nextn_predict_layers - 1
 
 
 class PybindMirror(ABC):
@@ -1420,6 +1437,24 @@ class BaseLlmArgs(BaseModel):
                     decoding_mode=DecodingMode.Medusa(),
                     medusa_choices=self.speculative_config.medusa_choices)
             elif isinstance(self.speculative_config, EagleDecodingConfig):
+                assert self.speculative_config.max_draft_len > 0
+                assert self.speculative_config.speculative_model_dir is not None, "Path to EAGLE3 weights must be specified."
+                self.build_config.max_draft_len = self.speculative_config.max_draft_len
+                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.EAGLE
+                if self.speculative_config.eagle3_one_model:  # from __post_init__()
+                    self.num_extra_kv_tokens = self.max_draft_len - 1
+
+                if self.backend not in ['pytorch', '_autodeploy']:
+                    eagle_config = _EagleConfig(
+                        self.speculative_config.eagle_choices,
+                        self.speculative_config.greedy_sampling,
+                        self.speculative_config.posterior_threshold,
+                        self.speculative_config.use_dynamic_tree,
+                        self.speculative_config.dynamic_tree_max_topK)
+                    self.decoding_config = DecodingConfig(
+                        decoding_mode=DecodingMode.Eagle(),
+                        eagle_config=eagle_config)
+                """
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.EAGLE
                 assert self.speculative_config.max_draft_len > 0
 
@@ -1443,6 +1478,7 @@ class BaseLlmArgs(BaseModel):
                         speculative_model_dir,
                         eagle3_one_model=self.speculative_config.
                         eagle3_one_model)
+                """
             elif isinstance(self.speculative_config, NGramDecodingConfig):
                 assert self.backend in ['pytorch', '_autodeploy']
                 assert self.speculative_config.max_draft_len > 0 and self.speculative_config.max_matching_ngram_size > 0
@@ -1456,6 +1492,8 @@ class BaseLlmArgs(BaseModel):
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
 
             elif isinstance(self.speculative_config, MTPDecodingConfig):
+                self.speculative_config.max_draft_len = self.speculative_config.num_nextn_predict_layers  # from __post_init__()
+                """
                 from tensorrt_llm._torch.speculative import MTPConfig
                 self.speculative_config = MTPConfig(
                     num_nextn_predict_layers=self.speculative_config.
@@ -1466,6 +1504,7 @@ class BaseLlmArgs(BaseModel):
                     relaxed_topk=self.speculative_config.relaxed_topk,
                     relaxed_delta=self.speculative_config.relaxed_delta,
                     use_mtp_vanilla=self.speculative_config.use_mtp_vanilla)
+                """
             elif isinstance(self.speculative_config,
                             UserProvidedDecodingConfig):
                 assert self.backend in ['pytorch', '_autodeploy']

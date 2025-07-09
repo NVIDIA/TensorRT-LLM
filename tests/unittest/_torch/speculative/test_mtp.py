@@ -6,9 +6,9 @@ from parameterized import parameterized
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.speculative.mtp import (MTPConfig,
-                                                 MTPHiddenStatesManager,
+from tensorrt_llm._torch.speculative.mtp import (MTPHiddenStatesManager,
                                                  MTPSpecMetadata, MTPWorker)
+from tensorrt_llm.llmapi import MTPDecodingConfig
 
 
 def unittest_name_func(testcase_func, param_num, param):
@@ -294,7 +294,8 @@ class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
                                             ref_accepted_tokens,
                                             ref_num_accepted_tokens):
         batch_size = len(draft_len)
-        spec_config = MTPConfig(num_nextn_predict_layers=mtp_num_modules)
+        spec_config = MTPDecodingConfig(
+            num_nextn_predict_layers=mtp_num_modules)
 
         # attention metedata
         attn_metadata = TrtllmAttentionMetadata(max_num_requests=batch_size,
@@ -868,7 +869,7 @@ class TestMTPUpdateMTPHiddenStates(unittest.TestCase):
         batch_size = len(request_ids)
         batch_size - num_context_request
         hidden_size = hidden_states.shape[1]
-        spec_config = MTPConfig(
+        spec_config = MTPDecodingConfig(
             num_nextn_predict_layers=num_nextn_predict_layers)
 
         attn_metadata = TrtllmAttentionMetadata(max_num_requests=batch_size,
@@ -1359,7 +1360,7 @@ class TestMTPPrepareDrafterInputs(unittest.TestCase):
             hidden_size = previous_layer_hidden_states.shape[1]
         else:
             hidden_size = 10
-        spec_config = MTPConfig(
+        spec_config = MTPDecodingConfig(
             num_nextn_predict_layers=num_nextn_predict_layers)
 
         if attn_metadata is None:
