@@ -100,8 +100,7 @@ public:
     using RasterOrderOptions =
         typename cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90Params::RasterOrderOptions;
 
-    using TileBarrierType = cutlass::MulticastSystemBarrier<cutlass::detail::SyncNoOp, true /* Safe across phases */,
-        true /* membar.gpu */>;
+    using TileBarrierType = cutlass::MulticastSystemBarrier<cutlass::detail::SyncNoOp, true /* Safe across phases */>;
 
     // 16B alignment for TMA
     static constexpr int AlignmentA = 16 / sizeof(ElementA);

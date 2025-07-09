@@ -30,6 +30,8 @@ using namespace batchedGemm::batchedGemm;
 using namespace batchedGemm::gemm;
 using namespace batchedGemm::trtllm::gen;
 
+static BatchedGemmInterface::ModuleCache globalTrtllmGenBatchedGemmModuleCache;
+
 std::vector<int64_t> prioritizePredefinedConfigs(int m, int n, int k, std::vector<int64_t> const& sortedIndices,
     batchedGemm::batchedGemm::BatchedGemmConfig const* configs)
 {
@@ -295,7 +297,8 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vecto
     // FIXME once we start using all-reduce in the epilogue of the bmm this can be moved elsewhere
     bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
 
-    auto const err = bmm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount);
+    auto const err = bmm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount,
+        globalTrtllmGenBatchedGemmModuleCache);
 
     TLLM_CHECK_WITH_INFO(err == 0, "Error occurred when running GEMM!");
 }

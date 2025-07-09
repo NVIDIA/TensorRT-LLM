@@ -412,10 +412,12 @@ def main(*,
     if cpp_only:
         build_pyt = "OFF"
         build_pybind = "OFF"
+        build_deep_ep = "OFF"
     else:
-        targets.extend(["bindings", "th_common"])
+        targets.extend(["th_common", "bindings", "deep_ep"])
         build_pyt = "ON"
         build_pybind = "ON"
+        build_deep_ep = "ON"
 
     if benchmarks:
         targets.append("benchmarks")
@@ -454,7 +456,7 @@ def main(*,
                 )
             cmake_def_args = " ".join(cmake_def_args)
             cmake_configure_command = (
-                f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBUILD_PYBIND="{build_pybind}"'
+                f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBUILD_PYBIND="{build_pybind}" -DBUILD_DEEP_EP="{build_deep_ep}"'
                 f' -DNVTX_DISABLE="{disable_nvtx}" -DBUILD_MICRO_BENCHMARKS={build_micro_benchmarks}'
                 f' -DBUILD_WHEEL_TARGETS="{";".join(targets)}"'
                 f' -DPython_EXECUTABLE={venv_python} -DPython3_EXECUTABLE={venv_python}'
@@ -594,6 +596,13 @@ def main(*,
             "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/libdecoder_attention_1.so",
             lib_dir / "libdecoder_attention_1.so")
 
+    deep_ep_dir = pkg_dir / "deep_ep"
+    if deep_ep_dir.is_symlink():
+        deep_ep_dir.unlink()
+    elif deep_ep_dir.is_dir():
+        clear_folder(deep_ep_dir)
+        deep_ep_dir.rmdir()
+
     bin_dir = pkg_dir / "bin"
     if bin_dir.exists():
         clear_folder(bin_dir)
@@ -605,19 +614,41 @@ def main(*,
 
     if not cpp_only:
 
-        def get_pybind_lib():
-            pybind_build_dir = (build_dir / "tensorrt_llm" / "pybind")
+        def get_pybind_lib(subdirectory, name):
+            pybind_build_dir = (build_dir / "tensorrt_llm" / subdirectory)
             if on_windows:
-                pybind_lib = list(pybind_build_dir.glob("bindings.*.pyd"))
+                pybind_lib = list(pybind_build_dir.glob(f"{name}.*.pyd"))
             else:
-                pybind_lib = list(pybind_build_dir.glob("bindings.*.so"))
+                pybind_lib = list(pybind_build_dir.glob(f"{name}.*.so"))
 
             assert len(
                 pybind_lib
             ) == 1, f"Exactly one pybind library should be present: {pybind_lib}"
             return pybind_lib[0]
 
-        install_file(get_pybind_lib(), pkg_dir)
+        install_file(get_pybind_lib("pybind", "bindings"), pkg_dir)
+
+        with (build_dir / "tensorrt_llm" / "deep_ep" /
+              "cuda_architectures.txt").open() as f:
+            deep_ep_cuda_architectures = f.read().strip().strip(";")
+        if deep_ep_cuda_architectures:
+            install_file(get_pybind_lib("deep_ep", "deep_ep_cpp_tllm"), pkg_dir)
+            install_tree(build_dir / "tensorrt_llm" / "deep_ep" / "python" /
+                         "deep_ep",
+                         deep_ep_dir,
+                         dirs_exist_ok=True)
+            (lib_dir / "nvshmem").mkdir(exist_ok=True)
+            install_file(
+                build_dir / "tensorrt_llm/deep_ep/nvshmem-build/License.txt",
+                lib_dir / "nvshmem")
+            install_file(
+                build_dir /
+                "tensorrt_llm/deep_ep/nvshmem-build/src/lib/nvshmem_bootstrap_uid.so.3",
+                lib_dir / "nvshmem")
+            install_file(
+                build_dir /
+                "tensorrt_llm/deep_ep/nvshmem-build/src/lib/nvshmem_transport_ibgda.so.103",
+                lib_dir / "nvshmem")
         if not skip_stubs:
             with working_directory(project_dir):
                 build_run(f"\"{venv_python}\" -m pip install pybind11-stubgen")
@@ -650,15 +681,35 @@ def main(*,
                     new_library_path = "/usr/local/cuda/compat:/usr/local/cuda/compat/lib:/usr/local/cuda/compat/lib.real"
                     if 'LD_LIBRARY_PATH' in env_ld:
                         new_library_path += f":{env_ld['LD_LIBRARY_PATH']}"
+
+                    result = build_run("find /usr -name *libnvidia-ml.so*",
+                                       capture_output=True,
+                                       text=True)
+                    assert result.returncode == 0, f"Failed to run find *libnvidia-ml.so*: {result.stderr}"
+
+                    # Build containers only contain stub version of libnvidia-ml.so and not the real version.
+                    # If real version not in system, we need to create symbolic link to stub version to prevent import errors.
+                    if "libnvidia-ml.so.1" not in result.stdout:
+                        if "libnvidia-ml.so" in result.stdout:
+                            line = result.stdout.splitlines()[0]
+                            path = os.path.dirname(line)
+                            new_library_path += f":{path}"
+                            build_run(f"ln -s {line} {path}/libnvidia-ml.so.1")
+                        else:
+                            print(
+                                f"Failed to find libnvidia-ml.so: {result.stderr}",
+                                file=sys.stderr)
+                            exit(1)
+
                     env_ld["LD_LIBRARY_PATH"] = new_library_path
-                    try:
+
+                    build_run(
+                        f"\"{venv_python}\" -m pybind11_stubgen -o . bindings --exit-code",
+                        env=env_ld)
+                    if deep_ep_cuda_architectures:
                         build_run(
-                            f"\"{venv_python}\" -m pybind11_stubgen -o . bindings --exit-code",
+                            f"\"{venv_python}\" -m pybind11_stubgen -o . deep_ep_cpp_tllm --exit-code",
                             env=env_ld)
-                    except CalledProcessError as ex:
-                        print(f"Failed to build pybind11 stubgen: {ex}",
-                              file=sys.stderr)
-                        exit(1)
 
     if not skip_building_wheel:
         if dist_dir is None:

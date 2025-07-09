@@ -51,7 +51,7 @@ async def stream_generation_handler(worker,
         if task.request_handle._done:
             task.end_flag = True
 
-    sampling_params = worker.combine_sampling_params_with_generation_task(task)
+    sampling_params = worker.convert_task_params(task)
     if task.request_handle is None:
         task.request_handle = worker.llm.generate_async(
             task.input_str, sampling_params=sampling_params, streaming=True)

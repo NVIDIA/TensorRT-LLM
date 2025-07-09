@@ -523,7 +523,7 @@ std::vector<CutlassGemmConfig> get_candidate_configs(
     {
         return get_candidate_configs_sm100(config_type_param);
     }
-    if (sm == 120 && (config_type_param & CutlassGemmConfig::BLACKWELL))
+    if (sm >= 120 && (config_type_param & CutlassGemmConfig::BLACKWELL))
     {
         return get_candidate_configs_sm120(config_type_param);
     }

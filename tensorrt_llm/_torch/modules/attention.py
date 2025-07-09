@@ -268,7 +268,7 @@ class Attention(nn.Module):
 
         out_scale = None
         out_scale_sf = None
-        if self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4 or self.o_proj.has_fp8_block_scales:
+        if self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4 or self.o_proj.has_fp8_block_scales or self.o_proj.has_fp8_rowwise:
             out_scale = self.o_proj.inv_input_scale
         if self.o_proj.has_nvfp4 and self.support_nvfp4_output:
             out_scale_sf = self.o_proj.input_scale

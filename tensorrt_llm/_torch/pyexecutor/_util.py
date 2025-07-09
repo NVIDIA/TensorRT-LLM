@@ -400,6 +400,7 @@ class KvCacheCreator:
 
 
 def create_py_executor_instance(
+        *,
         dist,
         resources,
         mapping,
@@ -546,7 +547,7 @@ def create_py_executor_instance(
 
 
 def create_torch_sampler_args(executor_config: ExecutorConfig, mapping: Mapping,
-                              *, max_seq_len: int, mixed_sampler: bool):
+                              *, max_seq_len: int, enable_mixed_sampler: bool):
     max_num_sequences = executor_config.max_batch_size * mapping.pp_size
     max_draft_tokens = (0 if executor_config.speculative_config is None else
                         executor_config.speculative_config.max_draft_tokens)
@@ -555,7 +556,7 @@ def create_torch_sampler_args(executor_config: ExecutorConfig, mapping: Mapping,
         max_draft_tokens=max_draft_tokens,
         max_num_sequences=max_num_sequences,
         max_beam_width=executor_config.max_beam_width,
-        mixed_sampler=mixed_sampler,
+        enable_mixed_sampler=enable_mixed_sampler,
     )
 
 
@@ -567,7 +568,7 @@ def instantiate_sampler(engine: PyTorchModelEngine,
         executor_config,
         mapping,
         max_seq_len=engine.max_seq_len,
-        mixed_sampler=pytorch_backend_config.mixed_sampler)
+        enable_mixed_sampler=pytorch_backend_config.enable_mixed_sampler)
     if mapping.cp_config.get('cp_type') == 'star_attention':
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
         return TorchSampler(sampler_args)

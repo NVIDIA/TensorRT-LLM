@@ -17,9 +17,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
-# This is copied from https://huggingface.co/google/gemma-3-1b-it/blob/main/config.json.
-# Updated to have 1 local layer and 1 global layer. Sliding window size updated to 4.
-GEMMA3_1B_MINI_CONFIG = {
+GEMMA3_1B_CONFIG = {
     "architectures": ["Gemma3ForCausalLM"],
     "attention_bias": False,
     "attention_dropout": 0.0,
@@ -36,7 +34,7 @@ GEMMA3_1B_MINI_CONFIG = {
     "max_position_embeddings": 32768,
     "model_type": "gemma3_text",
     "num_attention_heads": 4,
-    "num_hidden_layers": 2,  # Modified for testing.
+    "num_hidden_layers": 26,
     "num_key_value_heads": 1,
     "pad_token_id": 0,
     "query_pre_attn_scalar": 256,
@@ -44,21 +42,60 @@ GEMMA3_1B_MINI_CONFIG = {
     "rope_local_base_freq": 10000,
     "rope_scaling": None,
     "rope_theta": 1000000,
-    "sliding_window": 4,  # Modified for testing.
-    "sliding_window_pattern": 2,  # Modified for testing.
+    "sliding_window": 512,
+    "sliding_window_pattern": 6,
     "torch_dtype": "bfloat16",
     "transformers_version": "4.50.0.dev0",
     "use_cache": True,
     "vocab_size": 262144
 }
 
+GEMMA3_27B_CONFIG = {
+    "architectures": ["Gemma3ForConditionalGeneration"],
+    "boi_token_index": 255999,
+    "eoi_token_index": 256000,
+    "eos_token_id": [1, 106],
+    "image_token_index": 262144,
+    "initializer_range": 0.02,
+    "mm_tokens_per_image": 256,
+    "model_type": "gemma3",
+    "text_config": {
+        "head_dim": 128,
+        "hidden_size": 5376,
+        "intermediate_size": 21504,
+        "model_type": "gemma3_text",
+        "num_attention_heads": 32,
+        "num_hidden_layers": 62,
+        "num_key_value_heads": 16,
+        "query_pre_attn_scalar": 168,
+        "rope_scaling": {
+            "factor": 8.0,
+            "rope_type": "linear"
+        },
+        "sliding_window": 1024
+    },
+    "torch_dtype": "bfloat16",
+    "transformers_version": "4.50.0.dev0",
+    "vision_config": {
+        "hidden_size": 1152,
+        "image_size": 896,
+        "intermediate_size": 4304,
+        "model_type": "siglip_vision_model",
+        "num_attention_heads": 16,
+        "num_hidden_layers": 27,
+        "patch_size": 14,
+        "vision_use_head": False
+    }
+}
+
 
 @dataclass(repr=False)
 class Scenario:
     backend: str
+    config_name: str
 
     def __repr__(self) -> str:
-        return f"backend:{self.backend.lower()}"
+        return f"backend:{self.backend.lower()}_config:{self.config_name.lower()}"
 
 
 class TestGemma3(unittest.TestCase):
@@ -95,7 +132,8 @@ class TestGemma3(unittest.TestCase):
 
     def test_gemma3_sanity(self):
 
-        config_dict = deepcopy(GEMMA3_1B_MINI_CONFIG)
+        config_dict = deepcopy(
+            GEMMA3_1B_CONFIG)  # Using 1B config for sanity test.
         gemma3_config = Gemma3Config.from_dict(config_dict)
 
         dtype = gemma3_config.torch_dtype
@@ -174,8 +212,12 @@ class TestGemma3(unittest.TestCase):
         kv_cache_manager.shutdown()
 
     @parameterized.expand([
-        Scenario(backend="TRTLLM"),
-        Scenario(backend="VANILLA"),
+        Scenario(backend="TRTLLM", config_name="1B"),
+        Scenario(backend="VANILLA", config_name="1B"),
+        Scenario(backend="FLASHINFER", config_name="1B"),
+        Scenario(backend="TRTLLM", config_name="27B"),
+        Scenario(backend="VANILLA", config_name="27B"),
+        Scenario(backend="FLASHINFER", config_name="27B"),
     ], lambda testcase_func, param_num, param:
                           f"{testcase_func.__name__}[{param.args[0]}]")
     @torch.no_grad()
@@ -184,13 +226,30 @@ class TestGemma3(unittest.TestCase):
         Compare output to HF.
         """
         backend = scenario.backend
+        config_name = scenario.config_name
         metadata_cls = get_attention_backend(backend).Metadata
 
         torch.random.manual_seed(0)
-        config_dict = deepcopy(GEMMA3_1B_MINI_CONFIG)
+
+        # Select the appropriate config based on the scenario
+        if config_name == "1B":
+            config_dict = deepcopy(GEMMA3_1B_CONFIG)
+        elif config_name == "27B":
+            config_dict = deepcopy(GEMMA3_27B_CONFIG)
+        else:
+            raise ValueError(f"Unknown config_name: {config_name}")
+
         gemma3_config = Gemma3Config.from_dict(config_dict)
+        if config_name == "27B":
+            gemma3_config.text_config.torch_dtype = gemma3_config.torch_dtype
+            gemma3_config = gemma3_config.text_config
         dtype = gemma3_config.torch_dtype
         device = torch.device('cuda')
+
+        # 2-layer network with one local (sliding window=4) and one global layer.
+        gemma3_config.num_hidden_layers = 2
+        gemma3_config.sliding_window = 4
+        gemma3_config.sliding_window_pattern = 2
 
         num_blocks = 1
         tokens_per_block = 128
@@ -253,6 +312,7 @@ class TestGemma3(unittest.TestCase):
                                     position_ids=position_ids,
                                     past_key_values=hf_cache,
                                     use_cache=True)
+
             torch.testing.assert_close(logits,
                                        ref.logits[:, -1].float(),
                                        atol=0.05,

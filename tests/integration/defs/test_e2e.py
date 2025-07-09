@@ -1546,7 +1546,7 @@ def test_build_time_benchmark_sanity(llm_root, llm_venv):
 
 ### Pivot-To-Python examples
 def test_ptp_quickstart(llm_root, llm_venv):
-    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
 
     src = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
     dst = f"{llm_venv.get_working_directory()}/meta-llama/Llama-3.1-8B-Instruct"
@@ -1558,7 +1558,7 @@ def test_ptp_quickstart(llm_root, llm_venv):
                                      dir="./",
                                      delete=True,
                                      delete_on_close=True) as running_log:
-        venv_check_call(llm_venv, [str(example_root / "quickstart.py")],
+        venv_check_call(llm_venv, [str(example_root / "quickstart_example.py")],
                         stdout=running_log)
         _check_mem_usage(running_log, [4.60, 0, 0, 0])
 
@@ -1595,10 +1595,28 @@ def test_ptp_quickstart(llm_root, llm_venv):
     pytest.param('Qwen3-30B-A3B',
                  'Qwen3/Qwen3-30B-A3B',
                  marks=pytest.mark.skip_less_device_memory(80000)),
+    pytest.param('Llama3.3-70B-FP8',
+                 'modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8',
+                 marks=skip_pre_blackwell),
+    pytest.param('Llama3.3-70B-FP4',
+                 'modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4',
+                 marks=skip_pre_blackwell),
+    pytest.param('Nemotron-Super-49B-v1-BF16',
+                 'nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1',
+                 marks=skip_pre_blackwell),
+    pytest.param('Mixtral-8x7B-BF16',
+                 'Mixtral-8x7B-Instruct-v0.1',
+                 marks=skip_pre_blackwell),
+    pytest.param('Mistral-Nemo-12b-Base',
+                 'Mistral-Nemo-Base-2407',
+                 marks=skip_pre_blackwell),
+    pytest.param('DeepSeek-R1-Distill-Qwen-32B',
+                 'DeepSeek-R1/DeepSeek-R1-Distill-Qwen-32B',
+                 marks=skip_pre_blackwell),
 ])
 def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
     print(f"Testing {model_name}.")
-    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     if model_name == "Nemotron-H-8B":
         llm_venv.run_cmd([
             str(example_root / "quickstart_advanced.py"),
@@ -1638,7 +1656,7 @@ def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
 def test_ptp_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
                                      model_path):
     print(f"Testing {model_name}.")
-    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     with tempfile.NamedTemporaryFile(mode='w+t',
                                      suffix=f".{model_name}.log",
                                      dir="./",
@@ -1664,7 +1682,7 @@ def test_ptp_quickstart_advanced_bs1(llm_root, llm_venv):
     model_name = "DeepSeek-V3-Lite-FP8"
     model_path = "DeepSeek-V3-Lite/fp8"
     print(f"Testing {model_name}.")
-    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     llm_venv.run_cmd([
         str(example_root / "quickstart_advanced.py"),
         "--use_cuda_graph",
@@ -1695,7 +1713,7 @@ def test_ptp_quickstart_advanced_deepseek_multi_nodes(llm_root, llm_venv,
                                                       model_path):
     # "RCCA https://nvbugs/5163844"
     print(f"Testing {model_path}.")
-    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     run_cmd = [
         "trtllm-llmapi-launch",
         "python3",
@@ -1719,7 +1737,7 @@ def test_ptp_quickstart_advanced_deepseek_multi_nodes(llm_root, llm_venv,
 def test_ptp_quickstart_advanced_eagle3(llm_root, llm_venv, model_name,
                                         model_path, eagle_model_path):
     print(f"Testing {model_name}.")
-    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     with tempfile.NamedTemporaryFile(mode='w+t',
                                      suffix=f".{model_name}.log",
                                      dir="./",
@@ -1748,7 +1766,7 @@ def test_ptp_quickstart_advanced_eagle3(llm_root, llm_venv, model_name,
 def test_ptp_quickstart_advanced_ngram(llm_root, llm_venv, model_name,
                                        model_path):
     print(f"Testing {model_name}.")
-    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     with tempfile.NamedTemporaryFile(mode='w+t',
                                      suffix=f".{model_name}.log",
                                      dir="./",
@@ -1782,7 +1800,7 @@ def test_ptp_quickstart_advanced_ngram(llm_root, llm_venv, model_name,
 def test_ptp_quickstart_advanced_deepseek_r1_8gpus(llm_root, llm_venv,
                                                    model_name, model_path):
     print(f"Testing {model_name}.")
-    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     with tempfile.NamedTemporaryFile(mode='w+t',
                                      suffix=f".{model_name}.log",
                                      dir="./",
@@ -1816,7 +1834,7 @@ def test_ptp_quickstart_advanced_deepseek_r1_8gpus(llm_root, llm_venv,
 def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
         llm_root, llm_venv, model_name, model_path):
     print(f"Testing {model_name}.")
-    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     with tempfile.NamedTemporaryFile(mode='w+t',
                                      suffix=f".{model_name}.log",
                                      dir="./",
@@ -1857,18 +1875,18 @@ def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
                  marks=skip_pre_hopper),
     pytest.param('Llama3.1-405B-FP8',
                  'llama-3.1-model/Llama-3.1-405B-Instruct-FP8',
-                 marks=skip_pre_hopper),
+                 marks=(skip_pre_hopper, pytest.mark.timeout(7200))),
     pytest.param('Mixtral-8x7B-NVFP4',
                  'nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1',
                  marks=skip_pre_blackwell),
     pytest.param('Nemotron-Ultra-253B',
                  'nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1',
-                 marks=skip_pre_hopper),
+                 marks=(skip_pre_hopper, pytest.mark.timeout(12600))),
 ])
 def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
                                        model_path):
     print(f"Testing {model_name}.")
-    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     mapping = {
         "Llama3.1-70B-BF16": 21.0,
         "Mixtral-8x7B-BF16": 16.5,
@@ -1909,7 +1927,7 @@ def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
 def test_ptp_quickstart_advanced_2gpus_sm120(llm_root, llm_venv, model_name,
                                              model_path):
     print(f"Testing {model_name} on 2 GPUs (SM120+).")
-    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     llm_venv.run_cmd([
         str(example_root / "quickstart_advanced.py"),
         "--enable_chunked_prefill",
@@ -1921,7 +1939,7 @@ def test_ptp_quickstart_advanced_2gpus_sm120(llm_root, llm_venv, model_name,
 
 @skip_pre_blackwell
 def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
-    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     model_path = "Llama-3_1-8B-Instruct_fp8_nvfp4_hf"
     with tempfile.NamedTemporaryFile(mode='w+t',
                                      suffix=f".{model_path}.log",
@@ -1940,6 +1958,7 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
 @pytest.mark.parametrize("modality", ["image", "video"])
 @pytest.mark.parametrize("model_name,model_path", [
     ("NVILA-8B-FP16", "vila/NVILA-8B"),
+    ("NVILA-15B-FP16", "NVILA-15B"),
     ("llava-v1.6-mistral-7b", "llava-v1.6-mistral-7b-hf"),
     ("qwen2-vl-7b-instruct", "Qwen2-VL-7B-Instruct"),
     ("qwen2.5-vl-7b-instruct", "Qwen2.5-VL-7B-Instruct"),
@@ -1949,7 +1968,7 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
     llm_venv.run_cmd(
         ['-m', 'pip', 'install', 'flash-attn==2.7.3', '--no-build-isolation'])
 
-    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     test_data_root = Path(
         os.path.join(llm_models_root(), "multimodals", "test_data"))
     print(f"Accuracy test {model_name} {modality} mode with example inputs.")
@@ -2193,7 +2212,7 @@ def test_ptp_star_attention_example(llm_root, llm_venv, model_name, model_path,
                                     star_attention_input_root):
     print(f"Testing {model_name}.")
     workspace = llm_venv.get_working_directory()
-    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     input_file = Path(
         os.path.join(star_attention_input_root,
                      "test_star_attention_input.jsonl"))
@@ -2241,7 +2260,7 @@ def test_ptp_quickstart_advanced_llama_multi_nodes(llm_root, llm_venv,
     if "Llama-4" in model_path:
         tp_size, pp_size = 8, 2
 
-    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     run_cmd = [
         "trtllm-llmapi-launch",
         "python3",
