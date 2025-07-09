@@ -70,7 +70,6 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             task.evaluate(llm, streaming=True)
 
 
-@skip_post_blackwell  # TODO: remove this skip after this nvbug is fixed: https://nvbugspro.nvidia.com/bug/5295470
 class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
