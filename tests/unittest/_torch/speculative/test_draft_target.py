@@ -15,6 +15,7 @@ from utils.llm_data import llm_models_root
 
 @pytest.mark.parametrize("use_cuda_graph,attn_backend",
                          [[False, "TRTLLM"], [True, "TRTLLM"]])
+@pytest.mark.high_cuda_memory
 def test_llama_draft_target(use_cuda_graph: bool, attn_backend: str):
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 60:
