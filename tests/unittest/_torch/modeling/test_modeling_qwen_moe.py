@@ -13,7 +13,7 @@ from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2_moe_weight_mapper import \
-    Qwen2MoeWeightMapper
+    Qwen2MoeHfWeightMapper
 from tensorrt_llm._torch.models.modeling_qwen_moe import Qwen2MoeForCausalLM
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
     DecodingCUDAGraphRunner
@@ -212,7 +212,7 @@ class TestQwenMoe(unittest.TestCase):
         model_config = ModelConfig(pretrained_config=qwen_moe_config,
                                    attn_backend=backend)
         qwen_moe = Qwen2MoeForCausalLM(model_config).to(device)
-        weight_mapper = Qwen2MoeWeightMapper()
+        weight_mapper = Qwen2MoeHfWeightMapper()
         weight_mapper.init(qwen_moe, qwen_moe_config)
         qwen_moe.load_weights(hf_qwen_moe.state_dict(), weight_mapper)
 

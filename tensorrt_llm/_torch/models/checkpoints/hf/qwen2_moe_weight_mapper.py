@@ -10,7 +10,7 @@ from tensorrt_llm._torch.modules.fused_moe.interface import MoE
 
 @register_mapper("HF", "Qwen2MoeForCausalLM")
 @guard_all_methods
-class Qwen2MoeWeightMapper(HfWeightMapper):
+class Qwen2MoeHfWeightMapper(HfWeightMapper):
 
     def is_special_instance_module(self, module: nn.Module) -> bool:
         return isinstance(module, MoE)

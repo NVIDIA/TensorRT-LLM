@@ -78,7 +78,7 @@ class BaseWeightMapper(ABC):
         """
 
     @abstractmethod
-    def apply_callbacks(self, module_name: str,
+    def apply_callbacks(self, module: nn.Module, module_name: str,
                         module_names_breakdown: list[str],
                         weights: dict) -> list[dict]:
         """
@@ -87,6 +87,7 @@ class BaseWeightMapper(ABC):
         on the implementation (e.g., storing callbacks to be applied later).
 
         Args:
+            module: The module to apply the callbacks to
             module_name: The specific module name (e.g., 'qkv_proj', 'gate_up_proj')
             module_names_breakdown: List of module path components for building full paths
             weights: The weights dictionary to process

@@ -40,8 +40,6 @@ def test_beam_search_output_shapes(gather_context_logits: bool,
         pytest.skip(
             "Beam search currently does not support return_log_probs with multiple prompts"
         )
-    # from IPython import embed
-    # embed()
     llm = LLM(
         model=os.path.join(llm_models_root(), "llama-models-v2",
                            "TinyLlama-1.1B-Chat-v1.0"),

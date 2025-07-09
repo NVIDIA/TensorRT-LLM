@@ -849,7 +849,7 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
 
             if weight_mapper.does_require_special_handling(module_name):
                 module_weights = weight_mapper.apply_callbacks(
-                    module_name, module_names_breakdown, weights)
+                    module, module_name, module_names_breakdown, weights)
                 module.load_weights(weights=module_weights)
             else:
                 module_weights = weight_mapper.filter_weights(name, weights)

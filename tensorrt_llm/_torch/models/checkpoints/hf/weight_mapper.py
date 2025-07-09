@@ -1,11 +1,7 @@
-from typing import Union
-
 import torch
 from torch import nn
 
-from tensorrt_llm._torch.model_config import TConfig
-from tensorrt_llm._torch.models.modeling_utils import (DecoderModelForCausalLM,
-                                                       register_mapper)
+from tensorrt_llm._torch.models.modeling_utils import register_mapper
 
 from ..base_weight_mapper import BaseWeightMapper, guard_all_methods
 
@@ -20,17 +16,13 @@ class HfWeightMapper(BaseWeightMapper):
             self._duplicate_kv_weights,
         ]
 
-    def init(self, model: Union[nn.Module, DecoderModelForCausalLM],
-             config: TConfig):
-        super().init(model, config)
-
     def map_weights(self) -> None:
         self._mapping.update({
             'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
             'gate_up_proj': ['gate_proj', 'up_proj']
         })
 
-    def apply_callbacks(self, module_name: str,
+    def apply_callbacks(self, module: nn.Module, module_name: str,
                         module_names_breakdown: list[str],
                         weights: dict) -> list[dict]:
         module_weights = []
@@ -39,7 +31,7 @@ class HfWeightMapper(BaseWeightMapper):
             fw = self.filter_weights(
                 '.'.join(module_names_breakdown + [new_name]), weights)
             for callback in self._callbacks:
-                fw = callback(new_name, fw)
+                fw = callback(module, new_name, fw)
             module_weights.append(fw)
 
         return module_weights
@@ -65,7 +57,8 @@ class HfWeightMapper(BaseWeightMapper):
 
         return super().should_skip_module(module_name)
 
-    def _duplicate_kv_weights(self, new_name: str, weights: dict):
+    def _duplicate_kv_weights(self, module: nn.Module, new_name: str,
+                              weights: dict):
         if new_name in ['k_proj', 'v_proj']:
             num_kv_heads_list = [self._num_kv_heads
                                  ] * len(weights) if isinstance(
