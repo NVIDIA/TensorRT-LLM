@@ -515,7 +515,7 @@ class Deepseekv3MoE(nn.Module):
             # FP4 all_gather moves this bf16 allgather in to after topk and fp4 quantization
             # to reduce allreduce BW
             if (disable_fp4_allgather()
-                    and not self.experts.enable_alltoall) or isinstance(
+                    and not self.experts.can_use_alltoall(hidden_states_fp4 or hidden_states)) or isinstance(
                         self.experts, TRTLLMGenFusedMoE):
                 hidden_states = allgather(hidden_states,
                                           self.mapping,
