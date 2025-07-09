@@ -525,7 +525,11 @@ class DecoderModelForCausalLM(nn.Module,
         )
 
     def load_weights(self, weights: Dict, skip_modules: List[str] = []):
-        _load_weights_impl(self, weights, skip_modules)
+        serial_load_weights = getattr(self, "serial_load_weights", None)
+        _load_weights_impl(self,
+                           weights,
+                           skip_modules,
+                           serial_load_weights=serial_load_weights)
 
     def infer_max_seq_len(self) -> int:
         # Modified from tensorrt_llm/builder.py _init_max_seq_len
@@ -675,7 +679,8 @@ def run_concurrently(func,
 def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                        weights: Dict,
                        skip_modules: List[str] = [],
-                       params_map: Optional[Dict[str, str]] = None):
+                       params_map: Optional[Dict[str, str]] = None,
+                       serial_load_weights: Optional[List[str]] = None):
     if not hasattr(model, 'model_config') or not isinstance(
             model.model_config, ModelConfig):
         raise ValueError("model must have a model_config attribute")
@@ -756,7 +761,24 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                                  desc="Loading weights"):
             load_single_module(name, module)
     else:
+        all_modules = dict(model.named_modules())
+        if serial_load_weights is not None:
+            serial_load_modules = []
+            for module in serial_load_weights:
+                serial_load_modules.extend([
+                    name for name in all_modules.keys() if name.endswith(module)
+                ])
+            logger.info(f"Serial load modules: {serial_load_modules}")
+            pbar = tqdm(serial_load_modules, desc="Loading weights serially")
+            for module in serial_load_modules:
+                # logger.info(f"Loading weights for {module} in serial")
+                load_single_module(module, all_modules[module])
+                pbar.update(1)
+                del all_modules[module]
+            pbar.close()
+
         pbar = tqdm(list(model.named_modules()),
                     desc="Loading weights concurrently")
-        args_list = [(name, module) for name, module in model.named_modules()]
+        args_list = [(name, module) for name, module in model.named_modules()
+                     if name not in serial_load_modules]
         run_concurrently(load_single_module, args_list, pbar=pbar)
