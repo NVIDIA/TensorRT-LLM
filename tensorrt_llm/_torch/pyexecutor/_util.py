@@ -82,9 +82,9 @@ class KvCacheCreator:
             ) * num_key_value_heads // tp_size
 
         # provide at least 1 layer to prevent division by zero cache size
-        num_hidden_layers = max(
-            len(mapping.pp_layers(config.num_hidden_layers)), 1)
-        mem_per_token *= num_hidden_layers * head_dim
+        num_attention_layers = max(
+            len(mapping.pp_layers(model_config.get_num_attention_layers())), 1)
+        mem_per_token *= num_attention_layers * head_dim
         # K and V
         mem_per_token *= kv_factor
         return mem_per_token
