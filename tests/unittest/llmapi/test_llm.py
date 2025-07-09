@@ -363,7 +363,7 @@ def test_llm_with_kv_cache_retention_config():
         print(output)
 
 
-@pytest.mark.parametrize('disable_hf_decode_incrementally', [False, True])
+@pytest.mark.parametrize('backend', ["HF", "TRTLLM"])
 @pytest.mark.parametrize(
     'tokenizer_dir, clean_up_tokenization_spaces, threshold',
     [
@@ -382,12 +382,12 @@ def test_llm_with_kv_cache_retention_config():
 @pytest.mark.part0
 def test_tokenizer_decode_incrementally(tokenizer_dir: str,
                                         clean_up_tokenization_spaces: bool,
-                                        threshold: float,
-                                        disable_hf_decode_incrementally: bool,
-                                        mocker):
-    if disable_hf_decode_incrementally:
-        mocker.patch.dict(os.environ,
-                          {"TLLM_DISABLE_HF_DECODE_INCREMENTALLY": "1"})
+                                        threshold: float, backend: str, mocker):
+    import tensorrt_llm.llmapi.tokenizer
+    mocker.patch.object(tensorrt_llm.llmapi.tokenizer,
+                        "TLLM_INCREMENTAL_DETOKENIZATION_BACKEND", backend)
+    assert tensorrt_llm.llmapi.tokenizer.TLLM_INCREMENTAL_DETOKENIZATION_BACKEND == backend
+
     random.seed(42)
 
     num_samples = 100
@@ -407,7 +407,6 @@ def test_tokenizer_decode_incrementally(tokenizer_dir: str,
                                                       truncation_side='left',
                                                       trust_remote_code=True,
                                                       use_fast=True)
-    assert tokenizer._disable_hf_decode_incrementally == disable_hf_decode_incrementally
 
     num_perfect = 0
     for text in dataset:

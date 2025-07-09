@@ -8,6 +8,18 @@ from transformers import (AutoTokenizer, PreTrainedTokenizerBase,
 from .._utils import nvtx_range_debug
 from ..logger import logger
 
+TLLM_INCREMENTAL_DETOKENIZATION_BACKEND = os.environ.get(
+    "TLLM_INCREMENTAL_DETOKENIZATION_BACKEND", "HF")
+TLLM_STREAM_INTERVAL_THRESHOLD = int(
+    os.environ.get("TLLM_STREAM_INTERVAL_THRESHOLD", "32"))
+try:
+    from tokenizers.decoders import DecodeStream  # noqa
+except ImportError:
+    logger.warning(
+        f"HF incremental detokenization is unsupported by tokenizer<0.21.0; fallback to TRTLLM incremental detokenization."
+    )
+    TLLM_INCREMENTAL_DETOKENIZATION_BACKEND = "TRTLLM"
+
 
 class TokenizerBase(PreTrainedTokenizerBase):
     ''' This is a protocol for the tokenizer. Users can implement their own tokenizer by inheriting this class.  '''
@@ -20,16 +32,6 @@ class TransformersTokenizer(TokenizerBase):
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
         self._all_special_tokens_set = set(self.tokenizer.all_special_tokens)
-        self._disable_hf_decode_incrementally = os.getenv(
-            "TLLM_DISABLE_HF_DECODE_INCREMENTALLY", "0") == "1"
-        if not self._disable_hf_decode_incrementally:
-            try:
-                from tokenizers.decoders import DecodeStream  # noqa
-            except ImportError:
-                logger.warning(
-                    f"HF incremental detokenization is unsupported by tokenizer<0.21.0; fallback to TRTLLM incremental detokenization."
-                )
-                self._disable_hf_decode_incrementally = True
 
     def __call__(self, text: str, *args, **kwargs) -> Any:
         return self.tokenizer(text, *args, **kwargs)
@@ -137,7 +139,8 @@ class TransformersTokenizer(TokenizerBase):
             flush: bool = False,
             skip_special_tokens: bool = False,
             clean_up_tokenization_spaces: Optional[bool] = None,
-            spaces_between_special_tokens: bool = True) -> Tuple[str, dict]:
+            spaces_between_special_tokens: bool = True,
+            stream_interval: int = 1) -> Tuple[str, dict]:
         """Incremental detokenization, typically used for streaming generation.
 
         Args:
@@ -148,14 +151,16 @@ class TransformersTokenizer(TokenizerBase):
             skip_special_tokens (bool): Whether to remove special tokens in the decoding.
             clean_up_tokenization_spaces (bool): Whether to clean up tokenization spaces.
             spaces_between_special_tokens (bool): Whether to add spaces between special tokens.
+            stream_interval (int): The iteration interval to create responses under the streaming mode.
 
         Returns:
             text, states (Tuple[str, dict]): text is the current decoded text, states is the current incremental detokenization states.
             They should be passed to next incremental detokenization iteration, if any.
         """
-        # HF incremental detokenization implementation is faster than TRTLLM
-        # when stream_interval is smaller.
-        if self._disable_hf_decode_incrementally:
+        # HF incremental detokenization implementation is faster than TRTLLM when stream_interval is smaller.
+        if (TLLM_INCREMENTAL_DETOKENIZATION_BACKEND == "TRTLLM"
+                or stream_interval >= TLLM_STREAM_INTERVAL_THRESHOLD
+                or spaces_between_special_tokens is False):
             return self.trtllm_decode_incrementally(
                 token_ids,
                 prev_text,
@@ -232,8 +237,6 @@ class TransformersTokenizer(TokenizerBase):
         skip_special_tokens: bool = False,
         clean_up_tokenization_spaces: Optional[bool] = None
     ) -> Tuple[str, dict]:
-        from tokenizers.decoders import DecodeStream
-
         if states is None:
             states = {
                 'decode_stream':
