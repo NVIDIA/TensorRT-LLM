@@ -20,10 +20,8 @@ from pydantic import BaseModel, field_validator
 from transformers import AutoTokenizer
 from transformers.tokenization_utils import PreTrainedTokenizer
 from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
-
-from benchmarks.cpp.utils.prepare_real_data import dataset
-from benchmarks.cpp.utils.prepare_synthetic_data import (token_norm_dist,
-                                                         token_unif_dist)
+from utils.prepare_real_data import dataset
+from utils.prepare_synthetic_data import token_norm_dist, token_unif_dist
 
 
 class RootArgs(BaseModel):

@@ -2,11 +2,9 @@ import random
 import warnings
 
 import click
-
-from benchmarks.cpp.utils.utils import (gen_random_tokens,
-                                        get_norm_dist_lengths,
-                                        get_unif_dist_lengths,
-                                        print_text_dataset, text_dataset_dump)
+from utils.utils import (gen_random_tokens, get_norm_dist_lengths,
+                         get_unif_dist_lengths, print_text_dataset,
+                         text_dataset_dump)
 
 
 def _generate_task_ids_and_lora_config(root_args, num_reqs):
