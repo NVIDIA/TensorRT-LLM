@@ -13,12 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import MagicMock
-
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest, LlmResponse,
                                                         SamplingConfig)
+from tensorrt_llm.bindings import LlmRequestState
 
 
 def create_sampling_config():
@@ -202,29 +201,47 @@ def test_create_response():
         max_new_tokens=10,
         input_tokens=[1, 2, 3],
         sampling_config=sampling_config,
-        is_streaming=False,
+        is_streaming=True,
         client_id=100,
     )
 
-    child_request = request.create_child_request(2)
-    child_response = child_request.create_response()
-
     # Test when result is not None
+    child_request = request.create_child_request(2)
+
+    request.add_new_token(1, 0)
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+
+    child_request.add_new_token(3, 0)
+    child_request.state = LlmRequestState.GENERATION_IN_PROGRESS
+
     response = request.create_response(use_fast_logits=True, mpi_world_rank=1)
     assert response is not None
     assert isinstance(response, LlmResponse)
-    assert response.request_id == request.py_request_id
+    assert response.request_id == 1
     assert response.client_id == request.py_client_id
     assert response.error_msg is None
     assert response.result is not None
     assert response.result.sequence_index == 0
 
+    child_response = child_request.create_response()
     assert child_response is not None
-    assert child_response.request_id == request.py_request_id
+    assert child_response.request_id == 2
     assert child_response.client_id == child_request.py_client_id
     assert child_response.error_msg is None
     assert child_response.result is not None
     assert child_response.result.sequence_index == 1
+
+    child_request.state = LlmRequestState.GENERATION_COMPLETE
+    # is_final=False since the parent request is not yet complete.
+    child_response = child_request.create_response()
+    assert child_response.result.is_final is False
+    assert child_response.result.is_sequence_final is True
+
+    # is_final=True since all requests are complete.
+    request.state = LlmRequestState.GENERATION_COMPLETE
+    response = request.create_response()
+    assert response.result.is_final is True
+    assert response.result.is_sequence_final is True
 
 
 def test_creates_none_response_when_result_is_none():
@@ -239,10 +256,8 @@ def test_creates_none_response_when_result_is_none():
         client_id=100,
     )
 
-    # Mock create_result to return None
-    request.create_result = MagicMock(return_value=None)
-
-    # Test when result is None
+    # request is non-streaming and not finished. It will return None result.
+    # response is None when result is None.
     response = request.create_response()
 
     assert response is None
