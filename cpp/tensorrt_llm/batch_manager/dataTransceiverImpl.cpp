@@ -223,8 +223,9 @@ void DataReceiverImpl::receiveSync(LlmRequest const& llmRequest)
         connections.emplace_back(connection);
     }
     auto const& resource = getReceiveCacheResource(llmRequest);
-    TransferSession session(connections, DataContext{tagFromRequestId(llmRequest.mRequestId)}, mSelfState, contextState,
-        resource->mBufferManager);
+    auto requestId = llmRequest.getContextPhaseParams().value().getReqId();
+    TransferSession session(
+        connections, DataContext{tagFromRequestId(requestId)}, mSelfState, contextState, resource->mBufferManager);
     mFormatter->unformat(session, llmRequest);
 }
 

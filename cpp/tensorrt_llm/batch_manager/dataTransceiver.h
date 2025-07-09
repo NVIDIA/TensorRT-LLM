@@ -149,6 +149,16 @@ public:
         mConnections[connIdx]->recv(mDataContext, data, size);
     }
 
+    void send(Connection const* conn, void const* data, size_t size)
+    {
+        conn->send(mDataContext, data, size);
+    }
+
+    void recv(Connection const* conn, void* data, size_t size)
+    {
+        conn->recv(mDataContext, data, size);
+    }
+
 private:
     std::vector<Connection const*> mConnections;
     DataContext mDataContext;
