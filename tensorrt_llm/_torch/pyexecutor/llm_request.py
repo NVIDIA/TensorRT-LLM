@@ -281,6 +281,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             **kwargs):
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
                                                     None)
+        # Multimodal data
+        self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
         super().__init__(
             *args,
             client_id=client_id,
@@ -313,6 +315,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_return_generation_logits = return_generation_logits
         self.py_return_logits_device_memory = return_logits_device_memory
         self.py_is_draft = is_draft
+        self.py_seq_slot = None
 
         # TODO: remove this when use DynamicDecodeOp in pytorch flow.
         # currently, keep py_stop_words_list as python list, rather than tensor.
@@ -399,6 +402,22 @@ def executor_request_to_llm_request(
     stop_words_list = convert_wordlist(
         executor_request.stop_words) if executor_request.stop_words else None
 
+    # Extract multimodal fields from executor request
+    multimodal_hashes = None
+    multimodal_positions = None
+    multimodal_lengths = None
+    if executor_request.multimodal_input is not None:
+        multimodal_hashes = executor_request.multimodal_input.multimodal_hashes
+        multimodal_positions = executor_request.multimodal_input.multimodal_positions
+        multimodal_lengths = executor_request.multimodal_input.multimodal_lengths
+
+    # Extract mrope fields
+    mrope_rotary_cos_sin = None
+    mrope_position_deltas = None
+    if executor_request.mrope_config is not None:
+        mrope_rotary_cos_sin = executor_request.mrope_config.mrope_rotary_cos_sin
+        mrope_position_deltas = executor_request.mrope_config.mrope_position_deltas
+
     llm_request = LlmRequest(
         request_id=req_id,
         max_new_tokens=executor_request.max_tokens,
@@ -418,24 +437,18 @@ def executor_request_to_llm_request(
         is None else executor_request.prompt_tuning_config.embedding_table,
         prompt_vocab_size=None if executor_request.prompt_tuning_config is None
         else executor_request.prompt_tuning_config.embedding_table.shape[0],
-        multimodal_hashes=None if executor_request.multimodal_input is None else
-        executor_request.multimodal_input.multimodal_hashes,
-        multimodal_positions=None if executor_request.multimodal_input is None
-        else executor_request.multimodal_input.multimodal_positions,
-        multimodal_lengths=None if executor_request.multimodal_input is None
-        else executor_request.multimodal_input.multimodal_lengths,
-        multimodal_embedding=None if executor_request.multimodal_embedding
-        is None else executor_request.multimodal_embedding,
+        multimodal_hashes=multimodal_hashes,
+        multimodal_positions=multimodal_positions,
+        multimodal_lengths=multimodal_lengths,
+        multimodal_embedding=executor_request.multimodal_embedding,
         lora_task_id=executor_request.lora_config.task_id
         if executor_request.lora_config is not None else None,
         lora_weights=executor_request.lora_config.weights
         if executor_request.lora_config is not None else None,
         lora_config=executor_request.lora_config.config
         if executor_request.lora_config is not None else None,
-        mrope_rotary_cos_sin=None if executor_request.mrope_config is None else
-        executor_request.mrope_config.mrope_rotary_cos_sin,
-        mrope_position_deltas=None if executor_request.mrope_config is None else
-        executor_request.mrope_config.mrope_position_deltas,
+        mrope_rotary_cos_sin=mrope_rotary_cos_sin,
+        mrope_position_deltas=mrope_position_deltas,
         lookahead_config=None,
         return_log_probs=executor_request.output_config.return_log_probs,
         return_context_logits=executor_request.output_config.
@@ -459,6 +472,7 @@ def executor_request_to_llm_request(
         if executor_request.client_id is not None else req_id,
         priority=0.5,
         llm_request_type=llm_request_type,
-        context_phase_params=executor_request.context_phase_params)
-
+        context_phase_params=executor_request.context_phase_params,
+        py_multimodal_data=getattr(executor_request, "py_multimodal_data",
+                                   None))
     return llm_request

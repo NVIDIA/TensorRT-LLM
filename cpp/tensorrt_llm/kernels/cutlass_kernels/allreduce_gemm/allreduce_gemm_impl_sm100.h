@@ -138,7 +138,7 @@ public:
     // Epilogue
     ////////////////
     using FusionCallbacks = cutlass::epilogue::fusion::LinearCombination<ElementD, float, void, float>;
-    using TileBarrierType = cutlass::MulticastSystemBarrier<cutlass::detail::SyncNoOp, true, true>;
+    using TileBarrierType = cutlass::MulticastSystemBarrier<cutlass::detail::SyncNoOp, true>;
     using EpilogueScheduleType = typename MmaAdapter<MmaType, IsFP4>::EpilogueSchedule;
     using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
     using FusionOp

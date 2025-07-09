@@ -415,6 +415,10 @@ private:
 
 inline XQAKernelList const* getXQAKernels(Data_type type, unsigned int sm)
 {
+    if (sm == kSM_121)
+    {
+        sm = kSM_120;
+    }
     return XQAKernelLoader::Get().getXQAKernels(type, sm);
 }
 
