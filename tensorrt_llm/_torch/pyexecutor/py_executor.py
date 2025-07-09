@@ -1086,6 +1086,7 @@ class PyExecutor:
 
                     sample_state = self._sample_async(scheduled_batch,
                                                       batch_outputs)
+                    assert sample_state is not None, "Sampling failed"
 
                     self._update_request_states(scheduled_batch)
 
