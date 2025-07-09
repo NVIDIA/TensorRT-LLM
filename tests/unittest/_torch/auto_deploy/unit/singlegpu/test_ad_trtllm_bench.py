@@ -59,7 +59,8 @@ def run_benchmark(model_name: str, dataset_path: str, temp_dir: str):
         "--extra_llm_api_options",
         f"{temp_dir}/model_kwargs.yaml",
     ]
-    runner.invoke(main, args, catch_exceptions=False)
+    result = runner.invoke(main, args, catch_exceptions=False)
+    assert result.exit_code == 0
 
 
 def test_trtllm_bench(llm_root):  # noqa: F811
