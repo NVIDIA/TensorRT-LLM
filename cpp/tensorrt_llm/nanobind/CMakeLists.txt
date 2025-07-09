@@ -3,7 +3,7 @@ set(TRTLLM_NB_MODULE
     ${TRTLLM_NB_MODULE}
     PARENT_SCOPE)
 
-set(SRCS ../runtime/ipcNvlsMemory.cpp bindings.cpp)
+set(SRCS ../runtime/ipcNvlsMemory.cu bindings.cpp)
 
 include_directories(${PROJECT_SOURCE_DIR}/include)
 
