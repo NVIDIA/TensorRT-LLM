@@ -536,6 +536,26 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skip(
+        reason=
+        "remove this skip after the kernel support mentioned in this nvbug is fixed: https://nvbugspro.nvidia.com/bug/5338620"
+    )
+    def test_auto_dtype_chunked_prefill(self):
+        # NOTE: Test with VSWA kv cache config.
+        self.kv_cache_config.max_attention_window = [
+            512, 512, 512, 512, 512, 32768
+        ]  # Gemma3 1B attention window size pattern
+        # chunked prefill case or more features
+        extra_llm_config = dict(
+            enable_chunked_prefill=True,
+            max_num_tokens=1024,
+        )
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=self.kv_cache_config,
+                 **extra_llm_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
 
 class TestMixtral8x7B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mixtral-8x7B-v0.1"
