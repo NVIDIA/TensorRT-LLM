@@ -49,7 +49,7 @@ BASE_EXAMPLE_CLASSES = {
     "tensorrt_llm._torch.models.modeling_qwen_moe": ["Qwen2MoeForCausalLM"],
     "tensorrt_llm._torch.models.modeling_siglip": ["SiglipVisionModel"],
     "tensorrt_llm._torch.models.modeling_vila": ["VilaModel"],
-    "tensorrt_llm._torch.models.modeling_orangina": ["OranginaForCausalLM"],
+    "tensorrt_llm._torch.models.modeling_openai": ["OpenAIMoeForCausalLM"],
     ### ending import of torch models classes
     "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig", "LoadFormat"],
     "tensorrt_llm._torch.pyexecutor.llm_request":
