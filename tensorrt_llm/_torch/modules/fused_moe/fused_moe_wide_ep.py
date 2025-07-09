@@ -684,6 +684,7 @@ class WideEPMoE(MoE):
                     self.dummy_allreduce()
                 final_hidden_states = self.alltoall_combine(
                     final_hidden_states, alltoall_info, token_count)
+
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
                 final_hidden_states = self.unpad_tensors(
                     padded, final_hidden_states)

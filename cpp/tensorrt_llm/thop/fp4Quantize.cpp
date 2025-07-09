@@ -153,6 +153,98 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self, std::opt
 
     return {valueE2M1, scaleFP8SF};
 }
+
+// fp4Tensor: [M, K / 2], FLOAT4_E2M1X2
+// scaleFactors: ceil(M / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE (UE4M3 or UE8M0)
+// globalScale: [1] float, = (448 * 6) / original_tensor.abs().max()
+// sfVecSize: 16 for nvfp4, 32 for mxfp4 (not supported yet)
+// sfUseUE8M0: false for nvfp4, true for mxfp4
+// isSfSwizzledLayout: bool, if true, the scale factors are stored in swizzled layout
+// outputDataType: "float16", "bfloat16", "float32"
+// returns: dequantized tensor with shape [M, K] and specified data type
+at::Tensor fp4_dequantize(at::Tensor const& fp4Tensor, at::Tensor const& scaleFactors, at::Tensor const& globalScale,
+    int64_t sfVecSize, bool sfUseUE8M0, bool isSfSwizzledLayout, std::string const& outputDataType)
+{
+    CHECK_TH_CUDA(fp4Tensor);
+    CHECK_CONTIGUOUS(fp4Tensor);
+    CHECK_TH_CUDA(scaleFactors);
+    CHECK_INPUT(globalScale, torch::kFloat32);
+    TORCH_CHECK(sfVecSize == 16, "sfVecSize can only be 16");
+
+    auto const& inputShape = fp4Tensor.sizes();
+    auto const& rank = inputShape.size();
+
+    TORCH_CHECK(rank >= 2, "Input should be >=2D tensor.");
+    int64_t m = 1;
+    for (size_t i = 0; i < rank - 1; i++)
+    {
+        m *= inputShape[i];
+    }
+    auto const k = inputShape[rank - 1] * 2; // FP4 is packed, so K is double the last dimension
+
+    // Determine output data type
+    torch::ScalarType outputScalarType;
+    if (outputDataType == "float16")
+    {
+        outputScalarType = torch::kFloat16;
+    }
+    else if (outputDataType == "bfloat16")
+    {
+        outputScalarType = torch::kBFloat16;
+    }
+    else if (outputDataType == "float32")
+    {
+        outputScalarType = torch::kFloat32;
+    }
+    else
+    {
+        TORCH_CHECK(
+            false, "Unsupported output data type: ", outputDataType, ". Supported types: float16, bfloat16, float32");
+    }
+
+    std::vector<int64_t> outputShape(inputShape.begin(), inputShape.end());
+    outputShape[rank - 1] = k;
+
+    at::Tensor output
+        = at::detail::empty_cuda(outputShape, outputScalarType, fp4Tensor.device(), /* stride */ std::nullopt);
+
+    const thread_local int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
+
+    auto const layout = isSfSwizzledLayout ? tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED
+                                           : tensorrt_llm::FP4QuantizationSFLayout::LINEAR;
+
+#define LAUNCH_FP4_DEQUANTIZE_KERNEL(T)                                                                                \
+    tensorrt_llm::kernels::invokeFP4Dequantization(m, k, reinterpret_cast<int64_t const*>(fp4Tensor.data_ptr()),       \
+        reinterpret_cast<int32_t const*>(scaleFactors.data_ptr()), globalScale.data_ptr<float>(),                      \
+        reinterpret_cast<T*>(output.data_ptr()), sfUseUE8M0, layout, mMultiProcessorCount,                             \
+        at::cuda::getCurrentCUDAStream(fp4Tensor.get_device()));
+
+    if (output.scalar_type() == at::ScalarType::Half)
+    {
+        LAUNCH_FP4_DEQUANTIZE_KERNEL(half)
+    }
+    else if (output.scalar_type() == at::ScalarType::BFloat16)
+    {
+#ifdef ENABLE_BF16
+        LAUNCH_FP4_DEQUANTIZE_KERNEL(__nv_bfloat16)
+#else
+        C10_THROW_ERROR(NotImplementedError, "BFloat16 must be enabled to dequantize fp4 tensor to bf16.");
+#endif
+    }
+    else if (output.scalar_type() == at::ScalarType::Float)
+    {
+        LAUNCH_FP4_DEQUANTIZE_KERNEL(float)
+    }
+    else
+    {
+        C10_THROW_ERROR(
+            NotImplementedError, "fp4_dequantize only supports output tensor with dtypes float16/bf16/float32.");
+    }
+
+#undef LAUNCH_FP4_DEQUANTIZE_KERNEL
+
+    return output;
+}
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -161,9 +253,14 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "fp4_quantize(Tensor input, Tensor? globalScale, int sfVecSize, bool sfUseUE8M0=False, bool "
         "isSfSwizzledLayout=True) "
         "-> (Tensor, Tensor)");
+    m.def(
+        "fp4_dequantize(Tensor fp4Tensor, Tensor scaleFactors, Tensor globalScale, int sfVecSize, bool "
+        "sfUseUE8M0=False, bool swizzedLayout=True, str outputDataType=\"float16\") "
+        "-> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("fp4_quantize", TORCH_FN(torch_ext::fp4_quantize));
+    m.impl("fp4_dequantize", TORCH_FN(torch_ext::fp4_dequantize));
 }
