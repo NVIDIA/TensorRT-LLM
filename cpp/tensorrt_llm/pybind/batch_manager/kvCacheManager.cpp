@@ -343,6 +343,12 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
         .def("add_sequence", &BaseKVCacheManager::addSequence)
         .def("remove_sequence", &BaseKVCacheManager::removeSequence)
         .def("scheduling_remove_sequence", &BaseKVCacheManager::schedulingRemoveSequence)
+        // ===== hstu modification start =====
+        .def("add_sequence_with_eviction", &BaseKVCacheManager::addSequenceWithEviction)
+        .def("offload_sequence", &BaseKVCacheManager::offloadSequence)
+        .def("get_num_tokens_cached", &BaseKVCacheManager::getNumTokensCached)
+        .def("get_cached_start_position", &BaseKVCacheManager::getCacheStartPos)
+        // ===== hstu modification end =====
         .def("get_block_pool_pointers",
             [](tbk::BaseKVCacheManager& self)
             {
@@ -374,6 +380,14 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
                 auto pool_layer_idx = self.getPoolLayerIdx(layer_idx);
                 return pool.index({torch::indexing::Slice(), pool_layer_idx});
             })
+        // ===== hstu modification start =====
+        .def("get_primary_pool",
+            [](tbk::BaseKVCacheManager& self) -> at::Tensor
+            {
+                auto pool = tr::Torch::tensor(self.getPrimaryPool(0));
+                return pool;
+            })
+        // ===== hstu modification end =====
         .def("get_block_offsets_of_batch",
             [](tbk::BaseKVCacheManager& self, at::Tensor output, SizeType32 firstBatchSlotIdx, SizeType32 batchSize,
                 SizeType32 beamWidth)
@@ -433,7 +447,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
         .def(py::init<std::vector<SizeType32> const&, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32,
                  SizeType32, std::vector<SizeType32> const&, SizeType32, SizeType32, bool, int64_t, bool, bool,
                  tbk::CacheType, std::optional<tensorrt_llm::executor::RetentionPriority>,
-                 std::shared_ptr<tbk::KVCacheEventManager>, bool, bool>(),
+                 std::shared_ptr<tbk::KVCacheEventManager>, bool, bool, SizeType32>(),
             py::arg("num_kv_heads_per_layer"), py::arg("size_per_head"), py::arg("tokens_per_block"),
             py::arg("blocks_in_primary_pool"), py::arg("blocks_in_secondary_pool"), py::arg("max_num_sequences"),
             py::arg("max_beam_width"), py::arg("max_attention_window_vec"), py::arg("temporary_attention_window"),
@@ -441,7 +455,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
             py::arg("enable_block_reuse") = false, py::arg("onboard_blocks") = true,
             py::arg_v("cache_type", tbk::CacheType::kSELF, "bindings.internal.batch_manager.CacheType.SELF"),
             py::arg("secondary_offload_min_priority") = std::nullopt, py::arg("event_manager") = nullptr,
-            py::arg("enable_partial_reuse") = true, py::arg("copy_on_partial_reuse") = true);
+            py::arg("enable_partial_reuse") = true, py::arg("copy_on_partial_reuse") = true,
+            py::arg("reserved_blocks_in_primary_pool") = 0);
 }
 
 void tb::BasePeftCacheManagerBindings::initBindings(py::module_& m)
