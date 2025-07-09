@@ -179,6 +179,8 @@ class Qwen2VLInputProcessorBase(InputProcessor):
                 # Calculate temporal position IDs based on model type
                 if hasattr(model_config.vision_config, 'tokens_per_second'):
                     # Qwen2_5_VL style temporal position calculation
+                    if isinstance(second_per_grid_t, torch.Tensor):
+                        second_per_grid_t = second_per_grid_t.item()
                     range_tensor = torch.arange(llm_grid_t).view(-1, 1)
                     expanded_range = range_tensor.expand(
                         -1, llm_grid_h * llm_grid_w)
@@ -273,6 +275,8 @@ class Qwen2VLInputProcessorBase(InputProcessor):
             do_rescale = False
         if videos and isinstance(videos[0][0], torch.Tensor):
             do_rescale = False
+            # transformers=4.53.1 does not support GPU video tensors in Qwen2VL processor.
+            videos = [[frame.to("cpu") for frame in video] for video in videos]
         return self.processor(text=[text],
                               images=images,
                               videos=videos,
