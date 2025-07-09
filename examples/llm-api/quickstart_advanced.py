@@ -217,7 +217,7 @@ def setup_llm(args):
         if args.use_torch_compile else None,
         moe_backend=args.moe_backend,
         enable_trtllm_sampler=args.enable_trtllm_sampler,
-        mixed_sampler=mixed_sampler,
+        enable_mixed_sampler=mixed_sampler,
         max_seq_len=args.max_seq_len,
         max_batch_size=args.max_batch_size,
         max_num_tokens=args.max_num_tokens,
