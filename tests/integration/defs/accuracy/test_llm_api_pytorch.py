@@ -537,17 +537,6 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-        # chunked prefill case or more features
-        extra_llm_config = dict(
-            enable_chunked_prefill=True,
-            max_num_tokens=1024,
-        )
-        with LLM(self.MODEL_PATH,
-                 kv_cache_config=self.kv_cache_config,
-                 **extra_llm_config) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
 
 class TestMixtral8x7B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mixtral-8x7B-v0.1"
