@@ -41,6 +41,7 @@ def create_llm(model_dir):
     )
 
 
+@pytest.mark.high_cuda_memory
 def test_trtllm_sampler(model_path, test_case):
     prompts = [
         "Magellan and Elcano lead the first",

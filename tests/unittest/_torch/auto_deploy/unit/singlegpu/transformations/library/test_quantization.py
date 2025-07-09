@@ -63,6 +63,8 @@ def test_quantization(quant_config, atol, rtol, num_p_og):
         True,  # test_load_hook
         False,  # strict_loading
         None,  # dynamic_shapes
+        None,  # check_num_matches
+        False,  # skip_output_assert
         quant_config,
     )
 
@@ -133,6 +135,7 @@ def test_bmm_quantization(quant_config, atol, rtol, num_p_og, model_class):
         False,  # strict_loading
         None,  # dynamic_shapes
         None,  # check_num_matches
+        False,  # skip_output_assert
         quant_config,
     )
 

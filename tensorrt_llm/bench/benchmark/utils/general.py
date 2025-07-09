@@ -130,6 +130,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
             params.get("pp"),
             dataset_metadata.avg_isl,
             dataset_metadata.avg_osl,
+            params.get("kv_cache_free_gpu_mem_fraction"),
         )
 
         logger.info(

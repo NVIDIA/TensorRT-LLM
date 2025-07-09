@@ -14,6 +14,7 @@
 # limitations under the License.
 import unittest
 
+import pytest
 import torch
 from parameterized import parameterized
 
@@ -479,6 +480,7 @@ class TestMoeAlltoAllSingleGPU(unittest.TestCase):
         # Hang with stream count > 8
         #(0, 9, 90, 8, 100),
     ])
+    @pytest.mark.no_xdist
     def test_moe_alltoall_prepare(self, ep_rank: int, ep_size: int,
                                   expert_count: int, slot_count: int,
                                   top_k: int, max_token_count_per_rank: int):

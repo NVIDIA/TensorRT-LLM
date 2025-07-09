@@ -914,10 +914,14 @@ int main(int argc, char** argv)
         notSupported = true;
     }
 
-    TLLM_CUDA_CHECK(cudaSetDevice(COMM_SESSION.getRank()));
+    int device_count;
+    TLLM_CUDA_CHECK(cudaGetDeviceCount(&device_count));
+
+    int device_id = COMM_SESSION.getRank() % device_count;
+    TLLM_CUDA_CHECK(cudaSetDevice(device_id));
 
     cudaDeviceProp props;
-    TLLM_CUDA_CHECK(cudaGetDeviceProperties(&props, COMM_SESSION.getRank()));
+    TLLM_CUDA_CHECK(cudaGetDeviceProperties(&props, device_id));
 
     if (props.major < 9)
     {

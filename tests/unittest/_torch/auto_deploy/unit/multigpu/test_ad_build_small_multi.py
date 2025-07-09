@@ -19,7 +19,7 @@ from build_and_run_ad import ExperimentConfig, main
     ],
 )
 def test_build_ad(world_size: int, experiment_config: Dict):
-    if world_size > 2:
+    if world_size > 1:
         pytest.skip("https://nvbugspro.nvidia.com/bug/5331013")
 
     experiment_config["args"]["world_size"] = world_size

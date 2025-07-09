@@ -159,8 +159,11 @@ class Llama4Attention(Attention):
             q = self._attention_scaling(q, position_ids)
 
         out_scale = None
+        out_scale_sf = None
         if self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4 or self.o_proj.has_fp8_block_scales:
             out_scale = self.o_proj.inv_input_scale
+        if self.o_proj.has_nvfp4 and self.support_nvfp4_output:
+            out_scale_sf = self.o_proj.input_scale
 
         q, k, v = self.convert_qkv(q, k, v)
         attn_output = self.attn.forward(q,
@@ -168,6 +171,7 @@ class Llama4Attention(Attention):
                                         v,
                                         attn_metadata,
                                         out_scale=out_scale,
+                                        out_scale_sf=out_scale_sf,
                                         attention_mask=attention_mask,
                                         mrope_config=mrope_config)
 
@@ -851,7 +855,10 @@ class Llama4InputProcessor(InputProcessor):
             mm_embeds = self.encoder.multi_modal_projector(mm_embeds)
             # for fuse_input_embeds
             token_ids[token_ids == self.image_token_index] = self.vocab_size + 1
-            return token_ids.tolist(), {"mm_embedding": mm_embeds}
+
+            multimodal_data = {}
+            multimodal_data["multimodal_embedding"] = mm_embeds
+            return token_ids.tolist(), {"multimodal_data": multimodal_data}
         else:
             return processed["input_ids"].squeeze().tolist(), {}
 
@@ -882,10 +889,14 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
-        mm_embed = kwargs.get("multi_modal_data", [])
-        if mm_embed:
-            _, inputs_embeds = fuse_input_embeds(self.model.embed_tokens,
-                                                 input_ids, mm_embed)
+        multimodal_params = kwargs.get("multimodal_params", [])
+        if multimodal_params:
+            mm_embed = [
+                multimodal_param.multimodal_data["multimodal_embedding"]
+                for multimodal_param in multimodal_params
+            ]
+            input_ids, inputs_embeds = fuse_input_embeds(
+                self.model.embed_tokens, input_ids, mm_embed)
         return super().forward(attn_metadata,
                                input_ids,
                                position_ids,
