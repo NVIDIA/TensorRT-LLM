@@ -15,7 +15,7 @@ from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import AsyncQueue
-from ..metrics import SupportedMetricNames, RequestEventTiming, MetricsCollector
+from ..metrics import MetricsCollector, RequestEventTiming, SupportedMetricNames
 from ..sampling_params import LogprobParams, SamplingParams
 from .utils import ErrorResponse, has_event_loop, is_llm_response
 
@@ -216,7 +216,8 @@ class GenerationResultBase:
                          response_tensors,
                          sequence_index,
                          logprobs_result=None,
-                         req_perf_metrics_dict: Optional[dict[str, float]] = None):
+                         req_perf_metrics_dict: Optional[dict[str,
+                                                              float]] = None):
         """ Handle a single sequence in the response. """
 
         seq_idx = sequence_index
@@ -340,7 +341,8 @@ class GenerationResultBase:
             if self.sampling_params.use_beam_search:
                 for beam_idx, _ in enumerate(response_result.output_token_ids):
                     self._handle_sequence(finish_reasons, response_result,
-                                          beam_idx, logprobs_result, req_perf_metrics_dict)
+                                          beam_idx, logprobs_result,
+                                          req_perf_metrics_dict)
             else:
                 self._handle_sequence(finish_reasons, response_result,
                                       response_result.sequence_index,
@@ -360,16 +362,23 @@ class GenerationResultBase:
         else:
             raise ValueError(f"Unknown response type: {response}")
 
-    def record_stats(self, output: CompletionOutput, stats: Optional[dict[str, float]] = None):
+    def record_stats(self,
+                     output: CompletionOutput,
+                     stats: Optional[dict[str, float]] = None):
         if not stats:
             return
         metrics_stats = {}
         if output.finish_reason:
-            metrics_stats.update({MetricsCollector.labelname_finish_reason: output.finish_reason})
-        processed_metrics_stat = _process_req_perf_metrics(stats, len(output.token_ids))
+            metrics_stats.update({
+                MetricsCollector.labelname_finish_reason:
+                output.finish_reason
+            })
+        processed_metrics_stat = _process_req_perf_metrics(
+            stats, len(output.token_ids))
         if processed_metrics_stat:
             metrics_stats.update(processed_metrics_stat)
         self.metrics_dict = metrics_stats
+
 
 class DetokenizedGenerationResultBase(GenerationResultBase):
     ''' The base class for the generation result with detokenization support. '''
@@ -717,6 +726,7 @@ def compute_logprobs(
     return LogProbsResult(prompt=prompt_logprobs,
                           generation=generation_logprobs)
 
+
 def _process_req_perf_metrics(req_perf_metrics_dict: Optional[dict[str, float]],
                               output_length: int) -> Optional[dict[str, float]]:
     stat = {}
@@ -728,14 +738,15 @@ def _process_req_perf_metrics(req_perf_metrics_dict: Optional[dict[str, float]],
           req_perf_metrics_dict.get(RequestEventTiming.ARRIVAL_TIME, 0)
     request_queue_time = req_perf_metrics_dict.get(RequestEventTiming.FIRST_SCHEDULED_TIME, 0) - \
                          req_perf_metrics_dict.get(RequestEventTiming.ARRIVAL_TIME, 0)
-    stat = {SupportedMetricNames.TTFT: ttft,
-            SupportedMetricNames.E2E: e2e,
-            SupportedMetricNames.REQUEST_QUEUE_TIME: request_queue_time}
+    stat = {
+        SupportedMetricNames.TTFT: ttft,
+        SupportedMetricNames.E2E: e2e,
+        SupportedMetricNames.REQUEST_QUEUE_TIME: request_queue_time
+    }
     if output_length > 1:
-        tpot = (req_perf_metrics_dict.get(RequestEventTiming.LAST_TOKEN_TIME, 0) -
-                req_perf_metrics_dict.get(RequestEventTiming.FIRST_TOKEN_TIME, 0)) / (output_length - 1)
+        tpot = (req_perf_metrics_dict.get(
+            RequestEventTiming.LAST_TOKEN_TIME, 0) - req_perf_metrics_dict.get(
+                RequestEventTiming.FIRST_TOKEN_TIME, 0)) / (output_length - 1)
         stat.update({SupportedMetricNames.TPOT: tpot})
-    stat = dict(
-        filter(lambda item: item[1] > 0, stat.items())
-    )
+    stat = dict(filter(lambda item: item[1] > 0, stat.items()))
     return stat
