@@ -40,12 +40,13 @@ from ..logger import logger, severity_map
               default=None,
               help="Path | Name of the tokenizer."
               "Specify this value only if using TensorRT engine as model.")
-@click.option("--backend",
-              type=click.Choice(["pytorch", "tensorrt"]),
-              default="pytorch",
-              help="Set to 'pytorch' for pytorch path. Default is cpp path.")
+@click.option(
+    "--backend",
+    type=click.Choice(["pytorch", "tensorrt"]),
+    default="pytorch",
+    help="Set to 'tensorrt' for TensorRT backend. Default is PyTorch backend.")
 @click.option('--log_level',
-              type=click.Choice(severity_map.keys()),
+              type=click.Choice(list(severity_map.keys())),
               default='info',
               help="The logging level.")
 @click.option("--max_beam_width",
