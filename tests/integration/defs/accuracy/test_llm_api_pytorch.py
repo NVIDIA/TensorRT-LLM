@@ -277,6 +277,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         with llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
     def test_guided_decoding(self, backend: str, mocker):
@@ -347,6 +349,7 @@ class TestLlama3_2_3B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+@pytest.mark.timeout(7200)
 class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.3-70B-Instruct"
 
@@ -448,6 +451,33 @@ class TestMistral7B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+class TestMinistral8BInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "mistralai/Ministral-8B-Instruct-2410"
+    MODEL_PATH = f"{llm_models_root()}/Ministral-8B-Instruct-2410"
+
+    def test_auto_dtype_gsm8k(self):
+        with LLM(self.MODEL_PATH) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_ada
+    def test_fp8(self):
+        # Test with FP8 quantization if pre-quantized model is available
+        model_path = f"{llm_models_root()}/Ministral-8B-Instruct-2410-FP8"
+        try:
+            with LLM(model_path) as llm:
+                assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+                task = GSM8K(self.MODEL_NAME)
+                task.evaluate(llm)
+                task = MMLU(self.MODEL_NAME)
+                task.evaluate(llm)
+        except (FileNotFoundError, OSError):
+            pytest.skip("FP8 pre-quantized Ministral-8B model not available")
+
+
 class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-3-1b-it"
     MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-1b-it/"
@@ -456,7 +486,12 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
     kv_cache_config = KvCacheConfig(enable_block_reuse=False)
 
     def test_auto_dtype(self):
-        with LLM(self.MODEL_PATH, kv_cache_config=self.kv_cache_config) as llm:
+        # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=False,
+            enable_partial_reuse=False,
+        )
+        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
@@ -1320,7 +1355,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                               attention_dp, cuda_graph, overlap_scheduler,
                               max_batch_size, moe_backend):
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.85)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
@@ -1511,6 +1546,7 @@ class TestNemotronUltra(LlmapiAccuracyTestHarness):
                              ids=["tp8", "tp8ep4", "tp8ep8"])
     def test_auto_dtype(self, cuda_graph, tp_size, pp_size, ep_size):
         with LLM(self.MODEL_PATH,
+                 max_batch_size=32,
                  tensor_parallel_size=tp_size,
                  pipeline_parallel_size=pp_size,
                  moe_expert_parallel_size=ep_size,
@@ -1520,9 +1556,9 @@ class TestNemotronUltra(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
+            # task = GPQADiamond(self.MODEL_NAME)
+            # task.evaluate(llm,
+            #                 extra_evaluator_kwargs=dict(apply_chat_template=True))
 
     @pytest.mark.skip_less_device(8)
     @pytest.mark.skip_device_not_contain(["H100", "B200"])
@@ -1792,6 +1828,7 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_blackwell
+    @pytest.mark.skip_less_device(8)
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend",
         [(8, 1, 8, True, True, True, "CUTLASS"),

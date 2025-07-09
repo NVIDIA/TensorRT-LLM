@@ -131,6 +131,7 @@ class KVCacheManager(BaseResourceManager):
         layer_mask: Optional[List[bool]] = None,
         max_num_tokens: int = 8192,
         model_config: Optional[ModelConfig] = None,
+        max_beam_width: int = 1,
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
@@ -235,6 +236,7 @@ class KVCacheManager(BaseResourceManager):
             tokens_per_block=tokens_per_block,
             sink_token_length=sink_token_length,
             max_seq_len=self.max_seq_len,
+            max_beam_width=max_beam_width,
         )
 
         if kv_cache_type != CacheTypeCpp.SELF:
@@ -260,7 +262,7 @@ class KVCacheManager(BaseResourceManager):
             'tokens_per_block': tokens_per_block,
             'blocks_per_window': blocks_per_window,
             'max_num_sequences': max_batch_size,
-            'max_beam_width': 1,  # TODO: more than 1 beam?
+            'max_beam_width': max_beam_width,
             'max_attention_window_vec': self.max_attention_window_vec,
             'temp_attention_window_inputs': temp_attention_window_inputs,
             'dtype': dtype,
@@ -334,7 +336,7 @@ class KVCacheManager(BaseResourceManager):
         generation_batch = scheduled_batch.generation_requests
         # allocate KV Cache
         for req in context_batch:
-            req_beam_width = 1  # req.sampling_config.beam_width
+            req_beam_width = req.sampling_config.beam_width
             if 'cp_type' in self.mapping.cp_config and 'star_attention' == self.mapping.cp_config[
                     'cp_type']:
                 if req.ctx_iters == 0:
@@ -373,7 +375,7 @@ class KVCacheManager(BaseResourceManager):
         prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
     ):
-        beam_width = 1
+        beam_width = 1  # TODO: more than 1 beam?
         requests = []
         for i, req_id in enumerate(request_ids):
             sampling_params = SamplingParams()
@@ -657,6 +659,7 @@ class KVCacheManager(BaseResourceManager):
         tokens_per_block: int,
         sink_token_length: int,
         max_seq_len: int,
+        max_beam_width: int,
     ) -> Tuple[BlocksPerWindow, int, List[int]]:
         """
         Validate and adjust attention windows against their upper bounds if needed.
@@ -672,7 +675,6 @@ class KVCacheManager(BaseResourceManager):
         Returns:
             Tuple of (adjusted_blocks_per_window, adjusted_max_seq_len, adjusted_max_attention_window_vec)
         """
-        max_beam_width = 1  # TODO: support more than 1 beam?
         window_adjustments = {}
         # Validate each window size in blocks_per_window against its upper bound
         for window_size, (blocks_in_primary_pool,
@@ -812,7 +814,7 @@ class MambaCacheManager(BaseResourceManager):
         self.mamba_cache_index: Dict[int, int] = {}
 
         # mamba cache state indices
-        self.state_indices: torch.Tensor = torch.tensor([],
+        self.state_indices: torch.Tensor = torch.arange(max_batch_size,
                                                         device=device,
                                                         dtype=torch.int32)
 
@@ -829,9 +831,8 @@ class MambaCacheManager(BaseResourceManager):
                 block = self.mamba_cache_free_blocks.pop()
                 self.mamba_cache_index[r] = block
                 state_indices.append(block)
-        self.state_indices = torch.as_tensor(state_indices,
-                                             dtype=torch.int32,
-                                             device=self.ssm_states.device)
+        self.state_indices[:len(state_indices)] = torch.as_tensor(
+            state_indices, dtype=torch.int32, device=self.ssm_states.device)
 
     def free_mamba_cache_blocks(self, request_id: int):
         if request_id in self.mamba_cache_index:

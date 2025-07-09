@@ -401,7 +401,7 @@ size_t CutlassLowLatencyFp8GemmRunner<T>::dispatchToArch(__nv_fp8_e4m3 const* A,
 {
 
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-
+#ifndef PLACEHOLDER_KERNELS
     if (mSm == 90)
     {
         return dispatchLowLatencyGemmToCutlassSm90<T>(static_cast<__nv_fp8_e4m3 const*>(A),
@@ -409,6 +409,7 @@ size_t CutlassLowLatencyFp8GemmRunner<T>::dispatchToArch(__nv_fp8_e4m3 const* A,
             pdl_overlap_ratio, preftch_ratio, gemmConfig, workspacePtr, workspaceBytes, stream);
     }
     else
+#endif
     {
 
         throw std::runtime_error(

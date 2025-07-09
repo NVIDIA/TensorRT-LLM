@@ -13,9 +13,9 @@ onnx_graphsurgeon>=0.5.2
 openai
 polygraphy
 psutil
-nvidia-ml-py>=12
+nvidia-ml-py>=12,<13
 # Just a wrapper since nvidia-modelopt requires pynvml
-pynvml>=12.0.0
+pynvml==12.0.0
 pulp
 pandas
 h5py==3.12.1
@@ -50,7 +50,7 @@ peft
 einops
 flashinfer-python==0.2.5
 opencv-python-headless
-xgrammar==0.1.18
+xgrammar==0.1.19
 backoff
 nvtx
 matplotlib # FIXME: this is added to make nvtx happy

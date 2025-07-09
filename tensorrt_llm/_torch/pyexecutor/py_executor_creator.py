@@ -227,9 +227,10 @@ def create_py_executor(
     with mem_monitor.observe_creation_stage(
             _ExecutorCreationStage.MODEL_ENGINE_MAIN):
         model_engine = PyTorchModelEngine(
-            checkpoint_dir,
-            pytorch_backend_config,
+            model_path=checkpoint_dir,
+            pytorch_backend_config=pytorch_backend_config,
             batch_size=executor_config.max_batch_size,
+            max_beam_width=executor_config.max_beam_width,
             max_num_tokens=executor_config.max_num_tokens,
             max_seq_len=executor_config.max_seq_len,
             mapping=mapping,
@@ -249,9 +250,10 @@ def create_py_executor(
             draft_spec_config.max_draft_tokens = 0
 
             draft_model_engine = PyTorchModelEngine(
-                spec_config.draft_model_path,
-                pytorch_backend_config,
+                model_path=spec_config.draft_model_path,
+                pytorch_backend_config=pytorch_backend_config,
                 batch_size=executor_config.max_batch_size,
+                max_beam_width=executor_config.max_beam_width,
                 max_num_tokens=executor_config.max_num_tokens,
                 # Note: The draft model engine will infer its own max_seq_len.
                 # We'll stop drafting when we hit the max.
@@ -356,24 +358,36 @@ def create_py_executor(
                 if estimating_kv_cache else _ExecutorCreationStage.KV_CACHE):
             kv_cache_creator.build_managers(resources)
 
+    # Drafter for speculative decoding
+    with mem_monitor.observe_creation_stage(_ExecutorCreationStage.DRAFTER):
+        drafter = get_spec_drafter(model_engine)
+
     # Resource managers for speculative decoding
     spec_resource_manager = get_spec_resource_manager(model_engine,
-                                                      draft_model_engine)
+                                                      draft_model_engine,
+                                                      drafter)
     if spec_resource_manager is not None:
         resources[
             ResourceManagerType.SPEC_RESOURCE_MANAGER] = spec_resource_manager
-
-    # Drafter for speculative decoding
-    with mem_monitor.observe_creation_stage(_ExecutorCreationStage.DRAFTER):
-        drafter = get_spec_drafter(model_engine, spec_resource_manager)
 
     with mem_monitor.observe_creation_stage(
             _ExecutorCreationStage.INIT_EXTRA_RESOURCES
             if estimating_kv_cache else _ExecutorCreationStage.EXTRA_RESOURCES):
         py_executor = create_py_executor_instance(
-            dist, resources, mapping, pytorch_backend_config, executor_config,
-            ctx_chunk_config, model_engine, draft_model_engine, False, sampler,
-            drafter, lora_config, garbage_collection_gen0_threshold)
+            dist=dist,
+            resources=resources,
+            mapping=mapping,
+            pytorch_backend_config=pytorch_backend_config,
+            executor_config=executor_config,
+            ctx_chunk_config=ctx_chunk_config,
+            model_engine=model_engine,
+            draft_model_engine=draft_model_engine,
+            start_worker=False,
+            sampler=sampler,
+            drafter=drafter,
+            lora_config=lora_config,
+            garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
+        )
 
     if estimating_kv_cache:
         assert kv_cache_creator is not None
@@ -402,10 +416,21 @@ def create_py_executor(
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.EXTRA_RESOURCES):
             py_executor = create_py_executor_instance(
-                dist, resources, mapping, pytorch_backend_config,
-                executor_config, ctx_chunk_config, model_engine,
-                draft_model_engine, False, sampler, drafter, lora_config,
-                garbage_collection_gen0_threshold)
+                dist=dist,
+                resources=resources,
+                mapping=mapping,
+                pytorch_backend_config=pytorch_backend_config,
+                executor_config=executor_config,
+                ctx_chunk_config=ctx_chunk_config,
+                model_engine=model_engine,
+                draft_model_engine=draft_model_engine,
+                start_worker=False,
+                sampler=sampler,
+                drafter=drafter,
+                lora_config=lora_config,
+                garbage_collection_gen0_threshold=
+                garbage_collection_gen0_threshold,
+            )
 
     py_executor.start_worker()
     return py_executor

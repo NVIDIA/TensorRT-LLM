@@ -851,7 +851,10 @@ class Llama4InputProcessor(InputProcessor):
             mm_embeds = self.encoder.multi_modal_projector(mm_embeds)
             # for fuse_input_embeds
             token_ids[token_ids == self.image_token_index] = self.vocab_size + 1
-            return token_ids.tolist(), {"mm_embedding": mm_embeds}
+
+            multimodal_data = {}
+            multimodal_data["multimodal_embedding"] = mm_embeds
+            return token_ids.tolist(), {"multimodal_data": multimodal_data}
         else:
             return processed["input_ids"].squeeze().tolist(), {}
 
@@ -882,10 +885,14 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
-        mm_embed = kwargs.get("multi_modal_data", [])
-        if mm_embed:
-            _, inputs_embeds = fuse_input_embeds(self.model.embed_tokens,
-                                                 input_ids, mm_embed)
+        multimodal_params = kwargs.get("multimodal_params", [])
+        if multimodal_params:
+            mm_embed = [
+                multimodal_param.multimodal_data["multimodal_embedding"]
+                for multimodal_param in multimodal_params
+            ]
+            input_ids, inputs_embeds = fuse_input_embeds(
+                self.model.embed_tokens, input_ids, mm_embed)
         return super().forward(attn_metadata,
                                input_ids,
                                position_ids,

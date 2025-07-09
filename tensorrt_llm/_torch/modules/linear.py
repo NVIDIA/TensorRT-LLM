@@ -364,6 +364,9 @@ class FP8QDQLinearMethod(LinearMethodBase):
         v_weight = v_weight.to(module.dtype) * weight_scale[2]
 
         fused_weight = torch.cat((q_weight, k_weight, v_weight))
+        if module.weight_scale.device != fused_weight.device:
+            module.weight_scale = Parameter(
+                module.weight_scale.data.to(fused_weight.device))
         fused_weight = (fused_weight / module.weight_scale).to(
             torch.float8_e4m3fn)
         copy_weight(module.weight, fused_weight)
@@ -385,9 +388,113 @@ class FP8QDQLinearMethod(LinearMethodBase):
         gate_weight = gate_weight.to(module.dtype) * weight_scale[0]
         up_weight = up_weight.to(module.dtype) * weight_scale[1]
         fused_weight = torch.cat((gate_weight, up_weight))
+        if module.weight_scale.device != fused_weight.device:
+            module.weight_scale = Parameter(
+                module.weight_scale.data.to(fused_weight.device))
         fused_weight = (fused_weight / module.weight_scale).to(
             torch.float8_e4m3fn)
         copy_weight(module.weight, fused_weight)
+
+
+class FP8RowwiseLinearMethod(LinearMethodBase):
+
+    def create_weights(self, module: Linear, in_features: int,
+                       out_features: int, bias: bool, dtype: torch.dtype):
+        weight_shape = (out_features, in_features)
+
+        module.weight = Parameter(torch.empty(weight_shape,
+                                              dtype=torch.float8_e4m3fn),
+                                  requires_grad=False)
+        module.weight_scale = Parameter(torch.empty(out_features),
+                                        requires_grad=False)
+        # Not really used for Gemm now.
+        # Only used to quantize output of FP8 attention.
+        module.input_scale = Parameter(torch.tensor(1., dtype=torch.float32),
+                                       requires_grad=False)
+        module.inv_input_scale = Parameter(torch.tensor(1.,
+                                                        dtype=torch.float32),
+                                           requires_grad=False)
+        if bias:
+            module.bias = Parameter(torch.empty((out_features), dtype=dtype),
+                                    requires_grad=False)
+        else:
+            module.register_parameter("bias", None)
+
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]):
+        # FP8 tensor inputs are from attention. Directly use ones as scale.
+        if input.dtype == torch.float8_e4m3fn:
+            qinput = input
+            cur_input_scale = torch.ones(input.shape[0],
+                                         device=input.device,
+                                         dtype=torch.float32)
+        else:
+            # Use dynamic per-token quantization for activation
+            qinput, cur_input_scale = torch.ops.tensorrt_llm.quantize_e4m3_activation(
+                input)
+
+        # This op does not support bias now.
+        output = torch.ops.trtllm.fp8_rowwise_gemm(
+            qinput,
+            module.weight,
+            cur_input_scale.float(),
+            module.weight_scale,
+            module.dtype or input.dtype,
+        )
+        if bias is not None:
+            output = output + bias
+        return output
+
+    def _get_scale_name(self, weights: List[Dict]):
+        # `weight_scale_inv` for DS recipe and  `weight_scale` for ModelOpt recipe.
+        # Actually they hold identical values of data_amax / 448.
+        scale_name = "weight_scale_inv"
+        if scale_name not in weights[0]:
+            scale_name = "weight_scale"
+        return scale_name
+
+    def load_weights_vanilla(self, module: Linear, weights: List[Dict]):
+        load_weights_vanilla_helper(module, weights)
+
+        scale_name = self._get_scale_name(weights)
+        weight_scale = load_weight_shard(weights[0][scale_name], module.tp_size,
+                                         module.tp_rank, module.tp_mode)
+        copy_weight(module.weight_scale, weight_scale)
+        if "input_scale" in weights[0]:
+            copy_weight(module.input_scale, weights[0]["input_scale"])
+            module.inv_input_scale.data = 1.0 / module.input_scale
+
+    def load_weights_fused_qkv_linear(self, module: Linear,
+                                      weights: List[Dict]):
+        q_weight, k_weight, v_weight = load_weights_fused_qkv_helper(
+            module, weights)
+        fused_weight = torch.cat((q_weight, k_weight, v_weight))
+        copy_weight(module.weight, fused_weight)
+
+        scale_name = self._get_scale_name(weights)
+        q_scale = load_weight_shard(weights[0][scale_name], module.tp_size,
+                                    module.tp_rank, module.tp_mode)
+        k_scale = load_weight_shard(weights[1][scale_name], module.tp_size,
+                                    module.tp_rank, module.tp_mode)
+        v_scale = load_weight_shard(weights[2][scale_name], module.tp_size,
+                                    module.tp_rank, module.tp_mode)
+        fused_fp8_block_scale = torch.cat((q_scale, k_scale, v_scale))
+        copy_weight(module.weight_scale, fused_fp8_block_scale)
+
+    def load_weights_fused_gate_up_linear(self, module: Linear,
+                                          weights: List[Dict]):
+        gate_weight, up_weight = load_weights_fused_gate_up_helper(
+            module, weights)
+        fused_weight = torch.cat((gate_weight, up_weight))
+        copy_weight(module.weight, fused_weight)
+
+        scale_name = self._get_scale_name(weights)
+        left_scale = load_weight_shard(weights[0][scale_name], module.tp_size,
+                                       module.tp_rank, module.tp_mode)
+        right_scale = load_weight_shard(weights[1][scale_name], module.tp_size,
+                                        module.tp_rank, module.tp_mode)
+        fused_scale = torch.cat((left_scale, right_scale))
+        copy_weight(module.weight_scale, fused_scale)
 
 
 class FP8BlockScalesLinearMethod(LinearMethodBase):
@@ -896,6 +1003,8 @@ def get_quant_method(quant_config: Optional[QuantConfig] = None):
         return UnquantizedLinearMethod()
     if quant_config.layer_quant_mode.has_fp8_qdq():
         return FP8QDQLinearMethod()
+    if quant_config.layer_quant_mode.has_fp8_rowwise():
+        return FP8RowwiseLinearMethod()
     if quant_config.layer_quant_mode.has_fp8_block_scales():
         return FP8BlockScalesLinearMethod()
     if quant_config.layer_quant_mode.has_nvfp4():
@@ -996,6 +1105,12 @@ class Linear(nn.Module):
     def has_fp8_qdq(self):
         assert self._weights_created
         return self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp8_qdq(
+        )
+
+    @property
+    def has_fp8_rowwise(self):
+        assert self._weights_created
+        return self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp8_rowwise(
         )
 
     @property
