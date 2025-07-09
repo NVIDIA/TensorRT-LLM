@@ -188,3 +188,8 @@ speakleash/Bielik-11B-v2.2-Instruct:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 64.36
+mistralai/Ministral-8B-Instruct-2410:
+  - accuracy: 66.35
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 65.96
