@@ -118,6 +118,7 @@ l0_dgx_h100:
   tests:
   # ------------- CPP tests ---------------
   - cpp/test_multi_gpu.py::test_mpi_utils[90]
+  - cpp/test_multi_gpu.py::test_fused_gemm_allreduce[4proc-90]
   - cpp/test_multi_gpu.py::test_cache_transceiver[2proc-mpi_kvcache-90]
   - cpp/test_multi_gpu.py::test_cache_transceiver[2proc-ucx_kvcache-90]
   - cpp/test_multi_gpu.py::test_cache_transceiver[8proc-mpi_kvcache-90]
