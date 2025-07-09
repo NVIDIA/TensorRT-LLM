@@ -21,7 +21,7 @@ This document shows how to build and run a [Qwen](https://huggingface.co/Qwen) m
     - [Quick start](#quick-start)
       - [Run a single inference](#run-a-single-inference)
     - [Evaluation](#evaluation)
-    - [Model Quantization to FP4](#model-quantization-to-fp4)
+    - [Model Quantization](#model-quantization)
     - [Benchmark](#benchmark)
     - [Serving](#serving)
       - [trtllm-serve](#trtllm-serve)
