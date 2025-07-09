@@ -8,8 +8,6 @@ backend: "pytorch"
 tensor_parallel_size: 1
 pipeline_parallel_size: 1
 
-pytorch_backend_config:
-  use_cuda_graph: False
 
 # ======= Triton Server Configurations =======
 # Triton Configurations to override the default values in config.pbtxt

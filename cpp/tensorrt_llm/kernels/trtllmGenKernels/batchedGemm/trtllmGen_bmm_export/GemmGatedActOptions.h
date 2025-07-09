@@ -45,6 +45,9 @@
 
 #endif
 
+namespace batchedGemm
+{
+
 namespace gemmGatedAct
 {
 
@@ -56,7 +59,17 @@ namespace tg = trtllm::gen;
 enum class ActType
 {
     // silu(x) = x * sigmoid(x) = x * (1 / (1 + e^(-x)))
-    Silu = 0
+    // For ActType == Silu,
+    //    gatedAct = scaleC * x0 * silu(x1 * scaleGate),
+    // where x0 and x1 are the raw numbers from Gemm, while scaleC and scaleGate are input scales.
+    Silu = 0,
+    // For ActType == SwiGlu, ideally we would like to have something like
+    //    gatedAct = scaleC * (x0 * scaleAb + beta) * sigmoid(alpha * x1 * scaleGate).
+    // But for now, we use the simplified version
+    //    gatedAct = scaleC' * (x0 + beta') * sigmoid(alpha * x1 * scaleGate),
+    // where x0 and x1 are the raw numbers from Gemm, while scaleC and scaleGate are input scales,
+    // beta' = beta / scaleAb, scaleC' = scaleC * scaleAb.
+    SwiGlu
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -70,8 +83,21 @@ enum class ActType
     }
 
 TLLM_ACT_TYPE_FUNCTION(Silu)
+TLLM_ACT_TYPE_FUNCTION(SwiGlu)
 
 #undef TLLM_ACT_TYPE_FUNCTION
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline std::string getActTypeName(ActType type)
+{
+    switch (type)
+    {
+    case ActType::Silu: return "Silu";
+    case ActType::SwiGlu: return "SwiGlu";
+    default: return "Unknown type";
+    }
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -108,7 +134,7 @@ inline bool checkAndUpdateGemmGatedActOptions(
 
     if (options.mUseTmaStore)
     {
-        TLLM_CHECK_ERROR(hiddenEpilogueTileSize * tg::dtypeGetNumBits(options.mDtypeElt) / /* bits */ 8 % 32 == 0,
+        TLLM_CHECK_ERROR(hiddenEpilogueTileSize * tg::dtypeGetNumBits(options.mDtypeC) / /* bits */ 8 % 32 == 0,
             "Unsupported output hidden tile size");
     }
 
@@ -136,6 +162,11 @@ inline bool checkAndUpdateGemmGatedActOptions(
     if (options.mNumSlicesForSplitK > 1)
     {
         TLLM_CHECK_ERROR(doesSplitKUseDsmem(options.mSplitK), "Split-k GMEM and GemmGatedAct are not supported yet.");
+    }
+
+    if (gemm::isBiasTypeMn(options.mBiasType))
+    {
+        TLLM_CHECK_ERROR(options.mTransposeMmaOutput, "Bias type Mn is not supported with not transpose mma output.");
     }
 
     return true;
@@ -190,3 +221,5 @@ struct GemmGatedActConfig
 #undef TLLM_LOG_INFO
 #undef TLLM_LOG_ERROR
 #endif // TLLM_GEN_EXPORT_INTERFACE
+
+} // namespace batchedGemm

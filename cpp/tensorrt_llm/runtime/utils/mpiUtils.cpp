@@ -265,9 +265,9 @@ size_t invokeChunked(TMpiFunc func, TBase* buffer, size_t size, MPI_Datatype dty
 }
 #endif // ENABLE_MULTI_DEVICE
 
-std::shared_ptr<MpiRequest> MpiComm::bcastAsync(void* buffer, size_t size, MpiType dtype, int root) const
+std::unique_ptr<MpiRequest> MpiComm::bcastAsync(void* buffer, size_t size, MpiType dtype, int root) const
 {
-    std::shared_ptr<MpiRequest> r = std::make_shared<MpiRequest>();
+    std::unique_ptr<MpiRequest> r = std::make_unique<MpiRequest>();
 #if ENABLE_MULTI_DEVICE
     invokeChunked(MPI_Ibcast, buffer, size, getMpiDtype(dtype), root, mComm, &r->mRequest);
 #else
@@ -276,7 +276,7 @@ std::shared_ptr<MpiRequest> MpiComm::bcastAsync(void* buffer, size_t size, MpiTy
     return r;
 }
 
-std::shared_ptr<MpiRequest> MpiComm::bcastAsync(runtime::IBuffer& buf, int root) const
+std::unique_ptr<MpiRequest> MpiComm::bcastAsync(runtime::IBuffer& buf, int root) const
 {
     return bcastAsync(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, root);
 }
@@ -295,11 +295,11 @@ void MpiComm::bcast(runtime::IBuffer& buf, int root) const
     bcast(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, root);
 }
 
-std::shared_ptr<MpiRequest> MpiComm::sendAsync(
+std::unique_ptr<MpiRequest> MpiComm::sendAsync(
     void const* buffer, size_t size, MpiType dtype, int dest, MpiTag tag) const
 {
     TLLM_LOG_DEBUG("start MPI_Isend with dest %d, tag %d, size %d", dest, static_cast<int>(tag), size);
-    std::shared_ptr<MpiRequest> r = std::make_shared<MpiRequest>();
+    std::unique_ptr<MpiRequest> r = std::make_unique<MpiRequest>();
 #if ENABLE_MULTI_DEVICE
     invokeChunked(MPI_Isend, buffer, size, getMpiDtype(dtype), dest, static_cast<int>(tag), mComm, &r->mRequest);
 #else
@@ -309,7 +309,7 @@ std::shared_ptr<MpiRequest> MpiComm::sendAsync(
     return r;
 }
 
-std::shared_ptr<MpiRequest> MpiComm::sendAsync(runtime::IBuffer const& buf, int dest, MpiTag tag) const
+std::unique_ptr<MpiRequest> MpiComm::sendAsync(runtime::IBuffer const& buf, int dest, MpiTag tag) const
 {
     return sendAsync(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, dest, tag);
 }

@@ -200,26 +200,24 @@ trtllm-bench --model $model_name throughput --dataset $dataset_file --backend py
 
 `llm_options.yml`
 ```yaml
-
- pytorch_backend_config:
-  use_cuda_graph: true
-  cuda_graph_padding_enabled: true
-  cuda_graph_batch_sizes:
-  - 1
-  - 2
-  - 4
-  - 8
-  - 16
-  - 32
-  - 64
-  - 128
-  - 256
-  - 384
-  - 512
-  - 1024
-  - 2048
-  - 4096
-  - 8192
+cuda_graph_config:
+  padding_enabled: true
+  batch_sizes:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    - 64
+    - 128
+    - 256
+    - 384
+    - 512
+    - 1024
+    - 2048
+    - 4096
+    - 8192
 ```
 
 In majority of cases, we also use a higher KV cache percentage by setting `--kv_cache_free_gpu_mem_fraction 0.95` in the benchmark command. This allows us to obtain better performance than the default setting of `0.90`. We fall back to `0.90` if we hit an out of memory issue.

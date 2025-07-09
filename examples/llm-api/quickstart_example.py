@@ -1,16 +1,17 @@
-from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm import SamplingParams
+from tensorrt_llm._tensorrt_engine import LLM
 
 
 def main():
 
     prompts = [
         "Hello, my name is",
-        "The president of the United States is",
         "The capital of France is",
         "The future of AI is",
     ]
     sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
 
+    # Alternatively, use "nvidia/Llama-3.1-8B-Instruct-FP8" to enable FP8 inference.
     llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
     outputs = llm.generate(prompts, sampling_params)

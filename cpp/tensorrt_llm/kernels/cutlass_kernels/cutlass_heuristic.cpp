@@ -523,7 +523,7 @@ std::vector<CutlassGemmConfig> get_candidate_configs(
     {
         return get_candidate_configs_sm100(config_type_param);
     }
-    if (sm == 120 && (config_type_param & CutlassGemmConfig::BLACKWELL))
+    if (sm >= 120 && (config_type_param & CutlassGemmConfig::BLACKWELL))
     {
         return get_candidate_configs_sm120(config_type_param);
     }
@@ -533,7 +533,7 @@ std::vector<CutlassGemmConfig> get_candidate_configs(
     std::vector<CutlassGemmConfig> candidate_configs;
 
     bool const int8_configs_only = config_type_param & CutlassGemmConfig::INT8_ONLY;
-    int const min_stages = int8_configs_only ? 3 : 2;
+    int const min_stages = (sm == 89) ? 3 : int8_configs_only ? 3 : 2;
     int const max_stages = int8_configs_only ? 6 : (sm >= 80 ? 4 : 2);
     for (auto const& tile_config : tiles)
     {

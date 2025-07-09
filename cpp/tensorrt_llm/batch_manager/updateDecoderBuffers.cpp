@@ -18,6 +18,7 @@
 #include "tensorrt_llm/batch_manager/updateDecoderBuffers.h"
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
+#include "tensorrt_llm/runtime/decoderState.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
 namespace tensorrt_llm::batch_manager
@@ -29,8 +30,8 @@ using ITensor = runtime::ITensor;
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
 runtime::CudaEvent UpdateDecoderBuffers::operator()(runtime::ModelConfig const& modelConfig,
-    DecoderBuffers& decoderBuffers, DecoderOutputBuffers& decoderOutputBuffers,
-    runtime::BufferManager const& copyBufferManager, runtime::GptDecoderBatched const& decoder, bool returnLogProbs,
+    DecoderOutputBuffers& decoderOutputBuffers, runtime::BufferManager const& copyBufferManager,
+    runtime::decoder::DecoderState const& decoderState, bool returnLogProbs,
     runtime::CudaEvent const& decoderFinishEvent) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -39,45 +40,32 @@ runtime::CudaEvent UpdateDecoderBuffers::operator()(runtime::ModelConfig const& 
     // Chain copy after decoder event, using a different stream
     copyBufferManager.getStream().wait(decoderFinishEvent);
 
-    copyBufferManager.copy(*decoder.getDecoderState().getAllNewTokens(), *decoderOutputBuffers.newOutputTokensHost);
-    copyBufferManager.copy(
-        *decoder.getDecoderState().getJointDecodingOutput().lengths, *decoderOutputBuffers.sequenceLengthsHost);
+    copyBufferManager.copy(*decoderState.getAllNewTokens(), *decoderOutputBuffers.newOutputTokensHost);
+    copyBufferManager.copy(*decoderState.getSequenceLengths(), *decoderOutputBuffers.sequenceLengthsHost);
 
-    auto const finishedSumDevice = decoder.getDecoderState().getFinishedSum();
+    auto const finishedSumDevice = decoderState.getFinishedSum();
     copyBufferManager.copy(*finishedSumDevice, *decoderOutputBuffers.finishedSumHost);
-    auto const finishReasonsDevice = decoder.getDecoderState().getFinishReasons();
+    auto const finishReasonsDevice = decoderState.getFinishReasons();
     copyBufferManager.copy(*finishReasonsDevice, *decoderOutputBuffers.finishReasonsHost);
 
     if (returnLogProbs)
     {
-        copyBufferManager.copy(*decoder.getDecoderState().getCumLogProbs(), *decoderOutputBuffers.cumLogProbsHost);
-        copyBufferManager.copy(*decoder.getDecoderState().getLogProbs(), *decoderOutputBuffers.logProbsHost);
+        copyBufferManager.copy(*decoderState.getCumLogProbs(), *decoderOutputBuffers.cumLogProbsHost);
+        copyBufferManager.copy(*decoderState.getLogProbs(), *decoderOutputBuffers.logProbsHost);
     }
 
     if (modelConfig.getSpeculativeDecodingMode().predictsDraftTokens())
     {
-        // TODO(rkobus): keep data on device for next iteration
-        decoderBuffers.draftBuffers.nextDraftTokensDevice = decoder.getDecoderState().getNextDraftTokens();
-        copyBufferManager.copy(
-            *decoderBuffers.draftBuffers.nextDraftTokensDevice, *decoderBuffers.draftBuffers.nextDraftTokensHost);
+        // TODO: keep data on device for next iteration
+        copyBufferManager.copy(*decoderState.getNextDraftTokens(), *decoderOutputBuffers.nextDraftTokensHost);
 
         if (modelConfig.getSpeculativeDecodingMode().variableDraftLength())
         {
-            decoderBuffers.draftBuffers.nextDraftTokensLengthsDevice
-                = decoder.getDecoderState().getNextDraftTokensLengths();
-            decoderBuffers.draftBuffers.prevDraftTokensLengthsDevice
-                = decoder.getDecoderState().getPrevDraftTokensLengths();
-            copyBufferManager.copy(*decoderBuffers.draftBuffers.nextDraftTokensLengthsDevice,
-                *decoderBuffers.draftBuffers.nextDraftTokensLengthsHost);
-            copyBufferManager.copy(*decoderBuffers.draftBuffers.prevDraftTokensLengthsDevice,
-                *decoderBuffers.draftBuffers.prevDraftTokensLengthsHost);
+            copyBufferManager.copy(
+                *decoderState.getNextDraftTokensLengths(), *decoderOutputBuffers.nextDraftTokensLengthsHost);
+            copyBufferManager.copy(
+                *decoderState.getPrevDraftTokensLengths(), *decoderOutputBuffers.prevDraftTokensLengthsHost);
         }
-    }
-
-    if (modelConfig.getSpeculativeDecodingMode().needsKVCacheRewind())
-    {
-        decoderBuffers.draftBuffers.acceptedLengthsCumSumDevice = decoder.getDecoderState().getAcceptedLengthsCumSum();
-        decoderBuffers.draftBuffers.acceptedPackedPathsDevice = decoder.getDecoderState().getAcceptedPackedPaths();
     }
 
     runtime::CudaEvent copyEvent{};

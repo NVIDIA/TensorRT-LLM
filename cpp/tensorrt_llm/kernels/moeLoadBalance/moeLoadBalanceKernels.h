@@ -70,6 +70,32 @@ void moeSetSignalForCpuStageForTest(MoeLoadBalanceSingleLayerSignal* signal);
 void moeStatisticDevice(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalanceStatisticInfo statisticInfo, int numTotalTokens,
     int* const enabled, bool isFirstStage, bool isLastStage, int* const gatheredRawExpertIds, cudaStream_t stream);
 
+// @brief do the statistic based on local device's data
+//
+// This function is used to launch a kernel to do the statistic for local tokens.
+//
+// @param metaInfo: the meta info
+// @param numTotalTokens: the total number of tokens in localRawExpertIds
+// @param localExpertTokenCount: the token count that each expert has for local tokens.
+// @param enabled: flag on device memory to indicate if the statistic is enabled
+// @param isFirstStage: whether the current stage is the first stage (only first stage need shift window)
+// @param isLastStage: whether the current stage is the last stage (only last stage need update load factor)
+// @param localRawExpertIds: the gathered raw expert ids, should have shape [numTotalTokens, metaInfo.topK]
+void moeHierarchicalStatisticLocalDevice(MoeLoadBalanceMetaInfo metaInfo, int numTotalTokens,
+    int* localExpertTokenCount, int* const enabled, bool isFirstStage, bool isLastStage, int* const localRawExpertIds,
+    cudaStream_t stream);
+
+// @brief update the statistic info based on global info
+//
+// This function is used to launch a kernel to update the statistic info per iteration.
+//
+// @param metaInfo: the meta info
+// @param statisticInfo: the statistic info
+// @param globalExpertTokenCount: the global expert token count, should have shape [metaInfo.expertCount]
+// @param enabled: flag on device memory to indicate if the statistic is enabled
+void moeHierarchicalStatisticUpdate(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalanceStatisticInfo statisticInfo,
+    int* globalExpertTokenCount, int* const enabled, cudaStream_t stream);
+
 // @brief compute the route
 //
 // This function is used to launch a kernel to compute the route based on the token selected experts and the placement
@@ -81,9 +107,10 @@ void moeStatisticDevice(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalanceStatistic
 // @param tokenSelectedExperts: the selected experts of all tokenCount tokens, has shape of [tokenCount * topK]
 // @param tokenRoutedRankIds: output the routed slotIds of all tokenCount tokens, has shape of [tokenCount * topK]
 // @param tokenCount: the token count to compute the route
+// @param offsetByEpRank: whether to offset the round robin position by epRank
 // @param stream: the CUDA stream to be used
 void moeComputeRouteDevice(MoeLoadBalanceMetaInfo metaInfo, MoePlacementInfo placementInfo,
-    int* const tokenSelectedExperts, int* tokenRoutedSlotIds, int tokenCount, cudaStream_t stream);
+    int* const tokenSelectedExperts, int* tokenRoutedSlotIds, int tokenCount, bool offsetByEpRank, cudaStream_t stream);
 
 // @brief wait for the signal from gpu to cpu on host
 //

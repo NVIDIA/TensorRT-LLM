@@ -1,33 +1,18 @@
-/***************************************************************************************************
- * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * 1. Redistributions of source code must retain the above copyright notice, this
- * list of conditions and the following disclaimer.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- * this list of conditions and the following disclaimer in the documentation
- * and/or other materials provided with the distribution.
- *
- * 3. Neither the name of the copyright holder nor the names of its
- * contributors may be used to endorse or promote products derived from
- * this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- **************************************************************************************************/
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 /*! \file
   \brief Functor performing elementwise operations used by epilogues.
 */
@@ -44,6 +29,9 @@
 
 #include "cutlass_extensions/arch/copy_red_global.hpp"
 #include "cutlass_extensions/util/gather_tensor.hpp"
+
+#include "cutlass/epilogue/collective/builders/sm90_builder.inl"
+#include "cutlass/epilogue/collective/builders/sm90_common.inl"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -230,7 +218,8 @@ public:
 
         // Function to scatter output rows
         auto& num_rows = params.num_rows_in_final_output;
-        auto read_scatter_map = IndexedGather(make_gmem_ptr(params.scatter_index + params.group_offset[l_coord]));
+        auto read_scatter_map = tensorrt_llm::cutlass_extensions::IndexedGather(
+            make_gmem_ptr(params.scatter_index + params.group_offset[l_coord]));
         auto get_scatter_idx = [&](auto i)
         {
             auto scatter = read_scatter_map(i);
@@ -243,7 +232,7 @@ public:
         ElementC const* ptr_C = epilogue_op.is_source_needed() ? params.ptr_C[l_coord] : nullptr;
         auto dC = epilogue_op.is_source_needed() ? params.dC[l_coord] : InternalStrideC{};
         Tensor mC_mnl = make_tensor(make_gmem_ptr(ptr_C), make_shape(M, N, mock_L), dC);        // (m,n,l)
-        Tensor mD_mnl = make_gather_tensor(
+        Tensor mD_mnl = tensorrt_llm::cutlass_extensions::make_gather_tensor(
             make_gmem_ptr(params.ptr_D), make_shape(M, N, mock_L), params.dD, get_scatter_idx); // (m,n,l)
 
         // Use fake shape for bias, it doesn't matter
@@ -503,7 +492,8 @@ struct EpilogueMoeFusedFinalizeBuilder
 
     using SmemLayoutAtomD
         = decltype(detail::sm90_get_epilogue_smem_swizzle_layout_atom<StrideD, ElementAccumulator, EpilogueTile>());
-    using CopyAtomR2S = decltype(detail::sm90_get_smem_store_op_for_accumulator<StrideD, ElementAccumulator>());
+    using CopyAtomR2S
+        = decltype(detail::sm90_get_smem_store_op_for_accumulator<StrideD, ElementAccumulator, EpilogueTile>());
     using CopyAtomS2R = DefaultCopy;
     using CopyAtomR2G = decltype(detail::get_vectorized_atomic_add_op<ElementD, EpiTileN>());
 

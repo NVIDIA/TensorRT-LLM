@@ -24,23 +24,23 @@ from packaging import version
 from .trt_test_alternative import check_call, check_output, exists, is_windows
 
 
-def venv_check_call(venv, cmd, running_log=None, env=None):
+def venv_check_call(venv, cmd, env=None, **kwargs):
 
     def _war_check_call(*args, **kwargs):
         kwargs["cwd"] = venv.get_working_directory()
         return check_call(*args, **kwargs)
 
-    venv.run_cmd(cmd, caller=_war_check_call, running_log=running_log, env=env)
+    venv.run_cmd(cmd, caller=_war_check_call, env=env, **kwargs)
 
 
-def venv_check_output(venv, cmd):
+def venv_check_output(venv, cmd, env=None, **kwargs):
 
     def _war_check_output(*args, **kwargs):
         kwargs["cwd"] = venv.get_working_directory()
         output = check_output(*args, **kwargs)
         return output
 
-    return venv.run_cmd(cmd, caller=_war_check_output)
+    return venv.run_cmd(cmd, caller=_war_check_output, env=env, **kwargs)
 
 
 def venv_mpi_check_call(venv, mpi_cmd, python_cmd):
@@ -335,9 +335,9 @@ def convert_weights(llm_venv,
         redrafter_draft_len_per_beam = kwargs.pop(
             "redrafter_draft_len_per_beam")
         convert_cmd = [
-            f"{example_root}/{script}", "--model_dir", model_path[0],
-            "--drafter_model_dir", model_path[1], "--output_dir", model_dir,
-            f"--dtype={data_type}", f"--tp_size={tp_size}",
+            f"{example_root}/{script}", "--base_model_checkpoint_dir",
+            model_path[0], "--drafter_model_dir", model_path[1], "--output_dir",
+            model_dir, f"--dtype={data_type}", f"--tp_size={tp_size}",
             f"--redrafter_num_beams={redrafter_num_beams}",
             f"--redrafter_draft_len_per_beam={redrafter_draft_len_per_beam}"
         ]

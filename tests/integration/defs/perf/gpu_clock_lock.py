@@ -29,7 +29,6 @@ import time
 import psutil  # type: ignore
 # Nvidia
 import pynvml  # type: ignore
-# TURTLE
 from defs.trt_test_alternative import print_info, print_warning
 
 from .misc import clean_device_product_name

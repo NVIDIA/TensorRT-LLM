@@ -46,7 +46,7 @@ from ..quantization.layers import (FP8Linear, Fp8RowwiseFusedGatedMLP,
                                    WeightOnlyQuantRowLinear)
 from ..quantization.mode import (KV_CACHE_QUANT_ALGO_LIST, QUANT_ALGO_LIST,
                                  W8A8_SQ_PLUGIN_LIST, QuantAlgo)
-from ..quantization.utils.fp4_utils import float4_sf_dtype
+from ..quantization.utils import fp4_utils
 from ..top_model_mixin import TopModelMixin
 from .convert_utils import weight_only_quantize_dict
 from .generation_mixin import GenerationMixin
@@ -97,6 +97,7 @@ class SpeculativeDecodingMode(IntFlag):
     EXPLICIT_DRAFT_TOKENS = auto()
     EAGLE = auto()
     NGRAM = auto()
+    USER_PROVIDED = auto()
 
     @staticmethod
     def from_arguments(args: argparse.Namespace):
@@ -114,6 +115,8 @@ class SpeculativeDecodingMode(IntFlag):
             return SpeculativeDecodingMode.EAGLE
         elif args.speculative_decoding_mode == "ngram":
             return SpeculativeDecodingMode.NGRAM
+        elif args.speculative_decoding_mode == "user_provided":
+            return SpeculativeDecodingMode.USER_PROVIDED
         else:
             assert False, "Unknown speculative_decoding_mode " + args.speculative_decoding_mode
 
@@ -1803,15 +1806,18 @@ def preprocess_perlayer_weights(weights,
         # Interleave block scale for NVFP4 plugin.
         for name in list(weights):
             if name.endswith('weights_scaling_factor'):
-                ori_shape = weights[name].shape
+                out_features, in_features = weights[name].shape
+                nrows = fp4_utils.pad_up(out_features, 128)
+                ncols = fp4_utils.pad_up(in_features, 4)
                 new_name = name.replace('weights_scaling_factor',
                                         'weights_block_scaling_factor')
                 weights[new_name] = weights[name]
                 weights[
                     new_name +
-                    "_interleaved"] = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
-                        weights[name].view(float4_sf_dtype).cpu().contiguous(
-                        )).reshape(ori_shape).view(float4_sf_dtype)
+                    "_interleaved"] = torch.ops.trtllm.nvfp4_block_scale_interleave(
+                        weights[name].view(fp4_utils.float4_sf_dtype).cpu(
+                        ).contiguous()).reshape(nrows, ncols).view(
+                            fp4_utils.float4_sf_dtype)
                 weights.pop(name)
             if name.endswith('weights_scaling_factor_2'):
                 new_name = name.replace('weights_scaling_factor_2',

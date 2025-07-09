@@ -27,23 +27,7 @@ namespace tensorrt_llm
 namespace kernels
 {
 
-namespace
-{
-namespace tg = trtllm::gen;
-
-tg::Dtype dtypeToTrtllmDtype(Dtype dtype)
-{
-    switch (dtype)
-    {
-    case Dtype::Bfloat16: return tg::Dtype::Bfloat16;
-    case Dtype::Fp16: return tg::Dtype::Fp16;
-    case Dtype::Fp32: return tg::Dtype::Fp32;
-    case Dtype::E2m1: return tg::Dtype::E2m1;
-    case Dtype::E4m3: return tg::Dtype::E4m3;
-    default: TLLM_CHECK_WITH_INFO(false, "Invalid dtype");
-    }
-}
-} // namespace
+static gemmGatedAct::GemmGatedActInterface::ModuleCache globalTrtllmGenGemmGatedActModuleCache;
 
 TrtllmGenGemmGatedActRunner::TrtllmGenGemmGatedActRunner(TrtllmGenGemmGatedActRunnerOptions const& options_)
     : mOptions(options_)
@@ -59,8 +43,7 @@ TrtllmGenGemmGatedActRunner::TrtllmGenGemmGatedActRunner(TrtllmGenGemmGatedActRu
         auto const options = configs[i].mOptions;
 
         // When we include low-latency kernels we can set transposeMmaOutput via constructor
-        if (options.mDtypeElt == dtypeToTrtllmDtype(mOptions.eltType)
-            && options.mDtypeC == dtypeToTrtllmDtype(mOptions.outputType)
+        if (options.mDtypeElt == mOptions.eltType && options.mDtypeC == mOptions.outputType
             && options.mUseDeepSeekFp8 == mOptions.deepSeekFp8
             && options.mTransposeMmaOutput == mOptions.transposeMmaOutput)
         {
@@ -123,7 +106,8 @@ void TrtllmGenGemmGatedActRunner::run(int32_t m, int32_t n, int32_t k, void cons
     // FIXME once we start using all-reduce in the epilogue of the gemm this can be moved elsewhere
     gemm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
 
-    auto const err = gemm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount);
+    auto const err = gemm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount,
+        globalTrtllmGenGemmGatedActModuleCache);
 
     TLLM_CHECK_WITH_INFO(err == 0, "Error occurred when running GEMM!");
 }

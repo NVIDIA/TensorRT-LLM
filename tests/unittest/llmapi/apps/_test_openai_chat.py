@@ -205,7 +205,8 @@ def test_multi_turn_dialogue(client: openai.OpenAI, model_name: str):
     assert message.content is not None and len(message.content) >= 0
 
 
-def test_beam_search(client: openai.OpenAI, model_name: str, backend: str):
+def test_multiple_response(client: openai.OpenAI, model_name: str,
+                           backend: str):
     if backend == "pytorch":
         pytest.skip("Beam search is not supported in PyTorch backend yet")
 
@@ -216,6 +217,7 @@ def test_beam_search(client: openai.OpenAI, model_name: str, backend: str):
         "role": "user",
         "content": "what is 1+1?"
     }]
+    # test beam search
     chat_completion = client.chat.completions.create(
         model=model_name,
         messages=messages,
@@ -228,6 +230,16 @@ def test_beam_search(client: openai.OpenAI, model_name: str, backend: str):
     assert chat_completion.choices[
         0].message.content != chat_completion.choices[
             1].message.content, "beam search should be different"
+    # test n and best_of
+    chat_completion = client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        max_completion_tokens=10,
+        n=2,
+        temperature=0.0,
+        extra_body=dict(best_of=4),
+    )
+    assert len(chat_completion.choices) == 2
 
 
 @pytest.mark.asyncio(loop_scope="module")

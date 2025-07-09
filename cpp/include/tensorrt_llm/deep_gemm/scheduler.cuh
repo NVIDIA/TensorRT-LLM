@@ -90,14 +90,12 @@ struct GroupedWithOffsetSchedulerInput
 {
     uint32_t shape_m;
     int64_t* problem_m_offsets;
-    int64_t* problem_m_padded_offsets;
 };
 
 struct GroupedWithOffsetSchedulerInputSwapAB
 {
     uint32_t shape_m;
     int64_t* problem_n_offsets;
-    int64_t* problem_n_padded_4_offsets;
 };
 
 struct StridedBatchedSchedulerInput
@@ -381,6 +379,15 @@ struct GroupedMaskedScheduler
     }
 };
 
+// Need to keep the same as the one in tests/unittest/_torch/thop/deep_gemm_tests.py
+template <typename T_offset, typename T_index>
+__host__ __device__ __forceinline__ T_offset compute_padded_offset(T_offset offset, T_index problem_idx)
+{
+    // This formulation ensures that padded_offset[i + 1] - padded_offset[i] >= offset[i + 1] - offset[i].
+    constexpr T_offset alignment = 32;
+    return (offset + problem_idx * (alignment - 1)) / alignment * alignment;
+}
+
 template <uint32_t SHAPE_N, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t kNumGroups, uint32_t kNumTMAMulticast,
     uint32_t kNumNBlocks = ceil_div(SHAPE_N, BLOCK_N), uint32_t kNumNBlocksPerGroup = 16>
 struct GroupedWithOffsetScheduler
@@ -394,7 +401,6 @@ struct GroupedWithOffsetScheduler
     int64_t m_padded_4_offset;
     int64_t m_boundary;
     int64_t* problem_m_offsets;
-    int64_t* problem_m_padded_offsets;
 
     using Input = GroupedWithOffsetSchedulerInput;
     Input input;
@@ -404,7 +410,6 @@ struct GroupedWithOffsetScheduler
     __device__ __forceinline__ GroupedWithOffsetScheduler(Input& input)
     {
         this->problem_m_offsets = input.problem_m_offsets;
-        this->problem_m_padded_offsets = input.problem_m_padded_offsets;
         curr_group_idx = 0;
         curr_cumsum = 0;
     }
@@ -441,9 +446,9 @@ struct GroupedWithOffsetScheduler
             // End of the task
             if (curr_group_idx == kNumGroups)
                 return false;
-            m_padded_4_offset = __ldg(problem_m_padded_offsets + curr_group_idx);
             m_offset = __ldg(problem_m_offsets + curr_group_idx);
             m_boundary = __ldg(problem_m_offsets + curr_group_idx + 1);
+            m_padded_4_offset = compute_padded_offset(m_offset, curr_group_idx);
             auto m = m_boundary - m_offset;
             // Within current group
             num_m_blocks = ceil_div(m, static_cast<int64_t>(BLOCK_M));
@@ -475,7 +480,6 @@ struct GroupedWithOffsetSchedulerSwapAB
     int64_t n_padded_4_offset;
     int64_t n_boundary;
     int64_t* problem_n_offsets;
-    int64_t* problem_n_padded_4_offsets;
 
     using Input = GroupedWithOffsetSchedulerInputSwapAB;
     Input input;
@@ -485,7 +489,6 @@ struct GroupedWithOffsetSchedulerSwapAB
     __device__ __forceinline__ GroupedWithOffsetSchedulerSwapAB(Input& input)
     {
         this->problem_n_offsets = input.problem_n_offsets;
-        this->problem_n_padded_4_offsets = input.problem_n_padded_4_offsets;
         curr_group_idx = 0;
         curr_cumsum = 0;
     }
@@ -526,9 +529,9 @@ struct GroupedWithOffsetSchedulerSwapAB
             // End of the task
             if (curr_group_idx == kNumGroups)
                 return false;
-            n_padded_4_offset = __ldg(problem_n_padded_4_offsets + curr_group_idx);
             n_offset = __ldg(problem_n_offsets + curr_group_idx);
             n_boundary = __ldg(problem_n_offsets + curr_group_idx + 1);
+            n_padded_4_offset = compute_padded_offset(n_offset, curr_group_idx);
             auto n = n_boundary - n_offset;
             // Within current group
             num_n_blocks = ceil_div(n, static_cast<int64_t>(BLOCK_N));

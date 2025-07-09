@@ -219,11 +219,23 @@ def test_deduplicate_during_export(model_cls: Type[nn.Module], device_export: st
     # check that deduplicated keys are removed from state_dict
     assert gm.state_dict().keys() == model.state_dict().keys() - model.get_deduplicated_keys()
 
-    # check that loading hook is called
-    sd_og = model.state_dict()
-    sd_og["fc3.weight"] = torch.randn_like(sd_og["fc1.weight"])
-    gm.load_state_dict(sd_og)
+    def check_parameter_loading(param_to_pop: str, expected_param: str):
+        """Helper function to check parameter loading behavior.
 
-    # check that fc1.weight got that tensor value
-    if device_export != "meta":
-        assert torch.equal(gm.fc1.weight, sd_og["fc3.weight"])
+        Args:
+            param_to_pop: The parameter to remove from state dict before loading
+            expected_param: The parameter whose value should be loaded into fc1.weight
+        """
+        sd_og = model.state_dict()
+        sd_og.pop(param_to_pop)
+        gm.load_state_dict(sd_og)
+
+        if device_export != "meta":
+            assert torch.equal(gm.fc1.weight, sd_og[expected_param])
+
+    # fc3.weight is aliased to fc1.weight
+    # Test loading fc3.weight into gm.fc1.weight. State dict does not contain fc1.weight
+    check_parameter_loading("fc1.weight", "fc3.weight")
+
+    # Test loading fc1.weight into gm.fc1.weight. State dict does not contain fc3.weight
+    check_parameter_loading("fc3.weight", "fc1.weight")

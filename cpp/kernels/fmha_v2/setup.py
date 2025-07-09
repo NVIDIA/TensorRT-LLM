@@ -1344,7 +1344,7 @@ void {sliding_or_chunked_causal_kernel_name}_nl({params_type} params){{
 
 #endif // sliding_or_chunked_causal_mask
 
-void {launcher_name}_nl({params_type} &params,
+void {launcher_name}_nl({fused_multihead_attention_params_v2_str} &params,
     const Launch_params& launch_params, cudaStream_t stream){{
   constexpr int loop_iters = {seq_len} / {noloop_step};
   static_assert(loop_iters * {noloop_step} == {seq_len}, "");
@@ -3049,14 +3049,20 @@ def get_kernel_traits_code(specs_names):
     return code
 
 
+# For now, only hopper head_size 128 kernel uses cubins, and other kernels use cu files.
+# You should set the condition `use_cubin_header` to false if you have modified the source code of the FMHA kernels on Hopper (sm90) with head_size 128.
+# This ensures that the kernels will be recompiled using the updated source code rather than relying on precompiled cubins.
+def use_cubin_header(kspec):
+    return kspec.sm == 90 and kspec.head_size == 128
+
+
 def get_cubin_header(kernel_traits, specs_names):
     cubins = []
     cubin_lens = []
     cubins_dict = {}
     cubin_lens_dict = {}
     for kspec, fname, lname, kname in specs_names:
-        # only generate hopper sage cubin header
-        if generate_cu_trtllm and not ('sage' in kname and 'sm90' in kname):
+        if generate_cu_trtllm and not use_cubin_header(kspec):
             continue
         name = fname.replace('.', '_')
         data = 'extern unsigned char cubin_{name}_cubin[];'.format(name=name)
@@ -3209,11 +3215,11 @@ def get_cubin_header(kernel_traits, specs_names):
             if generate_cu_trtllm:
 
                 def get_lname_from_kname(kname: str) -> str:
-                    if 'sage' in kname and 'sm90' in kname:
+                    if use_cubin_header(kspec):
                         return 'nullptr'
                     lname = kname.replace('_kernel', '')
                     mask_types = [
-                        '_sliding_window_causal', '_custom_mask', '_causal'
+                        '_sliding_or_chunked_causal', '_custom_mask', '_causal'
                     ]
                     for mask_type in mask_types:
                         lname = lname.replace(mask_type, '')
@@ -3226,6 +3232,12 @@ def get_cubin_header(kernel_traits, specs_names):
 {{ DATA_TYPE_{prec}, DATA_TYPE_{output_prec}, {seq_len}, {q_step}, {kv_step}, {head_size}, {head_size_v}, \
 {sage_block_sizes[0]}, {sage_block_sizes[1]}, {sage_block_sizes[2]}, kSM_{sm}, {cubin_name}, \
 {cubin_name}_len, \"{kname}\", {smem}, {threads}, {meta_unroll_step}, {attention_mask_type_value}, \
+{attention_input_layout_value}, {is_il}, {is_flash_atten}, {is_warp_specialization}, {is_fp32_accu}, \
+{is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}, {lname}}}\
+'''.format(**locals()) if use_cubin_header(kspec) else '''\
+{{ DATA_TYPE_{prec}, DATA_TYPE_{output_prec}, {seq_len}, {q_step}, {kv_step}, {head_size}, {head_size_v}, \
+{sage_block_sizes[0]}, {sage_block_sizes[1]}, {sage_block_sizes[2]}, kSM_{sm}, nullptr, \
+0, \"{kname}\", {smem}, {threads}, {meta_unroll_step}, {attention_mask_type_value}, \
 {attention_input_layout_value}, {is_il}, {is_flash_atten}, {is_warp_specialization}, {is_fp32_accu}, \
 {is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}, {lname}}}\
 '''.format(**locals())
@@ -3398,6 +3410,114 @@ static const struct TestMetaV2
     return code
 
 
+# This is used to add some kernels running in cubins.
+# The source code of paged context fmha kernels are not in this repo, but we have cubins for them.
+# Other kernels are for passing CI cases.
+def modify_cubin_header(cubin_header):
+    # for paged context fmha cases
+    target = "#ifndef EXCLUDE_SM_90"
+
+    first_addition = """extern unsigned char cubin_fmha_v2_flash_attention_bf16_64_128_S_qkv_192x128_tma_ws_sm90_cu_cubin[];
+extern unsigned char cubin_fmha_v2_flash_attention_bf16_64_128_S_q_paged_kv_192x128_tma_ws_sm90_cu_cubin[];"""
+
+    second_addition = """extern uint32_t cubin_fmha_v2_flash_attention_bf16_64_128_S_qkv_192x128_tma_ws_sm90_cu_cubin_len;
+extern uint32_t cubin_fmha_v2_flash_attention_bf16_64_128_S_q_paged_kv_192x128_tma_ws_sm90_cu_cubin_len;"""
+
+    third_addition = """{ DATA_TYPE_BF16, DATA_TYPE_BF16, 0, 64, 128, 192, 128, 0, 0, 0, kSM_90, cubin_fmha_v2_flash_attention_bf16_64_128_S_qkv_192x128_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_bf16_64_128_S_qkv_192x128_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_bf16_64_128_S_qkv_192x128_causal_tma_ws_sm90_kernel", 213248, 384, 64, 1, 0, false, true, true, true, false, false, false, false, nullptr},
+{ DATA_TYPE_BF16, DATA_TYPE_BF16, 0, 64, 128, 192, 128, 0, 0, 0, kSM_90, cubin_fmha_v2_flash_attention_bf16_64_128_S_q_paged_kv_192x128_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_bf16_64_128_S_q_paged_kv_192x128_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_bf16_64_128_S_q_paged_kv_192x128_causal_tma_ws_sm90_kernel", 213248, 384, 64, 1, 2, false, true, true, true, false, false, false, false, nullptr},"""
+
+    result = cubin_header
+    offset = 0
+    pos = -1
+
+    def add_kernel_line(result, target, addition, pos, offset):
+        if pos == -1:
+            pos = result.find(target)
+        else:
+            pos = result.find(target, pos + len(target) + offset)
+        if pos != -1:
+            end_pos = result.find('\n', pos)
+            if end_pos == -1:
+                end_pos = len(result)
+            result = result[:end_pos + 1] + addition + result[end_pos:]
+            offset += len(addition)
+        return result, offset, pos
+
+    result, offset, pos = add_kernel_line(result, target, first_addition, pos,
+                                          offset)
+
+    result, offset, pos = add_kernel_line(result, target, second_addition, pos,
+                                          offset)
+
+    result, offset, pos = add_kernel_line(result, target, third_addition, pos,
+                                          offset)
+
+    # for CI cases
+    def add_kernel_line(result, target, addition):
+        pos = result.find(target)
+        if pos != -1:
+            end_pos = result.find('\n', pos)
+            if end_pos == -1:
+                end_pos = len(result)
+            result = result[:end_pos + 1] + addition + result[end_pos:]
+        return result
+
+    target = "#ifndef EXCLUDE_SM_89"
+    addition = """extern unsigned char cubin_fmha_v2_flash_attention_bf16_64_32_S_qkv_128_sm89_cu_cubin[];
+extern uint32_t cubin_fmha_v2_flash_attention_bf16_64_32_S_qkv_128_sm89_cu_cubin_len;
+extern unsigned char cubin_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_paged_kv_576x512_output_bf16_sm89_cu_cubin[];
+extern uint32_t cubin_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_paged_kv_576x512_output_bf16_sm89_cu_cubin_len;"""
+    result = add_kernel_line(result, target, addition)
+
+    target = "#ifndef EXCLUDE_SM_86"
+    addition = """extern unsigned char cubin_fmha_v2_flash_attention_bf16_64_32_S_q_paged_kv_64_sm86_cu_cubin[];
+extern uint32_t cubin_fmha_v2_flash_attention_bf16_64_32_S_q_paged_kv_64_sm86_cu_cubin_len;"""
+    result = add_kernel_line(result, target, addition)
+
+    target = "#ifndef EXCLUDE_SM_80"
+    addition = """extern unsigned char cubin_fmha_v2_flash_attention_fp16_128_128_S_q_paged_kv_64_sm80_cu_cubin[];
+extern uint32_t cubin_fmha_v2_flash_attention_fp16_128_128_S_q_paged_kv_64_sm80_cu_cubin_len;
+extern unsigned char cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_cu_cubin[];
+extern uint32_t cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_cu_cubin_len;"""
+    result = add_kernel_line(result, target, addition)
+
+    def modify_kernel_line(result, target, new_line):
+        lines = result.split('\n')
+        for i, line in enumerate(lines):
+            if target in line:
+                lines[i] = new_line
+                break
+        return '\n'.join(lines)
+
+    target = "fmha_v2_flash_attention_bf16_64_32_S_qkv_128_causal_sm89_kernel_nl"
+    new_line = '{ DATA_TYPE_BF16, DATA_TYPE_BF16, 0, 64, 32, 128, 128, 0, 0, 0, kSM_89, cubin_fmha_v2_flash_attention_bf16_64_32_S_qkv_128_sm89_cu_cubin, cubin_fmha_v2_flash_attention_bf16_64_32_S_qkv_128_sm89_cu_cubin_len, "fmha_v2_flash_attention_bf16_64_32_S_qkv_128_causal_sm89_kernel_nl", 32768, 128, 64, 1, 0, false, true, false, true, true, false, false, true, nullptr},'
+    result = modify_kernel_line(result, target, new_line)
+
+    target = "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_paged_kv_576x512_output_bf16_sm89_kernel_nl_tiled"
+    new_line = '{ DATA_TYPE_E4M3, DATA_TYPE_BF16, 0, 64, 64, 576, 512, 0, 0, 0, kSM_89, cubin_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_paged_kv_576x512_output_bf16_sm89_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_paged_kv_576x512_output_bf16_sm89_cu_cubin_len, "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_paged_kv_576x512_output_bf16_sm89_kernel_nl_tiled", 65536, 128, 64, 0, 2, false, true, false, true, true, true, false, true, nullptr},'
+    result = modify_kernel_line(result, target, new_line)
+
+    target = "fmha_v2_flash_attention_fp16_128_128_S_q_paged_kv_64_causal_sm80_kernel_nl_tiled"
+    new_line = '{ DATA_TYPE_FP16, DATA_TYPE_FP16, 0, 128, 128, 64, 64, 0, 0, 0, kSM_80, cubin_fmha_v2_flash_attention_fp16_128_128_S_q_paged_kv_64_sm80_cu_cubin, cubin_fmha_v2_flash_attention_fp16_128_128_S_q_paged_kv_64_sm80_cu_cubin_len, "fmha_v2_flash_attention_fp16_128_128_S_q_paged_kv_64_causal_sm80_kernel_nl_tiled", 65536, 128, 128, 1, 2, false, true, false, false, true, true, false, true, nullptr},'
+    result = modify_kernel_line(result, target, new_line)
+
+    target = "fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_causal_sm80_kernel_nl_tiled"
+    new_line = '{ DATA_TYPE_FP16, DATA_TYPE_FP16, 0, 64, 128, 128, 128, 0, 0, 0, kSM_80, cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_cu_cubin, cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_cu_cubin_len, "fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_causal_sm80_kernel_nl_tiled", 81920, 128, 64, 1, 2, false, true, false, false, true, true, false, true, nullptr},'
+    result = modify_kernel_line(result, target, new_line)
+
+    target = "fmha_v2_flash_attention_bf16_64_32_S_q_paged_kv_64_causal_sm86_kernel_nl"
+    new_line = '{ DATA_TYPE_BF16, DATA_TYPE_BF16, 0, 64, 32, 64, 64, 0, 0, 0, kSM_86, cubin_fmha_v2_flash_attention_bf16_64_32_S_q_paged_kv_64_sm86_cu_cubin, cubin_fmha_v2_flash_attention_bf16_64_32_S_q_paged_kv_64_sm86_cu_cubin_len, "fmha_v2_flash_attention_bf16_64_32_S_q_paged_kv_64_causal_sm86_kernel_nl", 16384, 128, 64, 1, 2, false, true, false, true, true, false, false, true, nullptr},'
+    result = modify_kernel_line(result, target, new_line)
+
+    # make sure only one empty line at the end
+    lines = result.split('\n')
+    while lines and not lines[-1].strip():
+        lines.pop()
+    lines.append('')
+
+    return '\n'.join(lines)
+
+
 def generate_files(specs_names):
 
     kfiles = []
@@ -3438,7 +3558,6 @@ def generate_files(specs_names):
         f.write(print_kernel_traits_code)
 
     # Make sure we have a bin directory.
-    # TEMP disable this until sm90 is in a good shape [Timmy, do not MR.]
     if not os.path.exists('bin'):
         os.mkdir('bin')
     cmd = 'nvcc -I src -Xcompiler -Wno-enum-compare --std=c++17 -o bin/print_traits.exe generated/print_kernel_traits.cu'.split(
@@ -3460,6 +3579,8 @@ def generate_files(specs_names):
     # this gives: kname, smem bytes, threads_per_cta, loop_step
     kernel_traits = [traits.split() for traits in output.splitlines()]
     cubin_header = get_cubin_header(kernel_traits, valid_specs_names)
+    if generate_cu_trtllm:
+        cubin_header = modify_cubin_header(cubin_header)
 
     with open('./generated/fmha_cubin.h', 'w') as f:
         f.write(cubin_header)

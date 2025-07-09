@@ -9,7 +9,6 @@ from pydantic import (BaseModel, Field, PositiveFloat, field_validator,
                       model_validator)
 
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm._torch.auto_deploy.shim import AutoDeployConfig
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.llmapi import (BatchingType, CapacitySchedulerPolicy,
                                  ContextChunkingPolicy, DynamicBatchConfig,
@@ -33,7 +32,7 @@ class RuntimeConfig(BaseModel):
     world_config: ExecutorWorldConfig
     decoding_config: Optional[DecodingConfig] = None
     performance_options: PerformanceOptions
-    backend: Literal["pytorch", "autodeploy", None] = None
+    backend: Literal["pytorch", "_autodeploy", None] = None
     extra_llm_api_options: Optional[str] = None
     iteration_log: Optional[Path] = None
 
@@ -77,12 +76,11 @@ class RuntimeConfig(BaseModel):
 
         backend_config_map = {
             "pytorch": self.performance_options.get_pytorch_perf_config,
-            "autodeploy": self.performance_options.get_autodeploy_perf_config
+            "_autodeploy": self.performance_options.get_autodeploy_perf_config
         }
 
         if self.backend in backend_config_map:
-            llm_args["pytorch_backend_config"] = backend_config_map[
-                self.backend]()
+            llm_args.update(backend_config_map[self.backend]())
 
         return update_llm_args_with_extra_options(llm_args,
                                                   self.extra_llm_api_options)
@@ -109,13 +107,13 @@ class PerformanceOptions:
         return config
 
     def get_pytorch_perf_config(self) -> PyTorchConfig:
-        return PyTorchConfig(**self.pytorch_config)
+        return self.pytorch_config
 
-    def get_autodeploy_perf_config(self) -> AutoDeployConfig:
-        ad_config = AutoDeployConfig(**self.pytorch_config)
-        ad_config.attn_backend = "FlashInfer"
-        ad_config.torch_compile_enabled = True
-        ad_config.skip_loading_weights = True
+    def get_autodeploy_perf_config(self) -> Dict:
+        AutoDeployPerfConfig = dict
+        ad_config = AutoDeployPerfConfig()
+        ad_config["kv_cache_dtype"] = "auto"
+        ad_config["attn_backend"] = "flashinfer"
         return ad_config
 
 

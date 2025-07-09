@@ -24,6 +24,7 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/utils/mpiTags.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 namespace tc = tensorrt_llm::common;
 
@@ -37,10 +38,10 @@ enum class FastLogitsMpiId : uint64_t
 };
 
 void draftModelSendLogitsThread(int device, std::atomic<bool>* draftModelThreadShouldExit,
-    RequestVector* draftRequestsWaitingToSendLogits, std::shared_ptr<SequenceSlotManager> seqSlotManager,
-    SizeType32 maxInputLen, std::shared_ptr<kv_cache_manager::BaseKVCacheManager> kvCacheManager,
-    std::shared_ptr<kv_cache_manager::BaseKVCacheManager> crossKvCacheManager,
-    std::shared_ptr<BasePeftCacheManager> peftCacheManager)
+    RequestVector* draftRequestsWaitingToSendLogits, std::shared_ptr<SequenceSlotManager> const& seqSlotManager,
+    SizeType32 maxInputLen, std::shared_ptr<kv_cache_manager::BaseKVCacheManager> const& kvCacheManager,
+    std::shared_ptr<kv_cache_manager::BaseKVCacheManager> const& crossKvCacheManager,
+    std::shared_ptr<BasePeftCacheManager> const& peftCacheManager)
 {
 #if ENABLE_MULTI_DEVICE
     TLLM_CUDA_CHECK(cudaSetDevice(device));

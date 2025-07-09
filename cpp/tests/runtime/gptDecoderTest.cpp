@@ -100,24 +100,35 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
 
     // create decoder
     auto const vocabSizePadded = modelConfig.getVocabSizePadded(worldConfig.getSize());
-    auto decoder = IGptDecoder::create(decodingMode, modelConfig.getDataType(), batchSize, beamWidth, vocabSize,
-        vocabSizePadded, maxSeqLength, streamPtr);
+    auto decoder = IGptDecoder::create(
+        decodingMode, modelConfig.getDataType(), batchSize, beamWidth, vocabSize, vocabSizePadded, streamPtr);
     ASSERT_TRUE(static_cast<bool>(decoder));
 
     auto batchSlots = getDefaultBatchSlots(batchSize);
     decoder->setup(samplingConfig, batchSize, batchSlots);
 
     // set up inputs
-    auto logits = std::shared_ptr(
-        manager.gpu(ITensor::makeShape({batchSize, beamWidth, vocabSizePadded}), modelConfig.getDataType()));
-    manager.setZero(*logits);
+    std::vector<std::shared_ptr<ITensor const>> logitsVec;
+    for (auto i = 0; i < batchSize; ++i)
+    {
+        auto logits = manager.gpu(ITensor::makeShape({1, beamWidth, vocabSizePadded}), modelConfig.getDataType());
+        manager.setZero(*logits);
+        logitsVec.push_back(std::move(logits));
+    }
 
     int constexpr endId{50257};
     std::vector<int> const endIdsVec(batchSize * beamWidth, endId);
     auto endIds
         = std::shared_ptr(manager.copyFrom(endIdsVec, ITensor::makeShape({batchSize, beamWidth}), MemoryType::kGPU));
 
-    DecodingInput inputs{maxInputLength, maxSeqLength, sinkTokenLength, batchSize, logits, endIds, batchSlots};
+    DecodingInput inputs;
+    inputs.maxLength = maxInputLength;
+    inputs.maxAttentionWindow = maxSeqLength;
+    inputs.sinkTokenLength = sinkTokenLength;
+    inputs.batchSize = batchSize;
+    inputs.logitsVec = logitsVec;
+    inputs.endIds = endIds;
+    inputs.batchSlots = batchSlots;
 
     std::vector<std::int32_t> inputLengthsVec(batchSize * beamWidth, 0);
     inputs.lengths = manager.copyFrom(inputLengthsVec, ITensor::makeShape({batchSize * beamWidth}), MemoryType::kGPU);

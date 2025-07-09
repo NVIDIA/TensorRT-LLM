@@ -15,13 +15,13 @@ from .trt_test_alternative import call, check_call, print_info
 @pytest.fixture(autouse=True)
 def stop_triton_server():
     # Make sure Triton server are killed before each test.
-    call(f"pkill -9 tritonserver", shell=True)
-    call(f"pkill -9 trtllmExecutorWorker", shell=True)
+    call(f"pkill -9 -f tritonserver", shell=True)
+    call(f"pkill -9 -f trtllmExecutorWorker", shell=True)
     time.sleep(2)
     yield
     # Gracefully terminate Triton Server after each test.
-    call(f"pkill tritonserver", shell=True)
-    call(f"pkill trtllmExecutorWorker", shell=True)
+    call(f"pkill -f tritonserver", shell=True)
+    call(f"pkill -f trtllmExecutorWorker", shell=True)
     time.sleep(8)
 
 
@@ -37,7 +37,7 @@ def stop_triton_server():
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
                          ids=["enableDecoupleMode", "disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -170,7 +170,7 @@ def test_llama_v2_7b_ifb(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
                          ids=["enableDecoupleMode", "disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -287,7 +287,7 @@ def test_mistral_v1_7b_ifb(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
                          ids=["enableDecoupleMode", "disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -474,7 +474,7 @@ def test_mistral_v1_7b_python_backend(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
                          ids=["enableDecoupleMode", "disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -519,8 +519,7 @@ def test_llama_v2_70b_ifb(
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
 
-    llm_backend_repo_root = os.path.join(os.environ["LLM_ROOT"],
-                                         "triton_backend")
+    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
     # Build Engine
     ENGINE_PATH = prepare_llama_v2_70b_engine("ifb",
                                               tensorrt_llm_llama_example_root,
@@ -592,7 +591,7 @@ def test_llama_v2_70b_ifb(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
                          ids=["enableDecoupleMode", "disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -1043,7 +1042,7 @@ def test_gpt_350m_python_backend(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
                          ids=["enableDecoupleMode", "disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -1445,7 +1444,7 @@ def test_whisper_large_v3_ifb(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", ["0.2"])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["False"],
                          ids=["disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -1569,7 +1568,7 @@ def test_gpt_gather_logits_ifb(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", ["0.2"])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["False"],
                          ids=["disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -1759,7 +1758,7 @@ def test_gpt_350m_speculative_decoding(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", ["0.2"])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["False"],
                          ids=["disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -1950,7 +1949,7 @@ def test_gpt_350m_speculative_decoding_return_logits(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", ["0.2"])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["False"],
                          ids=["disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -2104,7 +2103,7 @@ def test_gpt_speculative_decoding_bls(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", ["0.2"])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["False"],
                          ids=["disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -2145,6 +2144,7 @@ def test_llama_v3_speculative_decoding_bls(
     tensorrt_llm_llama_example_root,
     llama_v3_8b_model_root,
     llama_v3_70b_model_root,
+    tensorrt_llm_example_root,
     llm_backend_inflight_batcher_llm_root,
     llm_backend_dataset_root,
     llm_backend_venv,
@@ -2161,16 +2161,19 @@ def test_llama_v3_speculative_decoding_bls(
     llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
     # Build engine
     DRAFT_ENGINE_DIR = prepare_llama_v3_8b_engine(
+        tensorrt_llm_example_root,
         tensorrt_llm_llama_example_root,
         llama_v3_8b_model_root,
         data_type=DATA_TYPE)
     CONTROL_ENGINE_DIR = prepare_llama_v3_70b_engine(
         "control_ifb",
+        tensorrt_llm_example_root,
         tensorrt_llm_llama_example_root,
         llama_v3_70b_model_root,
         data_type=DATA_TYPE)
     TARGET_ENGINE_DIR = prepare_llama_v3_70b_engine(
         "target_ifb",
+        tensorrt_llm_example_root,
         tensorrt_llm_llama_example_root,
         llama_v3_70b_model_root,
         data_type=DATA_TYPE)
@@ -2274,7 +2277,7 @@ def test_llama_v3_speculative_decoding_bls(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
                          ids=["enableDecoupleMode", "disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -2310,6 +2313,7 @@ def test_gpt_175b_dummyWeights_ifb(
     EXCLUDE_INPUT_IN_OUTPUT,
     inflight_batcher_llm_client_root,
     tensorrt_llm_gpt_example_root,
+    tensorrt_llm_example_root,
     gpt_tokenizer_model_root,
     llm_backend_venv,
 ):
@@ -2321,7 +2325,8 @@ def test_gpt_175b_dummyWeights_ifb(
 
     llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
     # Build Engine
-    ENGINE_PATH = prepare_gpt_175b_engine("ifb", tensorrt_llm_gpt_example_root)
+    ENGINE_PATH = prepare_gpt_175b_engine("ifb", tensorrt_llm_gpt_example_root,
+                                          tensorrt_llm_example_root)
     # Prepare model repo
     new_model_repo = os.path.join(llm_backend_repo_root, "triton_repo")
     prepare_ib_model_repo(llm_backend_repo_root, new_model_repo)
@@ -2388,7 +2393,7 @@ def test_gpt_175b_dummyWeights_ifb(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", ["0.7"])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
                          ids=["enableDecoupleMode", "disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -3621,8 +3626,7 @@ def test_benchmark_core_model(
                          ids=["disableDecoupleMode", "enableDecoupleMode"])
 # TODO: [JIRA-4496] Add batch support in llmapi backend and add tests here.
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["0"])
-# TODO: [JIRA-4040] Add more tensor parallel size
-@pytest.mark.parametrize("TENSOR_PARALLEL_SIZE", ["1"])
+@pytest.mark.parametrize("TENSOR_PARALLEL_SIZE", ["1", "4"])
 def test_llmapi_backend(E2E_MODEL_NAME, DECOUPLED_MODE, TRITON_MAX_BATCH_SIZE,
                         TENSOR_PARALLEL_SIZE,
                         llm_backend_inflight_batcher_llm_root, llm_backend_venv,
@@ -3638,6 +3642,8 @@ def test_llmapi_backend(E2E_MODEL_NAME, DECOUPLED_MODE, TRITON_MAX_BATCH_SIZE,
         model_config = yaml.safe_load(f)
     model_config["triton_config"]["decoupled"] = DECOUPLED_MODE
     model_config["triton_config"]["max_batch_size"] = int(TRITON_MAX_BATCH_SIZE)
+    model_config["tensor_parallel_size"] = int(TENSOR_PARALLEL_SIZE)
+    model_config["kv_cache_config"] = {"free_gpu_memory_fraction": 0.8}
     with open(model_config_path, "w") as f:
         yaml.dump(model_config, f)
 
@@ -3647,12 +3653,14 @@ def test_llmapi_backend(E2E_MODEL_NAME, DECOUPLED_MODE, TRITON_MAX_BATCH_SIZE,
     # Launch Triton Server
     launch_server_py = os.path.join(llm_backend_repo_root, "scripts",
                                     "launch_triton_server.py")
-    print_info(
-        f"DEBUG:: launch_server with args: python3 {launch_server_py} --world_size={TENSOR_PARALLEL_SIZE} --model_repo={new_model_repo} --no-mpi"
-    )
-    check_call(
-        f"python3 {launch_server_py} --world_size={TENSOR_PARALLEL_SIZE} --model_repo={new_model_repo} --no-mpi",
-        shell=True)
+    cmd = f"python3 {launch_server_py} --world_size={TENSOR_PARALLEL_SIZE} --model_repo={new_model_repo}"
+    if TENSOR_PARALLEL_SIZE == "4":
+        cmd += " --trtllm_llmapi_launch"
+        cmd += " --oversubscribe"
+    else:
+        cmd += " --no-mpi"
+    print_info(f"DEBUG:: launch_server with args: {cmd}")
+    check_call(cmd, shell=True)
     check_server_ready()
 
     # Speed up the test by running multiple tests with different configurations sharing the same triton server.
@@ -3699,3 +3707,165 @@ def test_llmapi_backend(E2E_MODEL_NAME, DECOUPLED_MODE, TRITON_MAX_BATCH_SIZE,
 
             print_info("DEBUG:: run_cmd: python3 " + " ".join(run_cmd))
             venv_check_call(llm_backend_venv, run_cmd)
+
+
+@pytest.mark.parametrize("E2E_MODEL_NAME", ["ensemble", "tensorrt_llm_bls"])
+@pytest.mark.parametrize("ACCUMULATE_TOKEN", ["False"])
+@pytest.mark.parametrize("BLS_INSTANCE_COUNT", ["1"])
+@pytest.mark.parametrize("PREPROCESSING_INSTANCE_COUNT", ["1"])
+@pytest.mark.parametrize("POSTPROCESSING_INSTANCE_COUNT", ["1"])
+@pytest.mark.parametrize("MAX_TOKENS_IN_KV_CACHE", [""])
+@pytest.mark.parametrize("MAX_ATTENTION_WINDOW_SIZE", [""])
+@pytest.mark.parametrize("BATCH_SCHEDULER_POLICY", ["guaranteed_no_evict"])
+@pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
+@pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
+                         ids=["disableTrtOverlap"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
+@pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
+                         ids=["enableDecoupleMode", "disableDecoupleMode"])
+@pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
+@pytest.mark.parametrize("MAX_QUEUE_DELAY_MICROSECONDS", ["0"])
+@pytest.mark.parametrize("ENABLE_KV_CACHE_REUSE", ["False"])
+@pytest.mark.parametrize("NORMALIZE_LOG_PROBS", ["True"])
+@pytest.mark.parametrize("ENABLE_CHUNKED_CONTEXT", ["False"])
+@pytest.mark.parametrize("GPU_DEVICE_IDS", [""])
+@pytest.mark.parametrize("DECODING_MODE", [""])
+@pytest.mark.parametrize("MAX_BEAM_WIDTH", ["1"])
+@pytest.mark.parametrize("EXCLUDE_INPUT_IN_OUTPUT", ["False"])
+@pytest.mark.parametrize("TOKEN_COUNT_TEST",
+                         ["input_only", "output_only", "both"])
+@pytest.mark.parametrize("BACKEND", ["tensorrtllm", "python"])
+def test_tiny_llama_ifb_token_counts(
+    E2E_MODEL_NAME,
+    MAX_TOKENS_IN_KV_CACHE,
+    MAX_ATTENTION_WINDOW_SIZE,
+    BATCH_SCHEDULER_POLICY,
+    KV_CACHE_FREE_GPU_MEM_FRACTION,
+    ENABLE_TRT_OVERLAP,
+    BATCHING_STRATEGY,
+    DECOUPLED_MODE,
+    TRITON_MAX_BATCH_SIZE,
+    MAX_QUEUE_DELAY_MICROSECONDS,
+    MAX_BEAM_WIDTH,
+    ENABLE_KV_CACHE_REUSE,
+    NORMALIZE_LOG_PROBS,
+    ENABLE_CHUNKED_CONTEXT,
+    GPU_DEVICE_IDS,
+    DECODING_MODE,
+    PREPROCESSING_INSTANCE_COUNT,
+    POSTPROCESSING_INSTANCE_COUNT,
+    ACCUMULATE_TOKEN,
+    BLS_INSTANCE_COUNT,
+    EXCLUDE_INPUT_IN_OUTPUT,
+    TOKEN_COUNT_TEST,
+    BACKEND,
+    inflight_batcher_llm_client_root,
+    tensorrt_llm_llama_example_root,
+    tiny_llama_model_root,
+    llm_backend_venv,
+):
+    """Test that the TRT-LLM inflight batcher backend can return input and output token counts."""
+    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
+        pytest.skip("Skipping. V1 doesn't support max_utilization.")
+
+    if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
+        pytest.skip("Skipping.")
+
+    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+    # Build engine
+    ENGINE_PATH, _ = prepare_tiny_llama_1b_engine(
+        type="ifb",
+        tensorrt_llm_llama_example_root=tensorrt_llm_llama_example_root,
+        tiny_llama_model_root=tiny_llama_model_root,
+        tensorrt_llm_example_root=None,
+    )
+    # Prepare model repo
+    new_model_repo = os.path.join(llm_backend_repo_root, "triton_repo")
+    prepare_ib_model_repo(llm_backend_repo_root, new_model_repo)
+
+    # Modify config.pbtxt
+    TOKENIZER_PATH = tiny_llama_model_root
+    modify_ib_config_pbtxt(new_model_repo,
+                           ENGINE_PATH,
+                           TOKENIZER_PATH,
+                           llm_backend_repo_root,
+                           DECOUPLED_MODE,
+                           MAX_TOKENS_IN_KV_CACHE,
+                           MAX_ATTENTION_WINDOW_SIZE,
+                           BATCH_SCHEDULER_POLICY,
+                           BATCHING_STRATEGY,
+                           KV_CACHE_FREE_GPU_MEM_FRACTION,
+                           EXCLUDE_INPUT_IN_OUTPUT,
+                           ENABLE_TRT_OVERLAP,
+                           TRITON_MAX_BATCH_SIZE,
+                           MAX_QUEUE_DELAY_MICROSECONDS,
+                           MAX_BEAM_WIDTH,
+                           ENABLE_KV_CACHE_REUSE,
+                           NORMALIZE_LOG_PROBS,
+                           ENABLE_CHUNKED_CONTEXT,
+                           GPU_DEVICE_IDS,
+                           DECODING_MODE,
+                           PREPROCESSING_INSTANCE_COUNT,
+                           POSTPROCESSING_INSTANCE_COUNT,
+                           ACCUMULATE_TOKEN,
+                           BLS_INSTANCE_COUNT,
+                           TENSORRT_LLM_TARGET_MODEL_NAME="tensorrt_llm",
+                           TENSORRT_LLM_DRAFT_MODEL_NAME="",
+                           BACKEND=BACKEND)
+
+    # Launch Triton Server
+    launch_server_py = os.path.join(llm_backend_repo_root, "scripts",
+                                    "launch_triton_server.py")
+    check_call(
+        f"python3 {launch_server_py} --world_size=1 --model_repo={new_model_repo}",
+        shell=True)
+    check_server_ready()
+
+    # Test token count functionality based on the test type
+    tokenizer_dir = f"{tiny_llama_model_root}"
+
+    # Prepare different test commands based on token count test type
+    if TOKEN_COUNT_TEST == "input_only":
+        test_args = ["--return-num-input-tokens"]
+    elif TOKEN_COUNT_TEST == "output_only":
+        test_args = ["--return-num-output-tokens"]
+    elif TOKEN_COUNT_TEST == "both":
+        test_args = ["--return-num-input-tokens", "--return-num-output-tokens"]
+
+    if DECOUPLED_MODE == "False":
+        run_cmd = [
+            f"{inflight_batcher_llm_client_root}/inflight_batcher_llm_client.py",
+            f"--tokenizer-dir={tokenizer_dir}",
+            "--tokenizer-type=auto",
+            "--request-output-len=20",
+        ] + test_args
+
+        output = venv_check_output(llm_backend_venv, run_cmd)
+    else:
+        run_cmd = [
+            f"{inflight_batcher_llm_client_root}/inflight_batcher_llm_client.py",
+            f"--tokenizer-dir={tokenizer_dir}",
+            "--tokenizer-type=auto",
+            "--request-output-len=20",
+            "--streaming",
+        ] + test_args
+
+        output = venv_check_output(llm_backend_venv, run_cmd)
+
+    print(output)
+    if TOKEN_COUNT_TEST == "input_only":
+        assert "Input token count: [[13]]" in output
+    elif TOKEN_COUNT_TEST == "output_only":
+        if DECOUPLED_MODE == "False":
+            assert "Output token count: [[33]]" in output
+        else:
+            assert "Output token count: [[1]]" in output and not "Output token count: [[20]]" in output
+    elif TOKEN_COUNT_TEST == "both":
+        assert "Input token count: [[13]]" in output
+        if DECOUPLED_MODE == "False":
+            assert "Output token count: [[33]]" in output
+        else:
+            assert "Output token count: [[1]]" in output and not "Output token count: [[20]]" in output
+    print_info(
+        f"Successfully tested token count functionality for {TOKEN_COUNT_TEST} mode"
+    )

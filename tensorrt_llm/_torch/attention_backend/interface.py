@@ -24,6 +24,7 @@ class AttentionRuntimeFeatures:
     chunked_prefill: bool = False
     cache_reuse: bool = False
     has_speculative_draft_tokens: bool = False
+    chunk_size: int = 0  # this is the chunk size for MLA chunked prefill, it will split kv cache into chunks to save global memory.
 
 
 # The type of requests in qkv passed to attention
@@ -44,6 +45,8 @@ class AttentionMetadata:
     max_num_requests: int
     # The max number of tokens in all requests in a single batch.
     max_num_tokens: int
+    # The max number of sequences in a single batch.
+    max_num_sequences: Optional[int] = None
     # The KV cache manager.
     kv_cache_manager: KVCacheManager
     mapping: Optional[Mapping] = None
@@ -117,7 +120,13 @@ class AttentionMetadata:
     runtime_features: AttentionRuntimeFeatures = field(
         default_factory=AttentionRuntimeFeatures)
 
-    all_rank_num_tokens: Optional[List[int]] = None
+    # The number of tokens in each rank.
+    _all_rank_num_tokens: Optional[List[int]] = field(init=False,
+                                                      default=None,
+                                                      repr=False)
+    all_rank_num_tokens: Optional[List[int]]
+    # The max number of tokens among all ranks.
+    all_rank_max_num_tokens: Optional[int] = None
 
     # These fields are set when changing seq_lens and _num_contexts to avoid computation
     # during execution. If the calculation happens during execution, torch compile treats it
@@ -147,6 +156,16 @@ class AttentionMetadata:
             self._num_tokens = self._seq_lens_kv.sum().item()
         elif self._seq_lens is not None:
             self._num_tokens = self._seq_lens.sum().item()
+
+    @property
+    def all_rank_num_tokens(self) -> Optional[List[int]]:
+        return self._all_rank_num_tokens
+
+    @all_rank_num_tokens.setter
+    def all_rank_num_tokens(self, value: Optional[List[int]]):
+        value = value if value is not AttentionMetadata.all_rank_num_tokens else None
+        self._all_rank_num_tokens = value
+        self.all_rank_max_num_tokens = max(value) if value is not None else None
 
     @property
     def seq_lens(self) -> Optional[torch.Tensor]:
@@ -299,6 +318,12 @@ class AttentionMetadata:
         cuda_graph_metadata.__post_init__()
         return cuda_graph_metadata
 
+    def update_spec_dec_param(self, is_spec_decoding_enabled, is_spec_dec_tree,
+                              is_spec_dec_dynamic_tree, max_draft_tokens):
+        """
+        Hook to be called when using TRTLLM attention backend in spec-dec mode.
+        """
+
 
 class PositionalEmbedder(Protocol):
     """
@@ -334,8 +359,9 @@ class RopeParams:
         # get rotary parameters.
         hidden_size = config.hidden_size
         num_attention_heads = config.num_attention_heads
-        head_dim = getattr(config, 'head_dim',
-                           hidden_size // num_attention_heads)
+        head_dim = getattr(config, 'head_dim', None)
+        if not isinstance(head_dim, int):
+            head_dim = hidden_size // num_attention_heads
         rope_scaling = getattr(config, 'rope_scaling', None)
         rope_params.max_positions = config.max_position_embeddings
         rope_params.theta = getattr(config, 'rope_theta', 10000.0)
@@ -390,8 +416,7 @@ class RopeParams:
                 )
 
         if self.scale_type == RotaryScalingType.yarn:
-            rope_inv_freq = None
-            _, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
+            rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
                 self.max_positions,
                 self.dim,
                 self.theta,
@@ -419,7 +444,7 @@ class RopeParams:
                     self.original_max_positions,
                 })
         if rope_inv_freq is not None:
-            rope_inv_freq = torch.torch.tensor(
+            rope_inv_freq = torch.tensor(
                 rope_inv_freq,
                 dtype=torch.float32,
                 device='cuda',
@@ -428,7 +453,7 @@ class RopeParams:
             rope_cos_sin = rope_cos_sin.reshape(
                 self.max_positions, -1,
                 2)[:, :self.dim // 2, :].transpose(0, 2, 1).reshape(1, -1)
-        rope_cos_sin = torch.torch.tensor(
+        rope_cos_sin = torch.tensor(
             rope_cos_sin,
             dtype=torch.float32,
             device='cuda',
@@ -554,6 +579,10 @@ class AttentionBackend(Generic[TMetadata]):
 
     @classmethod
     def support_mla(cls) -> bool:
+        return False
+
+    @classmethod
+    def support_nvfp4_output(cls) -> bool:
         return False
 
 

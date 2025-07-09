@@ -864,7 +864,11 @@ def _apply_chat_template(text, conv, tokenizer):
 
 class VilaInputProcessor(InputProcessor):
 
-    def __init__(self, model_path, model_config, tokenizer):
+    def __init__(self,
+                 model_path,
+                 model_config,
+                 tokenizer,
+                 trust_remote_code: bool = True):
         self.model_config = model_config
         llm_path, vision_tower_path, mm_projector_path = _get_model_paths(
             self.model_config)
@@ -1103,13 +1107,15 @@ class VilaInputProcessor(InputProcessor):
         )  # use_fast uses Pytorch GPU preprocessing, otherwise uses PIL CPU preprocessing
         mm_features = self._process(mm_tensor, block_sizes)
         fused_input_ids, mm_features = self._postprocess(input_ids, mm_features)
+        multimodal_data = {}
+        multimodal_data["multimodal_embedding"] = mm_features
         return fused_input_ids.to(torch.int32).tolist(), {
-            "mm_embedding": mm_features
+            "multimodal_data": multimodal_data
         }
 
 
 @register_auto_model(VilaConfig.model_architecture)
-@register_input_processor(VilaInputProcessor)
+@register_input_processor(VilaInputProcessor, model_type="llava_llama")
 class VilaModel(PreTrainedModel):
     config_class = VilaConfig
 
@@ -1146,8 +1152,8 @@ class VilaModel(PreTrainedModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: Optional[bool] = False,
         **kwargs,
@@ -1157,7 +1163,11 @@ class VilaModel(PreTrainedModel):
         """
 
         num_context_requests, num_generation_requests = attn_metadata.num_contexts, attn_metadata.num_generations
-        mm_embed = kwargs.get("multi_modal_data", [])
+        multimodal_params = kwargs.get("multimodal_params", [])
+        mm_embed = [
+            multimodal_param.multimodal_data["multimodal_embedding"]
+            for multimodal_param in multimodal_params
+        ]
 
         assert mm_embed == [] or len(
             mm_embed

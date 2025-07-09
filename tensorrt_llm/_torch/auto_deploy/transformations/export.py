@@ -1,6 +1,7 @@
+import importlib.metadata
 import math
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -8,6 +9,7 @@ import torch
 import torch.export as te
 import torch.nn as nn
 import torch.nn.functional as F
+from packaging import version
 from torch import fx
 from torch.utils._sympy.value_ranges import ValueRanges
 
@@ -129,7 +131,6 @@ def _deduplicate_params_and_buffers(gm: fx.GraphModule):
         submod, _, name = n.target.rpartition(".")
         t_target = getattr(gm.get_submodule(submod), name)
         targets[id(t_target)].append(n)
-
     # now replace all instances of the same tensor with the same get_attr node (idx 0 in the list)
     for nodes in targets.values():
         node_kept = nodes[0]
@@ -161,6 +162,7 @@ def _clean_up_checks(gm: fx.GraphModule):
         torch.ops.aten._assert_scalar,
         torch.ops.aten.sym_constrain_range,
         torch.ops.aten.sym_constrain_range_for_size,
+        torch.ops.aten._assert_tensor_metadata,
         # torch.ops.aten._functional_sym_constrain_range,
         # torch.ops.aten._functional_sym_constrain_range_for_size
     }
@@ -210,6 +212,12 @@ def _torch_where_patch(condition: torch.Tensor, *args, **kwargs):
 _torch_where_patch.where_original = torch.where
 
 
+def _torch_linear_patch(
+    input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    return torch.ops.auto_deploy.torch_linear_simple(input, weight, bias)
+
+
 # TODO: remove once https://github.com/pytorch/pytorch/issues/142439 is resolved
 def _torch_modulelist_getitem_patch(self: nn.ModuleList, idx):
     if isinstance(idx, slice):
@@ -224,6 +232,63 @@ def _torch_modulelist_getitem_patch(self: nn.ModuleList, idx):
 _torch_modulelist_getitem_patch.getitem_original = nn.ModuleList.__getitem__
 
 
+def _torch_tensor_patch(data, **kwargs):
+    """Patch torch.tensor to handle 0.0 on meta device.
+
+    ``torch.tensor(0.0, device="meta")`` does not work and hence we are patching it to use
+    ``torch.zeros((), device="meta")`` instead, which is equivalent.
+    """
+    device = kwargs.get("device", None)
+    if data == 0.0 and device is not None and torch.device(device) == torch.device("meta"):
+        return torch.zeros((), **kwargs)
+    return _torch_tensor_patch.tensor_original(data, **kwargs)
+
+
+_torch_tensor_patch.tensor_original = torch.tensor
+
+
+def _transformers_version() -> str:
+    """Get the version of transformers."""
+    return version.parse(importlib.metadata.version("transformers")).base_version
+
+
+# TODO (@lucaslie): https://github.com/NVIDIA/TensorRT-LLM/issues/5728
+# not great that this patch is here but it's the least invasisve change until we make headway on the
+# above issue.
+@contextmanager
+def _transformers_sdpa_mask_patch():
+    """Patch transformers.masking_utils.sdpa_mask to be export-compatible."""
+    # this patch is only needed+compatible for transformers >= 4.53.0
+    if version.parse(_transformers_version()) < version.parse("4.53.0"):
+        yield  # Just yield without doing anything (like nullcontext)
+        return
+
+    # imports only after version check
+    from transformers import masking_utils
+    from transformers.integrations.executorch import sdpa_mask_without_vmap
+
+    # recall original implementation
+    sdpa_mask_original = masking_utils.sdpa_mask
+
+    # patch function and mask attention interface
+    masking_utils.sdpa_mask = sdpa_mask_without_vmap
+    if "sdpa" in masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._local_mapping:
+        sdpa_local_original = masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._local_mapping["sdpa"]
+    else:
+        sdpa_local_original = None
+    masking_utils.ALL_MASK_ATTENTION_FUNCTIONS["sdpa"] = sdpa_mask_without_vmap
+
+    try:
+        yield
+    finally:
+        # revert patches
+        masking_utils.sdpa_mask = sdpa_mask_original
+        if sdpa_local_original is None:
+            del masking_utils.ALL_MASK_ATTENTION_FUNCTIONS["sdpa"]
+        else:
+            masking_utils.ALL_MASK_ATTENTION_FUNCTIONS["sdpa"] = sdpa_local_original
+
+
 def add_missing_load_hooks(gm: fx.GraphModule, model: nn.Module) -> fx.GraphModule:
     """Adds back the state dict load hooks stripped away during export."""
     hooks = {
@@ -236,10 +301,76 @@ def add_missing_load_hooks(gm: fx.GraphModule, model: nn.Module) -> fx.GraphModu
         if mod_name in hooks:
             for hook in hooks.pop(mod_name).values():
                 mod._register_load_state_dict_pre_hook(hook.hook, with_module=hook.with_module)
-
     assert not (bool(hooks)), f"""Mismatch in names of exported and source modules with hooks.
         The following module names were not found in exported module {list(hooks.keys())}"""
+
     return gm
+
+
+def add_load_hook_for_aliased_params(gm: fx.GraphModule, model: nn.Module):
+    """
+    Add a load hook to handle aliased parameters in the model.
+
+    When parameters are aliased (multiple parameter names point to the same tensor),
+    we need to ensure all aliases get the same value during loading. This hook:
+    1. Identifies groups of aliased parameters
+    2. For each group, finds a valid parameter value from the state dict
+    3. Applies that value to all aliases in the group
+
+    Args:
+        gm: The graph module to add the hook to
+        model: The source model containing the original parameter aliases
+    """
+    # Find all parameter aliases in the source model
+    param_to_names = defaultdict(list)
+    for name, param in model.named_parameters(remove_duplicate=False):
+        param_to_names[id(param)].append(name)
+
+    # Filter to only groups with multiple aliases
+    aliased_groups = [names for names in param_to_names.values() if len(names) > 1]
+
+    if not aliased_groups:
+        return gm  # No aliases to handle
+
+    def find_valid_param_value(
+        state_dict: Dict[str, torch.Tensor], param_names: List[str]
+    ) -> Optional[torch.Tensor]:
+        """Find a valid parameter value from state dict for a group of aliased parameters.
+
+        Args:
+            state_dict: The state dict being loaded
+            param_names: List of parameter names that are aliases of each other
+
+        Returns:
+            A valid tensor value if found, None otherwise
+        """
+        # First try to find a non-meta tensor value
+        value = None
+        for name in param_names:
+            if name in state_dict:
+                value = state_dict[name]
+                if value.device.type != "meta":
+                    return value
+
+        return value
+
+    def aliasing_load_pre_hook(state_dict: Dict[str, torch.Tensor], prefix: str, *args, **kwargs):
+        """Load hook that ensures aliased parameters get the same value."""
+        for group in aliased_groups:
+            # Find a valid value for this group of aliases
+            value = find_valid_param_value(state_dict, group)
+            assert value is not None, (
+                f"No valid value found in state dict for aliased parameters: {group}"
+            )
+
+            # Apply the value to all aliases
+            for name in group:
+                state_dict[name] = value
+
+            ad_logger.debug(f"Applied value from {group[0]} to aliased parameters: {group}")
+
+    # Register the hook
+    gm._register_load_state_dict_pre_hook(aliasing_load_pre_hook)
 
 
 @torch.inference_mode()
@@ -264,12 +395,13 @@ def torch_export_to_gm(
     # there is no guarantee how it is represented and we need to make sure it is easily identifiable
     # in the graph.
     sdpa_original = F.scaled_dot_product_attention
-    F.scaled_dot_product_attention = torch.ops.attention.scaled_dot_product_attention
+    F.scaled_dot_product_attention = torch.ops.auto_deploy.torch_attention_sdpa
 
     # We overwrite the linear functional as well. This basically avoids exporting the view ops
     # that are used to flatten/unflatten multiple batch dimensions of the input tensor.
     linear_original = F.linear
-    F.linear = torch.ops.linear.simple
+    # patch linear → always supply bias
+    F.linear = _torch_linear_patch
 
     # patch torch.where(condition) to torch.nonzero(condition, as_tuple=True)
     torch.where = _torch_where_patch
@@ -283,24 +415,29 @@ def torch_export_to_gm(
     torch.autocast = lambda *args, **kwargs: nullcontext()
     torch.nn.attention.sdpa_kernel = lambda *args, **kwargs: nullcontext()
 
-    with lift_to_meta(model) as state_dict:
-        # clean up args, kwargs and move to correct device
-        args, kwargs = tree_to((args, kwargs or {}), device="meta")
+    # patch torch.tensor to handle 0.0 on meta device
+    torch.tensor = _torch_tensor_patch
 
-        # NOTE: we always export in non-strict mode for now as it relaxes some
-        # assumptions around tracing. Strict mode uses torchdynamo (symbolic bytecode analysis),
-        # which can be brittle since it relies on the exact bytecode representation of the model.
-        # see here as well: https://pytorch.org/docs/stable/export.html#non-strict-export
-        export_kwargs["strict"] = False
+    # run export with sdpa masking patch and lifted to meta
+    with _transformers_sdpa_mask_patch():
+        with lift_to_meta(model) as state_dict:
+            # clean up args, kwargs and move to correct device
+            args, kwargs = tree_to((args, kwargs or {}), device="meta")
 
-        # run export and extract graph module
-        egm: fx.GraphModule = torch_export(model, args, kwargs, **export_kwargs).module()
+            # NOTE: we always export in non-strict mode for now as it relaxes some
+            # assumptions around tracing. Strict mode uses torchdynamo (symbolic bytecode analysis),
+            # which can be brittle since it relies on the exact bytecode representation of the model
+            # see here as well: https://pytorch.org/docs/stable/export.html#non-strict-export
+            export_kwargs["strict"] = False
 
-        # load state_dict into egm
-        # NOTE: export might have removed unused params/buffers (hence we allow unexpected keys)
-        load_buffers_and_params(
-            egm, state_dict, strict_missing=True, strict_unexpected=False, clone=clone
-        )
+            # run export and extract graph module
+            egm: fx.GraphModule = torch_export(model, args, kwargs, **export_kwargs).module()
+
+            # load state_dict into egm
+            # NOTE: export might have removed unused params/buffers (hence we allow unexpected keys)
+            load_buffers_and_params(
+                egm, state_dict, strict_missing=True, strict_unexpected=False, clone=clone
+            )
 
     # revert sdpa back to original
     F.scaled_dot_product_attention = sdpa_original
@@ -318,6 +455,9 @@ def torch_export_to_gm(
     torch.autocast = autocast_original
     torch.nn.attention.sdpa_kernel = sdpa_kernel_original
 
+    # revert torch.tensor patch
+    torch.tensor = _torch_tensor_patch.tensor_original
+
     # Export strips away all methods not traced during forward. The model could have
     # load hooks that contain logic for correct state_dict loading. We need to add those
     # hooks back to the exported graph module.
@@ -332,6 +472,9 @@ def torch_export_to_gm(
 
     # clean up devices in the graph
     _clean_up_device_info(egm)
+
+    # Add load hook to correctly load parameters that are aliased in the source model.
+    add_load_hook_for_aliased_params(egm, model)
 
     # deduplicate params and buffers
     _deduplicate_params_and_buffers(egm)

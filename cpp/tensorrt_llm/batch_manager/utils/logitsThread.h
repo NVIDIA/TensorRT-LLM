@@ -47,10 +47,10 @@ namespace tensorrt_llm::batch_manager::utils
 {
 
 void draftModelSendLogitsThread(int device, std::atomic<bool>* draftModelThreadShouldExit,
-    RequestVector* draftRequestsWaitingToSendLogits, std::shared_ptr<SequenceSlotManager> seqSlotManager,
-    runtime::SizeType32 maxInputLen, std::shared_ptr<kv_cache_manager::BaseKVCacheManager> kvCacheManager,
-    std::shared_ptr<kv_cache_manager::BaseKVCacheManager> crossKvCacheManager,
-    std::shared_ptr<BasePeftCacheManager> peftCacheManager);
+    RequestVector* draftRequestsWaitingToSendLogits, std::shared_ptr<SequenceSlotManager> const& seqSlotManager,
+    runtime::SizeType32 maxInputLen, std::shared_ptr<kv_cache_manager::BaseKVCacheManager> const& kvCacheManager,
+    std::shared_ptr<kv_cache_manager::BaseKVCacheManager> const& crossKvCacheManager,
+    std::shared_ptr<BasePeftCacheManager> const& peftCacheManager);
 
 std::optional<runtime::ITensor::SharedPtr> targetModelReceiveLogits(
     executor::SpeculativeDecodingFastLogitsInfo const& fastLogitsInfo, runtime::ModelConfig const& modelConfig);

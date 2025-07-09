@@ -17,13 +17,13 @@
 
 #include "tensorrt_llm/batch_manager/logitsPostProcessor.h"
 
-#include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
-#include "tensorrt_llm/runtime/utils/debugUtils.h"
+
+namespace tr = tensorrt_llm::runtime;
 
 namespace tensorrt_llm::batch_manager
 {
@@ -34,7 +34,7 @@ using ITensor = runtime::ITensor;
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
 bool LogitsPostProcessor::operator()(RequestVector const& contextRequests, RequestVector const& generationRequests,
-    bool replicateLogitsPostProcessor, DecoderBuffers& decoderBuffers, tr::WorldConfig const& worldConfig,
+    bool replicateLogitsPostProcessor, std::vector<TensorPtr>& seqSlotLogits, tr::WorldConfig const& worldConfig,
     tr::TllmRuntime& runtime, std::optional<LogitsPostProcessorBatched> logitsPostProcessorBatched) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -59,7 +59,7 @@ bool LogitsPostProcessor::operator()(RequestVector const& contextRequests, Reque
                     logitsPostProcessorIsApplied = true;
                     if (replicateLogitsPostProcessor || worldConfig.isFirstTensorParallelRank())
                     {
-                        auto& logits = decoderBuffers.logits.at(llmReq->mSeqSlot.value());
+                        auto& logits = seqSlotLogits.at(llmReq->mSeqSlot.value());
                         (*llmReq->mLogitsPostProcessor)(
                             llmReq->mRequestId, logits, llmReq->getTokens(), runtime.getStreamPtr(), llmReq->mClientId);
                     }
@@ -68,7 +68,7 @@ bool LogitsPostProcessor::operator()(RequestVector const& contextRequests, Reque
                 {
                     reqIdsVec.push_back(llmReq->mRequestId);
 
-                    auto& logits = decoderBuffers.logits.at(llmReq->mSeqSlot.value());
+                    auto& logits = seqSlotLogits.at(llmReq->mSeqSlot.value());
                     logitsVec.push_back(logits);
 
                     beamTokensVec.emplace_back(llmReq->getTokens());

@@ -16,6 +16,7 @@ Our sharding algorithm for tensor parallelism (TP) is based on the following ste
        happens automatically via the checkpoint loading hook added in step 2c.
 """
 
+import math
 import operator
 from collections import defaultdict
 from functools import partial
@@ -31,6 +32,7 @@ from ...utils.node_utils import (
     identify_regions_between_residuals,
     is_linear_op,
     is_op,
+    num_users_of_weight_node,
 )
 from ...utils.quantization_utils import QuantizationImpl
 from .._graph import canonicalize_graph
@@ -70,7 +72,13 @@ def _load_hook_remove(
 
 
 def _insert_sharded_matmul(
-    gm: GraphModule, node: Node, dim: int, rank: int, world_size: int, add_dist: bool = False
+    gm: GraphModule,
+    node: Node,
+    dim: int,
+    rank: int,
+    world_size: int,
+    add_dist: bool = False,
+    min_local_shape: int = 1,
 ):
     """Replaces the matmul node with a new matmul node that accepts sharded weights.
 
@@ -82,10 +90,29 @@ def _insert_sharded_matmul(
     quantization_impl = QuantizationImpl.create(node)
 
     def split_tensor(
-        t: torch.Tensor, d: int = dim, r: int = rank, ws: int = world_size
+        t: torch.Tensor,
+        d: int = dim,
+        r: int = rank,
+        ws: int = world_size,
+        min_d_shape: int = min_local_shape,
     ) -> torch.Tensor:
+        # The local tensor shape has to be divisible by min_d_shape
+        max_split_size = t.shape[d] // min_d_shape
+        if ws > max_split_size:
+            num_groups = math.ceil(ws / max_split_size)
+            ad_logger.debug(
+                f"World size {ws} is greater than the max split size {max_split_size}. "
+                + f"Splitting tensor to {num_groups} chunks"
+            )
+            return torch.tensor_split(t, max_split_size, dim=d)[r // num_groups]
         return torch.tensor_split(t, ws, dim=d)[r]
 
+    num_users = num_users_of_weight_node(node)
+    if num_users > 1 or num_users == 0:
+        ad_logger.warning(
+            f"Weight node {node} has {num_users} users. This is not supported for sharding. Skipping."
+        )
+        return
     # get weight and bias key
     weight_key, bias_key = extract_param_names_from_lin_node(node)
 
@@ -161,8 +188,8 @@ def _insert_sharded_matmul(
 
     # figure out the right dist op
     dist_lookup = {
-        0: (torch.ops.dist.all_gather, -1),
-        1: (torch.ops.dist.all_reduce,),
+        0: (torch.ops.auto_deploy.torch_dist_all_gather, -1),
+        1: (torch.ops.auto_deploy.torch_dist_all_reduce,),
     }
     fn_dist, *dist_args = dist_lookup[dim]
 
@@ -183,7 +210,12 @@ def _simple_shard(
             _insert_sharded_matmul(gm, n, 0, rank, world_size, add_dist=True)
 
 
-def column_row_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
+def column_row_shard(
+    gm: GraphModule,
+    rank: int,
+    world_size: int,
+    simple_shard_only: bool = False,
+) -> GraphModule:
     """A transformation to apply sharding to the model following tensor parallelism.
 
     The transformation is based on the following steps:
@@ -196,8 +228,10 @@ def column_row_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule
        **all** nodes in the subgraph. The subgraph here is defined as the region between the first
        linear node to the last linear node of an identified sharding region.
     # 5. Shard the GEMM nodes or skip accordingly.
+
+    min_local_shape is the minimum size of the local tensor shard, to prevent TP parallelism
+    splitting, e.g., the individual heads into smaller shards.
     """
-    ad_logger.info("Sharding graph for TP")
     ad_logger.debug("Before sharding graph: " + str(gm))
 
     if world_size < 2:
@@ -224,9 +258,9 @@ def column_row_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule
 
     # acceptable attention nodes between sharded GEMMs
     shardable_attention_nodes = {
-        torch.ops.attention.scaled_dot_product_attention,
-        torch.ops.attention.grouped_sdpa,
-        torch.ops.attention.bsnd_grouped_sdpa,
+        torch.ops.auto_deploy.torch_attention_sdpa,
+        torch.ops.auto_deploy.torch_attention_grouped_sdpa,
+        torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa,
     }
 
     # This is a heuristic. Basically, we assume those are okay to shard if we also encounter an
@@ -236,7 +270,7 @@ def column_row_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule
     shardable_nodes_with_attention = {
         torch.ops.aten.view,
         torch.ops.aten.reshape,
-        torch.ops.rope.flashinfer,
+        torch.ops.auto_deploy.flashinfer_rope,
         operator.getitem,
     }
 
@@ -249,6 +283,7 @@ def column_row_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule
     #           col_split (dim 1) 2nd group + all_reduce output of 2nd group
     # 3. Linear nodes that are not in two groups or we cannot account for all nodes:
     #       --> row_split (dim 0 of weight) + all_gather (dim -1 of output) output
+    num_shards = 0
     for n_start, n_end in zip(boundary_nodes[:-1], boundary_nodes[1:]):
         # we iterate through all nodes between the two boundary nodes and store linear nodes
         # sorted by their input activation node. We also store remaining nodes.
@@ -271,6 +306,13 @@ def column_row_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule
 
         # nothing to shard
         if len(nodes_linear) == 0:
+            continue
+
+        num_shards += 1
+
+        if simple_shard_only:
+            ad_logger.debug(f"Forcing Simple Shard: Linear groups: {nodes_linear}")
+            _simple_shard(gm, nodes_linear, rank, world_size)
             continue
 
         # simple shard when we have != 2 groups of linear nodes
@@ -311,11 +353,157 @@ def column_row_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule
 
         # If we can account for all sharded nodes, we can do a two-way shard
         # --> row_split (dim 0) + col_split (dim 1) + all_reduce
+
+        # check if we are sharding the attention block
+        if attention_nodes:
+            if len(attention_nodes) > 1:
+                # Column-row shard boundary region detection is probably wrong - there should be
+                # only one attention operation. Fall back to simple shard.
+                ad_logger.debug(f"More than one attention node: {unaccounted_nodes}")
+                _simple_shard(gm, nodes_linear, rank, world_size)
+                continue
+            # Extract head dimension. We cannot shard below the head_dim size.
+            # Assume that head_dim is the last (innermost) dimension of the tensor
+            min_local_shape = attention_nodes.pop().meta["val"].shape[-1]
+        else:
+            min_local_shape = 1
         for i, group in enumerate(nodes_linear.values()):
             for n in group:
-                _insert_sharded_matmul(gm, n, i, rank, world_size, add_dist=i > 0)
+                _insert_sharded_matmul(
+                    gm, n, i, rank, world_size, add_dist=i > 0, min_local_shape=min_local_shape
+                )
 
     # canonicalize and return
-    gm = canonicalize_graph(gm)
+    if num_shards:
+        gm = canonicalize_graph(gm)
     ad_logger.debug("After sharding: " + str(gm))
+    ad_logger.info(f"Found {num_shards} TP shards")
+    return gm
+
+
+def dp_bmm_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
+    """A transformation to apply sharding to batched matrix multiplications in the graph.
+
+    We'll shard the BMM nodes by slicing the batch dimension of input tensors into world_size number of slices.
+    After sharding each BMM node, we'll insert an all_gather node to gather the results across the different devices.
+    This transformation handles any combination of tensor types for both inputs to the BMM operation.
+
+    We'll also assume that the inputs to BMM are broadcasted across the devices already.
+    """
+    ad_logger.debug("Before sharding graph: " + str(gm))
+
+    if world_size < 2:
+        ad_logger.info("Skipping sharding for single device")
+        return gm
+
+    assert isinstance(gm, GraphModule), "Expecting GraphModule"
+
+    num_bmm_shards = 0
+
+    def handle_tensor(
+        bmm_node: Node, tensor_node: Node, arg_idx: int, start_idx: int, end_idx: int
+    ):
+        """Unified helper function to shard either a parameter tensor or a dynamic tensor.
+
+        Args:
+            bmm_node: The BMM node that is being processed
+            tensor_node: The input tensor node to shard
+            arg_idx: The argument index of the tensor in the BMM node
+            start_idx: Start index for sharding
+            end_idx: End index for sharding
+        """
+
+        # Define slice function for the sharding
+        def slice_tensor(t: torch.Tensor) -> torch.Tensor:
+            return t[start_idx:end_idx]
+
+        if tensor_node.op == "get_attr":
+            # Handle parameter tensor
+            weight_key = tensor_node.target
+            modname, _, param_name = weight_key.rpartition(".")
+            param = gm.get_parameter(weight_key)
+
+            # Update the parameter with its shard
+            param_new = nn.Parameter(slice_tensor(param).detach().clone(), requires_grad=True)
+            gm.get_submodule(modname).register_parameter(param_name, param_new)
+
+            # Register load state dict hook
+            gm._register_load_state_dict_pre_hook(
+                partial(
+                    _load_hook,
+                    f_split=slice_tensor,
+                    param_key=weight_key,
+                    param_shape=param_new.shape,
+                )
+            )
+        else:
+            # Handle dynamic tensor
+            with gm.graph.inserting_before(bmm_node):
+                tensor_slice = gm.graph.call_function(
+                    torch.ops.aten.slice.Tensor, args=(tensor_node, 0, start_idx, end_idx, 1)
+                )
+            # Update BMM node to use the sliced tensor
+            bmm_node.update_arg(arg_idx, tensor_slice)
+
+    for node in gm.graph.nodes:
+        if not is_op(node, {torch.ops.aten.bmm}):
+            continue
+
+        ad_logger.debug(f"Found BMM node: {node}")
+
+        # Get the input tensors
+        lhs_tensor = node.args[0]
+        rhs_tensor = node.args[1]
+
+        # Check batch sizes from meta information
+        lhs_batch_size = lhs_tensor.meta["val"].shape[0]
+        rhs_batch_size = rhs_tensor.meta["val"].shape[0]
+
+        assert lhs_batch_size == rhs_batch_size, "Batch sizes of both tensors must match"
+        bmm_batch_size = lhs_batch_size
+
+        # Calculate balanced distribution
+        base_size = bmm_batch_size // world_size
+        remainder = bmm_batch_size % world_size
+
+        # NOTE: our torch.ops.auto_deploy.torch_dist_all_gather doesn't support uneven splits at the moment.
+        if remainder:
+            ad_logger.warning(
+                f"BMM batch size {bmm_batch_size} is not divisible by world size {world_size}. "
+                f"This will result in uneven distribution of work across devices. Skipping."
+            )
+            continue
+
+        # Calculate start and end indices for this rank
+        if rank < remainder:
+            start_idx = rank * (base_size + 1)
+            end_idx = start_idx + base_size + 1
+        else:
+            start_idx = remainder + rank * base_size
+            end_idx = start_idx + base_size
+
+        ad_logger.debug(
+            f"Sharding BMM for rank {rank}: batch_size={bmm_batch_size}, start_idx={start_idx}, end_idx={end_idx}"
+        )
+
+        # Handle both tensors
+        handle_tensor(node, lhs_tensor, 0, start_idx, end_idx)
+        handle_tensor(node, rhs_tensor, 1, start_idx, end_idx)
+
+        # Add all_gather node after BMM to collect results
+        with gm.graph.inserting_after(node):
+            gather_node = gm.graph.call_function(
+                torch.ops.auto_deploy.torch_dist_all_gather,
+                args=(node, 0),  # Gather along batch dimension (0)
+            )
+            node.replace_all_uses_with(gather_node)
+            gather_node.replace_input_with(gather_node, node)
+
+        num_bmm_shards += 1
+
+    # Canonicalize and return
+    if num_bmm_shards:
+        gm = canonicalize_graph(gm)
+    ad_logger.debug("After sharding BMM: " + str(gm))
+    ad_logger.info(f"Found {num_bmm_shards} BMM shards")
     return gm

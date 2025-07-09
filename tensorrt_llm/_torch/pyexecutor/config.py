@@ -1,21 +1,15 @@
-import math
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Dict, List, Optional, Union
 
 from tensorrt_llm.bindings.executor import ExecutorConfig
 
 from ...builder import BuildConfig
+from ...llmapi.llm_args import LoadFormat
 from ...logger import logger
 from ...mapping import Mapping
+from ..model_config import MoeLoadBalancerConfig
 from ..speculative import SpecConfig
 from .resource_manager import BaseResourceManager
-
-
-class LoadFormat(Enum):
-    AUTO = 0
-    # Initialize all weights randomly.
-    DUMMY = 1
 
 
 @dataclass
@@ -49,11 +43,12 @@ class PyTorchConfig:
     # If set, at most moe_max_num_tokens tokens will be sent to torch.ops.trtllm.fused_moe at the same time.
     # If the number of tokens exceeds moe_max_num_tokens, the input tensors will be split into chunks and a for loop will be used.
     moe_max_num_tokens: Optional[int] = None
+    moe_load_balancer: Optional[Union[MoeLoadBalancerConfig, dict, str]] = None
 
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'
 
-    mixed_sampler: bool = False
+    enable_mixed_sampler: bool = False
     """
     If true, will iterate over sampling_params of each request and use the
     corresponding sampling strategy, e.g. top-k, top-p, etc.
@@ -65,7 +60,6 @@ class PyTorchConfig:
     """
 
     kv_cache_dtype: str = "auto"
-    use_kv_cache: bool = True
     enable_iter_perf_stats: bool = False
     # If true, enables per request stats per iteration
     # Must also set enable_iter_perf_stats to true to get request stats
@@ -89,45 +83,15 @@ class PyTorchConfig:
     # from the model checkpoint.
     load_format: Union[str, LoadFormat] = 'auto'
 
-    def _convert_load_format(self) -> None:
-        if isinstance(self.load_format, LoadFormat):
-            return
-        load_format = self.load_format.upper()
-        if load_format not in LoadFormat.__members__:
-            raise NotImplementedError(f"Invalid LoadFormat: {self.load_format}")
-        self.load_format = LoadFormat[load_format]
+    # If true, enable min-latency mode. Currently only used for Llama4.
+    enable_min_latency: bool = False
+    allreduce_strategy: str = "AUTO"
 
-    def __post_init__(self) -> None:
-        if self.torch_compile_enabled and self.torch_compile_piecewise_cuda_graph:
-            assert self.torch_compile_fullgraph, "Fullgraph must be enabled for piecewise CUDA graph."
+    # The iteration interval to create responses under the streaming mode.
+    # TODO: make this a per-request parameter
+    stream_interval: int = 1
 
-        if self.cuda_graph_batch_sizes is not None:
-            assert self.cuda_graph_max_batch_size == 0, (
-                "Please don't set both cuda_graph_batch_sizes "
-                "and cuda_graph_max_batch_size.")
-            self.cuda_graph_batch_sizes = sorted(self.cuda_graph_batch_sizes)
-        else:
-            self.cuda_graph_max_batch_size = self.cuda_graph_max_batch_size or 128
-            if self.cuda_graph_padding_enabled:
-                self.cuda_graph_batch_sizes = [1, 2, 4] + [
-                    i * 8 for i in range(1, 17)
-                ]
-            else:
-                self.cuda_graph_batch_sizes = list(range(1, 32)) + [32, 64, 128]
-            self.cuda_graph_batch_sizes += [
-                2**i for i in range(
-                    8, math.floor(math.log(self.cuda_graph_max_batch_size, 2)))
-            ]
-            self.cuda_graph_batch_sizes = [
-                size for size in self.cuda_graph_batch_sizes
-                if size <= self.cuda_graph_max_batch_size
-            ]
-            if self.cuda_graph_max_batch_size != self.cuda_graph_batch_sizes[
-                    -1]:
-                self.cuda_graph_batch_sizes.append(
-                    self.cuda_graph_max_batch_size)
-
-        self._convert_load_format()
+    force_dynamic_quantization: bool = False
 
 
 EXETENDED_EXECUTOR_CONFIG_FIELDS = [
@@ -137,7 +101,6 @@ EXETENDED_EXECUTOR_CONFIG_FIELDS = [
     'tokens_per_block',
     'mapping',
     'hf_model_dir',
-    'trt_engine_dir',
 ]
 
 
@@ -149,7 +112,6 @@ def update_executor_config(
         build_config: Optional[BuildConfig] = None,
         speculative_config: Optional[SpecConfig] = None,
         hf_model_dir: Optional[str] = None,
-        trt_engine_dir: Optional[str] = None,
         max_input_len: Optional[int] = None,
         max_seq_len: Optional[int] = None):
     if backend is None:
@@ -173,7 +135,6 @@ def update_executor_config(
     executor_config.tokens_per_block = executor_config.tokens_per_block or build_config.plugin_config.tokens_per_block
 
     executor_config.hf_model_dir = hf_model_dir
-    executor_config.trt_engine_dir = trt_engine_dir
 
     if max_input_len is not None:
         executor_config.max_input_len = max_input_len

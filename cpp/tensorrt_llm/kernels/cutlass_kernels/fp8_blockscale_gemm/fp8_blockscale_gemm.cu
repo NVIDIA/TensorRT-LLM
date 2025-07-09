@@ -22,18 +22,6 @@ namespace tensorrt_llm::kernels::fp8_blockscale_gemm
 {
 
 template <typename ElementA, typename ElementB, typename ElementD>
-CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::CutlassFp8BlockScaleGemmRunner()
-{
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-}
-
-template <typename ElementA, typename ElementB, typename ElementD>
-CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::~CutlassFp8BlockScaleGemmRunner()
-{
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-}
-
-template <typename ElementA, typename ElementB, typename ElementD>
 void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::gemm(void* mat_d, void const* mat_a,
     void const* mat_b, int shape_m, int shape_n, int shape_k, cudaStream_t stream, float const* scales_a,
     float const* scales_b)
@@ -110,7 +98,6 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(void*
     float* per_token_per_128c_scales;
     __nv_fp8_e4m3* fp8_mat_b;
     float* per_block_scales;
-    int64_t* problem_m_padded_offsets;
 
     auto* ws_ptr = workspace_;
     if constexpr (internal_quantize_a || internal_quantize_b)
@@ -146,32 +133,27 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(void*
         }
     }
 
-    problem_m_padded_offsets = reinterpret_cast<int64_t*>(ws_ptr);
-    ws_ptr += (num_problems + 1) * sizeof(int64_t);
-
 #ifdef COMPILE_HOPPER_TMA_GEMMS
     if constexpr (std::is_same_v<ElementA, __nv_bfloat16> && std::is_same_v<ElementB, __nv_bfloat16>)
     {
         fp8_grouped_gemm_run(reinterpret_cast<__nv_bfloat16 const*>(mat_a), fp8_mat_a, per_token_per_128c_scales,
             reinterpret_cast<__nv_bfloat16 const*>(mat_b), fp8_mat_b, per_block_scales,
-            reinterpret_cast<__nv_bfloat16*>(mat_d), problem_m_offsets, problem_m_padded_offsets, num_problems,
-            expected_m_, max_shape_m_4_align_, max_shape_m_32_align_padded_, shape_n, shape_k, stream,
-            internal_quantize_a, internal_quantize_b);
+            reinterpret_cast<__nv_bfloat16*>(mat_d), problem_m_offsets, num_problems, expected_m_, max_shape_m_4_align_,
+            max_shape_m_32_align_padded_, shape_n, shape_k, stream, internal_quantize_a, internal_quantize_b);
     }
     else if constexpr (std::is_same_v<ElementA, __nv_bfloat16> && std::is_same_v<ElementB, __nv_fp8_e4m3>)
     {
         fp8_grouped_gemm_run(reinterpret_cast<__nv_bfloat16 const*>(mat_a), fp8_mat_a, per_token_per_128c_scales,
             nullptr, fp8_mat_b, per_block_scales, reinterpret_cast<__nv_bfloat16*>(mat_d), problem_m_offsets,
-            problem_m_padded_offsets, num_problems, expected_m_, max_shape_m_4_align_, max_shape_m_32_align_padded_,
-            shape_n, shape_k, stream, internal_quantize_a, internal_quantize_b);
+            num_problems, expected_m_, max_shape_m_4_align_, max_shape_m_32_align_padded_, shape_n, shape_k, stream,
+            internal_quantize_a, internal_quantize_b);
     }
     else if constexpr (std::is_same_v<ElementA, __nv_fp8_e4m3> && std::is_same_v<ElementB, __nv_fp8_e4m3>)
     {
         fp8_grouped_gemm_run(nullptr, fp8_mat_a, per_token_per_128c_scales,
             reinterpret_cast<__nv_bfloat16 const*>(mat_b), fp8_mat_b, per_block_scales,
-            reinterpret_cast<__nv_bfloat16*>(mat_d), problem_m_offsets, problem_m_padded_offsets, num_problems,
-            expected_m_, max_shape_m_4_align_, max_shape_m_32_align_padded_, shape_n, shape_k, stream,
-            internal_quantize_a, internal_quantize_b);
+            reinterpret_cast<__nv_bfloat16*>(mat_d), problem_m_offsets, num_problems, expected_m_, max_shape_m_4_align_,
+            max_shape_m_32_align_padded_, shape_n, shape_k, stream, internal_quantize_a, internal_quantize_b);
     }
     else
     {
@@ -223,7 +205,7 @@ size_t CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::getWorkspac
     {
         expected_m_ = div_up(max_shape_m_4_align_, num_problems);
     }
-    max_shape_m_32_align_padded_ = int64_t(div_up(max_shape_m + num_problems * 31, 32) * 32);
+    max_shape_m_32_align_padded_ = deep_gemm::compute_padded_offset(max_shape_m, num_problems);
 
     constexpr bool internal_quantize_a = !std::is_same_v<ElementA, __nv_fp8_e4m3>;
     constexpr bool internal_quantize_b = !std::is_same_v<ElementB, __nv_fp8_e4m3>;
@@ -243,8 +225,6 @@ size_t CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::getWorkspac
         // scales_b
         total_workspace_size += num_problems * div_up(shape_k, 128) * div_up(shape_n, 128) * sizeof(float);
     }
-
-    total_workspace_size += (num_problems + 1) * sizeof(int64_t);
 
     return total_workspace_size;
 }

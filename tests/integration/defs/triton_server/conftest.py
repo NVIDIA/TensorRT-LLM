@@ -7,33 +7,10 @@ import tempfile
 
 import pytest
 
-# pytest_plugins = ["pytester", "trt_test.pytest_plugin"]
-USE_TURTLE = True
-try:
-    import trt_test  # noqa
-except ImportError:
-    from .test_list_parser import (CorrectionMode, get_test_name_corrections_v2,
-                                   handle_corrections)
-    from .trt_test_alternative import (SessionDataWriter, check_call,
-                                       check_output, print_info)
-
-    @pytest.fixture(scope="session")
-    def trt_config():
-        return None  # tekit shall never call this
-
-    @pytest.fixture(scope="session")
-    def gitlab_token():
-        return None  # tekit shall never call this
-
-    @pytest.fixture(scope="session")
-    def versions_from_infer_device():
-        pass
-
-    USE_TURTLE = False
-else:
-    from trt_test.misc import check_call, check_output, print_info
-    from trt_test.session_data_writer import SessionDataWriter
-    USE_TURTLE = True
+from .test_list_parser import (CorrectionMode, get_test_name_corrections_v2,
+                               handle_corrections)
+from .trt_test_alternative import (SessionDataWriter, check_call, check_output,
+                                   print_info)
 
 
 def llm_models_root() -> str:
@@ -78,9 +55,9 @@ def trt_performance_cache_fpath(trt_config, trt_performance_cache_name):
     return fpath
 
 
-# Get the executing turtle case name
+# Get the executing test case name
 @pytest.fixture(autouse=True)
-def turtle_case_name(request):
+def test_case_name(request):
     return request.node.nodeid
 
 
@@ -121,52 +98,21 @@ def llm_session_data_writer(trt_config, trt_gpu_clock_lock,
     session_data_writer.teardown()
 
 
-if USE_TURTLE:
+@pytest.fixture(scope="session")
+def custom_user_workspace(request):
+    return request.config.getoption("--workspace")
 
-    @pytest.fixture(scope="session")
-    def trt_py3_venv_factory(trt_py_base_venv_factory):
-        """
-        Session-scoped fixture which provides a factory function to produce a VirtualenvRunner capable of
-        running Python3 code.  Used by other session-scoped fixtures which need to modify the default VirtualenvRunner prolog.
-        """
 
-        # TODO: remove update env after TURTLE support multi devices
-        # Temporarily update CUDA_VISIBLE_DEVICES visible device
-        device_count = get_device_count()
-        visible_devices = ",".join([str(i) for i in range(device_count)])
-
-        print_info(f"Setting CUDA_VISIBLE_DEVICES to {visible_devices}.")
-
-        os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
-
-        def factory():
-            return trt_py_base_venv_factory("python3")
-
-        return factory
-
-    @pytest.fixture(scope="session")
-    def llm_backend_venv(trt_py3_venv_factory):
-        """
-        The fixture venv used for LLM tests.
-        """
-        venv = trt_py3_venv_factory()
-        return venv
-else:
-
-    @pytest.fixture(scope="session")
-    def custom_user_workspace(request):
-        return request.config.getoption("--workspace")
-
-    @pytest.fixture(scope="session")
-    def llm_backend_venv(custom_user_workspace):
-        workspace_dir = custom_user_workspace
-        subdir = datetime.datetime.now().strftime("ws-%Y-%m-%d-%H-%M-%S")
-        if workspace_dir is None:
-            workspace_dir = "triton-backend-test-workspace"
-        workspace_dir = os.path.join(workspace_dir, subdir)
-        from defs.local_venv import PythonVenvRunnerImpl
-        return PythonVenvRunnerImpl("", "", "python3",
-                                    os.path.join(os.getcwd(), workspace_dir))
+@pytest.fixture(scope="session")
+def llm_backend_venv(custom_user_workspace):
+    workspace_dir = custom_user_workspace
+    subdir = datetime.datetime.now().strftime("ws-%Y-%m-%d-%H-%M-%S")
+    if workspace_dir is None:
+        workspace_dir = "triton-backend-test-workspace"
+    workspace_dir = os.path.join(workspace_dir, subdir)
+    from defs.local_venv import PythonVenvRunnerImpl
+    return PythonVenvRunnerImpl("", "", "python3",
+                                os.path.join(os.getcwd(), workspace_dir))
 
 
 @pytest.fixture(scope="session")
@@ -628,15 +574,16 @@ def setup_cache_data(request, tensorrt_llm_example_root):
 
 
 def cleanup_engine_outputs(output_dir_root):
-    for dirpath, dirnames, _ in os.walk(output_dir_root, topdown=False):
-        for dirname in dirnames:
-            if "engine_dir" in dirname or "model_dir" in dirname or "ckpt_dir" in dirname:
-                folder_path = os.path.join(dirpath, dirname)
-                try:
-                    shutil.rmtree(folder_path)
-                    print_info(f"Deleted folder: {folder_path}")
-                except Exception as e:
-                    print_info(f"Error deleting {folder_path}: {e}")
+    if output_dir_root is not None:
+        for dirpath, dirnames, _ in os.walk(output_dir_root, topdown=False):
+            for dirname in dirnames:
+                if "engine_dir" in dirname or "model_dir" in dirname or "ckpt_dir" in dirname:
+                    folder_path = os.path.join(dirpath, dirname)
+                    try:
+                        shutil.rmtree(folder_path)
+                        print_info(f"Deleted folder: {folder_path}")
+                    except Exception as e:
+                        print_info(f"Error deleting {folder_path}: {e}")
 
 
 # Teardown hook to clean up engine outputs after each group of test cases are finished
@@ -689,98 +636,34 @@ def output_dir(request):
         return request.config.getoption("--output-dir")
 
 
-if USE_TURTLE:  # perf tests can not run outside turtle for now
-    # Cache all the pytest items so that we can do test list validation.
-    ALL_PYTEST_ITEMS = None  # All pytest items available, before deselection.
+def deselect_by_regex(regexp, items, test_prefix, config):
+    """Filter out tests based on the patterns specified in the given list of regular expressions.
+        If a test matches *any* of the expressions in the list it is considered selected."""
+    compiled_regexes = []
+    regex_list = []
+    r = re.compile(regexp)
+    compiled_regexes.append(r)
+    regex_list.append(regexp)
 
-    @pytest.hookimpl(hookwrapper=True, tryfirst=True)
-    def pytest_collection_modifyitems(session, config, items):
-        # Flush the current stdout line.
-        print()
+    selected = []
+    deselected = []
 
-        import copy
+    corrections = get_test_name_corrections_v2(set(regex_list),
+                                               set(it.nodeid for it in items),
+                                               CorrectionMode.REGEX)
+    handle_corrections(corrections, test_prefix)
 
-        global ALL_PYTEST_ITEMS
-        ALL_PYTEST_ITEMS = copy.copy(items)
-        _ = yield
+    for item in items:
+        found = False
+        for regex in compiled_regexes:
+            if regex.search(item.nodeid):
+                found = True
+                break
+        if found:
+            selected.append(item)
+        else:
+            deselected.append(item)
 
-else:
-    #
-    # When test parameters have an empty id, older versions of pytest ignored that parameter when generating the
-    # test node's ID completely. This however was actually a bug, and not expected behavior that got fixed in newer
-    # versions of pytest:https://github.com/pytest-dev/pytest/pull/6607. TRT test defs however rely on this behavior
-    # for quite a few test names. This is a hacky WAR that restores the old behavior back so that the
-    # test names do not change. Note: This might break in a future pytest version.
-    #
-    # TODO: Remove this hack once the test names are fixed.
-    #
-
-    from _pytest.python import CallSpec2
-    CallSpec2.id = property(
-        lambda self: "-".join(map(str, filter(None, self._idlist))))
-
-    # @pytest.hookimpl(tryfirst=True, hookwrapper=True)
-    # def pytest_collection_modifyitems(config, items):
-    #     testlist_path = config.getoption("--test-list")
-    #     waives_file = config.getoption("--waives-file")
-    #     test_prefix = config.getoption("--test-prefix")
-    #     if test_prefix:
-    #         # Override the internal nodeid of each item to contain the correct test prefix.
-    #         # This is needed for reporting to correctly process the test name in order to bucket
-    #         # it into the appropriate test suite.
-    #         for item in items:
-    #             item._nodeid = "{}/{}".format(test_prefix, item._nodeid)
-
-    #     regexp = config.getoption("--regexp")
-
-    #     if testlist_path:
-    #         modify_by_test_list(testlist_path, items, config)
-
-    #     if regexp is not None:
-    #         deselect_by_regex(regexp, items, test_prefix, config)
-
-    #     if waives_file:
-    #         apply_waives(waives_file, items, config)
-
-    #     # We have to remove prefix temporarily before splitting the test list
-    #     # After that change back the test id.
-    #     for item in items:
-    #         if test_prefix and item._nodeid.startswith(f"{test_prefix}/"):
-    #             item._nodeid = item._nodeid[len(f"{test_prefix}/"):]
-    #     yield
-    #     for item in items:
-    #         if test_prefix:
-    #             item._nodeid = f"{test_prefix}/{item._nodeid}"
-
-
-    def deselect_by_regex(regexp, items, test_prefix, config):
-        """Filter out tests based on the patterns specified in the given list of regular expressions.
-           If a test matches *any* of the expressions in the list it is considered selected."""
-        compiled_regexes = []
-        regex_list = []
-        r = re.compile(regexp)
-        compiled_regexes.append(r)
-        regex_list.append(regexp)
-
-        selected = []
-        deselected = []
-
-        corrections = get_test_name_corrections_v2(
-            set(regex_list), set(it.nodeid for it in items),
-            CorrectionMode.REGEX)
-        handle_corrections(corrections, test_prefix)
-
-        for item in items:
-            found = False
-            for regex in compiled_regexes:
-                if regex.search(item.nodeid):
-                    found = True
-                    break
-            if found:
-                selected.append(item)
-            else:
-                deselected.append(item)
-
-        if deselected:
-            config.hook.pytest_deselected(items=deselected)
-        items[:] = selected
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+    items[:] = selected

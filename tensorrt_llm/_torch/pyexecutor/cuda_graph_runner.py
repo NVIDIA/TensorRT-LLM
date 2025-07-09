@@ -7,7 +7,14 @@ from ..attention_backend.interface import AttentionMetadata
 from ..speculative.interface import SpecMetadata
 from ..utils import make_weak_ref, set_piecewise_cuda_graph_flag
 
-_local = threading.local()
+
+class graph_capturing_local(threading.local):
+
+    def __init__(self):
+        self.is_graph_capturing = False
+
+
+_local = graph_capturing_local()
 
 
 def set_graph_capturing(enable: bool):
@@ -15,8 +22,6 @@ def set_graph_capturing(enable: bool):
 
 
 def is_graph_capturing() -> bool:
-    if not hasattr(_local, 'is_graph_capturing'):
-        return False
     return _local.is_graph_capturing
 
 
@@ -28,6 +33,7 @@ class DecodingCUDAGraphRunner:
         device: str,
         attn_metadata: AttentionMetadata,
         spec_metadata: Optional[SpecMetadata] = None,
+        use_mrope: bool = False,
     ) -> None:
         """
         Stores a CUDA graph and its associated input buffers.
@@ -52,16 +58,19 @@ class DecodingCUDAGraphRunner:
         # Using ones instead of zeros prevents NaNs in e.g. Deepseek
         self.input_ids = torch.ones((batch_size * token_per_request, ),
                                     device=device,
-                                    dtype=torch.int64)
+                                    dtype=torch.int32)
         self.position_ids = torch.zeros((1, batch_size * token_per_request),
                                         device=device,
-                                        dtype=torch.int64)
+                                        dtype=torch.int32)
+        self.mrope_position_deltas = torch.zeros(
+            (batch_size,
+             1), device=device, dtype=torch.int32) if use_mrope else None
 
-        self.extra_model_inputs = {}
         self.attn_metadata = attn_metadata
         self.spec_metadata = spec_metadata
         self._output = None
         self._graph = None
+        self.optional_extra_model_inputs = ["mrope_position_deltas"]
 
     def __del__(self):
         self._graph.reset()
@@ -70,22 +79,7 @@ class DecodingCUDAGraphRunner:
         self,
         forward_fn: Callable[[Dict[str, Any]], torch.Tensor],
         pool: Optional[Tuple[int, int]] = None,
-        extra_model_inputs: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Tuple[int, int]:
-        """
-        Captures a CUDA graph by calling forward_fn(inputs),
-        where inputs is extra_model_inputs + this graph runner's
-        input_ids, position_ids, spec_metadata and attn_metadata.
-
-        Extra model inputs have the following semantics if
-        the extra input is a tensor (or collection of
-        tensors). The CUDA graph runner will create a buffer
-        of the same shape/dtype/device, and subsequent calls to run() will
-        require this extra model input. Input tensors will be
-        copied into the buffer that this CUDA graph runner owns.
-        This implies that these buffers *must* have static shapes for
-        this CUDA graph's batch size.
-        """
         self._graph = torch.cuda.CUDAGraph()
         inputs = {
             "attn_metadata": self.attn_metadata,
@@ -93,12 +87,8 @@ class DecodingCUDAGraphRunner:
             "position_ids": self.position_ids,
             "inputs_embeds": None,
             "spec_metadata": self.spec_metadata,
+            "mrope_position_deltas": self.mrope_position_deltas,
         }
-        if extra_model_inputs is not None:
-            for key, tensor in extra_model_inputs.items():
-                new_tensor = tensor.clone()
-                inputs[key] = new_tensor
-                self.extra_model_inputs[key] = new_tensor
 
         # We have to do warm up runs to initialize PyTorch's
         # internal states according to the docs:
@@ -119,11 +109,7 @@ class DecodingCUDAGraphRunner:
     def needs_capture(self) -> bool:
         return self._output is None
 
-    def run(
-        self,
-        inputs: Dict[str, Any],
-        extra_model_inputs: Optional[Dict[str, torch.Tensor]] = None
-    ) -> torch.Tensor:
+    def run(self, inputs: Dict[str, Any]) -> torch.Tensor:
         assert "input_ids" in inputs
         assert "position_ids" in inputs
         assert "attn_metadata" in inputs
@@ -144,13 +130,9 @@ class DecodingCUDAGraphRunner:
         seqlen = input_ids.shape[0]
         self.input_ids[:seqlen].copy_(input_ids)
         self.position_ids[:, :seqlen].copy_(position_ids)
-
-        if self.extra_model_inputs:
-            assert extra_model_inputs is not None, "Model was captured with extra model inputs, so extra_model_inputs must be provided to run()"
-            for key in self.extra_model_inputs:
-                assert key in extra_model_inputs, f"Graph runner is missing extra input {key}"
-                dst_tensor = self.extra_model_inputs[key]
-                dst_tensor.copy_(extra_model_inputs[key])
+        if "mrope_position_deltas" in inputs:
+            self.mrope_position_deltas[:self.batch_size].copy_(
+                inputs["mrope_position_deltas"])
 
         assert self._output is not None and self._graph is not None
         self._graph.replay()

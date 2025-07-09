@@ -89,8 +89,8 @@ class MyModel(DecoderModel):
 
     def forward(self,
                 attn_metadata: AttentionMetadata,
-                input_ids: Optional[torch.LongTensor] = None,
-                position_ids: Optional[torch.LongTensor] = None,
+                input_ids: Optional[torch.IntTensor] = None,
+                position_ids: Optional[torch.IntTensor] = None,
                 inputs_embeds: Optional[torch.FloatTensor] = None):
         # Define the forward computation of the model
         ...
@@ -186,7 +186,7 @@ __all__ = [
 Alternatively, you can register the new model as an out-of-tree model, so that you can use the new model without touching the TensorRT-LLM codebase. To do so, place `modeling_mymodel.py` (and potentially `configuration_mymodel.py`) in your working directory, and import the modeling code in your script:
 
 ```python
-from tensorrt_llm._torch import LLM
+from tensorrt_llm import LLM
 import modeling_mymodel
 
 def main():
@@ -196,8 +196,8 @@ if __name__ == '__main__':
     main()
 ```
 
-We provide an out-of-tree modeling example in `examples/pytorch/out_of_tree_example`. The model is implemented in `modeling_opt.py` and you can run the example by:
+We provide an out-of-tree modeling example in `examples/llm-api/out_of_tree_example`. The model is implemented in `modeling_opt.py` and you can run the example by:
 
 ```bash
-python examples/pytorch/out_of_tree_example/main.py
+python examples/llm-api/out_of_tree_example/main.py
 ```

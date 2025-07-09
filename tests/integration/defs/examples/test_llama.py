@@ -30,9 +30,9 @@ from defs.common import (convert_weights, generate_summary_cmd,
                          venv_mpi_check_call)
 # yapf: disable
 from defs.conftest import (get_device_count, get_device_memory,
-                           get_host_total_memory, skip_fp8_pre_ada,
-                           skip_no_nvls, skip_post_blackwell, skip_pre_ada,
-                           skip_pre_blackwell)
+                           get_host_total_memory, get_sm_version,
+                           skip_fp8_pre_ada, skip_no_nvls, skip_post_blackwell,
+                           skip_pre_ada, skip_pre_blackwell)
 # yapf: enable
 from defs.trt_test_alternative import check_call, exists
 
@@ -1065,6 +1065,7 @@ def test_llm_llama_v3_1_autoq_2gpu_mmlu(llama_example_root, llama_model_root,
     check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device(2)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("use_auto_parallel", [True, False],
@@ -2201,6 +2202,7 @@ def test_llm_llama_code_llama_1gpu_summary(
     venv_check_call(llm_venv, summary_cmd)
 
 
+@pytest.mark.timeout(7200)
 @pytest.mark.skip_less_device_memory(40000)
 @pytest.mark.parametrize("num_beams", [1, 4],
                          ids=lambda num_beams: f'nb:{num_beams}')
@@ -2865,6 +2867,7 @@ def test_llm_llama_v2_lora_benchmark_2gpu(llama_example_root, llama_model_root,
         # check_call(lora_benchmark_cmd, env=envs)
 
 
+@pytest.mark.timeout(7200)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("num_beams", [1, 4],
@@ -3021,6 +3024,7 @@ def test_llm_llama_v3_8b_1048k_long_context_ppl(llama_example_root,
     'Llama-3-8B-Instruct-Gradient-1048k', 'Llama-3-70B-Instruct-Gradient-1048k'
 ],
                          indirect=True)
+@pytest.mark.timeout(10800 if get_sm_version() < 89 else 3600)
 def test_llm_llama_v3_1m_long_context_8gpus(llama_example_root,
                                             llama_model_root, llm_venv,
                                             engine_dir, cmodel_dir):
@@ -3364,8 +3368,6 @@ def test_llm_llama_v3_2_smoothquant_1node_single_gpu(
     venv_check_call(llm_venv, summary_cmd)
 
 
-# TODO: remove skip after support fp8 rowwise gemm on B200
-@skip_post_blackwell
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("fp8_quant",

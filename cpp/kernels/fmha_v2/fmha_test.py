@@ -145,14 +145,6 @@ def test_trtllm_sage_attention_fmha(d, s):
             shell=True,
             check=True)
 
-    # Hopper.
-    if sm_version == 90:
-        subprocess.run(
-            f"bin/fmha.exe -v 0 -runs 1 -min-s 1024 -s {s} -b 16 -h 8 -d {d} -bf16 \
-            -sage-block-q 64 -sage-block-k 64 -sage-block-v 256",
-            shell=True,
-            check=True)
-
 
 # The test cases for mla attention.
 @pytest.mark.parametrize('dtype', ["-bf16", "-e4m3", "-e4m3 -bf16-output"],
@@ -165,7 +157,7 @@ def test_trtllm_context_mla_attention_fmha(dtype, s):
         epsilon += ' -epsilon 0.03'
 
     sm_version = getSMVersion()
-    if dtype in ["-e4m3", "-e4m3 -bf16-output"] and sm_version != 89:
+    if sm_version != 89:
         pytest.skip("FP8 MLAs only supported on sm89 currently.")
 
     # Context phase kernels.

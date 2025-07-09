@@ -183,12 +183,15 @@ struct GemmGatedActData
 class GemmGatedActInterface
 {
 public:
+    using ModuleCache = std::unordered_map<std::string, std::tuple<CUmodule, CUfunction>>;
+
     GemmGatedActInterface() {}
 
     // Launch the cubin from the provided config. It calls all necessary memsets for internal buffers.
     // Provided config must be validated with isValidConfig before the call.
     int32_t run(GemmGatedActConfig const& config, void* workspace, GemmGatedActData const& data, void* cudaStream,
-        int32_t multiProcessorCount) const;
+        int32_t multiProcessorCount,
+        std::optional<std::reference_wrapper<ModuleCache>> moduleCache = std::nullopt) const;
 
     // Initializes the buffers before the world sync. Must be called before run.
     int32_t runInitBeforeWorldSync(
@@ -340,7 +343,7 @@ bool GemmGatedActInterface::isValidConfig(GemmGatedActConfig const& config, Gemm
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 int32_t GemmGatedActInterface::run(GemmGatedActConfig const& config, void* workspace, GemmGatedActData const& data,
-    void* cudaStream, int32_t multiProcessorCount) const
+    void* cudaStream, int32_t multiProcessorCount, std::optional<std::reference_wrapper<ModuleCache>> moduleCache) const
 {
     // Get options from config and data.
     auto options = getOptionsFromConfigAndData(config, data);
@@ -369,9 +372,8 @@ int32_t GemmGatedActInterface::run(GemmGatedActConfig const& config, void* works
 
     // Create kernel params.
     auto kernelParams = gemmGatedAct::KernelParams::setKernelParams(options, data.mInputBuffers.mPtrA,
-        reinterpret_cast<float const*>(data.mInputBuffers.mPtrSfA), data.mInputBuffers.mPtrPerTokenSfA,
-        data.mInputBuffers.mPtrB, reinterpret_cast<float const*>(data.mInputBuffers.mPtrSfB),
-        data.mInputBuffers.mPtrPerTokenSfB, data.mOutputBuffers.mPtrC,
+        data.mInputBuffers.mPtrSfA, data.mInputBuffers.mPtrPerTokenSfA, data.mInputBuffers.mPtrB,
+        data.mInputBuffers.mPtrSfB, data.mInputBuffers.mPtrPerTokenSfB, data.mOutputBuffers.mPtrC,
         reinterpret_cast<float const*>(data.mInputBuffers.mPtrScaleC), data.mOutputBuffers.mPtrSfC,
         reinterpret_cast<float const*>(data.mInputBuffers.mPtrScaleGate), reinterpret_cast<float*>(dRowMax),
         reinterpret_cast<uint32_t*>(dRowMaxBars));
@@ -393,8 +395,42 @@ int32_t GemmGatedActInterface::run(GemmGatedActConfig const& config, void* works
 #ifdef TLLM_GEN_EXPORT_INTERFACE
     CUmodule cuModule;
     CUfunction cuFunction;
-    cuModuleLoadData(&cuModule, config.mData);
-    cuModuleGetFunction(&cuFunction, cuModule, config.mFunctionName);
+    if (moduleCache.has_value())
+    {
+        ModuleCache& moduleCacheRef = moduleCache.value().get();
+
+        // Modules are associated with a specific context so include the ctxId in the key
+        CUcontext ctx;
+        unsigned long long ctxId;
+        cuCtxGetCurrent(&ctx);
+        cuCtxGetId(ctx, &ctxId);
+
+        // Reinterpret the ctxId as a string to avoid needing a custom hash or converting it to a string in decimal
+        // representation.
+        std::string const ctxName
+            = std::string(reinterpret_cast<char*>(&ctxId), sizeof(unsigned long long) / sizeof(char));
+        std::string const funcName = std::string(config.mFunctionName);
+        // As the ctxName is a fixed number of bytes, the two strings can just be appended without risk of a collision
+        auto const moduleKey = ctxName + funcName;
+        auto module = moduleCacheRef.find(moduleKey);
+
+        // Check if module exists in cache. Otherwise, load it
+        if (module != moduleCacheRef.end())
+        {
+            cuFunction = std::get<1>(module->second);
+        }
+        else
+        {
+            cuModuleLoadData(&cuModule, config.mData);
+            cuModuleGetFunction(&cuFunction, cuModule, config.mFunctionName);
+            moduleCacheRef.insert(std::make_pair(moduleKey, std::make_tuple(cuModule, cuFunction)));
+        }
+    }
+    else
+    {
+        cuModuleLoadData(&cuModule, config.mData);
+        cuModuleGetFunction(&cuFunction, cuModule, config.mFunctionName);
+    }
 
     // Prepare the grid/block.
     dim3 block3{static_cast<uint32_t>(config.mNumThreadsPerCTA), static_cast<uint32_t>(1), static_cast<uint32_t>(1)};
@@ -407,10 +443,17 @@ int32_t GemmGatedActInterface::run(GemmGatedActConfig const& config, void* works
 
     // Run the kernel.
     auto result = trtllm::gen::launchKernel((void*) &kernelParams, cudaStream, config.mSharedMemSize, cuFunction,
-        block3, grid3, cluster3, config.mOptions.mGridWaitForPrimary);
+        block3, grid3, cluster3,
+        config.mOptions.mGridWaitForPrimaryEarlyExit | config.mOptions.mGridWaitForPrimaryA
+            | config.mOptions.mGridWaitForPrimaryB);
     if (result != CUDA_SUCCESS)
     {
         return -1;
+    }
+    // If a module cache has not been given, unload the module to avoid leaking
+    if (!moduleCache.has_value())
+    {
+        cuModuleUnload(cuModule);
     }
 #else
     config.mCudaRunner->run((void*) &kernelParams, (void*) cudaStream, grid);

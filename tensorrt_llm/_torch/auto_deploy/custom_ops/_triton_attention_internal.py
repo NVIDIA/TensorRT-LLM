@@ -168,7 +168,9 @@ def _paged_context_mha(
     )
 
 
-@torch.library.custom_op("attention::fused_mha_with_paged_cache", mutates_args=())
+@torch.library.custom_op(
+    "auto_deploy::triton_attention_fused_mha_with_paged_cache", mutates_args=()
+)
 def fused_mha_with_paged_cache(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -210,10 +212,10 @@ def fused_mha_with_paged_cache(
     if freqs_cis is not None:
         if s == 1:
             rope_args = (freqs_cis, input_pos, "bsnd")
-            fn_rope = torch.ops.rope.apply_rope_with_input_pos
+            fn_rope = torch.ops.auto_deploy.triton_rope_with_input_pos
         else:
             rope_args = (freqs_cis, input_pos, seq_len, seq_start)
-            fn_rope = torch.ops.rope.apply_rope_on_flattened_inputs
+            fn_rope = torch.ops.auto_deploy.triton_rope_on_flattened_inputs
         q = fn_rope(q, *rope_args)
         k = fn_rope(k, *rope_args)
 
@@ -312,6 +314,7 @@ def _generate_mha_rope_fusion(
     )
 
     HEAD_BLOCK_SIZE = max(16, triton.next_power_of_2(n_heads // n_kv_heads))
+    scale = 1.0 / math.sqrt(d_head)
     gqa_attention_kv_stage1[
         (
             b,
@@ -327,6 +330,7 @@ def _generate_mha_rope_fusion(
         stage1_output_values,
         stage1_output_logsumexp,
         num_blocks,
+        scale,
         max_seq_len,
         n_heads,
         n_kv_heads,
@@ -414,7 +418,9 @@ def _flattened_context_mha_rope_fusion(
     )
 
 
-@torch.library.custom_op("attention::fused_flattened_mha_with_cache_rope_fusion", mutates_args=())
+@torch.library.custom_op(
+    "auto_deploy::triton_attention_fused_flattened_mha_with_cache_rope_fusion", mutates_args=()
+)
 def fused_flattened_mha_with_cache_rope_fusion(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -539,7 +545,7 @@ def _context_mha(
     )
 
 
-@torch.library.custom_op("attention::fused_mha_with_cache", mutates_args=())
+@torch.library.custom_op("auto_deploy::triton_attention_fused_mha_with_cache", mutates_args=())
 def fused_mha_with_cache(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -561,18 +567,19 @@ def fused_mha_with_cache(
 
     # rope embedding
     if freqs_cis is not None:
-        q = torch.ops.rope.apply_rope_with_input_pos(q, freqs_cis, input_pos, "bsnd")
-        k = torch.ops.rope.apply_rope_with_input_pos(k, freqs_cis, input_pos, "bsnd")
+        q = torch.ops.auto_deploy.triton_rope_with_input_pos(q, freqs_cis, input_pos, "bsnd")
+        k = torch.ops.auto_deploy.triton_rope_with_input_pos(k, freqs_cis, input_pos, "bsnd")
 
     # attention (assumed layout is bsnd)
     y = torch.empty_like(q)
+    scale = 1.0 / math.sqrt(head_dim)
     if s > 1:
         # context phase
         _context_mha(q, k, v, k_cache, v_cache, y)
     else:
         # generate phase
         cache_locs = torch.arange(0, b, device=q.device, dtype=torch.int32)
-        _generate_mha(q, k, v, k_cache, v_cache, cache_locs, input_pos, y)
+        _generate_mha(q, k, v, k_cache, v_cache, cache_locs, input_pos, scale, y)
 
     return y.view(b, s, -1)  # [b,s,n*h_d]
 
@@ -590,7 +597,9 @@ def fused_mha_fake(
     return torch.empty_like(q.contiguous())
 
 
-@torch.library.custom_op("attention::fused_flattened_mha_with_cache", mutates_args=())
+@torch.library.custom_op(
+    "auto_deploy::triton_attention_fused_flattened_mha_with_cache", mutates_args=()
+)
 def fused_flattened_mha_with_cache(
     # Q, K, V
     q: torch.Tensor,
@@ -635,10 +644,10 @@ def fused_flattened_mha_with_cache(
     if freqs_cis.numel() > 0:
         if s == 1:
             rope_args = (freqs_cis, input_pos, "bsnd")
-            fn_rope = torch.ops.rope.apply_rope_with_input_pos
+            fn_rope = torch.ops.auto_deploy.triton_rope_with_input_pos
         else:
             rope_args = (freqs_cis, input_pos, seq_len, seq_start)
-            fn_rope = torch.ops.rope.apply_rope_on_flattened_inputs
+            fn_rope = torch.ops.auto_deploy.triton_rope_on_flattened_inputs
         q = fn_rope(q, *rope_args)
         k = fn_rope(k, *rope_args)
 

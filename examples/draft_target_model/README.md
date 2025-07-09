@@ -130,8 +130,8 @@ python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/preprocessing/config.pbtx
 python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/postprocessing/config.pbtxt      triton_max_batch_size:4,tokenizer_dir:${HF_MODEL},postprocessing_instance_count:1
 python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/tensorrt_llm_bls/config.pbtxt    triton_max_batch_size:4,decoupled_mode:False,logits_datatype:TYPE_FP32,bls_instance_count:1,accumulate_tokens:False,tensorrt_llm_model_name:${TARGET_MODEL_NAME},tensorrt_llm_draft_model_name:${DRAFT_MODEL_NAME}
 
-python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/tensorrt_llm/config.pbtxt        triton_max_batch_size:4,decoupled_mode:False,logits_datatype:TYPE_FP32,triton_backend:tensorrtllm,max_tokens_in_paged_kv_cache:2560,max_attention_window_size:2560,kv_cache_free_gpu_mem_fraction:0.5,exclude_input_in_output:True,enable_kv_cache_reuse:True,batching_strategy:inflight_fused_batching,max_queue_delay_microseconds:0,encoder_input_features_data_type:TYPE_FP16,engine_dir:${TARGET_ENGINE_PATH},gpu_device_ids:${TARGET_DEVICE_IDS}
-python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/tensorrt_llm_draft/config.pbtxt  triton_max_batch_size:4,decoupled_mode:False,logits_datatype:TYPE_FP32,triton_backend:tensorrtllm,max_tokens_in_paged_kv_cache:2560,max_attention_window_size:2560,kv_cache_free_gpu_mem_fraction:0.5,exclude_input_in_output:True,enable_kv_cache_reuse:True,batching_strategy:inflight_fused_batching,max_queue_delay_microseconds:0,encoder_input_features_data_type:TYPE_FP16,engine_dir:${DRAFT_ENGINE_PATH},gpu_device_ids:${DRAFT_DEVICE_IDS}
+python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/tensorrt_llm/config.pbtxt        triton_max_batch_size:4,decoupled_mode:False,logits_datatype:TYPE_FP32,triton_backend:tensorrtllm,max_tokens_in_paged_kv_cache:2560,max_attention_window_size:2560,kv_cache_free_gpu_mem_fraction:0.5,exclude_input_in_output:False,enable_kv_cache_reuse:True,batching_strategy:inflight_fused_batching,max_queue_delay_microseconds:0,encoder_input_features_data_type:TYPE_FP16,engine_dir:${TARGET_ENGINE_PATH},gpu_device_ids:${TARGET_DEVICE_IDS}
+python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/tensorrt_llm_draft/config.pbtxt  triton_max_batch_size:4,decoupled_mode:False,logits_datatype:TYPE_FP32,triton_backend:tensorrtllm,max_tokens_in_paged_kv_cache:2560,max_attention_window_size:2560,kv_cache_free_gpu_mem_fraction:0.5,exclude_input_in_output:False,enable_kv_cache_reuse:True,batching_strategy:inflight_fused_batching,max_queue_delay_microseconds:0,encoder_input_features_data_type:TYPE_FP16,engine_dir:${DRAFT_ENGINE_PATH},gpu_device_ids:${DRAFT_DEVICE_IDS}
 ```
 
 + Start the triton inference server.
@@ -254,8 +254,8 @@ python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/preprocessing/config.pbtx
 python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/postprocessing/config.pbtxt      triton_max_batch_size:4,tokenizer_dir:${HF_MODEL},postprocessing_instance_count:1
 python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/tensorrt_llm_bls/config.pbtxt    triton_max_batch_size:4,decoupled_mode:False,logits_datatype:TYPE_FP32,bls_instance_count:1,accumulate_tokens:False,tensorrt_llm_model_name:${TARGET_MODEL_NAME},tensorrt_llm_draft_model_name:${DRAFT_MODEL_NAME}
 
-python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/tensorrt_llm/config.pbtxt        triton_max_batch_size:4,decoupled_mode:False,logits_datatype:TYPE_FP32,triton_backend:tensorrtllm,max_tokens_in_paged_kv_cache:2560,max_attention_window_size:2560,kv_cache_free_gpu_mem_fraction:0.5,exclude_input_in_output:True,enable_kv_cache_reuse:True,batching_strategy:inflight_fused_batching,max_queue_delay_microseconds:0,encoder_input_features_data_type:TYPE_FP16,engine_dir:${TARGET_ENGINE_PATH}
-python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/tensorrt_llm_draft/config.pbtxt  triton_max_batch_size:4,decoupled_mode:False,logits_datatype:TYPE_FP32,triton_backend:tensorrtllm,max_tokens_in_paged_kv_cache:2560,max_attention_window_size:2560,kv_cache_free_gpu_mem_fraction:0.5,exclude_input_in_output:True,enable_kv_cache_reuse:True,batching_strategy:inflight_fused_batching,max_queue_delay_microseconds:0,encoder_input_features_data_type:TYPE_FP16,engine_dir:${DRAFT_ENGINE_PATH}
+python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/tensorrt_llm/config.pbtxt        triton_max_batch_size:4,decoupled_mode:False,logits_datatype:TYPE_FP32,triton_backend:tensorrtllm,max_tokens_in_paged_kv_cache:2560,max_attention_window_size:2560,kv_cache_free_gpu_mem_fraction:0.5,exclude_input_in_output:False,enable_kv_cache_reuse:True,batching_strategy:inflight_fused_batching,max_queue_delay_microseconds:0,encoder_input_features_data_type:TYPE_FP16,engine_dir:${TARGET_ENGINE_PATH}
+python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/tensorrt_llm_draft/config.pbtxt  triton_max_batch_size:4,decoupled_mode:False,logits_datatype:TYPE_FP32,triton_backend:tensorrtllm,max_tokens_in_paged_kv_cache:2560,max_attention_window_size:2560,kv_cache_free_gpu_mem_fraction:0.5,exclude_input_in_output:False,enable_kv_cache_reuse:True,batching_strategy:inflight_fused_batching,max_queue_delay_microseconds:0,encoder_input_features_data_type:TYPE_FP16,engine_dir:${DRAFT_ENGINE_PATH}
 
 sed -i 's/\${gpu_device_ids}/'"${DRAFT_DEVICE_IDS}"'/g' ${TRITON_MODEL_REPO}/tensorrt_llm_draft/config.pbtxt
 sed -i 's/\${gpu_device_ids}/'"${TARGET_DEVICE_IDS}"'/g' ${TRITON_MODEL_REPO}/tensorrt_llm/config.pbtxt
@@ -283,12 +283,39 @@ python3 scripts/launch_triton_server.py \
 + Edit model configuration.
 
 ```bash
+cd examples/models/core/llama
+export TARGET_CKPT_PATH=/workspace/ckpt-target
+export TARGET_ENGINE_PATH=/workspace/engine-target
+export MAX_BATCH_SIZE=4
+export MAX_DRAFT_LEN=10
+export MAX_INPUT_LEN=3200
+export MAX_SEQ_LEN=4800
+
+python3 convert_checkpoint.py \
+    --model_dir=${TARGET_MODEL_PATH} \
+    --output_dir=${TARGET_CKPT_PATH} \
+    --dtype=float16 \
+    --tp_size=2
+
+trtllm-build \
+    --checkpoint_dir=${TARGET_CKPT_PATH} \
+    --output_dir=${TARGET_ENGINE_PATH} \
+    --gemm_plugin=float16 \
+    --use_paged_context_fmha=enable \
+    --speculative_decoding_mode=draft_tokens_external \
+    --max_batch_size=${MAX_BATCH_SIZE} \
+    --max_draft_len=${MAX_DRAFT_LEN} \
+    --max_input_len=${MAX_INPUT_LEN} \
+    --max_seq_len=${MAX_SEQ_LEN}
+```
+
+```bash
 export DRAFT_DEVICE_IDS="0"
 export TARGET_DEVICE_IDS="1,2"
 export DRAFT_PARTICIPANT_IDS="1"
 export TARGET_PARTICIPANT_IDS="2,3"
 
-cd /work/tekit-backend
+cd /work/tensorrtllm_backend
 rm -rf ${TRITON_MODEL_REPO}
 cp -r all_models/inflight_batcher_llm/ ${TRITON_MODEL_REPO}
 cp -r ${TRITON_MODEL_REPO}/tensorrt_llm ${TRITON_MODEL_REPO}/tensorrt_llm_draft
@@ -299,8 +326,8 @@ python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/preprocessing/config.pbtx
 python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/postprocessing/config.pbtxt      triton_max_batch_size:4,tokenizer_dir:${HF_MODEL},postprocessing_instance_count:1
 python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/tensorrt_llm_bls/config.pbtxt    triton_max_batch_size:4,decoupled_mode:False,bls_instance_count:1,accumulate_tokens:False,tensorrt_llm_model_name:${TARGET_MODEL_NAME},logits_datatype:TYPE_FP32,tensorrt_llm_draft_model_name:${DRAFT_MODEL_NAME}
 
-python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/tensorrt_llm/config.pbtxt        triton_max_batch_size:4,triton_backend:tensorrtllm,decoupled_mode:False,max_beam_width:1,engine_dir:${TARGET_ENGINE_PATH},max_tokens_in_paged_kv_cache:2560,max_attention_window_size:2560,kv_cache_free_gpu_mem_fraction:0.5,exclude_input_in_output:True,enable_kv_cache_reuse:True,batching_strategy:inflight_fused_batching,max_queue_delay_microseconds:0,encoder_input_features_data_type:TYPE_FP16,logits_datatype:TYPE_FP32,gpu_device_ids:${TARGET_DEVICE_IDS},participant_ids:2,3,speculative_decoding_fast_logits:1
-python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/tensorrt_llm_draft/config.pbtxt  triton_max_batch_size:4,triton_backend:tensorrtllm,decoupled_mode:False,max_beam_width:1,engine_dir:${DRAFT_ENGINE_PATH},max_tokens_in_paged_kv_cache:2560,max_attention_window_size:2560,kv_cache_free_gpu_mem_fraction:0.5,exclude_input_in_output:True,enable_kv_cache_reuse:True,batching_strategy:inflight_fused_batching,max_queue_delay_microseconds:0,encoder_input_features_data_type:TYPE_FP16,logits_datatype:TYPE_FP32,gpu_device_ids:${DRAFT_DEVICE_IDS},participant_ids:1,speculative_decoding_fast_logits:1
+python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/tensorrt_llm/config.pbtxt        triton_max_batch_size:4,triton_backend:tensorrtllm,decoupled_mode:False,max_beam_width:1,engine_dir:${TARGET_ENGINE_PATH},max_tokens_in_paged_kv_cache:2560,max_attention_window_size:2560,kv_cache_free_gpu_mem_fraction:0.5,exclude_input_in_output:False,enable_kv_cache_reuse:True,batching_strategy:inflight_fused_batching,max_queue_delay_microseconds:0,encoder_input_features_data_type:TYPE_FP16,logits_datatype:TYPE_FP32,gpu_device_ids:${TARGET_DEVICE_IDS},participant_ids:2,3,speculative_decoding_fast_logits:1
+python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/tensorrt_llm_draft/config.pbtxt  triton_max_batch_size:4,triton_backend:tensorrtllm,decoupled_mode:False,max_beam_width:1,engine_dir:${DRAFT_ENGINE_PATH},max_tokens_in_paged_kv_cache:2560,max_attention_window_size:2560,kv_cache_free_gpu_mem_fraction:0.5,exclude_input_in_output:False,enable_kv_cache_reuse:True,batching_strategy:inflight_fused_batching,max_queue_delay_microseconds:0,encoder_input_features_data_type:TYPE_FP16,logits_datatype:TYPE_FP32,gpu_device_ids:${DRAFT_DEVICE_IDS},participant_ids:1,speculative_decoding_fast_logits:1
 
 sed -i 's/\${gpu_device_ids}/'"${DRAFT_DEVICE_IDS}"'/g' ${TRITON_MODEL_REPO}/tensorrt_llm_draft/config.pbtxt
 sed -i 's/\${participant_ids}/'"${DRAFT_PARTICIPANT_IDS}"'/g' ${TRITON_MODEL_REPO}/tensorrt_llm_draft/config.pbtxt

@@ -232,4 +232,4 @@ class CLIPVisionModel(nn.Module):
             r'(.*?)mlp\.fc1(.*)': r'\1mlp.up_proj\2',
             r'(.*?)mlp\.fc2(.*)': r'\1mlp.down_proj\2',
         }
-        _load_weights_impl(self, weights, pattern_mapping)
+        _load_weights_impl(self, weights, params_map=pattern_mapping)

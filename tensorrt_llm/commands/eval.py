@@ -18,11 +18,11 @@ import click
 
 import tensorrt_llm.profiler as profiler
 
-from .._torch.llm import LLM as PyTorchLLM
-from .._torch.pyexecutor.config import PyTorchConfig
+from .. import LLM as PyTorchLLM
+from .._tensorrt_engine import LLM
 from ..evaluate import (GSM8K, MMLU, CnnDailymail, GPQADiamond, GPQAExtended,
-                        GPQAMain)
-from ..llmapi import LLM, BuildConfig, KvCacheConfig
+                        GPQAMain, JsonModeEval)
+from ..llmapi import BuildConfig, KvCacheConfig
 from ..llmapi.llm_utils import update_llm_args_with_extra_options
 from ..logger import logger, severity_map
 
@@ -113,9 +113,6 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
 
     if backend == "tensorrt":
         backend = None
-    pytorch_backend_config = None
-    if backend == "pytorch":
-        pytorch_backend_config = PyTorchConfig()
 
     llm_args = {
         "model": model,
@@ -128,7 +125,6 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
         "build_config": build_config,
         "kv_cache_config": kv_cache_config,
         "backend": backend,
-        "pytorch_backend_config": pytorch_backend_config,
     }
 
     if extra_llm_api_options is not None:
@@ -155,6 +151,7 @@ main.add_command(GSM8K.command)
 main.add_command(GPQADiamond.command)
 main.add_command(GPQAMain.command)
 main.add_command(GPQAExtended.command)
+main.add_command(JsonModeEval.command)
 
 if __name__ == "__main__":
     main()

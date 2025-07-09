@@ -125,6 +125,14 @@ class ZeroMqQueue:
                 # Send data without HMAC
                 self.socket.send_pyobj(obj)
 
+    def put_noblock(self, obj: Any):
+        self.setup_lazily()
+        with nvtx_range_debug("send", color="blue", category="IPC"):
+            data = pickle.dumps(obj)  # nosec B301
+            if self.use_hmac_encryption:
+                data = self._sign_data(data)
+            self.socket.send(data, flags=zmq.NOBLOCK)
+
     async def put_async(self, obj: Any):
         self.setup_lazily()
         try:

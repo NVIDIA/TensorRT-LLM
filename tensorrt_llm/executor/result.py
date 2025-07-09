@@ -59,6 +59,11 @@ class ResponseWrapper:
         self._response = response
         self.logprobs = logprobs
 
+    @property
+    def _is_llm_response(self):
+        response = object.__getattribute__(self, '_response')
+        return isinstance(response, tllm.Response)
+
     def __getattr__(self, name):
         response = object.__getattribute__(self, '_response')
         return getattr(response, name)
@@ -79,6 +84,7 @@ class CompletionOutput:
         stop_reason (int, str, optional): The stop string or token id that caused the completion to stop, None if the completion finished for some other reason. Defaults to None.
         generation_logits (torch.Tensor, optional): The logits on the generated output token ids. Defaults to None.
         disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Parameters needed for disaggregated serving. Includes the type of request, the first generated tokens, the context request id and the any additional state needing to be transferred from context and generation instances. Defaults to None.
+        request_perf_metrics (tensorrt_llm.bindings.executor.RequestPerfMetrics, optional): Performance metrics for the request. Defaults to None.
 
     Attributes:
         length (int): The number of generated tokens.
@@ -97,6 +103,7 @@ class CompletionOutput:
     stop_reason: Optional[Union[int, str]] = None
     generation_logits: Optional[torch.Tensor] = None
     disaggregated_params: Optional[DisaggregatedParams] = None
+    request_perf_metrics: Optional[tllm.RequestPerfMetrics] = None
 
     # hidden fields for tracking the diffs
     _last_text_len: int = field(default=0, init=False, repr=False)
@@ -209,10 +216,6 @@ class GenerationResultBase:
         else:
             output.token_ids.extend(response_tensors.output_token_ids[src_idx])
 
-        # In PD, the first token should be ignored in streaming mode, since it's already been returned by the context server
-        if self.disaggregated_params is not None and self.disaggregated_params.request_type == "generation_only" and self._streaming and self.decoding_iter == 2:
-            output._last_token_ids_len = 1
-
         if response_tensors.cum_log_probs is not None:
             output.cumulative_logprob = response_tensors.cum_log_probs[src_idx]
 
@@ -236,6 +239,9 @@ class GenerationResultBase:
                 src_idx] == tllm.FinishReason.CANCELLED:
             output.finish_reason = 'cancelled'
 
+        if response_tensors.request_perf_metrics is not None:
+            output.request_perf_metrics = response_tensors.request_perf_metrics
+
         if self._done:
             if finish_reasons[src_idx] == tllm.FinishReason.END_ID:
                 output.finish_reason = 'stop'
@@ -252,6 +258,10 @@ class GenerationResultBase:
                 output.finish_reason = 'length'
             elif finish_reasons[src_idx] == tllm.FinishReason.TIMED_OUT:
                 output.finish_reason = 'timeout'
+            # For disaggregated serving, finish reason might be NOT_FINISHED which is ok
+            elif finish_reasons[
+                    src_idx] == tllm.FinishReason.NOT_FINISHED and self.disaggregated_params is not None and self.disaggregated_params.request_type == "context_only":
+                output.finish_reason = 'not_finished'
             elif finish_reasons[src_idx] == tllm.FinishReason.CANCELLED:
                 pass
             else:
@@ -289,6 +299,9 @@ class GenerationResultBase:
                     handler(response.error_msg)
 
             response_result = response.result
+            if hasattr(response_result, "_result"):
+                response_result.deserialize()
+
             self._done = response_result.is_final
             context_phase_params = response_result.context_phase_params
             self.decoding_iter = response_result.decoding_iter
@@ -347,9 +360,6 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
         self.tokenizer = tokenizer
         self._streaming = streaming
 
-    @nvtx_range_debug("handle_response",
-                      color="red",
-                      category="DetokenizedGenerationResultBase")
     def _handle_response(self, response: "GenerationExecutor.Response"):
         GenerationResultBase._handle_response(self, response)
 
@@ -612,6 +622,11 @@ def compute_logprobs(
         if logits.dim() == 3:
             # reshape from [1, T, V] to [T, V]
             logits = logits.squeeze(0)
+
+        if tokens is not None and logits.size(0) > len(tokens):
+            # WAR for nvbug 5324291 where TRT backend might return more logits
+            # than output tokens.
+            logits = logits[:len(tokens)]
 
         logprobs = F.log_softmax(logits.to("cuda", dtype=torch.float32), dim=-1)
         topk_vals, topk_indices = torch.topk(logprobs, k=top_k, dim=-1)

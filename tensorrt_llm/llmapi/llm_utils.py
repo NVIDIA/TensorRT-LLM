@@ -30,9 +30,11 @@ from ..models.modeling_utils import PretrainedConfig, QuantAlgo, QuantConfig
 from ..module import Module
 from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
                           get_build_cache_config_from_env)
-from .llm_args import (CalibConfig, EagleDecodingConfig, KvCacheConfig, LlmArgs,
+from .llm_args import (CalibConfig, CudaGraphConfig, DraftTargetDecodingConfig,
+                       EagleDecodingConfig, KvCacheConfig, LlmArgs,
                        LookaheadDecodingConfig, MedusaDecodingConfig,
-                       MTPDecodingConfig, NGramDecodingConfig, _ModelFormatKind,
+                       MTPDecodingConfig, NGramDecodingConfig,
+                       UserProvidedDecodingConfig, _ModelFormatKind,
                        _ModelWrapper, _ParallelConfig, get_model_format,
                        update_llm_args_with_extra_dict,
                        update_llm_args_with_extra_options)
@@ -624,6 +626,9 @@ class CachedModelLoader:
         if self.llm_args.model_format is _ModelFormatKind.TLLM_ENGINE:
             return Path(self.llm_args.model), None
 
+        if self.llm_args.backend == "_autodeploy":
+            return None, ""
+
         self.engine_cache_stage: Optional[CachedStage] = None
 
         self._hf_model_dir = None
@@ -631,7 +636,7 @@ class CachedModelLoader:
         self.model_loader = ModelLoader(self.llm_args)
 
         if self.llm_args.backend is not None:
-            if self.llm_args.backend not in ["pytorch", "autodeploy"]:
+            if self.llm_args.backend not in ["pytorch", "_autodeploy"]:
                 raise ValueError(
                     f'backend {self.llm_args.backend} is not supported.')
 
@@ -750,6 +755,11 @@ class CachedModelLoader:
 
                 if self.llm_args.parallel_config.is_multi_gpu:
                     assert self.mpi_session
+
+                    #mpi_session cannot be pickled so remove from self.llm_args
+                    if self.llm_args.mpi_session:
+                        del self.llm_args.mpi_session
+
                     # The engine_dir:Path will be stored to MPINodeState.state
                     build_infos = self.mpi_session.submit_sync(
                         CachedModelLoader._node_build_task,
@@ -866,12 +876,15 @@ __all__ = [
     'MedusaDecodingConfig',
     'MTPDecodingConfig',
     'NGramDecodingConfig',
+    'DraftTargetDecodingConfig',
+    'UserProvidedDecodingConfig',
     'ContextChunkingPolicy',
     'CapacitySchedulerPolicy',
     'BuildConfig',
     'BuildCacheConfig',
     'QuantConfig',
     'CalibConfig',
+    'CudaGraphConfig',
     'KvCacheConfig',
     'CachedModelLoader',
     'EagleDecodingConfig',

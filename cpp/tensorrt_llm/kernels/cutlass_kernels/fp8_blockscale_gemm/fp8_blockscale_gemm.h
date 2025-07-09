@@ -85,8 +85,8 @@ template <typename ElementA, typename ElementB, typename ElementD>
 class CutlassFp8BlockScaleGemmRunner : public CutlassFp8BlockScaleGemmRunnerInterface
 {
 public:
-    CutlassFp8BlockScaleGemmRunner();
-    ~CutlassFp8BlockScaleGemmRunner();
+    CutlassFp8BlockScaleGemmRunner() = default;
+    ~CutlassFp8BlockScaleGemmRunner() override = default;
 
     void gemm(void* mat_d, void const* mat_a, void const* mat_b, int shape_m, int shape_n, int shape_k,
         cudaStream_t stream, float const* scales_a = nullptr, float const* scales_b = nullptr) override;

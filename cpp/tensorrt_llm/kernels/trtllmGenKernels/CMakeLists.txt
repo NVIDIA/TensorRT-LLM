@@ -15,7 +15,6 @@
 # the License.
 #
 
-add_subdirectory(blockscaleGemm)
 add_subdirectory(fmha)
 add_subdirectory(gemm)
 add_subdirectory(batchedGemm)

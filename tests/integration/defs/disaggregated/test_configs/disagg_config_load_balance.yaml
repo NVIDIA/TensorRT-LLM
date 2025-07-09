@@ -16,9 +16,7 @@ context_servers:
   kv_cache_config:
     free_gpu_memory_fraction: 0.15
     enable_partial_reuse: False
-  pytorch_backend_config:
-    use_cuda_graph: False
-    disable_overlap_scheduler: True
+  disable_overlap_scheduler: True
   urls:
       - "localhost:8001"
       - "localhost:8002"
@@ -35,9 +33,7 @@ generation_servers:
   kv_cache_config:
     free_gpu_memory_fraction: 0.15
     enable_partial_reuse: False
-  pytorch_backend_config:
-    use_cuda_graph: False
-    disable_overlap_scheduler: False
+  disable_overlap_scheduler: False
   urls:
       - "localhost:8003"
       - "localhost:8004"

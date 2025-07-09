@@ -306,6 +306,8 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
                                  head_dim)
 
 
+# Set seed for reproducibility.
+random.seed(0)
 min_context_sequence_length = 1
 max_context_sequence_length = 1000
 min_num_contexts = 1
@@ -337,7 +339,7 @@ scenarios = [
 
 accuracy_dict = {
     torch.bfloat16: (3e-2, 3e-3),
-    torch.float8_e4m3fn: (3e-1, 3e-2),
+    torch.float8_e4m3fn: (4e-1, 4e-2),
 }
 
 

@@ -52,14 +52,27 @@ def _run_llmapi_example(llm_root, engine_dir, llm_venv, script_name: str,
 
     # Create llm models softlink to avoid duplicated downloading for llm api example
     src_dst_dict = {
+        # TinyLlama-1.1B-Chat-v1.0
         f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0":
         f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        # vicuna-7b-v1.3
         f"{llm_models_root()}/vicuna-7b-v1.3":
         f"{llm_venv.get_working_directory()}/lmsys/vicuna-7b-v1.3",
+        # medusa-vicuna-7b-v1.3
         f"{llm_models_root()}/medusa-vicuna-7b-v1.3":
         f"{llm_venv.get_working_directory()}/FasterDecoding/medusa-vicuna-7b-v1.3",
+        # llama3.1-medusa-8b-hf_v0.1
         f"{llm_models_root()}/llama3.1-medusa-8b-hf_v0.1":
         f"{llm_venv.get_working_directory()}/nvidia/Llama-3.1-8B-Medusa-FP8",
+        # Llama-3.1-8B-Instruct
+        f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct":
+        f"{llm_venv.get_working_directory()}/meta-llama/Llama-3.1-8B-Instruct",
+        # DeepSeek-V3-Lite/bf16
+        f"{llm_models_root()}/DeepSeek-V3-Lite/bf16":
+        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/bf16",
+        # EAGLE3-LLaMA3.1-Instruct-8B
+        f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B":
+        f"{llm_venv.get_working_directory()}/yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
     }
 
     for src, dst in src_dst_dict.items():
@@ -77,68 +90,38 @@ def _run_llmapi_example(llm_root, engine_dir, llm_venv, script_name: str,
     venv_check_call(llm_venv, run_command)
 
 
+@pytest.mark.skip(reason="https://nvbugs/5365825")
 def test_llmapi_quickstart(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv, "quickstart_example.py")
 
 
+@pytest.mark.skip(reason="https://nvbugs/5365825")
 def test_llmapi_example_inference(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv, "llm_inference.py")
 
 
-def test_llmapi_example_customize(llm_root, engine_dir, llm_venv):
-    _run_llmapi_example(llm_root, engine_dir, llm_venv,
-                        "llm_inference_customize.py")
-
-
+@pytest.mark.skip(reason="https://nvbugs/5365825")
 def test_llmapi_example_inference_async(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv,
                         "llm_inference_async.py")
 
 
+@pytest.mark.skip(reason="https://nvbugs/5365825")
 def test_llmapi_example_inference_async_streaming(llm_root, engine_dir,
                                                   llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv,
                         "llm_inference_async_streaming.py")
 
 
-def test_llmapi_example_quantization(llm_root, engine_dir, llm_venv):
-    _run_llmapi_example(llm_root, engine_dir, llm_venv, "llm_quantization.py")
-
-
-def test_llmapi_example_logits_processor(llm_root, engine_dir, llm_venv):
-    _run_llmapi_example(llm_root, engine_dir, llm_venv,
-                        "llm_logits_processor.py")
-
-
+@pytest.mark.skip(reason="https://nvbugs/5365825")
 def test_llmapi_example_multilora(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv, "llm_multilora.py")
 
 
+@pytest.mark.skip(reason="https://nvbugs/5365825")
 def test_llmapi_example_guided_decoding(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv,
                         "llm_guided_decoding.py")
-
-
-def test_llmapi_example_lookahead_decoding(llm_root, engine_dir, llm_venv):
-    _run_llmapi_example(llm_root, engine_dir, llm_venv,
-                        "llm_lookahead_decoding.py")
-
-
-def test_llmapi_example_medusa_decoding(llm_root, engine_dir, llm_venv):
-    _run_llmapi_example(llm_root, engine_dir, llm_venv,
-                        "llm_medusa_decoding.py")
-
-
-def test_llmapi_example_medusa_decoding_use_modelopt(llm_root, engine_dir,
-                                                     llm_venv):
-    _run_llmapi_example(
-        llm_root, engine_dir, llm_venv, "llm_medusa_decoding.py",
-        "--use_modelopt_ckpt",
-        f"--model_dir={llm_models_root()}/llama3.1-medusa-8b-hf_v0.1")
-
-
-def test_llmapi_example_eagle_decoding(llm_root, engine_dir, llm_venv):
-    _run_llmapi_example(llm_root, engine_dir, llm_venv, "llm_eagle_decoding.py")
 
 
 @pytest.mark.skip_less_device(2)
@@ -147,13 +130,34 @@ def test_llmapi_example_distributed_tp2(llm_root, engine_dir, llm_venv):
                         "llm_inference_distributed.py")
 
 
-@pytest.mark.skip_less_device(2)
-def test_llmapi_example_distributed_autopp_tp2(llm_root, engine_dir, llm_venv):
-    _run_llmapi_example(llm_root, engine_dir, llm_venv, "llm_auto_parallel.py")
+@pytest.mark.skip(reason="https://nvbugs/5365825")
+def test_llmapi_example_logits_processor(llm_root, engine_dir, llm_venv):
+    _run_llmapi_example(llm_root, engine_dir, llm_venv,
+                        "llm_logits_processor.py")
 
 
+@pytest.mark.skip(reason="https://nvbugs/5365825")
 def test_llmapi_quickstart_atexit(llm_root, engine_dir, llm_venv):
     script_path = Path(
         llm_root
     ) / "tests/integration/defs/examples/run_llm_quickstart_atexit.py"
     llm_venv.run_cmd([str(script_path)])
+
+
+@pytest.mark.skip(reason="https://nvbugs/5365825")
+def test_llmapi_speculative_decoding_mtp(llm_root, engine_dir, llm_venv):
+    _run_llmapi_example(llm_root, engine_dir, llm_venv,
+                        "llm_speculative_decoding.py", "MTP", "--model",
+                        f"{llm_models_root()}/DeepSeek-V3-Lite/bf16")
+
+
+@pytest.mark.skip(reason="https://nvbugs/5365825")
+def test_llmapi_speculative_decoding_eagle3(llm_root, engine_dir, llm_venv):
+    _run_llmapi_example(llm_root, engine_dir, llm_venv,
+                        "llm_speculative_decoding.py", "EAGLE3")
+
+
+@pytest.mark.skip(reason="https://nvbugs/5365825")
+def test_llmapi_speculative_decoding_ngram(llm_root, engine_dir, llm_venv):
+    _run_llmapi_example(llm_root, engine_dir, llm_venv,
+                        "llm_speculative_decoding.py", "NGRAM")

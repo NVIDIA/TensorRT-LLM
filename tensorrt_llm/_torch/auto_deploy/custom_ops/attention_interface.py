@@ -30,10 +30,21 @@ class CacheConfig:
 class SequenceInfo:
     """A dataclass to hold information about how the sequence is laid out and stored in cache.
 
-    We assume the sequence + cache is laid out in the following way:
+    We assume the sequence + cache is laid out in the following way. Also note that we differentiate
+    between arguments that are originally part of the model/graph and arguments that are needed for
+    the attention operator when we switch to cached+flattened attention.
 
+    # ORIGINAL MODEL ARGUMENTS #####################################################################
     - input_ids: [id_0, ..., id_{s_total-1}]
       flattened sequence of [b, 1] or [1, s_total]. We use [b, 1] to denote generate-only batches.
+    - position_ids: [pos_0, ..., pos_{s_total-1}]
+      flattened sequence of [b, 1] or [1, s_total] indicating absolute position ids for every token
+      in the input_ids sequence. We use [b, 1] to denote generate-only batches.
+
+    NOTE: ``input_ids`` and ``position_ids`` are initially expected to be of shape [b, seq_len]
+    before we switch to cached+flattened attention.
+
+    # EXTRA ARGUMENTS NEEDED FOR ATTENTION OPERATORS FOR FLATTENED SEQUENCES + CACHES ##############
     - seq_len: [s_0, s_1, ..., s_{b-1}] such that s_total = sum(s_i)
       Describes how long each sequence is. For example,
       input_ids[:s_0] will correspond to sequence 0 in the batch and input_ids[s_0:s_1] will
@@ -46,6 +57,8 @@ class SequenceInfo:
     - pages_per_seq: [ps_0, ps_1, ..., ps_{b-1}] where ps_i is the number of pages allocated for
       sequence i. Note that, for example, cache_loc[p_0:p_1] will correspond to the pages associated
       with sequence 1 in the batch.
+
+    ################################################################################################
 
     Here are a couple of notes to emphasize this notation:
 
@@ -73,12 +86,12 @@ class SequenceInfo:
     # then the maximum number of sequences possible in the batch is min (max_batch_size, max_num_tokens // ISL).
     # Similarly, if a batch is composed of generate-only requests,
     # then the maximum number of sequences possible in the batch is min (max_batch_size, max_num_tokens).
-    max_num_tokens: int = 0
+    max_num_tokens: Optional[int] = None
 
     ## [UPDATE WITH CARE] TENSOR FIELDS THAT WILL BE PASSED TO PREPARE_METADATA OP #################
     # input_ids MUST ALWAYS BE THE FIRST FIELD
     input_ids: torch.Tensor = field(default_factory=lambda: torch.zeros(1, 1, dtype=torch.int))
-    position_ids: torch.Tensor = field(default_factory=lambda: torch.zeros(1, 1, dtype=torch.int))
+    position_ids: torch.Tensor = field(default_factory=lambda: torch.zeros(1, 1, dtype=torch.long))
 
     seq_len: torch.Tensor = field(default_factory=lambda: torch.ones(1, dtype=torch.int))
     input_pos: torch.Tensor = field(default_factory=lambda: torch.zeros(1, dtype=torch.int))
@@ -93,14 +106,20 @@ class SequenceInfo:
     def __post_init__(self):
         if self.page_size < 1:
             self.page_size = self.max_seq_len
-        if self.max_num_tokens < 1:
-            self.max_num_tokens = self.max_batch_size * self.max_seq_len
+
+        # NOTE (lucaslie): WAR to address issue when using flashinfer attention with
+        # (max_batch_size, max_seq_len) input in trtllm runtime.
+        # see https://github.com/NVIDIA/TensorRT-LLM/issues/4504
+        max_seq_len_adjusted = self.max_seq_len + 1
+
+        if self.max_num_tokens is None or self.max_num_tokens < 1:
+            self.max_num_tokens = self.max_batch_size * max_seq_len_adjusted
         # if the provided max_num_tokens is less than the max_batch_size * max_seq_len,
         # we use the provided max_num_tokens to calculate the number of pages
-        total_tokens = min(self.max_num_tokens, self.max_batch_size * self.max_seq_len)
+        total_tokens = min(self.max_num_tokens, self.max_batch_size * max_seq_len_adjusted)
         self._num_pages = (total_tokens) // self.page_size + (total_tokens % self.page_size > 0)
         self.input_ids = torch.ones(self.max_batch_size, 1, dtype=torch.int)
-        self.position_ids = torch.zeros(self.max_batch_size, 1, dtype=torch.int)
+        self.position_ids = torch.zeros(self.max_batch_size, 1, dtype=torch.long)
         self.seq_len = torch.empty(self.max_batch_size, dtype=torch.int)
         self.input_pos = torch.empty_like(self.seq_len)
         self.cache_loc = torch.empty(self.num_pages, dtype=torch.int)
@@ -111,6 +130,9 @@ class SequenceInfo:
 
         # keep a list-like object of sequence lengths for simplicity as well
         self._sequence_lengths = [0] * self.max_batch_size
+
+        # indicator if extra args are activated that are needed for cached attention backends
+        self._is_cached_attn = False
 
         # call reset once to initialize the tensors
         self.reset()
@@ -126,23 +148,24 @@ class SequenceInfo:
             val = getattr(self, f.name)
             if isinstance(val, torch.Tensor):
                 args.append(val)
+            if len(args) >= self._num_uncached_attn_args and not self._is_cached_attn:
+                break
         return tuple(args)
 
     @property
-    def num_original_args(self) -> int:
+    def _num_uncached_attn_args(self) -> int:
         """Return the number of original graph arguments expected by the model."""
         return 2
 
     @property
-    def args_original(self) -> Tuple[torch.Tensor, ...]:
-        """Return the original graph arguments expected by the model."""
-        return self.args[: self.num_original_args]
+    def _cached_attn_arg_names(self) -> List[str]:
+        """Return extra arg names for the prepare_metadata op beyond input_ids and position_ids.
 
-    @property
-    def extra_arg_names(self) -> List[str]:
-        """Return extra arg names for the prepare_metadata op beyond input_ids and position_ids."""
+        These extra args are needed once we switch from regular attention to inserting cached
+        attention ops in the model.
+        """
         return [f.name for f in fields(self) if isinstance(getattr(self, f.name), torch.Tensor)][
-            self.num_original_args :
+            self._num_uncached_attn_args :
         ]
 
     @property
@@ -160,14 +183,10 @@ class SequenceInfo:
             # set up shape for position_ids (same as input_ids)
             dynamic_shapes[1].update(dynamic_shapes[0])
             # set up shape for extra args
-            dynamic_shapes += ({},) * len(self.extra_arg_names)
+            if self._is_cached_attn:
+                dynamic_shapes += ({},) * len(self._cached_attn_arg_names)
             self._dynamic_shapes = dynamic_shapes
         return self._dynamic_shapes
-
-    @property
-    def original_dynamic_shapes(self) -> Tuple[Dict[str, Dim]]:
-        """Return the dynamic shapes of the original graph arguments."""
-        return self.dynamic_shapes[: self.num_original_args]
 
     @property
     def num_sequences(self) -> int:
@@ -265,6 +284,23 @@ class SequenceInfo:
             num_seq = b
         return num_seq
 
+    def switch_to_cached_attn_inputs(self) -> List[str]:
+        """Switch to inputs for cached+flattened attention operators.
+
+        Returns:
+            List[str]: List of new argument names that are now activated.
+
+        This function will change the inputs provided by the interface from the arguments expected
+        by regular attention in PyTorch (SDPA-style) to the arguments needed once we use attention
+        operators with cache support and flattened sequences.
+
+        NOTE: The graph inference optimizer is responsible for ensuring the the new inputs are
+        correctly reflected in the graph after this function is called.
+        """
+        assert not self._is_cached_attn, "Cached+flattened attention already activated"
+        self._is_cached_attn = True
+        return self._cached_attn_arg_names
+
     def to(self, *args, **kwargs) -> None:
         for f in fields(self):
             val = getattr(self, f.name)
@@ -300,8 +336,8 @@ class SequenceInfo:
         self.cache_loc[:] = torch.arange(self.num_pages, dtype=torch.int, device=self.device)
         self.pages_per_seq.fill_(1)
 
-    def _set_example_sequence(self) -> None:
-        """Set an example sequence for export purposes with shape [bs, seq_len]."""
+    def set_example_sequence(self) -> None:
+        """Set an example sequence useful for testing and export purposes."""
         self.reset()
         bs, seq_len = min(2, self.max_batch_size), min(4, self.max_seq_len)
         input_ids = torch.ones(
@@ -311,8 +347,11 @@ class SequenceInfo:
             device=self.device,
         )
         self.nest_sequences(input_ids)
-        self.input_ids = self.input_ids.view(bs, seq_len)
-        self.position_ids = self.position_ids.view(bs, seq_len)
+
+        # unflatten if we are not yet using cached+flattened attention
+        if not self._is_cached_attn:
+            self.input_ids = self.input_ids.view(bs, seq_len)
+            self.position_ids = self.position_ids.view(bs, seq_len)
 
     def _set_max_num_tokens_sample(self) -> None:
         """Set an example sequence with max_num_tokens."""
@@ -327,15 +366,19 @@ class SequenceInfo:
         self.pages_per_seq.fill_(seq_len // self.page_size)
         self.nest_sequences(input_ids)
 
-    def _set_generate_only_batch(self) -> None:
-        """Set an example sequence for generate-only batch."""
+    def set_generate_only_batch(self) -> None:
+        """Set an example sequence for generate-only batch.
+
+        NOTE: this batch is already formatted as [b, 1] in both original and in the cached attention
+        mode. So we don't need to do anything mode-specific here.
+        """
         self.reset()
         self.nest_sequences([[1]] * self.max_batch_size)
 
     def _update_position_ids(self) -> None:
         # set new position_ids as new tensor from input_pos and seq_len via torch.arange
         position_ids_list = [
-            torch.arange(in_pos, in_pos + seq_len, dtype=torch.int)
+            torch.arange(in_pos, in_pos + seq_len, dtype=torch.long)
             for in_pos, seq_len in zip(self.input_positions, self.sequence_lengths)
         ]
         self.position_ids = torch.cat(position_ids_list, dim=0).to(self.device)

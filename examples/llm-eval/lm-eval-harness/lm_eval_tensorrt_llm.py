@@ -32,12 +32,12 @@ from packaging.version import parse
 from tqdm import tqdm
 
 import tensorrt_llm
-from tensorrt_llm._torch import LLM as TORCH_LLM
+from tensorrt_llm import LLM as TORCH_LLM
+from tensorrt_llm._tensorrt_engine import LLM as TRT_LLM
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.bindings.executor import DecodingConfig
 from tensorrt_llm.llmapi import KvCacheConfig as TRT_KvCacheConfig
 from tensorrt_llm.llmapi import RequestOutput, SamplingParams
-from tensorrt_llm.llmapi.llm import LLM as TRT_LLM
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +60,8 @@ class TRTLLMEvalBase(TemplateLM):
         max_context_length: Optional[int] = None,
         moe_expert_parallel_size: Optional[int] = None,
         moe_backend: Optional[str] = "TRTLLM",
+        enable_chunked_prefill: bool = False,
+        max_num_tokens: Optional[int] = None,
         **kwargs,
     ):
         # initialize TemplateLM, copied from TemplateAPI
@@ -94,13 +96,12 @@ class TRTLLMEvalBase(TemplateLM):
                 tp = torch.cuda.device_count()
 
             pytorch_config_params = {
-                "use_cuda_graph": use_cuda_graph,
+                'cuda_graph_config': {} if use_cuda_graph else None,
                 "print_iter_log": False,
             }
             if hasattr(PyTorchConfig, "moe_backend"):
                 pytorch_config_params["moe_backend"] = self.moe_backend
                 print(f"Info: moe_backend is set to {self.moe_backend}")
-            pytorch_config = PyTorchConfig(**pytorch_config_params)
 
             # stop words not currently supported by torch backend
             self.use_stop_words = False
@@ -109,8 +110,9 @@ class TRTLLMEvalBase(TemplateLM):
                 model=model,
                 tensor_parallel_size=tp,
                 trust_remote_code=trust_remote_code,
-                enable_chunked_prefill=False,
-                pytorch_backend_config=pytorch_config,
+                enable_chunked_prefill=enable_chunked_prefill,
+                max_num_tokens=max_num_tokens,
+                **pytorch_config_params,
                 tokenizer=self.tokenizer,
                 kv_cache_config=trt_kv_cache_config,
                 moe_expert_parallel_size=self.moe_expert_parallel_size,
@@ -292,11 +294,12 @@ class TRTLLMEvalBase(TemplateLM):
             # process the output of the request i
             r_out: RequestOutput = futures.pop(i).result()
             stop_words = future_stop_words.pop(i)
-            for word in stop_words:
-                txt = r_out.outputs[0].text
-                word_index = txt.find(word)
-                if word_index >= 0:
-                    txt = txt[:word_index]
+            txt = r_out.outputs[0].text
+            if stop_words:
+                for word in stop_words:
+                    word_index = txt.find(word)
+                    if word_index >= 0:
+                        txt = txt[:word_index]
             results.append(txt)
 
         return results

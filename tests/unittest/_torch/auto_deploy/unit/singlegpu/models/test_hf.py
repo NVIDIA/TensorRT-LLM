@@ -9,7 +9,6 @@ from transformers.models.llama4.configuration_llama4 import Llama4Config
 from tensorrt_llm._torch.auto_deploy.models.hf import (
     AutoModelForCausalLMFactory,
     hf_load_state_dict_with_device,
-    load_state_dict_with_assign,
 )
 
 
@@ -17,36 +16,6 @@ class SimpleModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.linear = nn.Linear(10, 10)
-
-
-def test_load_state_dict_with_assign():
-    """Test that load_state_dict_with_assign correctly patches torch.nn.Module.load_state_dict."""
-    # Instead of trying to test the implementation details of the context manager,
-    # let's focus on testing its behavior - that it causes assign=True to be used
-
-    # First, let's check the behavior when assign=True is used directly
-    model1 = SimpleModel()
-    model2 = SimpleModel()
-
-    # Create a state dict with modified parameters
-    new_weight = torch.randn_like(model1.linear.weight)
-    new_bias = torch.randn_like(model1.linear.bias)
-    state_dict = {"linear.weight": new_weight, "linear.bias": new_bias}
-
-    # Load with assign=True explicitly
-    model1.load_state_dict(state_dict, assign=True)
-
-    # Now load with the context manager
-    with load_state_dict_with_assign():
-        model2.load_state_dict(state_dict)
-
-    # Both models should have identical parameters
-    assert torch.all(model1.linear.weight == model2.linear.weight)
-    assert torch.all(model1.linear.bias == model2.linear.bias)
-
-    # And both should match the new values
-    assert torch.all(model1.linear.weight == new_weight)
-    assert torch.all(model2.linear.weight == new_weight)
 
 
 def test_hf_load_state_dict_with_device():
@@ -97,7 +66,7 @@ def mock_factory():
         # Create factory instance with mocked methods to avoid HTTP requests
         factory = AutoModelForCausalLMFactory(model="dummy_model")
         # Set model path directly to avoid prefetch
-        factory._prefetched_path = "/dummy/path"
+        factory._prefetched_model_path = "/dummy/path"
         yield factory
 
 

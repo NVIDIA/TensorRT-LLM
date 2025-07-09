@@ -179,13 +179,8 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         }
 
         using tensorrt_llm::batch_manager::kv_cache_manager::MLACacheFormatter;
-        auto makeFormatter = [cacheManager, isMLA, this]() -> std::unique_ptr<IOFormatter>
-        {
-            return isMLA ? std::unique_ptr<IOFormatter>(
-                       std::make_unique<MLACacheFormatter>(cacheManager, this->mCacheTransBufferManager.get()))
-                         : std::unique_ptr<IOFormatter>(
-                             std::make_unique<CacheFormatter>(cacheManager, this->mCacheTransBufferManager.get()));
-        };
+        auto makeFormatter = [cacheManager, isMLA, this]()
+        { return createCacheFormatter(cacheManager, mCacheTransBufferManager.get(), isMLA); };
 
         mDataResponder = std::make_unique<DataResponder>(
             std::make_unique<DataSenderImpl>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter()));
@@ -522,7 +517,9 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             // Gather the kv cache transfer time from all workers and update to leader rank
             if (!common::getEnvKVCacheTransferOutputPath().empty())
             {
-                updateKVCacheTransferBW(*mMpiGroupComm, it->first);
+                auto syncComm
+                    = mCacheState->getParallelConfig().mEnableAttentionDP ? mMpiGroupDataComm.get() : mMpiGroupComm;
+                updateKVCacheTransferBW(*syncComm, it->first);
             }
             TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
                 "**** it->first->mRequestId: %ld, context request ID: %ld ******** get feature ***",

@@ -15,7 +15,7 @@ def model_name():
     return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 
-@pytest.fixture(scope="module", params=[None, 'pytorch'])
+@pytest.fixture(scope="module", params=["trt", 'pytorch'])
 def backend(request):
     return request.param
 
@@ -34,10 +34,13 @@ def max_seq_len(request):
 def server(model_name: str, backend: str, max_batch_size: str,
            max_seq_len: str):
     model_path = get_model_path(model_name)
-    args = ["--max_beam_width", "4"]
-    if backend is not None:
+    args = []
+    if backend == "pytorch":
         args.append("--backend")
         args.append(backend)
+    if backend != "pytorch":
+        args.append("--max_beam_width")
+        args.append("4")
     if max_batch_size is not None:
         args.append("--max_batch_size")
         args.append(max_batch_size)
@@ -83,6 +86,7 @@ async def test_request_cancellation(server: RemoteOpenAIServer,
                                     model_name: str):
     # clunky test: send an ungodly amount of load in with short timeouts
     # then ensure that it still responds quickly afterwards
+    pytest.skip("https://nvbugs/5310314")
 
     chat_input = [{"role": "user", "content": "Write a long story"}]
     client = server.get_async_client(timeout=0.5, max_retries=3)

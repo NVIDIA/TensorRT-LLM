@@ -56,8 +56,6 @@ GTEST_DIR ?= /usr
 GTEST_LIB = -lgtest -lgtest_main
 GTEST_INC = -I$(GTEST_DIR)/include
 
-NVCC_FLAGS += -Xcicc --uumn -Xptxas -uumn
-
 # Special SM89 support for QMMA.
 ifdef ENABLE_SM89_QMMA
   NVCC_FLAGS += -DFMHA_ENABLE_SM89_QMMA

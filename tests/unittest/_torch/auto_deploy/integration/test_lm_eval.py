@@ -1,3 +1,8 @@
+"""Testing lm-eval with AutoDeploy for basic accuracy validation.
+
+NOTE (lucaslie): this test is for local testing only. It is not registered to run as part of CI.
+"""
+
 import gc
 import glob
 import json
@@ -60,17 +65,12 @@ def _cli_evaluate_with_mocks(args):
                     f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct",
                     "meta-llama/Meta-Llama-3.1-8B-Instruct",
                 ),
-                "attn_backend": "FlashInfer",
+                "attn_backend": "flashinfer",
                 "max_batch_size": 32,
             },
             ["gsm8k", "mmlu"],
             ["exact_match,strict-match", "acc,none"],
             [0.75, 0.675],
-            marks_extra=[
-                pytest.mark.skip(
-                    reason="https://nvbugspro.nvidia.com/bug/5123940; failed and timeout"
-                )
-            ],
         ),
         param_with_device_count(
             2,
@@ -97,9 +97,6 @@ def _cli_evaluate_with_mocks(args):
             [0.70, 0.64],
             marks_extra=[
                 pytest.mark.skipif(not fp4_compatible(), reason="Requires fp4 support"),
-                pytest.mark.skip(
-                    reason="https://nvbugspro.nvidia.com/bug/5095416; to add ckpt on llm-models"
-                ),
             ],
         ),
         param_with_device_count(
@@ -114,9 +111,6 @@ def _cli_evaluate_with_mocks(args):
             ["gsm8k", "mmlu"],
             ["exact_match,strict-match", "acc,none"],
             [0.583, 0.67],
-            marks_extra=[
-                pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5095416; timeout")
-            ],
         ),
     ],
 )

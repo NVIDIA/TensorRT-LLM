@@ -1,6 +1,6 @@
 """
 This transformation defines two main RoPE (Rotary Positional Embedding) pattern matchers used
-to identify and replace RoPE subgraphs with a custom op (`torch.ops.rope.flashinfer`).
+to identify and replace RoPE subgraphs with a custom op (`torch.ops.auto_deploy.flashinfer_rope`).
 
 Supported RoPE variants:
 
@@ -47,124 +47,136 @@ TODO: Support other variants:
 
 import operator
 from collections import defaultdict
-from typing import Any, DefaultDict, Dict, List, Optional, Sequence
+from typing import Any, DefaultDict, Dict, Optional, Sequence
 
 import torch
 from torch.fx import GraphModule, Node
 
 from ...utils.logger import ad_logger
-from ...utils.node_utils import bfs, extract_output_tuple, identify_regions_between_residuals, is_op
+from ...utils.node_utils import extract_op_args, extract_output_tuple, is_op
+from ...utils.pattern_matcher import ADPatternMatcherPass, Match, register_ad_pattern
 from .._graph import canonicalize_graph
 
 
-def match_explicit_rope(gm: GraphModule) -> GraphModule:
-    """
-    Identify and replace RoPE subgraphs (explicit cos/sin multiplication pattern):
+def _rotate_half(x):
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
 
-      - HF-style: output = (raw * unsqueeze(cos)) + (rotate_half(raw) * unsqueeze(sin))
-      - DS-style: requires interleaving Q/K before the cos/sin mul
 
-    If exactly two such branches (query and key) are detected within each region, they're replaced
-    by a call to `rope::torch_apply_rope_with_qk_interleaving` or
-    `rope::torch_apply_rope_with_explicit_cos_sin` respectively.
-    """
-    ad_logger.info("Match explicit(HF) style RoPE")
+def _explicit_rope_pattern(q, k, cos, sin, unsqueeze_dim=1):
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (_rotate_half(q) * sin)
+    k_embed = (k * cos) + (_rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+def _explicit_rope_repl(q, k, cos, sin, unsqueeze_dim):
+    return torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin.default(
+        q, k, cos, sin, unsqueeze_dim
+    )
+
+
+def _interleaved_rope_pattern(q, k, cos, sin, unsqueeze_dim=1):
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    b, h, s, d = q.shape
+    q = q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+    b, h, s, d = k.shape
+    k = k.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+    q_embed = (q * cos) + (_rotate_half(q) * sin)
+    k_embed = (k * cos) + (_rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+def _interleaved_rope_repl(q, k, cos, sin, unsqueeze_dim):
+    return torch.ops.auto_deploy.torch_rope_with_qk_interleaving.default(
+        q, k, cos, sin, unsqueeze_dim
+    )
+
+
+# exporting with {"unsqueeze_dim": 2},
+# would confuse the pattern matcher since '2' is arg of other ops
+def _complex_rope_pattern(xq, xk, freqs_cis, unsqueeze_dim=1):
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    freqs_q = freqs_cis.unsqueeze(unsqueeze_dim)
+    freqs_k = freqs_cis.unsqueeze(unsqueeze_dim)
+    xq_out = torch.view_as_real(xq_ * freqs_q).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs_k).flatten(3)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+
+
+def _complex_rope_repl(q, k, freqs_cis, unsqueeze_dim):
+    return torch.ops.auto_deploy.torch_rope_with_complex_freqs.default(
+        q, k, freqs_cis, unsqueeze_dim
+    )
+
+
+def _explicit_not_interleaved(match: Match) -> bool:
+    q, k = match.kwargs.get("q"), match.kwargs.get("k")
+    return not any(isinstance(n, Node) and _match_input_interleave_pattern(n) for n in (q, k))
+
+
+def match_rope_pattern(gm: GraphModule) -> GraphModule:
     graph = gm.graph
-    boundary_nodes: List[torch.fx.Node] = identify_regions_between_residuals(gm)
+    patterns = ADPatternMatcherPass()
 
-    for start_boundary, end_boundary in zip(boundary_nodes[:-1], boundary_nodes[1:]):
-        matches = []  # list of (match_info, is_ds)
-        node = start_boundary
-        while node != end_boundary:
-            if is_op(node, torch.ops.aten.add):
-                explicit = _match_explicit_rope_subpattern(node)
-                if explicit is not None:
-                    raw = explicit["raw_input"]
-                    # check if this raw is result of DS interleave
-                    inter = _match_input_interleave_pattern(raw)
-                    if inter is not None:
-                        ds_match = {
-                            "raw_input": inter["interleaved"],
-                            "unsqueeze_cos": explicit["unsqueeze_cos"],
-                            "unsqueeze_sin": explicit["unsqueeze_sin"],
-                            "add_node": explicit["add_node"],
-                        }
-                        matches.append((ds_match, True))
-                    else:
-                        matches.append((explicit, False))
-            node = node.next
+    # dummy shapes: can be arbitrary
+    batch_size = 8
+    seq_len = 16
+    num_heads = 8
+    hidden_size = 512
+    head_dim = hidden_size // num_heads
 
-        if not matches:
-            continue
-        if len(matches) != 2:
-            ad_logger.warning(
-                f"Expected exactly 2 legacy RoPE branches between {start_boundary} and {end_boundary}, "
-                f"found {len(matches)}."
-            )
-            continue
+    dummy_explicit = [
+        torch.randn(batch_size, num_heads, seq_len, head_dim, device="meta", dtype=torch.float16),
+        torch.randn(batch_size, num_heads, seq_len, head_dim, device="meta", dtype=torch.float16),
+        torch.randn(batch_size, seq_len, head_dim, device="meta", dtype=torch.float16),
+        torch.randn(batch_size, seq_len, head_dim, device="meta", dtype=torch.float16),
+    ]
+    dummy_complex = [
+        torch.randn(batch_size, num_heads, seq_len, head_dim, device="meta", dtype=torch.float16),
+        torch.randn(batch_size, num_heads, seq_len, head_dim, device="meta", dtype=torch.float16),
+        torch.randn(batch_size, seq_len, head_dim // 2, device="meta", dtype=torch.float16),
+    ]
+    register_ad_pattern(
+        search_fn=_explicit_rope_pattern,
+        replace_fn=_explicit_rope_repl,
+        patterns=patterns,
+        dummy_args=dummy_explicit,
+        op_ignore_types={torch.ops.aten.slice.Tensor: (int,)},
+        scalar_workaround={"unsqueeze_dim": 1},
+        extra_check=_explicit_not_interleaved,
+    )
+    register_ad_pattern(
+        search_fn=_interleaved_rope_pattern,
+        replace_fn=_interleaved_rope_repl,
+        patterns=patterns,
+        dummy_args=dummy_explicit,
+        op_ignore_types={
+            torch.ops.aten.slice.Tensor: (int,),
+            torch.ops.aten.reshape.default: (int,),
+            torch.ops.aten.view.default: (int,),
+        },
+        scalar_workaround={"unsqueeze_dim": 1},
+    )
+    register_ad_pattern(
+        search_fn=_complex_rope_pattern,
+        replace_fn=_complex_rope_repl,
+        patterns=patterns,
+        dummy_args=dummy_complex,
+        op_ignore_types={
+            torch.ops.aten.reshape.default: (int,),
+        },
+        scalar_workaround={"unsqueeze_dim": 1},
+    )
 
-        (q_match, q_is_ds), (k_match, k_is_ds) = matches
-        if q_is_ds != k_is_ds:
-            ad_logger.warning("Mismatched RoPE types between q and k branches")
-            continue
-
-        if q_is_ds:
-            _process_input_interleave_rope(graph, q_match, k_match)
-        else:
-            _process_explicit_rope(graph, q_match, k_match, start_boundary)
-
+    num_matches = patterns.apply(graph)
     gm = canonicalize_graph(gm)
-    return gm
-
-
-def match_complex_rope(gm: GraphModule) -> GraphModule:
-    """
-    Identify and replace RoPE subgraphs using complex multiplication pattern:
-
-      output = type_as(flatten(view_as_real(mul(view_as_complex(reshape(to_dtype(x))), unsqueeze(freqs_cis, 2)))), x)
-
-    If exactly two such branches (query and key) are detected within each region, they're replaced
-    by a call to `torch.ops.rope.torch_apply_rope_with_complex_freqs`.
-    """
-    ad_logger.info("Match Complex style RoPE")
-    graph = gm.graph
-    boundary_nodes: List[torch.fx.Node] = identify_regions_between_residuals(gm)
-
-    for start_boundary, end_boundary in zip(boundary_nodes[:-1], boundary_nodes[1:]):
-        matches = []
-        node = start_boundary
-        while node != end_boundary:
-            if is_op(node, torch.ops.aten.type_as):
-                match_info = _match_complex_rope_subpattern(node)
-                if match_info:
-                    matches.append(match_info)
-            node = node.next
-
-        if not matches:
-            continue
-        if len(matches) != 2:
-            ad_logger.warning(
-                f"Expected exactly 2 complex RoPE branches between {start_boundary} and {end_boundary}, "
-                f"found {len(matches)}."
-            )
-            continue
-
-        # Assume the first matched branch is query (q), second is key (k).
-        # This assumption is based on the default ordering in the exported graph,
-        # since node naming conventions don't reliably indicate q/k branches.
-        q_match, k_match = matches
-        _process_complex_rope(graph, q_match, k_match)
-
-    gm = canonicalize_graph(gm)
-    return gm
-
-
-def _get_default_unsqueeze_dim(op):
-    schema = next(iter(op._schemas.values()))
-    for a in schema.arguments:
-        if a.name == "unsqueeze_dim" and a.has_default_value:
-            return a.default_value
-    raise RuntimeError(f"No default unsqueeze_dim on {op}")
+    ad_logger.info(f"Found and matched {num_matches} RoPE patterns")
+    return gm, num_matches
 
 
 def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> GraphModule:
@@ -183,24 +195,29 @@ def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> GraphMo
 
     graph = gm.graph
     rope_ops = {
-        torch.ops.rope.torch_apply_rope_with_explicit_cos_sin,
-        torch.ops.rope.torch_apply_rope_with_qk_interleaving,
-        torch.ops.rope.torch_apply_rope_with_complex_freqs,
+        torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin,
+        torch.ops.auto_deploy.torch_rope_with_qk_interleaving,
+        torch.ops.auto_deploy.torch_rope_with_complex_freqs,
     }
 
     need_transpose = False
-    need_canonicalize_graph = False
+    num_rope_layout_matches = 0
     for node in graph.nodes:
         if not is_op(node, rope_ops):
             continue
 
-        rope_op = next(op for op in rope_ops if is_op(node, op))
-        if is_op(node, torch.ops.rope.torch_apply_rope_with_complex_freqs):
-            q_node, k_node, freqs_node, *rest = node.args
-            unsq = rest[0] if rest else _get_default_unsqueeze_dim(rope_op)
+        if is_op(node, torch.ops.auto_deploy.torch_rope_with_complex_freqs):
+            q_node, k_node, freqs_node, unsq = extract_op_args(
+                node,
+                "xq",  # argument name in schema
+                "xk",
+                "freqs_cis",
+                "unsqueeze_dim",
+            )
         else:
-            q_node, k_node, cos_node, sin_node, *rest = node.args
-            unsq = rest[0] if rest else _get_default_unsqueeze_dim(rope_op)
+            q_node, k_node, cos_node, sin_node, unsq = extract_op_args(
+                node, "q", "k", "cos", "sin", "unsqueeze_dim"
+            )
 
         if unsq == 2:
             current_layout = "bsnd"
@@ -218,7 +235,7 @@ def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> GraphMo
         if not need_transpose:
             continue
 
-        need_canonicalize_graph = True
+        num_rope_layout_matches += 1
         # retrieve q and k output node from node
         q_rope_old, k_rope_old = extract_output_tuple(node, 2)
         if q_rope_old is None or k_rope_old is None:
@@ -240,7 +257,7 @@ def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> GraphMo
         q_for_op_contig.meta["val"] = q_node.meta["val"].transpose(1, 2)
         k_for_op_contig.meta["val"] = k_node.meta["val"].transpose(1, 2)
 
-        if is_op(node, torch.ops.rope.torch_apply_rope_with_complex_freqs):
+        if is_op(node, torch.ops.auto_deploy.torch_rope_with_complex_freqs):
             new_args = (
                 q_for_op_contig,
                 k_for_op_contig,
@@ -273,8 +290,9 @@ def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> GraphMo
         q_rope_new.args = (q_rope_old, 1, 2)
         k_rope_new.args = (k_rope_old, 1, 2)
 
-    if need_canonicalize_graph:
+    if num_rope_layout_matches:
         gm = canonicalize_graph(gm)
+    ad_logger.info(f"Found {num_rope_layout_matches} RoPE layout matches")
     return gm
 
 
@@ -285,18 +303,22 @@ def optimize_rope(gm: GraphModule) -> GraphModule:
     Precomputes positional IDs and the fused cosine-sine cache as explicit nodes,
     and reuses those nodes when possible.
     """
-    ad_logger.info("RoPE optimization")
     graph = gm.graph
     rope_flash_cache: DefaultDict[Any, Optional[Node]] = defaultdict(lambda: None)
     rope_position_ids_cache: Dict[str, Node] = {}
 
+    num_rope_optimizations = 0
     for node in list(graph.nodes):
-        if is_op(node, torch.ops.rope.torch_apply_rope_with_explicit_cos_sin):
+        if is_op(node, torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin):
             _optimize_explicit(graph, node, rope_flash_cache, rope_position_ids_cache)
-        elif is_op(node, torch.ops.rope.torch_apply_rope_with_complex_freqs):
+        elif is_op(node, torch.ops.auto_deploy.torch_rope_with_complex_freqs):
             _optimize_complex(graph, node, rope_flash_cache, rope_position_ids_cache)
-
-    gm = canonicalize_graph(gm)
+        else:
+            continue
+        num_rope_optimizations += 1
+    if num_rope_optimizations:
+        gm = canonicalize_graph(gm)
+    ad_logger.info(f"Found {num_rope_optimizations} RoPE optimizations")
     return gm
 
 
@@ -376,7 +398,7 @@ def _optimize_explicit(
             rope_position_ids_cache=pos_cache,
         )
         flash_node = graph.call_function(
-            torch.ops.rope.flashinfer,
+            torch.ops.auto_deploy.flashinfer_rope,
             args=(q_node, k_node, position_ids, fused_cos_sin_to, True),
         )
 
@@ -397,7 +419,13 @@ def _optimize_explicit(
 def _optimize_complex(
     graph: GraphModule, node: Node, cache: Dict[Any, Node], pos_cache: Dict[str, Node]
 ) -> None:
-    q_node, k_node, inv_freq_node = node.args
+    # q_node, k_node, inv_freq_node = node.args
+    q_node, k_node, inv_freq_node = extract_op_args(
+        node,
+        "xq",  # argument name in schema
+        "xk",
+        "freqs_cis",
+    )
 
     # Sanity check on head_dim
     if not _validate_rope_inputs(q_node, k_node):
@@ -450,7 +478,7 @@ def _optimize_complex(
             graph, q_node, batch_dim=0, seq_dim=1, rope_position_ids_cache=pos_cache
         )
         flash_node = graph.call_function(
-            torch.ops.rope.flashinfer,
+            torch.ops.auto_deploy.flashinfer_rope,
             args=(q_node, k_node, position_ids, cos_sin_flash, False),
         )
 
@@ -478,306 +506,6 @@ def _match_input_interleave_pattern(node: Node) -> Optional[Dict[str, Node]]:
     if not isinstance(raw_node, Node):
         return None
     return {"interleaved": raw_node}
-
-
-def _match_explicit_rope_subpattern(add_node: Node) -> Optional[Dict[str, Node]]:
-    """
-    Given an aten.add.Tensor node that is expected to compute:
-      output = (raw_input * unsqueeze(cos)) + (rotate_half(raw_input) * unsqueeze(sin))
-    where rotate_half is implemented as:
-      rotate_half(x) = cat([ -slice(x, second_half), slice(x, first_half) ], dim=-1)
-    this function inspects the structure of add_node and returns a dictionary with:
-       - "raw_input": the original q/k tensor,
-       - "unsqueeze_cos": the unsqueeze node feeding the raw multiplication,
-       - "unsqueeze_sin": the unsqueeze node feeding the rotated multiplication,
-       - "add_node": the addition node itself.
-    Returns None if the pattern does not match.
-    """
-    # Check that add_node is an add operation with two inputs.
-    if not is_op(add_node, torch.ops.aten.add):
-        return None
-    if not (len(add_node.args) == 2):
-        return None
-
-    mul1, mul2 = add_node.args
-    # Both inputs to the add should be multiplications.
-    if not is_op(mul1, torch.ops.aten.mul):
-        return None
-    if not is_op(mul2, torch.ops.aten.mul):
-        return None
-
-    # One branch should be the raw branch and the other the rotated branch.
-    # We decide by checking if one multiplication’s first argument is a cat (i.e. the rotate_half result).
-    if is_op(mul1.args[0], torch.ops.aten.cat):
-        mul_rot = mul1
-        mul_raw = mul2
-    elif is_op(mul2.args[0], torch.ops.aten.cat):
-        mul_rot = mul2
-        mul_raw = mul1
-    else:
-        return None
-
-    # Verify that both multiplications have an unsqueeze as their second argument.
-    unsqueeze_cos = mul_raw.args[1]
-    unsqueeze_sin = mul_rot.args[1]
-    if not is_op(unsqueeze_cos, torch.ops.aten.unsqueeze):
-        return None
-    if not is_op(unsqueeze_sin, torch.ops.aten.unsqueeze):
-        return None
-
-    # Check that the rotated branch is a cat of two tensors along -1.
-    cat_node = mul_rot.args[0]
-    if not is_op(cat_node, torch.ops.aten.cat):
-        return None
-    # Expecting two inputs in a list/tuple.
-    cat_inputs = cat_node.args[0]
-    if not (isinstance(cat_inputs, (list, tuple)) and len(cat_inputs) == 2):
-        return None
-
-    # One of the two inputs should be a negation of a slice, the other should be a slice.
-    first_item, second_item = cat_inputs
-    if not is_op(first_item, torch.ops.aten.neg):
-        return None
-    if not is_op(second_item, torch.ops.aten.slice):
-        return None
-
-    # The negation node should wrap a slice.
-    neg_node = first_item
-    if not (len(neg_node.args) >= 1 and is_op(neg_node.args[0], torch.ops.aten.slice)):
-        return None
-
-    # For simplicity, require that the two slice operations (the one inside neg and the one used directly)
-    # are applied on the same original tensor. This original tensor is the one being rotated.
-    slice_in_neg = neg_node.args[0]
-    if slice_in_neg.args[0] != second_item.args[0]:
-        return None
-
-    # Finally, the raw branch should multiply the original tensor (i.e. q or k) by unsqueeze_cos.
-    raw_input = mul_raw.args[0]
-    # We also expect that the tensor being sliced (and negated) is the same as raw_input.
-    if raw_input != slice_in_neg.args[0]:
-        return None
-
-    return {
-        "raw_input": raw_input,
-        "unsqueeze_cos": unsqueeze_cos,
-        "unsqueeze_sin": unsqueeze_sin,
-        "add_node": add_node,
-    }
-
-
-def _match_complex_rope_subpattern(type_as_node: Node) -> Optional[Dict[str, Node]]:
-    """
-    Given a type_as node, this function inspects the graph
-    structure and returns a dictionary with:
-       - "input": the original xq (or xk) tensor,
-       - "inv_freq": the freqs_cis tensor (before unsqueeze),
-       - "out": the type_as node corresponding to the branch output.
-
-    Expected branch structure for each output:
-        x_out = type_as( flatten( view_as_real( view_as_complex(reshape(to_dtype(x))) * unsqueeze(freqs_cis) ) ) )
-
-    Returns None if the structure does not match.
-    """
-    if not is_op(type_as_node, torch.ops.aten.type_as):
-        return None
-
-    # The type_as node should have at least one argument: its first argument is the flatten op.
-    if not (len(type_as_node.args) >= 1):
-        return None
-    flatten_node = type_as_node.args[0]
-    if not is_op(flatten_node, torch.ops.aten.flatten):
-        return None
-
-    # The input of the flatten op should be a view_as_real op.
-    if not (len(flatten_node.args) >= 1):
-        return None
-    view_as_real_node = flatten_node.args[0]
-    if not is_op(view_as_real_node, torch.ops.aten.view_as_real):
-        return None
-
-    # The input of view_as_real should be a multiplication.
-    if not (len(view_as_real_node.args) >= 1):
-        return None
-    mul_node = view_as_real_node.args[0]
-    if not is_op(mul_node, torch.ops.aten.mul):
-        return None
-    if len(mul_node.args) != 2:
-        return None
-
-    # In the multiplication, one operand should be an unsqueeze of freqs_cis and
-    #    the other operand is the output of view_as_complex.
-    if is_op(mul_node.args[0], torch.ops.aten.unsqueeze):
-        unsqueeze_node = mul_node.args[0]
-        vc_node = mul_node.args[1]
-    elif is_op(mul_node.args[1], torch.ops.aten.unsqueeze):
-        unsqueeze_node = mul_node.args[1]
-        vc_node = mul_node.args[0]
-    else:
-        return None
-
-    if not (len(unsqueeze_node.args) >= 2):
-        return None
-    unsqueeze_dim = unsqueeze_node.args[1]
-
-    inv_freq_candidate = unsqueeze_node.args[0]
-
-    # Match the view_as_complex branch.
-    if not is_op(vc_node, torch.ops.aten.view_as_complex):
-        return None
-    if not (len(vc_node.args) >= 1):
-        return None
-    reshape_node = vc_node.args[0]
-    if not is_op(reshape_node, torch.ops.aten.reshape):
-        return None
-
-    # The reshape op should get its input from a to(dtype) conversion.
-    if not (len(reshape_node.args) >= 1):
-        return None
-    to_node = reshape_node.args[0]
-    if not is_op(to_node, torch.ops.aten.to):
-        return None
-    if not (len(to_node.args) >= 1):
-        return None
-    input_tensor = to_node.args[0]
-
-    return {
-        "input": input_tensor,
-        "inv_freq": inv_freq_candidate,
-        "out": type_as_node,
-        "unsqueeze_dim": unsqueeze_dim,
-    }
-
-
-def _process_explicit_rope(
-    graph: GraphModule.graph,
-    q_match: Dict[str, Node],
-    k_match: Dict[str, Node],
-    start_boundary: Node,
-) -> None:
-    """
-    Replace matched Explicit RoPE subgraph with `rope::torch_apply_rope_with_explicit_cos_sin`.
-    """
-    q_node = q_match["raw_input"]
-    k_node = k_match["raw_input"]
-    cos_unsq = q_match["unsqueeze_cos"]
-    sin_unsq = q_match["unsqueeze_sin"]
-    cos_node = cos_unsq.args[0]
-    sin_node = sin_unsq.args[0]
-    unsq_dim = cos_unsq.args[1]
-    add_node = q_match["add_node"]
-
-    # Sanity-check: ensure cos/sin nodes trace back to aten.cos/aten.sin.
-    bfs(
-        cos_node,
-        lambda n: is_op(n, torch.ops.aten.cos),
-        attr_next="all_input_nodes",
-        boundary=start_boundary,
-    )
-    bfs(
-        sin_node,
-        lambda n: is_op(n, torch.ops.aten.sin),
-        attr_next="all_input_nodes",
-        boundary=start_boundary,
-    )
-
-    with graph.inserting_before(add_node):
-        rope_node = graph.call_function(
-            torch.ops.rope.torch_apply_rope_with_explicit_cos_sin,
-            args=(q_node, k_node, cos_node, sin_node, unsq_dim),
-        )
-
-    with graph.inserting_after(rope_node):
-        out_q = graph.call_function(operator.getitem, args=(rope_node, 0))
-        out_k = graph.call_function(operator.getitem, args=(rope_node, 1))
-
-    out_q.meta["val"] = add_node.meta.get("val", None)
-    out_k.meta["val"] = k_match["add_node"].meta.get("val", None)
-
-    q_match["add_node"].replace_all_uses_with(out_q)
-    k_match["add_node"].replace_all_uses_with(out_k)
-
-
-def _process_complex_rope(
-    graph: GraphModule.graph,
-    q_match: Dict[str, Node],
-    k_match: Dict[str, Node],
-) -> None:
-    """
-    Replace matched Complex RoPE subgraph with `rope::torch_apply_rope_with_complex_freqs`.
-    """
-    xq = q_match["input"]
-    xk = k_match["input"]
-    inv = q_match["inv_freq"]
-    usdim = q_match["unsqueeze_dim"]
-    out_node = q_match.get("out")
-
-    if inv != k_match["inv_freq"]:
-        ad_logger.warning(
-            "Mismatch of freqs_cis (inv_freq) between branches. Fail to match complex rope pattern"
-        )
-        return
-
-    with graph.inserting_before(out_node):
-        rope_node = graph.call_function(
-            torch.ops.rope.torch_apply_rope_with_complex_freqs,
-            args=(xq, xk, inv, usdim),
-        )
-
-    with graph.inserting_after(rope_node):
-        out_q = graph.call_function(operator.getitem, args=(rope_node, 0))
-        out_k = graph.call_function(operator.getitem, args=(rope_node, 1))
-
-    out_q.meta["val"] = out_node.meta.get("val", None)
-    out_k.meta["val"] = k_match["out"].meta.get("val", None)
-
-    out_node.replace_all_uses_with(out_q)
-    k_match["out"].replace_all_uses_with(out_k)
-
-
-def _process_input_interleave_rope(
-    graph: GraphModule,
-    q_match: Dict[str, Node],
-    k_match: Dict[str, Node],
-) -> None:
-    """
-    Replace a matched DS-style RoPE subgraph with a call to rope::torch_apply_rope_with_qk_interleaving.
-    Cache the one-time unsqueeze of cos/sin.
-    """
-    q_node = q_match["raw_input"]
-    k_node = k_match["raw_input"]
-    cos_node = q_match["unsqueeze_cos"].args[0]
-    sin_node = q_match["unsqueeze_sin"].args[0]
-    # A patch for the case when q_output appears before k_input in the graph
-    # Move q_output down right before its first user so that graph remains in
-    # topological order after inserting the apply rope custom op
-    q_match["add_node"] = _move_node_before_first_user(q_match["add_node"])
-
-    # Infer unsqueeze_dim from layout
-    unsq_dim = 1
-    fake = q_node.meta.get("val", None)
-    if fake is not None and len(fake.shape) == 4:
-        # if shape[1] symbolic, it's [B, S, N, D] => BSND -> head dim is 2
-        if isinstance(fake.shape[1], torch.SymInt):
-            unsq_dim = 2
-        else:
-            unsq_dim = 1
-
-    with graph.inserting_after(_get_last_node([q_node, k_node, cos_node, sin_node])):
-        ds_node = graph.call_function(
-            torch.ops.rope.torch_apply_rope_with_qk_interleaving,
-            args=(q_node, k_node, cos_node, sin_node, unsq_dim),
-        )
-
-    with graph.inserting_after(ds_node):
-        q_out = graph.call_function(operator.getitem, args=(ds_node, 0))
-        k_out = graph.call_function(operator.getitem, args=(ds_node, 1))
-
-    q_out.meta["val"] = q_match["add_node"].meta.get("val", None)
-    k_out.meta["val"] = k_match["add_node"].meta.get("val", None)
-
-    q_match["add_node"].replace_all_uses_with(q_out)
-    k_match["add_node"].replace_all_uses_with(k_out)
 
 
 def _move_node_before_first_user(node: Node) -> Node:

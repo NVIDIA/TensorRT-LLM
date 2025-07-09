@@ -50,14 +50,14 @@ namespace
 {
 
 // Get NCCL unique ID for a group of ranks.
-ncclUniqueId getUniqueId(std::set<int> const& group) noexcept
+ncclUniqueId getUniqueId(std::set<int> const& group)
 {
     auto const rank = COMM_SESSION.getRank();
     TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, rank);
     ncclUniqueId id;
     if (rank == *group.begin())
     {
-        NCCLCHECK(ncclGetUniqueId(&id));
+        NCCLCHECK_THROW(ncclGetUniqueId(&id));
         for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
         {
             COMM_SESSION.sendValue(id, *it, tensorrt_llm::mpi::MpiTag::kDefault);
@@ -122,7 +122,7 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
 #else
     setenv("NCCL_RUNTIME_CONNECT", "0", 0);
 #endif // _WIN32
-    NCCLCHECK(ncclCommInitRank(ncclComm.get(), group.size(), id, groupRank));
+    NCCLCHECK_THROW(ncclCommInitRank(ncclComm.get(), group.size(), id, groupRank));
     commMap[group] = ncclComm;
     TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, rank);
     return ncclComm;

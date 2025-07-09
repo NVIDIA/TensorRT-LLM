@@ -22,6 +22,7 @@ from utils.util import (skip_pre_blackwell, skip_pre_blackwell_unittest,
                         unittest_name_func)
 
 import tensorrt_llm
+import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 
 
 # Used by the (fp16 -> int4) quant layer + int4 gemm network.
@@ -110,8 +111,9 @@ class TestFunctional(unittest.TestCase):
         b_pt_batched = e2m1_and_ufp8_scale_batches(b_fp4.cpu(), b_sf.cpu(),
                                                    1 / b_global_sf, sf_vec_size)
 
-        c = (torch.ops.trtllm.fp4_bmm(a_fp4, b_fp4, a_sf, b_sf, ab_global_sf,
-                                      False).float().cpu())
+        c = (torch.ops.trtllm.fp4_bmm(
+            a_fp4, b_fp4, a_sf, b_sf, ab_global_sf,
+            fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4).float().cpu())
 
         torch.cuda.synchronize()
 
@@ -170,8 +172,8 @@ def test_fp4_sf_interleave(b, m, k):
     w_cuda = w.cuda()
 
     # The cpu and cuda kernels are different
-    w_out_cpu = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(w)
-    w_out_cuda = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(w_cuda)
+    w_out_cpu = torch.ops.trtllm.nvfp4_block_scale_interleave(w)
+    w_out_cuda = torch.ops.trtllm.nvfp4_block_scale_interleave(w_cuda)
     torch.cuda.synchronize()
 
     torch.testing.assert_allclose(w_out_cpu.cuda(), w_out_cuda)

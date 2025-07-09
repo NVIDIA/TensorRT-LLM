@@ -104,6 +104,7 @@ def gqa_attention_kv_stage1(
     output_values_ptr,  # [Batch, N_HEADS, num_blocks, D_HEAD]
     output_logsumexp_ptr,  # [Batch, N_HEADS, num_blocks]
     num_blocks,
+    SCALE: tl.constexpr,
     MAX_SEQ_LEN: tl.constexpr,  # Maximum supported sequence length
     N_HEADS: tl.constexpr,  # Number of heads
     N_KV_HEADS: tl.constexpr,  # Number of KV heads.
@@ -160,8 +161,6 @@ def gqa_attention_kv_stage1(
     v_dhead_offsets = tl.arange(0, triton.next_power_of_2(V_D_HEAD))
     v_dhead_mask = v_dhead_offsets < V_D_HEAD
 
-    sm_scale: tl.constexpr = 1.0 / (Q_D_HEAD**0.5)
-
     # Program loads the entire Q for the head assigned to it.
     # [NUM_HEADS, Q_D_HEAD]
     q_batch_offset = batch_id * N_HEADS * Q_D_HEAD
@@ -200,12 +199,13 @@ def gqa_attention_kv_stage1(
     # [NUM_HEADS, Q_D_HEAD] * [seq_block, Q_D_HEAD], sum along axis 1
     attn = tl.dot(q, k.trans())  # [N, seq_block]
     attn = attn.to(tl.float32)
-    attn *= sm_scale
-    max_attn = tl.max(attn, axis=1)  # [N, 1]
+    attn *= SCALE
     # Set to -inf attn values where mask is not set. This forces exp(attn) to 0.
     attn = tl.where(head_mask[:, None] * seq_mask[None, :], attn, float("-inf"))
-    exp_attn = tl.exp(attn - max_attn[:, None])
+    # compute max_attn only when invalid attn values are masked out.
+    max_attn = tl.max(attn, axis=1)  # [N, 1]
 
+    exp_attn = tl.exp(attn - max_attn[:, None])
     sumexp = tl.sum(exp_attn, axis=1)  # [N, 1]
 
     # [NUM_HEADS, seq_len] * [seq_len, V_D_HEAD], sum along axis 0
@@ -415,7 +415,7 @@ def context_attention_kv(
     v_cache_ptr,  # [bsnd]
     seq_len,
     o_ptr,
-    softmax_scale,
+    SCALE: tl.constexpr,
     N_HEADS: tl.constexpr,  # Number of heads
     N_KV_HEADS: tl.constexpr,  # Number of KV heads.
     Q_D_HEAD: tl.constexpr,  # Dimension of each query head.
@@ -484,7 +484,7 @@ def context_attention_kv(
         qk += tl.dot(q, k.trans())
         # causal mask
         qk = tl.where(seq_offsets[:, None] >= kv_seq_offsets[None, :], qk, float("-inf"))
-        qk *= softmax_scale
+        qk *= SCALE
         # rowmax
         m_ij = tl.maximum(tl.max(qk, 1), lse_i)
         p = tl.exp(qk - m_ij[:, None])  # [S,S]
@@ -566,7 +566,7 @@ def context_attention_kv_flattened(
     input_pos_ptr,  # [b] # specifies the location in the sequence where kv must be written back.
     cache_loc_ptr,  # [b] # location of the sequence in the cache.
     o_ptr,
-    softmax_scale: tl.constexpr,
+    SCALE: tl.constexpr,
     N_HEADS: tl.constexpr,  # Number of heads
     N_KV_HEADS: tl.constexpr,  # Number of KV heads.
     Q_D_HEAD: tl.constexpr,  # Dimension of each query head.
@@ -640,7 +640,7 @@ def context_attention_kv_flattened(
         qk = tl.where(
             (seq_offsets[:, None] + kv_position) >= kv_seq_offsets[None, :], qk, float("-inf")
         )
-        qk *= softmax_scale
+        qk *= SCALE
         # rowmax
         m_ij = tl.maximum(tl.max(qk, 1), lse_i)
         p = tl.exp(qk - m_ij[:, None])

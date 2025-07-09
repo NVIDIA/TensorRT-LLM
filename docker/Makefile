@@ -1,15 +1,22 @@
 # Default base image for the docker build as defined in Dockerfile.multi
-BASE_IMAGE         ?= $(shell grep 'ARG BASE_IMAGE=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
-BASE_TAG           ?= $(shell grep 'ARG BASE_TAG=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
+BASE_IMAGE         ?= $(shell grep '^ARG BASE_IMAGE=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
+BASE_TAG           ?= $(shell grep '^ARG BASE_TAG=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
 # Name of the new image
 IMAGE_NAME         ?= tensorrt_llm
 IMAGE_TAG          ?= latest
+
+# Used to share .cache when LOCAL_USER=1. Possibility of override is
+# helpful, e.g., for use with Docker rootless mode.
+HOME_DIR           ?= $(HOME)
 
 # Local user information
 USER_ID            ?= $(shell id --user)
 USER_NAME          ?= $(shell id --user --name)
 GROUP_ID           ?= $(shell id --group)
 GROUP_NAME         ?= $(shell id --group --name)
+
+# Try to detect Docker rootless mode
+IS_ROOTLESS        ?= $(shell ./detect_rootless.sh)
 
 # Set this to 1 to add the current user to the docker image and run the container with the user
 LOCAL_USER         ?= 0
@@ -31,7 +38,7 @@ DOCKER_PROGRESS    ?= auto
 PLATFORM           ?= $(shell uname -m | grep -q 'aarch64' && echo "arm64" || echo "amd64")
 CUDA_ARCHS         ?= $(if $(filter arm64,$(PLATFORM)),'90-real;100-real;120-real',)
 BUILD_WHEEL_OPTS   ?=
-BUILD_WHEEL_ARGS   ?= $(shell grep 'ARG BUILD_WHEEL_ARGS=' Dockerfile.multi | grep -o '=.*' | tr -d '="')$(if $(CUDA_ARCHS), --cuda_architectures $(CUDA_ARCHS))$(if $(BUILD_WHEEL_OPTS), $(BUILD_WHEEL_OPTS))
+BUILD_WHEEL_ARGS   ?= $(shell grep '^ARG BUILD_WHEEL_ARGS=' Dockerfile.multi | grep -o '=.*' | tr -d '="')$(if $(CUDA_ARCHS), --cuda_architectures $(CUDA_ARCHS))$(if $(BUILD_WHEEL_OPTS), $(BUILD_WHEEL_OPTS))
 TORCH_INSTALL_TYPE ?= skip
 CUDA_VERSION       ?=
 CUDNN_VERSION      ?=
@@ -45,6 +52,7 @@ PYTHON_VERSION     ?=
 NGC_STAGING_REPO   ?= nvcr.io/nvstaging/tensorrt-llm
 NGC_REPO           ?= nvcr.io/nvidia/tensorrt-llm
 NGC_USE_STAGING    ?= 0
+NGC_AUTO_REPO      ?= $(if $(filter 1,$(NGC_USE_STAGING)),$(NGC_STAGING_REPO),$(NGC_REPO))
 
 define add_local_user
 	docker build \
@@ -64,7 +72,7 @@ define rewrite_tag
 $(shell echo $(IMAGE_WITH_TAG) | sed "s/\/tensorrt-llm:/\/tensorrt-llm-staging:/g")
 endef
 
-%_build: DEVEL_IMAGE = $(if $(findstring 1,$(JENKINS_DEVEL)),$(shell grep 'LLM_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"'))
+%_build: DEVEL_IMAGE = $(if $(findstring 1,$(JENKINS_DEVEL)),$(shell . ../jenkins/current_image_tags.properties && echo $$LLM_DOCKER_IMAGE))
 %_build:
 	@echo "Building docker image: $(IMAGE_WITH_TAG)"
 	docker buildx build $(DOCKER_BUILD_OPTS) $(DOCKER_BUILD_ARGS) \
@@ -107,7 +115,7 @@ endef
 	@echo "Pulling docker image: $(IMAGE_WITH_TAG)"
 	docker pull $(IMAGE_WITH_TAG)
 
-DOCKER_RUN_OPTS   ?= --rm -it --ipc=host --ulimit memlock=-1 --ulimit stack=67108864
+DOCKER_RUN_OPTS ?= --rm -it --ipc=host --ulimit stack=67108864 $(if $(filter 0,$(IS_ROOTLESS)),--ulimit memlock=-1)
 DOCKER_RUN_ARGS   ?=
 # Check if NVIDIA_VISIBLE_DEVICES is set and not empty
 NVIDIA_VISIBLE_DEVICES_VAL = $(shell echo $$NVIDIA_VISIBLE_DEVICES)
@@ -128,6 +136,9 @@ WORK_DIR          ?= $(CODE_DIR)
 DOCKER_PULL       ?= 0
 
 %_run:
+ifeq ($(IS_ROOTLESS),1)
+	@echo "Assuming Docker rootless mode."
+endif
 ifeq ($(DOCKER_PULL),1)
 	@$(MAKE) --no-print-directory $*_pull
 endif
@@ -137,6 +148,7 @@ endif
 	docker run $(DOCKER_RUN_OPTS) $(DOCKER_RUN_ARGS) \
     		$(GPU_OPTS) \
     		--volume $(SOURCE_DIR):$(CODE_DIR) \
+    		$(if $(filter 1,$(LOCAL_USER)),--volume ${HOME_DIR}/.cache:/home/${USER_NAME}/.cache:rw) \
     		--env "CCACHE_DIR=${CCACHE_DIR}" \
     		--env "CCACHE_BASEDIR=${CODE_DIR}" \
     	    --env "CONAN_HOME=${CONAN_DIR}" \
@@ -159,25 +171,25 @@ release_%: STAGE = release
 release_run: WORK_DIR = /app/tensorrt_llm
 
 # For x86_64
-jenkins_%: IMAGE_WITH_TAG = $(shell grep 'LLM_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
-jenkins_%: STAGE = devel
+jenkins_%: IMAGE_WITH_TAG = $(shell . ../jenkins/current_image_tags.properties && echo $$LLM_DOCKER_IMAGE)
+jenkins_%: STAGE = tritondevel
 
 # For aarch64
-jenkins-aarch64_%: IMAGE_WITH_TAG = $(shell grep 'LLM_SBSA_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
-jenkins-aarch64_%: STAGE = devel
+jenkins-aarch64_%: IMAGE_WITH_TAG = $(shell . ../jenkins/current_image_tags.properties && echo $$LLM_SBSA_DOCKER_IMAGE)
+jenkins-aarch64_%: STAGE = tritondevel
 
 # For x86_64
-jenkins-rockylinux8_%: IMAGE_WITH_TAG = $(shell grep 'LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
-jenkins-rockylinux8_%: STAGE = devel
+jenkins-rockylinux8_%: IMAGE_WITH_TAG = $(shell . ../jenkins/current_image_tags.properties && echo $$LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE)
+jenkins-rockylinux8_%: STAGE = tritondevel
 jenkins-rockylinux8_%: BASE_IMAGE = nvidia/cuda
 jenkins-rockylinux8_%: BASE_TAG = 12.9.0-devel-rockylinux8
 
-rockylinux8_%: STAGE = devel
+rockylinux8_%: STAGE = tritondevel
 rockylinux8_%: BASE_IMAGE = nvidia/cuda
 rockylinux8_%: BASE_TAG = 12.9.0-devel-rockylinux8
 
 # For x86_64 and aarch64
-ubuntu22_%: STAGE = devel
+ubuntu22_%: STAGE = tritondevel
 ubuntu22_%: BASE_IMAGE = nvidia/cuda
 ubuntu22_%: BASE_TAG = 12.9.0-devel-ubuntu22.04
 
@@ -185,11 +197,11 @@ trtllm_%: STAGE = release
 trtllm_%: PUSH_TO_STAGING := 0
 trtllm_%: DEVEL_IMAGE = $(shell \
     if [ "$(PLATFORM)" = "amd64" ]; then \
-        grep 'LLM_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"'; \
+        . ../jenkins/current_image_tags.properties && echo $$LLM_DOCKER_IMAGE; \
     elif [ "$(PLATFORM)" = "arm64" ]; then \
-        grep 'LLM_SBSA_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"'; \
+        . ../jenkins/current_image_tags.properties && echo $$LLM_SBSA_DOCKER_IMAGE; \
     fi)
-trtllm_%: IMAGE_NAME = $(shell grep 'IMAGE_NAME = ' ../jenkins/BuildDockerImage.groovy | grep -o '".*"' | tr -d '"')
+trtllm_%: IMAGE_NAME = $(shell . ../jenkins/current_image_tags.properties && echo $$IMAGE_NAME)
 trtllm_%: IMAGE_TAG = $(shell git rev-parse --abbrev-ref HEAD | tr '/' '_')-$(PLATFORM)
 trtllm_run: WORK_DIR = /app/tensorrt_llm
 
@@ -202,7 +214,8 @@ ngc-devel_%: IMAGE_TAG = $(TRT_LLM_VERSION)
 ngc-devel_push: DOCKER_BUILD_ARGS = --push
 ngc-devel_push: ngc-devel_build ;
 
-ngc-devel_run: IMAGE_NAME = $(if $(filter 1,$(NGC_USE_STAGING)),$(NGC_STAGING_REPO),$(NGC_REPO))
+ngc-devel_run:  IMAGE_NAME = $(NGC_AUTO_REPO)
+ngc-devel_pull: IMAGE_NAME = $(NGC_AUTO_REPO)
 
 ngc-release_%: STAGE = release
 ngc-release_%: DOCKER_BUILD_OPTS = --pull --load --platform linux/$(PLATFORM)
@@ -210,8 +223,11 @@ ngc-release_%: DEVEL_IMAGE = $(NGC_STAGING_REPO)/devel:$(TRT_LLM_VERSION)
 ngc-release_%: IMAGE_NAME = $(NGC_STAGING_REPO)
 ngc-release_%: IMAGE_TAG = $(TRT_LLM_VERSION)-$(PLATFORM)
 
-ngc-release_run: IMAGE_NAME = $(if $(filter 1,$(NGC_USE_STAGING)),$(NGC_STAGING_REPO),$(NGC_REPO))
-ngc-release_run: WORK_DIR = /app/tensorrt_llm
+ngc-release_run:  WORK_DIR = /app/tensorrt_llm
+ngc-release_run:  IMAGE_NAME = $(NGC_AUTO_REPO)
+ngc-release_run:  IMAGE_TAG = $(TRT_LLM_VERSION)
+ngc-release_pull: IMAGE_NAME = $(NGC_AUTO_REPO)
+ngc-release_pull: IMAGE_TAG = $(TRT_LLM_VERSION)
 
 ngc-manifest_%: STAGE = release
 ngc-manifest_%: IMAGE_NAME = $(NGC_STAGING_REPO)
