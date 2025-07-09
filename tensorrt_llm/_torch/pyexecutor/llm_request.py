@@ -276,8 +276,17 @@ def create_response(
         return None
     else:
         return LlmResponse(request_id=request.py_request_id,
-                           result=LlmResult(result, request.py_result),
+                           result=LlmResult(result, request.py_result,
+                                            result.is_final),
                            client_id=request.py_client_id)
+
+
+def finish_by(request: Union[
+    'LlmRequest', tensorrt_llm.bindings.internal.batch_manager.LlmRequest],
+              reason: FinishReason, beam: int) -> None:
+    """CPP finish by reason does not support beam_width > 1"""
+    request.state = LlmRequestState.GENERATION_COMPLETE
+    request.set_finished_reason(reason, beam)
 
 
 class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
@@ -298,6 +307,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             stop_words_list: list[list[int]] | None = None,
             is_draft: bool = False,
             **kwargs):
+
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
                                                     None)
         # Multimodal data
@@ -377,8 +387,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         child_request.is_cuda_graph_dummy = self.is_cuda_graph_dummy
         child_request.is_dummy = self.is_dummy
 
-        # Override create_response to return the child request
+        # Mimic the behavior of the original LlmRequest.
         child_request.create_response = partial(create_response, child_request)
+        child_request.finish_by = partial(finish_by, child_request)
 
         return child_request
 
@@ -394,8 +405,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
     def finish_by(self, reason: FinishReason, beam: int) -> None:
         """CPP finish by reason does not support beam_width > 1"""
-        self.state = LlmRequestState.GENERATION_COMPLETE
-        self.set_finished_reason(reason, beam)
+        finish_by(self, reason, beam)
 
 
 def convert_wordlist(word_list) -> List[List[int]]:
