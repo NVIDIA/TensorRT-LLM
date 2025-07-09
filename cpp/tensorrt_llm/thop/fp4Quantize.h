@@ -25,4 +25,8 @@ namespace torch_ext
 {
 std::tuple<torch::Tensor, torch::Tensor> fp4_quantize(torch::Tensor const& self, torch::Tensor const& globalScale,
     int64_t sfVecSize, bool sfUseUE8M0, bool isSfSwizzledLayout);
-}
+
+torch::Tensor fp4_dequantize(torch::Tensor const& fp4Tensor, torch::Tensor const& scaleFactors,
+    torch::Tensor const& globalScale, int64_t sfVecSize, bool sfUseUE8M0, bool isSfSwizzledLayout,
+    std::string const& outputDataType);
+} // namespace torch_ext

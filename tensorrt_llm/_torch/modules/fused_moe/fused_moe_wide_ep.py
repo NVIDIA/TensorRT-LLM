@@ -621,6 +621,7 @@ class WideEPMoE(MoE):
                     self.dummy_allreduce()
                 final_hidden_states = self.alltoall_combine(
                     final_hidden_states, alltoall_info, token_count)
+
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
                 if num_recv_token_is_zero:
                     final_hidden_states = final_hidden_states[:0]
