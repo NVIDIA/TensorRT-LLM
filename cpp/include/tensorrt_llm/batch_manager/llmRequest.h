@@ -1027,35 +1027,26 @@ public:
 
         auto const promptLen = getPromptLen();
         TLLM_CHECK(prepopulatedPromptLen < promptLen);
-        mPrepopulatedPromptLen = prepopulatedPromptLen;
 
-        if (prepopulatedPromptLen > 0)
+        auto newPrepopulatedPromptLen = prepopulatedPromptLen;
+        auto oldPrepopulatedPromptLen = mPrepopulatedPromptLen;
+
+        mPrepopulatedPromptLen = newPrepopulatedPromptLen;
+
+        // Adjust chunk size to ensure that prepopulatedPromptLen + chunkSize stay constant.
+        //
+        // Chunk size stored in GenericLlmRequest is the chunk size adjusted for prepopulated prompt len, NOT the original chunk size without KV cache reuse.
+        // We cannot simply call chunkSize -= prepopulatedPromptLen, because setPrepopulatedPromptLen may get called multiple times for each individual window_size.
+        auto chunkSizeWithoutReuse = oldPrepopulatedPromptLen + getContextChunkSize();
+        auto newChunkSize = chunkSizeWithoutReuse - newPrepopulatedPromptLen;
+        setContextChunkSize(newChunkSize);
+        setContextCurrentPosition(newPrepopulatedPromptLen);
+
+        if (!isLastContextChunk())
         {
-            // Currently, the runtime process is to apply for cache first and then determine prepopulation.
-            // Use the prepopulated length to advance the context position and decrease chunk size if necessary.
-            auto chunkSize = getContextChunkSize();
-            // minwei
-            /*
-            if (prepopulatedPromptLen + chunkSize < promptLen)
-            {
-                // make sure to end at block boundary after current chunk
-                auto const flooredEndPosition
-                    = (prepopulatedPromptLen + chunkSize) / kvTokensPerBlock * kvTokensPerBlock;
-                chunkSize = flooredEndPosition - prepopulatedPromptLen;
-                TLLM_CHECK(chunkSize <= getContextChunkSize());
-            }
-            */
-            TLLM_CHECK_WITH_INFO(chunkSize >= prepopulatedPromptLen, "minwei chunkSize < prepopulatedPromptLen");
-            chunkSize -= prepopulatedPromptLen;
-            setContextCurrentPosition(prepopulatedPromptLen);
-            setContextChunkSize(chunkSize);
-
-            if (!isLastContextChunk())
-            {
-                TLLM_CHECK_WITH_INFO((getContextCurrentPosition() + getContextChunkSize()) % kvTokensPerBlock == 0,
-                    "To prevent cache fragmentation, the context position after current chunk should be divisible "
-                    "by the number of tokens per block, except for the last chunk.");
-            }
+            TLLM_CHECK_WITH_INFO((getContextCurrentPosition() + getContextChunkSize()) % kvTokensPerBlock == 0,
+                "To prevent cache fragmentation, the context position after current chunk should be divisible "
+                "by the number of tokens per block, except for the last chunk.");
         }
     }
 
