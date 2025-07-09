@@ -69,7 +69,7 @@ def test_fp8_block_scale_gemm(dtype, m, k, n):
 )
 @pytest.mark.parametrize(
     "m",
-    [7, 128, 4096],
+    [7, 64, 128],
 )
 @pytest.mark.parametrize(
     "num_groups",
