@@ -152,7 +152,7 @@ def get_spec_worker(spec_config, mapping):
     return None
 
 
-def get_draft_model_prompt(spec_dec_mode: SpeculativeDecodingMode,
+def get_draft_model_prompt(spec_dec_mode,
                            input_tokens: torch.Tensor) -> torch.Tensor:
     """
     Can be used to modify prompts for speculative algorithms that need to update tokens

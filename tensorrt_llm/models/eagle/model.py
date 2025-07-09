@@ -1228,7 +1228,7 @@ class EagleForCausalLM(LLaMAForCausalLM):
             quant_config: Optional[QuantConfig] = None,
             **kwargs):
         assert hf_model_or_dir is not None
-        speculative_model_dir = kwargs.get('speculative_model', None)
+        speculative_model_dir = kwargs.get('speculative_model_dir', None)
         tllm_config = EagleConfig.from_hugging_face(hf_model_or_dir,
                                                     dtype=dtype,
                                                     mapping=mapping,

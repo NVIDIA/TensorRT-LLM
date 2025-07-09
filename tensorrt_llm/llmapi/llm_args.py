@@ -223,7 +223,7 @@ class _ModelFormatKind(Enum):
 
 class DecodingBaseConfig(BaseModel):
     max_draft_len: Optional[int] = None
-    speculative_model: Optional[Union[str, Path]] = None
+    speculative_model_dir: Optional[Union[str, Path]] = None
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -302,7 +302,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
     decoding_type: ClassVar[str] = "Eagle"
 
     def validate(self) -> None:
-        if self.speculative_model is None:
+        if self.speculative_model_dir is None:
             raise ValueError("Draft model must be provided for EAGLE")
 
     @functools.cached_property
@@ -1104,7 +1104,7 @@ class BaseLlmArgs(BaseModel):
         return self._model_format
 
     @property
-    def speculative_model(self) -> Optional[_ModelFormatKind]:
+    def speculative_model_dir(self) -> Optional[_ModelFormatKind]:
         return self._speculative_model
 
     @property
@@ -1482,7 +1482,7 @@ class BaseLlmArgs(BaseModel):
             self.decoding_config = None
 
         self._speculative_model = getattr(self.speculative_config,
-                                          "speculative_model", None)
+                                          "speculative_model_dir", None)
         speculative_model_obj = _ModelWrapper(
             self._speculative_model
         ) if self._speculative_model is not None else None

@@ -1119,7 +1119,7 @@ def test_llm_api_medusa():
 
     speculative_config = MedusaDecodingConfig(num_medusa_heads=4,
             max_draft_len=63,
-            speculative_model=get_model_path("medusa-vicuna-7b-v1.3"),
+            speculative_model_dir=get_model_path("medusa-vicuna-7b-v1.3"),
             medusa_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
                                             [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], \
                                             [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], \
@@ -1158,7 +1158,7 @@ def test_llm_api_medusa_tp2():
 
     speculative_config = MedusaDecodingConfig(num_medusa_heads=4,
             max_draft_len=63,
-              speculative_model=get_model_path("medusa-vicuna-7b-v1.3"),
+              speculative_model_dir=get_model_path("medusa-vicuna-7b-v1.3"),
                             medusa_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
                                             [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], \
                                             [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], \
@@ -1196,7 +1196,7 @@ def test_llm_api_eagle(**llm_kwargs):
 
     speculative_config = EagleDecodingConfig(
         max_draft_len=63,
-        speculative_model=get_model_path("EAGLE-Vicuna-7B-v1.3"),
+        speculative_model_dir=get_model_path("EAGLE-Vicuna-7B-v1.3"),
         num_eagle_layers=4,
         max_non_leaves_per_layer=10,
                             eagle_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
@@ -1243,7 +1243,7 @@ def test_llm_api_eagle2(**llm_kwargs):
 
     speculative_config = EagleDecodingConfig(
         max_draft_len=63,
-        speculative_model=get_model_path("EAGLE-Vicuna-7B-v1.3"),
+        speculative_model_dir=get_model_path("EAGLE-Vicuna-7B-v1.3"),
         num_eagle_layers=4,
         max_non_leaves_per_layer=10,
         use_dynamic_tree=True,
