@@ -519,7 +519,7 @@ pipeline {
             steps {
                 script {
                     collectResultPodSpec = createKubernetesPodConfig("agent")
-                    trtllm_utils.launchKubernetesPod(this, collectResultPodSpec, "alpine", {
+                    trtllm_utils.launchKubernetesPod(this, collectResultPodSpec, "python3", {
                         // Install wget
                         trtllm_utils.llmExecStepWithRetry(this, script: "apt-get update && apt-get -y install wget")
 
