@@ -3,11 +3,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Union
 
 import torch
-from pydantic import Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 
 from ...llmapi.llm_args import BaseLlmArgs, BuildConfig, _ParallelConfig
 from ...llmapi.utils import get_type_repr
 from .models import ModelFactory, ModelFactoryRegistry
+
+PathLike = Union[str, Path]
 
 
 def _try_decode_dict_with_str_values(value: Dict[str, Any]) -> Dict[str, Any]:
@@ -21,15 +23,21 @@ def _try_decode_dict_with_str_values(value: Dict[str, Any]) -> Dict[str, Any]:
     return value
 
 
-class LlmArgs(BaseLlmArgs):
-    """LLM arguments specifically for AutoDeploy backend.
+class AutoDeployConfig(BaseModel):
+    """An argument class stripped down to AutoDeploy-specific configurations.
 
-    This class extends BaseLlmArgs with AutoDeploy-specific configuration options.
-    AutoDeploy provides automatic deployment and optimization of language models
-    with various attention backends and optimization strategies.
+    This class be used as a drop-in replacement to simplify configuring the AutoDeploy backend and
+    should be used in place of LlmArgs unless more advanced features are needed.
+
+    It is compatible with AutoDeploy's LLM API (``tensorrt_llm._torch.auto_deploy.llm.LLM``) and
+    exposes the full set of parameters used in AutoDeploy's ``InferenceOptimizer``.
     """
 
     ### MODEL AND TOKENIZER FACTORY ################################################################
+    model: PathLike = Field(
+        description="The path to the model checkpoint or the model name from the Hugging Face Hub."
+    )
+
     model_factory: Literal["AutoModelForCausalLM", "AutoModelForImageTextToText"] = Field(
         default="AutoModelForCausalLM",
         description="The model factory to use for loading the model.",
@@ -56,7 +64,7 @@ class LlmArgs(BaseLlmArgs):
         "Defaults to the same device as the rest of the pipeline.",
     )
 
-    tokenizer: Optional[Union[str, Path]] = Field(
+    tokenizer: Optional[PathLike] = Field(
         description="The tokenizer",
         default=None,
         repr=False,
@@ -68,6 +76,10 @@ class LlmArgs(BaseLlmArgs):
         "model_kwargs. For example, the default HF Llama tokenizer can be initialized with the "
         "arguments specified here: "
         "https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/tokenization_llama_fast.py#L127.",
+    )
+
+    skip_tokenizer_init: bool = Field(
+        default=False, description="Whether to skip the tokenizer initialization."
     )
 
     ### RUNTIME FEATURES ###########################################################################
@@ -139,6 +151,8 @@ class LlmArgs(BaseLlmArgs):
     visualize: bool = Field(default=False, description="Whether to visualize the model graph.")
 
     ### SEQUENCE INTERFACE CONFIG ##################################################################
+    max_input_len: int = Field(default=1024, description="The maximum input length.")
+    max_num_tokens: Optional[int] = Field(default=None, description="The maximum number of tokens.")
     max_seq_len: int = Field(default=512, ge=1, description="The maximum sequence length.")
     max_batch_size: int = Field(default=8, ge=1, description="The maximum batch size.")
     attn_page_size: int = Field(
@@ -149,7 +163,58 @@ class LlmArgs(BaseLlmArgs):
         "properly passed through.",
     )
 
-    ### !!! DO NOT USE !!! #########################################################################
+    ### VALIDATION #################################################################################
+    @field_validator("model_kwargs", "tokenizer_kwargs", mode="after")
+    @classmethod
+    def validate_model_kwargs(cls, value: Dict[str, Any]) -> Dict[str, Any]:
+        """Try to parse string values as JSON to convert to native types if possible."""
+        return _try_decode_dict_with_str_values(value)
+
+    @model_validator(mode="after")
+    def update_attn_page_size(self):
+        # NOTE force attn_page_size to equal max_seq_len for triton backend
+        if self.attn_backend == "triton":
+            self.attn_page_size = self.max_seq_len
+        return self
+
+    ### UTILITY METHODS ############################################################################
+    def create_factory(self) -> ModelFactory:
+        """Create a model factory from the arguments."""
+
+        return ModelFactoryRegistry.get(self.model_factory)(
+            model=self.model,
+            model_kwargs=self.model_kwargs,
+            tokenizer=self.tokenizer,
+            tokenizer_kwargs=self.tokenizer_kwargs,
+            skip_loading_weights=self.skip_loading_weights,
+            max_seq_len=self.max_seq_len,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert the arguments to a dictionary."""
+        return self.model_dump()
+
+    def to_llm_args(self) -> "LlmArgs":
+        """Convert the arguments to a LlmArgs instance that is used for the LLM API."""
+        return LlmArgs(**self.to_dict())
+
+
+class LlmArgs(AutoDeployConfig, BaseLlmArgs):
+    """LlmArgs config class for providing full expert configurability of the AutoDeploy backend.
+
+    Specifically, this class extends AutoDeployConfig with all the fields from BaseLlmArgs for
+    providing configurability beyond what is provided by AutoDeployConfig.
+
+    Just like AutoDeployConfig, this class is compatible with AutoDeploy's LLM API
+    (``tensorrt_llm._torch.auto_deploy.llm.LLM``) but provides greater configurability.
+
+    NOTE: this class should only be used directly for advanced use cases. For most use cases,
+    AutoDeployConfig should be used instead.
+
+    NOTE: this class may expose redundant fields from BaseLlmArgs or fields that are ignored or
+    have overlapping functionality with AutoDeployConfig. Please be careful when using this class.
+    """
+
     build_config: Optional[object] = Field(
         default_factory=lambda: BuildConfig(),
         description="!!! DO NOT USE !!! Internal only; needed for BaseLlmArgs compatibility.",
@@ -174,15 +239,28 @@ class LlmArgs(BaseLlmArgs):
     @field_validator("build_config", mode="before")
     @classmethod
     def ensure_no_build_config(cls, value: Any) -> Any:
-        if value is not None:
-            raise ValueError("build_config is not used")
-        return value
+        raise ValueError("build_config is not in use by AutoDeploy's LlmArgs")
 
-    @field_validator("model_kwargs", "tokenizer_kwargs", mode="after")
+    @field_validator(
+        "tensor_parallel_size",
+        "pipeline_parallel_size",
+        "context_parallel_size",
+        "moe_cluster_parallel_size",
+        "moe_tensor_parallel_size",
+        "moe_expert_parallel_size",
+        "enable_attention_dp",
+        "cp_config",
+        mode="before",
+    )
     @classmethod
-    def validate_model_kwargs(cls, value: Dict[str, Any]) -> Dict[str, Any]:
-        """Try to parse string values as JSON to convert to native types if possible."""
-        return _try_decode_dict_with_str_values(value)
+    def ensure_no_custom_parallel_config(cls, value: Any, info: ValidationInfo) -> Any:
+        field_name = info.field_name
+        assert field_name is not None, "field_name should be set for validated field."
+        if value != cls.model_fields[field_name].get_default(call_default_factory=True):
+            raise ValueError(
+                "AutoDeploy only supports parallelization via the `world_size` argument."
+            )
+        return value
 
     @model_validator(mode="after")
     def validate_parallel_config(self):
@@ -192,7 +270,6 @@ class LlmArgs(BaseLlmArgs):
         rank to automatically shard the model. This is just to ensure that other objects in the
         runtime that may read parallel_config can do so.
         """
-        # setup parallel config
         self._parallel_config = _ParallelConfig(
             auto_parallel=True, gpus_per_node=self.gpus_per_node
         )
@@ -204,26 +281,7 @@ class LlmArgs(BaseLlmArgs):
         """Skip tokenizer initialization in config. We do this in the AutoDeploy LLM class."""
         return self
 
-    @model_validator(mode="after")
-    def update_attn_page_size(self):
-        # NOTE force attn_page_size to equal max_seq_len for triton backend
-        if self.attn_backend == "triton":
-            self.attn_page_size = self.max_seq_len
-        return self
-
     ### UTILITY METHODS ############################################################################
-    def create_factory(self) -> ModelFactory:
-        """Create a model factory from the arguments."""
-
-        return ModelFactoryRegistry.get(self.model_factory)(
-            model=self.model,
-            model_kwargs=self.model_kwargs,
-            tokenizer=self.tokenizer,
-            tokenizer_kwargs=self.tokenizer_kwargs,
-            skip_loading_weights=self.skip_loading_weights,
-            max_seq_len=self.max_seq_len,
-        )
-
     # TODO: Remove this after the PyTorch backend is fully migrated to LlmArgs from ExecutorConfig
     def get_pytorch_backend_config(self) -> "LlmArgs":
         """Return the LlmArgs (self) object."""

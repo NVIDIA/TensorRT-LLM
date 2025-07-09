@@ -3,12 +3,12 @@
 import gc
 
 import torch
-from torch.fx import GraphModule
+import torch.nn as nn
 
 from ..compile import compile_and_capture
 from ..custom_ops.attention_interface import AttentionRegistry
 from ..distributed import common as dist_ad
-from ..llm_args import LlmArgs
+from ..llm_args import AutoDeployConfig
 from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
 from ..utils.logger import ad_logger
@@ -38,11 +38,11 @@ from .library import (
 
 
 class InferenceOptimizer:
-    def __init__(self, factory: ModelFactory, ad_config: LlmArgs):
+    def __init__(self, factory: ModelFactory, ad_config: AutoDeployConfig):
         self.factory = factory
         self.ad_config = ad_config
 
-    def __call__(self, cm: CachedSequenceInterface) -> GraphModule:
+    def __call__(self, cm: CachedSequenceInterface) -> nn.Module:
         """Transform a model into an optimized inference model.
 
         Args:
@@ -54,7 +54,7 @@ class InferenceOptimizer:
             quantization: The quantization method to use. Defaults to None.
 
         Returns:
-            A GraphModule representing the optimized inference model.
+            A nn.Module representing the optimized inference model.
         """
         ############################################################################################
         # INITIALIZE MODEL
