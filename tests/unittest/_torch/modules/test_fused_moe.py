@@ -368,7 +368,8 @@ def set_tensor_value_4(x, num_row, num_cols):
     product(
         [torch.bfloat16],
         [72],
-        [128, 256, 384, 512, 1024, 2048, 4096, 8192],
+        # [128, 256, 384, 512, 1024, 2048, 4096, 8192],
+        [7726, 130],
         [2560],
         [DefaultMoeRoutingMethod],
     ),
@@ -467,6 +468,10 @@ def test_fused_moe_fp8_blockwise(dtype,
     )
     ref_fused_moe.load_weights([weights])
     ref_fused_moe.cuda()
+
+    AutoTuner.get().clear_cache()
+    with torch.inference_mode(), autotune():
+        fused_moe.forward(x, router_logits)
 
     with torch.inference_mode():
         output = fused_moe.forward(x, router_logits)

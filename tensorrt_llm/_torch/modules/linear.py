@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Dict, List, Optional, Union
 
+import nvtx
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -431,15 +432,10 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
 
         # output = torch.ops.trtllm.fp8_block_scaling_gemm(
         #     act_input_fp8, module.weight, act_input_sf, module.weight_scale)
-        # output = torch.ops.trtllm.cute_dsl_fp8_gemm(act_input_fp8,
-        #                                             module.weight, act_input_sf,
-        #                                             module.weight_scale)
-        # output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(act_input_fp8,
-        #                                             module.weight, act_input_sf,
-        #                                             module.weight_scale)
-        cute_dsl_fp8_gemm_func = select_cute_dsl_fp8_gemm_by_sm_version()
-        output = cute_dsl_fp8_gemm_func(act_input_fp8, module.weight,
-                                        act_input_sf, module.weight_scale)
+        with nvtx.annotate("linear_cuda_dsl", color="blue"):
+            cute_dsl_fp8_gemm_func = select_cute_dsl_fp8_gemm_by_sm_version()
+            output = cute_dsl_fp8_gemm_func(act_input_fp8, module.weight,
+                                            act_input_sf, module.weight_scale)
         if bias is not None:
             output = output + bias
         return output

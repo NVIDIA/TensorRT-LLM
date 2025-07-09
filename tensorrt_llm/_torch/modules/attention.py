@@ -2,6 +2,7 @@ import math
 import weakref
 from typing import Optional, Union, cast
 
+import nvtx
 import torch
 from torch import nn
 
@@ -1191,9 +1192,10 @@ class MLA(nn.Module):
             # torch.ops.trtllm.fp8_block_scaling_bmm_out(
             #     q_nope_fp8, self.k_b_proj_trans, q_nope_scales,
             #     self.k_b_proj_trans_scale, q_nope_out)
-            torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(
-                q_nope_fp8, self.k_b_proj_trans, q_nope_scales,
-                self.k_b_proj_trans_scale, q_nope_out)
+            with nvtx.annotate("attn_bmm_cuda_dsl_qk", color="green"):
+                torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(
+                    q_nope_fp8, self.k_b_proj_trans, q_nope_scales,
+                    self.k_b_proj_trans_scale, q_nope_out)
             q_nope_scales = None
 
             # # [num_heads, num_tokens, self.kv_lora_rank]
@@ -1255,10 +1257,12 @@ class MLA(nn.Module):
             # torch.ops.trtllm.fp8_block_scaling_bmm_out(
             #     attn_out_latent, self.v_b_proj, attn_out_latent_scales,
             #     self.v_b_proj_scale, attn_output.transpose(0, 1))
-            torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(
-                attn_out_latent, self.v_b_proj, attn_out_latent_scales,
-                self.v_b_proj_scale, attn_output.transpose(0, 1))
+            with nvtx.annotate("attn_bmm_cuda_dsl_v", color="orange"):
+                torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(
+                    attn_out_latent, self.v_b_proj, attn_out_latent_scales,
+                    self.v_b_proj_scale, attn_output.transpose(0, 1))
             attn_out_latent_scales = None
+
             # fp8_block_scaling_bmm_out(attn_out_latent, self.v_b_proj,
             #                           self.v_b_proj_scale,
             #                           attn_output.transpose(0, 1))

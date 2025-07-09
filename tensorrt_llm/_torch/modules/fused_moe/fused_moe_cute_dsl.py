@@ -1,9 +1,12 @@
 import math
 from typing import List, Optional, Union
 
+import nvtx
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
+    cute_dsl_fp8_group_gemm_blackwell
 from tensorrt_llm._utils import get_sm_version
 
 from ...model_config import ModelConfig
@@ -11,6 +14,38 @@ from ...utils import Fp4QuantizedTensor
 from .fused_moe_cutlass import CutlassFusedMoE
 from .quantization import MoEWeightLoadingMode
 from .routing import BaseMoeRoutingMethod
+
+
+def save_tensor_to_file(tensor, dir_name, filename, dtype="float"):
+    # 确保tensor在CPU上并转换为numpy数组
+    if tensor.is_cuda:
+        tensor_cpu = tensor.cpu()
+    else:
+        tensor_cpu = tensor
+    if dtype == "float":
+        numpy_array = tensor_cpu.detach().float().numpy()
+    elif dtype == "int":
+        numpy_array = tensor_cpu.detach().numpy()
+    else:
+        raise ValueError(f"Invalid dtype: {dtype}")
+
+    # 创建目录(如果不存在)
+    import os
+    os.makedirs(dir_name, exist_ok=True)
+
+    # 保存为npy格式
+    import numpy as np
+    np.save(f"{dir_name}/{filename}.npy", numpy_array)
+
+    # 同时保存一些基本信息到文本文件
+    with open(f"{dir_name}/{filename}.txt", "w") as f:
+        f.write(f"Tensor shape: {tensor.shape}\n")
+        f.write(f"Tensor dtype: {tensor.dtype}\n")
+        f.write(f"Tensor device: {tensor.device}\n")
+        f.write(f"Tensor mean: {tensor.float().mean().item()}\n")
+        f.write(f"Tensor std: {tensor.float().std().item()}\n")
+        f.write(f"Tensor min: {tensor.float().min().item()}\n")
+        f.write(f"Tensor max: {tensor.float().max().item()}\n")
 
 
 def swiglu_fused_moe(x):
@@ -28,6 +63,12 @@ def cute_dsl_fp8_group_blockwise_gemm_ref(
     m, k = a.shape[0], a.shape[1]
     l, n, k = b.shape[0], b.shape[1], b.shape[2]
     num_group, w_n, w_k = b_sf.shape[0], b_sf.shape[1], b_sf.shape[2]
+
+    # print(f"limin: a.shape = {a.shape}, a.stride = {a.stride()}")
+    # print(f"limin: b.shape = {b.shape}, b.stride = {b.stride()}")
+    # print(f"limin: a_sf.shape = {a_sf.shape}, a_sf.stride = {a_sf.stride()}")
+    # print(f"limin: b_sf.shape = {b_sf.shape}, b_sf.stride = {b_sf.stride()}")
+    # print(f"limin: offset_array.shape = {offset_array.shape}, offset_array.stride = {offset_array.stride()}")
 
     # Note: view(int8) will cause error.
     a_tmp = a.as_strided((m, k, 1), (k, 1, m * k))
@@ -181,67 +222,108 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 raise ValueError(
                     f"unsupported quantization mode for CUTEDSL backend: {self.quant_config.quant_mode}"
                 )
-
-        (
-            permuted_row_to_unpermuted_row_tensor,
-            permuted_token_selected_experts_tensor,
-            permuted_data_tensor,
-            expert_first_token_offset_tensor,
-            permuted_token_final_scales_tensor,
-            unpermuted_row_to_permuted_row_tensor,
-        ) = torch.ops.trtllm.moe_permute_op(
-            x,
-            token_selected_experts,
-            token_final_scales,
-            None,  # w3_w1_weight.view(weight_dtype),
-            None,  # w2_weight.view(weight_dtype),
-            None,  # quant_scales,
-            input_sf=x_sf,
-            num_experts_on_rank=self.expert_size_per_partition,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            ep_size=self.ep_size,
-            ep_rank=self.ep_rank,
-            cluster_size=self.cluster_size,
-            cluster_rank=self.cluster_rank,
-            min_latency_mode=False,
-            use_fp8_block_scaling=use_deepseek_fp8_block_scale,
-        )
-        act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
-            permuted_data_tensor)
-        h1 = cute_dsl_fp8_group_blockwise_gemm_ref(
-            a=act_input_fp8,
-            b=self.w3_w1_weight.view(weight_dtype),
-            a_sf=act_input_sf,
-            b_sf=self.quant_scales[0],
-            offset_array=expert_first_token_offset_tensor,
-        )
-        h2 = swiglu_fused_moe(h1)
-        act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(h2)
-        h3 = cute_dsl_fp8_group_blockwise_gemm_ref(
-            a=act_input_fp8,
-            b=self.w2_weight.view(weight_dtype),
-            a_sf=act_input_sf,
-            b_sf=self.quant_scales[1],
-            offset_array=expert_first_token_offset_tensor,
-        )
-        final_hidden_states = torch.ops.trtllm.moe_finalize_scale_op(
-            h3,
-            None,  # biases
-            token_final_scales,
-            unpermuted_row_to_permuted_row_tensor,
-            permuted_row_to_unpermuted_row_tensor,
-            token_selected_experts,
-            expert_first_token_offset_tensor,
-            False,  # enable_alltoall
-            x.shape[0],  # num_rows
-            x.shape[1],  # hidden_size
-            self.routing_method.top_k,
-            self.expert_size_per_partition,  # num_experts_per_node
-            self.tp_size,
-            self.tp_rank,
-            self.ep_size,
-            self.ep_rank,
-        )
+        # print(f"limin: x.shape = {x.shape}")
+        with nvtx.annotate(f"fused_moe_cuda_dsl, x.shape = {x.shape}",
+                           color="red"):
+            with nvtx.annotate("moe_permute_op", color="yellow"):
+                (
+                    permuted_row_to_unpermuted_row_tensor,
+                    permuted_token_selected_experts_tensor,
+                    permuted_data_tensor,
+                    expert_first_token_offset_tensor,
+                    permuted_token_final_scales_tensor,
+                    unpermuted_row_to_permuted_row_tensor,
+                ) = torch.ops.trtllm.moe_permute_op(
+                    x,
+                    token_selected_experts,
+                    token_final_scales,
+                    None,  # w3_w1_weight.view(weight_dtype),
+                    None,  # w2_weight.view(weight_dtype),
+                    None,  # quant_scales,
+                    input_sf=x_sf,
+                    num_experts_on_rank=self.expert_size_per_partition,
+                    tp_size=self.tp_size,
+                    tp_rank=self.tp_rank,
+                    ep_size=self.ep_size,
+                    ep_rank=self.ep_rank,
+                    cluster_size=self.cluster_size,
+                    cluster_rank=self.cluster_rank,
+                    min_latency_mode=False,
+                    use_fp8_block_scaling=use_deepseek_fp8_block_scale,
+                )
+            with nvtx.annotate("fp8_quantize_1x128", color="gray"):
+                act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
+                    permuted_data_tensor)
+            # h1 = cute_dsl_fp8_group_blockwise_gemm_ref(
+            #     a=act_input_fp8,
+            #     b=self.w3_w1_weight.view(weight_dtype),
+            #     a_sf=act_input_sf,
+            #     b_sf=self.quant_scales[0],
+            #     offset_array=expert_first_token_offset_tensor,
+            # )
+            with nvtx.annotate("cute_dsl_fp8_group_gemm", color="blue"):
+                # #"""
+                # if act_input_fp8.shape[0] == 46356 or act_input_fp8.shape[0] == 780:
+                #     save_tensor_to_file(act_input_fp8, "debug", "act_input_fp8")
+                #     save_tensor_to_file(act_input_sf, "debug", "act_input_sf")
+                #     save_tensor_to_file(self.w3_w1_weight.view(weight_dtype), "debug", "w3_w1_weight")
+                #     save_tensor_to_file(self.quant_scales[0], "debug", "quant_scales_0")
+                #     save_tensor_to_file(expert_first_token_offset_tensor, "debug", "expert_first_token_offset_tensor", "int")
+                #     # h1 = cute_dsl_fp8_group_gemm_blackwell(
+                #     #     input=act_input_fp8.cpu().cuda(),
+                #     #     weight=self.w3_w1_weight.view(weight_dtype).cpu().cuda(),
+                #     #     input_scale=act_input_sf.cpu().cuda(),
+                #     #     weight_scale=self.quant_scales[0].cpu().cuda(),
+                #     #     group_offset=expert_first_token_offset_tensor.cpu().cuda(),
+                #     # )
+                # # #"""
+                # # else:
+                try:
+                    h1 = cute_dsl_fp8_group_gemm_blackwell(
+                        input=act_input_fp8,
+                        weight=self.w3_w1_weight.view(weight_dtype),
+                        input_scale=act_input_sf,
+                        weight_scale=self.quant_scales[0],
+                        group_offset=expert_first_token_offset_tensor,
+                    )
+                except Exception as e:
+                    print(f"limin: error = {e}")
+                    assert False
+            with nvtx.annotate("swiglu_fused_moe", color="gray"):
+                h2 = swiglu_fused_moe(h1)
+            act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
+                h2)
+            # h3 = cute_dsl_fp8_group_blockwise_gemm_ref(
+            #     a=act_input_fp8,
+            #     b=self.w2_weight.view(weight_dtype),
+            #     a_sf=act_input_sf,
+            #     b_sf=self.quant_scales[1],
+            #     offset_array=expert_first_token_offset_tensor,
+            # )
+            h3 = cute_dsl_fp8_group_gemm_blackwell(
+                input=act_input_fp8,
+                weight=self.w2_weight.view(weight_dtype),
+                input_scale=act_input_sf,
+                weight_scale=self.quant_scales[1],
+                group_offset=expert_first_token_offset_tensor,
+            )
+            final_hidden_states = torch.ops.trtllm.moe_finalize_scale_op(
+                h3,
+                None,  # biases
+                token_final_scales,
+                unpermuted_row_to_permuted_row_tensor,
+                permuted_row_to_unpermuted_row_tensor,
+                token_selected_experts,
+                expert_first_token_offset_tensor,
+                False,  # enable_alltoall
+                x.shape[0],  # num_rows
+                x.shape[1],  # hidden_size
+                self.routing_method.top_k,
+                self.expert_size_per_partition,  # num_experts_per_node
+                self.tp_size,
+                self.tp_rank,
+                self.ep_size,
+                self.ep_rank,
+            )
 
         return final_hidden_states

@@ -196,6 +196,7 @@ class AccuracyTask:
         evaluator = self.EVALUATOR_CLS(num_samples=num_samples,
                                        **evaluator_kwargs)
         accuracy = evaluator.evaluate(llm, sampling_params, streaming)
+        print(f"limin: accuracy = {accuracy}, threshold = {threshold}")
         if self.HIGHER_IS_BETTER:
             assert accuracy >= threshold, f"Expected accuracy >= {threshold}, but got {accuracy}."
         else:

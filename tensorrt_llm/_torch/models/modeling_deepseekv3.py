@@ -30,6 +30,7 @@ import os
 import warnings
 from typing import Dict, List, Optional, Tuple
 
+import nvtx
 import torch
 import torch.nn.functional as F
 import triton
@@ -527,16 +528,18 @@ class Deepseekv3MoE(nn.Module):
                     hidden_states,
                     (0, 0, 0, max_num_token - hidden_states.shape[0]))
 
-        router_logits = self.gate(hidden_states)
+        with nvtx.annotate(f"gate", color="blue"):
+            router_logits = self.gate(hidden_states)
 
-        routed_output = self.experts(
-            hidden_states_fp4 or hidden_states,
-            router_logits,
-            do_finalize=do_finalize,
-            output_dtype=hidden_states.dtype,
-            all_rank_num_tokens=all_rank_num_tokens,
-            use_dp_padding=use_dp_padding,
-        )
+        with nvtx.annotate(f"experts", color="yellow"):
+            routed_output = self.experts(
+                hidden_states_fp4 or hidden_states,
+                router_logits,
+                do_finalize=do_finalize,
+                output_dtype=hidden_states.dtype,
+                all_rank_num_tokens=all_rank_num_tokens,
+                use_dp_padding=use_dp_padding,
+            )
 
         return routed_output
 
@@ -559,10 +562,10 @@ class Deepseekv3MoE(nn.Module):
             return shared_output
 
         def _compute_routed_output():
-            routed_output = self.compute_routed_output(hidden_states,
-                                                       hidden_states_fp4,
-                                                       all_rank_num_tokens,
-                                                       do_finalize)
+            with nvtx.annotate(f"compute_routed_output", color="gray"):
+                routed_output = self.compute_routed_output(
+                    hidden_states, hidden_states_fp4, all_rank_num_tokens,
+                    do_finalize)
             return routed_output
 
         routed_output, shared_output = maybe_execute_in_parallel(
@@ -740,27 +743,46 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
-        hidden_states = self.self_attn(
-            position_ids=position_ids,
-            hidden_states=hidden_states,
-            attn_metadata=attn_metadata,
-            all_reduce_params=AllReduceParams(
-                enable_allreduce=not (self.disable_attn_allreduce)),
-            **kwargs,
-        )
-
-        if isinstance(self.mlp, Deepseekv3MoE):
-            return self.forward_MoE(
+        with nvtx.annotate(f"attn, hidden_states.shape = {hidden_states.shape}",
+                           color="green"):
+            hidden_states = self.self_attn(
+                position_ids=position_ids,
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
-                residual=residual,
+                all_reduce_params=AllReduceParams(
+                    enable_allreduce=not (self.disable_attn_allreduce)),
+                **kwargs,
             )
+
+        if isinstance(self.mlp, Deepseekv3MoE):
+            # return self.forward_MoE(
+            #     hidden_states=hidden_states,
+            #     attn_metadata=attn_metadata,
+            #     residual=residual,
+            # )
+            with nvtx.annotate(
+                    f"MoE, hidden_states.shape = {hidden_states.shape}",
+                    color="purple"):
+                out = self.forward_MoE(
+                    hidden_states=hidden_states,
+                    attn_metadata=attn_metadata,
+                    residual=residual,
+                )
+            return out
         else:
             assert isinstance(self.mlp, GatedMLP)
-            return self.forward_mlp(
-                hidden_states=hidden_states,
-                residual=residual,
-            )
+            # return self.forward_mlp(
+            #     hidden_states=hidden_states,
+            #     residual=residual,
+            # )
+            with nvtx.annotate(
+                    f"mlp, hidden_states.shape = {hidden_states.shape}",
+                    color="purple"):
+                out = self.forward_mlp(
+                    hidden_states=hidden_states,
+                    residual=residual,
+                )
+            return out
 
     def forward_MoE(
         self,
@@ -1041,6 +1063,7 @@ class DeepseekV3Model(DecoderModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         hidden_states = inputs_embeds
+        # print(f"limin: hidden_states.shape: {hidden_states.shape}")
         residual = None
 
         for decoder_layer in self.layers[:self.num_hidden_layers]:
