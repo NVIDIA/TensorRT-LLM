@@ -686,8 +686,13 @@ CUBIN_EXPORT __global__
     constexpr uint32_t tileSize = gemm0CtaTileNbTokens;
     static_assert(!(allowSlidingWindow && useSpecDec), "Sliding window is not yet supported in spec-dec mode");
 #if SLIDING_WINDOW
+#if SPEC_DEC
+    bool const rtIsReallySliding = (cacheSeqLen - (reqInputTokEnd - reqInputTokBeg) > slidingWinSize);
+    uint32_t const nbTotalSkipTokens = rtIsReallySliding ? cacheSeqLen - slidingWinSize - (reqInputTokEnd - reqInputTokBeg) : 0;
+#else
     bool const rtIsReallySliding = (cacheSeqLen > slidingWinSize);
     uint32_t const nbTotalSkipTokens = rtIsReallySliding ? cacheSeqLen - slidingWinSize : 0;
+#endif
 #else
     constexpr bool rtIsReallySliding = false;
     constexpr uint32_t nbTotalSkipTokens = 0;
@@ -721,9 +726,9 @@ CUBIN_EXPORT __global__
         return;
     }
 #if SPEC_DEC
-    uint32_t const idxInputSubSeq = blockIdx.x;
-    uint32_t const inputSeqLen = reqInputTokEnd - reqInputTokBeg;
-    uint32_t const ctaTokOffset = inputTokensPerCta * idxInputSubSeq;
+    uint32_t const idxInputSubSeq = blockIdx.x; // 0 or 1  // 
+    uint32_t const inputSeqLen = reqInputTokEnd - reqInputTokBeg; // 5
+    uint32_t const ctaTokOffset = inputTokensPerCta * idxInputSubSeq; // 4 * 0 or 1
     uint32_t const ctaNbValidTokens = mha::min(uint32_t{inputTokensPerCta}, inputSeqLen - ctaTokOffset);
     if (ctaTokOffset >= inputSeqLen)
     {
@@ -1342,7 +1347,7 @@ CUBIN_EXPORT __global__
                 kTilePartLoader.loadPages(idxKTile);
 #if USE_INPUT_KV || ENABLE_PDL == 2
 #if SPEC_DEC
-                static_assert(SLIDING_WINDOW == 0);
+                // static_assert(SLIDING_WINDOW == 0);
                 bool const anyNewTokens = (gemm0CtaTileNbTokens * (idxKTile + 1) > cacheSeqLen - inputSeqLen);
 #else
                 bool const anyNewTokens = (gemm0CtaTileNbTokens * (idxKTile + 1) >= cacheSeqLen);
