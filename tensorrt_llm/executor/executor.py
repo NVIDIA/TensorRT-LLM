@@ -132,18 +132,21 @@ class GenerationExecutor(ABC):
         if postproc_params:
             postproc_params.postproc_args.num_prompt_tokens = len(
                 prompt_token_ids)
-        result = self.submit(
-            GenerationRequest(
-                prompt_token_ids,
-                sampling_params=sampling_params,
-                postproc_params=postproc_params,
-                query_token_ids=query_token_ids,
-                lora_request=lora_request,
-                prompt_adapter_request=prompt_adapter_request,
-                streaming=streaming,
-                kv_cache_retention_config=kv_cache_retention_config,
-                disaggregated_params=disaggregated_params,
-                multimodal_params=multimodal_params))
+        request = GenerationRequest(
+            prompt_token_ids,
+            sampling_params=sampling_params,
+            postproc_params=postproc_params,
+            query_token_ids=query_token_ids,
+            lora_request=lora_request,
+            prompt_adapter_request=prompt_adapter_request,
+            streaming=streaming,
+            kv_cache_retention_config=kv_cache_retention_config,
+            disaggregated_params=disaggregated_params,
+            multimodal_params=multimodal_params)
+        result = self.submit(request)
+        # release memory in time
+        if hasattr(request, "multimodal_params"):
+            del request.multimodal_params
         return result
 
     def generate(
