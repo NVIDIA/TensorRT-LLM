@@ -1613,6 +1613,9 @@ def test_ptp_quickstart(llm_root, llm_venv):
     pytest.param('DeepSeek-R1-Distill-Qwen-32B',
                  'DeepSeek-R1/DeepSeek-R1-Distill-Qwen-32B',
                  marks=skip_pre_blackwell),
+    pytest.param('Llama4-Maverick-17B-128E-Instruct-FP8',
+                 'llama4-models/Llama-4-Maverick-17B-128E-Instruct-FP8',
+                 marks=skip_pre_hopper),
 ])
 def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
     print(f"Testing {model_name}.")
