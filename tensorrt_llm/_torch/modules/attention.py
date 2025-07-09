@@ -67,8 +67,9 @@ class Attention(nn.Module):
         config = config or ModelConfig()
         self.hidden_size = hidden_size
         self.num_heads = num_attention_heads
-        self.head_dim = getattr(config.pretrained_config, "head_dim",
-                                self.hidden_size // self.num_heads)
+        self.head_dim = getattr(config.pretrained_config, 'head_dim', None)
+        if not isinstance(self.head_dim, int):
+            self.head_dim = self.hidden_size // self.num_heads
         self.num_key_value_heads = num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = max_position_embeddings
