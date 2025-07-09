@@ -25,7 +25,7 @@ from ...pyexecutor.scheduler import (
 )
 from ..custom_ops.attention_interface import SequenceInfo
 from ..distributed import common as dist
-from ..llm_args import LlmArgs
+from ..llm_args import AutoDeployConfig, LlmArgs
 from ..transformations.transform import InferenceOptimizer
 from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
@@ -82,8 +82,8 @@ class ADEngine(ModelEngine):
         return self.cache_seq_interface.device
 
     @classmethod
-    def build_from_config(cls, ad_config: LlmArgs):
-        """Build the ADEngine using the AD LlmArgs that gets passed through from the LLM."""
+    def build_from_config(cls, ad_config: AutoDeployConfig):
+        """Build the ADEngine using the AutoDeployConfig that gets passed through from the LLM."""
 
         max_batch_size = ad_config.max_batch_size
         max_seq_len = ad_config.max_seq_len

@@ -6,7 +6,7 @@ import torch
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, CliApp, CliImplicitFlag
 
-from tensorrt_llm._torch.auto_deploy import LLM, DemoLLM, LlmArgs
+from tensorrt_llm._torch.auto_deploy import LLM, AutoDeployConfig, DemoLLM
 from tensorrt_llm._torch.auto_deploy.llm_args import _try_decode_dict_with_str_values
 from tensorrt_llm._torch.auto_deploy.utils.benchmark import benchmark, store_benchmark_results
 from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
@@ -18,7 +18,11 @@ torch._dynamo.config.cache_size_limit = 20
 
 
 class PromptConfig(BaseModel):
-    """Prompt configuration."""
+    """Prompt configuration.
+
+    This configuration class can be used for this example script to configure the example prompts
+    and the sampling parameters.
+    """
 
     batch_size: int = Field(default=2, description="Number of queries")
     queries: Union[str, List[str]] = Field(
@@ -60,7 +64,11 @@ class PromptConfig(BaseModel):
 
 
 class BenchmarkConfig(BaseModel):
-    """Benchmark configuration."""
+    """Benchmark configuration.
+
+    This configuration class can be used for this example script to configure the simple
+    benchmarking we run at the end of the script.
+    """
 
     enabled: bool = Field(default=False, description="If true, run simple benchmark")
     num: int = Field(default=10, ge=1, description="By default run 10 times and get average")
@@ -74,7 +82,11 @@ class BenchmarkConfig(BaseModel):
 
 
 class ExperimentConfig(BaseSettings):
-    """Experiment Configuration based on Pydantic BaseModel."""
+    """Experiment Configuration for the example script.
+
+    This configuration aggregates all relevant configurations for this example script. It is also
+    used to auto-generate the CLI interface.
+    """
 
     model_config = ConfigDict(
         extra="forbid",
@@ -82,9 +94,10 @@ class ExperimentConfig(BaseSettings):
     )
 
     ### CORE ARGS ##################################################################################
-    # The main LLM arguments - contains model, tokenizer, backend configs, etc.
-    args: LlmArgs = Field(
-        description="The main LLM arguments containing model, tokenizer, backend configs, etc."
+    # The main AutoDeploy arguments - contains model, tokenizer, backend configs, etc.
+    args: AutoDeployConfig = Field(
+        description="The main AutoDeploy arguments containing model, tokenizer, backend configs, etc. "
+        "Please check `tensorrt_llm._torch.auto_deploy.llm_args.AutoDeployConfig` for more details."
     )
 
     # Optional model field for convenience - if provided, will be used to initialize args.model
@@ -122,13 +135,13 @@ class ExperimentConfig(BaseSettings):
     @field_validator("model", mode="after")
     @classmethod
     def sync_model_with_args(cls, model_value, info):
-        args: LlmArgs = info.data["args"]
+        args: AutoDeployConfig = info.data["args"]
         return args.model if args is not None else model_value
 
     @field_validator("prompt", mode="after")
     @classmethod
     def sync_prompt_batch_size_with_args_max_batch_size(cls, prompt: PromptConfig, info):
-        args: LlmArgs = info.data["args"]
+        args: AutoDeployConfig = info.data["args"]
         if args.max_batch_size < prompt.batch_size:
             args.max_batch_size = prompt.batch_size
         return prompt
@@ -136,7 +149,7 @@ class ExperimentConfig(BaseSettings):
     @field_validator("benchmark", mode="after")
     @classmethod
     def adjust_args_for_benchmark(cls, benchmark: BenchmarkConfig, info):
-        args: LlmArgs = info.data["args"]
+        args: AutoDeployConfig = info.data["args"]
         if benchmark.enabled:
             # propagate benchmark settings to args
             args.max_batch_size = max(benchmark.bs, args.max_batch_size)
@@ -151,7 +164,6 @@ def build_llm_from_config(config: ExperimentConfig) -> LLM:
         "demollm": DemoLLM,
         "trtllm": LLM,
     }
-    ad_logger.info(f"{config.args._parallel_config=}")
     llm = llm_lookup[config.args.runtime](**config.args.to_dict())
     return llm
 

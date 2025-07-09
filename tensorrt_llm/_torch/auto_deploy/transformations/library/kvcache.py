@@ -1,7 +1,7 @@
 """Graph transformation to automatically add kv cache into fused MHA op."""
 
 import operator
-from typing import Dict
+from typing import Dict, Type
 
 import torch
 from torch.fx import Graph, GraphModule, Node
@@ -22,9 +22,6 @@ def update_in_out_nodes(egm: GraphModule, cm: CachedSequenceInterface) -> None:
     Args:
         egm: The graph module to analyze and modify.
         cm: Cached sequence interface containing extra argument information.
-
-    Returns:
-        The updated GraphModule with new input nodes and a canonicalized graph.
     """
     # loop through nodes to get input, output, and get_attr nodes
     input_nodes, output_nodes = get_all_input_output_nodes(egm.graph)
@@ -51,9 +48,9 @@ def update_in_out_nodes(egm: GraphModule, cm: CachedSequenceInterface) -> None:
 def insert_cached_attention(
     egm: GraphModule,
     cm: CachedSequenceInterface,
-    attn_descriptor: AttentionDescriptor,
+    attn_descriptor: Type[AttentionDescriptor],
     cache_config: CacheConfig,
-) -> GraphModule:
+) -> None:
     """Replace uncached source attention node with corresponding cached attn node."""
     # Get all attention nodes and their info objects
     source_op = attn_descriptor.get_source_attention_op()
@@ -66,7 +63,7 @@ def insert_cached_attention(
 
     if not source_attn_nodes:
         # If there are no nodes for kv cache insertion found, return current graph
-        return egm
+        return
 
     # Sanity check
     if cm.info.is_paged:
