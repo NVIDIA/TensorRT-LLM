@@ -893,9 +893,7 @@ CUBIN_EXPORT __global__
             acc = acc * qkScale;
 
             // apply mask
-#if SPEC_DEC
-            warpGrpApplyMask(acc, specDec, cacheSeqLen, idxKTile, warpRank);
-#else
+
             bool const isFirstTile = (idxKTile == nbSkipLeadingTiles);
             bool const needMaskLeading = (rtIsReallySliding && isFirstTile && tile0NbSkipTokens > 0);
             bool const isLastTile = (idxKTile + 1 == nbTiles);
@@ -906,14 +904,15 @@ CUBIN_EXPORT __global__
                 uint32_t const validTokenEnd = (needMaskTrailing ? cacheSeqLen % tileSize : tileSize);
                 if (validTokenBeg > 0 || validTokenEnd < tileSize)
                 {
-#if SWAP_AB
+#if SPEC_DEC
+                    warpGrpApplyMask(acc, specDec, cacheSeqLen, idxKTile, warpRank);
+#elif SWAP_AB
                     warpGrpApplyMask(warpRank, acc, validTokenBeg, validTokenEnd);
 #else
                     warpGrpApplyMask(acc, validTokenBeg, validTokenEnd);
 #endif
                 }
             }
-#endif
             // update colMax in shared mem and get a register copy
 #if SWAP_AB
             RegColWiseVec const colMax = computeWarpGrpColMax_sync(smem.gemm0WarpGrpBar, smem.gemm0CurrentSeqMax, acc);
