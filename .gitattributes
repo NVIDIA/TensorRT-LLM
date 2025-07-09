@@ -6,3 +6,5 @@
 triton_backend/tools/gpt/input_data.json filter=lfs diff=lfs merge=lfs -text
 *cubin.cpp filter=lfs diff=lfs merge=lfs -text
 docs/source/blogs/media/tech_blog3_mla_absorb.png filter=lfs diff=lfs merge=lfs -text
+# SCM syntax highlighting & preventing 3-way merges
+pixi.lock merge=binary linguist-language=YAML linguist-generated=true

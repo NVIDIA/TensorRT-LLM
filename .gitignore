@@ -65,3 +65,7 @@ CMakeUserPresets.json
 compile_commands.json
 *.bin
 .dir-locals.el
+
+# pixi environments
+.pixi
+*.egg-info

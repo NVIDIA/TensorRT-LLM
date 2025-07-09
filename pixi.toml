@@ -1,0 +1,16 @@
+[workspace]
+authors = ["Marcel Rød <mroed@nvidia.com>"]
+channels = ["conda-forge"]
+name = "TensorRT-LLM"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+openmpi = ">=4.1.6,<4.2"
+
+[activation.env]
+LD_LIBRARY_PATH = "$CONDA_PREFIX/lib"
+TORCH_CUDA_ARCH_LIST = "10.0"
+
