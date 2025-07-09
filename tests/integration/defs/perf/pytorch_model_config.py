@@ -144,13 +144,22 @@ def get_model_yaml_config(model_label: str,
     if 'pytorch' in model_label and 'loras' in model_label:
         lora_config = {
             'lora_config': {
-                'lora_dir': lora_dirs if lora_dirs is not None else [],
-                'max_lora_rank': 64,
-                'lora_target_modules': ['attn_q', 'attn_k', 'attn_v'],
+                'lora_dir':
+                lora_dirs if lora_dirs is not None else [],
+                'max_lora_rank':
+                64,
+                'lora_target_modules': [
+                    'attn_q', 'attn_k', 'attn_v', 'attn_dense', 'mlp_h_to_4h',
+                    'mlp_4h_to_h', 'mlp_gate'
+                ],
                 'trtllm_modules_to_hf_modules': {
                     "attn_q": "q_proj",
                     "attn_k": "k_proj",
-                    "attn_v": "v_proj"
+                    "attn_v": "v_proj",
+                    "attn_dense": "o_proj",
+                    "mlp_h_to_4h": "gate_proj",
+                    "mlp_4h_to_h": "down_proj",
+                    "mlp_gate": "up_proj",
                 }
             }
         }
