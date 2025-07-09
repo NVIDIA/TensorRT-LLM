@@ -240,13 +240,16 @@ class WideEPMoE(MoE):
         if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
             return AlltoallMethodType.NotEnabled
 
-        if mapping.moe_ep_size <= top_k:
+        use_deep_ep = os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "0") == "1"
+
+        # Sometimes, even for a single node, we may still need DeepEP low latency mode.
+        if mapping.moe_ep_size <= top_k and not use_deep_ep:
             return AlltoallMethodType.NotEnabled
 
         if MnnvlMemory.supports_mnnvl():
             return AlltoallMethodType.MNNVL
 
-        if os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "0") == "1":
+        if use_deep_ep:
             if deep_ep_installed and dtype == torch.bfloat16:
                 if use_cuda_graph:
                     # Here we can only choose DeepEPLowLatency since only this method supports CUDA Graphs.
@@ -441,11 +444,6 @@ class WideEPMoE(MoE):
                         x.shape[0], 1)
                     token_final_scales = torch.ones_like(
                         token_selected_slots, dtype=token_final_scales.dtype)
-            else:
-                raise NotImplementedError(
-                    f"Not available alltoall method type: {self.alltoall_method_type!r}"
-                )
-
         x_sf = None
         x_is_sf_swizzled = x.is_sf_swizzled if isinstance(
             x, Fp4QuantizedTensor) else False
@@ -552,9 +550,68 @@ class WideEPMoE(MoE):
                         x_sf = swizzle_sf(x_sf, x.shape[0], x.shape[1] * 2,
                                           self.scaling_vector_size)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
-                raise NotImplementedError(
-                    "Not implemented postquant for DeepEPLowLatency, please set TRTLLM_MOE_POST_QUANT_ALLTOALLV=0"
-                )
+                assert x_sf is not None and self.has_nvfp4 and not x_is_sf_swizzled
+                x_sf_dtype = x_sf.dtype
+                x_dtype = x.dtype
+                assert x_sf_dtype == torch.uint8 and x_dtype == torch.uint8
+                x_sf = x_sf.view(torch.bfloat16)
+                assert x_sf.shape[0] == x_row and x_sf.shape[
+                    1] == x_col // 16 // 2
+                x = x.view(torch.bfloat16)
+                assert x.shape[0] == x_row and x.shape[1] == x_col // 4
+                # DeepEP LL dispatch only supports bf16 tensors with a hidden size of 2560, 4096, 5120, or 7168 as input. A hidden size of 2560 is sufficient to accommodate packed FP4 data.
+                packed_hidden_size = 2560
+                assert x.shape[1] + x_sf.shape[1] <= packed_hidden_size
+                fp4_packed_tensor = torch.empty((x_row, packed_hidden_size),
+                                                dtype=torch.bfloat16,
+                                                device=x.device)
+                fp4_packed_tensor[:, :x.shape[1]] = x
+                fp4_packed_tensor[:,
+                                  x.shape[1]:x.shape[1] + x_sf.shape[1]] = x_sf
+
+                deep_ep_topk_idx = token_selected_slots.to(torch.int64)
+                deep_ep_topk_weights = token_final_scales
+                # Each LL combine/dispatch kernel call requires that the `dispatch_rdma_recv_count_buffer` be properly cleaned.
+                # However, the offset of this buffer within the entire RDMA buffer changes according to the hidden size.
+                # Therefore, if the hidden size for the next LL dispatch/combine call is different from the current kernel call, manual cleaning is necessary.
+                if packed_hidden_size != x_col:
+                    self.deep_ep_buffer.clean_low_latency_buffer(
+                        self.deep_ep_max_num_tokens, packed_hidden_size,
+                        self.num_slots)
+                fp4_packed_tensor, recv_expert_count, deep_ep_handle = \
+                    self.deep_ep_buffer.low_latency_dispatch(fp4_packed_tensor, deep_ep_topk_idx, self.deep_ep_max_num_tokens, self.num_slots)
+                if packed_hidden_size != x_col:
+                    self.deep_ep_buffer.clean_low_latency_buffer(
+                        self.deep_ep_max_num_tokens, x_col, self.num_slots)
+                deep_ep_handle = list(deep_ep_handle)
+                deep_ep_handle[3] = x_col
+                deep_ep_handle = tuple(deep_ep_handle)
+
+                fp4_packed_tensor = fp4_packed_tensor[:, :self.mapping.
+                                                      moe_ep_size *
+                                                      all_rank_max_num_tokens]
+                assert fp4_packed_tensor.ndim == 3 and fp4_packed_tensor.shape[
+                    2] == packed_hidden_size
+                x_sf = fp4_packed_tensor[:, :, x.shape[1]:x.shape[1] +
+                                         x_sf.shape[1]].contiguous()
+                x = fp4_packed_tensor[:, :, :x.shape[1]].contiguous()
+                mask = torch.arange(
+                    x.shape[1], dtype=torch.int32, device=x.device).expand(
+                        x.shape[0], x.shape[1]) < recv_expert_count.unsqueeze(1)
+                token_selected_slots = torch.where(
+                    mask,
+                    torch.arange(x.shape[0] * self.mapping.moe_ep_rank,
+                                 x.shape[0] * (self.mapping.moe_ep_rank + 1),
+                                 dtype=torch.int32,
+                                 device=x.device).unsqueeze(1), self.num_slots)
+                x = x.reshape(x.shape[0] * x.shape[1], x.shape[2]).view(x_dtype)
+                x_sf = x_sf.reshape(x_sf.shape[0] * x_sf.shape[1],
+                                    x_sf.shape[2]).view(x_sf_dtype)
+                x_sf = swizzle_sf(x_sf, x.shape[0], x.shape[1] * 2,
+                                  self.scaling_vector_size)
+                token_selected_slots = token_selected_slots.view(x.shape[0], 1)
+                token_final_scales = torch.ones_like(
+                    token_selected_slots, dtype=token_final_scales.dtype)
             else:
                 raise NotImplementedError(
                     f"Not available alltoall method type: {self.alltoall_method_type!r}"
