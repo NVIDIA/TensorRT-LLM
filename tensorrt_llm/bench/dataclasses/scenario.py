@@ -11,6 +11,7 @@ from pydantic import (AliasChoices, AliasPath, BaseModel, Field, PrivateAttr,
 from transformers import AutoConfig
 
 # isort: off
+from tensorrt_llm._torch.model_config import ModelConfig as TllmModelConfig
 from tensorrt_llm.bench.benchmark.tuning.utils import get_model_config
 from tensorrt_llm.bench.build.utils import get_safetensors_metadata
 from tensorrt_llm.bench.dataclasses.general import DatasetMetadata
@@ -42,7 +43,7 @@ class LlmRuntimeSpecification(BaseModel):
     eos_id: Optional[int] = Field(
         default=-1,
         description="The end-of-sequence token to use for benchmarking.")
-    extra_llm_api_options: Optional[Dict[str, Any]] = Field(
+    extra_llm_api_options: Dict[str, Any] = Field(
         default_factory=dict,
         description=
         "A dictionary of extra LLM API options to use for benchmarking.")
@@ -67,7 +68,7 @@ class LlmRuntimeSpecification(BaseModel):
     @classmethod
     def validate_extra_llm_api_options(cls, v) -> Union[Dict[str, Any], None]:
         if v is None:
-            return None
+            return dict()
         else:
             if isinstance(v, Path) or isinstance(v, str):
                 p = Path(v)
@@ -275,6 +276,10 @@ class ScenarioSpecification(BaseModel):
         description="The batching options to use for benchmarking.",
         default_factory=BatchingConfiguration,
     )
+    reporting_config: ReportingConfiguration = Field(
+        description="The reporting options to use for benchmarking.",
+        default_factory=ReportingConfiguration,
+    )
     world: WorldConfig = Field(description="The world to use for benchmarking.")
 
     _engine_config: Dict[str, Any] = PrivateAttr(default=dict)
@@ -454,8 +459,8 @@ class BenchmarkEnvironment(BaseModel):
     def model_type(self) -> str:
         return self.get_bench_model_config().model_type
 
-    def get_tllm_model_config(self) -> ModelConfig:
-        return ModelConfig.from_pretrained(
+    def get_tllm_model_config(self) -> TllmModelConfig:
+        return TllmModelConfig.from_pretrained(
             self.model_path,
             trust_remote_code=True
         )
