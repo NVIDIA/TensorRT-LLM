@@ -211,6 +211,47 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    def test_ngram(self):
+        speculative_decoding_config = {
+            "decoding_type": "NGram",
+            "prompt_lookup_num_tokens": 4,
+            "max_matching_ngram_size": 4,
+            "is_keep_all": True,
+            "is_use_oldest": True,
+            "is_public_pool": True
+        }
+        kv_cache_config = {
+            "free_gpu_memory_fraction": 0.5,
+            "enable_block_reuse": False
+        }
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "kv_cache_config": kv_cache_config,
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": True,
+            "speculative_config": speculative_decoding_config,
+            "kv_cache_config": kv_cache_config,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
 
 @pytest.mark.timeout(3600)
 @pytest.mark.skip_less_device_memory(140000)

@@ -1,3 +1,4 @@
+import math
 import os
 import weakref
 from dataclasses import dataclass, field
@@ -39,6 +40,8 @@ class PlanParams:
 
     attention_mask_type: AttentionMaskType
     attention_mask_data: Optional[torch.Tensor] = None
+    sm_scale: Optional[float] = None
+    window_left: Optional[int] = None
 
 
 @dataclass(kw_only=True)
@@ -309,13 +312,23 @@ class FlashInferAttentionMetadata(AttentionMetadata):
              q_dtype: torch.dtype,
              kv_dtype: torch.dtype,
              attention_mask_type: int,
+             q_scaling: Optional[float] = None,
+             attention_window_size: Optional[int] = None,
              attention_mask_data: Optional[torch.Tensor] = None) -> PlanParams:
+
+        sm_scale = None
+        if q_scaling is not None:
+            sm_scale = 1 / (math.sqrt(head_dim) * q_scaling)
+
         plan_params = PlanParams(
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             q_dtype=q_dtype,
             kv_dtype=kv_dtype,
+            sm_scale=sm_scale,
+            window_left=attention_window_size
+            if attention_window_size is not None else -1,
             attention_mask_type=AttentionMaskType(attention_mask_type),
             attention_mask_data=attention_mask_data)
         return self._plan_with_params(plan_params)
@@ -363,6 +376,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 plan_params.head_dim,
                 self.page_size,
                 causal=is_causal,
+                sm_scale=plan_params.sm_scale,
+                window_left=plan_params.window_left,
                 q_data_type=plan_params.q_dtype,
                 kv_data_type=plan_params.kv_dtype,
             )
@@ -398,6 +413,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 plan_params.num_kv_heads,
                 plan_params.head_dim,
                 self.page_size,
+                sm_scale=plan_params.sm_scale,
+                window_left=plan_params.window_left,
                 q_data_type=plan_params.q_dtype,
                 kv_data_type=plan_params.kv_dtype,
             )
@@ -431,6 +448,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         head_dim: int,
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
+        q_scaling: Optional[float] = None,
         skip_create_weights_in_init: bool = False,
         **kwargs,
     ):
@@ -438,6 +456,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                          quant_config, **kwargs)
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
+        self.q_scaling = q_scaling
 
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config
@@ -452,6 +471,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 v: Optional[torch.Tensor],
                 metadata: FlashInferAttentionMetadata,
                 *,
+                attention_window_size: Optional[int] = None,
                 attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
                 **kwargs) -> torch.Tensor:
         if attention_mask == PredefinedAttentionMask.CAUSAL:
@@ -463,10 +483,18 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         else:
             raise ValueError("Unexpected attention mask type")
 
-        return forward_pattern(q, k, v, self.num_heads, self.head_dim,
-                               self.num_kv_heads, self.layer_idx,
-                               self.has_fp8_kv_cache, attention_mask_type,
-                               attention_mask_data)
+        return forward_pattern(q=q,
+                               k=k,
+                               v=v,
+                               num_heads=self.num_heads,
+                               head_dim=self.head_dim,
+                               num_kv_heads=self.num_kv_heads,
+                               layer_idx=self.layer_idx,
+                               has_fp8_kv_cache=self.has_fp8_kv_cache,
+                               attention_mask_type=attention_mask_type,
+                               q_scaling=self.q_scaling,
+                               attention_mask_data=attention_mask_data,
+                               attention_window_size=attention_window_size)
 
 
 @torch.library.custom_op("trtllm::flashinfer_forward", mutates_args=())
@@ -480,7 +508,9 @@ def forward_pattern(
     layer_idx: int,
     has_fp8_kv_cache: bool,
     attention_mask_type: int,
-    attention_mask_data: Optional[torch.Tensor],
+    q_scaling: Optional[float] = None,
+    attention_mask_data: Optional[torch.Tensor] = None,
+    attention_window_size: Optional[int] = None,
 ) -> torch.Tensor:
     '''
     Wrapping the flashinfer forward as a custom op is required to fix `torch.compile` graph breaks,
@@ -548,6 +578,8 @@ def forward_pattern(
                                 head_dim,
                                 q_dtype=q.dtype,
                                 kv_dtype=kv_cache.dtype,
+                                q_scaling=q_scaling,
+                                attention_window_size=attention_window_size,
                                 attention_mask_type=attention_mask_type,
                                 attention_mask_data=attention_mask_data)
 

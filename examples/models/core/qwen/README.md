@@ -624,10 +624,10 @@ git clone https://huggingface.co/Qwen/Qwen3-30B-A3B <YOUR_MODEL_DIR>
 
 #### Run a single inference
 
-To quickly run Qwen3, [examples/pytorch/quickstart_advanced.py](../../../pytorch/quickstart_advanced.py):
+To quickly run Qwen3, [examples/llm-api/quickstart_advanced.py](../../../pytorch/quickstart_advanced.py):
 
 ```bash
-python3 examples/pytorch/quickstart_advanced.py --model_dir Qwen3-30B-A3B/ --kv_cache_fraction 0.6
+python3 examples/llm-api/quickstart_advanced.py --model_dir Qwen3-30B-A3B/ --kv_cache_fraction 0.6
 ```
 
 ### Evaluation

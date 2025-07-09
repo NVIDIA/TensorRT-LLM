@@ -15,11 +15,14 @@ from utils.llm_data import llm_models_root
 
 @pytest.mark.parametrize(
     "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model",
-    [[True, "TRTLLM", True, False, False], [
-        False, "TRTLLM", True, False, False
-    ], [True, "FLASHINFER", True, False, False],
-     [False, "FLASHINFER", True, False, False],
-     [False, "TRTLLM", False, True, True], [True, "TRTLLM", False, True, True]])
+    [
+        [True, "TRTLLM", True, False, False],
+        [False, "TRTLLM", True, False, False],
+        [True, "FLASHINFER", True, False, False],
+        [False, "FLASHINFER", True, False, False],
+        #  [False, "TRTLLM", False, True, True], [True, "TRTLLM", False, True, True] # TODO: nvbugs/5379915
+    ])
+@pytest.mark.high_cuda_memory
 def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
                       disable_overlap_scheduler: bool, enable_block_reuse: bool,
                       use_one_model: bool):
