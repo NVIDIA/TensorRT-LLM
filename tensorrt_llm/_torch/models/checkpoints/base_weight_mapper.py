@@ -149,8 +149,16 @@ class BaseWeightMapper(ABC):
                            p: nn.Parameter) -> None:
         p.data.copy_(module_weights[n][:])
 
-    def should_apply_to_module(self, module_name: str) -> bool:
+    def does_require_special_handling(self, module_name: str) -> bool:
         return module_name in self._mapping
+
+    def is_special_instance_module(self, module: nn.Module) -> bool:
+        return False
+
+    def handle_special_instance_module(self, module: nn.Module,
+                                       module_name: str,
+                                       module_weights: dict) -> None:
+        raise NotImplementedError()
 
     @property
     def skip_modules(self) -> List[str]:

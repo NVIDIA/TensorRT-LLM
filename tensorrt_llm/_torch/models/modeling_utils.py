@@ -847,13 +847,17 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
             names = name.split('.')
             module_names_breakdown, module_name = names[:-1], names[-1]
 
-            if weight_mapper.should_apply_to_module(module_name):
+            if weight_mapper.does_require_special_handling(module_name):
                 module_weights = weight_mapper.apply_callbacks(
                     module_name, module_names_breakdown, weights)
                 module.load_weights(weights=module_weights)
             else:
                 module_weights = weight_mapper.filter_weights(name, weights)
-                if hasattr(module, 'load_weights'):
+                if weight_mapper.is_special_instance_module(module):
+                    weight_mapper.handle_special_instance_module(
+                        module, module_name, module_weights)
+
+                elif hasattr(module, 'load_weights'):
                     module.load_weights(weights=[module_weights])
                 else:
                     for n, p in module._parameters.items():
