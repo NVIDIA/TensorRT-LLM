@@ -244,6 +244,26 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    def test_beam_search(self):
+        pytorch_config = dict(
+            disable_overlap_scheduler=True,
+            cuda_graph_config=CudaGraphConfig(batch_sizes=[1]),
+        )
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+
+        llm = LLM(model=self.MODEL_PATH,
+                  **pytorch_config,
+                  kv_cache_config=kv_cache_config,
+                  max_beam_width=4,
+                  max_batch_size=128,
+                  max_seq_len=128,
+                  enable_trtllm_sampler=True,
+                  build_config=None)
+
+        with llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
     def test_ngram(self):
         pytorch_config = dict(disable_overlap_scheduler=True)
 
