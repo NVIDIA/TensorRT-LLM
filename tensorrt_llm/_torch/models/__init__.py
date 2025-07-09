@@ -23,6 +23,8 @@ from .modeling_qwen_moe import Qwen2MoeForCausalLM
 from .modeling_siglip import SiglipVisionModel
 from .modeling_utils import get_model_architecture
 from .modeling_vila import VilaModel
+# from .modeling_dream import DreamModel, DreamForCausalLM
+from .modeling_dream import DreamModel
 
 # Note: for better readiblity, this should have same order as imports above
 __all__ = [
@@ -30,6 +32,8 @@ __all__ = [
     "BertForSequenceClassification",
     "CLIPVisionModel",
     "DeepseekV3ForCausalLM",
+    "DreamModel",
+    # "DreamForCausalLM",
     "Gemma3ForCausalLM",
     "HCXVisionForCausalLM",
     "Gemma3Model",

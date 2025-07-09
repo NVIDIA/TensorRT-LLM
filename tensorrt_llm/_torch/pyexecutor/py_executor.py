@@ -192,6 +192,19 @@ class PyExecutor:
         self.sampler = sampler
         self.dist = dist
         self.disable_overlap_scheduler = disable_overlap_scheduler
+        
+        # Initialize block prediction sampler if needed
+        self.block_prediction_sampler = None
+        if hasattr(model_engine, 'pytorch_backend_config') and model_engine.pytorch_backend_config.enable_block_prediction:
+            from .sampler import BlockPredictionSampler
+            config = model_engine.pytorch_backend_config
+            self.block_prediction_sampler = BlockPredictionSampler(
+                max_seq_len=max_input_len,
+                block_size=config.block_size,
+                keep_threshold=config.keep_threshold,
+                mask_token_id=config.mask_token_id,
+                max_iterations=config.max_iterations
+            )
 
         # Draft model for certain spec decode algorithms, e.g. EAGLE3
         self.draft_model_engine = draft_model_engine
@@ -964,6 +977,129 @@ class PyExecutor:
                             scheduled_requests=scheduled_batch),
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
+    def _executor_loop_block(self):
+        torch.cuda.set_device(self.device_id)
+        is_ngram = hasattr(
+            self.model_engine, "spec_config"
+        ) and self.model_engine.spec_config is not None and self.model_engine.spec_config.spec_dec_mode.is_ngram(
+        )
+        with self._profiler() as profile_step:
+            iter_start_time = time.time()
+            iter_stats = None
+            while not self.is_shutdown or len(self.active_requests) > 0:
+                profile_step()
+                if self.enable_iter_perf_stats:
+                    iter_start_time = time.time()
+                new_requests = self._fetch_new_requests()
+                if self.is_shutdown and len(self.active_requests) == 0:
+                    break
+
+                if self.kv_cache_transceiver:
+                    self._check_disagg_gen_transfer_status()
+
+                if self.enable_iter_perf_stats:
+                    iter_stats = self._get_init_iter_stats(
+                        len(new_requests),
+                        self.new_active_requests_queue_latency_ms)
+
+                self._pad_attention_dp_dummy_request()
+
+                if self.draft_model_engine is not None or is_ngram:
+                    self._prepare_draft_requests()
+
+                scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
+                )
+
+                if self.kv_cache_transceiver:
+                    # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
+                    self._prepare_disagg_gen_init(
+                        fitting_disagg_gen_init_requests)
+                    if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests:
+                        logger.warning(
+                            "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
+                        )
+                        self.kv_cache_transceiver.check_context_transfer_status(
+                            1)
+                else:
+                    assert scheduled_batch.batch_size > 0, (
+                        "fail to schedule any pending request, "
+                        "probably run out of resource.")
+
+                self.num_scheduled_requests = scheduled_batch.batch_size
+                logger.debug(
+                    f'has {len(self.active_requests)} active_request, '
+                    f'scheduled {len(scheduled_batch.context_requests)} context requests and '
+                    f'{len(scheduled_batch.generation_requests)} generation requests'
+                )
+
+                self._pause_requests(scheduled_batch.paused_requests)
+
+                finished_requests = []
+
+                if scheduled_batch.batch_size > 0:
+                    if self.kv_cache_transceiver:
+                        # For generation requests which have completed KV cache transfer
+                        self._prepare_disagg_gen_transmission_complete(
+                            scheduled_batch)
+
+                    has_ngram_iter_stats = is_ngram and self.model_engine.spec_config.spec_dec_mode.is_ngram(
+                    ) and iter_stats is not None
+                    if has_ngram_iter_stats:
+                        before = time.time()
+
+                    self.resource_manager.prepare_resources(scheduled_batch)
+                    if self.draft_model_engine is not None:
+                        self._prepare_draft_tokens(scheduled_batch)
+
+                    if has_ngram_iter_stats:
+                        self._insert_ngram_iter_stats(scheduled_batch,
+                                                      iter_stats)
+                        iter_stats.specdec_stats.iter_latency_ms = (
+                            time.time() - before) * 1e3
+
+                    if self.kv_cache_transceiver:
+                        # For generation requests which have completed KV cache transfer
+                        self._prepare_disagg_gen_transmission_complete(
+                            scheduled_batch)
+
+                        # Return the first token to the client
+                        self._handle_first_token_response(scheduled_batch)
+
+                    batch_outputs = self._forward_step_block(scheduled_batch)
+
+                    sample_state = self._sample_async_block(scheduled_batch,
+                                                      batch_outputs)
+
+                    self._update_request_states(scheduled_batch)
+                    self._update_requests(sample_state)
+
+                    ctx_transmission_reqs = self._send_disagg_ctx_cache(
+                        scheduled_batch.context_requests
+                    ) if self.kv_cache_transceiver else []
+
+                    if self.kv_cache_transceiver:
+                        # For context only req in transmission, we reset the state since sampler might have changed it
+                        for req in ctx_transmission_reqs:
+                            req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+
+                    self._handle_cancelled_requests()
+                    finished_requests = self._handle_responses()
+                    self.resource_manager.update_resources(scheduled_batch)
+                    if self.enable_kv_cache_events:
+                        self._add_kv_cache_events()
+
+                if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
+                    self._terminate_ctx_finished_requests()
+
+                if self.enable_iter_perf_stats:
+                    iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
+                        'num_ctx_tokens']
+                    self._process_iter_stats(
+                        finished_requests, self.active_requests,
+                        BatchState(sample_state=SampleState(
+                            scheduled_requests=scheduled_batch),
+                                   iter_stats=iter_stats,
+                                   iter_start_time=iter_start_time))
 
     def _prepare_draft_requests(self):
         try:
@@ -1631,6 +1767,37 @@ class PyExecutor:
                 f"Encountered an error in forward function: {error_msg}")
             self._handle_errors(error_msg)
             return None
+    
+    def _forward_step_block(self,
+                      scheduled_requests,
+                      new_tensors_device: Optional[SampleStateTensors] = None):
+
+        @nvtx_range(
+            f"[Executor] _forward_step_block: {len(scheduled_requests.context_requests)} ctx reqs, {len(scheduled_requests.generation_requests)} gen reqs"
+        )
+        def forward(scheduled_requests, resource_manager, new_tensors_device,
+                    gather_context_logits):
+            return self.model_engine.forward(
+                scheduled_requests,
+                resource_manager,
+                new_tensors_device,
+                gather_context_logits=gather_context_logits)
+
+        try:
+            gather_context_logits = any(
+                a.py_return_context_logits
+                for a in scheduled_requests.context_requests)
+            outputs = forward(scheduled_requests, self.resource_manager,
+                              new_tensors_device, gather_context_logits)
+            return outputs
+        except Exception as e:
+            traceback.print_exc()
+            error_msg = str(e)
+            logger.error(
+                f"Encountered an error in forward function: {error_msg}")
+            self._handle_errors(error_msg)
+            return None
+
 
     def _update_request_states_tp(self, scheduled_requests: ScheduledRequests):
         # handle potential attention dp dummy request
@@ -1681,6 +1848,25 @@ class PyExecutor:
             error_msg = str(e)
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
+    
+
+    @nvtx_range("_sample_async_block")
+    def _sample_async_block(self, scheduled_batch,
+                      batch_outputs) -> SampleState | None:
+        try:
+            if batch_outputs is not None:
+                # For block prediction, we need to use a special sampler
+                # that can handle non-causal attention and iterative unmasking
+                if hasattr(self, 'block_prediction_sampler'):
+                    return self.block_prediction_sampler.sample_async(scheduled_batch, batch_outputs)
+                else:
+                    return self.sampler.sample_async(scheduled_batch, batch_outputs)
+        except Exception as e:
+            traceback.print_exc()
+            error_msg = str(e)
+            logger.error(f"Encountered an error in sampling: {error_msg}")
+            self._handle_errors(error_msg)
+
 
     @nvtx_range("_setup_sampler_step")
     def _setup_sampler_step(self, requests):

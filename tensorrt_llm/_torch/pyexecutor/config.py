@@ -86,6 +86,13 @@ class PyTorchConfig:
     # If true, enable min-latency mode. Currently only used for Llama4.
     enable_min_latency: bool = False
     allreduce_strategy: str = "AUTO"
+    
+    # Block prediction configuration
+    enable_block_prediction: bool = False
+    block_size: int = 8
+    keep_threshold: float = 0.8
+    mask_token_id: int = 151666
+    max_iterations: int = 10
 
 
 EXETENDED_EXECUTOR_CONFIG_FIELDS = [
