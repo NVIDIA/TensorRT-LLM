@@ -70,8 +70,10 @@ function(process_target target_name enable_hopper enable_blackwell)
                                PUBLIC COMPILE_HOPPER_TMA_GROUPED_GEMMS)
   endif()
 
-  if(${enable_blackwell} AND ("100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
-                              OR "120" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG))
+  if(${enable_blackwell}
+     AND ("100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+          OR "120" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+          OR "121" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG))
 
     if("100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
       # No kernels should be parsed, unless blackwell is specified. This is a
@@ -81,7 +83,8 @@ function(process_target target_name enable_hopper enable_blackwell)
       target_compile_definitions(${target_name}
                                  PUBLIC COMPILE_BLACKWELL_TMA_GROUPED_GEMMS)
     endif()
-    if("120" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
+    if("120" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+       OR "121" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
       target_compile_definitions(${target_name}
                                  PRIVATE COMPILE_BLACKWELL_SM120_TMA_GEMMS)
       target_compile_definitions(
@@ -246,11 +249,14 @@ endif()
 if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
   add_library(
     ar_gemm_src STATIC
-    ${ARGEMM_SRC_CU}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../runtime/ipcNvlsMemory.cpp)
+    ${ARGEMM_SRC_CU} ${CMAKE_CURRENT_SOURCE_DIR}/../../runtime/ipcNvlsMemory.cu)
   target_include_directories(
     ar_gemm_src
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../internal_cutlass_kernels/include)
+  if(ENABLE_NVSHMEM)
+    target_link_libraries(ar_gemm_src PRIVATE nvshmem::nvshmem_host
+                                              nvshmem::nvshmem_device)
+  endif()
   set_cuda_architectures(ar_gemm_src 90 100f)
 endif()
 

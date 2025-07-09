@@ -7,10 +7,9 @@ from tensorrt_llm.logger import logger
 
 from ..pyexecutor.llm_request import *
 from ..pyexecutor.resource_manager import BaseResourceManager
-from ..pyexecutor.sampler import SampleState
 from ..pyexecutor.scheduler import ScheduledRequests
 from .drafter import Drafter
-from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
+from .interface import SpecConfig, SpeculativeDecodingMode
 
 
 @dataclass
@@ -38,16 +37,6 @@ class NGramConfig(SpecConfig):
 
     def update_from_model_config(self, model_config):
         pass
-
-
-@dataclass
-class NGramSpecMetadata(SpecMetadata):
-    """
-    Metadata for NGram.
-    """
-
-    def __post_init__(self) -> None:
-        return
 
 
 class NGramPoolManager(BaseResourceManager):
@@ -148,7 +137,7 @@ class NGramPoolManager(BaseResourceManager):
                 pattern = tuple(sequence[l:l + size])
                 new_match = tuple(sequence[l + size:r])
                 if pattern not in pool or \
-                    (not self.is_keep_all and len(match) > pool[pattern][0]):
+                    (not self.is_keep_all and len(new_match) > len(pool[pattern][0])):
                     # Replace the match if
                     # 1. the pattern does not exist in the pool
                     # 2. only one match is kept, and the new match is longer (MRU)
@@ -212,15 +201,16 @@ class NGramDrafter(Drafter):
     def prepare_draft_tokens(
         self,
         scheduled_requests: ScheduledRequests,
-        state: SampleState,
     ) -> None:
-
-        if state is None:  # Skip the first step
-            return
-
-        for request in sorted(scheduled_requests.generation_requests,
-                              key=lambda r: r.py_batch_idx):
-            # Add new token to a copy of the generated tokens to find new daft tokens
+        # Sort by request_id when py_batch_idx is None as a fallback.
+        # This happens in the disagg case: for a set of new requests, we draft
+        # before forward_step, so py_batch_idx is not assigned.
+        for request in sorted(
+                scheduled_requests.generation_requests,
+                key=lambda r:
+            (r.py_batch_idx is None, r.py_batch_idx or r.request_id),
+        ):
+            # Add new token to a copy of the generated tokens to find new draft tokens
             prefix = list(request.get_tokens()[0])  # Get a copy
 
             # Generate draft tokens

@@ -7,7 +7,7 @@ from tqdm import tqdm
 from transformers import Gemma3TextConfig
 from transformers.activations import ACT2FN
 
-from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
@@ -64,7 +64,9 @@ class Gemma3Attention(Attention):
         rope_params = RopeParams.from_config(config)
         self.attention_window_size = None
         if is_sliding:
-            rope_params.theta = 10000
+            rope_params.theta = config.rope_local_base_freq
+            rope_params.scale_type = RotaryScalingType.none
+            rope_params.scale = 1.0
             self.attention_window_size = config.sliding_window - 1  # Gemma3 sliding window isn't inclusive.
         pos_embd_params = PositionalEmbeddingParams(
             type=PositionEmbeddingType.rope_gpt_neox,

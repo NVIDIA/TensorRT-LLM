@@ -104,7 +104,10 @@ else:
         'libs/libnvinfer_plugin_tensorrt_llm.so',
         'libs/libtensorrt_llm_ucx_wrapper.so', 'libs/libdecoder_attention_0.so',
         'libs/libtensorrt_llm_nixl_wrapper.so',
-        'libs/libdecoder_attention_1.so', 'bindings.*.so', "include/**/*"
+        'libs/libdecoder_attention_1.so', 'libs/nvshmem/License.txt',
+        'libs/nvshmem/nvshmem_bootstrap_uid.so.3',
+        'libs/nvshmem/nvshmem_transport_ibgda.so.103', 'bindings.*.so',
+        'deep_ep/LICENSE', 'deep_ep_cpp_tllm.*.so', "include/**/*"
     ]
 
 package_data += [

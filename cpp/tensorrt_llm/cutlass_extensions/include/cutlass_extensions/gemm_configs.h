@@ -332,12 +332,12 @@ enum class ClusterShape
     ClusterShape_1x2x1,
     ClusterShape_2x2x1,
     ClusterShape_1x4x1,
+    ClusterShape_4x1x1,
     ClusterShape_4x2x1,
     ClusterShape_2x4x1,
     ClusterShape_4x4x1,
     ClusterShape_1x8x1,
-    ClusterShape_8x1x1,
-    ClusterShape_4x1x1
+    ClusterShape_8x1x1
 };
 
 static auto get_cluster_shape_name(ClusterShape Shape_MNK)
@@ -484,9 +484,9 @@ struct CutlassGemmConfig
 
     int getTileConfigAsInt() const
     {
-        if (sm_version == 120)
+        if (sm_version == 120 || sm_version == 121)
             return (int) tile_config_sm120;
-        if (sm_version >= 100)
+        if (sm_version >= 100 && sm_version < 120)
             return (int) tile_config_sm100;
         if (sm_version == 90)
             return (int) tile_config_sm90;
