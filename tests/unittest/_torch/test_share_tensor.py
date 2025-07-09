@@ -41,39 +41,52 @@ class TestShareTensor(unittest.TestCase):
         mp.set_start_method('spawn', force=True)
         queue = mp.Queue()
 
-        # Producer process
-        producer = mp.Process(target=self._producer,
-                              args=(queue, self.ref_tensor, "cuda"))
-        producer.start()
-        status, data = queue.get(timeout=100)
-        # Verify
-        self.assertEqual(status, 'success')
-        reconstructed = SharedTensorContainer.from_dict(data).get_local_view()
-        queue.put(
-            'done'
-        )  # producer can be released as early as here as ownership is transferred to consumer
-        self.assertTrue(torch.allclose(reconstructed.cpu(), self.ref_tensor))
-        del reconstructed
-        producer.join()
+        try:
+            # Producer process
+            producer = mp.Process(target=self._producer,
+                                  args=(queue, self.ref_tensor, "cuda"))
+            producer.start()
+            status, data = queue.get(timeout=100)
+            # Verify
+            self.assertEqual(status, 'success')
+            reconstructed = SharedTensorContainer.from_dict(
+                data).get_local_view()
+            queue.put(
+                'done'
+            )  # producer can be released as early as here as ownership is transferred to consumer
+            self.assertTrue(torch.allclose(reconstructed.cpu(),
+                                           self.ref_tensor))
+            del reconstructed
+            producer.join()
+        finally:
+            # Explicit cleanup to prevent QueueFeederThread leak
+            queue.close()
+            queue.join_thread()
 
     def test_share_cpu_tensor(self):
         """Test CPU tensor sharing between processes."""
         mp.set_start_method('spawn', force=True)
         queue = mp.Queue()
 
-        # Producer process
-        producer = mp.Process(target=self._producer,
-                              args=(queue, self.ref_tensor, "cpu"))
-        producer.start()
-        status, data = queue.get(timeout=100)
-        # Verify
-        self.assertEqual(status, 'success')
-        reconstructed = SharedTensorContainer.from_dict(data).get_local_view()
-        queue.put(
-            'done'
-        )  # producer can be released as early as here as ownership is transferred to consumer
-        self.assertTrue(torch.allclose(reconstructed, self.ref_tensor))
-        producer.join()
+        try:
+            # Producer process
+            producer = mp.Process(target=self._producer,
+                                  args=(queue, self.ref_tensor, "cpu"))
+            producer.start()
+            status, data = queue.get(timeout=100)
+            # Verify
+            self.assertEqual(status, 'success')
+            reconstructed = SharedTensorContainer.from_dict(
+                data).get_local_view()
+            queue.put(
+                'done'
+            )  # producer can be released as early as here as ownership is transferred to consumer
+            self.assertTrue(torch.allclose(reconstructed, self.ref_tensor))
+            producer.join()
+        finally:
+            # Explicit cleanup to prevent QueueFeederThread leak
+            queue.close()
+            queue.join_thread()
 
     def test_share_tensor_different_shapes(self):
         """Test CPU tensor sharing with different tensor shapes."""
@@ -86,35 +99,40 @@ class TestShareTensor(unittest.TestCase):
             (10, ),
         ]
 
-        for shape in test_shapes:
-            with self.subTest(shape=shape):
-                test_tensor = torch.randn(shape)
-                producer = mp.Process(target=self._producer,
-                                      args=(queue, test_tensor, "cpu"))
-                producer.start()
-                status, data = queue.get(timeout=100)
+        try:
+            for shape in test_shapes:
+                with self.subTest(shape=shape):
+                    test_tensor = torch.randn(shape)
+                    producer = mp.Process(target=self._producer,
+                                          args=(queue, test_tensor, "cpu"))
+                    producer.start()
+                    status, data = queue.get(timeout=100)
 
-                self.assertEqual(status, 'success')
-                reconstructed = SharedTensorContainer.from_dict(
-                    data).get_local_view()
-                self.assertTrue(torch.allclose(reconstructed, test_tensor))
-                queue.put('done')
-                producer.join()
+                    self.assertEqual(status, 'success')
+                    reconstructed = SharedTensorContainer.from_dict(
+                        data).get_local_view()
+                    self.assertTrue(torch.allclose(reconstructed, test_tensor))
+                    queue.put('done')
+                    producer.join()
 
-            with self.subTest(shape=shape):
-                test_tensor = torch.randn(shape)
-                producer = mp.Process(target=self._producer,
-                                      args=(queue, test_tensor, "cuda"))
-                producer.start()
-                status, data = queue.get(timeout=100)
-                self.assertEqual(status, 'success')
-                reconstructed = SharedTensorContainer.from_dict(
-                    data).get_local_view()
-                self.assertTrue(
-                    torch.allclose(reconstructed, test_tensor.cuda()))
-                del reconstructed
-                queue.put('done')
-                producer.join()
+                with self.subTest(shape=shape):
+                    test_tensor = torch.randn(shape)
+                    producer = mp.Process(target=self._producer,
+                                          args=(queue, test_tensor, "cuda"))
+                    producer.start()
+                    status, data = queue.get(timeout=100)
+                    self.assertEqual(status, 'success')
+                    reconstructed = SharedTensorContainer.from_dict(
+                        data).get_local_view()
+                    self.assertTrue(
+                        torch.allclose(reconstructed, test_tensor.cuda()))
+                    del reconstructed
+                    queue.put('done')
+                    producer.join()
+        finally:
+            # Explicit cleanup to prevent QueueFeederThread leak
+            queue.close()
+            queue.join_thread()
 
     def test_share_tensor_different_dtypes(self):
         """Test CPU tensor sharing with different data types."""
@@ -129,37 +147,42 @@ class TestShareTensor(unittest.TestCase):
             torch.int64,
         ]
 
-        for dtype in test_dtypes:
-            with self.subTest(dtype=dtype):
-                test_tensor = torch.randn(2, 3).to(dtype)
-                producer = mp.Process(target=self._producer,
-                                      args=(queue, test_tensor, "cpu"))
-                producer.start()
-                status, data = queue.get(timeout=100)
+        try:
+            for dtype in test_dtypes:
+                with self.subTest(dtype=dtype):
+                    test_tensor = torch.randn(2, 3).to(dtype)
+                    producer = mp.Process(target=self._producer,
+                                          args=(queue, test_tensor, "cpu"))
+                    producer.start()
+                    status, data = queue.get(timeout=100)
 
-                self.assertEqual(status, 'success')
-                reconstructed = SharedTensorContainer.from_dict(
-                    data).get_local_view()
-                self.assertTrue(torch.allclose(reconstructed, test_tensor))
-                self.assertEqual(reconstructed.dtype, test_tensor.dtype)
-                queue.put('done')
-                producer.join()
+                    self.assertEqual(status, 'success')
+                    reconstructed = SharedTensorContainer.from_dict(
+                        data).get_local_view()
+                    self.assertTrue(torch.allclose(reconstructed, test_tensor))
+                    self.assertEqual(reconstructed.dtype, test_tensor.dtype)
+                    queue.put('done')
+                    producer.join()
 
-            with self.subTest(dtype=dtype):
-                test_tensor = torch.randn(2, 3).to(dtype)
-                producer = mp.Process(target=self._producer,
-                                      args=(queue, test_tensor, "cuda"))
-                producer.start()
-                status, data = queue.get(timeout=100)
-                self.assertEqual(status, 'success')
-                reconstructed = SharedTensorContainer.from_dict(
-                    data).get_local_view()
-                self.assertTrue(
-                    torch.allclose(reconstructed, test_tensor.cuda()))
-                self.assertEqual(reconstructed.dtype, test_tensor.dtype)
-                del reconstructed
-                queue.put('done')
-                producer.join()
+                with self.subTest(dtype=dtype):
+                    test_tensor = torch.randn(2, 3).to(dtype)
+                    producer = mp.Process(target=self._producer,
+                                          args=(queue, test_tensor, "cuda"))
+                    producer.start()
+                    status, data = queue.get(timeout=100)
+                    self.assertEqual(status, 'success')
+                    reconstructed = SharedTensorContainer.from_dict(
+                        data).get_local_view()
+                    self.assertTrue(
+                        torch.allclose(reconstructed, test_tensor.cuda()))
+                    self.assertEqual(reconstructed.dtype, test_tensor.dtype)
+                    del reconstructed
+                    queue.put('done')
+                    producer.join()
+        finally:
+            # Explicit cleanup to prevent QueueFeederThread leak
+            queue.close()
+            queue.join_thread()
 
     @staticmethod
     def _stand_by_producer(conn):
