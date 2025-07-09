@@ -715,7 +715,8 @@ class TRTLLMSampler(Sampler):
     @torch.inference_mode()
     def update_requests(self, state: SampleStateTRTLLM):
         assert isinstance(state, SampleStateTRTLLM)
-        assert state.scheduled_requests.batch_size > 0
+        if state.scheduled_requests.batch_size == 0:
+            return
 
         if state.sampler_event:
             state.sampler_event.synchronize()

@@ -1134,9 +1134,7 @@ class PyExecutor:
                     ) if self.kv_cache_transceiver else []
 
                     if self.previous_batch is not None:
-                        previous_batch_size = self.previous_batch.sample_state.scheduled_requests.batch_size
-                        if previous_batch_size > 0:  # first previous batch size is 0
-                            self._process_previous_batch()
+                        self._process_previous_batch()
                         self.previous_batch: Optional[BatchState] = None
 
                     scheduled_batch.context_requests = [
