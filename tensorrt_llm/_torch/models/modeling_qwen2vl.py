@@ -598,6 +598,10 @@ class Qwen2VLModelBase(PreTrainedModel):
                 multimodal_params, num_context_requests,
                 num_generation_requests)
 
+        if 'mrope_position_deltas' in kwargs:
+            mrope_config['mrope_position_deltas'] = kwargs[
+                'mrope_position_deltas']
+
         input_ids, input_embeds = fuse_input_embeds(self.llm.model.embed_tokens,
                                                     input_ids, mm_embeds)
         output_prob = self.llm.forward(

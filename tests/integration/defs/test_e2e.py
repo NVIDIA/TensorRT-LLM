@@ -1955,6 +1955,7 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
         _check_mem_usage(running_log, [12.0, 0, 0, 0])
 
 
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
 @pytest.mark.parametrize("modality", ["image", "video"])
 @pytest.mark.parametrize("model_name,model_path", [
     ("NVILA-8B-FP16", "vila/NVILA-8B"),
@@ -1964,7 +1965,7 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
     ("qwen2.5-vl-7b-instruct", "Qwen2.5-VL-7B-Instruct"),
 ])
 def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
-                                   modality):
+                                   modality, use_cuda_graph):
     llm_venv.run_cmd(
         ['-m', 'pip', 'install', 'flash-attn==2.7.3', '--no-build-isolation'])
 
@@ -2067,6 +2068,8 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
     if model_name in ["qwen2-vl-7b-instruct", "qwen2.5-vl-7b-instruct"
                       ] and modality == "video":
         cmd.append("--max_num_tokens=16384")
+    if use_cuda_graph:
+        cmd.append("--use_cuda_graph")
     output = llm_venv.run_cmd(cmd, caller=check_output)
 
     def parse_output(text):
