@@ -335,7 +335,7 @@ class WideEPMoE(MoE):
         use_dp_padding: Optional[bool] = None,
     ):
         outputs = inputs
-        if not use_all_toall:
+        if not use_all_to_all:
             if self.enable_dummy_allreduce:
                 self.dummy_allreduce()
             outputs = reducescatter(
@@ -398,7 +398,7 @@ class WideEPMoE(MoE):
         ) and is_first_call:
             self.layer_load_balancer.maybe_cudagraph_done_wait()
 
-        use_allgather = not self.enable_alltoall
+        use_allgather = not use_all_to_all
 
         loadbalancer_local_statistic_info = None
         gathered_loadbalancer_local_statistic_info = None
@@ -407,7 +407,7 @@ class WideEPMoE(MoE):
             token_selected_slots = token_selected_experts
         else:
             if not self.layer_load_balancer.is_static_routing(
-            ) and self.enable_alltoall:
+            ) and use_all_to_all:
                 self.layer_load_balancer.local_statistic(
                     token_selected_experts,
                     is_first_stage=is_first_call,
@@ -416,7 +416,7 @@ class WideEPMoE(MoE):
                 token_selected_experts, self.use_dp)
             if not self.layer_load_balancer.is_static_routing():
                 # split into two part to get possible overlap with load balancer routing
-                if self.enable_alltoall:
+                if use_all_to_all:
                     if is_last_call:
                         loadbalancer_local_statistic_info = self.layer_load_balancer.get_local_statistic_tensor(
                         )
@@ -428,6 +428,8 @@ class WideEPMoE(MoE):
         ExpertStatistic.set_layer(self.layer_idx)
         ExpertStatistic.maybe_add_info(self.num_slots, token_selected_slots)
 
+        # If alltoall is disabled, we need also disable use_postquant_alltoall
+        use_postquant_alltoall = self.use_postquant_alltoall and use_all_to_all
         if use_all_to_all:
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
                 if self.enable_dummy_allreduce:
@@ -439,13 +441,14 @@ class WideEPMoE(MoE):
                                                          x,
                                                          token_selected_slots,
                                                          token_final_scales,
+                                                         use_postquant_alltoall,
                                                          loadbalancer_local_statistic_info)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
-                if not self.use_postquant_alltoall:
+                if not use_postquant_alltoall:
                     x, recv_topk_idx, token_final_scales, num_recv_tokens_per_expert_list, deep_ep_handle = \
                         self.deep_ep_buffer.dispatch(x, token_selected_slots.to(torch.int64), token_final_scales, self.num_slots)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
-                if not self.use_postquant_alltoall:
+                if not use_postquant_alltoall:
                     deep_ep_topk_idx = token_selected_slots.to(torch.int64)
                     deep_ep_topk_weights = token_final_scales
                     x, recv_expert_count, deep_ep_handle = \
@@ -485,7 +488,7 @@ class WideEPMoE(MoE):
                 x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
                     x, self.fc31_input_dequant)
             elif self.has_nvfp4:
-                if use_allgather or self.use_postquant_alltoall:
+                if use_allgather or use_postquant_alltoall:
                     if isinstance(x, Fp4QuantizedTensor):
                         if use_allgather:
                             assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before allgather"
@@ -518,7 +521,7 @@ class WideEPMoE(MoE):
                     f"unsupported quantization mode: {self.quant_config.quant_mode}"
                 )
 
-        if use_allgather and not use_all_to_all::
+        if use_allgather and not use_all_to_all:
             # using allgather case.
             if self.enable_dummy_allreduce:
                 self.dummy_allreduce()
@@ -541,7 +544,7 @@ class WideEPMoE(MoE):
 
         if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
         ):
-            if self.enable_alltoall:
+            if use_all_to_all:
                 if is_last_call:
                     gathered_loadbalancer_local_statistic_info = gathered_loadbalancer_local_statistic_info.view(
                         (self.mapping.moe_ep_size, self.num_experts))
@@ -561,7 +564,7 @@ class WideEPMoE(MoE):
         cluster_rank = self.cluster_rank
         quant_scales = self.quant_scales
 
-        if self.use_postquant_alltoall:
+        if use_postquant_alltoall:
             if x_sf is not None and self.has_nvfp4:
                 assert not x_is_sf_swizzled, "Fp4 scaling factor should not be swizzled before Alltoall"
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
@@ -814,7 +817,7 @@ class WideEPMoE(MoE):
             all_rank_max_num_tokens_list = split_chunk(all_rank_max_num_tokens,
                                                        num_chunks)
             chunk_size_list = all_rank_chunk_size_list[self.rank]
-            if self.enable_alltoall:
+            if use_all_to_all:
                 all_rank_num_tokens_list = [[
                     1 if val == 0 else val for val in val_list
                 ] for val_list in all_rank_num_tokens_list]
@@ -912,7 +915,7 @@ class WideEPMoE(MoE):
     def alltoall_prepare_maybe_dispatch(
             self, all_rank_max_num_tokens: int, x: torch.Tensor,
             token_selected_slots: torch.Tensor,
-            token_final_scales: torch.Tensor,
+            token_final_scales: torch.Tensor, use_postquant_alltoall: bool,
             local_statistic_tensor: Optional[torch.Tensor]):
         top_k = self.routing_method.experts_per_token
 
@@ -958,7 +961,7 @@ class WideEPMoE(MoE):
                 gathered_token_final_scales, all_rank_max_num_tokens,
                 self.num_slots, top_k, self.ep_rank, self.ep_size)
 
-        if not self.use_postquant_alltoall:
+        if not use_postquant_alltoall:
             assert not isinstance(
                 x, Fp4QuantizedTensor
             ), "pre-quant alltoall doesn't support fp4 tensor"
