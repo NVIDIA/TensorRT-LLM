@@ -9,7 +9,7 @@ This document shows how to run Llama4-Maverick on B200 with PyTorch workflow and
   - [B200 Max-throughput](#b200-max-throughput)
   - [B200 Min-latency](#b200-min-latency)
 - [Advanced Configuration](#advanced-configuration)
-  - [Exploring ISL/OSL combinations](#exploring-islosl-combinations)
+  - [Configuration tuning](#configuration-tuning)
   - [Troubleshooting](#troubleshooting)
     - [Out of memory issues](#out-of-memory-issues)
 
