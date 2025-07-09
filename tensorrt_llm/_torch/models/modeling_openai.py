@@ -28,7 +28,7 @@ from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
 
 
 @dataclass
-class OranginaModelConfig:
+class OpenAIMoeConfig:
     num_hidden_layers: int = 36
     num_experts: int = 128
     experts_per_token: int = 4
@@ -58,7 +58,7 @@ class AttentionBlock(Attention):
 
     def __init__(
         self,
-        config: ModelConfig[OranginaModelConfig],
+        config: ModelConfig[OpenAIMoeConfig],
         layer_idx: int = 0,
     ):
         pretrained_config = config.pretrained_config
@@ -141,7 +141,7 @@ class MLPBlock(torch.nn.Module):
 
     def __init__(
         self,
-        config: ModelConfig[OranginaModelConfig],
+        config: ModelConfig[OpenAIMoeConfig],
         layer_idx: int,
     ):
         super().__init__()
@@ -236,7 +236,7 @@ class TransformerBlock(DecoderLayer):
 
     def __init__(
         self,
-        config: ModelConfig[OranginaModelConfig],
+        config: ModelConfig[OpenAIMoeConfig],
         layer_idx: int,
     ):
         super().__init__()
@@ -263,7 +263,7 @@ class TransformerBlock(DecoderLayer):
 
 class Transformer(DecoderModel):
 
-    def __init__(self, model_config: ModelConfig[OranginaModelConfig]):
+    def __init__(self, model_config: ModelConfig[OpenAIMoeConfig]):
         super().__init__(model_config)
         config = self.model_config
 
@@ -334,10 +334,10 @@ class Transformer(DecoderModel):
         return hidden_states
 
 
-# TODO: fix plumbing for OranginaModelConfig
-@register_auto_model("OranginaForCausalLM")
-class OranginaForCausalLM(DecoderModelForCausalLM[Transformer,
-                                                  OranginaModelConfig]):
+# TODO: fix plumbing for OpenAIMoeConfig
+@register_auto_model("OpenAIMoeForCausalLM")
+class OpenAIMoeForCausalLM(DecoderModelForCausalLM[Transformer,
+                                                   OpenAIMoeConfig]):
 
     params_map = {
         # TRTLLM module name : Orangina module name
@@ -348,7 +348,7 @@ class OranginaForCausalLM(DecoderModelForCausalLM[Transformer,
 
     def __init__(
         self,
-        model_config: ModelConfig[OranginaModelConfig],
+        model_config: ModelConfig[OpenAIMoeConfig],
     ):
         super().__init__(
             Transformer(model_config),

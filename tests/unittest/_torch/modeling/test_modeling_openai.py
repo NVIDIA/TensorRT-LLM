@@ -10,7 +10,7 @@ from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
 configs = """
 {
     "architectures": [
-            "OranginaForCausalLM"
+            "OpenAIMoeForCausalLM"
     ],
     "model_type": "mixtral",
     "torch_dtype": "bfloat16",
