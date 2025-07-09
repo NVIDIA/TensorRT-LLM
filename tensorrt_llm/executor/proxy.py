@@ -13,13 +13,13 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.collector import MetricsCollector
 
 from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
-from ..utils.utils import set_prometheus_multiproc_dir
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             enable_llm_debug, print_colored,
                             print_colored_debug)
+from ..utils.utils import set_prometheus_multiproc_dir
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorker, PostprocWorkerConfig
@@ -62,7 +62,10 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.worker_cls = worker_cls
 
         set_prometheus_multiproc_dir()
-        self.metrics_collector = MetricsCollector({"model_name": "undefined", "engine_type": "undefined"})
+        self.metrics_collector = MetricsCollector({
+            "model_name": "undefined",
+            "engine_type": "undefined"
+        })
 
         mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
 
@@ -187,15 +190,23 @@ class GenerationExecutorProxy(GenerationExecutor):
                 if res._response and res._response.result and res._response.result.is_final:
                     self._results[client_id]._handle_response(res)
                 if metrics_dict := self._results[client_id].metrics_dict:
-                    if finish_reason := metrics_dict.get(MetricsCollector.labelname_finish_reason):
-                        self.metrics_collector.log_request_success(1, {MetricsCollector.labelname_finish_reason:
-                                                                           finish_reason})
+                    if finish_reason := metrics_dict.get(
+                            MetricsCollector.labelname_finish_reason):
+                        self.metrics_collector.log_request_success(
+                            1, {
+                                MetricsCollector.labelname_finish_reason:
+                                finish_reason
+                            })
                         self.metrics_collector.log_histogram(metrics_dict)
             if isinstance(res, PostprocWorker.Output):
                 if metrics_dict := res.metrics:
-                    if finish_reason := metrics_dict.get(MetricsCollector.labelname_finish_reason):
-                        self.metrics_collector.log_request_success(1, {MetricsCollector.labelname_finish_reason:
-                                                                           finish_reason})
+                    if finish_reason := metrics_dict.get(
+                            MetricsCollector.labelname_finish_reason):
+                        self.metrics_collector.log_request_success(
+                            1, {
+                                MetricsCollector.labelname_finish_reason:
+                                finish_reason
+                            })
                         self.metrics_collector.log_histogram(metrics_dict)
 
             if (is_llm_response(res) and res.result.is_final) or isinstance(

@@ -120,8 +120,7 @@ class PostprocWorker:
             tokenizer=tokenizer)
 
     async def _handle_input(
-            self,
-            input: Union["PostprocWorker.Input", "ResponseWrapper"]
+        self, input: Union["PostprocWorker.Input", "ResponseWrapper"]
     ) -> [Any, Optional[dict[str, float]]]:
         ''' Handle a single response from await_response worker. '''
         if input.rsp.result.context_logits is not None or \
@@ -179,7 +178,11 @@ class PostprocWorker:
             is_final = inp.rsp.result.is_final if is_llm_response(
                 inp.rsp) else True
             res, metrics = await self._handle_input(inp)
-            batch.append(PostprocWorker.Output(client_id=client_id, res=res, is_final=is_final, metrics=metrics))
+            batch.append(
+                PostprocWorker.Output(client_id=client_id,
+                                      res=res,
+                                      is_final=is_final,
+                                      metrics=metrics))
             if is_final:
                 self._records.pop(client_id)
 

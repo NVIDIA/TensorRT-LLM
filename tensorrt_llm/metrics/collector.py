@@ -8,13 +8,19 @@ from .enums import SupportedMetricNames
 
 class MetricsCollector:
     labelname_finish_reason = "finished_reason"
+
     def __init__(self, labels: Dict[str, str]) -> None:
         from prometheus_client import Counter, Histogram
         self.last_log_time = time.time()
         self.labels = labels
 
-        self.finish_reason_label = {MetricsCollector.labelname_finish_reason: "unknown"}
-        self.labels_with_finished_reason = {**self.labels, **self.finish_reason_label}
+        self.finish_reason_label = {
+            MetricsCollector.labelname_finish_reason: "unknown"
+        }
+        self.labels_with_finished_reason = {
+            **self.labels,
+            **self.finish_reason_label
+        }
 
         self.counter_request_success = Counter(
             name="request_success_total",
@@ -51,10 +57,12 @@ class MetricsCollector:
 
         self.histogram_queue_time_request = Histogram(
             name="request_queue_time_seconds",
-            documentation="Histogram of time spent in WAITING phase for request.",
-            buckets = [
+            documentation=
+            "Histogram of time spent in WAITING phase for request.",
+            buckets=[
                 0.3, 0.5, 0.8, 1.0, 1.5, 2.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0,
-                40.0, 50.0, 60.0, 120.0, 240.0, 480.0, 960.0, 1920.0, 7680.0],
+                40.0, 50.0, 60.0, 120.0, 240.0, 480.0, 960.0, 1920.0, 7680.0
+            ],
             labelnames=self.labels.keys())
 
     def _label_merge(self, labels: Dict[str, str]) -> Dict[str, str]:
@@ -62,7 +70,8 @@ class MetricsCollector:
             return self.labels
         return {**self.labels, **labels}
 
-    def _log_counter(self, counter, labels: Dict[str, str], data: Union[int, float]) -> None:
+    def _log_counter(self, counter, labels: Dict[str, str],
+                     data: Union[int, float]) -> None:
         # Convenience function for logging to counter.
         counter.labels(**self._label_merge(labels)).inc(data)
 
@@ -70,7 +79,8 @@ class MetricsCollector:
         # Convenience function for logging to histogram.
         histogram.labels(**self.labels).observe(data)
 
-    def log_request_success(self, data: Union[int, float], labels: Dict[str, str]) -> None:
+    def log_request_success(self, data: Union[int, float],
+                            labels: Dict[str, str]) -> None:
         self._log_counter(self.counter_request_success, labels, data)
         self.last_log_time = time.time()
 
@@ -81,6 +91,8 @@ class MetricsCollector:
             self._log_histogram(self.histogram_time_to_first_token, ttft)
         if tpot := data.get(SupportedMetricNames.TPOT, 0):
             self._log_histogram(self.histogram_time_per_output_token, tpot)
-        if request_queue_time := data.get(SupportedMetricNames.REQUEST_QUEUE_TIME, 0):
-            self._log_histogram(self.histogram_queue_time_request, request_queue_time)
+        if request_queue_time := data.get(
+                SupportedMetricNames.REQUEST_QUEUE_TIME, 0):
+            self._log_histogram(self.histogram_queue_time_request,
+                                request_queue_time)
         self.last_log_time = time.time()

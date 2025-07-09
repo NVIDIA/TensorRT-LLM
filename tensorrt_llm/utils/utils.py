@@ -14,9 +14,9 @@ def set_prometheus_multiproc_dir():
     if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
         logger.info("User set PROMETHEUS_MULTIPROC_DIR detected.")
         prometheus_multiproc_dir = tempfile.TemporaryDirectory(
-            dir=os.environ["PROMETHEUS_MULTIPROC_DIR"]
-        )
+            dir=os.environ["PROMETHEUS_MULTIPROC_DIR"])
     else:
         prometheus_multiproc_dir = tempfile.TemporaryDirectory()
         os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
-    logger.info(f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
+    logger.info(
+        f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
