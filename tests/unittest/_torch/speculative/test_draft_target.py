@@ -36,7 +36,7 @@ def test_llama_draft_target(use_cuda_graph: bool, attn_backend: str):
 
     draft_len = 4
     spec_config = DraftTargetDecodingConfig(
-        max_draft_len=draft_len, pytorch_weights_path=draft_model_dir)
+        max_draft_len=draft_len, speculative_model_dir=draft_model_dir)
     llm_spec = LLM(model=target_model_dir,
                    max_batch_size=max_batch_size,
                    disable_overlap_scheduler=True,

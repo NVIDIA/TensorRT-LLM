@@ -51,7 +51,7 @@ from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      run_concurrently, timing)
 from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, MoeLoadBalancerIterContext, maybe_create_moe_load_balancer)
-from ..speculative import SpecConfig, SpecMetadata, get_spec_metadata
+from ..speculative import SpecMetadata, get_spec_metadata
 from ..utils import (get_model_extra_attrs, set_torch_compiling,
                      with_model_extra_attrs)
 from .config import LoadFormat, PyTorchConfig
@@ -353,7 +353,7 @@ class PyTorchModelEngine(ModelEngine):
         mapping: Optional[Mapping] = None,
         attn_runtime_features: Optional[AttentionRuntimeFeatures] = None,
         dist: Optional[MPIDist] = None,
-        spec_config: Optional[SpecConfig] = None,
+        spec_config: Optional["DecodingBaseConfig"] = None,
         guided_decoding_config: Optional[GuidedDecodingConfig] = None,
         lora_config: Optional[LoraConfig] = None,
         is_draft_model: bool = False,
@@ -858,6 +858,7 @@ class PyTorchModelEngine(ModelEngine):
         if no_cache:
             return get_spec_metadata(
                 self.spec_config,
+                self.model.config,
                 self.batch_size,
                 max_num_tokens=self.max_num_tokens,
                 spec_resource_manager=spec_resource_manager,
@@ -867,6 +868,7 @@ class PyTorchModelEngine(ModelEngine):
             return self.spec_metadata
         self.spec_metadata = get_spec_metadata(
             self.spec_config,
+            self.model.config,
             self.batch_size,
             max_num_tokens=self.max_num_tokens,
             spec_resource_manager=spec_resource_manager,
@@ -951,7 +953,7 @@ class PyTorchModelEngine(ModelEngine):
     def _maybe_get_cuda_graph(
         self,
         batch: ScheduledRequests,
-        spec_config: Optional[SpecConfig] = None
+        spec_config: Optional["DecodingBaseConfig"] = None
     ) -> Optional[DecodingCUDAGraphRunner]:
         """
         Get a CUDA graph runner or return None (e.g. if CUDA graphs are disabled
@@ -1078,7 +1080,8 @@ class PyTorchModelEngine(ModelEngine):
 
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
-                    weights = load_weights(self.spec_config.draft_model_path)
+                    weights = load_weights(
+                        self.spec_config.speculative_model_dir)
                     model.load_draft_weights(weights)
 
             elif load_format == LoadFormat.DUMMY:

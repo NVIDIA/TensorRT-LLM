@@ -76,7 +76,8 @@ class NGramPoolManager(BaseResourceManager):
             It maps from request ID to the index of the prompt to update the pool in the next step.
     """
 
-    def __init__(self, spec_config: SpecConfig, max_num_requests: int):
+    def __init__(self, spec_config: "NGramDecodingConfig",
+                 max_num_requests: int):
         self.prompt_lookup_num_tokens = spec_config.prompt_lookup_num_tokens
         self.max_matching_ngram_size = spec_config.max_matching_ngram_size
         self.is_keep_all = spec_config.is_keep_all
@@ -191,7 +192,7 @@ class NGramDrafter(Drafter):
 
     def __init__(
         self,
-        spec_config: SpecConfig,
+        spec_config: "NGramDecodingConfig",
         ngram_pool_manager: NGramPoolManager = None,
     ):
         assert ngram_pool_manager is not None, "NGram needs a resource manager to maintain the pool."

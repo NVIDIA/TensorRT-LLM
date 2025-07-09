@@ -118,7 +118,7 @@ class SpecConfig:
     # The max number of draft tokens
     max_draft_tokens: int = 1024
     # The path to the draft model
-    draft_model_path: Optional[str] = None
+    speculative_model_dir: Optional[str] = None
     # The number of extra kv tokens
     num_extra_kv_tokens: int = 0
 
@@ -180,7 +180,7 @@ class SpecMetadata:
     # Some speculative decoding methods need to use different kv lengths for the
     # draft/target layers. But KVCacheManager can only support kv caches with the
     # same kv lengths for different layers. Add extra kv token in kv cache manager
-    # to haddle this issue.
+    # to handle this issue.
     num_extra_kv_tokens: Optional[int] = 0  # Number of layers in target model
     # The number of layers
     num_layers: int = 0

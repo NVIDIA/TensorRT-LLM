@@ -24,7 +24,7 @@ class Eagle3Config(SpecConfig):
     eagle3_one_model: bool = True
 
     def __post_init__(self):
-        if self.draft_model_path is None:
+        if self.speculative_model_dir is None:
             raise ValueError("Path to EAGLE3 weights must be specified.")
 
         if self.eagle3_one_model:
@@ -55,7 +55,7 @@ class Eagle3ResourceManager(BaseResourceManager):
     and one for the draft model. Use this class to manage the hidden states.
     """
 
-    def __init__(self, config: Eagle3Config, dtype: torch.dtype,
+    def __init__(self, config: "EagleDecodingConfig", dtype: torch.dtype,
                  hidden_size: int, max_num_requests: int, max_seq_len: int,
                  max_num_tokens: int):
         self.dtype = dtype
@@ -293,7 +293,7 @@ class Eagle3OneModelSampler(MTPSampler):
 
 class Eagle3OneModelWorker(nn.Module):
 
-    def __init__(self, spec_config: Eagle3Config, mapping: Mapping):
+    def __init__(self, spec_config: "EagleDecodingConfig", mapping: Mapping):
         super().__init__()
         self.spec_config = spec_config
         self.max_draft_tokens = self.spec_config.max_draft_tokens
