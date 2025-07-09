@@ -152,9 +152,12 @@ void KvCacheConfig::setCopyOnPartialReuse(bool copyOnPartialReuse)
     mCopyOnPartialReuse = copyOnPartialReuse;
 }
 
-void KvCacheConfig::setMaxTokens(SizeType32 maxTokens)
+void KvCacheConfig::setMaxTokens(std::optional<SizeType32> maxTokens)
 {
-    TLLM_CHECK(maxTokens > 0);
+    if (maxTokens)
+    {
+        TLLM_CHECK(maxTokens.value() > 0);
+    }
     mMaxTokens = maxTokens;
 }
 
