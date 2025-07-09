@@ -1,6 +1,6 @@
 # Llama4-Maverick
 
-This document shows how to run Llama4-Maverick on B200 with PyTorch workflow and how to run performance benchmark
+This document shows how to run Llama4-Maverick on B200 with PyTorch workflow and how to run performance benchmarks
 
 
 ## Table of Contents
@@ -16,7 +16,7 @@ This document shows how to run Llama4-Maverick on B200 with PyTorch workflow and
 
 ## Performance Benchmarks
 
-This section provides the steps to launch TensorRT-LLM server and run performance benchmark for different scenarios.
+This section provides the steps to launch TensorRT-LLM server and run performance benchmarks for different scenarios.
 
 
 ### B200 Max-throughput
@@ -54,7 +54,7 @@ trtllm-serve nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
 ```
 
 
-#### 3. Run performance benchmark
+#### 3. Run performance benchmarks
 TensorRT-LLM provides a benchmark tool to benchmark trtllm-serve
 Prepare a new terminal and run `benchmark_serving`
 ```bash
@@ -140,4 +140,4 @@ python -m tensorrt_llm.serve.scripts.benchmark_serving \
 
 #### Out of memory issues
 
-It's possible seeing OOM issues on some cases. Considering reducing `kv_cache_free_gpu_mem_fraction` to a smaller value as a workaround. We're working on the investigation and addressing the problem.
+It's possible to see OOM issues in some cases. Considering reducing `kv_cache_free_gpu_mem_fraction` to a smaller value as a workaround. We're working on investigating and addressing the problem.
