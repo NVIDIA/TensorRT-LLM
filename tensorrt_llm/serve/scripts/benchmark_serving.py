@@ -753,6 +753,9 @@ def main(args: argparse.Namespace):
                     raise ValueError(
                         "Invalid metadata format. Please use KEY=VALUE format.")
 
+        # Merge with benchmark result
+        result_json = {**result_json, **benchmark_result}
+
         if not args.save_detailed:
             # Remove fields with too many data points
             for field in [
@@ -767,9 +770,6 @@ def main(args: argparse.Namespace):
                                        < float("inf") else "inf")
         result_json["burstiness"] = args.burstiness
         result_json["max_concurrency"] = args.max_concurrency
-
-        # Merge with benchmark result
-        result_json = {**result_json, **benchmark_result}
 
         # Save to file
         base_model_id = model_id.split("/")[-1]
