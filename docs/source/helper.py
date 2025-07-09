@@ -25,7 +25,7 @@ def generate_examples():
     doc_dir = root_dir / "docs/source/1.0/examples"
 
     # Source paths for LLMAPI examples
-    llmapi_script_dir = root_dir / "1.0/examples/llm-api"
+    llmapi_script_dir = root_dir / "examples/llm-api"
     llmapi_script_paths = sorted(
         llmapi_script_dir.glob("*.py"),
         # The autoPP example should be at the end since it is a preview example
