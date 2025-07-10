@@ -472,11 +472,6 @@ public:
         mExcludeInputFromOutput = exclude;
     }
 
-    bool getExcludeInputFromOutput()
-    {
-        return mExcludeInputFromOutput;
-    }
-
     /// @brief Get the params of the context
     /// @return The params of the context
     [[nodiscard]] std::optional<executor::ContextPhaseParams> const& getContextPhaseParams() const noexcept
@@ -772,11 +767,6 @@ public:
     [[nodiscard]] RequestIdType getParentRequestId() const
     {
         return mParentRequestId;
-    }
-
-    [[nodiscard]] SizeType32 getSequenceIndex() const
-    {
-        return mSequenceIndex;
     }
 
     /// @brief Return a vector of the last-generated tokens of shape [num_beams]
@@ -1865,11 +1855,6 @@ public:
 
     // current position of the prompt tuning table (only used in chunked prefill mode)
     SizeType32 mPtableCurrentPosition{0};
-
-    [[nodiscard]] std::shared_ptr<std::vector<bool>> getSequenceFinalVec() const
-    {
-        return mSequenceFinalVec;
-    }
 
 protected:
     bool mIsStreaming;
