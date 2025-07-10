@@ -32,8 +32,9 @@ using SizeType32 = MakeDecodingBatchInputOutput::SizeType32;
 using TensorPtr = MakeDecodingBatchInputOutput::TensorPtr;
 
 std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::createDecoderBatchInputs(
-    std::vector<SizeType32> const& activeSlots, runtime::decoder::DecoderState const& decoderState,
-    std::vector<TensorPtr> const& logits, SizeType32 maxNumSequences, std::vector<TensorPtr> const& batchSlots)
+    DecoderInputBuffers& inputBuffers, std::vector<SizeType32> const& activeSlots,
+    runtime::decoder::DecoderState const& decoderState, std::vector<TensorPtr> const& logits,
+    SizeType32 maxNumSequences)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -41,6 +42,8 @@ std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::createDe
     auto const& maxDecodingEngineTokens = decoderState.getMaxDecodingEngineTokens();
     auto const& maxDecodingDecoderTokens = decoderState.getMaxDecodingDecoderTokens();
     auto const maxDecoderSteps = common::ceilDiv(maxDecodingEngineTokens, maxDecodingDecoderTokens);
+
+    auto& batchSlots = inputBuffers.forwardBatchSlots;
 
     for (SizeType32 step = 0; step < maxDecoderSteps; ++step)
     {
@@ -176,17 +179,17 @@ void setEagleInputs(tr::DecodingInput& dInput, RuntimeBuffers const& fusedRuntim
 
 } // namespace
 
-std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::operator()(RequestVector const& contextRequests,
-    RequestVector const& generationRequests, DecoderInputBuffers const& inputBuffers,
-    runtime::decoder::DecoderState& decoderState, runtime::ModelConfig const& modelConfig, SizeType32 maxNumSequences,
+std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::operator()(DecoderInputBuffers& inputBuffers,
+    runtime::decoder::DecoderState& decoderState, RequestVector const& contextRequests,
+    RequestVector const& generationRequests, std::vector<TensorPtr> const& logits,
+    runtime::ModelConfig const& modelConfig, SizeType32 maxNumSequences,
     OptionalRef<RuntimeBuffers> fusedRuntimeBuffers) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto [activeSlots, generationSteps] = getActiveSlots(contextRequests, generationRequests);
 
-    auto decodingInput = createDecoderBatchInputs(
-        activeSlots, decoderState, inputBuffers.logits, maxNumSequences, inputBuffers.forwardBatchSlots);
+    auto decodingInput = createDecoderBatchInputs(inputBuffers, activeSlots, decoderState, logits, maxNumSequences);
 
     auto const maxBeamWidth = decoderState.getMaxBeamWidth();
     if (maxBeamWidth > 1)
