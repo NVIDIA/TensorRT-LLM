@@ -681,6 +681,8 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                        skip_modules: List[str] = [],
                        params_map: Optional[Dict[str, str]] = None,
                        preload_weight_modules: Optional[List[str]] = None):
+    # TODO: remove preload_weight_modules - it is a workaround for min-latency llama4 model loading where
+    # we need some order in the module loading. Once this is resolved, we can remove this workaround.
     if not hasattr(model, 'model_config') or not isinstance(
             model.model_config, ModelConfig):
         raise ValueError("model must have a model_config attribute")
