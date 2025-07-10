@@ -311,7 +311,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "moe_local_gather(Tensor recv_rank_cum_sum, Tensor local_gather_indices, Tensor gathered_expert_ids, Tensor? "
-        "gathered_scales, Tensor local_expert_ids, Tensor local_scales, int max_token_count_per_rank, int "
+        "gathered_scales, Tensor local_expert_ids, Tensor? local_scales, int max_token_count_per_rank, int "
         "expert_count, int top_k, int ep_rank, int ep_size) -> ()");
 }
 

@@ -86,8 +86,6 @@ class WideEPMoE(MoE):
         assert self.parallel_size > 1, "WideEP should only be enabled with parallel_size > 1"
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
-        assert self.apply_router_weight_on_input is False, "WideEP doesn't support apply_router_weight_on_input."
-
         self.layer_idx = layer_idx
 
         moe_load_balancer = get_moe_load_balancer()
@@ -169,7 +167,7 @@ class WideEPMoE(MoE):
             model_config.mapping, routing_method.experts_per_token, dtype,
             model_config.use_cuda_graph)
         logger.info_once(
-            f"CutlassFusedMoE selects alltoall_method_type {self.alltoall_method_type!r}",
+            f"{self.__class__.__name__} selects alltoall_method_type {self.alltoall_method_type!r}",
             key="alltoall_method_type")
         self.use_postquant_alltoall = False
         if self.enable_alltoall:
@@ -215,6 +213,9 @@ class WideEPMoE(MoE):
 
     def _check_configs(self):
         assert self._weights_created
+
+        if self.apply_router_weight_on_input:
+            assert self.routing_method.top_k == 1, "Current walkaround only supports top-1 routing"
 
         if self.quant_config and self.quant_config.quant_mode.has_any_quant(
                 exclude_kv_cache=True):
@@ -364,6 +365,12 @@ class WideEPMoE(MoE):
         assert token_selected_experts.shape[0] == router_logits.shape[0]
         assert token_final_scales.dtype == torch.float32
         assert token_selected_experts.dtype == torch.int32
+
+        if self.apply_router_weight_on_input:
+            assert x.dtype != torch.float8_e4m3fn, "Current workaround for apply_router_weight_on_input does not support fp8 input"
+            x = x * token_final_scales.to(x.dtype)
+            # TODO: remove this once we have correct fusedmoe kernel ready
+            token_final_scales = None
 
         if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
         ) and is_first_call:
