@@ -17,12 +17,12 @@ from tensorrt_llm.models import PretrainedConfig
 from tensorrt_llm.models.llama.model import LLaMAForCausalLM
 
 # isort: off
+from .lora_test_utils import check_trt_python_llama_7b_multi_lora_from_request_test_harness
 from .test_llm import (
     DummyError, DummyExecutorWorker3, _test_llm_capture_request_error,
     _test_llm_generate_async, check_llm_return_context_logits,
     check_llm_return_generation_logits, llm_return_logprobs_test_harness,
-    default_model_name, get_model_path,
-    llama_7b_multi_lora_from_request_test_harness, llama_model_path,
+    default_model_name, get_model_path, llama_model_path,
     llama_v2_7b_prompt_adapter_test_harness,
     llama_v2_13b_lora_from_dir_test_harness, llm_check_output,
     llm_get_stats_async_test_harness, llm_get_stats_test_harness,
@@ -261,7 +261,7 @@ def test_llama_v2_13b_lora_tp2():
 @pytest.mark.gpu2
 @pytest.mark.part3
 def test_llama_7b_multi_lora_tp2():
-    llama_7b_multi_lora_from_request_test_harness(
+    check_trt_python_llama_7b_multi_lora_from_request_test_harness(
         tensor_parallel_size=2,
         max_loras=1,
         max_cpu_loras=8,
