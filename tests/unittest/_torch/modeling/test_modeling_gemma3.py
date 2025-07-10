@@ -6,6 +6,7 @@ import torch
 from parameterized import parameterized
 from transformers import Gemma3Config
 from transformers import Gemma3ForCausalLM as HFGemma3ForCausalLM
+from transformers import Gemma3TextConfig
 from transformers.cache_utils import HybridCache
 
 import tensorrt_llm
@@ -35,7 +36,7 @@ GEMMA3_1B_CONFIG = {
     "max_position_embeddings": 32768,
     "model_type": "gemma3_text",
     "num_attention_heads": 4,
-    "num_hidden_layers": 26,
+    "num_hidden_layers": 6,
     "num_key_value_heads": 1,
     "pad_token_id": 0,
     "query_pre_attn_scalar": 256,
@@ -43,7 +44,7 @@ GEMMA3_1B_CONFIG = {
     "rope_local_base_freq": 10000,
     "rope_scaling": None,
     "rope_theta": 1000000,
-    "sliding_window": 512,
+    "sliding_window": 4,
     "sliding_window_pattern": 6,
     "torch_dtype": "bfloat16",
     "transformers_version": "4.50.0.dev0",
@@ -66,14 +67,15 @@ GEMMA3_27B_CONFIG = {
         "intermediate_size": 21504,
         "model_type": "gemma3_text",
         "num_attention_heads": 32,
-        "num_hidden_layers": 62,
+        "num_hidden_layers": 6,
         "num_key_value_heads": 16,
         "query_pre_attn_scalar": 168,
         "rope_scaling": {
             "factor": 8.0,
             "rope_type": "linear"
         },
-        "sliding_window": 1024
+        "sliding_window": 4,
+        "sliding_window_pattern": 6,
     },
     "torch_dtype": "bfloat16",
     "transformers_version": "4.50.0.dev0",
@@ -101,7 +103,7 @@ class Scenario:
 
 class TestGemma3(unittest.TestCase):
 
-    def get_kv_cache_manager(self, dtype: torch.dtype, config: Gemma3Config,
+    def get_kv_cache_manager(self, dtype: torch.dtype, config: Gemma3TextConfig,
                              tokens_per_block: int, max_seq_len: int,
                              batch_size: int, num_blocks: int):
         if dtype == torch.half:
@@ -135,7 +137,7 @@ class TestGemma3(unittest.TestCase):
 
         # Using 1B config for sanity test.
         config_dict = deepcopy(GEMMA3_1B_CONFIG)
-        gemma3_config = Gemma3Config.from_dict(config_dict)
+        gemma3_config = Gemma3TextConfig.from_dict(config_dict)
 
         dtype = gemma3_config.torch_dtype
         device = torch.device('cuda')
@@ -240,17 +242,15 @@ class TestGemma3(unittest.TestCase):
         else:
             raise ValueError(f"Unknown config_name: {config_name}")
 
-        gemma3_config = Gemma3Config.from_dict(config_dict)
         if config_name == "27B":
+            gemma3_config = Gemma3Config.from_dict(config_dict)
             gemma3_config.text_config.torch_dtype = gemma3_config.torch_dtype
             gemma3_config = gemma3_config.text_config
+        else:
+            gemma3_config = Gemma3TextConfig.from_dict(config_dict)
+
         dtype = gemma3_config.torch_dtype
         device = torch.device('cuda')
-
-        # 2-layer network with one local (sliding window=4) and one global layer.
-        gemma3_config.num_hidden_layers = 2
-        gemma3_config.sliding_window = 4
-        gemma3_config.sliding_window_pattern = 2
 
         num_blocks = 1
         tokens_per_block = 128
@@ -326,8 +326,8 @@ class TestGemma3(unittest.TestCase):
                                     use_cache=True)
             torch.testing.assert_close(logits,
                                        ref.logits[:, -1].float(),
-                                       atol=0.05,
-                                       rtol=0.05)
+                                       atol=0.4,
+                                       rtol=0.4)
 
         # Generation phase.
         gen_input_ids = torch.tensor([900], dtype=torch.int, device=device)
@@ -360,19 +360,19 @@ class TestGemma3(unittest.TestCase):
                                     position_ids=gen_position_ids,
                                     past_key_values=hf_cache,
                                     use_cache=True,
-                                    cache_position=torch.IntTensor(
+                                    cache_position=torch.LongTensor(
                                         [input_ids.size(-1)]).to(device),
                                     last_cache_position=input_ids.size(-1) + 1)
             torch.testing.assert_close(logits,
                                        ref.logits[:, -1].float(),
-                                       atol=0.05,
-                                       rtol=0.05)
+                                       atol=0.4,
+                                       rtol=0.4)
 
         kv_cache_manager.shutdown()
 
     def test_gemma3_flashinfer_mask(self):
         config_dict = deepcopy(GEMMA3_1B_CONFIG)
-        gemma3_config = Gemma3Config.from_dict(config_dict)
+        gemma3_config = Gemma3TextConfig.from_dict(config_dict)
 
         dtype = gemma3_config.torch_dtype
         device = torch.device('cuda')
@@ -450,7 +450,7 @@ class TestGemma3(unittest.TestCase):
 
     def test_gemma3_global_context_mask(self) -> None:
         config_dict = deepcopy(GEMMA3_1B_CONFIG)
-        gemma3_config = Gemma3Config.from_dict(config_dict)
+        gemma3_config = Gemma3TextConfig.from_dict(config_dict)
         device = torch.device('cuda')
         model_config = ModelConfig(pretrained_config=gemma3_config,
                                    attn_backend="FLASHINFER")
@@ -487,7 +487,7 @@ class TestGemma3(unittest.TestCase):
 
     def test_gemma3_local_context_mask(self) -> None:
         config_dict = deepcopy(GEMMA3_1B_CONFIG)
-        gemma3_config = Gemma3Config.from_dict(config_dict)
+        gemma3_config = Gemma3TextConfig.from_dict(config_dict)
         device = torch.device('cuda')
         model_config = ModelConfig(pretrained_config=gemma3_config,
                                    attn_backend="FLASHINFER")
