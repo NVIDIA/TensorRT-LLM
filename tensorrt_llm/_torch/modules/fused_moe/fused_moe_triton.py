@@ -5,6 +5,8 @@ from typing import Dict, List, NamedTuple, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 IS_TRITON_KERNELS_AVAILABLE = False
 try:
@@ -32,7 +34,6 @@ try:
         SwizzlingType, perm_tensor_from_contig, perm_tuple_from_contig,
         swizzle_mx_scale_bw, swizzle_mxfp4_scale_hopper,
         swizzle_mxfp4_value_hopper)
-    from triton_kernels.routing import routing
     IS_TRITON_KERNELS_AVAILABLE = True
     from triton_kernels.numerics_details.mxfp import downcast_to_mxfp_torch
 except ImportError:
@@ -58,6 +59,110 @@ def shuffle_weight_for_activation_kernel(
     w3_w1_weight[..., 0::2] = temp_weight[..., last_dim // 2:]
     w3_w1_weight[..., 1::2] = temp_weight[..., 0:last_dim // 2]
     return w3_w1_weight
+
+
+# Helper function used for triton EP masking
+@triton.jit
+def _routing_shift_bitmatrix(Bitmatrix, stride_bm, stride_bn, n_words, start,
+                             BLOCK_N: tl.constexpr):
+    pid_m = tl.program_id(0)
+    start_word = start // 32
+    start_bit = start % 32
+
+    for col0 in range(0, n_words, BLOCK_N):
+        w = col0 + tl.arange(0, BLOCK_N)  # dst‐word indices
+        dst_mask = w < n_words
+
+        # corresponding source words (and the next word for carry bits)
+        src1_w = start_word + w
+        src2_w = src1_w + 1
+
+        ptr1 = Bitmatrix + pid_m * stride_bm + src1_w * stride_bn
+        ptr2 = Bitmatrix + pid_m * stride_bm + src2_w * stride_bn
+
+        v1 = tl.load(ptr1, mask=src1_w < n_words, other=0).to(tl.uint32)
+        v2 = tl.load(ptr2, mask=src2_w < n_words, other=0).to(tl.uint32)
+
+        # shift the slice down to bit‐0
+        shifted = tl.where(start_bit == 0, v1,
+                           (v1 >> start_bit) | (v2 << (32 - start_bit)))
+
+        # write back in place; bits past the region are already zero
+        tl.store(Bitmatrix + pid_m * stride_bm + w * stride_bn,
+                 shifted.to(tl.int32),
+                 mask=dst_mask)
+
+
+class TritonEPRouter():
+
+    def prune_routing_range(self, expt_scal, expt_indx, bitmatrix, slice_start,
+                            slice_end):
+        from triton_kernels.compaction import compaction
+        from triton_kernels.routing import _routing_clear_bitmatrix
+        n_tokens_pad = expt_scal.shape[0]
+        n_expts_tot = bitmatrix.shape_raw[-1]
+        _routing_shift_bitmatrix[(n_tokens_pad, )](
+            bitmatrix.handle,
+            bitmatrix.handle.stride(0),
+            bitmatrix.handle.stride(1),
+            bitmatrix.handle.shape[1],
+            slice_start,
+            BLOCK_N=512,
+        )
+        _routing_clear_bitmatrix[(n_tokens_pad, )](
+            bitmatrix.handle,
+            bitmatrix.handle.stride(0),
+            bitmatrix.handle.stride(1),
+            bitmatrix.handle.shape[1],
+            slice_end - slice_start,
+            BLOCK_N=512,
+        )
+        expt_indx = torch.where(expt_indx < slice_end, expt_indx - slice_start,
+                                expt_indx)
+        expt_indx = torch.where(expt_indx < 0, expt_indx + slice_end, expt_indx)
+        # perform compaction to update expt_scal / expt_indx
+        expt_scal, expt_indx = compaction(expt_scal, expt_indx, bitmatrix)
+        n_expts_tot = slice_end - slice_start
+        bitmatrix.shape_raw[-1] = n_expts_tot
+        return expt_scal, expt_indx, bitmatrix
+
+    def __call__(self,
+                 logits,
+                 n_expts_act,
+                 sm_first=False,
+                 expt_indx=None,
+                 ep=1,
+                 node_idx=0,
+                 n_rows=None):
+        n_expts_tot = logits.shape[-1]
+        n_expts_local = n_expts_tot // ep
+        slice_start = node_idx * n_expts_local
+        slice_end = slice_start + n_expts_local
+
+        from triton_kernels.routing import (GatherIndx, RoutingData,
+                                            ScatterIndx, compute_expt_data,
+                                            sort_tokens)
+        from triton_kernels.topk import topk
+        if sm_first:
+            logits = torch.softmax(logits, dim=-1)
+        expt_scal, expt_indx, bitmatrix = topk(
+            logits,
+            n_expts_act,  #
+            apply_softmax=not sm_first,
+            y_indx=expt_indx,
+            n_rows=n_rows)
+        # mutate bitmatrix
+        if ep > 1:
+            expt_scal, expt_indx, bitmatrix = self.prune_routing_range(
+                expt_scal, expt_indx, bitmatrix, slice_start, slice_end)
+        hist, topk_indx, gate_indx, gate_scal = sort_tokens(
+            expt_scal, expt_indx, bitmatrix)
+        # pack the matmul data structure
+        gather_indx = GatherIndx(src_indx=topk_indx, dst_indx=gate_indx)
+        scatter_indx = ScatterIndx(src_indx=gate_indx, dst_indx=topk_indx)
+        expt_data = compute_expt_data(hist, n_expts_local, topk_indx.numel())
+        return RoutingData(gate_scal, hist, n_expts_local, n_expts_act,
+                           expt_data), gather_indx, scatter_indx
 
 
 class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
@@ -181,7 +286,11 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
         # Step 1: Routing
         num_experts = expert_logits.shape[1]
         if num_experts > 1:
-            rdata, gather_indx, scatter_indx = routing(expert_logits, top_k)
+            rdata, gather_indx, scatter_indx = TritonEPRouter()(
+                expert_logits,
+                top_k,
+                ep=module.ep_size,
+                node_idx=module.ep_rank)
         else:
             rdata, gather_indx, scatter_indx = None, None, None
 
@@ -387,7 +496,11 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         # Step 1: Routing
         num_experts = expert_logits.shape[1]
         if num_experts > 1:
-            rdata, gather_indx, scatter_indx = routing(expert_logits, top_k)
+            rdata, gather_indx, scatter_indx = TritonEPRouter()(
+                expert_logits,
+                top_k,
+                ep=module.ep_size,
+                node_idx=module.ep_rank)
         else:
             rdata, gather_indx, scatter_indx = None, None, None
 
@@ -937,7 +1050,11 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         # Step 1: Routing
         num_experts = expert_logits.shape[1]
         if num_experts > 1:
-            rdata, gather_indx, scatter_indx = routing(expert_logits, top_k)
+            rdata, gather_indx, scatter_indx = TritonEPRouter()(
+                expert_logits,
+                top_k,
+                ep=module.ep_size,
+                node_idx=module.ep_rank)
         else:
             rdata, gather_indx, scatter_indx = None, None, None
 
@@ -1072,7 +1189,6 @@ class TritonFusedMoE(MoE):
             "routing_method must be an instance of RenormalizeMoeRoutingMethod for TritonFusedMoE"
         assert not self.smart_router, "Smart router is not supported in TritonFusedMoE."
         assert not self.use_dp, "AttentionDP is not supported in TritonFusedMoE."
-        assert self.ep_size == 1, " TritonFusedMoE does not support expert parallelism (ep_size > 1)."
 
         self.num_slots = self.num_experts
         self.expert_size_per_partition = self.num_experts // self.ep_size
@@ -1147,10 +1263,9 @@ class TritonFusedMoE(MoE):
         # TODO(dongfengy): Add missing comm primitives for TP/EP
         hidden_states = self.quant_method.apply(self, x, router_logits)
 
-        if self.tp_size > 1:
-            assert self.reduce_results
+        if self.parallel_size > 1 and self.reduce_results:
             hidden_states = hidden_states.contiguous(
-            )  # There might be padding going on
+            )  # If padding is removed, the hidden_states may not be contiguous
             hidden_states = self.all_reduce(hidden_states)
 
         return hidden_states
