@@ -20,6 +20,7 @@
 #include "tensorrt_llm/batch_manager/assignReqSeqSlots.h"
 #include "tensorrt_llm/batch_manager/capacityScheduler.h"
 #include "tensorrt_llm/batch_manager/createNewDecoderRequests.h"
+#include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/handleContextLogits.h"
 #include "tensorrt_llm/batch_manager/handleGenerationLogits.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
@@ -133,8 +134,8 @@ void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::mod
 
     py::class_<MakeDecodingBatchInputOutput>(m, MakeDecodingBatchInputOutput::name)
         .def(py::init())
-        .def("__call__", &MakeDecodingBatchInputOutput::operator(), py::arg("context_requests"),
-            py::arg("generation_requests"), py::arg("decoder_input_buffers"), py::arg("decoder_state"),
+        .def("__call__", &MakeDecodingBatchInputOutput::operator(), py::arg("decoder_input_buffers"),
+            py::arg("decoder_state"), py::arg("context_requests"), py::arg("generation_requests"), py::arg("logits"),
             py::arg("model_config"), py::arg("max_num_sequences"), py::arg("fused_runtime_buffers") = std::nullopt)
         .def("name", [](MakeDecodingBatchInputOutput const&) { return MakeDecodingBatchInputOutput::name; });
 

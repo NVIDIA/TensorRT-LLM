@@ -15,8 +15,9 @@ from tensorrt_llm.bindings.executor import (DecodingConfig, DecodingMode,
                                             ExecutorConfig, FinishReason)
 from tensorrt_llm.bindings.internal.algorithms import CreateNewDecoderRequests
 from tensorrt_llm.bindings.internal.batch_manager import (
-    DecoderInputBuffers, add_new_tokens_to_requests, make_decoding_batch_input)
+    add_new_tokens_to_requests, make_decoding_batch_input)
 from tensorrt_llm.bindings.internal.runtime import (BufferManager, CudaEvent,
+                                                    DecoderInputBuffers,
                                                     DecoderState,
                                                     GptDecoderBatched)
 from tensorrt_llm.executor.result import Logprob
@@ -536,8 +537,7 @@ class TRTLLMSampler(Sampler):
             "buffer_manager":
             buffer_manager,
             "decoder_input_buffers": [
-                DecoderInputBuffers(self.max_num_sequences,
-                                    self.executor_config.max_batch_size,
+                DecoderInputBuffers(self.executor_config.max_batch_size,
                                     self.MAX_DECODING_TOKENS, buffer_manager)
                 for _ in range(self.num_micro_batches)
             ],
@@ -549,7 +549,6 @@ class TRTLLMSampler(Sampler):
                         dtype=torch.int),
             "decoder_state":
             DecoderState(),
-            "decoding_input": [None] * self.num_micro_batches,
         }
 
         self.store["decoder_state"].setup(
@@ -657,21 +656,30 @@ class TRTLLMSampler(Sampler):
             self._update_cache_indirection_buffer(scheduled_requests)
 
         # TODO: Enable this back once nanobind is merged and/or llm request is a pure python object
-        # decoding_input = self.algs.make_decoding_batch_input_output(
-        #     scheduled_requests, model_outputs["logits"], beam_width,
-        #     num_context_logits_prefix_sum)
+        # self.algs.make_decoding_batch_input_output(
+        #     self.store["decoder_input_buffers"][self.micro_batch_idx],
+        #     self.store["decoder_state"],
+        #     scheduled_requests,
+        #     model_outputs["logits"],
+        #     beam_width,
+        #     num_context_logits_prefix_sum,
+        # )
 
-        self.store["decoding_input"][
-            self.micro_batch_idx] = make_decoding_batch_input(
-                scheduled_requests.context_requests,
-                scheduled_requests.generation_requests, model_outputs["logits"],
-                beam_width, num_context_logits_prefix_sum,
-                self.store["decoder_input_buffers"][self.micro_batch_idx],
-                self.store["decoder_state"], self.store["buffer_manager"])
+        make_decoding_batch_input(
+            self.store["decoder_input_buffers"][self.micro_batch_idx],
+            self.store["decoder_state"],
+            scheduled_requests.context_requests,
+            scheduled_requests.generation_requests,
+            model_outputs["logits"],
+            beam_width,
+            num_context_logits_prefix_sum,
+            self.store["buffer_manager"],
+        )
 
         self.algs.decoder.forward_async(
             self.store["decoder_state"],
-            self.store["decoding_input"][self.micro_batch_idx])
+            self.store["decoder_input_buffers"][self.micro_batch_idx],
+        )
 
         new_output_tokens = self.store["decoder_state"].all_new_tokens.to(
             'cpu', non_blocking=True)
