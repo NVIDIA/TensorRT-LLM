@@ -1264,9 +1264,8 @@ class PyTorchModelEngine(ModelEngine):
         extend_requests += extend_dummy_requests
 
         if not self._disable_overlap_scheduler and self.is_spec_decode:
-            spec_dec_mode = self.spec_config.spec_dec_mode
-            assert spec_dec_mode.support_overlap_scheduler(
-            ), f"{self.spec_config.spec_dec_name} does not support overlap scheduler"
+            assert self.spec_config.spec_dec_mode.support_overlap_scheduler(
+            ), f"{self.spec_config.decoding_type} does not support overlap scheduler"
 
         # will contain previous batch indices of generation requests
         previous_batch_indices = []

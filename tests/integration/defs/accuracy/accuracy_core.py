@@ -157,7 +157,8 @@ class AccuracyTask:
         elif isinstance(llm.args.speculative_config, DecodingBaseConfig):
             spec_dec_algo = llm.args.speculative_config.decoding_type
         elif isinstance(llm.args.speculative_config, SpecConfig):
-            # TODO: This branch is deprecated, but thread-leak of pytest raises flaky error if removing it.
+            # This branch is deprecated, but thread-leak of pytest raises flaky error if removing it.
+            # TODO: remove this branch safely.
             spec_dec_algo = llm.args.speculative_config.spec_dec_name
         else:
             raise ValueError(
