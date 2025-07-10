@@ -101,7 +101,7 @@ std::pair<std::vector<SizeType32>, std::vector<SizeType32>> getActiveSlots(
         {
             if (llmReq->isGenerationInProgressState() || llmReq->isLastContextChunk())
             {
-                slots.push_back({llmReq->mSeqSlot.value(), llmReq->getDecodingIter()});
+                slots.emplace_back(llmReq->mSeqSlot.value(), llmReq->getDecodingIter());
             }
         }
     }
