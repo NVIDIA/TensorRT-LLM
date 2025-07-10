@@ -13,16 +13,20 @@ trtllm-bench is a comprehensive benchmarking tool for TensorRT-LLM engines. It p
    :commands: throughput, latency, build
 
 
-Dataset Preparation
-------------------
-trtllm-bench is designed to work with the [`prepare_dataset.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/benchmarks/cpp/prepare_dataset.py) script, which generates benchmark datasets in the required format. The prepare_dataset script supports:
+
+prepare_dataset.py
+===========================
+
+trtllm-bench is designed to work with the `prepare_dataset.py <https://github.com/NVIDIA/TensorRT-LLM/blob/main/benchmarks/cpp/prepare_dataset.py>`_ script, which generates benchmark datasets in the required format. The prepare_dataset script supports:
 
 **Dataset Types:**
+
 - Real datasets from various sources
 - Synthetic datasets with normal or uniform token distributions
 - LoRA task-specific datasets
 
 **Key Features:**
+
 - Tokenizer integration for proper text preprocessing
 - Configurable random seeds for reproducible results
 - Support for LoRA adapters and task IDs
@@ -31,8 +35,17 @@ trtllm-bench is designed to work with the [`prepare_dataset.py`](https://github.
 .. important::
    The ``--stdout`` flag is **required** when using prepare_dataset.py with trtllm-bench to ensure proper data streaming format.
 
-**prepare_dataset.py CLI Options:**
+**Usage:**
 
+prepare_dataset
+-------------------
+
+.. code-block:: bash
+
+    python prepare_dataset.py [OPTIONS]
+
+**Options**
+----
 .. list-table::
    :widths: 20 80
    :header-rows: 1
@@ -56,23 +69,17 @@ trtllm-bench is designed to work with the [`prepare_dataset.py`](https://github.
    * - ``--log-level``
      - Logging level: info or debug (default: info)
 
-**prepare_dataset.py Subcommands:**
+dataset
+-------------------
 
-.. list-table::
-   :widths: 20 80
-   :header-rows: 1
+Process real datasets from various sources.
 
-   * - Subcommand
-     - Description
-   * - ``dataset``
-     - Process real datasets from various sources
-   * - ``token_norm_dist``
-     - Generate synthetic datasets with normal token distribution
-   * - ``token_unif_dist``
-     - Generate synthetic datasets with uniform token distribution
+.. code-block:: bash
 
-**Dataset Subcommand Options:**
+    python prepare_dataset.py dataset [OPTIONS]
 
+**Options**
+----
 .. list-table::
    :widths: 20 80
    :header-rows: 1
@@ -90,8 +97,18 @@ trtllm-bench is designed to work with the [`prepare_dataset.py`](https://github.
    * - ``--format``
      - Input format: json, jsonl, csv, or txt (default: auto-detect)
 
-**Token Normal Distribution Subcommand Options:**
 
+token_norm_dist
+-------------------
+
+Generate synthetic datasets with normal token distribution.
+
+.. code-block:: bash
+
+    python prepare_dataset.py token_norm_dist [OPTIONS]
+
+**Options**
+----
 .. list-table::
    :widths: 20 80
    :header-rows: 1
@@ -109,8 +126,18 @@ trtllm-bench is designed to work with the [`prepare_dataset.py`](https://github.
    * - ``--output-stdev``
      - Normal distribution standard deviation for output tokens (required)
 
-**Token Uniform Distribution Subcommand Options:**
 
+token_unif_dist
+-------------------
+
+Generate synthetic datasets with uniform token distribution
+
+.. code-block:: bash
+
+    python prepare_dataset.py token_unif_dist [OPTIONS]
+
+**Options**
+----
 .. list-table::
    :widths: 20 80
    :header-rows: 1
@@ -127,15 +154,3 @@ trtllm-bench is designed to work with the [`prepare_dataset.py`](https://github.
      - Uniform distribution minimum for output tokens (required)
    * - ``--output-max``
      - Uniform distribution maximum for output tokens (required)
-
-**Usage Example:**
-
-.. code-block:: bash
-
-    python prepare_dataset.py --tokenizer <model_name> --stdout dataset --output benchmark_data.jsonl
-
-This workflow allows you to:
-
-1. Prepare datasets using ``prepare_dataset.py`` with the required ``--stdout`` flag
-2. Build optimized engines with ``trtllm-bench build`` using the prepared dataset
-3. Run comprehensive benchmarks with ``trtllm-bench throughput`` or ``trtllm-bench latency``
