@@ -2034,7 +2034,7 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
         scheduledRequests.contextRequests, scheduledRequests.generationRequests, seqSlotLogits, mModelConfig,
         getMaxNumSequences(), *fusedRuntimeBuffers);
 
-    auto decoderFinishEvent = mDecoder->forwardAsync(*mDecoderState, *decodingInput);
+    auto decoderFinishEvent = mDecoder->forwardAsync(*mDecoderState, decoderInputBuffers);
 
     auto const returnLogProbs = batchReturnLogProbs(scheduledRequests);
     auto updateDecoderBuffersEvent = (*mUpdateDecoderBuffers)(mModelConfig, mDecoderOutputBuffers.at(fusedBufferId),
