@@ -75,16 +75,15 @@ class KvCacheCreator:
             head_dim = config.kv_lora_rank + config.qk_rope_head_dim
             kv_factor = 1
         else:
-            head_dim = getattr(
-                config,
-                "head_dim",
-                config.hidden_size // config.num_attention_heads,
-            ) * num_key_value_heads // tp_size
+            _head_dim = getattr(config, 'head_dim', None)
+            if not isinstance(_head_dim, int):
+                _head_dim = config.hidden_size // config.num_attention_heads
+            head_dim = _head_dim * num_key_value_heads // tp_size
 
         # provide at least 1 layer to prevent division by zero cache size
-        num_hidden_layers = max(
-            len(mapping.pp_layers(config.num_hidden_layers)), 1)
-        mem_per_token *= num_hidden_layers * head_dim
+        num_attention_layers = max(
+            len(mapping.pp_layers(model_config.get_num_attention_layers())), 1)
+        mem_per_token *= num_attention_layers * head_dim
         # K and V
         mem_per_token *= kv_factor
         return mem_per_token
@@ -281,8 +280,9 @@ class KvCacheCreator:
         num_attention_heads = config.num_attention_heads
         num_key_value_heads = getattr(config, 'num_key_value_heads',
                                       num_attention_heads)
-        head_dim = getattr(config, "head_dim",
-                           hidden_size // num_attention_heads)
+        head_dim = getattr(config, "head_dim", None)
+        if not isinstance(head_dim, int):
+            head_dim = hidden_size // num_attention_heads
 
         if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
         ):
@@ -400,6 +400,7 @@ class KvCacheCreator:
 
 
 def create_py_executor_instance(
+        *,
         dist,
         resources,
         mapping,
@@ -546,7 +547,7 @@ def create_py_executor_instance(
 
 
 def create_torch_sampler_args(executor_config: ExecutorConfig, mapping: Mapping,
-                              *, max_seq_len: int, mixed_sampler: bool):
+                              *, max_seq_len: int, enable_mixed_sampler: bool):
     max_num_sequences = executor_config.max_batch_size * mapping.pp_size
     max_draft_tokens = (0 if executor_config.speculative_config is None else
                         executor_config.speculative_config.max_draft_tokens)
@@ -555,7 +556,7 @@ def create_torch_sampler_args(executor_config: ExecutorConfig, mapping: Mapping,
         max_draft_tokens=max_draft_tokens,
         max_num_sequences=max_num_sequences,
         max_beam_width=executor_config.max_beam_width,
-        mixed_sampler=mixed_sampler,
+        enable_mixed_sampler=enable_mixed_sampler,
     )
 
 
@@ -567,7 +568,7 @@ def instantiate_sampler(engine: PyTorchModelEngine,
         executor_config,
         mapping,
         max_seq_len=engine.max_seq_len,
-        mixed_sampler=pytorch_backend_config.mixed_sampler)
+        enable_mixed_sampler=pytorch_backend_config.enable_mixed_sampler)
     if mapping.cp_config.get('cp_type') == 'star_attention':
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
         return TorchSampler(sampler_args)

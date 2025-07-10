@@ -48,7 +48,7 @@ class PyTorchConfig:
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'
 
-    mixed_sampler: bool = False
+    enable_mixed_sampler: bool = False
     """
     If true, will iterate over sampling_params of each request and use the
     corresponding sampling strategy, e.g. top-k, top-p, etc.
@@ -75,7 +75,7 @@ class PyTorchConfig:
 
     # Enable autotuner only when torch compile is enabled
     # TODO: after it can be work stable in warmup stage
-    autotuner_enabled: bool = True
+    enable_autotuner: bool = True
 
     # If true, enable layerwise nvtx marker
     enable_layerwise_nvtx_marker: bool = False

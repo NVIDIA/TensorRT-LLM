@@ -235,6 +235,7 @@ class DecodingBaseConfig(BaseModel):
             "Lookahead": LookaheadDecodingConfig,
             "NGram": NGramDecodingConfig,
             "DraftTarget": DraftTargetDecodingConfig,
+            "UserProvided": UserProvidedDecodingConfig,
         }
 
         config_class = config_classes.get(decoding_type)
@@ -274,6 +275,17 @@ class EagleDecodingConfig(DecodingBaseConfig):
         return cls(**data)
 
     decoding_type: ClassVar[str] = "Eagle"
+
+
+class UserProvidedDecodingConfig(DecodingBaseConfig):
+    # Type should be Drafter, but it leads to circular import
+    drafter: object
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+    decoding_type: ClassVar[str] = "UserProvided"
 
 
 class NGramDecodingConfig(DecodingBaseConfig):
@@ -633,6 +645,7 @@ SpeculativeConfig: TypeAlias = Optional[Union[
     MedusaDecodingConfig,
     MTPDecodingConfig,
     NGramDecodingConfig,
+    UserProvidedDecodingConfig,
 ]]
 
 
@@ -1347,9 +1360,9 @@ class BaseLlmArgs(BaseModel):
                         eagle3_one_model=self.speculative_config.
                         eagle3_one_model)
             elif isinstance(self.speculative_config, NGramDecodingConfig):
-                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.NGRAM
                 assert self.backend in ['pytorch', '_autodeploy']
                 assert self.speculative_config.prompt_lookup_num_tokens > 0 and self.speculative_config.max_matching_ngram_size > 0
+                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.NGRAM
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
                 from tensorrt_llm._torch.speculative import NGramConfig
                 self.speculative_config = NGramConfig(
@@ -1382,6 +1395,15 @@ class BaseLlmArgs(BaseModel):
                     relaxed_topk=self.speculative_config.relaxed_topk,
                     relaxed_delta=self.speculative_config.relaxed_delta,
                     use_mtp_vanilla=self.speculative_config.use_mtp_vanilla)
+            elif isinstance(self.speculative_config,
+                            UserProvidedDecodingConfig):
+                assert self.backend in ['pytorch', '_autodeploy']
+                from tensorrt_llm._torch.speculative import UserProvidedConfig
+                self.speculative_config = UserProvidedConfig(
+                    max_draft_tokens=self.speculative_config.max_draft_len,
+                    drafter=self.speculative_config.drafter)
+                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.USER_PROVIDED
+                self.build_config.max_draft_len = self.speculative_config.max_draft_tokens
             else:
                 raise ValueError(
                     f"Speculative config type not recognized: {self.speculative_config}"
@@ -1702,7 +1724,7 @@ class TorchLlmArgs(BaseLlmArgs):
     moe_backend: str = Field(default='CUTLASS',
                              description="MoE backend to use.")
 
-    mixed_sampler: bool = Field(
+    enable_mixed_sampler: bool = Field(
         default=False,
         description=
         "If true, will iterate over sampling_params of each request and use the corresponding sampling strategy, e.g. top-k, top-p, etc."
@@ -1732,7 +1754,7 @@ class TorchLlmArgs(BaseLlmArgs):
     torch_compile_config: Optional[TorchCompileConfig] = Field(
         default=None, description="Torch compile config.")
 
-    autotuner_enabled: bool = Field(
+    enable_autotuner: bool = Field(
         default=True,
         description="Enable autotuner only when torch compile is enabled.")
 
@@ -1918,7 +1940,7 @@ class TorchLlmArgs(BaseLlmArgs):
             moe_load_balancer=self.moe_load_balancer,
             attn_backend=self.attn_backend,
             moe_backend=self.moe_backend,
-            mixed_sampler=self.mixed_sampler,
+            enable_mixed_sampler=self.enable_mixed_sampler,
             enable_trtllm_sampler=self.enable_trtllm_sampler,
             kv_cache_dtype=self.kv_cache_dtype,
             enable_iter_perf_stats=self.enable_iter_perf_stats,
@@ -1938,7 +1960,7 @@ class TorchLlmArgs(BaseLlmArgs):
             torch_compile_enable_userbuffers=self.torch_compile_config.
             enable_userbuffers if self.torch_compile_config is not None else
             TorchCompileConfig.model_fields['enable_userbuffers'].default,
-            autotuner_enabled=self.autotuner_enabled,
+            enable_autotuner=self.enable_autotuner,
             enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
             load_format=self.load_format,
             enable_min_latency=self.enable_min_latency,

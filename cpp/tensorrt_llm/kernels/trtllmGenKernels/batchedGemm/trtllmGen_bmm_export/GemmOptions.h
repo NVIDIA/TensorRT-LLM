@@ -100,11 +100,11 @@ struct GemmOptions
         MatrixLayout layoutA, MatrixLayout layoutB, int m, int mmaK, tg::MmaKind mmaKind, int mmaM, int mmaN,
         bool mockAllReduce, int n, int numSlicesForSplitK, int numSlicesForSliceK, int numStages, int numStagesMma,
         int numStagesMmaWithinWorkTile, int numStagesMmaAcrossWorkTile, int numStagesWorkId, bool outputDebugTensors,
-        bool useShuffledMatrixA, bool sliceK, SplitK splitK, bool transposeMmaOutput, int tileM, int tileN, int tileK,
-        bool useUnrollLoop2xForMma, bool useCustomMmaSchedule, bool useHoistTryWaitForCustomMmaSchedule,
-        bool useDeepSeekFp8, bool usePerTokenSfA, bool usePerTokenSfB, bool useTmaStore, bool useTwoTmaLoadWarps,
-        bool useTwoMmaWarps, tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC,
-        int sfReshapeFactor, TileScheduler tileScheduler)
+        bool patchF2fp, bool useShuffledMatrixA, bool sliceK, SplitK splitK, bool transposeMmaOutput, int tileM,
+        int tileN, int tileK, bool useUnrollLoop2xForMma, bool useCustomMmaSchedule,
+        bool useHoistTryWaitForCustomMmaSchedule, bool useDeepSeekFp8, bool usePerTokenSfA, bool usePerTokenSfB,
+        bool useTmaStore, bool useTwoTmaLoadWarps, bool useTwoMmaWarps, tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB,
+        tg::SfLayout sfLayoutC, int sfReshapeFactor, TileScheduler tileScheduler)
         : mAllReduceAlgo{allReduceAlgo}
         , mBiasType{biasType}
         , mBlockK(blockK)
@@ -150,6 +150,7 @@ struct GemmOptions
         , mNumStagesMmaAcrossWorkTile{numStagesMmaAcrossWorkTile}
         , mNumStagesWorkId{numStagesWorkId}
         , mOutputDebugTensors{outputDebugTensors}
+        , mPatchF2fp{patchF2fp}
         , mUseShuffledMatrixA{useShuffledMatrixA}
         , mSliceK{sliceK}
         , mSplitK{splitK}
@@ -276,6 +277,8 @@ struct GemmOptions
     int mNumStagesWorkId{3};
     // Whether to output debug tensors.
     bool mOutputDebugTensors{false};
+    // Patch float conversions.
+    bool mPatchF2fp{false};
     // Reorder rows/cols in the A matrix for the better memory accesses in the M-major epilogue.
     bool mUseShuffledMatrixA{false};
     // Slice-K implementation to use TileM dimension for TileK.
@@ -455,6 +458,7 @@ inline std::string dumpOptions(GemmOptions const& options)
     ss << "mNumStagesMmaAcrossWorkTile=" << options.mNumStagesMmaAcrossWorkTile << "," << std::endl;
     ss << "mNumStagesWorkId=" << options.mNumStagesWorkId << "," << std::endl;
     ss << "mOutputDebugTensors=" << options.mOutputDebugTensors << "," << std::endl;
+    ss << "mPatchF2fp=" << options.mPatchF2fp << "," << std::endl;
     ss << "mUseShuffledMatrixA=" << options.mUseShuffledMatrixA << "," << std::endl;
     ss << "mSliceK=" << options.mSliceK << "," << std::endl;
     ss << "mSplitK="
@@ -563,16 +567,24 @@ inline bool checkAndUpdateGemmOptions(
     TLLM_CHECK_ERROR((options.mDtypeA == options.mDtypeMmaA)
             || ((options.mDtypeA == tg::Dtype::MxE2m1 || options.mDtypeA == tg::Dtype::E2m1)
                 && options.mDtypeMmaA == tg::Dtype::Bfloat16),
-        "Unsupported cast: ", tg::dtypeToString(options.mDtypeA), " -> ", tg::dtypeToString(options.mDtypeMmaA));
-    // Casting B is currently not supported.
-    // Note: This is because we currently write the output of the cast directly to TMEM.
-    //       In the future, we can support this through shared memory.
-    TLLM_CHECK_ERROR(
-        (options.mDtypeB == options.mDtypeMmaB), "Casting B is not supported: dtypeMmaB must be the same as dtypeB.");
+        "Unsupported cast for A: ", tg::dtypeToString(options.mDtypeA), " -> ", tg::dtypeToString(options.mDtypeMmaA));
+
+    // Check that the B cast is supported.
+    // Currently, we only support Fp8 -> MxFp8.
+    // TODO: add same support for A (no transpose)
+    TLLM_CHECK_ERROR((options.mDtypeB == options.mDtypeMmaB)
+            || (options.mDtypeB == tg::Dtype::E4m3 && options.mDtypeMmaB == tg::Dtype::MxE4m3),
+        "Unsupported cast for B: ", tg::dtypeToString(options.mDtypeB), " -> ", tg::dtypeToString(options.mDtypeMmaB));
 
     if (options.mDtypeA != options.mDtypeMmaA)
     {
         TLLM_CHECK_ERROR(options.mTileM == 128, "TileM must be 128 when casting the input matrix A before the MMA.");
+    }
+
+    if (options.mPatchF2fp)
+    {
+        TLLM_CHECK_ERROR(options.mDtypeA == tg::Dtype::MxE2m1 && options.mDtypeMmaA == tg::Dtype::Bfloat16,
+            "PatchF2fp is only supported for MxFp4 to Bf16 casts.");
     }
 
     // FIXME: We do not support different dtypes for A and B when not on Blackwell.
@@ -703,10 +715,6 @@ inline bool checkAndUpdateGemmOptions(
     {
         TLLM_CHECK_ERROR(isBlackwell, "Block scaling is only supported on Blackwell");
 
-        TLLM_CHECK_ERROR(options.mSfLayoutB == tg::SfLayout::R128c4 || options.mSfLayoutB == tg::SfLayout::R8c4
-                || options.mSfLayoutB == tg::SfLayout::Linear,
-            "Only the 128x4 and 8x4 SF layouts are supported for B, got ", tg::sfLayoutToString(options.mSfLayoutB));
-
         int const mmaK = (options.mMmaKind == tg::MmaKind::MxFp4NvFp4) ? 64 : 32;
         if (options.mMmaK != mmaK)
         {
@@ -724,10 +732,6 @@ inline bool checkAndUpdateGemmOptions(
             }
         }
 
-        // TileN must be a multiple of the number of rows per SF tile.
-        int const numSfTileRowsB = options.mSfLayoutB == tg::SfLayout::R128c4 ? 128 : 8;
-        TLLM_CHECK_ERROR(options.mTileN % numSfTileRowsB == 0, "TileN (", options.mTileN, ") must be a multiple of ",
-            numSfTileRowsB, " for B SF layout ", tg::sfLayoutToString(options.mSfLayoutB));
         // The MMA N may only be smaller than 64 if it is equal to the tile N.
         TLLM_CHECK_ERROR(options.mMmaN >= 64 || options.mMmaN == options.mTileN, "MmaN (", options.mMmaN,
             ") must be >= 64 or equal to TileN (", options.mTileN, ")");
@@ -737,13 +741,47 @@ inline bool checkAndUpdateGemmOptions(
         int numEltsPerSfA = tg::dtypeNumEltsPerSf(options.mDtypeA);
         TLLM_CHECK_ERROR(options.mTileK % (4 * numEltsPerSfA) == 0, "TileK (", options.mTileK,
             ") must be a multiple of ", (4 * numEltsPerSfA), " for typeA ", gemm::toString(options.mDtypeA));
+        auto const numEltsPerSfAInK = options.mK / numEltsPerSfA;
+        TLLM_CHECK_ERROR(numEltsPerSfAInK % 4 == 0, "K dimension of scaling factors for A (", numEltsPerSfAInK,
+            ") must be a multiple of 4");
     }
     if (tg::dtypeIsBlockFmt(options.mDtypeB))
     {
+        TLLM_CHECK_ERROR(options.mSfLayoutB == tg::SfLayout::R128c4 || options.mSfLayoutB == tg::SfLayout::R8c4
+                || options.mSfLayoutB == tg::SfLayout::Linear,
+            "Only the 128x4 and 8x4 SF layouts are supported for B, got ", tg::sfLayoutToString(options.mSfLayoutB));
+
+        // TileN must be a multiple of the number of rows per SF tile.
+        int const numSfTileRowsB = options.mSfLayoutB == tg::SfLayout::R128c4 ? 128 : 8;
+        TLLM_CHECK_ERROR(options.mTileN % numSfTileRowsB == 0, "TileN (", options.mTileN, ") must be a multiple of ",
+            numSfTileRowsB, " for B SF layout ", tg::sfLayoutToString(options.mSfLayoutB));
+
         int numEltsPerSfB = tg::dtypeNumEltsPerSf(options.mDtypeB);
         TLLM_CHECK_ERROR(options.mTileK % (4 * numEltsPerSfB) == 0, "TileK (", options.mTileK,
             ") must be a multiple of ", (4 * numEltsPerSfB), " for typeB ", gemm::toString(options.mDtypeB));
+        auto const numEltsPerSfBInK = options.mK / numEltsPerSfB;
+        TLLM_CHECK_ERROR(numEltsPerSfBInK % 4 == 0, "K dimension of scaling factors for B (", numEltsPerSfBInK,
+            ") must be a multiple of 4");
     }
+
+    int32_t padMultiplierA = 1;
+    int32_t padMultiplierB = 1;
+    if (options.mMmaKind == tg::MmaKind::MxFp8Fp6Fp4)
+    {
+        if (options.mDtypeA == tg::Dtype::MxE2m1)
+        {
+            padMultiplierA = 2;
+        }
+        if (options.mDtypeB == tg::Dtype::MxE2m1)
+        {
+            padMultiplierB = 2;
+        }
+    }
+    TLLM_CHECK_ERROR((padMultiplierA * tg::dtypeGetNumBits(options.mDtypeA) * options.mK / 8) % 16 == 0,
+        "K dimension of A must be aligned to 16 bytes.");
+    TLLM_CHECK_ERROR((padMultiplierB * tg::dtypeGetNumBits(options.mDtypeB) * options.mK / 8) % 16 == 0,
+        "K dimension of B must be aligned to 16 bytes.");
+
     if (options.mDtypeC == tg::Dtype::E2m1 || options.mDtypeC == tg::Dtype::MxE4m3)
     {
         TLLM_CHECK_ERROR(isBlackwell, "Block scaling is only supported on Blackwell");
@@ -751,8 +789,10 @@ inline bool checkAndUpdateGemmOptions(
         TLLM_CHECK_ERROR(options.mSfLayoutC == tg::SfLayout::R128c4 || options.mSfLayoutC == tg::SfLayout::R8c4,
             "Only the 128x4 and 8x4 SF layouts are supported for C.");
         int const numSfTileRowsC = options.mSfLayoutC == tg::SfLayout::R128c4 ? 128 : 8;
-        TLLM_CHECK_ERROR(options.mTileN % numSfTileRowsC == 0, "TileN (", options.mTileN, ") must be a multiple of ",
-            numSfTileRowsC, " for C SF layout ", tg::sfLayoutToString(options.mSfLayoutC));
+        int const tileTokenDim = options.mTransposeMmaOutput ? options.mTileN : options.mTileM;
+        TLLM_CHECK_ERROR_FMT(tileTokenDim % numSfTileRowsC == 0,
+            "Tile%s (%d) must be a multiple of %d for C SF layout %s", options.mTransposeMmaOutput ? "N" : "M",
+            tileTokenDim, numSfTileRowsC, tg::sfLayoutToString(options.mSfLayoutC).c_str());
 
         int const hiddenDim = options.mTransposeMmaOutput ? options.mM : options.mN;
         int const hiddenGranularity = 4 * tg::dtypeNumEltsPerSf(options.mDtypeC);

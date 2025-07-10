@@ -18,13 +18,14 @@ from utils.llm_data import llm_models_root
     "disable_overlap_scheduler,use_cuda_graph,attn_backend",
     [[True, False, "TRTLLM"], [True, True, "TRTLLM"],
      [True, False, "FLASHINFER"]])
+@pytest.mark.high_cuda_memory
 def test_llama_ngram(disable_overlap_scheduler: bool, use_cuda_graph: bool,
                      attn_backend: str):
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 20:
         pytest.skip("Not enough memory to load target model")
     cuda_graph_config = CudaGraphConfig(
-        cuda_graph_batch_sizes=[1]) if use_cuda_graph else None
+        batch_sizes=[1]) if use_cuda_graph else None
 
     llm_common_config = dict( \
         model=llm_models_root() / "llama-3.1-model" /"Meta-Llama-3.1-8B",

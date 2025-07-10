@@ -25,6 +25,7 @@ class TestFunctional(unittest.TestCase):
             product([5376], [4], ['context'], ['float16', 'bfloat16'], [2],
                     [131072], [10240], [False, True], [False, True])),
         name_func=unittest_name_func)
+    @pytest.mark.high_cuda_memory
     def test_mamba_conv1d(self, dim, dconv, req_type, dtype, batch_size,
                           max_seq_len, stride_size, remove_padding, apply_silu):
         if max_seq_len == 131072:

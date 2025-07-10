@@ -171,9 +171,9 @@ private:
     void callTestedFunction(
         RoutingKernelTestParam const& param, tensorrt_llm::runtime::ITensor::SharedPtr& workspaceDevice) override
     {
-        moe::dev::routingRenormalize::Data routingData;
+        moe::dev::routing::routingRenormalize::Data routingData;
         setParams(param, routingData);
-        moe::dev::routingRenormalize::run(routingData, mStream->get());
+        moe::dev::routing::routingRenormalize::run(routingData, mStream->get());
     }
 };
 

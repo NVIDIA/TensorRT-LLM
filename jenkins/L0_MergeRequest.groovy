@@ -366,6 +366,7 @@ def launchReleaseCheck(pipeline)
                 ignoreList = [
                     "*/.git/*",
                     "*/3rdparty/*",
+                    "*/cpp/tensorrt_llm/deep_ep/nvshmem_src_*.txz",
                     "*/examples/scaffolding/contrib/mcp/weather/weather.py",
                     "*/tensorrt_llm_internal_cutlass_kernels_static.tar.xz"
                 ]

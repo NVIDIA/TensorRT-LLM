@@ -348,7 +348,7 @@ size_t CutlassFp4GemmRunner<T, fp4GemmType>::dispatchToArch(T* D, void const* A,
             return dispatchNVFP4xNVFP4GemmCTAShapeSm100<T>(D, A, B, input_sf, weight_sf, global_sf, m, n, k,
                 batch_count, gemmConfig, workspace, workspaceBytes, stream, occupancy);
         }
-        else if (mSm == 120)
+        else if (mSm == 120 || mSm == 121)
         {
             return dispatchNVFP4xNVFP4GemmCTAShapeSm120<T>(D, A, B, input_sf, weight_sf, global_sf, m, n, k,
                 batch_count, gemmConfig, workspace, workspaceBytes, stream, occupancy);
