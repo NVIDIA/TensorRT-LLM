@@ -157,10 +157,10 @@ class KvCacheCreator:
         if not pytorch_backend_config.disable_overlap_scheduler:
             num_extra_tokens_per_seq = num_extra_tokens_per_seq + 1
             if spec_cfg is not None:
-                num_extra_tokens_per_seq += spec_cfg.max_draft_tokens
+                num_extra_tokens_per_seq += spec_cfg.max_draft_len
 
         if spec_cfg is not None:
-            num_extra_tokens_per_seq += spec_cfg.max_draft_tokens
+            num_extra_tokens_per_seq += spec_cfg.max_draft_len
             num_extra_tokens_per_seq += spec_cfg.num_extra_kv_tokens
         for req in self._dummy_reqs:
             num_req_tokens = len(req.input_token_ids) + num_extra_tokens_per_seq
@@ -538,7 +538,7 @@ def create_py_executor_instance(
         disable_overlap_scheduler,
         max_batch_size=executor_config.max_batch_size,
         max_beam_width=executor_config.max_beam_width,
-        max_draft_tokens=spec_config.max_draft_tokens
+        max_draft_len=spec_config.max_draft_len
         if spec_config is not None else 0,
         kv_cache_transceiver=kv_cache_transceiver,
         draft_model_engine=draft_model_engine,
@@ -549,11 +549,11 @@ def create_py_executor_instance(
 def create_torch_sampler_args(executor_config: ExecutorConfig, mapping: Mapping,
                               *, max_seq_len: int, enable_mixed_sampler: bool):
     max_num_sequences = executor_config.max_batch_size * mapping.pp_size
-    max_draft_tokens = (0 if executor_config.speculative_config is None else
-                        executor_config.speculative_config.max_draft_tokens)
+    max_draft_len = (0 if executor_config.speculative_config is None else
+                     executor_config.speculative_config.max_draft_len)
     return TorchSampler.Args(
         max_seq_len=max_seq_len,
-        max_draft_tokens=max_draft_tokens,
+        max_draft_len=max_draft_len,
         max_num_sequences=max_num_sequences,
         max_beam_width=executor_config.max_beam_width,
         enable_mixed_sampler=enable_mixed_sampler,
