@@ -561,10 +561,14 @@ class MnnvlMoe:
         ep_size: int,
         top_k: int,
         token_count: int,
+        x_sf: torch.Tensor = None,
+        is_sf_swizzled: bool = False,
+        low_precision_global_scale: torch.Tensor = None,
     ):
         assert x.dim() == 2, "2D tensor supported, please reshape."
+        hidden_dim = x.shape[1]
         output_tensor = torch.zeros(
-            token_count * top_k, x.shape[1], dtype=x.dtype, device=torch.device("cuda")
+            token_count * top_k, hidden_dim, dtype=x.dtype, device=torch.device("cuda")
         )
         torch.ops.trtllm.moe_comm(
             x,
@@ -577,6 +581,33 @@ class MnnvlMoe:
             ep_rank,
             ep_size,
         )
+
+        if x_sf is not None:
+            assert x_sf.dim() == 2, "2D tensor supported, please reshape."
+            hidden_dim *= 2
+            output_sf_tensor = torch.zeros(
+                token_count * top_k, x_sf.shape[1], dtype=x_sf.dtype, device=torch.device("cuda")
+            )
+            torch.ops.trtllm.moe_comm(
+                x_sf,
+                alltoall_info.recv_rank_count_cumsum,
+                alltoall_info.recv_rank_local_indices,
+                output_sf_tensor,
+                alltoall_info.send_rank_count_cumsum,
+                alltoall_info.backward_recv_rank_local_indices,
+                workspace,
+                ep_rank,
+                ep_size,
+            )
+            output_tensor = torch.ops.trtllm.fp4_dequantize(
+                output_tensor,
+                output_sf_tensor,
+                1.0 / low_precision_global_scale,
+                16,
+                False,
+                is_sf_swizzled,
+                "bfloat16",
+            )
         return torch.sum(
-            output_tensor.reshape(token_count, top_k, x.shape[1]), dim=1, keepdim=False
+            output_tensor.reshape(token_count, top_k, hidden_dim), dim=1, keepdim=False
         )
