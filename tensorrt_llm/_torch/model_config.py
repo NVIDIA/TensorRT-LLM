@@ -293,12 +293,13 @@ class ModelConfig(Generic[TConfig]):
             "W4A8_MXFP4_MXFP8": QuantAlgo.W4A8_MXFP4_MXFP8,
             "W4A8_MXFP4_FP8": QuantAlgo.W4A8_MXFP4_FP8,
         }
-        if new_algo is not None and new_algo.upper() in supported_algos:
-            return supported_algos[new_algo.upper()]
-        else:
-            logger.warning(
-                f"Unsupported quant algo: {new_algo}, supported algos: {supported_algos.keys()}"
-            )
+        if new_algo is not None:
+            if new_algo.upper() in supported_algos:
+                return supported_algos[new_algo.upper()]
+            else:
+                logger.warning(
+                    f"Unsupported quant algo: {new_algo}, supported algos: {supported_algos.keys()}"
+                )
         return None
 
     @classmethod
