@@ -353,8 +353,7 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
 
     auto activeSlots = std::vector<SizeType32>(batchSize);
     std::iota(activeSlots.begin(), activeSlots.end(), 0);
-    tb::MakeDecodingBatchInputOutput::createDecoderBatchInputs(
-        inputBuffers, activeSlots, decoderState, decoderInputs.logits, batchSize);
+    tb::MakeDecodingBatchInputOutput::createDecoderBatchInputs(inputBuffers, activeSlots, decoderState, batchSize);
     decoder.forward(decoderState, inputBuffers);
 
     checkSequenceLengths(*decoderState.getSequenceLengths(), expectedLengths, manager);
@@ -483,8 +482,7 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
 
         auto activeSlots = std::vector<SizeType32>(batchIdx + 1);
         std::iota(activeSlots.begin(), activeSlots.end(), 0);
-        tb::MakeDecodingBatchInputOutput::createDecoderBatchInputs(
-            inputBuffers, activeSlots, decoderState, decoderInputs.logits, batchSize);
+        tb::MakeDecodingBatchInputOutput::createDecoderBatchInputs(inputBuffers, activeSlots, decoderState, batchSize);
         decoder.forward(decoderState, inputBuffers);
 
         advanceSequenceLengths(
@@ -506,8 +504,7 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
     auto finishedVec = getFinished(*decoderState.getFinishedSum(), samplingConfigs, manager);
     while (!std::all_of(expectedFinished.begin(), expectedFinished.end(), [](bool finish) { return finish; }))
     {
-        tb::MakeDecodingBatchInputOutput::createDecoderBatchInputs(
-            inputBuffers, activeSlots, decoderState, decoderInputs.logits, batchSize);
+        tb::MakeDecodingBatchInputOutput::createDecoderBatchInputs(inputBuffers, activeSlots, decoderState, batchSize);
         decoder.forward(decoderState, inputBuffers);
         finishedVec = getFinished(*decoderState.getFinishedSum(), samplingConfigs, manager);
 
@@ -642,8 +639,7 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
 
     auto activeSlots = std::vector<SizeType32>(batchSize);
     std::iota(activeSlots.begin(), activeSlots.end(), 0);
-    tb::MakeDecodingBatchInputOutput::createDecoderBatchInputs(
-        inputBuffers, activeSlots, decoderState, decoderInputs.logits, batchSize);
+    tb::MakeDecodingBatchInputOutput::createDecoderBatchInputs(inputBuffers, activeSlots, decoderState, batchSize);
     decoder.forward(decoderState, inputBuffers);
     checkSequenceLengths(*decoderState.getSequenceLengths(), expectedLengths, manager);
     EXPECT_THAT(getFinished(*decoderState.getFinishedSum(), samplingConfigs, manager), ::testing::Each(false));
