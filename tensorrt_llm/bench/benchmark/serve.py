@@ -9,13 +9,13 @@ from huggingface_hub import snapshot_download
 # isort: off
 from tensorrt_llm.bench.benchmark.utils.general import (
     TuningConstraints, get_settings_from_engine, get_settings)
-# isort: on
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.builder import BuildConfig
 from tensorrt_llm.commands.serve import launch_server
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
+# isort: on
 
 
 @click.command(name="throughput")
