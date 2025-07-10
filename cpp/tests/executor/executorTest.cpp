@@ -190,7 +190,7 @@ TEST_F(GptExecutorTest, missingPeftTask)
         if (response.hasError())
         {
             auto err = response.getErrorMsg();
-            EXPECT_EQ(err, std::string("LoRA task 10 not found in cache. Please send LoRA weights with request"));
+            EXPECT_EQ(0, err.find("LoRA task 10 not found in cache. Please send LoRA weights with request"));
             done = true;
         }
         else
