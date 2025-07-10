@@ -73,6 +73,19 @@ __device__ float4 loadfloat4(void const* ptr)
     return *(float4*) return_value;
 }
 
+__device__ __inline__ float2 loadfloat2(void const* ptr)
+{
+
+    float return_value[2];
+
+    asm volatile("ld.volatile.global.v2.f32 {%0, %1}, [%2];\n"
+                 : "=f"(return_value[0]), "=f"(return_value[1])
+                 : "l"(ptr)
+                 : "memory");
+
+    return *(float2*) return_value;
+}
+
 template <int WORLD_SIZE, typename T>
 __global__ void twoshot_allreduce_kernel(T* output_ptr, T* shard_ptr, T** input_ptrs, T* mcast_ptr, int num_tokens,
     int buffer_M, int token_dim, int rank, uint32_t* buffer_flags, bool wait_for_results)
@@ -156,34 +169,24 @@ __global__ void twoshot_allreduce_kernel(T* output_ptr, T* shard_ptr, T** input_
             asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" ::"l"(offset_access_ptr), "r"(1) : "memory");
         }
         // Only use a set of CTAs for lamport sync, reargange the grid
-        constexpr int NUM_LAMPORT_CTAS = 32;
-        constexpr int ELTS_PER_LOAD = sizeof(float4) / sizeof(T);
-        if (blockIdx.x < NUM_LAMPORT_CTAS)
+        constexpr int ELTS_PER_LOAD = sizeof(float2) / sizeof(T);
+        // blockDim.x / ELTS_PER_LOAD should be at least the size of a warp (32)
+        if (threadIdx.x < (blockDim.x / ELTS_PER_LOAD))
         {
-            // num_CTAs * token_dim * ELTS_PER_LOAD
-            uint32_t stride = (NUM_LAMPORT_CTAS < gridDim.x ? NUM_LAMPORT_CTAS : gridDim.x) * blockDim.x * gridDim.y
-                * ELTS_PER_LOAD;
-            uint32_t loads_per_thread = (num_tokens * token_dim + stride - 1) / stride;
-#pragma unroll
-            for (int i = 0; i < loads_per_thread; i++)
+            uint64_t current_pos = blockIdx.x * token_dim + blockIdx.y * blockDim.x + threadIdx.x * ELTS_PER_LOAD;
+
+            void* lamport_ptr = (void*) &input_ptrs[rank][input_offset + buffer_M * token_dim + current_pos];
+            // We have 2 assumptions here:
+            // 1. The write is atomic in 8B granularity -> Each buffer in the buffer group should be aligned to 8B
+            // 2. The num_token * token_dim is divisible by ELTS_PER_LOAD (4 for BF16 and 2 for FP32)
+            float2 val = loadfloat2(lamport_ptr);
+            while (isNegZero(*(T*) &val))
             {
-                // This will not exceed token_dim * num_tokens so uint32 should be sufficient?
-                uint32_t current_pos = stride * i
-                    + (blockIdx.x * gridDim.y * blockDim.x + blockIdx.y * blockDim.x + threadIdx.x) * ELTS_PER_LOAD;
-                if (current_pos >= token_dim * num_tokens)
-                    break;
-                void* lamport_ptr = (void*) &input_ptrs[rank][input_offset + buffer_M * token_dim + current_pos];
-
-                // We have 2 assumptions here:
-                // 1. The write is atomic in 16B granularity -> Each buffer in the buffer group should be aligned to 16B
-                // 2. The num_token * token_dim is divisible by ELTS_PER_LOAD (8 for BF16 and 4 for FP32)
-                float4 val = loadfloat4(lamport_ptr);
-                while (isNegZero(*(T*) &val))
-                    val = loadfloat4(lamport_ptr);
-
-                // Copy if requested
-                if (output_ptr)
-                    *((float4*) &output_ptr[current_pos]) = val;
+                val = loadfloat2(lamport_ptr);
+            }
+            if (output_ptr)
+            {
+                *((float2*) &output_ptr[current_pos]) = val;
             }
         }
 
@@ -522,7 +525,6 @@ __global__ void __launch_bounds__(128, 1)
         buffer_flags[1] = (flag.y + 1) % 3;
         *(offset_access_ptr) = 0;
     }
-    __syncthreads();
 #endif
 }
 
