@@ -28,7 +28,7 @@ Welcome to TensorRT-LLM's Documentation!
    :maxdepth: 2
    :caption: Models
 
-   1.0/models/support-models.md
+   1.0/models/supported-models.md
    1.0/models/adding-new-model.md
 
 
@@ -54,13 +54,14 @@ Welcome to TensorRT-LLM's Documentation!
    :caption: Features
    :name: Features
 
+   1.0/features/feature-combination-matrix.md
    1.0/features/attention.md
    1.0/features/disagg-serving.md
-   1.0/features/intro-inference-features.md
    1.0/features/kvcache.md
    1.0/features/long-sequence.md
    1.0/features/lora.md
    1.0/features/multi-modality.md
+   1.0/features/overlap-scheduler.md
    1.0/features/paged-attention-ifb-scheduling.md
    1.0/features/parallel-strategy.md
    1.0/features/quantization.md
