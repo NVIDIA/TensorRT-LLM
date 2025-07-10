@@ -614,11 +614,11 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
     }
 
     // Allocate the attention sinks (per head)
-    auto attentionSinks = ManagedMemBuf<float>(headGrpSize);
+    auto attentionSinks = ManagedMemBuf<float>(nbQHeads);
     // The attention sinks ptr.
     float* attentionSinksPtr = hasAttentionSinks ? reinterpret_cast<float*>(attentionSinks.get()) : nullptr;
     // Initialize the attention sinks (use large values to detect the potential bugs).
-    for (uint32_t i = 0; i < headGrpSize; i++)
+    for (uint32_t i = 0; i < nbQHeads; i++)
     {
         // Range: [2, 5]
         attentionSinks.get()[i] = 2.f + float(i % 4);
@@ -1223,7 +1223,7 @@ TEST(RefCheck, llama_V2_70b)
 TEST(RefCheck, attention_sinks)
 {
     auto runAttentionSinksTest = [](uint32_t batchSize, uint32_t seqLen)
-    { runTest<2>(batchSize, seqLen, false, true, false, false, /*hasAttentionSinks*/ true); };
+    { runTest<8>(batchSize, seqLen, false, true, false, false, /*hasAttentionSinks*/ true); };
 
     runAttentionSinksTest(2, 2);
     runAttentionSinksTest(2, 15);
