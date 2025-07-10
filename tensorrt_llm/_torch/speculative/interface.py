@@ -15,7 +15,7 @@ class SpeculativeDecodingMode(IntEnum):
     EAGLE3 = auto()
     EAGLE3_ONE_MODEL = auto()
     NGRAM = auto()
-    DRAFTTARGET = auto()
+    DRAFT_TARGET = auto()
     USER_PROVIDED = auto()
     NONE = auto()
 
@@ -44,7 +44,7 @@ class SpeculativeDecodingMode(IntEnum):
         return self == SpeculativeDecodingMode.NONE
 
     def is_draft_target(self):
-        return self == SpeculativeDecodingMode.DRAFTTARGET
+        return self == SpeculativeDecodingMode.DRAFT_TARGET
 
     def without_logits(self):
         return self.is_mtp() or self.is_eagle3_one_model()
@@ -106,6 +106,17 @@ class SpeculativeDecodingMode(IntEnum):
 
 
 @dataclass
+class SpecConfig:
+    """
+    Configuration for speculative decoding.
+    This class is deprecated, but thread-leak of pytest raises flaky error if removing it.
+    TODO: remove this class safely.
+    """
+    # The name of speculative decoding.
+    spec_dec_name = None
+
+
+@dataclass
 class SpecMetadata:
     """
     Metadata for speculative decoding.
@@ -113,7 +124,7 @@ class SpecMetadata:
     # The max number of requests in a single batch.
     max_num_requests: int
     # The max number of draft tokens.
-    max_draft_tokens: int
+    max_draft_len: int
     # The number of gen-phase sequences in the batch.
     num_generations: int = 0
     # Whether CUDA graph is enabled.

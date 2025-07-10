@@ -157,8 +157,8 @@ class MTPSpecMetadata(SpecMetadata):
                                      pin_memory=True)
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
                                                  non_blocking=True)
-        # MTP vanilla worker uses total max_draft_tokens input tokens in generation phase,
-        # while MTP Eagle worker uses (max_draft_tokens + 1) input tokens in the 1st draft
+        # MTP vanilla worker uses total max_draft_len input tokens in generation phase,
+        # while MTP Eagle worker uses (max_draft_len + 1) input tokens in the 1st draft
         # forward and only one input token in the following draft forward.
         # This num_tokens is used to set the all_rank_num_tokens for attention dp.
         if not self.spec_dec_mode.is_mtp_eagle():
@@ -700,7 +700,7 @@ class MTPWorker(nn.Module):
 
         Returns:
             accepted_tokens: torch.Tensor
-                [batch_size, (max_draft_tokens + 1)]
+                [batch_size, (max_draft_len + 1)]
                 Accepted token ids. Flattened.
 
             num_accepted_tokens: torch.Tensor
@@ -900,7 +900,7 @@ class MTPWorker(nn.Module):
                 Target model's hidden states.
 
             accepted_tokens: torch.Tensor
-                [batch_size, max_draft_tokens + 1]
+                [batch_size, max_draft_len + 1]
                 Accepted token ids. Flattened.
 
             num_accepted_tokens: torch.Tensor
@@ -1038,7 +1038,7 @@ class MTPWorker(nn.Module):
 
         Returns:
             draft_tokens: torch.Tensor
-                [batch_size * max_draft_tokens]
+                [batch_size * max_draft_len]
                 Draft token ids. Flattened.
         '''
 

@@ -23,7 +23,7 @@ class NGramPoolManager(BaseResourceManager):
     `matches` is a list of candidate draft token ids attaching to a pattern.
 
     Arguments:
-        prompt_lookup_num_tokens: int
+        max_draft_len: int
             The length maximum of draft tokens (can be understood as length maximum of output draft tokens).
 
         max_matching_ngram_size: int
@@ -49,7 +49,7 @@ class NGramPoolManager(BaseResourceManager):
 
     def __init__(self, spec_config: "NGramDecodingConfig",
                  max_num_requests: int):
-        self.prompt_lookup_num_tokens = spec_config.prompt_lookup_num_tokens
+        self.max_draft_len = spec_config.max_draft_len
         self.max_matching_ngram_size = spec_config.max_matching_ngram_size
         self.is_keep_all = spec_config.is_keep_all
         self.is_use_oldest = spec_config.is_use_oldest  # TODO: remove this if updating strategy is supported
@@ -105,7 +105,7 @@ class NGramPoolManager(BaseResourceManager):
                           -1):
             # Find each possible pattern-match combination, and use tuple for hash
             for l in range(len(sequence) - size):
-                r = min(l + size + self.prompt_lookup_num_tokens, len(sequence))
+                r = min(l + size + self.max_draft_len, len(sequence))
                 pattern = tuple(sequence[l:l + size])
                 new_match = tuple(sequence[l + size:r])
                 if pattern not in pool or \
@@ -137,7 +137,7 @@ class NGramPoolManager(BaseResourceManager):
         # Update start_index
         self.start_index[request_id] = max(
             0, prefix_len -
-            (self.prompt_lookup_num_tokens + self.max_matching_ngram_size - 1))
+            (self.max_draft_len + self.max_matching_ngram_size - 1))
 
         return draft_tokens
 

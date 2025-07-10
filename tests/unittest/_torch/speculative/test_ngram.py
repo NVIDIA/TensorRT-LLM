@@ -24,11 +24,12 @@ def test_llama_ngram(disable_overlap_scheduler: bool, use_cuda_graph: bool,
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 20:
         pytest.skip("Not enough memory to load target model")
+
+    max_batch_size = 2
+    max_draft_len = 4
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False)
     cuda_graph_config = CudaGraphConfig(
         batch_sizes=[1]) if use_cuda_graph else None
-
-    max_batch_size = 4
-    max_draft_len = 4
 
     llm_common_config = dict( \
         model=llm_models_root() / "llama-3.1-model" /"Meta-Llama-3.1-8B",
@@ -37,13 +38,12 @@ def test_llama_ngram(disable_overlap_scheduler: bool, use_cuda_graph: bool,
         disable_overlap_scheduler=disable_overlap_scheduler,
         cuda_graph_config=cuda_graph_config,
         max_batch_size=max_batch_size,
-        kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+        kv_cache_config=kv_cache_config,
         max_num_tokens=2048,
     )
 
     spec_config = NGramDecodingConfig(
         max_draft_len=max_draft_len,
-        prompt_lookup_num_tokens=max_draft_len,
         max_matching_ngram_size=2,
         is_keep_all=True,
         is_use_oldest=True,

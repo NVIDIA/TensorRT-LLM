@@ -70,7 +70,7 @@ class MedusaConfig(PretrainedConfig):
         import transformers
 
         trust_remote_code = kwargs.pop('trust_remote_code', True)
-        speculative_config_or_dir = kwargs.pop('speculative_model', None)
+        speculative_config_or_dir = kwargs.pop('speculative_model_dir', None)
         speculative_config = kwargs.pop("speculative_config", None)
 
         if isinstance(hf_config_or_dir, transformers.PretrainedConfig):

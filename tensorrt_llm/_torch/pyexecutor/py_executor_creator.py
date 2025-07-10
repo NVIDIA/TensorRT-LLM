@@ -19,8 +19,7 @@ from tensorrt_llm.quantization import QuantAlgo
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..distributed import MPIDist
-from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
-                           get_spec_resource_manager)
+from ..speculative import get_spec_drafter, get_spec_resource_manager
 from ._util import (KvCacheCreator, create_py_executor_instance,
                     instantiate_sampler, is_mla)
 from .config import PyTorchConfig
@@ -251,7 +250,7 @@ def create_py_executor(
             draft_spec_config.max_draft_len = 0
 
             draft_model_engine = PyTorchModelEngine(
-                model_path=spec_config.speculative_model,
+                model_path=spec_config.speculative_model_dir,
                 pytorch_backend_config=pytorch_backend_config,
                 batch_size=executor_config.max_batch_size,
                 max_beam_width=executor_config.max_beam_width,
@@ -280,7 +279,7 @@ def create_py_executor(
             max_seq_len += spec_config.max_draft_len
 
     if spec_config is not None:
-        max_seq_len += get_num_extra_kv_tokens(spec_config)
+        max_seq_len += spec_config.num_extra_kv_tokens
         max_seq_len += spec_config.max_draft_len
 
     executor_config.max_seq_len = max_seq_len

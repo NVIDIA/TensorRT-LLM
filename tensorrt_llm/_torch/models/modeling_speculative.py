@@ -340,7 +340,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 model_config, 'spec_config', None
         ) and model_config.spec_config.spec_dec_mode.use_one_engine():
             draft_config = ModelConfig.from_pretrained(
-                model_config.spec_config.speculative_model,
+                model_config.spec_config.speculative_model_dir,
                 trust_remote_code=True,
                 attn_backend=model_config.attn_backend,
                 moe_backend=model_config.moe_backend,
