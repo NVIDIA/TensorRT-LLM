@@ -13,6 +13,11 @@ from tensorrt_llm.lora_manager import LoraConfig
 def check_multi_unique_lora_adapters_from_request(
         llm: BaseLLM, hf_lora_dirs: list[str],
         lora_adapter_count_per_call: list[int], repeats: int):
+    """Calls llm.generate s.t. for each c in lora_adapter_count_per_call, llm.generate is called with c requests.
+    All requests sent to llm.generate over all calls (in a single repeats iteration) are configured to each use a unique
+    LoRA adapter. This entire process is done in a loop (with the same requests) 'repeats' times with the same requests.
+    Asserts the output of each llm.generate call is similar to the expected.
+    """  # noqa: D205
     total_lora_adapters = sum(lora_adapter_count_per_call)
 
     # Each prompt should have a reference for every LoRA adapter dir (in the same order as in hf_lora_dirs)
