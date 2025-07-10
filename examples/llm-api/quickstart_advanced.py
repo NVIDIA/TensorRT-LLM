@@ -191,7 +191,11 @@ def setup_llm(args):
     greedy_decoding = ((args.temperature == 0.0)
                        or (args.top_k == 1 and
                            (args.top_p == 0.0 or args.top_p is None)))
-    mixed_sampler = not greedy_decoding and not args.enable_trtllm_sampler
+    mixed_sampler = (
+        not greedy_decoding and not args.enable_trtllm_sampler
+        # Eagle3 does not support mixed sampler.
+        # Refer TorchSampler._process_requests.
+        and spec_decode_algo != 'EAGLE3')
 
     cuda_graph_config = CudaGraphConfig(
         batch_sizes=args.cuda_graph_batch_sizes,
