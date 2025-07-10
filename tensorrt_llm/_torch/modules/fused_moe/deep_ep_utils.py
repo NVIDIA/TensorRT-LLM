@@ -129,9 +129,9 @@ class VariableLengthLowLatencyBuffer:
                                  num_rdma_bytes,
                                  low_latency_mode=True,
                                  num_qps_per_rank=num_experts // world_size,
-                                 comm=self.comm,
                                  allow_nvlink_for_low_latency_mode=
-                                 allow_nvlink_for_low_latency_mode)
+                                 allow_nvlink_for_low_latency_mode,
+                                 comm=self.comm)
 
     def low_latency_dispatch(self, hidden_states: torch.Tensor,
                              topk_idx: torch.Tensor,

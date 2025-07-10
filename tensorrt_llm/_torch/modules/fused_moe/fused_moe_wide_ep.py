@@ -240,13 +240,15 @@ class WideEPMoE(MoE):
         if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
             return AlltoallMethodType.NotEnabled
 
-        use_deep_ep = os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "0") == "1"
+        supports_mnnvl = MnnvlMemory.supports_mnnvl()
+        use_deep_ep = (os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "0")
+                       == "1") and not supports_mnnvl
 
         # Sometimes, even for a single node, we may still need DeepEP low latency mode.
         if mapping.moe_ep_size <= top_k and not use_deep_ep:
             return AlltoallMethodType.NotEnabled
 
-        if MnnvlMemory.supports_mnnvl():
+        if supports_mnnvl:
             return AlltoallMethodType.MNNVL
 
         if use_deep_ep:
@@ -551,18 +553,21 @@ class WideEPMoE(MoE):
                                           self.scaling_vector_size)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                 assert x_sf is not None and self.has_nvfp4 and not x_is_sf_swizzled
+                token_num = x_row
+                hidden_size = x_col
+                assert hidden_size % 32 == 0
                 x_sf_dtype = x_sf.dtype
                 x_dtype = x.dtype
                 assert x_sf_dtype == torch.uint8 and x_dtype == torch.uint8
                 x_sf = x_sf.view(torch.bfloat16)
-                assert x_sf.shape[0] == x_row and x_sf.shape[
-                    1] == x_col // 16 // 2
+                assert x_sf.shape[0] == token_num and x_sf.shape[
+                    1] == hidden_size // 16 // 2
                 x = x.view(torch.bfloat16)
-                assert x.shape[0] == x_row and x.shape[1] == x_col // 4
+                assert x.shape[0] == token_num and x.shape[1] == hidden_size // 4
                 # DeepEP LL dispatch only supports bf16 tensors with a hidden size of 2560, 4096, 5120, or 7168 as input. A hidden size of 2560 is sufficient to accommodate packed FP4 data.
                 packed_hidden_size = 2560
                 assert x.shape[1] + x_sf.shape[1] <= packed_hidden_size
-                fp4_packed_tensor = torch.empty((x_row, packed_hidden_size),
+                fp4_packed_tensor = torch.empty((token_num, packed_hidden_size),
                                                 dtype=torch.bfloat16,
                                                 device=x.device)
                 fp4_packed_tensor[:, :x.shape[1]] = x
@@ -574,17 +579,18 @@ class WideEPMoE(MoE):
                 # Each LL combine/dispatch kernel call requires that the `dispatch_rdma_recv_count_buffer` be properly cleaned.
                 # However, the offset of this buffer within the entire RDMA buffer changes according to the hidden size.
                 # Therefore, if the hidden size for the next LL dispatch/combine call is different from the current kernel call, manual cleaning is necessary.
-                if packed_hidden_size != x_col:
+                if packed_hidden_size != hidden_size:
                     self.deep_ep_buffer.clean_low_latency_buffer(
                         self.deep_ep_max_num_tokens, packed_hidden_size,
                         self.num_slots)
                 fp4_packed_tensor, recv_expert_count, deep_ep_handle = \
                     self.deep_ep_buffer.low_latency_dispatch(fp4_packed_tensor, deep_ep_topk_idx, self.deep_ep_max_num_tokens, self.num_slots)
-                if packed_hidden_size != x_col:
+                if packed_hidden_size != hidden_size:
                     self.deep_ep_buffer.clean_low_latency_buffer(
-                        self.deep_ep_max_num_tokens, x_col, self.num_slots)
+                        self.deep_ep_max_num_tokens, hidden_size,
+                        self.num_slots)
                 deep_ep_handle = list(deep_ep_handle)
-                deep_ep_handle[3] = x_col
+                deep_ep_handle[3] = hidden_size
                 deep_ep_handle = tuple(deep_ep_handle)
 
                 fp4_packed_tensor = fp4_packed_tensor[:, :self.mapping.
