@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 
-#include "moe_gemm_kernels.h"
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/include/moe_util_kernels.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
@@ -38,7 +38,7 @@ namespace torch_ext
 template <typename T>
 void runPermute(void const* input_activations_void, void const* input_sf_void, int const* token_selected_experts,
     float const* token_final_scales, void const* fc1_expert_weights_void, void const* fc1_expert_biases_void,
-    tensorrt_llm::ActivationType fc1_activation_type, void const* fc2_expert_weights_void,
+    cutlass_kernels::ActivationType fc1_activation_type, void const* fc2_expert_weights_void,
     void const* fc2_expert_biases_void, cutlass_kernels::QuantParams quant_params, int64_t const num_rows,
     int64_t const hidden_size, int const full_num_experts, int const experts_per_token,
     int* permuted_row_to_unpermuted_row_, int* permuted_token_selected_experts_, T* permuted_data_,
@@ -53,7 +53,7 @@ void runPermute(void const* input_activations_void, void const* input_sf_void, i
 
     auto const* input_activations = static_cast<T const*>(input_activations_void);
     auto const* input_sf = input_sf_void
-        ? reinterpret_cast<tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::ElementSF const*>(input_sf_void)
+        ? reinterpret_cast<cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF const*>(input_sf_void)
         : nullptr;
     int const num_experts_per_node = full_num_experts / parallelism_config.ep_size;
     int start_expert = num_experts_per_node * parallelism_config.ep_rank;
@@ -123,7 +123,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     int64_t hidden_size = input.sizes()[1];
     auto const num_experts_total = static_cast<int>(num_experts_on_rank * ep_size);
     auto parallelism_config = cutlass_kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank);
-    auto activation_type = tensorrt_llm::ActivationType::Swiglu;
+    auto activation_type = cutlass_kernels::ActivationType::Swiglu;
 
     int const num_experts_per_node = num_experts_on_rank;
     auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
