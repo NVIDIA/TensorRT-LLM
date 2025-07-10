@@ -21,6 +21,8 @@ import tqdm
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
+from tensorrt_llm._torch.speculative import (
+    get_num_extra_kv_tokens, update_spec_config_from_model_config)
 from tensorrt_llm._torch.speculative.mtp import SampleStateTensorsMTP
 from tensorrt_llm._utils import (is_trace_enabled, local_mpi_rank,
                                  local_mpi_size, nvtx_range, release_gc,
@@ -455,7 +457,8 @@ class PyTorchModelEngine(ModelEngine):
 
         if self.is_spec_decode:
             self.spec_metadata = None
-            self.spec_config.update_from_model_config(self.model.config)
+            update_spec_config_from_model_config(self.spec_config,
+                                                 self.model.config)
             max_num_draft_tokens = self.spec_config.max_draft_len * batch_size
             self.draft_tokens_cuda = torch.empty((max_num_draft_tokens, ),
                                                  dtype=torch.int,
@@ -1264,9 +1267,8 @@ class PyTorchModelEngine(ModelEngine):
         extend_requests += extend_dummy_requests
 
         if not self._disable_overlap_scheduler and self.is_spec_decode:
-            spec_dec_mode = self.spec_config.spec_dec_mode
-            assert spec_dec_mode.support_overlap_scheduler(
-            ), f"{self.spec_config.spec_dec_name} does not support overlap scheduler"
+            assert self.spec_config.spec_dec_mode.support_overlap_scheduler(
+            ), f"{self.spec_config.decoding_type} does not support overlap scheduler"
 
         # will contain previous batch indices of generation requests
         previous_batch_indices = []
@@ -1494,8 +1496,7 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.kv_cache_params = KVCacheParams(
             use_cache=True,
             num_cached_tokens_per_seq=num_cached_tokens_per_seq,
-            num_extra_kv_tokens=0 if self.spec_config is None else
-            self.spec_config.num_extra_kv_tokens)
+            num_extra_kv_tokens=get_num_extra_kv_tokens(self.spec_config))
         attn_metadata.kv_cache_manager = kv_cache_manager
 
         attn_metadata.prepare()

@@ -225,10 +225,6 @@ class DecodingBaseConfig(BaseModel):
     max_draft_len: Optional[int] = None
     speculative_model_dir: Optional[Union[str, Path]] = None
 
-    # Keep this for compliance with the old interface.
-    # TODO: remove this later
-    num_extra_kv_tokens: int = 0
-
     @classmethod
     def from_dict(cls, data: dict):
         # dispatch to the correct decoding config
@@ -274,17 +270,6 @@ class DecodingBaseConfig(BaseModel):
         return TorchSpeculativeDecodingMode.from_string(
             self.decoding_type.upper())
 
-    # Keep this for compliance with the old interface.
-    # TODO: remove this later
-    def update_from_model_config(self, model_config):
-        pass
-
-    # Keep this for compliance with the old interface.
-    # TODO: remove this later
-    def get_draft_model_prompt(self,
-                               input_tokens: torch.Tensor) -> torch.Tensor:
-        return input_tokens
-
 
 class MedusaDecodingConfig(DecodingBaseConfig):
     medusa_choices: Optional[List[List[int]]] = None
@@ -327,15 +312,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
         if self.eagle3_one_model:
             return TorchSpeculativeDecodingMode.EAGLE3_ONE_MODEL
         return TorchSpeculativeDecodingMode.EAGLE3
-
-    # Keep this for compliance with the old interface.
-    # TODO: remove this later
-    def get_draft_model_prompt(self,
-                               input_tokens: torch.Tensor) -> torch.Tensor:
-        """
-        Eagle3 always throws away the first token when processing draft inputs
-        """
-        return input_tokens[1:]
 
 
 class UserProvidedDecodingConfig(DecodingBaseConfig):
@@ -431,14 +407,6 @@ class MTPDecodingConfig(DecodingBaseConfig):
         if self.num_nextn_predict_layers_from_model_config == 1 and not self.use_mtp_vanilla:
             return TorchSpeculativeDecodingMode.MTP_EAGLE
         return TorchSpeculativeDecodingMode.MTP
-
-    # Keep this for compliance with the old interface.
-    # TODO: remove this later
-    def update_from_model_config(self, model_config):
-        assert self.num_nextn_predict_layers > 0
-        if model_config.num_nextn_predict_layers == 1 and not self.use_mtp_vanilla:
-            # self.spec_dec_mode = SpeculativeDecodingMode.MTP_EAGLE
-            self.num_extra_kv_tokens = self.num_nextn_predict_layers - 1
 
 
 class PybindMirror(ABC):
@@ -1444,7 +1412,7 @@ class BaseLlmArgs(BaseModel):
                 assert self.speculative_config.speculative_model_dir is not None, "Path to EAGLE3 weights must be specified."
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.EAGLE
-                if self.speculative_config.eagle3_one_model:  # from __post_init__()
+                if self.speculative_config.eagle3_one_model:
                     self.num_extra_kv_tokens = self.max_draft_len - 1
                 if self.backend not in ['pytorch', '_autodeploy']:
                     eagle_config = _EagleConfig(
@@ -1466,12 +1434,13 @@ class BaseLlmArgs(BaseModel):
             elif isinstance(self.speculative_config, DraftTargetDecodingConfig):
                 assert self.backend in ['pytorch']
                 assert self.speculative_config.max_draft_len > 0
+                assert self.speculative_config.speculative_model_dir is not None, "Path to draft model must be specified."
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.DRAFT_TOKENS_EXTERNAL
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
 
             elif isinstance(self.speculative_config, MTPDecodingConfig):
                 assert self.speculative_config.num_nextn_predict_layers > 0
-                self.speculative_config.max_draft_len = self.speculative_config.num_nextn_predict_layers  # from __post_init__()
+                self.speculative_config.max_draft_len = self.speculative_config.num_nextn_predict_layers
 
             elif isinstance(self.speculative_config,
                             UserProvidedDecodingConfig):
