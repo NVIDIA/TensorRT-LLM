@@ -15,7 +15,11 @@ from tensorrt_llm.bench.build.build import get_model_config
 
 # isort: off
 from tensorrt_llm.bench.benchmark.utils.general import (
-    get_settings_from_engine, get_settings, ALL_SUPPORTED_BACKENDS)
+    ALL_SUPPORTED_BACKENDS,
+    TuningConstraints,
+    get_settings_from_engine,
+    get_settings
+)
 # isort: on
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm._tensorrt_engine import LLM
@@ -312,8 +316,16 @@ def throughput_command(
         if bench_env.checkpoint_path is None:
             snapshot_download(model)
 
-        exec_settings = get_settings(params, metadata, bench_env.model,
-                                     bench_env.checkpoint_path)
+        tuning_constraints = TuningConstraints(
+            average_isl=metadata.avg_isl,
+            average_osl=metadata.avg_osl,
+            maximum_isl=metadata.max_isl,
+            maximum_osl=metadata.max_osl,
+            max_sequence_length=max_seq_len or metadata.max_sequence_length,
+        )
+
+        exec_settings = get_settings(params, tuning_constraints,
+                                     bench_env.model, bench_env.checkpoint_path)
         kwargs_max_sql = max_seq_len or metadata.max_sequence_length
         logger.info(f"Setting PyTorch max sequence length to {kwargs_max_sql}")
         kwargs["max_seq_len"] = kwargs_max_sql

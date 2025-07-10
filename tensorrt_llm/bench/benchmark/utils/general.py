@@ -7,13 +7,13 @@ from random import choices, shuffle
 from typing import Dict, List, Tuple, Union
 
 import yaml
+from pydantic import BaseModel
 
 from tensorrt_llm._torch.pyexecutor.model_engine import \
     validate_and_set_kv_cache_quant
 from tensorrt_llm.bench.build.build import (get_benchmark_engine_settings,
                                             get_model_config)
-from tensorrt_llm.bench.dataclasses.general import (DatasetMetadata,
-                                                    InferenceRequest)
+from tensorrt_llm.bench.dataclasses.general import InferenceRequest
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -23,6 +23,15 @@ _KV_CACHE_MAP = {
 }
 
 ALL_SUPPORTED_BACKENDS = ["pytorch", "_autodeploy", "tensorrt"]
+
+
+class TuningConstraints(BaseModel):
+    """Dataclass for tuning constraints."""
+    average_isl: int
+    average_osl: int
+    maximum_isl: int
+    maximum_osl: int
+    max_sequence_length: int
 
 
 def get_settings_from_engine(
@@ -73,7 +82,8 @@ def get_settings_from_engine(
     return runtime_config, engine_build_cfg
 
 
-def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
+def get_settings(params: dict, tuning_constraints: TuningConstraints,
+                 model: str,
                  model_path: Union[Path, None]) -> Dict[str, Union[str, int]]:
     """Retrieve basic runtime config for pytorch backend path
 
@@ -132,24 +142,25 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
             tllm_model_config.quant_config,
             params.get("tp"),
             params.get("pp"),
-            dataset_metadata.avg_isl,
-            dataset_metadata.avg_osl,
+            tuning_constraints.average_isl,
+            tuning_constraints.average_osl,
             params.get("kv_cache_free_gpu_mem_fraction"),
         )
 
         logger.info(
             f"Max batch size and max num tokens not provided. "
-            f"Using heuristics or pre-defined settings: max_batch_size={max_batch_size}, max_num_tokens={max_num_tokens}."
-        )
+            f"Using heuristics or pre-defined settings: max_batch_size={max_batch_size}, "
+            f"max_num_tokens={max_num_tokens}.")
 
         # If chunked prefill is disabled, we need to ensure that the max_num_tokens is at least the max_isl
         if not enable_chunked_prefill:
             logger.warning(
-                f"Chunked prefill is disabled, but max_num_tokens ({max_num_tokens}) is less than the max ISL ({dataset_metadata.max_isl}). "
-                f"Forcing max_num_tokens to {dataset_metadata.max_isl + max_batch_size}."
-            )
-            max_num_tokens = max(max_num_tokens,
-                                 dataset_metadata.max_isl + max_batch_size)
+                f"Chunked prefill is disabled, but max_num_tokens ({max_num_tokens}) is "
+                f"less than the max ISL "
+                f"({tuning_constraints.maximum_isl}). Forcing max_num_tokens to "
+                f"{tuning_constraints.max_seq_len + max_batch_size}.")
+            max_num_tokens = max(
+                max_num_tokens, tuning_constraints.maximum_isl + max_batch_size)
         else:
             # TODO: Figure out how to handle chunked block size.
             # Expecting this to be the max of chunk block and max_num_tokens.
