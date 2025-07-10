@@ -99,6 +99,8 @@ class GenerationRequest:
                 f"prompt_token_ids ({prompt_token_ids}) should be an instance of torch.Tensor, np.ndarray or list"
             )
 
+        # NOTE: Exercise caution when adding memory intense attributes, because the current implementation might lead to leaks without manual cleanup.
+        # Refer to https://github.com/NVIDIA/TensorRT-LLM/pull/5029#discussion_r2141859873 for details.
         self.sampling_params = sampling_params
         self.postproc_params = postproc_params
         self.lora_request = lora_request

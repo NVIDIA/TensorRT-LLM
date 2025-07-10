@@ -104,6 +104,7 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, tg::MmaKind mmaKind, st
         else if ((fastestDimTileSizeBytes % 32) == 0)
         {
             swizzleType = CU_TENSOR_MAP_SWIZZLE_32B;
+            // This path is only for the scaling factors.
         }
         else if ((fastestDimTileSizeBytes % 16) == 0 && (dtype == tg::Dtype::UE8m0 || dtype == tg::Dtype::E4m3))
         {

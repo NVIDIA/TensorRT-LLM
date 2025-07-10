@@ -374,6 +374,7 @@ class KVCacheManager(BaseResourceManager):
         is_gen: bool = False,
         prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
+        use_mrope: bool = False,
     ):
         beam_width = 1  # TODO: more than 1 beam?
         requests = []
@@ -388,12 +389,15 @@ class KVCacheManager(BaseResourceManager):
                 1
             ] * token_num if self.impl.cross_kv else None
             # Using 1 instead of 0 prevents NaN during warmup in e.g. Deepseek
+            mrope_position_deltas = torch.zeros(
+                1, device="cuda", dtype=torch.int32) if use_mrope else None
             req = LlmRequest(request_id=req_id,
                              max_new_tokens=1,
                              input_tokens=[1] * token_num,
                              sampling_config=SamplingConfig(
                                  sampling_params._get_sampling_config()),
                              is_streaming=False,
+                             mrope_position_deltas=mrope_position_deltas,
                              encoder_input_tokens=encoder_input_tokens)
             req.is_dummy_request = True
             req.paged_kv_block_ids = []
@@ -818,7 +822,7 @@ class MambaCacheManager(BaseResourceManager):
                                                         device=device,
                                                         dtype=torch.int32)
 
-    def prepare_mamba_cache_blocks(self, request_ids: List[int]):
+    def _prepare_mamba_cache_blocks(self, request_ids: List[int]):
         state_indices = []
         for r in request_ids:
             # cache hit
@@ -834,12 +838,7 @@ class MambaCacheManager(BaseResourceManager):
         self.state_indices[:len(state_indices)] = torch.as_tensor(
             state_indices, dtype=torch.int32, device=self.ssm_states.device)
 
-    def free_mamba_cache_blocks(self, request_id: int):
-        if request_id in self.mamba_cache_index:
-            block = self.mamba_cache_index.pop(request_id)
-            self.mamba_cache_free_blocks.append(block)
-
-    def prepare_mamba_resources(self, scheduled_batch: ScheduledRequests):
+    def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_ids = [
             i.py_request_id for i in scheduled_batch.context_requests
         ]
@@ -847,10 +846,13 @@ class MambaCacheManager(BaseResourceManager):
             i.py_request_id for i in scheduled_batch.generation_requests
         ]
         request_ids = context_ids + generation_ids
-        self.prepare_mamba_cache_blocks(request_ids)
+        self._prepare_mamba_cache_blocks(request_ids)
 
-    def free_mamba_resources(self, request: LlmRequest):
-        self.free_mamba_cache_blocks(request.py_request_id)
+    def free_resources(self, request: LlmRequest):
+        request_id = request.py_request_id
+        if request_id in self.mamba_cache_index:
+            block = self.mamba_cache_index.pop(request_id)
+            self.mamba_cache_free_blocks.append(block)
 
     def get_state_indices(self) -> torch.Tensor:
         return self.state_indices
@@ -862,6 +864,13 @@ class MambaCacheManager(BaseResourceManager):
     def get_ssm_states(self, layer_idx: int) -> torch.Tensor:
         layer_offset = self.mamba_layer_offsets[layer_idx]
         return self.ssm_states[layer_offset]
+
+    def shutdown(self):
+        # release tensor memory, keeping python references as tensors
+        self.conv_states = torch.tensor([])
+        self.ssm_states = torch.tensor([])
+        self.state_indices = torch.tensor([])
+        torch.cuda.empty_cache()
 
 
 class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
@@ -933,12 +942,16 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        self.prepare_mamba_resources(scheduled_batch)
-        super().prepare_resources(scheduled_batch)
+        MambaCacheManager.prepare_resources(self, scheduled_batch)
+        KVCacheManager.prepare_resources(self, scheduled_batch)
 
     def free_resources(self, request: LlmRequest):
-        self.free_mamba_resources(request)
-        super().free_resources(request)
+        MambaCacheManager.free_resources(self, request)
+        KVCacheManager.free_resources(self, request)
+
+    def shutdown(self):
+        MambaCacheManager.shutdown(self)
+        KVCacheManager.shutdown(self)
 
 
 class SlotManager:

@@ -41,6 +41,7 @@ def create_llm(model_dir):
     )
 
 
+@pytest.mark.high_cuda_memory
 def test_trtllm_sampler(model_path, test_case):
     prompts = [
         "Magellan and Elcano lead the first",
@@ -48,8 +49,8 @@ def test_trtllm_sampler(model_path, test_case):
         "The capital of Bolivia is",
     ]
 
-    expected_outputs = [["circumnavigation of the world."], [" Paris."],
-                        [" La Paz."]]
+    expected_outputs = [["circumnavigation of the world."], ["Paris."],
+                        ["La Paz."]]
 
     # Test configuration
     max_new_tokens = test_case["max_new_tokens"]

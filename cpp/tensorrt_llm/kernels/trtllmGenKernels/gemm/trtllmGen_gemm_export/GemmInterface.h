@@ -17,6 +17,7 @@
 #pragma once
 
 #include <numeric>
+#include <optional>
 
 #include "GemmOptions.h"
 #include "KernelParams.h"

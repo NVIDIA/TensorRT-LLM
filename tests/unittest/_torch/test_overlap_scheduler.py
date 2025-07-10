@@ -42,6 +42,7 @@ def create_llm(model_dir, disable_overlap_scheduler, enable_trtllm_sampler):
 
 
 @pytest.mark.parametrize("enable_trtllm_sampler", [False, True])
+@pytest.mark.high_cuda_memory
 def test_overlap_scheduler_consistency(model_path, test_case,
                                        enable_trtllm_sampler):
     # Test configuration

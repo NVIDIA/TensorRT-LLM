@@ -9,7 +9,7 @@ def main():
 
     llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
               tensor_parallel_size=2,
-              autotuner_enabled=False,
+              enable_autotuner=False,
               kv_cache_dtype='auto',
               kv_cache_config=KvCacheConfig(enable_block_reuse=True,
                                             event_buffer_max_size=1024),

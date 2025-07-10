@@ -72,6 +72,12 @@ if(ENABLE_MULTI_DEVICE)
   include_directories(${MPI_C_INCLUDE_DIRS})
 endif()
 
+if(ENABLE_NVSHMEM)
+  # Add hints for aarch64
+  find_package(NVSHMEM REQUIRED HINTS /usr/lib/sbsa-linux-gnu/cmake/nvshmem/)
+  include_directories(/usr/include/nvshmem/)
+endif()
+
 if(NOT WIN32)
   set(DECODER_SHARED_TARGET_0 decoder_attention_0)
   set(DECODER_SHARED_TARGET_1 decoder_attention_1)
@@ -231,7 +237,10 @@ if(ENABLE_MULTI_DEVICE)
   set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} ${MPI_C_LIBRARIES} ${NCCL_LIB})
 endif()
 
-message("TRTLLM_LINK_LIBS: ${TRTLLM_LINK_LIBS}")
+if(ENABLE_NVSHMEM)
+  set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} nvshmem::nvshmem_host
+                       nvshmem::nvshmem_device)
+endif()
 
 if(NOT WIN32) # Unix-like compilers
   set(UNDEFINED_FLAG "-Wl,--no-undefined")

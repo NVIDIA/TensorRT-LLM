@@ -102,7 +102,7 @@ methods:
       torch_compile_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.TorchCompileConfig]
         default: null
-      autotuner_enabled:
+      enable_autotuner:
         annotation: bool
         default: True
       enable_layerwise_nvtx_marker:

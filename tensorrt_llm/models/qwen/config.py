@@ -105,7 +105,7 @@ class QWenConfig(PretrainedConfig):
             hf_config.architectures = ['Qwen2ForCausalLM']
 
         valid_types = ('qwen', 'qwen2', 'qwen2_moe', 'qwen2_llava_onevision',
-                       'qwen2_vl', 'qwen2_audio')
+                       'qwen2_vl', 'qwen2_audio', 'qwen3', 'qwen3_moe')
         assert qwen_type in valid_types, f"Unsupported Qwen type: {qwen_type}, only {valid_types} are acceptable."
         num_key_value_heads = getattr(hf_config, "num_key_value_heads",
                                       hf_config.num_attention_heads)
@@ -114,7 +114,12 @@ class QWenConfig(PretrainedConfig):
         hidden_act = getattr(hf_config, "hidden_act", "silu")
         if qwen_type == "qwen2_moe":
             hidden_act = "swiglu"
-        attn_bias = True  # All existing Qwen models have attn bias
+
+        # Qwen3 models have no attention bias, while legacy models have bias
+        if qwen_type in ('qwen3', 'qwen3_moe'):
+            attn_bias = False  # Qwen3 models have no attn bias
+        else:
+            attn_bias = True  # Legacy Qwen models have attn bias
         rotary_scaling = getattr(hf_config, "rope_scaling", None)
         seq_length = getattr(hf_config, "seq_length", 8192)
         use_logn_attn = getattr(hf_config, "use_logn_attn", False)

@@ -598,7 +598,8 @@ void run(Data const& data, void* stream)
     {
         int const numThreads = 128;
         int const numBlocksX = (data.hiddenDim - 1 + numThreads) / numThreads;
-        int const numBlocksY = data.numTokens;
+        // Capped at rather arbitrary 8192 to avoid gridDim exceeding 65535 specified by CUDA.
+        int const numBlocksY = std::min(8192, data.numTokens);
         dim3 numBlocks(numBlocksX, numBlocksY);
 
         LAUNCH_EXPW(data, finalizeDeepSeekKernel, numBlocks, numThreads, 0, stream);
@@ -607,7 +608,8 @@ void run(Data const& data, void* stream)
     {
         int const numThreads = 256;
         int const numBlocksX = (data.hiddenDim - 1 + numThreads) / numThreads;
-        int const numBlocksY = data.numTokens;
+        // Capped at rather arbitrary 8192 to avoid gridDim exceeding 65535 specified by CUDA.
+        int const numBlocksY = std::min(8192, data.numTokens);
         dim3 numBlocks(numBlocksX, numBlocksY);
 
         LAUNCH_EXPW(data, finalizeKernel, numBlocks, numThreads, 0, stream);

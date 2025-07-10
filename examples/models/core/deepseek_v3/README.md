@@ -77,10 +77,10 @@ git clone https://huggingface.co/deepseek-ai/DeepSeek-V3 <YOUR_MODEL_DIR>
 ## Quick Start
 
 ### Run a single inference
-To quickly run DeepSeek-V3, [examples/pytorch/quickstart_advanced.py](../pytorch/quickstart_advanced.py):
+To quickly run DeepSeek-V3, [examples/llm-api/quickstart_advanced.py](../pytorch/quickstart_advanced.py):
 
 ```bash
-cd examples/pytorch
+cd examples/llm-api
 python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --tp_size 8
 ```
 
@@ -94,9 +94,9 @@ Prompt: 'The future of AI is', Generated text: ' a topic of great interest and s
 ```
 
 ### Multi-Token Prediction (MTP)
-To run with MTP, use [examples/pytorch/quickstart_advanced.py](../pytorch/quickstart_advanced.py) with additional options, see
+To run with MTP, use [examples/llm-api/quickstart_advanced.py](../pytorch/quickstart_advanced.py) with additional options, see
 ```bash
-cd examples/pytorch
+cd examples/llm-api
 python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_nextn N
 ```
 
@@ -123,7 +123,7 @@ When verifying and receiving draft tokens, there are two ways:
   Here is an example. We allow the first 15 (`--relaxed_topk 15`) tokens to be used as the initial candidate set, and use delta (`--relaxed_delta 0.5`) to filter out tokens with a large probability gap, which may be semantically different from the top-1 token.
 
   ```bash
-  cd examples/pytorch
+  cd examples/llm-api
   python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_nextn N --use_relaxed_acceptance_for_thinking --relaxed_topk 15 --relaxed_delta 0.5
   ```
 
@@ -794,7 +794,7 @@ Chunked Prefill is supported for MLA only on SM100 currently. You should add `--
 More specifically, we can imitate what we did in the [Quick Start](#quick-start):
 
 ``` bash
-cd examples/pytorch
+cd examples/llm-api
 python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --enable_chunked_prefill
 ```
 

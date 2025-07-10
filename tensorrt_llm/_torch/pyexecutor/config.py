@@ -75,7 +75,7 @@ class PyTorchConfig:
 
     # Enable autotuner only when torch compile is enabled
     # TODO: after it can be work stable in warmup stage
-    autotuner_enabled: bool = True
+    enable_autotuner: bool = True
 
     # If true, enable layerwise nvtx marker
     enable_layerwise_nvtx_marker: bool = False

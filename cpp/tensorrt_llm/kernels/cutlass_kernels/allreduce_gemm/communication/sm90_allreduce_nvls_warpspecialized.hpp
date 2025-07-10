@@ -201,7 +201,7 @@ public:
         auto [M, N, K, L] = problem_shape;
         auto [m, n, k, l] = tile_coord;
 
-        if (!tile_valid(m, n) || params_ptr->world_size == 1)
+        if (!tile_valid(m, n) || params_ptr->world_size <= 2)
         {
             return; // nothing to do
         }
@@ -212,7 +212,7 @@ public:
 
         // Wait for all multicast writes to be visible to us.
         // This is safe between phases.
-        SystemBarrier::arrive_and_wait(
+        SystemBarrier::arrive_and_wait<cuda::thread_scope::thread_scope_system>(
             params_ptr->barrier_params_final_sync, thread_idx, tile_index, params_ptr->rank, params_ptr->world_size);
     }
 
@@ -297,13 +297,20 @@ public:
                 Tensor tGR_gD1_vec = zipped_divide(tGR_gD1(_, _, _, red_m, red_n), Vec);
                 Tensor tRG_gOut_vec = zipped_divide(tRG_gOut(_, _, _, red_m, red_n), Vec);
 
-                auto pred_fn
-                    = [&](auto const&... coords) { return elem_less(tGR_pD_vec(_0{}, coords...), problem_shape); };
+                // Create predicate tensor for bounds checking
+                Tensor pred_tensor = make_tensor<bool>(make_shape(size(tGR_pD_vec)), Stride<_1>{});
+
+                // Set predicate values based on coordinate bounds
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = 0; i < size(pred_tensor); ++i)
+                {
+                    pred_tensor(i) = elem_less(tGR_pD_vec(_0{}, i), problem_shape);
+                }
 
                 // Read from self.
-                cute::copy_if(CopyAtomG2R{}, pred_fn, tGR_gD0_vec, tGR_rD0_vec);
+                cute::copy_if(CopyAtomG2R{}, pred_tensor, tGR_gD0_vec, tGR_rD0_vec);
                 // Read from remote.
-                cute::copy_if(CopyAtomG2R{}, pred_fn, tGR_gD1_vec, tGR_rD1_vec);
+                cute::copy_if(CopyAtomG2R{}, pred_tensor, tGR_gD1_vec, tGR_rD1_vec);
                 // Reduce
                 CUTLASS_PRAGMA_UNROLL
                 for (int i = 0; i < size(tGR_rD0_vec); i++)
@@ -311,7 +318,7 @@ public:
                     tGR_rD0_vec(i) += tGR_rD1_vec(i);
                 }
                 // store to self.
-                cute::copy_if(CopyAtomG2R{}, pred_fn, tGR_rD0_vec, tRG_gOut_vec);
+                cute::copy_if(CopyAtomG2R{}, pred_tensor, tGR_rD0_vec, tRG_gOut_vec);
             }
         }
     }
@@ -386,13 +393,21 @@ public:
                 Tensor tGR_gD_vec = zipped_divide(tGR_gD(_, _, _, red_m, red_n), Vec);
                 Tensor tRG_gD_vec = zipped_divide(tRG_gD(_, _, _, red_m, red_n), Vec);
                 Tensor tGR_pD_vec = zipped_divide(tGR_pD(_, _, _, red_m, red_n), Vec);
-                // problem shape bounds check
-                auto pred_fn
-                    = [&](auto const&... coords) { return elem_less(tGR_pD_vec(_0{}, coords...), problem_shape); };
+
+                // Create predicate tensor for bounds checking
+                Tensor pred_tensor = make_tensor<bool>(make_shape(size(tGR_gD_vec)), Stride<_1>{});
+
+                // Set predicate values based on coordinate bounds
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = 0; i < size(pred_tensor); ++i)
+                {
+                    pred_tensor(i) = elem_less(tGR_pD_vec(_0{}, i), problem_shape);
+                }
+
                 // load-reduce in switch
-                cute::copy_if(CopyAtomG2R{}, pred_fn, tGR_gD_vec, tGR_rD_vec);
+                cute::copy_if(CopyAtomG2R{}, pred_tensor, tGR_gD_vec, tGR_rD_vec);
                 // store switch multicast
-                cute::copy_if(CopyAtomR2G{}, pred_fn, tGR_rD_vec, tRG_gD_vec);
+                cute::copy_if(CopyAtomR2G{}, pred_tensor, tGR_rD_vec, tRG_gD_vec);
             }
         }
     }

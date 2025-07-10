@@ -183,7 +183,7 @@ set_target_properties(
              CXX_STANDARD 17
              CUDA_STANDARD 17
              CUDA_SEPARABLE_COMPILATION ON
-             CUDA_ARCHITECTURES ${DEEP_EP_CUDA_ARCHITECTURES}
+             CUDA_ARCHITECTURES "${DEEP_EP_CUDA_ARCHITECTURES}"
              LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/deep_ep_cpp_tllm.version
              INSTALL_RPATH "$ORIGIN/libs/nvshmem;${TORCH_INSTALL_PREFIX}/lib"
              BUILD_WITH_INSTALL_RPATH TRUE)

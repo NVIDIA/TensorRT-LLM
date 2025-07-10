@@ -287,6 +287,3 @@ class LlavaNextModel(PreTrainedModel):
         logits = self.llm.forward(attn_metadata, input_ids, position_ids,
                                   inputs_embeds, return_context_logits)
         return logits
-
-
-AutoModel.register(LlavaNextConfig, LlavaNextModel)

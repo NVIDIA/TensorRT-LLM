@@ -499,8 +499,8 @@ class BaseLLM:
                 raise ValueError(
                     "tokenizer is required to initialize a default sampling_params, or you can explicitly specify a sampling_params"
                 )
-            return SamplingParams(end_id=self.tokenizer.eos_token_id,
-                                  pad_id=self.tokenizer.pad_token_id)
+            sampling_params = SamplingParams(end_id=self.tokenizer.eos_token_id,
+                                             pad_id=self.tokenizer.pad_token_id)
         elif isinstance(sampling_params, SamplingParams):
             if sampling_params.end_id is None:
                 if self.tokenizer is None:
@@ -508,20 +508,25 @@ class BaseLLM:
                         "tokenizer is required to reset end_id if it is None, or you can explicitly specify the end_id for sampling_params"
                     )
                 sampling_params._setup(self.tokenizer)
-            # auto enabled context and/or generation logits flags, as they are required by logprob computation for TRT backend.
-            if self.args.backend not in ["pytorch", "_autodeploy"]:
-                if sampling_params.prompt_logprobs and not sampling_params.return_context_logits:
-                    sampling_params.return_context_logits = True
-                    sampling_params._context_logits_auto_enabled = True
-                if sampling_params.logprobs and not sampling_params.return_generation_logits:
-                    sampling_params.return_generation_logits = True
-                    sampling_params._generation_logits_auto_enabled = True
-
-            return sampling_params
         else:
             raise TypeError(
                 f"The sampling_params must be type SamplingParams or None, but got {type(sampling_params)}"
             )
+
+        # auto enabled context and/or generation logits flags, as they are required by logprob computation for TRT backend.
+        if self.args.backend not in ["pytorch", "_autodeploy"]:
+            if sampling_params.prompt_logprobs and not sampling_params.return_context_logits:
+                sampling_params.return_context_logits = True
+                sampling_params._context_logits_auto_enabled = True
+            if sampling_params.logprobs and not sampling_params.return_generation_logits:
+                sampling_params.return_generation_logits = True
+                sampling_params._generation_logits_auto_enabled = True
+
+        if sampling_params._stream_interval is None:
+            sampling_params._stream_interval = getattr(self.args,
+                                                       "stream_interval", 1)
+
+        return sampling_params
 
     def _check_arguments(self, prompt_len: int, query_len: int,
                          sampling_params: SamplingParams) -> None:
