@@ -1002,7 +1002,8 @@ public:
         std::optional<RetentionPriority> secondaryOffloadMinPriority = std::nullopt, size_t eventBufferMaxSize = 0,
         bool enablePartialReuse = true, bool copyOnPartialReuse = true, bool useUvm = false,
         SizeType32 attentionDpEventsGatherPeriodMs = 5,
-        std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults = std::nullopt);
+        std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults = std::nullopt,
+        std::optional<uint64_t> const& maxFreeGpuMemorySize = std::nullopt);
 
     [[nodiscard]] bool getEnableBlockReuse() const;
     [[nodiscard]] bool getEnablePartialReuse() const;
@@ -1018,6 +1019,7 @@ public:
     [[nodiscard]] size_t getEventBufferMaxSize() const;
     [[nodiscard]] bool getUseUvm() const;
     [[nodiscard]] SizeType32 getAttentionDpEventsGatherPeriodMs() const;
+    [[nodiscard]] std::optional<uint64_t> getMaxFreeGpuMemorySize() const;
 
     void setEnableBlockReuse(bool enableBlockReuse);
     void setEnablePartialReuse(bool enablePartialReuse);
@@ -1033,6 +1035,7 @@ public:
     void setEventBufferMaxSize(size_t eventBufferMaxSize);
     void setUseUvm(bool useUvm);
     void setAttentionDpEventsGatherPeriodMs(SizeType32 attentionDpEventsGatherPeriodMs);
+    void setMaxFreeGpuMemorySize(uint64_t maxFreeGpuMemorySize);
 
     void fillEmptyFieldsFromRuntimeDefaults(tensorrt_llm::runtime::RuntimeDefaults const& runtimeDefaults);
 
@@ -1091,6 +1094,11 @@ private:
 
     /// @brief The period in milliseconds to gather attention DP events across ranks
     SizeType32 mAttentionDpEventsGatherPeriodMs;
+    /// @brief The maximum size in bytes of GPU memory that can be allocated for the KV cache.
+    /// This is only used for VSWA case for now as a alternative to mMaxTokens.
+    /// If both mMaxFreeGpuMemorySize and mFreeGpuMemoryFraction are specified, memory corresponding to the minimum will
+    /// be allocated.
+    std::optional<uint64_t> mMaxFreeGpuMemorySize;
 };
 
 /// @brief Configuration class for the runtime perf knobs

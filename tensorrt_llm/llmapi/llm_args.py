@@ -985,6 +985,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     )
     use_uvm: bool = Field(default=False,
                           description="Whether to use UVM for the KV cache.")
+    max_free_gpu_memory_size: Optional[int] = Field(
+        default=None,
+        description=
+        "The maximum size in bytes of GPU memory that can be allocated for the KV cache. This is only used for VSWA case for now as a alternative to `max_tokens`. If both `max_free_gpu_memory_size` and `free_gpu_memory_fraction` are specified, memory corresponding to the minimum will be allocated."
+    )
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     dtype: str = Field(default="auto",
@@ -1007,6 +1012,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             use_uvm=self.use_uvm,
             attention_dp_events_gather_period_ms=self.
             attention_dp_events_gather_period_ms,
+            max_free_gpu_memory_size=self.max_free_gpu_memory_size
         )
 
 
