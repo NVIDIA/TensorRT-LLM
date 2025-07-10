@@ -2177,9 +2177,12 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
 
     @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRITON", "TRTLLM"])
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
-        [(1, 1, 1, False, True, True)],
-        ids=["latency"])
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler", [
+            (1, 1, 1, False, True, True),
+            (2, 1, 2, False, True, True),
+            (4, 1, 4, False, True, True),
+        ],
+        ids=["latency", "ep2", "ep4"])
     @pytest.mark.parametrize("activation_dtype", ["static_fp8", "mxfp8"],
                              ids=["fp8", "mxfp8"])
     def test_w4a8_mxfp4(self, moe_backend, tp_size, pp_size, ep_size,
