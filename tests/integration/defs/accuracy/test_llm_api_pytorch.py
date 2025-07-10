@@ -1647,6 +1647,31 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    def test_eagle3(self):
+        pytorch_config = dict(
+            disable_overlap_scheduler=True,
+            cuda_graph_config=CudaGraphConfig(batch_sizes=[1]),
+        )
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+
+        eagle_model_dir = f"{llm_models_root()}/Qwen3/qwen3_8b_eagle3"
+        target_model_dir = f"{llm_models_root()}/Qwen3/Qwen3-8B"
+
+        draft_len = 4
+        spec_config = EagleDecodingConfig(max_draft_len=draft_len,
+                                          pytorch_weights_path=eagle_model_dir,
+                                          eagle3_one_model=False)
+
+        llm = LLM(model=target_model_dir,
+                  **pytorch_config,
+                  kv_cache_config=kv_cache_config,
+                  speculative_config=spec_config,
+                  build_config=None)
+
+        with llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
 
 class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-30B-A3B"
