@@ -1487,11 +1487,13 @@ def llama_7b_multi_unique_lora_adapters_from_request(
         ([
             5,
         ], 2, 2, 1),
-        # Test eviction and re-loading a previously evicted adapter from the LoRA GPU cache, within a single llm.generate call
+        # Test eviction and re-loading a previously evicted adapter from the LoRA GPU cache, within a single
+        # llm.generate call
         ([
             2,
         ], 1, 2, 2),
-        # Test eviction and loading of new adapters in the evicted space, over several llm.generate calls, with LoRA GPU cache size < LoRA CPU cache size
+        # Test eviction and loading of new adapters in the evicted space, over several llm.generate calls, with LoRA GPU
+        # cache size < LoRA CPU cache size
         ([2, 2, 2], 1, 3, 1),
     ])
 @skip_gpu_memory_less_than_40gb
