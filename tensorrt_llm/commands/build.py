@@ -41,12 +41,16 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 def enum_type(enum_class):
 
     def parse_enum(value):
-        try:
-            return enum_class[value.upper()]
-        except KeyError:
-            raise argparse.ArgumentTypeError(
-                f"Invalid value '{value}'. Expected one of {[e.name.lower() for e in enum_class]}"
-            )
+        if isinstance(value, enum_class):
+            return value
+
+        if isinstance(value, str):
+            return enum_class.from_string(value)
+
+        valid_values = [e.name for e in enum_class]
+        raise argparse.ArgumentTypeError(
+            f"Invalid value '{value}' of type {type(value).__name__}. Expected one of {valid_values}"
+        )
 
     return parse_enum
 
