@@ -4,7 +4,6 @@ from typing import List, Optional, Tuple
 import torch
 from torch import nn
 
-from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
@@ -12,40 +11,8 @@ from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
-from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
+from .interface import SpecMetadata
 from .mtp import MTPSampler
-
-
-@dataclass
-class Eagle3Config(SpecConfig):
-    spec_dec_name: str = "EAGLE3"
-    num_layers: int = 0
-    hidden_size: int = 0
-    eagle3_one_model: bool = True
-
-    def __post_init__(self):
-        if self.speculative_model_dir is None:
-            raise ValueError("Path to EAGLE3 weights must be specified.")
-
-        if self.eagle3_one_model:
-            self.spec_dec_mode = SpeculativeDecodingMode.EAGLE3_ONE_MODEL
-            self.num_extra_kv_tokens = self.max_draft_len - 1
-        else:
-            self.spec_dec_mode = SpeculativeDecodingMode.from_string(
-                self.spec_dec_name)
-        logger.info(f"EAGLE3 Config: {self}")
-
-    def update_from_model_config(self, model_config):
-        self.num_layers = model_config.num_hidden_layers
-        self.hidden_size = model_config.hidden_size
-        self.dtype = model_config.torch_dtype
-
-    def get_draft_model_prompt(self,
-                               input_tokens: torch.Tensor) -> torch.Tensor:
-        """
-        Eagle3 always throws away the first token when processing draft inputs
-        """
-        return input_tokens[1:]
 
 
 class Eagle3ResourceManager(BaseResourceManager):
