@@ -31,9 +31,9 @@ namespace tensorrt_llm::batch_manager
 using SizeType32 = MakeDecodingBatchInputOutput::SizeType32;
 using TensorPtr = MakeDecodingBatchInputOutput::TensorPtr;
 
-std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::createDecoderBatchInputs(
+void MakeDecodingBatchInputOutput::createDecoderBatchInputs(DecoderInputBuffers& inputBuffers,
     std::vector<SizeType32> const& activeSlots, runtime::decoder::DecoderState const& decoderState,
-    std::vector<TensorPtr> const& decoderLogits, SizeType32 maxNumSequences, std::vector<TensorPtr> const& batchSlots)
+    SizeType32 maxNumSequences)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -41,6 +41,9 @@ std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::createDe
     auto const& maxDecodingEngineTokens = decoderState.getMaxDecodingEngineTokens();
     auto const& maxDecodingDecoderTokens = decoderState.getMaxDecodingDecoderTokens();
     auto const maxDecoderSteps = common::ceilDiv(maxDecodingEngineTokens, maxDecodingDecoderTokens);
+
+    auto& batchSlots = inputBuffers.forwardBatchSlots;
+    auto& decoderLogits = inputBuffers.decoderLogits;
 
     for (SizeType32 step = 0; step < maxDecoderSteps; ++step)
     {
@@ -64,7 +67,7 @@ std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::createDe
             auto batchSlotsRange = tr::BufferRange<SizeType32>(*batchSlots.at(step));
             batchSlotsRange[batchSizes[step]] = slot;
             batchSizes[step]++;
-            TensorPtr logitsSlice = tr::ITensor::slice(logits, step, singleRequest);
+            auto logitsSlice = tr::ITensor::slice(logits, step, singleRequest);
             batchLogits[step].emplace_back(std::move(logitsSlice));
         }
     }
@@ -75,10 +78,10 @@ std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::createDe
     }
     batchLogits.resize(maxActiveDecoderSteps);
 
-    auto decodingInput = std::make_unique<tr::decoder_batch::Input>(batchLogits, maxActiveDecoderSteps);
-    decodingInput->batchSlots = batchSlots;
+    inputBuffers.maxDecoderSteps = maxActiveDecoderSteps;
+    inputBuffers.batchLogits = batchLogits;
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return decodingInput;
 }
 
 namespace
@@ -163,8 +166,10 @@ std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::operator
 
     auto [activeSlots, generationSteps] = getActiveSlots(inputBuffers.decoderRequests);
 
-    auto decodingInput = createDecoderBatchInputs(
-        activeSlots, decoderState, inputBuffers.logits, maxNumSequences, inputBuffers.forwardBatchSlots);
+    createDecoderBatchInputs(inputBuffers, activeSlots, decoderState, maxNumSequences);
+
+    auto decodingInput = std::make_unique<tr::decoder_batch::Input>(inputBuffers.batchLogits, inputBuffers.maxDecoderSteps);
+    decodingInput->batchSlots = inputBuffers.forwardBatchSlots;
 
     auto const maxBeamWidth = decoderState.getMaxBeamWidth();
     if (maxBeamWidth > 1)
