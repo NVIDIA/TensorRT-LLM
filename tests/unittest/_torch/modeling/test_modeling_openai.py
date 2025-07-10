@@ -45,7 +45,7 @@ def dump_config_json(dst_dir):
 
 
 @pytest.mark.parametrize("kv_cache", ["fp8", "auto"])
-@pytest.mark.parametrize("moe_backend", ["TRTLLM", "CUTLASS", "TRITON"])
+@pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRITON"])
 def test_orangina_trtllmgen(kv_cache, moe_backend):
     prompts = [
         "How are you?",

@@ -12,6 +12,7 @@ from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
                                            PredefinedAttentionMask, RopeParams)
+from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
@@ -108,14 +109,13 @@ class AttentionBlock(Attention):
         position_ids: Optional[torch.LongTensor],
         hidden_states: torch.Tensor | Fp4QuantizedTensor,
         attn_metadata: AttentionMetadata,
+        residual: Optional[torch.Tensor] = None,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
         CAUSAL,
         all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,
         **kwargs,
-    ) -> torch.Tensor:
-        x = hidden_states
-        hidden_states = self.norm(hidden_states)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
 
         attention_window_size = self.sliding_window
         attn_output = super().forward(
@@ -128,7 +128,7 @@ class AttentionBlock(Attention):
             attention_window_size=attention_window_size,
             attention_sinks=self.sinks.data,
             **kwargs)
-        return attn_output + x
+        return attn_output, residual
 
     def load_weights(self, weights: Dict):
         sinks = weights[0]['sinks'][self.num_heads *
@@ -143,6 +143,7 @@ class MLPBlock(torch.nn.Module):
         self,
         config: ModelConfig[OpenAIMoeConfig],
         layer_idx: int,
+        reduce_results: bool = True,
     ):
         super().__init__()
 
@@ -179,7 +180,7 @@ class MLPBlock(torch.nn.Module):
             hidden_size=pretrained_config.hidden_size,
             intermediate_size=pretrained_config.intermediate_size,
             dtype=pretrained_config.torch_dtype,
-            reduce_results=True,
+            reduce_results=reduce_results,
             model_config=config,
             weight_loading_mode=MoEWeightLoadingMode.FUSED_GATE_UP_PROJ,
             bias=True,
@@ -216,9 +217,12 @@ class MLPBlock(torch.nn.Module):
             device=device,
             dtype=pretrained_config.torch_dtype)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        t = self.norm(x)
-        g = self.gate(t)
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        g = self.gate(x)
         # Use ideal load balanced logits if enabled, otherwise use gate output
         if self.config.enable_perfect_router:
             # WARNING: This discards the learned gate output and uses ideal logits for perfect load balancing
@@ -228,8 +232,8 @@ class MLPBlock(torch.nn.Module):
             g = self._create_ideal_expert_load_balanced_logits(
                 num_tokens=num_tokens, num_experts=num_experts, device=x.device)
 
-        t = self.experts(x=t, router_logits=g)
-        return x + t
+        t = self.experts(x, router_logits=g)
+        return t, residual
 
 
 class TransformerBlock(DecoderLayer):
@@ -241,8 +245,102 @@ class TransformerBlock(DecoderLayer):
     ):
         super().__init__()
         self.layer_idx = layer_idx
+
+        mapping = config.mapping
+        self.enable_attn_dp = mapping.enable_attention_dp
+        self.is_tp = mapping.has_tp() and not self.enable_attn_dp
+
+        pretrained_config = config.pretrained_config
+        self.input_layernorm = RMSNorm(
+            hidden_size=pretrained_config.hidden_size,
+            eps=pretrained_config.rms_norm_eps,
+            dtype=pretrained_config.torch_dtype)
+
         self.attn = AttentionBlock(config, layer_idx)
-        self.mlp = MLPBlock(config, layer_idx)
+
+        self.post_attention_layernorm = RMSNorm(
+            hidden_size=pretrained_config.hidden_size,
+            eps=pretrained_config.rms_norm_eps,
+            dtype=pretrained_config.torch_dtype)
+
+        self.mlp = MLPBlock(config, layer_idx, reduce_results=not self.is_tp)
+
+        self.next_layer_layernorm = RMSNorm(
+            hidden_size=pretrained_config.hidden_size,
+            eps=pretrained_config.rms_norm_eps,
+            dtype=pretrained_config.torch_dtype)
+
+        # setup for tp
+        self.allreduce = AllReduce(mapping=config.mapping,
+                                   strategy=config.allreduce_strategy,
+                                   dtype=config.pretrained_config.torch_dtype)
+
+    def forward_normal(
+        self,
+        position_ids: torch.LongTensor,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        residual: Optional[torch.Tensor] = ...,
+        **kwargs,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+
+        x, residual = self.attn(position_ids,
+                                hidden_states,
+                                attn_metadata,
+                                residual=residual,
+                                **kwargs)
+        x, residual = self.post_attention_layernorm(x, residual)
+
+        x, residual = self.mlp(x, residual)
+        x, residual = self.next_layer_layernorm(x, residual)
+        return x, residual
+
+    def forward_tp(
+        self,
+        position_ids: torch.LongTensor,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        residual: Optional[torch.Tensor] = ...,
+        **kwargs,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+
+        x, residual = self.attn(
+            position_ids,
+            hidden_states,
+            attn_metadata,
+            residual=residual,
+            all_reduce_params=AllReduceParams(enable_allreduce=False),
+            **kwargs)
+
+        x, residual = self.allreduce(
+            x,
+            all_reduce_params=AllReduceParams(
+                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                residual=residual,
+                norm_weight=self.post_attention_layernorm.weight,
+                eps=self.post_attention_layernorm.variance_epsilon,
+                trigger_completion_at_end=False,
+            ))
+
+        x, residual = self.mlp(x, residual)
+
+        x, residual = self.allreduce(
+            x,
+            all_reduce_params=AllReduceParams(
+                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                residual=residual,
+                norm_weight=self.next_layer_layernorm.weight,
+                eps=self.next_layer_layernorm.variance_epsilon,
+                trigger_completion_at_end=False,
+            ))
+
+        return x, residual
 
     def forward(
         self,
@@ -252,13 +350,12 @@ class TransformerBlock(DecoderLayer):
         residual: Optional[torch.Tensor] = ...,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        x = self.attn(position_ids,
-                      hidden_states,
-                      attn_metadata,
-                      residual=residual,
-                      **kwargs)
-        x = self.mlp(x)
-        return x
+        if self.is_tp:
+            _forward = self.forward_tp
+        else:
+            _forward = self.forward_normal
+        return _forward(position_ids, hidden_states, attn_metadata, residual,
+                        **kwargs)
 
 
 class Transformer(DecoderModel):
@@ -308,33 +405,21 @@ class Transformer(DecoderModel):
 
         residual = None
         for i, block in enumerate(self.block):
-            # TODO: apply rms_norm/residual_add fusion
-            # hidden_states, residual = block(
-            #     position_ids=position_ids,
-            #     hidden_states=hidden_states,
-            #     attn_metadata=attn_metadata,
-            #     residual=residual,
-            #     mrope_config=mrope_config,
-            # )
-            hidden_states = block(
+            hidden_states, residual = block(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 residual=residual,
                 mrope_config=mrope_config,
             )
-            residual = None
 
             if spec_metadata is not None:
-
                 spec_metadata.maybe_capture_hidden_states(
                     i, hidden_states, residual)
 
-        hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
-# TODO: fix plumbing for OpenAIMoeConfig
 @register_auto_model("OpenAIMoeForCausalLM")
 class OpenAIMoeForCausalLM(DecoderModelForCausalLM[Transformer,
                                                    OpenAIMoeConfig]):
@@ -479,7 +564,22 @@ class OpenAIMoeForCausalLM(DecoderModelForCausalLM[Transformer,
                     module.load_weights(weights=[module_weights])
             else:
                 # Load LN weights.
+                if names[-1].endswith("layernorm") and names[-3] == "block":
+                    # skip loading weights for the fused norms
+                    continue
                 for n, p in module._parameters.items():
                     if p is not None:
                         p.data.copy_(module_weights[n.replace(
                             "weight", "scale")][:])
+
+        for idx, layer in enumerate(
+                self.model.block[:self.config.num_hidden_layers]):
+            if idx == 0:
+                layer.input_layernorm = layer.attn.norm
+
+            layer.post_attention_layernorm = layer.mlp.norm
+
+            if idx == self.config.num_hidden_layers - 1:
+                layer.next_layer_layernorm = self.model.norm
+            else:
+                layer.next_layer_layernorm = self.model.block[idx + 1].attn.norm
