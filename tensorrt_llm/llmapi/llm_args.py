@@ -1792,6 +1792,19 @@ class TorchLlmArgs(BaseLlmArgs):
                 'MNNVL']] = Field(default='AUTO',
                                   description="Allreduce strategy to use.")
 
+    checkpoint_loader: Optional[object] = Field(
+        default=None,
+        description="The checkpoint loader to use for this LLM instance.",
+        json_schema_extra={
+            "type": "Optional[tensorrt_llm._torch.BaseCheckpointLoader]"
+        },
+    )
+
+    checkpoint_format: Optional[str] = Field(
+        default=None,
+        description="The format of the provided checkpoint.",
+    )
+
     # TODO: remove backend later
     @field_validator('backend', mode='before')
     def init_backend(cls, v):
@@ -1849,6 +1862,22 @@ class TorchLlmArgs(BaseLlmArgs):
         if self.stream_interval <= 0:
             raise ValueError(
                 f"stream_interval must be positive, got {self.stream_interval}")
+        return self
+
+    @model_validator(mode="after")
+    def validate_checkpoint_format(self):
+        if self.checkpoint_format is not None and self.checkpoint_loader is not None:
+            logger.warning(
+                "checkpoint_format and checkpoint_loader are both provided, "
+                "checkpoint_loader will be ignored.")
+            self.checkpoint_loader = None
+
+        if self.checkpoint_format is None and self.checkpoint_loader is None:
+            logger.info(
+                "neither checkpoint_format nor checkpoint_loader were provided, "
+                "checkpoint_format will be set to HF.")
+            self.checkpoint_format = "HF"
+
         return self
 
     @staticmethod
