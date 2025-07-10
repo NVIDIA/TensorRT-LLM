@@ -137,17 +137,20 @@ def test_llmapi_quickstart_atexit(llm_root, engine_dir, llm_venv):
     llm_venv.run_cmd([str(script_path)])
 
 
+@pytest.mark.skip_less_device_memory(80000)
 def test_llmapi_speculative_decoding_mtp(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv,
                         "llm_speculative_decoding.py", "MTP", "--model",
                         f"{llm_models_root()}/DeepSeek-V3-Lite/bf16")
 
 
+@pytest.mark.skip_less_device_memory(80000)
 def test_llmapi_speculative_decoding_eagle3(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv,
                         "llm_speculative_decoding.py", "EAGLE3")
 
 
+@pytest.mark.skip_less_device_memory(80000)
 def test_llmapi_speculative_decoding_ngram(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv,
                         "llm_speculative_decoding.py", "NGRAM")
