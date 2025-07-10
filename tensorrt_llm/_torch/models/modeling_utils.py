@@ -525,11 +525,11 @@ class DecoderModelForCausalLM(nn.Module,
         )
 
     def load_weights(self, weights: Dict, skip_modules: List[str] = []):
-        serial_load_weights = getattr(self, "serial_load_weights", None)
+        preload_weight_modules = getattr(self, "preload_weight_modules", None)
         _load_weights_impl(self,
                            weights,
                            skip_modules,
-                           serial_load_weights=serial_load_weights)
+                           preload_weight_modules=preload_weight_modules)
 
     def infer_max_seq_len(self) -> int:
         # Modified from tensorrt_llm/builder.py _init_max_seq_len
@@ -680,7 +680,7 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                        weights: Dict,
                        skip_modules: List[str] = [],
                        params_map: Optional[Dict[str, str]] = None,
-                       serial_load_weights: Optional[List[str]] = None):
+                       preload_weight_modules: Optional[List[str]] = None):
     if not hasattr(model, 'model_config') or not isinstance(
             model.model_config, ModelConfig):
         raise ValueError("model must have a model_config attribute")
@@ -762,9 +762,9 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
             load_single_module(name, module)
     else:
         all_modules = dict(model.named_modules())
-        if serial_load_weights is not None:
-            serial_load_modules = []
-            for module in serial_load_weights:
+        serial_load_modules = []
+        if preload_weight_modules is not None:
+            for module in preload_weight_modules:
                 serial_load_modules.extend([
                     name for name in all_modules.keys() if name.endswith(module)
                 ])
