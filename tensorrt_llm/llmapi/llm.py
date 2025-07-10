@@ -918,7 +918,10 @@ class _TorchLLM(BaseLLM):
             or tllm.BatchingType.INFLIGHT,
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
-            gather_generation_logits=self.args.gather_generation_logits)
+            gather_generation_logits=self.args.gather_generation_logits,
+        )
+        if self.args.kv_cache_config is not None:
+            self._executor_config.tokens_per_block = self.args.kv_cache_config.tokens_per_block
 
         if self.args.kv_cache_config is not None:
             self._executor_config.kv_cache_config = PybindMirror.maybe_to_pybind(

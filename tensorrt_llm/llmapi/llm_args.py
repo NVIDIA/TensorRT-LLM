@@ -797,6 +797,9 @@ class KvCacheConfig(BaseModel, PybindMirror):
     use_uvm: bool = Field(default=False,
                           description="Whether to use UVM for the KV cache.")
 
+    tokens_per_block: int = Field(default=64,
+                                  description="The number of tokens per block.")
+
     def _to_pybind(self):
         return _KvCacheConfig(
             enable_block_reuse=self.enable_block_reuse,
