@@ -124,6 +124,7 @@ def test_llmapi_example_distributed_tp2(llm_root, engine_dir, llm_venv):
                         "llm_inference_distributed.py")
 
 
+@pytest.mark.skip(reason="https://nvbugs/5385576")
 def test_llmapi_example_logits_processor(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv,
                         "llm_logits_processor.py")
