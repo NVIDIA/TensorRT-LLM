@@ -111,13 +111,22 @@ public:
     {
         std::vector<torch::Tensor> output_list;
         output_list.reserve(input_list.size());
-        ncclGroupStart();
+        bool use_nccl_reducescatter = !sizes.has_value()
+            || std::all_of(sizes.value().begin(), sizes.value().end(),
+                [&sizes](int64_t size) { return size == sizes.value()[0]; });
+        if (use_nccl_reducescatter)
+        {
+            ncclGroupStart();
+        }
         for (auto const& input : input_list)
         {
             auto output = run(input, sizes);
             output_list.push_back(output);
         }
-        ncclGroupEnd();
+        if (use_nccl_reducescatter)
+        {
+            ncclGroupEnd();
+        }
         return output_list;
     }
 

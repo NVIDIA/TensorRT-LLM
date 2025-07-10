@@ -42,9 +42,7 @@ from helpers import (get_input_tensor_by_name, get_output_config_from_request,
 from mpi4py.futures import MPICommExecutor
 from mpi4py.MPI import COMM_WORLD
 
-from tensorrt_llm import LLM as PyTorchLLM
-from tensorrt_llm import SamplingParams
-from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._utils import global_mpi_rank, global_mpi_size
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 
@@ -200,15 +198,8 @@ class TritonPythonModel:
             # Create LLM in a thread to avoid blocking
             loop = asyncio.get_running_loop()
             try:
-                backend = self.llm_engine_args.get("backend", None)
-                # Update LLM engine args with disaggregated config if present
-                if backend == "pytorch":
-                    llm = await loop.run_in_executor(
-                        None, lambda: PyTorchLLM(**self.llm_engine_args))
-                else:
-                    self.llm_engine_args["pytorch_backend_config"] = None
-                    llm = await loop.run_in_executor(
-                        None, lambda: LLM(**self.llm_engine_args))
+                llm = await loop.run_in_executor(
+                    None, lambda: LLM(**self.llm_engine_args))
                 yield llm
             finally:
                 if 'llm' in locals():
