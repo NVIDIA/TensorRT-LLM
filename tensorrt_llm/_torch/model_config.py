@@ -70,7 +70,7 @@ class ModelConfig(Generic[TConfig]):
     # to support mixed quantization.
     skip_create_weights_in_init: bool = False
 
-    spec_config: Optional["SpecConfig"] = None
+    spec_config: Optional["DecodingBaseConfig"] = None
     lora_config: Optional["LoraConfig"] = None
 
     is_generation: bool = True
