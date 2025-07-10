@@ -45,7 +45,9 @@ prepare_dataset
     python prepare_dataset.py [OPTIONS]
 
 **Options**
+
 ----
+
 .. list-table::
    :widths: 20 80
    :header-rows: 1
@@ -79,7 +81,9 @@ Process real datasets from various sources.
     python prepare_dataset.py dataset [OPTIONS]
 
 **Options**
+
 ----
+
 .. list-table::
    :widths: 20 80
    :header-rows: 1
@@ -108,7 +112,9 @@ Generate synthetic datasets with normal token distribution.
     python prepare_dataset.py token_norm_dist [OPTIONS]
 
 **Options**
+
 ----
+
 .. list-table::
    :widths: 20 80
    :header-rows: 1
@@ -137,7 +143,9 @@ Generate synthetic datasets with uniform token distribution
     python prepare_dataset.py token_unif_dist [OPTIONS]
 
 **Options**
+
 ----
+
 .. list-table::
    :widths: 20 80
    :header-rows: 1
