@@ -1419,8 +1419,9 @@ def llama_7b_multi_lora_from_request_test_harness(**llm_kwargs):
                        ref) or key_word in output.outputs[0].txt
 
 
-def llama_7b_multi_unique_lora_adapters_from_request(lora_adapter_count_per_call: list[int], max_loras: int,
-                                                     max_cpu_loras: int, repeats: int, **llm_kwargs):
+def llama_7b_multi_unique_lora_adapters_from_request(
+        lora_adapter_count_per_call: list[int], max_loras: int,
+        max_cpu_loras: int, repeats: int, **llm_kwargs):
     total_lora_adapters = sum(lora_adapter_count_per_call)
 
     hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
@@ -1440,7 +1441,8 @@ def llama_7b_multi_unique_lora_adapters_from_request(lora_adapter_count_per_call
     llm = LLM(hf_model_dir,
               enable_lora=True,
               build_config=build_config,
-              fast_build=True)
+              fast_build=True,
+              **llm_kwargs)
 
     # Each prompt should have a reference for every LoRA adapter dir (in the same order as in hf_lora_dirs)
     prompt_to_references = OrderedDict({
@@ -1489,10 +1491,8 @@ def llama_7b_multi_unique_lora_adapters_from_request(lora_adapter_count_per_call
 def test_llama_7b_multi_lora_evict_load_new_adapters(
         lora_adapter_count_per_call: list[int], max_loras: int,
         max_cpu_loras: int):
-    llama_7b_multi_unique_lora_adapters_from_request(lora_adapter_count_per_call,
-                                                     max_loras,
-                                                     max_cpu_loras,
-                                                     repeats=1)
+    llama_7b_multi_unique_lora_adapters_from_request(
+        lora_adapter_count_per_call, max_loras, max_cpu_loras, repeats=1)
 
 
 @pytest.mark.parametrize(
