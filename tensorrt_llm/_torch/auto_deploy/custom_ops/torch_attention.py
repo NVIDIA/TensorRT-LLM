@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# TODO (chenghao): Remove related kernels once we have a backend-specific implementation for attention.
+
 
 @torch.library.custom_op("auto_deploy::torch_attention_repeat_kv", mutates_args=())
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
