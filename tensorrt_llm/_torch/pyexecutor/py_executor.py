@@ -173,7 +173,7 @@ class PyExecutor:
                  max_input_len: int = 2048,
                  max_batch_size: int = 8,
                  max_beam_width: int = 1,
-                 max_draft_tokens: int = 0,
+                 max_draft_len: int = 0,
                  kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
                  draft_model_engine: Optional[ModelEngine] = None,
                  garbage_collection_gen0_threshold: Optional[int] = None,
@@ -207,7 +207,7 @@ class PyExecutor:
         self.active = True
         self.next_req_id = max_batch_size  # The first max_batch_size request IDs are reserved for dummy requests
         self.max_beam_width = max_beam_width
-        self.max_draft_tokens = max_draft_tokens
+        self.max_draft_len = max_draft_len
         self.print_log = model_engine.pytorch_backend_config.print_iter_log
         self.enable_iter_perf_stats = model_engine.pytorch_backend_config.enable_iter_perf_stats
         self.enable_iter_req_stats = model_engine.pytorch_backend_config.enable_iter_req_stats
@@ -911,7 +911,8 @@ class PyExecutor:
 
                 finished_requests = []
 
-                if scheduled_batch.batch_size > 0:
+                if scheduled_batch.batch_size > 0 or (
+                        self.enable_attention_dp and self.dist.tp_size > 1):
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
                         self._prepare_disagg_gen_transmission_complete(
@@ -974,10 +975,11 @@ class PyExecutor:
             # and scheduler aware of them.
             for req in self.active_requests:
                 # TODO: enable draft tokens in context phase
-                if req.state != LlmRequestState.GENERATION_IN_PROGRESS:
+                if req.state not in (LlmRequestState.GENERATION_IN_PROGRESS,
+                                     LlmRequestState.DISAGG_GENERATION_INIT):
                     continue
                 req.py_last_draft_tokens = req.py_draft_tokens
-                max_draft_len = self.model_engine.spec_config.max_draft_tokens
+                max_draft_len = self.model_engine.spec_config.max_draft_len
 
                 if max_draft_len > 0:
                     req.py_draft_tokens = [0] * max_draft_len
@@ -1084,6 +1086,7 @@ class PyExecutor:
 
                     sample_state = self._sample_async(scheduled_batch,
                                                       batch_outputs)
+                    assert sample_state is not None, "Sampling failed"
 
                     self._update_request_states(scheduled_batch)
 
@@ -1158,8 +1161,8 @@ class PyExecutor:
     def _broadcast_new_requests(
         self,
         new_requests: List[RequestQueueItem],
-        py_request_objects: Optional[tuple[str, dict]] = None,
-    ) -> tuple[List[RequestQueueItem], Optional[tuple[str, dict]]]:
+        py_request_objects: Optional[dict[str, tuple[str, dict]]] = None,
+    ) -> tuple[List[RequestQueueItem], Optional[dict[str, tuple[str, dict]]]]:
         """Broadcasts new_requests and optional Python-only metadata (`py_request_objects`) across pipeline stages.
            `py_request_objects` is a tuple of (attribute_name, {request_id: object}).
         """
@@ -1206,8 +1209,12 @@ class PyExecutor:
                 total_max_num_active_requests - total_num_active_requests)
 
         if self.dist.rank == 0:
-            py_request_objects = self._collect_py_objects_from_requests(
+            py_logits_post_processors = self._collect_py_objects_from_requests(
                 new_requests, "py_logits_post_processors")
+            py_multimodal_data = self._collect_py_objects_from_requests(
+                new_requests, "py_multimodal_data")
+            py_request_objects = tuple(
+                filter(None, [py_logits_post_processors, py_multimodal_data]))
         else:
             py_request_objects = None
 
@@ -1234,9 +1241,9 @@ class PyExecutor:
 
         if py_request_objects and (self.dist.tp_size > 1
                                    or self.dist.has_pp) and self.dist.rank > 0:
-            attr_name, req_obj_dict = py_request_objects
-            self._attach_py_objects_to_requests(new_requests, attr_name,
-                                                req_obj_dict)
+            for attr_name, req_obj_dict in py_request_objects:
+                self._attach_py_objects_to_requests(new_requests, attr_name,
+                                                    req_obj_dict)
 
         if not self.enable_attention_dp:
             self._update_new_active_requests_queue_latency(new_requests)
@@ -1516,7 +1523,7 @@ class PyExecutor:
                 request_ids=[0],
                 is_gen=not self.has_context_request,
                 prepare_resource=not self.has_context_request,
-                max_num_draft_tokens=self.max_draft_tokens,
+                max_num_draft_tokens=self.max_draft_len,
             )[0]
             llm_request.is_attention_dp_dummy = True
             spec_resource_manager = self.resource_manager.get_resource_manager(
@@ -1533,12 +1540,17 @@ class PyExecutor:
             disagg_gen_init_to_prepare.generation_requests = []
             disagg_gen_init_to_prepare.paused_requests = []
 
-            self.resource_manager.resource_managers[
-                ResourceManagerType.KV_CACHE_MANAGER].prepare_resources(
-                    disagg_gen_init_to_prepare)
-            self.resource_manager.resource_managers[
-                ResourceManagerType.SEQ_SLOT_MANAGER].prepare_resources(
-                    disagg_gen_init_to_prepare)
+            for resource_mgr_type in (
+                    ResourceManagerType.KV_CACHE_MANAGER,
+                    ResourceManagerType.SEQ_SLOT_MANAGER,
+                    ResourceManagerType.SPEC_RESOURCE_MANAGER,
+                    ResourceManagerType.DRAFT_KV_CACHE_MANAGER):
+                if (resource_mgr_type in self.resource_manager.resource_managers
+                        and self.resource_manager.
+                        resource_managers[resource_mgr_type] is not None):
+                    self.resource_manager.resource_managers[
+                        resource_mgr_type].prepare_resources(
+                            disagg_gen_init_to_prepare)
 
             # Trigger KV cache exchange for new disagg_gen_init_requests
             self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
@@ -1859,15 +1871,15 @@ class PyExecutor:
             # this? Just needs proper kernel support.
             def _pad_to_max_draft_tokens():
                 for req in scheduled_requests.generation_requests:
-                    max_draft_tokens = self.max_draft_tokens
+                    max_draft_len = self.max_draft_len
                     num_draft_tokens = len(req.py_draft_tokens)
                     req.py_draft_tokens.extend(
-                        0 for _ in range(max_draft_tokens - num_draft_tokens))
+                        0 for _ in range(max_draft_len - num_draft_tokens))
 
             draft_batch.generation_requests = draft_batch.context_requests + draft_batch.generation_requests
             draft_batch.context_requests = []
 
-            for i in range(self.max_draft_tokens - 1):
+            for i in range(self.max_draft_len - 1):
                 if len(draft_batch.generation_requests) == 0:
                     break
 
@@ -2026,7 +2038,8 @@ class PyExecutor:
                 request.update_perf_metrics(self.model_engine.iter_counter)
 
             request_done = False
-            if self.model_engine.iter_counter % self.stream_interval == 0 or request.is_finished:
+            if request.py_decoding_iter == 1 or request.is_finished or \
+                    request.py_decoding_iter % self.stream_interval == 0:
                 response = request.create_response(False, self.dist.rank)
                 if response:
                     request_done = response.result.is_final

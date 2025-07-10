@@ -30,19 +30,22 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
 
+import aiohttp
 import numpy as np
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
-from .backend_request_func import (ASYNC_REQUEST_FUNCS,
-                                   OPENAI_COMPATIBLE_BACKENDS, RequestFuncInput,
-                                   RequestFuncOutput, get_tokenizer)
-from .benchmark_dataset import (AIMODataset, BurstGPTDataset,
-                                ConversationDataset, CustomDataset,
-                                HuggingFaceDataset, InstructCoderDataset,
-                                RandomDataset, SampleRequest, ShareGPTDataset,
-                                SonnetDataset, VisionArenaDataset)
-from .benchmark_utils import convert_to_pytorch_benchmark_format, write_to_json
+# isort: off
+from tensorrt_llm.serve.scripts.backend_request_func import (
+    AIOHTTP_TIMEOUT, ASYNC_REQUEST_FUNCS, OPENAI_COMPATIBLE_BACKENDS,
+    RequestFuncInput, RequestFuncOutput, get_tokenizer)
+from tensorrt_llm.serve.scripts.benchmark_dataset import (
+    AIMODataset, BurstGPTDataset, ConversationDataset, CustomDataset,
+    HuggingFaceDataset, InstructCoderDataset, RandomDataset, SampleRequest,
+    ShareGPTDataset, SonnetDataset, VisionArenaDataset)
+from tensorrt_llm.serve.scripts.benchmark_utils import (
+    convert_to_pytorch_benchmark_format, write_to_json)
+# isort: on
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
 
@@ -326,18 +329,29 @@ async def benchmark(
     semaphore = (asyncio.Semaphore(max_concurrency)
                  if max_concurrency else None)
 
-    async def limited_request_func(request_func_input, streaming, pbar):
+    async def limited_request_func(request_func_input, streaming, pbar,
+                                   session):
         if semaphore is None:
             return await request_func(request_func_input=request_func_input,
                                       streaming=streaming,
-                                      pbar=pbar)
+                                      pbar=pbar,
+                                      session=session)
         async with semaphore:
             return await request_func(request_func_input=request_func_input,
                                       streaming=streaming,
-                                      pbar=pbar)
+                                      pbar=pbar,
+                                      session=session)
 
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
+    session = aiohttp.ClientSession(trust_env=True,
+                                    timeout=AIOHTTP_TIMEOUT,
+                                    connector=aiohttp.TCPConnector(
+                                        limit=0,
+                                        limit_per_host=0,
+                                        force_close=True))
+
+    i = 0
     async for request in get_request(input_requests, request_rate, burstiness):
         prompt, prompt_len, output_len = request.prompt, \
             request.prompt_len, request.expected_output_len
@@ -360,7 +374,9 @@ async def benchmark(
             asyncio.create_task(
                 limited_request_func(request_func_input=request_func_input,
                                      streaming=streaming,
-                                     pbar=pbar)))
+                                     pbar=pbar,
+                                     session=session)))
+        i += 1
     outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
 
     if profile:
@@ -374,7 +390,8 @@ async def benchmark(
             logprobs=logprobs,
         )
         profile_output = await request_func(request_func_input=profile_input,
-                                            streaming=streaming)
+                                            streaming=streaming,
+                                            session=session)
         if profile_output.success:
             print("Profiler stopped")
 
@@ -382,6 +399,9 @@ async def benchmark(
         pbar.close()
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
+
+    # Close the session
+    await session.close()
 
     metrics, actual_output_lens = calculate_metrics(
         input_requests=input_requests,
@@ -735,6 +755,9 @@ def main(args: argparse.Namespace):
                     raise ValueError(
                         "Invalid metadata format. Please use KEY=VALUE format.")
 
+        # Merge with benchmark result
+        result_json = {**result_json, **benchmark_result}
+
         if not args.save_detailed:
             # Remove fields with too many data points
             for field in [
@@ -749,9 +772,6 @@ def main(args: argparse.Namespace):
                                        < float("inf") else "inf")
         result_json["burstiness"] = args.burstiness
         result_json["max_concurrency"] = args.max_concurrency
-
-        # Merge with benchmark result
-        result_json = {**result_json, **benchmark_result}
 
         # Save to file
         base_model_id = model_id.split("/")[-1]
