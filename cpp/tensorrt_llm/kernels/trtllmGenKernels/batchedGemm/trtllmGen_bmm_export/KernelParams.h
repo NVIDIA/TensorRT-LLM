@@ -23,6 +23,9 @@
 #include "Enums.h"
 #include "TmaDescriptor.h"
 
+namespace batchedGemm
+{
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // TODO: Find a better header to put this in, that we can include from here.
@@ -33,9 +36,6 @@ inline T ceilDiv(T m, T n)
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
-namespace batchedGemm
-{
 
 namespace tg = trtllm::gen;
 
@@ -180,7 +180,7 @@ struct KernelParams
     // The input matrix A.
     // If (routeAct == true && batchM), the shape is [M, K]. tmaA is not used.
     // Otherwise, check layout of tmaA to see the shape and strides.
-    void const* ptrA;
+    void const* ptrA{nullptr};
 
     // The stride for matrix A in bytes.
     // Equals to K * dtypeGetNumBits(dtypeA) / 8.
@@ -189,13 +189,13 @@ struct KernelParams
     // The input matrix B.
     // If (routeAct == true && batchN), the shape is [N, K]. tmaB is not used.
     // Otherwise, check layout of tmaB to see the shape and strides.
-    void const* ptrB;
+    void const* ptrB{nullptr};
     // The stride for matrix B in bytes.
     // Equals to K * dtypeGetNumBits(dtypeB) / 8.
     uint64_t strideInBytesB;
 
     // The output matrix C. Check "logical" layout of tmaC to see the shape and strides.
-    void* ptrC;
+    void* ptrC{nullptr};
 
     // Inputs and output are MxFp{4,8}, Fp8, NvFp4.
     // The scaling factors to apply to the output - can be used to incorporate input scaling factors
@@ -216,17 +216,19 @@ struct KernelParams
     // The output tensor scaling factor for MxFp{4,8}, Fp8, NvFp4 and DeepSeek FP8 quantization.
     // TensorRT-LLM API requires a scaling factor on the device.
     // Shape is [B]. One scaling factor per tensor in batch.
-    float const* ptrScaleC;
+    float const* ptrScaleC{nullptr};
 
     // The output gate scale for MxFp{4,8}, Fp8, NvFp4 and DeepSeek FP8 quantization.
     // TensorRT-LLM API requires a scaling factor on the device.
     // Shape is [B]. One scaling factor per tensor in batch.
-    float const* ptrScaleGate;
+    float const* ptrScaleGate{nullptr};
 
-    // The alpha and beta for SwiGlu and Swish.
+    // The alpha and beta for SwiGlu.
     // Shape is [B]. One alpha and one beta per tensor in batch.
-    float const* ptrAlpha;
-    float const* ptrBeta;
+    // Alpha is 1.f if nullptr.
+    // Beta is 0.f if nullptr.
+    float const* ptrSwiGluAlpha{nullptr};
+    float const* ptrSwiGluBeta{nullptr};
 
     // The K dimension. It is the hidden dimension of the input matrices.
     int32_t k;
@@ -241,7 +243,7 @@ struct KernelParams
 
     // TODO get rid of that.
     // DeepSeek FP8 scaling factors for C
-    float* ptrDqSfsC;
+    float* ptrDqSfsC{nullptr};
 
     // The block scaling factors for A.
     // The pointer must always be set regardless of the quantization recipe.
@@ -260,7 +262,7 @@ struct KernelParams
     //        The shape is [M / 128, K / 128],
     //      The rightmost dimension is contiguous in memory.
     //      The dtype is Dtype::Float32.
-    void const* ptrSfA;
+    void const* ptrSfA{nullptr};
 
     // The block scaling factors for B.
     // The pointer must always be set regardless of the quantization recipe.
@@ -279,7 +281,7 @@ struct KernelParams
     //        where paddedN is sum(divUpMul(N[bi], tileN) for bi in B).
     //      The rightmost dimension is contiguous in memory.
     //      The dtype is Dtype::Float32.
-    void const* ptrSfB;
+    void const* ptrSfB{nullptr};
 
     // The per-token scaling factors from scale A.
     //
@@ -294,7 +296,7 @@ struct KernelParams
     // if (batchN (A is weights)):
     //     Logical shape is [B, divUpMul(M, tileM)]
     //
-    void const* ptrPerTokenSfA;
+    void const* ptrPerTokenSfA{nullptr};
 
     // The per-token scaling factors from scale B.
     //
@@ -308,7 +310,7 @@ struct KernelParams
     //
     // if (batchN (B is activations)):
     //     Logical shape is [sum(divUpMul(N[bi], tileN) for bi in B)]
-    void const* ptrPerTokenSfB;
+    void const* ptrPerTokenSfB{nullptr};
 
     // The bias applied after the GEMM and before the activation function.
     // The bias is applied before applying the global scaling factor. I.e.
@@ -363,7 +365,7 @@ struct KernelParams
     //   where paddedN is sum(divUpMul(N[bi], tileN) for bi in B).
     // The rightmost dimension is contiguous in memory.
     // The dtype is Dtype::Float32.
-    void* ptrSfC;
+    void* ptrSfC{nullptr};
 
     //////////////////////////////////////////////////////////////////////////////////////////////////
     //
@@ -392,7 +394,7 @@ struct KernelParams
     // expandedIdx[2] = divUpMul(2, 4) + 0 = 4
     //
     // The route map is [B0, B0, X, X, B1, X, X, X] where X could be any value.
-    int32_t const* ptrRouteMap;
+    int32_t const* ptrRouteMap{nullptr};
 
     // Total number of unpadded inputs
     int32_t numTokens;
@@ -413,7 +415,7 @@ struct KernelParams
     // The size is 1 and the dtype is int32_t.
     // Used if isStaticBatch == false, otherwise set to nullptr.
     // The pointer points to a scalar and the dtype is int32_t. The pointed value must be >= 0.
-    int32_t const* ptrNumNonExitingCtas;
+    int32_t const* ptrNumNonExitingCtas{nullptr};
 
     // Pointer to total number of padded tokens.
     // Computed as
@@ -425,7 +427,7 @@ struct KernelParams
     // The size is 1 and the dtype is int32_t.
     // If isStaticBatch == true, ptrTotalNumPaddedTokens should be set to nullptr and
     // totalNumPaddedTokens is used.
-    int32_t const* ptrTotalNumPaddedTokens;
+    int32_t const* ptrTotalNumPaddedTokens{nullptr};
 
     // Pointer to the map from the CTA index (in X/Y dim) to the batch index.
     // Maps CTA index in batch dim (i.e. blockDim.x if batchM, otherwise blockDim.y)
@@ -434,7 +436,7 @@ struct KernelParams
     // ctaIdxXyToBatchIdx = [0, 1, 1, 2]
     // If isStaticBatch == true, ptrCtaIdxXyToBatchIdx should be set to nullptr and ctaIdxXyToBatchIdx
     // is used.
-    int32_t const* ptrCtaIdxXyToBatchIdx;
+    int32_t const* ptrCtaIdxXyToBatchIdx{nullptr};
 
     // Pointer from the CTA index X/Y to the expanded tile index where the expanded tile index is
     // computed as:
@@ -446,7 +448,7 @@ struct KernelParams
     // expandIdx += <index in the batch>
     // E.g. with numTokens = [128,255,32] and tileM = 128, should be equal to
     // ptrCtaIdxXyToMnLimit = [128, 256, 383, 416]
-    int32_t const* ptrCtaIdxXyToMnLimit;
+    int32_t const* ptrCtaIdxXyToMnLimit{nullptr};
 
     // Total number of padded tokens - used as the stride for the activation and C scaling factors.
     // Check ptrTotalNumPaddedTokens to see how it is computed.
@@ -485,7 +487,7 @@ struct KernelParams
     // This is temporary storage for the row max results.
     // If batchM, the shape is [2, totalNumPaddedTokens, N / 128] and the dtype is float.
     // Otherwise, the shape is [2, totalNumPaddedTokens, M / 128] and the dtype is float.
-    float* ptrPartialRowMax;
+    float* ptrPartialRowMax{nullptr};
 
     // Flags in global memory that sync on "exit" for row max computation.
     // The shape is [numTilesM * numTilesN / 2] and the dtype is uint32_t, where
@@ -497,7 +499,7 @@ struct KernelParams
     // numTilesN = divUp(totalNumPaddedTokens, tileN).
     //
     // The memory must be set to 0 before the kernel launch.
-    uint32_t* ptrRowMaxCompletionBars;
+    uint32_t* ptrRowMaxCompletionBars{nullptr};
 
     //////////////////////////////////////////////////////////////////////////////////////////////////
     //
@@ -713,10 +715,10 @@ struct KernelParams
     static KernelParams setKernelParams(GemmOptions_ const& options, bool const batchM, void const* ptrA,
         void const* ptrB, void* ptrC, void const* dSfA, void const* dSfB, void const* ptrPerTokenSfA,
         void const* ptrPerTokenSfB, void const* ptrBias, void* dSfC, float const* ptrScaleC, float const* ptrScaleGate,
-        float const* ptrAlpha, float const* ptrBeta, int32_t const* routeMap, float* rowMax, uint32_t* rowMaxBars,
-        int32_t const* ptrNumNonExitingCtas = nullptr, int32_t const* ptrTotalNumPaddedTokens = nullptr,
-        int32_t const* ptrCtaIdxXyToBatchIdx = nullptr, int32_t const* ptrCtaIdxXyToMnLimit = nullptr,
-        int32_t const maxNumCtas = MaxNumCtas)
+        float const* ptrSwiGluAlpha, float const* ptrSwiGluBeta, int32_t const* routeMap, float* rowMax,
+        uint32_t* rowMaxBars, int32_t const* ptrNumNonExitingCtas = nullptr,
+        int32_t const* ptrTotalNumPaddedTokens = nullptr, int32_t const* ptrCtaIdxXyToBatchIdx = nullptr,
+        int32_t const* ptrCtaIdxXyToMnLimit = nullptr, int32_t const maxNumCtas = MaxNumCtas)
     {
 
         static_assert(sizeof(KernelParams) <= 32 * 1024, "sizeof(KernelParams) has to be less or equal than 32KB");
@@ -730,8 +732,8 @@ struct KernelParams
         params.ptrScaleC = ptrScaleC;
         params.ptrScaleGate = ptrScaleGate;
 
-        params.ptrAlpha = ptrAlpha;
-        params.ptrBeta = ptrBeta;
+        params.ptrSwiGluAlpha = ptrSwiGluAlpha;
+        params.ptrSwiGluBeta = ptrSwiGluBeta;
 
         int32_t ctaOffset = 0;
 

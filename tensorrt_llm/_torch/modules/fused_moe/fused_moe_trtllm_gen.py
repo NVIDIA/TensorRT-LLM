@@ -293,9 +293,6 @@ class TRTLLMGenFusedMoE(MoE):
         elif self.has_w4a16_mxfp4:
             assert x.dtype == torch.bfloat16
 
-            # FIXME: tile_tokens_dim is hardcoded for now
-            tile_tokens_dim = 8
-
             # TODO: remove bias / act_type
             final_hidden_states = torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
                 router_logits,
@@ -318,27 +315,19 @@ class TRTLLMGenFusedMoE(MoE):
                 slot_start,  # local_expert_start;  use ep_rank if stride!=1
                 self.expert_size_per_partition,  # local_expert_size
                 routed_scaling_factor,
-                tile_tokens_dim,
+                self._get_tile_tokens_dim(x),
                 self.routing_method.routing_method_type,
-                0 if self.swiglu_alpha is None else 2,  # act_type
+                0,  # act_type
             )
         elif self.has_w4a8_mxfp4_fp8:
             x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
-                x, self.fc31_input_dequant[0])
-            fake_block_scale = torch.zeros(
-                (x.shape[0] * x.shape[1] // 32),
-                device='cuda',
-                dtype=torch.float).to(torch.uint8).fill_(127)
-
-            # FIXME: tile_tokens_dim is hardcoded for now
-            tile_tokens_dim = 8
+                x, self.fc31_input_gate_dequant[0])
 
             # TODO: remove bias / act_type
-            final_hidden_states = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
+            final_hidden_states = torch.ops.trtllm.e4m3_mxe2m1_block_scale_moe_runner(
                 router_logits,
                 routing_bias,
                 x,
-                fake_block_scale,
                 self.w3_w1_weight,
                 self.w3_w1_weight_scale,
                 self.w3_w1_bias,
@@ -348,8 +337,8 @@ class TRTLLMGenFusedMoE(MoE):
                 self.w2_weight_scale,
                 self.w2_bias,
                 self.fc31_input_dequant,  # output1_scales_scalar
-                self.fc31_input_dequant,  # output1_scales_gate_scalar
-                self.fc2_input_dequant,  # output2_scales_scalar always 1.0
+                self.fc31_input_gate_dequant,  # output1_scales_gate_scalar
+                self.fc2_input_dequant,  # output2_scales_scalar
                 self.num_slots,
                 top_k,
                 n_group,
@@ -359,16 +348,13 @@ class TRTLLMGenFusedMoE(MoE):
                 slot_start,  # local_expert_start;  use ep_rank if stride!=1
                 self.expert_size_per_partition,  # local_expert_size
                 routed_scaling_factor,
-                tile_tokens_dim,
+                self._get_tile_tokens_dim(x),
                 self.routing_method.routing_method_type,
-                0 if self.swiglu_alpha is None else 2,  # act_type
+                0,  # act_type
             )
         elif self.has_w4a8_mxfp4_mxfp8:
             # TRTLLM-Gen uses linear SF layout for the mxfp8 input.
             mxfp8_x, sf = torch.ops.trtllm.mxfp8_quantize(x, False)
-
-            # FIXME: tile_tokens_dim is hardcoded for now
-            tile_tokens_dim = 8
 
             # TODO: remove bias / act_type
             final_hidden_states = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
@@ -384,9 +370,6 @@ class TRTLLMGenFusedMoE(MoE):
                 self.w2_weight,
                 self.w2_weight_scale,
                 self.w2_bias,
-                self.fake_input_scale,  # output1_scales_scalar always 1.0
-                self.fake_input_scale,  # output1_scales_gate_scalar always 1.0
-                self.fake_input_scale,  # output2_scales_scalar always 1.0
                 self.num_slots,
                 top_k,
                 n_group,
@@ -396,9 +379,9 @@ class TRTLLMGenFusedMoE(MoE):
                 slot_start,  # local_expert_start;  use ep_rank if stride!=1
                 self.expert_size_per_partition,  # local_expert_size
                 routed_scaling_factor,
-                tile_tokens_dim,
+                self._get_tile_tokens_dim(x),
                 self.routing_method.routing_method_type,
-                0 if self.swiglu_alpha is None else 2,  # act_type
+                0,  # act_type
             )
         else:
             raise NotImplementedError(

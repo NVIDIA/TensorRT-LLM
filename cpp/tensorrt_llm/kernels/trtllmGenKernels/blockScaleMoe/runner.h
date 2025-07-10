@@ -300,7 +300,7 @@ class Runner
 public:
     // FIXME: tileTokensDim is hardcoded for now
     Runner(batchedGemm::trtllm::gen::Dtype dtypeAct, batchedGemm::trtllm::gen::Dtype dtypeWeights, bool useDeepSeekFp8,
-        int tileTokensDim = 8, ActType actType = ActType::Silu);
+        int tileTokensDim = 8, ActType actType = ActType::SwiGlu);
     Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim = 8);
 
     void run(

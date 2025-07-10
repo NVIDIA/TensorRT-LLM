@@ -81,7 +81,6 @@ enum class ActType
     }
 
 TLLM_ACT_TYPE_FUNCTION(SwiGlu)
-TLLM_ACT_TYPE_FUNCTION(Swish)
 
 #undef TLLM_ACT_TYPE_FUNCTION
 
@@ -92,7 +91,6 @@ inline std::string getActTypeName(ActType type)
     switch (type)
     {
     case ActType::SwiGlu: return "SwiGlu";
-    case ActType::Swish: return "Swish";
     default: return "Unknown type";
     }
 }
@@ -198,6 +196,7 @@ struct GemmGatedActConfig
     uint32_t const mSharedMemSize{0};
     char const* mFunctionName{nullptr};
     uint32_t const mNumThreadsPerCTA{0};
+    char const* mHash{nullptr};
 #else
     trtllm::gen::CudaRunner* mCudaRunner{nullptr};
 #endif

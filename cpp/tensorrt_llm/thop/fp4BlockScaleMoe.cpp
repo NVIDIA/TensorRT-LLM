@@ -161,12 +161,6 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::Tensor const& r
     at::Tensor num_non_exiting_ctas
         = at::empty({}, at::TensorOptions().device(routing_logits.device()).dtype(at::ScalarType::Int));
 
-    // FIXME: check shape
-    auto const hidden_states_scale_linear_size
-        = tensorrt_llm::computeLinearLayoutSFSize(args.num_tokens, args.hidden_size / 16);
-    at::Tensor hidden_states_scale_linear = at::detail::empty_cuda(
-        hidden_states_scale_linear_size, at::ScalarType::Float8_e4m3fn, hidden_states.device(), std::nullopt);
-
     //
     // TopK routing
     //
@@ -258,8 +252,6 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::Tensor const& r
     workspace.cta_idx_xy_to_batch_idx = cta_idx_xy_to_batch_idx.data_ptr<int>();
     workspace.cta_idx_xy_to_mn_limit = cta_idx_xy_to_mn_limit.data_ptr<int>();
     workspace.num_non_exiting_ctas = num_non_exiting_ctas.data_ptr<int>();
-
-    workspace.hidden_states_scale_linear = hidden_states_scale_linear.data_ptr();
 
     // gemm1 intermediate ws
     workspace.gemm1_output = gemm1_output.data_ptr();

@@ -244,11 +244,13 @@ struct BatchedGemmData
         // Shape is [B].
         float const* mPtrScaleGate{nullptr};
 
-        // The alpha and beta for SwiGlu and Swish.
-        // gatedActivation <- (x0 + beta) * sigmoid(alpha * x1)
-        // Shape is [B]
-        float const* mPtrAlpha{nullptr};
-        float const* mPtrBeta{nullptr};
+        // The alpha and beta for SwiGlu.
+        // gatedActivation <- (x0 + beta) * activation(x1, alpha)
+        // Shape is [B].
+        // Alpha is 1.f if nullptr.
+        // Beta is 0.f if nullptr.
+        float const* mPtrSwiGluAlpha{nullptr};
+        float const* mPtrSwiGluBeta{nullptr};
 
         // Param is used when the kernel is configured with -routeAct true.
         // The inputs are not padded, but the outputs are padded to divUpMul(M[bi], tileM) for batchM or
@@ -400,8 +402,8 @@ public:
     // Launch the cubin from the provided config. It calls all necessary memsets for internal buffers.
     // Provided config must be validated with isValidConfig before the call.
     int32_t run(BatchedGemmConfig const& config, void* workspace, BatchedGemmData const& options, void* cudaStream,
-        int32_t multiProcessorCount, std::optional<std::reference_wrapper<ModuleCache>> moduleCache = std::nullopt,
-        bool usePdl = true);
+        int32_t multiProcessorCount, bool usePdl = true,
+        std::optional<std::reference_wrapper<ModuleCache>> moduleCache = std::nullopt);
 
     // Initializes the buffers before the world sync. Must be called before run.
     int32_t runInitBeforeWorldSync(
@@ -584,11 +586,12 @@ std::vector<size_t> BatchedGemmInterface::getWorkspaceSizesInBytes(
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspace,
-    BatchedGemmData const& batchedGemmData, void* cudaStream, int32_t /* multiProcessorCount */,
-    std::optional<std::reference_wrapper<ModuleCache>> moduleCache, bool usePdl)
+    BatchedGemmData const& batchedGemmData, void* cudaStream, int32_t /* multiProcessorCount */, bool usePdl,
+    std::optional<std::reference_wrapper<ModuleCache>> moduleCache)
 {
     // Might be used.
     (void) usePdl;
+    (void) moduleCache;
     // Get options from config and data.
     auto options = getOptionsFromConfigAndData(config, batchedGemmData);
 
@@ -646,7 +649,7 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
         batchedGemmData.mInputBuffers.mPtrPerTokenSfA, batchedGemmData.mInputBuffers.mPtrPerTokenSfB,
         batchedGemmData.mInputBuffers.mPtrBias, batchedGemmData.mOutputBuffers.mPtrSfC,
         batchedGemmData.mInputBuffers.mPtrScaleC, batchedGemmData.mInputBuffers.mPtrScaleGate,
-        batchedGemmData.mInputBuffers.mPtrAlpha, batchedGemmData.mInputBuffers.mPtrBeta,
+        batchedGemmData.mInputBuffers.mPtrSwiGluAlpha, batchedGemmData.mInputBuffers.mPtrSwiGluBeta,
         batchedGemmData.mInputBuffers.mPtrRouteMap, dPtrRowMax, dPtrRowMaxBars,
         batchedGemmData.mInputBuffers.mPtrNumNonExitingCtas, batchedGemmData.mInputBuffers.mPtrTotalNumPaddedTokens,
         batchedGemmData.mInputBuffers.mPtrCtaIdxXyToBatchIdx, batchedGemmData.mInputBuffers.mPtrCtaIdxXyToMnLimit,
@@ -658,26 +661,26 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
 #ifdef TLLM_GEN_EXPORT_INTERFACE
     CUmodule cuModule;
     CUfunction cuFunction;
+
     if (moduleCache.has_value())
     {
         ModuleCache& moduleCacheRef = moduleCache.value().get();
 
-        // Modules are associated with a specific context so include the ctxId in the key
+        // Modules are associated with a specific context, so the context is included in the key
         CUcontext ctx;
         unsigned long long ctxId;
         cuCtxGetCurrent(&ctx);
         cuCtxGetId(ctx, &ctxId);
 
-        // Reinterpret the ctxId as a string to avoid needing a custom hash or converting it to a string in decimal
-        // representation.
+        // Reinterpret the ctxId as a string to avoid needing a custom hash or converting it to a
+        // string in decimal representation.
         std::string const ctxName
             = std::string(reinterpret_cast<char*>(&ctxId), sizeof(unsigned long long) / sizeof(char));
         std::string const funcName = std::string(config.mFunctionName);
-        // As the ctxName is a fixed number of bytes, the two strings can just be appended without risk of a collision
         auto const moduleKey = ctxName + funcName;
         auto module = moduleCacheRef.find(moduleKey);
 
-        // Check if module exists in cache. Otherwise, load it
+        // Use cache if module is found, otherwise load and insert into cache
         if (module != moduleCacheRef.end())
         {
             cuFunction = std::get<1>(module->second);
@@ -714,7 +717,7 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
     {
         return -1;
     }
-    // If a module cache has not been given, unload the module to avoid overflow
+    // If a module cache has not been given, unload the module to avoid leaking
     if (!moduleCache.has_value())
     {
         cuModuleUnload(cuModule);
