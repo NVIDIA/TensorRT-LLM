@@ -31,6 +31,27 @@ using kv_cache_manager::BlockKeyHasher;
 namespace
 {
 
+SizeType32 tryDetermineNumPages(
+    OptionalRef<BasePeftCacheManager const> peftCacheManager, std::shared_ptr<LlmRequest> const& llmRequest)
+{
+    if (peftCacheManager)
+    {
+        try
+        {
+            return peftCacheManager->determineNumPages(llmRequest);
+        }
+        catch (std::runtime_error const& e)
+        {
+            // Catch the exception so handling its consequences won't be in the scheduler
+            TLLM_LOG_WARNING(
+                "GuaranteedNoEvictScheduler caught exception raised from peftCacheManager->determineNumPages, assuming "
+                "it requires 0 pages. Exception: %s",
+                e.what());
+        }
+    }
+    return 0;
+}
+
 std::tuple<std::unordered_set<BlockKey, BlockKeyHasher>, std::unordered_set<BlockKey, BlockKeyHasher>>
 prefillWithChunkedContextsAlreadyExecuting(RequestList const& activeRequests,
     kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
@@ -257,7 +278,7 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
             bool const isNewTask = reqHasLora && !uniqTaskIds.count(req->getLoraTaskId().value());
             if (isNewTask)
             {
-                claimedPeftPages += peftCacheManager ? peftCacheManager->determineNumPages(req) : 0;
+                claimedPeftPages += tryDetermineNumPages(peftCacheManager, req);
                 uniqTaskIds.insert(req->getLoraTaskId().value());
             }
         }
@@ -303,7 +324,7 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                         = reservedCrossBlocks ? reservedCrossBlocks->enoughAvailableBlocks(*req) : true;
                     bool reqHasLora = req->getLoraTaskId().has_value();
                     bool isNewTask = reqHasLora && !uniqTaskIds.count(req->getLoraTaskId().value());
-                    auto neededPeftPages = isNewTask && peftCacheManager ? peftCacheManager->determineNumPages(req) : 0;
+                    auto neededPeftPages = isNewTask ? tryDetermineNumPages(peftCacheManager, req) : 0;
 
                     if (enoughBlocks && enoughCrossBlocks && neededPeftPages <= availablePeftPages)
                     {
