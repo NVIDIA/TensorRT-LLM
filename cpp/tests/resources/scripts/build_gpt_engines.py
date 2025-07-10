@@ -92,9 +92,7 @@ def build_engines(model_cache: Optional[str] = None,
         else:
             url_prefix = "file://"
 
-        model_url = url_prefix + str(
-            Path(model_cache) /
-            model_name) if model_cache else "https://huggingface.co/gpt2"
+        model_url = "https://huggingface.co/gpt2"
         run_command([
             "git", "clone", model_url, "--single-branch", "--no-local",
             model_name
