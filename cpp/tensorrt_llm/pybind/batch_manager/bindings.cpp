@@ -412,7 +412,8 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("fill_values_device", &tb::DecoderInputBuffers::fillValuesDevice)
         .def_readwrite("inputs_ids", &tb::DecoderInputBuffers::inputsIds)
         .def_readwrite("forward_batch_slots", &tb::DecoderInputBuffers::forwardBatchSlots)
-        .def_readwrite("logits", &tb::DecoderInputBuffers::logits)
+        .def_readwrite("batch_logits", &tb::DecoderInputBuffers::batchLogits)
+        .def_readwrite("decoder_logits", &tb::DecoderInputBuffers::decoderLogits)
         .def_readwrite("decoder_requests", &tb::DecoderInputBuffers::decoderRequests);
 
     py::class_<tb::DecoderOutputBuffers>(m, "DecoderOutputBuffers")

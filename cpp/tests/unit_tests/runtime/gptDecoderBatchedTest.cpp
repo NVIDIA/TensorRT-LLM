@@ -48,11 +48,6 @@ using TensorPtr = decoder_batch::Input::TensorPtr;
 namespace
 {
 
-struct DecoderInputs
-{
-    std::vector<TensorPtr> logits;
-};
-
 std::shared_ptr<tb::LlmRequest> createLlmRequest(SizeType32 batchSlot, SizeType32 inputLengths,
     SizeType32 generatedTokensPerSteps, SizeType32 acceptedTokensPerStep, TokenIdType inputTokenId,
     TokenIdType expectedTokenId, SizeType32 maxNewTokens, SamplingConfig const& samplingConfig, TokenIdType endId)
@@ -130,24 +125,23 @@ void newRequests(std::vector<std::shared_ptr<tb::LlmRequest>> const& requests, T
     runtimeStream.wait(event);
 }
 
-DecoderInputs createDecoderInputs(SizeType32 batchSize, SizeType32 vocabSizePadded, nvinfer1::DataType dataType,
-    std::vector<SamplingConfig>& samplingConfigs, std::vector<SizeType32> const& generatedTokensPerSteps,
-    bool computeLogProbs, BufferManager& manager)
+void createDecoderInputs(tb::DecoderInputBuffers& inputBuffers, SizeType32 batchSize, SizeType32 vocabSizePadded,
+    nvinfer1::DataType dataType, std::vector<SamplingConfig>& samplingConfigs,
+    std::vector<SizeType32> const& generatedTokensPerSteps, bool computeLogProbs, BufferManager& manager)
 {
-    DecoderInputs inputs;
-
-    inputs.logits.reserve(batchSize);
+    auto& logits = inputBuffers.decoderLogits;
+    logits.reserve(batchSize);
     for (auto batchIdx = 0; batchIdx < batchSize; ++batchIdx)
     {
-        auto const beamWidth = samplingConfigs[batchIdx].beamWidth;
-        samplingConfigs[batchIdx].outputLogProbs = {{computeLogProbs}};
-        samplingConfigs[batchIdx].cumLogProbs = {{computeLogProbs}};
-        inputs.logits.emplace_back(
-            manager.gpu(ITensor::makeShape({generatedTokensPerSteps[batchIdx], beamWidth, vocabSizePadded}), dataType));
-        manager.setZero(*inputs.logits.back());
-    }
+        auto& samplingConfig = samplingConfigs[batchIdx];
+        auto const beamWidth = samplingConfig.beamWidth;
+        samplingConfig.outputLogProbs = {{computeLogProbs}};
+        samplingConfig.cumLogProbs = {{computeLogProbs}};
 
-    return inputs;
+        logits.emplace_back(
+            manager.gpu(ITensor::makeShape({generatedTokensPerSteps[batchIdx], beamWidth, vocabSizePadded}), dataType));
+        manager.setZero(*logits.back());
+    }
 }
 
 void copySequenceLengths(
@@ -325,8 +319,8 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
     auto batchSlotsRange = BufferRange<SizeType32>(*inputBuffers.setupBatchSlots);
     std::iota(batchSlotsRange.begin(), batchSlotsRange.end(), 0);
 
-    auto decoderInputs = createDecoderInputs(
-        batchSize, vocabSizePadded, dataType, samplingConfigs, generatedTokensPerSteps, computeLogProbs, manager);
+    createDecoderInputs(inputBuffers, batchSize, vocabSizePadded, dataType, samplingConfigs, generatedTokensPerSteps,
+        computeLogProbs, manager);
     manager.setZero(*decoderState.getCacheIndirectionInput());
     copySequenceLengths(tiledInputLengths, *decoderState.getSequenceLengths(), manager);
 
@@ -457,8 +451,8 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
     // set up inputs and outputs
     tb::DecoderInputBuffers inputBuffers(batchSize, maxGeneratedTokensPerStep, manager);
 
-    auto decoderInputs = createDecoderInputs(
-        batchSize, vocabSizePadded, dataType, samplingConfigs, generatedTokensPerSteps, computeLogProbs, manager);
+    createDecoderInputs(inputBuffers, batchSize, vocabSizePadded, dataType, samplingConfigs, generatedTokensPerSteps,
+        computeLogProbs, manager);
     manager.setZero(*decoderState.getCacheIndirectionInput());
     copySequenceLengths(tiledInputLengths, *decoderState.getSequenceLengths(), manager);
 
@@ -611,8 +605,8 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     // set up inputs and outputs
     tb::DecoderInputBuffers inputBuffers(batchSize, maxGeneratedTokensPerStep, manager);
 
-    auto decoderInputs = createDecoderInputs(
-        batchSize, vocabSizePadded, dataType, samplingConfigs, generatedTokensPerSteps, false, manager);
+    createDecoderInputs(
+        inputBuffers, batchSize, vocabSizePadded, dataType, samplingConfigs, generatedTokensPerSteps, false, manager);
     manager.setZero(*decoderState.getCacheIndirectionInput());
     copySequenceLengths(tiledInputLengths, *decoderState.getSequenceLengths(), manager);
 
