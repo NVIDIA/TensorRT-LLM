@@ -174,9 +174,7 @@ def get_num_extra_kv_tokens(spec_config):
 
 def update_spec_config_from_model_config(spec_config, model_config):
     if spec_config.spec_dec_mode.is_mtp():
-        # Use `max_draft_len` for several low-level APIs. TODO: Remove this after distinguishing them,
+        # Use `max_draft_len` for several low-level APIs. TODO: Remove this after distinguishing them.
         spec_config.max_draft_len = spec_config.num_nextn_predict_layers
         # Use `num_nextn_predict_layers_from_model_config` to decide decoding mode MTP / MTP_EAGLE.
         spec_config.num_nextn_predict_layers_from_model_config = model_config.num_nextn_predict_layers
-        if model_config.num_nextn_predict_layers == 1 and not spec_config.use_mtp_vanilla:
-            spec_config.num_extra_kv_tokens = spec_config.num_nextn_predict_layers - 1
