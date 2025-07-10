@@ -15,7 +15,7 @@ trtllm-bench is a comprehensive benchmarking tool for TensorRT-LLM engines. It p
 
 Dataset Preparation
 ------------------
-trtllm-bench is designed to work with the ``prepare_dataset.py`` script, which generates benchmark datasets in the required format. The prepare_dataset script supports:
+trtllm-bench is designed to work with the [`prepare_dataset.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/benchmarks/cpp/prepare_dataset.py) script, which generates benchmark datasets in the required format. The prepare_dataset script supports:
 
 **Dataset Types:**
 - Real datasets from various sources
