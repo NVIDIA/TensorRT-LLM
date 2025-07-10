@@ -52,8 +52,7 @@ public:
         runtime::ModelConfig const& modelConfig, SizeType32 maxNumSequences,
         OptionalRef<RuntimeBuffers> fusedRuntimeBuffers) const;
 
-    [[nodiscard]] static std::unique_ptr<runtime::decoder_batch::Input> createDecoderBatchInputs(
-        DecoderInputBuffers& inputBuffers, std::vector<SizeType32> const& activeSlots,
+    static void createDecoderBatchInputs(DecoderInputBuffers& inputBuffers, std::vector<SizeType32> const& activeSlots,
         runtime::decoder::DecoderState const& decoderState, std::vector<TensorPtr> const& logits,
         SizeType32 maxNumSequences);
 };
