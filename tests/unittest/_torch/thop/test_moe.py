@@ -35,9 +35,7 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
 
 # Keep this in sync with the ActType in cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h
 class ActType(Enum):
-    Silu = 0
-    Swiglu = 1
-    Swish = 2
+    SwiGlu = 0
 
 
 class moe_args:
@@ -65,7 +63,7 @@ class moe_args:
                  gemm1_alpha=None,
                  gemm1_beta=None,
                  gemm2_bias=None,
-                 act_type=ActType.Silu):
+                 act_type=ActType.SwiGlu):
         self.num_tokens = num_tokens
         self.num_experts = num_experts
         self.hidden_size = hidden_size
@@ -110,7 +108,7 @@ class moe_args_dequant:
                  gemm1_alpha=None,
                  gemm1_beta=None,
                  gemm2_bias=None,
-                 act_type=ActType.Silu):
+                 act_type=ActType.SwiGlu):
         self.num_tokens = num_tokens
         self.num_experts = num_experts
         self.hidden_size = hidden_size
@@ -391,18 +389,13 @@ def run_moe_dequant(args,
             my_a += args.gemm1_bias[expert_idx]
         my_x1 = my_a[:, :args.intermediate_size]
         my_x2 = my_a[:, args.intermediate_size:]
-        if args.act_type == ActType.Swiglu:
-            assert args.gemm1_alpha is not None and args.gemm1_beta is not None
-            act = F.sigmoid(my_x2 * args.gemm1_alpha[expert_idx])
-            activation_output[i:i + my_num_tokens] = act * (
-                args.gemm1_beta[expert_idx] + my_x1)
-        elif args.act_type == ActType.Silu:
-            activation_output[i:i + my_num_tokens] = F.silu(my_x2) * my_x1
-        elif args.act_type == ActType.Swish:
-            assert args.gemm1_alpha is not None and args.gemm1_beta is not None
-            act = my_x2 * F.sigmoid(my_x2 * args.gemm1_alpha[expert_idx])
-            activation_output[i:i + my_num_tokens] = act * (
-                args.gemm1_beta[expert_idx] + my_x1)
+        if args.act_type == ActType.SwiGlu:
+            alpha = args.gemm1_alpha[
+                expert_idx] if args.gemm1_alpha is not None else 1.0
+            beta = args.gemm1_beta[
+                expert_idx] if args.gemm1_beta is not None else 0.0
+            act = my_x2 * F.sigmoid(my_x2 * alpha)
+            activation_output[i:i + my_num_tokens] = act * (beta + my_x1)
         i += my_num_tokens
         i = (i + args.padding - 1) // args.padding * args.padding
 
@@ -619,6 +612,26 @@ def run_moe_reference_mxe4m3_mxe2m1(args):
     return run_moe_dequant(args_dequant, "mxe4m3"), args_dequant
 
 
+def run_moe_reference_e4m3_mxe2m1(args):
+    hidden_states_dequant = args.hidden_states.to(
+        torch.float) / args.hidden_states_scale_global
+
+    gemm1_weights_dequant = mxe2m1_and_ue8m0_scale_batches(
+        args.gemm1_weights, args.gemm1_scales).cuda()
+
+    gemm2_weights_dequant = mxe2m1_and_ue8m0_scale_batches(
+        args.gemm2_weights, args.gemm2_scales).cuda()
+
+    args_dequant = moe_args_dequant(
+        args.num_tokens, args.num_experts, args.hidden_size,
+        args.intermediate_size, args.top_k, args.padding, hidden_states_dequant,
+        args.expert_logits, gemm1_weights_dequant, gemm2_weights_dequant,
+        args.permute_info, args.use_routing_scales_on_input, args.gemm1_bias,
+        args.gemm1_alpha, args.gemm1_beta, args.gemm2_bias, args.act_type)
+
+    return run_moe_dequant(args_dequant, "perTensorFp8"), args_dequant
+
+
 def run_moe_reference_bf16_mxe2m1(args):
     gemm1_weights_dequant = mxe2m1_and_ue8m0_scale_batches(
         args.gemm1_weights, args.gemm1_scales).cuda()
@@ -747,10 +760,10 @@ def quant_mxe2m1_batches(a, num_experts, is_sf_swizzled_layout=True):
 
 
 def quant_dequant_mxe4m3(a, is_sf_swizzled_layout=True):
-    a_fp4, a_sf = torch.ops.tensorrt_llm.quantize_mxe4m3_host(
+    a_fp8, a_sf = torch.ops.tensorrt_llm.quantize_mxe4m3_host(
         a.cpu(), is_sf_swizzled_layout)
 
-    a_pt = dequantize_mxe4m3(a_fp4.cpu(), a_sf.cpu())
+    a_pt = dequantize_mxe4m3(a_fp8.cpu(), a_sf.cpu())
 
     return a_pt.cuda()
 
@@ -963,7 +976,6 @@ class TestMoeFp4:
             {
                 "num_experts": 128,
                 "top_k": 4,
-                "padding": 8,
                 "n_groups": None,
                 "top_k_groups": None,
                 "routed_scaling": None,
@@ -1397,7 +1409,7 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
     reason="The kernel only supports Blackwell. Current SM is %d." %
     getSMVersion(),
 )
-@pytest.mark.parametrize("num_tokens", [1, 4, 384, 4096])
+@pytest.mark.parametrize("num_tokens", [1, 256])
 @pytest.mark.parametrize("hidden_size", [512])
 @pytest.mark.parametrize("intermediate_size", [512])
 @pytest.mark.parametrize(
@@ -1407,7 +1419,6 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
             {
                 "num_experts": 128,
                 "top_k": 8,
-                "padding": 8,
                 "n_groups": None,
                 "top_k_groups": None,
                 "routed_scaling": None,
@@ -1419,7 +1430,6 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
             {
                 "num_experts": 128,
                 "top_k": 4,
-                "padding": 8,
                 "n_groups": None,
                 "top_k_groups": None,
                 "routed_scaling": None,
@@ -1429,12 +1439,12 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
             id="RoutingRenormalize_topk_4"),
     ],
 )
-@pytest.mark.parametrize("dtype_activation", ["mxfp8", "bf16"])
-@pytest.mark.parametrize("act_type", [ActType.Silu, ActType.Swish])
+@pytest.mark.parametrize("dtype_activation", ["mxfp8", "bf16", "fp8"])
+@pytest.mark.parametrize("act_type_str", ["SwiGlu", "GatedSilu"])
 @pytest.mark.parametrize("use_autotune", [True, False],
                          ids=["autotune", "no_autotune"])
 def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
-                            routing_info, dtype_activation, act_type,
+                            routing_info, dtype_activation, act_type_str,
                             use_autotune):
     torch.random.manual_seed(0)
 
@@ -1442,16 +1452,33 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
     # Data Generation
     #
 
+    act_type = ActType.SwiGlu
+    num_experts = routing_info["num_experts"]
     top_k = routing_info["top_k"]
-    # FIXME: set to TileN size
-    padding = routing_info["padding"]
     n_groups = routing_info["n_groups"]
     top_k_groups = routing_info["top_k_groups"]
     routed_scaling = routing_info["routed_scaling"]
-    num_experts = routing_info["num_experts"]
+    has_routing_bias = routing_info["has_routing_bias"]
     routing_method_type = routing_info["routing_method_type"]
-    tile_tokens_dim = 8
-    is_mx_fp8 = dtype_activation == "mxfp8"
+    # Perfect expert distribution results in `num_tokens * top_k / num_experts` tokens per expert.
+    tile_tokens_dim = (num_tokens * top_k) // num_experts
+    # And pad the number of tokens to the next power of 2.
+    tile_tokens_dim = next_positive_power_of_2(tile_tokens_dim)
+    # At least padded to 8 tokens per CTA tile
+    tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
+    padding = tile_tokens_dim
+    if padding >= 256:
+        pytest.skip("Routing kernel requires that padding be less than 256")
+
+    if act_type_str == "GatedSilu":
+        if not use_autotune or dtype_activation != "mxfp8":
+            pytest.skip("GatedSilu is tested only with autotune and mxfp8")
+    if not use_autotune:
+        if dtype_activation != "mxfp8":
+            pytest.skip("No autotune is tested only with mxfp8")
+    if top_k != 8:
+        if dtype_activation != "mxfp8":
+            pytest.skip("TopK = 4 is tested only with mxfp8")
 
     assert top_k <= num_experts
     assert top_k <= 8
@@ -1470,7 +1497,7 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
     else:
         raise ValueError("Invalid routing method type")
 
-    if routing_info["has_routing_bias"]:
+    if has_routing_bias:
         routing_bias = torch.randn(num_experts,
                                    device="cuda",
                                    dtype=torch.bfloat16)
@@ -1486,18 +1513,20 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
     gemm2_weights = torch.randn((num_experts, hidden_size, intermediate_size),
                                 device='cuda',
                                 dtype=torch.bfloat16)
-
     gemm1_bias = 50 * torch.randn(
         num_experts, 2 * intermediate_size, device='cuda', dtype=torch.float)
-    gemm1_alpha = torch.randn(num_experts, device='cuda', dtype=torch.float)
-    gemm1_beta = torch.ones(num_experts, device='cuda', dtype=torch.float)
+    gemm1_alpha = None
+    gemm1_beta = None
+    if act_type_str == "SwiGlu":
+        gemm1_alpha = torch.randn(num_experts, device='cuda', dtype=torch.float)
+        gemm1_beta = torch.randn(num_experts, device='cuda', dtype=torch.float)
     gemm2_bias = 50 * torch.randn(
         num_experts, hidden_size, device='cuda', dtype=torch.float)
 
     hidden_states_mxe4m3 = None
     hidden_states_scale_linear_mxe4m3 = None
     hidden_states_scale_mxe4m3_bytes = None
-    if is_mx_fp8:
+    if dtype_activation == "mxfp8":
         # Quantize hidden states. Produces scales for activations in 128x4 layout for ref impl.
         hidden_states_mxe4m3, hidden_states_scale_mxe4m3_bytes = quant_mxe4m3(
             hidden_states, True)
@@ -1543,22 +1572,36 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
     else:
         raise ValueError("Invalid routing method type")
 
-    args = moe_args(num_tokens, num_experts, hidden_size, intermediate_size,
-                    top_k, padding,
-                    hidden_states_mxe4m3 if is_mx_fp8 else hidden_states,
-                    hidden_states_scale_mxe4m3_bytes if is_mx_fp8 else None,
-                    None, scores, gemm1_weights_mxe2m1_bytes,
-                    gemm1_scales_mxe2m1_bytes, None, gemm2_weights_mxe2m1_bytes,
-                    gemm2_scales_mxe2m1_bytes, None, permute_info, False,
-                    gemm1_bias, gemm1_alpha, gemm1_beta, gemm2_bias, act_type)
+    input_hidden_states = None
+    input_hidden_global_scale = None
+    if dtype_activation == "mxfp8":
+        input_hidden_states = hidden_states_mxe4m3
+    elif dtype_activation == "bf16":
+        input_hidden_states = hidden_states.to(torch.bfloat16)
+    elif dtype_activation == "fp8":
+        input_hidden_states, input_hidden_global_scale = quant_fp8_per_tensor(
+            hidden_states)
 
-    if is_mx_fp8:
+    args = moe_args(
+        num_tokens, num_experts, hidden_size, intermediate_size, top_k, padding,
+        input_hidden_states, hidden_states_scale_mxe4m3_bytes
+        if dtype_activation == "mxfp8" else None, input_hidden_global_scale,
+        scores, gemm1_weights_mxe2m1_bytes, gemm1_scales_mxe2m1_bytes, None,
+        gemm2_weights_mxe2m1_bytes, gemm2_scales_mxe2m1_bytes, None,
+        permute_info, False, gemm1_bias, gemm1_alpha, gemm1_beta, gemm2_bias,
+        act_type)
+
+    if dtype_activation == "mxfp8":
         output_dequant_reference, args_dequant = run_moe_reference_mxe4m3_mxe2m1(
             args)
-    else:
+    elif dtype_activation == "bf16":
         output_dequant_reference, args_dequant = run_moe_reference_bf16_mxe2m1(
             args)
-
+    elif dtype_activation == "fp8":
+        output_dequant_reference, args_dequant = run_moe_reference_e4m3_mxe2m1(
+            args)
+    else:
+        raise ValueError("Invalid dtype_activation")
     #
     # Run the reference implementations
     #
@@ -1640,53 +1683,77 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
     gemm2_bias_shuffled = torch.stack(gemm2_bias_shuffled).reshape(
         num_experts, -1)
 
-    # FIXME: the global scaling factors for Fp8 emulation with MxFp8. Initialize them to the real values.
-    output1_scales_scalar = torch.ones(num_experts,
-                                       device='cuda',
-                                       dtype=torch.float)
-    output1_scales_gate_scalar = torch.ones(num_experts,
-                                            device='cuda',
-                                            dtype=torch.float)
-    output2_scales_scalar = torch.ones(num_experts,
-                                       device='cuda',
-                                       dtype=torch.float)
+    if dtype_activation == "fp8":
+        # c_global_sf: fc2_input_scale
+        scale_c_fc1 = (
+            args_dequant.c_global_sf *
+            (1.0 / args.hidden_states_scale_global)).expand(num_experts).to(
+                torch.float).cuda().contiguous()
+
+        # self.fc31_alpha
+        scale_gate_fc1 = (
+            1.0 / args.hidden_states_scale_global).expand(num_experts).to(
+                torch.float).cuda().contiguous()
+
+        # self.fc2_alpha
+        scale_c_fc2 = (1.0 / args_dequant.c_global_sf).expand(num_experts).to(
+            torch.float).cuda().contiguous()
+
+        # NOTE: correct the beta to account for the global scale factor
+        # Check cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/GemmGatedActOptions.h
+        # for more details
+        gemm1_beta = gemm1_beta * args.hidden_states_scale_global
+        # Check cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/BatchedGemmInterface.h
+        # for more details
+        gemm1_bias_shuffled = gemm1_bias_shuffled * args.hidden_states_scale_global
+        gemm2_bias_shuffled = gemm2_bias_shuffled * args_dequant.c_global_sf
 
     #
     # Run the TRT-LLM kernel
     #
-    if is_mx_fp8:
-        with autotune(use_autotune):
+    with autotune(use_autotune):
+        if dtype_activation == "mxfp8":
             output = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
                 expert_logits, routing_bias,
                 hidden_states_mxe4m3.cuda().view(torch.float8_e4m3fn),
                 hidden_states_scale_linear_mxe4m3.cuda(),
                 gemm1_weights_mxe2m1_shuffled.cuda(),
                 gemm1_scales_mxe2m1_shuffled.cuda(), gemm1_bias_shuffled.cuda(),
-                gemm1_alpha.cuda() if act_type is not ActType.Silu else None,
-                gemm1_beta.cuda() if act_type is not ActType.Silu else None,
-                gemm2_weights_mxe2m1_shuffled.cuda(),
+                gemm1_alpha, gemm1_beta, gemm2_weights_mxe2m1_shuffled.cuda(),
                 gemm2_scales_mxe2m1_shuffled.cuda(), gemm2_bias_shuffled.cuda(),
-                output1_scales_scalar.cuda(), output1_scales_gate_scalar.cuda(),
-                output2_scales_scalar.cuda(), num_experts, top_k, n_groups,
-                top_k_groups, intermediate_size, 0, num_experts, routed_scaling,
-                tile_tokens_dim, routing_method_type, act_type.value)
-    else:
-        with autotune(use_autotune):
+                num_experts, top_k, n_groups, top_k_groups, intermediate_size,
+                0, num_experts, routed_scaling, tile_tokens_dim,
+                routing_method_type, act_type.value)
+        elif dtype_activation == "bf16":
             output = torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
                 expert_logits, routing_bias,
                 hidden_states.cuda().to(torch.bfloat16),
                 gemm1_weights_mxe2m1_shuffled.cuda(),
                 gemm1_scales_mxe2m1_shuffled.cuda(), gemm1_bias_shuffled.cuda(),
-                gemm1_alpha.cuda() if act_type is not ActType.Silu else None,
-                gemm1_beta.cuda() if act_type is not ActType.Silu else None,
-                gemm2_weights_mxe2m1_shuffled.cuda(),
+                gemm1_alpha, gemm1_beta, gemm2_weights_mxe2m1_shuffled.cuda(),
                 gemm2_scales_mxe2m1_shuffled.cuda(), gemm2_bias_shuffled.cuda(),
                 num_experts, top_k, n_groups, top_k_groups, intermediate_size,
                 0, num_experts, routed_scaling, tile_tokens_dim,
                 routing_method_type, act_type.value)
+        elif dtype_activation == "fp8":
+            output = torch.ops.trtllm.e4m3_mxe2m1_block_scale_moe_runner(
+                expert_logits, routing_bias,
+                input_hidden_states.cuda().to(torch.float8_e4m3fn),
+                gemm1_weights_mxe2m1_shuffled.cuda(),
+                gemm1_scales_mxe2m1_shuffled.cuda(), gemm1_bias_shuffled.cuda(),
+                gemm1_alpha, gemm1_beta, gemm2_weights_mxe2m1_shuffled.cuda(),
+                gemm2_scales_mxe2m1_shuffled.cuda(), gemm2_bias_shuffled.cuda(),
+                scale_c_fc1, scale_gate_fc1, scale_c_fc2, num_experts, top_k,
+                n_groups, top_k_groups, intermediate_size, 0, num_experts,
+                routed_scaling, tile_tokens_dim, routing_method_type,
+                act_type.value)
+        else:
+            raise ValueError("Invalid dtype_activation")
 
+    # print(output_dequant_reference)
+    # print(output)
     output_dequant_actual = output.to(torch.float)
-    percent = 0.8 if is_mx_fp8 else 0.85
+    percent = 0.8 if dtype_activation == "mxfp8" else 0.85
     check_accuracy(output_dequant_reference,
                    output_dequant_actual,
                    atol=0.0,

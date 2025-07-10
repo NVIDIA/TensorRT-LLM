@@ -2103,6 +2103,11 @@ class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
             module.expert_size_per_partition, dtype=torch.float32),
                                           requires_grad=False)
         module.register_parameter("fc31_input_dequant", fc31_input_dequant)
+        fc31_input_gate_dequant = nn.Parameter(torch.empty(
+            module.expert_size_per_partition, dtype=torch.float32),
+                                               requires_grad=False)
+        module.register_parameter("fc31_input_gate_dequant",
+                                  fc31_input_gate_dequant)
 
         fc2_input_dequant = nn.Parameter(torch.empty(
             module.expert_size_per_partition, dtype=torch.float32),
@@ -2112,36 +2117,46 @@ class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
         super().create_weights(module)
 
     def load_expert_fc31_input_scale_w4a8_mxfp4_fp8(
-            self, w1_input_scale, w3_input_scale,
-            dst_fc31_input_scale: torch.Tensor):
+            self, w1_input_scale, w3_input_scale, w2_input_scale,
+            dst_fc31_input_scale: torch.Tensor,
+            dst_fc2_input_scale: torch.Tensor):
         w1_input_scale = w1_input_scale[...].reshape([])
+        w2_input_scale = w2_input_scale[...].reshape([])
         assert torch.allclose(
             w1_input_scale, w3_input_scale), "w1_input_scale != w3_input_scale"
         dst_fc31_input_scale.copy_(w1_input_scale)
+        dst_fc2_input_scale.copy_(w2_input_scale)
 
     def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
         # Step1: Load input scales.
         tmp_fc31_input_scale = torch.empty(module.num_experts,
                                            dtype=torch.float32)
 
+        tmp_fc2_input_scale = torch.empty(module.num_experts,
+                                          dtype=torch.float32)
+
         for expert_id in range(module.num_experts):
             if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
                 w1_input_scale = weights[f"{expert_id}.w1.input_scale"]
                 w3_input_scale = weights[f"{expert_id}.w3.input_scale"]
+                w2_input_scale = weights[f"{expert_id}.w2.input_scale"]
             elif module.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
                 w1_input_scale = weights["gate_up_proj_input_scale"]
                 w3_input_scale = weights["gate_up_proj_input_scale"]
+                w2_input_scale = weights["down_proj_input_scale"]
             else:
                 raise NotImplementedError(
                     f"Unknown weight loading mode in MoE: {module.weight_loading_mode}"
                 )
 
             self.load_expert_fc31_input_scale_w4a8_mxfp4_fp8(
-                w1_input_scale, w3_input_scale, tmp_fc31_input_scale[expert_id])
+                w1_input_scale, w3_input_scale, w2_input_scale,
+                tmp_fc31_input_scale[expert_id], tmp_fc2_input_scale[expert_id])
 
-        module.fc31_input_dequant.data.copy_(tmp_fc31_input_scale.max())
-        # TRTLLMGen uses dynamic MXFP8 for fc2 so we need to set scales to 1.0.
-        module.fc2_input_dequant.fill_(1.0)
+        module.fc31_input_dequant.data.copy_(tmp_fc31_input_scale.max() /
+                                             tmp_fc2_input_scale.max())
+        module.fc31_input_gate_dequant.data.copy_(tmp_fc31_input_scale.max())
+        module.fc2_input_dequant.data.copy_(tmp_fc2_input_scale.max())
 
         # Step2: Load weight block scales.
         super().load_quant_scales(module, weights)
@@ -2150,16 +2165,8 @@ class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
 class W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
 
     def create_weights(self, module: torch.nn.Module):
-        fake_input_scale = nn.Parameter(torch.empty(
-            module.expert_size_per_partition, dtype=torch.float32),
-                                        requires_grad=False)
-        module.register_parameter("fake_input_scale", fake_input_scale)
-
         super().create_weights(module)
 
     def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
-        # All input scales are handled by the MMA.
-        module.fake_input_scale.fill_(1.0)
-
-        # Step2: Load weight block scales.
+        # Load weight block scales.
         super().load_quant_scales(module, weights)

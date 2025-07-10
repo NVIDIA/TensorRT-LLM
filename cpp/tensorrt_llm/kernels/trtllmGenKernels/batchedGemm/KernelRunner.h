@@ -28,27 +28,19 @@ namespace kernels
 {
 
 // Keep this in sync with the ActType in
-// cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/BatchedGemmOptions.h Type of the gated
-// activation
+// cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/GemmGatedActOptions.h
 enum class ActType
 {
-    // silu(x) = x * sigmoid(x) = x * (1 / (1 + e^(-x)))
-    // For ActType == Silu,
-    //    gatedAct = scaleC * x0 * silu(x1 * scaleGate),
-    // where x0 and x1 are the raw numbers from Gemm, while scaleC and scaleGate are input scales.
-    Silu = 0,
     // For ActType == SwiGlu, ideally we would like to have something like
-    //    gatedAct = scaleC * (x0 * scaleAb + beta) * sigmoid(alpha * x1 * scaleGate).
+    //    gatedAct = scaleC * (x0 * scaleAb + beta) * ((x1 * scaleGate) * sigmoid(alpha * x1 *
+    //    scaleGate)).
     // But for now, we use the simplified version
-    //    gatedAct = scaleC' * (x0 + beta') * sigmoid(alpha * x1 * scaleGate),
+    //    gatedAct = scaleC' * (x0 + beta') * ((x1 * scaleGate) * sigmoid(alpha * x1 * scaleGate)),
     // where x0 and x1 are the raw numbers from Gemm, while scaleC and scaleGate are input scales,
     // beta' = beta / scaleAb, scaleC' = scaleC * scaleAb.
-    SwiGlu,
-    // For ActType == Swish,
-    //    gatedAct = scaleC' * (x0 + beta') * (x1 * scaleGate * sigmoid(alpha * x1 * scaleGate)),
-    // where x0 and x1 are the raw numbers from Gemm, while scaleC and scaleGate are input scales,
-    // beta' = beta / scaleAb, scaleC' = scaleC * scaleAb.
-    Swish
+    //
+    // GatedSilu is a special case of SwiGlu where the alpha is 1.0 and the beta is 0.0.
+    SwiGlu
 };
 
 struct TrtllmGenBatchedGemmRunnerOptions
@@ -56,7 +48,7 @@ struct TrtllmGenBatchedGemmRunnerOptions
     batchedGemm::trtllm::gen::Dtype dtypeA;
     batchedGemm::trtllm::gen::Dtype dtypeB;
     batchedGemm::trtllm::gen::Dtype dtypeC;
-    ActType actType{ActType::Silu};
+    ActType actType{ActType::SwiGlu};
     bool deepSeekFp8{false};
     bool fusedAct{false};
     bool routeAct{false};
