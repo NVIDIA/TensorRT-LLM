@@ -137,8 +137,8 @@ examples/test_llama.py::test_llm_llama_v2_lora_1gpu[chinese-llama-2-lora-13b-lla
 examples/test_llama.py::test_llm_llama_v2_lora_benchmark_2gpu[chinese_lora-llama-v2-13b-hf]
 examples/test_llama.py::test_llm_llama_v3_1_1node_multi_gpus[enable_gemm_allreduce_plugin-llama-3.1-405b-enable_fp8] TIMEOUT (120)
 examples/test_llama.py::test_llm_llama_v3_1_1node_multi_gpus[enable_gemm_allreduce_plugin-llama-3.1-405b-fp8-disable_fp8] TIMEOUT (90)
-examples/test_llama.py::test_llm_llama_v3_1_1node_multi_gpus[enable_gemm_allreduce_plugin-llama-3.1-70b-disable_fp8]TIMEOUT (60)
-examples/test_llama.py::test_llm_llama_v3_1_1node_multi_gpus[disable_gemm_allreduce_plugin-llama-3.1-70b-enable_fp8]TIMEOUT (60)
+examples/test_llama.py::test_llm_llama_v3_1_1node_multi_gpus[enable_gemm_allreduce_plugin-llama-3.1-70b-disable_fp8]
+examples/test_llama.py::test_llm_llama_v3_1_1node_multi_gpus[disable_gemm_allreduce_plugin-llama-3.1-70b-enable_fp8]
 examples/test_llama.py::test_llm_llama_v3_1m_long_context_8gpus[Llama-3-8B-Instruct-Gradient-1048k] TIMEOUT (180)
 examples/test_llama.py::test_llm_llama_v3_dora_1gpu[commonsense-llama-v3-8b-dora-r32-llama-v3-8b-hf-base_fp16]
 examples/test_llama.py::test_llm_llama_1gpu_fp4[llama-3.1-70b-instruct-enable_norm_quant_fusion-enable_fused_quant-fp4_plugin-bfloat16]
