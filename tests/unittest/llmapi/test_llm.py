@@ -18,12 +18,13 @@ import random
 import shutil
 import sys
 import tempfile
-from typing import List, Optional, Union
+from typing import List, Optional, OrderedDict, Union
 
 import datasets
 import pytest
 import torch
 import transformers
+from utils.util import duplicate_list_to_length, flatten_list, skip_single_gpu
 
 from tensorrt_llm import LLM as LLM_torch
 from tensorrt_llm._tensorrt_engine import LLM
@@ -1406,6 +1407,10 @@ def llama_7b_multi_lora_from_request_test_harness(**llm_kwargs):
     ]
     lora_req1 = LoRARequest("luotuo", 1, hf_lora_dir1)
     lora_req2 = LoRARequest("Japanese", 2, hf_lora_dir2)
+    lora_req3 = LoRARequest("luotuo", 3, hf_lora_dir1)
+    lora_req4 = LoRARequest("Japanese", 4, hf_lora_dir2)
+    lora_req5 = LoRARequest("luotuo", 5, hf_lora_dir1)
+    lora_req6 = LoRARequest("Japanese", 6, hf_lora_dir2)
     sampling_params = SamplingParams(max_tokens=20)
     outputs = llm.generate(
         prompts,
@@ -1414,6 +1419,80 @@ def llama_7b_multi_lora_from_request_test_harness(**llm_kwargs):
     for output, ref, key_word in zip(outputs, references, key_words):
         assert similar(output.outputs[0].text,
                        ref) or key_word in output.outputs[0].txt
+    outputs = llm.generate(
+        prompts,
+        sampling_params,
+        lora_request=[None, lora_req3, lora_req4, None, lora_req5, lora_req6])
+    for output, ref, key_word in zip(outputs, references, key_words):
+        assert similar(output.outputs[0].text,
+                       ref) or key_word in output.outputs[0].txt
+
+
+@pytest.mark.parametrize(
+    "lora_adapter_count_per_call, max_loras, max_cpu_loras, repeats", [
+        ([
+            5,
+        ], 4, 4, 2),
+    ])
+@skip_gpu_memory_less_than_40gb
+def test_llama_7b_multi_lora_eviction(lora_adapter_count_per_call: list[int],
+                                      max_loras: int, max_cpu_loras: int,
+                                      repeats: int):
+    print(f"{lora_adapter_count_per_call=}, {max_loras=}, {max_cpu_loras=}")
+    total_lora_adapters = sum(lora_adapter_count_per_call)
+
+    hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
+    hf_lora_dirs = [
+        f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1",
+        f"{llm_models_root()}/llama-models/Japanese-Alpaca-LoRA-7b-v0"
+    ]
+
+    build_config = BuildConfig(lora_config=LoraConfig(
+        lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
+        max_lora_rank=8,
+        max_loras=max_loras,
+        max_cpu_loras=max_cpu_loras))
+    llm = LLM(hf_model_dir,
+              enable_lora=True,
+              build_config=build_config,
+              fast_build=True)
+
+    # Each prompt should have a reference for every LoRA adapter dir (in the same order as in hf_lora_dirs)
+    prompt_to_references = OrderedDict({
+        "美国的首都在哪里? \n答案:": [
+            "美国的首都是华盛顿。\n\n美国的",
+            "纽约\n\n### カンファレンスの",
+        ],
+        "アメリカ合衆国の首都はどこですか? \n答え:": [
+            "华盛顿。\n\n英国の首都是什",
+            "ワシントン\nQ1. アメリカ合衆国",
+        ],
+    })
+
+    prompts_to_generate = duplicate_list_to_length(
+        flatten_list([[prompt] * len(hf_lora_dirs)
+                      for prompt in prompt_to_references.keys()]),
+        total_lora_adapters)
+    references = duplicate_list_to_length(
+        flatten_list(list(prompt_to_references.values())), total_lora_adapters)
+    lora_requests = [
+        LoRARequest(str(i), i, hf_lora_dirs[i % len(hf_lora_dirs)])
+        for i in range(total_lora_adapters)
+    ]
+
+    # Perform repeats of the same requests to test reuse and reload of adapters previously unloaded from cache
+    for i in range(repeats):
+        last_idx = 0
+        for adapter_count in lora_adapter_count_per_call:
+            sampling_params = SamplingParams(max_tokens=20)
+            outputs = llm.generate(
+                prompts_to_generate[last_idx:last_idx + adapter_count],
+                sampling_params,
+                lora_request=lora_requests[last_idx:last_idx + adapter_count])
+            for output, ref in zip(
+                    outputs, references[last_idx:last_idx + adapter_count]):
+                assert similar(output.outputs[0].text, ref)
+            last_idx += adapter_count
 
 
 @skip_gpu_memory_less_than_40gb
