@@ -1120,7 +1120,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 use_paged_context_fmha=use_paged_context_fmha,
                 is_mla_enable=self.is_mla_enable,
             )
-
         self.wrapper.plan(
             layer_idx=self.get_local_layer_idx(metadata),
             tokens_per_block=metadata.tokens_per_block,
