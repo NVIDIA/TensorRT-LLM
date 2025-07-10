@@ -12,3 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# This import inexplicably starts a thread!
+# This causes problems for our test infra. The issue is that TRTLLM will import
+# this module. If the import happens before the test starts, there are no problems.
+# But if the import happens lazily after the test starts, pytest will think you leaked
+# the thread. We thus do the import here to prevent thread leak issues cropping up when messing
+# with the import statements in tests.
+from torch._inductor import lowering  # NOQA
