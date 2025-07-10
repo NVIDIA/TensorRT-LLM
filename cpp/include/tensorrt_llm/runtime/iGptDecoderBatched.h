@@ -27,8 +27,9 @@
 
 namespace tensorrt_llm::batch_manager
 {
+class DecoderInputBuffers;
 class LlmRequest;
-}
+} // namespace tensorrt_llm::batch_manager
 
 namespace tensorrt_llm::runtime
 {
@@ -94,10 +95,13 @@ public:
     virtual void disableLookahead(RequestVector const& genRequests, TensorPtr const& batchSlots) = 0;
 
     //! @brief Run one step for all requests without blocking the host process and return the token for synchronization.
-    virtual CudaEvent forwardAsync(decoder::DecoderState const& decoderState, decoder_batch::Input const& input) = 0;
+    virtual CudaEvent forwardAsync(
+        decoder::DecoderState const& decoderState, batch_manager::DecoderInputBuffers const& input)
+        = 0;
 
     //! @brief Run one step for all requests and wait for completion on the host.
-    virtual void forward(decoder::DecoderState const& decoderState, decoder_batch::Input const& input) = 0;
+    virtual void forward(decoder::DecoderState const& decoderState, batch_manager::DecoderInputBuffers const& input)
+        = 0;
 
     //! @brief Gather final beam search results for request `batchIdx`.
     //! Result will only be available after event returned
