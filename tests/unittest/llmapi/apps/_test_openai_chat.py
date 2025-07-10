@@ -524,6 +524,7 @@ def test_stop_reason(client: openai.OpenAI, model_name: str, backend: str):
     )
     assert resp.choices[0].finish_reason == "stop"
     assert resp.choices[0].stop_reason == "two"
+    
 
 @pytest.mark.asyncio
 async def test_chat_completion_with_logit_bias(async_client: openai.AsyncOpenAI,
