@@ -231,6 +231,10 @@ class WideEPMoE(MoE):
     def select_alltoall_method_type(mapping: Mapping, top_k: int,
                                     dtype: torch.dtype,
                                     use_cuda_graph: bool) -> AlltoallMethodType:
+        all2all_method_type = os.environ.get("TRTLLM_FORCE_ALLTOALL_METHOD")
+        if all2all_method_type is not None:
+            return AlltoallMethodType[all2all_method_type]
+
         if not mapping.enable_attention_dp:
             return AlltoallMethodType.NotEnabled
 
@@ -240,18 +244,13 @@ class WideEPMoE(MoE):
         if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
             return AlltoallMethodType.NotEnabled
 
-        supports_mnnvl = MnnvlMemory.supports_mnnvl()
-        use_deep_ep = (os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "0")
-                       == "1") and not supports_mnnvl
-
-        # Sometimes, even for a single node, we may still need DeepEP low latency mode.
-        if mapping.moe_ep_size <= top_k and not use_deep_ep:
+        if mapping.moe_ep_size <= top_k:
             return AlltoallMethodType.NotEnabled
 
-        if supports_mnnvl:
+        if MnnvlMemory.supports_mnnvl():
             return AlltoallMethodType.MNNVL
 
-        if use_deep_ep:
+        if os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "0") == "1":
             if deep_ep_installed and dtype == torch.bfloat16:
                 if use_cuda_graph:
                     # Here we can only choose DeepEPLowLatency since only this method supports CUDA Graphs.
