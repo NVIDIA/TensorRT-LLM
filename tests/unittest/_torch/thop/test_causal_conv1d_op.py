@@ -43,6 +43,7 @@ from tensorrt_llm.llmapi.utils import get_total_gpu_memory
                        )),
             product([5376], [4], ['context'], ['float16', 'bfloat16'], [2],
                     [131072], [False, True], [False, True], [False]))))
+@pytest.mark.high_cuda_memory
 def test_causal_conv1d(dim, dconv, req_type, dtype, batch_size, max_seq_len,
                        remove_padding, apply_silu, paged_cache):
     device = "cuda"

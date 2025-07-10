@@ -815,10 +815,13 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
             auto contextInputsIds = ITensor::slice(inputsIds, 0, numContextTokens);
             manager.copy(inputHost.data(), *contextInputsIds);
 
-            auto generationInputsIds = ITensor::slice(inputsIds, numContextTokens);
-            auto seqSlotsDeviceSlice = ITensor::slice(seqSlotsDevice, numContextRequests);
-            runtime::kernels::invokeGatherBatch(
-                *generationInputsIds, *newOutputTokens, *seqSlotsDeviceSlice, maxBeamWidth, stream);
+            if (!genRequests.empty())
+            {
+                auto generationInputsIds = ITensor::slice(inputsIds, numContextTokens);
+                auto seqSlotsDeviceSlice = ITensor::slice(seqSlotsDevice, numContextRequests);
+                runtime::kernels::invokeGatherBatch(
+                    *generationInputsIds, *newOutputTokens, *seqSlotsDeviceSlice, maxBeamWidth, stream);
+            }
         }
         else
         {
@@ -884,6 +887,8 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
                 contextRequests, genRequests, decoderState.getEagleBuffers(), runtime, modelConfig, worldConfig);
         }
     }
+
+    sync_check_cuda_error(stream.get());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

@@ -45,6 +45,8 @@ class AttentionMetadata:
     max_num_requests: int
     # The max number of tokens in all requests in a single batch.
     max_num_tokens: int
+    # The max number of sequences in a single batch.
+    max_num_sequences: Optional[int] = None
     # The KV cache manager.
     kv_cache_manager: KVCacheManager
     mapping: Optional[Mapping] = None
@@ -357,8 +359,9 @@ class RopeParams:
         # get rotary parameters.
         hidden_size = config.hidden_size
         num_attention_heads = config.num_attention_heads
-        head_dim = getattr(config, 'head_dim',
-                           hidden_size // num_attention_heads)
+        head_dim = getattr(config, 'head_dim', None)
+        if not isinstance(head_dim, int):
+            head_dim = hidden_size // num_attention_heads
         rope_scaling = getattr(config, 'rope_scaling', None)
         rope_params.max_positions = config.max_position_embeddings
         rope_params.theta = getattr(config, 'rope_theta', 10000.0)
@@ -498,8 +501,14 @@ class PredefinedAttentionMask(str, Enum):
     FULL = "full"
 
 
-# May extend to custom attention mask type
-AttentionMask = Union[PredefinedAttentionMask]
+class CustomAttentionMask(str, Enum):
+    """
+    Custom attention mask types
+    """
+    CUSTOM = "custom"
+
+
+AttentionMask = Union[PredefinedAttentionMask, CustomAttentionMask]
 
 
 class AttentionBackend(Generic[TMetadata]):

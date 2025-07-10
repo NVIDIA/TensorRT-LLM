@@ -188,7 +188,7 @@ def test_single_chat_session_video(client: openai.OpenAI, model_name: str):
             "type": "text",
             "text": content_text
         }, {
-            "type": "image_url",
+            "type": "video_url",
             "video_url": {
                 "url": video_url
             }
