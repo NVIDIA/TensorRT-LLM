@@ -11,7 +11,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_siglip import SiglipVisionModel
 
 # use the default config from HF (https://github.com/huggingface/transformers/blob/main/src/transformers/models/siglip/configuration_siglip.py#L126-L147)
-SIGLIP_CONFIG = {
+DEFAULT_SIGLIP_CONFIG = {
     "hidden_size": 768,
     "intermediate_size": 3072,
     "num_hidden_layers": 12,
@@ -26,8 +26,21 @@ SIGLIP_CONFIG = {
     "vision_use_head": False,
 }
 
+# Comes from https://huggingface.co/google/gemma-3-27b-it/blob/main/config.json.
+GEMMA3_SIGLIP_CONFIG = {
+    "hidden_size": 1152,
+    "image_size": 896,
+    "intermediate_size": 4304,
+    "model_type": "siglip_vision_model",
+    "num_attention_heads": 16,
+    "num_hidden_layers": 27,
+    "patch_size": 14,
+    "vision_use_head": False
+}
+
 ACCURACY_CONFIG = {
-    torch.float16: (2e-2, 5e-2),
+    'default': (2e-2, 5e-2),
+    'gemma3': (5e-1, 5e-1),
 }
 
 
@@ -36,9 +49,10 @@ class Scenario:
     backend: str
     num_images: int
     dtype: torch.dtype
+    config_name: str
 
     def __repr__(self) -> str:
-        return f"backend:{self.backend.lower()}_num_images:{self.num_images}_dtype:{self.dtype}"
+        return f"backend:{self.backend.lower()}_num_images:{self.num_images}_dtype:{self.dtype}_config_name:{self.config_name}"
 
 
 class TestSiglipVisionModel(unittest.TestCase):
@@ -48,9 +62,22 @@ class TestSiglipVisionModel(unittest.TestCase):
         torch.random.manual_seed(1234)
 
     @parameterized.expand([
-        Scenario(backend="VANILLA", num_images=2, dtype=torch.float16),
-        Scenario(backend="TRTLLM", num_images=2, dtype=torch.float16),
-        Scenario(backend="TRTLLM", num_images=21, dtype=torch.float16),
+        Scenario(backend="VANILLA",
+                 num_images=2,
+                 dtype=torch.float16,
+                 config_name="default"),
+        Scenario(backend="TRTLLM",
+                 num_images=2,
+                 dtype=torch.float16,
+                 config_name="default"),
+        Scenario(backend="TRTLLM",
+                 num_images=1,
+                 dtype=torch.bfloat16,
+                 config_name="gemma3"),
+        Scenario(backend="TRTLLM",
+                 num_images=21,
+                 dtype=torch.float16,
+                 config_name="default"),
     ], lambda testcase_func, param_num, param:
                           f"{testcase_func.__name__}[{param.args[0]}]")
     def test_siglip_vision_allclose_to_hf(self, scenario: Scenario):
@@ -58,10 +85,16 @@ class TestSiglipVisionModel(unittest.TestCase):
         backend = scenario.backend
         num_images = scenario.num_images
         dtype = scenario.dtype
+        config_name = scenario.config_name
         device = torch.device('cuda')
 
         # Create configs
-        config_dict = deepcopy(SIGLIP_CONFIG)
+        if config_name == "default":
+            config_dict = deepcopy(DEFAULT_SIGLIP_CONFIG)
+        elif config_name == "gemma3":
+            config_dict = deepcopy(GEMMA3_SIGLIP_CONFIG)
+        else:
+            raise ValueError(f"Invalid config name: {config_name}")
         hf_config = SiglipVisionConfig.from_dict(config_dict)
 
         # Prepare HF model
@@ -111,13 +144,13 @@ class TestSiglipVisionModel(unittest.TestCase):
             torch.testing.assert_close(
                 hf_hs.float(),
                 tllm_hs.float(),
-                rtol=ACCURACY_CONFIG[dtype][0],
-                atol=ACCURACY_CONFIG[dtype][1],
+                rtol=ACCURACY_CONFIG[config_name][0],
+                atol=ACCURACY_CONFIG[config_name][1],
                 msg=
-                f"FAILED: TRT-LLM and HF hidden_states mismatch for {dtype} with {num_images} images at layer {i}, the mean value of this layer is {hf_hs.mean()}"
+                f"FAILED: TRT-LLM and HF hidden_states mismatch for {dtype} with {num_images} images at layer {i}: max diff is {(hf_hs - tllm_hs).abs().max()}, mean diff is {(hf_hs - tllm_hs).abs().mean()}"
             )
             print(
-                f"PASSED: TRT-LLM and HF hidden_states match for {dtype} with {num_images} images at layer {i}, the mean value of this layer is {hf_hs.mean()}"
+                f"PASSED: TRT-LLM and HF hidden_states match for {dtype} with {num_images} images at layer {i}: max diff is {(hf_hs - tllm_hs).abs().max()}, mean diff is {(hf_hs - tllm_hs).abs().mean()}"
             )
 
 
