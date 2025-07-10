@@ -17,6 +17,7 @@
 
 #include "bindings.h"
 #include "moeBindings.h"
+#include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.h"
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
@@ -47,6 +48,7 @@
 
 namespace tr = tensorrt_llm::runtime;
 namespace te = tensorrt_llm::executor;
+namespace tb = tensorrt_llm::batch_manager;
 
 class PyITensor : public tensorrt_llm::runtime::ITensor
 {
@@ -249,14 +251,6 @@ void initBindings(pybind11::module_& m)
         .def_property_readonly("logits_dtype_from_engine",
             [](tr::TllmRuntime& self) { return self.getEngine().getTensorDataType("logits"); });
 
-    py::class_<tr::decoder_batch::Input>(m, "DecoderBatchInput")
-        .def(py::init<std::vector<std::vector<tr::ITensor::SharedConstPtr>>, tr::SizeType32>(), py::arg("logits"),
-            py::arg("max_decoding_engine_tokens"))
-        .def(py::init<std::vector<tr::ITensor::SharedConstPtr>>(), py::arg("logits"))
-        .def_readwrite("logits", &tr::decoder_batch::Input::logits)
-        .def_readwrite("max_decoder_steps", &tr::decoder_batch::Input::maxDecoderSteps)
-        .def_readwrite("batch_slots", &tr::decoder_batch::Input::batchSlots);
-
     py::class_<tr::LookaheadDecodingBuffers>(m, "LookaheadDecodingBuffers")
         .def(py::init<tr::SizeType32, tr::SizeType32, tr::BufferManager const&>(), py::arg("max_num_sequences"),
             py::arg("max_tokens_per_step"), py::arg("buffer_manager"))
@@ -364,6 +358,19 @@ void initBindings(pybind11::module_& m)
         .def_property_readonly("speculative_decoding_mode", &tr::decoder::DecoderState::getSpeculativeDecodingMode)
         .def_property("generation_steps", &tr::decoder::DecoderState::getGenerationSteps,
             &tr::decoder::DecoderState::setGenerationSteps);
+
+    py::class_<tb::DecoderInputBuffers>(m, "DecoderInputBuffers")
+        .def(py::init<tr::SizeType32, tr::SizeType32, tr::BufferManager>(), py::arg("max_batch_size"),
+            py::arg("max_tokens_per_engine_step"), py::arg("manager"))
+        .def_readwrite("setup_batch_slots", &tb::DecoderInputBuffers::setupBatchSlots)
+        .def_readwrite("setup_batch_slots_device", &tb::DecoderInputBuffers::setupBatchSlotsDevice)
+        .def_readwrite("fill_values", &tb::DecoderInputBuffers::fillValues)
+        .def_readwrite("fill_values_device", &tb::DecoderInputBuffers::fillValuesDevice)
+        .def_readwrite("inputs_ids", &tb::DecoderInputBuffers::inputsIds)
+        .def_readwrite("batch_logits", &tb::DecoderInputBuffers::batchLogits)
+        .def_readwrite("forward_batch_slots", &tb::DecoderInputBuffers::forwardBatchSlots)
+        .def_readwrite("decoder_logits", &tb::DecoderInputBuffers::decoderLogits)
+        .def_readwrite("max_decoder_steps", &tb::DecoderInputBuffers::maxDecoderSteps);
 
     py::class_<tr::GptDecoderBatched>(m, "GptDecoderBatched")
         .def(py::init<tr::GptDecoderBatched::CudaStreamPtr>(), py::arg("stream"))

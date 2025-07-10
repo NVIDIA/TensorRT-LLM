@@ -158,7 +158,7 @@ void setEagleInputs(tr::DecodingInput& dInput, RuntimeBuffers const& fusedRuntim
 
 } // namespace
 
-std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::operator()(DecoderInputBuffers& inputBuffers,
+void MakeDecodingBatchInputOutput::operator()(DecoderInputBuffers& inputBuffers,
     runtime::decoder::DecoderState& decoderState, runtime::ModelConfig const& modelConfig, SizeType32 maxNumSequences,
     OptionalRef<RuntimeBuffers> fusedRuntimeBuffers) const
 {
@@ -167,9 +167,6 @@ std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::operator
     auto [activeSlots, generationSteps] = getActiveSlots(inputBuffers.decoderRequests);
 
     createDecoderBatchInputs(inputBuffers, activeSlots, decoderState, maxNumSequences);
-
-    auto decodingInput = std::make_unique<tr::decoder_batch::Input>(inputBuffers.batchLogits, inputBuffers.maxDecoderSteps);
-    decodingInput->batchSlots = inputBuffers.forwardBatchSlots;
 
     auto const maxBeamWidth = decoderState.getMaxBeamWidth();
     if (maxBeamWidth > 1)
@@ -197,7 +194,6 @@ std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::operator
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return decodingInput;
 }
 
 } // namespace tensorrt_llm::batch_manager
