@@ -215,6 +215,8 @@ def test_create_response():
     child_request.state = LlmRequestState.GENERATION_IN_PROGRESS
 
     response = request.create_response(use_fast_logits=True, mpi_world_rank=1)
+    # The response having non-error result contain _result.
+    response.result.deserialize()
     assert response is not None
     assert isinstance(response, LlmResponse)
     assert response.request_id == 1
@@ -224,6 +226,7 @@ def test_create_response():
     assert response.result.sequence_index == 0
 
     child_response = child_request.create_response()
+    child_response.result.deserialize()
     assert child_response is not None
     assert child_response.request_id == 2
     assert child_response.client_id == child_request.py_client_id
@@ -234,12 +237,14 @@ def test_create_response():
     child_request.state = LlmRequestState.GENERATION_COMPLETE
     # is_final=False since the parent request is not yet complete.
     child_response = child_request.create_response()
+    child_response.result.deserialize()
     assert child_response.result.is_final is False
     assert child_response.result.is_sequence_final is True
 
     # is_final=True since all requests are complete.
     request.state = LlmRequestState.GENERATION_COMPLETE
     response = request.create_response()
+    response.result.deserialize()
     assert response.result.is_final is True
     assert response.result.is_sequence_final is True
 

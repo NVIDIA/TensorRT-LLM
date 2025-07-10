@@ -288,6 +288,13 @@ def finish_by(request: Union[
     request.set_finished_reason(reason, beam)
 
 
+def is_generation_only_request(
+    request: Union['LlmRequest',
+                   tensorrt_llm.bindings.internal.batch_manager.LlmRequest]
+) -> bool:
+    return request.py_llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
+
+
 class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
     """LlmRequest wraps `bindings.internal.batch_manager.LlmRequest`
     but detour some features to Python implementation"""
@@ -356,8 +363,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                                   return_generation_logits,
                                   exclude_last_generation_logits)
 
-    def is_generation_only_request(self):
-        return self.py_llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
+    def is_generation_only(self):
+        # is_generation_only_request is a property getter at the C++ side,
+        # so here use a different name at the pytorch backend.
+        return is_generation_only_request(self)
 
     def create_child_request(self, request_id: int):
         """ Create a child request.
@@ -386,11 +395,14 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         child_request.py_request_id = child_request.request_id
         child_request.py_llm_request_type = child_request.llm_request_type
         child_request.py_batch_idx = None
+        child_request.py_seq_slot = None
 
         # Mimic the behavior of the original LlmRequest.
         child_request.is_attention_dp_dummy = self.is_attention_dp_dummy
         child_request.is_cuda_graph_dummy = self.is_cuda_graph_dummy
         child_request.is_dummy = self.is_dummy
+        child_request.is_generation_only = partial(is_generation_only_request,
+                                                   child_request)
         child_request.create_response = partial(create_response, child_request)
         child_request.finish_by = partial(finish_by, child_request)
 
