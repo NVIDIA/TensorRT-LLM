@@ -495,7 +495,7 @@ class TestResourceManager(unittest.TestCase):
                     window_size_to_layers=window_size_to_layers,
                     model_config=model_config,
                     kv_cache_config=kv_cache_config,
-                    allotted_mem_bytes=memory_bytes,
+                    pool_memory_bytes=memory_bytes,
                     kv_factor=kv_factor,
                     dtype=model_config.data_type,
                     is_cross_attention=False,
