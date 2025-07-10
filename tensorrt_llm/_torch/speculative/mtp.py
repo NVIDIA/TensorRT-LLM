@@ -10,7 +10,7 @@ from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import (SampleState, SampleStateTensors, TorchSampler,
                                   add_token, int_tensor)
 from ..pyexecutor.scheduler import ScheduledRequests
-from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
+from .interface import SpecMetadata
 
 
 @dataclass(kw_only=True)
@@ -23,48 +23,6 @@ class SampleStateTensorsMTP(SampleStateTensors):
 class SampleStateMTP(SampleState):
     device: SampleStateTensorsMTP
     host: SampleStateTensorsMTP
-
-
-@dataclass
-class MTPConfig(SpecConfig):
-    """
-    Configuration for MTP.
-    """
-    # The name of speculative decoding.
-    spec_dec_name = "MTP"
-    # The number of MTP modules
-    num_nextn_predict_layers: int = 1
-    # The number of max batch size
-    max_batch_size: int = 8
-
-    # Whether to use relaxed acceptance during thinking phase for reasoning model
-    use_relaxed_acceptance_for_thinking: bool = False
-    # The top-N tokens are sampled from logits to obtain a candidate set.
-    relaxed_topk: int = 1
-    # The threshold to further filter the candidate set.
-    # Filter out tokens with a large probability gap between the top-1 token's log probability.
-    relaxed_delta: float = 0.
-
-    # Whether to use vanilla MTP
-    use_mtp_vanilla: bool = False
-
-    # TODO: Hard code for DeepSeek R1
-    # When encounter <think>, start thinking phase.
-    # When encounter </think>, end thinking phase.
-    # <think> [thinking phase] </think> [real output]
-    BEGIN_THINKING_PHASE_TOKEN: int = 128798
-    END_THINKING_PHASE_TOKEN: int = 128799
-
-    def __post_init__(self) -> None:
-        self.spec_dec_mode = SpeculativeDecodingMode.from_string(
-            self.spec_dec_name)
-        self.max_draft_len = self.num_nextn_predict_layers
-
-    def update_from_model_config(self, model_config):
-        assert self.num_nextn_predict_layers > 0
-        if model_config.num_nextn_predict_layers == 1 and not self.use_mtp_vanilla:
-            self.spec_dec_mode = SpeculativeDecodingMode.MTP_EAGLE
-            self.num_extra_kv_tokens = self.num_nextn_predict_layers - 1
 
 
 class MTPHiddenStatesManager(BaseResourceManager):

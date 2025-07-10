@@ -1412,30 +1412,33 @@ class BaseLlmArgs(BaseModel):
     @model_validator(mode="after")
     def validate_speculative_config(self):
         if self.speculative_config:
+            if not self.speculative_config.supports_backend(self.backend):
+                raise ValueError(
+                    f"Speculation type {self.speculative_config.decoding_type} does not "
+                    f"support backend {self.backend}")
 
             # Below, we only need to set speculative_decoding_mode/decoding_config for speculation
             # on the TRT backend.
             if isinstance(self.speculative_config, LookaheadDecodingConfig):
-                lookahead_config = self.speculative_config
-                # Update the build config
-                _, _, max_draft_len, _ = lookahead_config.calculate_speculative_resource(
-                )
+                max_draft_len = self.speculative_config.calculate_speculative_resource(
+                )[2]
+                assert max_draft_len > 0
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.LOOKAHEAD_DECODING
-                if max_draft_len > self.build_config.max_draft_len:
-                    self.build_config.max_draft_len = max_draft_len
-
+                self.build_config.max_draft_len = max(
+                    self.build_config.max_draft_len, max_draft_len)
                 self.decoding_config = DecodingConfig(
                     decoding_mode=DecodingMode.Lookahead(),
                     lookahead_decoding_config=PybindMirror.maybe_to_pybind(
-                        lookahead_config))
-            elif isinstance(self.speculative_config, MedusaDecodingConfig):
-                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.MEDUSA
+                        self.speculative_config))
 
+            elif isinstance(self.speculative_config, MedusaDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0
+                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.MEDUSA
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
                 self.decoding_config = DecodingConfig(
                     decoding_mode=DecodingMode.Medusa(),
                     medusa_choices=self.speculative_config.medusa_choices)
+
             elif isinstance(self.speculative_config, EagleDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0
                 assert self.speculative_config.speculative_model_dir is not None, "Path to EAGLE3 weights must be specified."
@@ -1443,7 +1446,6 @@ class BaseLlmArgs(BaseModel):
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.EAGLE
                 if self.speculative_config.eagle3_one_model:  # from __post_init__()
                     self.num_extra_kv_tokens = self.max_draft_len - 1
-
                 if self.backend not in ['pytorch', '_autodeploy']:
                     eagle_config = _EagleConfig(
                         self.speculative_config.eagle_choices,
@@ -1454,31 +1456,7 @@ class BaseLlmArgs(BaseModel):
                     self.decoding_config = DecodingConfig(
                         decoding_mode=DecodingMode.Eagle(),
                         eagle_config=eagle_config)
-                """
-                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.EAGLE
-                assert self.speculative_config.max_draft_len > 0
 
-                self.build_config.max_draft_len = self.speculative_config.max_draft_len
-
-                if self.backend not in ['pytorch', '_autodeploy']:
-                    eagle_config = _EagleConfig(
-                        self.speculative_config.eagle_choices,
-                        self.speculative_config.greedy_sampling,
-                        self.speculative_config.posterior_threshold,
-                        self.speculative_config.use_dynamic_tree,
-                        self.speculative_config.dynamic_tree_max_topK)
-                    self.decoding_config = DecodingConfig(
-                        decoding_mode=DecodingMode.Eagle(),
-                        eagle_config=eagle_config)
-                else:
-                    from tensorrt_llm._torch.speculative import Eagle3Config
-                    self.speculative_config = Eagle3Config(
-                        max_draft_len=self.speculative_config.max_draft_len,
-                        speculative_model_dir=self.speculative_config.
-                        speculative_model_dir,
-                        eagle3_one_model=self.speculative_config.
-                        eagle3_one_model)
-                """
             elif isinstance(self.speculative_config, NGramDecodingConfig):
                 assert self.backend in ['pytorch', '_autodeploy']
                 assert self.speculative_config.max_draft_len > 0 and self.speculative_config.max_matching_ngram_size > 0
@@ -1486,34 +1464,26 @@ class BaseLlmArgs(BaseModel):
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
 
             elif isinstance(self.speculative_config, DraftTargetDecodingConfig):
-                assert self.backend == 'pytorch'
+                assert self.backend in ['pytorch']
                 assert self.speculative_config.max_draft_len > 0
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.DRAFT_TOKENS_EXTERNAL
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
 
             elif isinstance(self.speculative_config, MTPDecodingConfig):
+                assert self.speculative_config.num_nextn_predict_layers > 0
                 self.speculative_config.max_draft_len = self.speculative_config.num_nextn_predict_layers  # from __post_init__()
-                """
-                from tensorrt_llm._torch.speculative import MTPConfig
-                self.speculative_config = MTPConfig(
-                    num_nextn_predict_layers=self.speculative_config.
-                    num_nextn_predict_layers,
-                    max_batch_size=self.build_config.max_batch_size,
-                    use_relaxed_acceptance_for_thinking=self.speculative_config.
-                    use_relaxed_acceptance_for_thinking,
-                    relaxed_topk=self.speculative_config.relaxed_topk,
-                    relaxed_delta=self.speculative_config.relaxed_delta,
-                    use_mtp_vanilla=self.speculative_config.use_mtp_vanilla)
-                """
+
             elif isinstance(self.speculative_config,
                             UserProvidedDecodingConfig):
                 assert self.backend in ['pytorch', '_autodeploy']
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.USER_PROVIDED
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
+
             else:
                 raise ValueError(
                     f"Unrecognized speculative config type {type(self.speculative_config)}"
                 )
+
         else:
             self.decoding_config = None
 

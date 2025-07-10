@@ -899,7 +899,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         max_batch_size: int,
         mapping: Mapping,
         dtype: DataType = DataType.HALF,
-        spec_config: Optional["SpecConfig"] = None,
+        spec_config: Optional["DecodingBaseConfig"] = None,
     ) -> None:
 
         # mamba hybrid cache requires block reuse to be disabled in KV cache config
