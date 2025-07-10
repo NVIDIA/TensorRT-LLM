@@ -332,6 +332,7 @@ async def test_completion_with_logit_bias(async_client: openai.AsyncOpenAI,
     
     assert completion.choices[0].text
 
+
 @pytest.mark.asyncio
 async def test_completion_with_invalid_logit_bias(async_client: openai.AsyncOpenAI,
                                                  model_name: str):
@@ -343,6 +344,7 @@ async def test_completion_with_invalid_logit_bias(async_client: openai.AsyncOpen
             logit_bias={"invalid_token": 1.0},  # Non-integer key
             max_tokens=5,
         )
+
         
 def test_detokenize_single(client: openai.OpenAI, model_name):
     completion = client.completions.create(
