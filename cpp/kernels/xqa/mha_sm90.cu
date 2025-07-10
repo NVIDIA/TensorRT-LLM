@@ -686,8 +686,13 @@ CUBIN_EXPORT __global__
     constexpr uint32_t tileSize = gemm0CtaTileNbTokens;
     static_assert(!(allowSlidingWindow && useSpecDec), "Sliding window is not yet supported in spec-dec mode");
 #if SLIDING_WINDOW
+#if SPEC_DEC
+    bool const rtIsReallySliding = (cacheSeqLen - (reqInputTokEnd - reqInputTokBeg) > slidingWinSize);
+    uint32_t const nbTotalSkipTokens = rtIsReallySliding ? cacheSeqLen - slidingWinSize - (reqInputTokEnd - reqInputTokBeg) : 0;
+#else
     bool const rtIsReallySliding = (cacheSeqLen > slidingWinSize);
     uint32_t const nbTotalSkipTokens = rtIsReallySliding ? cacheSeqLen - slidingWinSize : 0;
+#endif
 #else
     constexpr bool rtIsReallySliding = false;
     constexpr uint32_t nbTotalSkipTokens = 0;
@@ -721,9 +726,9 @@ CUBIN_EXPORT __global__
         return;
     }
 #if SPEC_DEC
-    uint32_t const idxInputSubSeq = blockIdx.x;
-    uint32_t const inputSeqLen = reqInputTokEnd - reqInputTokBeg;
-    uint32_t const ctaTokOffset = inputTokensPerCta * idxInputSubSeq;
+    uint32_t const idxInputSubSeq = blockIdx.x; // 0 or 1  // 
+    uint32_t const inputSeqLen = reqInputTokEnd - reqInputTokBeg; // 5
+    uint32_t const ctaTokOffset = inputTokensPerCta * idxInputSubSeq; // 4 * 0 or 1
     uint32_t const ctaNbValidTokens = mha::min(uint32_t{inputTokensPerCta}, inputSeqLen - ctaTokOffset);
     if (ctaTokOffset >= inputSeqLen)
     {
@@ -888,9 +893,7 @@ CUBIN_EXPORT __global__
             acc = acc * qkScale;
 
             // apply mask
-#if SPEC_DEC
-            warpGrpApplyMask(acc, specDec, cacheSeqLen, idxKTile, warpRank);
-#else
+
             bool const isFirstTile = (idxKTile == nbSkipLeadingTiles);
             bool const needMaskLeading = (rtIsReallySliding && isFirstTile && tile0NbSkipTokens > 0);
             bool const isLastTile = (idxKTile + 1 == nbTiles);
@@ -901,14 +904,15 @@ CUBIN_EXPORT __global__
                 uint32_t const validTokenEnd = (needMaskTrailing ? cacheSeqLen % tileSize : tileSize);
                 if (validTokenBeg > 0 || validTokenEnd < tileSize)
                 {
-#if SWAP_AB
+#if SPEC_DEC
+                    warpGrpApplyMask(acc, specDec, cacheSeqLen, idxKTile, warpRank);
+#elif SWAP_AB
                     warpGrpApplyMask(warpRank, acc, validTokenBeg, validTokenEnd);
 #else
                     warpGrpApplyMask(acc, validTokenBeg, validTokenEnd);
 #endif
                 }
             }
-#endif
             // update colMax in shared mem and get a register copy
 #if SWAP_AB
             RegColWiseVec const colMax = computeWarpGrpColMax_sync(smem.gemm0WarpGrpBar, smem.gemm0CurrentSeqMax, acc);
@@ -1342,7 +1346,7 @@ CUBIN_EXPORT __global__
                 kTilePartLoader.loadPages(idxKTile);
 #if USE_INPUT_KV || ENABLE_PDL == 2
 #if SPEC_DEC
-                static_assert(SLIDING_WINDOW == 0);
+                // static_assert(SLIDING_WINDOW == 0);
                 bool const anyNewTokens = (gemm0CtaTileNbTokens * (idxKTile + 1) > cacheSeqLen - inputSeqLen);
 #else
                 bool const anyNewTokens = (gemm0CtaTileNbTokens * (idxKTile + 1) >= cacheSeqLen);
