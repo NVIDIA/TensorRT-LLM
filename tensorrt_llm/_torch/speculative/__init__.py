@@ -1,5 +1,5 @@
 from .eagle3 import Eagle3SpecMetadata
-from .interface import SpecMetadata
+from .interface import SpecConfig, SpecMetadata
 from .mtp import MTPEagleWorker, MTPSpecMetadata, MTPWorker
 from .ngram import NGramDrafter, NGramPoolManager
 from .utils import (get_draft_model_prompt, get_num_extra_kv_tokens,
@@ -14,6 +14,7 @@ __all__ = [
     "MTPWorker",
     "NGramDrafter",
     "NGramPoolManager",
+    "SpecConfig",
     "SpecMetadata",
     "get_draft_model_prompt",
     "get_num_extra_kv_tokens",

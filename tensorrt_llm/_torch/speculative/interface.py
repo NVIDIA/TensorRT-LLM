@@ -106,6 +106,16 @@ class SpeculativeDecodingMode(IntEnum):
 
 
 @dataclass
+class SpecConfig:
+    """
+    Configuration for speculative decoding.
+    TODO: This class is deprecated, but thread-leak of pytest raises flaky error if removing it.
+    """
+    # The name of speculative decoding.
+    spec_dec_name = None
+
+
+@dataclass
 class SpecMetadata:
     """
     Metadata for speculative decoding.
