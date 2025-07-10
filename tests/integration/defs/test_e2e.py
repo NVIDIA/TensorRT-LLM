@@ -1963,9 +1963,12 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
     ("llava-v1.6-mistral-7b", "llava-v1.6-mistral-7b-hf"),
     ("qwen2-vl-7b-instruct", "Qwen2-VL-7B-Instruct"),
     ("qwen2.5-vl-7b-instruct", "Qwen2.5-VL-7B-Instruct"),
+    ("mistral-small-3.1-24b-instruct", "Mistral-Small-3.1-24B-Instruct-2503"),
 ])
 def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                                    modality, use_cuda_graph):
+    # NOTE: individual tests need to be enabled in
+    # tests/integration/test_lists/qa/examples_test_list.txt
     llm_venv.run_cmd(
         ['-m', 'pip', 'install', 'flash-attn==2.7.3', '--no-build-isolation'])
 
@@ -2049,6 +2052,16 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
             "video": [
                 ["woman", "neon", "night", "jacket", "wet"],
                 ["earth", "rotating", "night", "lights", "cities"],
+            ],
+        },
+        "mistral-small-3.1-24b-instruct": {
+            "image": [
+                [
+                    "dramatic", "seascape", "stormy", "turbulent", "waves",
+                    "rough"
+                ],
+                ["scenic", "rock", "landscape", "snow", "formation"],
+                ["highway", "traffic", "directions", "lanes", "Jurong"],
             ],
         },
     }
