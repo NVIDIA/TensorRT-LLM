@@ -34,6 +34,10 @@ Note:
 
 | Model/Feature | Overlap Scheduler | CUDA Graph | Attention Data Parallelism | Disaggregated Serving | Chunked Prefill | MTP | EAGLE-3(One Model Engine) | EAGLE-3(Two Model Engine) | Torch Sampler | TLLM C++ Sampler | KV Cache Reuse | Slide Window Attention | Logits Post Processor | Guided Decoding |
 | ------------- | ----------------- | ---------- | -------------------------- | --------------------- | --------------- | --- | ------------------------- | ------------------------- | ------------- | ---------------- | -------------- | ---------------------- | --------------------- | --------------- |
-| DeepSeek-V3   | Yes               | Yes        | Yes                        | Yes                   | Yes(1)          | Yes | No                        | No                        | Yes           | Yes              | Yes(2)         | ---                    | Yes                   | Yes             |
+| DeepSeek-V3   | Yes               | Yes        | Yes                        | Yes                   | Yes [^1]        | Yes | No                        | No                        | Yes           | Yes              | Yes [^2]       | ---                    | Yes                   | Yes             |
 | Qwen3         | Yes               | Yes        | Yes                        | Yes                   | Yes             | No  | No                        | No                        | Yes           | Yes              | Yes            | ---                    | Yes                   | Yes             |
 | Llama 4       | Yes               | Yes        | Yes                        | Yes                   | Untested        | No  | Yes                       | Yes                       | Yes           | Yes              | Untested       | ---                    | Yes                   | Yes             |
+
+
+[^1] Chunked Prefill for MLA can only be enabled on SM100.
+[^2] KV cache reuse for MLA can only be enabled on SM90/SM100 and in BF16/FP8 KV cache dtype.
