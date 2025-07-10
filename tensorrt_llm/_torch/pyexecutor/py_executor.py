@@ -1083,11 +1083,8 @@ class PyExecutor:
                         scheduled_batch.context_requests
                     ) if self.kv_cache_transceiver else []
 
-                    has_previous_batch = self.previous_batch is not None
-                    if has_previous_batch:
-                        previous_batch_size = self.previous_batch.sample_state.scheduled_requests.batch_size
-                        if previous_batch_size > 0:  # first previous batch size is 0
-                            self._process_previous_batch()
+                    if self.previous_batch is not None:
+                        self._process_previous_batch()
                         self.previous_batch: Optional[BatchState] = None
 
                     # Separate chunked requests so we can handle them in _update_requests w/o relying on the request state.
