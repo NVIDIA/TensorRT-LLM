@@ -115,7 +115,7 @@ void prepareForward(decoder::DecoderState const& decoderState, SizeType32 step, 
 
     dInput.batchSlots = input.forwardBatchSlots.at(step);
     dInput.batchSize = static_cast<SizeType32>(dInput.batchSlots->getSize());
-    dInput.logitsVec = input.logits.at(step);
+    dInput.logitsVec = input.batchLogits.at(step);
 
     if (speculativeDecodingMode.isDraftTokensExternal())
     {
