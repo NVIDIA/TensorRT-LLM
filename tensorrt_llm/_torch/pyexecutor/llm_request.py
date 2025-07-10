@@ -269,16 +269,15 @@ def create_response(
         use_fast_logits=False,
         mpi_world_rank=0) -> tensorrt_llm.bindings.executor.Response | None:
     """ Create a response for a given request. """
-
-    result = request.create_result(use_fast_logits, mpi_world_rank)
-
-    if result is None:
-        return None
-    else:
-        return LlmResponse(request_id=request.py_request_id,
-                           result=LlmResult(result, request.py_result,
-                                            result.is_final),
-                           client_id=request.py_client_id)
+    create_serialized_result = \
+        super(LlmRequest, request).create_serialized_result \
+        if isinstance(request, LlmRequest) else \
+        request.create_serialized_result
+    result, is_final = create_serialized_result(use_fast_logits, mpi_world_rank)
+    return LlmResponse(
+        request_id=request.py_request_id,
+        result=LlmResult(result, request.py_result, is_final),
+        client_id=request.py_client_id) if len(result) > 0 else None
 
 
 def finish_by(request: Union[
@@ -357,6 +356,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                                   return_generation_logits,
                                   exclude_last_generation_logits)
 
+    def is_generation_only_request(self):
+        return self.py_llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
+
     def create_child_request(self, request_id: int):
         """ Create a child request.
 
@@ -382,6 +384,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # Override specific attributes that should use child_request values.
         child_request.py_parent_request_id = self.py_request_id
         child_request.py_request_id = child_request.request_id
+        child_request.py_llm_request_type = child_request.llm_request_type
         child_request.py_batch_idx = None
         child_request.is_attention_dp_dummy = self.is_attention_dp_dummy
         child_request.is_cuda_graph_dummy = self.is_cuda_graph_dummy
