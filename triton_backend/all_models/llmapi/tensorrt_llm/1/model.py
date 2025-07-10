@@ -29,8 +29,12 @@ import gc
 import json
 import os
 import queue
+import sys
 import threading
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from random import randint
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -44,7 +48,16 @@ from mpi4py.MPI import COMM_WORLD
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._utils import global_mpi_rank, global_mpi_size
+from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
+
+
+@dataclass
+class RequestData:
+    triton_req_id: int
+    triton_user_id: str
+    triton_request: Any
+    response_iterator: RequestOutput
 
 
 def get_model_config(filename, include_keys=None, exclude_keys=None):
@@ -71,6 +84,22 @@ def get_model_config(filename, include_keys=None, exclude_keys=None):
             for k, v in engine_config.items() if k not in exclude_keys
         }
     return engine_config
+
+
+def get_input_scalar_by_name(request,
+                             name,
+                             expected_batch_size=1,
+                             batch_index=0):
+    tensor = pb_utils.get_input_tensor_by_name(request, name)
+    if tensor is None:
+        return None
+    tensor = tensor.as_numpy()
+
+    if tensor.size != expected_batch_size:
+        raise pb_utils.TritonModelException(
+            f"Expected a scalar tensor for tensor {name}")
+
+    return tensor.item(batch_index)
 
 
 class TritonPythonModel:
@@ -146,11 +175,21 @@ class TritonPythonModel:
             # Starting the TRT-LLM engine with LLM API and its event thread running the AsyncIO event loop.
             self._init_engine()
 
+            self.running = False
+
             # Starting the response thread. It allows TRT-LLM to keep making progress while
             # response sender(s) are sending responses to server frontend.
             self._response_queue = queue.Queue()
             self._response_thread = threading.Thread(target=self._response_loop)
             self._response_thread.start()
+
+            self.req_id_to_request_data = {}
+            self.triton_user_id_to_req_ids = {}
+            self.lock = threading.Lock()
+            self.cancellation_thread = threading.Thread(
+                target=self.cancellation_loop)
+            self.running = True
+            self.cancellation_thread.start()
         else:
             self.logger.log_info(
                 f"[trtllm] rank{global_mpi_rank()} is waiting for the leader node..."
@@ -267,6 +306,41 @@ class TritonPythonModel:
             finally:
                 if response_flag == pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL:
                     self._ongoing_request_count -= 1
+                    with self.lock:
+                        if self.running:
+                            self.cancellation_thread.join()
+                            self.cancellation_thread = None
+                            self.running = False
+
+    def cancellation_loop(self):
+        """Checks if any pending requests have been cancelled."""
+        while self.running:
+            import time
+            time.sleep(.001)
+            #with self.lock:
+            #    for req_id, request_data in self.req_id_to_request_data.items():
+            #        if request_data.triton_request.is_cancelled():
+            #            print(f'cancelled request {req_id}')
+
+    def handle_stop_request(self, triton_user_id, response_sender):
+        if triton_user_id is None or triton_user_id == "":
+            response_sender.send(
+                pb_utils.InferenceResponse(error=pb_utils.TritonError(
+                    "A request id must be provided for request cancellation")),
+                flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL)
+            return
+
+        with self.lock:
+            if triton_user_id in self.triton_user_id_to_req_ids:
+                req_ids = self.triton_user_id_to_req_ids[triton_user_id]
+                for req_id in req_ids:
+                    request_data = self.req_id_to_request_data[req_id]
+                    request_data.response_iterator.abort()
+
+        response_sender.send(
+            pb_utils.InferenceResponse(error=pb_utils.TritonError(
+                "Request cancelled by client", pb_utils.TritonError.CANCELLED)),
+            flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL)
 
     def execute(self, requests):
         """
@@ -295,6 +369,13 @@ class TritonPythonModel:
         Execute a single inference request asynchronously.
         """
         response_sender = request.get_response_sender()
+        triton_user_id = request.request_id()
+
+        stop = get_input_scalar_by_name(request, 'stop')
+        if stop:
+            self.handle_stop_request(triton_user_id, response_sender)
+            return
+
         response_state = {
             "response_sender": response_sender,
             "is_cancelled": False,
@@ -303,6 +384,10 @@ class TritonPythonModel:
         }
         self._ongoing_request_count += 1
         decrement_ongoing_request_count = True
+
+        # Unique request id used to identify each triton request
+        triton_req_id = str(randint(0, sys.maxsize))
+
         try:
             # TODO: [JIRA-4496] Implement when request contains batched prompts
             (prompt, sampling_params, streaming,
@@ -314,8 +399,22 @@ class TritonPythonModel:
             response_iterator = self._llm_engine.generate_async(
                 prompt, SamplingParams(**sampling_params), streaming)
 
+            print(f'adding request_id: {triton_req_id}')
+            print(f'response_iterator: {type(response_iterator)}')
+            with self.lock:
+                self.req_id_to_request_data[triton_req_id] = RequestData(
+                    triton_req_id=triton_req_id,
+                    triton_user_id=request.request_id(),
+                    triton_request=request,
+                    response_iterator=response_iterator,
+                )
+                if triton_user_id is not None and triton_user_id != "" and triton_user_id:
+                    self.triton_user_id_to_req_ids[triton_user_id] = set()
+                    # TODO: [JIRA-4496] Add all batched request ids to the set
+                    self.triton_user_id_to_req_ids[triton_user_id].add(
+                        triton_req_id)
+
             async for request_output in response_iterator:
-                # TODO: [JIRA-4040] Add request cancellation check here
                 # Send each response if streaming.
                 if streaming:
                     response = self._create_response(
@@ -332,6 +431,7 @@ class TritonPythonModel:
 
             # Send the last response which contains all the outputs if not streaming.
             if not streaming:
+                print(f'sending last response for request_id: {triton_req_id}')
                 response_sender.send(
                     self._create_response(request_output=request_output,
                                           output_config=output_config),
@@ -352,6 +452,12 @@ class TritonPythonModel:
         finally:
             if decrement_ongoing_request_count:
                 self._ongoing_request_count -= 1
+            with self.lock:
+                print(f'deleting request_id: {triton_req_id}')
+                if triton_req_id in self.req_id_to_request_data:
+                    del self.req_id_to_request_data[triton_req_id]
+                if triton_user_id is not None and triton_user_id != "" and triton_user_id in self.triton_user_id_to_req_ids:
+                    del self.triton_user_id_to_req_ids[triton_user_id]
 
     def _convert_request(self, request):
         """Helper function to convert the request into a prompt for LLM.generate_async
@@ -552,6 +658,11 @@ class TritonPythonModel:
         if self._response_thread is not None:
             self._response_thread.join()
             self._response_thread = None
+
+        if self.cancellation_thread is not None:
+            self.running = False
+            self.cancellation_thread.join()
+            self.cancellation_thread = None
 
         # When using parallel tensors, the stub process may not shutdown due to
         # unreleased references, so manually run the garbage collector once.
