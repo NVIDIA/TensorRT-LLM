@@ -26,6 +26,7 @@ from utils.util import getSMVersion
 
 from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.modules.fused_moe import RoutingMethodType
+from tensorrt_llm._torch.utils import next_positive_power_of_2
 from tensorrt_llm.quantization.utils.fp4_utils import (
     reorder_rows_for_gated_act_gemm, shuffle_matrix_a, shuffle_matrix_sf_a)
 
@@ -817,16 +818,22 @@ class TestMoeFp4:
         #
         # Data Generation
         #
-
+        num_experts = routing_info["num_experts"]
         top_k = routing_info["top_k"]
-        # FIXME: set to TileN size
-        padding = routing_info["padding"]
         n_groups = routing_info["n_groups"]
         top_k_groups = routing_info["top_k_groups"]
         routed_scaling = routing_info["routed_scaling"]
-        num_experts = routing_info["num_experts"]
+        has_routing_bias = routing_info["has_routing_bias"]
         routing_method_type = routing_info["routing_method_type"]
-        tile_tokens_dim = 8
+        # Perfect expert distribution results in `num_tokens * top_k / num_experts` tokens per expert.
+        tile_tokens_dim = (num_tokens * top_k) // num_experts
+        # And pad the number of tokens to the next power of 2.
+        tile_tokens_dim = next_positive_power_of_2(tile_tokens_dim)
+        # At least padded to 8 tokens per CTA tile
+        tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
+        padding = tile_tokens_dim
+        if padding >= 256:
+            pytest.skip("Routing kernel requires that padding be less than 256")
 
         assert top_k <= num_experts
         assert top_k <= 8
@@ -844,7 +851,7 @@ class TestMoeFp4:
             expert_logits = torch.randn((num_tokens, num_experts),
                                         device='cuda').to(torch.bfloat16)
 
-        if routing_info["has_routing_bias"]:
+        if has_routing_bias:
             routing_bias = torch.randn(num_experts,
                                        device="cuda",
                                        dtype=torch.bfloat16)
@@ -1073,8 +1080,6 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
     # Data Generation
     #
     num_experts, n_groups, top_k_groups, top_k, use_routing_scales_on_input = expert_info
-    # FIXME: set to TileN size
-    padding = 8
     routed_scaling = 2.5
     routing_method_type = RoutingMethodType.Llama4
     tile_tokens_dim = 8
@@ -1109,10 +1114,10 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
 
     permute_info, scores = routing_reference_no_aux(
         expert_logits, routing_bias, top_k, n_groups, top_k_groups,
-        routed_scaling, padding, use_routing_scales_on_input)
+        routed_scaling, tile_tokens_dim, use_routing_scales_on_input)
 
     args = moe_args(num_tokens, num_experts, hidden_size, intermediate_size,
-                    top_k, padding, hidden_states_quant, None,
+                    top_k, tile_tokens_dim, hidden_states_quant, None,
                     hidden_states_global_scale, scores, gemm1_weights_quant,
                     None, gemm1_global_scales, gemm2_weights_quant, None,
                     gemm2_global_scales, permute_info,
