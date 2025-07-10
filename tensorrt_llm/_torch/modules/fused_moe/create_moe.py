@@ -144,7 +144,6 @@ def create_moe(
         )
     elif moe_cls == FluxFusedMoE:
         assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in FluxFusedMoE."
-        assert not enable_alltoall, "enable_alltoall is not supported in FluxFusedMoE."
         assert moe_load_balancer is None, "moe_load_balancer is not supported in FluxFusedMoE."
         assert model_config.mapping.enable_attention_dp, "FluxFusedMoE should be used with attention dp"
 

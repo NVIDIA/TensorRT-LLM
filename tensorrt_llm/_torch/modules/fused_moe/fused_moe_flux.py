@@ -1,14 +1,10 @@
-import threading
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import flux
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.utils._mode_utils import no_dispatch
-
-from tensorrt_llm._torch.modules.linear import (TensorParallelMode,
-                                                load_weight_shard)
 
 from ...distributed import allgather
 from ...model_config import ModelConfig
@@ -59,15 +55,24 @@ class FluxFusedMoE(VanillaMoE):
                                       nnodes=self.mapping.node_num,
                                       ep_group=get_ep_group(self.mapping))
         topk = self.routing_method.get_experts_per_token()
+
         # flux_m_max is the size for the shared memory(nvshmem) used by flux
         flux_m_max = self.moe_max_num_tokens * topk * self.dist_env.world_size
+
+        # we have to do this redundant initialization because create_weights could be skipped in __init__
+        self.has_fp8_qdq = self.quant_config and self.quant_config.layer_quant_mode.has_any_quant(
+            exclude_kv_cache=True
+        ) and self.quant_config.layer_quant_mode.has_fp8_qdq()
+        # Flux moe_ag_scatter requires input_dtype and weight_dtype to be the same. if has_fp8_qdq, use float8_e4m3fn as input_dtype
+        input_dtype = torch.float8_e4m3fn if self.has_fp8_qdq else self.dtype
+
         moe_args = flux.MoeArguments(
             max_ntokens=self.moe_max_num_tokens,
             hidden=self.hidden_size,
             ffn_hidden=self.intermediate_size,
             nexperts=self.num_experts,
             topk=topk,
-            input_dtype=self.dtype,
+            input_dtype=input_dtype,
             output_dtype=self.dtype,
         )
 
@@ -81,11 +86,26 @@ class FluxFusedMoE(VanillaMoE):
 
     def _check_configs(self):
         assert self.use_dp, "FluxFusedMoe should be used with attention dp."
+        assert not (self.quant_config.layer_quant_mode.has_fp8_block_scales()
+                    or self.quant_config.layer_quant_mode.has_nvfp4()
+                    ), "FluxFusedMoE does not support fp8_block_scales or nvfp4"
 
     # flux sample code: https://github.com/bytedance/flux/blob/main/python/flux/testing/moe_utils.py#L141
     def calc_scatter_index_stable(self, choosed_experts):
         return (choosed_experts.flatten().argsort(
             stable=True).argsort().int().view(choosed_experts.shape))
+
+    def quantize_e4m3_activation(self, x: torch.Tensor, input_scale=None):
+        if x is not None and x.numel() != 0:
+            if input_scale is not None:
+                x, x_scale = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                    x, input_scale)
+            else:
+                x, x_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(x)
+            return x, x_scale
+        else:
+            return torch.empty_like(x, dtype=torch.float8_e4m3fn), torch.ones(
+                1, dtype=torch.float32).cuda()
 
     def forward(
         self,
@@ -108,8 +128,8 @@ class FluxFusedMoE(VanillaMoE):
         assert token_final_scales.dtype == torch.float32
         assert token_selected_experts.dtype == torch.int32
 
-        # split the gate_up_proj_weight into up_proj_weight and gate_weight since flux does not support fused GatedMLP
-        up_proj_weight, gate_weight = torch.split(
+        # split the gate_up_proj_weight into gate_weight and up_proj_weight since flux does not support fused GatedMLP
+        gate_weight, up_proj_weight = torch.split(
             self.gate_up_proj_weight,
             self.intermediate_size_per_partition,
             dim=1)
@@ -136,11 +156,22 @@ class FluxFusedMoE(VanillaMoE):
         ]
 
         weights = [gate_weight.contiguous(), up_proj_weight.contiguous()]
+
+        ag_scatter_output_scale = None
+        if self.has_fp8_qdq and x.dtype != torch.float8_e4m3fn:
+            x, x_scale = self.quantize_e4m3_activation(
+                x, self.gate_up_proj_input_scale)
+            assert x_scale.shape == self.gate_up_proj_weight_scale.shape, f"x_scale.shape: {x_scale.shape}, self.gate_up_proj_weight_scale.shape: {self.gate_up_proj_weight_scale.shape}, shape not match"
+            ag_scatter_output_scale = [
+                x_scale * self.gate_up_proj_weight_scale
+            ] * 2
+
         self.flux_ag_op.forward_multiple_weights(
             inputs_shard=x,
             weights=weights,
             splits_gpu=splits_gpu,
             scatter_index=scatter_index,
+            output_scale=ag_scatter_output_scale,
             outputs_buf=flux_intermediate_output)
         gate_output, up_proj_output = flux_intermediate_output[
             0], flux_intermediate_output[1]
@@ -158,13 +189,22 @@ class FluxFusedMoE(VanillaMoE):
         weighted_gated_mlp_output = gated_mlp_output * scattered_routing_scores[
             begin_token_index:end_token_index]
 
+        gather_rs_input_scale = None
+        gather_rs_weight_scale = None
+        if self.has_fp8_qdq and weighted_gated_mlp_output.dtype != torch.float8_e4m3fn:
+            # use dynamic quantization for gather_rs_input_scale for now(todo: may be need to fix by using static quantization)
+            weighted_gated_mlp_output, gather_rs_input_scale = self.quantize_e4m3_activation(
+                weighted_gated_mlp_output)
+            gather_rs_input_scale = gather_rs_input_scale[0].to(torch.float32)
+            gather_rs_weight_scale = self.down_proj_weight_scale
+
         final_hidden_states = self.flux_rs_op.forward_gather_rs(
             weighted_gated_mlp_output,
             self.down_proj_weight,
             splits_cpu,
             scatter_index.view(-1),
-            input_scale=None,
-            weight_scale=None,
+            input_scale=gather_rs_input_scale,
+            weight_scale=gather_rs_weight_scale,
             output_vec_scale=None,
             fast_accum=False)
 
@@ -174,98 +214,96 @@ class FluxFusedMoE(VanillaMoE):
 
         return outputs
 
-    def load_weights(self, weights: List[Dict]):
-        assert self._weights_created
-        assert len(weights) == 1
-        weights = weights[0]
-
-        def load_expert_gate_up_proj_weight(
-                gate_weight, up_proj_weight,
-                dst_gate_up_proj_weight: torch.Tensor):
-            gate_weight_shard = load_weight_shard(gate_weight, self.tp_size,
-                                                  self.tp_rank,
-                                                  TensorParallelMode.COLUMN)
-            up_proj_weight_shard = load_weight_shard(up_proj_weight,
-                                                     self.tp_size, self.tp_rank,
-                                                     TensorParallelMode.COLUMN)
-
-            w31_weight_shard = torch.cat(
-                [up_proj_weight_shard, gate_weight_shard], dim=0)
-            dst_gate_up_proj_weight.copy_(
-                w31_weight_shard.view(dst_gate_up_proj_weight.dtype))
-
-        def load_expert_down_proj_weight(down_proj_weight,
-                                         dst_down_proj_weight: torch.Tensor):
-            down_proj_weight_shard = load_weight_shard(down_proj_weight,
-                                                       self.tp_size,
-                                                       self.tp_rank,
-                                                       TensorParallelMode.ROW)
-
-            dst_down_proj_weight.copy_(
-                down_proj_weight_shard.view(dst_down_proj_weight.dtype))
-
-        # Use multi-threading to load expert weights in parallel.
-        # Even though CPython has global interpreter lock (GIL),
-        # it's still faster to load weights in parallel because it can utilize
-        # CPU memory bandwidth better.
-        threads = []
-
-        for expert_id in range(self.expert_start, self.expert_end):
-            expert_idx = expert_id - self.expert_start
-
-            if self.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
-                gate_weight = weights[f"{expert_id}.w1.weight"]
-                up_proj_weight = weights[f"{expert_id}.w3.weight"]
-                down_proj_weight = weights[f"{expert_id}.w2.weight"]
-            elif self.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
-                w1_up_proj_weight = weights["gate_up_proj"][
-                    expert_id].transpose(0, 1)
-                gate_weight, up_proj_weight = w1_up_proj_weight.chunk(2, dim=0)
-                down_proj_weight = weights["down_proj"][expert_id].transpose(
-                    0, 1).contiguous()
-            else:
-                raise NotImplementedError(
-                    f"Unknown weight loading mode in MoE: {self.weight_loading_mode}"
-                )
-
-            thread = threading.Thread(
-                target=load_expert_gate_up_proj_weight,
-                args=(gate_weight, up_proj_weight,
-                      self.gate_up_proj_weight.data[expert_idx]))
-            thread.start()
-            threads.append(thread)
-
-            thread = threading.Thread(
-                target=load_expert_down_proj_weight,
-                args=(down_proj_weight, self.down_proj_weight.data[expert_idx]))
-            thread.start()
-            threads.append(thread)
-
-        for thread in threads:
-            thread.join()
-
     def create_weights(self):
         if self._weights_created:
             return
         self._weights_created = True
-        weight_dtype = self.dtype
-        gate_up_proj_weight_shape = (self.expert_size_per_partition,
-                                     self.intermediate_size_per_partition * 2,
-                                     self.hidden_size)
-        down_proj_weight_shape = (
+        assert self.pack_weights, "FluxFusedMoE should be used with pack_weights"
+
+        self.has_any_quant = False
+        self.has_fp8_qdq = False
+        gate_up_proj_shape = (
+            self.expert_size_per_partition,
+            self.intermediate_size_per_partition * 2,
+            self.hidden_size,
+        )
+        down_proj_shape = (
             self.expert_size_per_partition,
             self.hidden_size,
             self.intermediate_size_per_partition,
         )
+        if self.quant_config and self.quant_config.layer_quant_mode.has_any_quant(
+                exclude_kv_cache=True):
+            self.has_any_quant = True
+            qc = self.quant_config
+            if qc.layer_quant_mode.has_fp8_qdq():
+                self.has_fp8_qdq = True
 
-        # Fused gate_up_proj (column parallel)
-        gate_up_proj_weight = nn.Parameter(torch.empty(
-            gate_up_proj_weight_shape, dtype=weight_dtype),
-                                           requires_grad=False)
-        self.register_parameter("gate_up_proj_weight", gate_up_proj_weight)
+                self.gate_up_proj_weight = nn.Parameter(
+                    torch.empty(
+                        gate_up_proj_shape,
+                        dtype=torch.float8_e4m3fn,
+                    ),
+                    requires_grad=False,
+                )
+                self.gate_up_proj_weight_scale = nn.Parameter(
+                    torch.empty(
+                        self.expert_size_per_partition,
+                        dtype=torch.float32,
+                    ),
+                    requires_grad=False,
+                )
+                self.gate_up_proj_input_scale = nn.Parameter(
+                    torch.empty(
+                        self.expert_size_per_partition,
+                        dtype=torch.float32,
+                    ),
+                    requires_grad=False,
+                )
+                self.gate_up_proj_inv_input_scale = nn.Parameter(
+                    torch.empty(
+                        self.expert_size_per_partition,
+                        dtype=torch.float32,
+                    ),
+                    requires_grad=False,
+                )
 
-        # down_proj (row parallel)
-        down_proj_weight = nn.Parameter(torch.empty(down_proj_weight_shape,
-                                                    dtype=weight_dtype),
-                                        requires_grad=False)
-        self.register_parameter("down_proj_weight", down_proj_weight)
+                self.down_proj_weight = nn.Parameter(
+                    torch.empty(
+                        down_proj_shape,
+                        dtype=torch.float8_e4m3fn,
+                    ),
+                    requires_grad=False,
+                )
+                self.down_proj_weight_scale = nn.Parameter(
+                    torch.empty(
+                        self.expert_size_per_partition,
+                        dtype=torch.float32,
+                    ),
+                    requires_grad=False,
+                )
+                self.down_proj_input_scale = nn.Parameter(
+                    torch.empty(
+                        self.expert_size_per_partition,
+                        dtype=torch.float32,
+                    ),
+                    requires_grad=False,
+                )
+                self.down_proj_inv_input_scale = nn.Parameter(
+                    torch.empty(
+                        self.expert_size_per_partition,
+                        dtype=torch.float32,
+                    ),
+                    requires_grad=False,
+                )
+            else:
+                raise ValueError(f'unsupported quant mode: {qc.quant_mode}')
+        else:
+            self.gate_up_proj_weight = nn.Parameter(
+                torch.empty(gate_up_proj_shape, dtype=self.dtype),
+                requires_grad=False,
+            )
+            self.down_proj_weight = nn.Parameter(
+                torch.empty(down_proj_shape, dtype=self.dtype),
+                requires_grad=False,
+            )
