@@ -1,10 +1,9 @@
 #!/usr/bin/env python
 import asyncio
 import signal
-import traceback
 import time
+import traceback
 import uuid
-            
 from contextlib import asynccontextmanager
 from datetime import datetime
 from http import HTTPStatus
