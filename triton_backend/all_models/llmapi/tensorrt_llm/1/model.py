@@ -317,10 +317,23 @@ class TritonPythonModel:
         while self.running:
             import time
             time.sleep(.001)
-            #with self.lock:
-            #    for req_id, request_data in self.req_id_to_request_data.items():
-            #        if request_data.triton_request.is_cancelled():
-            #            print(f'cancelled request {req_id}')
+            with self.lock:
+                cancelled_req_ids = []
+                for req_id, request_data in self.req_id_to_request_data.items():
+                    if request_data.triton_request.is_cancelled():
+                        request_data.response_iterator.abort()
+
+                        response_sender = request_data.triton_request.get_response_sender(
+                        )
+                        response_sender.send(
+                            pb_utils.InferenceResponse(
+                                error=pb_utils.TritonError(
+                                    "Request cancelled by client",
+                                    pb_utils.TritonError.CANCELLED)),
+                            flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL)
+                        cancelled_req_ids.append(req_id)
+                for req_id in cancelled_req_ids:
+                    del self.req_id_to_request_data[req_id]
 
     def handle_stop_request(self, triton_user_id, response_sender):
         if triton_user_id is None or triton_user_id == "":
@@ -336,6 +349,7 @@ class TritonPythonModel:
                 for req_id in req_ids:
                     request_data = self.req_id_to_request_data[req_id]
                     request_data.response_iterator.abort()
+                    del self.req_id_to_request_data[req_id]
 
         response_sender.send(
             pb_utils.InferenceResponse(error=pb_utils.TritonError(
@@ -399,8 +413,6 @@ class TritonPythonModel:
             response_iterator = self._llm_engine.generate_async(
                 prompt, SamplingParams(**sampling_params), streaming)
 
-            print(f'adding request_id: {triton_req_id}')
-            print(f'response_iterator: {type(response_iterator)}')
             with self.lock:
                 self.req_id_to_request_data[triton_req_id] = RequestData(
                     triton_req_id=triton_req_id,
@@ -431,12 +443,18 @@ class TritonPythonModel:
 
             # Send the last response which contains all the outputs if not streaming.
             if not streaming:
-                print(f'sending last response for request_id: {triton_req_id}')
-                response_sender.send(
-                    self._create_response(request_output=request_output,
-                                          output_config=output_config),
-                    flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL,
-                )
+                was_cancelled = False
+
+                # If the request was cancelled, we don't need to send the last response
+                with self.lock:
+                    if not triton_req_id in self.req_id_to_request_data:
+                        was_cancelled = True
+
+                if not was_cancelled:
+                    response_sender.send(
+                        self._create_response(request_output=request_output,
+                                              output_config=output_config),
+                        flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL)
 
         except Exception as e:
             self.logger.log_error(f"[trtllm] Error generating request: {e}")
@@ -453,7 +471,6 @@ class TritonPythonModel:
             if decrement_ongoing_request_count:
                 self._ongoing_request_count -= 1
             with self.lock:
-                print(f'deleting request_id: {triton_req_id}')
                 if triton_req_id in self.req_id_to_request_data:
                     del self.req_id_to_request_data[triton_req_id]
                 if triton_user_id is not None and triton_user_id != "" and triton_user_id in self.triton_user_id_to_req_ids:
