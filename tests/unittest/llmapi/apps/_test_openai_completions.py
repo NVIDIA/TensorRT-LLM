@@ -369,6 +369,7 @@ async def test_completion_streaming(async_client: openai.AsyncOpenAI,
         tokens.extend(chunk.choices[0].token_ids)
 
     assert tokens == single_output
+
 @pytest.mark.asyncio
 async def test_completion_with_logit_bias(async_client: openai.AsyncOpenAI,
                                          model_name: str):

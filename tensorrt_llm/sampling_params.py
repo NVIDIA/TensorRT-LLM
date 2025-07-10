@@ -107,6 +107,7 @@ class BatchedLogitsProcessor(ABC):
         """
         pass  # noqa
     
+    
 class LogitBiasLogitsProcessor(LogitsProcessor):
     def __init__(self, logit_bias: Dict[str, float]) -> None:
         super().__init__()
@@ -140,7 +141,7 @@ class LogitBiasLogitsProcessor(LogitsProcessor):
         vocab_size = logits.size(-1)
         token_ids_list = list(self.tokens_to_adjust.keys())
         bias_values = torch.tensor(
-            list(self.tokens_to_adjust.values())
+            list(self.tokens_to_adjust.values()), device=logits.device
         )
         
         invalid_token_ids = [tid for tid in token_ids_list if tid >= vocab_size]
