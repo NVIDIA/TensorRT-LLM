@@ -38,8 +38,8 @@ public:
     using SizeType32 = runtime::SizeType32;
     using TensorPtr = runtime::ITensor::SharedPtr;
 
-    explicit DecoderInputBuffers(SizeType32 maxNumSequences, SizeType32 maxBatchSize, SizeType32 maxDecoderSteps,
-        runtime::BufferManager const& manager);
+    explicit DecoderInputBuffers(
+        SizeType32 maxBatchSize, SizeType32 maxDecoderSteps, runtime::BufferManager const& manager);
 
     void setupMedusaLogits(SizeType32 maxNumSequences, runtime::ModelConfig const& modelConfig);
 

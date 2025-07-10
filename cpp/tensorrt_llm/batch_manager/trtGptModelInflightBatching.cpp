@@ -1498,7 +1498,7 @@ void TrtGptModelInflightBatching::createBuffers(executor::DecodingConfig const& 
     for (SizeType32 i = 0; i < mNumMicroBatches; ++i)
     {
         mDecoderInputBuffers.emplace_back(
-            getMaxNumSequences(), getMaxBatchSize(), mModelConfig.getMaxDecodingTokens(), mRuntime->getBufferManager());
+            getMaxBatchSize(), mModelConfig.getMaxDecodingTokens(), mRuntime->getBufferManager());
         mDecoderInputBuffers.back().setupMedusaLogits(getMaxNumSequences(), mModelConfig);
         mDecoderOutputBuffers.emplace_back(getMaxNumSequences(), mOperatingBeamWidth, getMaxSequenceLen(),
             mModelConfig.getMaxDecodingTokens(), mRuntime->getBufferManager());
