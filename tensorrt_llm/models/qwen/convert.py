@@ -655,6 +655,34 @@ def convert_hf_qwen(hf_model,
                                        plugin_weight_only_quant_type, dtype,
                                        use_gemm_woq_plugin))
 
+        # Qwen3: Add q_norm and k_norm weight conversion
+        if qwen_type in ('qwen3', 'qwen3_moe'):
+            # Process q_norm.weight
+            q_norm_weight = get_weight(model_params,
+                                       prefix + key_list[0] + 'q_norm', dtype)
+            weights.update(
+                get_tllm_linear_weight(
+                    q_norm_weight,
+                    tllm_prex + 'attention.q_layernorm.',
+                    None,
+                    False,  # LayerNorm should not be quantized
+                    plugin_weight_only_quant_type,
+                    dtype,
+                    use_gemm_woq_plugin))
+
+            # Process k_norm.weight
+            k_norm_weight = get_weight(model_params,
+                                       prefix + key_list[0] + 'k_norm', dtype)
+            weights.update(
+                get_tllm_linear_weight(
+                    k_norm_weight,
+                    tllm_prex + 'attention.k_layernorm.',
+                    None,
+                    False,  # LayerNorm should not be quantized
+                    plugin_weight_only_quant_type,
+                    dtype,
+                    use_gemm_woq_plugin))
+
         if qwen_type == "qwen2_moe" and moe_config and moe_config.has_moe():
 
             # shared_expert for qwen2_moe
@@ -1039,7 +1067,7 @@ def load_weights_from_hf_gptq_model(hf_model, config: QWenConfig):
 
     model_params = {k: v for k, v in hf_model.state_dict().items()}
     torch.cuda.empty_cache()
-    valid_types = ('qwen', 'qwen2', 'qwen2_vl')
+    valid_types = ('qwen', 'qwen2', 'qwen2_vl', 'qwen3', 'qwen3_moe')
     assert qwen_type in valid_types, f"Unsupported Qwen type: {qwen_type}, only {valid_types} are supported for GPTQ."
     layer_prefix = "transformer.h." if qwen_type == 'qwen' else "model.layers."
     key_list = get_qwen_key_list(qwen_type)
