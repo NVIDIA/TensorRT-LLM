@@ -113,8 +113,6 @@ void initBindings(pybind11::module_& m)
         .def("set_generated_tokens", &GenLlmReq::setGeneratedTokens, py::arg("generated_beam_tokens"))
         .def("pause", &GenLlmReq::pause, py::arg("max_input_len"))
         .def_property("max_sent_token_len", &GenLlmReq::getMaxSentTokenLen, &GenLlmReq::setMaxSentTokenLen)
-        .def_property(
-            "exclude_input_from_output", &GenLlmReq::getExcludeInputFromOutput, &GenLlmReq::setExcludeInputFromOutput)
         .def_property_readonly("prompt_embedding_table", &GenLlmReq::getPromptEmbeddingTable)
         .def_property_readonly("multimodal_embedding", &GenLlmReq::getMultimodalEmbedding)
         .def_property_readonly("mrope_rotary_cos_sin", &GenLlmReq::getMropeRotaryCosSin)
