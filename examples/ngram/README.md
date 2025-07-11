@@ -40,7 +40,7 @@ return None                                         # No any candidate exists
 + We use an open-source `llama-v2-13B` models in this example.
 + `--use_paged_context_fmha=enable` must be specified since we need KVcache reuse in this approach.
 + `--speculative_decoding_mode=draft_tokens_external` must be specified.
-+ `--max_draft_len` must be specified larger or equal to `max_draft_len`.
++ `--max_draft_len` must be specified as the length maximum of the draft tokens.
 + `--ngram_config` is corresponding configuration of NGram, we can see its usage in [util.py](../util.py).
   + As an example, `[10,2,[0]]` means `max_draft_len=10`, `max_matching_ngram_size=2`, and device of target model is `GPU0`.
 + `--kv_cache_enable_block_reuse` must be specified for this approach.
@@ -50,29 +50,29 @@ return None                                         # No any candidate exists
 ```bash
 # Build engine
 python3 examples/models/core/llama/convert_checkpoint.py \
-    --model_dir=<Path To Llama-v2-13B repo> \
-    --output_dir=./ckpt-target \
-    --dtype=float16
+    --model_dir <Path To Llama-v2-13B repo> \
+    --output_dir ./ckpt-target \
+    --dtype float16
 
 trtllm-build \
-    --checkpoint_dir=./ckpt-target \
-    --output_dir=./target-engine \
-    --gemm_plugin=float16 \
-    --use_paged_context_fmha=enable \
-    --speculative_decoding_mode=draft_tokens_external \
-    --max_draft_len=10 \
-    --max_batch_size=4 \
-    --max_input_len=3200 \
-    --max_seq_len=4800
+    --checkpoint_dir ./ckpt-target \
+    --output_dir ./target-engine \
+    --gemm_plugin float16 \
+    --use_paged_context_fmha enable \
+    --speculative_decoding_mode draft_tokens_external \
+    --max_draft_len 10 \
+    --max_batch_size 4 \
+    --max_input_len 3200 \
+    --max_seq_len 4800
 
 # Run decoding
 python3 examples/run.py \
     --tokenizer_dir <Path To Llama-v2-7B repo> \
     --engine_dir ./target-engine \
-    --ngram_config="[10,2,[0]]" \
-    --max_output_len=256 \
+    --ngram_config "[10,2,[0]]" \
+    --max_output_len 256 \
     --kv_cache_enable_block_reuse \
-    --input_text="How does Draft-Sampling work?"
+    --input_text "How does Draft-Sampling work?"
 
 # Run summarization tasks
 python examples/summarize.py \
@@ -81,8 +81,8 @@ python examples/summarize.py \
     --check_accuracy \
     --hf_model_dir <Path To Llama-v2-7B repo> \
     --engine_dir ./target-engine \
-    --batch_size=1 \
-    --ngram_config="[10,2,[0]]" \
+    --batch_size 1 \
+    --ngram_config "[10,2,[0]]" \
     --kv_cache_enable_block_reuse
 ```
 
@@ -90,7 +90,8 @@ python examples/summarize.py \
 
 ```bash
 python3 examples/llm-api/quickstart_advanced.py \
-    --max_draft_len=4
-    --max_matching_ngram_size=2 \
-    --spec_decode_nextn=4
+    --spec_decode_nextn 4 \
+    --max_matching_ngram_size 2 \
+    --disable_overlap_scheduler \
+    --disable_kv_cache_reuse
 ```
