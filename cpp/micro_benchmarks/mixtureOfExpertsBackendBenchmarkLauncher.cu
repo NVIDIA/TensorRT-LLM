@@ -472,16 +472,16 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
                 if (!has_tactic_ids2)
                     t2 = t1;
 
-                benchmark->Args({num_experts,                                             //
-                    get_range("k"),                                                       //
-                    get_range("hidden_size"),                                             //
-                    get_range("inter_size"),                                              //
-                    tp_size, ep_size, world_rank,                                         //
-                    get_range("num_tokens"),                                              //
-                    bias, do_final_scale,                                                 //
-                    get_range("act_fn", 0, (int) tensorrt_llm::ActivationType::Identity), //
-                    t1,                                                                   //
-                    t2,                                                                   //
+                benchmark->Args({num_experts,                               //
+                    get_range("k"),                                         //
+                    get_range("hidden_size"),                               //
+                    get_range("inter_size"),                                //
+                    tp_size, ep_size, world_rank,                           //
+                    get_range("num_tokens"),                                //
+                    bias, do_final_scale,                                   //
+                    get_range("act_fn", 0, (int) ActivationType::Identity), //
+                    t1,                                                     //
+                    t2,                                                     //
                     *routing_config});
             }
         }
@@ -497,10 +497,10 @@ void argGenHardcoded(benchmark::internal::Benchmark* benchmark)
     auto inter_size_mul = {4.f};               // {7.f/2.f, 4.f};
     auto num_tokens = {2048};                  // {1, 20, 200, 2048};
     auto use_bias = {0};                       // {0, 1};
-    auto activation_type = {tensorrt_llm::ActivationType::Gelu};
-    // {tensorrt_llm::ActivationType::Relu, tensorrt_llm::ActivationType::Gelu,
-    // tensorrt_llm::ActivationType::Silu, tensorrt_llm::ActivationType::Geglu,
-    // tensorrt_llm::ActivationType::Swiglu};
+    auto activation_type = {ActivationType::Gelu};
+    // {ActivationType::Relu, ActivationType::Gelu,
+    // ActivationType::Silu, ActivationType::Geglu,
+    // ActivationType::Swiglu};
     auto cutlass_tactic = {-1};                           // {0,..., listAllTactics<BenchClass>().size()};
     auto routing_config = {LOAD_BALANCED_ROUTING_CONFIG}; // {0, 1, 2};
 
