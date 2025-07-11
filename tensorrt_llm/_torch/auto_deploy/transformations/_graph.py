@@ -59,7 +59,7 @@ def load_buffers_and_params(
         if clone:
             v_new = v.detach().clone()
             if isinstance(v, torch.nn.Parameter):
-                v_new = nn.Parameter(v_new)
+                v_new = nn.Parameter(v_new, requires_grad=False)
         else:
             v_new = state_dict[k]
         setattr(submod, name, v_new)

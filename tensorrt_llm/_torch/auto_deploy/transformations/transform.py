@@ -32,6 +32,7 @@ from .library import (
     match_rope_pattern,
     optimize_rope,
     quantize,
+    quantize_moe,
     resize_kv_cache,
     update_in_out_nodes,
 )
@@ -77,6 +78,7 @@ class InferenceOptimizer:
 
         # quantization
         quantize(egm, self.factory.get_quant_config())
+        quantize_moe(egm, self.factory.get_quant_config())
 
         # Match MoE pattern
         match_moe_pattern(egm)

@@ -11,7 +11,6 @@ from ...utils.node_utils import (
     get_quantization_params_from_linear_node,
     is_bmm_op,
     is_linear_op,
-    is_match,
 )
 from ...utils.quantization_utils import (
     QuantizationImpl,
@@ -19,6 +18,7 @@ from ...utils.quantization_utils import (
     is_quantized_graph,
     is_quantized_op,
     remove_output_quantizers,
+    should_skip_quantization,
 )
 from .._graph import canonicalize_graph
 
@@ -174,7 +174,7 @@ def quantize(gm: GraphModule, quant_config: Dict[str, Any]) -> None:
     # extract info from quant_config
     is_quant_graph = is_quantized_graph(gm)
     quant_algo = quant_config.get("quant_algo")
-    skip = quant_config.get("exclude_modules", [])
+    excluded_patterns = quant_config.get("exclude_modules", [])
 
     # no quantization to do
     if not (is_quant_graph or quant_config):
@@ -184,8 +184,7 @@ def quantize(gm: GraphModule, quant_config: Dict[str, Any]) -> None:
     # tracking quantized operations in the graph
     quantized_nodes: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for n in gm.graph.nodes:
-        # check if we should skip this node
-        if is_match(n, skip):
+        if should_skip_quantization(n, excluded_patterns):
             continue
 
         # Process linear operations
