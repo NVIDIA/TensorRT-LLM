@@ -1,7 +1,6 @@
 # TRT-LLM Disaggregated Serving
 
 To run TRT-LLM in disaggregated mode, you must first launch context (prefill) and generation (decode) servers using `trtllm-serve`.
-Depending on your deployment environment, this can be done in different ways.
 
 ## Launching context and generation servers using multiple independent `trtllm-serve` commands
 
@@ -45,7 +44,7 @@ generation_servers:
 
 Clients can then send requests to the disaggregated server at `localhost:8000`, which is an OpenAI compatible endpoint.
 
-## Launching context and generation servers using MPI
+### Launching context and generation servers using MPI (Deprecated)
 
 One can also launch all context and generation servers using MPI. This can be done by issuing the following command:
 ```
@@ -101,8 +100,8 @@ Or using the provided client parsing the prompts from a file and sending request
 ```
 python3 ./clients/disagg_client.py -c disagg_config.yaml -p ./clients/prompts.json -e chat
 ```
+## Dynamic scaling (Experimental)
 
-## Dynamic scaling with ETCD (experimental)
 Currently, trtllm supports dynamic addition and removal of servers by leveraging ETCD. To enable this feature, you should start the context and generation servers with an additional flag ```--metadata_server_config_file``` and ```--server_role```.
 Before launching the context and generation servers, you should first start the ETCD server. By default, the ETCD server listens for client requests at ```localhost:2379```.
 ```
@@ -133,6 +132,7 @@ refersh_interval: 10.0
 The ```hostname``` and ```port``` must match those used when starting the ETCD server. The ```health_check_timeout``` parameter specifies how long a server will be considered dead if no healthy response is received. By default, trtllm will perform two checks before marking a server as dead. The ```refresh_interval``` parameter determines how often the latest server list is fetched from the ETCD server.
 
 ### Dynamically adding servers
+
 Users can add servers by directly launching them with trtllm-serve. For example, you can start an additional generation server as follows:
 ```
 CUDA_VISIBLE_DEVICES=3 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8004 --backend pytorch --server_role GENERATION --extra_llm_api_options ./gen_extra-llm-api-config.yml --metadata_server_config_file ./metadata_config.yml &> log_gen_0 &
@@ -140,4 +140,5 @@ CUDA_VISIBLE_DEVICES=3 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host lo
 Trtllm will automatically register any newly launched server with the ETCD server, allowing the router to send new requests to the added server.
 
 ### Dynamically removing servers
+
 When removing servers, special attention is required in the current version. You need to first remove the corresponding key from the ETCD server. After you see the log message "Server xxxx is removed," you can then safely shut down the server. This part will be improved soon.
