@@ -7,9 +7,9 @@ from transformers import LlamaConfig
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
-from tensorrt_llm._torch.debug.debug_hook import (DebuggerContext, Filter,
-                                                  debug_mode,
-                                                  get_current_debug_ctx)
+from tensorrt_llm._torch.debug.debug_hook import (
+    DebuggerContext, Filter, debug_mode, get_current_debug_ctx,
+    register_memory_info_dump_hook)
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
@@ -174,6 +174,7 @@ class TestDebugger(unittest.TestCase):
 
         with torch.inference_mode(), debug_mode(llama):
             register_module_name_dump_hook()
+            register_memory_info_dump_hook()
             attn_metadata.prepare()
             logits = llama.forward(input_ids=input_ids,
                                    position_ids=position_ids,
