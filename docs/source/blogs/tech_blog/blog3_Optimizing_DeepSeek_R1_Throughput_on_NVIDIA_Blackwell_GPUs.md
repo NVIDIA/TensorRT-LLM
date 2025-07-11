@@ -157,7 +157,7 @@ These optimizations target the overall execution flow, scheduling, and resource 
 
     There is a feature called CUDA Graph padding in TensorRT-LLM, which is a good trade-off between the number of CUDA Graphs and the CUDA Graph hit ratio; it tries to pad a batch to the nearest one with a captured CUDA Graph. Normally you should enable the CUDA Graph padding feature to increase the CUDA Graph hit rate, but the padding itself has some overhead due to wasted tokens computation.
 
-    Users can opt-out the CUDA Graph padding feature to see the perf benefits, by setting the `cuda_graph_config:\n  padding_enabled: False`, see API here [Pytorch backend config](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/pyexecutor/config.py#L41)
+    Users can opt-out the CUDA Graph padding feature to see the perf benefits, by setting the `cuda_graph_config:\n  enable_padding: False`, see API here [Pytorch backend config](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/pyexecutor/config.py#L41)
 
 * Overlap Scheduler:
 

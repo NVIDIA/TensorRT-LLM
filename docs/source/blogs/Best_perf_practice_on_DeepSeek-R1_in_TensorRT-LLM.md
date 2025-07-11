@@ -196,7 +196,7 @@ We are seeing meaningful speedup using FP8 KV cache, thus refreshing the numbers
 ```bash
 cat >./extra-llm-api-config.yml <<EOF
 cuda_graph_config:
-  padding_enabled: true
+  enable_padding: true
   batch_sizes:
   - 896
   - 512
@@ -263,7 +263,7 @@ YOUR_DATA_PATH=./dataset.txt
 
 cat >./extra-llm-api-config.yml <<EOF
 cuda_graph_config:
-  padding_enabled: true
+  enable_padding: true
   batch_sizes:
   - 1
   - 2
