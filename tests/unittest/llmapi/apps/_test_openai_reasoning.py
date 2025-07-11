@@ -14,19 +14,15 @@ def model_name() -> str:
     return "DeepSeek-R1-Distill-Qwen-1.5B"
 
 
-@pytest.fixture(scope="module",
-                params=[None, 'pytorch'],
-                ids=["trt", "pytorch"])
+@pytest.fixture(scope="module", params=["trt", "pytorch"])
 def backend(request):
     return request.param
 
 
 @pytest.fixture(scope="module")
-def server(model_name: str, backend: str) -> RemoteOpenAIServer:
+def server(model_name: str, backend: str):
     model_path = get_model_path(model_name)
-    args = []
-    if backend == "pytorch":
-        args.extend(["--backend", f"{backend}"])
+    args = ["--backend", f"{backend}"]
     max_beam_width = 1 if backend == "pytorch" else 2
     args.extend(["--max_beam_width", str(max_beam_width)])
     args.extend(["--max_batch_size", "2", "--max_seq_len", "1024"])
@@ -68,7 +64,7 @@ def test_reasoning_parser(client: openai.OpenAI, model_name: str, backend: str):
 
 
 @pytest.fixture(scope="module")
-def oning_client(server: RemoteOpenAIServer) -> openai.OpenAI:
+def async_client(server: RemoteOpenAIServer) -> openai.AsyncOpenAI:
     return server.get_async_client()
 
 
@@ -90,10 +86,10 @@ async def process_stream(
 
 
 @pytest.mark.asyncio(loop_scope="module")
-async def test_reasoning_parser_streaming(oning_client: openai.OpenAI,
-                                          model_name: str, backend: str):
+async def test_reasoning_parser_streaming(async_client: openai.AsyncOpenAI,
+                                          model_name: str):
     messages = [{"role": "user", "content": "hi"}]
-    stream = await oning_client.chat.completions.create(
+    stream = await async_client.chat.completions.create(
         model=model_name,
         messages=messages,
         max_completion_tokens=1000,
@@ -106,7 +102,7 @@ async def test_reasoning_parser_streaming(oning_client: openai.OpenAI,
     assert len(content_chunks) > 0
     assert len(reasoning_content_chunks) > 0
 
-    stream = await oning_client.chat.completions.create(
+    stream = await async_client.chat.completions.create(
         model=model_name,
         messages=messages,
         max_completion_tokens=1,
