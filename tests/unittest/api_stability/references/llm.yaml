@@ -95,6 +95,10 @@ methods:
       reasoning_parser:
         annotation: Optional[str]
         default: null
+      # Runtime behavior
+      fail_fast_on_attention_window_too_large:
+        annotation: bool
+        default: false
       # kwargs
       kwargs:
         annotation: Any
