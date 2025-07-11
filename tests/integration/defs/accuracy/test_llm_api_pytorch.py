@@ -255,6 +255,30 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    def test_beam_search(self):
+        pytorch_config = dict(disable_overlap_scheduler=True, )
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9, )
+        max_beam_width = 4
+
+        sampling_params = SamplingParams(n=max_beam_width,
+                                         best_of=max_beam_width,
+                                         use_beam_search=True)
+
+        llm = LLM(model=self.MODEL_PATH,
+                  **pytorch_config,
+                  kv_cache_config=kv_cache_config,
+                  max_beam_width=max_beam_width,
+                  max_batch_size=16,
+                  max_seq_len=1024,
+                  enable_trtllm_sampler=True,
+                  build_config=None)
+
+        with llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm,
+                          sampling_params=sampling_params,
+                          extra_acc_spec="beam_width=4")
+
     def test_ngram(self):
         pytorch_config = dict(disable_overlap_scheduler=True)
 
@@ -455,7 +479,7 @@ class TestMinistral8BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Ministral-8B-Instruct-2410"
     MODEL_PATH = f"{llm_models_root()}/Ministral-8B-Instruct-2410"
 
-    def test_auto_dtype_gsm8k(self):
+    def test_auto_dtype(self):
         with LLM(self.MODEL_PATH) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
