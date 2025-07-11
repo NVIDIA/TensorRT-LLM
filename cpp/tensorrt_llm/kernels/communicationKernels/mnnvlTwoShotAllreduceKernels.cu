@@ -164,9 +164,14 @@ __global__ void twoshot_allreduce_kernel(T* output_ptr, T* shard_ptr, T** input_
     {
         // Update the atomic counter to indicate the block has read the offsets
         __syncthreads();
+
         if (threadIdx.x == 0)
         {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
             asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" ::"l"(offset_access_ptr), "r"(1) : "memory");
+#else
+            atomicAdd(offset_access_ptr, 1);
+#endif
         }
         // Only use a set of CTAs for lamport sync, reargange the grid
         constexpr int ELTS_PER_LOAD = sizeof(float2) / sizeof(T);
@@ -384,7 +389,11 @@ __global__ void __launch_bounds__(128, 1)
     __syncthreads();
     if (threadIdx.x == 0)
     {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" ::"l"(offset_access_ptr), "r"(1) : "memory");
+#else
+        atomicAdd(offset_access_ptr, 1);
+#endif
     }
     // Load all inputs
     bool valid = false;
