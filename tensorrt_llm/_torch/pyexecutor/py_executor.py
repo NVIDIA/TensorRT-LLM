@@ -69,15 +69,23 @@ class RequestQueueItem:
         return not (self.is_shutdown_request or self.is_canceled_request)
 
 
-def _get_from_request_queue(request_queue: queue.Queue):
-    result = []
-    while True:
-        try:
-            item = request_queue.get_nowait()  # Non-blocking get
-            result.append(item)
-        except queue.Empty:  # Queue is empty, exit loop
-            break
-    return result
+def _get_from_request_queue(
+        request_queue,
+        timeout: Optional[datetime.timedelta]) -> List[RequestQueueItem]:
+    items = []
+    timeout_secs = timeout.total_seconds() if timeout is not None else None
+    try:
+        if request_queue.empty() and (timeout_secs is None or timeout_secs > 0):
+            # if queue is empty and want to wait, wait
+            items.append(request_queue.get(timeout=timeout_secs))
+        else:
+            # if not empty or don't want to wait, just return all items in queue
+            while True:
+                queue_item = request_queue.get_nowait()
+                items.append(queue_item)
+    except queue.Empty:
+        pass
+    return items
 
 
 def _get_from_waiting_queue(
@@ -272,7 +280,7 @@ class PyExecutor:
         self.send_handles = [None] * self.num_micro_batches
 
         self.inflight_req_ids = ReqIdsSet()
-        self.canceled_req_ids = set()
+        self.canceled_req_ids = []
 
         self.model_engine.warmup(self.resource_manager)
         if self.draft_model_engine is not None:
@@ -482,8 +490,8 @@ class PyExecutor:
 
     @property
     def should_stop_processing(self):
-        return self.is_shutdown and self.active_requests.empty(
-        ) and self.waiting_queue.empty()
+        return self.is_shutdown and len(self.active_requests) == 0 and len(
+            self.waiting_queue) == 0
 
     @contextmanager
     def _profiler(self):
@@ -1220,9 +1228,22 @@ class PyExecutor:
 
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(self) -> List[RequestQueueItem]:
+        if self.enable_attention_dp:
+            all_ranks_num_active_requests = []
+            responses_list = self.dist.tp_allgather(len(self.active_requests))
+            for num_active_requests in responses_list:
+                all_ranks_num_active_requests.append(num_active_requests)
+            total_num_active_requests = sum(all_ranks_num_active_requests)
+            total_max_num_active_requests = self.dist.tp_size * self.max_num_active_requests
+        else:
+            total_num_active_requests = len(self.active_requests)
+            total_max_num_active_requests = self.max_num_active_requests
+
+        timeout = None if total_num_active_requests == 0 else datetime.timedelta(
+            0)
         new_requests = []
         if self.dist.rank == 0 and not self.is_shutdown:
-            new_requests = _get_from_request_queue(self.request_queue)
+            new_requests = _get_from_request_queue(self.request_queue, timeout)
 
         if self.dist.rank == 0:
             py_logits_post_processors = self._collect_py_objects_from_requests(
@@ -1249,7 +1270,7 @@ class PyExecutor:
                 self.is_shutdown = True
                 break
             elif req_item.is_canceled_request:
-                self.canceled_req_ids.insert(req_item.id)
+                self.canceled_req_ids.append(req_item.id)
             else:
                 valid_new_requests.append(req_item)
         # Check if the beam width of the requests is equal to the max_beam_width
@@ -1263,17 +1284,6 @@ class PyExecutor:
                                                     attr_name, req_obj_dict)
 
         self.waiting_queue.extend(valid_new_requests)
-
-        if self.enable_attention_dp:
-            all_ranks_num_active_requests = []
-            responses_list = self.dist.tp_allgather(len(self.active_requests))
-            for num_active_requests in responses_list:
-                all_ranks_num_active_requests.append(num_active_requests)
-            total_num_active_requests = sum(all_ranks_num_active_requests)
-            total_max_num_active_requests = self.dist.tp_size * self.max_num_active_requests
-        else:
-            total_num_active_requests = len(self.active_requests)
-            total_max_num_active_requests = self.max_num_active_requests
 
         new_requests = _get_from_waiting_queue(
             self.waiting_queue,
@@ -1964,7 +1974,16 @@ class PyExecutor:
     def _handle_canceled_requests(self):
         if len(self.canceled_req_ids) == 0:
             return
-        # TODO: cancel request in the waiting queue
+
+        # cancel request in the waiting queue
+        to_cancel = []
+        for i, request in enumerate(self.waiting_queue):
+            req_id = request.id
+            if req_id in self.canceled_req_ids:
+                to_cancel.append(i)
+
+        for i in reversed(to_cancel):
+            self.waiting_queue.pop(i)
 
         for request in self.active_requests:
             req_id = request.py_request_id
