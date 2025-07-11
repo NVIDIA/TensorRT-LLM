@@ -803,7 +803,6 @@ public:
         if (mCapacity < newSize)
         {
             release();
-            printf("MulticastBuffer resize: %d B\n", int(toBytes(newSize)));
             mHandle = ipcNvlsAllocate(toBytes(newSize), mRanks);
 
             TLLM_CHECK(mHandle->size % BufferDataType(mType).getSize() == 0);

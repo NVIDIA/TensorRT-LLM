@@ -951,8 +951,8 @@ public:
         {
             bool do_tail_store = false;
 
-            constexpr auto ARBarrier = (uint32_t) cutlass::arch::ReservedNamedBarriers::FirstUserBarrier;
-            CollectiveAllReduce collective_allreduce(params.allreduce, ARBarrier);
+            const uint32_t AR_barrier_id = 0;
+            CollectiveAllReduce collective_allreduce(params.allreduce, AR_barrier_id);
             int thread_idx = threadIdx.x - (MaxThreadsPerBlock - NumARThreads);
             auto init_cta_coord_mnkl = cta_coord_mnkl;
 
