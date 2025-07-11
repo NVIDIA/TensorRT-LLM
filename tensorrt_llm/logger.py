@@ -15,6 +15,7 @@
 import logging
 import os
 import sys
+import time
 from typing import Optional
 
 import tensorrt as trt
@@ -62,9 +63,11 @@ class Logger(metaclass=Singleton):
         self._logger = logging.getLogger(self.PREFIX)
         self._logger.propagate = False
         handler = logging.StreamHandler(stream=sys.stdout)
-        handler.setFormatter(
-            logging.Formatter(fmt="[%(asctime)s] %(message)s", datefmt="%m/%d/%Y-%H:%M:%S")
+        formatter = logging.Formatter(
+            fmt="[%(asctime)s.%(msecs)03d UTC] %(message)s", datefmt="%m/%d/%Y-%H:%M:%S"
         )
+        formatter.converter = time.gmtime
+        handler.setFormatter(formatter)
         self._logger.addHandler(handler)
         self._logger.setLevel(severity_map[min_severity][1])
         self._polygraphy_logger = G_LOGGER
