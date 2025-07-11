@@ -1498,7 +1498,7 @@ void TrtGptModelInflightBatching::createBuffers(executor::DecodingConfig const& 
     for (SizeType32 i = 0; i < mNumMicroBatches; ++i)
     {
         mDecoderInputBuffers.emplace_back(
-            getMaxNumSequences(), getMaxBatchSize(), mModelConfig.getMaxDecodingTokens(), mRuntime->getBufferManager());
+            getMaxBatchSize(), mModelConfig.getMaxDecodingTokens(), mRuntime->getBufferManager());
         mDecoderInputBuffers.back().setupMedusaLogits(getMaxNumSequences(), mModelConfig);
         mDecoderOutputBuffers.emplace_back(getMaxNumSequences(), mOperatingBeamWidth, getMaxSequenceLen(),
             mModelConfig.getMaxDecodingTokens(), mRuntime->getBufferManager());
@@ -1512,8 +1512,6 @@ void TrtGptModelInflightBatching::createBuffers(executor::DecodingConfig const& 
         mSlotDecoderBuffers.emplace_back(std::make_unique<SlotDecoderBuffers>(
             mOperatingBeamWidth, getMaxSequenceLen(), mRuntime->getBufferManager()));
     }
-
-    mDecodingInputs.resize(mNumMicroBatches);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -1997,19 +1995,19 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
     NVTX3_SCOPED_RANGE(decoderStepAsync);
 
     auto& decoderInputBuffers = mDecoderInputBuffers.at(getFusedBufferId());
-    auto& seqSlotLogits = decoderInputBuffers.logits;
+    auto seqSlotLogits = std::vector<TensorPtr>(getMaxNumSequences());
 
     auto const contextBufferId = mCtxGenFusion ? getFusedBufferId() : getContextBufferId();
     auto& contextRuntimeBuffers = mBuffers.at(contextBufferId);
-    auto const logitsIndex = (*mHandleContextLogits)(decoderInputBuffers, scheduledRequests.contextRequests,
-        contextRuntimeBuffers->logits, contextRuntimeBuffers->numContextLogits, mModelConfig,
-        mRuntime->getBufferManager(), contextRuntimeBuffers->mMedusaBuffers);
+    auto const logitsIndex = (*mHandleContextLogits)(seqSlotLogits, decoderInputBuffers,
+        scheduledRequests.contextRequests, contextRuntimeBuffers->logits, contextRuntimeBuffers->numContextLogits,
+        mModelConfig, mRuntime->getBufferManager(), contextRuntimeBuffers->mMedusaBuffers);
 
     auto const genLogitsIndex = mCtxGenFusion ? logitsIndex : 0;
     auto const genBufferId = mCtxGenFusion ? getFusedBufferId() : getGenerationBufferId();
     auto& genRuntimeBuffers = mBuffers.at(genBufferId);
-    (*mHandleGenerationLogits)(decoderInputBuffers, scheduledRequests.generationRequests, genRuntimeBuffers->logits,
-        genLogitsIndex, mModelConfig, mRuntime->getBufferManager(), *genRuntimeBuffers,
+    (*mHandleGenerationLogits)(seqSlotLogits, decoderInputBuffers, scheduledRequests.generationRequests,
+        genRuntimeBuffers->logits, genLogitsIndex, mModelConfig, mRuntime->getBufferManager(), *genRuntimeBuffers,
         genRuntimeBuffers->mMedusaBuffers);
 
     if (mOperatingBeamWidth > 1)
@@ -2029,12 +2027,10 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
     auto const fusedBufferId = getFusedBufferId();
     auto& fusedRuntimeBuffers = mBuffers.at(fusedBufferId);
 
-    auto& decodingInput = mDecodingInputs.at(mMicroBatchId);
-    decodingInput = (*mMakeDecodingBatchInputOutput)(scheduledRequests.contextRequests,
-        scheduledRequests.generationRequests, mDecoderInputBuffers.at(fusedBufferId), *mDecoderState, mModelConfig,
-        getMaxNumSequences(), *fusedRuntimeBuffers);
+    (*mMakeDecodingBatchInputOutput)(decoderInputBuffers, *mDecoderState, scheduledRequests.contextRequests,
+        scheduledRequests.generationRequests, seqSlotLogits, mModelConfig, *fusedRuntimeBuffers);
 
-    auto decoderFinishEvent = mDecoder->forwardAsync(*mDecoderState, *decodingInput);
+    auto decoderFinishEvent = mDecoder->forwardAsync(*mDecoderState, decoderInputBuffers);
 
     auto const returnLogProbs = batchReturnLogProbs(scheduledRequests);
     auto updateDecoderBuffersEvent = (*mUpdateDecoderBuffers)(mModelConfig, mDecoderOutputBuffers.at(fusedBufferId),

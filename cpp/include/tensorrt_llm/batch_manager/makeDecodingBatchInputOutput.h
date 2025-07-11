@@ -40,20 +40,19 @@ public:
     constexpr static auto name{"MakeDecodingBatchInputOutput"};
 
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
-    using TensorPtr = runtime::decoder_batch::Input::TensorPtr;
+    using TensorPtr = runtime::ITensor::SharedPtr;
     template <typename T>
     using OptionalRef = tensorrt_llm::common::OptionalRef<T>;
 
     MakeDecodingBatchInputOutput() = default;
 
-    std::unique_ptr<runtime::decoder_batch::Input> operator()(RequestVector const& contextRequests,
-        RequestVector const& generationRequests, DecoderInputBuffers const& inputBuffers,
-        runtime::decoder::DecoderState& decoderState, runtime::ModelConfig const& modelConfig,
-        SizeType32 maxNumSequences, OptionalRef<RuntimeBuffers> fusedRuntimeBuffers) const;
+    void operator()(DecoderInputBuffers& inputBuffers, runtime::decoder::DecoderState& decoderState,
+        RequestVector const& contextRequests, RequestVector const& generationRequests,
+        std::vector<TensorPtr> const& logits, runtime::ModelConfig const& modelConfig,
+        OptionalRef<RuntimeBuffers> fusedRuntimeBuffers) const;
 
-    [[nodiscard]] static std::unique_ptr<runtime::decoder_batch::Input> createDecoderBatchInputs(
-        std::vector<SizeType32> const& activeSlots, runtime::decoder::DecoderState const& decoderState,
-        std::vector<TensorPtr> const& logits, SizeType32 maxNumSequences, std::vector<TensorPtr> const& batchSlots);
+    static void createDecoderBatchInputs(DecoderInputBuffers& inputBuffers, std::vector<SizeType32> const& activeSlots,
+        runtime::decoder::DecoderState const& decoderState, std::vector<TensorPtr> const& logits);
 };
 
 } // namespace tensorrt_llm::batch_manager

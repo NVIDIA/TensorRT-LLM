@@ -37,6 +37,8 @@ class MedusaBuffers;
 class HandleContextLogits : Algorithm
 {
 public:
+    using TensorPtr = runtime::ITensor::SharedPtr;
+
     template <typename T>
     using OptionalRef = tensorrt_llm::common::OptionalRef<T>;
 
@@ -44,10 +46,10 @@ public:
 
     HandleContextLogits() = default;
 
-    runtime::SizeType32 operator()(DecoderInputBuffers& inputBuffers, RequestVector const& contextRequests,
-        runtime::ITensor::SharedPtr const& logits, std::vector<runtime::SizeType32> const& numContextLogitsVec,
-        runtime::ModelConfig const& modelConfig, runtime::BufferManager const& manager,
-        OptionalRef<MedusaBuffers> medusaBuffers) const;
+    runtime::SizeType32 operator()(std::vector<TensorPtr>& seqSlotLogits, DecoderInputBuffers& inputBuffers,
+        RequestVector const& contextRequests, TensorPtr const& logits,
+        std::vector<runtime::SizeType32> const& numContextLogitsVec, runtime::ModelConfig const& modelConfig,
+        runtime::BufferManager const& manager, OptionalRef<MedusaBuffers> medusaBuffers) const;
 };
 
 } // namespace tensorrt_llm::batch_manager

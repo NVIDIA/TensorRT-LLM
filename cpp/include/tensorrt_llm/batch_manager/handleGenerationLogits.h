@@ -37,6 +37,8 @@ class MedusaBuffers;
 class HandleGenerationLogits : Algorithm
 {
 public:
+    using TensorPtr = runtime::ITensor::SharedPtr;
+
     template <typename T>
     using OptionalRef = tensorrt_llm::common::OptionalRef<T>;
 
@@ -44,8 +46,8 @@ public:
 
     HandleGenerationLogits() = default;
 
-    void operator()(DecoderInputBuffers& inputBuffers, RequestVector const& generationRequests,
-        runtime::ITensor::SharedPtr const& logits, runtime::SizeType32 logitsIndex,
+    void operator()(std::vector<TensorPtr>& seqSlotLogits, DecoderInputBuffers& inputBuffers,
+        RequestVector const& generationRequests, TensorPtr const& logits, runtime::SizeType32 logitsIndex,
         runtime::ModelConfig const& modelConfig, runtime::BufferManager const& manager,
         OptionalRef<RuntimeBuffers> genRuntimeBuffers, OptionalRef<MedusaBuffers> medusaBuffers) const;
 };
