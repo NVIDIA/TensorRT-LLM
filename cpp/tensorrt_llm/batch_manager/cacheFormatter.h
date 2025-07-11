@@ -26,35 +26,13 @@
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
-#include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <NvInferRuntimeBase.h>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <iterator>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
-
-class TransferHelper
-{
-public:
-    static void sendBuffer(
-        executor::kv_cache::Connection const& connection, runtime::IBuffer const& buf, uint64_t requestId)
-    {
-        int const tag = ((requestId & 0xFFF) << 8) | (kDATA_TAG & 0xFF);
-        connection.send(executor::kv_cache::DataContext{tag}, buf.data(), buf.getSizeInBytes());
-    }
-
-    static void recvBuffer(executor::kv_cache::Connection const& connection, runtime::IBuffer& buf, uint64_t requestId)
-    {
-        int const tag = ((requestId & 0xFFF) << 8) | (kDATA_TAG & 0xFF);
-        connection.recv(executor::kv_cache::DataContext{tag}, buf.data(), buf.getSizeInBytes());
-    }
-
-private:
-    static constexpr int32_t kDATA_TAG{43};
-};
 
 BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest);
 
@@ -67,15 +45,15 @@ public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
     using CacheState = executor::kv_cache::CacheState;
 
-    virtual void formatOutput(LlmRequest const& llmRequest,
-        std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
-        SizeType32 selfIdx, CacheState const& destConfig, runtime::BufferManager const& bufferManager)
-        = 0;
+    /// @brief Format the cache data into bytes for sending.
+    /// @param session The transfer session.
+    /// @param llmRequest The request object to which the data belongs.
+    virtual void format(TransferSession& session, LlmRequest const& llmRequest) = 0;
 
-    virtual void formatInput(LlmRequest const& llmRequest,
-        std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
-        SizeType32 selfIdx, CacheState const& destConfig, runtime::BufferManager const& bufferManager)
-        = 0;
+    /// @brief Unformat the cache data from received bytes.
+    /// @param session The transfer session.
+    /// @param llmRequest The request object to which the data belongs.
+    virtual void unformat(TransferSession& session, LlmRequest const& llmRequest) = 0;
 
     /// @brief Determine whether the sender is applicable to the source and target.
     /// @param selfConfig Source data arrangement.
@@ -116,13 +94,9 @@ public:
         TLLM_CHECK(mCacheTransBufferManager);
     }
 
-    void formatOutput(LlmRequest const& llmRequest,
-        std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
-        SizeType32 selfIdx, CacheState const& destConfig, runtime::BufferManager const& bufferManager) override;
+    void format(TransferSession& session, LlmRequest const& llmRequest) override;
 
-    void formatInput(LlmRequest const& llmRequest,
-        std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
-        SizeType32 selfIdx, CacheState const& destConfig, runtime::BufferManager const& bufferManager) override;
+    void unformat(TransferSession& session, LlmRequest const& llmRequest) override;
 
     [[nodiscard]] bool inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const override;
 
