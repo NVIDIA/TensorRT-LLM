@@ -9,7 +9,6 @@ def main():
     # Sample prompts.
     prompts = [
         "Hello, my name is",
-        "The president of the United States is",
         "The capital of France is",
         "The future of AI is",
     ]
@@ -24,12 +23,12 @@ def main():
     model = "lmsys/vicuna-7b-v1.3"
 
     # The end user can customize the eagle decoding configuration by specifying the
-    # speculative_model, max_draft_len, num_eagle_layers, max_non_leaves_per_layer, eagle_choices
+    # speculative_model_dir, max_draft_len, num_eagle_layers, max_non_leaves_per_layer, eagle_choices
     # greedy_sampling,posterior_threshold, use_dynamic_tree and dynamic_tree_max_topK
     # with the EagleDecodingConfig class
 
     speculative_config = EagleDecodingConfig(
-        speculative_model="yuhuili/EAGLE-Vicuna-7B-v1.3",
+        speculative_model_dir="yuhuili/EAGLE-Vicuna-7B-v1.3",
         max_draft_len=63,
         num_eagle_layers=4,
         max_non_leaves_per_layer=10,

@@ -2058,6 +2058,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
     multiGpuJobs = parallelJobs.findAll{(it.key.contains("4_GPUs") || it.key.contains("8_GPUs")) && !it.key.contains("Post-Merge")}
     println multiGpuJobs.keySet()
+    multiGpuJobsPostMerge = parallelJobs.findAll{(it.key.contains("4_GPUs") || it.key.contains("8_GPUs")) && it.key.contains("Post-Merge")}
 
     parallelJobs += docBuildJobs
     parallelJobs += sanityCheckJobs
@@ -2105,7 +2106,11 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
     // Check --only-multi-gpu-test, if true, only run multi-GPU test stages.
     if (testFilter[(ONLY_MULTI_GPU_TEST)]) {
-        parallelJobsFiltered = multiGpuJobs
+        if (testFilter[(IS_POST_MERGE)]) {
+            parallelJobsFiltered = multiGpuJobsPostMerge
+        } else {
+            parallelJobsFiltered = multiGpuJobs
+        }
     }
 
     // Check --disable-multi-gpu-test, if true, remove multi-GPU test stages.
@@ -2220,6 +2225,7 @@ pipeline {
         //Workspace normally is: /home/jenkins/agent/workspace/LLM/L0_MergeRequest@tmp/
         HF_HOME="${env.WORKSPACE_TMP}/.cache/huggingface"
         CCACHE_DIR="${CCACHE_DIR}"
+        GITHUB_MIRROR="https://urm.nvidia.com/artifactory/github-go-remote"
         PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
         // force datasets to be offline mode, to prevent CI jobs are downloading HF dataset causing test failures
         HF_DATASETS_OFFLINE=1

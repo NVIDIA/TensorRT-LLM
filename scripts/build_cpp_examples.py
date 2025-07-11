@@ -21,7 +21,7 @@ def working_directory(path: PathLike):
 
 
 def build_cpp_examples(build_dir: PathLike, trt_dir: PathLike,
-                       loglevel: int) -> None:
+                       enable_multi_device: str, loglevel: int) -> None:
     logging.basicConfig(level=loglevel,
                         format='%(asctime)s - %(levelname)s - %(message)s')
     # Convert input paths to pathlib.Path objects
@@ -52,6 +52,7 @@ def build_cpp_examples(build_dir: PathLike, trt_dir: PathLike,
             '-B',
             '.',
             f'-DTensorRT_ROOT={cmake_parse(trt_dir)}',
+            f'-DENABLE_MULTI_DEVICE={enable_multi_device}',
         ] + generator
         logging.info(f"Executing {generate_command}")
         subprocess.run(generate_command, check=True)
@@ -70,6 +71,9 @@ if __name__ == '__main__':
     parser.add_argument('--trt-dir',
                         default='/usr/local/tensorrt',
                         help='TensorRT directory path')
+    parser.add_argument('--enable-multi-device',
+                        default='ON',
+                        help='Enable multi device support (requires MPI)')
     parser.add_argument('-v',
                         '--verbose',
                         help="verbose",

@@ -100,8 +100,10 @@ class Gemma3InputProcessor(InputProcessor):
             "pixel_values"]
         input_ids = preprocess_outputs[0]["mm_processor_kwargs"]["input_ids"]
         mm_features = self._process(pixel_values)
+        multimodal_data = {}
+        multimodal_data["multimodal_embedding"] = mm_features.squeeze(dim=0)
         return input_ids[0].to(torch.int32).tolist(), {
-            "mm_embedding": mm_features
+            "multimodal_data": multimodal_data
         }
 
 
@@ -127,6 +129,7 @@ class Gemma3Model(PreTrainedModel):
 
         self.model_config = model_config
         self.vocab_size = config.text_config.vocab_size
+        self.sliding_window = config.text_config.sliding_window
         self.model_dtype = getattr(config.text_config, "torch_dtype",
                                    torch.float16)
         logger.info(f"[Gemma3Model::__init__]{self.dtype=} {self.model_dtype=}")
@@ -161,20 +164,33 @@ class Gemma3Model(PreTrainedModel):
             f"[Gemma3Model::forward]{num_context_requests=}, {num_generation_requests=}"
         )
 
-        mm_embed = kwargs.get("multi_modal_data", [])
+        multimodal_params = kwargs.get("multimodal_params", [])
+        mm_embed = [
+            multimodal_param.multimodal_data["multimodal_embedding"]
+            for multimodal_param in multimodal_params
+        ]
         assert mm_embed == [] or len(
             mm_embed
         ) == num_context_requests, "Number of multimodal features (if provided) should be equal to number of context requests"
 
+        mm_token_ids = torch.tensor([self.image_token_index
+                                     ]).to(input_ids.device)
+        mm_token_mask = None
+        if len(mm_embed) > 0:
+            # Get token type ids. 0 corresponds to text tokens, 1 corresponds to image tokens.
+            mm_token_mask = torch.isin(input_ids, mm_token_ids)
         input_ids, inputs_embeds = fuse_input_embeds(
             embedding_layer=self.llm.model.embed_tokens,
             input_ids=input_ids,
             mm_embeds=mm_embed,
             mm_token_ids=torch.tensor([self.image_token_index
                                        ]).to(input_ids.device))
-        logits = self.llm.forward(attn_metadata, input_ids, position_ids,
-                                  inputs_embeds, return_context_logits)
+        logits = self.llm.forward(
+            attn_metadata=attn_metadata,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            return_context_logits=return_context_logits,
+            image_token_mask=mm_token_mask,
+        )
         return logits
-
-
-AutoModel.register(Gemma3Config, Gemma3Model)

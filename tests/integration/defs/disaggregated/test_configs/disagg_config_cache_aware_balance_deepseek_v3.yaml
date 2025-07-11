@@ -3,7 +3,7 @@ port: 8000
 model: DeepSeek-V3-Lite/bf16
 backend: "pytorch"
 disable_overlap_scheduler: True
-autotuner_enabled: False
+enable_autotuner: False
 context_servers:
   num_instances: 2
   router:

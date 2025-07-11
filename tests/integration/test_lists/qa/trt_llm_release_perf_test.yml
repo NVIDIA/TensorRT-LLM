@@ -37,6 +37,21 @@ trt_llm_release_perf_test:
   - perf/test_perf.py::test_perf[starcoder2_3b-bench-pytorch-float16-input_output_len:512,200]
   - perf/test_perf.py::test_perf[mistral_7b_v0.1-bench-float16-input_output_len:128,128]
 
+  # Ministral-8B
+  - perf/test_perf.py::test_perf[ministral_8b-bench-pytorch-bfloat16-maxbs:1-maxnt:5000-input_output_len:5000,500-reqs:8-con:1]
+  - perf/test_perf.py::test_perf[ministral_8b-bench-pytorch-bfloat16-maxbs:1-input_output_len:500,2000-reqs:8-con:1]
+  - perf/test_perf.py::test_perf[ministral_8b-bench-pytorch-bfloat16-maxnt:5000-input_output_len:5000,500-reqs:500-con:250]
+  - perf/test_perf.py::test_perf[ministral_8b-bench-pytorch-bfloat16-input_output_len:500,2000-reqs:500-con:250]
+
+  # Ministral-8B FP8
+  - perf/test_perf.py::test_perf[ministral_8b_fp8-bench-pytorch-float8-maxbs:1-maxnt:5000-input_output_len:5000,500-reqs:8-con:1]
+  - perf/test_perf.py::test_perf[ministral_8b_fp8-bench-pytorch-float8-maxbs:1-input_output_len:500,2000-reqs:8-con:1]
+  - perf/test_perf.py::test_perf[ministral_8b_fp8-bench-pytorch-float8-maxnt:5000-input_output_len:5000,500-reqs:500-con:250]
+  - perf/test_perf.py::test_perf[ministral_8b_fp8-bench-pytorch-float8-input_output_len:500,2000-reqs:500-con:250]
+
+  # Ministral-8B LoRA tests (using dummy Mistral LoRA checkpoint)
+  - perf/test_perf.py::test_perf[ministral_8b-bench-pytorch-bfloat16-maxbs:2-maxnt:1024-input_output_len:128,128-loras:1-reqs:8-con:2]
+
   # E2E ENC-DEC
   - perf/test_perf.py::test_perf[bart_large_cnn-cppmanager-exe-plugin_ifb-float16-input_output_len:128,20]
   - perf/test_perf.py::test_perf[mbart_large_50_many_to_one_mmt-cppmanager-exe-plugin_ifb-float16-input_output_len:128,20]

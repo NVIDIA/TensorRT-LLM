@@ -3,6 +3,7 @@ import asyncio
 import copy
 import os
 import signal
+import traceback
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import List, Optional, Type, Union
@@ -68,7 +69,7 @@ class OpenAIDisaggServer:
         async def lifespan(app: FastAPI):
             # Create a persistent aiohttp ClientSession
             self.session = aiohttp.ClientSession(
-                connector=aiohttp.TCPConnector(limit=0, limit_per_host=0, keepalive_timeout=300),
+                connector=aiohttp.TCPConnector(limit=0, limit_per_host=0, force_close=True),
                 timeout=aiohttp.ClientTimeout(total=req_timeout_secs))
 
             logger.info("Waiting for context and generation servers to be ready")
@@ -168,12 +169,12 @@ class OpenAIDisaggServer:
 
     async def _handle_exception(self, exception):
         if isinstance(exception, CppExecutorError):
-            logger.error(exception)
+            logger.error(traceback.format_exc())
             signal.raise_signal(signal.SIGINT)
         elif isinstance(exception, HTTPException):
             raise exception  # Re-raise HTTP exceptions properly
         else:
-            logger.error(exception)
+            logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=f"Internal server error {str(exception)}")
 
     async def _send_context_request(self, ctx_server: str, ctx_req: Union[CompletionRequest, ChatCompletionRequest]):

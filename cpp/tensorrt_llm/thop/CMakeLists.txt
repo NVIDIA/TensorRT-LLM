@@ -45,6 +45,7 @@ add_library(
   convertSpecDecodingMaskToPackedMaskOp.cpp
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
+  cudaScaledMM.cpp
   dynamicDecodeOp.cpp
   fmhaPackMaskOp.cpp
   fp8Op.cpp
@@ -56,6 +57,7 @@ add_library(
   fp4Quantize.cpp
   fp4BatchedQuantize.cpp
   fp8BlockScalingGemm.cpp
+  fp8RowwiseGemm.cpp
   fp8Quantize.cpp
   dsv3FusedAGemmOp.cpp
   fusedQKNormRopeOp.cpp

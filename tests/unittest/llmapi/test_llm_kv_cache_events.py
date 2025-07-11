@@ -50,7 +50,7 @@ def create_llm(tensor_parallel_size=1):
     return LLM(model=llama_model_path,
                tensor_parallel_size=tensor_parallel_size,
                kv_cache_config=global_kvcache_config,
-               autotuner_enabled=False,
+               enable_autotuner=False,
                backend="pytorch")
 
 

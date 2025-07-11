@@ -6,9 +6,9 @@ from parameterized import parameterized
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.speculative.mtp import (MTPConfig,
-                                                 MTPHiddenStatesManager,
+from tensorrt_llm._torch.speculative.mtp import (MTPHiddenStatesManager,
                                                  MTPSpecMetadata, MTPWorker)
+from tensorrt_llm.llmapi import MTPDecodingConfig
 
 
 def unittest_name_func(testcase_func, param_num, param):
@@ -40,15 +40,14 @@ class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
             device="cuda")  # [num_tokens, vocab_size]
 
         draft_tokens = torch.tensor(
-            [], dtype=torch.int,
-            device="cuda")  # [batch_size * max_draft_tokens]
+            [], dtype=torch.int, device="cuda")  # [batch_size * max_draft_len]
 
         draft_len = torch.tensor([0], dtype=torch.int,
                                  device="cuda")  # [batch_size]
 
         ref_accepted_tokens = torch.tensor(
             [[1, 0]], dtype=torch.int,
-            device="cuda")  # [batch_size * max_draft_tokens]
+            device="cuda")  # [batch_size * max_draft_len]
 
         ref_num_accepted_tokens = torch.tensor([1],
                                                dtype=torch.int,
@@ -74,15 +73,14 @@ class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
             device="cuda")  # [num_tokens, vocab_size]
 
         draft_tokens = torch.tensor(
-            [], dtype=torch.int,
-            device="cuda")  # [batch_size * max_draft_tokens]
+            [], dtype=torch.int, device="cuda")  # [batch_size * max_draft_len]
 
         draft_len = torch.tensor([0, 0, 0, 0], dtype=torch.int,
                                  device="cuda")  # [batch_size]
 
         ref_accepted_tokens = torch.tensor(
             [[1, 0], [3, 0], [3, 0], [6, 0]], dtype=torch.int,
-            device="cuda")  # [batch_size * max_draft_tokens]
+            device="cuda")  # [batch_size * max_draft_len]
 
         ref_num_accepted_tokens = torch.tensor([1, 1, 1, 1],
                                                dtype=torch.int,
@@ -111,14 +109,14 @@ class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
 
         draft_tokens = torch.tensor(
             [1, 3, 4], dtype=torch.int,
-            device="cuda")  # [batch_size * max_draft_tokens]
+            device="cuda")  # [batch_size * max_draft_len]
 
         draft_len = torch.tensor([3], dtype=torch.int,
                                  device="cuda")  # [batch_size]
 
         ref_accepted_tokens = torch.tensor(
             [[1, 3, 2, 0]], dtype=torch.int,
-            device="cuda")  # [batch_size * max_draft_tokens]
+            device="cuda")  # [batch_size * max_draft_len]
 
         ref_num_accepted_tokens = torch.tensor([3],
                                                dtype=torch.int,
@@ -147,14 +145,14 @@ class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
 
         draft_tokens = torch.tensor(
             [1, 5], dtype=torch.int,
-            device="cuda")  # [batch_size * max_draft_tokens]
+            device="cuda")  # [batch_size * max_draft_len]
 
         draft_len = torch.tensor([1, 1], dtype=torch.int,
                                  device="cuda")  # [batch_size]
 
         ref_accepted_tokens = torch.tensor(
             [[1, 3], [4, 0]], dtype=torch.int,
-            device="cuda")  # [batch_size * max_draft_tokens]
+            device="cuda")  # [batch_size * max_draft_len]
 
         ref_num_accepted_tokens = torch.tensor([2, 1],
                                                dtype=torch.int,
@@ -187,14 +185,14 @@ class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
 
         draft_tokens = torch.tensor(
             [1, 3, 4, 4, 7, 3], dtype=torch.int,
-            device="cuda")  # [batch_size * max_draft_tokens]
+            device="cuda")  # [batch_size * max_draft_len]
 
         draft_len = torch.tensor([3, 3], dtype=torch.int,
                                  device="cuda")  # [batch_size]
 
         ref_accepted_tokens = torch.tensor(
             [[1, 3, 2, 0], [4, 6, 0, 0]], dtype=torch.int,
-            device="cuda")  # [batch_size * max_draft_tokens]
+            device="cuda")  # [batch_size * max_draft_len]
 
         ref_num_accepted_tokens = torch.tensor([3, 2],
                                                dtype=torch.int,
@@ -231,7 +229,7 @@ class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
 
         draft_tokens = torch.tensor(
             [1, 3, 5, 4, 6, 5, 5, 7, 4], dtype=torch.int,
-            device="cuda")  # [batch_size * max_draft_tokens]
+            device="cuda")  # [batch_size * max_draft_len]
 
         draft_len = torch.tensor([3, 3, 3], dtype=torch.int,
                                  device="cuda")  # [batch_size]
@@ -239,7 +237,7 @@ class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
         ref_accepted_tokens = torch.tensor(
             [[1, 3, 2, 0], [4, 6, 5, 2], [4, 0, 0, 0]],
             dtype=torch.int,
-            device="cuda")  # [batch_size * max_draft_tokens]
+            device="cuda")  # [batch_size * max_draft_len]
 
         ref_num_accepted_tokens = torch.tensor([3, 4, 1],
                                                dtype=torch.int,
@@ -267,15 +265,14 @@ class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
             device="cuda")  # [num_tokens, vocab_size]
 
         draft_tokens = torch.tensor(
-            [4], dtype=torch.int,
-            device="cuda")  # [batch_size * max_draft_tokens]
+            [4], dtype=torch.int, device="cuda")  # [batch_size * max_draft_len]
 
         draft_len = torch.tensor([0, 1], dtype=torch.int,
                                  device="cuda")  # [batch_size]
 
         ref_accepted_tokens = torch.tensor(
             [[1, 0], [4, 6]], dtype=torch.int,
-            device="cuda")  # [batch_size * max_draft_tokens]
+            device="cuda")  # [batch_size * max_draft_len]
 
         ref_num_accepted_tokens = torch.tensor([1, 2],
                                                dtype=torch.int,
@@ -297,7 +294,8 @@ class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
                                             ref_accepted_tokens,
                                             ref_num_accepted_tokens):
         batch_size = len(draft_len)
-        spec_config = MTPConfig(num_nextn_predict_layers=mtp_num_modules)
+        spec_config = MTPDecodingConfig(
+            num_nextn_predict_layers=mtp_num_modules)
 
         # attention metedata
         attn_metadata = TrtllmAttentionMetadata(max_num_requests=batch_size,
@@ -310,7 +308,7 @@ class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
         # speculative decoding metadata
         spec_metadata = MTPSpecMetadata(max_num_requests=32,
                                         spec_dec_mode=spec_config.spec_dec_mode,
-                                        max_draft_tokens=mtp_num_modules,
+                                        max_draft_len=mtp_num_modules,
                                         mtp_num_modules=mtp_num_modules)
         spec_metadata.draft_tokens = draft_tokens
 
@@ -871,7 +869,7 @@ class TestMTPUpdateMTPHiddenStates(unittest.TestCase):
         batch_size = len(request_ids)
         batch_size - num_context_request
         hidden_size = hidden_states.shape[1]
-        spec_config = MTPConfig(
+        spec_config = MTPDecodingConfig(
             num_nextn_predict_layers=num_nextn_predict_layers)
 
         attn_metadata = TrtllmAttentionMetadata(max_num_requests=batch_size,
@@ -892,7 +890,7 @@ class TestMTPUpdateMTPHiddenStates(unittest.TestCase):
         spec_metadata = MTPSpecMetadata(
             max_num_requests=32,
             spec_dec_mode=spec_config.spec_dec_mode,
-            max_draft_tokens=num_nextn_predict_layers,
+            max_draft_len=num_nextn_predict_layers,
             mtp_num_modules=num_nextn_predict_layers,
             mtp_hidden_states_manager=spec_manager)
         spec_metadata.request_ids = request_ids
@@ -1362,7 +1360,7 @@ class TestMTPPrepareDrafterInputs(unittest.TestCase):
             hidden_size = previous_layer_hidden_states.shape[1]
         else:
             hidden_size = 10
-        spec_config = MTPConfig(
+        spec_config = MTPDecodingConfig(
             num_nextn_predict_layers=num_nextn_predict_layers)
 
         if attn_metadata is None:
@@ -1387,7 +1385,7 @@ class TestMTPPrepareDrafterInputs(unittest.TestCase):
         spec_metadata = MTPSpecMetadata(
             max_num_requests=32,
             spec_dec_mode=spec_config.spec_dec_mode,
-            max_draft_tokens=num_nextn_predict_layers,
+            max_draft_len=num_nextn_predict_layers,
             mtp_num_modules=num_nextn_predict_layers,
             mtp_hidden_states_manager=spec_manager)
         spec_metadata.request_ids = request_ids

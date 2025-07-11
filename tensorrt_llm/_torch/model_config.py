@@ -7,6 +7,7 @@ import torch
 import transformers
 
 from tensorrt_llm import logger
+from tensorrt_llm._torch.pyexecutor.config_utils import is_nemotron_hybrid
 from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
@@ -69,7 +70,7 @@ class ModelConfig(Generic[TConfig]):
     # to support mixed quantization.
     skip_create_weights_in_init: bool = False
 
-    spec_config: Optional["SpecConfig"] = None
+    spec_config: Optional["DecodingBaseConfig"] = None
     lora_config: Optional["LoraConfig"] = None
 
     is_generation: bool = True
@@ -298,7 +299,7 @@ class ModelConfig(Generic[TConfig]):
         model_config_cpp = ModelConfigCpp(
             vocab_size=self.pretrained_config.vocab_size,
             num_layers=self.pretrained_config.num_hidden_layers,
-            num_attention_layers=self.pretrained_config.num_hidden_layers,
+            num_attention_layers=self.get_num_attention_layers(),
             num_rnn_layers=0,
             num_heads=num_heads,
             hidden_size=hidden_size,
@@ -376,3 +377,9 @@ class ModelConfig(Generic[TConfig]):
             ] * self.pretrained_config.num_hidden_layers
         else:
             return None
+
+    def get_num_attention_layers(self):
+        if is_nemotron_hybrid(self.pretrained_config):
+            return self.pretrained_config.hybrid_override_pattern.count("*")
+        else:
+            return self.pretrained_config.num_hidden_layers

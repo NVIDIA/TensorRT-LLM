@@ -89,7 +89,7 @@ python examples/summarize.py \
 ### V2 workflow
 
 ```bash
-python3 examples/pytorch/quickstart_advanced.py \
+python3 examples/llm-api/quickstart_advanced.py \
     --max_matching_ngram_size=2 \
     --spec_decode_nextn=4
 ```

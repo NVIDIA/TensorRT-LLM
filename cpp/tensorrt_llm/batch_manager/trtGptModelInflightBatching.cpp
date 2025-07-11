@@ -929,6 +929,25 @@ void TrtGptModelInflightBatching::storeContextBlocks(std::shared_ptr<LlmRequest>
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
+void TrtGptModelInflightBatching::storeNewBlock(std::shared_ptr<LlmRequest> const& llmReq)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    // TMJ - Note
+    // Make context blocks reusable immediately after each generation step.
+
+    if (mKvCacheManager)
+    {
+        mKvCacheManager->storeNewBlock(*llmReq);
+    }
+    if (mCrossKvCacheManager)
+    {
+        mCrossKvCacheManager->storeNewBlock(*llmReq);
+    }
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
 void TrtGptModelInflightBatching::resetIterationStats()
 {
     mLastIterationStatsIFB = IterationStatsIFB{mMicroBatchId};
@@ -1099,6 +1118,7 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
                     }
                     else if (llmReq->isGenerationInProgressState())
                     {
+                        storeNewBlock(llmReq);
                         TLLM_LOG_DEBUG("request with ID %lu forwards a step in decoder gen phase", llmReq->mRequestId);
                     }
                 }

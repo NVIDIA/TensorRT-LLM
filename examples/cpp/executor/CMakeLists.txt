@@ -22,10 +22,19 @@ if(NOT TRTLLM_BUILD_DIR)
   set(TRTLLM_BUILD_DIR "${TRTLLM_DIR}/cpp/build")
 endif()
 set(TRTLLM_LIB_PATH "${TRTLLM_BUILD_DIR}/tensorrt_llm/libtensorrt_llm.so")
+if(NOT EXISTS ${TRTLLM_LIB_PATH})
+  message(FATAL_ERROR "Cannot find ${TRTLLM_LIB_PATH}")
+endif()
+
 set(TRTLLM_PLUGIN_PATH
     "${TRTLLM_BUILD_DIR}/tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so"
 )
 set(TRTLLM_INCLUDE_DIR "${TRTLLM_DIR}/cpp/include")
+
+option(
+  ENABLE_MULTI_DEVICE
+  "Enable multi device/instance examples building (requires MPI headers/libs)"
+  ON)
 
 # Determine CXX11 ABI compatibility
 execute_process(
@@ -47,8 +56,13 @@ set(CMAKE_VERBOSE_MAKEFILE 1)
 # Define project name
 project(executorExamples)
 
-# Compile options
-set(CMAKE_CXX_FLAGS "-Wall -pthread -lstdc++ -DENABLE_MULTI_DEVICE=1")
+# Compile options $<BOOL:${ENABLE_MULTI_DEVICE}> ?
+if(ENABLE_MULTI_DEVICE)
+  set(EMD 1)
+else()
+  set(EMD 0)
+endif()
+set(CMAKE_CXX_FLAGS "-Wall -pthread -lstdc++ -DENABLE_MULTI_DEVICE=${EMD} ")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 set(CMAKE_BUILD_TYPE release)
 
@@ -120,23 +134,25 @@ target_link_libraries(executorExampleAdvanced nvinfer_plugin_tensorrt_llm
                       cxxopts::cxxopts)
 
 # MultiInstance
+if(ENABLE_MULTI_DEVICE)
+  find_package(MPI REQUIRED)
+  message(STATUS "Using MPI_C_INCLUDE_DIRS: ${MPI_C_INCLUDE_DIRS}")
+  message(STATUS "Using MPI_C_LIBRARIES: ${MPI_C_LIBRARIES}")
+  include_directories(${MPI_C_INCLUDE_DIRS})
 
-find_package(MPI REQUIRED)
-message(STATUS "Using MPI_C_INCLUDE_DIRS: ${MPI_C_INCLUDE_DIRS}")
-message(STATUS "Using MPI_C_LIBRARIES: ${MPI_C_LIBRARIES}")
-include_directories(${MPI_C_INCLUDE_DIRS})
+  add_executable(executorExampleAdvancedMultiInstances
+                 executorExampleAdvancedMultiInstances.cpp)
+  target_link_libraries(
+    executorExampleAdvancedMultiInstances nvinfer_plugin_tensorrt_llm
+    cxxopts::cxxopts ${MPI_C_LIBRARIES})
 
-add_executable(executorExampleAdvancedMultiInstances
-               executorExampleAdvancedMultiInstances.cpp)
-target_link_libraries(
-  executorExampleAdvancedMultiInstances nvinfer_plugin_tensorrt_llm
-  cxxopts::cxxopts ${MPI_C_LIBRARIES})
+  # FastLogits
+  add_executable(executorExampleFastLogits executorExampleFastLogits.cpp)
+  target_link_libraries(executorExampleFastLogits nvinfer_plugin_tensorrt_llm
+                        cxxopts::cxxopts ${MPI_C_LIBRARIES})
 
-# FastLogits
-add_executable(executorExampleFastLogits executorExampleFastLogits.cpp)
-target_link_libraries(executorExampleFastLogits nvinfer_plugin_tensorrt_llm
-                      cxxopts::cxxopts ${MPI_C_LIBRARIES})
-
-add_executable(executorExampleDisaggregated executorExampleDisaggregated.cpp)
-target_link_libraries(executorExampleDisaggregated nvinfer_plugin_tensorrt_llm
-                      cxxopts::cxxopts ${MPI_C_LIBRARIES})
+  add_executable(executorExampleDisaggregated executorExampleDisaggregated.cpp)
+  target_link_libraries(
+    executorExampleDisaggregated nvinfer_plugin_tensorrt_llm cxxopts::cxxopts
+    ${MPI_C_LIBRARIES})
+endif()

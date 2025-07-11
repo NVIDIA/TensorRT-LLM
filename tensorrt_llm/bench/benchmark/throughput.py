@@ -223,6 +223,16 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Path where output should be written to.",
 )
 @optgroup.option(
+    "--request_json",
+    type=click.Path(dir_okay=False,
+                    writable=True,
+                    readable=False,
+                    path_type=Path,
+                    resolve_path=True),
+    required=False,
+    help="Path where per request information is written to.",
+)
+@optgroup.option(
     "--enable_chunked_context",
     is_flag=True,
     default=False,
@@ -262,6 +272,7 @@ def throughput_command(
     # Reporting options
     report_json: Path = params.pop("report_json")
     output_json: Path = params.pop("output_json")
+    request_json: Path = params.pop("request_json")
     iteration_log: Path = params.pop("iteration_log")
     iteration_writer = IterationWriter(iteration_log)
 
@@ -433,6 +444,10 @@ def throughput_command(
             with open(output_json, "w") as f:
                 output_token_info = report_utility.get_output_tokens(tokenizer)
                 f.write(json.dumps(output_token_info, indent=4))
+        if request_json:
+            logger.info(f"Writing request information to {request_json}.")
+            with open(request_json, "w") as f:
+                f.write(json.dumps(report_utility.get_request_info(tokenizer)))
         report_utility.report_statistics()
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt, exiting benchmark...")

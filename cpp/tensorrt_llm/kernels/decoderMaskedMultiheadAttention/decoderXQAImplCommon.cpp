@@ -54,7 +54,7 @@ XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQAParams const& xqaParam
 
     return {xqaParams.kv_cache_data_type, head_size, beam_width, kernel_num_q_heads_over_kv, kernel_m_tilesize,
         xqaParams.paged_kv_cache ? static_cast<unsigned int>(xqaParams.tokens_per_block) : 0, xqaParams.paged_kv_cache,
-        xqaParams.multi_query_tokens};
+        xqaParams.multi_query_tokens, xqaParams.is_fp8_output};
 }
 
 } // namespace tensorrt_llm::kernels
