@@ -59,6 +59,7 @@ class StatsKeeper:
         Register request perf items, used exclusively with LLM API.
         """
         record = self.requests[request_perf_item.request_id]
+        record.id = request_perf_item.request_id
         record.num_input_tokens = request_perf_item.num_input_tokens
         record.start_timestamp = request_perf_item.start_timestamp
         record.register_event(request_perf_item.error,
@@ -219,6 +220,16 @@ class ReportUtility:
             output_str = tokenizer.decode(request.tokens)
             retval[req_id] = output_str
         return dict(sorted(retval.items()))
+
+    def get_request_info(self, tokenizer) -> Dict[int, List[str]]:
+        requests = []
+        for request in self.raw_statistics.requests.values():
+            entry = request.model_dump()
+            entry["output"] = tokenizer.decode(entry["tokens"])
+            entry["output_tokens"] = len(entry["tokens"])
+            entry.pop("tokens")
+            requests.append(entry)
+        return requests
 
     def get_statistics_dict(self) -> Dict[str, Any]:
         """Get statistics as a dictionary.
