@@ -487,10 +487,6 @@ class OpenAIMoeForCausalLM(DecoderModelForCausalLM[Transformer,
         )
 
     def load_weights(self, weights: Dict):
-        # TODO: remove the upcast
-        for k, v in weights.items():
-            if v.dtype == torch.float8_e5m2:
-                weights[k] = v.to(self.model.dtype)
         head_dim = self.config.head_dim
         num_q_head = self.config.num_attention_heads
         num_kv_head = self.config.num_key_value_heads
@@ -517,20 +513,42 @@ class OpenAIMoeForCausalLM(DecoderModelForCausalLM[Transformer,
                 # [num_experts, intermediate_size, hidden_size]
                 down_proj = filter_weights(name.replace("experts", "mlp2"),
                                            weights)
+                gate_up_weight = gate_up_proj['weight.blocks'].flatten(-2, -1)
+                gate, up = gate_up_weight[:, ::2, :], gate_up_weight[:, 1::2, :]
+                gate_up_weight = torch.cat([gate, up], dim=-2)
+                gate_up_bias = gate_up_proj['bias']
+                gate, up = gate_up_bias[:, ::2], gate_up_bias[:, 1::2]
+                gate_up_bias = torch.cat([gate, up], dim=-1)
                 moe_weights = {
                     'gate_up_proj': [
-                        gate_up_proj['weight'][i, :, :].transpose(0, 1)
+                        gate_up_weight[i, :, :].transpose(0, 1)
                         for i in range(num_expert)
                     ],
                     'down_proj': [
-                        down_proj['weight'][i, :, :].transpose(0, 1)
+                        down_proj['weight.blocks'].flatten(
+                            -2, -1)[i, :, :].transpose(0, 1)
                         for i in range(num_expert)
                     ],
                     'gate_up_proj.bias':
-                    [gate_up_proj['bias'][i, :] for i in range(num_expert)],
+                    [gate_up_bias[i, :] for i in range(num_expert)],
                     'down_proj.bias':
                     [down_proj['bias'][i, :] for i in range(num_expert)]
                 }
+                if module.quant_config.quant_mode.has_mxfp4():
+                    gate_up_weight_scale = gate_up_proj['weight.scales']
+                    gate, up = gate_up_weight_scale[:, ::
+                                                    2, :], gate_up_weight_scale[:,
+                                                                                1::
+                                                                                2, :]
+                    gate_up_weight_scale = torch.cat([gate, up], dim=-2)
+                    moe_weights['gate_up_proj_weight_scale'] = [
+                        gate_up_weight_scale[i, :, :].transpose(0, 1)
+                        for i in range(num_expert)
+                    ]
+                    moe_weights['down_proj_weight_scale'] = [
+                        down_proj['weight.scales'][i, :, :].transpose(0, 1)
+                        for i in range(num_expert)
+                    ]
                 module.load_weights(weights=[moe_weights])
             elif hasattr(module, "load_weights"):
                 # Load Attention module weights.
