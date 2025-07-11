@@ -66,7 +66,7 @@ A. Yes, it's recommended that different executor use different GPUs . We support
 
 *Q. How to handle error `Disaggregated serving is not enabled, please check the configuration?`*
 
-A. please set the environment variables
+A. Please set the environment variables
 ```
 export TRTLLM_USE_UCX_KVCACHE=1
 ```
