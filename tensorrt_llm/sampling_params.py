@@ -383,6 +383,10 @@ class SamplingParams:
         return self.return_generation_logits and not self._generation_logits_auto_enabled
 
     def _setup(self, tokenizer, add_special_tokens: bool = False) -> "SamplingParams":
+        print(
+            f"DEBUG: SamplingParams._setup - stop = {self.stop}, add_special_tokens = {add_special_tokens}"
+        )
+
         if self.end_id is None:
             self.end_id = tokenizer.eos_token_id
             self.pad_id = tokenizer.pad_token_id
@@ -397,9 +401,11 @@ class SamplingParams:
 
         if self.stop is not None:
             strs = [self.stop] if isinstance(self.stop, str) else self.stop
+            print(f"DEBUG: Tokenizing stop strings: {strs}")
             self._stop_word_ids = [
                 tokenizer.encode(s, add_special_tokens=add_special_tokens) for s in strs
             ]
+            print(f"DEBUG: _stop_word_ids = {self._stop_word_ids}")
 
         return self
 
@@ -423,17 +429,23 @@ class SamplingParams:
         if self.stop_token_ids:
             words = [[i] for i in self.stop_token_ids]
 
-        if self.stop is None:
-            return words
-        else:
-            if self._stop_word_ids is None:
-                raise RuntimeError(
-                    f"{self.__class__.__name__}.stop ({self.stop}) is not processed by tokenizer, "
-                    "please call the setup method."
-                )
-            return words + self._stop_word_ids
+        # Don't add _stop_word_ids since we're using detokenization-based detection
+        # This disables the C++ engine's token-based stop detection
+
+        # if self.stop is None:
+        #     return words
+        # else:
+        #     if self._stop_word_ids is None:
+        #         raise RuntimeError(
+        #             f"{self.__class__.__name__}.stop ({self.stop}) is not processed by tokenizer, "
+        #             "please call the setup method."
+        #         )
+        #     return words + self._stop_word_ids
+
+        return words
 
     def _get_stop_reasons_and_words(self) -> List[Tuple[Union[str, int], List[List[int]]]]:
+        print("DEBUG: _get_stop_reasons_and_words called")
         stop_reasons = []
         if self.stop_token_ids is not None:
             stop_reasons.extend(self.stop_token_ids)
@@ -442,7 +454,11 @@ class SamplingParams:
                 stop_reasons.append(self.stop)
             else:
                 stop_reasons.extend(self.stop)
-        stop_words = self._get_stop_words()
+
+        # For detokenization-based approach, return empty word lists
+        stop_words = [[] for _ in stop_reasons]  # Empty lists for each stop reason
+        print(f"DEBUG: Returning stop_reasons: {stop_reasons}, stop_words: {stop_words}")
+
         return list(zip(stop_reasons, stop_words))
 
     def _get_sampling_config(self) -> tllme.SamplingConfig:

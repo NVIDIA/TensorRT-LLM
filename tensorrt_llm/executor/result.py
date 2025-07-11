@@ -139,10 +139,12 @@ class GenerationResultBase:
                  id: int,
                  sampling_params: SamplingParams,
                  background_error_handler: Optional[Callable] = None,
-                 postproc_params: "Optional[PostprocParams]" = None):
+                 postproc_params: "Optional[PostprocParams]" = None,
+                 streaming: bool = False):
         self.id = id
         self.sampling_params = sampling_params
         self.postproc_params = postproc_params
+        self._streaming = streaming
         self.disaggregated_params = None
         self.decoding_iter = 0
         self._done = False
@@ -197,6 +199,71 @@ class GenerationResultBase:
     def context_logits(self) -> Optional[torch.Tensor]:
         return self._context_logits
 
+    def _handle_streaming_stop_detection(self, output, new_tokens):
+        """Handle stop word detection for streaming responses"""
+        if not self.sampling_params.stop:
+            return False
+
+        if not hasattr(self, '_streaming_state'):
+            self._streaming_state = {}
+
+        # Get or initialize accumulated text for THIS SPECIFIC output
+        output_id = id(output)
+        if output_id not in self._streaming_state:
+            self._streaming_state[output_id] = {"accumulated_text": ""}
+
+        accumulated_text = self._streaming_state[output_id]["accumulated_text"]
+
+        if not hasattr(self, 'tokenizer') or self.tokenizer is None:
+            print(f"DEBUG: ERROR - No tokenizer for streaming!")
+            return False
+
+        new_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+        full_text = accumulated_text + new_text
+
+        print(f"DEBUG: Streaming - accumulated: '{accumulated_text}'")
+        print(f"DEBUG: Streaming - new text: '{new_text}'")
+        print(f"DEBUG: Streaming - full text: '{full_text}'")
+
+        for stop_reason, _ in self.sampling_params._get_stop_reasons_and_words(
+        ):
+            if isinstance(stop_reason, str) and stop_reason in full_text:
+                print(f"DEBUG: Streaming - found stop word '{stop_reason}'!")
+
+                stop_pos = full_text.find(stop_reason)
+                if not self.sampling_params.include_stop_str_in_output:
+                    truncated_text = full_text[:stop_pos]
+                else:
+                    truncated_text = full_text[:stop_pos + len(stop_reason)]
+
+                print(f"DEBUG: Before update - output.text: '{output.text}'")
+                print(
+                    f"DEBUG: Before update - output._last_text_len: {output._last_text_len}"
+                )
+
+                output.token_ids = self.tokenizer.encode(
+                    truncated_text, add_special_tokens=False)
+                output.text = truncated_text
+                output.finish_reason = 'stop'
+                output.stop_reason = stop_reason
+
+                print(f"DEBUG: After update - output.text: '{output.text}'")
+                print(
+                    f"DEBUG: After update - output._last_text_len: {output._last_text_len}"
+                )
+                print(
+                    f"DEBUG: After update - output.text_diff: '{output.text_diff}'"
+                )
+
+                if output_id in self._streaming_state:
+                    del self._streaming_state[output_id]
+
+                print(f"DEBUG: Streaming - truncated to: '{truncated_text}'")
+                return True
+
+        self._streaming_state[output_id]["accumulated_text"] = full_text
+        return False
+
     def _handle_sequence(self,
                          finish_reasons,
                          response_tensors,
@@ -204,16 +271,36 @@ class GenerationResultBase:
                          logprobs_result=None):
         """ Handle a single sequence in the response. """
 
+        print(
+            f"DEBUG: _handle_sequence called - sequence_index: {sequence_index}"
+        )
+        print(f"DEBUG: finish_reasons: {finish_reasons}")
+        print(
+            f"DEBUG: finish_reason for this sequence: {finish_reasons[sequence_index] if sequence_index < len(finish_reasons) else 'N/A'}"
+        )
+
         seq_idx = sequence_index
         src_idx = sequence_index if self.sampling_params.use_beam_search else 0
 
         output = self._outputs[seq_idx]
         output.disaggregated_params = self.disaggregated_params
         output._last_token_ids_len = len(output.token_ids)
+
+        # Get new tokens for this step
+        new_tokens = response_tensors.output_token_ids[src_idx]
+
         if self.sampling_params.use_beam_search:
             # Beam search enforces returning all generated tokens
             output.token_ids = response_tensors.output_token_ids[src_idx]
         else:
+            if self._streaming and self.sampling_params.stop:
+                print(
+                    f"DEBUG: Streaming stop detection - new tokens: {new_tokens}"
+                )
+                if self._handle_streaming_stop_detection(output, new_tokens):
+                    print(f"DEBUG: Stop word detected in streaming mode!")
+                    self._done = True
+                    return
             output.token_ids.extend(response_tensors.output_token_ids[src_idx])
 
         if response_tensors.cum_log_probs is not None:
@@ -247,19 +334,91 @@ class GenerationResultBase:
             output.request_perf_metrics = response_tensors.request_perf_metrics
 
         if self._done:
+            print(
+                f"DEBUG: About to check finish_reason: {finish_reasons[src_idx]}"
+            )
+
             if finish_reasons[src_idx] == tllm.FinishReason.END_ID:
                 output.finish_reason = 'stop'
-            elif finish_reasons[src_idx] == tllm.FinishReason.STOP_WORDS:
-                output.finish_reason = 'stop'
-                for stop_reason, stop_ids in self.sampling_params._get_stop_reasons_and_words(
-                ):
-                    if output.token_ids[-len(stop_ids):] == stop_ids:
-                        output.stop_reason = stop_reason
-                        if not self.sampling_params.include_stop_str_in_output:
-                            output.token_ids = output.token_ids[:-len(stop_ids)]
-                        break
+            # elif finish_reasons[src_idx] == tllm.FinishReason.STOP_WORDS:
+            #     output.finish_reason = 'stop'
+            #     for stop_reason, stop_ids in self.sampling_params._get_stop_reasons_and_words(
+            #     ):
+            #         if output.token_ids[-len(stop_ids):] == stop_ids:
+            #             output.stop_reason = stop_reason
+            #             if not self.sampling_params.include_stop_str_in_output:
+            #                 output.token_ids = output.token_ids[:-len(stop_ids)]
+            #             break
+            # elif finish_reasons[src_idx] == tllm.FinishReason.LENGTH:
+            #     output.finish_reason = 'length'
             elif finish_reasons[src_idx] == tllm.FinishReason.LENGTH:
-                output.finish_reason = 'length'
+                # For non-streaming or when streaming is complete
+                if not self._streaming or not self.sampling_params.stop:
+                    print(f"DEBUG: ENTERING LENGTH PROCESSING!")
+
+                    print(
+                        f"DEBUG: self has tokenizer: {hasattr(self, 'tokenizer')}"
+                    )
+                    if hasattr(self, 'tokenizer'):
+                        print(f"DEBUG: tokenizer is: {self.tokenizer}")
+                    else:
+                        print(f"DEBUG: No tokenizer found!")
+                        output.finish_reason = 'length'
+
+                    print(
+                        f"DEBUG: About to detokenize {len(output.token_ids)} tokens"
+                    )
+                    print(f"DEBUG: Token IDs: {output.token_ids}")
+
+                    generated_text = self.tokenizer.decode(
+                        output.token_ids, skip_special_tokens=True)
+                    print(f"DEBUG: Detokenized text: '{generated_text}'")
+
+                    print(
+                        f"DEBUG: About to check stop words: {self.sampling_params.stop}"
+                    )
+
+                    for stop_reason, _ in self.sampling_params._get_stop_reasons_and_words(
+                    ):
+                        print(f"DEBUG: Checking stop_reason: {stop_reason}")
+                        if isinstance(stop_reason,
+                                      str) and stop_reason in generated_text:
+                            print(
+                                f"DEBUG: FOUND STOP WORD '{stop_reason}' in text!"
+                            )
+                            output.finish_reason = 'stop'
+                            output.stop_reason = stop_reason
+
+                            stop_pos = generated_text.find(stop_reason)
+                            print(
+                                f"DEBUG: Stop word found at position: {stop_pos}"
+                            )
+
+                            if not self.sampling_params.include_stop_str_in_output:
+                                truncated_text = generated_text[:stop_pos]
+                                output.token_ids = self.tokenizer.encode(
+                                    truncated_text, add_special_tokens=False)
+                                print(
+                                    f"DEBUG: Truncated text (excluded stop word): '{truncated_text}'"
+                                )
+                            else:
+                                truncated_text = generated_text[:stop_pos +
+                                                                len(stop_reason
+                                                                    )]
+                                output.token_ids = self.tokenizer.encode(
+                                    truncated_text, add_special_tokens=False)
+                                print(
+                                    f"DEBUG: Truncated text (included stop word): '{truncated_text}'"
+                                )
+                            break
+                    else:
+                        print(
+                            f"DEBUG: No stop words found, setting finish_reason to 'length'"
+                        )
+                        output.finish_reason = 'length'
+                else:
+                    # For streaming, stop detection already happened above
+                    output.finish_reason = 'length'
             elif finish_reasons[src_idx] == tllm.FinishReason.TIMED_OUT:
                 output.finish_reason = 'timeout'
             # For disaggregated serving, finish reason might be NOT_FINISHED which is ok
@@ -278,6 +437,10 @@ class GenerationResultBase:
     def _handle_response(self,
                          response: Union["PostprocWorker.Output", tllm.Response,
                                          ResponseWrapper, ErrorResponse]):
+        print(
+            f"DEBUG: _handle_response called with response type: {type(response)}"
+        )
+
         if isinstance(response, ResponseWrapper):
             logprobs_result = response.logprobs
             response = response._response
@@ -297,6 +460,7 @@ class GenerationResultBase:
                         handler := self._background_error_handler()):
                     handler(response.error)
         elif is_llm_response(response):
+            print(f"DEBUG: Processing LLM response")
             if response.has_error():
                 if self._background_error_handler is not None and (
                         handler := self._background_error_handler()):
@@ -318,6 +482,7 @@ class GenerationResultBase:
                     draft_tokens=context_phase_params.draft_tokens)
 
             finish_reasons = response_result.finish_reasons
+            print(f"DEBUG: finish_reasons: {finish_reasons}")
             # output_token_ids = (beams, tokens)
             if self.sampling_params.use_beam_search:
                 for beam_idx, _ in enumerate(response_result.output_token_ids):
@@ -422,6 +587,7 @@ class GenerationResult(GenerationResultBase):
             generation_request.sampling_params,
             background_error_handler,
             postproc_params=generation_request.postproc_params,
+            streaming=generation_request.streaming,
         )
         self._generation_request = generation_request
         self._streaming = generation_request.streaming
