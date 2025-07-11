@@ -1028,10 +1028,6 @@ class BaseLlmArgs(BaseModel):
     lora_config: Optional[LoraConfig] = Field(
         default=None, description="LoRA configuration for the model.")
 
-    # Quantization and calibration configurations
-    quant_config: Optional[QuantConfig] = Field(
-        default=None, description="Quantization config.", validate_default=True)
-
     # Several options from ExecutorConfig, expanded here for less hierarchy
     kv_cache_config: KvCacheConfig = Field(default_factory=KvCacheConfig,
                                            description="KV cache config.")
@@ -1210,13 +1206,6 @@ class BaseLlmArgs(BaseModel):
                 v = 'float16'
             if v == 'bfloat16':
                 raise RuntimeError("Pre SM 80 GPUs do not support bfloat16")
-        return v
-
-    @field_validator("quant_config", mode='before')
-    @classmethod
-    def validate_quant_config(cls, v, info):
-        if v is None:
-            v = QuantConfig()
         return v
 
     @field_validator("gpus_per_node", mode='before')
@@ -1660,6 +1649,10 @@ class TrtLlmArgs(BaseLlmArgs):
     calib_config: Optional[CalibConfig] = Field(
         default=None, description="Calibration config.", validate_default=True)
 
+    # Quantization and calibration configurations
+    quant_config: Optional[QuantConfig] = Field(
+        default=None, description="Quantization config.", validate_default=True)
+
     embedding_parallel_mode: str = Field(
         default='SHARDING_ALONG_VOCAB',
         description="The embedding parallel mode.")
@@ -1695,6 +1688,13 @@ class TrtLlmArgs(BaseLlmArgs):
     def init_calib_config(cls, v):
         if v is None:
             return CalibConfig()
+        return v
+
+    @field_validator("quant_config", mode='before')
+    @classmethod
+    def validate_quant_config(cls, v, info):
+        if v is None:
+            v = QuantConfig()
         return v
 
     @model_validator(mode="after")
@@ -1872,6 +1872,19 @@ class TorchLlmArgs(BaseLlmArgs):
                 'MNNVL']] = Field(default='AUTO',
                                   description="Allreduce strategy to use.")
 
+    # PrivateVars
+    _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
+
+    @property
+    def quant_config(self) -> QuantConfig:
+        if self._quant_config is None:
+            self._quant_config = QuantConfig()
+        return self._quant_config
+
+    @quant_config.setter
+    def quant_config(self, value: QuantConfig):
+        self._quant_config = value
+
     # TODO: remove backend later
     @field_validator('backend', mode='before')
     def init_backend(cls, v):
@@ -1997,6 +2010,17 @@ class TorchLlmArgs(BaseLlmArgs):
             config.batch_sizes = generated_sizes
             config.max_batch_size = max_batch_size
 
+        return self
+
+    @model_validator(mode='after')
+    def sync_quant_config_with_kv_cache_config_dtype(self) -> 'TorchLlmArgs':
+        assert self.quant_config is not None
+        if self.kv_cache_config.dtype == 'fp8':
+            self.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+        else:
+            logger.warning(
+                f"Cannot sync quant_config.kv_cache_quant_algo with kv_cache_config.dtype of {self.kv_cache_config.dtype}, "
+                "please update the validator")
         return self
 
     # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
