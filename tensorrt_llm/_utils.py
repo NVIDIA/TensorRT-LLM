@@ -471,27 +471,27 @@ local_comm = mpi_comm().Split_type(split_type=OMPI_COMM_TYPE_HOST)
 
 
 def mpi_rank():
-    return mpi_comm().Get_rank() if ENABLE_MULTI_DEVICE else 0
+    return mpi_comm().Get_rank() if is_multi_device_enable() else 0
 
 
 def global_mpi_rank():
-    return MPI.COMM_WORLD.Get_rank() if ENABLE_MULTI_DEVICE else 0
+    return MPI.COMM_WORLD.Get_rank() if is_multi_device_enable() else 0
 
 
 def global_mpi_size():
-    return MPI.COMM_WORLD.Get_size() if ENABLE_MULTI_DEVICE else 1
+    return MPI.COMM_WORLD.Get_size() if is_multi_device_enable() else 1
 
 
 def mpi_world_size():
-    return mpi_comm().Get_size() if ENABLE_MULTI_DEVICE else 1
+    return mpi_comm().Get_size() if is_multi_device_enable() else 1
 
 
 def local_mpi_rank():
-    return local_comm.Get_rank() if ENABLE_MULTI_DEVICE else 0
+    return local_comm.Get_rank() if is_multi_device_enable() else 0
 
 
 def local_mpi_size():
-    return local_comm.Get_size() if ENABLE_MULTI_DEVICE else 1
+    return local_comm.Get_size() if is_multi_device_enable() else 1
 
 
 def default_gpus_per_node():
@@ -504,54 +504,54 @@ def default_gpus_per_node():
 
 
 def mpi_barrier():
-    if ENABLE_MULTI_DEVICE:
+    if is_multi_device_enable():
         mpi_comm().Barrier()
 
 
 def mpi_broadcast(obj, root=0):
-    return mpi_comm().bcast(obj, root) if ENABLE_MULTI_DEVICE else obj
+    return mpi_comm().bcast(obj, root) if is_multi_device_enable() else obj
 
 
 def mpi_allgather(obj):
-    return mpi_comm().allgather(obj) if ENABLE_MULTI_DEVICE else obj
+    return mpi_comm().allgather(obj) if is_multi_device_enable() else obj
 
 
 def mpi_isend(buf, dest, tag=0):
     # isend in buf-like objects (e.g. numpy array)
-    # return request handle if ENABLE_MULTI_DEVICE
-    if ENABLE_MULTI_DEVICE:
+    # return request handle if is_multi_device_enable()
+    if is_multi_device_enable():
         return mpi_comm().Isend(buf, dest, tag=tag)
     return None
 
 
 def mpi_send(buf, dest, tag=0):
     # send in buf-like objects (e.g. numpy array)
-    # return request handle if ENABLE_MULTI_DEVICE
-    if ENABLE_MULTI_DEVICE:
+    # return request handle if is_multi_device_enable()
+    if is_multi_device_enable():
         mpi_comm().Send(buf, dest, tag=tag)
     return None
 
 
 def mpi_recv(buf, source, tag):
     # recv in buf-like object (e.g. numpy array)
-    if ENABLE_MULTI_DEVICE:
+    if is_multi_device_enable():
         return mpi_comm().Recv(buf, source, tag=tag)
     return None
 
 
 def mpi_send_object(obj, dest, tag=0):
-    if ENABLE_MULTI_DEVICE:
+    if is_multi_device_enable():
         mpi_comm().send(obj, dest=dest, tag=tag)
 
 
 def mpi_isend_object(obj, dest, tag=0):
-    if ENABLE_MULTI_DEVICE:
+    if is_multi_device_enable():
         return mpi_comm().isend(obj, dest=dest, tag=tag)
     return None
 
 
 def mpi_recv_object(source, tag):
-    if ENABLE_MULTI_DEVICE:
+    if is_multi_device_enable():
         return mpi_comm().recv(source=source, tag=tag)
     return None
 
@@ -1079,3 +1079,13 @@ class KVCacheEventSerializer:
             "token_id": data.token_id,
             "token_extra_id": data.token_extra_id
         }
+
+def is_multi_device_enable():
+    """
+    This method evaluates if we are running on multiple GPUs and the flag ENABLE_MULTI_DEVICE is set.
+    So we can avoid broadcast calls on single GPU.
+    see: https://github.com/NVIDIA/TensorRT-LLM/issues/5927
+    ENABLE_MULTI_DEVICE is true by default when building tensorrt-llm so we need to also check
+    the number of devices
+    """
+    return local_comm.Get_size() > 1 and ENABLE_MULTI_DEVICE
