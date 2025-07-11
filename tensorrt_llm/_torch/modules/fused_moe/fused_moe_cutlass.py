@@ -272,9 +272,6 @@ class CutlassFusedMoE(MoE):
                             False, True)
             elif self.has_w4a8_mxfp4_mxfp8:
                 use_mxfp8_act_scaling = True
-                # TODO: Fuse padding.
-                pad_size = self.w3_w1_weight.shape[-1] * 16 - x.shape[-1]
-                x = torch.nn.functional.pad(x, (0, pad_size))
                 x, x_sf = torch.ops.trtllm.mxfp8_quantize(x, True)
             else:
                 raise ValueError(
@@ -325,13 +322,11 @@ class CutlassFusedMoE(MoE):
             min_latency_mode=False,
             tune_max_num_tokens=self.tune_max_num_tokens,
         )
+
         # Custom op requires all inputs are in the same type.
         # Only in cutlass_min_latency_mode, the output is a list of tensors.
         # Otherwise, the output should be unpacked as a single tensor.
         final_hidden_states = final_hidden_states[0]
-        # TODO: Fuse this for padded MXFP4.
-        final_hidden_states = final_hidden_states[:, :self.
-                                                  hidden_size].contiguous()
 
         return final_hidden_states
 

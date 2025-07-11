@@ -103,7 +103,6 @@ def create_moe(
             reduce_results=reduce_results,
             model_config=model_config,
             weight_loading_mode=weight_loading_mode,
-            bias=bias,
             layer_idx=layer_idx,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
