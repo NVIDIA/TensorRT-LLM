@@ -1239,10 +1239,10 @@ class PyExecutor:
             total_num_active_requests = len(self.active_requests)
             total_max_num_active_requests = self.max_num_active_requests
 
-        timeout = None if total_num_active_requests == 0 else datetime.timedelta(
-            0)
+        timeout = None if (total_num_active_requests == 0) and len(
+            self.waiting_queue) == 0 else datetime.timedelta(0)
         new_requests = []
-        if self.dist.rank == 0 and not self.is_shutdown:
+        if self.dist.rank == 0:
             new_requests = _get_from_request_queue(self.request_queue, timeout)
 
         if self.dist.rank == 0:
