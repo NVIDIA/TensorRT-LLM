@@ -45,8 +45,6 @@ examples/test_nemotron.py::test_llm_nemotron_3_8b_1gpu[bfloat16-fp8] SKIP (https
 examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-chunked_summarization_long] SKIP (https://nvbugs/5321371)
 test_e2e.py::test_openai_completions_example[pytorch] SKIP (https://nvbugspro.nvidia.com/bug/5004744)
 test_e2e.py::test_openai_completions_example[trt] SKIP (https://nvbugspro.nvidia.com/bug/5004744)
-test_e2e.py::test_openai_lora SKIP (https://nvbugspro.nvidia.com/bug/5375590)
-test_e2e.py::test_trtllm_serve_lora_example SKIP (https://nvbugspro.nvidia.com/bug/5375590)
 test_e2e.py::test_openai_chat_structural_tag_example SKIP (https://nvbugspro.nvidia.com/bug/5375594)
 cpp/test_e2e.py::test_model[fp8-chatglm-90] SKIP (https://nvbugs/5034830)
 full:B200_PCIe/examples/test_mamba.py::test_llm_mamba_1gpu[mamba2-130m-float16-enable_gemm_plugin] SKIP (Disable for Blackwell)
