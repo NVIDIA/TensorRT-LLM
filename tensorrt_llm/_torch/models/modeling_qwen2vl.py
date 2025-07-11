@@ -33,13 +33,21 @@ class Qwen2VLInputProcessorBase(InputProcessor):
                  trust_remote_code: bool = True):
         self.model_config = model_config
         self.tokenizer = tokenizer
-        # TODO: change to True and also change the according test result
-        self.use_fast = False
+        try:
+            self.use_fast = False
+            self.processor = AutoProcessor.from_pretrained(
+                model_path,
+                use_fast=self.use_fast,
+                trust_remote_code=trust_remote_code)
+        except TypeError:
+            logger.info("Switching processor to use_fast=True")
+            self.use_fast = True
+            self.processor = AutoProcessor.from_pretrained(
+                model_path,
+                use_fast=self.use_fast,
+                trust_remote_code=trust_remote_code)
+
         self.device = 'cuda'
-        self.processor = AutoProcessor.from_pretrained(
-            model_path,
-            use_fast=self.use_fast,
-            trust_remote_code=trust_remote_code)
 
         self.tllm_multimodal_token_id = self.model_config.vocab_size + 1
         self._post_init_()
