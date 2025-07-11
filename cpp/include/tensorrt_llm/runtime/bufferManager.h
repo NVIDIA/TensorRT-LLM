@@ -20,6 +20,7 @@
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "virtualMemory.h"
 #include <NvInferRuntime.h>
 
 #include <cstring>

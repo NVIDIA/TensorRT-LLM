@@ -214,6 +214,10 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("scaling_vec_pointer", &tr::LoraCache::TaskLayerModuleConfig::scalingVecPointer)
         .def(py::self == py::self);
 
+    py::class_<tr::CudaVirtualMemoryManager>(m, "CudaVirtualMemoryManager")
+        .def("release_with_mark", &tr::CudaVirtualMemoryManager::releaseWithMark, py::arg("mark"))
+        .def("materialize_with_mark", &tr::CudaVirtualMemoryManager::materializeWithMark, py::arg("mark"));
+
     py::classh<tr::BufferManager>(m, "BufferManager")
         .def(py::init<tr::BufferManager::CudaStreamPtr, bool>(), py::arg("stream"), py::arg("trim_pool") = false)
         .def_property_readonly("stream", &tr::BufferManager::getStream);
@@ -424,6 +428,28 @@ void initBindings(pybind11::module_& m)
         "max_workspace_size_lowprecision",
         [](int32_t tp_size) { return tensorrt_llm::kernels::max_workspace_size_lowprecision(tp_size); },
         "Calculate the maximum workspace size needed for low precision all-reduce operations");
+
+    py::enum_<tr::CudaVirtualAddressAllocator::RestoreMode>(m, "CudaVirtualAddressAllocatorRestoreMode")
+        .value("NONE", tr::CudaVirtualAddressAllocator::RestoreMode::NONE)
+        .value("CPU", tr::CudaVirtualAddressAllocator::RestoreMode::CPU)
+        .value("PINNED", tr::CudaVirtualAddressAllocator::RestoreMode::PINNED)
+        .value("MEMSET", tr::CudaVirtualAddressAllocator::RestoreMode::MEMSET);
+
+    m.def("get_virtual_memory_manager", &tr::getVirtualMemoryManager, "Get the virtual memory manager",
+        py::return_value_policy::reference);
+
+    m.def(
+        "push_virtual_address_allocator",
+        [](std::string const& mark, tr::CudaVirtualAddressAllocator::RestoreMode mode, uintptr_t stream)
+        {
+            tr::pushVirtualAddressAllocator(mark, mode,
+                std::make_shared<tr::CudaStream>(
+                    reinterpret_cast<cudaStream_t>(stream), tensorrt_llm::common::getDevice(), false));
+        },
+        "Push the current virtual address allocator");
+
+    m.def(
+        "pop_virtual_address_allocator", &tr::popVirtualAddressAllocator, "Pop the current virtual address allocator");
 
     py::class_<tensorrt_llm::runtime::McastGPUBuffer>(m, "McastGPUBuffer")
         .def(py::init<size_t, uint32_t, uint32_t, at::Device, bool>())
