@@ -869,8 +869,8 @@ class PyExecutor:
 
                 self._pad_attention_dp_dummy_request()
 
-                if self.draft_model_engine is not None or is_ngram or hasattr(
-                        self, 'drafter') and self.drafter is not None:
+                if self.draft_model_engine is not None or is_ngram or (hasattr(
+                        self, 'drafter') and self.drafter is not None):
                     self._prepare_draft_requests(self.active_requests)
 
                 scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
@@ -1595,8 +1595,13 @@ class PyExecutor:
             if req.is_context_only_request and (req.is_context_finished or
                                                 req.is_finished_due_to_length):
                 self.kv_cache_transceiver.respond_and_send_async(req)
-                self.resource_manager.resource_managers[
-                    ResourceManagerType.SEQ_SLOT_MANAGER].free_resources(req)
+                for resource_mgr_type in (
+                        ResourceManagerType.SEQ_SLOT_MANAGER,
+                        ResourceManagerType.SPEC_RESOURCE_MANAGER):
+                    if resource_mgr_type in self.resource_manager.resource_managers and self.resource_manager.resource_managers[
+                            resource_mgr_type] is not None:
+                        self.resource_manager.resource_managers[
+                            resource_mgr_type].free_resources(req)
 
         self.kv_cache_transceiver.check_context_transfer_status(0)
 
