@@ -433,19 +433,6 @@ pipeline {
     agent {
         kubernetes createKubernetesPodConfig("agent")
     }
-
-    parameters {
-        string(
-            name: "branch",
-            defaultValue: "main",
-            description: "Branch to launch job."
-        )
-        choice(
-            name: "action",
-            choices: ["build", "push"],
-            description: "Docker image generation action. build: only perform image build step; push: build docker image and push it to artifacts"
-        )
-    }
     options {
         // Check the valid options at: https://www.jenkins.io/doc/book/pipeline/syntax/
         // some step like results analysis stage, does not need to check out source code
