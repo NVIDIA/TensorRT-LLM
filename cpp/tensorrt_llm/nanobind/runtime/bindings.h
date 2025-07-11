@@ -17,15 +17,15 @@
 
 #pragma once
 
-#include "tensorrt_llm/pybind/common/customCasters.h"
-#include <pybind11/pybind11.h>
+#include "tensorrt_llm/nanobind/common/customCasters.h"
+#include <nanobind/nanobind.h>
 
-namespace py = pybind11;
+namespace nb = nanobind;
 
-namespace tensorrt_llm::pybind::runtime
+namespace tensorrt_llm::nanobind::runtime
 {
 
-void initBindings(py::module_& m);
-void initBindingsEarly(py::module_& m);
+void initBindings(nb::module_& m);
+void initBindingsEarly(nb::module_& m);
 
-} // namespace tensorrt_llm::pybind::runtime
+} // namespace tensorrt_llm::nanobind::runtime

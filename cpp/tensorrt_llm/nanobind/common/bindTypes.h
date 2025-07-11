@@ -17,31 +17,34 @@
 
 #pragma once
 
-#include "tensorrt_llm/pybind/common/customCasters.h"
-#include <pybind11/pybind11.h>
+#include "tensorrt_llm/nanobind/common/customCasters.h"
+#include <nanobind/make_iterator.h>
+#include <nanobind/nanobind.h>
+#include <nanobind/stl/string.h>
 
 namespace PybindUtils
 {
 
-namespace py = pybind11;
+namespace nb = nanobind;
 
 template <typename T>
-void bindList(py::module& m, std::string const& name)
+void bindList(nb::module_& m, std::string const& name)
 {
-    py::class_<T>(m, name.c_str())
-        .def(py::init())
+    nb::class_<T>(m, name.c_str())
+        .def(nb::init<>())
         .def("push_back", [](T& lst, const typename T::value_type& value) { lst.push_back(value); })
         .def("pop_back", [](T& lst) { lst.pop_back(); })
         .def("push_front", [](T& lst, const typename T::value_type& value) { lst.push_front(value); })
         .def("pop_front", [](T& lst) { lst.pop_front(); })
         .def("__len__", [](T const& lst) { return lst.size(); })
         .def(
-            "__iter__", [](T& lst) { return py::make_iterator(lst.begin(), lst.end()); }, py::keep_alive<0, 1>())
+            "__iter__", [](T& lst) { return nb::make_iterator(nb::type<T>(), "iterator", lst.begin(), lst.end()); },
+            nb::keep_alive<0, 1>())
         .def("__getitem__",
             [](T const& lst, size_t index)
             {
                 if (index >= lst.size())
-                    throw py::index_error();
+                    throw nb::index_error();
                 auto it = lst.begin();
                 std::advance(it, index);
                 return *it;
@@ -50,7 +53,7 @@ void bindList(py::module& m, std::string const& name)
             [](T& lst, size_t index, const typename T::value_type& value)
             {
                 if (index >= lst.size())
-                    throw py::index_error();
+                    throw nb::index_error();
                 auto it = lst.begin();
                 std::advance(it, index);
                 *it = value;
@@ -58,37 +61,41 @@ void bindList(py::module& m, std::string const& name)
 }
 
 template <typename T>
-void bindSet(py::module& m, std::string const& name)
+void bindSet(nb::module_& m, std::string const& name)
 {
-    py::class_<T>(m, name.c_str())
-        .def(py::init())
+    nb::class_<T>(m, name.c_str())
+        .def(nb::init<>())
         .def("clear", &T::clear)
         .def("size", &T::size)
         .def("insert", [](T& s, typename T::value_type const& value) { s.insert(value); })
-        .def("erase", py::overload_cast<typename T::value_type const&>(&T::erase))
+        .def("erase", nb::overload_cast<typename T::value_type const&>(&T::erase))
         .def("__len__", [](T const& lst) { return lst.size(); })
         .def("__contains__", [](T const& s, typename T::value_type x) { return s.find(x) != s.end(); })
         .def(
-            "__iter__", [](T& s) { return py::make_iterator(s.begin(), s.end()); }, py::keep_alive<0, 1>())
+            "__iter__", [](T& s) { return nb::make_iterator(nb::type<T>(), "iterator", s.begin(), s.end()); },
+            nb::keep_alive<0, 1>())
         .def("__eq__", [](T const& s, T const& other) { return s == other; })
-        .def(py::pickle(
-            [](T const& s) { // __getstate__
+        .def("__getstate__",
+            [](T const& v)
+            {
                 /* Return a tuple that fully encodes the state of the object */
-                return py::make_tuple(std::vector<typename T::value_type>(s.begin(), s.end()));
-            },
-            [](py::tuple t) { // __setstate__
+                return nb::make_tuple(std::vector<typename T::value_type>(v.begin(), v.end()));
+            })
+        .def("__setstate__",
+            [](T& v, nb::tuple const& t)
+            {
                 if (t.size() != 1)
                     throw std::runtime_error("Invalid state!");
                 /* Create a new C++ instance */
                 T s;
                 /* Assign any additional state */
-                auto state_list = t[0].cast<std::vector<typename T::value_type>>();
+                auto state_list = nb::cast<std::vector<typename T::value_type>>(t[0]);
                 for (auto& item : state_list)
                 {
                     s.insert(item);
                 }
                 return s;
-            }));
+            });
 }
 
 } // namespace PybindUtils
