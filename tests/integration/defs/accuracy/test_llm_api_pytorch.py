@@ -274,10 +274,11 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
     def test_guided_decoding(self, backend: str, mocker):
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
-        with LLM(self.MODEL_PATH,
-                 guided_decoding_backend=backend,
-                 disable_overlap_scheduler=True,
-                 cuda_graph_config=CudaGraphConfig()) as llm:
+        llm = LLM(self.MODEL_PATH,
+                  guided_decoding_backend=backend,
+                  disable_overlap_scheduler=True,
+                  cuda_graph_config=CudaGraphConfig())
+        with llm:
             task = JsonModeEval(self.MODEL_NAME)
             task.evaluate(llm)
 
