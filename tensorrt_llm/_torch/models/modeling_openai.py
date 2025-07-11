@@ -531,6 +531,15 @@ class OpenAIMoeForCausalLM(DecoderModelForCausalLM[Transformer,
                     'down_proj.bias':
                     [down_proj['bias'][i, :] for i in range(num_expert)]
                 }
+                if module.quant_config.quant_mode.has_mxfp4():
+                    moe_weights['gate_up_proj_weight_scale'] = [
+                        gate_up_proj['weight_scale'][i, :, :].transpose(0, 1)
+                        for i in range(num_expert)
+                    ]
+                    moe_weights['down_proj_weight_scale'] = [
+                        down_proj['weight_scale'][i, :, :].transpose(0, 1)
+                        for i in range(num_expert)
+                    ]
                 module.load_weights(weights=[moe_weights])
             elif hasattr(module, "load_weights"):
                 # Load Attention module weights.
