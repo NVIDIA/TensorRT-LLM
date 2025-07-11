@@ -20,9 +20,7 @@ def model_name():
     return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 
-@pytest.fixture(scope="module",
-                params=[None, 'pytorch'],
-                ids=["trt", "pytorch"])
+@pytest.fixture(scope="module", params=["trt", "pytorch"])
 def backend(request):
     return request.param
 
@@ -67,10 +65,9 @@ def temp_extra_llm_api_options_file(request):
 def server(model_name: str, backend: str, extra_llm_api_options: bool,
            temp_extra_llm_api_options_file: str, num_postprocess_workers: int):
     model_path = get_model_path(model_name)
-    if backend == "pytorch":
-        args = ["--backend", f"{backend}"]
-    else:
-        args = ["--max_beam_width", "4"]
+    args = ["--backend", f"{backend}"]
+    if backend == "trt":
+        args.extend(["--max_beam_width", "4"])
     if extra_llm_api_options:
         args.extend(
             ["--extra_llm_api_options", temp_extra_llm_api_options_file])
