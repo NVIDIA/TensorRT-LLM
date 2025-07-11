@@ -9,7 +9,7 @@ import threading
 import time
 import traceback
 import weakref
-from collections import namedtuple
+from collections import deque, namedtuple
 from contextlib import contextmanager
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -69,25 +69,39 @@ class RequestQueueItem:
         return not (self.is_shutdown_request or self.is_canceled_request)
 
 
-def _get_from_request_queue(request_queue,
-                            timeout: Optional[datetime.timedelta],
-                            max_req_count: int) -> List[RequestQueueItem]:
+def _get_from_request_queue(request_queue: queue.Queue):
+    result = []
+    while True:
+        try:
+            item = request_queue.get_nowait()  # Non-blocking get
+            result.append(item)
+        except queue.Empty:  # Queue is empty, exit loop
+            break
+    return result
+
+
+def _get_from_waiting_queue(
+    waiting_queue: deque[RequestQueueItem],
+    max_req_count: int,
+) -> List[RequestQueueItem]:
+    """Safely extracts up to max_req_count items from a deque.
+
+    Args:
+        waiting_queue: The queue to pop items from.
+        max_req_count: Maximum items to retrieve. Returns empty list if <=0.
+
+    Returns:
+        List of retrieved items (may be shorter than max_req_count if queue empties first).
+    """
+    # Edge case handling
+    if max_req_count <= 0:  # Handles negative/zero counts
+        return []
+
     items = []
-    timeout_secs = timeout.total_seconds() if timeout is not None else None
     req_count = 0
-    try:
-        if request_queue.empty() and (timeout_secs is None or timeout_secs > 0):
-            # if queue is empty and want to wait, wait
-            items.append(request_queue.get(timeout=timeout_secs))
-        else:
-            # if not empty or don't want to wait, just return all items in queue
-            while req_count < max_req_count:
-                queue_item = request_queue.get_nowait()
-                items.append(queue_item)
-                if not queue_item.is_normal_request:
-                    req_count += 1
-    except queue.Empty:
-        pass
+    while req_count < max_req_count and waiting_queue:
+        items.append(waiting_queue.popleft())
+        req_count += 1
     return items
 
 
@@ -188,6 +202,7 @@ class PyExecutor:
         self.device_id = torch.cuda.current_device()
         self.global_rank = global_mpi_rank()
         self.request_queue: queue.Queue[RequestQueueItem] = queue.Queue()
+        self.waiting_queue: deque[RequestQueueItem] = deque()
 
         # profile config
         self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
@@ -257,7 +272,7 @@ class PyExecutor:
         self.send_handles = [None] * self.num_micro_batches
 
         self.inflight_req_ids = ReqIdsSet()
-        self.canceled_req_ids = ReqIdsSet()
+        self.canceled_req_ids: List[RequestQueueItem] = []
 
         self.model_engine.warmup(self.resource_manager)
         if self.draft_model_engine is not None:
@@ -464,6 +479,11 @@ class PyExecutor:
 
     def set_gather_responses(self, gather_all_responses):
         self.gather_all_responses = gather_all_responses
+
+    @property
+    def should_stop_processing(self):
+        return self.is_shutdown and self.active_requests.empty(
+        ) and self.waiting_queue.empty()
 
     @contextmanager
     def _profiler(self):
@@ -721,12 +741,12 @@ class PyExecutor:
         with self._profiler() as profile_step:
             iter_start_time = time.time()
             iter_stats = None
-            while not self.is_shutdown or len(self.active_requests) > 0:
+            while not self.should_stop_processing:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
                 new_requests = self._fetch_new_requests()
-                if self.is_shutdown and len(self.active_requests) == 0:
+                if self.should_stop_processing:
                     break
 
                 if self.enable_iter_perf_stats:
@@ -872,12 +892,12 @@ class PyExecutor:
             sample_state = None
             iter_start_time = time.time()
             iter_stats = None
-            while not self.is_shutdown or len(self.active_requests) > 0:
+            while not self.should_stop_processing:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
                 new_requests = self._fetch_new_requests()
-                if self.is_shutdown and len(self.active_requests) == 0:
+                if self.should_stop_processing:
                     break
 
                 if self.kv_cache_transceiver:
@@ -1017,12 +1037,12 @@ class PyExecutor:
         with self._profiler() as profile_step:
             iter_start_time = time.time()
             iter_stats = None
-            while not self.is_shutdown or len(self.active_requests) > 0:
+            while not self.should_stop_processing:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
                 new_requests = self._fetch_new_requests()
-                if self.is_shutdown and len(self.active_requests) == 0:
+                if self.should_stop_processing:
                     break
 
                 if self.kv_cache_transceiver:
@@ -1200,24 +1220,9 @@ class PyExecutor:
 
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(self) -> List[RequestQueueItem]:
-        if self.enable_attention_dp:
-            all_ranks_num_active_requests = []
-            responses_list = self.dist.tp_allgather(len(self.active_requests))
-            for num_active_requests in responses_list:
-                all_ranks_num_active_requests.append(num_active_requests)
-            total_num_active_requests = sum(all_ranks_num_active_requests)
-            total_max_num_active_requests = self.dist.tp_size * self.max_num_active_requests
-        else:
-            total_num_active_requests = len(self.active_requests)
-            total_max_num_active_requests = self.max_num_active_requests
-
-        timeout = None if total_num_active_requests == 0 else datetime.timedelta(
-            0)
         new_requests = []
-        if self.dist.rank == 0:
-            new_requests = _get_from_request_queue(
-                self.request_queue, timeout,
-                total_max_num_active_requests - total_num_active_requests)
+        if self.dist.rank == 0 and not self.is_shutdown:
+            new_requests = _get_from_request_queue(self.request_queue)
 
         if self.dist.rank == 0:
             py_logits_post_processors = self._collect_py_objects_from_requests(
@@ -1250,13 +1255,29 @@ class PyExecutor:
         # Check if the beam width of the requests is equal to the max_beam_width
         for req_item in valid_new_requests:
             assert req_item.request.sampling_config.beam_width == self.max_beam_width, f"Request beam width {req_item.request.sampling_config.beam_width} is not equal to max_beam_width {self.max_beam_width}. This is not supported!"
-        new_requests = valid_new_requests
 
         if py_request_objects and (self.dist.tp_size > 1
                                    or self.dist.has_pp) and self.dist.rank > 0:
             for attr_name, req_obj_dict in py_request_objects:
-                self._attach_py_objects_to_requests(new_requests, attr_name,
-                                                    req_obj_dict)
+                self._attach_py_objects_to_requests(valid_new_requests,
+                                                    attr_name, req_obj_dict)
+
+        self.waiting_queue.extend(valid_new_requests)
+
+        if self.enable_attention_dp:
+            all_ranks_num_active_requests = []
+            responses_list = self.dist.tp_allgather(len(self.active_requests))
+            for num_active_requests in responses_list:
+                all_ranks_num_active_requests.append(num_active_requests)
+            total_num_active_requests = sum(all_ranks_num_active_requests)
+            total_max_num_active_requests = self.dist.tp_size * self.max_num_active_requests
+        else:
+            total_num_active_requests = len(self.active_requests)
+            total_max_num_active_requests = self.max_num_active_requests
+
+        new_requests = _get_from_waiting_queue(
+            self.waiting_queue,
+            total_max_num_active_requests - total_num_active_requests)
 
         if not self.enable_attention_dp:
             self._update_new_active_requests_queue_latency(new_requests)
@@ -1943,6 +1964,7 @@ class PyExecutor:
     def _handle_canceled_requests(self):
         if len(self.canceled_req_ids) == 0:
             return
+        # TODO: cancel request in the waiting queue
 
         for request in self.active_requests:
             req_id = request.py_request_id
