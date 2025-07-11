@@ -9,7 +9,7 @@ import threading
 import time
 import traceback
 import weakref
-from collections import namedtuple
+from collections import deque, namedtuple
 from contextlib import contextmanager
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -210,6 +210,7 @@ class PyExecutor:
         self.max_draft_len = max_draft_len
         self.print_log = model_engine.pytorch_backend_config.print_iter_log
         self.enable_iter_perf_stats = model_engine.pytorch_backend_config.enable_iter_perf_stats
+        self.iter_perf_latest_stats_size = model_engine.pytorch_backend_config.iter_perf_latest_stats_size
         self.enable_iter_req_stats = model_engine.pytorch_backend_config.enable_iter_req_stats
         self.stream_interval = model_engine.pytorch_backend_config.stream_interval
         self.num_fetch_requests_cur_rank = 0
@@ -260,7 +261,7 @@ class PyExecutor:
         self.is_shutdown = False
 
         self.stats_lock = threading.Lock()
-        self.stats = []
+        self.stats = deque(maxlen=self.iter_perf_latest_stats_size)
         self.start_times = {}
         self.new_active_requests_queue_latency_ms = 0
         self.gather_all_responses = False
@@ -410,8 +411,8 @@ class PyExecutor:
         latest_stats = (IterationStats(), None)
         try:
             self.stats_lock.acquire()
-            latest_stats = self.stats
-            self.stats = []
+            latest_stats = list(self.stats)
+            self.stats.clear()
         finally:
             self.stats_lock.release()
 
