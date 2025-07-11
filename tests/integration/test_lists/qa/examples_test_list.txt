@@ -305,6 +305,7 @@ accuracy/test_cli_flow.py::TestPhi3Small8kInstruct::test_auto_dtype
 accuracy/test_cli_flow.py::TestPhi3Small128kInstruct::test_auto_dtype
 accuracy/test_cli_flow.py::TestPhi3_5MiniInstruct::test_auto_dtype
 accuracy/test_cli_flow.py::TestPhi4MiniInstruct::test_auto_dtype
+accuracy/test_cli_flow.py::TestPhi4MiniInstruct::test_tp2
 accuracy/test_cli_flow.py::TestLongAlpaca7B::test_auto_dtype
 accuracy/test_cli_flow.py::TestLongAlpaca7B::test_multiblock_aggressive
 accuracy/test_cli_flow.py::TestMamba130M::test_auto_dtype
