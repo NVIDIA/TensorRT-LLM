@@ -6,7 +6,7 @@ from torch import nn
 from torch.nn.parameter import Parameter
 from tqdm import tqdm
 
-from tensorrt_llm._torch.distributed import AllReduceParams
+from tensorrt_llm._torch.distributed import AllReduceParams, allgather
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 
 from ..attention_backend import AttentionMetadata
@@ -18,14 +18,16 @@ from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (MoE, MoEWeightLoadingMode,
-                                 RenormalizeMoeRoutingMethod, create_moe,
+                                 RenormalizeMoeRoutingMethod, TRTLLMGenFusedMoE,
+                                 create_moe,
                                  create_renormalize_expert_load_balanced_logits)
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
-from ..utils import Fp4QuantizedTensor
+from ..utils import Fp4QuantizedTensor, disable_fp4_allgather
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             filter_weights, register_auto_model)
+                             duplicate_kv_weight, filter_weights,
+                             register_auto_model)
 
 
 @dataclass
@@ -151,6 +153,8 @@ class MLPBlock(torch.nn.Module):
         pretrained_config = config.pretrained_config
         self.num_experts = pretrained_config.num_experts
         self.layer_idx = layer_idx
+        self.enable_attention_dp = config.mapping.enable_attention_dp
+        self.mapping = config.mapping
 
         self.norm = RMSNorm(hidden_size=pretrained_config.hidden_size,
                             eps=pretrained_config.rms_norm_eps,
@@ -180,7 +184,8 @@ class MLPBlock(torch.nn.Module):
             hidden_size=pretrained_config.hidden_size,
             intermediate_size=pretrained_config.intermediate_size,
             dtype=pretrained_config.torch_dtype,
-            reduce_results=reduce_results,
+            reduce_results=not self.enable_attention_dp
+            and reduce_results,  # Don't allreduce when using attention_dp
             model_config=config,
             weight_loading_mode=MoEWeightLoadingMode.FUSED_GATE_UP_PROJ,
             bias=True,
@@ -217,14 +222,21 @@ class MLPBlock(torch.nn.Module):
             device=device,
             dtype=pretrained_config.torch_dtype)
 
-    def forward(
+    def forward_normal(
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        g = self.gate(x)
+        orig_shape = x.shape
+        hidden_dim = orig_shape[-1]
+        x = x.view(-1, hidden_dim)
+
+        # t = self.norm(x) was done in the parent block
+        t = x
+
+        g = self.gate(t)
         # Use ideal load balanced logits if enabled, otherwise use gate output
-        if self.config.enable_perfect_router:
+        if getattr(self.config, 'enable_perfect_router', False):
             # WARNING: This discards the learned gate output and uses ideal logits for perfect load balancing
             # Only use this for testing load balancing strategies, not for actual inference
             # The gate is still computed to maintain realistic performance measurement
@@ -232,8 +244,80 @@ class MLPBlock(torch.nn.Module):
             g = self._create_ideal_expert_load_balanced_logits(
                 num_tokens=num_tokens, num_experts=num_experts, device=x.device)
 
-        t = self.experts(x, router_logits=g)
-        return t, residual
+        # When attention_dp is not enabled, don't pass those parameters
+        expert_output = self.experts(x=t, router_logits=g)
+
+        expert_output = expert_output.view(orig_shape)
+        return expert_output, residual
+
+    def forward_attn_dp(
+        self,
+        x: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        residual: Optional[torch.Tensor] = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        orig_shape = x.shape
+        hidden_dim = orig_shape[-1]
+        x = x.view(-1, hidden_dim)
+
+        # t = self.norm(x) was done in the parent block
+        t = x
+
+        # Get attention_dp parameters
+        all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        all_rank_max_num_tokens = attn_metadata.all_rank_max_num_tokens
+
+        # Check if we should use padding instead of allgather
+        # This is needed when using FP4 quantization because x_sf has different shape
+        use_dp_padding = False
+        if self.mapping.tp_size > 1 and all_rank_num_tokens is not None:
+            if (disable_fp4_allgather()
+                    and not self.experts.enable_alltoall) or isinstance(
+                        self.experts, TRTLLMGenFusedMoE):
+                t = allgather(t, self.mapping, dim=0, sizes=all_rank_num_tokens)
+            # Use padding when the experts have quantization that produces x_sf with different shape
+            # Check if the experts have FP4 quantization - check for all FP4 variants
+            # Also check for MXFP4 modes which also produce x_sf
+            elif (self.experts.has_nvfp4 or self.experts.has_w4a16_mxfp4
+                  or self.experts.has_w4a8_mxfp4_fp8
+                  or self.experts.has_w4a8_mxfp4_mxfp8):
+                use_dp_padding = True
+                # Pad the tensor to max size
+                t = torch.nn.functional.pad(
+                    t, (0, 0, 0, all_rank_max_num_tokens - t.shape[0]))
+
+        g = self.gate(t)
+        # Use ideal load balanced logits if enabled, otherwise use gate output
+        if getattr(self.config, 'enable_perfect_router', False):
+            # WARNING: This discards the learned gate output and uses ideal logits for perfect load balancing
+            # Only use this for testing load balancing strategies, not for actual inference
+            # The gate is still computed to maintain realistic performance measurement
+            num_tokens, num_experts = g.shape
+            g = self._create_ideal_expert_load_balanced_logits(
+                num_tokens=num_tokens, num_experts=num_experts, device=x.device)
+
+        # Let CutlassFusedMoE handle allgather internally
+        # Pass the normalized tensor (t) as input to experts, not x
+        expert_output = self.experts(
+            x=t,
+            router_logits=g,
+            all_rank_num_tokens=all_rank_num_tokens,
+            all_rank_max_num_tokens=all_rank_max_num_tokens,
+            use_dp_padding=use_dp_padding)
+
+        expert_output = expert_output.view(orig_shape)
+        return expert_output, residual
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        residual: Optional[torch.Tensor] = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.enable_attention_dp:
+            return self.forward_attn_dp(x, attn_metadata, residual)
+        else:
+            return self.forward_normal(x, residual)
 
 
 class TransformerBlock(DecoderLayer):
@@ -264,6 +348,8 @@ class TransformerBlock(DecoderLayer):
             dtype=pretrained_config.torch_dtype)
 
         self.mlp = MLPBlock(config, layer_idx, reduce_results=not self.is_tp)
+        self.enable_attention_dp = config.mapping.enable_attention_dp
+        self.mapping = config.mapping
 
         self.next_layer_layernorm = RMSNorm(
             hidden_size=pretrained_config.hidden_size,
@@ -294,7 +380,7 @@ class TransformerBlock(DecoderLayer):
                                 **kwargs)
         x, residual = self.post_attention_layernorm(x, residual)
 
-        x, residual = self.mlp(x, residual)
+        x, residual = self.mlp(x, attn_metadata, residual)
         x, residual = self.next_layer_layernorm(x, residual)
         return x, residual
 
@@ -328,7 +414,7 @@ class TransformerBlock(DecoderLayer):
                 trigger_completion_at_end=False,
             ))
 
-        x, residual = self.mlp(x, residual)
+        x, residual = self.mlp(x, attn_metadata, residual)
 
         x, residual = self.allreduce(
             x,
@@ -364,14 +450,23 @@ class Transformer(DecoderModel):
         super().__init__(model_config)
         config = self.model_config
 
-        self.embedding = Embedding(
-            config.pretrained_config.vocab_size,
-            config.pretrained_config.hidden_size,
-            dtype=config.pretrained_config.torch_dtype,
-            mapping=config.mapping,
-            tensor_parallel_mode=TensorParallelMode.COLUMN,
-            gather_output=True,
-        )
+        if model_config.mapping.enable_attention_dp:
+            # When attention_dp is enabled, we cannot do all_reduce since
+            # the problem size of different ranks are different.
+            # So, we don't do parallelism here.
+            self.embedding = Embedding(
+                config.pretrained_config.vocab_size,
+                config.pretrained_config.hidden_size,
+                dtype=config.pretrained_config.torch_dtype)
+        else:
+            self.embedding = Embedding(
+                config.pretrained_config.vocab_size,
+                config.pretrained_config.hidden_size,
+                dtype=config.pretrained_config.torch_dtype,
+                mapping=config.mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                gather_output=True,
+            )
         # For modeling_speculative, different name expected
         self.embed_tokens = self.embedding
         self.block = nn.ModuleList([
@@ -495,6 +590,9 @@ class OpenAIMoeForCausalLM(DecoderModelForCausalLM[Transformer,
         num_q_head = self.config.num_attention_heads
         num_kv_head = self.config.num_key_value_heads
         num_expert = self.config.num_experts
+        enable_attention_dp = self.model_config.mapping.enable_attention_dp
+        tp_size = self.model_config.mapping.tp_size
+
         for name, module in tqdm(list(self.named_modules()),
                                  desc="Loading weights"):
             if len(module._parameters) <= 0:
@@ -531,15 +629,19 @@ class OpenAIMoeForCausalLM(DecoderModelForCausalLM[Transformer,
                     'down_proj.bias':
                     [down_proj['bias'][i, :] for i in range(num_expert)]
                 }
-                if module.quant_config.quant_mode.has_mxfp4():
-                    moe_weights['gate_up_proj_weight_scale'] = [
-                        gate_up_proj['weight_scale'][i, :, :].transpose(0, 1)
-                        for i in range(num_expert)
-                    ]
-                    moe_weights['down_proj_weight_scale'] = [
-                        down_proj['weight_scale'][i, :, :].transpose(0, 1)
-                        for i in range(num_expert)
-                    ]
+                try:
+                    if module.quant_config.quant_mode.has_mxfp4():
+                        moe_weights['gate_up_proj_weight_scale'] = [
+                            gate_up_proj['weight_scale'][i, :, :].transpose(
+                                0, 1) for i in range(num_expert)
+                        ]
+                        moe_weights['down_proj_weight_scale'] = [
+                            down_proj['weight_scale'][i, :, :].transpose(0, 1)
+                            for i in range(num_expert)
+                        ]
+                except KeyError:
+                    # Dynamic quantization path
+                    pass
                 module.load_weights(weights=[moe_weights])
             elif hasattr(module, "load_weights"):
                 # Load Attention module weights.
@@ -557,16 +659,47 @@ class OpenAIMoeForCausalLM(DecoderModelForCausalLM[Transformer,
                                                     num_q_head:head_dim *
                                                     (num_q_head + num_kv_head)]
                     v_bias = module_weights['bias'][-head_dim * num_kv_head:]
+
+                    # Handle KV weight duplication for GQA
+                    tensors_need_duplication = ['weight', 'bias']
+                    if module.quant_config.quant_mode.has_mxfp4():
+                        tensors_need_duplication.append('weight_scale')
+
+                    # Duplicate KV weights if needed
+                    tensor_parallel_size = tp_size if not enable_attention_dp else 1
+
+                    k_weight_dict = {'weight': k_weight, 'bias': k_bias}
+                    v_weight_dict = {'weight': v_weight, 'bias': v_bias}
+
+                    if 'weight_scale' in module_weights:
+                        k_weight_dict['weight_scale'] = module_weights[
+                            'weight_scale'][head_dim * num_q_head:head_dim *
+                                            (num_q_head + num_kv_head), :]
+                        v_weight_dict['weight_scale'] = module_weights[
+                            'weight_scale'][-head_dim * num_kv_head:, :]
+
+                    k_weight_dict = {
+                        k: (duplicate_kv_weight(
+                            weight=v,
+                            num_kv_heads=num_kv_head,
+                            tensor_parallel_size=tensor_parallel_size)
+                            if k in tensors_need_duplication else v)
+                        for k, v in k_weight_dict.items()
+                    }
+
+                    v_weight_dict = {
+                        k: (duplicate_kv_weight(
+                            weight=v,
+                            num_kv_heads=num_kv_head,
+                            tensor_parallel_size=tensor_parallel_size)
+                            if k in tensors_need_duplication else v)
+                        for k, v in v_weight_dict.items()
+                    }
+
                     qkv_weights = [{
                         'weight': q_weight,
                         'bias': q_bias
-                    }, {
-                        'weight': k_weight,
-                        'bias': k_bias
-                    }, {
-                        'weight': v_weight,
-                        'bias': v_bias
-                    }]
+                    }, k_weight_dict, v_weight_dict]
                     module.load_weights(weights=qkv_weights)
                 else:
                     # Dense & gate & sinks
@@ -592,3 +725,50 @@ class OpenAIMoeForCausalLM(DecoderModelForCausalLM[Transformer,
                 layer.next_layer_layernorm = self.model.norm
             else:
                 layer.next_layer_layernorm = self.model.block[idx + 1].attn.norm
+
+
+'''
+Since we don't have accuracy CI for Orangina, we should run several accuracy checks before we merge changes to the feature branch.
+
+
+
+//// BF16 Checkpoint + TP2 + EP2
+for moe_backend in CUTLASS TRTLLM TRITON;
+do
+printf '%s\n' 'enable_chunked_prefill: true' 'moe_backend: "'$moe_backend'"' > llm-config.yml
+cat ./llm-config.yml
+python -m tensorrt_llm.commands.eval --model /workspace/orangina-real-weight-pre-release_vv1 --tp_size 2 --ep_size 2 --extra_llm_api_options ./llm-config.yml  mmlu
+done
+
+
+
+(The MXFP4 checkpoint can be converted from customer's bf16 checkpoint with /home/scratch.dongfengy_sw/qi_quant.py
+
+//// MXFP4 Checkpoint Single GPU
+for moe_backend in CUTLASS TRTLLM TRITON;
+do
+printf '%s\n' 'enable_attention_dp: true' 'moe_backend: "'$moe_backend'"' > llm-config.yml
+cat ./llm-config.yml
+python -m tensorrt_llm.commands.eval --model ./orangina-real-weight-pre-release_vv1_trtllm_mxfp4_moeonly --tp_size 1 --ep_size 1 --extra_llm_api_options llm-config.yml mmlu
+done
+
+
+
+//// MXFP4 Checkpoint + Attention DP
+for moe_backend in CUTLASS TRTLLM;
+do
+printf '%s\n' 'enable_attention_dp: true' 'moe_backend: "'$moe_backend'"' > llm-config.yml
+cat ./llm-config.yml
+python -m tensorrt_llm.commands.eval --model ./orangina-real-weight-pre-release_vv1_trtllm_mxfp4_moeonly --tp_size 4 --ep_size 4 --extra_llm_api_options llm-config.yml mmlu
+done
+
+
+//// MXFP4 Dynamic Quant + Triton
+for moe_backend in TRITON;
+do
+printf '%s\n' 'enable_chunked_prefill: true' 'moe_backend: "'$moe_backend'"' > llm-config.yml
+cat ./llm-config.yml
+OVERRIDE_QUANT_ALGO=W4A16_MXFP4 python -m tensorrt_llm.commands.eval --model /workspace/orangina-real-weight-pre-release_vv1 --tp_size 1 --ep_size 1 --extra_llm_api_options ./llm-config.yml  mmlu
+OVERRIDE_QUANT_ALGO=W4A16_MXFP4 python -m tensorrt_llm.commands.eval --model /workspace/orangina-real-weight-pre-release_vv1 --tp_size 2 --ep_size 2 --extra_llm_api_options ./llm-config.yml  mmlu
+done
+'''
