@@ -68,7 +68,7 @@ class OpenAIDisaggServer:
         async def lifespan(app: FastAPI):
             # Create a persistent aiohttp ClientSession
             self.session = aiohttp.ClientSession(
-                connector=aiohttp.TCPConnector(limit=0, limit_per_host=0, keepalive_timeout=300),
+                connector=aiohttp.TCPConnector(limit=0, limit_per_host=0, force_close=True),
                 timeout=aiohttp.ClientTimeout(total=req_timeout_secs))
 
             logger.info("Waiting for context and generation servers to be ready")
