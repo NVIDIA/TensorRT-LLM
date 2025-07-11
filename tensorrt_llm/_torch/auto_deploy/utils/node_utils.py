@@ -106,27 +106,17 @@ def get_quantization_params_from_linear_node(linear_op: torch.fx.node.Node):
     return input_params, weight_params, output_params
 
 
-def is_match(node: Node, names_to_skip: List[str]):
-    if names_to_skip is None:
-        return False
-    for n in names_to_skip:
-        module_stack = node.meta.get("nn_module_stack", None)
-        if module_stack is None:
-            return False
-        module_stack = list(module_stack.keys())
-        if n in module_stack[-1]:
-            return True
-    return False
-
-
 def extract_weight_node(mm_node: Node) -> int:
-    """Extracts the weight node from the given matmul node."""
+    """Extracts the weight node from the given linear or BMM node. We assume torch.bmm(activation, weight)"""
 
     def find_get_attr_node(node: Node) -> Node:
         """Recursively traverse inputs of allowed nodes to find a node with 'get_attr' op."""
         # If node is a get_attr node return node
         # List of nodes allowed in between a get_attr node and the matmul node
-        allowed_ops = {torch.ops.aten.to.dtype}
+        allowed_ops = {
+            torch.ops.aten.to.dtype,
+            torch.ops.aten.view.default,
+        }
 
         if node.op == "get_attr":
             return node
@@ -161,8 +151,8 @@ def extract_param_names_from_lin_node(mm_node: Node) -> Tuple[str, Optional[str]
     Args:
         mm_node: Matmul node in the graph.
     """
-    assert is_linear_op(mm_node, include_quantization=True), (
-        f"Expecting linear node, Found: {mm_node}"
+    assert is_linear_op(mm_node, include_quantization=True) or is_bmm_op(mm_node), (
+        f"Expecting linear or bmm node, Found: {mm_node}"
     )
     weight_node = extract_weight_node(mm_node)
 

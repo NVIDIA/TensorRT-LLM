@@ -302,7 +302,13 @@ class AutoModelForCausalLMFactory(ModelFactory):
         ckpt_file = self._get_checkpoint_file(self.model)
         # reuse the load checkpoint utility from accelerate
         with hf_load_state_dict_with_device(device):
-            load_checkpoint_in_model(model, checkpoint=ckpt_file)
+            # Set `full_state_dict=False` to skip Accelerate's FSDP weight sync logic.
+            # Internally, load_checkpoint_in_model → set_model_state_dict → _load_model_state_dict,
+            # which collects local model params, syncs weights from checkpoint, and applies them via
+            # model.load_state_dict.
+            # This sync step can interfere with load_hooks by mixing raw checkpoint weights and
+            # model-transformed weights,leading to unexpected key mismatches or format issues.
+            load_checkpoint_in_model(model, checkpoint=ckpt_file, full_state_dict=False)
 
     def _load_quantization_config(self):
         """Load the quantization config from the model directory if not done already."""
