@@ -108,7 +108,7 @@ When using EAGLE-2, please enable `--eagle_use_dynamic_tree`, which indicates wh
 - In EagleNet2, the `N` output nodes of EagleNet1 are expanded, and each node expands `N` new draft tokens. Therefore, this layer also has a total of `N * N` draft tokens. And select the top `N` as the output of this layer.
 - Etc.
 
-Finally, after `num_eagle_layer` EagleNets, `N + N * N * (num_eagle_layer - 1)` draft tokens are generated. We will rebuild the final tree based on all draft tokens and their scores. The final generated tree will have `min(N + N * N * (num_eagle_layer - 1), max_draft_tokens)` nodes.
+Finally, after `num_eagle_layer` EagleNets, `N + N * N * (num_eagle_layer - 1)` draft tokens are generated. We will rebuild the final tree based on all draft tokens and their scores. The final generated tree will have `min(N + N * N * (num_eagle_layer - 1), max_draft_len)` nodes.
 
 
 
