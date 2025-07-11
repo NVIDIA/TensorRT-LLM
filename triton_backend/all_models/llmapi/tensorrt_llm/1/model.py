@@ -443,12 +443,13 @@ class TritonPythonModel:
 
             # Send the last response which contains all the outputs if not streaming.
             if not streaming:
-                was_cancelled = False
-
                 # If the request was cancelled, we don't need to send the last response
                 with self.lock:
-                    if not triton_req_id in self.req_id_to_request_data:
-                        was_cancelled = True
+                    was_cancelled = triton_req_id not in self.req_id_to_request_data
+                    if not was_cancelled:
+                        # Remove the request from the request data map so the cancellation loop stops querying
+                        # is_cancelled() on the request
+                        del self.req_id_to_request_data[triton_req_id]
 
                 if not was_cancelled:
                     response_sender.send(
