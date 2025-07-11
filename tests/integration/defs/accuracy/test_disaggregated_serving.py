@@ -338,8 +338,14 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
 
     @pytest.mark.parametrize("overlap_scheduler", [False, True])
     def test_auto_dtype(self, overlap_scheduler):
-        ctx_server_config = {"disable_overlap_scheduler": True}
-        gen_server_config = {"disable_overlap_scheduler": overlap_scheduler}
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "cuda_graph_config": None
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": overlap_scheduler,
+            "cuda_graph_config": None
+        }
         ctx_server_config["kv_cache_config"] = {
             "max_attention_window": [512, 512, 512, 512, 512, 32768],
             "enable_block_reuse": False
