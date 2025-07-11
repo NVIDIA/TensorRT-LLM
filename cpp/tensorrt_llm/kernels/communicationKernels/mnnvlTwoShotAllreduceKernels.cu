@@ -167,8 +167,10 @@ __global__ void twoshot_allreduce_kernel(T* output_ptr, T* shard_ptr, T** input_
 
         if (threadIdx.x == 0)
         {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000))
             asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" ::"l"(offset_access_ptr), "r"(1) : "memory");
+#elif (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+            asm volatile("red.global.gpu.add.u32 [%0], %1;" ::"l"(offset_access_ptr), "r"(1) : "memory");
 #else
             atomicAdd(offset_access_ptr, 1);
 #endif
@@ -389,8 +391,10 @@ __global__ void __launch_bounds__(128, 1)
     __syncthreads();
     if (threadIdx.x == 0)
     {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000))
         asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" ::"l"(offset_access_ptr), "r"(1) : "memory");
+#elif (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+        asm volatile("red.global.gpu.add.u32 [%0], %1;" ::"l"(offset_access_ptr), "r"(1) : "memory");
 #else
         atomicAdd(offset_access_ptr, 1);
 #endif
