@@ -57,10 +57,70 @@ methods:
       fail_fast_on_attention_window_too_large:
         annotation: bool
         default: false
-      # kwargs
-      kwargs:
-        annotation: Any
-        default: inspect._empty
+      garbage_collection_gen0_threshold:
+        annotation: int
+        default: 20000
+      # Misc
+      backend:
+        annotation: Optional[str]
+        default: null
+      build_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.BuildConfig]
+        default: null
+      cuda_graph_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.CudaGraphConfig]
+        default: null
+      disable_overlap_scheduler:
+        annotation: bool
+        default: False
+      moe_max_num_tokens:
+        annotation: Optional[int]
+        default: null
+      moe_load_balancer:
+        annotation: Union[tensorrt_llm._torch.MoeLoadBalancerConfig, str, None]
+        default: null
+      attn_backend:
+        annotation: str
+        default: TRTLLM
+      moe_backend:
+        annotation: str
+        default: CUTLASS
+      enable_mixed_sampler:
+        annotation: bool
+        default: False
+      enable_trtllm_sampler:
+        annotation: bool
+        default: False
+      kv_cache_dtype:
+        annotation: str
+        default: auto
+      enable_iter_perf_stats:
+        annotation: bool
+        default: False
+      enable_iter_req_stats:
+        annotation: bool
+        default: False
+      print_iter_log:
+        annotation: bool
+        default: False
+      torch_compile_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.TorchCompileConfig]
+        default: null
+      enable_autotuner:
+        annotation: bool
+        default: True
+      enable_layerwise_nvtx_marker:
+        annotation: bool
+        default: False
+      enable_min_latency:
+        annotation: bool
+        default: False
+      force_dynamic_quantization:
+        annotation: bool
+        default: False
+      allreduce_strategy:
+        annotation: Optional[Literal['AUTO', 'NCCL', 'UB', 'MINLATENCY', 'ONESHOT', 'TWOSHOT', 'LOWPRECISION', 'MNNVL']]
+        default: AUTO
     return_annotation: None
   generate:
     parameters:
