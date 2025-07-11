@@ -75,16 +75,15 @@ class KvCacheCreator:
             head_dim = config.kv_lora_rank + config.qk_rope_head_dim
             kv_factor = 1
         else:
-            head_dim = getattr(
-                config,
-                "head_dim",
-                config.hidden_size // config.num_attention_heads,
-            ) * num_key_value_heads // tp_size
+            _head_dim = getattr(config, 'head_dim', None)
+            if not isinstance(_head_dim, int):
+                _head_dim = config.hidden_size // config.num_attention_heads
+            head_dim = _head_dim * num_key_value_heads // tp_size
 
         # provide at least 1 layer to prevent division by zero cache size
-        num_hidden_layers = max(
-            len(mapping.pp_layers(config.num_hidden_layers)), 1)
-        mem_per_token *= num_hidden_layers * head_dim
+        num_attention_layers = max(
+            len(mapping.pp_layers(model_config.get_num_attention_layers())), 1)
+        mem_per_token *= num_attention_layers * head_dim
         # K and V
         mem_per_token *= kv_factor
         return mem_per_token
@@ -158,10 +157,10 @@ class KvCacheCreator:
         if not pytorch_backend_config.disable_overlap_scheduler:
             num_extra_tokens_per_seq = num_extra_tokens_per_seq + 1
             if spec_cfg is not None:
-                num_extra_tokens_per_seq += spec_cfg.max_draft_tokens
+                num_extra_tokens_per_seq += spec_cfg.max_draft_len
 
         if spec_cfg is not None:
-            num_extra_tokens_per_seq += spec_cfg.max_draft_tokens
+            num_extra_tokens_per_seq += spec_cfg.max_draft_len
             num_extra_tokens_per_seq += spec_cfg.num_extra_kv_tokens
         for req in self._dummy_reqs:
             num_req_tokens = len(req.input_token_ids) + num_extra_tokens_per_seq
@@ -281,8 +280,9 @@ class KvCacheCreator:
         num_attention_heads = config.num_attention_heads
         num_key_value_heads = getattr(config, 'num_key_value_heads',
                                       num_attention_heads)
-        head_dim = getattr(config, "head_dim",
-                           hidden_size // num_attention_heads)
+        head_dim = getattr(config, "head_dim", None)
+        if not isinstance(head_dim, int):
+            head_dim = hidden_size // num_attention_heads
 
         if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
         ):
@@ -538,7 +538,7 @@ def create_py_executor_instance(
         disable_overlap_scheduler,
         max_batch_size=executor_config.max_batch_size,
         max_beam_width=executor_config.max_beam_width,
-        max_draft_tokens=spec_config.max_draft_tokens
+        max_draft_len=spec_config.max_draft_len
         if spec_config is not None else 0,
         kv_cache_transceiver=kv_cache_transceiver,
         draft_model_engine=draft_model_engine,
@@ -549,11 +549,11 @@ def create_py_executor_instance(
 def create_torch_sampler_args(executor_config: ExecutorConfig, mapping: Mapping,
                               *, max_seq_len: int, enable_mixed_sampler: bool):
     max_num_sequences = executor_config.max_batch_size * mapping.pp_size
-    max_draft_tokens = (0 if executor_config.speculative_config is None else
-                        executor_config.speculative_config.max_draft_tokens)
+    max_draft_len = (0 if executor_config.speculative_config is None else
+                     executor_config.speculative_config.max_draft_len)
     return TorchSampler.Args(
         max_seq_len=max_seq_len,
-        max_draft_tokens=max_draft_tokens,
+        max_draft_len=max_draft_len,
         max_num_sequences=max_num_sequences,
         max_beam_width=executor_config.max_beam_width,
         enable_mixed_sampler=enable_mixed_sampler,

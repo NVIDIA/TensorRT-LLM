@@ -363,22 +363,31 @@ def test_llm_with_kv_cache_retention_config():
         print(output)
 
 
-@pytest.mark.skip(reason="https://nvbugs/5370718")
+@pytest.mark.parametrize('backend', ["HF", "TRTLLM"])
 @pytest.mark.parametrize(
-    'tokenizer_dir, threshold',
+    'tokenizer_dir, clean_up_tokenization_spaces, threshold',
     [
-        (get_model_path('gpt2'), 0.95),  # BPE
-        (get_model_path('bert/bert-base-uncased'), 0.95),  # WordPiece
-        (get_model_path('t5-small'), 0.95),  # SentencePiece
-        (get_model_path('starcoder2-3b'), 0.95),
-        (get_model_path('falcon-7b-instruct'), 0.95),
-        (get_model_path('llama-models-v2/llama-v2-7b-hf'), 0.95),
-        (get_model_path('codellama/CodeLlama-7b-Instruct-hf'), 0.95),
-        (llama_model_path, 0.95),
-        (get_model_path(mixtral_model_name), 0.95)
+        (get_model_path('gpt2'), False, 0.95),  # BPE
+        (get_model_path('bert/bert-base-uncased'), True, 0.95),  # WordPiece
+        (get_model_path('t5-small'), True, 0.95),  # SentencePiece
+        (get_model_path('starcoder2-3b'), False, 0.95),
+        (get_model_path('falcon-7b-instruct'), False, 0.95),
+        (get_model_path('llama-models-v2/llama-v2-7b-hf'), False, 0.95),
+        (get_model_path('codellama/CodeLlama-7b-Instruct-hf'), False, 0.95),
+        (llama_model_path, False, 0.95),
+        (get_model_path(mixtral_model_name), False, 0.95),
+        (get_model_path('llama-3.1-model/Meta-Llama-3.1-8B'), False, 0.95),
+        (get_model_path('DeepSeek-R1/DeepSeek-R1'), False, 0.95)
     ])
 @pytest.mark.part0
-def test_tokenizer_decode_incrementally(tokenizer_dir: str, threshold: float):
+def test_tokenizer_decode_incrementally(tokenizer_dir: str,
+                                        clean_up_tokenization_spaces: bool,
+                                        threshold: float, backend: str, mocker):
+    import tensorrt_llm.llmapi.tokenizer
+    mocker.patch.object(tensorrt_llm.llmapi.tokenizer,
+                        "TLLM_INCREMENTAL_DETOKENIZATION_BACKEND", backend)
+    assert tensorrt_llm.llmapi.tokenizer.TLLM_INCREMENTAL_DETOKENIZATION_BACKEND == backend
+
     random.seed(42)
 
     num_samples = 100
@@ -410,8 +419,7 @@ def test_tokenizer_decode_incrementally(tokenizer_dir: str, threshold: float):
             decoded_text, states = tokenizer.decode_incrementally(
                 [token_ids[i]], decoded_text, states)
 
-        if tokenizer_dir.endswith(
-                'bert-base-uncased') and tokenizer.clean_up_tokenization_spaces:
+        if clean_up_tokenization_spaces and tokenizer.clean_up_tokenization_spaces:
             decoded_text = tokenizer.clean_up_tokenization(decoded_text)
         reference = tokenizer.decode(token_ids)
         if decoded_text == reference:
@@ -532,6 +540,41 @@ def _test_llm_generate_async(model_name=default_model_name,
     test_future(streaming=False)
     test_future_async()
     test_non_streaming_usage_wait()
+
+
+@pytest.mark.parametrize("chunked", [True, False])
+@pytest.mark.part0
+def test_llm_generate_async_with_stream_interval(chunked):
+    pytest.skip("https://nvbugs/5383670")
+    model_path = f"{llm_models_root()}/nvfp4-quantized/Meta-Llama-3.1-8B"
+    max_num_tokens = 256
+    with LLM_torch(model_path,
+                   max_num_tokens=max_num_tokens,
+                   stream_interval=4,
+                   enable_chunked_prefill=chunked) as llm:
+        sampling_params = SamplingParams(max_tokens=13,
+                                         ignore_eos=True,
+                                         detokenize=False)
+        step = 0
+        last_step_len = 0
+        prompt = "The capital of France is "
+        if chunked:
+            prompt = prompt * max_num_tokens
+        for output in llm.generate_async(prompt,
+                                         sampling_params=sampling_params,
+                                         streaming=True):
+            current_step_len = len(output.outputs[0].token_ids)
+            # The output lens of each step need to be [1, 3, 4, 4, 1]
+            if step == 0:
+                assert current_step_len == 1
+            elif step == 1:
+                assert current_step_len - last_step_len == 3
+            elif step == 2 or step == 3:
+                assert current_step_len - last_step_len == 4
+            else:
+                assert current_step_len - last_step_len == 1
+            step += 1
+            last_step_len = current_step_len
 
 
 @pytest.fixture(scope="module")
@@ -1085,7 +1128,7 @@ def test_llm_api_medusa():
 
     speculative_config = MedusaDecodingConfig(num_medusa_heads=4,
             max_draft_len=63,
-            speculative_model=get_model_path("medusa-vicuna-7b-v1.3"),
+            speculative_model_dir=get_model_path("medusa-vicuna-7b-v1.3"),
             medusa_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
                                             [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], \
                                             [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], \
@@ -1124,7 +1167,7 @@ def test_llm_api_medusa_tp2():
 
     speculative_config = MedusaDecodingConfig(num_medusa_heads=4,
             max_draft_len=63,
-              speculative_model=get_model_path("medusa-vicuna-7b-v1.3"),
+              speculative_model_dir=get_model_path("medusa-vicuna-7b-v1.3"),
                             medusa_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
                                             [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], \
                                             [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], \
@@ -1162,7 +1205,7 @@ def test_llm_api_eagle(**llm_kwargs):
 
     speculative_config = EagleDecodingConfig(
         max_draft_len=63,
-        speculative_model=get_model_path("EAGLE-Vicuna-7B-v1.3"),
+        speculative_model_dir=get_model_path("EAGLE-Vicuna-7B-v1.3"),
         num_eagle_layers=4,
         max_non_leaves_per_layer=10,
                             eagle_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
@@ -1209,7 +1252,7 @@ def test_llm_api_eagle2(**llm_kwargs):
 
     speculative_config = EagleDecodingConfig(
         max_draft_len=63,
-        speculative_model=get_model_path("EAGLE-Vicuna-7B-v1.3"),
+        speculative_model_dir=get_model_path("EAGLE-Vicuna-7B-v1.3"),
         num_eagle_layers=4,
         max_non_leaves_per_layer=10,
         use_dynamic_tree=True,

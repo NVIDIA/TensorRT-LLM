@@ -60,14 +60,14 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("stream_interval", [4, 64],
                              ids=["stream_interval_4", "stream_interval_64"])
     def test_nvfp4_streaming(self, stream_interval):
-        model_path = f"{llm_models_root()}/nvfp4-quantized/Meta-Llama-3.1-8B"
-
-        # When stream_interval < 32, hf incremental detokenization is used.
-        # When stream_interval >= 32, trtllm implemented incremental detokenization is used.
+        # When stream_interval < TLLM_STREAM_INTERVAL_THRESHOLD, hf incremental detokenization is used.
+        # When stream_interval >= TLLM_STREAM_INTERVAL_THRESHOLD, trtllm implemented incremental detokenization is used.
         # The behavior is due to perf considerations, while both paths need to be tested.
-        with LLM(model_path, stream_interval=stream_interval) as llm:
+        with LLM(f"{llm_models_root()}/nvfp4-quantized/Meta-Llama-3.1-8B",
+                 stream_interval=stream_interval) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+            assert llm.args.stream_interval == stream_interval
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm, streaming=True)
 
@@ -243,7 +243,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
         draft_len = 4
         spec_config = EagleDecodingConfig(max_draft_len=draft_len,
-                                          pytorch_weights_path=eagle_model_dir)
+                                          speculative_model_dir=eagle_model_dir)
 
         llm = LLM(model=target_model_dir,
                   **pytorch_config,
@@ -262,7 +262,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
         draft_len = 4
         spec_config = NGramDecodingConfig(
-            prompt_lookup_num_tokens=draft_len,
+            max_draft_len=draft_len,
             max_matching_ngram_size=draft_len,
             is_keep_all=True,
             is_use_oldest=True,
@@ -276,6 +276,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
         with llm:
             task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
@@ -447,6 +449,33 @@ class TestMistral7B(LlmapiAccuracyTestHarness):
         with LLM(self.MODEL_PATH) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+class TestMinistral8BInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "mistralai/Ministral-8B-Instruct-2410"
+    MODEL_PATH = f"{llm_models_root()}/Ministral-8B-Instruct-2410"
+
+    def test_auto_dtype_gsm8k(self):
+        with LLM(self.MODEL_PATH) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_ada
+    def test_fp8(self):
+        # Test with FP8 quantization if pre-quantized model is available
+        model_path = f"{llm_models_root()}/Ministral-8B-Instruct-2410-FP8"
+        try:
+            with LLM(model_path) as llm:
+                assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+                task = GSM8K(self.MODEL_NAME)
+                task.evaluate(llm)
+                task = MMLU(self.MODEL_NAME)
+                task.evaluate(llm)
+        except (FileNotFoundError, OSError):
+            pytest.skip("FP8 pre-quantized Ministral-8B model not available")
 
 
 class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
@@ -1703,14 +1732,20 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend",
         [
-            (1, 1, 1, True, True, True, "CUTLASS"),
+            (1, 1, 1, False, True, True, "CUTLASS"),
             (1, 1, 1, False, True, True, "TRTLLM"),
+            (4, 1, 4, True, True, True, "CUTLASS"),
+            (4, 1, 4, True, True, True, "TRTLLM"),
             (4, 1, 4, False, True, True, "CUTLASS"),
             (4, 1, 4, False, True, True, "TRTLLM"),
         ],
         ids=[
-            "latency_moe_cutlass", "latency_moe_trtllm",
-            "4gpu_latency_moe_trtllm", "4gpu_latency_moe_cutlass"
+            "latency_moe_cutlass",
+            "latency_moe_trtllm",
+            "dep4_latency_moe_cutlass",
+            "dep4_latency_moe_trtllm",
+            "tep4_latency_moe_cutlass",
+            "tep4_latency_moe_trtllm",
         ],
     )
     def test_nvfp4(
@@ -1803,7 +1838,7 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend",
         [(8, 1, 8, True, True, True, "CUTLASS"),
-         (8, 1, 8, False, True, True, "TRTLLM")],
+         (8, 1, 8, True, True, True, "TRTLLM")],
         ids=["latency_moe_cutlass", "latency_moe_trtllm"],
     )
     def test_nvfp4(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
