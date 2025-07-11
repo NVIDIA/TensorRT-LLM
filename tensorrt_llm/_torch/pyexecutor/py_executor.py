@@ -1976,14 +1976,8 @@ class PyExecutor:
             return
 
         # cancel request in the waiting queue
-        to_cancel = []
-        for i, request in enumerate(self.waiting_queue):
-            req_id = request.id
-            if req_id in self.canceled_req_ids:
-                to_cancel.append(i)
-
-        for i in reversed(to_cancel):
-            self.waiting_queue.pop(i)
+        self.waiting_queue = deque(req for req in self.waiting_queue
+                                   if req.id not in self.canceled_req_ids)
 
         for request in self.active_requests:
             req_id = request.py_request_id
