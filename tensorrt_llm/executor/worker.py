@@ -540,7 +540,9 @@ class GenerationExecutorWorker(GenerationExecutor):
 
     def _pop_result(self, client_id: int):
         self._results.pop(client_id, None)
-        self._client_id_to_request_id.pop(client_id, None)
+        if self._client_id_to_request_id.pop(client_id, None) is None:
+            logger.warning(
+                f"client_id {client_id} not found in _client_id_to_request_id")
 
     def shutdown(self):
 
