@@ -44,47 +44,6 @@ generation_servers:
 
 Clients can then send requests to the disaggregated server at `localhost:8000`, which is an OpenAI compatible endpoint.
 
-### Launching context and generation servers using MPI (Deprecated)
-
-One can also launch all context and generation servers using MPI. This can be done by issuing the following command:
-```
-export TRTLLM_USE_MPI_KVCACHE=1
-mpirun -n <total_num_ranks> trtllm-serve disaggregated_mpi_worker -c disagg_config.yaml
-```
-where `<total_num_ranks>` is the sum of `TP*PP` for all context and generation servers. For the example above, `total_num_ranks` is 3
-since `TP` and `PP` is 1 for the two context and one generation server.
-
-The `disagg_config.yaml` file must now contain the configuration parameters of the context and generation servers. For example,
-it could look like:
-
-```yaml
-hostname: localhost
-port: 8000
-model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
-backend: "pytorch"
-disable_overlap_scheduler: True
-context_servers:
-  num_instances: 2
-  tensor_parallel_size: 1
-  pipeline_parallel_size: 1
-  kv_cache_config:
-    free_gpu_memory_fraction: 0.9
-  urls:
-      - "localhost:8001"
-      - "localhost:8002"
-generation_servers:
-  num_instances: 1
-  tensor_parallel_size: 1
-  pipeline_parallel_size: 1
-  urls:
-      - "localhost:8003"
-```
-
-Once the context and generation servers are launched, you can again launch the disaggregated server with
-```
-trtllm-serve disaggregated -c disagg_config.yaml
-```
-
 ## Sending requests to the disaggregated server
 
 Once the context, generation and disaggregated servers are launched, you can send requests to the disaggregated server using curl:
@@ -143,3 +102,44 @@ Trtllm will automatically register any newly launched server with the ETCD serve
 ### Dynamically removing servers
 
 When removing servers, special attention is required in the current version. You need to first remove the corresponding key from the ETCD server. After you see the log message "Server xxxx is removed," you can then safely shut down the server. This part will be improved soon.
+
+## Launching context and generation servers using MPI (Deprecated)
+
+One can also launch all context and generation servers using MPI. This can be done by issuing the following command:
+```
+export TRTLLM_USE_MPI_KVCACHE=1
+mpirun -n <total_num_ranks> trtllm-serve disaggregated_mpi_worker -c disagg_config.yaml
+```
+where `<total_num_ranks>` is the sum of `TP*PP` for all context and generation servers. For the example above, `total_num_ranks` is 3
+since `TP` and `PP` is 1 for the two context and one generation server.
+
+The `disagg_config.yaml` file must now contain the configuration parameters of the context and generation servers. For example,
+it could look like:
+
+```yaml
+hostname: localhost
+port: 8000
+model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+backend: "pytorch"
+disable_overlap_scheduler: True
+context_servers:
+  num_instances: 2
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  kv_cache_config:
+    free_gpu_memory_fraction: 0.9
+  urls:
+      - "localhost:8001"
+      - "localhost:8002"
+generation_servers:
+  num_instances: 1
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  urls:
+      - "localhost:8003"
+```
+
+Once the context and generation servers are launched, you can again launch the disaggregated server with
+```
+trtllm-serve disaggregated -c disagg_config.yaml
+```
