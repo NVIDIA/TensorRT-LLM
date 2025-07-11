@@ -336,6 +336,8 @@ void RoutingKernelTest<T>::runTest(RoutingKernelTestParam const& param)
     {
         GTEST_SKIP() << "Skip test due to compute capability requirement.";
     }
+    // Set seed to time-based seed
+    resetToTimeBasedSeed();
 
     // Allocate buffers
     allocateBuffers(param);
