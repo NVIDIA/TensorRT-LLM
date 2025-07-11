@@ -559,3 +559,12 @@ def _register_fake():
     @torch.library.register_fake("trtllm::nvfp4_block_scale_interleave_reverse")
     def _(sf: torch.Tensor):
         return torch.empty_like(sf, dtype=torch.uint8)
+
+    @torch.library.register_fake("trtllm::moe_finalize_allreduce")
+    def _(input, residual, norm_weight, expanded_idx_to_permuted_idx,
+          shared_expert_output, expert_scale_factor, workspace, rank, nranks,
+          eps) -> List[torch.Tensor]:
+        return [
+            torch.empty_like(residual),
+            torch.empty_like(residual),
+        ]
