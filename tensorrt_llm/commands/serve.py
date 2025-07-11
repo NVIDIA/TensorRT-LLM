@@ -165,7 +165,7 @@ def launch_server(host: str,
               help="Hostname of the server.")
 @click.option("--port", type=int, default=8000, help="Port of the server.")
 @click.option("--backend",
-              type=click.Choice(["pytorch", "tensorrt"]),
+              type=click.Choice(["pytorch", "trt"]),
               default="pytorch",
               help="Set to 'pytorch' for pytorch path. Default is cpp path.")
 @click.option('--log_level',
