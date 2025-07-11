@@ -533,16 +533,15 @@ constexpr static int FINALIZE_THREADS_PER_BLOCK = 256;
 
 // Final kernel to unpermute and scale
 // This kernel unpermutes the original data, does the k-way reduction and performs the final skip connection.
-template <typename KernelParams>
+template <typename KernelParams, int32_t TopK>
 __global__ void finalizeKernelVecLoad(KernelParams params)
 {
-    assert(params.hiddenDim % 4 == 0);
+    assert(params.hiddenDim % 8 == 0);
 
     using Type = typename KernelParams::Type;
     using TypeExpW = typename KernelParams::TypeExpW;
     // Load 128-bits per thread, according to the smallest data type we read/write
-    constexpr int64_t FINALIZE_ELEM_PER_THREAD
-        = 128 / std::min(cutlass::sizeof_bits<Type>::value, cutlass::sizeof_bits<Type>::value);
+    constexpr int64_t FINALIZE_ELEM_PER_THREAD = 128 / cutlass::sizeof_bits<Type>::value;
     using InputElem = cutlass::Array<Type, FINALIZE_ELEM_PER_THREAD>;
     using OutputElem = cutlass::Array<Type, FINALIZE_ELEM_PER_THREAD>;
     using ComputeElem = cutlass::Array<float, FINALIZE_ELEM_PER_THREAD>;
@@ -557,11 +556,74 @@ __global__ void finalizeKernelVecLoad(KernelParams params)
     auto* outElemPtr = reinterpret_cast<OutputElem*>(outputPtr);
     auto const* inElemPtr = reinterpret_cast<InputElem const*>(params.inPtr);
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.wait;");
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    // wait on primary kernel when using PDL
+    if constexpr (KernelParams::UsePdl)
+    {
+        cudaGridDependencySynchronize();
+    }
 #endif
 
+    for (int elemIndex = startOffset; elemIndex < numElemsInCol; elemIndex += stride)
+    {
+        ComputeElem threadOutput;
+        threadOutput.fill(0);
 #pragma unroll
+        for (int k = 0; k < TopK; ++k)
+        {
+            int const expandedIdx = tokenIdx * TopK + k;
+            int const permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
+            if (permutedIdx == -1)
+            {
+                continue;
+            }
+
+            float const scale
+                = (params.expertWeightsPtr != nullptr) ? static_cast<float>(params.expertWeightsPtr[expandedIdx]) : 1.f;
+
+            auto const* inputPermutedPtr = inElemPtr + permutedIdx * numElemsInCol;
+
+            ComputeElem expertResult = arrayConvert<InputElem, ComputeElem>(inputPermutedPtr[elemIndex]);
+
+            threadOutput = threadOutput + scale * expertResult;
+        }
+
+        OutputElem outputElem = arrayConvert<ComputeElem, OutputElem>(threadOutput);
+        outElemPtr[elemIndex] = outputElem;
+    }
+}
+
+template <typename KernelParams>
+__global__ void finalizeKernelVecLoad(KernelParams params)
+{
+    assert(params.hiddenDim % 8 == 0);
+
+    using Type = typename KernelParams::Type;
+    using TypeExpW = typename KernelParams::TypeExpW;
+    // Load 128-bits per thread, according to the smallest data type we read/write
+    constexpr int64_t FINALIZE_ELEM_PER_THREAD = 128 / cutlass::sizeof_bits<Type>::value;
+    using InputElem = cutlass::Array<Type, FINALIZE_ELEM_PER_THREAD>;
+    using OutputElem = cutlass::Array<Type, FINALIZE_ELEM_PER_THREAD>;
+    using ComputeElem = cutlass::Array<float, FINALIZE_ELEM_PER_THREAD>;
+
+    int64_t const tokenIdx = blockIdx.x;
+    int64_t const startOffset = threadIdx.x;
+    int64_t const stride = FINALIZE_THREADS_PER_BLOCK;
+    int64_t const numElemsInCol = params.hiddenDim / FINALIZE_ELEM_PER_THREAD;
+
+    auto const offset = tokenIdx * params.hiddenDim;
+    Type* outputPtr = params.outPtr + offset;
+    auto* outElemPtr = reinterpret_cast<OutputElem*>(outputPtr);
+    auto const* inElemPtr = reinterpret_cast<InputElem const*>(params.inPtr);
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    // wait on primary kernel when using PDL
+    if constexpr (KernelParams::UsePdl)
+    {
+        cudaGridDependencySynchronize();
+    }
+#endif
+
     for (int elemIndex = startOffset; elemIndex < numElemsInCol; elemIndex += stride)
     {
         ComputeElem threadOutput;
@@ -588,9 +650,6 @@ __global__ void finalizeKernelVecLoad(KernelParams params)
         OutputElem outputElem = arrayConvert<ComputeElem, OutputElem>(threadOutput);
         outElemPtr[elemIndex] = outputElem;
     }
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.launch_dependents;");
-#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -668,7 +727,6 @@ __global__ void finalizeDeepSeekKernel(KernelParams params)
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
 void run(Data const& data, void* stream)
 {
     if (data.mUseDeepSeekFp8)
@@ -700,8 +758,25 @@ void run(Data const& data, void* stream)
         }
         else
         {
-            LAUNCH_EXPW(data, finalizeKernelVecLoad, /*numBlocks=*/data.numTokens,
-                /*numThreads=*/FINALIZE_THREADS_PER_BLOCK, 0, stream);
+            switch (data.topK)
+            {
+            case 1:
+                LAUNCH_EXPW_TOPK(data, finalizeKernelVecLoad, 1, /*numBlocks=*/data.numTokens,
+                    /*numThreads=*/FINALIZE_THREADS_PER_BLOCK, 0, stream);
+                break;
+            case 4:
+                LAUNCH_EXPW_TOPK(data, finalizeKernelVecLoad, 4, /*numBlocks=*/data.numTokens,
+                    /*numThreads=*/FINALIZE_THREADS_PER_BLOCK, 0, stream);
+                break;
+            case 8:
+                LAUNCH_EXPW_TOPK(data, finalizeKernelVecLoad, 8, /*numBlocks=*/data.numTokens,
+                    /*numThreads=*/FINALIZE_THREADS_PER_BLOCK, 0, stream);
+                break;
+            default:
+                LAUNCH_EXPW(data, finalizeKernelVecLoad, /*numBlocks=*/data.numTokens,
+                    /*numThreads=*/FINALIZE_THREADS_PER_BLOCK, 0, stream);
+                break;
+            }
         }
     }
 }
