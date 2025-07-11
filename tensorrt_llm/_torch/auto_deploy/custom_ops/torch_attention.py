@@ -115,6 +115,9 @@ def bsnd_grouped_sdpa(
     dropout_p: float = 0.0,
     is_causal: bool = False,
     scale: Optional[float] = None,
+    sinks: Optional[torch.Tensor] = None,
+    sliding_window: Optional[int] = None,
+    logit_cap: Optional[float] = None,
 ) -> torch.Tensor:
     """Attention that assumes the input layout is bsnd.
 
@@ -134,7 +137,16 @@ def bsnd_grouped_sdpa(
 
 @bsnd_grouped_sdpa.register_fake
 def bsnd_grouped_sdpa_fake(
-    query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None
+    query,
+    key,
+    value,
+    attn_mask=None,
+    dropout_p=0.0,
+    is_causal=False,
+    scale=None,
+    sinks=None,
+    sliding_window=None,
+    logit_cap=None,
 ):
     """Fake implementation of bnsd grouped SDPA."""
     return query.new_empty(*query.shape[:-1], value.shape[-1]).contiguous()

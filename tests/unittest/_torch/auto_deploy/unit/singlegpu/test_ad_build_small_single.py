@@ -75,7 +75,7 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             compile_backend="torch-simple",
         ),
         get_small_model_config(
-            "meta-llama/Meta-Llama-3.1-8B-Instruct",
+            "microsoft/Phi-3-mini-4k-instruct",
             attn_backend="torch",
             compile_backend="torch-simple",
         ),
