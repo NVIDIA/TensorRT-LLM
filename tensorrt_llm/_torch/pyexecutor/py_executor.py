@@ -272,7 +272,7 @@ class PyExecutor:
         self.send_handles = [None] * self.num_micro_batches
 
         self.inflight_req_ids = ReqIdsSet()
-        self.canceled_req_ids: List[RequestQueueItem] = []
+        self.canceled_req_ids = set()
 
         self.model_engine.warmup(self.resource_manager)
         if self.draft_model_engine is not None:
