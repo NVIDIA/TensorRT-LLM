@@ -275,7 +275,12 @@ class CutlassFusedMoE(MoE):
                 # TODO: Fuse padding.
                 pad_size = self.w3_w1_weight.shape[-1] * 16 - x.shape[-1]
                 x = torch.nn.functional.pad(x, (0, pad_size))
-                x, x_sf = torch.ops.trtllm.mxfp8_quantize(x, True)
+                # Update x_row and x_col to the padded shape
+                x_row, x_col = x.shape[0], x.shape[1]
+                if use_allgather:
+                    x, x_sf = torch.ops.trtllm.mxfp8_quantize(x, False)
+                else:
+                    x, x_sf = torch.ops.trtllm.mxfp8_quantize(x, True)
             else:
                 raise ValueError(
                     f"unsupported quantization mode: {self.quant_config.quant_mode}"
@@ -353,7 +358,7 @@ class CutlassFusedMoE(MoE):
         use_dp_padding: Optional[bool] = None,
     ) -> torch.Tensor:
         assert do_finalize, "CutlassFusedMoE does not support do_finalize=False"
-        if self.use_dp:
+        if self.use_dp and self.parallel_size > 1:
             assert all_rank_num_tokens is not None
             assert use_dp_padding is not None
             num_rows = sum(all_rank_num_tokens)
@@ -448,7 +453,7 @@ class CutlassFusedMoE(MoE):
 
             outputs = torch.cat(outputs_list)
 
-        if self.use_dp:
+        if self.use_dp and self.parallel_size > 1:
             rank = self.mapping.tp_rank
             outputs = outputs[:all_rank_num_tokens[rank]]
         return outputs
