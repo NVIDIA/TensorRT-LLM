@@ -122,7 +122,7 @@ value for a given parameter, the vector can be limited to a single element
 
 |        Method name in HF         |                    Condition in HF                    | Method name in TRT-LLM |              Condition in TRT-LLM              |
 | :------------------------------: | :---------------------------------------------------: | :--------------------: | :--------------------------------------------: |
-|        assisted decoding         | `assistant_model` or `prompt_lookup_num_tokens!=None` |           X            |                                                |
+|        assisted decoding         | `assistant_model` or `max_draft_len!=None` |           X            |                                                |
 |       beam-search decoding       |          `num_beams>1` and `do_sample=False`          |      beam search       |                `beamWidth > 1`                 |
 | beam-search multinomial sampling |          `num_beams>1` and `do_sample=True`           |           X            |                                                |
 | constrained beam-search decoding |    `constraints!=None` or `force_words_ids!=None`     |           X            |                                                |
