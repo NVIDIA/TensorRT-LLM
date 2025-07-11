@@ -87,6 +87,11 @@ class PyTorchConfig:
     enable_min_latency: bool = False
     allreduce_strategy: str = "AUTO"
 
+    # If true, adjust PyTorch CUDA memory fraction to correspond to the
+    # total GPU memory minus the statically allocated engine memory.
+    # If false, set the PyTorch CUDA memory fraction to 1.0.
+    _limit_torch_cuda_mem_fraction: bool = True
+
 
 EXETENDED_EXECUTOR_CONFIG_FIELDS = [
     'backend',
