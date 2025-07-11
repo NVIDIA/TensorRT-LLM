@@ -1062,7 +1062,7 @@ def test_fused_moe_w4afp8(dtype):
 
 
 @skip_pre_blackwell
-@pytest.mark.parametrize("moe_backend", ["TRTLLM", "CUTLASS"])
+@pytest.mark.parametrize("moe_backend", ["TRTLLM"])
 @pytest.mark.parametrize("bias", [True, False])
 def test_fused_moe_mxfp4_mxpf8(moe_backend, bias):
     SCALING_VECTOR_SIZE = 32
@@ -1081,11 +1081,9 @@ def test_fused_moe_mxfp4_mxpf8(moe_backend, bias):
     weights = {}
     for expert_id in range(NUM_EXPERTS):
         if bias:
-            w1_bias = torch.randn(
-                (INTERMEDIATE_SIZE, ), dtype=dtype).cuda() * 0.1
-            w2_bias = torch.randn((HIDDEN_SIZE, ), dtype=dtype).cuda() * 0.1
-            w3_bias = torch.randn(
-                (INTERMEDIATE_SIZE, ), dtype=dtype).cuda() * 0.1
+            w1_bias = torch.randn((INTERMEDIATE_SIZE, ), dtype=dtype).cuda()
+            w2_bias = torch.randn((HIDDEN_SIZE, ), dtype=dtype).cuda()
+            w3_bias = torch.randn((INTERMEDIATE_SIZE, ), dtype=dtype).cuda()
             weights[f"{expert_id}.w1.bias"] = w1_bias
             weights[f"{expert_id}.w2.bias"] = w2_bias
             weights[f"{expert_id}.w3.bias"] = w3_bias
@@ -1143,7 +1141,6 @@ def test_fused_moe_mxfp4_mxpf8(moe_backend, bias):
         hidden_size=HIDDEN_SIZE,
         intermediate_size=INTERMEDIATE_SIZE,
         dtype=dtype,
-        bias=bias,
         model_config=ModelConfig(quant_config=quant_config))
     ref_fused_moe.cuda()
     ref_fused_moe.load_weights([weights])

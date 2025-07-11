@@ -104,7 +104,7 @@ class TRTLLMGenFusedMoE(MoE):
             or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8, "TRTLLMGenFusedMoE only supports fp8_block_scaling, nvfp4, w4a16_mxfp4, w4a8_mxfp4_fp8 and w4a8_mxfp4_mxfp8 dtypes."
 
         if self.bias or self.swiglu_alpha is not None or self.swiglu_beta is not None:
-            assert self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8, "TRTLLMGenFusedMoE only supports mxfp4 quantization with bias, swiglu_alpha and swiglu_beta."
+            assert self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8, "TRTLLMGenFusedMoE only supports w4a16_mxfp4 and w4a8_mxfp4_fp8 dtypes with bias, swiglu_alpha and swiglu_beta."
 
     def _get_tile_tokens_dim(self, x: torch.Tensor):
         top_k = self.routing_method.top_k
@@ -354,11 +354,7 @@ class TRTLLMGenFusedMoE(MoE):
             )
         elif self.has_w4a8_mxfp4_mxfp8:
             # TRTLLM-Gen uses linear SF layout for the mxfp8 input.
-            pad_size = self.w3_w1_weight.shape[-1] * 2 - x.shape[-1]
-            x = torch.nn.functional.pad(x, (0, pad_size))
             mxfp8_x, sf = torch.ops.trtllm.mxfp8_quantize(x, False)
-            intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
-                -2] // 2
 
             # TODO: remove bias / act_type
             final_hidden_states = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
@@ -378,7 +374,7 @@ class TRTLLMGenFusedMoE(MoE):
                 top_k,
                 n_group,
                 topk_group,
-                intermediate_size_per_partition_padded,
+                self.intermediate_size_per_partition,
                 self.
                 slot_start,  # local_expert_start;  use ep_rank if stride!=1
                 self.expert_size_per_partition,  # local_expert_size
@@ -387,9 +383,6 @@ class TRTLLMGenFusedMoE(MoE):
                 self.routing_method.routing_method_type,
                 0,  # act_type
             )
-            # TODO: Fuse this for padded MXFP4.
-            final_hidden_states = final_hidden_states[:, :self.
-                                                      hidden_size].contiguous()
         else:
             raise NotImplementedError(
                 "TRTLLMGenFusedMoE only supports fp8_block_scaling, nvfp4, w4a16_mxfp4 and w4a8_mxfp4_fp8 dtypes."
