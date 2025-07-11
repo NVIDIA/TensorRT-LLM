@@ -268,7 +268,7 @@ For Pareto curves with MTP = 1, 2, 3, it can be observed that disaggregated resu
 
 <div align="center">
 <figure>
-  <img src="https://github.com/Shixiaowei02/TensorRT-LLM/blob/user/xiaoweis/blog/docs/source/blogs/media/tech_blog5_Picture15.png" width="640" height="auto" alt="Qwen 3 Pareto curves">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture15.png" width="640" height="auto" alt="Qwen 3 Pareto curves">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 15. Qwen 3 Pareto curves.</em></sub></p>
