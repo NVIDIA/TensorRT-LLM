@@ -735,7 +735,10 @@ def main(*,
                             line = result.stdout.splitlines()[0]
                             path = os.path.dirname(line)
                             new_library_path += f":{path}"
-                            build_run(f"ln -s {line} {path}/libnvidia-ml.so.1")
+                            sudo_prefix = "sudo " if os.geteuid() != 0 else ""
+                            build_run(
+                                f"{sudo_prefix}ln -s {line} {path}/libnvidia-ml.so.1"
+                            )
                         else:
                             print(
                                 f"Failed to find libnvidia-ml.so: {result.stderr}",
