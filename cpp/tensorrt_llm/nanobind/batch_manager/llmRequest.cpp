@@ -17,7 +17,7 @@
 #include "llmRequest.h"
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
-#include "tensorrt_llm/pybind/common/bindTypes.h"
+#include "tensorrt_llm/nanobind/common/bindTypes.h"
 #include "tensorrt_llm/runtime/torch.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/torchView.h"
@@ -31,7 +31,7 @@ namespace tb = tensorrt_llm::batch_manager;
 namespace tr = tensorrt_llm::runtime;
 namespace tle = tensorrt_llm::executor;
 
-using namespace tensorrt_llm::pybind::batch_manager;
+using namespace tensorrt_llm::nanobind::batch_manager;
 
 using LlmRequestPtr = std::shared_ptr<tb::LlmRequest>;
 using RequestList = std::list<LlmRequestPtr>;

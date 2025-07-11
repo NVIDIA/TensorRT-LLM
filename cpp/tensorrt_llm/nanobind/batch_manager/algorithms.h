@@ -17,12 +17,12 @@
 
 #pragma once
 
-#include "tensorrt_llm/pybind/common/customCasters.h"
-#include <pybind11/pybind11.h>
+#include "tensorrt_llm/nanobind/common/customCasters.h"
+#include <nanobind/nanobind.h>
 
-namespace tensorrt_llm::pybind::batch_manager::algorithms
+namespace tensorrt_llm::nanobind::batch_manager::algorithms
 {
 
-void initBindings(pybind11::module_& m);
+void initBindings(nb::module_& m);
 
 }

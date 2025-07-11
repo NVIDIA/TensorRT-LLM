@@ -20,415 +20,432 @@
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
-#include <optional>
-#include <pybind11/cast.h>
-#include <pybind11/functional.h>
-#include <pybind11/operators.h>
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
+#include <nanobind/nanobind.h>
+#include <nanobind/stl/function.h>
+#include <nanobind/stl/map.h>
+#include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
+#include <nanobind/stl/set.h>
+#include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/unordered_map.h>
+#include <nanobind/stl/unordered_set.h>
+#include <nanobind/stl/vector.h>
 #include <torch/torch.h>
 #include <vector>
 
-namespace py = pybind11;
+namespace nb = nanobind;
 namespace tle = tensorrt_llm::executor;
 using SizeType32 = tle::SizeType32;
 using RuntimeDefaults = tensorrt_llm::runtime::RuntimeDefaults;
 
-namespace tensorrt_llm::pybind::executor
+namespace tensorrt_llm::nanobind::executor
 {
 
-void initConfigBindings(pybind11::module_& m)
+void initConfigBindings(nb::module_& m)
 {
-    py::enum_<tle::BatchingType>(m, "BatchingType")
+    nb::enum_<tle::BatchingType>(m, "BatchingType")
         .value("STATIC", tle::BatchingType::kSTATIC)
         .value("INFLIGHT", tle::BatchingType::kINFLIGHT);
 
     auto dynamicBatchConfigGetstate = [](tle::DynamicBatchConfig const& self)
     {
-        return py::make_tuple(self.getEnableBatchSizeTuning(), self.getEnableMaxNumTokensTuning(),
+        return nb::make_tuple(self.getEnableBatchSizeTuning(), self.getEnableMaxNumTokensTuning(),
             self.getDynamicBatchMovingAverageWindow(), self.getBatchSizeTable());
     };
-    auto dynamicBatchConfigSetstate = [](py::tuple const& state)
+    auto dynamicBatchConfigSetstate = [](tle::DynamicBatchConfig& self, nb::tuple const& state)
     {
         if (state.size() != 4)
         {
             throw std::runtime_error("Invalid state!");
         }
-        return tle::DynamicBatchConfig(state[0].cast<bool>(), state[1].cast<bool>(), state[2].cast<SizeType32>(),
-            state[3].cast<std::vector<std::pair<SizeType32, SizeType32>>>());
+        new (&self) tle::DynamicBatchConfig(nb::cast<bool>(state[0]), nb::cast<bool>(state[1]),
+            nb::cast<SizeType32>(state[2]), nb::cast<std::vector<std::pair<SizeType32, SizeType32>>>(state[3]));
     };
-    py::class_<tle::DynamicBatchConfig>(m, "DynamicBatchConfig")
-        .def(py::init<bool, bool, SizeType32>(), py::arg("enable_batch_size_tuning"),
-            py::arg("enable_max_num_tokens_tuning"), py::arg("dynamic_batch_moving_average_window"))
-        .def_property_readonly("enable_batch_size_tuning", &tle::DynamicBatchConfig::getEnableBatchSizeTuning)
-        .def_property_readonly("enable_max_num_tokens_tuning", &tle::DynamicBatchConfig::getEnableMaxNumTokensTuning)
-        .def_property_readonly(
+    nb::class_<tle::DynamicBatchConfig>(m, "DynamicBatchConfig")
+        .def(nb::init<bool, bool, SizeType32>(), nb::arg("enable_batch_size_tuning"),
+            nb::arg("enable_max_num_tokens_tuning"), nb::arg("dynamic_batch_moving_average_window"))
+        .def_prop_ro("enable_batch_size_tuning", &tle::DynamicBatchConfig::getEnableBatchSizeTuning)
+        .def_prop_ro("enable_max_num_tokens_tuning", &tle::DynamicBatchConfig::getEnableMaxNumTokensTuning)
+        .def_prop_ro(
             "dynamic_batch_moving_average_window", &tle::DynamicBatchConfig::getDynamicBatchMovingAverageWindow)
-        .def(py::pickle(dynamicBatchConfigGetstate, dynamicBatchConfigSetstate));
+        .def("__getstate__", dynamicBatchConfigGetstate)
+        .def("__setstate__", dynamicBatchConfigSetstate);
 
-    auto schedulerConfigSetstate = [](py::tuple const& state)
+    auto schedulerConfigSetstate = [](tle::SchedulerConfig& self, nb::tuple const& state)
     {
         if (state.size() != 3)
         {
             throw std::runtime_error("Invalid state!");
         }
-        return tle::SchedulerConfig(state[0].cast<tle::CapacitySchedulerPolicy>(),
-            state[1].cast<std::optional<tle::ContextChunkingPolicy>>(),
-            state[2].cast<std::optional<tle::DynamicBatchConfig>>());
+        new (&self) tle::SchedulerConfig(nb::cast<tle::CapacitySchedulerPolicy>(state[0]),
+            nb::cast<std::optional<tle::ContextChunkingPolicy>>(state[1]),
+            nb::cast<std::optional<tle::DynamicBatchConfig>>(state[2]));
     };
     auto schedulerConfigGetstate = [](tle::SchedulerConfig const& self)
     {
-        return py::make_tuple(
+        return nb::make_tuple(
             self.getCapacitySchedulerPolicy(), self.getContextChunkingPolicy(), self.getDynamicBatchConfig());
     };
-    py::class_<tle::SchedulerConfig>(m, "SchedulerConfig")
-        .def(py::init<tle::CapacitySchedulerPolicy, std::optional<tle::ContextChunkingPolicy>,
+    nb::class_<tle::SchedulerConfig>(m, "SchedulerConfig")
+        .def(nb::init<tle::CapacitySchedulerPolicy, std::optional<tle::ContextChunkingPolicy>,
                  std::optional<tle::DynamicBatchConfig>>(),
-            py::arg_v("capacity_scheduler_policy", tle::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT,
-                "CapacitySchedulerPolicy.GUARANTEED_NO_EVICT"),
-            py::arg("context_chunking_policy") = py::none(), py::arg("dynamic_batch_config") = py::none())
-        .def_property_readonly("capacity_scheduler_policy", &tle::SchedulerConfig::getCapacitySchedulerPolicy)
-        .def_property_readonly("context_chunking_policy", &tle::SchedulerConfig::getContextChunkingPolicy)
-        .def_property_readonly("dynamic_batch_config", &tle::SchedulerConfig::getDynamicBatchConfig)
-        .def(py::pickle(schedulerConfigGetstate, schedulerConfigSetstate));
+            nb::arg("capacity_scheduler_policy") = tle::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT,
+            nb::arg("context_chunking_policy") = nb::none(), nb::arg("dynamic_batch_config") = nb::none())
+        .def_prop_ro("capacity_scheduler_policy", &tle::SchedulerConfig::getCapacitySchedulerPolicy)
+        .def_prop_ro("context_chunking_policy", &tle::SchedulerConfig::getContextChunkingPolicy)
+        .def_prop_ro("dynamic_batch_config", &tle::SchedulerConfig::getDynamicBatchConfig)
+        .def("__getstate__", schedulerConfigGetstate)
+        .def("__setstate__", schedulerConfigSetstate);
 
-    py::class_<RuntimeDefaults>(m, "RuntimeDefaults")
-        .def(py::init<std::optional<std::vector<SizeType32>>, std::optional<SizeType32>>(),
-            py::arg("max_attention_window") = py::none(), py::arg("sink_token_length") = py::none())
-        .def_readonly("max_attention_window", &RuntimeDefaults::maxAttentionWindowVec)
-        .def_readonly("sink_token_length", &RuntimeDefaults::sinkTokenLength);
+    nb::class_<RuntimeDefaults>(m, "RuntimeDefaults")
+        .def(nb::init<std::optional<std::vector<SizeType32>>, std::optional<SizeType32>>(),
+            nb::arg("max_attention_window") = nb::none(), nb::arg("sink_token_length") = nb::none())
+        .def_ro("max_attention_window", &RuntimeDefaults::maxAttentionWindowVec)
+        .def_ro("sink_token_length", &RuntimeDefaults::sinkTokenLength);
 
     auto kvCacheConfigGetstate = [](tle::KvCacheConfig const& self)
     {
-        return py::make_tuple(self.getEnableBlockReuse(), self.getMaxTokens(), self.getMaxAttentionWindowVec(),
+        return nb::make_tuple(self.getEnableBlockReuse(), self.getMaxTokens(), self.getMaxAttentionWindowVec(),
             self.getSinkTokenLength(), self.getFreeGpuMemoryFraction(), self.getHostCacheSize(),
             self.getOnboardBlocks(), self.getCrossKvCacheFraction(), self.getSecondaryOffloadMinPriority(),
             self.getEventBufferMaxSize(), self.getEnablePartialReuse(), self.getCopyOnPartialReuse(), self.getUseUvm());
     };
-    auto kvCacheConfigSetstate = [](py::tuple const& state)
+    auto kvCacheConfigSetstate = [](tle::KvCacheConfig& self, nb::tuple const& state)
     {
         if (state.size() != 13)
         {
             throw std::runtime_error("Invalid state!");
         }
-        return tle::KvCacheConfig(state[0].cast<bool>(), state[1].cast<std::optional<SizeType32>>(),
-            state[2].cast<std::optional<std::vector<SizeType32>>>(), state[3].cast<std::optional<SizeType32>>(),
-            state[4].cast<std::optional<float>>(), state[5].cast<std::optional<size_t>>(), state[6].cast<bool>(),
-            state[7].cast<std::optional<float>>(), state[8].cast<std::optional<tle::RetentionPriority>>(),
-            state[9].cast<size_t>(), state[10].cast<bool>(), state[11].cast<bool>(), state[12].cast<bool>());
+        new (&self) tle::KvCacheConfig(nb::cast<bool>(state[0]), nb::cast<std::optional<SizeType32>>(state[1]),
+            nb::cast<std::optional<std::vector<SizeType32>>>(state[2]), nb::cast<std::optional<SizeType32>>(state[3]),
+            nb::cast<std::optional<float>>(state[4]), nb::cast<std::optional<size_t>>(state[5]),
+            nb::cast<bool>(state[6]), nb::cast<std::optional<float>>(state[7]),
+            nb::cast<std::optional<tle::RetentionPriority>>(state[8]), nb::cast<size_t>(state[9]),
+            nb::cast<bool>(state[10]), nb::cast<bool>(state[11]), nb::cast<bool>(state[12]));
     };
-    py::class_<tle::KvCacheConfig>(m, "KvCacheConfig")
-        .def(py::init<bool, std::optional<SizeType32> const&, std::optional<std::vector<SizeType32>> const&,
+    nb::class_<tle::KvCacheConfig>(m, "KvCacheConfig")
+        .def(nb::init<bool, std::optional<SizeType32> const&, std::optional<std::vector<SizeType32>> const&,
                  std::optional<SizeType32> const&, std::optional<float> const&, std::optional<size_t> const&, bool,
                  std::optional<float> const&, std::optional<tle::RetentionPriority>, size_t const&, bool, bool, bool,
                  std::optional<RuntimeDefaults> const&>(),
-            py::arg("enable_block_reuse") = true, py::arg("max_tokens") = py::none(),
-            py::arg("max_attention_window") = py::none(), py::arg("sink_token_length") = py::none(),
-            py::arg("free_gpu_memory_fraction") = py::none(), py::arg("host_cache_size") = py::none(),
-            py::arg("onboard_blocks") = true, py::arg("cross_kv_cache_fraction") = py::none(),
-            py::arg("secondary_offload_min_priority") = py::none(), py::arg("event_buffer_max_size") = 0, py::kw_only(),
-            py::arg("enable_partial_reuse") = true, py::arg("copy_on_partial_reuse") = true, py::arg("use_uvm") = false,
-            py::arg("runtime_defaults") = py::none())
-        .def_property(
+            nb::arg("enable_block_reuse") = true, nb::arg("max_tokens") = nb::none(),
+            nb::arg("max_attention_window") = nb::none(), nb::arg("sink_token_length") = nb::none(),
+            nb::arg("free_gpu_memory_fraction") = nb::none(), nb::arg("host_cache_size") = nb::none(),
+            nb::arg("onboard_blocks") = true, nb::arg("cross_kv_cache_fraction") = nb::none(),
+            nb::arg("secondary_offload_min_priority") = nb::none(), nb::arg("event_buffer_max_size") = 0, nb::kw_only(),
+            nb::arg("enable_partial_reuse") = true, nb::arg("copy_on_partial_reuse") = true, nb::arg("use_uvm") = false,
+            nb::arg("runtime_defaults") = nb::none())
+        .def_prop_rw(
             "enable_block_reuse", &tle::KvCacheConfig::getEnableBlockReuse, &tle::KvCacheConfig::setEnableBlockReuse)
-        .def_property("max_tokens", &tle::KvCacheConfig::getMaxTokens, &tle::KvCacheConfig::setMaxTokens)
-        .def_property("max_attention_window", &tle::KvCacheConfig::getMaxAttentionWindowVec,
+        .def_prop_rw("max_tokens", &tle::KvCacheConfig::getMaxTokens, &tle::KvCacheConfig::setMaxTokens)
+        .def_prop_rw("max_attention_window", &tle::KvCacheConfig::getMaxAttentionWindowVec,
             &tle::KvCacheConfig::setMaxAttentionWindowVec)
-        .def_property(
+        .def_prop_rw(
             "sink_token_length", &tle::KvCacheConfig::getSinkTokenLength, &tle::KvCacheConfig::setSinkTokenLength)
-        .def_property("free_gpu_memory_fraction", &tle::KvCacheConfig::getFreeGpuMemoryFraction,
+        .def_prop_rw("free_gpu_memory_fraction", &tle::KvCacheConfig::getFreeGpuMemoryFraction,
             &tle::KvCacheConfig::setFreeGpuMemoryFraction)
-        .def_property("host_cache_size", &tle::KvCacheConfig::getHostCacheSize, &tle::KvCacheConfig::setHostCacheSize)
-        .def_property("onboard_blocks", &tle::KvCacheConfig::getOnboardBlocks, &tle::KvCacheConfig::setOnboardBlocks)
-        .def_property("cross_kv_cache_fraction", &tle::KvCacheConfig::getCrossKvCacheFraction,
+        .def_prop_rw("host_cache_size", &tle::KvCacheConfig::getHostCacheSize, &tle::KvCacheConfig::setHostCacheSize)
+        .def_prop_rw("onboard_blocks", &tle::KvCacheConfig::getOnboardBlocks, &tle::KvCacheConfig::setOnboardBlocks)
+        .def_prop_rw("cross_kv_cache_fraction", &tle::KvCacheConfig::getCrossKvCacheFraction,
             &tle::KvCacheConfig::setCrossKvCacheFraction)
-        .def_property("secondary_offload_min_priority", &tle::KvCacheConfig::getSecondaryOffloadMinPriority,
+        .def_prop_rw("secondary_offload_min_priority", &tle::KvCacheConfig::getSecondaryOffloadMinPriority,
             &tle::KvCacheConfig::setSecondaryOffloadMinPriority)
-        .def_property("event_buffer_max_size", &tle::KvCacheConfig::getEventBufferMaxSize,
+        .def_prop_rw("event_buffer_max_size", &tle::KvCacheConfig::getEventBufferMaxSize,
             &tle::KvCacheConfig::setEventBufferMaxSize)
-        .def_property("enable_partial_reuse", &tle::KvCacheConfig::getEnablePartialReuse,
+        .def_prop_rw("enable_partial_reuse", &tle::KvCacheConfig::getEnablePartialReuse,
             &tle::KvCacheConfig::setEnablePartialReuse)
-        .def_property("copy_on_partial_reuse", &tle::KvCacheConfig::getCopyOnPartialReuse,
+        .def_prop_rw("copy_on_partial_reuse", &tle::KvCacheConfig::getCopyOnPartialReuse,
             &tle::KvCacheConfig::setCopyOnPartialReuse)
-        .def_property("use_uvm", &tle::KvCacheConfig::getUseUvm, &tle::KvCacheConfig::setUseUvm)
+        .def_prop_rw("use_uvm", &tle::KvCacheConfig::getUseUvm, &tle::KvCacheConfig::setUseUvm)
         .def("fill_empty_fields_from_runtime_defaults", &tle::KvCacheConfig::fillEmptyFieldsFromRuntimeDefaults)
-        .def(py::pickle(kvCacheConfigGetstate, kvCacheConfigSetstate));
+        .def("__getstate__", kvCacheConfigGetstate)
+        .def("__setstate__", kvCacheConfigSetstate);
 
-    py::class_<tle::OrchestratorConfig>(m, "OrchestratorConfig")
-        .def(py::init<bool, std::string, std::shared_ptr<mpi::MpiComm>, bool>(), py::arg("is_orchestrator") = true,
-            py::arg("worker_executable_path") = "", py::arg("orch_leader_comm") = nullptr,
-            py::arg("spawn_processes") = true)
-        .def_property(
+    nb::class_<tle::OrchestratorConfig>(m, "OrchestratorConfig")
+        .def(nb::init<bool, std::string, std::shared_ptr<mpi::MpiComm>, bool>(), nb::arg("is_orchestrator") = true,
+            nb::arg("worker_executable_path") = "", nb::arg("orch_leader_comm").none() = nullptr,
+            nb::arg("spawn_processes") = true)
+        .def_prop_rw(
             "is_orchestrator", &tle::OrchestratorConfig::getIsOrchestrator, &tle::OrchestratorConfig::setIsOrchestrator)
-        .def_property("worker_executable_path", &tle::OrchestratorConfig::getWorkerExecutablePath,
+        .def_prop_rw("worker_executable_path", &tle::OrchestratorConfig::getWorkerExecutablePath,
             &tle::OrchestratorConfig::setWorkerExecutablePath)
-        .def_property("orch_leader_comm", &tle::OrchestratorConfig::getOrchLeaderComm,
+        .def_prop_rw("orch_leader_comm", &tle::OrchestratorConfig::getOrchLeaderComm,
             &tle::OrchestratorConfig::setOrchLeaderComm)
-        .def_property("spawn_processes", &tle::OrchestratorConfig::getSpawnProcesses,
+        .def_prop_rw("spawn_processes", &tle::OrchestratorConfig::getSpawnProcesses,
             &tle::OrchestratorConfig::setSpawnProcesses);
 
     auto parallelConfigGetstate = [](tle::ParallelConfig const& self)
     {
-        return py::make_tuple(self.getCommunicationType(), self.getCommunicationMode(), self.getDeviceIds(),
+        return nb::make_tuple(self.getCommunicationType(), self.getCommunicationMode(), self.getDeviceIds(),
             self.getParticipantIds(), self.getOrchestratorConfig(), self.getNumNodes());
     };
-    auto parallelConfigSetstate = [](py::tuple const& state)
+    auto parallelConfigSetstate = [](tle::ParallelConfig& self, nb::tuple const& state)
     {
         if (state.size() != 6)
         {
             throw std::runtime_error("Invalid state!");
         }
-        return tle::ParallelConfig(state[0].cast<tle::CommunicationType>(), state[1].cast<tle::CommunicationMode>(),
-            state[2].cast<std::optional<std::vector<SizeType32>>>(),
-            state[3].cast<std::optional<std::vector<SizeType32>>>(),
-            state[4].cast<std::optional<tle::OrchestratorConfig>>(), state[5].cast<std::optional<SizeType32>>());
+        new (&self) tle::ParallelConfig(nb::cast<tle::CommunicationType>(state[0]),
+            nb::cast<tle::CommunicationMode>(state[1]), nb::cast<std::optional<std::vector<SizeType32>>>(state[2]),
+            nb::cast<std::optional<std::vector<SizeType32>>>(state[3]),
+            nb::cast<std::optional<tle::OrchestratorConfig>>(state[4]), nb::cast<std::optional<SizeType32>>(state[5]));
     };
-    py::class_<tle::ParallelConfig>(m, "ParallelConfig")
-        .def(py::init<tle::CommunicationType, tle::CommunicationMode, std::optional<std::vector<SizeType32>> const&,
+    nb::class_<tle::ParallelConfig>(m, "ParallelConfig")
+        .def(nb::init<tle::CommunicationType, tle::CommunicationMode, std::optional<std::vector<SizeType32>> const&,
                  std::optional<std::vector<SizeType32>> const&, std::optional<tle::OrchestratorConfig> const&,
                  std::optional<SizeType32> const&>(),
-            py::arg_v("communication_type", tle::CommunicationType::kMPI, "CommunicationType.MPI"),
-            py::arg_v("communication_mode", tle::CommunicationMode::kLEADER, "CommunicationMode.LEADER"),
-            py::arg("device_ids") = py::none(), py::arg("participant_ids") = py::none(),
-            py::arg("orchestrator_config") = py::none(), py::arg("num_nodes") = py::none())
-        .def_property("communication_type", &tle::ParallelConfig::getCommunicationType,
+            nb::arg("communication_type") = tle::CommunicationType::kMPI,
+            nb::arg("communication_mode") = tle::CommunicationMode::kLEADER, nb::arg("device_ids") = nb::none(),
+            nb::arg("participant_ids") = nb::none(), nb::arg("orchestrator_config") = nb::none(),
+            nb::arg("num_nodes") = nb::none())
+        .def_prop_rw("communication_type", &tle::ParallelConfig::getCommunicationType,
             &tle::ParallelConfig::setCommunicationType)
-        .def_property("communication_mode", &tle::ParallelConfig::getCommunicationMode,
+        .def_prop_rw("communication_mode", &tle::ParallelConfig::getCommunicationMode,
             &tle::ParallelConfig::setCommunicationMode)
-        .def_property("device_ids", &tle::ParallelConfig::getDeviceIds, &tle::ParallelConfig::setDeviceIds)
-        .def_property(
+        .def_prop_rw("device_ids", &tle::ParallelConfig::getDeviceIds, &tle::ParallelConfig::setDeviceIds)
+        .def_prop_rw(
             "participant_ids", &tle::ParallelConfig::getParticipantIds, &tle::ParallelConfig::setParticipantIds)
-        .def_property("orchestrator_config", &tle::ParallelConfig::getOrchestratorConfig,
+        .def_prop_rw("orchestrator_config", &tle::ParallelConfig::getOrchestratorConfig,
             &tle::ParallelConfig::setOrchestratorConfig)
-        .def_property("num_nodes", &tle::ParallelConfig::getNumNodes, &tle::ParallelConfig::setNumNodes)
-        .def(py::pickle(parallelConfigGetstate, parallelConfigSetstate));
+        .def_prop_rw("num_nodes", &tle::ParallelConfig::getNumNodes, &tle::ParallelConfig::setNumNodes)
+        .def("__getstate__", parallelConfigGetstate)
+        .def("__setstate__", parallelConfigSetstate);
 
-    auto peftCacheConfigSetstate = [](py::tuple const& state)
+    auto peftCacheConfigSetstate = [](tle::PeftCacheConfig& self, nb::tuple const& state)
     {
         if (state.size() != 11)
         {
             throw std::runtime_error("Invalid state!");
         }
-        return tle::PeftCacheConfig(state[0].cast<SizeType32>(), state[1].cast<SizeType32>(),
-            state[2].cast<SizeType32>(), state[3].cast<SizeType32>(), state[4].cast<SizeType32>(),
-            state[5].cast<SizeType32>(), state[6].cast<SizeType32>(), state[7].cast<SizeType32>(),
-            state[8].cast<SizeType32>(), state[9].cast<std::optional<float>>(),
-            state[10].cast<std::optional<size_t>>());
+        new (&self) tle::PeftCacheConfig(nb::cast<SizeType32>(state[0]), nb::cast<SizeType32>(state[1]),
+            nb::cast<SizeType32>(state[2]), nb::cast<SizeType32>(state[3]), nb::cast<SizeType32>(state[4]),
+            nb::cast<SizeType32>(state[5]), nb::cast<SizeType32>(state[6]), nb::cast<SizeType32>(state[7]),
+            nb::cast<SizeType32>(state[8]), nb::cast<std::optional<float>>(state[9]),
+            nb::cast<std::optional<size_t>>(state[10]));
     };
     auto peftCacheConfigGetstate = [](tle::PeftCacheConfig const& self)
     {
-        return py::make_tuple(self.getNumHostModuleLayer(), self.getNumDeviceModuleLayer(),
+        return nb::make_tuple(self.getNumHostModuleLayer(), self.getNumDeviceModuleLayer(),
             self.getOptimalAdapterSize(), self.getMaxAdapterSize(), self.getNumPutWorkers(), self.getNumEnsureWorkers(),
             self.getNumCopyStreams(), self.getMaxPagesPerBlockHost(), self.getMaxPagesPerBlockDevice(),
             self.getDeviceCachePercent(), self.getHostCacheSize());
     };
-    py::class_<tle::PeftCacheConfig>(m, "PeftCacheConfig")
-        .def(py::init<SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32,
+    nb::class_<tle::PeftCacheConfig>(m, "PeftCacheConfig")
+        .def(nb::init<SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32,
                  SizeType32, std::optional<float> const&, std::optional<size_t> const&,
                  std::optional<std::string> const&>(),
-            py::arg("num_host_module_layer") = 0, py::arg("num_device_module_layer") = 0,
-            py::arg("optimal_adapter_size") = 8, py::arg("max_adapter_size") = 64, py::arg("num_put_workers") = 1,
-            py::arg("num_ensure_workers") = 1, py::arg("num_copy_streams") = 1,
-            py::arg("max_pages_per_block_host") = 24, py::arg("max_pages_per_block_device") = 8,
-            py::arg("device_cache_percent") = py::none(), py::arg("host_cache_size") = py::none(),
-            py::arg("lora_prefetch_dir") = py::none())
-        .def_property_readonly("num_host_module_layer", &tle::PeftCacheConfig::getNumHostModuleLayer)
-        .def_property_readonly("num_device_module_layer", &tle::PeftCacheConfig::getNumDeviceModuleLayer)
-        .def_property_readonly("optimal_adapter_size", &tle::PeftCacheConfig::getOptimalAdapterSize)
-        .def_property_readonly("max_adapter_size", &tle::PeftCacheConfig::getMaxAdapterSize)
-        .def_property_readonly("num_put_workers", &tle::PeftCacheConfig::getNumPutWorkers)
-        .def_property_readonly("num_ensure_workers", &tle::PeftCacheConfig::getNumEnsureWorkers)
-        .def_property_readonly("num_copy_streams", &tle::PeftCacheConfig::getNumCopyStreams)
-        .def_property_readonly("max_pages_per_block_host", &tle::PeftCacheConfig::getMaxPagesPerBlockHost)
-        .def_property_readonly("max_pages_per_block_device", &tle::PeftCacheConfig::getMaxPagesPerBlockDevice)
-        .def_property_readonly("device_cache_percent", &tle::PeftCacheConfig::getDeviceCachePercent)
-        .def_property_readonly("host_cache_size", &tle::PeftCacheConfig::getHostCacheSize)
-        .def_property_readonly("lora_prefetch_dir", &tle::PeftCacheConfig::getLoraPrefetchDir)
-        .def(py::pickle(peftCacheConfigGetstate, peftCacheConfigSetstate));
+            nb::arg("num_host_module_layer") = 0, nb::arg("num_device_module_layer") = 0,
+            nb::arg("optimal_adapter_size") = 8, nb::arg("max_adapter_size") = 64, nb::arg("num_put_workers") = 1,
+            nb::arg("num_ensure_workers") = 1, nb::arg("num_copy_streams") = 1,
+            nb::arg("max_pages_per_block_host") = 24, nb::arg("max_pages_per_block_device") = 8,
+            nb::arg("device_cache_percent") = nb::none(), nb::arg("host_cache_size") = nb::none(),
+            nb::arg("lora_prefetch_dir") = nb::none())
+        .def_prop_ro("num_host_module_layer", &tle::PeftCacheConfig::getNumHostModuleLayer)
+        .def_prop_ro("num_device_module_layer", &tle::PeftCacheConfig::getNumDeviceModuleLayer)
+        .def_prop_ro("optimal_adapter_size", &tle::PeftCacheConfig::getOptimalAdapterSize)
+        .def_prop_ro("max_adapter_size", &tle::PeftCacheConfig::getMaxAdapterSize)
+        .def_prop_ro("num_put_workers", &tle::PeftCacheConfig::getNumPutWorkers)
+        .def_prop_ro("num_ensure_workers", &tle::PeftCacheConfig::getNumEnsureWorkers)
+        .def_prop_ro("num_copy_streams", &tle::PeftCacheConfig::getNumCopyStreams)
+        .def_prop_ro("max_pages_per_block_host", &tle::PeftCacheConfig::getMaxPagesPerBlockHost)
+        .def_prop_ro("max_pages_per_block_device", &tle::PeftCacheConfig::getMaxPagesPerBlockDevice)
+        .def_prop_ro("device_cache_percent", &tle::PeftCacheConfig::getDeviceCachePercent)
+        .def_prop_ro("host_cache_size", &tle::PeftCacheConfig::getHostCacheSize)
+        .def_prop_ro("lora_prefetch_dir", &tle::PeftCacheConfig::getLoraPrefetchDir)
+        .def("__getstate__", peftCacheConfigGetstate)
+        .def("__setstate__", peftCacheConfigSetstate);
 
     auto decodingConfigGetstate = [](tle::DecodingConfig const& self)
     {
-        return py::make_tuple(
+        return nb::make_tuple(
             self.getDecodingMode(), self.getLookaheadDecodingConfig(), self.getMedusaChoices(), self.getEagleConfig());
     };
-    auto decodingConfigSetstate = [](py::tuple const& state)
+    auto decodingConfigSetstate = [](tle::DecodingConfig& self, nb::tuple const& state)
     {
         if (state.size() != 4)
         {
             throw std::runtime_error("Invalid state!");
         }
-        return tle::DecodingConfig(state[0].cast<std::optional<tle::DecodingMode>>(), // DecodingMode
-            state[1].cast<std::optional<tle::LookaheadDecodingConfig>>(),             // LookaheadDecodingConfig
-            state[2].cast<std::optional<tle::MedusaChoices>>(),                       // MedusaChoices
-            state[3].cast<std::optional<tle::EagleConfig>>()                          // EagleConfig
+        new (&self) tle::DecodingConfig(nb::cast<std::optional<tle::DecodingMode>>(state[0]), // DecodingMode
+            nb::cast<std::optional<tle::LookaheadDecodingConfig>>(state[1]),                  // LookaheadDecodingConfig
+            nb::cast<std::optional<tle::MedusaChoices>>(state[2]),                            // MedusaChoices
+            nb::cast<std::optional<tle::EagleConfig>>(state[3])                               // EagleConfig
         );
     };
-    py::class_<tle::DecodingConfig>(m, "DecodingConfig")
-        .def(py::init<std::optional<tle::DecodingMode>, std::optional<tle::LookaheadDecodingConfig>,
+    nb::class_<tle::DecodingConfig>(m, "DecodingConfig")
+        .def(nb::init<std::optional<tle::DecodingMode>, std::optional<tle::LookaheadDecodingConfig>,
                  std::optional<tle::MedusaChoices>, std::optional<tle::EagleConfig>>(),
-            py::arg("decoding_mode") = py::none(), py::arg("lookahead_decoding_config") = py::none(),
-            py::arg("medusa_choices") = py::none(), py::arg("eagle_config") = py::none())
-        .def_property("decoding_mode", &tle::DecodingConfig::getDecodingMode, &tle::DecodingConfig::setDecodingMode)
-        .def_property("lookahead_decoding_config", &tle::DecodingConfig::getLookaheadDecodingConfig,
+            nb::arg("decoding_mode") = nb::none(), nb::arg("lookahead_decoding_config") = nb::none(),
+            nb::arg("medusa_choices") = nb::none(), nb::arg("eagle_config") = nb::none())
+        .def_prop_rw("decoding_mode", &tle::DecodingConfig::getDecodingMode, &tle::DecodingConfig::setDecodingMode)
+        .def_prop_rw("lookahead_decoding_config", &tle::DecodingConfig::getLookaheadDecodingConfig,
             &tle::DecodingConfig::setLookaheadDecodingConfig)
-        .def_property("medusa_choices", &tle::DecodingConfig::getMedusaChoices, &tle::DecodingConfig::setMedusaChoices)
-        .def_property("eagle_config", &tle::DecodingConfig::getEagleConfig, &tle::DecodingConfig::setEagleConfig)
-        .def(py::pickle(decodingConfigGetstate, decodingConfigSetstate));
+        .def_prop_rw("medusa_choices", &tle::DecodingConfig::getMedusaChoices, &tle::DecodingConfig::setMedusaChoices)
+        .def_prop_rw("eagle_config", &tle::DecodingConfig::getEagleConfig, &tle::DecodingConfig::setEagleConfig)
+        .def("__getstate__", decodingConfigGetstate)
+        .def("__setstate__", decodingConfigSetstate);
 
     auto debugConfigGetstate = [](tle::DebugConfig const& self)
     {
-        return py::make_tuple(self.getDebugInputTensors(), self.getDebugOutputTensors(), self.getDebugTensorNames(),
+        return nb::make_tuple(self.getDebugInputTensors(), self.getDebugOutputTensors(), self.getDebugTensorNames(),
             self.getDebugTensorsMaxIterations());
     };
-    auto debugConfigSetstate = [](py::tuple const& state)
+    auto debugConfigSetstate = [](tle::DebugConfig& self, nb::tuple const& state)
     {
         if (state.size() != 4)
         {
             throw std::runtime_error("Invalid state!");
         }
-        return tle::DebugConfig(state[0].cast<bool>(), state[1].cast<bool>(), state[2].cast<std::vector<std::string>>(),
-            state[3].cast<SizeType32>());
+        new (&self) tle::DebugConfig(nb::cast<bool>(state[0]), nb::cast<bool>(state[1]),
+            nb::cast<std::vector<std::string>>(state[2]), nb::cast<SizeType32>(state[3]));
     };
-    py::class_<tle::DebugConfig>(m, "DebugConfig")
-        .def(py::init<bool, bool, std::vector<std::string>, SizeType32>(), py::arg("debug_input_tensors") = false,
-            py::arg("debug_output_tensors") = false, py::arg("debug_tensor_names") = py::none(),
-            py::arg("debug_tensors_max_iterations") = false)
-        .def_property(
+    nb::class_<tle::DebugConfig>(m, "DebugConfig")
+        .def(nb::init<bool, bool, std::vector<std::string>, SizeType32>(), nb::arg("debug_input_tensors") = false,
+            nb::arg("debug_output_tensors") = false, nb::arg("debug_tensor_names") = nb::none(),
+            nb::arg("debug_tensors_max_iterations") = false)
+        .def_prop_rw(
             "debug_input_tensors", &tle::DebugConfig::getDebugInputTensors, &tle::DebugConfig::setDebugInputTensors)
-        .def_property(
+        .def_prop_rw(
             "debug_output_tensors", &tle::DebugConfig::getDebugOutputTensors, &tle::DebugConfig::setDebugOutputTensors)
-        .def_property(
+        .def_prop_rw(
             "debug_tensor_names", &tle::DebugConfig::getDebugTensorNames, &tle::DebugConfig::setDebugTensorNames)
-        .def_property("debug_tensors_max_iterations", &tle::DebugConfig::getDebugTensorsMaxIterations,
+        .def_prop_rw("debug_tensors_max_iterations", &tle::DebugConfig::getDebugTensorsMaxIterations,
             &tle::DebugConfig::setDebugTensorsMaxIterations)
-        .def(py::pickle(debugConfigGetstate, debugConfigSetstate));
+        .def("__getstate__", debugConfigGetstate)
+        .def("__setstate__", debugConfigSetstate);
 
     auto logitsPostProcessorConfigGetstate = [](tle::LogitsPostProcessorConfig const& self)
-    { return py::make_tuple(self.getProcessorMap(), self.getProcessorBatched(), self.getReplicate()); };
+    { return nb::make_tuple(self.getProcessorMap(), self.getProcessorBatched(), self.getReplicate()); };
 
-    auto logitsPostProcessorConfigSetstate = [](py::tuple const& state)
+    auto logitsPostProcessorConfigSetstate = [](tle::LogitsPostProcessorConfig& self, nb::tuple const& state)
     {
         if (state.size() != 3)
         {
             throw std::runtime_error("Invalid LogitsPostProcessorConfig state!");
         }
-        return tle::LogitsPostProcessorConfig(state[0].cast<std::optional<tle::LogitsPostProcessorMap>>(),
-            state[1].cast<std::optional<tle::LogitsPostProcessorBatched>>(), state[2].cast<bool>());
+        new (&self) tle::LogitsPostProcessorConfig(nb::cast<std::optional<tle::LogitsPostProcessorMap>>(state[0]),
+            nb::cast<std::optional<tle::LogitsPostProcessorBatched>>(state[1]), nb::cast<bool>(state[2]));
     };
 
-    py::class_<tle::LogitsPostProcessorConfig>(m, "LogitsPostProcessorConfig")
-        .def(py::init<std::optional<tle::LogitsPostProcessorMap>, std::optional<tle::LogitsPostProcessorBatched>,
+    nb::class_<tle::LogitsPostProcessorConfig>(m, "LogitsPostProcessorConfig")
+        .def(nb::init<std::optional<tle::LogitsPostProcessorMap>, std::optional<tle::LogitsPostProcessorBatched>,
                  bool>(),
-            py::arg("processor_map") = py::none(), py::arg("processor_batched") = py::none(),
-            py::arg("replicate") = true)
-        .def_property("processor_map", &tle::LogitsPostProcessorConfig::getProcessorMap,
+            nb::arg("processor_map") = nb::none(), nb::arg("processor_batched") = nb::none(),
+            nb::arg("replicate") = true)
+        .def_prop_rw("processor_map", &tle::LogitsPostProcessorConfig::getProcessorMap,
             &tle::LogitsPostProcessorConfig::setProcessorMap)
-        .def_property("processor_batched", &tle::LogitsPostProcessorConfig::getProcessorBatched,
+        .def_prop_rw("processor_batched", &tle::LogitsPostProcessorConfig::getProcessorBatched,
             &tle::LogitsPostProcessorConfig::setProcessorBatched)
-        .def_property(
+        .def_prop_rw(
             "replicate", &tle::LogitsPostProcessorConfig::getReplicate, &tle::LogitsPostProcessorConfig::setReplicate)
-        .def(py::pickle(logitsPostProcessorConfigGetstate, logitsPostProcessorConfigSetstate));
+        .def("__getstate__", logitsPostProcessorConfigGetstate)
+        .def("__setstate__", logitsPostProcessorConfigSetstate);
 
-    auto extendedRuntimePerfKnobConfigSetstate = [](py::tuple const& state)
+    auto extendedRuntimePerfKnobConfigSetstate = [](tle::ExtendedRuntimePerfKnobConfig& self, nb::tuple const& state)
     {
         if (state.size() != 4)
         {
             throw std::runtime_error("Invalid extendedRuntimePerfKnobConfig state!");
         }
-        return tle::ExtendedRuntimePerfKnobConfig(
-            state[0].cast<bool>(), state[1].cast<bool>(), state[2].cast<bool>(), state[2].cast<SizeType32>());
+        new (&self) tle::ExtendedRuntimePerfKnobConfig(nb::cast<bool>(state[0]), nb::cast<bool>(state[1]),
+            nb::cast<bool>(state[2]), nb::cast<SizeType32>(state[2]));
     };
     auto extendedRuntimePerfKnobConfigGetstate = [](tle::ExtendedRuntimePerfKnobConfig const& self)
     {
-        return py::make_tuple(self.getMultiBlockMode(), self.getEnableContextFMHAFP32Acc(), self.getCudaGraphMode(),
+        return nb::make_tuple(self.getMultiBlockMode(), self.getEnableContextFMHAFP32Acc(), self.getCudaGraphMode(),
             self.getCudaGraphCacheSize());
     };
-    py::class_<tle::ExtendedRuntimePerfKnobConfig>(m, "ExtendedRuntimePerfKnobConfig")
+    nb::class_<tle::ExtendedRuntimePerfKnobConfig>(m, "ExtendedRuntimePerfKnobConfig")
         .def(
-            py::init<bool, bool>(), py::arg("multi_block_mode") = true, py::arg("enable_context_fmha_fp32_acc") = false)
-        .def_property("multi_block_mode", &tle::ExtendedRuntimePerfKnobConfig::getMultiBlockMode,
+            nb::init<bool, bool>(), nb::arg("multi_block_mode") = true, nb::arg("enable_context_fmha_fp32_acc") = false)
+        .def_prop_rw("multi_block_mode", &tle::ExtendedRuntimePerfKnobConfig::getMultiBlockMode,
             &tle::ExtendedRuntimePerfKnobConfig::setMultiBlockMode)
-        .def_property("enable_context_fmha_fp32_acc", &tle::ExtendedRuntimePerfKnobConfig::getEnableContextFMHAFP32Acc,
+        .def_prop_rw("enable_context_fmha_fp32_acc", &tle::ExtendedRuntimePerfKnobConfig::getEnableContextFMHAFP32Acc,
             &tle::ExtendedRuntimePerfKnobConfig::setEnableContextFMHAFP32Acc)
-        .def_property("cuda_graph_mode", &tle::ExtendedRuntimePerfKnobConfig::getCudaGraphMode,
+        .def_prop_rw("cuda_graph_mode", &tle::ExtendedRuntimePerfKnobConfig::getCudaGraphMode,
             &tle::ExtendedRuntimePerfKnobConfig::setCudaGraphMode)
-        .def_property("cuda_graph_cache_size", &tle::ExtendedRuntimePerfKnobConfig::getCudaGraphCacheSize,
+        .def_prop_rw("cuda_graph_cache_size", &tle::ExtendedRuntimePerfKnobConfig::getCudaGraphCacheSize,
             &tle::ExtendedRuntimePerfKnobConfig::setCudaGraphCacheSize)
-        .def(py::pickle(extendedRuntimePerfKnobConfigGetstate, extendedRuntimePerfKnobConfigSetstate));
+        .def("__getstate__", extendedRuntimePerfKnobConfigGetstate)
+        .def("__setstate__", extendedRuntimePerfKnobConfigSetstate);
 
     auto SpeculativeDecodingConfigGetState
-        = [](tle::SpeculativeDecodingConfig const& self) { return py::make_tuple(self.fastLogits); };
-    auto SpeculativeDecodingConfigSetState = [](py::tuple const& state)
+        = [](tle::SpeculativeDecodingConfig const& self) { return nb::make_tuple(self.fastLogits); };
+    auto SpeculativeDecodingConfigSetState = [](tle::SpeculativeDecodingConfig& self, nb::tuple const& state)
     {
         if (state.size() != 1)
         {
             throw std::runtime_error("Invalid SpeculativeDecodingConfig state!");
         }
-        return tle::SpeculativeDecodingConfig(state[0].cast<bool>());
+        new (&self) tle::SpeculativeDecodingConfig(nb::cast<bool>(state[0]));
     };
-    py::class_<tle::SpeculativeDecodingConfig>(m, "SpeculativeDecodingConfig")
-        .def(py::init<bool>(), py::arg("fast_logits") = false)
-        .def_readwrite("fast_logits", &tle::SpeculativeDecodingConfig::fastLogits)
-        .def(py::pickle(SpeculativeDecodingConfigGetState, SpeculativeDecodingConfigSetState));
+    nb::class_<tle::SpeculativeDecodingConfig>(m, "SpeculativeDecodingConfig")
+        .def(nb::init<bool>(), nb::arg("fast_logits") = false)
+        .def_rw("fast_logits", &tle::SpeculativeDecodingConfig::fastLogits)
+        .def("__getstate__", SpeculativeDecodingConfigGetState)
+        .def("__setstate__", SpeculativeDecodingConfigSetState);
 
     // Guided decoding config
-    auto pyGuidedDecodingConfig = py::class_<tle::GuidedDecodingConfig>(m, "GuidedDecodingConfig");
+    auto pyGuidedDecodingConfig = nb::class_<tle::GuidedDecodingConfig>(m, "GuidedDecodingConfig");
 
-    py::enum_<tle::GuidedDecodingConfig::GuidedDecodingBackend>(pyGuidedDecodingConfig, "GuidedDecodingBackend")
+    nb::enum_<tle::GuidedDecodingConfig::GuidedDecodingBackend>(pyGuidedDecodingConfig, "GuidedDecodingBackend")
         .value("XGRAMMAR", tle::GuidedDecodingConfig::GuidedDecodingBackend::kXGRAMMAR)
         .value("LLGUIDANCE", tle::GuidedDecodingConfig::GuidedDecodingBackend::kLLGUIDANCE);
 
     auto guidedDecodingConfigGetstate = [](tle::GuidedDecodingConfig const& self) {
-        return py::make_tuple(
+        return nb::make_tuple(
             self.getBackend(), self.getEncodedVocab(), self.getTokenizerStr(), self.getStopTokenIds());
     };
-    auto guidedDecodingConfigSetstate = [](py::tuple state)
+    auto guidedDecodingConfigSetstate = [](tle::GuidedDecodingConfig& self, nb::tuple state)
     {
         if (state.size() != 4)
         {
             throw std::runtime_error("Invalid GuidedDecodingConfig state!");
         }
-        return tle::GuidedDecodingConfig(state[0].cast<tle::GuidedDecodingConfig::GuidedDecodingBackend>(),
-            state[1].cast<std::optional<std::vector<std::string>>>(), state[2].cast<std::optional<std::string>>(),
-            state[3].cast<std::optional<std::vector<tle::TokenIdType>>>());
+        new (&self) tle::GuidedDecodingConfig(nb::cast<tle::GuidedDecodingConfig::GuidedDecodingBackend>(state[0]),
+            nb::cast<std::optional<std::vector<std::string>>>(state[1]), nb::cast<std::optional<std::string>>(state[2]),
+            nb::cast<std::optional<std::vector<tle::TokenIdType>>>(state[3]));
     };
 
     pyGuidedDecodingConfig
-        .def(py::init<tle::GuidedDecodingConfig::GuidedDecodingBackend, std::optional<std::vector<std::string>>,
+        .def(nb::init<tle::GuidedDecodingConfig::GuidedDecodingBackend, std::optional<std::vector<std::string>>,
                  std::optional<std::string>, std::optional<std::vector<tle::TokenIdType>>>(),
-            py::arg("backend"), py::arg("encoded_vocab") = py::none(), py::arg("tokenizer_str") = py::none(),
-            py::arg("stop_token_ids") = py::none())
-        .def_property("backend", &tle::GuidedDecodingConfig::getBackend, &tle::GuidedDecodingConfig::setBackend)
-        .def_property(
+            nb::arg("backend"), nb::arg("encoded_vocab") = nb::none(), nb::arg("tokenizer_str") = nb::none(),
+            nb::arg("stop_token_ids") = nb::none())
+        .def_prop_rw("backend", &tle::GuidedDecodingConfig::getBackend, &tle::GuidedDecodingConfig::setBackend)
+        .def_prop_rw(
             "encoded_vocab", &tle::GuidedDecodingConfig::getEncodedVocab, &tle::GuidedDecodingConfig::setEncodedVocab)
-        .def_property(
+        .def_prop_rw(
             "tokenizer_str", &tle::GuidedDecodingConfig::getTokenizerStr, &tle::GuidedDecodingConfig::setTokenizerStr)
-        .def_property(
+        .def_prop_rw(
             "stop_token_ids", &tle::GuidedDecodingConfig::getStopTokenIds, &tle::GuidedDecodingConfig::setStopTokenIds)
-        .def(py::pickle(guidedDecodingConfigGetstate, guidedDecodingConfigSetstate));
+        .def("__getstate__", guidedDecodingConfigGetstate)
+        .def("__setstate__", guidedDecodingConfigSetstate);
 
     auto cacheTransceiverConfigGetstate
-        = [](tle::CacheTransceiverConfig const& self) { return py::make_tuple(self.getMaxNumTokens()); };
-    auto cacheTransceiverConfigSetstate = [](py::tuple const& state)
+        = [](tle::CacheTransceiverConfig const& self) { return nb::make_tuple(self.getMaxNumTokens()); };
+    auto cacheTransceiverConfigSetstate = [](tle::CacheTransceiverConfig& self, nb::tuple const& state)
     {
         if (state.size() != 1)
         {
             throw std::runtime_error("Invalid CacheTransceiverConfig state!");
         }
-        return tle::CacheTransceiverConfig(state[0].cast<std::optional<size_t>>());
+        new (&self) tle::CacheTransceiverConfig(nb::cast<std::optional<size_t>>(state[0]));
     };
 
-    py::class_<tle::CacheTransceiverConfig>(m, "CacheTransceiverConfig")
-        .def(py::init<std::optional<size_t>>(), py::arg("max_num_tokens") = py::none())
-        .def_property("max_num_tokens", &tle::CacheTransceiverConfig::getMaxNumTokens,
+    nb::class_<tle::CacheTransceiverConfig>(m, "CacheTransceiverConfig")
+        .def(nb::init<std::optional<size_t>>(), nb::arg("max_num_tokens") = nb::none())
+        .def_prop_rw("max_num_tokens", &tle::CacheTransceiverConfig::getMaxNumTokens,
             &tle::CacheTransceiverConfig::setMaxNumTokens)
-        .def(py::pickle(cacheTransceiverConfigGetstate, cacheTransceiverConfigSetstate));
+        .def("__getstate__", cacheTransceiverConfigGetstate)
+        .def("__setstate__", cacheTransceiverConfigSetstate);
 
-    auto executorConfigGetState = [](py::object const& self)
+    auto executorConfigGetState = [](nb::object const& self)
     {
-        auto& c = self.cast<tle::ExecutorConfig&>();
+        auto& c = nb::cast<tle::ExecutorConfig&>(self);
         // Return a tuple containing C++ data and the Python __dict__
-        auto cpp_states = py::make_tuple(c.getMaxBeamWidth(), c.getSchedulerConfig(), c.getKvCacheConfig(),
+        auto cpp_states = nb::make_tuple(c.getMaxBeamWidth(), c.getSchedulerConfig(), c.getKvCacheConfig(),
             c.getEnableChunkedContext(), c.getNormalizeLogProbs(), c.getIterStatsMaxIterations(),
             c.getRequestStatsMaxIterations(), c.getBatchingType(), c.getMaxBatchSize(), c.getMaxNumTokens(),
             c.getParallelConfig(), c.getPeftCacheConfig(), c.getLogitsPostProcessorConfig(), c.getDecodingConfig(),
@@ -437,61 +454,65 @@ void initConfigBindings(pybind11::module_& m)
             c.getMaxSeqIdleMicroseconds(), c.getSpecDecConfig(), c.getGuidedDecodingConfig(),
             c.getAdditionalModelOutputs(), c.getCacheTransceiverConfig(), c.getGatherGenerationLogits(),
             c.getPromptTableOffloading(), c.getEnableTrtOverlap());
-        auto pickle_tuple = py::make_tuple(cpp_states, py::getattr(self, "__dict__"));
+        auto pickle_tuple = nb::make_tuple(cpp_states, nb::getattr(self, "__dict__"));
         return pickle_tuple;
     };
-    auto executorConfigSetState = [](py::tuple const& state)
+
+    auto executorConfigSetState = [](nb::object self, nb::tuple const& state)
     {
         if (state.size() != 2)
         {
             throw std::runtime_error("Invalid state!");
         }
 
-        // Restore C++ data
-        auto cpp_states = state[0].cast<py::tuple>();
+        auto cpp_states = nb::cast<nb::tuple>(state[0]);
         if (cpp_states.size() != 28)
         {
             throw std::runtime_error("Invalid cpp_states!");
         }
 
-        auto ec = tle::ExecutorConfig(                                            //
-            cpp_states[0].cast<SizeType32>(),                                     // MaxBeamWidth
-            cpp_states[1].cast<tle::SchedulerConfig>(),                           // SchedulerConfig
-            cpp_states[2].cast<tle::KvCacheConfig>(),                             // KvCacheConfig
-            cpp_states[3].cast<bool>(),                                           // EnableChunkedContext
-            cpp_states[4].cast<bool>(),                                           // NormalizeLogProbs
-            cpp_states[5].cast<SizeType32>(),                                     // IterStatsMaxIterations
-            cpp_states[6].cast<SizeType32>(),                                     // RequestStatsMaxIterations
-            cpp_states[7].cast<tle::BatchingType>(),                              // BatchingType
-            cpp_states[8].cast<std::optional<SizeType32>>(),                      // MaxBatchSize
-            cpp_states[9].cast<std::optional<SizeType32>>(),                      // MaxNumTokens
-            cpp_states[10].cast<std::optional<tle::ParallelConfig>>(),            // ParallelConfig
-            cpp_states[11].cast<std::optional<tle::PeftCacheConfig>>(),           // PeftCacheConfig
-            cpp_states[12].cast<std::optional<tle::LogitsPostProcessorConfig>>(), // LogitsPostProcessorConfig
-            cpp_states[13].cast<std::optional<tle::DecodingConfig>>(),            // DecodingConfig
-            cpp_states[14].cast<bool>(),                                          // UseGpuDirectStorage
-            cpp_states[15].cast<float>(),                                         // GpuWeightsPercent
-            cpp_states[16].cast<std::optional<SizeType32>>(),                     // MaxQueueSize
-            cpp_states[17].cast<tle::ExtendedRuntimePerfKnobConfig>(),            // ExtendedRuntimePerfKnobConfig
-            cpp_states[18].cast<std::optional<tle::DebugConfig>>(),               // DebugConfig
-            cpp_states[19].cast<SizeType32>(),                                    // RecvPollPeriodMs
-            cpp_states[20].cast<uint64_t>(),                                      // MaxSeqIdleMicroseconds
-            cpp_states[21].cast<std::optional<tle::SpeculativeDecodingConfig>>(), // SpecDecConfig
-            cpp_states[22].cast<std::optional<tle::GuidedDecodingConfig>>(),      // GuidedDecodingConfig
-            cpp_states[23].cast<std::optional<std::vector<tle::AdditionalModelOutput>>>(), // AdditionalModelOutputs
-            cpp_states[24].cast<std::optional<tle::CacheTransceiverConfig>>(),             // CacheTransceiverConfig
-            cpp_states[25].cast<bool>(),                                                   // GatherGenerationLogits
-            cpp_states[26].cast<bool>(),                                                   // PromptTableOffloading
-            cpp_states[27].cast<bool>()                                                    // EnableTrtOverlap
+        // Restore C++ data
+        tle::ExecutorConfig* cpp_self = nb::inst_ptr<tle::ExecutorConfig>(self);
+        new (cpp_self) tle::ExecutorConfig(                                          //
+            nb::cast<SizeType32>(cpp_states[0]),                                     // MaxBeamWidth
+            nb::cast<tle::SchedulerConfig>(cpp_states[1]),                           // SchedulerConfig
+            nb::cast<tle::KvCacheConfig>(cpp_states[2]),                             // KvCacheConfig
+            nb::cast<bool>(cpp_states[3]),                                           // EnableChunkedContext
+            nb::cast<bool>(cpp_states[4]),                                           // NormalizeLogProbs
+            nb::cast<SizeType32>(cpp_states[5]),                                     // IterStatsMaxIterations
+            nb::cast<SizeType32>(cpp_states[6]),                                     // RequestStatsMaxIterations
+            nb::cast<tle::BatchingType>(cpp_states[7]),                              // BatchingType
+            nb::cast<std::optional<SizeType32>>(cpp_states[8]),                      // MaxBatchSize
+            nb::cast<std::optional<SizeType32>>(cpp_states[9]),                      // MaxNumTokens
+            nb::cast<std::optional<tle::ParallelConfig>>(cpp_states[10]),            // ParallelConfig
+            nb::cast<std::optional<tle::PeftCacheConfig>>(cpp_states[11]),           // PeftCacheConfig
+            nb::cast<std::optional<tle::LogitsPostProcessorConfig>>(cpp_states[12]), // LogitsPostProcessorConfig
+            nb::cast<std::optional<tle::DecodingConfig>>(cpp_states[13]),            // DecodingConfig
+            nb::cast<bool>(cpp_states[14]),                                          // UseGpuDirectStorage
+            nb::cast<float>(cpp_states[15]),                                         // GpuWeightsPercent
+            nb::cast<std::optional<SizeType32>>(cpp_states[16]),                     // MaxQueueSize
+            nb::cast<tle::ExtendedRuntimePerfKnobConfig>(cpp_states[17]),            // ExtendedRuntimePerfKnobConfig
+            nb::cast<std::optional<tle::DebugConfig>>(cpp_states[18]),               // DebugConfig
+            nb::cast<SizeType32>(cpp_states[19]),                                    // RecvPollPeriodMs
+            nb::cast<uint64_t>(cpp_states[20]),                                      // MaxSeqIdleMicroseconds
+            nb::cast<std::optional<tle::SpeculativeDecodingConfig>>(cpp_states[21]), // SpecDecConfig
+            nb::cast<std::optional<tle::GuidedDecodingConfig>>(cpp_states[22]),      // GuidedDecodingConfig
+            nb::cast<std::optional<std::vector<tle::AdditionalModelOutput>>>(cpp_states[23]), // AdditionalModelOutputs
+            nb::cast<std::optional<tle::CacheTransceiverConfig>>(cpp_states[24]),             // CacheTransceiverConfig
+            nb::cast<bool>(cpp_states[25]),                                                   // GatherGenerationLogits
+            nb::cast<bool>(cpp_states[26]),                                                   // PromptTableOffloading
+            nb::cast<bool>(cpp_states[27])                                                    // EnableTrtOverlap
         );
 
-        auto py_state = state[1].cast<py::dict>();
+        // Restore Python data
+        auto py_state = nb::cast<nb::dict>(state[1]);
+        self.attr("__dict__").attr("update")(py_state);
 
-        return std::make_pair(ec, py_state);
+        nb::inst_mark_ready(self);
     };
 
-    py::class_<tle::ExecutorConfig>(m, "ExecutorConfig", pybind11::dynamic_attr())
-        .def(py::init<                                                   //
+    nb::class_<tle::ExecutorConfig>(m, "ExecutorConfig", nb::dynamic_attr())
+        .def(nb::init<                                                   //
                  SizeType32,                                             // MaxBeamWidth
                  tle::SchedulerConfig const&,                            // SchedulerConfig
                  tle::KvCacheConfig const&,                              // KvCacheConfig
@@ -521,76 +542,74 @@ void initConfigBindings(pybind11::module_& m)
                  bool,                                                   // PromptTableOffloading
                  bool                                                    // EnableTrtOverlap
                  >(),
-            py::arg("max_beam_width") = 1, py::arg_v("scheduler_config", tle::SchedulerConfig(), "SchedulerConfig()"),
-            py::arg_v("kv_cache_config", tle::KvCacheConfig(), "KvCacheConfig()"),
-            py::arg("enable_chunked_context") = false, py::arg("normalize_log_probs") = true,
-            py::arg("iter_stats_max_iterations") = tle::ExecutorConfig::kDefaultIterStatsMaxIterations,
-            py::arg("request_stats_max_iterations") = tle::ExecutorConfig::kDefaultRequestStatsMaxIterations,
-            py::arg_v("batching_type", tle::BatchingType::kINFLIGHT, "BatchingType.INFLIGHT"),
-            py::arg("max_batch_size") = py::none(), py::arg("max_num_tokens") = py::none(),
-            py::arg("parallel_config") = py::none(),
-            py::arg_v("peft_cache_config", tle::PeftCacheConfig(), "PeftCacheConfig()"),
-            py::arg("logits_post_processor_config") = py::none(), py::arg("decoding_config") = py::none(),
-            py::arg("use_gpu_direct_storage") = false, py::arg("gpu_weights_percent") = 1.0,
-            py::arg("max_queue_size") = py::none(),
-            py::arg_v("extended_runtime_perf_knob_config", tle::ExtendedRuntimePerfKnobConfig(),
-                "ExtendedRuntimePerfKnobConfig()"),
-            py::arg("debug_config") = py::none(), py::arg("recv_poll_period_ms") = 0,
-            py::arg("max_seq_idle_microseconds") = tle::ExecutorConfig::kDefaultMaxSeqIdleMicroseconds,
-            py::arg("spec_dec_config") = py::none(), py::arg("guided_decoding_config") = py::none(),
-            py::arg("additional_model_outputs") = py::none(), py::arg("cache_transceiver_config") = py::none(),
-            py::arg("gather_generation_logits") = false, py::arg("mm_embedding_offloading") = false,
-            py::arg("enable_trt_overlap") = false)
-        .def_property("max_beam_width", &tle::ExecutorConfig::getMaxBeamWidth, &tle::ExecutorConfig::setMaxBeamWidth)
-        .def_property("max_batch_size", &tle::ExecutorConfig::getMaxBatchSize, &tle::ExecutorConfig::setMaxBatchSize)
-        .def_property("max_num_tokens", &tle::ExecutorConfig::getMaxNumTokens, &tle::ExecutorConfig::setMaxNumTokens)
-        .def_property(
+            nb::arg("max_beam_width") = 1, nb::arg("scheduler_config") = tle::SchedulerConfig(),
+            nb::arg("kv_cache_config") = tle::KvCacheConfig(), nb::arg("enable_chunked_context") = false,
+            nb::arg("normalize_log_probs") = true,
+            nb::arg("iter_stats_max_iterations") = tle::ExecutorConfig::kDefaultIterStatsMaxIterations,
+            nb::arg("request_stats_max_iterations") = tle::ExecutorConfig::kDefaultRequestStatsMaxIterations,
+            nb::arg("batching_type") = tle::BatchingType::kINFLIGHT, nb::arg("max_batch_size") = nb::none(),
+            nb::arg("max_num_tokens") = nb::none(), nb::arg("parallel_config") = nb::none(),
+            nb::arg("peft_cache_config") = tle::PeftCacheConfig(), nb::arg("logits_post_processor_config") = nb::none(),
+            nb::arg("decoding_config") = nb::none(), nb::arg("use_gpu_direct_storage") = false,
+            nb::arg("gpu_weights_percent") = 1.0, nb::arg("max_queue_size") = nb::none(),
+            nb::arg("extended_runtime_perf_knob_config") = tle::ExtendedRuntimePerfKnobConfig(),
+            nb::arg("debug_config") = nb::none(), nb::arg("recv_poll_period_ms") = 0,
+            nb::arg("max_seq_idle_microseconds") = tle::ExecutorConfig::kDefaultMaxSeqIdleMicroseconds,
+            nb::arg("spec_dec_config") = nb::none(), nb::arg("guided_decoding_config") = nb::none(),
+            nb::arg("additional_model_outputs") = nb::none(), nb::arg("cache_transceiver_config") = nb::none(),
+            nb::arg("gather_generation_logits") = false, nb::arg("mm_embedding_offloading") = false,
+            nb::arg("enable_trt_overlap") = false)
+        .def_prop_rw("max_beam_width", &tle::ExecutorConfig::getMaxBeamWidth, &tle::ExecutorConfig::setMaxBeamWidth)
+        .def_prop_rw("max_batch_size", &tle::ExecutorConfig::getMaxBatchSize, &tle::ExecutorConfig::setMaxBatchSize)
+        .def_prop_rw("max_num_tokens", &tle::ExecutorConfig::getMaxNumTokens, &tle::ExecutorConfig::setMaxNumTokens)
+        .def_prop_rw(
             "scheduler_config", &tle::ExecutorConfig::getSchedulerConfigRef, &tle::ExecutorConfig::setSchedulerConfig)
-        .def_property(
+        .def_prop_rw(
             "kv_cache_config", &tle::ExecutorConfig::getKvCacheConfigRef, &tle::ExecutorConfig::setKvCacheConfig)
-        .def_property("enable_chunked_context", &tle::ExecutorConfig::getEnableChunkedContext,
+        .def_prop_rw("enable_chunked_context", &tle::ExecutorConfig::getEnableChunkedContext,
             &tle::ExecutorConfig::setEnableChunkedContext)
-        .def_property("normalize_log_probs", &tle::ExecutorConfig::getNormalizeLogProbs,
+        .def_prop_rw("normalize_log_probs", &tle::ExecutorConfig::getNormalizeLogProbs,
             &tle::ExecutorConfig::setNormalizeLogProbs)
-        .def_property("iter_stats_max_iterations", &tle::ExecutorConfig::getIterStatsMaxIterations,
+        .def_prop_rw("iter_stats_max_iterations", &tle::ExecutorConfig::getIterStatsMaxIterations,
             &tle::ExecutorConfig::setIterStatsMaxIterations)
-        .def_property("request_stats_max_iterations", &tle::ExecutorConfig::getRequestStatsMaxIterations,
+        .def_prop_rw("request_stats_max_iterations", &tle::ExecutorConfig::getRequestStatsMaxIterations,
             &tle::ExecutorConfig::setRequestStatsMaxIterations)
-        .def_property("batching_type", &tle::ExecutorConfig::getBatchingType, &tle::ExecutorConfig::setBatchingType)
-        .def_property(
+        .def_prop_rw("batching_type", &tle::ExecutorConfig::getBatchingType, &tle::ExecutorConfig::setBatchingType)
+        .def_prop_rw(
             "parallel_config", &tle::ExecutorConfig::getParallelConfig, &tle::ExecutorConfig::setParallelConfig)
-        .def_property(
+        .def_prop_rw(
             "peft_cache_config", &tle::ExecutorConfig::getPeftCacheConfig, &tle::ExecutorConfig::setPeftCacheConfig)
-        .def_property("logits_post_processor_config", &tle::ExecutorConfig::getLogitsPostProcessorConfig,
+        .def_prop_rw("logits_post_processor_config", &tle::ExecutorConfig::getLogitsPostProcessorConfig,
             &tle::ExecutorConfig::setLogitsPostProcessorConfig)
-        .def_property(
+        .def_prop_rw(
             "decoding_config", &tle::ExecutorConfig::getDecodingConfig, &tle::ExecutorConfig::setDecodingConfig)
-        .def_property("use_gpu_direct_storage", &tle::ExecutorConfig::getUseGpuDirectStorage,
+        .def_prop_rw("use_gpu_direct_storage", &tle::ExecutorConfig::getUseGpuDirectStorage,
             &tle::ExecutorConfig::setUseGpuDirectStorage)
-        .def_property("gpu_weights_percent", &tle::ExecutorConfig::getGpuWeightsPercent,
+        .def_prop_rw("gpu_weights_percent", &tle::ExecutorConfig::getGpuWeightsPercent,
             &tle::ExecutorConfig::setGpuWeightsPercent)
-        .def_property("max_queue_size", &tle::ExecutorConfig::getMaxQueueSize, &tle::ExecutorConfig::setMaxQueueSize)
-        .def_property("extended_runtime_perf_knob_config", &tle::ExecutorConfig::getExtendedRuntimePerfKnobConfig,
+        .def_prop_rw("max_queue_size", &tle::ExecutorConfig::getMaxQueueSize, &tle::ExecutorConfig::setMaxQueueSize)
+        .def_prop_rw("extended_runtime_perf_knob_config", &tle::ExecutorConfig::getExtendedRuntimePerfKnobConfig,
             &tle::ExecutorConfig::setExtendedRuntimePerfKnobConfig)
-        .def_property("debug_config", &tle::ExecutorConfig::getDebugConfig, &tle::ExecutorConfig::setDebugConfig)
-        .def_property(
+        .def_prop_rw("debug_config", &tle::ExecutorConfig::getDebugConfig, &tle::ExecutorConfig::setDebugConfig)
+        .def_prop_rw(
             "recv_poll_period_ms", &tle::ExecutorConfig::getRecvPollPeriodMs, &tle::ExecutorConfig::setRecvPollPeriodMs)
-        .def_property("max_seq_idle_microseconds", &tle::ExecutorConfig::getMaxSeqIdleMicroseconds,
+        .def_prop_rw("max_seq_idle_microseconds", &tle::ExecutorConfig::getMaxSeqIdleMicroseconds,
             &tle::ExecutorConfig::setMaxSeqIdleMicroseconds)
-        .def_property("spec_dec_config", &tle::ExecutorConfig::getSpecDecConfig, &tle::ExecutorConfig::setSpecDecConfig)
-        .def_property("guided_decoding_config", &tle::ExecutorConfig::getGuidedDecodingConfig,
+        .def_prop_rw("spec_dec_config", &tle::ExecutorConfig::getSpecDecConfig, &tle::ExecutorConfig::setSpecDecConfig)
+        .def_prop_rw("guided_decoding_config", &tle::ExecutorConfig::getGuidedDecodingConfig,
             &tle::ExecutorConfig::setGuidedDecodingConfig)
-        .def_property("additional_model_outputs", &tle::ExecutorConfig::getAdditionalModelOutputs,
+        .def_prop_rw("additional_model_outputs", &tle::ExecutorConfig::getAdditionalModelOutputs,
             &tle::ExecutorConfig::setAdditionalModelOutputs)
-        .def_property("cache_transceiver_config", &tle::ExecutorConfig::getCacheTransceiverConfig,
+        .def_prop_rw("cache_transceiver_config", &tle::ExecutorConfig::getCacheTransceiverConfig,
             &tle::ExecutorConfig::setCacheTransceiverConfig)
-        .def_property("gather_generation_logits", &tle::ExecutorConfig::getGatherGenerationLogits,
+        .def_prop_rw("gather_generation_logits", &tle::ExecutorConfig::getGatherGenerationLogits,
             &tle::ExecutorConfig::setGatherGenerationLogits)
-        .def_property("mm_embedding_offloading", &tle::ExecutorConfig::getPromptTableOffloading,
+        .def_prop_rw("mm_embedding_offloading", &tle::ExecutorConfig::getPromptTableOffloading,
             &tle::ExecutorConfig::setPromptTableOffloading)
-        .def_property(
+        .def_prop_rw(
             "enable_trt_overlap", &tle::ExecutorConfig::getEnableTrtOverlap, &tle::ExecutorConfig::setEnableTrtOverlap)
-        .def(py::pickle(executorConfigGetState, executorConfigSetState));
+        .def("__getstate__", executorConfigGetState)
+        .def("__setstate__", executorConfigSetState);
 }
 
-} // namespace tensorrt_llm::pybind::executor
+} // namespace tensorrt_llm::nanobind::executor

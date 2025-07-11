@@ -17,13 +17,12 @@
 
 #pragma once
 
-#include "tensorrt_llm/pybind/common/customCasters.h"
-#include <pybind11/pybind11.h>
+#include "tensorrt_llm/nanobind/common/customCasters.h"
 
-namespace tensorrt_llm::pybind::executor
+namespace tensorrt_llm::nanobind::executor
 {
 
 // Register bindings for executor API.
-void initConfigBindings(pybind11::module_& m);
+void initConfigBindings(nb::module_& m);
 
-} // namespace tensorrt_llm::pybind::executor
+} // namespace tensorrt_llm::nanobind::executor

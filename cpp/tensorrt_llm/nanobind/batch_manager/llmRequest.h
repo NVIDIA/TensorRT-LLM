@@ -18,20 +18,19 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
-#include "tensorrt_llm/pybind/common/customCasters.h"
+#include "tensorrt_llm/nanobind/common/customCasters.h"
 
 #include <ATen/ATen.h>
 #include <ATen/ops/tensor.h>
 #include <memory>
 #include <optional>
-#include <pybind11/pybind11.h>
 
-namespace tensorrt_llm::pybind::batch_manager
+namespace tensorrt_llm::nanobind::batch_manager
 {
 
 namespace tb = tensorrt_llm::batch_manager;
 
-/* Unfortunately, torch's default pybind bindings don't know about c10::cuda::CUDAStream,
+/* Unfortunately, torch's default nanobind bindings don't know about c10::cuda::CUDAStream,
  * so we have to pass the more generic c10::Stream, and convert it back to a full-fledged
  * torch.cuda.Stream in python. See example in test/bindings/test_gpt_manager.py
  */
@@ -156,4 +155,4 @@ public:
     [[nodiscard]] std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest> toTrtLlm() const;
 };
 
-} // namespace tensorrt_llm::pybind::batch_manager
+} // namespace tensorrt_llm::nanobind::batch_manager

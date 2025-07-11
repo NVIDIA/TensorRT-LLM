@@ -19,12 +19,14 @@
 
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
-#include "tensorrt_llm/pybind/common/customCasters.h"
-#include <pybind11/pybind11.h>
+#include "tensorrt_llm/nanobind/common/customCasters.h"
+#include <nanobind/nanobind.h>
+#include <nanobind/ndarray.h>
 
+namespace nb = nanobind;
 namespace tle = tensorrt_llm::executor;
 
-namespace tensorrt_llm::pybind::executor
+namespace tensorrt_llm::nanobind::executor
 {
 
 class Executor
@@ -36,16 +38,16 @@ public:
     Executor(std::filesystem::path const& encoderModelPath, std::filesystem::path const& decoderModelPath,
         tle::ModelType modelType, tle::ExecutorConfig const& executorConfig);
 
-    Executor(pybind11::buffer engineBuffer, std::string const& jsonConfigStr, tle::ModelType modelType,
-        tle::ExecutorConfig const& executorConfig, std::optional<pybind11::dict> managedWeights);
+    Executor(nb::bytes const& engineBuffer, std::string const& jsonConfigStr, tle::ModelType modelType,
+        tle::ExecutorConfig const& executorConfig, std::optional<nb::dict> managedWeights);
 
     Executor(std::string const& encoderEngineBuffer, std::string const& encoderJsonConfigStr,
         std::string const& decoderEngineBuffer, std::string const& decoderJsonConfigStr, tle::ModelType modelType,
         tle::ExecutorConfig const& executorConfig);
 
-    pybind11::object enter();
-    void exit([[maybe_unused]] pybind11::handle type, [[maybe_unused]] pybind11::handle value,
-        [[maybe_unused]] pybind11::handle traceback);
+    nb::object enter();
+    void exit(
+        [[maybe_unused]] nb::handle type, [[maybe_unused]] nb::handle value, [[maybe_unused]] nb::handle traceback);
     void shutdown();
 
     [[nodiscard]] tle::IdType enqueueRequest(tle::Request const& request)
@@ -63,7 +65,7 @@ public:
     {
         // Await responses blocks until a response is received. Release GIL so that it can be ran in a background
         // thread.
-        pybind11::gil_scoped_release release;
+        nb::gil_scoped_release release;
         return mExecutor->awaitResponses(timeout);
     }
 
@@ -72,7 +74,7 @@ public:
     {
         // Await responses blocks until a response is received. Release GIL so that it can be ran in a background
         // thread.
-        pybind11::gil_scoped_release release;
+        nb::gil_scoped_release release;
         return mExecutor->awaitResponses(requestId, timeout);
     }
 
@@ -81,7 +83,7 @@ public:
     {
         // Await responses blocks until a response is received. Release GIL so that it can be ran in a background
         // thread.
-        pybind11::gil_scoped_release release;
+        nb::gil_scoped_release release;
         return mExecutor->awaitResponses(requestIds, timeout);
     }
 
@@ -120,10 +122,10 @@ public:
         return mExecutor->getKVCacheEventManager();
     }
 
-    static void initBindings(pybind11::module_& m);
+    static void initBindings(nb::module_& m);
 
 private:
     std::unique_ptr<tle::Executor> mExecutor;
 };
 
-} // namespace tensorrt_llm::pybind::executor
+} // namespace tensorrt_llm::nanobind::executor
