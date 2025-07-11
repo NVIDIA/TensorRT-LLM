@@ -512,11 +512,16 @@ class Deepseekv3MoE(nn.Module):
         # max-throughput
         use_dp_padding = False
         if self.use_dp and self.mapping.tp_size > 1:
+            # MoE use static heuristic to check alltoall enabled or not, however, for wide_ep, the alltoall could also be dynamically disabled when chunking is used or TRTLLM_DEEP_EP_TOKEN_LIMIT is hit.
+            is_wide_ep_alltoall_disabled = isinstance(
+                self.experts, WideEPMoE) and not self.experts.can_use_alltoall(
+                    hidden_states, all_rank_num_tokens)
+            alltoall_enabled = self.experts.enable_alltoall and not is_wide_ep_alltoall_disabled
+
             # FP4 all_gather moves this bf16 allgather in to after topk and fp4 quantization
             # to reduce allreduce BW
-            if (disable_fp4_allgather()
-                    and not self.experts.can_use_alltoall(hidden_states_fp4 or hidden_states)) or isinstance(
-                        self.experts, TRTLLMGenFusedMoE):
+            if (disable_fp4_allgather() and not alltoall_enabled) or isinstance(
+                    self.experts, TRTLLMGenFusedMoE):
                 hidden_states = allgather(hidden_states,
                                           self.mapping,
                                           dim=0,
