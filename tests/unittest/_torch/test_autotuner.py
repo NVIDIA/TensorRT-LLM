@@ -19,14 +19,16 @@ def test_multi_dynamic_dims():
     x = torch.rand([5, 1024])
     w = torch.rand([7, 19])
     dynamic_tensor_specs = (
-        DynamicTensorSpec(0, 0, [1, 3, 5], lambda x: x // 2),
-        DynamicTensorSpec(0, 1, [16, 24, 1024], lambda x: x // 2),
+        DynamicTensorSpec(0, 0, [1, 3, 5]),
+        DynamicTensorSpec(0, 1, [16, 24, 1024]),
         DynamicTensorSpec(1, 1, [3, 7, 9], lambda x: x // 2),
     )
 
     profiles = tuner._optimization_profiles(
         tuning_config=TuningConfig(dynamic_tensor_specs=dynamic_tensor_specs),
         inputs=[x, w])
+    # choice(0, 0) * choice(0, 1) * choice(1, 1)
+    # 3 * 3 * 3 = 27, because 19 is mapped to 9 and already inside the bucket
     assert len(profiles) == 27
     sample_0 = OptimizationProfile(shapes=[[
         DynamicDim(min=1, opt=1, max=3),
@@ -90,7 +92,7 @@ def check_gemm_tactic_valid(tactic: int, m: int) -> bool:
 class GemmRunner(TunableRunner):
 
     def get_valid_tactics(self, inputs: List[FakeTensor],
-                          profile: OptimizationProfile) -> List[int]:
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
         # The simulated delay is not deterministic, so we need to return specific tactics here
         return [-1, 0, 1]
 
@@ -98,25 +100,28 @@ class GemmRunner(TunableRunner):
                 /,
                 inputs: List[torch.Tensor],
                 *,
-                tactic: int = -1) -> torch.Tensor:
+                tactic: int = -1,
+                **kwargs) -> torch.Tensor:
         assert tactic in [-1, 0, 1]
         return [gemm_0, gemm_1, gemm_fallback][tactic](*inputs)
 
 
 @torch.library.custom_op("autotuner_test::get_best_gemm_tactic",
                          mutates_args=())
-def get_best_gemm_tactic(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    runners = [GemmRunner()]
-    tunner = AutoTuner.get()
-    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+@autotuner.tuning_config(
+    name="test_autotuner_get_best_gemm_tactic",
+    dynamic_tensor_specs=(DynamicTensorSpec(
         input_idx=0,
         dim_idx=0,
         gen_tuning_buckets=get_power_of_2_num_tokens_buckets,
-        map_to_tuning_buckets=next_positive_power_of_2), ), )
+        map_to_tuning_buckets=next_positive_power_of_2), ),
+)
+def get_best_gemm_tactic(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    runners = [GemmRunner()]
+    tunner = AutoTuner.get()
     runner, tactic = tunner.choose_one(
         "autotuner_test::get_best_gemm_tactic",
         runners,
-        tuning_config,
         [x, w],
     )
     return torch.tensor(tactic)
@@ -173,12 +178,12 @@ def test_autotuner_try_block():
         map_to_tuning_buckets=next_positive_power_of_2), ), )
     with autotune():
         runner, tactic = tunner.choose_one("test_autotuner_try_block", runners,
-                                           tuning_config, [x, w])
+                                           [x, w], tuning_config)
 
     m = M // 2
     while m >= 1:
         _, tactic = tunner.choose_one("test_autotuner_try_block", runners,
-                                      tuning_config, [torch.randn(m, 64), w])
+                                      [torch.randn(m, 64), w], tuning_config)
         assert tactic in [
             -1, 0
         ], f"Expect only tactic -1, 0 being chosen, but got tactic {tactic}."
@@ -187,6 +192,14 @@ def test_autotuner_try_block():
 
 @torch.library.custom_op("autotuner_test::recursive_get_best_gemm_tactic",
                          mutates_args=())
+@autotuner.tuning_config(
+    name="test_autotuner_recursive_get_best_gemm_tactic",
+    dynamic_tensor_specs=(DynamicTensorSpec(
+        input_idx=0,
+        dim_idx=0,
+        gen_tuning_buckets=get_power_of_2_num_tokens_buckets,
+        map_to_tuning_buckets=next_positive_power_of_2), ),
+)
 def recursive_get_best_gemm_tactic(x: torch.Tensor, w1: torch.Tensor,
                                    w2: torch.Tensor) -> torch.Tensor:
     # Only the first custom_op is tuned, the second one uses the tuned result in cache
@@ -235,6 +248,14 @@ class GemmRunnerWithAttributes(TunableRunner):
         return [gemm_0, gemm_1, gemm_fallback][tactic](*inputs)
 
 
+@autotuner.tuning_config(
+    name="test_multiple_runners",
+    dynamic_tensor_specs=(DynamicTensorSpec(
+        input_idx=0,
+        dim_idx=0,
+        gen_tuning_buckets=get_power_of_2_num_tokens_buckets,
+        map_to_tuning_buckets=next_positive_power_of_2), ),
+)
 def test_multiple_runners_different_attributes():
     """Test that runners with different attributes get different cache entries"""
     x, w = torch.randn(16, 64), torch.randn(64, 128)
@@ -244,39 +265,32 @@ def test_multiple_runners_different_attributes():
     runner_1 = GemmRunnerWithAttributes(block_size=256, num_warps=8)
     runners = [runner_0, runner_1]
 
-    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
-        input_idx=0,
-        dim_idx=0,
-        gen_tuning_buckets=get_power_of_2_num_tokens_buckets,
-        map_to_tuning_buckets=next_positive_power_of_2), ), )
-
     # Do tuning
     with autotune():
         tuner = AutoTuner.get()
         runner_a, tactic_a = tuner.choose_one("test_multiple_runners", runners,
-                                              tuning_config, [x, w])
+                                              [x, w])
 
         # Verify different cache keys are generated
         shapes = (x.shape, w.shape)
-        cache_key_0 = tuner._get_cache_key(custom_op="test_multiple_runners",
-                                           input_shapes=shapes,
-                                           runner=runner_0,
-                                           tuning_config=tuning_config)
-        cache_key_1 = tuner._get_cache_key(custom_op="test_multiple_runners",
-                                           input_shapes=shapes,
-                                           runner=runner_1,
-                                           tuning_config=tuning_config)
+        cache_key_0 = tuner._get_cache_key(
+            custom_op="test_multiple_runners",
+            input_shapes=shapes,
+            runner=runner_0,
+            tuning_config=tuner.get_tuning_config("test_multiple_runners"))
+        cache_key_1 = tuner._get_cache_key(
+            custom_op="test_multiple_runners",
+            input_shapes=shapes,
+            runner=runner_1,
+            tuning_config=tuner.get_tuning_config("test_multiple_runners"))
 
         assert cache_key_0 != cache_key_1, "Runners with different attributes should have different cache keys"
 
 
-def test_multiple_dynamic_shapes_cache():
-    """Test that different dynamic shape combinations are properly cached"""
-    w = torch.randn(64, 128)
-    runners = [GemmRunner()]
-
-    # Define dynamic ranges for both dimensions
-    tuning_config = TuningConfig(dynamic_tensor_specs=(
+# Define dynamic ranges for both dimensions
+@autotuner.tuning_config(
+    name="test_multiple_dynamic_shapes",
+    dynamic_tensor_specs=(
         DynamicTensorSpec(input_idx=0,
                           dim_idx=0,
                           gen_tuning_buckets=(3, 4, 5),
@@ -285,14 +299,19 @@ def test_multiple_dynamic_shapes_cache():
                           dim_idx=1,
                           gen_tuning_buckets=(64, 128, 256, 512),
                           map_to_tuning_buckets=lambda x: x),
-    ), )
+    ),
+)
+def test_multiple_dynamic_shapes_cache():
+    """Test that different dynamic shape combinations are properly cached"""
+    w = torch.randn(64, 128)
+    runners = [GemmRunner()]
 
     # Do tuning with a sample input
     x = torch.randn(3, 64)
     with autotune():
         tuner = AutoTuner.get()
         runner, tactic = tuner.choose_one("test_multiple_dynamic_shapes",
-                                          runners, tuning_config, [x, w])
+                                          runners, [x, w])
 
     # Verify cache size - should have 12 entries (3x4 combinations)
     cache_entries = [
@@ -301,3 +320,39 @@ def test_multiple_dynamic_shapes_cache():
     ]
     assert len(cache_entries) == 12, \
         f"Expected 12 cache entries for 3x4 shape combinations, got {len(cache_entries)}"
+
+
+class GemmRunnerWithTacticConfigs(TunableRunner):
+
+    def get_valid_tactics(self, inputs: List[FakeTensor],
+                          profile: OptimizationProfile,
+                          block_size: int) -> List[int]:
+        # The simulated delay is not deterministic, so we need to return specific tactics here
+        return [-1, 0, 1]
+
+    def forward(self,
+                /,
+                inputs: List[torch.Tensor],
+                *,
+                tactic: int = -1,
+                block_size: int = 128) -> torch.Tensor:
+        assert tactic in [-1, 0, 1]
+        return [gemm_0, gemm_1, gemm_fallback][tactic](*inputs)
+
+
+@autotuner.tuning_config(
+    name="test_autotuner_tactic_configs",
+    configs={
+        "block_size": [128, 256],
+    },
+)
+def test_autotuner_tactic_configs():
+    runner_0 = GemmRunnerWithTacticConfigs()
+    runners = [runner_0]
+    x, w = torch.randn(64, 64), torch.randn(64, 128)
+    with autotune():
+        tuner = AutoTuner.get()
+        runner, tactic, configs = tuner.choose_one(
+            "test_autotuner_tactic_configs", runners, [x, w])
+
+    runner_0.forward(inputs=[x, w], tactic=tactic, **configs)

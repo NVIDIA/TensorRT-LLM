@@ -20,6 +20,7 @@ from parameterized import parameterized
 from utils.util import skip_pre_blackwell_unittest, unittest_name_func
 
 import tensorrt_llm
+from tensorrt_llm._torch.autotuner import autotune
 
 
 class TestFunctional(unittest.TestCase):
@@ -73,9 +74,10 @@ class TestFunctional(unittest.TestCase):
         a_block_sf = torch.ops.trtllm.nvfp4_block_scale_interleave(a_block_sf)
         b_block_sf = torch.ops.trtllm.nvfp4_block_scale_interleave(b_block_sf)
 
-        c = (torch.ops.trtllm.w4a8_mxfp4_fp8_gemm(mat_a, mat_b, a_block_sf,
-                                                  b_block_sf, a_sf,
-                                                  torch.bfloat16))
+        with autotune():
+            c = (torch.ops.trtllm.w4a8_mxfp4_fp8_gemm(mat_a, mat_b, a_block_sf,
+                                                      b_block_sf, a_sf,
+                                                      torch.bfloat16))
         c_ref = (mat_a_ref @ mat_b_ref.T * a_sf).to(torch.bfloat16)
 
         assert torch.allclose(c_ref, c, atol=1e-2, rtol=1e-2)

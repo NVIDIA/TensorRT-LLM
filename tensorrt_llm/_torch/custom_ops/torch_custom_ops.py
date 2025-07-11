@@ -6,6 +6,7 @@ import torch
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._utils import get_sm_version
 
+from .. import autotuner
 from ..attention_backend.interface import AttentionInputType
 from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                          OptimizationProfile, TunableRunner, TuningConfig)
@@ -23,9 +24,6 @@ def bmm_out(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
 class MoERunner(TunableRunner):
     # avoid overhead of creating a new runner in forward pass
     runner_dict = dict()
-    tuning_config = TuningConfig(dynamic_tensor_specs=(
-        DynamicTensorSpec(0, 0, get_last_power_of_2_num_tokens_buckets(8192),
-                          lambda x: min(last_positive_power_of_2(x), 8192)), ))
 
     def __init__(
         self,
@@ -87,6 +85,7 @@ class MoERunner(TunableRunner):
         do_preparation: bool = False,
     ):
         x, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights, fc2_expert_biases = inputs
+        # determine if we should use min latency mode according to the profiled seq len
         self.fused_moe_runner.run_gemm_profile(
             x,
             fc1_expert_weights,
@@ -107,17 +106,15 @@ class MoERunner(TunableRunner):
             do_preparation,
         )
 
-    @classmethod
-    @lru_cache(maxsize=None)
-    def refine_tuning_config(cls, tune_max_num_tokens: int):
-        cls.tuning_config = TuningConfig(
-            dynamic_tensor_specs=(DynamicTensorSpec(
-                0, 0, get_last_power_of_2_num_tokens_buckets(
-                    tune_max_num_tokens), lambda x: min(
-                        last_positive_power_of_2(x), tune_max_num_tokens)), ))
-
 
 @torch.library.custom_op("trtllm::fused_moe", mutates_args=())
+@autotuner.tuning_config(
+    name=("trtllm::fused_moe::gemm1", "trtllm::fused_moe::gemm2"),
+    dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, get_last_power_of_2_num_tokens_buckets,
+        last_positive_power_of_2), ),
+    tune_max_num_tokens=8192,
+)
 def fused_moe(
     input: torch.Tensor,
     token_selected_experts: torch.Tensor,
@@ -144,7 +141,6 @@ def fused_moe(
 ) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
-    MoERunner.refine_tuning_config(tune_max_num_tokens)
 
     # allocate workspace for profiling
     moe_runner = MoERunner(
@@ -168,23 +164,23 @@ def fused_moe(
     _, gemm_tactic_1 = tuner.choose_one(
         "trtllm::fused_moe::gemm1",
         [moe_runner],
-        MoERunner.tuning_config,
         [
             input, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
             fc2_expert_biases
         ],
         gemm_idx=1,
+        tune_max_num_tokens=tune_max_num_tokens,
     )
 
     _, gemm_tactic_2 = tuner.choose_one(
         "trtllm::fused_moe::gemm2",
         [moe_runner],
-        MoERunner.tuning_config,
         [
             input, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
             fc2_expert_biases
         ],
         gemm_idx=2,
+        tune_max_num_tokens=tune_max_num_tokens,
     )
 
     run_moe = moe_runner.fused_moe_runner.run_moe_min_latency if min_latency_mode else moe_runner.fused_moe_runner.run_moe
@@ -257,14 +253,6 @@ def _(
 
 class FP8RowwiseGemmRunner(TunableRunner):
     runner_dict = dict()
-    tuning_config = TuningConfig(
-        dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, get_last_power_of_2_num_tokens_buckets,
-            last_positive_power_of_2), ),
-        constraint_specs=(
-            ConstraintSpec(2, 0, lambda shapes: shapes[0][0]),
-            ConstraintSpec(3, 0, lambda shapes: shapes[1][0]),
-        ))
 
     def __init__(
         self,
@@ -305,6 +293,16 @@ class FP8RowwiseGemmRunner(TunableRunner):
 
 
 @torch.library.custom_op("trtllm::fp8_rowwise_gemm", mutates_args=())
+@autotuner.tuning_config(
+    name="trtllm::fp8_rowwise_gemm::gemm",
+    dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, get_last_power_of_2_num_tokens_buckets,
+        last_positive_power_of_2), ),
+    constraint_specs=(
+        ConstraintSpec(2, 0, lambda shapes: shapes[0][0]),
+        ConstraintSpec(3, 0, lambda shapes: shapes[1][0]),
+    ),
+)
 def fp8_rowwise_gemm(
     act: torch.Tensor,
     weight: torch.Tensor,
@@ -322,7 +320,6 @@ def fp8_rowwise_gemm(
     _, best_tactic = tuner.choose_one(
         "trtllm::fp8_rowwise_gemm::gemm",
         [fp8_rowwise_gemm_runner],
-        FP8RowwiseGemmRunner.tuning_config,
         [act, weight, act_scale, weight_scale],
     )
 
@@ -344,11 +341,6 @@ def _(
 
 class FP4GemmRunner(TunableRunner):
     runner_dict = dict()
-    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
-        0, 0, get_last_power_of_2_num_tokens_buckets,
-        last_positive_power_of_2), ),
-                                 constraint_specs=(ConstraintSpec(
-                                     2, 0, fp4_scale_infer_shape), ))
 
     def __init__(
         self,
@@ -391,6 +383,13 @@ class FP4GemmRunner(TunableRunner):
 
 
 @torch.library.custom_op("trtllm::nvfp4_gemm", mutates_args=())
+@autotuner.tuning_config(
+    name="trtllm::nvfp4_gemm::gemm",
+    dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, get_last_power_of_2_num_tokens_buckets,
+        last_positive_power_of_2), ),
+    constraint_specs=(ConstraintSpec(2, 0, fp4_scale_infer_shape), ),
+)
 def nvfp4_gemm(
     act_fp4: torch.Tensor,
     weight: torch.Tensor,
@@ -410,13 +409,13 @@ def nvfp4_gemm(
     _, best_tactic = tuner.choose_one(
         "trtllm::fp4_gemm::gemm",
         [nvfp4_gemm_runner],
-        FP4GemmRunner.tuning_config,
         [act_fp4, weight, act_sf, weight_scale, alpha],
     )
 
     return nvfp4_gemm_runner(
         inputs=[act_fp4, weight, act_sf, weight_scale, alpha],
-        tactic=best_tactic)
+        tactic=best_tactic,
+    )
 
 
 @nvfp4_gemm.register_fake
@@ -589,8 +588,8 @@ def fp8_batched_gemm_trtllmgen(
     _, best_tactic = tuner.choose_one(
         "trtllm::fp8_batched_gemm_trtllmgen::batched_gemm",
         [kernel_runner],
-        FP8BatchedGemmRunner.tuning_config,
         inputs,
+        tuning_config=FP8BatchedGemmRunner.tuning_config,
     )
 
     return kernel_runner(
@@ -633,6 +632,13 @@ def _(
 
 
 @torch.library.custom_op("trtllm::w4a8_mxfp4_fp8_gemm", mutates_args=())
+@autotuner.tuning_config(
+    name="trtllm::w4a8_mxfp4_fp8_gemm::gemm",
+    dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, get_last_power_of_2_num_tokens_buckets,
+        last_positive_power_of_2), ),
+    constraint_specs=(ConstraintSpec(2, 0, fp4_scale_infer_shape), ),
+)
 def w4a8_mxfp4_fp8_gemm(
     act_fp8: torch.Tensor,
     weight: torch.Tensor,
@@ -652,7 +658,6 @@ def w4a8_mxfp4_fp8_gemm(
     _, best_tactic = tuner.choose_one(
         "trtllm::w4a8_mxfp4_fp8_gemm::gemm",
         [w4a8_mxfp4_fp8_gemm_runner],
-        FP4GemmRunner.tuning_config,
         [act_fp8, weight, act_sf, weight_scale, alpha],
     )
 
@@ -719,6 +724,12 @@ class W4A16GemmRunner(TunableRunner):
 
 
 @torch.library.custom_op("trtllm::w4a16_gemm", mutates_args=())
+@autotuner.tuning_config(
+    name="trtllm::w4a16_gemm::gemm",
+    dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, get_last_power_of_2_num_tokens_buckets(8192),
+        last_positive_power_of_2), ),
+)
 def w4a16_gemm(input: torch.Tensor,
                weight: torch.Tensor,
                scales: torch.Tensor,
@@ -731,11 +742,6 @@ def w4a16_gemm(input: torch.Tensor,
 
     tuner = AutoTuner.get()
 
-    tuning_config = TuningConfig(dynamic_tensor_specs=(
-        # For tensor index 0 (input A), tune dimension 0 (M dimension)
-        DynamicTensorSpec(0, 0, (8192, 4096, 2048, 1024, 512, 256, 128, 64, 32,
-                                 16, 8, 4, 2, 1), last_positive_power_of_2), ))
-
     # NOTE: qunant_mode equals 0 it means we use scale only (FINEGRAINED_SCALE_ONLY), zeros is not used, else we use scale and zero point
     quant_mode = 1 if has_zero_point else 0
     if quant_mode == 0:
@@ -745,7 +751,7 @@ def w4a16_gemm(input: torch.Tensor,
 
     kwargs = {"group_size": group_size, "zeros": zeros, "bias": bias}
     _, best_tactic = tuner.choose_one("trtllm::w4a16_gemm::gemm",
-                                      [w4a16_gemm_runner], tuning_config,
+                                      [w4a16_gemm_runner],
                                       [input, weight, scales], **kwargs)
 
     return w4a16_gemm_runner(inputs=[input, weight, scales],
