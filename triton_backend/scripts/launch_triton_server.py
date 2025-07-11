@@ -187,13 +187,9 @@ def get_cmd(world_size,
             cmd += ['-n', '1']
         if trtllm_llmapi_launch:
             cmd += ['trtllm-llmapi-launch']
+        cmd += [tritonserver, f'--model-repository={model_repo}']
         if exit_timeout:
-            cmd += [
-                tritonserver, f'--model-repository={model_repo}',
-                f'--exit-timeout-secs={exit_timeout}'
-            ]
-        else:
-            cmd += [tritonserver, f'--model-repository={model_repo}']
+            cmd += [f'--exit-timeout-secs={exit_timeout}']
 
         # Add port configuration
         cmd = add_port_config(cmd, grpc_port, http_port, metrics_port)
