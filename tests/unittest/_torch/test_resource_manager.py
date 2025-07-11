@@ -446,11 +446,12 @@ class TestResourceManager(unittest.TestCase):
         model_config.num_hidden_layers = len(total_layers)
         model_config.num_attention_layers = len(total_layers)
 
-        kv_cache_config = tllm.KvCacheConfig()
         kv_factor = 2
         cache_bytes_per_token_per_layer = 8
 
-        # Define test cases: (memory_bytes, expected_window_sizes, description)
+        # Define test cases:
+        #    (memory_bytes, expected_window_sizes, max_tokens, description)
+        #    If max_tokens is None, then it will use the default value of KvCacheConfig.
         test_cases = [
             (
                 # Case 1: Limited memory - windows get clamped
@@ -459,6 +460,7 @@ class TestResourceManager(unittest.TestCase):
                     100: [0, 1, 2, 3],
                     130: [4, 5, 6, 7, 8],
                 },
+                None,
                 "limited_memory_clamped_windows"),
             (
                 # Case 2: Less limited memory - the largest window get clamped
@@ -469,6 +471,7 @@ class TestResourceManager(unittest.TestCase):
                     200: [4, 5, 6],
                     1017: [7, 8],
                 },
+                None,
                 "less_limited_memory_clamped_windows"),
             (
                 # Case 3: Sufficient memory - no clamping needed
@@ -479,6 +482,7 @@ class TestResourceManager(unittest.TestCase):
                     200: [4, 5, 6],
                     7000: [7, 8],
                 },
+                None,
                 "sufficient_memory_no_clamping"),
             (
                 # Case 4: Very limited memory - all windows get small values
@@ -486,11 +490,24 @@ class TestResourceManager(unittest.TestCase):
                 {
                     51: [0, 1, 2, 3, 4, 5, 6, 7, 8],
                 },
+                None,
                 "very_limited_memory_all_clamped"),
+            (
+                # Case 5: Less limited memory but max_tokens is given.
+                # memory is enough for 1017 tokens, it will be clamped by max_tokens=134.
+                cache_bytes_per_token_per_layer *
+                (100 * 9 + 100 * 5 + 817 * 2) + 4,
+                {
+                    100: [0, 1, 2, 3],
+                    134: [4, 5, 6, 7, 8],
+                },
+                134,
+                "less_limited_memory_but_clamped_by_max_tokens"),
         ]
 
-        for memory_bytes, expected_window_sizes, description in test_cases:
+        for memory_bytes, expected_window_sizes, max_tokens, description in test_cases:
             with self.subTest(case=description, memory_bytes=memory_bytes):
+                kv_cache_config = tllm.KvCacheConfig(max_tokens=max_tokens)
                 adjusted = KVCacheManager.adjust_window_sizes_for_vswa(
                     window_size_to_layers=window_size_to_layers,
                     model_config=model_config,
