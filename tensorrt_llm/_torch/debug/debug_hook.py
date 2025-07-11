@@ -1,6 +1,7 @@
 import inspect
 import os
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -371,3 +372,94 @@ def register_tensor_dump_hook():
     assert debug_ctx is not None, ""
     debug_ctx.register_pre_forward_action(DumpTensorFilter(), dump_tensor)
     debug_ctx.register_after_forward_action(DumpTensorFilter(), dump_tensor)
+
+
+class EmptyFilter(Filter):
+
+    def __init__(self):
+        pass
+
+    def filter(self, module: torch.nn.Module, debug_ctx: DebuggerContext):
+        return True
+
+
+def print_module_name(module: torch.nn.Module, data_tensor,
+                      debug_ctx: DebuggerContext):
+    name = module.name if hasattr(module, "name") else module.__class__.__name__
+    is_pre_forward = debug_ctx.check_in_pre_forward()
+    phase = "pre_forward" if is_pre_forward else "after_forward"
+    print(f"module {name} is running at {phase}.")
+
+
+def register_module_name_dump_hook():
+    debug_ctx = get_current_debug_ctx()
+    assert debug_ctx is not None, ""
+    debug_ctx.register_pre_forward_action(EmptyFilter(), print_module_name)
+    debug_ctx.register_after_forward_action(EmptyFilter(), print_module_name)
+
+
+@dataclass
+class MemoryInfo:
+    free: int
+    gpu_total: int
+    torch_used: int
+    torch_peak: int
+
+
+memory_info = {}
+
+
+def print_memory_info(module: torch.nn.Module, data_tensor,
+                      debug_ctx: DebuggerContext):
+    global memory_info
+    GB = 1 << 30
+
+    def get_module_path():
+        name_parts = []
+        for idx in range(len(debug_ctx.get_current_modules_tree())):
+            inner_idx = f"{debug_ctx.get_module_indices_tree()[idx]}"
+            layer_name = debug_ctx.get_current_modules_tree()[idx]
+            name_parts.append(".".join([inner_idx, layer_name]))
+        module_path = "-".join(name_parts)
+
+        return module_path
+
+    def dump_memory_info():
+        module_path = get_module_path()
+        torch.cuda.synchronize()
+        torch_peak_memory = torch.cuda.memory_stats(
+        )["allocated_bytes.all.peak"]
+
+        # Clear the caching allocator before measuring the current memory usage
+        end, total_gpu_memory = torch.cuda.mem_get_info()
+        torch_used_bytes = torch.cuda.memory_stats(
+        )["allocated_bytes.all.current"]
+        if debug_ctx.check_in_pre_forward():
+            memory_info[module_path] = MemoryInfo(end, total_gpu_memory,
+                                                  torch_peak_memory,
+                                                  torch_used_bytes)
+            print(
+                f"module {module_path}: before forward: total used {(total_gpu_memory - end) / (GB):.2f} GiB, torch used {torch_used_bytes / (GB):.2f}, torch peak memory: {torch_peak_memory / (GB):.2f} GiB, free: {end / (GB):.2f} GiB."
+            )
+        else:
+            delta_msg = ''
+            before_forward_info: MemoryInfo = memory_info[
+                module_path] if module_path in memory_info else None
+            if before_forward_info is not None:
+                delta_total_used = (total_gpu_memory - end) - (
+                    before_forward_info.gpu_total - before_forward_info.free)
+                delta_torch_used = torch_used_bytes - before_forward_info.torch_used
+                delta_peak = torch_peak_memory - before_forward_info.torch_peak
+                delta_msg = f'delta total used {delta_total_used / (GB):.2f} GiB, delta torch used {delta_torch_used / (GB):.2f} GiB, delta torch peak {delta_peak / (GB):.2f} GiB.'
+            print(
+                f"module {module_path}: after forward: total used {(total_gpu_memory - end) / (GB):.2f} GiB, torch used {torch_used_bytes / (GB):.2f}, torch peak memory: {torch_peak_memory / (GB):.2f} GiB, free: {end / (GB):.2f} GiB. {delta_msg}"
+            )
+
+    dump_memory_info()
+
+
+def register_memory_info_dump_hook():
+    debug_ctx = get_current_debug_ctx()
+    assert debug_ctx is not None, ""
+    debug_ctx.register_pre_forward_action(EmptyFilter(), print_memory_info)
+    debug_ctx.register_after_forward_action(EmptyFilter(), print_memory_info)
