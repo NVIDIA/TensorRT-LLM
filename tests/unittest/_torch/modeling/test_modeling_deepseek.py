@@ -8,7 +8,7 @@ from utils.llm_data import llm_models_root
 from utils.util import getSMVersion
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig
+from tensorrt_llm.llmapi import KvCacheConfig, MoeConfig, MTPDecodingConfig
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 
 
@@ -71,7 +71,7 @@ def test_deepseek_trtllmgen(model_name):
         kv_cache_dtype="auto",
         attn_backend="TRTLLM",
         load_format="dummy",
-        moe_backend="TRTLLM",
+        moe_config=MoeConfig(backend="TRTLLM"),
     )
 
     model_dir = str(llm_models_root() / Path(f"DeepSeek-R1/{model_name}"))
