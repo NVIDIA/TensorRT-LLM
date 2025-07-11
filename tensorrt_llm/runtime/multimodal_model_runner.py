@@ -2774,7 +2774,7 @@ class MultimodalModelRunner:
                 input_text = '<image>\n' + input_text
 
             # Set up image context token (following baseline pattern)
-            IMG_CONTEXT_TOKEN = '<image>'
+            IMG_CONTEXT_TOKEN = '<image>'  # nosec B105
             img_context_token_id = self.tokenizer.convert_tokens_to_ids(
                 IMG_CONTEXT_TOKEN)
 
