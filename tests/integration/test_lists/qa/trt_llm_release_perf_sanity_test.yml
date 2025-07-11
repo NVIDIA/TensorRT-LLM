@@ -202,6 +202,8 @@ trt_llm_release_perf_sanity_test:
   - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-pytorch-bfloat16-maxbs:1-input_output_len:2000,200-reqs:10-gpus:8]
   - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-bfloat16-maxbs:1-input_output_len:200,2000-reqs:10-gpus:8]
   - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-pytorch-bfloat16-maxbs:1-input_output_len:200,2000-reqs:10-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b-bench-pytorch-bfloat16-input_output_len:500,2000-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b-bench-pytorch-bfloat16-input_output_len:2000,500-gpus:8]
   - perf/test_perf.py::test_perf[gpt_20b-bench-float16-maxbs:1-input_output_len:128,128-reqs:10-gpus:8]
 
 
