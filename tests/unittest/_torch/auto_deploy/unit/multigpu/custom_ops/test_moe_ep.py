@@ -21,23 +21,25 @@ def _run_moe_ep_test(num_experts: int, topk: int, rank: int, world_size: int):
 
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
-    x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda() * 0.5
+    x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype, device="cuda") * 0.5
 
-    router_logits = torch.randn((SEQ_LEN, NUM_EXPERTS), dtype=torch.float32).cuda()
+    router_logits = torch.randn((SEQ_LEN, NUM_EXPERTS), dtype=torch.float32, device="cuda")
     routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
     final_scales, selected_experts = torch.topk(routing_weights, TOP_K, dim=-1)
     final_scales = final_scales / final_scales.sum(dim=-1, keepdim=True)
     final_scales = final_scales.to(x.dtype)
 
     fused_w3_w1_stacked_weight = torch.empty(
-        (NUM_EXPERTS, INTERMEDIATE_SIZE * 2, HIDDEN_SIZE), dtype=dtype
-    ).cuda()
-    fused_w2_weight = torch.empty((NUM_EXPERTS, HIDDEN_SIZE, INTERMEDIATE_SIZE), dtype=dtype).cuda()
+        (NUM_EXPERTS, INTERMEDIATE_SIZE * 2, HIDDEN_SIZE), dtype=dtype, device="cuda"
+    )
+    fused_w2_weight = torch.empty(
+        (NUM_EXPERTS, HIDDEN_SIZE, INTERMEDIATE_SIZE), dtype=dtype, device="cuda"
+    )
     weights = {}
     for expert_id in range(NUM_EXPERTS):
-        w1 = torch.randn((INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=dtype).cuda() * 0.5
-        w2 = torch.randn((HIDDEN_SIZE, INTERMEDIATE_SIZE), dtype=dtype).cuda() * 0.5
-        w3 = torch.randn((INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=dtype).cuda() * 0.5
+        w1 = torch.randn((INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=dtype, device="cuda") * 0.5
+        w2 = torch.randn((HIDDEN_SIZE, INTERMEDIATE_SIZE), dtype=dtype, device="cuda") * 0.5
+        w3 = torch.randn((INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=dtype, device="cuda") * 0.5
         weights[f"{expert_id}.w1.weight"] = w1
         weights[f"{expert_id}.w2.weight"] = w2
         weights[f"{expert_id}.w3.weight"] = w3

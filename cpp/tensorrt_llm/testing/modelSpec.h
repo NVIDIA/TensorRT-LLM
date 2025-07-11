@@ -206,12 +206,6 @@ public:
         return mEnableContextFMHAFp32Acc;
     }
 
-    ModelSpec& setBatchSizes(std::vector<SizeType32> batchSizes)
-    {
-        mBatchSizes = std::move(batchSizes);
-        return *this;
-    }
-
     ModelSpec& setMaxInputLength(SizeType32 maxInputLength)
     {
         mMaxInputLength = maxInputLength;
@@ -338,7 +332,6 @@ public:
     QuantMethod mQuantMethod{QuantMethod::kNONE};
 
     SpeculativeDecodingMode mSpecDecodingMode{SpeculativeDecodingMode::None()};
-    std::vector<SizeType32> mBatchSizes{1, 2, 8};
 
     std::optional<tensorrt_llm::executor::CapacitySchedulerPolicy> mCapacitySchedulerPolicy{std::nullopt};
 

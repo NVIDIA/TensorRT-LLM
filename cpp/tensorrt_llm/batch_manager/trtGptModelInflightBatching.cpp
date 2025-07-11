@@ -567,7 +567,7 @@ TrtGptModelInflightBatching::clampWindowSizesToFitAtLeastOneSequence(BlocksPerWi
     TLLM_LOG_WARNING("maxAttentionWindowVec too large to fit at least one sequence in kvCache. Old: %s, New: %s",
         common::vec2str(getMaxAttentionWindowVec()).c_str(), common::vec2str(newMaxAttentionWindowVec).c_str());
     setMaxAttentionWindowVec(newMaxAttentionWindowVec);
-    if (getMaxSequenceLen() < getMaxAttentionWindow())
+    if (getMaxSequenceLen() > getMaxAttentionWindow())
     {
         TLLM_LOG_WARNING("maxSequenceLen is reduced to maxAttentionWindow: %d", getMaxAttentionWindow());
         setMaxSequenceLen(getMaxAttentionWindow());
@@ -929,6 +929,25 @@ void TrtGptModelInflightBatching::storeContextBlocks(std::shared_ptr<LlmRequest>
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
+void TrtGptModelInflightBatching::storeNewBlock(std::shared_ptr<LlmRequest> const& llmReq)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    // TMJ - Note
+    // Make context blocks reusable immediately after each generation step.
+
+    if (mKvCacheManager)
+    {
+        mKvCacheManager->storeNewBlock(*llmReq);
+    }
+    if (mCrossKvCacheManager)
+    {
+        mCrossKvCacheManager->storeNewBlock(*llmReq);
+    }
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
 void TrtGptModelInflightBatching::resetIterationStats()
 {
     mLastIterationStatsIFB = IterationStatsIFB{mMicroBatchId};
@@ -1024,6 +1043,7 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
             {
                 prepareDistGenBufferAndDecoder(currRequests.generationRequests);
             }
+            sync_check_cuda_error(mRuntime->getStream().get());
 
             executeBatch(currRequests);
             if (mWorldConfig.isLastPipelineParallelRank() && mGuidedDecoder)
@@ -1063,6 +1083,8 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
                 ? std::make_optional(decoderStepAsync(currRequests))
                 : std::nullopt;
 
+            sync_check_cuda_error(mRuntime->getStream().get());
+
             mLastIterationStatsIFB = fillIterationStats(currRequests, requestsToPause);
             for (auto const& requests : {currRequests.contextRequests, currRequests.generationRequests})
             {
@@ -1096,6 +1118,7 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
                     }
                     else if (llmReq->isGenerationInProgressState())
                     {
+                        storeNewBlock(llmReq);
                         TLLM_LOG_DEBUG("request with ID %lu forwards a step in decoder gen phase", llmReq->mRequestId);
                     }
                 }

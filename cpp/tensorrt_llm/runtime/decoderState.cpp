@@ -644,6 +644,16 @@ TensorPtr DecoderState::getCacheIndirectionOutput() const
     return mJointDecodingOutput->cacheIndirection;
 }
 
+std::optional<std::vector<SizeType32>> const& DecoderState::getGenerationSteps() const
+{
+    return mJointDecodingInput->generationSteps;
+}
+
+void DecoderState::setGenerationSteps(std::vector<SizeType32> const& generationSteps)
+{
+    mJointDecodingInput->generationSteps = generationSteps;
+}
+
 DecodingInput& DecoderState::getJointDecodingInput() const
 {
     return *mJointDecodingInput;

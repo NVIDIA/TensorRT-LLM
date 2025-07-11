@@ -19,6 +19,7 @@ from tensorrt_llm.bench.benchmark.utils.general import (
 # isort: on
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
@@ -222,6 +223,16 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Path where output should be written to.",
 )
 @optgroup.option(
+    "--request_json",
+    type=click.Path(dir_okay=False,
+                    writable=True,
+                    readable=False,
+                    path_type=Path,
+                    resolve_path=True),
+    required=False,
+    help="Path where per request information is written to.",
+)
+@optgroup.option(
     "--enable_chunked_context",
     is_flag=True,
     default=False,
@@ -261,6 +272,7 @@ def throughput_command(
     # Reporting options
     report_json: Path = params.pop("report_json")
     output_json: Path = params.pop("output_json")
+    request_json: Path = params.pop("request_json")
     iteration_log: Path = params.pop("iteration_log")
     iteration_writer = IterationWriter(iteration_log)
 
@@ -370,6 +382,12 @@ def throughput_command(
                     "Ignore extended_runtime_perf_knob_config for pytorch backend."
                 )
             llm = PyTorchLLM(**kwargs)
+        elif runtime_config.backend == "_autodeploy":
+            if kwargs.pop("extended_runtime_perf_knob_config", None):
+                logger.warning(
+                    "Ignore extended_runtime_perf_knob_config for _autodeploy backend."
+                )
+            llm = AutoDeployLLM(**kwargs)
         else:
             llm = LLM(**kwargs)
 
@@ -426,6 +444,10 @@ def throughput_command(
             with open(output_json, "w") as f:
                 output_token_info = report_utility.get_output_tokens(tokenizer)
                 f.write(json.dumps(output_token_info, indent=4))
+        if request_json:
+            logger.info(f"Writing request information to {request_json}.")
+            with open(request_json, "w") as f:
+                f.write(json.dumps(report_utility.get_request_info(tokenizer)))
         report_utility.report_statistics()
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt, exiting benchmark...")

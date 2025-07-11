@@ -20,7 +20,7 @@ The TensorRT-LLM Whisper example code is located in [`examples/models/core/whisp
 
  * [`convert_checkpoint.py`](./convert_checkpoint.py) to convert weights from OpenAI Whisper format to TRT-LLM format.
  * `trtllm-build` to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the Whisper model.
- * [`run.py`](./run.py) to run the inference on a single wav file, or [a HuggingFace dataset](https://huggingface.co/datasets/librispeech_asr) [\(Librispeech test clean\)](https://www.openslr.org/12).
+ * [`run.py`](./run.py) to run the inference on a single wav file, or [a HuggingFace dataset](https://huggingface.co/datasets/openslr/librispeech_asr) [\(Librispeech test clean\)](https://www.openslr.org/12).
 
 ## Support Matrix
   * FP16

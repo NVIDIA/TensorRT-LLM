@@ -111,7 +111,7 @@ public:
         bool useRoutingScalesOnInput, bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream);
 
 private:
-    int32_t mTileTokensDim{8};
+    int32_t mTileTokensDim;
 };
 } // namespace Routing
 

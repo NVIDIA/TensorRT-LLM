@@ -19,6 +19,7 @@ class SeqSlotManager(BaseResourceManager):
             if llm_req.seq_slot is None or llm_req.is_disagg_generation_transmission_complete:
                 llm_req.seq_slot = self.slot_manager.add_slot(
                     llm_req.request_id)
+                llm_req.py_seq_slot = llm_req.seq_slot
                 if llm_req.return_perf_metrics:
                     llm_req.set_first_scheduled_time()
 

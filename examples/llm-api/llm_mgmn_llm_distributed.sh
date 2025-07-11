@@ -36,7 +36,7 @@
 #      the LOCAL_MODEL directory.
 
 # Adjust the paths to run
-export script=$SOURCE_ROOT/examples/pytorch/quickstart_advanced.py
+export script=$SOURCE_ROOT/examples/llm-api/quickstart_advanced.py
 
 # Just launch the PyTorch example with trtllm-llmapi-launch command.
 srun -l \

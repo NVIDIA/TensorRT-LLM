@@ -179,15 +179,15 @@ class ReDrafterMixin:
         bb_range = default_range(max_batch_size)
         bb0_range = default_range(max_batch_size, min_range=0, opt_offset=1)
         num_beam_tokens = self.num_beams * self.beam_length
-        max_draft_tokens = num_beam_tokens - self.num_beams  # ignore the true token
-        max_gen_token_len = 1 + max_draft_tokens  # for the true token
+        max_draft_len = num_beam_tokens - self.num_beams  # ignore the true token
+        max_gen_token_len = 1 + max_draft_len  # for the true token
         max_gen_token_len_range = default_range(max_gen_token_len)
         bb_max_gen_token_len_range = default_range(max_gen_token_len *
                                                    max_batch_size,
                                                    min_range=0)
 
         kwargs['speculative_decoding_draft_tokens_external'] = False
-        kwargs['max_draft_len'] = max_draft_tokens
+        kwargs['max_draft_len'] = max_draft_len
         kwargs['spec_decoding_is_generation_length_variable'] = True
         inputs = super().prepare_inputs(*args, **kwargs)
         assert inputs['spec_decoding_params'] is not None

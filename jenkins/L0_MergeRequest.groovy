@@ -44,12 +44,6 @@ def getContainerURIs()
     return uris
 }
 
-// TODO: Move common variables to an unified location
-BUILD_CORES_REQUEST = "8"
-BUILD_CORES_LIMIT = "8"
-BUILD_MEMORY_REQUEST = "48Gi"
-BUILD_MEMORY_LIMIT = "48Gi"
-
 // Stage choices
 STAGE_CHOICE_NORMAL = "normal"
 STAGE_CHOICE_SKIP = "skip"
@@ -214,34 +208,12 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                     resources:
                       requests:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
                       limits:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
-                    imagePullPolicy: Always"""
-        nodeLabelPrefix = "cpu"
-        break
-    case "build":
-        containerConfig = """
-                  - name: trt-llm
-                    image: ${image}
-                    command: ['cat']
-                    volumeMounts:
-                    - name: sw-tensorrt-pvc
-                      mountPath: "/mnt/sw-tensorrt-pvc"
-                      readOnly: false
-                    tty: true
-                    resources:
-                      requests:
-                        cpu: ${BUILD_CORES_REQUEST}
-                        memory: ${BUILD_MEMORY_REQUEST}
-                        ephemeral-storage: 200Gi
-                      limits:
-                        cpu: ${BUILD_CORES_LIMIT}
-                        memory: ${BUILD_MEMORY_LIMIT}
-                        ephemeral-storage: 200Gi
                     imagePullPolicy: Always"""
         nodeLabelPrefix = "cpu"
         break
@@ -254,11 +226,11 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                     resources:
                       requests:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
                       limits:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
                     imagePullPolicy: Always"""
         nodeLabelPrefix = "cpu"
@@ -299,11 +271,11 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                     resources:
                       requests:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
                       limits:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
                 qosClass: Guaranteed
                 volumes:
@@ -327,7 +299,7 @@ def echoNodeAndGpuInfo(pipeline, stageName)
 def setupPipelineEnvironment(pipeline, testFilter, globalVars)
 {
     image = "urm.nvidia.com/docker/golang:1.22"
-    setupPipelineSpec = createKubernetesPodConfig(image, "build")
+    setupPipelineSpec = createKubernetesPodConfig(image, "package")
     trtllm_utils.launchKubernetesPod(pipeline, setupPipelineSpec, "trt-llm", {
         sh "env | sort"
         updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: 'running'
@@ -394,6 +366,7 @@ def launchReleaseCheck(pipeline)
                 ignoreList = [
                     "*/.git/*",
                     "*/3rdparty/*",
+                    "*/cpp/tensorrt_llm/deep_ep/nvshmem_src_*.txz",
                     "*/examples/scaffolding/contrib/mcp/weather/weather.py",
                     "*/tensorrt_llm_internal_cutlass_kernels_static.tar.xz"
                 ]
@@ -413,7 +386,7 @@ def launchReleaseCheck(pipeline)
 
     def image = "urm.nvidia.com/docker/golang:1.22"
     stageName = "Release Check"
-    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "build"), "trt-llm", {
+    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package"), "trt-llm", {
         stage("[${stageName}] Run") {
             if (RELESE_CHECK_CHOICE == STAGE_CHOICE_SKIP) {
                 echo "Release Check job is skipped due to Jenkins configuration"

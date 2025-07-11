@@ -15,7 +15,8 @@ from ..modules.embedding import Embedding
 from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE, MoE,
                                  RenormalizeMoeRoutingMethod,
                                  RenormalizeNaiveMoeRoutingMethod,
-                                 RoutingMethodType, WideEPMoE, create_moe)
+                                 RoutingMethodType, TRTLLMGenFusedMoE,
+                                 WideEPMoE, create_moe)
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
@@ -134,7 +135,9 @@ class Qwen3MoE(nn.Module):
         if self.enable_attention_dp and self.mapping.tp_size > 1:
             # FP4 all_gather moves this bf16 allgather in to after topk and fp4 quantization
             # to reduce allreduce BW
-            if disable_fp4_allgather() and not self.experts.enable_alltoall:
+            if (disable_fp4_allgather()
+                    and not self.experts.enable_alltoall) or isinstance(
+                        self.experts, TRTLLMGenFusedMoE):
                 hidden_states = allgather(hidden_states,
                                           self.mapping,
                                           dim=0,

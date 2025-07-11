@@ -392,13 +392,14 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
             })
         .def("copy_batch_block_offsets",
             [](tbk::BaseKVCacheManager& self, at::Tensor output,
-                std::vector<tb::LlmRequest::RequestIdType> const& requestIds)
+                std::vector<tb::LlmRequest::RequestIdType> const& requestIds, SizeType32 const beamWidth,
+                SizeType32 const offset)
             {
                 auto _output = from_torch(output);
                 TLLM_CHECK_WITH_INFO(_output.has_value(), "Invalid output tensor.");
                 for (size_t i = 0; i < requestIds.size(); ++i)
                 {
-                    self.copyBlockOffsets(*(_output.value()), i, requestIds[i]);
+                    self.copyBlockOffsets(*(_output.value()), i * beamWidth + offset, requestIds[i]);
                 }
             })
         .def(

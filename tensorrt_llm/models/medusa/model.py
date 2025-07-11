@@ -191,7 +191,7 @@ class MedusaForCausalLm(PretrainedModel):
         import transformers
 
         assert hf_model_or_dir is not None
-        speculative_model_dir = kwargs.get('speculative_model', None)
+        speculative_model_dir = kwargs.get('speculative_model_dir', None)
 
         use_preloading = isinstance(hf_model_or_dir,
                                     transformers.PreTrainedModel)

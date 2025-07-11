@@ -55,6 +55,8 @@
 
 #include "gemm_universal_allreduce.hpp"
 
+#include "tensorrt_llm/kernels/archCondition.h"
+
 ///////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass::gemm::kernel
@@ -418,7 +420,23 @@ public:
     CUTLASS_DEVICE
     void operator()(Params const& params, char* smem_buf)
     {
+        if constexpr (tensorrt_llm::kernels::arch::is_major_v<10>)
+        {
+            _invoke(params, smem_buf);
+        }
+        else
+        {
+            if (cute::thread0())
+            {
+                printf("%s : This kernel shall only run on SM10x devices.\n", __PRETTY_FUNCTION__);
+                __trap();
+            }
+        }
+    }
 
+    CUTLASS_DEVICE
+    void _invoke(Params const& params, char* smem_buf)
+    {
         using namespace cute;
         using X = Underscore;
 
@@ -951,8 +969,8 @@ public:
         {
             bool do_tail_store = false;
 
-            constexpr auto ARBarrier = (uint32_t) cutlass::arch::ReservedNamedBarriers::FirstUserBarrier;
-            CollectiveAllReduce collective_allreduce(params.allreduce, ARBarrier);
+            const uint32_t AR_barrier_id = 0;
+            CollectiveAllReduce collective_allreduce(params.allreduce, AR_barrier_id);
             int thread_idx = threadIdx.x - (MaxThreadsPerBlock - NumARThreads);
             auto init_cta_coord_mnkl = cta_coord_mnkl;
 

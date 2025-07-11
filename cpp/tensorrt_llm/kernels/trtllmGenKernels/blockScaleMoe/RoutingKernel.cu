@@ -16,6 +16,7 @@
 
 #include "DevKernel.h"
 #include "RoutingKernel.h"
+#include "RoutingKernelTopK.cuh"
 
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
@@ -26,6 +27,8 @@
 
 #include <type_traits>
 
+#include "tensorrt_llm/kernels/archCondition.h"
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace moe::dev
@@ -33,26 +36,21 @@ namespace moe::dev
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+static constexpr bool TLLM_GEN_HAS_FAST_REDUX = tensorrt_llm::kernels::arch::is_major_v<10>;
+
 namespace routing
 {
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-namespace tg = batchedGemm::trtllm::gen;
 namespace cg = cooperative_groups;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-static constexpr int NumThreads = 256;
-static constexpr int NumBlocksPerCluster = 8;
 static constexpr int WarpSize = 32;
-static constexpr int NumWarps = NumThreads / WarpSize;
-static constexpr int NumTopGroupScores = 2;
-static constexpr int MaxNumTopExperts = 8;
-static constexpr int MaxNumTopGroups = 4;
-
+static constexpr int NumBlocksPerCluster = 8;
 // Performance tuning knob.
 static constexpr int NumEltsPerOffsetTilePerThread = 8;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000 && defined(__CUDA_ARCH_FEAT_SM100_ALL))
 #define TLLM_GEN_ENABLE_FAST_REDUX
@@ -60,177 +58,10 @@ static constexpr int NumEltsPerOffsetTilePerThread = 8;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename TypeExpW_>
-struct TopKRedType
-{
-    using TypeExpW = TypeExpW_;
-    static_assert(std::is_same_v<TypeExpW, float> || std::is_same_v<TypeExpW, cutlass::bfloat16_t>,
-        "Top K reduction only implemented for float and Bf16");
-    using TypeCmp = std::conditional_t<sizeof(TypeExpW) >= 4, double, float>;
-    static constexpr int64_t Mask64 = 0x000000000000FFFF;
-    static constexpr int32_t Mask32 = 0x0000FFFF;
-
-    TypeCmp compVal;
-
-    static __host__ __device__ inline TypeCmp makeCmpVal(TypeExpW val, int32_t idx = 0)
-    {
-        auto cmpVal = TypeCmp{val};
-        TypeCmp cmpValWithIdx;
-        if constexpr (sizeof(TypeExpW) >= 4)
-        {
-            auto cmpValIdx64 = reinterpret_cast<int64_t&>(cmpVal) | (Mask64& int64_t{idx});
-            cmpValWithIdx = reinterpret_cast<TypeCmp&>(cmpValIdx64);
-        }
-        else
-        {
-            auto cmpValIdx32 = reinterpret_cast<int32_t&>(cmpVal) | (Mask32 & idx);
-            cmpValWithIdx = reinterpret_cast<TypeCmp&>(cmpValIdx32);
-        }
-        return cmpValWithIdx;
-    }
-
-    static __host__ __device__ inline void unpack(TypeExpW& val, int32_t& idx, TypeCmp cmp)
-    {
-        if constexpr (sizeof(TypeExpW) >= 4)
-        {
-            idx = static_cast<int32_t>(reinterpret_cast<int64_t&>(cmp) & Mask64);
-            auto val64 = reinterpret_cast<int64_t&>(cmp) & ~Mask64;
-            val = static_cast<float>(reinterpret_cast<double&>(val64));
-        }
-        else
-        {
-            idx = reinterpret_cast<int32_t&>(cmp) & Mask32;
-            auto val32 = reinterpret_cast<int32_t&>(cmp) >> 16;
-            val = TypeExpW::bitcast(reinterpret_cast<uint16_t&>(val32));
-        }
-    }
-
-    __host__ __device__ TopKRedType() = default;
-
-    __host__ __device__ TopKRedType(TypeExpW val, int32_t idx)
-        : compVal(makeCmpVal(val, idx))
-    {
-    }
-
-    __host__ __device__ operator TypeCmp() const noexcept
-    {
-        return compVal;
-    }
-
-    __device__ inline TypeCmp reduce(cg::thread_block_tile<WarpSize> const& warp)
-    {
-#if defined(TLLM_GEN_ENABLE_FAST_REDUX)
-        static constexpr bool UseCg = false;
-#else
-        static constexpr bool UseCg = true;
-#endif
-        if constexpr (UseCg || sizeof(TypeExpW) >= 4)
-        {
-            return cg::reduce(warp, compVal, cg::greater<TypeCmp>{});
-        }
-        else
-        {
-            float result;
-            asm("redux.sync.max.f32 %0, %1, 0xffffffff;\n" : "=f"(result) : "f"(compVal));
-            return result;
-        }
-    }
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
 static __device__ inline float sigmoid_accurate(float x)
 {
     return 0.5f * tanhf(0.5f * x) + 0.5f;
 }
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <int K_, bool Enable_>
-struct TopKIdx
-{
-    // by default, empty
-};
-
-template <int K_>
-struct TopKIdx<K_, true>
-{
-    static constexpr int K = K_;
-    int32_t val[K];
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <int K, typename Type>
-__device__ void reduceTopK(cg::thread_block_tile<WarpSize> const& warp, Type (&out)[K], int32_t (&outIdx)[K],
-    Type value, int32_t idx, Type minValue)
-{
-    static_assert(K > 0, "Top K must have K > 0");
-    static_assert(K < WarpSize, "Top K must have K < WarpSize");
-    using RedType = TopKRedType<Type>;
-    RedType topK{value, idx};
-    typename RedType::TypeCmp packedMax{};
-#pragma unroll
-    for (int kk = 0; kk < K; ++kk)
-    {
-        topK = kk > 0 && packedMax == topK.compVal ? RedType{minValue, idx} : topK;
-        // get the next largest value
-        packedMax = topK.reduce(warp);
-        RedType::unpack(out[kk], outIdx[kk], packedMax);
-    }
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-#define TOPK_SWAP(I, J)                                                                                                \
-    {                                                                                                                  \
-        auto pairMin = min(topK[I].compVal, topK[J].compVal);                                                          \
-        auto pairMax = max(topK[I].compVal, topK[J].compVal);                                                          \
-        topK[I].compVal = pairMax;                                                                                     \
-        topK[J].compVal = pairMin;                                                                                     \
-    }
-
-template <int K, typename Type, int N, bool IsSorted = false>
-__device__ void reduceTopK(cg::thread_block_tile<WarpSize> const& warp, Type (&out)[K], int32_t (&outIdx)[K],
-    Type (&value)[N], int32_t (&idx)[N], Type minValue)
-{
-    static_assert(K > 0, "Top K must have K > 0");
-    static_assert(K < WarpSize, "Top K must have K < WarpSize");
-    static_assert(N > 0, "Top K must have N > 1");
-    static_assert(N <= K, "Top K must have N < K");
-    using RedType = TopKRedType<Type>;
-    RedType topK[N];
-#pragma unroll
-    for (int nn = 0; nn < N; ++nn)
-        topK[nn] = RedType{value[nn], idx[nn]};
-    if constexpr (!IsSorted)
-    {
-        static_assert(N <= 4, "Unsorted topK expects N <= 4");
-        TOPK_SWAP(0, 2);
-        TOPK_SWAP(1, 3);
-
-        TOPK_SWAP(0, 1);
-        TOPK_SWAP(2, 3);
-
-        TOPK_SWAP(1, 2);
-    }
-    typename RedType::TypeCmp packedMax{};
-#pragma unroll
-    for (int kk = 0; kk < K; ++kk)
-    {
-        bool update = kk > 0 && packedMax == topK[0].compVal;
-#pragma unroll
-        for (int nn = 0; nn < N; ++nn)
-        {
-            topK[nn] = update && nn == N - 1 ? RedType{minValue, idx[nn]} : update ? topK[nn + 1] : topK[nn];
-        }
-        // get the next largest value
-        packedMax = topK[0].reduce(warp);
-        RedType::unpack(out[kk], outIdx[kk], packedMax);
-    }
-};
-
-#undef TOPK_SWAP
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -257,6 +88,101 @@ __host__ __device__ constexpr T divUpMulLog2(T a, T bLog2)
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+__host__ __device__ constexpr int32_t getBits(int32_t value, int idx)
+{
+    int mask = idx == 0 ? 0x000000FF : idx == 1 ? 0x0000FF00 : idx == 2 ? 0x00FF0000 : 0xFF000000;
+    return (value & mask) >> (idx * 8);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <bool IsZero = false>
+__host__ __device__ constexpr void setBits(int32_t& value, int32_t newBits, int idx)
+{
+    if constexpr (!IsZero)
+    {
+        int mask = idx == 0 ? 0xFFFFFF00 : idx == 1 ? 0xFFFF00FF : idx == 2 ? 0xFF00FFFF : 0x00FFFFFF;
+        value &= mask;
+    }
+    value |= (newBits << (idx * 8));
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+template <typename TypeExpW, int VecSize>
+__device__ void calcSoftmax(cg::thread_block_tile<WarpSize> const& warp, TypeExpW (&scores)[VecSize])
+{
+    TypeExpW maxScore = TypeExpW{-INFINITY};
+    TypeExpW sumScore = TypeExpW{0.f};
+
+    // Get the max score for each token
+    for (int i = 0; i < VecSize; ++i)
+    {
+        maxScore = scores[i] >= maxScore ? scores[i] : maxScore;
+    }
+    maxScore = cg::reduce(warp, maxScore, cg::greater<TypeExpW>());
+
+    // Get the summation of scores for each token
+#pragma unroll
+    for (int i = 0; i < VecSize; ++i)
+    {
+        scores[i] = static_cast<TypeExpW>(exp(scores[i] - maxScore));
+        sumScore += scores[i];
+    }
+    sumScore = cg::reduce(warp, sumScore, cg::plus<TypeExpW>());
+
+    // Normalize the scores
+#pragma unroll
+    for (int i = 0; i < VecSize; ++i)
+    {
+        scores[i] = static_cast<TypeExpW>(scores[i] / sumScore);
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename TypeExpW>
+__device__ TypeExpW calcSoftmax(
+    cg::thread_block_tile<WarpSize> const& warp, TypeExpW score, int32_t laneIdx, int32_t NumTopExperts)
+{
+    TypeExpW maxScore = TypeExpW{-INFINITY};
+    if (laneIdx < NumTopExperts)
+    {
+        maxScore = score >= maxScore ? score : maxScore;
+    }
+    maxScore = cg::reduce(warp, maxScore, cg::greater<TypeExpW>());
+
+    float sumScore = float{0.f};
+    float newScore;
+    // Get the summation of scores for each token
+    if (laneIdx < NumTopExperts)
+    {
+        newScore = static_cast<float>(score) - static_cast<float>(maxScore);
+        newScore = static_cast<float>(exp(newScore));
+        sumScore += newScore;
+    }
+    sumScore = cg::reduce(warp, sumScore, cg::plus<float>());
+
+    if (laneIdx < NumTopExperts)
+    {
+        score = static_cast<TypeExpW>(newScore / sumScore);
+    }
+
+    return score;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+namespace routingDeepSeek
+{
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static constexpr int NumThreads = 256;
+static constexpr int NumWarps = NumThreads / WarpSize;
+static constexpr int NumTopGroupScores = 2;
+static constexpr int MaxNumTopExperts = 8;
+static constexpr int MaxNumTopGroups = 4;
 
 template <typename KernelParams>
 __global__ void routingMainKernel(KernelParams params)
@@ -345,7 +271,7 @@ __global__ void routingMainKernel(KernelParams params)
 
     if constexpr (KernelParams::UseGroups)
     {
-        reduceTopK(warp, topExpGroupScores, topExpGroupIdx, scoreBias, threadExpert,
+        topk::reduceTopK(warp, topExpGroupScores, topExpGroupIdx, scoreBias, threadExpert,
             /* minValue */ invalidScoreFloat);
 
         // get the final group score and write it to shared
@@ -367,7 +293,7 @@ __global__ void routingMainKernel(KernelParams params)
         {
             float groupScore = laneIdx < params.mNumExpertGroups ? smemGroupScores[laneIdx] : invalidScoreFloat;
 
-            reduceTopK(warp, topGroups, topGroupIdx, groupScore, laneIdx,
+            topk::reduceTopK(warp, topGroups, topGroupIdx, groupScore, laneIdx,
                 /* minValue */ invalidScoreFloat);
 
             // final expert selection: get relevant indexes and scores from shared
@@ -401,7 +327,7 @@ __global__ void routingMainKernel(KernelParams params)
             }
         }
 
-        reduceTopK(warp, topScores, topExperts, expertScoreGroup, expertIdxGroup,
+        topk::reduceTopK(warp, topScores, topExperts, expertScoreGroup, expertIdxGroup,
             /* minValue */ invalidScoreFloat);
 
         // determine our lane's expert index and write to output
@@ -1314,7 +1240,7 @@ void run(Data const& data, void* stream)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-} // namespace routing
+} // namespace routingDeepSeek
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -1323,15 +1249,8 @@ namespace routingLlama4
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-namespace tg = batchedGemm::trtllm::gen;
-namespace cg = cooperative_groups;
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
 static constexpr int NumThreads = 1024;
 static constexpr int NumThreadsHist = 256;
-static constexpr int NumBlocksPerCluster = 8;
-static constexpr int WarpSize = 32;
 static constexpr int NumWarps = NumThreads / WarpSize;
 static constexpr int NumWarpsHist = NumThreadsHist / WarpSize;
 static constexpr int NumTopExperts = 1;
@@ -1343,231 +1262,6 @@ static constexpr int WarpKernelSmemStride = 33;
 // increase. For now, it is a good cut-off point for when the block-wise
 // operations are more efficient end-to-end.
 static constexpr int WarpKernelMaxNumTokens = 4;
-
-// Performance tuning knob.
-static constexpr int NumEltsPerOffsetTilePerThread = 8;
-
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000 && defined(__CUDA_ARCH_FEAT_SM100_ALL))
-#define TLLM_GEN_ENABLE_FAST_REDUX
-#endif
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <typename TypeExpW_>
-struct TopKRedType
-{
-    using TypeExpW = TypeExpW_;
-    static_assert(std::is_same_v<TypeExpW, float> || std::is_same_v<TypeExpW, cutlass::bfloat16_t>,
-        "Top K reduction only implemented for float and Bf16");
-    using TypeCmp = std::conditional_t<sizeof(TypeExpW) >= 4, double, float>;
-    static constexpr int64_t Mask64 = 0x000000000000FFFF;
-    static constexpr int32_t Mask32 = 0x0000FFFF;
-
-    TypeCmp compVal;
-
-    static __host__ __device__ inline TypeCmp makeCmpVal(TypeExpW val, int32_t idx = 0)
-    {
-        auto cmpVal = TypeCmp{val};
-        TypeCmp cmpValWithIdx;
-        if constexpr (sizeof(TypeExpW) >= 4)
-        {
-            auto cmpValIdx64 = reinterpret_cast<int64_t&>(cmpVal) | (Mask64& int64_t{idx});
-            cmpValWithIdx = reinterpret_cast<TypeCmp&>(cmpValIdx64);
-        }
-        else
-        {
-            auto cmpValIdx32 = reinterpret_cast<int32_t&>(cmpVal) | (Mask32 & idx);
-            cmpValWithIdx = reinterpret_cast<TypeCmp&>(cmpValIdx32);
-        }
-        return cmpValWithIdx;
-    }
-
-    static __host__ __device__ inline void unpack(TypeExpW& val, int32_t& idx, TypeCmp cmp)
-    {
-        if constexpr (sizeof(TypeExpW) >= 4)
-        {
-            idx = static_cast<int32_t>(reinterpret_cast<int64_t&>(cmp) & Mask64);
-            auto val64 = reinterpret_cast<int64_t&>(cmp) & ~Mask64;
-            val = static_cast<float>(reinterpret_cast<double&>(val64));
-        }
-        else
-        {
-            idx = reinterpret_cast<int32_t&>(cmp) & Mask32;
-            auto val32 = reinterpret_cast<int32_t&>(cmp) >> 16;
-            val = TypeExpW::bitcast(reinterpret_cast<uint16_t&>(val32));
-        }
-    }
-
-    __host__ __device__ TopKRedType() = default;
-
-    __host__ __device__ TopKRedType(TypeExpW val, int32_t idx)
-        : compVal(makeCmpVal(val, idx))
-    {
-    }
-
-    __host__ __device__ operator TypeCmp() const noexcept
-    {
-        return compVal;
-    }
-
-    __device__ inline TypeCmp reduce(cg::thread_block_tile<WarpSize> const& warp)
-    {
-#if defined(TLLM_GEN_ENABLE_FAST_REDUX)
-        static constexpr bool UseCg = false;
-#else
-        static constexpr bool UseCg = true;
-#endif
-        if constexpr (UseCg || sizeof(TypeExpW) >= 4)
-        {
-            return cg::reduce(warp, compVal, cg::greater<TypeCmp>{});
-        }
-        else
-        {
-            float result;
-            asm("redux.sync.max.f32 %0, %1, 0xffffffff;\n" : "=f"(result) : "f"(compVal));
-            return result;
-        }
-    }
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-static __device__ inline float sigmoid_accurate(float x)
-{
-    return 0.5f * tanhf(0.5f * x) + 0.5f;
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <int K_, bool Enable_>
-struct TopKIdx
-{
-    // by default, empty
-};
-
-template <int K_>
-struct TopKIdx<K_, true>
-{
-    static constexpr int K = K_;
-    int32_t val[K];
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <int K, typename Type>
-__device__ void reduceTopK(cg::thread_block_tile<WarpSize> const& warp, Type (&out)[K], int32_t (&outIdx)[K],
-    Type value, int32_t idx, Type minValue)
-{
-    static_assert(K > 0, "Top K must have K > 0");
-    static_assert(K < WarpSize, "Top K must have K < WarpSize");
-    using RedType = TopKRedType<Type>;
-    RedType topK{value, idx};
-    typename RedType::TypeCmp packedMax{};
-#pragma unroll
-    for (int kk = 0; kk < K; ++kk)
-    {
-        topK = kk > 0 && packedMax == topK.compVal ? RedType{minValue, idx} : topK;
-        // get the next largest value
-        packedMax = topK.reduce(warp);
-        RedType::unpack(out[kk], outIdx[kk], packedMax);
-    }
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-#define TOPK_SWAP(I, J)                                                                                                \
-    {                                                                                                                  \
-        auto pairMin = min(topK[I].compVal, topK[J].compVal);                                                          \
-        auto pairMax = max(topK[I].compVal, topK[J].compVal);                                                          \
-        topK[I].compVal = pairMax;                                                                                     \
-        topK[J].compVal = pairMin;                                                                                     \
-    }
-
-template <int K, typename Type, int N, bool IsSorted = false>
-__device__ void reduceTopK(cg::thread_block_tile<WarpSize> const& warp, Type (&out)[K], int32_t (&outIdx)[K],
-    Type (&value)[N], int32_t (&idx)[N], Type minValue)
-{
-    static_assert(K > 0, "Top K must have K > 0");
-    static_assert(K < WarpSize, "Top K must have K < WarpSize");
-    static_assert(N > 0, "Top K must have N > 1");
-    static_assert(N <= K, "Top K must have N < K");
-    using RedType = TopKRedType<Type>;
-    RedType topK[N];
-#pragma unroll
-    for (int nn = 0; nn < N; ++nn)
-        topK[nn] = RedType{value[nn], idx[nn]};
-    if constexpr (!IsSorted)
-    {
-        TOPK_SWAP(0, 2);
-        TOPK_SWAP(1, 3);
-
-        TOPK_SWAP(0, 1);
-        TOPK_SWAP(2, 3);
-
-        TOPK_SWAP(1, 2);
-    }
-    typename RedType::TypeCmp packedMax{};
-#pragma unroll
-    for (int kk = 0; kk < K; ++kk)
-    {
-        bool update = kk > 0 && packedMax == topK[0].compVal;
-#pragma unroll
-        for (int nn = 0; nn < N; ++nn)
-        {
-            topK[nn] = update && nn == N - 1 ? RedType{minValue, idx[nn]} : update ? topK[nn + 1] : topK[nn];
-        }
-        // get the next largest value
-        packedMax = topK[0].reduce(warp);
-        RedType::unpack(out[kk], outIdx[kk], packedMax);
-    }
-};
-
-#undef TOPK_SWAP
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <typename T>
-__host__ __device__ constexpr T mulLog2(T a, T bLog2)
-{
-    return a << bLog2;
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <typename T>
-__host__ __device__ constexpr T divUpLog2(T a, T bLog2)
-{
-    return ((a + (1 << bLog2) - 1) >> bLog2);
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <typename T>
-__host__ __device__ constexpr T divUpMulLog2(T a, T bLog2)
-{
-    return mulLog2<T>(divUpLog2<T>(a, bLog2), bLog2);
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-__host__ __device__ constexpr int32_t getBits(int32_t value, int idx)
-{
-    int mask = idx == 0 ? 0x000000FF : idx == 1 ? 0x0000FF00 : idx == 2 ? 0x00FF0000 : 0xFF000000;
-    return (value & mask) >> (idx * 8);
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <bool IsZero = false>
-__host__ __device__ constexpr void setBits(int32_t& value, int32_t newBits, int idx)
-{
-    if constexpr (!IsZero)
-    {
-        int mask = idx == 0 ? 0xFFFFFF00 : idx == 1 ? 0xFFFF00FF : idx == 2 ? 0xFF00FFFF : 0x00FFFFFF;
-        value &= mask;
-    }
-    value |= (newBits << (idx * 8));
-}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -1639,7 +1333,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
             int32_t warpMaxExpertIdx[NumTopExperts];
             TypeExpW warpMaxScore[NumTopExperts];
             // warp-wide reduction to get the best score for all experts
-            reduceTopK(warp, warpMaxScore, warpMaxExpertIdx, maxScore, maxExpertIdx, minScore);
+            topk::reduceTopK(warp, warpMaxScore, warpMaxExpertIdx, maxScore, maxExpertIdx, minScore);
             if (cute::elect_one_sync())
             {
                 // one thread updates the count linking token to chosen expert
@@ -1877,7 +1571,7 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
             }
             int32_t warpMaxExpertIdx[NumTopExperts];
             TypeExpW warpMaxScore[NumTopExperts];
-            reduceTopK(warp, warpMaxScore, warpMaxExpertIdx, maxScore, maxExpertIdx, minScore);
+            topk::reduceTopK(warp, warpMaxScore, warpMaxExpertIdx, maxScore, maxExpertIdx, minScore);
             if (cute::elect_one_sync())
             {
                 TypePacked packedScore{warpMaxScore[0], static_cast<int16_t>(warpMaxExpertIdx[0])};
@@ -2116,7 +1810,7 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramScoresK
         }
         int32_t warpMaxExpertIdx[NumTopExperts];
         TypeExpW warpMaxScore[NumTopExperts];
-        reduceTopK(warp, warpMaxScore, warpMaxExpertIdx, maxScore, maxExpertIdx, minScore);
+        topk::reduceTopK(warp, warpMaxScore, warpMaxExpertIdx, maxScore, maxExpertIdx, minScore);
         if (cute::elect_one_sync())
         {
             TypePacked packedScore{warpMaxScore[0], static_cast<int16_t>(warpMaxExpertIdx[0])};
@@ -2579,310 +2273,16 @@ void run(Data const& data, void* stream)
 
 namespace routingRenormalize
 {
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-namespace cg = cooperative_groups;
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 static constexpr int NumThreads = 1024;
 static constexpr int NumThreadsHist = 256;
-static constexpr int NumBlocksPerCluster = 8;
-static constexpr int WarpSize = 32;
 static constexpr int NumWarps = NumThreads / WarpSize;
 static constexpr int NumWarpsHist = NumThreadsHist / WarpSize;
 static constexpr int NumTopExperts = 8;
 static constexpr int MaxNumExperts = 128;
 static constexpr int MaxNumTokensSingleCluster = NumBlocksPerCluster * NumThreads;
 static constexpr int MaxNumTokensSingleClusterScores = NumBlocksPerCluster * NumWarps;
-
-// Performance tuning knob.
-static constexpr int NumEltsPerOffsetTilePerThread = 8;
-
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000 && defined(__CUDA_ARCH_FEAT_SM100_ALL))
-#define TLLM_GEN_ENABLE_FAST_REDUX
-#endif
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <typename TypeExpW_>
-struct TopKRedType
-{
-    using TypeExpW = TypeExpW_;
-    static_assert(std::is_same_v<TypeExpW, float> || std::is_same_v<TypeExpW, cutlass::bfloat16_t>,
-        "Top K reduction only implemented for float and Bf16");
-    using TypeCmp = std::conditional_t<sizeof(TypeExpW) >= 4, double, float>;
-    static constexpr int64_t Mask64 = 0x000000000000FFFF;
-    static constexpr int32_t Mask32 = 0x0000FFFF;
-
-    TypeCmp compVal;
-
-    static __host__ __device__ inline TypeCmp makeCmpVal(TypeExpW val, int32_t idx = 0)
-    {
-        auto cmpVal = TypeCmp{val};
-        TypeCmp cmpValWithIdx;
-        if constexpr (sizeof(TypeExpW) >= 4)
-        {
-            auto cmpValIdx64 = reinterpret_cast<int64_t&>(cmpVal) | (Mask64& int64_t{idx});
-            cmpValWithIdx = reinterpret_cast<TypeCmp&>(cmpValIdx64);
-        }
-        else
-        {
-            auto cmpValIdx32 = reinterpret_cast<int32_t&>(cmpVal) | (Mask32 & idx);
-            cmpValWithIdx = reinterpret_cast<TypeCmp&>(cmpValIdx32);
-        }
-        return cmpValWithIdx;
-    }
-
-    static __host__ __device__ inline void unpack(TypeExpW& val, int32_t& idx, TypeCmp cmp)
-    {
-        if constexpr (sizeof(TypeExpW) >= 4)
-        {
-            idx = static_cast<int32_t>(reinterpret_cast<int64_t&>(cmp) & Mask64);
-            auto val64 = reinterpret_cast<int64_t&>(cmp) & ~Mask64;
-            val = static_cast<float>(reinterpret_cast<double&>(val64));
-        }
-        else
-        {
-            idx = reinterpret_cast<int32_t&>(cmp) & Mask32;
-            auto val32 = reinterpret_cast<int32_t&>(cmp) >> 16;
-            val = TypeExpW::bitcast(reinterpret_cast<uint16_t&>(val32));
-        }
-    }
-
-    __host__ __device__ TopKRedType() = default;
-
-    __host__ __device__ TopKRedType(TypeExpW val, int32_t idx)
-        : compVal(makeCmpVal(val, idx))
-    {
-    }
-
-    __host__ __device__ operator TypeCmp() const noexcept
-    {
-        return compVal;
-    }
-
-    __device__ inline TypeCmp reduce(cg::thread_block_tile<WarpSize> const& warp)
-    {
-#if defined(TLLM_GEN_ENABLE_FAST_REDUX)
-        static constexpr bool UseCg = false;
-#else
-        static constexpr bool UseCg = true;
-#endif
-        if constexpr (UseCg || sizeof(TypeExpW) >= 4)
-        {
-            return cg::reduce(warp, compVal, cg::greater<TypeCmp>{});
-        }
-        else
-        {
-            float result;
-            asm("redux.sync.max.f32 %0, %1, 0xffffffff;\n" : "=f"(result) : "f"(compVal));
-            return result;
-        }
-    }
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <int K_, bool Enable_>
-struct TopKIdx
-{
-    // by default, empty
-};
-
-template <int K_>
-struct TopKIdx<K_, true>
-{
-    static constexpr int K = K_;
-    int32_t val[K];
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <int K, typename Type>
-__device__ void reduceTopK(cg::thread_block_tile<WarpSize> const& warp, Type (&out)[K], int32_t (&outIdx)[K],
-    Type value, int32_t idx, Type minValue)
-{
-    static_assert(K > 0, "Top K must have K > 0");
-    static_assert(K < WarpSize, "Top K must have K < WarpSize");
-    using RedType = TopKRedType<Type>;
-    RedType topK{value, idx};
-    typename RedType::TypeCmp packedMax{};
-#pragma unroll
-    for (int kk = 0; kk < K; ++kk)
-    {
-        topK = kk > 0 && packedMax == topK.compVal ? RedType{minValue, idx} : topK;
-        // get the next largest value
-        packedMax = topK.reduce(warp);
-        RedType::unpack(out[kk], outIdx[kk], packedMax);
-    }
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-#define TOPK_SWAP(I, J)                                                                                                \
-    {                                                                                                                  \
-        auto pairMin = min(topK[I].compVal, topK[J].compVal);                                                          \
-        auto pairMax = max(topK[I].compVal, topK[J].compVal);                                                          \
-        topK[I].compVal = pairMax;                                                                                     \
-        topK[J].compVal = pairMin;                                                                                     \
-    }
-
-template <int K, typename Type, int N, bool IsSorted = false>
-__device__ void reduceTopK(cg::thread_block_tile<WarpSize> const& warp, Type (&out)[K], int32_t (&outIdx)[K],
-    Type (&value)[N], int32_t (&idx)[N], Type minValue)
-{
-    static_assert(K > 0, "Top K must have K > 0");
-    static_assert(K < WarpSize, "Top K must have K < WarpSize");
-    static_assert(N > 0, "Top K must have N > 1");
-    // static_assert(N <= K, "Top K must have N < K");
-    using RedType = TopKRedType<Type>;
-    RedType topK[N];
-#pragma unroll
-    for (int nn = 0; nn < N; ++nn)
-    {
-        topK[nn] = RedType{value[nn], idx[nn]};
-    }
-
-    if constexpr (!IsSorted)
-    {
-        TOPK_SWAP(0, 2);
-        TOPK_SWAP(1, 3);
-
-        TOPK_SWAP(0, 1);
-        TOPK_SWAP(2, 3);
-
-        TOPK_SWAP(1, 2);
-    }
-    typename RedType::TypeCmp packedMax{};
-#pragma unroll
-    for (int kk = 0; kk < K; ++kk)
-    {
-        bool update = kk > 0 && packedMax == topK[0].compVal;
-#pragma unroll
-        for (int nn = 0; nn < N; ++nn)
-        {
-            topK[nn] = update && nn == N - 1 ? RedType{minValue, idx[nn]} : update ? topK[nn + 1] : topK[nn];
-        }
-        // get the next largest value
-        packedMax = topK[0].reduce(warp);
-        RedType::unpack(out[kk], outIdx[kk], packedMax);
-    }
-};
-
-#undef TOPK_SWAP
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <typename T>
-__host__ __device__ constexpr T mulLog2(T a, T bLog2)
-{
-    return a << bLog2;
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <typename T>
-__host__ __device__ constexpr T divUpLog2(T a, T bLog2)
-{
-    return ((a + (1 << bLog2) - 1) >> bLog2);
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <typename T>
-__host__ __device__ constexpr T divUpMulLog2(T a, T bLog2)
-{
-    return mulLog2<T>(divUpLog2<T>(a, bLog2), bLog2);
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-__host__ __device__ constexpr int32_t getBits(int32_t value, int idx)
-{
-    int mask = idx == 0 ? 0x000000FF : idx == 1 ? 0x0000FF00 : idx == 2 ? 0x00FF0000 : 0xFF000000;
-    return (value & mask) >> (idx * 8);
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <bool IsZero = false>
-__host__ __device__ constexpr void setBits(int32_t& value, int32_t newBits, int idx)
-{
-    if constexpr (!IsZero)
-    {
-        int mask = idx == 0 ? 0xFFFFFF00 : idx == 1 ? 0xFFFF00FF : idx == 2 ? 0xFF00FFFF : 0x00FFFFFF;
-        value &= mask;
-    }
-    value |= (newBits << (idx * 8));
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <typename TypeExpW, int VecSize>
-__device__ void calcSoftmax(cg::thread_block_tile<WarpSize> const& warp, TypeExpW (&scores)[VecSize])
-{
-    TypeExpW maxScore = TypeExpW{-INFINITY};
-    TypeExpW sumScore = TypeExpW{0.f};
-
-    // Get the max score for each token
-    for (int i = 0; i < VecSize; ++i)
-    {
-        maxScore = scores[i] >= maxScore ? scores[i] : maxScore;
-    }
-    maxScore = cg::reduce(warp, maxScore, cg::greater<TypeExpW>());
-
-    // Get the summation of scores for each token
-#pragma unroll
-    for (int i = 0; i < VecSize; ++i)
-    {
-        scores[i] = static_cast<TypeExpW>(exp(scores[i] - maxScore));
-        sumScore += scores[i];
-    }
-    sumScore = cg::reduce(warp, sumScore, cg::plus<TypeExpW>());
-
-    // Normalize the scores
-#pragma unroll
-    for (int i = 0; i < VecSize; ++i)
-    {
-        scores[i] = static_cast<TypeExpW>(scores[i] / sumScore);
-    }
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <typename TypeExpW>
-__device__ TypeExpW calcSoftmax(
-    cg::thread_block_tile<WarpSize> const& warp, TypeExpW score, int32_t laneIdx, int32_t NumTopExperts)
-{
-    TypeExpW maxScore = TypeExpW{-INFINITY};
-    if (laneIdx < NumTopExperts)
-    {
-        maxScore = score >= maxScore ? score : maxScore;
-    }
-    maxScore = cg::reduce(warp, maxScore, cg::greater<TypeExpW>());
-
-    float sumScore = float{0.f};
-    float newScore;
-    // Get the summation of scores for each token
-    if (laneIdx < NumTopExperts)
-    {
-        newScore = static_cast<float>(score) - static_cast<float>(maxScore);
-        newScore = static_cast<float>(exp(newScore));
-        sumScore += newScore;
-    }
-    sumScore = cg::reduce(warp, sumScore, cg::plus<float>());
-
-    if (laneIdx < NumTopExperts)
-    {
-        score = static_cast<TypeExpW>(newScore / sumScore);
-    }
-
-    return score;
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename KernelParams, bool DoSoftmaxBeforeTopK = false>
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -2977,7 +2377,7 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
             }
 
             // Get the top-k scores and their corresponding expert indices
-            reduceTopK(warp, warpTopKScore, warpTopKExpertIdx, score, idx, minScore);
+            topk::reduceTopK(warp, warpTopKScore, warpTopKExpertIdx, score, idx, minScore);
 
             // Normalize the scores
             if constexpr (DoSoftmaxBeforeTopK)
@@ -3276,7 +2676,7 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramScoresK
         }
 
         // Get the top-k scores and their corresponding expert indices
-        reduceTopK(warp, warpTopKScore, warpTopKExpertIdx, allScores, allExpertIdx, minScore);
+        topk::reduceTopK(warp, warpTopKScore, warpTopKExpertIdx, allScores, allExpertIdx, minScore);
         __syncwarp(); //@TODO: check the synchronization
 
         // Normalize the scores
@@ -3738,4 +3138,5 @@ void run(Data const& data, void* stream)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+} // namespace routing
 } // namespace moe::dev

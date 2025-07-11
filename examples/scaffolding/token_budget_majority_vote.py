@@ -77,16 +77,17 @@ def main():
     args = parse_arguments()
     workers = {}
 
-    llm_worker = TRTLLMWorker.init_with_new_llm(args.model_dir,
-                                                backend="pytorch",
-                                                max_batch_size=32,
-                                                max_num_tokens=4096,
-                                                temperature=0.9)
+    llm_worker = TRTLLMWorker.init_with_new_llm(
+        args.model_dir,
+        max_batch_size=32,
+        max_num_tokens=4096,
+    )
 
     prototype_generation_controller = NativeGenerationController(
-        custom_sampling_params={
+        sampling_params={
             "max_tokens": 4096,
             "top_p": 0.9,
+            "temperature": 0.9,
         })
     workers[NativeGenerationController.WorkerTag.GENERATION] = llm_worker
 

@@ -42,6 +42,7 @@ class MoERunner(TunableRunner):
         enable_alltoall: bool,
         use_deepseek_fp8_block_scale: bool,
         use_w4a8_group_scaling: bool,
+        use_mxfp8_act_scaling: bool,
         min_latency_mode: bool,
     ):
         self.x_dtype = x_dtype
@@ -57,15 +58,18 @@ class MoERunner(TunableRunner):
         self.enable_alltoall = enable_alltoall
         self.use_deepseek_fp8_block_scale = use_deepseek_fp8_block_scale
         self.use_w4a8_group_scaling = use_w4a8_group_scaling
+        self.use_mxfp8_act_scaling = use_mxfp8_act_scaling
         self.min_latency_mode = min_latency_mode
         instance_key = (x_dtype, weight_dtype, output_dtype,
-                        use_deepseek_fp8_block_scale, use_w4a8_group_scaling)
+                        use_deepseek_fp8_block_scale, use_w4a8_group_scaling,
+                        use_mxfp8_act_scaling)
 
         if instance_key not in MoERunner.runner_dict:
             MoERunner.runner_dict[
                 instance_key] = torch.classes.trtllm.FusedMoeRunner(
                     x_dtype, weight_dtype, output_dtype,
-                    use_deepseek_fp8_block_scale, use_w4a8_group_scaling)
+                    use_deepseek_fp8_block_scale, use_w4a8_group_scaling,
+                    use_mxfp8_act_scaling)
         self.fused_moe_runner = MoERunner.runner_dict[instance_key]
 
     def get_valid_tactics(
@@ -134,6 +138,7 @@ def fused_moe(
     enable_alltoall: bool = False,
     use_deepseek_fp8_block_scale: bool = False,
     use_w4a8_group_scaling: bool = False,
+    use_mxfp8_act_scaling: bool = False,
     min_latency_mode: bool = False,
     tune_max_num_tokens: int = 8192,
 ) -> List[torch.Tensor]:
@@ -156,6 +161,7 @@ def fused_moe(
         enable_alltoall=enable_alltoall,
         use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
         use_w4a8_group_scaling=use_w4a8_group_scaling,
+        use_mxfp8_act_scaling=use_mxfp8_act_scaling,
         min_latency_mode=min_latency_mode,
     )
 
@@ -227,6 +233,7 @@ def _(
     enable_alltoall: bool = False,
     use_deepseek_fp8_block_scale: bool = False,
     use_w4a8_group_scaling: bool = False,
+    use_mxfp8_act_scaling: bool = False,
     min_latency_mode: bool = False,
     tune_max_num_tokens: int = 8192,
 ):
@@ -246,6 +253,93 @@ def _(
         ]
     else:
         return [input.new_empty([seq_len, hidden_size], dtype=output_dtype)]
+
+
+class FP8RowwiseGemmRunner(TunableRunner):
+    runner_dict = dict()
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2), ),
+        constraint_specs=(
+            ConstraintSpec(2, 0, lambda shapes: shapes[0][0]),
+            ConstraintSpec(3, 0, lambda shapes: shapes[1][0]),
+        ))
+
+    def __init__(
+        self,
+        to_userbuffers: bool,
+        output_dtype: torch.dtype,
+    ):
+        self.to_userbuffers = to_userbuffers
+        self.output_dtype = output_dtype
+        instance_key = (output_dtype, )
+        if instance_key not in FP8RowwiseGemmRunner.runner_dict:
+            FP8RowwiseGemmRunner.runner_dict[
+                instance_key] = torch.classes.trtllm.FP8RowwiseGemmRunner(
+                    output_dtype)
+        self.fp8_rowwise_gemm_runner = FP8RowwiseGemmRunner.runner_dict[
+            instance_key]
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+    ) -> List[int]:
+        return list(range(self.fp8_rowwise_gemm_runner.get_num_configs()))
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = -1,
+    ) -> torch.Tensor:
+        mat1, mat2, mat1_scale, mat2_scale = inputs
+        return self.fp8_rowwise_gemm_runner.run_gemm(
+            mat1,
+            mat2,
+            mat1_scale,
+            mat2_scale,
+            self.to_userbuffers,
+            tactic,
+        )
+
+
+@torch.library.custom_op("trtllm::fp8_rowwise_gemm", mutates_args=())
+def fp8_rowwise_gemm(
+    act: torch.Tensor,
+    weight: torch.Tensor,
+    act_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    to_userbuffers: bool = False,
+) -> torch.Tensor:
+
+    tuner = AutoTuner.get()
+
+    # allocate workspace for profiling
+    fp8_rowwise_gemm_runner = FP8RowwiseGemmRunner(to_userbuffers, output_dtype)
+
+    _, best_tactic = tuner.choose_one(
+        "trtllm::fp8_rowwise_gemm::gemm",
+        [fp8_rowwise_gemm_runner],
+        FP8RowwiseGemmRunner.tuning_config,
+        [act, weight, act_scale, weight_scale],
+    )
+
+    return fp8_rowwise_gemm_runner(
+        inputs=[act, weight, act_scale, weight_scale], tactic=best_tactic)
+
+
+@fp8_rowwise_gemm.register_fake
+def _(
+    act: torch.Tensor,
+    weight: torch.Tensor,
+    act_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    to_userbuffers: bool = False,
+) -> torch.Tensor:
+    return act.new_empty((act.size(0), weight.size(0)), dtype=output_dtype)
 
 
 class FP4GemmRunner(TunableRunner):

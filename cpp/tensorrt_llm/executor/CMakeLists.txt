@@ -18,7 +18,7 @@ set(SRCS
     cache_transmission/mpi_utils/connection.cpp
     cache_transmission/agent_utils/connection.cpp
     cache_transmission/transferAgent.cpp
-    cache_transmission/cacheConcatenate.cu
+    cache_transmission/cacheSplitConcat.cu
     contextPhaseParams.cpp
     debugConfig.cpp
     decodingConfig.cpp

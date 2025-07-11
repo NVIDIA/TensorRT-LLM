@@ -7,3 +7,7 @@ h11>=0.16.0
 tornado>=6.5.0
 # WAR against https://github.com/advisories/GHSA-5rjg-fvgr-3xxf
 setuptools>=78.1.1
+# WAR against https://github.com/advisories/GHSA-8qvm-5x2c-j2w7
+protobuf>=4.25.8
+# WAR against https://github.com/advisories/GHSA-33p9-3p43-82vq
+jupyter-core>=5.8.1

@@ -23,6 +23,7 @@
 #include "tensorrt_llm/kernels/delayStream.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
+#include "tensorrt_llm/runtime/decoderState.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
 #include "tensorrt_llm/runtime/gptDecoder.h"
@@ -273,10 +274,7 @@ void initBindings(pybind11::module_& m)
         .def(py::init<std::vector<tr::ITensor::SharedConstPtr>>(), py::arg("logits"))
         .def_readwrite("logits", &tr::decoder_batch::Input::logits)
         .def_readwrite("max_decoder_steps", &tr::decoder_batch::Input::maxDecoderSteps)
-        .def_readwrite("batch_slots", &tr::decoder_batch::Input::batchSlots)
-        .def_readwrite("batch_slots_request_order", &tr::decoder_batch::Input::batchSlotsRequestOrder)
-        .def_readwrite("generation_steps", &tr::decoder_batch::Input::generationSteps)
-        .def_readwrite("predicted_draft_logits", &tr::decoder_batch::Input::predictedDraftLogits);
+        .def_readwrite("batch_slots", &tr::decoder_batch::Input::batchSlots);
 
     py::class_<tr::LookaheadDecodingBuffers>(m, "LookaheadDecodingBuffers")
         .def(py::init<tr::SizeType32, tr::SizeType32, tr::BufferManager const&>(), py::arg("max_num_sequences"),
@@ -338,6 +336,8 @@ void initBindings(pybind11::module_& m)
             py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"))
         .def_property_readonly("joint_decoding_input", &tr::decoder::DecoderState::getJointDecodingInput)
         .def_property_readonly("joint_decoding_output", &tr::decoder::DecoderState::getJointDecodingOutput)
+        .def_property_readonly("cache_indirection_input", &tr::decoder::DecoderState::getCacheIndirectionInput)
+        .def_property_readonly("cache_indirection_output", &tr::decoder::DecoderState::getCacheIndirectionOutput)
         .def_property_readonly(
             "sequence_lengths", py::overload_cast<>(&tr::decoder::DecoderState::getSequenceLengths, py::const_))
         .def("get_sequence_lengths",
@@ -380,7 +380,9 @@ void initBindings(pybind11::module_& m)
             py::arg("batch_idx"))
         .def("set_num_decoding_engine_tokens", &tr::decoder::DecoderState::setNumDecodingEngineTokens,
             py::arg("batch_idx"), py::arg("num_tokens"))
-        .def_property_readonly("speculative_decoding_mode", &tr::decoder::DecoderState::getSpeculativeDecodingMode);
+        .def_property_readonly("speculative_decoding_mode", &tr::decoder::DecoderState::getSpeculativeDecodingMode)
+        .def_property("generation_steps", &tr::decoder::DecoderState::getGenerationSteps,
+            &tr::decoder::DecoderState::setGenerationSteps);
 
     py::class_<tr::GptDecoderBatched>(m, "GptDecoderBatched")
         .def(py::init<tr::GptDecoderBatched::CudaStreamPtr>(), py::arg("stream"))
@@ -388,6 +390,8 @@ void initBindings(pybind11::module_& m)
             py::arg("max_beam_width"), py::arg("dtype"), py::arg("model_config"), py::arg("world_config"))
         .def("forward_async", &tr::GptDecoderBatched::forwardAsync, py::arg("decoder_state"), py::arg("input"))
         .def("underlying_decoder", &tr::GptDecoderBatched::getUnderlyingDecoder, py::return_value_policy::reference)
+        .def("finalize", &tr::GptDecoderBatched::finalize, py::arg("decoder_state"), py::arg("batch_idx"),
+            py::arg("sampling_config"), py::arg("streaming"))
         .def_property_readonly(
             "decoder_stream",
             [](tr::GptDecoderBatched& self) -> tr::CudaStream const& { return *self.getDecoderStream(); },

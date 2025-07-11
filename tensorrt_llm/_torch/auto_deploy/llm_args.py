@@ -79,7 +79,7 @@ class LlmArgs(BaseLlmArgs):
         repr=False,
     )
 
-    mixed_sampler: bool = Field(
+    enable_mixed_sampler: bool = Field(
         default=False,
         description="If true, will iterate over sampling_params of each request and use the corresponding "
         "sampling strategy, e.g. top-k, top-p, etc.",
@@ -95,6 +95,12 @@ class LlmArgs(BaseLlmArgs):
     runtime: Literal["demollm", "trtllm"] = Field(default="trtllm")
 
     device: str = Field(default="cuda", description="The device to use for the model.", frozen=True)
+
+    kv_cache_dtype: str = Field(
+        default="auto",
+        description="Data type for KV cache. This is a temporary field until kv_cache_dtype is "
+        "supported in AutoDeploy.",
+    )
 
     # INFERENCE OPTIMIZER CONFIG ###################################################################
     attn_backend: Literal["flashinfer", "triton"] = Field(

@@ -552,7 +552,7 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
         mAllBlocksById, {blocksInPrimaryPool, blocksInSecondaryPool}, secondaryOffloadMinPriority);
     if (mEventManager)
     {
-        mEventManager->enqueueCreatedEvent({blocksInPrimaryPool, blocksInSecondaryPool});
+        mEventManager->enqueueCreatedEvent({blocksInPrimaryPool, blocksInSecondaryPool}, mWindowSize);
     }
 }
 
@@ -741,7 +741,7 @@ void WindowBlockManager::freeChildren(
     // Free block
     if (mEventManager && blockInRadixTree(block))
     {
-        mEventManager->enqueueRemovedEvent(block);
+        mEventManager->enqueueRemovedEvent(block, mWindowSize);
     }
 
     claimLeafBlock(block, priority, durationMs);
@@ -776,7 +776,8 @@ BlockPtr WindowBlockManager::getFreeBlock(
         if (mEventManager && blockInRadixTree(block))
         {
             mEventManager->enqueueUpdatedEvent(
-                tle::KVCacheUpdatedData(block->getHash()).cacheLevelUpdated(kPrimaryLevel, kSecondaryLevel));
+                tle::KVCacheUpdatedData(block->getHash()).cacheLevelUpdated(kPrimaryLevel, kSecondaryLevel),
+                mWindowSize);
         }
         mEvictionPolicy->releaseBlock(block); // append offload block to mFreeSecondaryBlocks queue
         block = offloadBlock;
@@ -881,7 +882,8 @@ void WindowBlockManager::onboardBlock(BlockPtr const& offloadBlock)
         if (mEventManager)
         {
             mEventManager->enqueueUpdatedEvent(
-                tle::KVCacheUpdatedData(offloadBlock->getHash()).cacheLevelUpdated(kSecondaryLevel, kPrimaryLevel));
+                tle::KVCacheUpdatedData(offloadBlock->getHash()).cacheLevelUpdated(kSecondaryLevel, kPrimaryLevel),
+                mWindowSize);
         }
         mEvictionPolicy->releaseBlock(block); // append block to offload queue
                                               // offloadBlock is now in primary memory pool
@@ -908,7 +910,8 @@ void WindowBlockManager::offloadBlock(BlockPtr const& block)
         if (mEventManager && blockInRadixTree(block))
         {
             mEventManager->enqueueUpdatedEvent(
-                tle::KVCacheUpdatedData(block->getHash()).cacheLevelUpdated(kPrimaryLevel, kSecondaryLevel));
+                tle::KVCacheUpdatedData(block->getHash()).cacheLevelUpdated(kPrimaryLevel, kSecondaryLevel),
+                mWindowSize);
         }
         mEvictionPolicy->releaseBlock(offloadBlock); // append offloadBlock to mFreePrimaryBlocks queue
                                                      // block is now in secondary memory
@@ -980,7 +983,8 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
             {
                 mEventManager->enqueueUpdatedEvent(
                     tle::KVCacheUpdatedData(matchingBlock->getHash())
-                        .priorityUpdated(matchingBlock->getPriority(), *perBlockRetentions[bi].retentionPriority));
+                        .priorityUpdated(matchingBlock->getPriority(), *perBlockRetentions[bi].retentionPriority),
+                    mWindowSize);
             }
             if (partialMatch)
             {
@@ -1275,7 +1279,7 @@ void WindowBlockManager::storeBlocks(
     }
     if (mEventManager)
     {
-        mEventManager->enqueueStoredEvent(storedBlocks);
+        mEventManager->enqueueStoredEvent(storedBlocks, mWindowSize);
     }
 }
 
@@ -1409,6 +1413,77 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
         }
         manager.releaseBlocks(sequence);
     }
+}
+
+void BlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest)
+{
+    // we store newest block for potential reuse only if:
+    // - Block reuse is enabled.
+    // - A request was provided to this function call to identify which tokens these blocks cover
+    // - Beam search is NOT enabled <=> beam width == 1
+    // - The sequence was not marked for use with cyclic kv-cache when it was added (when its context is too long to fit
+    // the max attention window).
+    // - The sequence did not switch to cyclic kv-cache during generation phase.
+    //  A sequence is cyclic if its *minimum window size* is crossed, even if other window sizes were not reached.
+    bool const storeBlocksForReuse = sequence.getBeamWidth() == 1 && llmRequest.has_value() && !sequence.isCyclic();
+    if (!storeBlocksForReuse)
+    {
+        return;
+    }
+    for (auto& [_, manager] : mWindowBlockManagers)
+    {
+        manager.storeNewBlock(sequence, llmRequest);
+    }
+}
+
+void WindowBlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest)
+{
+    auto constexpr beamIdx = 0;
+    auto const& uniqueTokens = llmRequest->getUniqueTokens(beamIdx);
+    auto const& cacheBlockIds = sequence.getCacheBlockIds(mWindowSize);
+
+    if (uniqueTokens.size() == 0)
+    {
+        return;
+    }
+
+    // TODO: get the caller to mark tokens as filled / not filled, so that the kv-cache manager doesn't
+    // have to guess. Only (length - 1) tokens of the sequence have their kv-state recorded in kv-cache. We assume
+    // the last token's state is not filled yet.
+    auto const usableSize = static_cast<runtime::SizeType32>(uniqueTokens.size()) - 1;
+    if (usableSize % mTokensPerBlock != 0)
+    {
+        return;
+    }
+    auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableSize, mTokensPerBlock, true);
+    auto blockKeys = buildBlockKeys(blockedUniqueTokens, *llmRequest);
+    if (blockKeys.size() < 2 || cacheBlockIds[beamIdx].size() < blockKeys.size())
+    {
+        // store all blocks
+        TLLM_LOG_DEBUG("%s::storeNewBlock - store all blocks", mLogPrefix.c_str());
+        storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
+        return;
+    }
+
+    auto lastBlock = mAllBlocksById.at(cacheBlockIds[beamIdx][blockKeys.size() - 1]);
+    auto prevBlock = mAllBlocksById.at(cacheBlockIds[beamIdx][blockKeys.size() - 2]);
+
+    // If the previous block is not in the radix tree, we need to store all blocks
+    if (prevBlock->getPrevBlock() == nullptr)
+    {
+        TLLM_LOG_DEBUG("%s::storeNewBlock - store all blocks", mLogPrefix.c_str());
+        storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
+        return;
+    }
+
+    if (lastBlock->getPrevBlock() != nullptr)
+    {
+        // If the last block is not in the radix tree, we need to store all blocks
+        TLLM_LOG_DEBUG("%s::storeNewBlock - no need to store", mLogPrefix.c_str());
+        return;
+    }
+    TLLM_LOG_DEBUG("%s::storeNewBlock - store the last block", mLogPrefix.c_str());
+    storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
 }
 
 void WindowBlockManager::storeBlocksForReuse(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest)
@@ -1957,6 +2032,17 @@ void KVCacheManager::storeContextBlocks(LlmRequest const& llmRequest)
     if (mEnableBlockReuse && !sequence.isCyclic() && !llmRequest.isDummyRequest())
     {
         mBlockManager.storeContextBlocks(sequence, llmRequest);
+    }
+}
+
+void KVCacheManager::storeNewBlock(LlmRequest const& llmRequest)
+{
+    auto const requestId = llmRequest.mRequestId;
+    auto& sequence = getSequence(requestId);
+    bool const storeBlocksForReuse = sequence.getBeamWidth() == 1 && !sequence.isCyclic();
+    if (mEnableBlockReuse && storeBlocksForReuse)
+    {
+        mBlockManager.storeNewBlock(sequence, llmRequest);
     }
 }
 

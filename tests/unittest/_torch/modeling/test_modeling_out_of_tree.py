@@ -23,7 +23,7 @@ class TestOutOfTree(unittest.TestCase):
             sys.path.append(
                 os.path.join(
                     os.path.dirname(__file__),
-                    '../../../../examples/pytorch/out_of_tree_example'))
+                    '../../../../examples/llm-api/out_of_tree_example'))
             import modeling_opt  # noqa
 
         model_dir = str(llm_models_root() / "opt-125m")

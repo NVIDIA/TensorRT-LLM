@@ -142,24 +142,6 @@ public:
 
     struct EagleInputs
     {
-        EagleInputs(TensorConstPtr nextDraftTokens, TensorConstPtr nextDraftLens, TensorConstPtr nextDraftPaths,
-            TensorConstPtr lastDraftTokens, TensorConstPtr lastDraftLens, TensorConstPtr lastDraftPaths,
-            TensorConstPtr acceptedTokens, TensorConstPtr acceptedLens, TensorConstPtr acceptedPathIds,
-            TensorConstPtr chunkedContextNextTokens, TensorConstPtr seqSlots)
-            : nextDraftTokens(std::move(nextDraftTokens))
-            , nextDraftLens(std::move(nextDraftLens))
-            , nextDraftPaths(std::move(nextDraftPaths))
-            , lastDraftTokens(std::move(lastDraftTokens))
-            , lastDraftLens(std::move(lastDraftLens))
-            , lastDraftPaths(std::move(lastDraftPaths))
-            , acceptedTokens(std::move(acceptedTokens))
-            , acceptedLens(std::move(acceptedLens))
-            , acceptedPathIds(std::move(acceptedPathIds))
-            , chunkedContextNextTokens(std::move(chunkedContextNextTokens))
-            , seqSlots(std::move(seqSlots))
-        {
-        }
-
         TensorConstPtr nextDraftTokens;          // [batchSize, maxDecodingDraftTokens]
         TensorConstPtr nextDraftLens;            // [batchSize]
         TensorConstPtr nextDraftPaths;           // [batchSize, maxDecodingTokens, maxPathLen]

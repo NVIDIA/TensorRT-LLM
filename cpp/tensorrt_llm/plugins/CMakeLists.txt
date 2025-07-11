@@ -107,6 +107,7 @@ if(WIN32)
 endif()
 
 add_library(${PLUGIN_SHARED_TARGET} SHARED ${PLUGIN_SOURCES})
+add_cuda_architectures(${PLUGIN_SHARED_TARGET} 89)
 
 target_include_directories(
   ${PLUGIN_SHARED_TARGET}
