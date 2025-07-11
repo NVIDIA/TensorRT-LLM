@@ -51,7 +51,7 @@ from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      run_concurrently, timing)
 from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, MoeLoadBalancerIterContext, maybe_create_moe_load_balancer)
-from ..speculative import SpecConfig, SpecMetadata, get_spec_metadata
+from ..speculative import SpecMetadata, get_spec_metadata
 from ..utils import (get_model_extra_attrs, set_torch_compiling,
                      with_model_extra_attrs)
 from .config import LoadFormat, PyTorchConfig
@@ -353,7 +353,7 @@ class PyTorchModelEngine(ModelEngine):
         mapping: Optional[Mapping] = None,
         attn_runtime_features: Optional[AttentionRuntimeFeatures] = None,
         dist: Optional[MPIDist] = None,
-        spec_config: Optional[SpecConfig] = None,
+        spec_config: Optional["DecodingBaseConfig"] = None,
         guided_decoding_config: Optional[GuidedDecodingConfig] = None,
         lora_config: Optional[LoraConfig] = None,
         is_draft_model: bool = False,
@@ -456,7 +456,7 @@ class PyTorchModelEngine(ModelEngine):
         if self.is_spec_decode:
             self.spec_metadata = None
             self.spec_config.update_from_model_config(self.model.config)
-            max_num_draft_tokens = self.spec_config.max_draft_tokens * batch_size
+            max_num_draft_tokens = self.spec_config.max_draft_len * batch_size
             self.draft_tokens_cuda = torch.empty((max_num_draft_tokens, ),
                                                  dtype=torch.int,
                                                  device='cuda')
@@ -472,7 +472,7 @@ class PyTorchModelEngine(ModelEngine):
                                                              device='cuda')
             self.without_logits = self.spec_config.spec_dec_mode.without_logits(
             )
-            self.max_draft_len = spec_config.max_draft_tokens
+            self.max_draft_len = spec_config.max_draft_len
         else:
             self.without_logits = False
             self.max_draft_len = 0
@@ -766,7 +766,7 @@ class PyTorchModelEngine(ModelEngine):
                                              resource_manager=resource_manager)
                                 torch.cuda.synchronize()
 
-            if self.pytorch_backend_config.autotuner_enabled:
+            if self.pytorch_backend_config.enable_autotuner:
                 with self.no_cuda_graph(), autotune():
                     result = get_autotune_warmup_request()
                     with release_batch(result) as batch:
@@ -870,6 +870,7 @@ class PyTorchModelEngine(ModelEngine):
         if no_cache:
             return get_spec_metadata(
                 self.spec_config,
+                self.model.config,
                 self.batch_size,
                 max_num_tokens=self.max_num_tokens,
                 spec_resource_manager=spec_resource_manager,
@@ -879,6 +880,7 @@ class PyTorchModelEngine(ModelEngine):
             return self.spec_metadata
         self.spec_metadata = get_spec_metadata(
             self.spec_config,
+            self.model.config,
             self.batch_size,
             max_num_tokens=self.max_num_tokens,
             spec_resource_manager=spec_resource_manager,
@@ -963,7 +965,7 @@ class PyTorchModelEngine(ModelEngine):
     def _maybe_get_cuda_graph(
         self,
         batch: ScheduledRequests,
-        spec_config: Optional[SpecConfig] = None
+        spec_config: Optional["DecodingBaseConfig"] = None
     ) -> Optional[DecodingCUDAGraphRunner]:
         """
         Get a CUDA graph runner or return None (e.g. if CUDA graphs are disabled
@@ -973,7 +975,7 @@ class PyTorchModelEngine(ModelEngine):
         if ExpertStatistic.set_iter(self.iter_counter):
             return None
 
-        spec_max_draft_tokens = spec_config.max_draft_tokens if self.is_spec_decode else 0
+        spec_max_draft_tokens = spec_config.max_draft_len if self.is_spec_decode else 0
         can_run_cuda_graph = batch.can_run_cuda_graph
         batch_size = len(batch.generation_requests)
         if self._run_cuda_graphs and self.enable_attention_dp and self.mapping.tp_size > 1:
@@ -1090,7 +1092,8 @@ class PyTorchModelEngine(ModelEngine):
 
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
-                    weights = load_weights(self.spec_config.draft_model_path)
+                    weights = load_weights(
+                        self.spec_config.speculative_model_dir)
                     model.load_draft_weights(weights)
 
             elif load_format == LoadFormat.DUMMY:
@@ -1273,9 +1276,8 @@ class PyTorchModelEngine(ModelEngine):
         extend_requests += extend_dummy_requests
 
         if not self._disable_overlap_scheduler and self.is_spec_decode:
-            spec_dec_mode = self.spec_config.spec_dec_mode
-            assert spec_dec_mode.support_overlap_scheduler(
-            ), f"{self.spec_config.spec_dec_name} does not support overlap scheduler"
+            assert self.spec_config.spec_dec_mode.support_overlap_scheduler(
+            ), f"{self.spec_config.decoding_type} does not support overlap scheduler"
 
         # will contain previous batch indices of generation requests
         previous_batch_indices = []
@@ -2090,7 +2092,7 @@ class PyTorchModelEngine(ModelEngine):
                 spec_metadata.spec_dec_mode.attention_need_spec_dec_mode(),
                 spec_metadata.is_spec_dec_tree,
                 spec_metadata.is_spec_dec_dynamic_tree,
-                spec_metadata.max_draft_tokens)
+                spec_metadata.max_draft_len)
         else:
             spec_metadata = None
 

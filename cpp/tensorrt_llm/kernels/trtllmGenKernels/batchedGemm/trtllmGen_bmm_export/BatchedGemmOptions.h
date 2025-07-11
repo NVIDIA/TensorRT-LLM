@@ -91,9 +91,9 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions
         gemm::KernelTraits kernelTraits, gemm::MatrixLayout layoutA, gemm::MatrixLayout layoutB, int m, int mmaK,
         tg::MmaKind mmaKind, int mmaM, int mmaN, bool mockAllReduce, int n, int numSlicesForSplitK,
         int numSlicesForSliceK, int numStages, int numStagesMma, int numStagesMmaWithinWorkTile,
-        int numStagesMmaAcrossWorkTile, int numStagesWorkId, bool outputDebugTensors, bool useShuffledMatrixA,
-        bool sliceK, gemm::SplitK splitK, bool transposeMmaOutput, int tileM, int tileN, int tileK,
-        bool useUnrollLoop2xForMma, bool useCustomMmaSchedule, bool useHoistTryWaitForCustomMmaSchedule,
+        int numStagesMmaAcrossWorkTile, int numStagesWorkId, bool outputDebugTensors, bool patchF2fp,
+        bool useShuffledMatrixA, bool sliceK, gemm::SplitK splitK, bool transposeMmaOutput, int tileM, int tileN,
+        int tileK, bool useUnrollLoop2xForMma, bool useCustomMmaSchedule, bool useHoistTryWaitForCustomMmaSchedule,
         bool useDeepSeekFp8, bool usePerTokenSfA, bool usePerTokenSfB, bool useTmaStore, bool useTwoTmaLoadWarps,
         bool useTwoMmaWarps, tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC,
         int32_t sfReshapeFactor, gemm::TileScheduler tileScheduler, gemmGatedAct::ActType actType,
@@ -107,7 +107,7 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions
                 gridTriggerSecondaryB, gridWaitForPrimaryEarlyExit, gridWaitForPrimaryA, gridWaitForPrimaryB,
                 hoistLoadTaskInit, hoistMmaTaskTryWaits, k, kernelTraits, layoutA, layoutB, m, mmaK, mmaKind, mmaM,
                 mmaN, mockAllReduce, n, numSlicesForSplitK, numSlicesForSliceK, numStages, numStagesMma,
-                numStagesMmaWithinWorkTile, numStagesMmaAcrossWorkTile, numStagesWorkId, outputDebugTensors,
+                numStagesMmaWithinWorkTile, numStagesMmaAcrossWorkTile, numStagesWorkId, outputDebugTensors, patchF2fp,
                 useShuffledMatrixA, sliceK, splitK, transposeMmaOutput, tileM, tileN, tileK, useUnrollLoop2xForMma,
                 useCustomMmaSchedule, useHoistTryWaitForCustomMmaSchedule, useDeepSeekFp8, usePerTokenSfA,
                 usePerTokenSfB, useTmaStore, useTwoTmaLoadWarps, useTwoMmaWarps, sfLayoutA, sfLayoutB, sfLayoutC,
@@ -277,8 +277,9 @@ bool checkAndUpdateBatchedGemmOptions(BatchedGemmOptions& options, bool isBlackw
             }
             else
             {
-                TLLM_CHECK_ERROR(
-                    options.mSfLayoutB == tg::SfLayout::Linear, "Tokens need use SF linear layout when being routed");
+                // Note: if B is cast from a non-block format to a block format, there are no SFs to load.
+                TLLM_CHECK_ERROR(options.mSfLayoutB == tg::SfLayout::Linear || !tg::dtypeIsBlockFmt(options.mDtypeB),
+                    "Tokens need use SF linear layout when being routed");
             }
         }
 
