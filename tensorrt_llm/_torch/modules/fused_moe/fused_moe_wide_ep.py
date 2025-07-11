@@ -370,7 +370,13 @@ class WideEPMoE(MoE):
             assert x.dtype != torch.float8_e4m3fn, "Current workaround for apply_router_weight_on_input does not support fp8 input"
             x = x * token_final_scales.to(x.dtype)
             # TODO: remove this once we have correct fusedmoe kernel ready
-            token_final_scales = None
+            if self.alltoall_method_type in (
+                    AlltoallMethodType.DeepEP,
+                    AlltoallMethodType.DeepEPLowLatency):
+                # DeepEP doesn't support token_final_scales is None
+                token_final_scales = torch.ones_like(token_final_scales)
+            else:
+                token_final_scales = None
 
         if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
         ) and is_first_call:
@@ -420,19 +426,11 @@ class WideEPMoE(MoE):
                                                          loadbalancer_local_statistic_info)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
                 if not self.use_postquant_alltoall:
-                    # DeepEP doesn't support token_final_scales is None
-                    if token_final_scales is None:
-                        token_final_scales = torch.ones_like(
-                            token_selected_slots, dtype=torch.float32)
                     x, recv_topk_idx, token_final_scales, num_recv_tokens_per_expert_list, deep_ep_handle = \
                         self.deep_ep_buffer.dispatch(x, token_selected_slots.to(torch.int64), token_final_scales, self.num_slots)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                 if not self.use_postquant_alltoall:
                     deep_ep_topk_idx = token_selected_slots.to(torch.int64)
-                    # DeepEP doesn't support token_final_scales is None
-                    if token_final_scales is None:
-                        token_final_scales = torch.ones_like(
-                            token_selected_slots, dtype=torch.float32)
                     deep_ep_topk_weights = token_final_scales
                     x, recv_expert_count, deep_ep_handle = \
                         self.deep_ep_buffer.low_latency_dispatch(x, deep_ep_topk_idx, self.deep_ep_max_num_tokens, self.num_slots)
@@ -458,8 +456,8 @@ class WideEPMoE(MoE):
                     # Cheat the fused_moe API with fake top_k=1
                     token_selected_slots = token_selected_slots.view(
                         x.shape[0], 1)
-                    token_final_scales = torch.ones_like(token_selected_slots,
-                                                         dtype=torch.float32)
+                    token_final_scales = torch.ones_like(
+                        token_selected_slots, dtype=token_final_scales.dtype)
 
         x_sf = None
         x_is_sf_swizzled = x.is_sf_swizzled if isinstance(
