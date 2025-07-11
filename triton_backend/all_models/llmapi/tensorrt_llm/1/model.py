@@ -167,6 +167,13 @@ class TritonPythonModel:
                 f"[trtllm] rank{global_mpi_rank()} is starting trtllm engine with args: {self.llm_engine_args}"
             )
 
+            triton_config = get_model_config(
+                os.environ.get('LLM_CONFIG_PATH', 'model.yaml'),
+                include_keys=["triton_config"])["triton_config"]
+            self.cancellation_check_period_ms = int(
+                triton_config["cancellation_check_period_ms"]
+            ) if "cancellation_check_period_ms" in triton_config else 100
+
             if global_mpi_size() > 1:
                 mpi_session = MpiCommSession(comm=COMM_WORLD,
                                              n_workers=COMM_WORLD.Get_size())
@@ -311,7 +318,7 @@ class TritonPythonModel:
         """Checks if any pending requests have been cancelled."""
         while self.running:
             import time
-            time.sleep(.001)
+            time.sleep(self.cancellation_check_period_ms / 1000.0)
             with self.lock:
                 cancelled_req_ids = []
                 for req_id, request_data in self.req_id_to_request_data.items():
