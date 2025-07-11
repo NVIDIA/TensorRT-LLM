@@ -2,6 +2,7 @@ import os
 import sys
 
 import pytest
+import torch
 import yaml
 
 sys.path.append(os.path.join(os.environ["LLM_ROOT"], "triton_backend"))
@@ -3632,6 +3633,9 @@ def test_llmapi_backend(E2E_MODEL_NAME, DECOUPLED_MODE, TRITON_MAX_BATCH_SIZE,
                         llm_backend_inflight_batcher_llm_root, llm_backend_venv,
                         llm_backend_dataset_root):
     llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+
+    if torch.cuda.device_count() < int(TENSOR_PARALLEL_SIZE):
+        pytest.skip("Skipping. Not enough GPUs.")
 
     # Prepare model repo
     new_model_repo = os.path.join(llm_backend_repo_root, "triton_repo")
