@@ -26,6 +26,7 @@ import torch
 import torch.nn as nn
 from torch.fx import GraphModule, Node
 
+from ...custom_ops.quant import QUANT_BMM_OPS
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     extract_param_names_from_lin_node,
@@ -446,7 +447,7 @@ def dp_bmm_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
             bmm_node.update_arg(arg_idx, tensor_slice)
 
     for node in gm.graph.nodes:
-        if not is_op(node, {torch.ops.aten.bmm}):
+        if not is_op(node, {torch.ops.aten.bmm}.union(QUANT_BMM_OPS)):
             continue
 
         ad_logger.debug(f"Found BMM node: {node}")
