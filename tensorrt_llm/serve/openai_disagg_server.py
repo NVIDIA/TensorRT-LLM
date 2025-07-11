@@ -130,6 +130,8 @@ class OpenAIDisaggServer:
 
             #If request finished after first token not due to length, return right away and skip gen
             if ctx_response is not None and ctx_response.choices[0].finish_reason not in ["length", "not_finished"]:
+                del ctx_response.choices[0].disaggregated_params
+                yield ctx_response.json()
                 yield f"data: [DONE]\n\n".encode('utf-8')
             else:
                 # Then yield the generation responses
