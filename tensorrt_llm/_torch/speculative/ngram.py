@@ -59,10 +59,10 @@ class NGramPoolManager(BaseResourceManager):
         self.start_index = {}
 
     def get_max_resource_count(self) -> int:
-        raise self.max_num_requests
+        return self.max_num_requests
 
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
-        raise 0
+        return 0
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         pass

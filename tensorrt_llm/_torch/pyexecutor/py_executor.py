@@ -30,7 +30,7 @@ from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
 from tensorrt_llm.logger import logger
 
 from ..distributed import Distributed
-from ..speculative.drafter import Drafter
+from ..speculative.drafter import Drafter, create_drafter
 from .guided_decoder import GuidedDecoder
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
@@ -971,8 +971,20 @@ class PyExecutor:
                             scheduled_batch)
 
                     self.resource_manager.prepare_resources(scheduled_batch)
-                    if self.draft_model_engine is not None:
-                        self._prepare_draft_tokens(scheduled_batch)
+                    if self.draft_model_engine is not None and self.drafter is None:
+                        spec_resource_manager = self.resource_manager.get_resource_manager(
+                            ResourceManagerType.SPEC_RESOURCE_MANAGER)
+                        self.drafter = create_drafter(
+                            spec_decoding_mode=self.model_engine.spec_config.
+                            spec_dec_mode,
+                            spec_config=self.model_engine.spec_config,
+                            draft_model_engine=self.draft_model_engine,
+                            max_draft_tokens=self.max_draft_tokens,
+                            draft_seq_slot_manager=self.draft_seq_slot_manager,
+                            sampler=self.sampler,
+                            resource_manager=self.resource_manager,
+                            spec_resource_manager=spec_resource_manager,
+                        )
 
                     if self.drafter is not None:
                         self.drafter.prepare_draft_tokens(scheduled_batch)
