@@ -8,6 +8,7 @@ IMAGE_TAG          ?= latest
 # Used to share .cache when LOCAL_USER=1. Possibility of override is
 # helpful, e.g., for use with Docker rootless mode.
 HOME_DIR           ?= $(HOME)
+CACHE_DIR          ?= $(HOME_DIR)/.cache
 
 # Local user information
 USER_ID            ?= $(shell id --user)
@@ -148,7 +149,7 @@ endif
 	docker run $(DOCKER_RUN_OPTS) $(DOCKER_RUN_ARGS) \
     		$(GPU_OPTS) \
     		--volume $(SOURCE_DIR):$(CODE_DIR) \
-    		$(if $(filter 1,$(LOCAL_USER)),--volume ${HOME_DIR}/.cache:/home/${USER_NAME}/.cache:rw) \
+    		$(if $(filter 1,$(LOCAL_USER)),--volume ${CACHE_DIR}:/home/${USER_NAME}/.cache:rw) \
     		--env "CCACHE_DIR=${CCACHE_DIR}" \
     		--env "CCACHE_BASEDIR=${CODE_DIR}" \
     	    --env "CONAN_HOME=${CONAN_DIR}" \
