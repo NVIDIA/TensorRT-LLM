@@ -306,11 +306,6 @@ class TritonPythonModel:
             finally:
                 if response_flag == pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL:
                     self._ongoing_request_count -= 1
-                    with self.lock:
-                        if self.running:
-                            self.cancellation_thread.join()
-                            self.cancellation_thread = None
-                            self.running = False
 
     def cancellation_loop(self):
         """Checks if any pending requests have been cancelled."""
