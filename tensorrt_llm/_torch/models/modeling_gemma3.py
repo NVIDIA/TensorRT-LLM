@@ -318,6 +318,41 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
 
+    def _get_token_type_mask(self, image_token_mask: torch.BoolTensor):
+        device = image_token_mask.device
+        sequence_length = len(image_token_mask)
+
+        # Create a list of token type ids. 0 for text tokens, 1 for all image tokens (regardless of which image they belong to).
+        token_type_ids = torch.zeros(sequence_length,
+                                     dtype=torch.int32,
+                                     device=device).contiguous()
+        token_type_ids[image_token_mask] = 1
+
+        # There could be image tokens from multiple images where those corresponding to the
+        # same image are contiguous. We assign a unique id to each contiguous blob of image tokens now.
+
+        # Pad with zero at the start to detect changes.
+        padded = torch.cat((torch.tensor([0], device=device), token_type_ids))
+
+        # Identify where blobs start (0->1 transitions)
+        starts = (padded[1:] > padded[:-1]).int()
+
+        # Cumulative sum of starts gives a unique id for each blob. Note that
+        # this assigns a unique id to the zeros separating the blobs.
+        blob_ids = torch.cumsum(starts, dim=0)
+
+        # Mask out zeros (positions where token_type_ids == 0).
+        token_type_ids = blob_ids * token_type_ids
+
+        # Create a mask where each blob is a unique id.
+        token_type_mask = token_type_ids.unsqueeze(
+            0) == token_type_ids.unsqueeze(1)
+
+        # If text token, do not change anything.
+        token_type_mask[token_type_ids == 0] = False
+
+        return token_type_mask
+
     def get_context_mask(
         self,
         image_token_mask: torch.BoolTensor,
@@ -351,15 +386,7 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
             causal_mask = attention_mask_1 & attention_mask_2
 
         # Apply a bidirectional mask for image tokens.
-        token_type_ids = torch.zeros(sequence_length,
-                                     dtype=torch.int32,
-                                     device=device)
-        # 1 for image tokens, 0 for text tokens.
-        token_type_ids[image_token_mask] = 1
-        token_type_mask = token_type_ids.unsqueeze(
-            0) == token_type_ids.unsqueeze(1)
-        # If text token, do not change anything.
-        token_type_mask[token_type_ids == 0] = False
+        token_type_mask = self._get_token_type_mask(image_token_mask)
         causal_mask = causal_mask.masked_fill(token_type_mask, True)
         return causal_mask
 
