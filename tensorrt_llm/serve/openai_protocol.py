@@ -54,7 +54,7 @@ class StructuralTag(OpenAIBaseModel):
 class ResponseFormat(OpenAIBaseModel):
     # type must be "json_object" or "text" or "structural_tag"
     type: Literal["json", "text", "json_object", "structural_tag"]
-    schema: Optional[Union[str, BaseModel, dict]] = None
+    schema: Optional[dict] = None
     structures: Optional[List[StructuralTag]] = None
     triggers: Optional[List[str]] = None
 
