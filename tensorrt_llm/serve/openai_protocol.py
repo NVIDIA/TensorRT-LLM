@@ -53,7 +53,8 @@ class StructuralTag(OpenAIBaseModel):
 
 class ResponseFormat(OpenAIBaseModel):
     # type must be "json_object" or "text" or "structural_tag"
-    type: Literal["text", "json_object", "structural_tag"]
+    type: Literal["json", "text", "json_object", "structural_tag"]
+    schema: Optional[Union[str, BaseModel, dict]] = None
     structures: Optional[List[StructuralTag]] = None
     triggers: Optional[List[str]] = None
 
@@ -140,6 +141,12 @@ def _response_format_to_guided_decoding_params(
 ) -> Optional[GuidedDecodingParams]:
     if response_format is None:
         return None
+    elif response_format.type == "json":
+        if response_format.schema is None:
+            raise ValueError(
+                "The 'schema' field is required when response_format.type is 'json'."
+            )
+        return GuidedDecodingParams(json=response_format.schema)
     elif response_format.type == "text":
         return None
     elif response_format.type == "json_object":
