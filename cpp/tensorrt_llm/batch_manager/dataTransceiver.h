@@ -98,12 +98,12 @@ class TransferSession
 {
 public:
     TransferSession(std::vector<Connection const*> connections, DataContext dataContext,
-        executor::DataTransceiverState const& selfState, executor::DataTransceiverState const& otherState,
+        executor::DataTransceiverState const& selfState, executor::DataTransceiverState otherState,
         runtime::BufferManager& bufferManager)
         : mConnections(std::move(connections))
         , mDataContext(dataContext)
         , mSelfState(&selfState)
-        , mOtherState(&otherState)
+        , mOtherState(std::move(otherState))
         , mBufferManager(&bufferManager)
     {
         TLLM_CHECK(!mConnections.empty());
@@ -115,6 +115,12 @@ public:
     }
 
     [[nodiscard]] std::vector<Connection const*> const& getConnections() const
+    {
+        return mConnections;
+    }
+
+    // should be called only during the initialization of the TransferSession
+    [[nodiscard]] std::vector<Connection const*>& getConnectionsMutable()
     {
         return mConnections;
     }
@@ -131,7 +137,7 @@ public:
 
     [[nodiscard]] executor::DataTransceiverState const& getOtherState() const
     {
-        return *mOtherState;
+        return mOtherState;
     }
 
     [[nodiscard]] runtime::BufferManager& getBufferManager()
@@ -162,8 +168,8 @@ public:
 private:
     std::vector<Connection const*> mConnections;
     DataContext mDataContext;
-    executor::DataTransceiverState const* mSelfState;
-    executor::DataTransceiverState const* mOtherState;
+    executor::DataTransceiverState const* mSelfState; // stored in DataRequester/DataResponder
+    executor::DataTransceiverState mOtherState;
     runtime::BufferManager* mBufferManager;
 };
 

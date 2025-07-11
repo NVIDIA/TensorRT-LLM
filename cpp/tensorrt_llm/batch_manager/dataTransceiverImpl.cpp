@@ -81,33 +81,23 @@ DataSenderImpl::DataSenderImpl(executor::kv_cache::ConnectionManager* manager,
             peerRelativeRanks.begin(), peerRelativeRanks.end(), info.getTransState().getCommState()->getSelfIdx()));
     {
         std::unique_lock<std::mutex> lk(mMtxForMap);
-        auto it = mRequestToComms.find(requestId);
-        if (it == mRequestToComms.end())
+        auto it = mRequestToSession.find(requestId);
+        if (it == mRequestToSession.end())
         {
-            int recvExpectCount = peerRelativeRanks.size();
-            {
-                it = mRequestToComms.emplace(requestId, RequestMapInfo{}).first;
-                it->second.resize(recvExpectCount);
-            }
+            auto session = TransferSession(std::vector<Connection const*>(peerRelativeRanks.size(), nullptr),
+                DataContext{tagFromRequestId(requestId)}, mSelfState, info.getTransState(), mBufferManager);
+            it = mRequestToSession.emplace(requestId, std::move(session)).first;
         }
-        it->second[peerIdx] = {connection, info.getTransState()};
+        it->second.getConnectionsMutable()[peerIdx] = connection;
     }
     return info;
 }
 
 void DataSenderImpl::sendSync(LlmRequest const& llmRequest)
 {
-    std::vector<executor::kv_cache::Connection const*> connections;
-    auto it = mRequestToComms.find(llmRequest.mRequestId);
-    TLLM_CHECK(it != mRequestToComms.end());
-    auto const& reqToComm = it->second;
-    for (auto&& [connection, dataTransceiverState] : reqToComm)
-    {
-        connections.emplace_back(connection);
-    }
-    auto&& dataTransceiverState = reqToComm.at(0).second;
-    TransferSession session(connections, DataContext{tagFromRequestId(llmRequest.mRequestId)}, mSelfState,
-        dataTransceiverState, mBufferManager);
+    auto it = mRequestToSession.find(llmRequest.mRequestId);
+    TLLM_CHECK(it != mRequestToSession.end());
+    auto& session = it->second;
     mFormatter->format(session, llmRequest);
 }
 
@@ -123,17 +113,17 @@ void DataSenderImpl::setCommState(executor::kv_cache::CommState commState)
 
 [[nodiscard]] size_t DataSenderImpl::getCounterpartsCount(LlmRequest::RequestIdType requestId) const
 {
-    auto it = mRequestToComms.find(requestId);
-    TLLM_CHECK(it != mRequestToComms.end());
-    return it->second.size();
+    auto it = mRequestToSession.find(requestId);
+    TLLM_CHECK(it != mRequestToSession.end());
+    return it->second.getNumConnections();
 }
 
 void DataSenderImpl::release(LlmRequest::RequestIdType requestId)
 {
-    auto it = mRequestToComms.find(requestId);
-    TLLM_CHECK(it != mRequestToComms.end());
+    auto it = mRequestToSession.find(requestId);
+    TLLM_CHECK(it != mRequestToSession.end());
     std::unique_lock<std::mutex> lk(mMtxForMap);
-    mRequestToComms.erase(it);
+    mRequestToSession.erase(it);
 }
 
 DataReceiverImpl::DataReceiverImpl(executor::kv_cache::ConnectionManager* manager,
@@ -224,8 +214,8 @@ void DataReceiverImpl::receiveSync(LlmRequest const& llmRequest)
     }
     auto const& resource = getReceiveCacheResource(llmRequest);
     auto requestId = llmRequest.getContextPhaseParams().value().getReqId();
-    TransferSession session(
-        connections, DataContext{tagFromRequestId(requestId)}, mSelfState, contextState, resource->mBufferManager);
+    TransferSession session(std::move(connections), DataContext{tagFromRequestId(requestId)}, mSelfState, contextState,
+        resource->mBufferManager);
     mFormatter->unformat(session, llmRequest);
 }
 
