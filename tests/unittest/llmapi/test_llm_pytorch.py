@@ -5,12 +5,11 @@ from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
-from .test_llm import (get_model_path, global_kvcache_config, llama_model_path,
-                       llm_get_stats_async_test_harness,
-                       llm_get_stats_test_harness, prompts,
-                       run_llm_abort_request,
-                       run_llm_with_postprocess_parallel_and_result_handler,
-                       tinyllama_logits_processor_test_harness)
+from .test_llm import (
+    get_model_path, global_kvcache_config, llama_model_path,
+    llm_get_stats_async_test_harness, llm_get_stats_test_harness, prompts,
+    run_llm_abort_request, run_llm_with_postprocess_parallel_and_result_handler,
+    tinyllama_logits_processor_test_harness, _test_llm_capture_request_error)
 from utils.util import force_ampere, similar, skip_gpu_memory_less_than_40gb, skip_gpu_memory_less_than_80gb, skip_gpu_memory_less_than_138gb
 from utils.llm_data import llm_models_root
 from tensorrt_llm.lora_manager import LoraConfig
@@ -63,6 +62,10 @@ def test_llm_get_stats_async(return_context_logits, use_overlap,
         pytorch_backend=True,
         use_overlap=use_overlap,
         enable_iter_req_stats=enable_iter_req_stats)
+
+
+def test_llm_capture_request_error():
+    _test_llm_capture_request_error(pytorch_backend=True, tp_size=1)
 
 
 @force_ampere

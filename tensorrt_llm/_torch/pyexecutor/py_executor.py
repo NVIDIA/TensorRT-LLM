@@ -879,8 +879,9 @@ class PyExecutor:
 
                 self._pad_attention_dp_dummy_request()
 
-                if self.draft_model_engine is not None or self.drafter is not None:
-                    self._prepare_draft_requests()
+                if self.draft_model_engine is not None or hasattr(
+                        self, 'drafter') and self.drafter is not None:
+                    self._prepare_draft_requests(self.active_requests)
 
                 scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
                 )
@@ -969,12 +970,11 @@ class PyExecutor:
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
 
-    def _prepare_draft_requests(self):
+    def _prepare_draft_requests(self, requests):
         try:
             # Set draft tokens here to make the KV cache manager
             # and scheduler aware of them.
-            for req in self.active_requests:
-                # TODO: enable draft tokens in context phase
+            for req in requests:
                 if req.state not in (LlmRequestState.GENERATION_IN_PROGRESS,
                                      LlmRequestState.DISAGG_GENERATION_INIT):
                     continue
@@ -1095,9 +1095,7 @@ class PyExecutor:
                     ) if self.kv_cache_transceiver else []
 
                     if self.previous_batch is not None:
-                        previous_batch_size = self.previous_batch.sample_state.scheduled_requests.batch_size
-                        if previous_batch_size > 0:  # first previous batch size is 0
-                            self._process_previous_batch()
+                        self._process_previous_batch()
                         self.previous_batch: Optional[BatchState] = None
 
                     scheduled_batch.context_requests = [
@@ -1786,7 +1784,6 @@ class PyExecutor:
                     # This is the first time the draft model is seeing this request.
                     # Prepare a context request. We discard the first token and take
                     # the newly decoded one - this is the convention for EAGLE 2 and 3.
-                    assert num_draft_tokens == 0
                     new_request = create_new_request(input_tokens)
                     draft_batch.context_requests.append(new_request)
                 elif num_accepted_tokens == 0:
@@ -1936,31 +1933,20 @@ class PyExecutor:
         if len(self.canceled_req_ids) == 0:
             return
 
-        cancelled_responses = {}
-        left_requests = []
-        # Tracks canceled requests for proper handling in overlap mode during `sampler.update_requests`.
-        self.canceled_requests = []
         for request in self.active_requests:
             req_id = request.py_request_id
             if req_id in self.canceled_req_ids:
-                self._terminate_request(request)
+                # Mark requests as finished, then, we reuse all existing code
+                # to clean up the KV cache resources.
                 request.finish_by_reason(FinishReason.CANCELLED)
                 request.decoding_iter = request.py_decoding_iter
-                cancelled_responses[req_id] = request.create_response(
-                    False, self.dist.rank)
-                self.canceled_requests.append(request)
                 self.canceled_req_ids.erase(req_id)
-            else:
-                left_requests.append(request)
-        self.active_requests = left_requests
 
-        # When enable attention dp, each rank does not have full copy of requests
-        # so we need to remove the cancel requests not in the local rank
-        self.canceled_req_ids.clear()
-
-        # enqueue the cancelled requests' responses as they are not
-        # active_requests and be discarded in the sampler loop.
-        self._enqueue_responses(cancelled_responses)
+        if self.enable_attention_dp:
+            # TODO: revisit the cancel logic of attention dp
+            # When enable attention dp, each rank does not have full copy of requests
+            # so we need to remove the cancel requests not in the local rank
+            self.canceled_req_ids.clear()
 
     @nvtx_range("_enqueue_responses")
     def _enqueue_responses(self, responses: Dict[int, LlmResponse]):
