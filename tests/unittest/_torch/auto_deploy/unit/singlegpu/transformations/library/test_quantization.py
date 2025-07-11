@@ -63,6 +63,7 @@ def test_quantization(quant_config, atol, rtol, num_p_og):
         False,  # strict_loading
         None,  # dynamic_shapes
         None,  # check_num_matches
+        False,  # skip_output_assert
         quant_config,
     )
 

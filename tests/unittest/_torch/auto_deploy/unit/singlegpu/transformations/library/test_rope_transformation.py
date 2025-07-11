@@ -269,6 +269,7 @@ def test_rope_variants(
             True,  # strict_loading
             dyn,  # dynamic_shapes
             None,  # check_num_matches
+            False,  # skip_output_assert
             target_layout,
         )
     elif transformation == "match":
@@ -284,6 +285,7 @@ def test_rope_variants(
             True,  # strict_loading
             dyn,  # dynamic_shapes
             1,  # check_num_matches
+            False,  # skip_output_assert
         )
     else:
         _ = run_test(
@@ -298,6 +300,7 @@ def test_rope_variants(
             True,  # strict_loading
             dyn,  # dynamic_shapes
             None,  # check_num_matches
+            False,  # skip_output_assert
         )
 
 
@@ -428,6 +431,7 @@ def test_match_and_layout_deepseek(layout, num_heads, num_kv_heads, mode, target
             True,  # strict_loading
             dynamic_shapes,  # dynamic_shapes
             None,  # check_num_matches
+            False,  # skip_output_assert
             target_layout,
         )
     else:
@@ -443,4 +447,5 @@ def test_match_and_layout_deepseek(layout, num_heads, num_kv_heads, mode, target
             True,  # strict_loading
             dynamic_shapes,  # dynamic_shapes
             1,  # check_num_matches
+            False,  # skip_output_assert
         )
