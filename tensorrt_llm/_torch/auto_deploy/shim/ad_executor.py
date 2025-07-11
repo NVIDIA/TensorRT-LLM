@@ -261,8 +261,8 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
 
     max_num_sequences = ad_config.max_batch_size * dist_mapping.pp_size
     # some derivative properties
-    max_draft_tokens = (
-        0 if ad_config.speculative_config is None else ad_config.speculative_config.max_draft_tokens
+    max_draft_len = (
+        0 if ad_config.speculative_config is None else ad_config.speculative_config.max_draft_len
     )
 
     # initialize model engine
@@ -299,7 +299,7 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
     # correctly for models as needed.
     sampler_args = TorchSampler.Args(
         max_seq_len=ad_config.max_seq_len,
-        max_draft_tokens=max_draft_tokens,
+        max_draft_len=max_draft_len,
         max_num_sequences=max_num_sequences,
         max_beam_width=executor_config.max_beam_width,
         enable_mixed_sampler=ad_config.enable_mixed_sampler,
@@ -317,7 +317,7 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
         disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
         max_input_len=ad_config.max_input_len,
         max_batch_size=ad_config.max_batch_size,
-        max_draft_tokens=max_draft_tokens,
+        max_draft_len=max_draft_len,
         max_beam_width=ad_config.max_beam_width,
     )
     return py_executor

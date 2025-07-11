@@ -1,5 +1,6 @@
 # Adapted from
 # https://github.com/deepseek-ai/DeepEP/blob/aae9fa9a6dd0fec2a723fbb85ec4b22460fab670/README.md
+import os
 import weakref
 from typing import List, Tuple, Union
 
@@ -115,6 +116,8 @@ class VariableLengthLowLatencyBuffer:
         num_rdma_bytes = Buffer.get_low_latency_rdma_size_hint(
             num_max_dispatch_tokens_per_rank, hidden_size, world_size,
             num_experts)
+        allow_nvlink_for_low_latency_mode = (os.environ.get(
+            "TRTLLM_DEEP_EP_DISABLE_P2P_FOR_LOW_LATENCY_MODE", "0") == "0")
 
         # Allocate a buffer if not existed or not enough buffer size
         if self.buffer is None or self.buffer.num_rdma_bytes < num_rdma_bytes:
@@ -126,6 +129,8 @@ class VariableLengthLowLatencyBuffer:
                                  num_rdma_bytes,
                                  low_latency_mode=True,
                                  num_qps_per_rank=num_experts // world_size,
+                                 allow_nvlink_for_low_latency_mode=
+                                 allow_nvlink_for_low_latency_mode,
                                  comm=self.comm)
 
     def low_latency_dispatch(self, hidden_states: torch.Tensor,
@@ -162,6 +167,11 @@ class VariableLengthLowLatencyBuffer:
 
         # NOTES: the same behavior as described in the dispatch kernel
         return combined_hidden_states
+
+    def clean_low_latency_buffer(self, num_max_dispatch_tokens_per_rank: int,
+                                 hidden: int, num_experts: int) -> None:
+        self.buffer.clean_low_latency_buffer(num_max_dispatch_tokens_per_rank,
+                                             hidden, num_experts)
 
 
 class BufferPool:

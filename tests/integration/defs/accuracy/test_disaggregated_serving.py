@@ -214,7 +214,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     def test_ngram(self):
         speculative_decoding_config = {
             "decoding_type": "NGram",
-            "prompt_lookup_num_tokens": 4,
+            "max_draft_len": 4,
             "max_matching_ngram_size": 4,
             "is_keep_all": True,
             "is_use_oldest": True,

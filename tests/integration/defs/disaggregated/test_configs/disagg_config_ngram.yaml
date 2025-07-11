@@ -18,7 +18,7 @@ generation_servers:
     - "localhost:8002"
   speculative_config:
     decoding_type: NGram
-    prompt_lookup_num_tokens: 4
+    max_draft_len: 4
     max_matching_ngram_size: 4
     is_keep_all: True
     is_use_oldest: True

@@ -192,7 +192,7 @@ class Gemma3DecoderLayer(DecoderLayer):
         super().__init__()
         self.layer_idx = layer_idx
         config = model_config.pretrained_config
-        is_sliding = bool((layer_idx + 1) % config.sliding_window_pattern)
+        is_sliding = (config.layer_types[layer_idx] == "sliding_attention")
         self.self_attn = Gemma3Attention(
             model_config,
             layer_idx=layer_idx,

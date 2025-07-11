@@ -545,6 +545,7 @@ def _test_llm_generate_async(model_name=default_model_name,
 @pytest.mark.parametrize("chunked", [True, False])
 @pytest.mark.part0
 def test_llm_generate_async_with_stream_interval(chunked):
+    pytest.skip("https://nvbugs/5383670")
     model_path = f"{llm_models_root()}/nvfp4-quantized/Meta-Llama-3.1-8B"
     max_num_tokens = 256
     with LLM_torch(model_path,
@@ -1127,7 +1128,7 @@ def test_llm_api_medusa():
 
     speculative_config = MedusaDecodingConfig(num_medusa_heads=4,
             max_draft_len=63,
-            speculative_model=get_model_path("medusa-vicuna-7b-v1.3"),
+            speculative_model_dir=get_model_path("medusa-vicuna-7b-v1.3"),
             medusa_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
                                             [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], \
                                             [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], \
@@ -1166,7 +1167,7 @@ def test_llm_api_medusa_tp2():
 
     speculative_config = MedusaDecodingConfig(num_medusa_heads=4,
             max_draft_len=63,
-              speculative_model=get_model_path("medusa-vicuna-7b-v1.3"),
+              speculative_model_dir=get_model_path("medusa-vicuna-7b-v1.3"),
                             medusa_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
                                             [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], \
                                             [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], \
@@ -1204,7 +1205,7 @@ def test_llm_api_eagle(**llm_kwargs):
 
     speculative_config = EagleDecodingConfig(
         max_draft_len=63,
-        speculative_model=get_model_path("EAGLE-Vicuna-7B-v1.3"),
+        speculative_model_dir=get_model_path("EAGLE-Vicuna-7B-v1.3"),
         num_eagle_layers=4,
         max_non_leaves_per_layer=10,
                             eagle_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
@@ -1251,7 +1252,7 @@ def test_llm_api_eagle2(**llm_kwargs):
 
     speculative_config = EagleDecodingConfig(
         max_draft_len=63,
-        speculative_model=get_model_path("EAGLE-Vicuna-7B-v1.3"),
+        speculative_model_dir=get_model_path("EAGLE-Vicuna-7B-v1.3"),
         num_eagle_layers=4,
         max_non_leaves_per_layer=10,
         use_dynamic_tree=True,

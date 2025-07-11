@@ -1,5 +1,6 @@
 import contextlib
 import os
+import re
 from typing import Any, Dict
 from unittest import mock
 
@@ -38,7 +39,8 @@ def mistral_small_3_1_24b_config():
             "max_position_embeddings": 131072,
             "model_type": "mistral",
             "num_attention_heads": 32,
-            "num_hidden_layers": 40,
+            # Reduce this from the original 40 to relieve memory needs for CI.
+            "num_hidden_layers": 4,
             "num_key_value_heads": 8,
             "rms_norm_eps": 1e-05,
             "rope_theta": 1000000000.0,
@@ -68,7 +70,7 @@ def mistral_small_3_1_24b_config():
 
 
 def reduce_mistral_config(
-    mem_for_full_model: int, config_dict: Dict[str, Any], default_num_layers: int = 32
+    mem_for_full_model: int, config_dict: Dict[str, Any], default_num_layers: int = 4
 ):
     _, total_mem = torch.cuda.mem_get_info()
     if "text_config" in config_dict:
@@ -101,6 +103,29 @@ def init_hf_model(cls, config, dtype, device):
     model.to(dtype=dtype)
 
     return model
+
+
+def convert_weights_names(weights: dict) -> dict:
+    # Since transformers version >= 4.52.0, the default model architecture is changed.
+    # We need to convert the weight names accordingly to match TRTLLM naming.
+    _checkpoint_conversion_mapping = {
+        "^model.language_model": "language_model.model",
+        "^model.vision_tower": "vision_tower",
+        "^model.multi_modal_projector": "multi_modal_projector",
+        "^lm_head": "language_model.lm_head",
+    }
+    converted_weights = {}
+    for weight_name, weight_value in weights.items():
+        new_name = weight_name
+        for pattern, replacement in _checkpoint_conversion_mapping.items():
+            new_name = re.sub(pattern, replacement, new_name)
+        converted_weights[new_name] = weight_value
+    return converted_weights
+
+
+@pytest.fixture(autouse=True)
+def empty_cuda_cache():
+    torch.cuda.empty_cache()
 
 
 @contextlib.contextmanager
@@ -276,7 +301,7 @@ def test_mistral_3_vlm_allclose_to_hf(mistral_small_3_1_24b_config, backend, use
         attn_backend=backend,
     )
     mistral = modeling_mistral.Mistral3VLM(model_config).to(dtype).to(device)
-    mistral.load_weights(hf_mistral.state_dict())
+    mistral.load_weights(convert_weights_names(hf_mistral.state_dict()))
 
     num_blocks = 1
     tokens_per_block = 128

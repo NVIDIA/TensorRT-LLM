@@ -353,7 +353,7 @@ Finally, you can launch the disaggregated server which will accept requests from
 the orchestration between the context and generation servers with:
 
 ```bash
-cat >./disagg-config.yml <<EOF
+cat >./disagg-config.yaml <<EOF
 hostname: localhost
 port: 8000
 backend: pytorch
@@ -362,9 +362,10 @@ context_servers:
   urls:
       - "localhost:8001"
 generation_servers:
-  num_instances: 1
+  num_instances: 2
   urls:
       - "localhost:8002"
+      - "localhost:8003"
 EOF
 
 trtllm-serve disaggregated -c disagg-config.yaml

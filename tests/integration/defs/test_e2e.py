@@ -1964,6 +1964,7 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
     ("qwen2-vl-7b-instruct", "Qwen2-VL-7B-Instruct"),
     ("qwen2.5-vl-7b-instruct", "Qwen2.5-VL-7B-Instruct"),
     ("mistral-small-3.1-24b-instruct", "Mistral-Small-3.1-24B-Instruct-2503"),
+    ("gemma-3-27b-it", "gemma/gemma-3-27b-it"),
 ])
 def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                                    modality, use_cuda_graph):
@@ -2064,6 +2065,13 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                 ["highway", "traffic", "directions", "lanes", "Jurong"],
             ],
         },
+        "gemma-3-27b-it": {
+            "image": [
+                ["dramatic", "turbulent", "waves", "ocean", "overcast"],
+                ["half", "dome", "yosemite", "landmark", "rounded"],
+                ["flowing", "standstill", "vehicles", "road", "Changi"],
+            ],
+        },
     }
 
     cmd = [
@@ -2083,6 +2091,14 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         cmd.append("--max_num_tokens=16384")
     if use_cuda_graph:
         cmd.append("--use_cuda_graph")
+    # Gemma3 VLM needs a custom mask which is only supported by flashinfer backend currently.
+    # Custom mask involves bidirectional masking of image tokens in context phase. To get this
+    # correct, chunked prefill and kv cache reuse need to be turned off.
+    if model_name == "gemma-3-27b-it":
+        cmd.append("--image_format=pil")
+        cmd.append("--attention_backend=FLASHINFER")
+        cmd.append("--disable_kv_cache_reuse")
+
     output = llm_venv.run_cmd(cmd, caller=check_output)
 
     def parse_output(text):

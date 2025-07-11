@@ -53,7 +53,7 @@ class DecodingCUDAGraphRunner:
         # [CUDA graph spec decode padding]
         # We pad input IDs/position IDs to the maximum draft length (token per request).
         # We're forced to do this because we cannot reallocate inputs over many graph runs.
-        token_per_request = spec_metadata.max_draft_tokens + 1 if spec_metadata is not None else 1
+        token_per_request = spec_metadata.max_draft_len + 1 if spec_metadata is not None else 1
 
         # Using ones instead of zeros prevents NaNs in e.g. Deepseek
         self.input_ids = torch.ones((batch_size * token_per_request, ),
