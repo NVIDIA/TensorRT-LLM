@@ -17,6 +17,7 @@ import torch
 
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
+from tensorrt_llm._torch.speculative import get_draft_model_prompt
 from tensorrt_llm._utils import (customized_gc_thresholds, global_mpi_rank,
                                  is_trace_enabled, nvtx_range, trace_func)
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
@@ -1767,9 +1768,9 @@ class PyExecutor:
                 num_rejected_tokens = num_draft_tokens - num_accepted_tokens
                 assert num_rejected_tokens >= 0
 
-                spec_config = self.model_engine.spec_config
                 beam_idx = 0
-                input_tokens = spec_config.get_draft_model_prompt(
+                input_tokens = get_draft_model_prompt(
+                    self.model_engine.spec_config.spec_dec_mode,
                     request.get_tokens()[beam_idx])
 
                 def create_new_request(input_tokens):
