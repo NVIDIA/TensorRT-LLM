@@ -1463,6 +1463,16 @@ class PyTorchModelEngine(ModelEngine):
                                 previous_batch_len * self.max_beam_width].copy_(
                                     new_tokens.flatten(), non_blocking=True)
 
+        if (not self._disable_overlap_scheduler
+                and next_draft_tokens_device is None
+                and len(extend_requests) > 0):
+            # During warmup, for those generation requests, we don't have previous tensors,
+            # so we need to set the previous_pos_id_offsets and previous_kv_lens_offsets to zeros
+            # to skip the value changes in _preprocess_inputs. Otherwise, there will be illegal memory access
+            # when writing key/values to the KV cache.
+            self.previous_pos_id_offsets_cuda *= 0
+            self.previous_kv_lens_offsets_cuda *= 0
+
         position_ids = torch.tensor(position_ids,
                                     dtype=torch.int,
                                     pin_memory=True)
