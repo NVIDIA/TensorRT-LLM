@@ -136,6 +136,15 @@ class DeepseekV3MTPHead(nn.Module):
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)
 
+    @torch.compile(mode="max-autotune-no-cudagraphs")
+    def get_last_token_states(self, hidden_states, attn_metadata):
+        last_tokens = torch.cumsum(
+            attn_metadata.seq_lens_cuda,
+            dim=0,
+            dtype=torch.long,
+        ) - 1
+        return hidden_states[last_tokens]
+
     def forward(self,
                 hidden_states: torch.Tensor,
                 lm_head: Linear,
@@ -143,16 +152,15 @@ class DeepseekV3MTPHead(nn.Module):
                 return_context_logits: bool = False) -> torch.Tensor:
         if not return_context_logits:
             if attn_metadata is not None:
-                last_tokens = torch.cumsum(
-                    attn_metadata.seq_lens_cuda,
-                    dim=0,
-                    dtype=torch.long,
-                ) - 1
-                hidden_states = hidden_states[last_tokens]
+                hidden_states = self.get_last_token_states(
+                    hidden_states, attn_metadata)
             else:
                 hidden_states = hidden_states[-1].unsqueeze(0)
 
+        lm_head.gather_output = False
         logits = lm_head(hidden_states)
+        # print("AMEYN: inside DeepseekV3MTPHead lm_head logits.shape:", logits.shape)
+        lm_head.gather_output = True
         return logits
 
 
@@ -913,6 +921,12 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         self.num_shared_experts = config.n_shared_experts
         self.top_k = config.num_experts_per_tok
 
+        self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
+        self.event_dict = {
+            key: torch.cuda.Event()
+            for key in [EventType.Main, EventType.MoeShared]
+        }
+
         self.enorm = RMSNorm(hidden_size=config.hidden_size,
                              eps=config.rms_norm_eps,
                              dtype=config.torch_dtype)
@@ -920,15 +934,33 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         self.hnorm = RMSNorm(hidden_size=config.hidden_size,
                              eps=config.rms_norm_eps,
                              dtype=config.torch_dtype)
+        self.fuse_norm_ar = False  #FIXME: AMEYN
+        if self.fuse_norm_ar:
+            self.eh_proj = Linear(
+                config.hidden_size * 2,
+                config.hidden_size,
+                bias=False,
+                dtype=config.torch_dtype,
+                tensor_parallel_mode=TensorParallelMode.ROW,
+                mapping=model_config.mapping,
+                reduce_output=False,
+                skip_create_weights_in_init=model_config.
+                skip_create_weights_in_init,
+            )
+        else:
+            self.eh_proj = Linear(
+                config.hidden_size * 2,
+                config.hidden_size,
+                bias=False,
+                dtype=config.torch_dtype,
+                tensor_parallel_mode=TensorParallelMode.ROW,
+                mapping=model_config.mapping,
+                reduce_output=True,
+                skip_create_weights_in_init=model_config.
+                skip_create_weights_in_init,
+            )
 
-        self.eh_proj = Linear(
-            config.hidden_size * 2,
-            config.hidden_size,
-            bias=False,
-            dtype=config.torch_dtype,
-            skip_create_weights_in_init=model_config.
-            skip_create_weights_in_init,
-        )
+        # Print shared head initialization message only for rank 0
 
         self.shared_head = DeepseekV3MTPHead(model_config)
 
@@ -944,14 +976,41 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        inputs_embeds = self.enorm(embed_tokens(input_ids))
-        hidden_states = self.hnorm(hidden_states)
+        def norm_embeds():
+            return self.enorm(embed_tokens(input_ids))  #emdedding
+
+        def norm_hidden():
+            return self.hnorm(hidden_states)
+
+        inputs_embeds, hidden_states = maybe_execute_in_parallel(
+            norm_embeds,
+            norm_hidden,
+            self.event_dict[EventType.Main],
+            self.event_dict[EventType.MoeShared],
+            self.aux_stream,
+        )
         hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
+        # Split hidden_states columnwise based on TP
+        tp_size = self.model_config.mapping.tp_size
+        tp_rank = self.model_config.mapping.tp_rank
+        if tp_size > 1:
+            hidden_states = torch.chunk(hidden_states, tp_size, dim=-1)[tp_rank]
         hidden_states = self.eh_proj(hidden_states)
 
         # Input layer norm
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        if self.fuse_norm_ar:
+            hidden_states, residual = self.allreduce(
+                hidden_states,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    residual=torch.zeros_like(hidden_states),
+                    norm_weight=self.input_layernorm.weight,
+                    eps=self.input_layernorm.variance_epsilon,
+                ),
+            )
+        else:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
         hidden_states = self.self_attn(
@@ -1084,7 +1143,8 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                                           self.model.aux_stream_dict)
                 self.model.layers.append(mtp_layer)
                 self.epilogue.append(mtp_layer)
-                self.mtp_worker = MTPEagleWorker(model_config.spec_config)
+                self.mtp_worker = MTPEagleWorker(model_config.spec_config,
+                                                 model_config)
             else:
                 mtp_layers = nn.ModuleList([
                     DeepseekV3MTP(model_config,
@@ -1094,7 +1154,8 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                 ])
                 self.model.layers.extend(mtp_layers)
                 self.epilogue.extend(mtp_layers)
-                self.mtp_worker = MTPWorker(model_config.spec_config)
+                self.mtp_worker = MTPWorker(model_config.spec_config,
+                                            model_config)
                 # modify the QuantConfig to support duplicated mtp layers
                 if model_config.quant_config.exclude_modules is not None:
                     extend_exclude_modules = []
