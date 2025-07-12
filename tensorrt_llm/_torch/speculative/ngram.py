@@ -167,8 +167,8 @@ class NGramDrafter(Drafter):
         ngram_pool_manager: NGramPoolManager = None,
     ):
         assert ngram_pool_manager is not None, "NGram needs a resource manager to maintain the pool."
-        super().__init__(spec_resource_manager=ngram_pool_manager)
         self.max_draft_len = spec_config.max_draft_len
+        self.spec_resource_manager = ngram_pool_manager
 
     def prepare_draft_tokens(
         self,
