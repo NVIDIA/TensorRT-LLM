@@ -308,7 +308,7 @@ def convert_weights(llm_venv,
             f"--dtype={data_type}",
         ]
 
-    elif "prompt_lookup" in model:
+    elif "ngram" in model:
         if "gpt" in model_path:
             example_name = "gpt"
         elif "llama" in model_path:

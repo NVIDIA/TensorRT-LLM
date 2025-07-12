@@ -41,7 +41,7 @@ from tensorrt_llm.tools.ppl import ppl
 if PYTHON_BINDINGS:
     from tensorrt_llm.runtime import ModelRunnerCpp
 
-from prompt_lookup.run_dtm_pld import run_dtm_pld
+from ngram.run_dtm_ngram import run_dtm_ngram
 
 
 def ensemble_mrope_params(batch_input_ids, max_position_embeddings,
@@ -318,17 +318,17 @@ def main(args):
             return [], [], [], {}
         input_lengths = [x.size(0) for x in batch_input_ids]
 
-        if args.prompt_lookup_config is not None:
-            # Speculative decoding of Prompt-Lookup-Decoding (PLD)
-            outputs = run_dtm_pld(batch_input_ids,
-                                  args,
-                                  runtime_rank,
-                                  end_id,
-                                  pad_id,
-                                  stop_words_list,
-                                  bad_words_list,
-                                  tokenizer.vocab_size,
-                                  target_runner=runner)
+        if args.ngram_config is not None:
+            # Speculative decoding of NGram
+            outputs = run_dtm_ngram(batch_input_ids,
+                                    args,
+                                    runtime_rank,
+                                    end_id,
+                                    pad_id,
+                                    stop_words_list,
+                                    bad_words_list,
+                                    tokenizer.vocab_size,
+                                    target_runner=runner)
             if not args.streaming:  # Unpack runner from the return value in No-Streaming mode
                 outputs, runner = list(outputs)[0]
         else:  # Normal run
@@ -596,18 +596,17 @@ def main(args):
                 args.lookahead_config
             ) == 3, "Lookahead needs [max_window_size, max_ngram_size, max_verification_set_size]"
             runner_kwargs.update(lookahead_config=args.lookahead_config)
-        if args.prompt_lookup_config is not None:
+        if args.ngram_config is not None:
             assert args.kv_cache_enable_block_reuse, "`--kv_cache_enable_block_reuse` must be specified in speculative decoding."
             assert not args.use_py_session, "`--use_py_session` is not supported in Speculative decoding."
-            assert not is_enc_dec, "Encoder-Decoder model is not supported in Speculative decoding."
             assert args.num_beams == 1, "`--num_beams>1` is not supported in Speculative decoding."
-            prompt_lookup_num_tokens, _, target_device_list = ast.literal_eval(
-                args.prompt_lookup_config)
-            args.max_output_len = output_len  # Specialization for PLD
+            max_draft_len, _, target_device_list = ast.literal_eval(
+                args.ngram_config)
+            args.max_output_len = output_len  # Specialization for NGram
             runner_kwargs.update(is_orchestrator_mode=True,
                                  device_ids=target_device_list,
-                                 max_input_len=test_token_num +
-                                 prompt_lookup_num_tokens + output_len)
+                                 max_input_len=test_token_num + max_draft_len +
+                                 output_len)
 
         runner = runner_cls.from_dir(**runner_kwargs)
         assert not (args.eval_ppl and not runner.gather_context_logits), \

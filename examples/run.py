@@ -35,7 +35,7 @@ from tensorrt_llm.runtime import PYTHON_BINDINGS, ModelRunner
 if PYTHON_BINDINGS:
     from tensorrt_llm.runtime import ModelRunnerCpp
 
-from prompt_lookup.run_dtm_pld import run_dtm_pld
+from ngram.run_dtm_ngram import run_dtm_ngram
 
 
 def parse_arguments(args=None):
@@ -430,17 +430,17 @@ def main(args):
 
     logger.info(f"Using {'Python' if args.use_py_session else 'C++'} session")
 
-    if args.draft_target_model_config is not None or args.prompt_lookup_config is not None:
-        # Speculative-Decoding of Draft-Target-Model (DTM) and Prompt-Lookup-Decoding (PLD)
-        # If the parameters of `runner_kwargs` and `runner.generate()` in the "else" branch change, the same change should be done for `examples/prompt_lookup/run_dtm_pld.py`
+    if args.draft_target_model_config is not None or args.ngram_config is not None:
+        # Speculative-Decoding of Draft-Target-Model (DTM) and NGram
+        # If the parameters of `runner_kwargs` and `runner.generate()` in the "else" branch change, the same change should be done for `examples/ngram/run_dtm_ngram.py`
         assert args.kv_cache_enable_block_reuse, "`--kv_cache_enable_block_reuse` must be specified in speculative decoding."
         assert not args.use_py_session, "`--use_py_session` is not supported in Speculative decoding."
         assert not is_enc_dec, "Encoder-Decoder model is not supported in Speculative decoding."
         assert args.num_beams == 1, "`--num_beams>1` is not supported in Speculative decoding."
 
-        outputs = run_dtm_pld(batch_input_ids, args, runtime_rank, end_id,
-                              pad_id, stop_words_list, bad_words_list,
-                              len(tokenizer))
+        outputs = run_dtm_ngram(batch_input_ids, args, runtime_rank, end_id,
+                                pad_id, stop_words_list, bad_words_list,
+                                len(tokenizer))
         if not args.streaming:  # Unpack runner from the return value in No-Streaming mode
             outputs, runner = list(outputs)[0]
 
