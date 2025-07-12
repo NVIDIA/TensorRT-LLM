@@ -53,40 +53,50 @@ def populate_benchmark_config(**kwargs):
     return template.format(**kwargs)
 
 
+# TODO Do not merge, these are the wrong configs
+
 # Default Mixtral configurations
-num_experts = 256
-k = 8
-hidden_size = 4096
-inter_size = 2048
-tp_size = 8
-ep_size = 1
+num_experts = 16
+k = 2
+hidden_size = 16384
+inter_size = 65536
+# tp_size = 32
+# ep_size = 1
 world_rank = 0
 act_fn = 3
-dtype_string = make_dtype_string(["fp4", "wfp4afp8"])  # All dtypes
-routing_string = make_routing_string(
-    name="uniform",
-    is_distribution=True)  # Use the default uniform random distribution
-tactic_id1 = '"auto"'
-tactic_id2 = '"auto"'
+dtype_string = make_dtype_string(
+    ["fp4"])  # All dtypese the default uniform random distribution
+tactic_id1 = '"all"'
+tactic_id2 = '"all"'
 
 configs = []
-for num_tokens in [1, 8, 64, 2048, 65536]:
-    configs.append(
-        populate_benchmark_config(
-            num_experts=num_experts,
-            k=k,
-            hidden_size=hidden_size,
-            inter_size=inter_size,
-            tp_size=tp_size,
-            ep_size=ep_size,
-            world_rank=world_rank,
-            num_tokens=num_tokens,
-            act_fn=act_fn,
-            dtype_string=dtype_string,
-            routing_string=routing_string,
-            tactic_string=make_tactic_string(tactic_id1=tactic_id1,
-                                             tactic_id2=tactic_id2),
-        ))
+for ep_size in [1, num_experts]:
+    for num_tokens in [8, 128, 8192, 16384]:
+        tp_size = 32 // ep_size
+        if num_tokens <= num_experts:
+            routing_string = make_routing_string(
+                name="balanced", is_distribution=False
+            )  # Use the default uniform random distribution
+        else:
+            routing_string = make_routing_string(
+                name="uniform", is_distribution=True
+            )  # Use the default uniform random distribution
+        configs.append(
+            populate_benchmark_config(
+                num_experts=num_experts,
+                k=k,
+                hidden_size=hidden_size,
+                inter_size=inter_size,
+                tp_size=tp_size,
+                ep_size=ep_size,
+                world_rank=world_rank,
+                num_tokens=num_tokens,
+                act_fn=act_fn,
+                dtype_string=dtype_string,
+                routing_string=routing_string,
+                tactic_string=make_tactic_string(tactic_id1=tactic_id1,
+                                                 tactic_id2=tactic_id2),
+            ))
 
 full_string = "[\n" + ",\n".join(configs) + "\n]"
 
