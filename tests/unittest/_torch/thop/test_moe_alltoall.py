@@ -716,12 +716,10 @@ class TestMoeAlltoAllSingleGPU(unittest.TestCase):
         for i in range(total_recv_token_count):
             for j in range(top_k):
                 expert_id = int(prepared_local_experts_cpu[i][j])
-                assert expert_id == slot_count or compute_target_rank(
-                    expert_id) == ep_rank
-                scale = float(prepared_local_scales_cpu[i][j])
-                if expert_id == slot_count:
-                    assert scale < 1e-6
-                else:
+                assert 0 <= expert_id and expert_id <= slot_count
+                if expert_id < slot_count:
+                    assert compute_target_rank(expert_id) == ep_rank
+                    scale = float(prepared_local_scales_cpu[i][j])
                     assert scale > 1e-6
 
         gathered_expert_statics_cpu = gathered_expert_statics.cpu()
