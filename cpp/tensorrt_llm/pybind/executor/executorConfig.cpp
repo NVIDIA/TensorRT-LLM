@@ -121,14 +121,14 @@ void initConfigBindings(pybind11::module_& m)
         .def(py::init<bool, std::optional<SizeType32> const&, std::optional<std::vector<SizeType32>> const&,
                  std::optional<SizeType32> const&, std::optional<float> const&, std::optional<size_t> const&, bool,
                  std::optional<float> const&, std::optional<tle::RetentionPriority>, size_t const&, bool, bool, bool,
-                 std::optional<RuntimeDefaults> const&>(),
+                 std::optional<RuntimeDefaults> const&, std::optional<uint64_t> const&>(),
             py::arg("enable_block_reuse") = true, py::arg("max_tokens") = py::none(),
             py::arg("max_attention_window") = py::none(), py::arg("sink_token_length") = py::none(),
             py::arg("free_gpu_memory_fraction") = py::none(), py::arg("host_cache_size") = py::none(),
             py::arg("onboard_blocks") = true, py::arg("cross_kv_cache_fraction") = py::none(),
             py::arg("secondary_offload_min_priority") = py::none(), py::arg("event_buffer_max_size") = 0, py::kw_only(),
             py::arg("enable_partial_reuse") = true, py::arg("copy_on_partial_reuse") = true, py::arg("use_uvm") = false,
-            py::arg("runtime_defaults") = py::none())
+            py::arg("runtime_defaults") = py::none(), py::arg("max_free_gpu_memory_size") = py::none())
         .def_property(
             "enable_block_reuse", &tle::KvCacheConfig::getEnableBlockReuse, &tle::KvCacheConfig::setEnableBlockReuse)
         .def_property("max_tokens", &tle::KvCacheConfig::getMaxTokens, &tle::KvCacheConfig::setMaxTokens)
@@ -138,6 +138,8 @@ void initConfigBindings(pybind11::module_& m)
             "sink_token_length", &tle::KvCacheConfig::getSinkTokenLength, &tle::KvCacheConfig::setSinkTokenLength)
         .def_property("free_gpu_memory_fraction", &tle::KvCacheConfig::getFreeGpuMemoryFraction,
             &tle::KvCacheConfig::setFreeGpuMemoryFraction)
+        .def_property("max_free_gpu_memory_size", &tle::KvCacheConfig::getMaxFreeGpuMemorySize,
+            &tle::KvCacheConfig::setMaxFreeGpuMemorySize)
         .def_property("host_cache_size", &tle::KvCacheConfig::getHostCacheSize, &tle::KvCacheConfig::setHostCacheSize)
         .def_property("onboard_blocks", &tle::KvCacheConfig::getOnboardBlocks, &tle::KvCacheConfig::setOnboardBlocks)
         .def_property("cross_kv_cache_fraction", &tle::KvCacheConfig::getCrossKvCacheFraction,

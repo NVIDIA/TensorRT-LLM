@@ -796,6 +796,11 @@ class KvCacheConfig(BaseModel, PybindMirror):
     )
     use_uvm: bool = Field(default=False,
                           description="Whether to use UVM for the KV cache.")
+    max_free_gpu_memory_size: Optional[int] = Field(
+        default=None,
+        description=
+        "The maximum size in bytes of GPU memory that can be allocated for the KV cache. This is only used for VSWA case for now as a alternative to `max_tokens`. If both `max_free_gpu_memory_size` and `free_gpu_memory_fraction` are specified, memory corresponding to the minimum will be allocated."
+    )
 
     def _to_pybind(self):
         return _KvCacheConfig(
@@ -811,7 +816,8 @@ class KvCacheConfig(BaseModel, PybindMirror):
             event_buffer_max_size=self.event_buffer_max_size,
             enable_partial_reuse=self.enable_partial_reuse,
             copy_on_partial_reuse=self.copy_on_partial_reuse,
-            use_uvm=self.use_uvm)
+            use_uvm=self.use_uvm,
+            max_free_gpu_memory_size=self.max_free_gpu_memory_size)
 
 
 @PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)

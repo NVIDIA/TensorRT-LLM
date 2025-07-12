@@ -27,7 +27,8 @@ KvCacheConfig::KvCacheConfig(bool enableBlockReuse, std::optional<SizeType32> co
     std::optional<size_t> const& hostCacheSize, bool onboardBlocks,
     std::optional<FloatType> const& crossKvCacheFraction, std::optional<RetentionPriority> secondaryOffloadMinPriority,
     size_t eventBufferMaxSize, bool enablePartialReuse, bool copyOnPartialReuse, bool useUvm,
-    std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults)
+    std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults,
+    std::optional<uint64_t> const& maxFreeGpuMemorySize)
     : mEnableBlockReuse(enableBlockReuse)
     , mHostCacheSize(hostCacheSize)
     , mOnboardBlocks(onboardBlocks)
@@ -60,6 +61,10 @@ KvCacheConfig::KvCacheConfig(bool enableBlockReuse, std::optional<SizeType32> co
     if (runtimeDefaults)
     {
         fillEmptyFieldsFromRuntimeDefaults(runtimeDefaults.value());
+    }
+    if (maxFreeGpuMemorySize)
+    {
+        setMaxFreeGpuMemorySize(maxFreeGpuMemorySize.value());
     }
 }
 
@@ -128,6 +133,11 @@ bool KvCacheConfig::getUseUvm() const
     return mUseUvm;
 }
 
+std::optional<uint64_t> KvCacheConfig::getMaxFreeGpuMemorySize() const
+{
+    return mMaxFreeGpuMemorySize;
+}
+
 void KvCacheConfig::setEnableBlockReuse(bool enableBlockReuse)
 {
     mEnableBlockReuse = enableBlockReuse;
@@ -143,9 +153,12 @@ void KvCacheConfig::setCopyOnPartialReuse(bool copyOnPartialReuse)
     mCopyOnPartialReuse = copyOnPartialReuse;
 }
 
-void KvCacheConfig::setMaxTokens(SizeType32 maxTokens)
+void KvCacheConfig::setMaxTokens(std::optional<SizeType32> maxTokens)
 {
-    TLLM_CHECK(maxTokens > 0);
+    if (maxTokens)
+    {
+        TLLM_CHECK(maxTokens.value() > 0);
+    }
     mMaxTokens = maxTokens;
 }
 
@@ -202,6 +215,11 @@ void KvCacheConfig::setEventBufferMaxSize(size_t eventBufferMaxSize)
 void KvCacheConfig::setUseUvm(bool useUvm)
 {
     mUseUvm = useUvm;
+}
+
+void KvCacheConfig::setMaxFreeGpuMemorySize(uint64_t maxFreeGpuMemorySize)
+{
+    mMaxFreeGpuMemorySize = maxFreeGpuMemorySize;
 }
 
 void KvCacheConfig::fillEmptyFieldsFromRuntimeDefaults(tensorrt_llm::runtime::RuntimeDefaults const& runtimeDefaults)

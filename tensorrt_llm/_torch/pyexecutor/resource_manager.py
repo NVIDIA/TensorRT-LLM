@@ -206,6 +206,7 @@ class KVCacheManager(BaseResourceManager):
             assert isinstance(
                 kv_cache_config, KvCacheConfigCpp
             ), "calculate_max_num_blocks_from_cpp only accepts KvCacheConfigCpp"
+
             blocks_per_window = self.calculate_max_num_blocks_from_cpp(
                 kv_cache_config=kv_cache_config,
                 model_config=model_config,
@@ -633,7 +634,13 @@ class KVCacheManager(BaseResourceManager):
         logger.debug(f"window_size_to_layers: {window_size_to_layers}")
 
         free_mem, total_mem = torch.cuda.mem_get_info()
-        primary_pool_memory_bytes = free_mem
+        primary_pool_memory_bytes = int(free_mem)
+        if kv_cache_config.max_free_gpu_memory_size is not None:
+            # overwrite max_tokens in VSWA case, use max_free_gpu_memory_size instead
+            kv_cache_config.max_tokens = None
+            primary_pool_memory_bytes = min(
+                kv_cache_config.max_free_gpu_memory_size,
+                primary_pool_memory_bytes)
         secondary_pool_memory_bytes = 0
         logger.debug(
             f"primary_pool_memory_bytes is set to {primary_pool_memory_bytes/1024**3}GB, \nsecondary_pool_memory_bytes is set to {secondary_pool_memory_bytes/1024**3}GB"
