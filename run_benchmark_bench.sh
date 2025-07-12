@@ -39,22 +39,22 @@ for req_info in "${data_configs[@]}"; do
 
   # Create the extra config file
   cat >./extra-llm-api-config.yml<<EOF
-  use_cuda_graph: true
-  cuda_graph_padding_enabled: true
-  cuda_graph_batch_sizes:
-    - 1
-    - 2
-    - 4
-    - 8
-    - 16
-    - 32
-    - 64
-    - 128
-    - 256
-    - 384
-    - 512
-    - 1024
-    - 2048
+  cuda_graph_config:
+      padding_enabled: true
+      batch_sizes:
+        - 1
+        - 2
+        - 4
+        - 8
+        - 16
+        - 32
+        - 64
+        - 128
+        - 256
+        - 384
+        - 512
+        - 1024
+        - 2048
   print_iter_log: ${PRINT_ITER_LOG}
   enable_attention_dp: ${adp}
 EOF
