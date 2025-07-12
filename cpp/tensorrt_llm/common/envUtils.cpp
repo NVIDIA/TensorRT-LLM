@@ -355,6 +355,12 @@ bool getEnvForceDeterministicMOE()
     return forceDeterministic;
 }
 
+bool getEnvMOEDisableFinalizeFusion()
+{
+    static bool const moeDisableFinalizeFusion = getBoolEnv("TRTLLM_MOE_DISABLE_FINALIZE_FUSION");
+    return moeDisableFinalizeFusion;
+}
+
 bool getEnvForceDeterministicAttention()
 {
     static bool const forceDeterministic
