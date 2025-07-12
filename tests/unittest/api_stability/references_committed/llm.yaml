@@ -57,13 +57,6 @@ methods:
       guided_decoding_backend:
         annotation: Optional[Literal["xgrammar", "llguidance"]]
         default: null
-      # Quantization and calibration
-      quant_config:
-        annotation: Optional[tensorrt_llm.models.modeling_utils.QuantConfig]
-        default: null
-      calib_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_utils.CalibConfig]
-        default: null
       # Speculative decoding
       speculative_config:
         annotation: Union[tensorrt_llm.llmapi.llm_args.DraftTargetDecodingConfig, tensorrt_llm.llmapi.llm_args.EagleDecodingConfig,tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig, tensorrt_llm.llmapi.llm_args.MedusaDecodingConfig, tensorrt_llm.llmapi.llm_args.MTPDecodingConfig, tensorrt_llm.llmapi.llm_args.NGramDecodingConfig, tensorrt_llm.llmapi.llm_args.UserProvidedDecodingConfig, NoneType]
