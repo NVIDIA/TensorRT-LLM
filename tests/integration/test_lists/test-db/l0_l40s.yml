@@ -17,6 +17,7 @@ l0_l40s:
   - unittest/_torch/modeling -k "modeling_mllama"
   - unittest/_torch/modeling -k "modeling_out_of_tree"
   - unittest/_torch/modeling -k "modeling_vila"
+  - unittest/_torch/modeling -k "modeling_siglip"
   - test_e2e.py::test_ptp_scaffolding[DeepSeek-R1-Distill-Qwen-7B-DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B]
   - test_e2e.py::test_ptp_quickstart_multimodal[NVILA-8B-FP16-vila/NVILA-8B-image-False]
   - test_e2e.py::test_ptp_quickstart_multimodal[NVILA-8B-FP16-vila/NVILA-8B-video-False]
