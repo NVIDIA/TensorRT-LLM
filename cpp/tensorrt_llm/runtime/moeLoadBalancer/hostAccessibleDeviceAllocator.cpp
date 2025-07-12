@@ -19,6 +19,8 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cuda_runtime_api.h>
+#include <numaif.h>
+#include <sys/mman.h>
 
 #include "gdrwrap.h"
 #include "hostAccessibleDeviceAllocator.h"
@@ -29,6 +31,139 @@
 
 namespace tensorrt_llm::runtime
 {
+
+class NumaHugePagePoolAllocator
+{
+public:
+    NumaHugePagePoolAllocator(NumaHugePagePoolAllocator const&) = delete;
+    void operator=(NumaHugePagePoolAllocator const&) = delete;
+
+    static NumaHugePagePoolAllocator& getInstance();
+
+    void* allocate(size_t memorySize);
+
+    void free(void* ptr);
+
+private:
+    static constexpr size_t kHugePageSize = 512LL * 1024 * 1024;
+    static constexpr size_t kAlignSize = 1024;
+    static constexpr size_t kReservedVirtualMemorySize = 256LL * 1024 * 1024 * 1024;
+    NumaHugePagePoolAllocator() = default;
+
+    void maybeInit();
+    void shutdown();
+
+    uint8_t* mMmapBasePtr = nullptr; // allocated memory address range, not aligned.
+    uint8_t* mBasePtr = nullptr;     // aligned memory address range.
+    size_t mAllocatedSize = 0;       // aligned to kAlignSize
+    size_t mMappedSize = 0;          // aligned to kHugePageSize
+
+    int mDevId = -1;
+    int mGpuMemNumaId = -1;
+
+    std::mutex mMutex{};
+    bool mIsInited = false;
+};
+
+NumaHugePagePoolAllocator& NumaHugePagePoolAllocator::getInstance()
+{
+    static NumaHugePagePoolAllocator instance;
+    instance.maybeInit();
+    return instance;
+}
+
+static void allocateAlignedHugePage(void* hintAddr, size_t sizeBytes, int numaNodeId)
+{
+    void* alignedAddr
+        = mmap(hintAddr, sizeBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (alignedAddr == MAP_FAILED)
+    {
+        TLLM_THROW("mmap aligned failed.");
+        return;
+    }
+    TLLM_CHECK_WITH_INFO(alignedAddr == hintAddr, "alignedAddr=%p, but hintAddr=%p", alignedAddr, hintAddr);
+
+    void* addr = alignedAddr;
+
+    // NUMA bind
+    unsigned long nodemask = 1UL << numaNodeId;
+    long mbind_ret = mbind(addr, sizeBytes, MPOL_BIND, &nodemask, sizeof(nodemask) * 8, 0);
+    if (mbind_ret != 0)
+    {
+        TLLM_THROW("mbind failed.");
+        munmap(addr, sizeBytes);
+        return;
+    }
+
+    // Request THP
+    if (madvise(addr, sizeBytes, MADV_HUGEPAGE) != 0)
+    {
+        TLLM_THROW("madvise(MADV_HUGEPAGE) failed.");
+    }
+
+    // Touch memory to actually allocate
+    memset(addr, 0, sizeBytes);
+}
+
+void* NumaHugePagePoolAllocator::allocate(size_t memorySize)
+{
+    std::unique_lock<std::mutex> lock(mMutex);
+    size_t alignedMemorySize = tensorrt_llm::common::divUp(memorySize, kAlignSize) * kAlignSize;
+    size_t totalAllocatedSize = mAllocatedSize + alignedMemorySize;
+    if (totalAllocatedSize > mMappedSize)
+    {
+        // we need to map new pages.
+        size_t newMapSize
+            = tensorrt_llm::common::divUp(totalAllocatedSize - mMappedSize, kHugePageSize) * kHugePageSize;
+        if (mMappedSize != 0)
+        {
+            TLLM_CUDA_CHECK(cudaHostUnregister(mBasePtr));
+        }
+        allocateAlignedHugePage(mBasePtr + mMappedSize, newMapSize, mGpuMemNumaId);
+        mMappedSize += newMapSize;
+        TLLM_CUDA_CHECK(cudaHostRegister(mBasePtr, mMappedSize, cudaHostRegisterDefault));
+    }
+    uint8_t* ptr = mBasePtr + mAllocatedSize;
+    mAllocatedSize += alignedMemorySize;
+    return ptr;
+}
+
+void NumaHugePagePoolAllocator::free(void* ptr)
+{
+    // TODO: we don't actually free up memory since reuse is not implemented, and our use case is for weights, which are
+    // not released until exit.
+    (void) ptr;
+}
+
+void NumaHugePagePoolAllocator::maybeInit()
+{
+    std::unique_lock<std::mutex> lock(mMutex);
+
+    if (mIsInited)
+    {
+        return;
+    }
+
+    TLLM_CUDA_CHECK(cudaGetDevice(&mDevId));
+    mGpuMemNumaId = TopologyDetector::getInstance().getCurrentGpuMemoryNumaId();
+    TLLM_CHECK_WITH_INFO(mGpuMemNumaId >= 0, "NUMA memory not supported.");
+    // allocate a range of virtual address
+    mMmapBasePtr = static_cast<uint8_t*>(
+        mmap(NULL, kReservedVirtualMemorySize + kHugePageSize, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    // aligned to huge page boundary
+    size_t offset = reinterpret_cast<uint64_t>(mMmapBasePtr) % kHugePageSize;
+    mBasePtr = mMmapBasePtr;
+    if (offset > 0)
+    {
+        mBasePtr += kHugePageSize - offset;
+    }
+    mIsInited = true;
+}
+
+void NumaHugePagePoolAllocator::shutdown()
+{
+    munmap(mMmapBasePtr, kReservedVirtualMemorySize + kHugePageSize);
+}
 
 bool HostAccessibleDeviceAllocator::mAllowManagedFallback = false;
 
@@ -216,7 +351,8 @@ void* HostAccessibleDeviceAllocator::allocate(size_t memorySize)
     gdrcopy::GdrMemDesc* memDesc = nullptr;
     if (mGpuMemNumaId >= 0)
     {
-        devPtr = TopologyDetector::getInstance().allocateCurrentGpuNumaMemory(memorySize);
+        // devPtr = TopologyDetector::getInstance().allocateCurrentGpuNumaMemory(memorySize);
+        devPtr = NumaHugePagePoolAllocator::getInstance().allocate(memorySize);
         hostPtr = devPtr;
     }
     else if (mGdrHandle)
@@ -248,7 +384,8 @@ void HostAccessibleDeviceAllocator::free(void* ptr)
         }
         else if (mGpuMemNumaId >= 0)
         {
-            TopologyDetector::getInstance().freeCurrentGpuNumaMemory(const_cast<void*>(it->first), allocInfo.size);
+            // TopologyDetector::getInstance().freeCurrentGpuNumaMemory(const_cast<void*>(it->first), allocInfo.size);
+            NumaHugePagePoolAllocator::getInstance().free(const_cast<void*>(it->first));
         }
         else
         {
