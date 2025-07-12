@@ -19,6 +19,9 @@
 /tensorrt_llm/commands/bench.py @NVIDIA/trtllm-bench-reviewers
 docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 
+## TensorRT-LLM LLM API
+/tensorrt_llm/llmapi @NVIDIA/trt-llm-llmapi-devs
+/tensorrt_llm/executor @NVIDIA/trt-llm-llmapi-devs
 
 # The rule below requires that any PR modifying public APIs must be approved by at least one member
 # of the NVIDIA/trt-llm-committed-api-review-committee or NVIDIA/trt-llm-noncommitted-api-review-committee team.
