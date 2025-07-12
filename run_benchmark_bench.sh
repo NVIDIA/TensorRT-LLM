@@ -12,8 +12,9 @@ pushd ${output_folder} # all the dataset and the yaml are stored inside the fold
 # Define an array of models to benchmark
 declare -a models=(
   "70B-FP8:nvidia/Llama-3.1-70B-Instruct-FP8:/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-70B-Instruct-FP8:4:false"
-  "405B-FP8:nvidia/Llama-3.1-405B-Instruct-FP8:/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-405B-Instruct-FP8:4:false"
+  "Scout-FP4:/home/scratch.trt_llm_data/llm-models/llama4-models/Llama-4-Scout-17B-16E-Instruct-FP4:/home/scratch.trt_llm_data/llm-models/llama4-models/Llama-4-Scout-17B-16E-Instruct-FP4:4:false"
   "R1-0528-FP4:nvidia/DeepSeek-R1-0528-FP4:/home/scratch.trt_llm_data/llm-models/DeepSeek-R1/DeepSeek-R1-0528-FP4:4:true"
+#  "405B-FP8:nvidia/Llama-3.1-405B-Instruct-FP8:/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-405B-Instruct-FP8:4:false"
 )
 
 # num_requests concurrency isl osl
@@ -71,6 +72,8 @@ EOF
   if [ -e ${model_path} ]; then # only use local data path when it is detected
     LOCAL_DATA_PATH_OPTIONS="--model_path ${model_path}"
   fi
+
+  cat  ./extra-llm-api-config.yml
 
   # Run benchmark for this model
   mpirun -n 1 --oversubscribe --allow-run-as-root \
