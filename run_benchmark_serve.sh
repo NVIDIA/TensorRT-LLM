@@ -12,9 +12,10 @@ pushd ${output_folder} # all the dataset and the yaml are stored inside the fold
 
 # Sweep configs, change here if you want to run less or more
 declare -a models=(
-  "R1-0528-FP4:nvidia/DeepSeek-R1-0528-FP4:/home/scratch.trt_llm_data/llm-models/DeepSeek-R1/DeepSeek-R1-0528-FP4:4:true:2048"
-  "70B-FP8:nvidia/Llama-3.1-70B-Instruct-FP8:/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-70B-Instruct-FP8:4:false:5500"
-  "405B-FP8:nvidia/Llama-3.1-405B-Instruct-FP8:/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-405B-Instruct-FP8:4:false:5500"
+  "R1-0528-FP4:nvidia/DeepSeek-R1-0528-FP4:/home/scratch.trt_llm_data/llm-models/DeepSeek-R1/DeepSeek-R1-0528-FP4:4:true:2048:0.9"
+  "70B-FP8:nvidia/Llama-3.1-70B-Instruct-FP8:/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-70B-Instruct-FP8:4:false:5500:0.9"
+  "Scout-FP4:/home/scratch.trt_llm_data/llm-models/llama4-models/Llama-4-Scout-17B-16E-Instruct-FP4:/home/scratch.trt_llm_data/llm-models/llama4-models/Llama-4-Scout-17B-16E-Instruct-FP4:4:false:2048:0.85"
+  #"405B-FP8:nvidia/Llama-3.1-405B-Instruct-FP8:/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-405B-Instruct-FP8:4:false:5500"
   #"70B-FP16:meta-llama/Llama-3.1-70B:/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Meta-Llama-3.1-70B:4:false:5500"
 )
 concurrency_levels=(1024 256 128 64 16 4)
@@ -61,7 +62,7 @@ wait_for_server() {
 
 # Loop through models and run benchmarks
 for model_info in "${models[@]}"; do
-  IFS=':' read -r model_label model_name model_path GPUS adp max_num_tokens <<< "$model_info"
+  IFS=':' read -r model_label model_name model_path GPUS adp max_num_tokens kv_fraction <<< "$model_info"
   # Parse model info (format: model_label:model_name:model_path:gpus)
   echo "========================================================="
   echo "Running benchmark for $model_label model: $model_name"
@@ -96,9 +97,11 @@ EOF
     MODEL="{model_name}"
   fi
 
+  cat  ./extra-llm-api-config.yml
+
   # Start the server and capture its PID
   mpirun -n 1 --oversubscribe --allow-run-as-root \
-  trtllm-serve ${MODEL} --backend pytorch --tp_size ${GPUS} --ep_size ${GPUS} --max_batch_size 1024 --max_num_tokens ${max_num_tokens} --extra_llm_api_options ./extra-llm-api-config.yml &
+  trtllm-serve ${MODEL} --backend pytorch --tp_size ${GPUS} --ep_size ${GPUS} --max_batch_size 1024 --max_num_tokens ${max_num_tokens} --kv_cache_free_gpu_memory_fraction ${kv_fraction} --extra_llm_api_options ./extra-llm-api-config.yml &
   server_pid=$!
 
   # Wait for the server to be ready before proceeding
