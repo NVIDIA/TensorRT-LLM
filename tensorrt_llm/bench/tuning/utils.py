@@ -1,13 +1,13 @@
 import math
 from pathlib import Path
 from typing import Optional, Tuple
+from transformers import AutoConfig
 
 from tensorrt_llm._torch.pyexecutor.config_utils import is_nemotron_hybrid
 from tensorrt_llm.bench.build.dataclasses import ModelConfig
 from tensorrt_llm.bench.build.utils import get_device_memory
 from tensorrt_llm.llmapi.llm_utils import QuantConfig
 from tensorrt_llm.logger import logger
-from tensorrt_llm.models.automodel import AutoConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.bench.build.dataclasses import ModelConfig, NemotronHybridConfig
 

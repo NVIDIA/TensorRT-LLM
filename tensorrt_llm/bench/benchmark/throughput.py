@@ -261,6 +261,11 @@ def throughput_command(
 
     logger.info("Preparing to run throughput benchmark...")
     # Local variables:
+    concurrency: int = params.get("concurrency")
+    warmup: int = params.get("warmup")
+    modality: str = params.get("modality")
+    post_proc_params = None  # No detokenization
+    streaming: bool = params.get("streaming")
     llm = None
 
     LLM_CLS_MAP = {
@@ -335,7 +340,6 @@ def throughput_command(
         logger.info("Setting up throughput benchmark.")
         llm_cls = LLM_CLS_MAP[backend]
         llm = llm_cls(**kwargs)
-        post_proc_params = None  # No detokenization
 
         # Perform warmup if requested.
         if warmup > 0:

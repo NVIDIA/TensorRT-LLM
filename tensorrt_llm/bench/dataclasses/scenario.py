@@ -12,7 +12,7 @@ from transformers import AutoConfig
 
 # isort: off
 from tensorrt_llm._torch.model_config import ModelConfig as TllmModelConfig
-from tensorrt_llm.bench.benchmark.tuning.utils import get_model_config
+from tensorrt_llm.bench.tuning.utils import get_model_config
 from tensorrt_llm.bench.build.utils import get_safetensors_metadata
 from tensorrt_llm.bench.dataclasses.general import DatasetMetadata
 from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
