@@ -690,8 +690,6 @@ class MTPWorker(nn.Module):
     @torch.compile(mode="max-autotune-no-cudagraphs")
     def process_generation_logits(self, logits, num_contexts):
         gen_logits = logits[num_contexts:]
-        # print(f"AMEYN MTP DBG: gen_logits.shape: {gen_logits.shape}")
-        # gen_logits shape: [num_gens, mtp_num_modules + 1, vocab_size]
         gen_logprobs = torch.softmax(gen_logits, dim=-1)
         return gen_logprobs
 
@@ -810,8 +808,6 @@ class MTPWorker(nn.Module):
                          >= 1).int() * self.spec_config.relaxed_delta
             ctx_slot_ids = spec_metadata.slot_ids[:num_contexts]
             mtp_relaxed_delta_pool.index_copy_(0, ctx_slot_ids, ctx_delta)
-
-            # print("AMEYN: before process_generation_logits (softmax) logits.shape:", logits.shape)
 
             # generation
             gen_logprobs = self.process_generation_logits(logits, num_contexts)
@@ -1043,13 +1039,10 @@ class MTPWorker(nn.Module):
     @torch.compile(mode="max-autotune-no-cudagraphs")
     def get_local_max_and_combined(self, logits):
         local_max_values, local_argmax = torch.max(logits, dim=-1, keepdim=True)
-        # print("AMEYN: 2 local_max_values , local_argmax info inside mtp.py draft_sampler:", local_max_values, local_argmax)
         # Adjust indices based on TP rank and size
         vocab_per_rank = logits.shape[-1]
         max_index_per_rank = local_argmax.type(
             torch.int32) + (self.model_config.mapping.tp_rank * vocab_per_rank)
-        # print("AMEYN: 3 max_index_per_rank info inside mtp.py draft_sampler:", max_index_per_rank)
-
         # Use torch.stack and flatten instead of view+cat to avoid torch.compile issues
         # Convert both to float32 to ensure consistent dtype
         max_index_per_rank_float = max_index_per_rank.float()
@@ -1059,14 +1052,10 @@ class MTPWorker(nn.Module):
         combined = torch.stack(
             [max_index_per_rank_float, local_max_values_float32],
             dim=-1).flatten(-2)
-        # print("AMEYN: 3.1 combined info inside mtp.py draft_sampler:", combined)
         return combined
 
     @torch.compile(mode="max-autotune-no-cudagraphs")
     def get_draft_tokens_from_gathered(self, gathered):
-        # print("AMEYN: 3.2 gathered info inside mtp.py get_draft_tokens_from_gathered:", gathered)
-        # Since we now use float32 for both indices and values, extract them directly
-        # gathered format: [idx0_float, val0_float, idx1_float, val1_float, ...]
         gathered_indices_float = gathered[..., 0::2]  # Even positions: indices
         gathered_values_float = gathered[..., 1::2]  # Odd positions: values
 
@@ -1076,7 +1065,6 @@ class MTPWorker(nn.Module):
         # Get the corresponding token indices and convert back to int32
         draft_tokens = torch.gather(gathered_indices_float, -1,
                                     max_indices).squeeze(-1).type(torch.int32)
-        # print("AMEYN: 6 draft_tokens info inside mtp.py draft_sampler:", draft_tokens)
         return draft_tokens
 
     def draft_sampler(
@@ -1096,12 +1084,10 @@ class MTPWorker(nn.Module):
                 [batch_size * max_draft_len]
                 Draft token ids. Flattened.
         '''
-        # print("AMEYN: draft_sampler info inside mtp.py draft_sampler:", logits.shape)
-        # print("AMEYN: self.model_config.mapping.tp_size:", self.model_config.mapping.tp_size)
-        # if False:
         if (self.model_config is not None
                 and hasattr(self.model_config, 'mapping')
-                and self.model_config.mapping.tp_size > 1):
+                and self.model_config.mapping.tp_size
+                > 1) and not (self.model_config.mapping.enable_attention_dp):
             combined = self.get_local_max_and_combined(logits)
             gathered = allgather(combined, self.model_config.mapping, dim=-1)
             draft_tokens = self.get_draft_tokens_from_gathered(gathered)
@@ -1109,13 +1095,13 @@ class MTPWorker(nn.Module):
             # Simple argmax if no TP or no model config
             draft_tokens = torch.argmax(logits, dim=-1).type(torch.int32)
 
-        # print("AMEYN: draft_tokens info inside mtp.py draft_sampler:", draft_tokens.shape)
         return draft_tokens
 
 
 class MTPEagleWorker(MTPWorker):
 
-    def __init__(self, spec_config: "MTPDecodingConfig", model_config: ModelConfig):
+    def __init__(self, spec_config: "MTPDecodingConfig",
+                 model_config: ModelConfig):
         super().__init__(spec_config)
         self.model_config = model_config
         self.mtp_num_modules = spec_config.num_nextn_predict_layers
@@ -1238,8 +1224,7 @@ class MTPEagleWorker(MTPWorker):
                         reorder_block_ids_per_seq, non_blocking=True)
             elif hasattr(attn_metadata, 'kv_lens_cuda'):
 
-                @torch.compile(mode="max-autotune-no-cudagraphs"
-                               )  # FIXME:AN no much improvement.
+                @torch.compile(mode="max-autotune-no-cudagraphs")
                 def update_kv_lens(kv_lens_cuda, batch_size):
                     kv_lens_cuda[:batch_size] += 1
 

@@ -131,6 +131,7 @@ class DeepseekV3MTPHead(nn.Module):
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__()
         config = model_config.pretrained_config
+        self.model_config = model_config
 
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
@@ -157,10 +158,11 @@ class DeepseekV3MTPHead(nn.Module):
             else:
                 hidden_states = hidden_states[-1].unsqueeze(0)
 
-        lm_head.gather_output = False
+        if not (self.model_config.mapping.enable_attention_dp):
+            lm_head.gather_output = False
         logits = lm_head(hidden_states)
-        # print("AMEYN: inside DeepseekV3MTPHead lm_head logits.shape:", logits.shape)
-        lm_head.gather_output = True
+        if not (self.model_config.mapping.enable_attention_dp):
+            lm_head.gather_output = True
         return logits
 
 
@@ -934,16 +936,12 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         self.hnorm = RMSNorm(hidden_size=config.hidden_size,
                              eps=config.rms_norm_eps,
                              dtype=config.torch_dtype)
-        self.fuse_norm_ar = False  #FIXME: AMEYN
-        if self.fuse_norm_ar:
+        if model_config.mapping.enable_attention_dp:
             self.eh_proj = Linear(
                 config.hidden_size * 2,
                 config.hidden_size,
                 bias=False,
                 dtype=config.torch_dtype,
-                tensor_parallel_mode=TensorParallelMode.ROW,
-                mapping=model_config.mapping,
-                reduce_output=False,
                 skip_create_weights_in_init=model_config.
                 skip_create_weights_in_init,
             )
@@ -959,8 +957,6 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
                 skip_create_weights_in_init=model_config.
                 skip_create_weights_in_init,
             )
-
-        # Print shared head initialization message only for rank 0
 
         self.shared_head = DeepseekV3MTPHead(model_config)
 
@@ -993,24 +989,14 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         # Split hidden_states columnwise based on TP
         tp_size = self.model_config.mapping.tp_size
         tp_rank = self.model_config.mapping.tp_rank
-        if tp_size > 1:
+
+        if tp_size > 1 and not (self.model_config.mapping.enable_attention_dp):
             hidden_states = torch.chunk(hidden_states, tp_size, dim=-1)[tp_rank]
         hidden_states = self.eh_proj(hidden_states)
 
         # Input layer norm
-        if self.fuse_norm_ar:
-            hidden_states, residual = self.allreduce(
-                hidden_states,
-                all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                    residual=torch.zeros_like(hidden_states),
-                    norm_weight=self.input_layernorm.weight,
-                    eps=self.input_layernorm.variance_epsilon,
-                ),
-            )
-        else:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
         hidden_states = self.self_attn(
