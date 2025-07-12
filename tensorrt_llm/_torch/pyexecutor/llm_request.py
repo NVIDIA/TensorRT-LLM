@@ -1,4 +1,6 @@
+import copy
 from dataclasses import dataclass
+from functools import partial
 from typing import List, Optional, Union
 
 import torch
@@ -261,6 +263,38 @@ class LlmResponse:
         return self.error_msg is not None
 
 
+def create_response(
+        request: Union['LlmRequest',
+                       tensorrt_llm.bindings.internal.batch_manager.LlmRequest],
+        use_fast_logits=False,
+        mpi_world_rank=0) -> tensorrt_llm.bindings.executor.Response | None:
+    """ Create a response for a given request. """
+    create_serialized_result = \
+        super(LlmRequest, request).create_serialized_result \
+        if isinstance(request, LlmRequest) else \
+        request.create_serialized_result
+    result, is_final = create_serialized_result(use_fast_logits, mpi_world_rank)
+    return LlmResponse(
+        request_id=request.py_request_id,
+        result=LlmResult(result, request.py_result, is_final),
+        client_id=request.py_client_id) if len(result) > 0 else None
+
+
+def finish_by(request: Union[
+    'LlmRequest', tensorrt_llm.bindings.internal.batch_manager.LlmRequest],
+              reason: FinishReason, beam: int) -> None:
+    """CPP finish by reason does not support beam_width > 1"""
+    request.state = LlmRequestState.GENERATION_COMPLETE
+    request.set_finished_reason(reason, beam)
+
+
+def is_generation_only_request(
+    request: Union['LlmRequest',
+                   tensorrt_llm.bindings.internal.batch_manager.LlmRequest]
+) -> bool:
+    return request.py_llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
+
+
 class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
     """LlmRequest wraps `bindings.internal.batch_manager.LlmRequest`
     but detour some features to Python implementation"""
@@ -279,6 +313,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             stop_words_list: list[list[int]] | None = None,
             is_draft: bool = False,
             **kwargs):
+
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
                                                     None)
         # Multimodal data
@@ -316,6 +351,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_return_logits_device_memory = return_logits_device_memory
         self.py_is_draft = is_draft
         self.py_seq_slot = None
+        self.py_exclude_last_generation_logits = exclude_last_generation_logits
 
         # TODO: remove this when use DynamicDecodeOp in pytorch flow.
         # currently, keep py_stop_words_list as python list, rather than tensor.
@@ -327,19 +363,56 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                                   return_generation_logits,
                                   exclude_last_generation_logits)
 
-    def is_generation_only_request(self):
-        return self.py_llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
+    def is_generation_only(self):
+        # is_generation_only_request is a property getter at the C++ side,
+        # so here use a different name at the pytorch backend.
+        return is_generation_only_request(self)
+
+    def create_child_request(self, request_id: int):
+        """ Create a child request.
+
+        NOTE: This function generate a child request by C++'s API to track the
+        states each other and returns the object of type batch_manager.LlmRequest,
+        which is not a llm_request.LlmRequest. As a workaround, to ensure the
+        child request behaves like its parent, this function mimics the behavior
+        of the original LlmRequest by dynamically adding the required attributes
+        of the parent request to the child request. This function will be
+        implemented when LlmRequest becomes pure-python.
+
+        See: https://github.com/NVIDIA/TensorRT-LLM/issues/3034
+        """
+
+        child_request = super().create_child_request(request_id)
+
+        # Copy all py_* attributes from parent to child
+        for attr_name, attr_value in self.__dict__.items():
+            if attr_name.startswith('py_'):
+                attr_value = getattr(self, attr_name)
+                setattr(child_request, attr_name, copy.deepcopy(attr_value))
+
+        # Override specific attributes that should use child_request values.
+        child_request.py_parent_request_id = self.py_request_id
+        child_request.py_request_id = child_request.request_id
+        child_request.py_llm_request_type = child_request.llm_request_type
+        child_request.py_batch_idx = None
+        child_request.py_seq_slot = None
+
+        # Mimic the behavior of the original LlmRequest.
+        child_request.is_attention_dp_dummy = self.is_attention_dp_dummy
+        child_request.is_cuda_graph_dummy = self.is_cuda_graph_dummy
+        child_request.is_dummy = self.is_dummy
+        child_request.is_generation_only = partial(is_generation_only_request,
+                                                   child_request)
+        child_request.create_response = partial(create_response, child_request)
+        child_request.finish_by = partial(finish_by, child_request)
+
+        return child_request
 
     def create_response(
             self,
             use_fast_logits=False,
             mpi_world_rank=0) -> tensorrt_llm.bindings.executor.Response | None:
-        result, is_final = super().create_serialized_result(
-            use_fast_logits, mpi_world_rank)
-        return LlmResponse(
-            request_id=self.py_request_id,
-            result=LlmResult(result, self.py_result, is_final),
-            client_id=self.py_client_id) if len(result) > 0 else None
+        return create_response(self, use_fast_logits, mpi_world_rank)
 
     @property
     def is_dummy(self):
@@ -347,8 +420,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
     def finish_by(self, reason: FinishReason, beam: int) -> None:
         """CPP finish by reason does not support beam_width > 1"""
-        self.state = LlmRequestState.GENERATION_COMPLETE
-        self.set_finished_reason(reason, beam)
+        finish_by(self, reason, beam)
 
 
 def convert_wordlist(word_list) -> List[List[int]]:
