@@ -38,10 +38,6 @@ namespace tensorrt_llm::kernels::speculative_decoding
 //! everything that is not path.
 //! \param batchSlots input buffer [engineBatchSize], address map from local index to
 //! global index [0, batchSize] -> [0, maxBatchSize].
-//! This is in the order of increasing order of the requests in the decoder.
-//! \param seqSlots input buffer [engineBatchSize], address map from local index to
-//! global index [0, batchSize] -> [0, maxBatchSize]
-//! These are the slots of the sequences in the runtime buffers.
 //! \param batchSize the number of sequences to be decoded
 //! \param engineBatchSize number of sequences processed in the engine.
 //! Includes chunked context reqs that are not in the last chunk.
@@ -52,9 +48,9 @@ namespace tensorrt_llm::kernels::speculative_decoding
 //! \param stream stream
 void invokePackAcceptedPaths(runtime::SizeType32* acceptedLengthsCumSum, runtime::SizeType32* pathsOffsets,
     runtime::SizeType32 const* acceptedLengths, runtime::SizeType32 const* bestPathIds,
-    runtime::SizeType32 const* paths, runtime::SizeType32 const* batchSlots, runtime::SizeType32 const* seqSlots,
-    runtime::SizeType32 batchSize, runtime::SizeType32 engineBatchSize, runtime::SizeType32 numPaths,
-    runtime::SizeType32 maxPathLen, bool isPathsSeqSlotIdx, cudaStream_t stream);
+    runtime::SizeType32 const* paths, runtime::SizeType32 const* batchSlots, runtime::SizeType32 batchSize,
+    runtime::SizeType32 engineBatchSize, runtime::SizeType32 numPaths, runtime::SizeType32 maxPathLen,
+    bool isPathsSeqSlotIdx, cudaStream_t stream);
 
 template <typename T>
 struct AcceptDraftTokensByIdsWithPathsParams

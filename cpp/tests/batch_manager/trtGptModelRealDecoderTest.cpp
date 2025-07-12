@@ -1605,7 +1605,9 @@ INSTANTIATE_TEST_SUITE_P(MedusaTests, ParamTest,
                 .usePackedInput()
                 .setKVCacheType(KVCacheType::kPAGED)
                 .useMedusa()),
-        testing::Values(TrtGptModelType::InflightFusedBatching), testing::Values(TrtGptModelIfbTestType::BULK),
+        testing::Values(TrtGptModelType::InflightFusedBatching),
+        testing::Values(
+            TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(BeamConfig{1, {1}}),
         testing::Values(std::nullopt),               // maxTokensInPagedKvCache
         testing::Values(0.4),                        // freeGpuMemoryFraction
@@ -1630,7 +1632,8 @@ INSTANTIATE_TEST_SUITE_P(EagleTests, ParamTest,
                 .setKVCacheType(KVCacheType::kPAGED)
                 .useEagle()),
         testing::Values(TrtGptModelType::InflightFusedBatching),
-        testing::Values(TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT),
+        testing::Values(
+            TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(BeamConfig{1, {1}}),
         testing::Values(std::nullopt),               // maxTokensInPagedKvCache
         testing::Values(0.4),                        // freeGpuMemoryFraction
@@ -1682,7 +1685,9 @@ INSTANTIATE_TEST_SUITE_P(ExplicitDraftTokensDecodingTests, ParamTest,
                 .setKVCacheType(KVCacheType::kPAGED)
                 .useExplicitDraftTokensDecoding()
                 .setMaxOutputLength(128)),
-        testing::Values(TrtGptModelType::InflightFusedBatching), testing::Values(TrtGptModelIfbTestType::BULK),
+        testing::Values(TrtGptModelType::InflightFusedBatching),
+        testing::Values(
+            TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(BeamConfig{1, {1}}),         // beamConfig
         testing::Values(std::nullopt),               // maxTokensInPagedKvCache
         testing::Values(0.4),                        // freeGpuMemoryFraction
