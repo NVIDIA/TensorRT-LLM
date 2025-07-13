@@ -61,3 +61,4 @@ etcd3
 blake3
 llguidance==0.7.29
 soundfile
+deep_gemm @ git+https://github.com/RayWang96/DeepGEMM.git@multi_arch_support
