@@ -100,3 +100,6 @@ class Mamba2Metadata:
                 self.chunk_indices, self.chunk_offsets = cu_seqlens_to_chunk_indices_offsets(
                     self.cu_seqlens[:num_contexts], self.chunk_size,
                     num_ctx_tokens)
+            else:
+                self.chunk_indices = None
+                self.chunk_offsets = None
