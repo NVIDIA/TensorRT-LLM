@@ -137,7 +137,11 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
     InputHead const* q,
 #endif
 #if USE_PAGED_KV_CACHE
+#if PAGED_KV_CACHE_FORMAT == 1
+    GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
+#else
     GMemCacheHead* pool, // global pool of pages
+#endif
     KVCachePageIndex const*
         kvCachePageList, // device pointer. shape: KVCachePageIndex[batchSize][beamWidth][2][maxNbPagesPerSeq].
 #else
