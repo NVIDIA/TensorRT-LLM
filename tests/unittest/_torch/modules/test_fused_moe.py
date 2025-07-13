@@ -9,7 +9,8 @@ import cloudpickle
 import pytest
 import torch
 import torch.nn as nn
-from _torch.helpers import per_block_cast_to_fp8
+from _torch.helpers import (per_block_cast_to_fp8, per_block_cast_to_fp8_e8m0,
+                            per_token_cast_to_fp8_e8m0)
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 from utils.util import (skip_neither_ada_nor_hopper_unittest,
@@ -25,6 +26,8 @@ from tensorrt_llm._torch.modules.fused_moe import (BaseMoeRoutingMethod,
                                                    VanillaMoE, WideEPMoE)
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import \
     CuteDslFusedMoE
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_deepgemm import \
+    DeepGemmFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_wide_ep import \
     AlltoallMethodType
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
@@ -377,6 +380,174 @@ def set_tensor_value_4(x, num_row, num_cols):
                               (num_cols + 3) // 4)[:num_row, :num_cols]
 
     x.copy_(repeated)
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize(
+    "dtype, num_experts, seq_len, hidden_size, RoutingMethodCls",
+    product(
+        [torch.bfloat16],
+        [72],
+        [128, 256, 384, 512, 1024, 2048, 4096, 8192],
+        [2560],
+        [DefaultMoeRoutingMethod],
+    ),
+)
+def test_fused_moe_fp8_blockwise_deepgemm(dtype,
+                                          num_experts,
+                                          seq_len,
+                                          hidden_size,
+                                          RoutingMethodCls,
+                                          mapping=None):
+    SEQ_LEN = seq_len
+    HIDDEN_SIZE = hidden_size
+    INTERMEDIATE_SIZE = 256
+    NUM_EXPERTS = num_experts
+    TOP_K = 2
+
+    routing_method = RoutingMethodCls(top_k=TOP_K)
+
+    mapping = mapping or Mapping()
+    mapping.rank = mpi_rank()
+    torch.cuda.set_device(mapping.rank)
+    torch.manual_seed(0)
+    torch.cuda.manual_seed(0)
+
+    x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda()
+    # Note: we use some special values init x and weight, otherwise the test will false positive failed.
+    set_tensor_value_2(x, SEQ_LEN, HIDDEN_SIZE)
+
+    x = x.cuda()
+    router_logits = torch.randn((SEQ_LEN, NUM_EXPERTS), dtype=dtype).cuda()
+
+    weights = {}
+    for expert_id in range(NUM_EXPERTS):
+        w1_weight = torch.randn(
+            (INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=dtype).cuda() / HIDDEN_SIZE
+        w2_weight = torch.randn((HIDDEN_SIZE, INTERMEDIATE_SIZE),
+                                dtype=dtype).cuda()
+        w3_weight = torch.randn(
+            (INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=dtype).cuda() / HIDDEN_SIZE
+        set_tensor_value_3(w1_weight, INTERMEDIATE_SIZE, HIDDEN_SIZE)
+        set_tensor_value_4(w2_weight, HIDDEN_SIZE, INTERMEDIATE_SIZE)
+        set_tensor_value_3(w3_weight, INTERMEDIATE_SIZE, HIDDEN_SIZE)
+
+        w1_weight_fp8, w1_weight_scale = per_block_cast_to_fp8_e8m0(w1_weight)
+        w1_weight_fp8 = w1_weight_fp8.view(torch.float8_e4m3fn).cuda()
+
+        w2_weight_fp8, w2_weight_scale = per_block_cast_to_fp8_e8m0(w2_weight)
+        w2_weight_fp8 = w2_weight_fp8.view(torch.float8_e4m3fn).cuda()
+
+        w3_weight_fp8, w3_weight_scale = per_block_cast_to_fp8_e8m0(w3_weight)
+        w3_weight_fp8 = w3_weight_fp8.view(torch.float8_e4m3fn).cuda()
+
+        weights[f"{expert_id}.w1.weight"] = w1_weight_fp8
+        weights[f"{expert_id}.w2.weight"] = w2_weight_fp8
+        weights[f"{expert_id}.w3.weight"] = w3_weight_fp8
+        weights[f"{expert_id}.w1.weight_scale_inv"] = w1_weight_scale
+        weights[f"{expert_id}.w2.weight_scale_inv"] = w2_weight_scale
+        weights[f"{expert_id}.w3.weight_scale_inv"] = w3_weight_scale
+        weights[f"{expert_id}.w1.weight_scale"] = w1_weight_scale
+        weights[f"{expert_id}.w2.weight_scale"] = w2_weight_scale
+        weights[f"{expert_id}.w3.weight_scale"] = w3_weight_scale
+
+    quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
+
+    fused_moe = DeepGemmFusedMoE(
+        num_experts=NUM_EXPERTS,
+        routing_method=routing_method,
+        hidden_size=HIDDEN_SIZE,
+        intermediate_size=INTERMEDIATE_SIZE,
+        dtype=dtype,
+        reduce_results=True,
+        model_config=ModelConfig(quant_config=quant_config, mapping=mapping),
+    )
+    fused_moe.cuda()
+    fused_moe.load_weights([weights])
+
+    def swiglu_fused_moe(x):
+        x, gate = x.chunk(2, dim=-1)
+        return torch.nn.functional.silu(gate) * x
+
+    def grouped_gemm(a: torch.Tensor, b: torch.Tensor, a_sf: torch.Tensor,
+                     b_sf: torch.Tensor,
+                     offset_array: torch.Tensor) -> torch.Tensor:
+        d = torch.empty((a.shape[0], b.shape[1]),
+                        device=b.device,
+                        dtype=torch.bfloat16)
+        m_indices = torch.empty(a.shape[0], device=b.device, dtype=torch.int32)
+        for idx in range(offset_array.numel() - 1):
+            m_indices[offset_array[idx]:offset_array[idx + 1]] = idx
+
+        num_groups, n, k_ = b.shape
+        d = torch.empty((a.shape[0], b.shape[1]),
+                        device=b.device,
+                        dtype=torch.bfloat16)
+        m_indices = torch.empty(a.shape[0], device=b.device, dtype=torch.int32)
+        for idx in range(offset_array.numel() - 1):
+            m_indices[offset_array[idx]:offset_array[idx + 1]] = idx
+
+        for g in range(num_groups):
+            aa = a[offset_array[g]:offset_array[g + 1], :].to(torch.bfloat16)
+            aa_sf = a_sf[offset_array[g]:offset_array[g + 1], :]
+            aa_dq = aa * aa_sf.repeat_interleave(
+                128, dim=1)[:aa.shape[0], :aa.shape[1]]
+            bb = b[g, :, :].to(torch.bfloat16)
+            bb_sf = b_sf[g, :, :]
+            bb_dq = bb * bb_sf.repeat_interleave(128, dim=0).repeat_interleave(
+                128, dim=1)[:bb.shape[0], :bb.shape[1]]
+            d[offset_array[g]:offset_array[g + 1], :] = (aa_dq @ bb_dq.t())
+        return d
+
+    token_selected_experts, token_final_scales = routing_method.apply(
+        router_logits)
+    t_idx = 0
+    permuted_data_tensor = torch.empty((x.shape[0] * TOP_K, x.shape[1]),
+                                       device=x.device,
+                                       dtype=torch.bfloat16)
+    expert_first_token_offset_tensor = torch.zeros(NUM_EXPERTS + 1,
+                                                   dtype=torch.int32)
+    unpermute_map = []
+    scales = []
+    for e_idx in range(NUM_EXPERTS):
+        for idx, token in enumerate(x):
+            for i, selected_expert in enumerate(token_selected_experts[idx]):
+                if e_idx == selected_expert:
+                    permuted_data_tensor[t_idx, :] = token
+                    unpermute_map.append(idx)
+                    scales.append(token_final_scales[idx, i])
+                    t_idx += 1
+        expert_first_token_offset_tensor[e_idx + 1] = t_idx
+
+    act_input_fp8, act_input_sf = per_token_cast_to_fp8_e8m0(
+        permuted_data_tensor)
+    h1 = grouped_gemm(
+        a=act_input_fp8,
+        b=fused_moe.w3_w1_weight,
+        a_sf=act_input_sf,
+        b_sf=fused_moe.quant_scales[0],
+        offset_array=expert_first_token_offset_tensor,
+    )
+    h2 = swiglu_fused_moe(h1)
+    act_input_fp8, act_input_sf = per_token_cast_to_fp8_e8m0(h2)
+    h3 = grouped_gemm(
+        a=act_input_fp8,
+        b=fused_moe.w2_weight,
+        a_sf=act_input_sf,
+        b_sf=fused_moe.quant_scales[1],
+        offset_array=expert_first_token_offset_tensor,
+    )
+    ref_output = torch.zeros_like(x)
+    for token_idx, h3_token in enumerate(h3):
+        original_idx = unpermute_map[token_idx]
+        ref_output[original_idx, :] += h3_token * scales[token_idx]
+
+    with torch.inference_mode():
+        output = fused_moe.forward(x, router_logits)
+
+    # compare
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
 
 
 @skip_non_hopper_unittest

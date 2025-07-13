@@ -365,30 +365,37 @@ def fp8_block_scaling_bmm_out(
         torch.ops.trtllm.fp8_block_scaling_bmm_out(mat1_fp8, mat2_fp8,
                                                    mat1_scale, mat2_scale, out)
     elif sm_version == 100:
-        low_latency = True
-        use_deep_seek_fp8 = True
-        tile_size = 8
-        epilogue_tile_m = 64 if use_deep_seek_fp8 else 128
-        m_size = mat1.shape[0]
-        if m_size % tile_size != 0:
-            tiled_shape = ((m_size + tile_size - 1) // tile_size) * tile_size
-            mat1 = torch.nn.functional.pad(
-                mat1, (0, 0, 0, 0, 0, tiled_shape - m_size), "constant", 0)
+        from ..models.modeling_deepseekv3 import weight_dequant
+        mat2 = weight_dequant(
+            mat2_fp8.view(-1, mat2_fp8.shape[-1]),
+            mat2_scale.view(-1, mat2_scale.shape[-1])).view(*mat2_fp8.shape)
+        output = torch.einsum("mbk,bnk->bmn", mat1, mat2.to(mat1.dtype))
+        out.copy_(output)
 
-        mat1_fp8, mat1_scale = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
-            mat1)
-        output, output_sf = torch.ops.trtllm.fp8_batched_gemm_trtllmgen(
-            mat1_fp8,
-            mat2_fp8,
-            tile_size=tile_size,
-            epilogue_tile_m=epilogue_tile_m,
-            use_deep_seek_fp8=use_deep_seek_fp8,
-            low_latency=low_latency,
-            dq_sfs_a=mat1_scale.reshape(mat1.shape[-1] // 128, -1),
-            dq_sfs_b=mat2_scale,
-            out_dtype=out.dtype,
-        )
-        out.copy_(output[:, :m_size])
+        # low_latency = True
+        # use_deep_seek_fp8 = True
+        # tile_size = 8
+        # epilogue_tile_m = 64 if use_deep_seek_fp8 else 128
+        # m_size = mat1.shape[0]
+        # if m_size % tile_size != 0:
+        #     tiled_shape = ((m_size + tile_size - 1) // tile_size) * tile_size
+        #     mat1 = torch.nn.functional.pad(
+        #         mat1, (0, 0, 0, 0, 0, tiled_shape - m_size), "constant", 0)
+
+        # mat1_fp8, mat1_scale = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
+        #     mat1)
+        # output, output_sf = torch.ops.trtllm.fp8_batched_gemm_trtllmgen(
+        #     mat1_fp8,
+        #     mat2_fp8,
+        #     tile_size=tile_size,
+        #     epilogue_tile_m=epilogue_tile_m,
+        #     use_deep_seek_fp8=use_deep_seek_fp8,
+        #     low_latency=low_latency,
+        #     dq_sfs_a=mat1_scale.reshape(mat1.shape[-1] // 128, -1),
+        #     dq_sfs_b=mat2_scale,
+        #     out_dtype=out.dtype,
+        # )
+        # out.copy_(output[:, :m_size])
     else:
         raise NotImplementedError(f"SM{sm_version} is not supported")
 
