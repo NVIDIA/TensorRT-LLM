@@ -16,7 +16,6 @@
 import pytest
 import torch
 from _torch.helpers import calc_diff
-from utils.util import getSMVersion
 
 
 def weight_only_quant_gemm_reference(a, b, b_scales):
@@ -42,10 +41,6 @@ def woq_tolerence_calculate(output, output_ref, b_dtype):
     return atol
 
 
-@pytest.mark.skipif(
-    getSMVersion() != 90,
-    reason="The test is for Hopper only. Current SM is %d." % getSMVersion(),
-)
 @pytest.mark.parametrize(
     "k, n",
     [(7168, 2112), (1536, 24576), (512, 32768), (16384, 7168), (1024, 1024)],
@@ -65,19 +60,19 @@ def woq_tolerence_calculate(output, output_ref, b_dtype):
 def test_weight_only_quant_gemm(a_dtype, b_dtype, m, k, n):
     torch.random.manual_seed(0)
 
+    # generate a, int4/int8 b, and scales
     a = torch.randn((m, k), dtype=a_dtype, device="cuda")
     b = torch.rand((k, n), dtype=a_dtype, device="cuda") * 2 - 1.0
-    ref_b, processed_b, b_scales = torch.ops.trtllm._symmetric_quantize_last_axis_of_batched_matrix(
+    b, processed_b, b_scales = torch.ops.trtllm._symmetric_quantize_last_axis_of_batched_matrix(
         b.cpu(), b_dtype)
     if b_dtype == torch.quint4x2:
-        ref_b = torch.ops.trtllm.unpack_int4_packed_tensor_to_int8(ref_b.cpu())
+        b = torch.ops.trtllm.unpack_int4_packed_tensor_to_int8(b.cpu())
 
     output = torch.ops.trtllm.weight_only_quant_gemm(a, processed_b.cuda(),
                                                      b_dtype, b_scales.cuda(),
                                                      a_dtype)
 
-    output_ref = weight_only_quant_gemm_reference(a, ref_b.cuda(),
-                                                  b_scales.cuda())
+    output_ref = weight_only_quant_gemm_reference(a, b.cuda(), b_scales.cuda())
 
     # check accuracy
     diff = calc_diff(output, output_ref)

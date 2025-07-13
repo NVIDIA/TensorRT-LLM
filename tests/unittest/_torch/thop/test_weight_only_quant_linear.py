@@ -24,6 +24,7 @@ def test_weight_only_quant_linear(dtype, weights_dtype):
     # w: int8 or int4x2 weight, w_processed: preprocessed weight, w_scales: scale of w
     w, w_processed, w_scales = torch.ops.trtllm._symmetric_quantize_last_axis_of_batched_matrix(
         w.cpu(), weights_dtype)
+    w = w.cuda()
     w_processed = w_processed.cuda()
     w_scales = w_scales.cuda()
 
@@ -41,8 +42,8 @@ def test_weight_only_quant_linear(dtype, weights_dtype):
                         quant_config=qc)
 
     linear_woq.load_weights([{
-        'weight': w.T.cuda(),
-        'weight_scale': w_scales.cuda(),
+        'weight': w.T,
+        'weight_scale': w_scales,
     }])
 
     linear_woq = linear_woq.cuda()
