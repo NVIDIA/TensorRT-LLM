@@ -1,7 +1,6 @@
 """High-level entrypoint to transform a model into an efficient inference model."""
 
 import gc
-
 import torch
 import torch.nn as nn
 
@@ -15,6 +14,10 @@ from ..utils.logger import ad_logger
 from ._graph import canonicalize_graph, lift_to_meta, move_to_device
 from .export import torch_export_to_gm
 from .library import (
+    TransformationConfig,
+    ShardingConfig,
+    transformation_executor,
+    detect_column_row_shard,
     column_row_shard,
     dp_bmm_shard,
     eliminate_redundant_transposes,
@@ -67,13 +70,16 @@ class InferenceOptimizer:
 
         cm.info.set_example_sequence()
         egm = torch_export_to_gm(model, args=cm.args, dynamic_shapes=cm.dynamic_shapes)
+        config = model.config
         del model
         ad_logger.debug("original graph: " + str(egm))
         local_rank, world_size = dist_ad.get_rank_world_size()
+        world_size = 2
 
         ############################################################################################
         # RUN PATTERN MATCHER TRANSFORMATIONS TO STANDARDIZE GRAPH REPRESENTATION
         ############################################################################################
+        transformation_config = TransformationConfig()
 
         # quantization
         quantize(egm, self.factory.get_quant_config())
@@ -115,14 +121,23 @@ class InferenceOptimizer:
         # see https://github.com/NVIDIA/TensorRT-LLM/pull/3668#discussion_r2052714528
         optimize_rope(egm)
 
+        # TODO (gkwasniewski): if present, infer sharding parameters (tp_size, row/column sharding)
+        # from the model config.
+        sharding_config = ShardingConfig()
+        
+        transformation_config.sharding_config = sharding_config
+        
         # run TP sharding across ranks
-        column_row_shard(egm, local_rank, world_size, self.ad_config.simple_shard_only)
+        sharding_config.tp_sharing_transformations = \
+            detect_column_row_shard(egm, local_rank, world_size, self.ad_config.simple_shard_only)
 
         # run EP sharding across ranks
         ep_shard(egm, local_rank, world_size)
 
         # run BMM sharding across ranks
         dp_bmm_shard(egm, local_rank, world_size)
+        
+        transformation_executor(transformation_config)
 
         # let's run a shape propagation pass to update the graph with correct meta values for
         # subsequent optimization passes. Lift state_dict to meta as shape propagation involves device check
@@ -209,3 +224,4 @@ class InferenceOptimizer:
         torch.cuda.empty_cache()
         gc.collect()
         return egm_compiled
+

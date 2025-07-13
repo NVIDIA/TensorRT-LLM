@@ -21,6 +21,8 @@ import operator
 from collections import defaultdict
 from functools import partial
 from typing import Callable, DefaultDict, Dict, List, Set
+from dataclasses import dataclass, field
+
 
 import torch
 import torch.nn as nn
@@ -36,6 +38,38 @@ from ...utils.node_utils import (
 )
 from ...utils.quantization_utils import QuantizationImpl
 from .._graph import canonicalize_graph
+
+
+@dataclass
+class TPSharingTransformation:
+    """Configuration for TP sharing transformations."""
+
+    anchor_gm: torch.fx.GraphModule = None
+    anchor_node: torch.fx.Node = None
+    dim: int = 0
+    rank: int = 0
+    world_size: int = 1
+    add_dist: bool = False
+    min_local_shape: int = 1
+
+
+@dataclass
+class ShardingConfig:
+    """Configuration for sharding the model."""
+
+    tp_size: int = 1
+    dp_size: int = 1
+    ep_size: int = 1
+
+    tp_sharing_transformations: List[TPSharingTransformation] = field(default_factory=list)
+    
+
+
+@dataclass
+class TransformationConfig:
+    """Configuration for transformations."""
+    
+    sharding_config: ShardingConfig = field(default_factory=ShardingConfig)
 
 
 def _load_hook(
@@ -210,6 +244,26 @@ def _simple_shard(
             _insert_sharded_matmul(gm, n, 0, rank, world_size, add_dist=True)
 
 
+def _append_simple_shard(
+    gm: GraphModule, nodes_linear: Dict[Node, List[Node]], rank: int, world_size: int
+) -> List[TPSharingTransformation]:
+    # for every linear node:
+    # --> row_split (dim 0 of weight) + all_gather (dim -1 of output)
+    tp_shards: List[TPSharingTransformation] = []
+    for node_group in nodes_linear.values():
+        for n in node_group:
+            tp_shards.append(TPSharingTransformation(
+                anchor_gm=gm,
+                anchor_node=n,
+                dim=0,
+                rank=rank,
+                world_size=world_size,
+            ))
+
+    return tp_shards
+
+
+
 def column_row_shard(
     gm: GraphModule,
     rank: int,
@@ -380,6 +434,183 @@ def column_row_shard(
     ad_logger.info(f"Found {num_shards} TP shards")
 
 
+
+def detect_column_row_shard(
+    gm: GraphModule,
+    rank: int,
+    world_size: int,
+    simple_shard_only: bool = False,
+) -> List[TPSharingTransformation]:
+    """A transformation to apply sharding to the model following tensor parallelism.
+
+    The transformation is based on the following steps:
+
+    1. Identify boundary nodes between residual nodes to identify shardable regions.
+    2. Identify the GEMM nodes that can be sharded
+    3. Trace through the subgraph using DFS/BFS between each pair of boundary nodes
+    4. Account for each node in the trace to ensure the op is correct even after sharding. This is
+       necessary to ensure that the sharding is correct and we need to be able to account for
+       **all** nodes in the subgraph. The subgraph here is defined as the region between the first
+       linear node to the last linear node of an identified sharding region.
+    # 5. Shard the GEMM nodes or skip accordingly.
+
+    min_local_shape is the minimum size of the local tensor shard, to prevent TP parallelism
+    splitting, e.g., the individual heads into smaller shards.
+    """
+    ad_logger.debug("Before sharding graph: " + str(gm))
+    
+    tp_shards: List[TPSharingTransformation] = []
+
+    if world_size < 2:
+        ad_logger.info("Skipping sharding for single device")
+        return tp_shards
+
+    assert isinstance(gm, GraphModule), "Expecting GraphModule"
+
+    # find boundary nodes of regions we want to shard
+    boundary_nodes = identify_regions_between_residuals(gm)
+
+    # TODO: continue updating these lists
+    # pointwise ops that don't affect the sharder
+    pointwise_ops = {
+        torch.ops.aten.gelu,
+        torch.ops.aten.leaky_relu,
+        torch.ops.aten.mul,
+        torch.ops.aten.relu,
+        torch.ops.aten.sigmoid,
+        torch.ops.aten.silu,
+        torch.ops.aten.tanh,
+        torch.ops.aten.contiguous,
+    }
+
+    # acceptable attention nodes between sharded GEMMs
+    shardable_attention_nodes = {
+        torch.ops.auto_deploy.torch_attention_sdpa,
+        torch.ops.auto_deploy.torch_attention_grouped_sdpa,
+        torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa,
+    }
+
+    # This is a heuristic. Basically, we assume those are okay to shard if we also encounter an
+    # attention node because we know that those ops must be compatible with the attention op. Now
+    # since the attention op is shardable, we will assume those are as well if used in conjunction
+    # with the attention op.
+    shardable_nodes_with_attention = {
+        torch.ops.aten.view,
+        torch.ops.aten.reshape,
+        torch.ops.auto_deploy.flashinfer_rope,
+        operator.getitem,
+    }
+
+    # let's look at linear nodes we can identify between pairs of boundary nodes
+    # There is three potential cases we can handle:
+    # 1. No linear nodes:
+    #       --> just continue
+    # 2. Two groups of linear nodes and we can account for all to the view nodes:
+    #       --> row_split (dim 0) 1st group + check for supported nodes +
+    #           col_split (dim 1) 2nd group + all_reduce output of 2nd group
+    # 3. Linear nodes that are not in two groups or we cannot account for all nodes:
+    #       --> row_split (dim 0 of weight) + all_gather (dim -1 of output) output
+    num_shards = 0
+    for n_start, n_end in zip(boundary_nodes[:-1], boundary_nodes[1:]):
+        # we iterate through all nodes between the two boundary nodes and store linear nodes
+        # sorted by their input activation node. We also store remaining nodes.
+        nodes_linear: DefaultDict[Node, List[Node]] = defaultdict(list)
+        attention_nodes: Set[Node] = set()
+        attention_related_nodes: Set[Node] = set()
+        unaccounted_nodes: Set[Node] = set()
+        current_node = n_start
+        while current_node != n_end:
+            if is_linear_op(current_node, include_quantization=True):
+                nodes_linear[current_node.args[0]].append(current_node)
+            elif is_op(current_node, shardable_attention_nodes):
+                attention_nodes.add(current_node)
+            elif is_op(current_node, shardable_nodes_with_attention):
+                attention_related_nodes.add(current_node)
+            elif not is_op(current_node, pointwise_ops):
+                unaccounted_nodes.add(current_node)
+            current_node = current_node.next
+            assert current_node, "Could not identify next node"
+
+        # nothing to shard
+        if len(nodes_linear) == 0:
+            continue
+
+        num_shards += 1
+
+        if simple_shard_only:
+            ad_logger.debug(f"Forcing Simple Shard: Linear groups: {nodes_linear}")
+            tp_shards.extend(_append_simple_shard(gm, nodes_linear, rank, world_size))
+            continue
+
+        # simple shard when we have != 2 groups of linear nodes
+        if len(nodes_linear) != 2:
+            ad_logger.debug(f"Linear groups: {nodes_linear}")
+            tp_shards.extend(_append_simple_shard(gm, nodes_linear, rank, world_size))
+            continue
+
+        # let's look at the unnacounted nodes. They are okay as long as they fall before the
+        # first linear node or after the last linear node, i.e., outside the sharded region
+        lin_nodes_flat: Set[Node] = {n for group in nodes_linear.values() for n in group}
+        lin_nodes_passed: Set[Node] = set()
+        current_node = n_start
+        while current_node != n_end:
+            # check if this is another linear node
+            if current_node in lin_nodes_flat:
+                lin_nodes_passed.add(current_node)
+
+            # check if we are OUTSIDE sharded region
+            if len(lin_nodes_passed) == 0 or lin_nodes_passed == lin_nodes_flat:
+                # remove node from unaccounted nodes since we are outside and it doesn't matter
+                unaccounted_nodes.discard(current_node)
+                attention_related_nodes.discard(current_node)
+                attention_nodes.discard(current_node)
+
+            current_node = current_node.next
+
+        # let's post-process the attention-related nodes
+        # we can disregard them if we also see attention nodes and we assume they are compatible
+        if len(attention_nodes) > 0:
+            attention_related_nodes.clear()
+
+        # check if any unaccounted nodes are left. If so, do a simply shard
+        if unaccounted_nodes or attention_related_nodes:
+            ad_logger.debug(f"Unaccounted nodes: {unaccounted_nodes}")
+            tp_shards.extend(_append_simple_shard(gm, nodes_linear, rank, world_size))
+            continue
+
+        # If we can account for all sharded nodes, we can do a two-way shard
+        # --> row_split (dim 0) + col_split (dim 1) + all_reduce
+
+        # check if we are sharding the attention block
+        if attention_nodes:
+            if len(attention_nodes) > 1:
+                # Column-row shard boundary region detection is probably wrong - there should be
+                # only one attention operation. Fall back to simple shard.
+                ad_logger.debug(f"More than one attention node: {unaccounted_nodes}")
+                tp_shards.extend(_append_simple_shard(gm, nodes_linear, rank, world_size))
+                continue
+            # Extract head dimension. We cannot shard below the head_dim size.
+            # Assume that head_dim is the last (innermost) dimension of the tensor
+            min_local_shape = attention_nodes.pop().meta["val"].shape[-1]
+        else:
+            min_local_shape = 1
+        for i, group in enumerate(nodes_linear.values()):
+            for n in group:
+                tp_shards.append(TPSharingTransformation(
+                    anchor_gm=gm,
+                    anchor_node=n,
+                    dim=i,
+                    rank=rank,
+                    world_size=world_size,
+                    add_dist=i > 0,
+                    min_local_shape=min_local_shape,
+                ))
+
+    ad_logger.info(f"Found {num_shards} TP shards")
+    return tp_shards
+
+
+
 def dp_bmm_shard(gm: GraphModule, rank: int, world_size: int) -> None:
     """A transformation to apply sharding to batched matrix multiplications in the graph.
 
@@ -505,3 +736,45 @@ def dp_bmm_shard(gm: GraphModule, rank: int, world_size: int) -> None:
         gm = canonicalize_graph(gm)
     ad_logger.debug("After sharding BMM: " + str(gm))
     ad_logger.info(f"Found {num_bmm_shards} BMM shards")
+
+
+
+
+
+def sharding_executor(config: ShardingConfig) -> None:
+    '''
+    Apply sharding transformations to the model.
+    Args:
+        config: Sharding configuration
+    Returns:
+        None. Transformations are applied in place.
+    '''
+    gms = set()
+    for transformation in config.tp_sharing_transformations:
+        if transformation.anchor_gm is None \
+            or transformation.anchor_node is None:
+            continue
+        gms.add(transformation.anchor_gm)
+        _insert_sharded_matmul(transformation.anchor_gm, 
+                              transformation.anchor_node, 
+                              transformation.dim,
+                              transformation.rank,
+                              transformation.world_size, 
+                              transformation.add_dist, 
+                              transformation.min_local_shape)
+    
+    # canonicalize and return
+    for gm in gms:
+        gm = canonicalize_graph(gm)
+        ad_logger.debug("After sharding: " + str(gm))
+        
+
+def transformation_executor(config: TransformationConfig) -> None:
+    '''
+    Apply transformations to the model.
+    Args:
+        config: Transformation configuration
+    Returns:
+        None. Transformations are applied in place.
+    '''
+    sharding_executor(config.sharding_config)
