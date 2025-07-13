@@ -33,7 +33,7 @@ from modelopt.torch.utils.speech_dataset_utils import get_speech_dataset_dataloa
 from safetensors.torch import load_file, save_file
 from torch.utils.data import DataLoader
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoProcessor,
-                          AutoTokenizer, WhisperProcessor)
+                          AutoTokenizer)
 
 from .._utils import release_gc, str_dtype_to_torch
 from ..logger import logger
