@@ -33,23 +33,28 @@ report() {
     echo "==========================================="
     echo "Report path" $(realpath ${results})
     echo "START" $start_time "-" "END" ${end_time} $(hostname)
-    grep -Hn "Per GPU Output Throughput" ${results}/bench.*log \
+    grep -Hn "Total Output Throughput" ${results}/bench.*log \
          | awk -F "/bench." '{print $2}' | awk -F ":" '{print $1" "$4}' | awk -F ".log" '{print $1" "$2}' \
          | awk -F "." '{print $1" "$2}'    | awk -F " " '{print $1" "$2" "$3}' | sort -k1,1 -k2,2nr \
          || true
     echo "==========================================="
 }
 
-clone_code
+run() {
 
-mkdir -p ${output_folder}
+    clone_code
+    
+    mkdir -p ${output_folder}
+    
+    echo "trtllm-bench Job ${SLURM_JOB_ID} started at:${start_time} on:$(hostname) under:$(pwd)
+    git commit: $(git log --oneline origin/main | head -1)
+    output: ${output_folder} " | ~/bin/slack.sh
+    
+    build
+    run_benchmark
+    end_time=$(date '+%Y-%m-%d-%H:%M:%S')
+    
+    report ${output_folder} | ~/bin/slack.sh
+}
 
-echo "trtllm-bench Job ${SLURM_JOB_ID} started at:${start_time} on:$(hostname) under:$(pwd)
-git commit: $(git log --oneline origin/main | head -1)
-output: ${output_folder} " | ~/bin/slack.sh
-
-build
-run_benchmark
-end_time=$(date '+%Y-%m-%d-%H:%M:%S')
-
-report ${output_folder} | ~/bin/slack.sh
+run
