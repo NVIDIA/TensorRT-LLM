@@ -29,10 +29,11 @@ import torch
 from accelerate.hooks import remove_hook_from_module
 from datasets import load_dataset
 from modelopt.torch.utils import print_rank_0
+from modelopt.torch.utils.speech_dataset_utils import get_speech_dataset_dataloader
 from safetensors.torch import load_file, save_file
 from torch.utils.data import DataLoader
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoProcessor,
-                          AutoTokenizer)
+                          AutoTokenizer, WhisperProcessor)
 
 from .._utils import release_gc, str_dtype_to_torch
 from ..logger import logger
@@ -128,7 +129,7 @@ def quant_cfg_choices():
 
 
 def model_type_is_enc_dec(model_type):
-    return model_type in ["t5", "bart"]
+    return model_type in ["t5", "bart", "whisper"]
 
 
 MODEL_NAME_PATTERN_MAP = {
@@ -168,7 +169,8 @@ MODEL_NAME_PATTERN_MAP = {
     "GraniteForCausalLM": "granite",
     "GraniteMoeForCausalLM": "granitemoe",
     "T5": "t5",
-    "Bart": "bart"
+    "Bart": "bart",
+    "WhisperForConditionalGeneration": "whisper",
 }
 
 MULTIMODAL_DATASETS = ['scienceqa', 'science_qa']
@@ -319,29 +321,22 @@ def get_model(ckpt_path: str,
     elif hf_config.model_type == 'qwen2_vl':
         from transformers import Qwen2VLForConditionalGeneration
         model_cls = Qwen2VLForConditionalGeneration
+    elif hf_config.model_type == "whisper":
+        from transformers import WhisperForConditionalGeneration
+        model_cls = WhisperForConditionalGeneration
+    elif model_type_is_enc_dec(hf_config.model_type) or hf_config.model_type == "glm":
+        from transformers import AutoModelForSeq2SeqLM
+        model_cls = AutoModelForSeq2SeqLM
 
     if "vila" in ckpt_path:
         model = _get_vila_model(ckpt_path)
     elif "llava-onevision-qwen2" in ckpt_path:
         model = _get_llava_qwen_model(ckpt_path, dtype, device)
-    elif hf_config.model_type == "glm":
-        from transformers import AutoModelForSeq2SeqLM
-        model = AutoModelForSeq2SeqLM.from_pretrained(ckpt_path,
-                                                      device_map="cuda",
-                                                      torch_dtype=torch_dtype,
-                                                      trust_remote_code=True)
-    elif model_type_is_enc_dec(hf_config.model_type):
-        from transformers import AutoModelForSeq2SeqLM
-        model = AutoModelForSeq2SeqLM.from_pretrained(ckpt_path,
-                                                      device_map=device,
-                                                      torch_dtype=torch_dtype,
-                                                      trust_remote_code=True)
-        model = EncDecModelWrapper(hf_model=model)
     else:
         model = model_cls.from_pretrained(
             ckpt_path,
             device_map=device_map if device != "cpu" else "cpu",
-            torch_dtype="auto",
+            torch_dtype=torch_dtype,
             trust_remote_code=True)
         if hf_config.model_type in ["llava", "internvl_chat"]:
             model = model.language_model
@@ -350,6 +345,9 @@ def get_model(ckpt_path: str,
             lm_head = model.lm_head
             model = model.model
             model.lm_head = lm_head
+
+    if model_type_is_enc_dec(hf_config.model_type):
+        model = EncDecModelWrapper(hf_model=model)
 
     model.eval()
 
@@ -711,6 +709,10 @@ def quantize_and_export(*,
         tokenizer = get_tokenizer(model_dir + "/llm",
                                   max_seq_length=tokenizer_max_seq_length,
                                   model_type=model_type)
+    elif model_type == 'whisper':
+        processor = get_processor(model_dir,
+                                  max_seq_length=tokenizer_max_seq_length,
+                                  model_type=model_type)
     elif model_type == "mllama":
         tokenizer = get_processor(model_dir,
                                   max_seq_length=tokenizer_max_seq_length,
@@ -775,15 +777,26 @@ def quantize_and_export(*,
                 print_rank_0("Quantizing lm_head layer")
                 del quant_cfg["quant_cfg"]["*lm_head*"]
 
-        calib_dataloader = get_calib_dataloader(
-            dataset_name_or_dir=calib_dataset,
-            tokenizer=tokenizer,
-            batch_size=batch_size,
-            calib_size=calib_size,
-            block_size=calib_max_seq_length,
-            device=model.device,
-            include_labels=auto_quantize_bits is not None,
-        )
+        if model_type == 'whisper':
+            model_dtype = next(model.parameters()).dtype
+            calib_dataloader, _ = get_speech_dataset_dataloader(
+                dataset_name=calib_dataset,
+                processor=processor,
+                batch_size=batch_size,
+                num_samples=calib_size,
+                device=model.device,
+                dtype=model_dtype,
+            )
+        else:
+            calib_dataloader = get_calib_dataloader(
+                dataset_name_or_dir=calib_dataset,
+                tokenizer=tokenizer,
+                batch_size=batch_size,
+                calib_size=calib_size,
+                block_size=calib_max_seq_length,
+                device=model.device,
+                include_labels=auto_quantize_bits is not None,
+            )
 
         model = quantize_model(model, quant_cfg, calib_dataloader, batch_size,
                                qformat, auto_quantize_bits)
