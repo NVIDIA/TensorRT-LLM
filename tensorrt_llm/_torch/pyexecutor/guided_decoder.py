@@ -7,7 +7,6 @@ from ...bindings.executor import GuidedDecodingConfig
 from .grammar_matcher import (GrammarMatcher, GrammarMatcherFactory,
                               LLGuidanceMatcherFactory, XGrammarMatcherFactory)
 from .scheduler import ScheduledRequests
-from .seq_slot_manager import SeqSlotManager
 
 
 class GuidedDecoder:
@@ -49,12 +48,11 @@ class GuidedDecoder:
     def bitmask_size(self) -> int:
         return math.ceil(self.vocab_size_padded / 32)
 
-    def build(self, scheduled_requests: ScheduledRequests,
-              resource_manager: SeqSlotManager) -> None:
+    def build(self, scheduled_requests: ScheduledRequests) -> None:
         for llm_req in scheduled_requests.all_requests():
             if llm_req.guided_decoding_params is None:
                 continue
-            slot = resource_manager.slot_manager.get_slot(llm_req.request_id)
+            slot = llm_req.py_seq_slot
             if llm_req.is_context_init_state and llm_req.context_current_position == llm_req.prepopulated_prompt_len:
                 self.grammar_matchers[
                     slot] = self.grammar_matcher_factory.create(
@@ -76,7 +74,7 @@ class GuidedDecoder:
                                          non_blocking=True)
 
     def execute(self, scheduled_requests: ScheduledRequests,
-                logits: torch.Tensor, resource_manager: SeqSlotManager) -> None:
+                logits: torch.Tensor) -> None:
         assert logits.size(0) == len(scheduled_requests.context_requests) + len(
             scheduled_requests.generation_requests)
         torch.cuda.current_stream().wait_stream(self._stream)
@@ -88,8 +86,7 @@ class GuidedDecoder:
             if llm_req.is_context_init_state and not llm_req.is_last_context_chunk:
                 continue
             batched_logits.append(logits[i])
-            slot = resource_manager.slot_manager.get_slot(llm_req.request_id)
-            batched_bitmask.append(self.bitmask[slot])
+            batched_bitmask.append(self.bitmask[llm_req.py_seq_slot])
 
         if len(batched_logits) > 0:
             torch.ops.trtllm.logits_bitmask(batched_logits, batched_bitmask)
