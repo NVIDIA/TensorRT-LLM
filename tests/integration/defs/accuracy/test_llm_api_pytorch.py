@@ -288,7 +288,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
         llm = LLM(self.MODEL_PATH,
                   guided_decoding_backend=backend,
-                  disable_overlap_scheduler=True,
                   cuda_graph_config=CudaGraphConfig())
         with llm:
             task = JsonModeEval(self.MODEL_NAME)
@@ -301,7 +300,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
         with LLM(self.MODEL_PATH,
                  guided_decoding_backend=backend,
-                 disable_overlap_scheduler=True,
                  cuda_graph_config=CudaGraphConfig(),
                  tensor_parallel_size=2,
                  pipeline_parallel_size=2) as llm:
