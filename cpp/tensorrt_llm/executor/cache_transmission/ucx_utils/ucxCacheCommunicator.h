@@ -36,6 +36,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <zmq.hpp>
 
 namespace tensorrt_llm::executor::kv_cache
 {
@@ -45,16 +46,20 @@ class UcxConnectionManager : public ConnectionManager, public std::enable_shared
 private:
     std::shared_ptr<ucxx::Context> mUcxCtx;
     std::vector<std::shared_ptr<ucxx::Worker>> mWorkersPool;
+    std::string mWorkerAddress;
     std::map<UcxConnection::ConnectionIdType, std::shared_ptr<UcxConnection>> mConnections;
     std::map<UcxConnection::ConnectionIdType, std::future<void>> mConnectionFutures;
     std::mutex mConnectionsMutex;
     std::mutex mConnectionFuturesMutex;
     std::unordered_map<std::string, uint64_t> mAddressToConnectionId;
     std::mutex mAddressToConnectionIdMutex;
-    std::shared_ptr<ucxx::Listener> mListener;
     CommState mCommState;
     int mDevice;
     std::atomic<UcxConnection::ConnectionIdType> mConnectionIdCounter{1};
+    zmq::context_t mZmqContext;
+    zmq::socket_t mZmqRepSocket;
+    std::string mZmqRepEndpoint;
+    std::thread mZmqRepThread;
 
     UcxConnection::ConnectionIdType getNewConnectionId(std::shared_ptr<ucxx::Endpoint> const& newEp);
     UcxConnection::ConnectionIdType addConnection(std::string const& ip, uint16_t port);
@@ -69,7 +74,7 @@ public:
         return std::make_unique<UcxConnectionManager>();
     }
 
-    void addConnection(ucp_conn_request_h connRequest);
+    void addConnection(std::string const& workerAddress);
     Connection const* recvConnect(DataContext const& ctx, void* data, size_t size) override;
     std::vector<Connection const*> getConnections(CommState const& state) override;
     [[nodiscard]] CommState const& getCommState() const override;
