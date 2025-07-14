@@ -4,8 +4,7 @@ import torch
 
 from ...distributed import allgather, reducescatter
 from ...model_config import ModelConfig
-from ...utils import (EventType, Fp4QuantizedTensor, ceil_div,
-                      disable_fp4_allgather, swizzle_sf)
+from ...utils import EventType, Fp4QuantizedTensor, ceil_div, swizzle_sf
 from .interface import MoE
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            FP8QDQFusedMoEMethod, MoEWeightLoadingMode,
@@ -220,8 +219,7 @@ class CutlassFusedMoE(MoE):
             # TODO: remove this once we have correct fusedmoe kernel ready
             token_final_scales = None
 
-        use_allgather = self.use_dp and self.parallel_size > 1 and not disable_fp4_allgather(
-        )
+        use_allgather = self.use_dp and self.parallel_size
 
         # quantize inputs
         use_deepseek_fp8_block_scale = False
