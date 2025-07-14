@@ -958,20 +958,15 @@ class PyExecutor:
                         self._prepare_disagg_gen_transmission_complete(
                             scheduled_batch)
 
+                        # Return the first token to the client
+                        self._handle_first_token_response(scheduled_batch)
+
                     self.resource_manager.prepare_resources(scheduled_batch)
                     if self.draft_model_engine is not None:
                         self._prepare_draft_tokens(scheduled_batch)
 
                     if self.drafter is not None:
                         self.drafter.prepare_draft_tokens(scheduled_batch)
-
-                    if self.kv_cache_transceiver:
-                        # For generation requests which have completed KV cache transfer
-                        self._prepare_disagg_gen_transmission_complete(
-                            scheduled_batch)
-
-                        # Return the first token to the client
-                        self._handle_first_token_response(scheduled_batch)
 
                     batch_outputs = self._forward_step(scheduled_batch)
 
