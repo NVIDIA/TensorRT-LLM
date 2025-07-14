@@ -1198,6 +1198,14 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
         --input-files=${inputFiles.join(",")}
     """
 
+    // Create a new results xml file with rerun results xml files for dashboard
+    sh """
+        python3 ${llmSrc}/tests/integration/defs/test_rerun.py \
+        merge_junit_xmls \
+        --output-file=${WORKSPACE}/${stageName}/rerun_results_for_dashboard.xml \
+        --input-files=${inputFiles.join(",")} \
+    """
+
     // Update original results xml file with rerun results xml files for junit
     sh """
         python3 ${llmSrc}/jenkins/test_rerun.py \
