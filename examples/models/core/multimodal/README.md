@@ -15,6 +15,7 @@ We first describe three runtime modes for running multimodal models and how to r
 - [InternLM-XComposer2](#internlm-xcomposer2)
 - [InternVL2](#internvl2)
 - [Kosmos-2](#kosmos-2)
+- [Llama 3.1 Nemotron Nano VL 8B V1](#llama-31-nemotron-nano-vl-8b-v1)
 - [LLaVA, LLaVa-NeXT, LLaVA-OneVision and VILA](#llava-llava-next-llava-onevision-and-vila)
 - [MLLaMA](#mllama)
 - [NeVA](#neva)
@@ -518,6 +519,60 @@ Firstly, please install transformers with 4.37.2
     python run.py \
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
         --engine_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu
+    ```
+
+## Llama 3.1 Nemotron Nano VL 8B V1
+
+This section shows how to build and run Llama 3.1 Nemotron Nano VL 8B V1 model in TensorRT-LLM.
+
+1. Download Huggingface weights
+
+    ```bash
+    export MODEL_NAME="Llama-3.1-Nemotron-Nano-VL-8B-V1"
+    git clone https://huggingface.co/nvidia/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
+    ```
+
+2. Convert Huggingface weights into TRT-LLM checkpoints
+
+    ```bash
+    python ../llama/convert_checkpoint.py \
+        --model_dir tmp/hf_models/${MODEL_NAME} \
+        --output_dir tmp/trt_models/${MODEL_NAME}/bf16/1-gpu \
+        --dtype bfloat16
+    ```
+
+3. Build TRT-LLM engine from TRT-LLM checkpoint
+
+    ```bash
+    trtllm-build \
+        --checkpoint_dir tmp/trt_models/${MODEL_NAME}/bf16/1-gpu \
+        --output_dir tmp/trt_engines/${MODEL_NAME}/bf16/1-gpu/llm \
+        --gemm_plugin bfloat16 \
+        --gpt_attention_plugin bfloat16 \
+        --max_batch_size 1 \
+        --max_seq_len 16384 \
+        --max_input_len 4096 \
+        --max_multimodal_len 13312 # 4 (max_imgs_per_chat) * 13 (max_patches_per_img) * 256 (num_visual_features)
+    ```
+
+4. Build TensorRT engines for visual components
+
+    ```bash
+    python build_multimodal_engine.py \
+        --model_path tmp/hf_models/${MODEL_NAME} \
+        --output_dir tmp/trt_engines/${MODEL_NAME}/bf16/1-gpu/vision \
+        --model_type llama_nemotron_nano_vl \
+        --max_batch_size 13 # 1 (max_batch_size) * 13 (max_patches_per_img)
+    ```
+
+5. Run the model
+
+    ```bash
+    python run.py \
+        --max_new_tokens 30 \
+        --hf_model_dir tmp/hf_models/${MODEL_NAME} \
+        --engine_dir tmp/trt_engines/${MODEL_NAME}/bf16/1-gpu \
+        --input_text "Which city is this?"
     ```
 
 ## LLaVA, LLaVa-NeXT, LLaVA-OneVision and VILA
