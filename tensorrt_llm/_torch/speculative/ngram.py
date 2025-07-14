@@ -5,7 +5,7 @@ from ordered_set import OrderedSet
 from tensorrt_llm.logger import logger
 
 from ..pyexecutor.llm_request import *
-from ..pyexecutor.resource_manager import BaseResourceManager
+from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManager
 from ..pyexecutor.scheduler import ScheduledRequests
 from .drafter import Drafter
 
@@ -173,6 +173,7 @@ class NGramDrafter(Drafter):
     def prepare_draft_tokens(
         self,
         scheduled_requests: ScheduledRequests,
+        resource_manager: Optional[ResourceManager] = None,
     ) -> None:
         # Sort by request_id when py_batch_idx is None as a fallback.
         # This happens in the disagg case: for a set of new requests, we draft

@@ -1,17 +1,20 @@
+from __future__ import annotations
+
 import traceback
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
-from ..pyexecutor.model_engine import ModelEngine
 from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManager
 from ..pyexecutor.sampler import Sampler, SampleState
 from ..pyexecutor.scheduler import ScheduledRequests
 from ..pyexecutor.seq_slot_manager import SeqSlotManager
 from .drafter import Drafter
-from .interface import SpecConfig
+
+if TYPE_CHECKING:
+    from ..pyexecutor.model_engine import ModelEngine
 
 
 class ModelDrafter(Drafter):
@@ -19,16 +22,13 @@ class ModelDrafter(Drafter):
 
     def __init__(
         self,
-        spec_config: SpecConfig,
-        draft_model_engine: ModelEngine,
+        spec_config: "DecodingBaseConfig",
+        draft_model_engine: "ModelEngine",
         max_draft_tokens: int,
         draft_seq_slot_manager: SeqSlotManager,
         sampler: Sampler,
-        resource_manager: ResourceManager,
         spec_resource_manager: Optional[BaseResourceManager] = None,
     ):
-        super().__init__(spec_resource_manager)
-
         # Validate required parameters
         if draft_model_engine is None:
             raise ValueError("draft_model_engine cannot be None")
@@ -38,7 +38,7 @@ class ModelDrafter(Drafter):
         # Model and resource management
         self.draft_model_engine = draft_model_engine
         self.draft_seq_slot_manager = draft_seq_slot_manager
-        self.resource_manager = resource_manager
+        self.spec_resource_manager = spec_resource_manager
 
         # Configuration
         self.spec_config = spec_config
@@ -148,9 +148,9 @@ class ModelDrafter(Drafter):
             return self._create_chunked_context_request(request, input_tokens,
                                                         num_accepted_tokens)
 
-    def _add_to_appropriate_batch(self, draft_batch: ScheduledRequests,
-                                  draft_request: LlmRequest,
-                                  original_request: LlmRequest) -> None:
+    def _add_to_draft_batch(self, draft_batch: ScheduledRequests,
+                            draft_request: LlmRequest,
+                            original_request: LlmRequest) -> None:
         """Add the draft request to the appropriate batch list."""
         # Copy additional properties
         draft_request.py_stop_words_list = original_request.py_stop_words_list
@@ -193,8 +193,8 @@ class ModelDrafter(Drafter):
 
                 draft_request = self._create_draft_request_for_request(request)
                 if draft_request is not None:
-                    self._add_to_appropriate_batch(draft_batch, draft_request,
-                                                   request)
+                    self._add_to_draft_batch(draft_batch, draft_request,
+                                             request)
 
             return draft_batch
 
@@ -213,17 +213,18 @@ class ModelDrafter(Drafter):
     def _forward_draft_model(
             self,
             draft_batch: ScheduledRequests,
+            resource_manager: ResourceManager,
             previous_batch: Optional[SampleState] = None) -> Dict[str, Any]:
         """Forward pass through the draft model."""
         if self._should_disable_cuda_graph(previous_batch):
             with self.draft_model_engine.no_cuda_graph():
                 outputs = self.draft_model_engine.forward(
-                    draft_batch, self.resource_manager)
+                    draft_batch, resource_manager)
         else:
             new_tensors_device = previous_batch.device if previous_batch else None
             outputs = self.draft_model_engine.forward(
                 draft_batch,
-                self.resource_manager,
+                resource_manager,
                 new_tensors_device=new_tensors_device)
 
         # Handle d2t data if available
@@ -296,15 +297,20 @@ class ModelDrafter(Drafter):
     def prepare_draft_tokens(
         self,
         scheduled_requests: ScheduledRequests,
+        resource_manager: Optional[ResourceManager] = None,
     ) -> None:
         """
         Prepare draft tokens for the scheduled requests.
 
         Args:
             scheduled_requests: The scheduled requests for this iteration
+            resource_manager: The resource manager for this iteration
         """
         if not self.draft_model_engine:
             raise ValueError("Draft model engine is not set")
+
+        if resource_manager is None:
+            raise ValueError("Resource manager is required")
 
         try:
             draft_batch = self._prepare_draft_batch(scheduled_requests)
@@ -320,7 +326,7 @@ class ModelDrafter(Drafter):
             }
 
             # Initial forward pass
-            outputs = self._forward_draft_model(draft_batch)
+            outputs = self._forward_draft_model(draft_batch, resource_manager)
             sample_state = self._sample_async(draft_batch, outputs)
             previous_batch = sample_state
 
@@ -335,7 +341,9 @@ class ModelDrafter(Drafter):
                 if len(draft_batch.generation_requests) == 0:
                     break
 
-                outputs = self._forward_draft_model(draft_batch, previous_batch)
+                outputs = self._forward_draft_model(draft_batch,
+                                                    resource_manager,
+                                                    previous_batch)
                 sample_state = self._sample_async(draft_batch, outputs)
                 self._update_request_states(draft_batch)
                 if previous_batch is not None:

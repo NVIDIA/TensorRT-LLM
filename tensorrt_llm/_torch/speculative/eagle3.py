@@ -117,40 +117,29 @@ class Eagle3SpecMetadata(SpecMetadata):
         # hidden state space before the target model forward.
         start_idx = 0
         if not self.is_draft_model:
-            if self.request_ids is not None and self.seq_lens is not None:
-                for req_id, seq_len in zip(self.request_ids, self.seq_lens):
-                    slot_id = self.eagle3_resource_manager.slot_manager.get_slot(
-                        req_id
-                    ) if self.eagle3_resource_manager is not None else None
-                    if self.eagle3_resource_manager is not None and slot_id is not None:
-                        self.eagle3_resource_manager.start_indices[
-                            slot_id] = start_idx
-                        start_idx += seq_len
+            for req_id, seq_len in zip(self.request_ids, self.seq_lens):
+                slot_id = self.eagle3_resource_manager.slot_manager.get_slot(
+                    req_id)
+                self.eagle3_resource_manager.start_indices[slot_id] = start_idx
+                start_idx += seq_len
         # Prepare hidden states gather ids
         hidden_states_read_indices = []
         hidden_states_write_indices = []
-        if self.request_ids is not None and self.seq_lens is not None:
-            for req_id, seq_len in zip(self.request_ids, self.seq_lens):
-                if self.eagle3_resource_manager is not None:
-                    slot_id = self.eagle3_resource_manager.slot_manager.get_slot(
-                        req_id)
-                    start_idx = self.eagle3_resource_manager.start_indices[
-                        slot_id]
-                    # If this is the first draft or the target model forward, we need to
-                    # read/write all of the hidden states, otherwise, only read the last token
-                    if is_first_draft or not self.is_draft_model:
-                        hidden_states_read_indices.extend(
-                            list(range(start_idx, start_idx + seq_len)))
-                        hidden_states_write_indices.extend(
-                            list(range(start_idx, start_idx + seq_len)))
-                    else:
-                        old_seq_len = self.eagle3_resource_manager.seq_lens[
-                            slot_id]
-                        hidden_states_read_indices.append(start_idx +
-                                                          old_seq_len - 1)
-                        hidden_states_write_indices.append(start_idx + seq_len -
-                                                           1)
-                    self.eagle3_resource_manager.seq_lens[slot_id] = seq_len
+        for req_id, seq_len in zip(self.request_ids, self.seq_lens):
+            slot_id = self.eagle3_resource_manager.slot_manager.get_slot(req_id)
+            start_idx = self.eagle3_resource_manager.start_indices[slot_id]
+            # If this is the first draft or the target model forward, we need to
+            # read/write all of the hidden states, otherwise, only read the last token
+            if is_first_draft or not self.is_draft_model:
+                hidden_states_read_indices.extend(
+                    list(range(start_idx, start_idx + seq_len)))
+                hidden_states_write_indices.extend(
+                    list(range(start_idx, start_idx + seq_len)))
+            else:
+                old_seq_len = self.eagle3_resource_manager.seq_lens[slot_id]
+                hidden_states_read_indices.append(start_idx + old_seq_len - 1)
+                hidden_states_write_indices.append(start_idx + seq_len - 1)
+            self.eagle3_resource_manager.seq_lens[slot_id] = seq_len
         # Prepare hidden states gather ids
         self.hidden_states_read_indices_host = torch.tensor(
             hidden_states_read_indices, dtype=torch.long, pin_memory=True)
