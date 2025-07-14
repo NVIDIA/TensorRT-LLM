@@ -752,8 +752,7 @@ class TRTLLMSampler(Sampler):
 
         reqs_with_new_tokens = [
             r for r in reqs
-            if (sequence_lengths_host_data[r.py_seq_slot] > r.get_num_tokens(0)
-                or self.is_trt_overlap)
+            if (sequence_lengths_host_data[r.py_seq_slot] > r.get_num_tokens(0))
         ]
 
         # Add new tokens
@@ -822,7 +821,6 @@ class TRTLLMSampler(Sampler):
             for beam in range(beam_width):
                 seq_len = sequence_lengths_host_data[seq_slot * beam_width +
                                                      beam]
-                seq_len = seq_len + 1 if self.is_trt_overlap and self.is_disagg else seq_len
                 num_new_tokens[beam] = min(
                     num_generated_tokens,
                     seq_len - request.get_num_tokens(beam))
