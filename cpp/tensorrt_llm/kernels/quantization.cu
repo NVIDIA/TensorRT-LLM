@@ -133,7 +133,7 @@ INSTANTIATE_INVOKE_PER_TOKEN_QUANTIZATION(__nv_bfloat16, __nv_fp8_e4m3);
 
 template <typename T, int SF_VEC_SIZE>
 void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFScale, int64_t* output, int32_t* SFOuput,
-    bool useUE8M0, QuantizationSFLayout layout, int multiProcessorCount, cudaStream_t stream)
+    bool useUE8M0, QuantizationSFLayout layout, int multiProcessorCount, bool perTokenGlobalScale, cudaStream_t stream)
 {
 #ifdef ENABLE_FP8
     if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
@@ -147,8 +147,12 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
 
         // Launch the cvt kernel.
         auto* kernel_instance = useUE8M0
-            ? &quantize_with_block_size<BlockScaleQuantizationType::FP8_TO_FP4, T, SF_VEC_SIZE, true>
-            : &quantize_with_block_size<BlockScaleQuantizationType::FP8_TO_FP4, T, SF_VEC_SIZE, false>;
+            ? (perTokenGlobalScale
+                    ? &quantize_with_block_size<BlockScaleQuantizationType::FP8_TO_FP4, T, SF_VEC_SIZE, true, true>
+                    : &quantize_with_block_size<BlockScaleQuantizationType::FP8_TO_FP4, T, SF_VEC_SIZE, true, false>)
+            : (perTokenGlobalScale
+                    ? &quantize_with_block_size<BlockScaleQuantizationType::FP8_TO_FP4, T, SF_VEC_SIZE, false, true>
+                    : &quantize_with_block_size<BlockScaleQuantizationType::FP8_TO_FP4, T, SF_VEC_SIZE, false, false>);
         kernel_instance<<<grid, block, 0, stream>>>(b, m, n, n, input, SFScale, reinterpret_cast<uint32_t*>(output),
             reinterpret_cast<uint32_t*>(SFOuput), layout);
     }
@@ -164,8 +168,12 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
 
         // Launch the cvt kernel.
         auto* kernel_instance = useUE8M0
-            ? &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE, true>
-            : &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE, false>;
+            ? (perTokenGlobalScale
+                    ? &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE, true, true>
+                    : &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE, true, false>)
+            : (perTokenGlobalScale
+                    ? &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE, false, true>
+                    : &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE, false, false>);
         cudaLaunchConfig_t config;
         config.gridDim = grid;
         config.blockDim = block;
@@ -349,7 +357,7 @@ inline __device__ void e2m1_to_fp32_vec(uint32_t e2m1Vec, float (&array)[8])
 }
 
 // Main FP4 dequantization kernel
-template <typename T, int SF_VEC_SIZE, bool UE8M0_SF>
+template <typename T, int SF_VEC_SIZE, bool UE8M0_SF, bool PER_TOKEN_GLOBAL_SCALE>
 __global__ void cvt_fp4_to_fp16(int m, int n, uint32_t const* input, uint32_t const* SFInput, float const* globalScale,
     T* output, FP4QuantizationSFLayout layout)
 {
@@ -359,7 +367,12 @@ __global__ void cvt_fp4_to_fp16(int m, int n, uint32_t const* input, uint32_t co
     int const groupsPerRow = n / SF_VEC_SIZE;
     int const totalGroups = m * groupsPerRow;
 
-    float const globalScaleVal = *globalScale;
+    // For per-tensor global scaling, read once; for per-token, read per row
+    float globalScaleVal;
+    if constexpr (!PER_TOKEN_GLOBAL_SCALE)
+    {
+        globalScaleVal = *globalScale;
+    }
 
     // In dequantization, each thread processes one complete scale factor group (SF_VEC_SIZE elements)
     constexpr int CVT_FP4_NUM_THREADS_PER_SF = 1;
@@ -395,6 +408,12 @@ __global__ void cvt_fp4_to_fp16(int m, int n, uint32_t const* input, uint32_t co
             fp8Val.__x = sfVal;
             scaleFloat = float(fp8Val);
         }
+
+        // Apply global scale - either per-tensor or per-token
+        if constexpr (PER_TOKEN_GLOBAL_SCALE)
+        {
+            globalScaleVal = globalScale[rowIdx];
+        }
         scaleFloat *= globalScaleVal;
 
         // Process SF_VEC_SIZE elements in this group (typically 16 elements)
@@ -427,41 +446,58 @@ __global__ void cvt_fp4_to_fp16(int m, int n, uint32_t const* input, uint32_t co
 
 template <typename T, int SF_VEC_SIZE>
 void invokeFP4Dequantization(int m, int n, int64_t const* input, int32_t const* SFInput, float const* globalScale,
-    T* output, bool useUE8M0, FP4QuantizationSFLayout layout, int multiProcessorCount, cudaStream_t stream)
+    T* output, bool useUE8M0, FP4QuantizationSFLayout layout, int multiProcessorCount, bool perTokenGlobalScale,
+    cudaStream_t stream)
 {
-    // Grid, Block size.
-    // Each thread processes multiple groups
+    // Grid, Block size - each thread processes multiple groups
     dim3 block(std::min(512, multiProcessorCount * 32));
     dim3 grid(std::min(multiProcessorCount * 8, int((m * n / SF_VEC_SIZE + block.x - 1) / block.x)));
 
-    // Launch the dequantization kernel
-    if (useUE8M0)
+    // Helper lambda to select and launch dequantization kernel
+    auto launchDequantKernel = [&]()
     {
-        cvt_fp4_to_fp16<T, SF_VEC_SIZE, true><<<grid, block, 0, stream>>>(m, n,
-            reinterpret_cast<uint32_t const*>(input), reinterpret_cast<uint32_t const*>(SFInput), globalScale, output,
-            layout);
-    }
-    else
-    {
-        cvt_fp4_to_fp16<T, SF_VEC_SIZE, false><<<grid, block, 0, stream>>>(m, n,
-            reinterpret_cast<uint32_t const*>(input), reinterpret_cast<uint32_t const*>(SFInput), globalScale, output,
-            layout);
-    }
+        if (useUE8M0 && perTokenGlobalScale)
+        {
+            cvt_fp4_to_fp16<T, SF_VEC_SIZE, true, true><<<grid, block, 0, stream>>>(m, n,
+                reinterpret_cast<uint32_t const*>(input), reinterpret_cast<uint32_t const*>(SFInput), globalScale,
+                output, layout);
+        }
+        else if (useUE8M0 && !perTokenGlobalScale)
+        {
+            cvt_fp4_to_fp16<T, SF_VEC_SIZE, true, false><<<grid, block, 0, stream>>>(m, n,
+                reinterpret_cast<uint32_t const*>(input), reinterpret_cast<uint32_t const*>(SFInput), globalScale,
+                output, layout);
+        }
+        else if (!useUE8M0 && perTokenGlobalScale)
+        {
+            cvt_fp4_to_fp16<T, SF_VEC_SIZE, false, true><<<grid, block, 0, stream>>>(m, n,
+                reinterpret_cast<uint32_t const*>(input), reinterpret_cast<uint32_t const*>(SFInput), globalScale,
+                output, layout);
+        }
+        else
+        {
+            cvt_fp4_to_fp16<T, SF_VEC_SIZE, false, false><<<grid, block, 0, stream>>>(m, n,
+                reinterpret_cast<uint32_t const*>(input), reinterpret_cast<uint32_t const*>(SFInput), globalScale,
+                output, layout);
+        }
+    };
+
+    launchDequantKernel();
 }
 
 // Instantiate the function.
 template void invokeFP4Quantization<half, 16>(int b, int m, int n, half const* input, float const* SFScale,
     int64_t* output, int32_t* SFOuput, bool useUE8M0, QuantizationSFLayout layout, int multiProcessorCount,
-    cudaStream_t stream);
+    bool perTokenGlobalScale, cudaStream_t stream);
 template void invokeFP4Quantization<half, 32>(int b, int m, int n, half const* input, float const* SFScale,
     int64_t* output, int32_t* SFOuput, bool useUE8M0, QuantizationSFLayout layout, int multiProcessorCount,
-    cudaStream_t stream);
+    bool perTokenGlobalScale, cudaStream_t stream);
 template void invokeMxFP8Quantization<half>(int b, int m, int n, int padded_n, half const* input, int64_t* output,
     int32_t* SFOuput, QuantizationSFLayout layout, int multiProcessorCount, cudaStream_t stream);
 #ifdef ENABLE_BF16
 template void invokeFP4Quantization<__nv_bfloat16, 16>(int b, int m, int n, __nv_bfloat16 const* input,
     float const* SFScale, int64_t* output, int32_t* SFOuput, bool useUE8M0, QuantizationSFLayout layout,
-    int multiProcessorCount, cudaStream_t stream);
+    int multiProcessorCount, bool perTokenGlobalScale, cudaStream_t stream);
 template void invokeFP4Quantization<__nv_bfloat16, 32>(int b, int m, int n, __nv_bfloat16 const* input,
     float const* SFScale, int64_t* output, int32_t* SFOuput, bool useUE8M0, QuantizationSFLayout layout,
     int multiProcessorCount, cudaStream_t stream);
@@ -472,32 +508,32 @@ template void invokeMxFP8Quantization<__nv_bfloat16>(int b, int m, int n, int pa
 #ifdef ENABLE_FP8
 template void invokeFP4Quantization<__nv_fp8_e4m3, 16>(int b, int m, int n, __nv_fp8_e4m3 const* input,
     float const* SFScale, int64_t* output, int32_t* SFOuput, bool useUE8M0, QuantizationSFLayout layout,
-    int multiProcessorCount, cudaStream_t stream);
+    int multiProcessorCount, bool perTokenGlobalScale, cudaStream_t stream);
 template void invokeFP4Quantization<__nv_fp8_e4m3, 32>(int b, int m, int n, __nv_fp8_e4m3 const* input,
     float const* SFScale, int64_t* output, int32_t* SFOuput, bool useUE8M0, QuantizationSFLayout layout,
-    int multiProcessorCount, cudaStream_t stream);
+    int multiProcessorCount, bool perTokenGlobalScale, cudaStream_t stream);
 #endif
 
 // FP4 Dequantization template instantiations
 template void invokeFP4Dequantization<half, 16>(int m, int n, int64_t const* input, int32_t const* SFInput,
     float const* globalScale, half* output, bool useUE8M0, FP4QuantizationSFLayout layout, int multiProcessorCount,
-    cudaStream_t stream);
+    bool perTokenGlobalScale, cudaStream_t stream);
 template void invokeFP4Dequantization<half, 32>(int m, int n, int64_t const* input, int32_t const* SFInput,
     float const* globalScale, half* output, bool useUE8M0, FP4QuantizationSFLayout layout, int multiProcessorCount,
-    cudaStream_t stream);
+    bool perTokenGlobalScale, cudaStream_t stream);
 template void invokeFP4Dequantization<float, 16>(int m, int n, int64_t const* input, int32_t const* SFInput,
     float const* globalScale, float* output, bool useUE8M0, FP4QuantizationSFLayout layout, int multiProcessorCount,
-    cudaStream_t stream);
+    bool perTokenGlobalScale, cudaStream_t stream);
 template void invokeFP4Dequantization<float, 32>(int m, int n, int64_t const* input, int32_t const* SFInput,
     float const* globalScale, float* output, bool useUE8M0, FP4QuantizationSFLayout layout, int multiProcessorCount,
-    cudaStream_t stream);
+    bool perTokenGlobalScale, cudaStream_t stream);
 #ifdef ENABLE_BF16
 template void invokeFP4Dequantization<__nv_bfloat16, 16>(int m, int n, int64_t const* input, int32_t const* SFInput,
     float const* globalScale, __nv_bfloat16* output, bool useUE8M0, FP4QuantizationSFLayout layout,
-    int multiProcessorCount, cudaStream_t stream);
+    int multiProcessorCount, bool perTokenGlobalScale, cudaStream_t stream);
 template void invokeFP4Dequantization<__nv_bfloat16, 32>(int m, int n, int64_t const* input, int32_t const* SFInput,
     float const* globalScale, __nv_bfloat16* output, bool useUE8M0, FP4QuantizationSFLayout layout,
-    int multiProcessorCount, cudaStream_t stream);
+    int multiProcessorCount, bool perTokenGlobalScale, cudaStream_t stream);
 #endif
 
 } // namespace kernels

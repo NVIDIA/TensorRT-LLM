@@ -29,7 +29,7 @@
 namespace torch_ext
 {
 // self: [M, K], fp16/bf16/fp8_quantized
-// globalScale: [1] float, = (448 * 6) / self.abs().max(). Not used when sfUseUE8M0 is true.
+// globalScale: [1] or [M] float, = (448 * 6) / self.abs().max(). Not used when sfUseUE8M0 is true.
 // nvfp4: sfVecSize = 16, sfUseUE8M0 = false
 // mxfp4: sfVecSize = 32, sfUseUE8M0 = true
 // alignment: sfVecSize
@@ -72,6 +72,14 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self, std::opt
     auto const k = inputShape[rank - 1];
     TORCH_CHECK(k % sfVecSize == 0);
 
+    // Check globalScale shape - support both [1] and [m] shapes
+    auto const& numGlobalScales = globalScale.numel();
+    TORCH_CHECK(numGlobalScales == 1 || numGlobalScales == m,
+        "Number of global scales must be 1 (shared) or match number of rows in input tensor (", m, "), but got ",
+        numGlobalScales);
+
+    bool isPerTokenGlobalScale = numGlobalScales == m;
+
     std::vector<int64_t> outputShape(inputShape.begin(), inputShape.end());
     outputShape[rank - 1] = k / 2;
 
@@ -92,7 +100,7 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self, std::opt
     tensorrt_llm::kernels::invokeFP4Quantization<T, SF_VEC_SIZE>(1, m, k, reinterpret_cast<T*>(self.data_ptr()),       \
         globalScalePtr, reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                                              \
         reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), sfUseUE8M0, layout, mMultiProcessorCount,                   \
-        at::cuda::getCurrentCUDAStream(self.get_device()));
+        isPerTokenGlobalScale, at::cuda::getCurrentCUDAStream(self.get_device()));
 
     if (sfUseUE8M0)
     {
@@ -156,7 +164,7 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self, std::opt
 
 // fp4Tensor: [M, K / 2], FLOAT4_E2M1X2
 // scaleFactors: ceil(M / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE (UE4M3 or UE8M0)
-// globalScale: [1] float, = (448 * 6) / original_tensor.abs().max()
+// globalScale: [1] or [M] float, = (448 * 6) / original_tensor.abs().max()
 // sfVecSize: 16 for nvfp4, 32 for mxfp4 (not supported yet)
 // sfUseUE8M0: false for nvfp4, true for mxfp4
 // isSfSwizzledLayout: bool, if true, the scale factors are stored in swizzled layout
@@ -181,6 +189,16 @@ at::Tensor fp4_dequantize(at::Tensor const& fp4Tensor, at::Tensor const& scaleFa
         m *= inputShape[i];
     }
     auto const k = inputShape[rank - 1] * 2; // FP4 is packed, so K is double the last dimension
+
+    // Check globalScale shape - support both [1] and [m] shapes
+    auto const& numGlobalScales = globalScale.numel();
+    TORCH_CHECK(numGlobalScales == 1 || numGlobalScales == m,
+        "Number of global scales must be 1 (shared) or match number of rows in input tensor (", m, "), but got ",
+        numGlobalScales);
+
+    bool isPerTokenGlobalScale = numGlobalScales == m;
+
+    // No special handling needed for per-token global scaling - the kernel handles it now
 
     // Determine output data type
     torch::ScalarType outputScalarType;
@@ -216,7 +234,7 @@ at::Tensor fp4_dequantize(at::Tensor const& fp4Tensor, at::Tensor const& scaleFa
 #define LAUNCH_FP4_DEQUANTIZE_KERNEL(T)                                                                                \
     tensorrt_llm::kernels::invokeFP4Dequantization(m, k, reinterpret_cast<int64_t const*>(fp4Tensor.data_ptr()),       \
         reinterpret_cast<int32_t const*>(scaleFactors.data_ptr()), globalScale.data_ptr<float>(),                      \
-        reinterpret_cast<T*>(output.data_ptr()), sfUseUE8M0, layout, mMultiProcessorCount,                             \
+        reinterpret_cast<T*>(output.data_ptr()), sfUseUE8M0, layout, mMultiProcessorCount, isPerTokenGlobalScale,      \
         at::cuda::getCurrentCUDAStream(fp4Tensor.get_device()));
 
     if (output.scalar_type() == at::ScalarType::Half)

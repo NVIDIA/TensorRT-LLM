@@ -76,7 +76,8 @@ void invokePerTokenQuantization(QuantT* dst, T const* src, int64_t const numRows
 
 template <typename T, int SF_VEC_SIZE = 16>
 void invokeFP4Quantization(int b, int m, int n, T const* input, float const* globalScale, int64_t* output,
-    int32_t* SFOuput, bool useUE8M0, QuantizationSFLayout layout, int multiProcessorCount, cudaStream_t stream = 0);
+    int32_t* SFOuput, bool useUE8M0, QuantizationSFLayout layout, int multiProcessorCount, bool perTokenGlobalScale,
+    cudaStream_t stream = 0);
 
 template <typename T>
 void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, int64_t* output, int32_t* SFOuput,
@@ -84,7 +85,8 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
 
 template <typename T, int SF_VEC_SIZE = 16>
 void invokeFP4Dequantization(int m, int n, int64_t const* input, int32_t const* SFInput, float const* globalScale,
-    T* output, bool useUE8M0, FP4QuantizationSFLayout layout, int multiProcessorCount, cudaStream_t stream = 0);
+    T* output, bool useUE8M0, FP4QuantizationSFLayout layout, int multiProcessorCount, bool perTokenGlobalScale,
+    cudaStream_t stream = 0);
 
 void invokeBlockScaleInterleave(int b, int m, int m_padded, int n, int n_padded, uint8_t const* SFIn, uint8_t* SFOutput,
     int multiProcessorCount, cudaStream_t stream = 0);

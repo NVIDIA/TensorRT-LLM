@@ -946,13 +946,20 @@ class WideEPMoE(MoE):
             final_hidden_states = final_hidden_states[0]
 
         if self.use_low_precision_alltoall_combine:
+            # Notes: this global scale is token-wise global scale
+            low_precision_global_scale = (
+                448 * 6) / final_hidden_states.abs().max(
+                    dim=-1, keepdim=True).values.to(torch.float32)
+            # low_precision_global_scale = self.low_precision_global_scale.expand(final_hidden_states.shape[0]).contiguous()
+            # low_precision_global_scale = self.low_precision_global_scale
             final_hidden_states, final_hidden_states_sf = torch.ops.trtllm.fp4_quantize(
-                final_hidden_states, self.low_precision_global_scale, 16, False,
+                final_hidden_states, low_precision_global_scale, 16, False,
                 False)
             final_hidden_states_sf = final_hidden_states_sf.view(
                 final_hidden_states.shape[0], -1)
         else:
             final_hidden_states_sf = None
+            low_precision_global_scale = None
 
         final_hidden_states = MnnvlMoe.mnnvl_moe_alltoallv_combine(
             final_hidden_states,
@@ -964,7 +971,7 @@ class WideEPMoE(MoE):
             token_count=token_count,
             x_sf=final_hidden_states_sf,
             is_sf_swizzled=False,
-            low_precision_global_scale=self.low_precision_global_scale)
+            low_precision_global_scale=low_precision_global_scale)
 
         return final_hidden_states
 

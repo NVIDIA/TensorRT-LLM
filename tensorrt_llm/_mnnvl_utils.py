@@ -583,6 +583,35 @@ class MnnvlMoe:
         )
 
         if x_sf is not None:
+            assert low_precision_global_scale is not None, (
+                "low_precision_global_scale is required when x_sf is not None"
+            )
+            assert low_precision_global_scale.dtype == torch.float32, (
+                "low_precision_global_scale should be float32"
+            )
+
+            if low_precision_global_scale.numel() > 1:
+                low_precision_global_scale_pad = torch.nn.functional.pad(
+                    low_precision_global_scale.view(-1, 1), (0, 3), "constant", 0
+                )
+                output_global_scale = torch.ones(
+                    token_count * top_k, 4, dtype=torch.float32, device=torch.device("cuda")
+                )
+                torch.ops.trtllm.moe_comm(
+                    low_precision_global_scale_pad,
+                    alltoall_info.recv_rank_count_cumsum,
+                    alltoall_info.recv_rank_local_indices,
+                    output_global_scale,
+                    alltoall_info.send_rank_count_cumsum,
+                    alltoall_info.backward_recv_rank_local_indices,
+                    workspace,
+                    ep_rank,
+                    ep_size,
+                )
+                output_global_scale = output_global_scale[:, :1].contiguous()
+            else:
+                output_global_scale = low_precision_global_scale
+
             assert x_sf.dim() == 2, "2D tensor supported, please reshape."
             hidden_dim *= 2
             output_sf_tensor = torch.zeros(
@@ -602,7 +631,7 @@ class MnnvlMoe:
             output_tensor = torch.ops.trtllm.fp4_dequantize(
                 output_tensor,
                 output_sf_tensor,
-                1.0 / low_precision_global_scale,
+                1.0 / output_global_scale,
                 16,
                 False,
                 is_sf_swizzled,
