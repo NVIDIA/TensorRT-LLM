@@ -22,6 +22,7 @@ l0_a10:
   - disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
   - test_e2e.py::test_openai_chat_structural_tag_example
+  - test_e2e.py::test_openai_chat_json_example
   - test_e2e.py::test_openai_chat_multimodal_example
   - test_e2e.py::test_openai_lora
   - test_e2e.py::test_trtllm_serve_multimodal_example
