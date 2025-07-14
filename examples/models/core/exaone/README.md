@@ -93,15 +93,27 @@ For more information, please refer to official [docs](https://github.com/NVIDIA/
 
 Troubleshooting
 
+The following error may occur during quantization:
 ```bash
 torch._dynamo.exc.Unsupported: Graph break under GenericContextWrappingVariable
 Explanation: Attempted to graph break in an active context manager(s) that doesn't support graph breaking.
 Hint: Move the offending context manager(s) to outside the compiled region.
 Hint: This graph break may have been caused by an earlier graph break. Resolving the earlier graph break may resolve this one.
 ```
-If you encounter the above log messages, it means torch.compile() may not be compatible with the HybridCache module of the transformers library. As a result, [TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer) (ModelOpt) cannot perform PTQ with HybridCache.
 
-To resolve this, please use DynamicCache when creating PTQ models. Be aware that DynamicCache disables sliding windows, which may break the model behavior. By default, ModelOpt's PTQ procedure uses relatively short input lengths (less than the sliding window size of EXAONE-4.0), so this workaround is effective as long as input lengths are not increased. In our tests, the default ModelOpt settings did not hurt accuracy on MMLU or GSM8k benchmarks.
+This error may indicate an incompatibility between `torch.compile()` and the `HybridCache` module of the transformers library. As a result, [TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer) (ModelOpt) cannot perform PTQ with HybridCache.
+
+Temporarily switching to `DynamicCache` when creating PTQ models could help address the issue. This can be done by updating the `cache_implementation` field in the `generation_config.json` file located in the model checkpoint directory, for example:
+```json
+# generation_config.json
+{
+    // Change "hybrid" to "dynamic" to run PTQ.
+    // Revert this to "hybrid" after quantization is complete.
+    "cache_implementation": "hybrid",
+    ...
+}
+```
+For models with sliding window attention, DynamicCache is less memory-efficient than HybridCache because it retains the entire key-value cache. However, this does not break the model's attention logic, as the cache implementation is separated from the attention computation itself. This trade-off is acceptable for the PTQ process, which is a one-time procedure. Our tests confirm that this workaround does not degrade accuracy on MMLU or GSM8K benchmarks with the default ModelOpt settings.
 
 ### TRT flow
 ### Convert checkpoint and build TensorRT engine(s)
