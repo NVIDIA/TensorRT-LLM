@@ -158,7 +158,7 @@ def get_settings(params: dict, tuning_constraints: TuningConstraints,
                 f"Chunked prefill is disabled, but max_num_tokens ({max_num_tokens}) is "
                 f"less than the max ISL "
                 f"({tuning_constraints.maximum_isl}). Forcing max_num_tokens to "
-                f"{tuning_constraints.max_seq_len + max_batch_size}.")
+                f"{tuning_constraints.max_sequence_length + max_batch_size}.")
             max_num_tokens = max(
                 max_num_tokens, tuning_constraints.maximum_isl + max_batch_size)
         else:

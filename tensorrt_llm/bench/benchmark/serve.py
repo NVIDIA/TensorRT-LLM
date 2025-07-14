@@ -18,7 +18,7 @@ from tensorrt_llm.logger import logger
 # isort: on
 
 
-@click.command(name="throughput")
+@click.command(name="serve")
 @optgroup.group("Engine run configuration.",
                 help="Runtime settings for executing a TensorRT-LLM engine.")
 @optgroup.option(
@@ -140,18 +140,24 @@ from tensorrt_llm.logger import logger
     "Server Configuration",
     help="Options for configuring the server.",
 )
-@click.option("--host",
-              type=str,
-              default="localhost",
-              help="Hostname of the server.")
-@click.option("--port", type=int, default=8000, help="Port of the server.")
+@optgroup.option(
+    "--host",
+    type=str,
+    default="localhost",
+    help="Hostname of the server."
+)
+@optgroup.option(
+    "--port",
+    type=int,
+    default=8000,
+    help="Port of the server."
+)
 @click.pass_obj
 def serve_command(
     bench_env: BenchmarkEnvironment,
     **params,
 ) -> None:
-    """Run a throughput test on a TRT-LLM engine."""
-
+    """Stand up a TRT-LLM OpenAI server with tuned settings."""
     logger.info("Preparing to run serve...")
 
     # Server configuration
@@ -183,7 +189,7 @@ def serve_command(
     if backend and backend.lower() in ["pytorch", "_autodeploy"]:
         # If we're dealing with a model name, perform a snapshot download to
         # make sure we have a local copy of the model.
-        if checkpoint_path is None:
+        if bench_env.checkpoint_path is None:
             snapshot_download(model)
 
         exec_settings = get_settings(params, tuning_constraints,
@@ -212,7 +218,7 @@ def serve_command(
     runtime_max_bs = runtime_max_bs or engine_bs
     runtime_max_tokens = runtime_max_tokens or engine_tokens
     kv_cache_percent = params.pop("kv_cache_free_gpu_mem_fraction")
-    beam_width = params.pop("beam_width")
+    beam_width = params.pop("max_beam_width")
     enable_chunked_context: bool = params.pop("enable_chunked_context")
     scheduler_policy: str = params.pop("scheduler_policy")
 
