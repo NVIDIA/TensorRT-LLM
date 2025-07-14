@@ -963,6 +963,25 @@ class PyExecutor:
                             if self.guided_decoder is not None:
                                 self.guided_decoder.rollback_rejected_tokens(
                                     scheduled_batch)
+                        # When running with an external drafter, only TP rank 0 sends request to drafter
+                        if self.dist.tp_size > 1 and getattr(
+                                self.drafter, 'single_draft_call',
+                                lambda: False)():
+                            if self.dist.rank == 0:
+                                self.drafter.prepare_draft_tokens(
+                                    scheduled_batch, self.resource_manager)
+                                draft_data = {}
+                                for req in scheduled_batch.generation_requests:
+                                    draft_data[
+                                        req.py_request_id] = req.py_draft_tokens
+                                self.dist.tp_broadcast(draft_data, root=0)
+                            else:
+                                draft_data = self.dist.tp_broadcast(None,
+                                                                    root=0)
+                                for req in scheduled_batch.generation_requests:
+                                    req.py_draft_tokens = draft_data[
+                                        req.py_request_id]
+                        else:
                             self.drafter.prepare_draft_tokens(
                                 scheduled_batch, self.resource_manager)
 
@@ -976,6 +995,7 @@ class PyExecutor:
                                                      num_draft_tokens))
 
                     batch_outputs = self._forward_step(scheduled_batch)
+
                     self._execute_guided_decoder(scheduled_batch,
                                                  batch_outputs['logits'])
 
