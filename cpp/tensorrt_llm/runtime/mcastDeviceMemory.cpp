@@ -103,20 +103,20 @@ McastDeviceMemory::McastDeviceMemory(
 McastDeviceMemory::~McastDeviceMemory()
 {
     tensorrt_llm::common::unregisterMcastDevMemBuffer(this);
+    TLLM_CUDA_CHECK(cudaFree(mSignalPadsDev));
+    TLLM_CUDA_CHECK(cudaFree(mUcPtrsDev));
+
     if (mIsMNNvlink)
     {
         for (uint32_t rank = 0; rank < mGroupSize; rank++)
         {
-            if (rank == mGroupRank)
-            {
-                cuMemRelease(mUcHandles[rank]);
-            }
-            else
-            {
-                mUcHandles[rank] = 0;
-            }
+            TLLM_CU_CHECK(cuMemUnmap(mUcPtrs[rank], mAllocationSize));
+            // We need to release the handle on each rank
+            TLLM_CU_CHECK(cuMemRelease(mUcHandles[rank]));
         }
-        cuMemRelease(mMcHandle);
+        TLLM_CU_CHECK(cuMemUnmap(mMcPtr, mAllocationSize));
+        TLLM_CU_CHECK(cuMemAddressFree(mMcPtr, mAllocationSize));
+        TLLM_CU_CHECK(cuMemRelease(mMcHandle));
     }
     else
     {
