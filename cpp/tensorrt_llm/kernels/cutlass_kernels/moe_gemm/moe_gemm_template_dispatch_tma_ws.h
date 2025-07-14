@@ -159,7 +159,7 @@ constexpr bool are_tile_shapes_supported_sm100()
         // {
         //     return false;
         // }
-        if ((TileN != 64 && TileN != 128) || TileM != 128)
+        if ((TileN != 64 && TileN != 128 && TileN != 256) || TileM != 128)
         {
             return false;
         }
