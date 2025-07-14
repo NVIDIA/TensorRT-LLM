@@ -11,7 +11,12 @@ from _dist_test_utils import get_device_counts
 from _graph_test_helpers import run_test
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
-from tensorrt_llm._torch.auto_deploy.transformations.library import column_row_shard
+from tensorrt_llm._torch.auto_deploy.transformations.library import (
+    ShardingConfig,
+    TransformationConfig,
+    detect_column_row_shard,
+    transformation_executor,
+)
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
 
@@ -139,7 +144,12 @@ def _run_job(
     # now run the test
     op_expected = getattr(torch.ops.auto_deploy, dist_op_expected)
 
-    transform_func = partial(column_row_shard, rank=rank, world_size=world_size)
+    def transform_func(gm):
+        transformation_config = TransformationConfig()
+        sharding_config = ShardingConfig()
+        transformation_config.sharding_config = sharding_config
+        sharding_config.tp_sharing_transformations = detect_column_row_shard(gm, rank, world_size)
+        transformation_executor(transformation_config)
 
     def combined_graph_check(gm) -> bool:
         # Check for expected distributed operations

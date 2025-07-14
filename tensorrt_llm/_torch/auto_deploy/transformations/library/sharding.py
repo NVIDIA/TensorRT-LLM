@@ -19,10 +19,9 @@ Our sharding algorithm for tensor parallelism (TP) is based on the following ste
 import math
 import operator
 from collections import defaultdict
+from dataclasses import dataclass, field
 from functools import partial
 from typing import Callable, DefaultDict, Dict, List, Set
-from dataclasses import dataclass, field
-
 
 import torch
 import torch.nn as nn
@@ -62,13 +61,12 @@ class ShardingConfig:
     ep_size: int = 1
 
     tp_sharing_transformations: List[TPSharingTransformation] = field(default_factory=list)
-    
 
 
 @dataclass
 class TransformationConfig:
     """Configuration for transformations."""
-    
+
     sharding_config: ShardingConfig = field(default_factory=ShardingConfig)
 
 
@@ -252,16 +250,19 @@ def _append_simple_shard(
     tp_shards: List[TPSharingTransformation] = []
     for node_group in nodes_linear.values():
         for n in node_group:
-            tp_shards.append(TPSharingTransformation(
-                anchor_gm=gm,
-                anchor_node=n,
-                dim=0,
-                rank=rank,
-                world_size=world_size,
-            ))
+            tp_shards.append(
+                TPSharingTransformation(
+                    anchor_gm=gm,
+                    anchor_node=n,
+                    dim=0,
+                    rank=rank,
+                    world_size=world_size,
+                    add_dist=True,
+                    min_local_shape=1,
+                )
+            )
 
     return tp_shards
-
 
 
 def column_row_shard(
@@ -434,7 +435,6 @@ def column_row_shard(
     ad_logger.info(f"Found {num_shards} TP shards")
 
 
-
 def detect_column_row_shard(
     gm: GraphModule,
     rank: int,
@@ -458,7 +458,7 @@ def detect_column_row_shard(
     splitting, e.g., the individual heads into smaller shards.
     """
     ad_logger.debug("Before sharding graph: " + str(gm))
-    
+
     tp_shards: List[TPSharingTransformation] = []
 
     if world_size < 2:
@@ -596,19 +596,20 @@ def detect_column_row_shard(
             min_local_shape = 1
         for i, group in enumerate(nodes_linear.values()):
             for n in group:
-                tp_shards.append(TPSharingTransformation(
-                    anchor_gm=gm,
-                    anchor_node=n,
-                    dim=i,
-                    rank=rank,
-                    world_size=world_size,
-                    add_dist=i > 0,
-                    min_local_shape=min_local_shape,
-                ))
+                tp_shards.append(
+                    TPSharingTransformation(
+                        anchor_gm=gm,
+                        anchor_node=n,
+                        dim=i,
+                        rank=rank,
+                        world_size=world_size,
+                        add_dist=i > 0,
+                        min_local_shape=min_local_shape,
+                    )
+                )
 
     ad_logger.info(f"Found {num_shards} TP shards")
     return tp_shards
-
 
 
 def dp_bmm_shard(gm: GraphModule, rank: int, world_size: int) -> None:
@@ -738,43 +739,41 @@ def dp_bmm_shard(gm: GraphModule, rank: int, world_size: int) -> None:
     ad_logger.info(f"Found {num_bmm_shards} BMM shards")
 
 
-
-
-
 def sharding_executor(config: ShardingConfig) -> None:
-    '''
+    """
     Apply sharding transformations to the model.
     Args:
         config: Sharding configuration
     Returns:
         None. Transformations are applied in place.
-    '''
+    """
     gms = set()
     for transformation in config.tp_sharing_transformations:
-        if transformation.anchor_gm is None \
-            or transformation.anchor_node is None:
+        if transformation.anchor_gm is None or transformation.anchor_node is None:
             continue
         gms.add(transformation.anchor_gm)
-        _insert_sharded_matmul(transformation.anchor_gm, 
-                              transformation.anchor_node, 
-                              transformation.dim,
-                              transformation.rank,
-                              transformation.world_size, 
-                              transformation.add_dist, 
-                              transformation.min_local_shape)
-    
+        _insert_sharded_matmul(
+            gm=transformation.anchor_gm,
+            node=transformation.anchor_node,
+            dim=transformation.dim,
+            rank=transformation.rank,
+            world_size=transformation.world_size,
+            add_dist=transformation.add_dist,
+            min_local_shape=transformation.min_local_shape,
+        )
+
     # canonicalize and return
     for gm in gms:
         gm = canonicalize_graph(gm)
         ad_logger.debug("After sharding: " + str(gm))
-        
+
 
 def transformation_executor(config: TransformationConfig) -> None:
-    '''
+    """
     Apply transformations to the model.
     Args:
         config: Transformation configuration
     Returns:
         None. Transformations are applied in place.
-    '''
+    """
     sharding_executor(config.sharding_config)

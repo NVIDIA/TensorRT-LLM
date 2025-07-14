@@ -1,6 +1,7 @@
 """High-level entrypoint to transform a model into an efficient inference model."""
 
 import gc
+
 import torch
 import torch.nn as nn
 
@@ -14,11 +15,9 @@ from ..utils.logger import ad_logger
 from ._graph import canonicalize_graph, lift_to_meta, move_to_device
 from .export import torch_export_to_gm
 from .library import (
-    TransformationConfig,
     ShardingConfig,
-    transformation_executor,
+    TransformationConfig,
     detect_column_row_shard,
-    column_row_shard,
     dp_bmm_shard,
     eliminate_redundant_transposes,
     ep_shard,
@@ -36,6 +35,7 @@ from .library import (
     optimize_rope,
     quantize,
     resize_kv_cache,
+    transformation_executor,
     update_in_out_nodes,
 )
 
@@ -70,7 +70,6 @@ class InferenceOptimizer:
 
         cm.info.set_example_sequence()
         egm = torch_export_to_gm(model, args=cm.args, dynamic_shapes=cm.dynamic_shapes)
-        config = model.config
         del model
         ad_logger.debug("original graph: " + str(egm))
         local_rank, world_size = dist_ad.get_rank_world_size()
@@ -124,19 +123,20 @@ class InferenceOptimizer:
         # TODO (gkwasniewski): if present, infer sharding parameters (tp_size, row/column sharding)
         # from the model config.
         sharding_config = ShardingConfig()
-        
+
         transformation_config.sharding_config = sharding_config
-        
+
         # run TP sharding across ranks
-        sharding_config.tp_sharing_transformations = \
-            detect_column_row_shard(egm, local_rank, world_size, self.ad_config.simple_shard_only)
+        sharding_config.tp_sharing_transformations = detect_column_row_shard(
+            egm, local_rank, world_size, self.ad_config.simple_shard_only
+        )
 
         # run EP sharding across ranks
         ep_shard(egm, local_rank, world_size)
 
         # run BMM sharding across ranks
         dp_bmm_shard(egm, local_rank, world_size)
-        
+
         transformation_executor(transformation_config)
 
         # let's run a shape propagation pass to update the graph with correct meta values for
@@ -224,4 +224,3 @@ class InferenceOptimizer:
         torch.cuda.empty_cache()
         gc.collect()
         return egm_compiled
-
