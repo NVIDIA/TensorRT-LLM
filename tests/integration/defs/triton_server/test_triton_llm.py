@@ -2491,7 +2491,7 @@ def test_llava(
     # NOTE
     # Due to mpi init error, manually set PMIX_MCA_gds=hash (ref: https://github.com/open-mpi/ompi/issues/6981)
     check_call(
-        f"PMIX_MCA_gds=hash python3 {launch_server_py} --world_size=1 --model_repo={new_model_repo}",
+        f"PMIX_MCA_gds=hash python3 {launch_server_py} --world_size=1 --model_repo={new_model_repo} --exit_timeout=300",
         shell=True)
     check_server_ready()
     # Run Test
