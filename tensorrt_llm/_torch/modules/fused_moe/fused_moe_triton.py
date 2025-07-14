@@ -1188,7 +1188,6 @@ class TritonFusedMoE(MoE):
         assert isinstance(self.routing_method, RenormalizeMoeRoutingMethod), \
             "routing_method must be an instance of RenormalizeMoeRoutingMethod for TritonFusedMoE"
         assert not self.smart_router, "Smart router is not supported in TritonFusedMoE."
-        assert not self.use_dp, "AttentionDP is not supported in TritonFusedMoE."
 
         self.num_slots = self.num_experts
         self.expert_size_per_partition = self.num_experts // self.ep_size
@@ -1257,18 +1256,23 @@ class TritonFusedMoE(MoE):
         self,
         x: torch.Tensor,
         router_logits: torch.Tensor,
-        *args,
+        do_finalize: bool = True,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        use_dp_padding: Optional[bool] = None,
         **kwargs,
     ) -> torch.Tensor:
-        # TODO(dongfengy): Add missing comm primitives for TP/EP
+        assert do_finalize, "TritonFusedMoE does not support do_finalize=False"
+        assert use_dp_padding is None or not use_dp_padding, \
+            "TritonFusedMoE does not support use_dp_padding=True"
+
         hidden_states = self.quant_method.apply(self, x, router_logits)
 
-        if self.parallel_size > 1 and self.reduce_results:
-            hidden_states = hidden_states.contiguous(
-            )  # If padding is removed, the hidden_states may not be contiguous
-            hidden_states = self.all_reduce(hidden_states)
+        final_hidden_states = self.reducescatter_or_allreduce(
+            hidden_states,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=use_dp_padding)
 
-        return hidden_states
+        return final_hidden_states
 
     def load_weights(self, weights: List[Dict]):
         assert self._weights_created

@@ -2,7 +2,7 @@ from typing import Dict, List, Optional, Union
 
 import torch
 
-from ...distributed import allgather, reducescatter
+from ...distributed import allgather
 from ...model_config import ModelConfig
 from ...utils import EventType, Fp4QuantizedTensor, ceil_div, swizzle_sf
 from .interface import MoE
@@ -186,24 +186,6 @@ class CutlassFusedMoE(MoE):
 
         self._weights_created = True
         self._check_configs()
-
-    def reducescatter_or_allreduce(
-        self,
-        inputs,
-        all_rank_num_tokens: Optional[List[int]] = None,
-        use_dp_padding: Optional[bool] = None,
-    ):
-        outputs = inputs
-        if self.parallel_size > 1:
-            if self.use_dp:
-                outputs = reducescatter(
-                    inputs,
-                    self.mapping,
-                    dim=0,
-                    sizes=None if use_dp_padding else all_rank_num_tokens)
-            elif self.reduce_results:
-                outputs = self.all_reduce(inputs)
-        return outputs
 
     def forward_chunk(
         self,

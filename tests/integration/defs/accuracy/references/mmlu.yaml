@@ -254,3 +254,5 @@ microsoft/Phi-4-multimodal-instruct-long-rope:
   - accuracy: 65.98
 LGAI-EXAONE/EXAONE-4.0-32B:
   - accuracy: 78.52
+OpenAI/BF16:
+  - accuracy: 77.50

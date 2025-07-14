@@ -2415,6 +2415,64 @@ class TestPhi4MM(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+class TestOpenAI(LlmapiAccuracyTestHarness):
+
+    @pytest.mark.parametrize("moe_backend", [
+        "CUTLASS", "TRITON"
+    ])  # No need to test TRTLLM as it falls back to CUTLASS for bf16 anyway.
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler", [
+            (4, 1, 1, False, True, True),
+            (4, 1, 4, False, True, True),
+            (4, 1, 4, True, True, True),
+        ],
+        ids=["tp4", "ep4", "dp4"])
+    def test_w16a16(self, moe_backend, tp_size, pp_size, ep_size, attention_dp,
+                    cuda_graph, overlap_scheduler):
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
+
+        open_ai_root = os.getenv("OPENAI_MODELS_ROOT")
+        assert open_ai_root, "OPENAI_MODELS_ROOT needs to be set as parent of orangina-real-weight-pre-release_vv1. Make sure the config.json in the model folder is also updated."
+        llm = LLM(f"{open_ai_root}/orangina-real-weight-pre-release_vv1",
+                  tensor_parallel_size=tp_size,
+                  pipeline_parallel_size=pp_size,
+                  moe_expert_parallel_size=ep_size,
+                  **pytorch_config,
+                  enable_attention_dp=attention_dp,
+                  moe_backend=moe_backend)
+        with llm:
+            task = MMLU("OpenAI/BF16")
+            task.evaluate(llm)
+
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler", [
+            (4, 1, 4, True, True, True),
+        ],
+        ids=["dp4"])
+    def test_w4a16_dynamic(self, tp_size, pp_size, ep_size, attention_dp,
+                           cuda_graph, overlap_scheduler, monkeypatch):
+        monkeypatch.setenv("OVERRIDE_QUANT_ALGO", "W4A16_MXFP4")
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
+
+        open_ai_root = os.getenv("OPENAI_MODELS_ROOT")
+        assert open_ai_root, "OPENAI_MODELS_ROOT needs to be set as parent of orangina-real-weight-pre-release_vv1. Make sure the config.json in the model folder is also updated."
+        llm = LLM(f"{open_ai_root}/orangina-real-weight-pre-release_vv1",
+                  tensor_parallel_size=tp_size,
+                  pipeline_parallel_size=pp_size,
+                  moe_expert_parallel_size=ep_size,
+                  **pytorch_config,
+                  enable_attention_dp=attention_dp,
+                  moe_backend="TRITON")
+        with llm:
+            task = MMLU("OpenAI/BF16")
+            task.evaluate(llm)
+
+
 class TestEXAONE4(LlmapiAccuracyTestHarness):
     MODEL_NAME = "LGAI-EXAONE/EXAONE-4.0-32B"
     kv_cache_config = KvCacheConfig(

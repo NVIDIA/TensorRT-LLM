@@ -3,7 +3,6 @@ from typing import Dict, List, Optional, Union
 import torch
 from torch import nn
 
-from ...distributed.ops import reducescatter
 from ...model_config import ModelConfig
 from ...utils import Fp4QuantizedTensor, next_positive_power_of_2
 from .interface import MoE, MoEWeightLoadingMode
@@ -138,24 +137,6 @@ class TRTLLMGenFusedMoE(MoE):
         else:
             raise NotImplementedError(
                 "TRTLLMGenFusedMoE doesn't support fp16/bf16/fp32 MoE.")
-
-    def reducescatter_or_allreduce(
-        self,
-        inputs,
-        all_rank_num_tokens: Optional[List[int]] = None,
-        use_dp_padding: Optional[bool] = None,
-    ):
-        outputs = inputs
-        if self.parallel_size > 1:
-            if self.use_dp:
-                outputs = reducescatter(
-                    inputs,
-                    self.mapping,
-                    dim=0,
-                    sizes=None if use_dp_padding else all_rank_num_tokens)
-            elif self.reduce_results:
-                outputs = self.all_reduce(inputs)
-        return outputs
 
     def create_weights(self):
         if self._weights_created:
