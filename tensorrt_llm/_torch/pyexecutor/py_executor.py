@@ -869,8 +869,7 @@ class PyExecutor:
 
                 self._pad_attention_dp_dummy_request()
 
-                if self.draft_model_engine is not None or is_ngram or (hasattr(
-                        self, 'drafter') and self.drafter is not None):
+                if self.draft_model_engine is not None or is_ngram:
                     self._prepare_draft_requests(self.active_requests)
 
                 scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
