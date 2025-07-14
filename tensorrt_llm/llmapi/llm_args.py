@@ -238,6 +238,7 @@ class DecodingBaseConfig(BaseModel):
             "NGram": NGramDecodingConfig,
             "DraftTarget": DraftTargetDecodingConfig,
             "UserProvided": UserProvidedDecodingConfig,
+            "ExternalAPI": ExternalAPIConfig,
         }
 
         config_class = config_classes.get(decoding_type)
@@ -338,6 +339,23 @@ class UserProvidedDecodingConfig(DecodingBaseConfig):
         return cls(**data)
 
     decoding_type: ClassVar[str] = "User_Provided"
+
+
+class ExternalAPIConfig(DecodingBaseConfig):
+    """
+    Configuration for custom drafter speculative decoding.
+
+    Arguments:
+        endpoint: str
+            The endpoint of the custom drafter from which to get the draft tokens.
+    """
+    endpoint: str
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+    decoding_type: ClassVar[str] = "External_API"
 
 
 class NGramDecodingConfig(DecodingBaseConfig):
@@ -732,6 +750,7 @@ SpeculativeConfig: TypeAlias = Optional[Union[
     MTPDecodingConfig,
     NGramDecodingConfig,
     UserProvidedDecodingConfig,
+    ExternalAPIConfig,
 ]]
 
 
@@ -1465,6 +1484,11 @@ class BaseLlmArgs(BaseModel):
                             UserProvidedDecodingConfig):
                 assert self.backend in ['pytorch', '_autodeploy']
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.USER_PROVIDED
+                self.build_config.max_draft_len = self.speculative_config.max_draft_len
+            
+            elif isinstance(self.speculative_config, ExternalAPIConfig):
+                assert self.backend in ['pytorch', '_autodeploy']
+                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.EXTERNAL_API
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
 
             else:

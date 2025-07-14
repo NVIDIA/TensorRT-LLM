@@ -200,6 +200,7 @@ def create_py_executor(
         checkpoint_dir: str = None,
         lora_config: Optional[LoraConfig] = None,
         garbage_collection_gen0_threshold: Optional[int] = None) -> PyExecutor:
+    logger.info("DEBUG MESSAGE - create_py_executor")
     _mangle_executor_config(executor_config)
     pytorch_backend_config = executor_config.pytorch_backend_config
 

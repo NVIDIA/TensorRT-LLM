@@ -7,6 +7,7 @@ from .eagle3 import (Eagle3OneModelSampler, Eagle3OneModelSpecMetadata,
 from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
 from .ngram import NGramDrafter, NGramPoolManager
+from .external_api import APIDrafter
 
 
 def get_spec_metadata(spec_config,
@@ -46,7 +47,8 @@ def get_spec_metadata(spec_config,
         )
     if  spec_config.spec_dec_mode.is_draft_target() or \
         spec_config.spec_dec_mode.is_ngram() or \
-        spec_config.spec_dec_mode.is_user_provided():
+        spec_config.spec_dec_mode.is_user_provided() or \
+        spec_config.spec_dec_mode.is_external_api():
         return SpecMetadata(
             max_draft_len=spec_config.max_draft_len,
             spec_dec_mode=spec_config.spec_dec_mode,
@@ -96,6 +98,9 @@ def get_spec_resource_manager(model_engine,
     if spec_dec_mode.is_ngram() or spec_dec_mode.is_user_provided():
         assert drafter is not None, "Drafter is required for ngram or user provided speculative decoding."
         return drafter.spec_resource_manager
+    if spec_dec_mode.is_external_api():
+        assert drafter is not None, "An error occurred, drafter could not be created for API endpoint."
+        return drafter.spec_resource_manager
     return None
 
 
@@ -123,6 +128,8 @@ def get_spec_drafter(model_engine):
                             NGramPoolManager(spec_config, max_num_requests))
     if spec_config.spec_dec_mode.is_user_provided():
         return spec_config.drafter
+    if spec_config.spec_dec_mode.is_external_api():
+        return APIDrafter(spec_config, spec_config.endpoint)
     return None
 
 
