@@ -199,8 +199,13 @@ class GenerationResultBase:
     def context_logits(self) -> Optional[torch.Tensor]:
         return self._context_logits
 
-    def _handle_streaming_stop_detection(self, output, new_tokens):
-        """Handle stop word detection for streaming responses"""
+    def _handle_streaming_stop_detection(self, output, new_tokens) -> bool:
+        """Handle stop word detection for streaming responses
+
+        Returns:
+            bool: whether the stop word is detected.
+        """
+
         if not self.sampling_params.stop:
             return False
 
@@ -243,7 +248,7 @@ class GenerationResultBase:
 
                 output.token_ids = self.tokenizer.encode(
                     truncated_text, add_special_tokens=False)
-                output.text = truncated_text
+                # output.text = truncated_text
                 output.finish_reason = 'stop'
                 output.stop_reason = stop_reason
 
@@ -337,6 +342,11 @@ class GenerationResultBase:
             print(
                 f"DEBUG: About to check finish_reason: {finish_reasons[src_idx]}"
             )
+            if hasattr(self, '_streaming_state'):
+                for output in self._outputs:
+                    output_id = id(output)
+                    if output_id in self._streaming_state:
+                        del self._streaming_state[output_id]
 
             if finish_reasons[src_idx] == tllm.FinishReason.END_ID:
                 output.finish_reason = 'stop'
