@@ -347,15 +347,13 @@ def add_load_hook_for_aliased_params(gm: fx.GraphModule, model: nn.Module):
         for group in aliased_groups:
             # Find a valid value for this group of aliases
             value = find_valid_param_value(state_dict, group)
-            assert value is not None, (
-                f"No valid value found in state dict for aliased parameters: {group}"
-            )
+        
+            if value is not None:
+                # Apply the value to all aliases
+                for name in group:
+                    state_dict[name] = value
 
-            # Apply the value to all aliases
-            for name in group:
-                state_dict[name] = value
-
-            ad_logger.debug(f"Applied value from {group[0]} to aliased parameters: {group}")
+                ad_logger.debug(f"Applied value from {group[0]} to aliased parameters: {group}")
 
     # Find all parameter aliases in the source model
     param_to_names = defaultdict(list)

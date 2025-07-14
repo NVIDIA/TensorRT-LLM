@@ -79,6 +79,11 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             attn_backend="torch",
             compile_backend="torch-simple",
         ),
+        get_small_model_config(
+            "Qwen/Qwen2.5-3B-Instruct",
+            attn_backend="triton",
+            compile_backend="torch-compile",
+        ),
     ],
 )
 def test_build_ad(experiment_config: Dict):
