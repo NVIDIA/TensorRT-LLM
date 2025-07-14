@@ -98,7 +98,6 @@ To run non-greedy sampling and use typical acceptance, set `--eagle_posterior_th
 `--temperature` can be specified as well. When no `--eagle_posterior_threshold` is specified or `--temperature=0.0` is set, greedy sampling is used.
 
 #### Run EAGLE-2
-**EAGLE-2 is still under the experimental stage.**
 
 EAGLE-2 can be enabled with 2 runtime flags (`--eagle_use_dynamic_tree` and `--eagle_dynamic_tree_max_top_k=N`). The same engine can be used for EAGLE-1 and EAGLE-2. Eagle choices must not be set in case of EAGLE-2. EAGLE-2 will generate the tree corresponding to choices dynamically in the runtime. For more details, please refer to [EAGLE-2 paper](https://arxiv.org/pdf/2406.16858).
 
