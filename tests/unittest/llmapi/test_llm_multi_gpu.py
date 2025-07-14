@@ -268,7 +268,6 @@ def test_llama_7b_multi_lora_tp2():
         kv_cache_config=global_kv_cache_config)
 
 
-@pytest.mark.skip(reason="https://nvbugs/5362426")
 @pytest.mark.gpu2
 @pytest.mark.part3
 def test_llama_v2_7b_prompt_adapter_tp2():
@@ -326,7 +325,6 @@ def test_llm_multi_node_pytorch(nworkers: int):
 
 @skip_single_gpu
 def test_llm_multi_node_with_postproc():
-    pytest.skip("https://nvbugspro.nvidia.com/bug/5327706")
     nworkers = 2
     test_case_file = os.path.join(os.path.dirname(__file__),
                                   "run_llm_with_postproc.py")
@@ -456,7 +454,7 @@ def test_llm_get_stats_async_tp2(pytorch_backend):
 
 
 def test_llm_capture_request_error():
-    _test_llm_capture_request_error(tp_size=2)
+    _test_llm_capture_request_error(pytorch_backend=False, tp_size=2)
 
 
 def test_llm_with_postprocess_parallel_tp2():

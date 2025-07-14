@@ -1,0 +1,66 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index cba899bba..c27337601 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -264,48 +264,20 @@ set(NVSHMEM_HOST_SOURCES_NOMAXREGCOUNT
+     host/comm/rma.cu
+     host/stream/comm/quiet_on_stream.cu
+     host/stream/comm/cuda_interface_sync.cu
+-    host/stream/coll/alltoall/alltoall.cu
+     host/stream/coll/barrier/barrier.cu
+-    host/stream/coll/broadcast/broadcast.cu
+-    host/stream/coll/fcollect/fcollect.cu
+-    host/stream/coll/rdxn/reduce_and.cu
+-    host/stream/coll/rdxn/reduce_or.cu
+-    host/stream/coll/rdxn/reduce_xor.cu
+-    host/stream/coll/rdxn/reduce_min.cu
+     host/stream/coll/rdxn/reduce_max.cu
+-    host/stream/coll/rdxn/reduce_prod.cu
+-    host/stream/coll/rdxn/reduce_sum.cu
+     host/stream/coll/rdxn/reduce_team.cu
+-    host/stream/coll/reducescatter/reducescatter_and.cu
+-    host/stream/coll/reducescatter/reducescatter_or.cu
+-    host/stream/coll/reducescatter/reducescatter_xor.cu
+-    host/stream/coll/reducescatter/reducescatter_min.cu
+-    host/stream/coll/reducescatter/reducescatter_max.cu
+-    host/stream/coll/reducescatter/reducescatter_prod.cu
+-    host/stream/coll/reducescatter/reducescatter_sum.cu
+ )
+ 
+ set(NVSHMEM_HOST_SOURCES
+     host/bootstrap/bootstrap.cpp
+     host/bootstrap/bootstrap_loader.cpp
+     host/coll/cpu_coll.cpp
+-    host/coll/alltoall/alltoall.cpp
+-    host/coll/alltoall/alltoall_on_stream.cpp
+     host/coll/barrier/barrier.cpp
+     host/coll/barrier/barrier_on_stream.cpp
+-    host/coll/broadcast/broadcast.cpp
+-    host/coll/broadcast/broadcast_on_stream.cpp
+-    host/coll/fcollect/fcollect.cpp
+-    host/coll/fcollect/fcollect_on_stream.cpp
+-    host/coll/rdxn/rdxn.cpp
+-    host/coll/rdxn/rdxn_on_stream.cpp
+-    host/coll/reducescatter/reducescatter.cpp
+-    host/coll/reducescatter/reducescatter_on_stream.cpp
+     host/comm/putget.cpp
+-    host/comm/fence.cpp
+     host/comm/quiet.cpp
+     host/comm/sync.cpp
+-    host/comm/amo.cpp
+     host/proxy/proxy.cpp
+     host/transport/transport.cpp
+     host/transport/p2p/p2p.cpp
+@@ -1006,3 +978,12 @@ set(CPACK_RPM_PACKAGE_REQUIRES_PREUN "/sbin/ldconfig")
+ 
+ include(CPack)
+ # End Installation definitions
++
++set_target_properties(
++  git_commit
++  nvshmem_device_project
++  nvshmem_bootstrap_pmi
++  nvshmem_bootstrap_pmi2
++  nvshmem_host
++  nvshmem-info
++  PROPERTIES EXCLUDE_FROM_ALL TRUE)

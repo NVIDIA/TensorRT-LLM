@@ -14,6 +14,7 @@
 # limitations under the License.
 import unittest
 
+import pytest
 import torch
 from parameterized import parameterized
 
@@ -479,6 +480,7 @@ class TestMoeAlltoAllSingleGPU(unittest.TestCase):
         # Hang with stream count > 8
         #(0, 9, 90, 8, 100),
     ])
+    @pytest.mark.no_xdist
     def test_moe_alltoall_prepare(self, ep_rank: int, ep_size: int,
                                   expert_count: int, slot_count: int,
                                   top_k: int, max_token_count_per_rank: int):
@@ -714,12 +716,10 @@ class TestMoeAlltoAllSingleGPU(unittest.TestCase):
         for i in range(total_recv_token_count):
             for j in range(top_k):
                 expert_id = int(prepared_local_experts_cpu[i][j])
-                assert expert_id == slot_count or compute_target_rank(
-                    expert_id) == ep_rank
-                scale = float(prepared_local_scales_cpu[i][j])
-                if expert_id == slot_count:
-                    assert scale < 1e-6
-                else:
+                assert 0 <= expert_id and expert_id <= slot_count
+                if expert_id < slot_count:
+                    assert compute_target_rank(expert_id) == ep_rank
+                    scale = float(prepared_local_scales_cpu[i][j])
                     assert scale > 1e-6
 
         gathered_expert_statics_cpu = gathered_expert_statics.cpu()

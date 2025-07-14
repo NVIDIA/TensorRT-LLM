@@ -75,16 +75,15 @@ class KvCacheCreator:
             head_dim = config.kv_lora_rank + config.qk_rope_head_dim
             kv_factor = 1
         else:
-            head_dim = getattr(
-                config,
-                "head_dim",
-                config.hidden_size // config.num_attention_heads,
-            ) * num_key_value_heads // tp_size
+            _head_dim = getattr(config, 'head_dim', None)
+            if not isinstance(_head_dim, int):
+                _head_dim = config.hidden_size // config.num_attention_heads
+            head_dim = _head_dim * num_key_value_heads // tp_size
 
         # provide at least 1 layer to prevent division by zero cache size
-        num_hidden_layers = max(
-            len(mapping.pp_layers(config.num_hidden_layers)), 1)
-        mem_per_token *= num_hidden_layers * head_dim
+        num_attention_layers = max(
+            len(mapping.pp_layers(model_config.get_num_attention_layers())), 1)
+        mem_per_token *= num_attention_layers * head_dim
         # K and V
         mem_per_token *= kv_factor
         return mem_per_token
@@ -122,6 +121,7 @@ class KvCacheCreator:
             self, input_seq_len: int) -> List[trtllm.Request]:
         vocab_size = self._model_engine.model.model_config.pretrained_config.vocab_size
         max_num_tokens = self._executor_config.max_num_tokens
+        max_beam_width = self._executor_config.max_beam_width
 
         requests = []
         input_seq_len = min(max_num_tokens, input_seq_len)
@@ -134,7 +134,8 @@ class KvCacheCreator:
             request = trtllm.Request(input_tokens,
                                      max_tokens=1,
                                      streaming=False,
-                                     sampling_config=trtllm.SamplingConfig(),
+                                     sampling_config=trtllm.SamplingConfig(
+                                         beam_width=max_beam_width, ),
                                      output_config=trtllm.OutputConfig(),
                                      end_id=-1)
             requests.append(request)
@@ -156,10 +157,10 @@ class KvCacheCreator:
         if not pytorch_backend_config.disable_overlap_scheduler:
             num_extra_tokens_per_seq = num_extra_tokens_per_seq + 1
             if spec_cfg is not None:
-                num_extra_tokens_per_seq += spec_cfg.max_draft_tokens
+                num_extra_tokens_per_seq += spec_cfg.max_draft_len
 
         if spec_cfg is not None:
-            num_extra_tokens_per_seq += spec_cfg.max_draft_tokens
+            num_extra_tokens_per_seq += spec_cfg.max_draft_len
             num_extra_tokens_per_seq += spec_cfg.num_extra_kv_tokens
         for req in self._dummy_reqs:
             num_req_tokens = len(req.input_token_ids) + num_extra_tokens_per_seq
@@ -167,7 +168,9 @@ class KvCacheCreator:
             num_cache_blocks += (num_req_tokens +
                                  executor_config.tokens_per_block -
                                  1) // executor_config.tokens_per_block
-        return num_cache_blocks * executor_config.tokens_per_block
+        # Multiply by beam width, to prevent rescaling of the max_seq_len caused by the influence of beam width during the preparation for kv_cache_estimation
+        return num_cache_blocks * executor_config.tokens_per_block * self._dummy_reqs[
+            0].sampling_config.beam_width
 
     def try_prepare_estimation(self) -> bool:
         """Prepare for possible KV cache capacity estimation.
@@ -277,8 +280,9 @@ class KvCacheCreator:
         num_attention_heads = config.num_attention_heads
         num_key_value_heads = getattr(config, 'num_key_value_heads',
                                       num_attention_heads)
-        head_dim = getattr(config, "head_dim",
-                           hidden_size // num_attention_heads)
+        head_dim = getattr(config, "head_dim", None)
+        if not isinstance(head_dim, int):
+            head_dim = hidden_size // num_attention_heads
 
         if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
         ):
@@ -303,8 +307,13 @@ class KvCacheCreator:
                 mapping=mapping,
                 dtype=kv_cache_dtype,
                 spec_config=spec_config,
+                max_beam_width=executor_config.max_beam_width,
             )
         elif is_nemotron_hybrid(config):
+            if executor_config.max_beam_width > 1:
+                raise ValueError(
+                    "MambaHybridCacheManager + beam search is not supported yet."
+                )
             config = model_engine.model.model_config.pretrained_config
             num_layers = config.hybrid_override_pattern.count("*")
             layer_mask = [
@@ -360,7 +369,9 @@ class KvCacheCreator:
                 dtype=kv_cache_dtype,
                 spec_config=spec_config,
                 max_num_tokens=executor_config.max_num_tokens,
-                model_config=binding_model_config)
+                model_config=binding_model_config,
+                max_beam_width=executor_config.max_beam_width,
+            )
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to executor_config
         if model_engine.kv_cache_manager_key == ResourceManagerType.KV_CACHE_MANAGER:
             executor_config.max_seq_len = kv_cache_manager.max_seq_len
@@ -389,6 +400,7 @@ class KvCacheCreator:
 
 
 def create_py_executor_instance(
+        *,
         dist,
         resources,
         mapping,
@@ -525,7 +537,8 @@ def create_py_executor_instance(
         disable_overlap_scheduler=pytorch_backend_config.
         disable_overlap_scheduler,
         max_batch_size=executor_config.max_batch_size,
-        max_draft_tokens=spec_config.max_draft_tokens
+        max_beam_width=executor_config.max_beam_width,
+        max_draft_len=spec_config.max_draft_len
         if spec_config is not None else 0,
         kv_cache_transceiver=kv_cache_transceiver,
         draft_model_engine=draft_model_engine,
@@ -534,16 +547,16 @@ def create_py_executor_instance(
 
 
 def create_torch_sampler_args(executor_config: ExecutorConfig, mapping: Mapping,
-                              *, max_seq_len: int, mixed_sampler: bool):
+                              *, max_seq_len: int, enable_mixed_sampler: bool):
     max_num_sequences = executor_config.max_batch_size * mapping.pp_size
-    max_draft_tokens = (0 if executor_config.speculative_config is None else
-                        executor_config.speculative_config.max_draft_tokens)
+    max_draft_len = (0 if executor_config.speculative_config is None else
+                     executor_config.speculative_config.max_draft_len)
     return TorchSampler.Args(
         max_seq_len=max_seq_len,
-        max_draft_tokens=max_draft_tokens,
+        max_draft_len=max_draft_len,
         max_num_sequences=max_num_sequences,
         max_beam_width=executor_config.max_beam_width,
-        mixed_sampler=mixed_sampler,
+        enable_mixed_sampler=enable_mixed_sampler,
     )
 
 
@@ -555,7 +568,7 @@ def instantiate_sampler(engine: PyTorchModelEngine,
         executor_config,
         mapping,
         max_seq_len=engine.max_seq_len,
-        mixed_sampler=pytorch_backend_config.mixed_sampler)
+        enable_mixed_sampler=pytorch_backend_config.enable_mixed_sampler)
     if mapping.cp_config.get('cp_type') == 'star_attention':
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
         return TorchSampler(sampler_args)

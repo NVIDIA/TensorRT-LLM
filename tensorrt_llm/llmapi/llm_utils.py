@@ -33,7 +33,8 @@ from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
 from .llm_args import (CalibConfig, CudaGraphConfig, DraftTargetDecodingConfig,
                        EagleDecodingConfig, KvCacheConfig, LlmArgs,
                        LookaheadDecodingConfig, MedusaDecodingConfig,
-                       MTPDecodingConfig, NGramDecodingConfig, _ModelFormatKind,
+                       MTPDecodingConfig, NGramDecodingConfig,
+                       UserProvidedDecodingConfig, _ModelFormatKind,
                        _ModelWrapper, _ParallelConfig, get_model_format,
                        update_llm_args_with_extra_dict,
                        update_llm_args_with_extra_options)
@@ -109,8 +110,8 @@ class ModelLoader:
 
         self.model_obj = _ModelWrapper(self.llm_args.model)
         self.speculative_model_obj = _ModelWrapper(
-            self.llm_args.speculative_model
-        ) if self.llm_args.speculative_model is not None else None
+            self.llm_args.speculative_model_dir
+        ) if self.llm_args.speculative_model_dir is not None else None
 
         if isinstance(self.llm_args, TrtLlmArgs):
             self.convert_checkpoint_options = self.llm_args._convert_checkpoint_options
@@ -439,8 +440,8 @@ class ModelLoader:
         model_cls = AutoModelForCausalLM.get_trtllm_model_class(
             self._model_dir, self.llm_args.trust_remote_code,
             self.llm_args.decoding_config.decoding_mode
-            if hasattr(self.llm_args, "speculative_model")
-            and self.llm_args.speculative_model else None)
+            if hasattr(self.llm_args, "speculative_model_dir")
+            and self.llm_args.speculative_model_dir else None)
 
         prequantized = self._update_from_hf_quant_config()
 
@@ -483,7 +484,7 @@ class ModelLoader:
                 load_model_on_cpu=
                 True,  # TODO:TRTLLM-195 to enhance the weights loading memory usage and chose best location
                 trust_remote_code=self.llm_args.trust_remote_code,
-                speculative_model=self._speculative_model_dir,
+                speculative_model_dir=self._speculative_model_dir,
                 speculative_config=self.llm_args.speculative_config
                 if not isinstance(self.llm_args.speculative_config,
                                   LookaheadDecodingConfig) else None,
@@ -876,6 +877,7 @@ __all__ = [
     'MTPDecodingConfig',
     'NGramDecodingConfig',
     'DraftTargetDecodingConfig',
+    'UserProvidedDecodingConfig',
     'ContextChunkingPolicy',
     'CapacitySchedulerPolicy',
     'BuildConfig',

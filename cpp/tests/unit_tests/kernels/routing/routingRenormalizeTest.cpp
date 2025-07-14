@@ -165,15 +165,14 @@ private:
         routingData.mNormTopkProb = param.routingMethod == RoutingMethodType::RenormalizeNaive;
 
         routingData.mPtrScores = bufferCast<T>(*this->mPtrScoresDevice);
-        routingData.mPtrExpertIdx = reinterpret_cast<PackedType*>(bufferCast<int8_t>(*this->mPtrExpertIdxDevice));
     }
 
     void callTestedFunction(
         RoutingKernelTestParam const& param, tensorrt_llm::runtime::ITensor::SharedPtr& workspaceDevice) override
     {
-        moe::dev::routingRenormalize::Data routingData;
+        moe::dev::routing::routingRenormalize::Data routingData;
         setParams(param, routingData);
-        moe::dev::routingRenormalize::run(routingData, mStream->get());
+        moe::dev::routing::routingRenormalize::run(routingData, mStream->get());
     }
 };
 
@@ -214,7 +213,7 @@ TYPED_TEST(RoutingRenormalizeKernelTest, ClusterLevelParallelizationWithRenormal
 
 TYPED_TEST(RoutingRenormalizeKernelTest, DeviceLevelParallelization)
 {
-    RoutingKernelTestParam param(RoutingMethodType::Renormalize, /*numTokens=*/300,
+    RoutingKernelTestParam param(RoutingMethodType::Renormalize, /*numTokens=*/1000,
         /*numExperts=*/128, /*topK=*/8,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
@@ -223,4 +222,47 @@ TYPED_TEST(RoutingRenormalizeKernelTest, DeviceLevelParallelization)
     this->runTest(param);
 };
 
+TYPED_TEST(RoutingRenormalizeKernelTest, ClusterLevelParallelizationTop4)
+{
+    RoutingKernelTestParam param(RoutingMethodType::Renormalize, /*numTokens=*/10,
+        /*numExperts=*/128, /*topK=*/4,
+        /*expertParallelization=*/1, /*expertParallelizationId=*/0,
+        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
+        /*usePdl=*/true, /*getExpWeights=*/true,
+        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingRenormalizeKernelTest, ClusterLevelParallelizationWithExpertParallelizationTop4)
+{
+    RoutingKernelTestParam param(RoutingMethodType::Renormalize, /*numTokens=*/100,
+        /*numExperts=*/128, /*topK=*/4,
+        /*expertParallelization=*/2, /*expertParallelizationId=*/1,
+        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
+        /*usePdl=*/true, /*getExpWeights=*/true,
+        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingRenormalizeKernelTest, ClusterLevelParallelizationWithRenormalizeNaiveTop4)
+{
+    RoutingKernelTestParam param(RoutingMethodType::RenormalizeNaive, /*numTokens=*/10,
+        /*numExperts=*/128, /*topK=*/4,
+        /*expertParallelization=*/1, /*expertParallelizationId=*/0,
+        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
+        /*usePdl=*/true, /*getExpWeights=*/true,
+        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingRenormalizeKernelTest, DeviceLevelParallelizationTop4)
+{
+    RoutingKernelTestParam param(RoutingMethodType::Renormalize, /*numTokens=*/1000,
+        /*numExperts=*/128, /*topK=*/4,
+        /*expertParallelization=*/1, /*expertParallelizationId=*/0,
+        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
+        /*usePdl=*/true, /*getExpWeights=*/true,
+        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 8);
+    this->runTest(param);
+};
 } // end namespace

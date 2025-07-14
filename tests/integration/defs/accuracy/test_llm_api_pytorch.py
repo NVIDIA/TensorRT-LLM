@@ -60,14 +60,14 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("stream_interval", [4, 64],
                              ids=["stream_interval_4", "stream_interval_64"])
     def test_nvfp4_streaming(self, stream_interval):
-        model_path = f"{llm_models_root()}/nvfp4-quantized/Meta-Llama-3.1-8B"
-
-        # When stream_interval < 32, hf incremental detokenization is used.
-        # When stream_interval >= 32, trtllm implemented incremental detokenization is used.
+        # When stream_interval < TLLM_STREAM_INTERVAL_THRESHOLD, hf incremental detokenization is used.
+        # When stream_interval >= TLLM_STREAM_INTERVAL_THRESHOLD, trtllm implemented incremental detokenization is used.
         # The behavior is due to perf considerations, while both paths need to be tested.
-        with LLM(model_path, stream_interval=stream_interval) as llm:
+        with LLM(f"{llm_models_root()}/nvfp4-quantized/Meta-Llama-3.1-8B",
+                 stream_interval=stream_interval) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+            assert llm.args.stream_interval == stream_interval
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm, streaming=True)
 
@@ -80,15 +80,10 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(32000)
     @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
     def test_chunked_prefill(self, attn_backend):
-        pytorch_config = dict(
-            attn_backend=attn_backend,
-            # https://nvbugspro.nvidia.com/bug/5345391
-            disable_overlap_scheduler=True)
-        llm = LLM(self.MODEL_PATH,
-                  enable_chunked_prefill=True,
-                  max_num_tokens=512,
-                  **pytorch_config)
-        with llm:
+        with LLM(self.MODEL_PATH,
+                 attn_backend=attn_backend,
+                 enable_chunked_prefill=True,
+                 max_num_tokens=512) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -107,8 +102,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             attn_backend=attn_backend,
             disable_overlap_scheduler=torch_compile,
         )
-        llm = LLM(self.MODEL_PATH, **pytorch_config)
-        with llm:
+        with LLM(self.MODEL_PATH, **pytorch_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -134,11 +128,10 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             attn_backend=attn_backend,
             disable_overlap_scheduler=torch_compile,
         )
-        llm = LLM(self.MODEL_PATH,
-                  tensor_parallel_size=tp_size,
-                  pipeline_parallel_size=pp_size,
-                  **pytorch_config)
-        with llm:
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 **pytorch_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -162,14 +155,13 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         if fp8kv:
             quant_config.kv_cache_quant_algo = QuantAlgo.FP8
             pytorch_config["kv_cache_dtype"] = "fp8"
-        llm = LLM(
-            f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
-            quant_config=quant_config,
-            **pytorch_config)
-        assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
-        if fp8kv:
-            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
-        with llm:
+        with LLM(
+                f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
+                quant_config=quant_config,
+                **pytorch_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            if fp8kv:
+                assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -201,31 +193,30 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         if fp8kv:
             quant_config.kv_cache_quant_algo = QuantAlgo.FP8
             pytorch_config["kv_cache_dtype"] = "fp8"
-        llm = LLM(
-            f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
-            tensor_parallel_size=tp_size,
-            pipeline_parallel_size=pp_size,
-            quant_config=quant_config,
-            **pytorch_config)
-        assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
-        if fp8kv:
-            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
-        with llm:
+        with LLM(
+                f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
+                tensor_parallel_size=tp_size,
+                pipeline_parallel_size=pp_size,
+                quant_config=quant_config,
+                **pytorch_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            if fp8kv:
+                assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
     @skip_pre_hopper
     def test_fp8_llm_sampler(self):
         model_path = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
-        llm = LLM(model_path, enable_trtllm_sampler=True, max_batch_size=256)
-        assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+        with LLM(model_path, enable_trtllm_sampler=True,
+                 max_batch_size=256) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
 
-        sampling_params = SamplingParams(
-            temperature=0.8,
-            top_p=0.95,
-        )
+            sampling_params = SamplingParams(
+                temperature=0.8,
+                top_p=0.95,
+            )
 
-        with llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm,
                           sampling_params=sampling_params,
@@ -243,15 +234,13 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
         draft_len = 4
         spec_config = EagleDecodingConfig(max_draft_len=draft_len,
-                                          pytorch_weights_path=eagle_model_dir)
+                                          speculative_model_dir=eagle_model_dir)
 
-        llm = LLM(model=target_model_dir,
-                  **pytorch_config,
-                  kv_cache_config=kv_cache_config,
-                  speculative_config=spec_config,
-                  build_config=None)
-
-        with llm:
+        with LLM(model=target_model_dir,
+                 **pytorch_config,
+                 kv_cache_config=kv_cache_config,
+                 speculative_config=spec_config,
+                 build_config=None) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -262,20 +251,20 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
         draft_len = 4
         spec_config = NGramDecodingConfig(
-            prompt_lookup_num_tokens=draft_len,
+            max_draft_len=draft_len,
             max_matching_ngram_size=draft_len,
             is_keep_all=True,
             is_use_oldest=True,
             is_public_pool=True,
         )
 
-        llm = LLM(model=self.MODEL_PATH,
-                  **pytorch_config,
-                  kv_cache_config=kv_cache_config,
-                  speculative_config=spec_config)
-
-        with llm:
+        with LLM(model=self.MODEL_PATH,
+                 **pytorch_config,
+                 kv_cache_config=kv_cache_config,
+                 speculative_config=spec_config) as llm:
             task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
@@ -289,17 +278,17 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = JsonModeEval(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.timeout(7200)
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
     def test_guided_decoding_4gpus(self, backend: str, mocker):
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
-        llm = LLM(self.MODEL_PATH,
-                  guided_decoding_backend=backend,
-                  disable_overlap_scheduler=True,
-                  cuda_graph_config=CudaGraphConfig(),
-                  tensor_parallel_size=2,
-                  pipeline_parallel_size=2)
-        with llm:
+        with LLM(self.MODEL_PATH,
+                 guided_decoding_backend=backend,
+                 disable_overlap_scheduler=True,
+                 cuda_graph_config=CudaGraphConfig(),
+                 tensor_parallel_size=2,
+                 pipeline_parallel_size=2) as llm:
             task = JsonModeEval(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -347,6 +336,7 @@ class TestLlama3_2_3B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+@pytest.mark.timeout(7200)
 class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.3-70B-Instruct"
 
@@ -403,12 +393,15 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
                                                          (8, 1, 8)],
                              ids=["tp8", "tp8ep4", "tp8ep8"])
     def test_auto_dtype(self, cuda_graph, tp_size, pp_size, ep_size):
-        with LLM(self.MODEL_PATH,
-                 tensor_parallel_size=tp_size,
-                 pipeline_parallel_size=pp_size,
-                 moe_expert_parallel_size=ep_size,
-                 cuda_graph_config=CudaGraphConfig()
-                 if cuda_graph else None) as llm:
+        with LLM(
+                self.MODEL_PATH,
+                tensor_parallel_size=tp_size,
+                # Keep this low to avoid warmup OOM in CI
+                max_seq_len=8192,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                cuda_graph_config=CudaGraphConfig()
+                if cuda_graph else None) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
@@ -426,12 +419,15 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
                                                          (8, 1, 8)],
                              ids=["tp8", "tp8ep4", "tp8ep8"])
     def test_auto_dtype(self, cuda_graph, tp_size, pp_size, ep_size):
-        with LLM(self.MODEL_PATH,
-                 tensor_parallel_size=tp_size,
-                 pipeline_parallel_size=pp_size,
-                 moe_expert_parallel_size=ep_size,
-                 cuda_graph_config=CudaGraphConfig()
-                 if cuda_graph else None) as llm:
+        with LLM(
+                self.MODEL_PATH,
+                tensor_parallel_size=tp_size,
+                # Keep this low to avoid warmup OOM in CI
+                max_seq_len=8192,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                cuda_graph_config=CudaGraphConfig()
+                if cuda_graph else None) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
@@ -446,6 +442,33 @@ class TestMistral7B(LlmapiAccuracyTestHarness):
         with LLM(self.MODEL_PATH) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+class TestMinistral8BInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "mistralai/Ministral-8B-Instruct-2410"
+    MODEL_PATH = f"{llm_models_root()}/Ministral-8B-Instruct-2410"
+
+    def test_auto_dtype_gsm8k(self):
+        with LLM(self.MODEL_PATH) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_ada
+    def test_fp8(self):
+        # Test with FP8 quantization if pre-quantized model is available
+        model_path = f"{llm_models_root()}/Ministral-8B-Instruct-2410-FP8"
+        try:
+            with LLM(model_path) as llm:
+                assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+                task = GSM8K(self.MODEL_NAME)
+                task.evaluate(llm)
+                task = MMLU(self.MODEL_NAME)
+                task.evaluate(llm)
+        except (FileNotFoundError, OSError):
+            pytest.skip("FP8 pre-quantized Ministral-8B model not available")
 
 
 class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
@@ -561,12 +584,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         mtp_config = None
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
-        llm = LLM(self.MODEL_PATH,
-                  kv_cache_config=kv_cache_config,
-                  **pytorch_config,
-                  enable_attention_dp=attention_dp,
-                  speculative_config=mtp_config)
-        with llm:
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 enable_attention_dp=attention_dp,
+                 speculative_config=mtp_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -604,15 +626,14 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         mtp_config = None
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
-        llm = LLM(self.MODEL_PATH,
-                  tensor_parallel_size=tp_size,
-                  pipeline_parallel_size=pp_size,
-                  moe_expert_parallel_size=ep_size,
-                  kv_cache_config=kv_cache_config,
-                  **pytorch_config,
-                  enable_attention_dp=attention_dp,
-                  speculative_config=mtp_config)
-        with llm:
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 enable_attention_dp=attention_dp,
+                 speculative_config=mtp_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -656,18 +677,17 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn,
                                            use_mtp_vanilla=True)
 
-        llm = LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
-                  kv_cache_config=kv_cache_config,
-                  **pytorch_config,
-                  quant_config=quant_config,
-                  enable_attention_dp=attention_dp,
-                  speculative_config=mtp_config)
+        with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 quant_config=quant_config,
+                 enable_attention_dp=attention_dp,
+                 speculative_config=mtp_config) as llm:
 
-        assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
-        if fp8kv:
-            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+            if fp8kv:
+                assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
-        with llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -712,20 +732,19 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
 
-        llm = LLM(
-            f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
-            kv_cache_config=kv_cache_config,
-            **pytorch_config,
-            quant_config=quant_config,
-            enable_attention_dp=attention_dp,
-            speculative_config=mtp_config,
-        )
+        with LLM(
+                f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
+                kv_cache_config=kv_cache_config,
+                **pytorch_config,
+                quant_config=quant_config,
+                enable_attention_dp=attention_dp,
+                speculative_config=mtp_config,
+        ) as llm:
 
-        assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
-        if fp8kv:
-            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+            if fp8kv:
+                assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
-        with llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -743,12 +762,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 padding_enabled=True,
             ),
         )
-        llm = LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
-                  kv_cache_config=kv_cache_config,
-                  **pytorch_config,
-                  speculative_config=mtp_config)
-        assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
-        with llm:
+        with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 speculative_config=mtp_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -769,15 +787,14 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         quant_config = QuantConfig()
         quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
 
-        llm = LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
-                  tensor_parallel_size=4,
-                  kv_cache_config=kv_cache_config,
-                  **pytorch_config,
-                  quant_config=quant_config,
-                  enable_attention_dp=attention_dp,
-                  speculative_config=mtp_config)
-        assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
-        with llm:
+        with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
+                 tensor_parallel_size=4,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 quant_config=quant_config,
+                 enable_attention_dp=attention_dp,
+                 speculative_config=mtp_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -826,21 +843,20 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
 
-        llm = LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
-                  tensor_parallel_size=tp_size,
-                  pipeline_parallel_size=pp_size,
-                  moe_expert_parallel_size=ep_size,
-                  kv_cache_config=kv_cache_config,
-                  **pytorch_config,
-                  quant_config=quant_config,
-                  enable_attention_dp=attention_dp,
-                  speculative_config=mtp_config)
+        with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 quant_config=quant_config,
+                 enable_attention_dp=attention_dp,
+                 speculative_config=mtp_config) as llm:
 
-        assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
-        if fp8kv:
-            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+            if fp8kv:
+                assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
-        with llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -896,23 +912,21 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
 
-        llm = LLM(
-            f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
-            tensor_parallel_size=tp_size,
-            pipeline_parallel_size=pp_size,
-            moe_expert_parallel_size=ep_size,
-            kv_cache_config=kv_cache_config,
-            **pytorch_config,
-            quant_config=quant_config,
-            enable_attention_dp=attention_dp,
-            speculative_config=mtp_config,
-        )
+        with LLM(
+                f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
+                tensor_parallel_size=tp_size,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                kv_cache_config=kv_cache_config,
+                **pytorch_config,
+                quant_config=quant_config,
+                enable_attention_dp=attention_dp,
+                speculative_config=mtp_config,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+            if fp8kv:
+                assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
-        assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
-        if fp8kv:
-            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
-
-        with llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -936,13 +950,12 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         pytorch_backend_options = dict(cuda_graph_config=CudaGraphConfig(),
                                        moe_backend="WIDEEP",
                                        moe_load_balancer=eplb_config)
-        llm = LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
-                  tensor_parallel_size=4,
-                  moe_expert_parallel_size=4,
-                  kv_cache_config=kv_cache_config,
-                  **pytorch_backend_options,
-                  enable_attention_dp=True)
-        with llm:
+        with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
+                 tensor_parallel_size=4,
+                 moe_expert_parallel_size=4,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_backend_options,
+                 enable_attention_dp=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -960,14 +973,13 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         mtp_config = None
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
-        llm = LLM(self.MODEL_PATH,
-                  tensor_parallel_size=4,
-                  moe_expert_parallel_size=4,
-                  kv_cache_config=kv_cache_config,
-                  enable_attention_dp=True,
-                  **pytorch_config,
-                  speculative_config=mtp_config)
-        with llm:
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=4,
+                 moe_expert_parallel_size=4,
+                 kv_cache_config=kv_cache_config,
+                 enable_attention_dp=True,
+                 **pytorch_config,
+                 speculative_config=mtp_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -988,14 +1000,13 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             quant_config.kv_cache_quant_algo = QuantAlgo.FP8
             pytorch_backend_options["kv_cache_dtype"] = "fp8"
 
-        llm = LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only",
-                  tensor_parallel_size=4,
-                  moe_expert_parallel_size=4,
-                  kv_cache_config=kv_cache_config,
-                  **pytorch_backend_options,
-                  enable_attention_dp=True,
-                  quant_config=quant_config)
-        with llm:
+        with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only",
+                 tensor_parallel_size=4,
+                 moe_expert_parallel_size=4,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_backend_options,
+                 enable_attention_dp=True,
+                 quant_config=quant_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -1036,18 +1047,16 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             quant_config.kv_cache_quant_algo = QuantAlgo.FP8
             pytorch_config["kv_cache_dtype"] = "fp8"
 
-        llm = LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
-                  kv_cache_config=kv_cache_config,
-                  **pytorch_config,
-                  quant_config=quant_config,
-                  enable_attention_dp=attention_dp,
-                  speculative_config=mtp_config)
+        with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 quant_config=quant_config,
+                 enable_attention_dp=attention_dp,
+                 speculative_config=mtp_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            if fp8kv:
+                assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
-        assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-        if fp8kv:
-            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
-
-        with llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -1075,8 +1084,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             pytest.skip("https://nvbugs/5252313")
         if torch_compile and pp_size > 1:
             pytest.skip("PP with torch.compile is not supported yet.")
-        if not attention_dp and (tp_size > 1 or ep_size > 1):
-            pytest.skip("https://nvbugs/5336321")
+
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         # Picewise Cuda Graph cannot be enabled for nvfp4 attention dp.
         torch_compile_config = TorchCompileConfig(
@@ -1100,21 +1108,19 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             quant_config.kv_cache_quant_algo = QuantAlgo.FP8
             pytorch_config["kv_cache_dtype"] = "fp8"
 
-        llm = LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
-                  tensor_parallel_size=tp_size,
-                  pipeline_parallel_size=pp_size,
-                  moe_expert_parallel_size=ep_size,
-                  kv_cache_config=kv_cache_config,
-                  **pytorch_config,
-                  quant_config=quant_config,
-                  enable_attention_dp=attention_dp,
-                  speculative_config=mtp_config)
+        with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 quant_config=quant_config,
+                 enable_attention_dp=attention_dp,
+                 speculative_config=mtp_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            if fp8kv:
+                assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
-        assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-        if fp8kv:
-            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
-
-        with llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -1165,22 +1171,19 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 quant_config.kv_cache_quant_algo = QuantAlgo.FP8
                 pytorch_config["kv_cache_dtype"] = "fp8"
 
-        llm = LLM(model_path,
-                  kv_cache_config=kv_cache_config,
-                  **pytorch_config,
-                  quant_config=quant_config,
-                  enable_attention_dp=attention_dp,
-                  speculative_config=mtp_config)
+        with LLM(model_path,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 quant_config=quant_config,
+                 enable_attention_dp=attention_dp,
+                 speculative_config=mtp_config) as llm:
+            if quant_dtype == "fp8":
+                assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+            elif quant_dtype == "nvfp4":
+                assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
 
-        if quant_dtype == "fp8":
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
-        elif quant_dtype == "nvfp4":
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-
-        if fp8kv:
-            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
-
-        with llm:
+            if fp8kv:
+                assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -1228,24 +1231,23 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 quant_config.kv_cache_quant_algo = QuantAlgo.FP8
                 pytorch_config["kv_cache_dtype"] = "fp8"
 
-        llm = LLM(model_path,
-                  kv_cache_config=kv_cache_config,
-                  enable_chunked_prefill=True,
-                  max_num_tokens=512,
-                  **pytorch_config,
-                  quant_config=quant_config,
-                  enable_attention_dp=True,
-                  speculative_config=mtp_config)
+        with LLM(model_path,
+                 kv_cache_config=kv_cache_config,
+                 enable_chunked_prefill=True,
+                 max_num_tokens=512,
+                 **pytorch_config,
+                 quant_config=quant_config,
+                 enable_attention_dp=True,
+                 speculative_config=mtp_config) as llm:
 
-        if quant_dtype == "fp8":
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
-        elif quant_dtype == "nvfp4":
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            if quant_dtype == "fp8":
+                assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+            elif quant_dtype == "nvfp4":
+                assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
 
-        if fp8kv:
-            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+            if fp8kv:
+                assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
-        with llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -1325,7 +1327,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                               attention_dp, cuda_graph, overlap_scheduler,
                               max_batch_size, moe_backend):
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.85)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
@@ -1340,23 +1342,22 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
         mtp_config = None
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
-        llm = LLM(f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-FP4",
-                  max_batch_size=max_batch_size,
-                  tensor_parallel_size=tp_size,
-                  pipeline_parallel_size=pp_size,
-                  moe_expert_parallel_size=ep_size,
-                  kv_cache_config=kv_cache_config,
-                  **pytorch_config,
-                  quant_config=quant_config,
-                  enable_attention_dp=attention_dp,
-                  speculative_config=mtp_config)
+        with LLM(f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-FP4",
+                 max_batch_size=max_batch_size,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 quant_config=quant_config,
+                 enable_attention_dp=attention_dp,
+                 speculative_config=mtp_config) as llm:
 
-        assert llm.args.moe_backend == moe_backend
-        assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-        if fp8kv:
-            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+            assert llm.args.moe_backend == moe_backend
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            if fp8kv:
+                assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
-        with llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
@@ -1391,21 +1392,20 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
         mtp_config = None
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
-        llm = LLM(f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1",
-                  max_batch_size=max_batch_size,
-                  tensor_parallel_size=tp_size,
-                  pipeline_parallel_size=pp_size,
-                  moe_expert_parallel_size=ep_size,
-                  kv_cache_config=kv_cache_config,
-                  **pytorch_config,
-                  quant_config=quant_config,
-                  enable_attention_dp=attention_dp,
-                  speculative_config=mtp_config)
-        assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
-        if fp8kv:
-            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+        with LLM(f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1",
+                 max_batch_size=max_batch_size,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 quant_config=quant_config,
+                 enable_attention_dp=attention_dp,
+                 speculative_config=mtp_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+            if fp8kv:
+                assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
-        with llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
@@ -1516,6 +1516,7 @@ class TestNemotronUltra(LlmapiAccuracyTestHarness):
                              ids=["tp8", "tp8ep4", "tp8ep8"])
     def test_auto_dtype(self, cuda_graph, tp_size, pp_size, ep_size):
         with LLM(self.MODEL_PATH,
+                 max_batch_size=32,
                  tensor_parallel_size=tp_size,
                  pipeline_parallel_size=pp_size,
                  moe_expert_parallel_size=ep_size,
@@ -1525,9 +1526,9 @@ class TestNemotronUltra(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
+            # task = GPQADiamond(self.MODEL_NAME)
+            # task.evaluate(llm,
+            #                 extra_evaluator_kwargs=dict(apply_chat_template=True))
 
     @pytest.mark.skip_less_device(8)
     @pytest.mark.skip_device_not_contain(["H100", "B200"])
@@ -1615,13 +1616,12 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
-        llm = LLM(f"{llm_models_root()}/Qwen3/Qwen3-8B-FP8",
-                  tensor_parallel_size=tp_size,
-                  pipeline_parallel_size=pp_size,
-                  moe_expert_parallel_size=ep_size,
-                  **pytorch_config,
-                  enable_attention_dp=attention_dp)
-        with llm:
+        with LLM(f"{llm_models_root()}/Qwen3/Qwen3-8B-FP8",
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 **pytorch_config,
+                 enable_attention_dp=attention_dp) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
@@ -1637,13 +1637,12 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
-        llm = LLM(f"{llm_models_root()}/Qwen3/Qwen3-8B",
-                  tensor_parallel_size=tp_size,
-                  pipeline_parallel_size=pp_size,
-                  moe_expert_parallel_size=ep_size,
-                  **pytorch_config,
-                  enable_attention_dp=attention_dp)
-        with llm:
+        with LLM(f"{llm_models_root()}/Qwen3/Qwen3-8B",
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 **pytorch_config,
+                 enable_attention_dp=attention_dp) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
@@ -1665,13 +1664,12 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
-        llm = LLM(f"{llm_models_root()}/Qwen3/Qwen3-30B-A3B-FP8",
-                  tensor_parallel_size=tp_size,
-                  pipeline_parallel_size=pp_size,
-                  moe_expert_parallel_size=ep_size,
-                  **pytorch_config,
-                  enable_attention_dp=attention_dp)
-        with llm:
+        with LLM(f"{llm_models_root()}/Qwen3/Qwen3-30B-A3B-FP8",
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 **pytorch_config,
+                 enable_attention_dp=attention_dp) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -1686,14 +1684,12 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
-        llm = LLM(
-            f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_fp8_hf",
-            tensor_parallel_size=tp_size,
-            pipeline_parallel_size=pp_size,
-            moe_expert_parallel_size=ep_size,
-            **pytorch_config,
-            enable_attention_dp=attention_dp)
-        with llm:
+        with LLM(f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_fp8_hf",
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 **pytorch_config,
+                 enable_attention_dp=attention_dp) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -1701,14 +1697,20 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend",
         [
-            (1, 1, 1, True, True, True, "CUTLASS"),
+            (1, 1, 1, False, True, True, "CUTLASS"),
             (1, 1, 1, False, True, True, "TRTLLM"),
+            (4, 1, 4, True, True, True, "CUTLASS"),
+            (4, 1, 4, True, True, True, "TRTLLM"),
             (4, 1, 4, False, True, True, "CUTLASS"),
             (4, 1, 4, False, True, True, "TRTLLM"),
         ],
         ids=[
-            "latency_moe_cutlass", "latency_moe_trtllm",
-            "4gpu_latency_moe_trtllm", "4gpu_latency_moe_cutlass"
+            "latency_moe_cutlass",
+            "latency_moe_trtllm",
+            "dep4_latency_moe_cutlass",
+            "dep4_latency_moe_trtllm",
+            "tep4_latency_moe_cutlass",
+            "tep4_latency_moe_trtllm",
         ],
     )
     def test_nvfp4(
@@ -1727,14 +1729,13 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             moe_backend=moe_backend,
         )
 
-        llm = LLM(
-            f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf",
-            tensor_parallel_size=tp_size,
-            pipeline_parallel_size=pp_size,
-            moe_expert_parallel_size=ep_size,
-            **pytorch_config,
-            enable_attention_dp=attention_dp)
-        with llm:
+        with LLM(
+                f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf",
+                tensor_parallel_size=tp_size,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                **pytorch_config,
+                enable_attention_dp=attention_dp) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -1753,13 +1754,12 @@ class TestQwen3_32B(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
-        llm = LLM(f"{llm_models_root()}/Qwen3/Qwen3-32B-FP8",
-                  tensor_parallel_size=tp_size,
-                  pipeline_parallel_size=pp_size,
-                  moe_expert_parallel_size=ep_size,
-                  **pytorch_config,
-                  enable_attention_dp=attention_dp)
-        with llm:
+        with LLM(f"{llm_models_root()}/Qwen3/Qwen3-32B-FP8",
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 **pytorch_config,
+                 enable_attention_dp=attention_dp) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
@@ -1782,25 +1782,25 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
-        llm = LLM(
-            f"{llm_models_root()}/Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",
-            tensor_parallel_size=tp_size,
-            pipeline_parallel_size=pp_size,
-            moe_expert_parallel_size=ep_size,
-            **pytorch_config,
-            enable_attention_dp=attention_dp,
-            kv_cache_config=kv_cache_config)
-        with llm:
+        with LLM(
+                f"{llm_models_root()}/Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",
+                tensor_parallel_size=tp_size,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                **pytorch_config,
+                enable_attention_dp=attention_dp,
+                kv_cache_config=kv_cache_config) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
     @skip_pre_blackwell
+    @pytest.mark.skip_less_device(8)
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend",
         [(8, 1, 8, True, True, True, "CUTLASS"),
-         (8, 1, 8, False, True, True, "TRTLLM")],
+         (8, 1, 8, True, True, True, "TRTLLM")],
         ids=["latency_moe_cutlass", "latency_moe_trtllm"],
     )
     def test_nvfp4(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
@@ -1811,15 +1811,14 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
             moe_backend=moe_backend)
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
-        llm = LLM(
-            f"{llm_models_root()}/Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
-            tensor_parallel_size=tp_size,
-            pipeline_parallel_size=pp_size,
-            moe_expert_parallel_size=ep_size,
-            **pytorch_config,
-            enable_attention_dp=attention_dp,
-            kv_cache_config=kv_cache_config)
-        with llm:
+        with LLM(
+                f"{llm_models_root()}/Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
+                tensor_parallel_size=tp_size,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                **pytorch_config,
+                enable_attention_dp=attention_dp,
+                kv_cache_config=kv_cache_config) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)

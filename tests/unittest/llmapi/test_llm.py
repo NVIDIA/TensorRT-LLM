@@ -5,9 +5,6 @@ import json
 import os
 import sys
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
-from gc_utils import assert_resource_freed
-
 # Required for test_generate_with_seed to pass.
 # See the discussion in https://github.com/NVIDIA/TensorRT-LLM/pull/4264#issuecomment-2943269891
 # The following line must be ahead of any tensorrt_llm imports,
@@ -27,7 +24,6 @@ import datasets
 import pytest
 import torch
 import transformers
-from utils.util import skip_single_gpu
 
 from tensorrt_llm import LLM as LLM_torch
 from tensorrt_llm._tensorrt_engine import LLM
@@ -51,6 +47,9 @@ from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
                                           LogitsProcessor, SamplingParams)
 
 # isort: off
+sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
+from gc_utils import assert_resource_freed
+from utils.util import skip_single_gpu
 from utils.llm_data import llm_models_root
 from utils.util import force_ampere, similar, skip_gpu_memory_less_than_40gb, skip_pre_hopper
 # isort: on
@@ -257,8 +256,7 @@ def test_llm_loading_from_ckpt():
 
 @pytest.mark.parametrize('model_format', [
     'hf',
-    pytest.param('ckpt',
-                 marks=pytest.mark.skip(reason="https://nvbugs/5266240"))
+    'ckpt',
 ])
 @pytest.mark.part0
 def test_llm_with_dummy_weights(model_format):
@@ -364,22 +362,31 @@ def test_llm_with_kv_cache_retention_config():
         print(output)
 
 
-@pytest.mark.skip(reason="https://nvbugs/5370718")
+@pytest.mark.parametrize('backend', ["HF", "TRTLLM"])
 @pytest.mark.parametrize(
-    'tokenizer_dir, threshold',
+    'tokenizer_dir, clean_up_tokenization_spaces, threshold',
     [
-        (get_model_path('gpt2'), 0.95),  # BPE
-        (get_model_path('bert/bert-base-uncased'), 0.95),  # WordPiece
-        (get_model_path('t5-small'), 0.95),  # SentencePiece
-        (get_model_path('starcoder2-3b'), 0.95),
-        (get_model_path('falcon-7b-instruct'), 0.95),
-        (get_model_path('llama-models-v2/llama-v2-7b-hf'), 0.95),
-        (get_model_path('codellama/CodeLlama-7b-Instruct-hf'), 0.95),
-        (llama_model_path, 0.95),
-        (get_model_path(mixtral_model_name), 0.95)
+        (get_model_path('gpt2'), False, 0.95),  # BPE
+        (get_model_path('bert/bert-base-uncased'), True, 0.95),  # WordPiece
+        (get_model_path('t5-small'), True, 0.95),  # SentencePiece
+        (get_model_path('starcoder2-3b'), False, 0.95),
+        (get_model_path('falcon-7b-instruct'), False, 0.95),
+        (get_model_path('llama-models-v2/llama-v2-7b-hf'), False, 0.95),
+        (get_model_path('codellama/CodeLlama-7b-Instruct-hf'), False, 0.95),
+        (llama_model_path, False, 0.95),
+        (get_model_path(mixtral_model_name), False, 0.95),
+        (get_model_path('llama-3.1-model/Meta-Llama-3.1-8B'), False, 0.95),
+        (get_model_path('DeepSeek-R1/DeepSeek-R1'), False, 0.95)
     ])
 @pytest.mark.part0
-def test_tokenizer_decode_incrementally(tokenizer_dir: str, threshold: float):
+def test_tokenizer_decode_incrementally(tokenizer_dir: str,
+                                        clean_up_tokenization_spaces: bool,
+                                        threshold: float, backend: str, mocker):
+    import tensorrt_llm.llmapi.tokenizer
+    mocker.patch.object(tensorrt_llm.llmapi.tokenizer,
+                        "TLLM_INCREMENTAL_DETOKENIZATION_BACKEND", backend)
+    assert tensorrt_llm.llmapi.tokenizer.TLLM_INCREMENTAL_DETOKENIZATION_BACKEND == backend
+
     random.seed(42)
 
     num_samples = 100
@@ -411,8 +418,7 @@ def test_tokenizer_decode_incrementally(tokenizer_dir: str, threshold: float):
             decoded_text, states = tokenizer.decode_incrementally(
                 [token_ids[i]], decoded_text, states)
 
-        if tokenizer_dir.endswith(
-                'bert-base-uncased') and tokenizer.clean_up_tokenization_spaces:
+        if clean_up_tokenization_spaces and tokenizer.clean_up_tokenization_spaces:
             decoded_text = tokenizer.clean_up_tokenization(decoded_text)
         reference = tokenizer.decode(token_ids)
         if decoded_text == reference:
@@ -535,6 +541,40 @@ def _test_llm_generate_async(model_name=default_model_name,
     test_non_streaming_usage_wait()
 
 
+@pytest.mark.parametrize("chunked", [True, False])
+@pytest.mark.part0
+def test_llm_generate_async_with_stream_interval(chunked):
+    model_path = get_model_path('llama-models-v2/llama-v2-7b-hf')
+    max_num_tokens = 256
+    with LLM_torch(model_path,
+                   max_num_tokens=max_num_tokens,
+                   stream_interval=4,
+                   enable_chunked_prefill=chunked) as llm:
+        sampling_params = SamplingParams(max_tokens=13,
+                                         ignore_eos=True,
+                                         detokenize=False)
+        step = 0
+        last_step_len = 0
+        prompt = "The capital of France is "
+        if chunked:
+            prompt = prompt * max_num_tokens
+        for output in llm.generate_async(prompt,
+                                         sampling_params=sampling_params,
+                                         streaming=True):
+            current_step_len = len(output.outputs[0].token_ids)
+            # The output lens of each step need to be [1, 3, 4, 4, 1]
+            if step == 0:
+                assert current_step_len == 1
+            elif step == 1:
+                assert current_step_len - last_step_len == 3
+            elif step == 2 or step == 3:
+                assert current_step_len - last_step_len == 4
+            else:
+                assert current_step_len - last_step_len == 1
+            step += 1
+            last_step_len = current_step_len
+
+
 @pytest.fixture(scope="module")
 def llm_for_sampling_params():
     build_config = BuildConfig(max_beam_width=3)
@@ -616,10 +656,10 @@ def test_generate_with_SamplingConfig(llm_for_sampling_params: LLM,
         assert len(output.outputs) == sampling_params.n
 
 
-@pytest.mark.skip(reason="https://nvbugs/5368507")
 @force_ampere
 @pytest.mark.part0
 def test_generate_with_seed(llm_for_sampling_params: LLM):
+    pytest.skip("https://nvbugs/5368507")
     prompts = ["The capital of France is"] * 10
     # Use a high temperature and large max_tokens to increase the diversity
     sampling_params = [
@@ -1086,7 +1126,7 @@ def test_llm_api_medusa():
 
     speculative_config = MedusaDecodingConfig(num_medusa_heads=4,
             max_draft_len=63,
-            speculative_model=get_model_path("medusa-vicuna-7b-v1.3"),
+            speculative_model_dir=get_model_path("medusa-vicuna-7b-v1.3"),
             medusa_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
                                             [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], \
                                             [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], \
@@ -1125,7 +1165,7 @@ def test_llm_api_medusa_tp2():
 
     speculative_config = MedusaDecodingConfig(num_medusa_heads=4,
             max_draft_len=63,
-              speculative_model=get_model_path("medusa-vicuna-7b-v1.3"),
+              speculative_model_dir=get_model_path("medusa-vicuna-7b-v1.3"),
                             medusa_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
                                             [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], \
                                             [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], \
@@ -1163,7 +1203,7 @@ def test_llm_api_eagle(**llm_kwargs):
 
     speculative_config = EagleDecodingConfig(
         max_draft_len=63,
-        speculative_model=get_model_path("EAGLE-Vicuna-7B-v1.3"),
+        speculative_model_dir=get_model_path("EAGLE-Vicuna-7B-v1.3"),
         num_eagle_layers=4,
         max_non_leaves_per_layer=10,
                             eagle_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
@@ -1210,7 +1250,7 @@ def test_llm_api_eagle2(**llm_kwargs):
 
     speculative_config = EagleDecodingConfig(
         max_draft_len=63,
-        speculative_model=get_model_path("EAGLE-Vicuna-7B-v1.3"),
+        speculative_model_dir=get_model_path("EAGLE-Vicuna-7B-v1.3"),
         num_eagle_layers=4,
         max_non_leaves_per_layer=10,
         use_dynamic_tree=True,
@@ -1402,12 +1442,19 @@ def llama_v2_7b_prompt_adapter_test_harness(**llm_kwargs):
         "Tweet text: I have no problems Label: ",
     ]
     references = [
-        "painter at the École des Beaux-Arts in Paris. He was a member of the",
-        "chef and has worked in the restaurant industry for 15 years.Ћ\nBorn in north",
-        "1999.\nTweet text: I have complaints! Label: 19",
-        "no complaint",
-        "100%\nI have no problems Label: 100%\nI have no",
-        "no complaint",
+        [
+            "painter at the École des Beaux-Arts in Paris. He was a member of the"
+        ],
+        [
+            "chef and has worked in the restaurant industry for 15 years.Ћ\nBorn in north"
+        ],
+        ["1999.\nTweet text: I have complaints! Label: 19"],
+        ["no complaint"],
+        [
+            "100%\nI have no problems Label: 100%\nI have no",
+            "1999\nLabel: 1999 (1999)\nT"
+        ],
+        ["no complaint"],
     ]
     pa_req = PromptAdapterRequest('tweet', 1, hf_prompt_adapter_dir)
     sampling_params = SamplingParams(max_tokens=20)
@@ -1416,7 +1463,9 @@ def llama_v2_7b_prompt_adapter_test_harness(**llm_kwargs):
         sampling_params,
         prompt_adapter_request=[None, pa_req, None, pa_req, None, pa_req])
     for output, ref in zip(outputs, references):
-        assert similar(output.outputs[0].text, ref)
+        # Currently, the 5th request may have non-deterministic outputs.
+        # Let the test pass if the generation output matches any of the candidate references.
+        assert any(similar(output.outputs[0].text, r) for r in ref)
 
 
 @skip_gpu_memory_less_than_40gb
@@ -2060,24 +2109,50 @@ def test_llm_chunked_prefill():
     success_path()
 
 
-def _test_llm_capture_request_error(tp_size: int = 1):
-    build_config = BuildConfig()
-    build_config.max_num_tokens = 64
+def _test_llm_capture_request_error(pytorch_backend: bool, tp_size: int = 1):
+    llm_args_extra = {}
+    if pytorch_backend:
+        LLM_CLASS = LLM_torch
+        llm_args_extra["max_num_tokens"] = 64
+    else:
+        LLM_CLASS = LLM
+        build_config = BuildConfig()
+        build_config.max_num_tokens = 64
+        llm_args_extra["fast_build"] = True
+        llm_args_extra["build_config"] = build_config
 
-    llm = LLM(
+    llm = LLM_CLASS(
         model=llama_model_path,
-        build_config=build_config,
-        fast_build=True,
+        tensor_parallel_size=tp_size,
+        **llm_args_extra,
     )
 
     prompt = 'A ' * 65  # the minimum max_num_tokens is 64
-
-    with pytest.raises(RequestError):
-        llm.generate(prompt)
+    if pytorch_backend:
+        # pytorch backend will raise ValueError for max_num_tokens
+        with pytest.raises(ValueError):
+            llm.generate(prompt)
+    else:
+        with pytest.raises(RequestError):
+            llm.generate(prompt)
 
 
 def test_llm_capture_request_error():
-    _test_llm_capture_request_error(tp_size=1)
+    _test_llm_capture_request_error(pytorch_backend=False, tp_size=1)
+
+
+def test_llm_shutdown_executor():
+    llm = LLM(
+        model=llama_model_path,
+        kv_cache_config=global_kvcache_config,
+        fast_build=True,
+    )
+
+    llm.generate("A")
+    llm.shutdown()
+
+    with pytest.raises(RuntimeError):
+        llm.generate("A")
 
 
 def test_llm_api_jupyter_scenario():
@@ -2130,16 +2205,18 @@ def test_llm_with_postprocess_parallel():
 def run_llm_with_postprocess_parallel_and_result_handler(
         streaming, backend, tp_size: int = 1):
     # avoid import error when running in CI
-    from tensorrt_llm.executor.postproc_worker import (PostprocArgs,
-                                                       PostprocParams)
+    from tensorrt_llm.executor.postproc_worker import PostprocParams
+    from tensorrt_llm.serve.postprocess_handlers import (
+        ChatPostprocArgs, chat_stream_post_processor)
 
-    from .run_llm_with_postproc import perform_faked_oai_postprocess
+    from .run_llm_with_postproc import get_concatenated_content
 
     sampling_params = SamplingParams(max_tokens=6)
-    post_proc_args = PostprocArgs(tokenizer=llama_model_path)
-    post_proc_params = PostprocParams(
-        post_processor=perform_faked_oai_postprocess,
-        postproc_args=post_proc_args)
+    post_proc_args = ChatPostprocArgs(tokenizer=llama_model_path,
+                                      role="assistant",
+                                      model=llama_model_path)
+    post_proc_params = PostprocParams(post_processor=chat_stream_post_processor,
+                                      postproc_args=post_proc_args)
     kwargs = {}
     if backend not in ["pytorch", "autodeploy"]:
         kwargs["fast_build"] = True
@@ -2154,17 +2231,16 @@ def run_llm_with_postprocess_parallel_and_result_handler(
                     num_postprocess_workers=2,
                     postprocess_tokenizer_dir=llama_model_path,
                     **kwargs)
-    golden_result = "DEFGHI"
-    for i, output in enumerate(
-            llm.generate_async(prompts[0],
-                               sampling_params=sampling_params,
-                               _postproc_params=post_proc_params,
-                               streaming=streaming)):
-        if i < len(golden_result) - 1:
-            assert golden_result[i] in output.outputs[0]._postprocess_result[-1]
-        else:
-            assert golden_result[i] in output.outputs[0]._postprocess_result[
-                -2]  # EOS
+    golden_result = "D E F G H I"
+    outputs = []
+    for output in llm.generate_async(prompts[0],
+                                     sampling_params=sampling_params,
+                                     _postproc_params=post_proc_params,
+                                     streaming=streaming):
+        outputs.append(output.outputs[0]._postprocess_result)
+    actual_result = get_concatenated_content(outputs)
+    assert actual_result == golden_result, \
+        f"Expected: {golden_result}, Actual: {actual_result}"
 
 
 @pytest.mark.parametrize("streaming", [True, False])

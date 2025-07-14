@@ -2,9 +2,10 @@ model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
 hostname: localhost
 port: 8000
 backend: "pytorch"
+cuda_graph_config: null
 free_gpu_memory_fraction: 0.1
 disable_overlap_scheduler: True
-autotuner_enabled: False
+enable_autotuner: False
 context_servers:
   num_instances: 2
   router:

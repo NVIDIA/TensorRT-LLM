@@ -2,7 +2,7 @@ import enum
 import math
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -21,9 +21,6 @@ if ENABLE_MULTI_DEVICE:
     from mpi4py import MPI
 
     from tensorrt_llm._utils import mpi_comm
-
-if TYPE_CHECKING:
-    from ..speculative.interface import SpecConfig
 
 BufferManagerCpp = tensorrt_llm.bindings.internal.runtime.BufferManager
 KVCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.KVCacheManager
@@ -83,7 +80,7 @@ class BaseResourceManager(ABC):
 def get_pp_layers(
     num_layers: int,
     mapping: Mapping,
-    spec_config: Optional["SpecConfig"] = None,
+    spec_config: Optional["DecodingBaseConfig"] = None,
     layer_mask: Optional[List[bool]] = None,
 ) -> Tuple[List[int], int]:
     from ..speculative.utils import get_num_spec_layers
@@ -127,10 +124,11 @@ class KVCacheManager(BaseResourceManager):
         max_batch_size: int,
         mapping: Mapping,
         dtype: DataType = DataType.HALF,
-        spec_config: Optional["SpecConfig"] = None,
+        spec_config: Optional["DecodingBaseConfig"] = None,
         layer_mask: Optional[List[bool]] = None,
         max_num_tokens: int = 8192,
         model_config: Optional[ModelConfig] = None,
+        max_beam_width: int = 1,
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
@@ -235,6 +233,7 @@ class KVCacheManager(BaseResourceManager):
             tokens_per_block=tokens_per_block,
             sink_token_length=sink_token_length,
             max_seq_len=self.max_seq_len,
+            max_beam_width=max_beam_width,
         )
 
         if kv_cache_type != CacheTypeCpp.SELF:
@@ -260,7 +259,7 @@ class KVCacheManager(BaseResourceManager):
             'tokens_per_block': tokens_per_block,
             'blocks_per_window': blocks_per_window,
             'max_num_sequences': max_batch_size,
-            'max_beam_width': 1,  # TODO: more than 1 beam?
+            'max_beam_width': max_beam_width,
             'max_attention_window_vec': self.max_attention_window_vec,
             'temp_attention_window_inputs': temp_attention_window_inputs,
             'dtype': dtype,
@@ -334,7 +333,7 @@ class KVCacheManager(BaseResourceManager):
         generation_batch = scheduled_batch.generation_requests
         # allocate KV Cache
         for req in context_batch:
-            req_beam_width = 1  # req.sampling_config.beam_width
+            req_beam_width = req.sampling_config.beam_width
             if 'cp_type' in self.mapping.cp_config and 'star_attention' == self.mapping.cp_config[
                     'cp_type']:
                 if req.ctx_iters == 0:
@@ -372,8 +371,9 @@ class KVCacheManager(BaseResourceManager):
         is_gen: bool = False,
         prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
+        use_mrope: bool = False,
     ):
-        beam_width = 1
+        beam_width = 1  # TODO: more than 1 beam?
         requests = []
         for i, req_id in enumerate(request_ids):
             sampling_params = SamplingParams()
@@ -386,12 +386,15 @@ class KVCacheManager(BaseResourceManager):
                 1
             ] * token_num if self.impl.cross_kv else None
             # Using 1 instead of 0 prevents NaN during warmup in e.g. Deepseek
+            mrope_position_deltas = torch.zeros(
+                1, device="cuda", dtype=torch.int32) if use_mrope else None
             req = LlmRequest(request_id=req_id,
                              max_new_tokens=1,
                              input_tokens=[1] * token_num,
                              sampling_config=SamplingConfig(
                                  sampling_params._get_sampling_config()),
                              is_streaming=False,
+                             mrope_position_deltas=mrope_position_deltas,
                              encoder_input_tokens=encoder_input_tokens)
             req.is_dummy_request = True
             req.paged_kv_block_ids = []
@@ -657,6 +660,7 @@ class KVCacheManager(BaseResourceManager):
         tokens_per_block: int,
         sink_token_length: int,
         max_seq_len: int,
+        max_beam_width: int,
     ) -> Tuple[BlocksPerWindow, int, List[int]]:
         """
         Validate and adjust attention windows against their upper bounds if needed.
@@ -672,7 +676,6 @@ class KVCacheManager(BaseResourceManager):
         Returns:
             Tuple of (adjusted_blocks_per_window, adjusted_max_seq_len, adjusted_max_attention_window_vec)
         """
-        max_beam_width = 1  # TODO: support more than 1 beam?
         window_adjustments = {}
         # Validate each window size in blocks_per_window against its upper bound
         for window_size, (blocks_in_primary_pool,
@@ -816,7 +819,7 @@ class MambaCacheManager(BaseResourceManager):
                                                         device=device,
                                                         dtype=torch.int32)
 
-    def prepare_mamba_cache_blocks(self, request_ids: List[int]):
+    def _prepare_mamba_cache_blocks(self, request_ids: List[int]):
         state_indices = []
         for r in request_ids:
             # cache hit
@@ -832,12 +835,7 @@ class MambaCacheManager(BaseResourceManager):
         self.state_indices[:len(state_indices)] = torch.as_tensor(
             state_indices, dtype=torch.int32, device=self.ssm_states.device)
 
-    def free_mamba_cache_blocks(self, request_id: int):
-        if request_id in self.mamba_cache_index:
-            block = self.mamba_cache_index.pop(request_id)
-            self.mamba_cache_free_blocks.append(block)
-
-    def prepare_mamba_resources(self, scheduled_batch: ScheduledRequests):
+    def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_ids = [
             i.py_request_id for i in scheduled_batch.context_requests
         ]
@@ -845,10 +843,13 @@ class MambaCacheManager(BaseResourceManager):
             i.py_request_id for i in scheduled_batch.generation_requests
         ]
         request_ids = context_ids + generation_ids
-        self.prepare_mamba_cache_blocks(request_ids)
+        self._prepare_mamba_cache_blocks(request_ids)
 
-    def free_mamba_resources(self, request: LlmRequest):
-        self.free_mamba_cache_blocks(request.py_request_id)
+    def free_resources(self, request: LlmRequest):
+        request_id = request.py_request_id
+        if request_id in self.mamba_cache_index:
+            block = self.mamba_cache_index.pop(request_id)
+            self.mamba_cache_free_blocks.append(block)
 
     def get_state_indices(self) -> torch.Tensor:
         return self.state_indices
@@ -860,6 +861,13 @@ class MambaCacheManager(BaseResourceManager):
     def get_ssm_states(self, layer_idx: int) -> torch.Tensor:
         layer_offset = self.mamba_layer_offsets[layer_idx]
         return self.ssm_states[layer_offset]
+
+    def shutdown(self):
+        # release tensor memory, keeping python references as tensors
+        self.conv_states = torch.tensor([])
+        self.ssm_states = torch.tensor([])
+        self.state_indices = torch.tensor([])
+        torch.cuda.empty_cache()
 
 
 class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
@@ -891,7 +899,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         max_batch_size: int,
         mapping: Mapping,
         dtype: DataType = DataType.HALF,
-        spec_config: Optional["SpecConfig"] = None,
+        spec_config: Optional["DecodingBaseConfig"] = None,
     ) -> None:
 
         # mamba hybrid cache requires block reuse to be disabled in KV cache config
@@ -931,12 +939,16 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        self.prepare_mamba_resources(scheduled_batch)
-        super().prepare_resources(scheduled_batch)
+        MambaCacheManager.prepare_resources(self, scheduled_batch)
+        KVCacheManager.prepare_resources(self, scheduled_batch)
 
     def free_resources(self, request: LlmRequest):
-        self.free_mamba_resources(request)
-        super().free_resources(request)
+        MambaCacheManager.free_resources(self, request)
+        KVCacheManager.free_resources(self, request)
+
+    def shutdown(self):
+        MambaCacheManager.shutdown(self)
+        KVCacheManager.shutdown(self)
 
 
 class SlotManager:

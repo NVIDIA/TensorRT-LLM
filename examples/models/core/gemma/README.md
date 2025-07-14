@@ -26,6 +26,8 @@
       - [Run inference under bfloat16 for torch checkpoint](#run-inference-under-bfloat16-for-torch-checkpoint-1)
     - [Run Gemma 3](#run-gemma-3)
       - [Run inference under bfloat16 for HF checkpoint](#run-inference-under-bfloat16-for-hf-checkpoint-1)
+      - [Disaggregated Serving](#disaggregated-serving)
+      - [Dynamo](#dynamo)
     - [Run Modelopt Quantization](#run-modelopt-quantization)
       - [Requirements](#requirements)
       - [Quantize Checkpoints](#quantize-checkpoints)
@@ -675,7 +677,100 @@ python3 ../../../summarize.py --test_trt_llm \
 [04/09/2025-18:28:26] [TRT-LLM] [I]   rouge2: 4.331099231480823
 [04/09/2025-18:28:26] [TRT-LLM] [I]   rougeL: 15.26751867562475
 [04/09/2025-18:28:26] [TRT-LLM] [I]   rougeLsum: 20.14696930976001
+
+#### Disaggregated Serving
+
+To serve the model in disaggregated mode, you should launch context and generation servers using `trtllm-serve`.
+
+For example, you can launch a single context server on port 8001 with:
+
+```bash
+export TRTLLM_USE_UCX_KVCACHE=1
+
+cat >./ctx-extra-llm-api-config.yml <<EOF
+print_iter_log: true
+disable_overlap_scheduler: true
+kv_cache_config:
+  max_attention_window: [512, 512, 512, 512, 512, 32768]
+  enable_block_reuse: false
+EOF
+
+trtllm-serve \
+  google/gemma-3-1b-it \
+  --host localhost \
+  --port 8001 \
+  --backend pytorch \
+  --max_batch_size 8 \
+  --tp_size 2 \
+  --ep_size 2 \
+  --pp_size 1 \
+  --kv_cache_free_gpu_memory_fraction 0.95 \
+  --extra_llm_api_options ./ctx-extra-llm-api-config.yml \
+  &> output_ctx_8001 &
 ```
+
+Then launch a single generation server on port 8002 with:
+
+```bash
+cat >./gen-extra-llm-api-config.yml <<EOF
+print_iter_log: true
+kv_cache_config:
+  max_attention_window: [512, 512, 512, 512, 512, 32768]
+  enable_block_reuse: false
+EOF
+
+trtllm-serve \
+  google/gemma-3-1b-it \
+  --host localhost \
+  --port 8002 \
+  --backend pytorch \
+  --max_batch_size 8 \
+  --tp_size 2 \
+  --ep_size 2 \
+  --pp_size 1 \
+  --kv_cache_free_gpu_memory_fraction 0.95 \
+  --extra_llm_api_options ./gen-extra-llm-api-config.yml \
+  &> output_gen_8002 &
+```
+
+Finally, you can launch the disaggregated server which will accept requests from the client and do
+the orchestration between the context and generation servers with:
+
+```bash
+cat >./disagg-config.yaml <<EOF
+hostname: localhost
+port: 8000
+backend: pytorch
+context_servers:
+  num_instances: 1
+  urls:
+      - "localhost:8001"
+generation_servers:
+  num_instances: 1
+  urls:
+      - "localhost:8002"
+EOF
+
+trtllm-serve disaggregated -c disagg-config.yaml
+```
+
+To query the server, you can start with a `curl` command:
+```bash
+curl http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+      "model": "google/gemma-3-1b-it",
+      "prompt": "Where is New York?",
+      "max_tokens": 16,
+      "temperature": 0
+  }'
+```
+
+
+#### Dynamo
+
+NVIDIA Dynamo is a high-throughput low-latency inference framework designed for serving generative AI and reasoning models in multi-node distributed environments.
+Dynamo supports TensorRT-LLM as one of its inference engine. For details on how to use TensorRT-LLM with Dynamo please refer to [LLM Deployment Examples using TensorRT-LLM](https://github.com/ai-dynamo/dynamo/blob/main/examples/tensorrt_llm/README.md)
 
 ### Run Modelopt Quantization
 

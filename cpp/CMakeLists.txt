@@ -28,8 +28,6 @@ project(tensorrt_llm LANGUAGES CXX)
 
 # Build options
 option(BUILD_PYT "Build in PyTorch TorchScript class mode" ON)
-option(BUILD_PYBIND "Build Python bindings for C++ runtime and batch manager"
-       ON)
 option(BUILD_TESTS "Build Google tests" ON)
 option(BUILD_BENCHMARKS "Build benchmarks" ON)
 option(BUILD_MICRO_BENCHMARKS "Build C++ micro benchmarks" OFF)
@@ -45,6 +43,7 @@ option(ENABLE_MULTI_DEVICE
 option(ENABLE_UCX "Enable building with UCX (Uniform Communication X) support"
        ON)
 option(NVRTC_DYNAMIC_LINKING "Link against the dynamic NVRTC libraries" OFF)
+option(ENABLE_NVSHMEM "Enable building with NVSHMEM support" OFF)
 option(USING_OSS_CUTLASS_LOW_LATENCY_GEMM
        "Using open sourced Cutlass low latency gemm kernel" ON)
 option(USING_OSS_CUTLASS_FP4_GEMM "Using open sourced Cutlass fp4 gemm kernel"
@@ -53,6 +52,8 @@ option(USING_OSS_CUTLASS_MOE_GEMM "Using open sourced Cutlass moe gemm kernel"
        ON)
 option(USING_OSS_CUTLASS_ALLREDUCE_GEMM
        "Using open sourced Cutlass AR gemm kernel" ON)
+
+message(STATUS "ENABLE_NVSHMEM is ${ENABLE_NVSHMEM}")
 
 if(NVTX_DISABLE)
   add_compile_definitions("NVTX_DISABLE")
@@ -64,6 +65,11 @@ endif()
 # Add TensorRT-LLM Gen export interface and CUDA support
 add_compile_definitions("TLLM_GEN_EXPORT_INTERFACE")
 add_compile_definitions("TLLM_ENABLE_CUDA")
+
+set(BINDING_TYPE
+    "pybind"
+    CACHE STRING
+          "Binding type of Python bindings for C++ runtime and batch manager")
 
 set(INTERNAL_CUTLASS_KERNELS_PATH
     ""
@@ -171,6 +177,7 @@ message(STATUS "CUDA library status:")
 message(STATUS "    version: ${CUDAToolkit_VERSION}")
 message(STATUS "    libraries: ${CUDAToolkit_LIBRARY_DIR}")
 message(STATUS "    include path: ${CUDAToolkit_INCLUDE_DIRS}")
+message(STATUS "CUDA_NVML_LIB: ${CUDA_NVML_LIB}")
 
 # Prevent CMake from creating a response file for CUDA compiler, so clangd can
 # pick up on the includes
@@ -191,7 +198,14 @@ set(TRT_LIB TensorRT::NvInfer)
 get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
 
 set(3RDPARTY_DIR ${TRT_LLM_ROOT_DIR}/3rdparty)
-add_subdirectory(${3RDPARTY_DIR}/pybind11 ${CMAKE_CURRENT_BINARY_DIR}/pybind11)
+if(BINDING_TYPE STREQUAL "pybind")
+  add_subdirectory(${3RDPARTY_DIR}/pybind11
+                   ${CMAKE_CURRENT_BINARY_DIR}/pybind11)
+endif()
+if(BINDING_TYPE STREQUAL "nanobind")
+  add_subdirectory(${3RDPARTY_DIR}/nanobind
+                   ${CMAKE_CURRENT_BINARY_DIR}/nanobind)
+endif()
 
 # include as system to suppress warnings
 include_directories(
@@ -202,8 +216,13 @@ include_directories(
   ${3RDPARTY_DIR}/cutlass/include
   ${3RDPARTY_DIR}/cutlass/tools/util/include
   ${3RDPARTY_DIR}/NVTX/include
-  ${3RDPARTY_DIR}/json/include
-  ${3RDPARTY_DIR}/pybind11/include)
+  ${3RDPARTY_DIR}/json/include)
+if(BINDING_TYPE STREQUAL "pybind")
+  include_directories(${3RDPARTY_DIR}/pybind11/include)
+endif()
+if(BINDING_TYPE STREQUAL "nanobind")
+  include_directories(${3RDPARTY_DIR}/nanobind/include)
+endif()
 
 if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "11")
   add_definitions("-DENABLE_BF16")
@@ -262,9 +281,21 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DBUILD_SYSTEM=cmake_oss ")
 # note: cmake expr generation $<BOOL:${ENABLE_MULTI_DEVICE}> is a build time
 # evaluation so hard to debug at cmake time
 if(ENABLE_MULTI_DEVICE)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DENABLE_MULTI_DEVICE=1")
+  # Add target definitions for both C++ and CUDA
+  add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:ENABLE_MULTI_DEVICE=1>
+                          $<$<COMPILE_LANGUAGE:CUDA>:ENABLE_MULTI_DEVICE=1>)
 else()
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DENABLE_MULTI_DEVICE=0")
+  # Add target definitions for both C++ and CUDA
+  add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:ENABLE_MULTI_DEVICE=0>
+                          $<$<COMPILE_LANGUAGE:CUDA>:ENABLE_MULTI_DEVICE=0>)
+endif()
+
+if(ENABLE_NVSHMEM)
+  add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:ENABLE_NVSHMEM=1>
+                          $<$<COMPILE_LANGUAGE:CUDA>:ENABLE_NVSHMEM=1>)
+else()
+  add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:ENABLE_NVSHMEM=0>
+                          $<$<COMPILE_LANGUAGE:CUDA>:ENABLE_NVSHMEM=0>)
 endif()
 
 # Fix linking issue with TRT 10, the detailed description about `--mcmodel` can

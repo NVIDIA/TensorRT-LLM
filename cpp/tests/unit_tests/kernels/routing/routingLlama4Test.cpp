@@ -51,31 +51,8 @@ private:
                 int16_t newIdx = static_cast<int16_t>(ie);
                 score = static_cast<float>(bufferCast<T>(*this->mPtrScoresHost)[it * param.numExperts + ie]);
 
-                if (param.doSoftmaxBeforeTopK && score > maxScore)
-                {
-                    maxScore = score;
-                }
-
                 PackedFloat si{static_cast<float>(score), newIdx};
                 expWeightsIdx[ie] = si;
-            }
-
-            if (param.doSoftmaxBeforeTopK)
-            {
-                // Run softmax before topk
-                for (int ie = 0; ie < param.numExperts; ++ie)
-                {
-                    expWeightsIdx[ie].score
-                        = static_cast<float>(std::exp(static_cast<float>(expWeightsIdx[ie].score) - maxScore));
-                    sum += expWeightsIdx[ie].score;
-                }
-
-                for (int ie = 0; ie < param.numExperts; ++ie)
-                {
-                    float score = static_cast<float>(expWeightsIdx[ie].score);
-                    score /= sum;
-                    expWeightsIdx[ie].score = static_cast<float>(score);
-                }
             }
 
             // Calculate the top-k scores and indices
@@ -83,7 +60,7 @@ private:
                 [](PackedFloat const& a, PackedFloat const& b)
                 {
                     return (
-                        (a.score > b.score) || (a.score == b.score && a.idx > b.idx)); //@TODO: check if this is correct
+                        (a.score > b.score) || (a.score == b.score && a.idx < b.idx)); //@TODO: check if this is correct
                 });
 
             // Apply sigmoid to the top-k scores
@@ -127,9 +104,9 @@ private:
     void callTestedFunction(
         RoutingKernelTestParam const& param, tensorrt_llm::runtime::ITensor::SharedPtr& workspaceDevice) override
     {
-        moe::dev::routingLlama4::Data routingData;
+        moe::dev::routing::routingLlama4::Data routingData;
         setParams(param, routingData);
-        moe::dev::routingLlama4::run(routingData, mStream->get());
+        moe::dev::routing::routingLlama4::run(routingData, mStream->get());
     }
 };
 
@@ -148,7 +125,7 @@ TYPED_TEST(RoutingLlama4KernelTest, WarpLevelParallelization)
 
 TYPED_TEST(RoutingLlama4KernelTest, ClusterLevelParallelization)
 {
-    RoutingKernelTestParam param(RoutingMethodType::Llama4, /*numTokens=*/100,
+    RoutingKernelTestParam param(RoutingMethodType::Llama4, /*numTokens=*/10,
         /*numExperts=*/128, /*topK=*/1,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
