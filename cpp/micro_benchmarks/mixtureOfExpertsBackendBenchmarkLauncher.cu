@@ -518,7 +518,7 @@ void argGenHardcoded(benchmark::internal::Benchmark* benchmark)
                                         for (auto tactic2 : cutlass_tactic)
                                             for (auto routing : routing_config)
                                                 benchmark->Args({num_expert, k, size, inter_size, 1, 1, 0, tokens, bias,
-                                                    (int) act, tactic1, tactic2, routing});
+                                                    1, (int) act, tactic1, tactic2, routing});
                     }
 }
 
@@ -540,8 +540,9 @@ void argGen(benchmark::internal::Benchmark* benchmark)
 
     // Generic setup
     benchmark->UseManualTime();
-    benchmark->ArgNames({"Num Experts", "K", "Hidden Size", "Inter Size", "TP Size", "EP Size", "World Rank",
-        "Num Tokens", "Use Bias", "Activation Function", "Tactic ID 1", "Tactic ID 2", "Routing ID"});
+    benchmark->ArgNames(
+        {"Num Experts", "K", "Hidden Size", "Inter Size", "TP Size", "EP Size", "World Rank", "Num Tokens", "Use Bias",
+            "Use Final Scale", "Activation Function", "Tactic ID 1", "Tactic ID 2", "Routing ID"});
 
     if (workloadFile)
         argGenLoadFile<BenchClass>(benchmark);
