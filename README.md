@@ -34,36 +34,37 @@ TensorRT-LLM
 ✨ [➡️ link](./docs/source/blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md)
 
 ## Latest News
+* [07/14] Submit questions for NVIDIA's upcoming inference Developer Town hall ✨ [➡️ link](https://docs.google.com/forms/d/e/1FAIpQLScgM5ixHMsvr_9FM7miYhQVqfApNQZmQCVxQLyX9bWFVp8ZTw/viewform?usp=preview)
 * [06/17] Join NVIDIA and DeepInfra for a developer meetup on June 26 ✨ [➡️ link](https://events.nvidia.com/scaletheunscalablenextgenai)
 * [05/22] Blackwell Breaks the 1,000 TPS/User Barrier With Meta’s Llama 4 Maverick
 ✨ [➡️ link](https://developer.nvidia.com/blog/blackwell-breaks-the-1000-tps-user-barrier-with-metas-llama-4-maverick/)
-* [04/10] TensorRT-LLM DeepSeek R1 performance benchmarking best practices now published.
-✨ [➡️ link](./docs/source/blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md)
-
-* [04/05] TensorRT-LLM can run Llama 4 at over 40,000 tokens per second on B200 GPUs!
-
-![L4_perf](./docs/source/media/l4_launch_perf.png)
-
-
-* [03/22] TensorRT-LLM is now fully open-source, with developments moved to GitHub!
-* [03/18]  🚀🚀 NVIDIA Blackwell Delivers World-Record DeepSeek-R1 Inference Performance with TensorRT-LLM [➡️ Link](https://developer.nvidia.com/blog/nvidia-blackwell-delivers-world-record-deepseek-r1-inference-performance/)
-* [02/28] 🌟 NAVER Place Optimizes SLM-Based Vertical Services with TensorRT-LLM [➡️ Link](https://developer.nvidia.com/blog/spotlight-naver-place-optimizes-slm-based-vertical-services-with-nvidia-tensorrt-llm/)
-
-* [02/25] 🌟 DeepSeek-R1 performance now optimized for Blackwell [➡️ Link](https://huggingface.co/nvidia/DeepSeek-R1-FP4)
-
-* [02/20] Explore the complete guide to achieve great accuracy, high throughput, and low latency at the lowest cost for your business [here](https://www.nvidia.com/en-us/solutions/ai/inference/balancing-cost-latency-and-performance-ebook/?ncid=so-twit-348956&linkId=100000341423615).
-
-* [02/18] Unlock #LLM inference with auto-scaling on @AWS EKS ✨ [➡️ link](https://aws.amazon.com/blogs/hpc/scaling-your-llm-inference-workloads-multi-node-deployment-with-tensorrt-llm-and-triton-on-amazon-eks/)
-
-* [02/12] 🦸⚡ Automating GPU Kernel Generation with DeepSeek-R1 and Inference Time Scaling
-[➡️ link](https://developer.nvidia.com/blog/automating-gpu-kernel-generation-with-deepseek-r1-and-inference-time-scaling/?ncid=so-twit-997075&linkId=100000338909937)
-
-* [02/12] 🌟 How Scaling Laws Drive Smarter, More Powerful AI
-[➡️ link](https://blogs.nvidia.com/blog/ai-scaling-laws/?ncid=so-link-889273&linkId=100000338837832)
 
 
 <details close>
 <summary>Previous News</summary>
+* [2025/04/10] TensorRT-LLM DeepSeek R1 performance benchmarking best practices now published.
+✨ [➡️ link](./docs/source/blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md)
+
+* [2025/04/05] TensorRT-LLM can run Llama 4 at over 40,000 tokens per second on B200 GPUs!
+
+![L4_perf](./docs/source/media/l4_launch_perf.png)
+
+
+* [2025/03/22] TensorRT-LLM is now fully open-source, with developments moved to GitHub!
+* [2025/03/18]  🚀🚀 NVIDIA Blackwell Delivers World-Record DeepSeek-R1 Inference Performance with TensorRT-LLM [➡️ Link](https://developer.nvidia.com/blog/nvidia-blackwell-delivers-world-record-deepseek-r1-inference-performance/)
+* [2025/02/28] 🌟 NAVER Place Optimizes SLM-Based Vertical Services with TensorRT-LLM [➡️ Link](https://developer.nvidia.com/blog/spotlight-naver-place-optimizes-slm-based-vertical-services-with-nvidia-tensorrt-llm/)
+
+* [2025/02/25] 🌟 DeepSeek-R1 performance now optimized for Blackwell [➡️ Link](https://huggingface.co/nvidia/DeepSeek-R1-FP4)
+
+* [2025/02/20] Explore the complete guide to achieve great accuracy, high throughput, and low latency at the lowest cost for your business [here](https://www.nvidia.com/en-us/solutions/ai/inference/balancing-cost-latency-and-performance-ebook/?ncid=so-twit-348956&linkId=100000341423615).
+
+* [2025/02/18] Unlock #LLM inference with auto-scaling on @AWS EKS ✨ [➡️ link](https://aws.amazon.com/blogs/hpc/scaling-your-llm-inference-workloads-multi-node-deployment-with-tensorrt-llm-and-triton-on-amazon-eks/)
+
+* [2025/02/12] 🦸⚡ Automating GPU Kernel Generation with DeepSeek-R1 and Inference Time Scaling
+[➡️ link](https://developer.nvidia.com/blog/automating-gpu-kernel-generation-with-deepseek-r1-and-inference-time-scaling/?ncid=so-twit-997075&linkId=100000338909937)
+
+* [2025/02/12] 🌟 How Scaling Laws Drive Smarter, More Powerful AI
+[➡️ link](https://blogs.nvidia.com/blog/ai-scaling-laws/?ncid=so-link-889273&linkId=100000338837832)
 
 * [2025/01/25] Nvidia moves AI focus to inference cost, efficiency [➡️ link](https://www.fierceelectronics.com/ai/nvidia-moves-ai-focus-inference-cost-efficiency?linkId=100000332985606)
 
