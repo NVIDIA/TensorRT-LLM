@@ -262,7 +262,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         speculative_decoding_config = {
             "decoding_type": "Eagle",
             "max_draft_len": 4,
-            "pytorch_weights_path":
+            "speculative_model_dir":
             f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
             "eagle3_one_model": False
         }
