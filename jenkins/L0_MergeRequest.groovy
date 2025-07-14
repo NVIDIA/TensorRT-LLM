@@ -696,6 +696,7 @@ def getOnlyDocsFileChanged(pipeline, testFilter, globalVars) {
     // TODO: Add more docs path to the list, e.g. *.md files in other directories
     def docsFileList = [
         "docs/",
+        "jenkins/"
     ]
 
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
