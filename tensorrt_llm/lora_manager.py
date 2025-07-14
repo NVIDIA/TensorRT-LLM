@@ -236,6 +236,10 @@ class NemoLoraLoader:
         # Hardcoded since LoraManager only supports this case now
         self.lora_target_modules = ["attn_qkv"]
 
+    def get_target_modules(self, trtllm_modules_to_hf_modules):
+        """Get target modules for NeMo LoRA."""
+        return self.lora_target_modules
+
 
 def load_nemo_lora(model, lora_config: LoraConfig):
     lora_loader = NemoLoraLoader(lora_config.lora_dir)
@@ -285,6 +289,54 @@ def load_torch_hf_lora(lora_config: LoraConfig):
 
     missing_qkv_modules = LoraManager.get_missing_qkv_modules(lora_config.lora_target_modules)
     lora_config.lora_target_modules.extend(missing_qkv_modules)
+
+
+def load_torch_nemo_lora(lora_config: LoraConfig):
+    """Load NeMo LoRA checkpoint for PyTorch workflow.
+
+    This is a PyTorch-specific loader for NeMo LoRA checkpoints, similar to
+    load_torch_hf_lora but handling NeMo checkpoint format.
+
+    Args:
+        lora_config: LoRA configuration with lora_ckpt_source="nemo"
+    """
+    # For NeMo, we need to set up module mappings differently
+    # NeMo uses "attn_qkv" as a combined module
+    lora_config.trtllm_modules_to_hf_modules = {"attn_qkv": "attn_qkv"}
+
+    assert len(lora_config.lora_dir) == 1, "Expecting only a single lora dir"
+    lora_loader = NemoLoraLoader(lora_config.lora_dir)
+
+    if not lora_loader.is_valid:
+        raise ValueError(f"Failed to load NeMo LoRA from {lora_config.lora_dir}")
+
+    if len(lora_config.lora_target_modules) == 0:
+        lora_config.lora_target_modules = lora_loader.get_target_modules(
+            lora_config.trtllm_modules_to_hf_modules
+        )
+
+    if len(lora_config.lora_target_modules) == 0:
+        raise ValueError(
+            "lora_target_modules is empty. "
+            "Please specify lora_target_modules or provide lora_dir to infer lora_target_modules."
+        )
+
+    # Validate that NeMo LoRA only supports attn_qkv
+    supported_modules = {"attn_qkv"}
+    unsupported_modules = set(lora_config.lora_target_modules) - supported_modules
+    if unsupported_modules:
+        raise ValueError(
+            f"NeMo LoRA only supports {supported_modules} modules, "
+            f"but got unsupported modules: {unsupported_modules}. "
+            f"NeMo LoRA does not support embedding, lm_head, or MLP adapters."
+        )
+
+    # NeMo only supports attn_qkv currently, no need for missing QKV module handling
+    # as it's already combined
+
+    # Note: For PyTorch workflow, the actual weight loading happens later
+    # via LoraManager when requests are made with LoRA UIDs. This function
+    # just sets up the configuration.
 
 
 def load_hf_lora(
