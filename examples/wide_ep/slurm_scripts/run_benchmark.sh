@@ -66,11 +66,7 @@ fi
 # check server is health by curl every 10 seconds timeout 1800 seconds
 timeout=1800
 start_time=$(date +%s)
-while true; do
-    status_code=$(curl -s -o /dev/null -w "%{http_code}" http://${hostname}:${port}/health)
-    if [ "$status_code" -eq 200 ]; then
-        break
-    fi
+while ! curl -s -o /dev/null -w "%{http_code}" http://${hostname}:${port}/health; do
     current_time=$(date +%s)
     elapsed=$((current_time - start_time))
     if [ $elapsed -ge $timeout ]; then
