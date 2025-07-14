@@ -124,7 +124,7 @@ def top_p_sampling_batch(logits: torch.Tensor, top_p: float = 0.9):
     logits_dim = logits.dim()
     if logits_dim == 1:
         logits = logits.unsqueeze(0)
-    assert logits_dim == 2, "logits should be 2D： [batch_size, vocab_size]"
+    assert logits_dim == 2, "logits should be 2D: [batch_size, vocab_size]"
 
     # sort the logits of each sample in descending order
     sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)

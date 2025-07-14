@@ -87,15 +87,13 @@ moeCommPrepareIndicesOp(torch::Tensor gatheredTargetRankIds, c10::optional<torch
 }
 
 void moeLocalGatherOp(torch::Tensor recvRankCumSum, torch::Tensor localGatherIndices, torch::Tensor gatheredExpertIds,
-    torch::Tensor gatheredScales, torch::Tensor localExpertIds, torch::Tensor localScales, int64_t maxTokenCountPerRank,
-    int64_t expertCount, int64_t topK, int64_t epRank, int64_t epSize)
+    c10::optional<torch::Tensor> gatheredScales, torch::Tensor localExpertIds, c10::optional<torch::Tensor> localScales,
+    int64_t maxTokenCountPerRank, int64_t expertCount, int64_t topK, int64_t epRank, int64_t epSize)
 {
     CHECK_INPUT(recvRankCumSum, torch::kInt32);
     CHECK_INPUT(localGatherIndices, torch::kInt32);
     CHECK_INPUT(gatheredExpertIds, torch::kInt32);
-    CHECK_INPUT(gatheredScales, torch::kFloat32);
     CHECK_INPUT(localExpertIds, torch::kInt32);
-    CHECK_INPUT(localScales, torch::kFloat32);
 
     TORCH_CHECK(maxTokenCountPerRank > 0, "maxTokenCountPerRank must be greater than 0");
     TORCH_CHECK(expertCount > 0, "expertCount must be greater than 0");
@@ -107,17 +105,31 @@ void moeLocalGatherOp(torch::Tensor recvRankCumSum, torch::Tensor localGatherInd
     TORCH_CHECK(recvRankCumSum.size(0) == epSize, "recvRankCumSum must have epSize elements");
     TORCH_CHECK(localGatherIndices.dim() == 1, "localGatherIndices must be a 1D tensor");
     TORCH_CHECK(gatheredExpertIds.dim() == 2, "gatheredExpertIds must be a 2D tensor");
-    TORCH_CHECK(gatheredScales.dim() == 2, "gatheredScales must be a 2D tensor");
     TORCH_CHECK(localExpertIds.dim() == 2, "localExpertIds must be a 2D tensor");
-    TORCH_CHECK(localScales.dim() == 2, "localScales must be a 2D tensor");
     TORCH_CHECK(gatheredExpertIds.size(1) == topK, "gatheredExpertIds must have topK columns");
-    TORCH_CHECK(gatheredScales.size(1) == topK, "gatheredScales must have topK columns");
     TORCH_CHECK(localExpertIds.size(1) == topK, "localExpertIds must have topK columns");
-    TORCH_CHECK(localScales.size(1) == topK, "localScales must have topK columns");
 
     int localMaxTokenCount = static_cast<int>(localGatherIndices.size(0));
     TORCH_CHECK(localExpertIds.size(0) == localMaxTokenCount, "localExpertIds must have localMaxTokenCount rows");
-    TORCH_CHECK(localScales.size(0) == localMaxTokenCount, "localScales must have localMaxTokenCount rows");
+
+    TORCH_CHECK(gatheredScales.has_value() == localScales.has_value(),
+        "gatheredScales and localScales must be both valid or both invalid");
+    float const* gatheredScalesPtr = nullptr;
+    float* localScalesPtr = nullptr;
+    if (gatheredScales.has_value())
+    {
+        CHECK_INPUT(gatheredScales.value(), torch::kFloat32);
+        CHECK_INPUT(localScales.value(), torch::kFloat32);
+
+        TORCH_CHECK(gatheredScales->dim() == 2, "gatheredScales must be a 2D tensor");
+        TORCH_CHECK(gatheredScales->size(1) == topK, "gatheredScales must have topK columns");
+        TORCH_CHECK(localScales->dim() == 2, "localScales must be a 2D tensor");
+        TORCH_CHECK(localScales->size(1) == topK, "localScales must have topK columns");
+        TORCH_CHECK(localScales->size(0) == localMaxTokenCount, "localScales must have localMaxTokenCount rows");
+
+        gatheredScalesPtr = gatheredScales->data_ptr<float>();
+        localScalesPtr = localScales->data_ptr<float>();
+    }
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -128,7 +140,7 @@ void moeLocalGatherOp(torch::Tensor recvRankCumSum, torch::Tensor localGatherInd
     tensorrt_llm::kernels::MoeEpWorldInfo worldInfo = {static_cast<int>(epSize), static_cast<int>(epRank)};
     tensorrt_llm::kernels::moeLocalGather(worldInfo, expertParallelInfo, maxTokenCountPerRank, localMaxTokenCount,
         recvRankCumSum.data_ptr<int>(), localGatherIndices.data_ptr<int>(), gatheredExpertIds.data_ptr<int>(),
-        gatheredScales.data_ptr<float>(), localExpertIds.data_ptr<int>(), localScales.data_ptr<float>(), stream);
+        gatheredScalesPtr, localExpertIds.data_ptr<int>(), localScalesPtr, stream);
 }
 
 void moeCommOp(torch::Tensor input, torch::Tensor sendRankCumSum, torch::Tensor sendIndices, torch::Tensor output,
@@ -203,14 +215,13 @@ int64_t getPrepareWorkspaceSizePerRank(int64_t epSize)
     return tensorrt_llm::kernels::moe_prepare::getMoePrepareWorkspaceSize(epSize32);
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-    c10::optional<torch::Tensor>>
-moePrepareOp(torch::Tensor expertsIds, torch::Tensor scales, c10::optional<torch::Tensor> expertsStatics,
+std::tuple<torch::Tensor, c10::optional<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, c10::optional<torch::Tensor>>
+moePrepareOp(torch::Tensor expertsIds, c10::optional<torch::Tensor> scales, c10::optional<torch::Tensor> expertsStatics,
     torch::Tensor allWorkspaces, int64_t maxTokenCountPerRank, int64_t epRank, int64_t epSize, int64_t expertCount,
     int64_t slotCount, int64_t topK)
 {
     CHECK_INPUT(expertsIds, torch::kInt32);
-    CHECK_INPUT(scales, torch::kFloat32);
     TORCH_CHECK(expertCount % 4 == 0, "expertCount must be divisible by 4");
     TORCH_CHECK(slotCount % 4 == 0, "slotCount must be divisible by 4");
 
@@ -219,8 +230,6 @@ moePrepareOp(torch::Tensor expertsIds, torch::Tensor scales, c10::optional<torch
 
     torch::Tensor preparedLocalExpertIds
         = torch::empty({maxTokenCountPerRank * epSize, topK}, expertsIds.options().dtype(torch::kInt32));
-    torch::Tensor preparedLocalScales
-        = torch::empty({maxTokenCountPerRank * epSize, topK}, expertsIds.options().dtype(torch::kFloat32));
 
     torch::Tensor sendRankCountCumSum = torch::empty({epSize}, expertsIds.options().dtype(torch::kInt32));
     torch::Tensor RecvRankCountCumSum = torch::empty({epSize}, expertsIds.options().dtype(torch::kInt32));
@@ -239,6 +248,18 @@ moePrepareOp(torch::Tensor expertsIds, torch::Tensor scales, c10::optional<torch
         = torch::empty({maxTokenCountPerRank * maxSendRanksPerToken}, expertsIds.options().dtype(torch::kInt32));
     torch::Tensor sendRankIndices
         = torch::empty({maxTokenCountPerRank * maxSendRanksPerToken}, expertsIds.options().dtype(torch::kInt32));
+
+    c10::optional<torch::Tensor> preparedLocalScales;
+    float* scalesPtr = nullptr;
+    float* preparedLocalScalesPtr = nullptr;
+    if (scales.has_value())
+    {
+        CHECK_INPUT(scales.value(), torch::kFloat32);
+        scalesPtr = scales->data_ptr<float>();
+        preparedLocalScales
+            = torch::empty({maxTokenCountPerRank * epSize, topK}, expertsIds.options().dtype(torch::kFloat32));
+        preparedLocalScalesPtr = preparedLocalScales->data_ptr<float>();
+    }
 
     int* localExpertStaticsPtr = nullptr;
     int* gatheredExpertStaticsPtr = nullptr;
@@ -271,10 +292,10 @@ moePrepareOp(torch::Tensor expertsIds, torch::Tensor scales, c10::optional<torch
         stream);
 
     tensorrt_llm::kernels::moe_prepare::allToAllMetadata(expertsIds.data_ptr<int>(),
-        preparedLocalExpertIds.data_ptr<int>(), scales.data_ptr<float>(), preparedLocalScales.data_ptr<float>(),
-        localExpertStaticsPtr, gatheredExpertStaticsPtr, workspace, sendRankCountCumSum.data_ptr<int>(),
-        sendRankIndices.data_ptr<int>(), RecvRankCountCumSum.data_ptr<int>(), recvRankIndices.data_ptr<int>(),
-        tokenCount, maxTokenCountPerRank, topK, expertCount, slotCount, epRank, epSize, stream);
+        preparedLocalExpertIds.data_ptr<int>(), scalesPtr, preparedLocalScalesPtr, localExpertStaticsPtr,
+        gatheredExpertStaticsPtr, workspace, sendRankCountCumSum.data_ptr<int>(), sendRankIndices.data_ptr<int>(),
+        RecvRankCountCumSum.data_ptr<int>(), recvRankIndices.data_ptr<int>(), tokenCount, maxTokenCountPerRank, topK,
+        expertCount, slotCount, epRank, epSize, stream);
 
     return std::make_tuple(preparedLocalExpertIds, preparedLocalScales, sendRankCountCumSum, gatherSendRankIndices,
         RecvRankCountCumSum, gatherRecvRankIndices, gatherBackwardRecvRankIndices, gatheredExpertStatics);
@@ -287,8 +308,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "moe_comm_prepare_indices(Tensor gathered_target_rank_ids, Tensor? real_rank_token_count_cum_sum, int "
         "max_token_count_per_rank, int expert_count, int top_k, int ep_rank, int ep_size) -> (Tensor, Tensor, Tensor, "
-        "Tensor, "
-        "Tensor, Tensor)");
+        "Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
@@ -299,10 +319,9 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "moe_local_gather(Tensor recv_rank_cum_sum, Tensor local_gather_indices, Tensor gathered_expert_ids, Tensor "
-        "gathered_scales, Tensor local_expert_ids, Tensor local_scales, int max_token_count_per_rank, int "
-        "expert_count, int "
-        "top_k, int ep_rank, int ep_size) -> ()");
+        "moe_local_gather(Tensor recv_rank_cum_sum, Tensor local_gather_indices, Tensor gathered_expert_ids, Tensor? "
+        "gathered_scales, Tensor local_expert_ids, Tensor? local_scales, int max_token_count_per_rank, int "
+        "expert_count, int top_k, int ep_rank, int ep_size) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
@@ -314,8 +333,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "moe_comm(Tensor input, Tensor send_rank_cum_sum, Tensor send_indices, Tensor output, Tensor "
-        "recv_rank_cum_sum, "
-        "Tensor recv_indices, Tensor all_workspaces, int ep_rank, int ep_size) -> ()");
+        "recv_rank_cum_sum, Tensor recv_indices, Tensor all_workspaces, int ep_rank, int ep_size) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
@@ -346,12 +364,9 @@ TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "mnnvl_moe_alltoallv_prepare_without_allgather(Tensor experts_ids, Tensor scales, Tensor? experts_statics, "
-        "Tensor allWorkspace, int "
-        "max_token_count_per_rank, int ep_rank, int ep_size, int expert_count, int slot_count, int top_k) -> (Tensor, "
-        "Tensor, Tensor, "
-        "Tensor, "
-        "Tensor, Tensor, Tensor, Tensor?)");
+        "mnnvl_moe_alltoallv_prepare_without_allgather(Tensor experts_ids, Tensor? scales, Tensor? experts_statics, "
+        "Tensor allWorkspace, int max_token_count_per_rank, int ep_rank, int ep_size, int expert_count, int "
+        "slot_count, int top_k) -> (Tensor, Tensor?, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor?)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

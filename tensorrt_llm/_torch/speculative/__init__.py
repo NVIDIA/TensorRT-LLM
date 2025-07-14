@@ -1,5 +1,5 @@
 from .eagle3 import Eagle3SpecMetadata
-from .interface import SpecConfig, SpecMetadata
+from .interface import SpecMetadata
 from .mtp import MTPEagleWorker, MTPSpecMetadata, MTPWorker
 from .ngram import NGramDrafter, NGramPoolManager
 from .utils import (get_num_spec_layers, get_spec_decoder, get_spec_drafter,
@@ -13,7 +13,6 @@ __all__ = [
     "MTPWorker",
     "NGramDrafter",
     "NGramPoolManager",
-    "SpecConfig",
     "SpecMetadata",
     "get_num_spec_layers",
     "get_spec_decoder",

@@ -461,7 +461,6 @@ __global__ void allToAllMetadataDevice(int* sendExperts, int* recvExperts, float
                 {
                     int tokenId = *(localSendIndice + maxTokenCountPerRank * targetRankId + (index / groupSize));
                     *((int4*) (experts)) = *(int4*) (sendExperts + tokenId * topK + groupId * UNIT_SIZE);
-                    *((float4*) (scales)) = *(float4*) (sendScales + tokenId * topK + groupId * UNIT_SIZE);
 
 #pragma unroll
                     for (int j = 0; j < UNIT_SIZE; j++)
@@ -470,15 +469,18 @@ __global__ void allToAllMetadataDevice(int* sendExperts, int* recvExperts, float
                         if (expertId / slotCountPerRank != targetRankId)
                         {
                             experts[j] = slotCount;
-                            scales[j] = 0.0f;
                         }
                     }
 
                     int* expertsPtr = (int*) (packPtr) + threadIdx.x * UNIT_SIZE;
-                    float* scaleBasePtr = (float*) (packPtr + SCALE_OFFSET);
-                    float* scalesPtr = (float*) (scaleBasePtr) + threadIdx.x * UNIT_SIZE;
                     *((int4*) (expertsPtr)) = *((int4*) (experts));
-                    *((float4*) (scalesPtr)) = *((float4*) (scales));
+                    if (sendScales != nullptr)
+                    {
+                        *((float4*) (scales)) = *(float4*) (sendScales + tokenId * topK + groupId * UNIT_SIZE);
+                        float* scaleBasePtr = (float*) (packPtr + SCALE_OFFSET);
+                        float* scalesPtr = (float*) (scaleBasePtr) + threadIdx.x * UNIT_SIZE;
+                        *((float4*) (scalesPtr)) = *((float4*) (scales));
+                    }
                 }
             }
             else if (localExpertStatics != nullptr)
@@ -518,18 +520,20 @@ __global__ void allToAllMetadataDevice(int* sendExperts, int* recvExperts, float
             {
                 if (threadIdx.x < packetUnitCount)
                 {
-                    int* expertsPtr = (int*) (packetPtr) + threadIdx.x * UNIT_SIZE;
-                    float* scaleBasePtr = (float*) (packetPtr + SCALE_OFFSET);
-                    float* scalesPtr = scaleBasePtr + threadIdx.x * UNIT_SIZE;
-                    *((int4*) (experts)) = *((int4*) (expertsPtr));
-                    *((float4*) (scales)) = *((float4*) (scalesPtr));
-
                     int tokenId = baseCumsum + (unitIdBase + threadIdx.x) / groupSize;
-
+                    int* expertsPtr = (int*) (packetPtr) + threadIdx.x * UNIT_SIZE;
+                    *((int4*) (experts)) = *((int4*) (expertsPtr));
                     int4* dstExpertsPtr = (int4*) (recvExperts + tokenId * topK + groupId * UNIT_SIZE);
-                    float4* dstScalesPtr = (float4*) (recvScales + tokenId * topK + groupId * UNIT_SIZE);
                     *dstExpertsPtr = *((int4*) (experts));
-                    *dstScalesPtr = *((float4*) (scales));
+
+                    if (recvScales != nullptr)
+                    {
+                        float* scaleBasePtr = (float*) (packetPtr + SCALE_OFFSET);
+                        float* scalesPtr = scaleBasePtr + threadIdx.x * UNIT_SIZE;
+                        *((float4*) (scales)) = *((float4*) (scalesPtr));
+                        float4* dstScalesPtr = (float4*) (recvScales + tokenId * topK + groupId * UNIT_SIZE);
+                        *dstScalesPtr = *((float4*) (scales));
+                    }
                 }
             }
             else if (localExpertStatics != nullptr)

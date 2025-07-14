@@ -17,6 +17,7 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <memory> //@todo check the usage of this
 #include <random> //@todo check the usage of this
 
@@ -320,6 +321,27 @@ template <typename T>
 class RoutingKernelTest : public testing::Test
 {
 public:
+    // Add a method to generate time-based seed
+    static uint32_t generateTimeBasedSeed()
+    {
+        std::random_device rd;
+        uint32_t seed = rd();
+        TLLM_LOG_DEBUG("Random device seed: %u", seed);
+        return seed;
+    }
+
+    // Method to set seed after construction
+    void setSeed(uint32_t seed)
+    {
+        mSeed = seed;
+    }
+
+    // Method to reset to time-based seed
+    void resetToTimeBasedSeed()
+    {
+        mSeed = generateTimeBasedSeed();
+    }
+
     void SetUp() override;
     void TearDown() override;
 
@@ -372,7 +394,7 @@ protected:
         routingData.mPtrExpandedIdxToPermutedIdx = bufferCast<int32_t>(*mPtrExpandedIdxToPermutedIdxDevice);
         routingData.mPtrPermutedIdxToTokenIdx = bufferCast<int32_t>(*mPtrPermutedIdxToTokenIdxDevice);
         routingData.mPtrExpertWeights = bufferCast<T>(*mPtrExpertWeightsDevice);
-        // routingData.mPtrExpertIdx = reinterpret_cast<PackedType*>(bufferCast<int8_t>(*mPtrExpertIdxDevice));
+        routingData.mPtrExpertIdx = reinterpret_cast<PackedType*>(bufferCast<int8_t>(*mPtrExpertIdxDevice));
 
         // Set grouped gemm launch config buffers
         routingData.mPtrCtaIdxXyToBatchIdx = bufferCast<int32_t>(*mPtrCtaIdxXyToBatchIdxDevice);

@@ -222,7 +222,30 @@ struct UniformRoutingConfig : public RoutingConfig
     {
         std::uniform_int_distribution<int> dist(0, num_experts - 1);
         std::vector<int> input(k * num_tokens);
-        std::generate(input.begin(), input.end(), [&] { return dist(twister); });
+        for (int i = 0; i < num_tokens; i++)
+        {
+            for (int j = 0; j < k; j++)
+            {
+                while (true)
+                {
+                    int expert_id = dist(twister);
+                    bool valid = true;
+                    for (int prev_j = 0; prev_j < j; prev_j++)
+                    {
+                        if (expert_id == input[i * k + prev_j])
+                        {
+                            valid = false;
+                            break;
+                        }
+                    }
+                    if (valid)
+                    {
+                        input[i * k + j] = expert_id;
+                        break;
+                    }
+                }
+            }
+        }
         check_cuda_error(cudaMemcpyAsync(
             selected_experts, input.data(), input.size() * sizeof(int), cudaMemcpyHostToDevice, streamPtr->get()));
         check_cuda_error(cudaStreamSynchronize(streamPtr->get()));
@@ -322,9 +345,8 @@ public:
     constexpr static int WEIGHT_ELEM_PER_BYTE = (INT4 || ANY_FP4) ? 2 : 1;
     int const BASE_HIDDEN_SIZE = 64 / sizeof(WeightType) * WEIGHT_ELEM_PER_BYTE;
 
-    constexpr static int64_t FP4_VECTOR_SIZE = NVFP4
-        ? tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize
-        : tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize;
+    constexpr static int64_t FP4_VECTOR_SIZE = NVFP4 ? TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize
+                                                     : TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize;
 
     std::vector<BufferManager::IBufferPtr> managed_buffers;
     int* mSelectedExperts{};
@@ -476,7 +498,7 @@ public:
     float* mExpertFP8Scale3{};
 
     float* mExpertFP4ActScale1{};
-    using ElementSF = tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::ElementSF;
+    using ElementSF = TmaWarpSpecializedGroupedGemmInput::ElementSF;
     ElementSF* mExpertFP4WeightSf1{};
     float* mExpertFP4GlobalScale1{};
     float* mExpertFP4ActScale2{};
@@ -532,7 +554,7 @@ public:
         mInterSize = inter_size / parallelism_config.tp_size;
         mNumExperts = num_experts;
         mK = k;
-        mIsGated = tensorrt_llm::isGatedActivation(mActType);
+        mIsGated = isGatedActivation(mActType);
         mGatedMultiplier = mIsGated ? 2 : 1;
         auto const gated_inter = mInterSize * mGatedMultiplier;
 
@@ -811,7 +833,7 @@ void MixtureOfExpertsBenchmark<TypeTuple_>::runBenchmark(benchmark::State& state
     int const num_tokens = state.range(7);
     mUseBias = state.range(8);
     mUseFinalScale = state.range(9);
-    mActType = static_cast<tensorrt_llm::ActivationType>(state.range(10));
+    mActType = static_cast<ActivationType>(state.range(10));
     int tactic_idx1 = state.range(11);
     int tactic_idx2 = state.range(12);
     int const routing_config = state.range(13);
