@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 
+import nvtx
 import pytest
 import torch
 from _torch.helpers import calc_diff, per_block_cast_to_fp8
@@ -94,6 +95,7 @@ def test_cute_dsl_fp8_block_scale_gemm(dtype, m, k, n):
     b = torch.randn((n, k), device='cuda', dtype=dtype) / k
 
     act_a_fp8, act_a_sf = torch.ops.trtllm.fp8_quantize_1x128(a)
+
     act_b_fp8, act_b_sf = per_block_cast_to_fp8(b)
 
     # # torch.float8_e4m3fn
@@ -127,7 +129,10 @@ def test_cute_dsl_fp8_block_scale_gemm(dtype, m, k, n):
     for k, v in AutoTuner.get().profiling_cache.items():
         print(f"Autotuner profiling cache: {k} = {v}")
     print("inference after autotune")
-    our_out = cute_dsl_fp_gemm_func(act_a_fp8, act_b_fp8, act_a_sf, act_b_sf)
+    for i in range(10):
+        with nvtx.annotate("cute_dsl_fp_gemm_func", color="red"):
+            our_out = cute_dsl_fp_gemm_func(act_a_fp8, act_b_fp8, act_a_sf,
+                                            act_b_sf)
 
     diff = calc_diff(our_out, output_expected)
     print("limin: our_out, output_expected, diff = ", diff)
@@ -152,6 +157,58 @@ def test_cute_dsl_fp8_block_scale_gemm(dtype, m, k, n):
     # print("limin: ds_ref, output_expected, diff = ", diff)
     # assert diff < 1e-3
     # torch.testing.assert_close(ds_ref, output_expected, atol=1e-3, rtol=1e-3)
+
+
+def test_cute_dsl_fp8_block_scale_bmm(dtype=torch.bfloat16,
+                                      m=1024,
+                                      k=256,
+                                      n=512,
+                                      l=16):
+
+    # print("limin: torch.ops.trtllm = ", torch.ops.trtllm, dir(torch.ops.trtllm))
+    # for op in dir(torch.ops.trtllm):
+    #     print(op)
+    # print("limin end print ops")
+    import math
+
+    torch.random.manual_seed(0)
+    a = torch.randn((l, m, k), device='cuda', dtype=dtype) / k
+    b = torch.randn((l, n, k), device='cuda', dtype=dtype) / k
+
+    act_a_fp8, act_a_sf = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
+        a)
+
+    b_fp8 = torch.empty(l, n, k, dtype=torch.float8_e4m3fn, device="cuda")
+    b_scale = torch.empty(l,
+                          math.ceil(n / 128),
+                          math.ceil(k / 128),
+                          dtype=torch.float32,
+                          device="cuda")
+    for i in range(l):
+        cur_b, cur_b_scale = per_block_cast_to_fp8(b[i, :, :])
+        b_fp8[i, :, :] = cur_b
+        b_scale[i, :, :] = cur_b_scale
+
+    output_expected = torch.einsum("lmk,lnk->lmn", a, b)
+
+    cute_dsl_fp_gemm_func = torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell
+
+    output = torch.empty((l, m, n), device='cuda', dtype=torch.bfloat16)
+
+    # from tensorrt_llm._torch.autotuner import autotune
+    with autotune():
+        cute_dsl_fp_gemm_func(act_a_fp8, b_fp8, act_a_sf, b_scale, output)
+    print("after autotune")
+    from tensorrt_llm._torch.autotuner import AutoTuner
+    for k, v in AutoTuner.get().profiling_cache.items():
+        print(f"Autotuner profiling cache: {k} = {v}")
+    print("inference after autotune")
+    cute_dsl_fp_gemm_func(act_a_fp8, b_fp8, act_a_sf, b_scale, output)
+
+    diff = calc_diff(output, output_expected)
+    print("limin: our_out, output_expected, diff = ", diff)
+    assert diff < 1e-3
+    torch.testing.assert_close(output, output_expected, atol=1e-3, rtol=1e-3)
 
 
 # from functools import lru_cache

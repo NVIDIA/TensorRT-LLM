@@ -1,6 +1,7 @@
 import os
 import sys
 
+import nvtx
 import torch
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../'))
@@ -106,26 +107,26 @@ def cute_dsl_fp8_group_blockwise_gemm_ref(
     for i in range(len_offset_array - 1):
         start = offset_array[i]
         end = offset_array[i + 1]
-        # assert start <= end, f"Invalid group boundaries: start={start} > end={end}"
-        if start <= 406 and end >= 406:
-            print(f"limin: start = {start}, end = {end}")
-            print(f"limin: updated_a[406, :, 0] = {updated_a[406, :, 0]}")
-            print(f"limin: updated_b[:, 588, i] = {updated_b[:, 588, i]}")
-            o = torch.dot(updated_a[406, :, 0], updated_b[588, :, i])
-            # limin: torch.dot = 0.0071868896484375, 0.0072021484375
-            print(f"limin: torch.dot = {o}, {o.to(torch.bfloat16)}")
-            o1 = torch.einsum("k,k->", updated_a[406, :, 0], updated_b[588, :,
-                                                                       i])
-            print(f"limin: o1 = {o1}, {o1.to(torch.bfloat16)}")
-        if start <= 3 and end >= 3:
-            print(f"\nlimin: start = {start}, end = {end}")
-            print(f"limin: updated_a[3, :, 0] = {updated_a[3, :, 0]}")
-            print(f"limin: updated_b[:, 1509, i] = {updated_b[:, 1509, i]}")
-            o = torch.dot(updated_a[3, :, 0], updated_b[1509, :, i])
-            print(f"limin: torch.dot = {o}, {o.to(torch.bfloat16)}")
-            o1 = torch.einsum("k,k->", updated_a[3, :, 0], updated_b[1509, :,
-                                                                     i])
-            print(f"limin: o1 = {o1}, {o1.to(torch.bfloat16)}")
+        # # assert start <= end, f"Invalid group boundaries: start={start} > end={end}"
+        # if start <= 406 and end >= 406:
+        #     print(f"limin: start = {start}, end = {end}")
+        #     print(f"limin: updated_a[406, :, 0] = {updated_a[406, :, 0]}")
+        #     print(f"limin: updated_b[:, 588, i] = {updated_b[:, 588, i]}")
+        #     o = torch.dot(updated_a[406, :, 0], updated_b[588, :, i])
+        #     # limin: torch.dot = 0.0071868896484375, 0.0072021484375
+        #     print(f"limin: torch.dot = {o}, {o.to(torch.bfloat16)}")
+        #     o1 = torch.einsum("k,k->", updated_a[406, :, 0], updated_b[588, :,
+        #                                                                i])
+        #     print(f"limin: o1 = {o1}, {o1.to(torch.bfloat16)}")
+        # if start <= 3 and end >= 3:
+        #     print(f"\nlimin: start = {start}, end = {end}")
+        #     print(f"limin: updated_a[3, :, 0] = {updated_a[3, :, 0]}")
+        #     print(f"limin: updated_b[:, 1509, i] = {updated_b[:, 1509, i]}")
+        #     o = torch.dot(updated_a[3, :, 0], updated_b[1509, :, i])
+        #     print(f"limin: torch.dot = {o}, {o.to(torch.bfloat16)}")
+        #     o1 = torch.einsum("k,k->", updated_a[3, :, 0], updated_b[1509, :,
+        #                                                              i])
+        #     print(f"limin: o1 = {o1}, {o1.to(torch.bfloat16)}")
         # ref[start:end, :] = torch.einsum("mk,nk->mn", updated_a[start:end, :,
         #                                                         0],
         #                                  updated_b[:, :, i])
@@ -135,8 +136,8 @@ def cute_dsl_fp8_group_blockwise_gemm_ref(
         #     for nn in range(n):
         #         ref[m, nn] = torch.dot(updated_a[m, :, 0], updated_b[nn, :, i])
     # limin: ref[406][588] = -0.11326146125793457
-    print(f"limin: ref[406][588] = {ref[406][588]}")
-    print(f"limin: ref[3][1509] = {ref[3][1509]}")
+    # print(f"limin: ref[406][588] = {ref[406][588]}")
+    # print(f"limin: ref[3][1509] = {ref[3][1509]}")
     ref = ref.to(torch.bfloat16)
     return ref
 
@@ -152,7 +153,8 @@ def test_cute_dsl_group_gemm(num_experts, k, n, max_tokens_per_group):
     #     group_m.append(m_aligned * random.randint(
     #         int(expect_m * 0.1) // m_aligned, int(expect_m * 5.5) // m_aligned
     #     ))
-    for max_tokens_per_group in range(1, 1500, 2):
+    # for max_tokens_per_group in range(1, 1500, 2):
+    for i in range(1):
         group_m = []
         for i in range(num_experts):
             group_m.append(random.randint(0, max_tokens_per_group))
@@ -163,6 +165,7 @@ def test_cute_dsl_group_gemm(num_experts, k, n, max_tokens_per_group):
         offset_group = torch.cat(
             [torch.tensor([0], dtype=torch.int32, device="cuda"), offset_group],
             dim=0)
+        offset_group = offset_group.to(torch.int32)
         print("limin: offset_group", offset_group)
 
         m = sum(group_m)
@@ -192,7 +195,7 @@ def test_cute_dsl_group_gemm(num_experts, k, n, max_tokens_per_group):
             b_fp8[i, :, :] = cur_b
             b_scale[i, :, :] = cur_b_scale
 
-        print("limin: a_scale.shape", a_scale.shape)
+        # print("limin: a_scale.shape", a_scale.shape)
         # c_actual = torch.ops.trtllm.cute_dsl_fp8_group_blockwise_gemm(a_fp8, b_fp8, a_scale.reshape(-1), b_scale, group_m)
         # c_actual_ref = cute_dsl_fp8_group_blockwise_gemm_ref(a_fp8, b_fp8, a_scale.reshape(-1), b_scale, group_m)
         c_actual_ref = cute_dsl_fp8_group_blockwise_gemm_ref(
@@ -201,11 +204,16 @@ def test_cute_dsl_group_gemm(num_experts, k, n, max_tokens_per_group):
             a_sf=a_scale,
             b_sf=b_scale,
             offset_array=offset_group)
-        c_actual = cute_dsl_fp8_group_gemm_blackwell(input=a_fp8,
-                                                     weight=b_fp8,
-                                                     input_scale=a_scale,
-                                                     weight_scale=b_scale,
-                                                     group_offset=offset_group)
+
+        for i in range(10):
+            with nvtx.annotate("cute_dsl_fp8_group_gemm_blackwell",
+                               color="red"):
+                c_actual = cute_dsl_fp8_group_gemm_blackwell(
+                    input=a_fp8,
+                    weight=b_fp8,
+                    input_scale=a_scale,
+                    weight_scale=b_scale,
+                    group_offset=offset_group)
 
         c_ref = torch.zeros(m, n, dtype=torch.float32)
 
@@ -322,24 +330,24 @@ def set_tensor_value_4(x, num_row, num_cols):
 def test_cute_dsl_group_gemm_input_from_file():
     x = load_tensor_from_file("debug", "act_input_fp8.npy",
                               torch.float32).cuda().to(torch.float8_e4m3fn)
-    print("limin: x.shape", x.shape)
-    print("limin: x", x)
+    # print("limin: x.shape", x.shape)
+    # print("limin: x", x)
     w = load_tensor_from_file("debug", "w3_w1_weight.npy",
                               torch.float32).cuda().to(torch.float8_e4m3fn)
-    print("limin: w.shape", w.shape)
-    print("limin: w", w)
+    # print("limin: w.shape", w.shape)
+    # print("limin: w", w)
     w_sf = load_tensor_from_file("debug", "quant_scales_0.npy",
                                  torch.float32).cuda()
-    print("limin: w_sf.shape", w_sf.shape)
-    print("limin: w_sf", w_sf)
+    # print("limin: w_sf.shape", w_sf.shape)
+    # print("limin: w_sf", w_sf)
     offset_array = load_tensor_from_file(
         "debug", "expert_first_token_offset_tensor.npy", torch.int32).cuda()
-    print("limin: offset_array.shape", offset_array.shape)
-    print("limin: offset_array", offset_array)
+    # print("limin: offset_array.shape", offset_array.shape)
+    # print("limin: offset_array", offset_array)
     x_sf = load_tensor_from_file("debug", "act_input_sf.npy",
                                  torch.float32).cuda()
-    print("limin: x_sf.shape", x_sf.shape)
-    print("limin: x_sf", x_sf)
+    # print("limin: x_sf.shape", x_sf.shape)
+    # print("limin: x_sf", x_sf)
 
     # optimized_fill_pattern_1(x, x.shape[0], x.shape[1])
     # for i in range(w.shape[0]):
@@ -352,10 +360,10 @@ def test_cute_dsl_group_gemm_input_from_file():
     for i in range(w_sf.shape[0]):
         optimized_fill_pattern_1(w_sf[i, :, :], w_sf.shape[1], w_sf.shape[2])
 
-    print("limin: x", x.shape)
-    print("limin: w", w.shape)
-    print("limin: x_sf", x_sf.shape)
-    print("limin: w_sf", w_sf.shape)
+    # print("limin: x", x.shape)
+    # print("limin: w", w.shape)
+    # print("limin: x_sf", x_sf.shape)
+    # print("limin: w_sf", w_sf.shape)
 
     print(
         f"limin: torch.cuda.memory_allocated() = {torch.cuda.memory_allocated()}"
@@ -367,11 +375,12 @@ def test_cute_dsl_group_gemm_input_from_file():
                                                b_sf=w_sf,
                                                offset_array=offset_array)
     torch.cuda.empty_cache()
-    h2 = cute_dsl_fp8_group_gemm_blackwell(input=x,
-                                           weight=w,
-                                           input_scale=x_sf,
-                                           weight_scale=w_sf,
-                                           group_offset=offset_array)
+    for i in range(10):
+        h2 = cute_dsl_fp8_group_gemm_blackwell(input=x,
+                                               weight=w,
+                                               input_scale=x_sf,
+                                               weight_scale=w_sf,
+                                               group_offset=offset_array)
     # a61 = x[61, :]
     # a_sf_61 = x_sf[:, 61].repeat_interleave(128)
     # print(f"limin: a61 = {a61.shape}")
@@ -445,5 +454,5 @@ if __name__ == "__main__":
     # Error:
     # test_cute_dsl_group_gemm(num_experts = 72, k = 512, n = 512, expect_m = 128)
     # test_cute_dsl_group_gemm(num_experts = 72, k = 7168, n = 4096, expect_m = 128)
-    test_cute_dsl_group_gemm_input_from_file()
-    # test_cute_dsl_group_gemm(72, 1536, 2560, 1024)
+    # test_cute_dsl_group_gemm_input_from_file()
+    test_cute_dsl_group_gemm(72, 1536, 2560, 1024)

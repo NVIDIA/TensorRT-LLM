@@ -130,6 +130,20 @@ std::tuple<at::Tensor, at::Tensor> fp8_batched_quantize_1x128_permute102(at::Ten
     auto* output_buffer = reinterpret_cast<__nv_bfloat16 const*>(self.data_ptr());
     mGemmRunner.fp8CS1x128Reshape(act_buffer, act_scale_buffer, output_buffer, n, b, m, lda, stream);
 
+    // [ # div_up(shape_m_4_align * div_up(shape_k, 128) * sizeof(float), 128) * 128/sizeof(float);
+    // input : [m, b, n]
+    // output : [b, m, n], scales : [b, n / 128, padding(m)]
+    // Post-process the scale tensor for sm100 cute_dsl_fp8_bmm_blackwell kernel
+    if (tensorrt_llm::common::getSMVersion() == 100)
+    {
+        auto const num_n_blocks = (n + 127) / 128;
+        auto const act_scal_elesize = b * num_n_blocks * m_padded;
+        TORCH_CHECK(act_scal_elesize <= scaleFP8SF.numel(), "Scale tensor size mismatch. Expected at least ",
+            act_scal_elesize, " elements, got ", scaleFP8SF.numel());
+
+        scaleFP8SF
+            = scaleFP8SF.slice(0, 0, act_scal_elesize).view({b, num_n_blocks, m_padded}).slice(2, 0, m).contiguous();
+    }
     return {valueE4M3.slice(0, 0, b * m * n).view({b, m, n}), scaleFP8SF};
 }
 } // namespace torch_ext

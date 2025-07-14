@@ -2007,6 +2007,12 @@ class BlockwiseContiguousGroupedGemmKernel:
         next_m_boundary = cutlass.Int32(0)
         if not_found:
             cur_group_idx = cur_group_idx + 1
+        # print(f"limin: not_found = {not_found}, cur_group_idx = {cur_group_idx}, group_count = {group_count}")
+        # print(f"limin: offset_mapping = {offset_mapping}")
+        # cute.printf(f"limin: not_found = {not_found}")
+        # cute.printf(f"limin: cur_group_idx = {cur_group_idx}")
+        # cute.printf(f"limin: group_count = {group_count}")
+        # cute.printf(f"limin: i am error")
         while not_found and cur_group_idx <= group_count:
             next_m_boundary = offset_mapping[cur_group_idx]
             num_m_blocks = cute.ceil_div((next_m_boundary - cur_m_boundary),
