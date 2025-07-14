@@ -2268,7 +2268,8 @@ pipeline {
         {
             when {
                 expression {
-                    env.targetArch == X86_64_TRIPLE  // Only execute the check if running on x86
+                    // Only run the test list validation when necessary
+                    env.targetArch == X86_64_TRIPLE && testFilter[ONLY_DOCS_FILE_CHANGED] == false
                 }
             }
             steps
