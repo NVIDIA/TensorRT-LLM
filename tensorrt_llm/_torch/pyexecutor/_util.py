@@ -437,7 +437,12 @@ def create_py_executor_instance(
         from tensorrt_llm.bindings import LoraModule
 
         if len(lora_config.lora_dir) == 1:
-            load_torch_hf_lora(lora_config)
+            # Route to appropriate loader based on checkpoint source
+            if lora_config.lora_ckpt_source == "nemo":
+                from tensorrt_llm.lora_manager import load_torch_nemo_lora
+                load_torch_nemo_lora(lora_config)
+            else:
+                load_torch_hf_lora(lora_config)
         else:
             assert len(lora_config.lora_target_modules
                        ) >= 1, "Expecting at least one lora target module"
