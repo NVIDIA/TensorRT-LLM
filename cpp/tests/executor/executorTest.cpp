@@ -2556,7 +2556,7 @@ TEST_F(GptExecutorTest, MaxSeqIdleMicrosecondsError)
             {
                 auto err = response.getErrorMsg();
                 std::cout << "err:" << err << std::endl;
-                EXPECT_THAT(err, testing::HasSubstr("Unable to get batch slot for reqId"));
+                EXPECT_THAT(err, testing::HasSubstr("Unable to get batch slot for request ID"));
                 done = true;
             }
             else

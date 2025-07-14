@@ -256,8 +256,7 @@ def test_llm_loading_from_ckpt():
 
 @pytest.mark.parametrize('model_format', [
     'hf',
-    pytest.param('ckpt',
-                 marks=pytest.mark.skip(reason="https://nvbugs/5266240"))
+    'ckpt',
 ])
 @pytest.mark.part0
 def test_llm_with_dummy_weights(model_format):
@@ -545,8 +544,7 @@ def _test_llm_generate_async(model_name=default_model_name,
 @pytest.mark.parametrize("chunked", [True, False])
 @pytest.mark.part0
 def test_llm_generate_async_with_stream_interval(chunked):
-    pytest.skip("https://nvbugs/5383670")
-    model_path = f"{llm_models_root()}/nvfp4-quantized/Meta-Llama-3.1-8B"
+    model_path = get_model_path('llama-models-v2/llama-v2-7b-hf')
     max_num_tokens = 256
     with LLM_torch(model_path,
                    max_num_tokens=max_num_tokens,
@@ -2111,24 +2109,36 @@ def test_llm_chunked_prefill():
     success_path()
 
 
-def _test_llm_capture_request_error(tp_size: int = 1):
-    build_config = BuildConfig()
-    build_config.max_num_tokens = 64
+def _test_llm_capture_request_error(pytorch_backend: bool, tp_size: int = 1):
+    llm_args_extra = {}
+    if pytorch_backend:
+        LLM_CLASS = LLM_torch
+        llm_args_extra["max_num_tokens"] = 64
+    else:
+        LLM_CLASS = LLM
+        build_config = BuildConfig()
+        build_config.max_num_tokens = 64
+        llm_args_extra["fast_build"] = True
+        llm_args_extra["build_config"] = build_config
 
-    llm = LLM(
+    llm = LLM_CLASS(
         model=llama_model_path,
-        build_config=build_config,
-        fast_build=True,
+        tensor_parallel_size=tp_size,
+        **llm_args_extra,
     )
 
     prompt = 'A ' * 65  # the minimum max_num_tokens is 64
-
-    with pytest.raises(RequestError):
-        llm.generate(prompt)
+    if pytorch_backend:
+        # pytorch backend will raise ValueError for max_num_tokens
+        with pytest.raises(ValueError):
+            llm.generate(prompt)
+    else:
+        with pytest.raises(RequestError):
+            llm.generate(prompt)
 
 
 def test_llm_capture_request_error():
-    _test_llm_capture_request_error(tp_size=1)
+    _test_llm_capture_request_error(pytorch_backend=False, tp_size=1)
 
 
 def test_llm_shutdown_executor():
@@ -2195,16 +2205,18 @@ def test_llm_with_postprocess_parallel():
 def run_llm_with_postprocess_parallel_and_result_handler(
         streaming, backend, tp_size: int = 1):
     # avoid import error when running in CI
-    from tensorrt_llm.executor.postproc_worker import (PostprocArgs,
-                                                       PostprocParams)
+    from tensorrt_llm.executor.postproc_worker import PostprocParams
+    from tensorrt_llm.serve.postprocess_handlers import (
+        ChatPostprocArgs, chat_stream_post_processor)
 
-    from .run_llm_with_postproc import perform_faked_oai_postprocess
+    from .run_llm_with_postproc import get_concatenated_content
 
     sampling_params = SamplingParams(max_tokens=6)
-    post_proc_args = PostprocArgs(tokenizer=llama_model_path)
-    post_proc_params = PostprocParams(
-        post_processor=perform_faked_oai_postprocess,
-        postproc_args=post_proc_args)
+    post_proc_args = ChatPostprocArgs(tokenizer=llama_model_path,
+                                      role="assistant",
+                                      model=llama_model_path)
+    post_proc_params = PostprocParams(post_processor=chat_stream_post_processor,
+                                      postproc_args=post_proc_args)
     kwargs = {}
     if backend not in ["pytorch", "autodeploy"]:
         kwargs["fast_build"] = True
@@ -2219,17 +2231,16 @@ def run_llm_with_postprocess_parallel_and_result_handler(
                     num_postprocess_workers=2,
                     postprocess_tokenizer_dir=llama_model_path,
                     **kwargs)
-    golden_result = "DEFGHI"
-    for i, output in enumerate(
-            llm.generate_async(prompts[0],
-                               sampling_params=sampling_params,
-                               _postproc_params=post_proc_params,
-                               streaming=streaming)):
-        if i < len(golden_result) - 1:
-            assert golden_result[i] in output.outputs[0]._postprocess_result[-1]
-        else:
-            assert golden_result[i] in output.outputs[0]._postprocess_result[
-                -2]  # EOS
+    golden_result = "D E F G H I"
+    outputs = []
+    for output in llm.generate_async(prompts[0],
+                                     sampling_params=sampling_params,
+                                     _postproc_params=post_proc_params,
+                                     streaming=streaming):
+        outputs.append(output.outputs[0]._postprocess_result)
+    actual_result = get_concatenated_content(outputs)
+    assert actual_result == golden_result, \
+        f"Expected: {golden_result}, Actual: {actual_result}"
 
 
 @pytest.mark.parametrize("streaming", [True, False])
