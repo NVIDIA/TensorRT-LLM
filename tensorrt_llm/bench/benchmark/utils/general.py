@@ -4,10 +4,10 @@ import json
 from importlib.metadata import version
 from pathlib import Path
 from random import choices, shuffle
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from tensorrt_llm._torch.pyexecutor.model_engine import \
     validate_and_set_kv_cache_quant
@@ -31,7 +31,14 @@ class TuningConstraints(BaseModel):
     average_osl: int
     maximum_isl: int
     maximum_osl: int
-    max_sequence_length: int
+    max_sequence_length: Optional[int] = None
+
+    @model_validator(mode="after")
+    def validate_max_sequence_length(self):
+        if self.max_sequence_length is None:
+            self.max_sequence_length = self.maximum_isl + self.maximum_osl
+
+        return self
 
 
 def get_settings_from_engine(
