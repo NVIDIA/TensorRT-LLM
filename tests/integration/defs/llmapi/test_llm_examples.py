@@ -164,5 +164,10 @@ def test_llmapi_speculative_decoding_ngram(llm_root, engine_dir, llm_venv):
 
 
 @pytest.mark.skip(reason="https://nvbugs/5365825")
+def test_llmapi_sampling(llm_root, engine_dir, llm_venv):
+    _run_llmapi_example(llm_root, engine_dir, llm_venv, "llm_sampling.py")
+
+
+@pytest.mark.skip(reason="https://nvbugs/5365825")
 def test_llmapi_runtime(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv, "llm_runtime.py")
