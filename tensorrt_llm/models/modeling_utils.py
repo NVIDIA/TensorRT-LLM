@@ -99,6 +99,7 @@ class SpeculativeDecodingMode(IntFlag):
     NGRAM = auto()
     USER_PROVIDED = auto()
     AUTO = auto()
+    EXTERNAL_API = auto()
 
     @staticmethod
     def from_arguments(args: argparse.Namespace):
@@ -120,6 +121,8 @@ class SpeculativeDecodingMode(IntFlag):
             return SpeculativeDecodingMode.USER_PROVIDED
         elif args.speculative_decoding_mode == "auto":
             return SpeculativeDecodingMode.AUTO
+        elif args.speculative_decoding_mode == "external_api":
+            return SpeculativeDecodingMode.EXTERNAL_API
         else:
             assert False, "Unknown speculative_decoding_mode " + args.speculative_decoding_mode
 

@@ -403,10 +403,12 @@ class ExecutorRequestQueue:
                 new_requests, "py_multimodal_data")
             py_scheduling_params = self._collect_py_objects_from_requests(
                 new_requests, "py_scheduling_params")
+            py_parallel_spec_dec_params = self._collect_py_objects_from_requests(
+                new_requests, "py_parallel_spec_dec_params")
             py_request_objects = tuple(
                 filter(None, [
                     py_logits_post_processors, py_multimodal_data,
-                    py_scheduling_params
+                    py_scheduling_params, py_parallel_spec_dec_params
                 ]))
         else:
             py_request_objects = None

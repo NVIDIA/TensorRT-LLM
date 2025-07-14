@@ -507,6 +507,8 @@ class TorchSampler(Sampler):
                 continue
             processed = 1
             num_accepted = self.process_draft_tokens(req, new_tokens)
+            if req.py_parallel_spec_dec_params is not None:
+                self._pre_verify(req, new_tokens)
             if get_draft_token_length(req) > 0:
                 req.py_num_accepted_draft_tokens = num_accepted
                 req.py_rewind_len = req.py_draft_pages_allocated - num_accepted
@@ -690,6 +692,30 @@ class TorchSampler(Sampler):
                 log_probs_host[slot, beam, :steps].copy_(log_probs,
                                                          non_blocking=True)
             offset += steps
+
+    def _pre_verify(self, req: LlmRequest, new_tokens: torch.Tensor):
+        try:
+            next_draft_token = req.py_parallel_spec_dec_params[
+                "old_draft_tokens"][0]
+            pre_verified_token = req.get_tokens(0)[-1]
+            if next_draft_token == pre_verified_token:
+                old_draft_tokens = req.py_parallel_spec_dec_params[
+                    "old_draft_tokens"][1:]
+                # remove draft sequence padding
+                while old_draft_tokens and old_draft_tokens[-1] == req.py_end_id:
+                    old_draft_tokens.pop()
+                # switch to post-verify
+                req.py_parallel_spec_dec_params[
+                    "old_draft_tokens"] = old_draft_tokens
+                req.py_parallel_spec_dec_params["pre_verify"] = False
+            else:
+                # switch to pre-verify
+                req.py_parallel_spec_dec_params["old_draft_tokens"] = []
+                req.py_parallel_spec_dec_params["pre_verify"] = True
+        except Exception:
+            # fall back to pre-verify
+            req.py_parallel_spec_dec_params["old_draft_tokens"] = []
+            req.py_parallel_spec_dec_params["pre_verify"] = True
 
 
 class Algorithms:

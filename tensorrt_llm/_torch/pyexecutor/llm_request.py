@@ -296,6 +296,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_lora_path: str | None = kwargs.pop("py_lora_path", None)
         # Multimodal data
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
+        self.py_parallel_spec_dec_params = kwargs.pop(
+            "py_parallel_spec_dec_params", None)
         if llm_request is not None:
             super().__init__(llm_request)
         else:
@@ -534,11 +536,13 @@ def executor_request_to_llm_request(
         llm_request_type=llm_request_type,
         context_phase_params=executor_request.context_phase_params,
         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
-                                   None))
+                                   None),
+        py_parallel_spec_dec_params=getattr(executor_request,
+                                            "py_parallel_spec_dec_params",
+                                            None))
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)
-
     return llm_request
 
 

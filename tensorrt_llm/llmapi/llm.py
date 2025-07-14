@@ -196,14 +196,10 @@ class BaseLLM:
                     suffix="-llm-workspace", dir=self.args.workspace)
             else:
                 self._workspace = None
-
             self._hf_model_dir: Optional[Path] = None
-
             self.runtime_context: Optional[_ModelRuntimeContext] = None
             self.llm_build_stats = LlmBuildStats()
-
             self._build_model()
-
         except Exception:
             if self.mpi_session is not None:
                 self.mpi_session.shutdown()
@@ -315,6 +311,7 @@ class BaseLLM:
         disaggregated_params: Optional[DisaggregatedParams] = None,
         _postproc_params: Optional[PostprocParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
+        parallel_spec_dec_params: Optional[dict] = None,
     ) -> RequestOutput:
         """Generate output for the given prompt in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -434,6 +431,7 @@ class BaseLLM:
             postproc_params=_postproc_params,
             multimodal_params=multimodal_params,
             scheduling_params=scheduling_params,
+            parallel_spec_dec_params=parallel_spec_dec_params,
         )
 
         return RequestOutput._from_generation_result(result, prompt,

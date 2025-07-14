@@ -1,3 +1,4 @@
+import asyncio
 import dataclasses
 import datetime
 import functools
@@ -935,7 +936,6 @@ class PyExecutor:
                         self._handle_first_token_response(scheduled_batch)
 
                     self.resource_manager.prepare_resources(scheduled_batch)
-
                     if self.kv_cache_transceiver and self.guided_decoder:
                         self.guided_decoder.init_disagg_gen_requests(
                             scheduled_batch)
@@ -946,10 +946,18 @@ class PyExecutor:
                             if self.guided_decoder is not None:
                                 self.guided_decoder.rollback_rejected_tokens(
                                     scheduled_batch)
-                            self.drafter.prepare_draft_tokens(
-                                scheduled_batch, self.resource_manager)
 
-                    batch_outputs = self._forward_step(scheduled_batch)
+                    run_parallel_spec_dec = self._get_parallel_spec_dec_mode(
+                        scheduled_batch.generation_requests)
+                    if run_parallel_spec_dec:
+                        batch_outputs = asyncio.run(
+                            self._parallel_spec_dec_forward_step(
+                                scheduled_batch))
+                    else:
+                        if self.drafter is not None and self.use_spec_decode:
+                            self._prepare_draft_tokens(scheduled_batch)
+                        batch_outputs = self._forward_step(scheduled_batch)
+
                     self._execute_guided_decoder(scheduled_batch,
                                                  batch_outputs['logits'])
 
@@ -1395,6 +1403,49 @@ class PyExecutor:
 
         return ctx_transmission_reqs
 
+    def _prepare_draft_tokens(self, scheduled_batch):
+        # External drafters can be configured to only make a single draft call when running with TP > 1
+        single_draft_call = getattr(self.drafter, 'single_draft_call',
+                                    lambda: False)()
+        if single_draft_call:
+            # Only rank 0 prepares draft tokens
+            if self.dist.rank == 0:
+                self.drafter.prepare_draft_tokens(scheduled_batch,
+                                                  self.resource_manager)
+            # Broadcast to other ranks
+            if self.dist.tp_size > 1:
+                if self.dist.rank == 0:
+                    draft_data = {}
+                    for req in scheduled_batch.generation_requests:
+                        draft_data[req.py_request_id] = req.py_draft_tokens
+                    self.dist.tp_broadcast(draft_data, root=0)
+                else:
+                    draft_data = self.dist.tp_broadcast(None, root=0)
+                    for req in scheduled_batch.generation_requests:
+                        req.py_draft_tokens = draft_data[req.py_request_id]
+        else:
+            self.drafter.prepare_draft_tokens(scheduled_batch,
+                                              self.resource_manager)
+
+    async def _parallel_prepare_draft_tokens(self, scheduled_batch):
+        single_draft_call = getattr(self.drafter, 'single_draft_call',
+                                    lambda: False)()
+        if not single_draft_call or not hasattr(self.drafter,
+                                                'async_prepare_draft_tokens'):
+            raise ValueError(
+                "Parallel speculation must use an external drafter with async_prepare_draft_tokens implemented"
+            )
+        if self.dist.rank == 0:
+            draft_tokens = await self.drafter.async_prepare_draft_tokens(
+                scheduled_batch, self.resource_manager)
+        # Broadcast to other ranks
+        if self.dist.tp_size > 1:
+            if self.dist.rank == 0:
+                self.dist.tp_broadcast(draft_tokens, root=0)
+            else:
+                draft_tokens = self.dist.tp_broadcast(None, root=0)
+        return draft_tokens
+
     def _forward_step(self,
                       scheduled_requests,
                       new_tensors_device: Optional[SampleStateTensors] = None):
@@ -1702,3 +1753,56 @@ class PyExecutor:
         """Remove reqids of current requests from self.inflight_req_ids."""
         for req in scheduled_requests.all_requests():
             self.inflight_req_ids.erase(req.request_id)
+
+    def _get_parallel_spec_dec_mode(self, scheduled_requests):
+        run_parallel = False
+        if len(scheduled_requests):
+            run_parallel = scheduled_requests[
+                0].py_parallel_spec_dec_params is not None
+        # check that all requests in the batch have the same parallel spec dec mode
+        for req in scheduled_requests:
+            if (req.py_parallel_spec_dec_params is not None) != run_parallel:
+                raise ValueError(
+                    "Parallel spec dec must be enabled for all or none of the requests in the batch"
+                )
+        return run_parallel
+
+    async def _parallel_forward_step(self, scheduled_batch):
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._forward_step,
+                                          scheduled_batch)
+
+    async def _parallel_spec_dec_forward_step(self, scheduled_batch):
+        # Append previous draft tokens to request prefixes
+        for req in scheduled_batch.generation_requests:
+            # if running with post-verify, load previous draft tokens
+            if not req.py_parallel_spec_dec_params["pre_verify"]:
+                if len(req.py_parallel_spec_dec_params["old_draft_tokens"]
+                       ) == 0:
+                    logger.error(
+                        f"Cannot run post-verify as previous draft tokens for request {req.py_request_id} are empty. Switching to pre-verify."
+                    )
+                    req.py_parallel_spec_dec_params["pre_verify"] = True
+                else:
+                    req.py_draft_tokens = list(
+                        req.py_parallel_spec_dec_params["old_draft_tokens"])
+                    pad_length = self.max_draft_len - len(req.py_draft_tokens)
+                    req.py_draft_tokens.extend([req.py_end_id] * pad_length)
+
+        draft_task = self._parallel_prepare_draft_tokens(scheduled_batch)
+        target_task = self._parallel_forward_step(scheduled_batch)
+
+        draft_tokens, batch_outputs = await asyncio.gather(
+            draft_task, target_task)
+        for req in scheduled_batch.generation_requests:
+            req.py_draft_tokens = draft_tokens[req.py_request_id]
+
+        # Restore old draft for verification
+        for req in scheduled_batch.generation_requests:
+            old_draft_tokens = req.py_parallel_spec_dec_params[
+                "old_draft_tokens"]
+            req.py_parallel_spec_dec_params[
+                "old_draft_tokens"] = req.py_draft_tokens
+            req.py_draft_tokens = old_draft_tokens
+
+        return batch_outputs

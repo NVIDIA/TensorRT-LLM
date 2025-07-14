@@ -122,6 +122,7 @@ class GenerationExecutor(ABC):
         postproc_params: Optional[PostprocParams] = None,
         multimodal_params: Optional[MultimodalParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
+        parallel_spec_dec_params: Optional[dict] = None,
     ) -> GenerationResult:
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -145,7 +146,8 @@ class GenerationExecutor(ABC):
             kv_cache_retention_config=kv_cache_retention_config,
             disaggregated_params=disaggregated_params,
             multimodal_params=multimodal_params,
-            scheduling_params=scheduling_params)
+            scheduling_params=scheduling_params,
+            parallel_spec_dec_params=parallel_spec_dec_params)
         result = self.submit(request)
         # release memory in time
         if hasattr(request, "multimodal_params"):
