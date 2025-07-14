@@ -44,51 +44,115 @@
 namespace torch_ext
 {
 
-W4A16GemmRunner::W4A16GemmRunner(at::ScalarType activationDtype, int64_t quant_mode)
+finegrainedMixedDtypeGemmRunner::finegrainedMixedDtypeGemmRunner(
+    at::ScalarType activationDtype, at::ScalarType outputDtype, int64_t quant_mode)
     : mActivationDtype(activationDtype)
+    , mOutputDtype(outputDtype)
 {
     if (quant_mode == 0)
     {
         if (activationDtype == at::ScalarType::Half)
         {
+            if (outputDtype != activationDtype)
+            {
+                TORCH_CHECK(false, "Activation dtype needs to match Output stype", activationDtype);
+            }
             mGemmRunner = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<half,
                 cutlass::uint4b_t, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY, half, half, half>>();
         }
         else if (activationDtype == at::ScalarType::BFloat16)
         {
+            if (outputDtype != activationDtype)
+            {
+                TORCH_CHECK(false, "Activation dtype needs to match Output stype", activationDtype);
+            }
             mGemmRunner = std::make_shared<
                 tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<__nv_bfloat16, cutlass::uint4b_t,
                     cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16>>();
         }
+
+        else if (activationDtype == at::ScalarType::Float8_e4m3fn)
+        {
+            if (outputDtype == at::ScalarType::BFloat16)
+            {
+                mGemmRunner = std::make_shared<
+                    tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<__nv_fp8_e4m3, cutlass::uint4b_t,
+                        cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY, half, __nv_bfloat16, __nv_bfloat16>>();
+            }
+            else if (outputDtype == at::ScalarType::Half)
+            {
+                mGemmRunner
+                    = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<__nv_fp8_e4m3,
+                        cutlass::uint4b_t, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY, half, half, half>>();
+            }
+            else
+            {
+                TORCH_CHECK(false, "Unsupported output dtype for Float8_e4m3fn activation", outputDtype);
+            }
+        }
+        else
+        {
+            TORCH_CHECK(false, "Unsupported activation dtype", activationDtype);
+        }
     }
+
     else if (quant_mode == 1)
     {
         if (activationDtype == at::ScalarType::Half)
         {
+            if (outputDtype != activationDtype)
+            {
+                TORCH_CHECK(false, "Activation dtype needs to match Output stype", activationDtype);
+            }
             mGemmRunner = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<half,
                 cutlass::uint4b_t, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS, half, half, half>>();
         }
         else if (activationDtype == at::ScalarType::BFloat16)
         {
+            if (outputDtype != activationDtype)
+            {
+                TORCH_CHECK(false, "Activation dtype needs to match Output stype", activationDtype);
+            }
             mGemmRunner
                 = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<__nv_bfloat16,
                     cutlass::uint4b_t, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS, __nv_bfloat16,
                     __nv_bfloat16, __nv_bfloat16>>();
         }
+        else if (activationDtype == at::ScalarType::Float8_e4m3fn)
+        {
+            if (outputDtype == at::ScalarType::BFloat16)
+            {
+                mGemmRunner = std::make_shared<
+                    tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<__nv_fp8_e4m3, cutlass::uint4b_t,
+                        cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS, half, __nv_bfloat16, __nv_bfloat16>>();
+            }
+            else if (outputDtype == at::ScalarType::Half)
+            {
+                mGemmRunner = std::make_shared<
+                    tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<__nv_fp8_e4m3, cutlass::uint4b_t,
+                        cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS, half, half, half>>();
+            }
+            else
+            {
+                TORCH_CHECK(false, "Unsupported output dtype for Float8_e4m3fn activation", outputDtype);
+            }
+        }
     }
     else
     {
-        TORCH_CHECK(false, "Unsupported quant mode for W4A16GemmRunner: ", quant_mode);
+        TORCH_CHECK(false, "Unsupported quant mode for finegrainedMixedDtypeGemmRunner: ", quant_mode);
     }
 
-    TORCH_CHECK(mGemmRunner, "Failed to create W4A16 GEMM runner for activation type ", c10::toString(activationDtype));
+    TORCH_CHECK(mGemmRunner, "Failed to create finegrained Mixed Dtype GEMM runner for activation type ",
+        c10::toString(activationDtype));
     mConfigs = mGemmRunner->getConfigs(); // Get configs via the interface
-    TORCH_CHECK(!mConfigs.empty(), "Failed to get CUTLASS configs for W4A16 GEMM with activation type ",
+    TORCH_CHECK(!mConfigs.empty(), "Failed to get CUTLASS configs for finegrainedMixedDtype GEMM with activation type ",
         c10::toString(activationDtype));
 }
 
-at::Tensor W4A16GemmRunner::runGemm(at::Tensor const& A, at::Tensor const& B_packed, at::Tensor const& scales,
-    int64_t group_size_long, int64_t configIdx, std::optional<at::Tensor> bias, std::optional<at::Tensor> zeros) const
+at::Tensor finegrainedMixedDtypeGemmRunner::runGemm(at::Tensor const& A, at::Tensor const& B_packed,
+    at::Tensor const& scales, int64_t group_size_long, int64_t configIdx, std::optional<at::Tensor> bias,
+    std::optional<at::Tensor> zeros, double alpha) const
 {
     TORCH_CHECK(A.is_cuda() && B_packed.is_cuda() && scales.is_cuda(), "All input tensors must be on CUDA");
     TORCH_CHECK(A.scalar_type() == mActivationDtype, "Activation tensor A's dtype ", c10::toString(A.scalar_type()),
@@ -96,6 +160,8 @@ at::Tensor W4A16GemmRunner::runGemm(at::Tensor const& A, at::Tensor const& B_pac
     TORCH_CHECK(B_packed.scalar_type() == torch::kQUInt4x2 || B_packed.scalar_type() == torch::kInt8
             || B_packed.scalar_type() == torch::kUInt8,
         "B_packed must be quint4x2, int8, or uint8 (view of quantized data)");
+    // TORCH_CHECK(scales.scalar_type() == torch::kFloat16 || scales.scalar_type() == torch::kBFloat16,
+    //     "Scales must be FP16 or BF 16");
     TORCH_CHECK(A.is_contiguous() && B_packed.is_contiguous() && scales.is_contiguous(),
         "All input tensors (A, B_packed, scales) must be contiguous");
 
@@ -158,17 +224,17 @@ at::Tensor W4A16GemmRunner::runGemm(at::Tensor const& A, at::Tensor const& B_pac
 
     // Set output dtype based on activation dtype
     torch::ScalarType output_dtype;
-    if (mActivationDtype == at::ScalarType::Half)
+    if (mOutputDtype == at::ScalarType::Half)
     {
         output_dtype = torch::kFloat16;
     }
-    else if (mActivationDtype == at::ScalarType::BFloat16)
+    else if (mOutputDtype == at::ScalarType::BFloat16)
     {
         output_dtype = torch::kBFloat16;
     }
     else
     {
-        TORCH_CHECK(false, "Unsupported activation type for output dtype determination");
+        TORCH_CHECK(false, "Unsupported output dtype");
     }
 
     torch::Tensor C_tensor = torch::empty(output_shape_vec, A.options().dtype(output_dtype));
@@ -201,16 +267,15 @@ at::Tensor W4A16GemmRunner::runGemm(at::Tensor const& A, at::Tensor const& B_pac
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(A.device().index());
 
-    mGemmRunner->gemm(A_ptr, B_ptr, scales_ptr, zeros_ptr, bias_ptr,
-        1.0f, // alpha
-        C_ptr, M, N_orig, K, group_size, gemm_config_to_use, workspace_ptr, workspace_bytes, stream);
+    mGemmRunner->gemm(A_ptr, B_ptr, scales_ptr, zeros_ptr, bias_ptr, static_cast<float>(alpha), C_ptr, M, N_orig, K,
+        group_size, gemm_config_to_use, workspace_ptr, workspace_bytes, stream);
 
     return C_tensor;
 }
 
-int64_t W4A16GemmRunner::getNumConfigs() const
+int64_t finegrainedMixedDtypeGemmRunner::getNumConfigs() const
 {
-    TORCH_CHECK(mGemmRunner, "W4A16GemmRunner not initialized properly.");
+    TORCH_CHECK(mGemmRunner, "finegrainedMixedDtypeGemmRunner not initialized properly.");
     return static_cast<int64_t>(mConfigs.size());
 }
 
@@ -218,8 +283,8 @@ int64_t W4A16GemmRunner::getNumConfigs() const
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.class_<torch_ext::W4A16GemmRunner>("W4A16GemmRunner")
-        .def(torch::init<at::ScalarType, int64_t>())
-        .def("run_gemm", &torch_ext::W4A16GemmRunner::runGemm)
-        .def("get_num_configs", &torch_ext::W4A16GemmRunner::getNumConfigs);
+    m.class_<torch_ext::finegrainedMixedDtypeGemmRunner>("finegrainedMixedDtypeGemmRunner")
+        .def(torch::init<at::ScalarType, at::ScalarType, int64_t>())
+        .def("run_gemm", &torch_ext::finegrainedMixedDtypeGemmRunner::runGemm)
+        .def("get_num_configs", &torch_ext::finegrainedMixedDtypeGemmRunner::getNumConfigs);
 }
