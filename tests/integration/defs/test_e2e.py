@@ -1996,7 +1996,7 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
             "image": [
                 ["ocean", "sky", "large", "waves", "shore", "blue"],
                 [
-                    "landscape", "rock", "landamark", "cliff", "surface",
+                    "landscape", "rock", "landmark", "formation", "smooth",
                     "mountain"
                 ],
                 ["highway", "vehicles", "traffic", "bus", "suburban"],
