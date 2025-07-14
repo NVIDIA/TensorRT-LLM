@@ -46,7 +46,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 )
 @optgroup.option("--backend",
                  type=click.Choice(ALL_SUPPORTED_BACKENDS),
-                 default=None,
+                 default="pytorch",
                  help="The backend to use when running benchmarking.")
 @optgroup.option(
     "--extra_llm_api_options",
