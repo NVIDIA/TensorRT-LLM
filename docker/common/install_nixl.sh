@@ -37,5 +37,6 @@ meson setup builddir \
 cd builddir && ninja install
 cd ../..
 rm -rf nixl*  # Remove NIXL source tree to save space
+rm  $CUDA_PATH/lib64/libcuda.so.1
 
 echo "export LD_LIBRARY_PATH=/opt/nvidia/nvda_nixl/lib/${ARCH_NAME}:/opt/nvidia/nvda_nixl/lib64:\$LD_LIBRARY_PATH" >> "${ENV}"
