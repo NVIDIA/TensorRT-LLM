@@ -92,10 +92,11 @@ Developer workflow for code contributions is as follows:
 
 3. Once the code changes are staged on the fork and ready for review, a [Pull Request](https://help.github.com/en/articles/about-pull-requests) (PR) can be [requested](https://help.github.com/en/articles/creating-a-pull-request) to merge the changes from a branch of the fork into a selected branch of upstream. PRs should typically target the `main` branch.
   * Creation of a PR creation kicks off the code review process.
-  * At least one TensorRT-LLM engineer will be assigned for the review. When the PR is under review, the label `Pending Review` will be added to the PR.
+  * At least one TensorRT-LLM engineer will be assigned for the review. When the PR is under review.
   * If changes are requested, then the reviewer will add the label `Changes Requested` to the PR.
   * Once changes are approved, CI will be launched to validate the change. When CI passes, the reviewer will merge the PR.
   * If CI reports any failures, it's up to the requester to fix any CI failures before requesting another review.
+  * An automatic comment will be generated with a checklist, that needs to be checked and resolved for merge.
 
 ### Automatic Reviewer Assignment
 
