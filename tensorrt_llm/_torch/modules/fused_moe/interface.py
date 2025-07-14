@@ -5,6 +5,7 @@ from typing import Dict, List, Optional
 import torch
 from torch import nn
 
+from ...distributed.ops import reducescatter
 from ...model_config import ModelConfig
 from .routing import BaseMoeRoutingMethod
 
@@ -151,3 +152,24 @@ class MoE(nn.Module):
         assert self._weights_created
         return self.quant_config is not None and self.quant_config.layer_quant_mode.has_w4a16_mxfp4(
         )
+
+    def reducescatter_or_allreduce(
+        self,
+        inputs,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        use_dp_padding: Optional[bool] = None,
+    ):
+        """
+        Common helper for TP and EP in subclasses of the MoE module.
+        """
+        outputs = inputs
+        if self.parallel_size > 1:
+            if self.use_dp:
+                outputs = reducescatter(
+                    inputs,
+                    self.mapping,
+                    dim=0,
+                    sizes=None if use_dp_padding else all_rank_num_tokens)
+            elif self.reduce_results:
+                outputs = self.all_reduce(inputs)
+        return outputs

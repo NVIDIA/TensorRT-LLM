@@ -18,13 +18,13 @@ from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (MoE, MoEWeightLoadingMode,
-                                 RenormalizeMoeRoutingMethod, TRTLLMGenFusedMoE,
-                                 create_moe,
+                                 RenormalizeMoeRoutingMethod, TritonFusedMoE,
+                                 TRTLLMGenFusedMoE, create_moe,
                                  create_renormalize_expert_load_balanced_logits)
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
-from ..utils import Fp4QuantizedTensor, disable_fp4_allgather
+from ..utils import Fp4QuantizedTensor
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              duplicate_kv_weight, filter_weights,
                              register_auto_model)
@@ -271,9 +271,7 @@ class MLPBlock(torch.nn.Module):
         # This is needed when using FP4 quantization because x_sf has different shape
         use_dp_padding = False
         if self.mapping.tp_size > 1 and all_rank_num_tokens is not None:
-            if (disable_fp4_allgather()
-                    and not self.experts.enable_alltoall) or isinstance(
-                        self.experts, TRTLLMGenFusedMoE):
+            if (isinstance(self.experts, (TRTLLMGenFusedMoE, TritonFusedMoE))):
                 t = allgather(t, self.mapping, dim=0, sizes=all_rank_num_tokens)
             # Use padding when the experts have quantization that produces x_sf with different shape
             # Check if the experts have FP4 quantization - check for all FP4 variants
@@ -752,50 +750,3 @@ class OpenAIMoeForCausalLM(DecoderModelForCausalLM[Transformer,
                 layer.next_layer_layernorm = self.model.norm
             else:
                 layer.next_layer_layernorm = self.model.block[idx + 1].attn.norm
-
-
-'''
-Since we don't have accuracy CI for Orangina, we should run several accuracy checks before we merge changes to the feature branch.
-
-
-
-//// BF16 Checkpoint + TP2 + EP2
-for moe_backend in CUTLASS TRTLLM TRITON;
-do
-printf '%s\n' 'enable_chunked_prefill: true' 'moe_backend: "'$moe_backend'"' > llm-config.yml
-cat ./llm-config.yml
-python -m tensorrt_llm.commands.eval --model /workspace/orangina-real-weight-pre-release_vv1 --tp_size 2 --ep_size 2 --extra_llm_api_options ./llm-config.yml  mmlu
-done
-
-
-
-(The MXFP4 checkpoint can be converted from customer's bf16 checkpoint with /home/scratch.dongfengy_sw/qi_quant.py
-
-//// MXFP4 Checkpoint Single GPU
-for moe_backend in CUTLASS TRTLLM TRITON;
-do
-printf '%s\n' 'enable_attention_dp: true' 'moe_backend: "'$moe_backend'"' > llm-config.yml
-cat ./llm-config.yml
-python -m tensorrt_llm.commands.eval --model ./orangina-real-weight-pre-release_vv1_trtllm_mxfp4_moeonly --tp_size 1 --ep_size 1 --extra_llm_api_options llm-config.yml mmlu
-done
-
-
-
-//// MXFP4 Checkpoint + Attention DP
-for moe_backend in CUTLASS TRTLLM;
-do
-printf '%s\n' 'enable_attention_dp: true' 'moe_backend: "'$moe_backend'"' > llm-config.yml
-cat ./llm-config.yml
-python -m tensorrt_llm.commands.eval --model ./orangina-real-weight-pre-release_vv1_trtllm_mxfp4_moeonly --tp_size 4 --ep_size 4 --extra_llm_api_options llm-config.yml mmlu
-done
-
-
-//// MXFP4 Dynamic Quant + Triton
-for moe_backend in TRITON;
-do
-printf '%s\n' 'enable_chunked_prefill: true' 'moe_backend: "'$moe_backend'"' > llm-config.yml
-cat ./llm-config.yml
-OVERRIDE_QUANT_ALGO=W4A16_MXFP4 python -m tensorrt_llm.commands.eval --model /workspace/orangina-real-weight-pre-release_vv1 --tp_size 1 --ep_size 1 --extra_llm_api_options ./llm-config.yml  mmlu
-OVERRIDE_QUANT_ALGO=W4A16_MXFP4 python -m tensorrt_llm.commands.eval --model /workspace/orangina-real-weight-pre-release_vv1 --tp_size 2 --ep_size 2 --extra_llm_api_options ./llm-config.yml  mmlu
-done
-'''

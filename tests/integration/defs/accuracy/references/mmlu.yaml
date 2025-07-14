@@ -242,3 +242,5 @@ microsoft/Phi-4-multimodal-instruct:
   - accuracy: 69.69
 microsoft/Phi-4-multimodal-instruct-long-rope:
   - accuracy: 65.98
+OpenAI/BF16:
+  - accuracy: 77.50
