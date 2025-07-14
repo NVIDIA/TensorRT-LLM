@@ -1,6 +1,6 @@
-from itertools import chain
-
-from ordered_set import OrderedSet
+import requests
+import json
+from typing import List
 
 from tensorrt_llm.logger import logger
 
@@ -27,9 +27,36 @@ class APIDrafter(Drafter):
         request_id: int,
         end_id: int,
         max_sequence_length: int,
-    ):
-        # TODO: Implement API endpoint call here
-        return []
+    ) -> List[int]:
+        try:
+            request_data = {
+                "prefix": prefix,
+                "request_id": request_id,
+                "end_id": end_id,
+                "max_sequence_length": max_sequence_length,
+            }
+            response = requests.post(
+                url=self.endpoint,
+                json=request_data,
+                headers={"Content-Type": "application/json"},
+                timeout=10,
+            )
+            
+            # check for unsuccessful response
+            if response.status_code != 200:
+                logger.warning(f"Failed to get draft tokens. API call failed for request {request_id} with status code {response.status_code} and message {response.text}")
+                return []
+            
+            result = response.json()
+            draft_tokens = result.get("draft_tokens", [])
+            #if len(draft_tokens) > self.max_draft_len:
+            #    draft_tokens = draft_tokens[:self.max_draft_len]
+            logger.debug(f"Retrieved draft tokens for request {request_id}")
+            return draft_tokens
+        
+        except Exception as e:
+            logger.warning(f"Failed to get draft tokens. API call failed for request {request_id} with error {e}")
+            return []
 
     def prepare_draft_tokens(
         self,
