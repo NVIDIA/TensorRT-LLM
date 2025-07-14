@@ -99,19 +99,15 @@ class TransferSession
 public:
     TransferSession(std::vector<Connection const*> connections, DataContext dataContext,
         executor::DataTransceiverState const& selfState, executor::DataTransceiverState otherState,
-        runtime::BufferManager& bufferManager)
+        runtime::BufferManager& bufferManager, LlmRequest const* llmRequest = nullptr)
         : mConnections(std::move(connections))
         , mDataContext(dataContext)
         , mSelfState(&selfState)
         , mOtherState(std::move(otherState))
         , mBufferManager(&bufferManager)
+        , mRequest(llmRequest)
     {
         TLLM_CHECK(!mConnections.empty());
-    }
-
-    [[nodiscard]] size_t getNumConnections() const
-    {
-        return mConnections.size();
     }
 
     [[nodiscard]] std::vector<Connection const*> const& getConnections() const
@@ -145,16 +141,6 @@ public:
         return *mBufferManager;
     }
 
-    void send(size_t connIdx, void const* data, size_t size)
-    {
-        mConnections[connIdx]->send(mDataContext, data, size);
-    }
-
-    void recv(size_t connIdx, void* data, size_t size)
-    {
-        mConnections[connIdx]->recv(mDataContext, data, size);
-    }
-
     void send(Connection const* conn, void const* data, size_t size)
     {
         conn->send(mDataContext, data, size);
@@ -165,12 +151,25 @@ public:
         conn->recv(mDataContext, data, size);
     }
 
+    [[nodiscard]] LlmRequest const& getLlmRequest() const
+    {
+        TLLM_CHECK(mRequest != nullptr);
+        return *mRequest;
+    }
+
+    // in DataSender, the LlmRequest is not available until the sendSync is called
+    void setLlmRequest(LlmRequest const& llmRequest)
+    {
+        mRequest = &llmRequest;
+    }
+
 private:
     std::vector<Connection const*> mConnections;
     DataContext mDataContext;
     executor::DataTransceiverState const* mSelfState; // stored in DataRequester/DataResponder
     executor::DataTransceiverState mOtherState;
     runtime::BufferManager* mBufferManager;
+    LlmRequest const* mRequest;
 };
 
 // Operators required for data transmission in specific communication protocols.

@@ -98,7 +98,8 @@ void DataSenderImpl::sendSync(LlmRequest const& llmRequest)
     auto it = mRequestToSession.find(llmRequest.mRequestId);
     TLLM_CHECK(it != mRequestToSession.end());
     auto& session = it->second;
-    mFormatter->format(session, llmRequest);
+    session.setLlmRequest(llmRequest);
+    mFormatter->format(session);
 }
 
 [[nodiscard]] executor::kv_cache::CommState const& DataSenderImpl::getCommState() const
@@ -115,7 +116,7 @@ void DataSenderImpl::setCommState(executor::kv_cache::CommState commState)
 {
     auto it = mRequestToSession.find(requestId);
     TLLM_CHECK(it != mRequestToSession.end());
-    return it->second.getNumConnections();
+    return it->second.getConnections().size();
 }
 
 void DataSenderImpl::release(LlmRequest::RequestIdType requestId)
@@ -215,8 +216,8 @@ void DataReceiverImpl::receiveSync(LlmRequest const& llmRequest)
     auto const& resource = getReceiveCacheResource(llmRequest);
     auto requestId = llmRequest.getContextPhaseParams().value().getReqId();
     TransferSession session(std::move(connections), DataContext{tagFromRequestId(requestId)}, mSelfState, contextState,
-        resource->mBufferManager);
-    mFormatter->unformat(session, llmRequest);
+        resource->mBufferManager, &llmRequest);
+    mFormatter->unformat(session);
 }
 
 void DataReceiverImpl::sendRequestInfo(executor::kv_cache::Connection const* connection, RequestInfo const& info)

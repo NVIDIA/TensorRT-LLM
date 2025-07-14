@@ -35,9 +35,9 @@ public:
         TLLM_CHECK(mCacheTransBufferManager);
     }
 
-    void format(TransferSession& session, LlmRequest const& llmRequest) override;
+    void format(TransferSession& session) override;
 
-    void unformat(TransferSession& session, LlmRequest const& llmRequest) override;
+    void unformat(TransferSession& session) override;
 
     [[nodiscard]] bool inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const override;
 

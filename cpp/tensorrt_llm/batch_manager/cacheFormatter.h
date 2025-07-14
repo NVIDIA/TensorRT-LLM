@@ -48,12 +48,12 @@ public:
     /// @brief Format the cache data into bytes for sending.
     /// @param session The transfer session.
     /// @param llmRequest The request object to which the data belongs.
-    virtual void format(TransferSession& session, LlmRequest const& llmRequest) = 0;
+    virtual void format(TransferSession& session) = 0;
 
     /// @brief Unformat the cache data from received bytes.
     /// @param session The transfer session.
     /// @param llmRequest The request object to which the data belongs.
-    virtual void unformat(TransferSession& session, LlmRequest const& llmRequest) = 0;
+    virtual void unformat(TransferSession& session) = 0;
 
     /// @brief Determine whether the sender is applicable to the source and target.
     /// @param selfConfig Source data arrangement.
@@ -94,9 +94,9 @@ public:
         TLLM_CHECK(mCacheTransBufferManager);
     }
 
-    void format(TransferSession& session, LlmRequest const& llmRequest) override;
+    void format(TransferSession& session) override;
 
-    void unformat(TransferSession& session, LlmRequest const& llmRequest) override;
+    void unformat(TransferSession& session) override;
 
     [[nodiscard]] bool inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const override;
 

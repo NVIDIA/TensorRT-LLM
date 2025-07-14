@@ -141,9 +141,10 @@ std::vector<executor::kv_cache::Connection const*> CacheFormatter::pickRecvConne
     return ret;
 }
 
-void CacheFormatter::format(TransferSession& session, LlmRequest const& llmRequest)
+void CacheFormatter::format(TransferSession& session)
 {
     NVTX3_SCOPED_RANGE(CacheFormatter_format);
+    auto const& llmRequest = session.getLlmRequest();
     TLLM_LOG_DEBUG(
         mpi::MpiComm::world().getRank(), "Start sending KV cache for request ID: %ld.", llmRequest.mRequestId);
 
@@ -401,9 +402,10 @@ void CacheFormatter::format(TransferSession& session, LlmRequest const& llmReque
         mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID:%ld ", llmRequest.mRequestId);
 }
 
-void CacheFormatter::unformat(TransferSession& session, LlmRequest const& llmRequest)
+void CacheFormatter::unformat(TransferSession& session)
 {
     NVTX3_SCOPED_RANGE(CacheFormatter_unformat);
+    auto const& llmRequest = session.getLlmRequest();
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "Start receiving KV cache for request ID: %ld, context request ID: %ld.", llmRequest.mRequestId,
         llmRequest.getContextPhaseParams().value().getReqId());

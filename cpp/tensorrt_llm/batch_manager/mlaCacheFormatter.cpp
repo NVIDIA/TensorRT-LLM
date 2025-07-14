@@ -87,9 +87,10 @@ bool MLACacheFormatter::needSendCache(
     return selfTpRank % (selfTPNum / destTPNum) == 0;
 }
 
-void MLACacheFormatter::format(TransferSession& session, LlmRequest const& llmRequest)
+void MLACacheFormatter::format(TransferSession& session)
 {
     NVTX3_SCOPED_RANGE(MLACacheFormatter_format);
+    auto const& llmRequest = session.getLlmRequest();
     TLLM_LOG_DEBUG(
         mpi::MpiComm::world().getRank(), "Start sending KV cache for request ID: %ld.", llmRequest.mRequestId);
     auto const& selfConfig = session.getSelfState().getCacheState().value();
@@ -279,9 +280,10 @@ void MLACacheFormatter::format(TransferSession& session, LlmRequest const& llmRe
         mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID: %ld.", llmRequest.mRequestId);
 }
 
-void MLACacheFormatter::unformat(TransferSession& session, LlmRequest const& llmRequest)
+void MLACacheFormatter::unformat(TransferSession& session)
 {
     NVTX3_SCOPED_RANGE(MLACacheFormatter_unformat);
+    auto const& llmRequest = session.getLlmRequest();
     TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently only supports beam width 1.");
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "Start receiving KV cache for request ID: %ld, context request ID: %ld.", llmRequest.mRequestId,
