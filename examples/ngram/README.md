@@ -90,7 +90,7 @@ python examples/summarize.py \
 
 ```bash
 python3 examples/llm-api/quickstart_advanced.py \
-    --spec_decode_nextn 4 \
+    --spec_decode_max_draft_len 4 \
     --max_matching_ngram_size 2 \
     --disable_overlap_scheduler \
     --disable_kv_cache_reuse
