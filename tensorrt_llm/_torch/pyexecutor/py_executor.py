@@ -2,14 +2,13 @@ import dataclasses
 import datetime
 import functools
 import gc
-import heapq
 import os
 import queue
 import threading
 import time
 import traceback
 import weakref
-from collections import deque, namedtuple
+from collections import deque
 from contextlib import contextmanager
 from typing import Dict, List, Optional, Union
 
@@ -23,7 +22,7 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
                                             RequestStage, RequestStats,
-                                            RequestType, SpecDecodingStats,
+                                            SpecDecodingStats,
                                             StaticBatchingStats)
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
@@ -34,9 +33,11 @@ from ..speculative.drafter import Drafter
 from .guided_decoder import GuidedDecoder
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
-                          LlmResponse, executor_request_to_llm_request)
+                          LlmResponse)
 from .model_engine import ModelEngine
-from .sampler import Sampler, SampleState, SampleStateTensors, TorchSampler
+from .request_fetcher import (SHUTDOWN_REQUEST_ID, RequestFetcher,
+                              RequestQueueItem)
+from .sampler import Sampler, SampleState, SampleStateTensors
 from .scheduler import RequestScheduler, ScheduledRequests
 
 # Environment variable to specify iteration ranges for profiling start/stop.
@@ -50,68 +51,6 @@ PROFILE_RECORD_GC_ENV_VAR_NAME = "TLLM_PROFILE_RECORD_GC"
 # Environment variable to enable PyTorch profiler tracing.
 # Set to a path to save detailed tracing of PyTorch operations.
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
-
-SHUTDOWN_REQUEST_ID = -1
-
-
-@dataclasses.dataclass
-class RequestQueueItem:
-    id: int
-    request: Optional[ExecutorRequest] = None
-    is_canceled_request: bool = False
-    query: Optional[list] = None  # only used in `StarAttention`
-
-    @property
-    def is_shutdown_request(self):
-        return self.id == SHUTDOWN_REQUEST_ID
-
-    @property
-    def is_normal_request(self):
-        return not (self.is_shutdown_request or self.is_canceled_request)
-
-
-def _get_from_request_queue(
-        request_queue,
-        timeout: Optional[datetime.timedelta]) -> List[RequestQueueItem]:
-    items = []
-    timeout_secs = timeout.total_seconds() if timeout is not None else None
-    try:
-        if request_queue.empty() and (timeout_secs is None or timeout_secs > 0):
-            # if queue is empty and want to wait, wait
-            items.append(request_queue.get(timeout=timeout_secs))
-        else:
-            # if not empty or don't want to wait, just return all items in queue
-            while True:
-                queue_item = request_queue.get_nowait()
-                items.append(queue_item)
-    except queue.Empty:
-        pass
-    return items
-
-
-def _get_from_waiting_queue(
-    waiting_queue: deque[RequestQueueItem],
-    max_req_count: int,
-) -> List[RequestQueueItem]:
-    """Safely extracts up to max_req_count items from a deque.
-
-    Args:
-        waiting_queue: The queue to pop items from.
-        max_req_count: Maximum items to retrieve. Returns empty list if <=0.
-
-    Returns:
-        List of retrieved items (may be shorter than max_req_count if queue empties first).
-    """
-    # Edge case handling
-    if max_req_count <= 0:  # Handles negative/zero counts
-        return []
-
-    items = []
-    req_count = 0
-    while req_count < max_req_count and waiting_queue:
-        items.append(waiting_queue.popleft())
-        req_count += 1
-    return items
 
 
 @functools.cache
@@ -285,10 +224,24 @@ class PyExecutor:
 
         self.is_shutdown = False
 
+        # request fetcher initialization
+        self.request_fetcher = RequestFetcher(
+            dist=self.dist,
+            request_queue=self.request_queue,
+            waiting_queue=self.waiting_queue,
+            active_requests=self.active_requests,
+            canceled_req_ids=self.canceled_req_ids,
+            enable_attention_dp=self.enable_attention_dp,
+            max_beam_width=self.max_beam_width,
+            max_num_active_requests=self.max_num_active_requests,
+            is_disaggregated=kv_cache_transceiver is not None,
+        )
+        self.request_fetcher.set_exclude_last_generation_logits(
+            self.disable_overlap_scheduler, self.sampler)
+
         self.stats_lock = threading.Lock()
         self.stats = []
         self.start_times = {}
-        self.new_active_requests_queue_latency_ms = 0
         self.gather_all_responses = False
 
         self.kv_cache_transceiver = kv_cache_transceiver
@@ -757,7 +710,8 @@ class PyExecutor:
                 if self.enable_iter_perf_stats:
                     iter_stats = self._get_init_iter_stats(
                         len(new_requests),
-                        self.new_active_requests_queue_latency_ms)
+                        self.request_fetcher.
+                        get_new_active_requests_queue_latency())
 
                 self._pad_attention_dp_dummy_request()
 
@@ -917,7 +871,8 @@ class PyExecutor:
                 if self.enable_iter_perf_stats:
                     iter_stats = self._get_init_iter_stats(
                         len(new_requests),
-                        self.new_active_requests_queue_latency_ms)
+                        self.request_fetcher.
+                        get_new_active_requests_queue_latency())
 
                 self._pad_attention_dp_dummy_request()
 
@@ -1059,7 +1014,8 @@ class PyExecutor:
                 if self.enable_iter_perf_stats:
                     iter_stats = self._get_init_iter_stats(
                         len(new_requests),
-                        self.new_active_requests_queue_latency_ms)
+                        self.request_fetcher.
+                        get_new_active_requests_queue_latency())
 
                 self._pad_attention_dp_dummy_request()
 
@@ -1191,162 +1147,18 @@ class PyExecutor:
             sampler_event=sampler_event,
         )
 
-    def _update_new_active_requests_queue_latency(
-            self, new_requests: List[RequestQueueItem]):
-        if self.enable_iter_perf_stats and self.dist.rank == 0:
-            now = time.time()
-            for req_item in new_requests:
-                if req_item.id in self.start_times:
-                    self.new_active_requests_queue_latency_ms += now - self.start_times.pop(
-                        req_item.id)
-
-    @nvtx_range("_broadcast_new_requests")
-    def _broadcast_new_requests(
-        self,
-        new_requests: List[RequestQueueItem],
-        py_request_objects: Optional[dict[str, tuple[str, dict]]] = None,
-    ) -> tuple[List[RequestQueueItem], Optional[dict[str, tuple[str, dict]]]]:
-        """Broadcasts new_requests and optional Python-only metadata (`py_request_objects`) across pipeline stages.
-           `py_request_objects` is a tuple of (attribute_name, {request_id: object}).
-        """
-        payloads = (new_requests, py_request_objects)
-
-        if not self.dist.has_pp:
-            return self.dist.broadcast(payloads, root=0)
-
-        # broadcast within first tp group before send/recv chain to other tp groups
-        if self.dist.tp_size > 1 and self.dist.is_first_pp_rank:
-            payloads = self.dist.tp_broadcast(payloads, root=0)
-
-        # tag = [0, num_micro_batches - 1] used for new_tokens send/recv
-        tag = self.num_micro_batches
-
-        # send payloads
-        if not self.dist.is_first_pp_rank:
-            payloads = self.dist.recv_object(self.dist.prev_pp_rank, tag)
-
-        if not self.dist.is_last_pp_rank:
-            self.dist.send_object(payloads, self.dist.next_pp_rank, tag)
-
-        return payloads
-
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(self) -> List[RequestQueueItem]:
-        if self.enable_attention_dp:
-            all_ranks_num_active_requests = []
-            responses_list = self.dist.tp_allgather(len(self.active_requests))
-            for num_active_requests in responses_list:
-                all_ranks_num_active_requests.append(num_active_requests)
-            total_num_active_requests = sum(all_ranks_num_active_requests)
-            total_max_num_active_requests = self.dist.tp_size * self.max_num_active_requests
-        else:
-            total_num_active_requests = len(self.active_requests)
-            total_max_num_active_requests = self.max_num_active_requests
-
-        timeout = None if (total_num_active_requests == 0) and len(
-            self.waiting_queue) == 0 else datetime.timedelta(0)
-        new_requests = []
-        if self.dist.rank == 0:
-            new_requests = _get_from_request_queue(self.request_queue, timeout)
-
-        if self.dist.rank == 0:
-            py_logits_post_processors = self._collect_py_objects_from_requests(
-                new_requests, "py_logits_post_processors")
-            py_multimodal_data = self._collect_py_objects_from_requests(
-                new_requests, "py_multimodal_data")
-            py_request_objects = tuple(
-                filter(None, [py_logits_post_processors, py_multimodal_data]))
-        else:
-            py_request_objects = None
-
-        if self.dist.rank == 0:
-            # Preserve original `new_requests` on rank 0 since it may contain
-            # Python-only objects (e.g., custom logits processors) not serializable by pybind.
-            _ = self._broadcast_new_requests(new_requests, py_request_objects)
-        else:
-            new_requests, py_request_objects = self._broadcast_new_requests(
-                new_requests, py_request_objects)
-
-        # drop requests arriving after shutdown
-        valid_new_requests = []
-        for req_item in new_requests:
-            if req_item.is_shutdown_request:
-                self.is_shutdown = True
-                break
-            elif req_item.is_canceled_request:
-                self.canceled_req_ids.append(req_item.id)
-            else:
-                valid_new_requests.append(req_item)
-        # Check if the beam width of the requests is equal to the max_beam_width
-        for req_item in valid_new_requests:
-            assert req_item.request.sampling_config.beam_width == self.max_beam_width, f"Request beam width {req_item.request.sampling_config.beam_width} is not equal to max_beam_width {self.max_beam_width}. This is not supported!"
-
-        if py_request_objects and (self.dist.tp_size > 1
-                                   or self.dist.has_pp) and self.dist.rank > 0:
-            for attr_name, req_obj_dict in py_request_objects:
-                self._attach_py_objects_to_requests(valid_new_requests,
-                                                    attr_name, req_obj_dict)
-
-        self.waiting_queue.extend(valid_new_requests)
-
-        new_requests = _get_from_waiting_queue(
-            self.waiting_queue,
-            total_max_num_active_requests - total_num_active_requests)
-
-        if not self.enable_attention_dp:
-            self._update_new_active_requests_queue_latency(new_requests)
-            new_requests = self._merge_requests(new_requests)
-            self.active_requests.extend(new_requests)
-            return new_requests
-
-        num_new_requests_all_ranks = len(new_requests)
-        self.expected_num_active_requests = max(
-            (total_num_active_requests + num_new_requests_all_ranks +
-             self.dist.tp_size - 1) // self.dist.tp_size,
-            max(all_ranks_num_active_requests),
+        new_requests = self.request_fetcher.fetch_new_requests(
+            start_times=self.start_times,
+            enable_iter_perf_stats=self.enable_iter_perf_stats,
         )
 
-        self.has_context_request = False
-        new_requests_cur_rank = []
-        if new_requests != [] and self.expected_num_active_requests > all_ranks_num_active_requests[
-                self.dist.tp_rank]:
-            # Balance context tokens across ranks
-            HeapVal = namedtuple(
-                'HeapVal',
-                [
-                    'num_tokens',  # number of context tokens that have been added
-                    'num_requests',  # number of requests to be added
-                    'rank',  # rank
-                    'request_list',  # new requests that have been added
-                ],
-            )
-            all_ranks_new_requests_heap = [
-                HeapVal(0, self.expected_num_active_requests - val, tp_rank, [])
-                for tp_rank, val in enumerate(all_ranks_num_active_requests)
-            ]
-            new_requests_cur_rank = all_ranks_new_requests_heap[
-                self.dist.tp_rank].request_list
-            all_ranks_new_requests_heap = [
-                val for val in all_ranks_new_requests_heap
-                if val.num_requests > 0
-            ]
-            heapq.heapify(all_ranks_new_requests_heap)
-            new_requests = sorted(new_requests,
-                                  key=lambda x: len(x.request.input_token_ids),
-                                  reverse=True)
-            for req_item in new_requests:
-                val = heapq.heappop(all_ranks_new_requests_heap)
-                val = val._replace(
-                    num_tokens=val.num_tokens +
-                    len(req_item.request.input_token_ids),
-                    num_requests=val.num_requests - 1,
-                )
-                val.request_list.append(req_item)
-                if val.num_requests > 0:
-                    heapq.heappush(all_ranks_new_requests_heap, val)
-                elif val.rank == self.dist.tp_rank:
-                    break
+        self.is_shutdown = self.request_fetcher.is_shutdown
+        self.expected_num_active_requests = self.request_fetcher.get_expected_num_active_requests(
+        )
 
+<<<<<<< HEAD
             # In disaggregated serving, we might get either context request or
             # generation request. In IFB, we only get context request from request queue
             # In IFB, we only get context request from request queue
@@ -1368,6 +1180,9 @@ class PyExecutor:
         new_requests_cur_rank = self._merge_requests(new_requests_cur_rank)
         self.active_requests.extend(new_requests_cur_rank)
         return new_requests_cur_rank
+=======
+        return new_requests
+>>>>>>> e173f8665 (Refactor fetching request logic)
 
     def _add_kv_cache_events(self):
         kv_cache_manager = self.resource_manager.resource_managers.get(
@@ -1377,149 +1192,6 @@ class PyExecutor:
         # Flush iteration events at each iteration to ensure that events have enough time
         # to be transferred to main thread when user needs them.
         kv_cache_manager.flush_iteration_events()
-
-    def _collect_py_objects_from_requests(
-            self, requests: list[RequestQueueItem],
-            attribute_name: str) -> Optional[tuple[str, dict]]:
-        """WAR to gather dynamic Python-only attributes (e.g., custom logits processors)
-        that cannot be handled by pybind serialization during MP communication.
-
-        Returns:
-            A tuple of (attribute_name, {request_id: object}) or None.
-        """
-        req_id_to_obj = {}
-        for item in requests:
-            if not item.is_normal_request:
-                continue
-            obj = getattr(item.request, attribute_name, None)
-            if obj is not None:
-                req_id_to_obj[item.id] = obj
-        return None if not req_id_to_obj else (attribute_name, req_id_to_obj)
-
-    def _attach_py_objects_to_requests(self, requests: list[RequestQueueItem],
-                                       attribute_name: str,
-                                       py_request_objects: dict):
-        """Attaches Python-only objects (e.g., dynamic attributes not handled by pybind)
-        to each request.
-        """
-        for item in requests:
-            py_obj = py_request_objects.get(item.id)
-            if py_obj is not None:
-                setattr(item.request, attribute_name, py_obj)
-
-    def _partition_context(self, ctx_ids_list):
-        ctx_ids = torch.tensor(ctx_ids_list).unsqueeze(0)
-        ctx_len = ctx_ids.shape[-1]
-        block_size = self.dist.cp_config['block_size']
-        if block_size is None:
-            block_size = ctx_len // self.dist.cp_size
-        anchor_block_size = self.dist.cp_config['cp_anchor_size']
-        if anchor_block_size is None:
-            anchor_block_size = block_size
-
-        assert anchor_block_size <= block_size, f'cp_anchor_size {anchor_block_size} should be smaller than block_size {block_size}'
-        padding = 0
-        if ctx_len % block_size != 0:
-            padding = block_size - (ctx_len % block_size)
-            assert padding <= ctx_len, f'block size is too large for context, please set it smaller'
-            ctx_ids = torch.cat(
-                (ctx_ids, torch.zeros_like(ctx_ids)[:, :padding]), dim=-1)
-        position_ids = torch.arange(0, ctx_ids.shape[-1]).unsqueeze(0)
-
-        ctx_ids_blocks = torch.tensor_split(
-            torch.stack(ctx_ids.split(block_size, dim=-1)), self.dist.cp_size)
-        position_ids_blocks = torch.tensor_split(
-            torch.stack(position_ids.split(block_size, dim=-1)),
-            self.dist.cp_size)
-        if self.dist.cp_rank != 0:
-            ctx_blocks, position_blocks = [
-                ctx_ids_blocks[0][0].tolist()[0][:anchor_block_size]
-            ], [position_ids_blocks[0][0].tolist()[0][:anchor_block_size]]
-        else:
-            ctx_blocks, position_blocks = [], []
-
-        for idx in range(len(ctx_ids_blocks[self.dist.cp_rank])):
-            ctx_block = ctx_ids_blocks[self.dist.cp_rank][idx]
-            position_block = position_ids_blocks[self.dist.cp_rank][idx]
-            ctx_blocks.append(ctx_block.tolist()[0])
-            position_blocks.append(position_block.tolist()[0])
-        return ctx_blocks, position_blocks, padding
-
-    def _merge_star_attention_requests(self,
-                                       new_requests: list[RequestQueueItem]):
-        result = []
-        for req_item in new_requests:
-            req_id, exe_req, query_token_ids = req_item.id, req_item.request, req_item.query
-            ctx_len0 = len(exe_req.input_token_ids)
-            ctx_blocks, position_blocks, last_block_padding_num = [
-                exe_req.input_token_ids
-            ], [[i for i in range(ctx_len0)]], 0
-            ctx_blocks, position_blocks, last_block_padding_num = self._partition_context(
-                exe_req.input_token_ids)
-            if self.dist.cp_rank == self.dist.cp_size - 1 and last_block_padding_num > 0:
-                ctx_blocks[-1] = ctx_blocks[-1][:-last_block_padding_num]
-                position_blocks[-1] = position_blocks[
-                    -1][:-last_block_padding_num]
-            #if has query
-            if query_token_ids:
-                ctx_blocks.append(query_token_ids)
-                position_blocks.append([
-                    i for i in range(ctx_len0, ctx_len0 + len(query_token_ids))
-                ])
-
-            # insert the dummy block to align the number of ctx iterations of each rank
-            block_size = self.dist.cp_config['block_size']
-            total_blocks = (ctx_len0 + block_size - 1) // block_size
-            num_blocks_per_rank = (
-                total_blocks + self.dist.cp_size -
-                1) // self.dist.cp_size + 1  # 1 for query block
-            if len(ctx_blocks) == num_blocks_per_rank:
-                ctx_blocks.insert(1, [])
-                position_blocks.insert(1, [])
-            elif len(ctx_blocks) == num_blocks_per_rank + 1:
-                # anchor + ctx_blocks + qry_block
-                pass
-            else:
-                print(
-                    f'rank = {self.dist.cp_rank}, len(ctx_blocks)  = {len(ctx_blocks) }, num_blocks_per_rank = {num_blocks_per_rank}'
-                )
-                assert False, f'invalid context partition'
-
-            # fake data for scheduler
-            ctx_blocks_list = [0] * (block_size +
-                                     self.dist.cp_config['cp_anchor_size'])
-
-            req = executor_request_to_llm_request(
-                req_id, exe_req, self._should_exclude_last_generation_logits(),
-                ctx_blocks_list)
-            req.gen_iters = 0
-            req.ctx_iters = 0
-            req.ctx_blocks = ctx_blocks
-            req.ctx_position_blocks = position_blocks
-            req.query_id = query_token_ids
-
-            result.append(req)
-
-        return result
-
-    @nvtx_range("_merge_requests")
-    def _merge_requests(self, new_requests: list[RequestQueueItem]):
-        cp_config = self.dist.cp_config
-        if 'cp_type' in cp_config:
-            cp_type = cp_config['cp_type']
-            if cp_type == 'star_attention':
-                return self._merge_star_attention_requests(new_requests)
-            elif cp_type == 'ring_attention':
-                raise NotImplementedError("ring attention not implemented yet")
-            else:
-                raise NotImplementedError(f'unsupport cp type {cp_type}')
-        else:
-            return [
-                executor_request_to_llm_request(
-                    req_item.id, req_item.request,
-                    self._should_exclude_last_generation_logits())
-                for req_item in new_requests
-            ]
 
     @nvtx_range("_schedule")
     def _schedule(self):
@@ -1911,7 +1583,8 @@ class PyExecutor:
                     requests_to_terminate.append(request)
             else:
                 new_active_requests.append(request)
-        self.active_requests = new_active_requests
+        self.active_requests.clear()
+        self.active_requests.extend(new_active_requests)
         self._enqueue_responses(new_responses)
         for request in requests_to_terminate:
             self._terminate_request(request)
@@ -1971,19 +1644,3 @@ class PyExecutor:
         """Remove reqids of current requests from self.inflight_req_ids."""
         for req in scheduled_requests.all_requests():
             self.inflight_req_ids.erase(req.request_id)
-
-    def _should_exclude_last_generation_logits(self) -> bool:
-        # When overlap scheduler is enabled then when starting to handle a new prompt,
-        # sample_async is called twice before the first call to update_requests:
-        # - 1st time as a context request that handles on the 1st generated token
-        # - 2nd time as a generation request that handles on the 2nd generated token.
-        # and only after these two calls the sampler's update_request method is called.
-        # So in a sampler that works by the expected flow of handling the logits in
-        # sample_async (TorchSampler is an anomaly that instead does that on
-        # update_requests), every update_request doesn't handle the newest token, but one
-        # before it. Since all these calls work on the same request object, then its
-        # logits storage contains the logits of both the token update_requests should work
-        # on, and also its next token. Thus, excluding the last generation logits from any
-        # getter is required, when not using TorchSampler.
-        return not self.disable_overlap_scheduler and not isinstance(
-            self.sampler, TorchSampler)
