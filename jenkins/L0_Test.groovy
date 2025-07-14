@@ -437,6 +437,8 @@ def DEBUG_MODE = "debug"
 @Field
 def DETAILED_LOG = "detailed_log"
 @Field
+def ONLY_DOCS_FILE_CHANGED = "only_docs_file_changed"
+@Field
 def testFilter = [
     (REUSE_STAGE_LIST): null,
     (ENABLE_SKIP_TEST): false,
@@ -453,6 +455,7 @@ def testFilter = [
     (DEBUG_MODE): false,
     (AUTO_TRIGGER_TAG_LIST): [],
     (DETAILED_LOG): false,
+    (ONLY_DOCS_FILE_CHANGED): false,
 ]
 
 @Field
@@ -2165,6 +2168,12 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         }
     }
 
+    if (testFilter[(ONLY_DOCS_FILE_CHANGED)]) {
+        echo "Only docs files are changed, run doc build stage only."
+        parallelJobsFiltered = docBuildJobs
+        println parallelJobsFiltered.keySet()
+    }
+
     // Check --stage-list, only run the stages in stage-list.
     if (testFilter[TEST_STAGE_LIST] != null) {
         echo "Use TEST_STAGE_LIST for filtering. Stages: ${testFilter[(TEST_STAGE_LIST)]}."
@@ -2259,7 +2268,8 @@ pipeline {
         {
             when {
                 expression {
-                    env.targetArch == X86_64_TRIPLE  // Only execute the check if running on x86
+                    // Only run the test list validation when necessary
+                    env.targetArch == X86_64_TRIPLE && testFilter[ONLY_DOCS_FILE_CHANGED] == false
                 }
             }
             steps
