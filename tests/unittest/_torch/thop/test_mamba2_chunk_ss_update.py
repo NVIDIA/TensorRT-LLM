@@ -21,6 +21,8 @@ from einops import rearrange, repeat
 from utils.torch_ref import (selective_state_update_ref,
                              ssd_chunk_scan_combined_ref)
 
+from tensorrt_llm._torch.modules.mamba.mamba2_metadata import \
+    cu_seqlens_to_chunk_indices_offsets
 from tensorrt_llm._torch.modules.mamba.selective_state_update import \
     selective_state_update
 from tensorrt_llm._torch.modules.mamba.ssd_combined import \
@@ -30,51 +32,58 @@ from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 
 
 @pytest.mark.parametrize(
-    "dim, headdim, ngroups, dstate, req_type, dtype, batch_size, max_seq_len, has_z, remove_padding, paged_cache",
+    "dim, headdim, ngroups, dstate, req_type, dtype, batch_size, max_seq_len, has_z, remove_padding, paged_cache, use_initial_states",
     # dim parametrization
     list(
         product([1024, 2048, 5120], [64], [1], [128], ['context', 'generation'],
-                ['bfloat16'], [3], [16], [False], [True], [False])) +
+                ['bfloat16'], [3], [16], [False], [True], [False], [False])) +
     # headdim parametrization
     list(
         product([2048], [32, 64, 128, 256], [1], [128],
                 ['context', 'generation'], ['bfloat16'], [3], [16], [False],
-                [True], [False])) +
+                [True], [False], [False])) +
     # ngroups parametrization
     list(
         product([2048], [64], [1, 4], [128], ['context', 'generation'],
-                ['bfloat16'], [3], [16], [False], [True], [False])) +
+                ['bfloat16'], [3], [16], [False], [True], [False], [False])) +
     # dstate parametrization
     list(
         product([2048], [64], [1], [64, 96, 128, 256],
                 ['context', 'generation'], ['bfloat16'], [3], [16], [False],
-                [True], [False])) +
+                [True], [False], [False])) +
     # dtype parametrization
     list(
         product([2048], [64], [1], [128], ['context', 'generation'],
                 ['float16', 'bfloat16', 'float32'], [3], [16], [False], [True],
-                [False])) +
+                [False], [False])) +
     # batch_size parametrization
     list(
         product([2048], [64], [1], [128], ['context', 'generation'],
-                ['bfloat16'], [1, 2, 8, 16], [16], [False], [True], [False])) +
+                ['bfloat16'], [1, 2, 8, 16], [16], [False], [True], [False],
+                [False])) +
     # max_seq_len parametrization
     list(
         product([2048], [64], [1], [128], ['context', 'generation'],
                 ['bfloat16'], [3], [32, 64, 256, 2048, 16384], [False], [True],
-                [False])) +
+                [False], [False])) +
     # has_z parametrization
     list(
         product([2048], [64], [1], [128], ['context', 'generation'],
-                ['bfloat16'], [3], [32], [True, False], [True], [False])) +
+                ['bfloat16'], [3], [32], [True, False], [True], [False],
+                [False])) +
     # remove_padding parametrization
     list(
         product([2048], [64], [1], [128], ['context', 'generation'],
-                ['bfloat16'], [3], [32], [False], [True, False], [False])) +
+                ['bfloat16'], [3], [32], [False], [True, False], [False],
+                [False])) +
     # paged_cache parametrization (relevant for generation only)
     list(
         product([2048], [64], [1], [128], ['generation'], ['bfloat16'], [3],
-                [32], [False], [False], [True, False])) +
+                [32], [False], [False], [True, False], [False])) +
+    # use_initial_states parametrization (relevant for context only and remove_padding=True)
+    list(
+        product([2048], [64], [1], [128], ['context'], ['bfloat16'], [3], [32],
+                [False], [True], [False], [True, False])) +
     # long sequence test to cover the int overflow issue
     [
         pytest.param(
@@ -89,6 +98,7 @@ from tensorrt_llm.llmapi.utils import get_total_gpu_memory
             False,
             False,
             False,
+            False,
             marks=pytest.mark.skipif(
                 get_total_gpu_memory(0) < 68 * 1024**3,
                 reason=
@@ -97,7 +107,8 @@ from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 def test_mamba2_chunk_scan_selective_state_update(dim, headdim, ngroups, dstate,
                                                   req_type, dtype, batch_size,
                                                   max_seq_len, has_z,
-                                                  remove_padding, paged_cache):
+                                                  remove_padding, paged_cache,
+                                                  use_initial_states):
     # configs
     device = "cuda"
     seq_len = max_seq_len if req_type == 'context' else 1
@@ -168,6 +179,8 @@ def test_mamba2_chunk_scan_selective_state_update(dim, headdim, ngroups, dstate,
     D = torch.randn(nheads, device=device)
     if has_z:
         z = torch.randn_like(x)
+    if use_initial_states:
+        initial_states = state.clone()
 
     if req_type == 'generation':
         # remove the seqlen dimension
@@ -193,8 +206,13 @@ def test_mamba2_chunk_scan_selective_state_update(dim, headdim, ngroups, dstate,
     C_ref = C.detach().clone()
     D_ref = D.detach().clone()
     z_ref = z.detach().clone() if has_z else None
+    initial_states_ref = state_ref.clone() if use_initial_states else None
 
     if req_type == "context":
+        if use_initial_states:
+            assert remove_padding
+            chunk_indices, chunk_offsets = cu_seqlens_to_chunk_indices_offsets(
+                cu_seqlens, chunk_size, input_seq_len)
         out, ssm_state = mamba_chunk_scan_combined(
             x,
             dt,
@@ -205,6 +223,9 @@ def test_mamba2_chunk_scan_selective_state_update(dim, headdim, ngroups, dstate,
             D=D,
             z=z if has_z else None,
             dt_bias=dt_bias,
+            initial_states=initial_states if use_initial_states else None,
+            chunk_indices=chunk_indices if use_initial_states else None,
+            chunk_offsets=chunk_offsets if use_initial_states else None,
             seq_idx=seq_idx if remove_padding else None,
             cu_seqlens=cu_seqlens if remove_padding else None,
             dt_softplus=delta_softplus,
@@ -273,7 +294,10 @@ def test_mamba2_chunk_scan_selective_state_update(dim, headdim, ngroups, dstate,
                     D=D_ref,
                     z=z_ref[:, start:end, ...] if has_z else None,
                     dt_bias=dt_bias_ref,
-                    dt_softplus=delta_softplus)
+                    dt_softplus=delta_softplus,
+                    initial_states=initial_states_ref[i:i + 1, ...]
+                    if use_initial_states else None,
+                )
                 out_ref[0, start:end, ...] = part_out_ref.squeeze(0)
                 state_ref[i, ...] = part_state_ref.squeeze(0)
         elif long_context:
@@ -295,7 +319,10 @@ def test_mamba2_chunk_scan_selective_state_update(dim, headdim, ngroups, dstate,
                     D=D_ref,
                     z=z_ref[i:i + 1, ...] if has_z else None,
                     dt_bias=dt_bias_ref,
-                    dt_softplus=delta_softplus)
+                    dt_softplus=delta_softplus,
+                    initial_states=initial_states_ref[i:i + 1, ...]
+                    if use_initial_states else None,
+                )
                 out_ref[i, ...] = part_out_ref.squeeze(0)
                 state_ref[i, ...] = part_state_ref.squeeze(0)
         else:
@@ -309,7 +336,10 @@ def test_mamba2_chunk_scan_selective_state_update(dim, headdim, ngroups, dstate,
                 D=D_ref,
                 z=z_ref if has_z else None,
                 dt_bias=dt_bias_ref,
-                dt_softplus=delta_softplus)
+                dt_softplus=delta_softplus,
+                initial_states=initial_states_ref
+                if use_initial_states else None,
+            )
     elif req_type == 'generation':
         out_ref = selective_state_update_ref(state_ref,
                                              x_ref,
