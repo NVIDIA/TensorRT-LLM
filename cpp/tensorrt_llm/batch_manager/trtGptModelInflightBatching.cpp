@@ -284,16 +284,15 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
                 cacheSizeBytesPerTokenPerWindow[windowSize] = cacheSizeBytesPerToken;
             }
 
-            return std::accumulate(cacheSizeBytesPerTokenPerWindow.cbegin(), cacheSizeBytesPerTokenPerWindow.cend(),
-                SizeType32{0}, [](SizeType32 acc, auto const cost) { return acc + cost.second; });
+            return cacheSizeBytesPerTokenPerWindow;
         };
         auto cacheTransceiverConfig
             = executorConfig.getCacheTransceiverConfig().value_or(executor::CacheTransceiverConfig());
 
-        auto const cacheSizebytesPerToken = calculateCacheSizePerToken(
+        auto const cacheSizeBytesPerTokenPerWindow = calculateCacheSizePerToken(
             mModelConfig, mWorldConfig, getMaxAttentionWindowVec(), mModelConfig.useCrossAttention(), 2);
         auto cacheTransPreAllocaSize = kv_cache_manager::CacheTransBufferManager::preAllocBufferSize(
-            cacheSizebytesPerToken, cacheTransceiverConfig);
+            cacheSizeBytesPerTokenPerWindow, cacheTransceiverConfig);
 
         auto const [freePrimaryMemBytes, freeSecondaryMemBytes]
             = BaseKVCacheManager::calculateFreeMemBytes(mRuntime->getBufferManager(), kvCacheConfig);
@@ -905,8 +904,9 @@ void TrtGptModelInflightBatching::forwardSync()
             {
                 // TODO: skip if sending layer-wise
                 {
-                    TLLM_CHECK_WITH_INFO(
-                        mCacheTransceiver, "Disaggregated serving is not enabled, please check the configuration.");
+                    TLLM_CHECK_WITH_INFO(mCacheTransceiver,
+                        "Disaggregated serving is not enabled, please check the configuration of "
+                        "cacheTransceiverConfig.");
                     mCacheTransceiver->respondAndSendAsync(llmReq.get());
                 }
                 mSeqSlotManager->freeSequenceSlot(llmReq->mRequestId);
@@ -1806,8 +1806,8 @@ void TrtGptModelInflightBatching::executeStep(
         bufferCast<void*>(*mBuffers[bufferId]->transformerBuffers->contextProgressHost)[0] = progress.get();
         if (progress)
         {
-            TLLM_CHECK_WITH_INFO(
-                mCacheTransceiver, "Disaggregated serving is not enabled, please check the configuration.");
+            TLLM_CHECK_WITH_INFO(mCacheTransceiver,
+                "Disaggregated serving is not enabled, please check the configuration of cacheTransceiverConfig.");
             mCacheTransceiver->respondAndSendLayerWise(layerWiseRequests, progress);
         }
     }
