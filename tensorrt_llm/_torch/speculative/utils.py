@@ -129,7 +129,7 @@ def get_spec_drafter(model_engine):
     if spec_config.spec_dec_mode.is_user_provided():
         return spec_config.drafter
     if spec_config.spec_dec_mode.is_external_api():
-        return APIDrafter(spec_config, spec_config.endpoint)
+        return APIDrafter(spec_config)
     return None
 
 

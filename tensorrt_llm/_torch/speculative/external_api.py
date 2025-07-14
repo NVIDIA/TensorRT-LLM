@@ -1,6 +1,6 @@
 import requests
 import json
-from typing import List
+from typing import List, Optional
 
 from tensorrt_llm.logger import logger
 
@@ -14,12 +14,42 @@ class APIDrafter(Drafter):
     def __init__(
         self,
         spec_config: "ExternalAPIConfig",
-        endpoint: str,
     ):
         super().__init__(spec_resource_manager=None)
         self.max_draft_len = spec_config.max_draft_len
-        assert endpoint is not None, "API endpoint is required for external API speculative decoding."
-        self.endpoint = endpoint
+        self.endpoint = spec_config.endpoint
+        assert self.endpoint is not None, "API endpoint is required for external API speculative decoding."
+        self.template = spec_config.template if spec_config.template is not None else {}
+        self.response_field = spec_config.response_field if spec_config.response_field is not None else "draft_tokens"
+    
+    def get_nested_field_from_response(self, response: dict) -> List[int]:
+        keys = self.response_field.split(".")
+        current = response
+
+        for key in keys:
+            try:
+                if key.isdigit():
+                    key = int(key)
+                    if isinstance(current, list) and 0 <= key < len(current):
+                        current = current[key]
+                    else:
+                        logger.warning(f"Response field {self.response_field} is a invalid for response {response}. Index {key} is invalid.")
+                        return []
+                else:
+                    if isinstance(current, dict) and key in current:
+                        current = current[key]
+                    else:
+                        logger.warning(f"Response field {self.response_field} is a invalid for response {response}. Index {key} is invalid.")
+                        return []
+            
+            except (KeyError, ValueError, IndexError):
+                logger.warning(f"Response field path is invalid: {self.response_field}")
+                return []
+        
+        if not isinstance(current, list):
+            logger.warning(f"API response '{self.response_field}' must be a list. For request {request_id}, got type: {type(current)}")
+            return []
+        return current
     
     def get_draft_tokens(
         self,
@@ -35,6 +65,8 @@ class APIDrafter(Drafter):
                 "end_id": end_id,
                 "max_sequence_length": max_sequence_length,
             }
+            if self.template:
+                request_data.update(self.template)            
             response = requests.post(
                 url=self.endpoint,
                 json=request_data,
@@ -48,14 +80,19 @@ class APIDrafter(Drafter):
                 return []
             
             result = response.json()
-            draft_tokens = result.get("draft_tokens", [])
-            #if len(draft_tokens) > self.max_draft_len:
-            #    draft_tokens = draft_tokens[:self.max_draft_len]
+            draft_tokens = self.get_nested_field_from_response(result)
+            if len(draft_tokens) > self.max_draft_len:
+                draft_tokens = draft_tokens[:self.max_draft_len]
             logger.debug(f"Retrieved draft tokens for request {request_id}")
             return draft_tokens
         
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse JSON response for request {request_id}: {e}")
+            logger.debug(f"Raw response: {response.text[:500]}...")
+            return []
+
         except Exception as e:
-            logger.warning(f"Failed to get draft tokens. API call failed for request {request_id} with error {e}")
+            logger.warning(f"Failed to get draft tokens. API call failed for request {request_id} with the following error: {e}")
             return []
 
     def prepare_draft_tokens(

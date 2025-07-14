@@ -348,8 +348,17 @@ class ExternalAPIConfig(DecodingBaseConfig):
     Arguments:
         endpoint: str
             The endpoint of the custom drafter from which to get the draft tokens.
+        template: dict
+            The template of the request body. Can be used to include additional fields in the request body.
+        response_field: str
+            The field of the response body from which to get the draft tokens.
+            If not provided, the default field "draft_tokens" is used.
+            The response body is expected to be a list of draft tokens.
+            Can be nested, e.g. "draft_tokens.0.tokens" to get draft tokens from response["draft_tokens"][0]["tokens"].
     """
     endpoint: str
+    template: Optional[dict] = None
+    response_field: Optional[str] = None
 
     @classmethod
     def from_dict(cls, data: dict):
