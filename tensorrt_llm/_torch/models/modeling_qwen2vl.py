@@ -10,6 +10,7 @@ from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
+from ..._utils import nvtx_range_debug
 from ...functional import RopeEmbeddingUtils, RotaryScalingType
 from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
                        register_input_processor)
@@ -328,7 +329,9 @@ class Qwen2VLInputProcessorBase(InputProcessor):
         concat_cos_sin = torch.concatenate((cos, sin), axis=-1)
         concat_cos_sin = concat_cos_sin.reshape(concat_cos_sin.shape[0], -1)
         mrope_config = {}
-        mrope_config['mrope_rotary_cos_sin'] = concat_cos_sin.to('cpu')
+        mrope_config[
+            'mrope_position_ids_padding'] = mrope_position_ids_padding.to('cpu')
+        # mrope_config['mrope_rotary_cos_sin'] = concat_cos_sin.to('cpu')
         mrope_config['mrope_position_deltas'] = mrope_position_deltas.to(
             'cpu').to(torch.int32)
         return mrope_config
@@ -341,10 +344,9 @@ class Qwen2VLInputProcessorBase(InputProcessor):
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         text_prompt, mm_data, mm_processor_kwargs = inputs.get("prompt"), \
                         inputs.get("multi_modal_data", {}), inputs.get("mm_processor_kwargs", {})
-
-        processed_inputs = self._preprocess(text_prompt, mm_data,
-                                            mm_processor_kwargs).to(self.device)
-
+        with nvtx_range_debug("transformers input preprocess"):
+            processed_inputs = self._preprocess(
+                text_prompt, mm_data, mm_processor_kwargs).to(self.device)
         if not mm_data:
             fused_input_ids = processed_inputs['input_ids']
             return fused_input_ids.to(torch.int32).tolist(), {}
@@ -513,6 +515,23 @@ class Qwen2VLModelBase(PreTrainedModel):
         logger.info(f"{self.dtype=} {self.model_dtype=}")
         self.post_config()
         self.is_loaded = True
+        self.init_rotary_cos_sin_ori()
+
+    def init_rotary_cos_sin_ori(self):
+        _, rotary_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
+            num_pos=self.model_config.pretrained_config.max_position_embeddings,
+            dim=int(self.model_config.pretrained_config.hidden_size /
+                    self.model_config.pretrained_config.num_attention_heads),
+            theta=float(self.model_config.pretrained_config.rope_theta),
+            scale_type=RotaryScalingType.mrope)
+        self.rotary_cos_sin = torch.from_numpy(rotary_cos_sin).to(self.device)
+        self.rotary_cos_sin = self.rotary_cos_sin.reshape(
+            self.model_config.pretrained_config.max_position_embeddings,
+            int(self.model_config.pretrained_config.hidden_size /
+                self.model_config.pretrained_config.num_attention_heads / 2), 2)
+
+        self.cos_ori = self.rotary_cos_sin[:, :, 0]
+        self.sin_ori = self.rotary_cos_sin[:, :, 1]
 
     def load_weights(self, weights):
         self.llm.load_weights(weights)
@@ -567,6 +586,43 @@ class Qwen2VLModelBase(PreTrainedModel):
 
         return batched_mrope_config
 
+    def add_rotary_cos_sin(self, multimodal_params: List[MultimodalParams]):
+        if self.cos_ori.device != self.device:
+            self.cos_ori = self.cos_ori.to(self.device)
+            self.sin_ori = self.sin_ori.to(self.device)
+
+        for param in multimodal_params:
+            mrope_config = param.multimodal_data.get('mrope_config')
+            if mrope_config:
+                mrope_position_ids_padding = mrope_config.get(
+                    'mrope_position_ids_padding', None)
+                if mrope_position_ids_padding is None:
+                    continue
+                mrope_position_ids_padding = mrope_position_ids_padding.to(
+                    self.cos_ori.device)
+                cos = self.cos_ori[mrope_position_ids_padding]
+                sin = self.sin_ori[mrope_position_ids_padding]
+
+                mrope_section = [16, 24, 24]
+                cos = torch.cat([
+                    m[:, i % 3]
+                    for i, m in enumerate(cos.split(mrope_section, dim=-1))
+                ],
+                                dim=-1).unsqueeze(-1)
+                sin = torch.cat([
+                    m[:, i % 3]
+                    for i, m in enumerate(sin.split(mrope_section, dim=-1))
+                ],
+                                dim=-1).unsqueeze(-1)
+                concat_cos_sin = torch.concatenate((cos, sin), axis=-1)
+                concat_cos_sin = concat_cos_sin.reshape(concat_cos_sin.shape[0],
+                                                        -1)
+
+                mrope_config['mrope_rotary_cos_sin'] = concat_cos_sin.to(
+                    self.device)
+
+        return multimodal_params
+
     @torch.inference_mode()
     def forward(
         self,
@@ -586,6 +642,8 @@ class Qwen2VLModelBase(PreTrainedModel):
         )
 
         multimodal_params = kwargs.get("multimodal_params", [])
+        multimodal_params = self.add_rotary_cos_sin(multimodal_params)
+
         mm_embeds = []
         mrope_config = {}
 
