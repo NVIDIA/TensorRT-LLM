@@ -201,7 +201,7 @@ public:
         auto [M, N, K, L] = problem_shape;
         auto [m, n, k, l] = tile_coord;
 
-        if (!tile_valid(m, n) || params_ptr->world_size <= 2)
+        if (!tile_valid(m, n) || params_ptr->world_size <= 1)
         {
             return; // nothing to do
         }
