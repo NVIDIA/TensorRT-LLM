@@ -8,11 +8,11 @@ from .llm_args import (BatchingType, CacheTransceiverConfig, CalibConfig,
                        CapacitySchedulerPolicy, ContextChunkingPolicy,
                        CudaGraphConfig, DraftTargetDecodingConfig,
                        DynamicBatchConfig, EagleDecodingConfig,
-                       ExtendedRuntimePerfKnobConfig, KvCacheConfig, LlmArgs,
-                       LookaheadDecodingConfig, MedusaDecodingConfig, MoeConfig,
-                       MTPDecodingConfig, NGramDecodingConfig, SchedulerConfig,
-                       TorchCompileConfig, TorchLlmArgs, TrtLlmArgs,
-                       UserProvidedDecodingConfig)
+                       ExtendedRuntimePerfKnobConfig, ExternalAPIConfig,
+                       KvCacheConfig, LlmArgs, LookaheadDecodingConfig,
+                       MedusaDecodingConfig, MoeConfig, MTPDecodingConfig,
+                       NGramDecodingConfig, SchedulerConfig, TorchCompileConfig,
+                       TorchLlmArgs, TrtLlmArgs, UserProvidedDecodingConfig)
 from .llm_utils import (BuildConfig, KvCacheRetentionConfig, QuantAlgo,
                         QuantConfig)
 from .mpi_session import MpiCommSession
@@ -48,6 +48,7 @@ __all__ = [
     'CacheTransceiverConfig',
     'NGramDecodingConfig',
     'UserProvidedDecodingConfig',
+    'ExternalAPIConfig',
     'TorchCompileConfig',
     'DraftTargetDecodingConfig',
     'LlmArgs',
