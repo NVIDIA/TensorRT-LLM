@@ -182,7 +182,7 @@ def _register_fake():
     @torch.library.register_fake("trtllm::moe_comm_prepare_indices")
     def _(
         gathered_target_rank_ids: torch.Tensor,
-        real_rank_token_count_cum_sum,
+        real_rank_token_count_cum_sum: Optional[torch.Tensor],
         max_token_count_per_rank: int,
         expert_count: int,
         top_k: int,
@@ -220,9 +220,9 @@ def _register_fake():
         recv_rank_cum_sum: torch.Tensor,
         local_gather_indices: torch.Tensor,
         gathered_expert_ids: torch.Tensor,
-        gathered_scales: torch.Tensor,
+        gathered_scales: Optional[torch.Tensor],
         local_expert_ids: torch.Tensor,
-        local_scales: torch.Tensor,
+        local_scales: Optional[torch.Tensor],
         max_token_count_per_rank: int,
         expert_count: int,
         top_k: int,

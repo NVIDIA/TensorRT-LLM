@@ -18,6 +18,8 @@ By NVIDIA TensorRT-LLM Team
       - [ISL 4400 - OSL 1200 (Machine Translation Dataset)](#ISL-4400---OSL-1200-Machine-Translation-Dataset)
       - [ISL 8192 - OSL 256 (Synthetic Dataset)](#ISL-8192---OSL-256-Synthetic-Dataset)
       - [ISL 4096 - OSL 1024 (Machine Translation Dataset)](#ISL-4096---OSL-1024-Machine-Translation-Dataset)
+    - [Qwen 3](#Qwen-3)
+      - [ISL 8192 - OSL 1024 (Machine Translation Dataset)](#ISL-8192---OSL-1024-Machine-Translation-Dataset)
     - [Reproducing Steps](#Reproducing-Steps)
   - [Future Work](#Future-Work)
   - [Acknowledgement](#Acknowledgement)
@@ -259,6 +261,19 @@ By comparing the disaggregated serving E2E results with the “rate-matched” c
 In Figure 13 and 14, the E2E Pareto curves for aggregated serving and disaggregated serving, with and without MTP are shown.
 
 For Pareto curves with MTP = 1, 2, 3, it can be observed that disaggregated results show a **1.7x** improvement over aggregated results at 50 tokens/sec/user (20 ms latency). Enabling MTP provides a larger speedup at higher concurrencies.
+
+### Qwen 3
+
+#### ISL 8192 - OSL 1024 (Machine Translation Dataset)
+
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture15.png" width="640" height="auto" alt="Qwen 3 Pareto curves">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 15. Qwen 3 Pareto curves.</em></sub></p>
+
+We also conducted performance evaluations of Qwen 3 on GB200 GPUs. The data indicate that the speedups achieved by disaggregation over aggregation range from 1.7x to 6.11x.
 
 ### Reproducing Steps
 
