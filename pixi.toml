@@ -7,10 +7,37 @@ version = "0.1.0"
 
 [tasks]
 
+
+
 [dependencies]
-openmpi = ">=4.1.6,<4.2"
+# openmpi = ">=4.1.6,<4.2"
+openmpi = ">=5"
+python = "3.12.*"
+cuda-nvcc = ">=12.8,<12.9"
+# rdma-core = "*"
+
+[pypi-dependencies]
+tensorrt_llm = { path = ".", editable = true }
 
 [activation.env]
 LD_LIBRARY_PATH = "$CONDA_PREFIX/lib"
 TORCH_CUDA_ARCH_LIST = "10.0"
 
+# For UCX
+UCX_TLS = "tcp,self,shm"
+UCX_SOCKADDR_CM_ENABLE = "n"
+
+# For NCCL (if used)
+NCCL_IB_DISABLE = "1"
+NCCL_P2P_LEVEL = "SYS"
+
+# For MPI (OpenMPI)
+OMPI_MCA_btl = "self,tcp"
+OMPI_MCA_mtl = "^psm,psm2"
+
+TLLM_FORCE_SINGLE_PROCESS = "1"
+
+[pypi-options]
+# index-url = "https://pypi.org/simple"
+extra-index-urls = ["https://download.pytorch.org/whl/cu128"]
+index-strategy = "unsafe-best-match"
