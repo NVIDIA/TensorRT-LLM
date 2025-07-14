@@ -67,13 +67,13 @@ from tensorrt_llm.logger import logger
 )
 @optgroup.option(
     "--target_input_len",
-    default=None,
+    required=True,
     type=click.IntRange(min=1),
     help="Target (average) input length for tuning heuristics.",
 )
 @optgroup.option(
     "--target_output_len",
-    default=None,
+    required=True,
     type=click.IntRange(min=1),
     help="Target (average) sequence length for tuning heuristics.",
 )
@@ -86,13 +86,13 @@ from tensorrt_llm.logger import logger
 @optgroup.option(
     "--max_isl",
     type=int,
-    default=None,
+    required=True,
     help="Maximum input length.",
 )
 @optgroup.option(
     "--max_osl",
     type=int,
-    default=None,
+    required=True,
     help="Maximum output length.",
 )
 @optgroup.group(
@@ -140,18 +140,11 @@ from tensorrt_llm.logger import logger
     "Server Configuration",
     help="Options for configuring the server.",
 )
-@optgroup.option(
-    "--host",
-    type=str,
-    default="localhost",
-    help="Hostname of the server."
-)
-@optgroup.option(
-    "--port",
-    type=int,
-    default=8000,
-    help="Port of the server."
-)
+@optgroup.option("--host",
+                 type=str,
+                 default="localhost",
+                 help="Hostname of the server.")
+@optgroup.option("--port", type=int, default=8000, help="Port of the server.")
 @click.pass_obj
 def serve_command(
     bench_env: BenchmarkEnvironment,
