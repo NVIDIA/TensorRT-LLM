@@ -1041,6 +1041,7 @@ class PyTorchModelEngine(ModelEngine):
             moe_max_num_tokens=moe_max_num_tokens,
             moe_load_balancer=moe_load_balancer,
             lora_config=lora_config,
+            allreduce_strategy=self.pytorch_backend_config.allreduce_strategy,
             **kwargs)
 
         validate_and_set_kv_cache_quant(

@@ -367,8 +367,11 @@ class FP8BlockScaleMoERunner(TunableRunner):
         HIDDEN_STATES_IDX = 2
         TUNED_DIM = 0
 
-        m_values = get_last_power_of_2_num_tokens_buckets(2048)
-        round_rule = lambda x: min(last_positive_power_of_2(x), 2048)
+        MAX_PROFILE_BUCKET = 4096
+
+        m_values = get_last_power_of_2_num_tokens_buckets(MAX_PROFILE_BUCKET)
+        round_rule = lambda x: min(last_positive_power_of_2(x),
+                                   MAX_PROFILE_BUCKET)
 
         specs = (DynamicTensorSpec(HIDDEN_STATES_IDX, TUNED_DIM, m_values,
                                    round_rule), )
@@ -377,7 +380,31 @@ class FP8BlockScaleMoERunner(TunableRunner):
 
     @classmethod
     def get_constraint_specs(cls) -> Tuple[ConstraintSpec, ...]:
-        return ()
+
+        def _constrain_to_num_tokens(shapes: Tuple[torch.Size]) -> int:
+            num_tokens = shapes[2][0]
+
+            return num_tokens
+
+        HS_SCALE_IDX = 3
+        CONSTRAINED_HS_SCALE_DIM = 1
+
+        constraint_hidden_states_scale = ConstraintSpec(
+            HS_SCALE_IDX, CONSTRAINED_HS_SCALE_DIM, _constrain_to_num_tokens)
+
+        ROUTER_LOGITS_IDX = 0
+        CONSTRAINED_RL_DIM = 0
+
+        constraint_routing_logits = ConstraintSpec(ROUTER_LOGITS_IDX,
+                                                   CONSTRAINED_RL_DIM,
+                                                   _constrain_to_num_tokens)
+
+        constraint_specs_tuple = (
+            constraint_hidden_states_scale,
+            constraint_routing_logits,
+        )
+
+        return constraint_specs_tuple
 
     @classmethod
     @lru_cache(maxsize=None)
