@@ -45,6 +45,7 @@ def test_llama_user_provided(disable_overlap_scheduler: bool,
     spec_config = ExternalAPIConfig(
         max_draft_len=max_draft_len,
         endpoint="dummy_endpoint_for_testing",
+        template=None,
     )
 
     prompts = [
