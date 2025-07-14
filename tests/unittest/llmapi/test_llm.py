@@ -544,8 +544,7 @@ def _test_llm_generate_async(model_name=default_model_name,
 @pytest.mark.parametrize("chunked", [True, False])
 @pytest.mark.part0
 def test_llm_generate_async_with_stream_interval(chunked):
-    pytest.skip("https://nvbugs/5383670")
-    model_path = f"{llm_models_root()}/nvfp4-quantized/Meta-Llama-3.1-8B"
+    model_path = get_model_path('llama-models-v2/llama-v2-7b-hf')
     max_num_tokens = 256
     with LLM_torch(model_path,
                    max_num_tokens=max_num_tokens,
