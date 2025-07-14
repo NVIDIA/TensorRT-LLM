@@ -1216,7 +1216,8 @@ class PyTorchModelEngine(ModelEngine):
             if next_draft_tokens_device is None or request.is_dummy or request.py_batch_idx is None:
                 # get token ids, including input token ids and draft token ids. For these dummy requests,
                 # no need to copy the token ids.
-                if not request.is_dummy:
+                if not (request.is_attention_dp_dummy
+                        or request.is_cuda_graph_dummy):
                     input_ids.append(request.get_last_tokens(0))
                     input_ids.extend(request.py_draft_tokens)
                     draft_tokens.extend(request.py_draft_tokens)
