@@ -9,7 +9,7 @@ import transformers
 
 from tensorrt_llm import logger
 from tensorrt_llm._torch.pyexecutor.config_utils import is_nemotron_hybrid
-from tensorrt_llm._utils import torch_dtype_to_binding
+from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.logger import logger
@@ -260,12 +260,13 @@ class ModelConfig(Generic[TConfig]):
         return quant_config, layer_quant_config
 
     @staticmethod
-    def load_quant_config_from_dtypes_json(dtypes_json_file):
+    def load_quant_config_from_dtypes_json(dtypes_json_file, moe_backend: str):
         quant_config = QuantConfig()
         layer_quant_config = None
 
         exclude_modules = set()
         has_mxfp4 = False
+        is_dynamic_quant = False
         with open(dtypes_json_file) as f:
             dtypes_json = json.load(f)
             for layer, dtype in dtypes_json.items():
@@ -274,15 +275,32 @@ class ModelConfig(Generic[TConfig]):
                         names = layer.split(".")
                         exclude_modules.add('.'.join(names[:-1]))
                     elif dtype == "MXFP4":
+                        # This is the path for the fp8 checkpoint which requires dynamic quantization.
+                        is_dynamic_quant = True
                         has_mxfp4 = True
-        quant_algo = ModelConfig.override_quant_algo()
-        if quant_algo is None:
-            return quant_config, layer_quant_config
+                elif layer.endswith("weight.blocks"):
+                    scale_name = layer.replace("weight.blocks", "weight.scales")
+                    scale_dtype = dtypes_json.get(scale_name, None)
+                    assert scale_dtype == "UE8"
+                    is_dynamic_quant = False
+                    has_mxfp4 = True
 
         if has_mxfp4:
+            quant_algo = ModelConfig.override_quant_algo()
+            if quant_algo is None and not is_dynamic_quant:
+                # Get default quant_algo for mxfp4 checkpoints
+                if moe_backend == 'TRITON':
+                    quant_algo = QuantAlgo.W4A16_MXFP4
+                else:
+                    if get_sm_version() >= 100:
+                        quant_algo = QuantAlgo.W4A8_MXFP4_MXFP8
+                    else:
+                        quant_algo = QuantAlgo.W4A16_MXFP4
             quant_config.quant_algo = quant_algo
             quant_config.group_size = 32
             quant_config.exclude_modules = list(exclude_modules)
+            logger.info(f"Setting quant_config: {quant_config}")
+
         return quant_config, layer_quant_config
 
     @staticmethod
@@ -332,7 +350,7 @@ class ModelConfig(Generic[TConfig]):
                 hf_quant_config, moe_backend)
         elif (quant_config_file := model_dir / 'dtypes.json').exists():
             quant_config, layer_quant_config = cls.load_quant_config_from_dtypes_json(
-                quant_config_file)
+                quant_config_file, moe_backend)
 
         model_config = cls(pretrained_config=pretrained_config,
                            quant_config=quant_config,
