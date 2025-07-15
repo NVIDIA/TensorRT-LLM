@@ -369,7 +369,8 @@ class GenerationResultBase:
                     tokenizer = None
                     if (self.postproc_params
                             and self.postproc_params.postproc_args
-                            and self.postproc_params.postproc_args.tokenizer):
+                            and self.postproc_params.postproc_args.tokenizer
+                            is not None):
                         tokenizer = self.postproc_params.postproc_args.tokenizer
                     elif hasattr(self,
                                  'tokenizer') and self.tokenizer is not None:
