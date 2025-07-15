@@ -12,8 +12,9 @@ from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Literal, Optional,
 
 import torch
 import yaml
-from pydantic import (BaseModel, Field, PrivateAttr, field_validator,
-                      model_validator)
+from pydantic import BaseModel
+from pydantic import Field as PydanticField
+from pydantic import PrivateAttr, field_validator, model_validator
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
@@ -59,6 +60,36 @@ from .tokenizer import TokenizerBase, tokenizer_factory
 from .utils import generate_api_docs_as_docstring, get_type_repr
 
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
+
+
+def Field(default: Any = ...,
+          *,
+          status: Optional[Literal["prototype", "beta"]] = None,
+          **kwargs: Any) -> Any:
+    """Custom Field wrapper that adds status to json_schema_extra.
+
+    Args:
+        default: The default value for the field
+        status: Optional status indicator that gets added to json_schema_extra.
+           - None: stable
+           - "beta": beta, recommended to use according to the latest documentation
+           - "prototype": prototype, not recommended to use
+        **kwargs: All other arguments passed to the original Pydantic Field
+
+    Returns:
+        A Pydantic FieldInfo object with the status added to json_schema_extra if provided
+    """
+
+    if status is not None:
+        json_schema_extra = kwargs.get('json_schema_extra', {})
+        if isinstance(json_schema_extra, dict):
+            json_schema_extra['status'] = status
+        else:
+            # If json_schema_extra is not a dict, create a new dict with the status
+            json_schema_extra = {'status': status}
+        kwargs['json_schema_extra'] = json_schema_extra
+
+    return PydanticField(default, **kwargs)
 
 
 class CudaGraphConfig(BaseModel):
@@ -972,6 +1003,7 @@ class BaseLlmArgs(BaseModel):
     gpus_per_node: Optional[int] = Field(
         default=None,
         description="The number of GPUs per node.",
+        status="beta",
         validate_default=True)
 
     moe_cluster_parallel_size: Optional[int] = Field(
@@ -988,10 +1020,13 @@ class BaseLlmArgs(BaseModel):
         description="The expert parallel size for MoE models's expert weights.")
 
     enable_attention_dp: bool = Field(
-        default=False, description="Enable attention data parallel.")
+        default=False,
+        description="Enable attention data parallel.",
+        status="beta")
 
     cp_config: Optional[dict] = Field(default_factory=dict,
-                                      description="Context parallel config.")
+                                      description="Context parallel config.",
+                                      status="prototype")
 
     load_format: Literal['auto', 'dummy'] = Field(
         default='auto',
@@ -1046,31 +1081,30 @@ class BaseLlmArgs(BaseModel):
 
     iter_stats_max_iterations: Optional[int] = Field(
         default=None,
-        description="The maximum number of iterations for iter stats.")
+        description="The maximum number of iterations for iter stats.",
+        status="prototype")
 
     request_stats_max_iterations: Optional[int] = Field(
         default=None,
-        description="The maximum number of iterations for request stats.")
+        description="The maximum number of iterations for request stats.",
+        status="prototype")
 
     # A handful of options from PretrainedConfig
     peft_cache_config: Optional[PeftCacheConfig] = Field(
-        default=None, description="PEFT cache config.")
+        default=None, description="PEFT cache config.", status="prototype")
 
     scheduler_config: SchedulerConfig = Field(default_factory=SchedulerConfig,
-                                              description="Scheduler config.")
+                                              description="Scheduler config.",
+                                              status="prototype")
 
     cache_transceiver_config: Optional[CacheTransceiverConfig] = Field(
-        default=None, description="Cache transceiver config.")
+        default=None,
+        description="Cache transceiver config.",
+        status="prototype")
 
     # Speculative decoding parameters
     speculative_config: SpeculativeConfig = Field(
         default=None, description="Speculative decoding config.")
-
-    batching_type: Optional[BatchingType] = Field(default=None,
-                                                  description="Batching type.")
-
-    normalize_log_probs: bool = Field(
-        default=False, description="Normalize log probabilities.")
 
     max_batch_size: Optional[int] = Field(default=None,
                                           description="The maximum batch size.")
@@ -1089,22 +1123,26 @@ class BaseLlmArgs(BaseModel):
         default=None, description="The maximum number of tokens.")
 
     gather_generation_logits: bool = Field(
-        default=False, description="Gather generation logits.")
+        default=False,
+        description="Gather generation logits.",
+        status="prototype")
 
     # private fields those are unstable and just for internal use
     num_postprocess_workers: int = Field(
         default=0,
         description=
-        "The number of processes used for postprocessing the generated tokens, including detokenization."
-    )
+        "The number of processes used for postprocessing the generated tokens, including detokenization.",
+        status="prototype")
 
     postprocess_tokenizer_dir: Optional[str] = Field(
         default=None,
-        description="The path to the tokenizer directory for postprocessing.")
+        description="The path to the tokenizer directory for postprocessing.",
+        status="prototype")
 
     reasoning_parser: Optional[str] = Field(
         default=None,
-        description="The parser to separate reasoning content from output.")
+        description="The parser to separate reasoning content from output.",
+        status="prototype")
 
     # TODO[Superjomn]: To deprecate this config.
     decoding_config: Optional[object] = Field(
@@ -1677,6 +1715,12 @@ class TrtLlmArgs(BaseLlmArgs):
     max_prompt_adapter_token: int = Field(
         default=0, description="The maximum number of prompt adapter tokens.")
 
+    batching_type: Optional[BatchingType] = Field(default=None,
+                                                  description="Batching type.")
+
+    normalize_log_probs: bool = Field(
+        default=False, description="Normalize log probabilities.")
+
     # Private attributes
     _auto_parallel_config: Optional[AutoParallelConfig] = PrivateAttr(
         default=None)
@@ -1806,7 +1850,8 @@ class TorchLlmArgs(BaseLlmArgs):
         default=20000,
         description=
         "Threshold for Python garbage collection of generation 0 objects."
-        "Lower values trigger more frequent garbage collection.")
+        "Lower values trigger more frequent garbage collection.",
+        status="beta")
 
     cuda_graph_config: Optional[CudaGraphConfig] = Field(
         default_factory=CudaGraphConfig,
@@ -1815,28 +1860,32 @@ class TorchLlmArgs(BaseLlmArgs):
         and are enabled for batches that consist of decoding requests *only* \
         (the reason is that it's hard to capture a single graph with prefill requests \
         since the input shapes are a function of the sequence lengths).\
-         Note that each CUDA graph can use up to 200 MB of extra memory.")
+         Note that each CUDA graph can use up to 200 MB of extra memory.",
+        status="beta")
 
     disable_overlap_scheduler: bool = Field(
-        default=False, description="Disable the overlap scheduler.")
+        default=False,
+        description="Disable the overlap scheduler.",
+        status="beta")
 
     moe_config: MoeConfig = Field(default_factory=MoeConfig,
                                   description="MoE config.")
 
     attn_backend: str = Field(default='TRTLLM',
-                              description="Attention backend to use.")
+                              description="Attention backend to use.",
+                              status="beta")
 
     enable_mixed_sampler: bool = Field(
         default=False,
         description=
-        "If true, will iterate over sampling_params of each request and use the corresponding sampling strategy, e.g. top-k, top-p, etc."
-    )
+        "If true, will iterate over sampling_params of each request and use the corresponding sampling strategy, e.g. top-k, top-p, etc.",
+        status="beta")
 
     enable_trtllm_sampler: bool = Field(
         default=False,
         description=
-        "If true, will use the TRTLLM sampler instead of the PyTorch sampler. The TRTLLM sampler has a wide coverage of sampling strategies."
-    )
+        "If true, will use the TRTLLM sampler instead of the PyTorch sampler. The TRTLLM sampler has a wide coverage of sampling strategies.",
+        status="prototype")
 
     enable_iter_perf_stats: bool = Field(
         default=False, description="Enable iteration performance statistics.")
@@ -1844,21 +1893,25 @@ class TorchLlmArgs(BaseLlmArgs):
     enable_iter_req_stats: bool = Field(
         default=False,
         description=
-        "If true, enables per request stats per iteration. Must also set enable_iter_perf_stats to true to get request stats."
-    )
+        "If true, enables per request stats per iteration. Must also set enable_iter_perf_stats to true to get request stats.",
+        status="prototype")
 
     print_iter_log: bool = Field(default=False,
-                                 description="Print iteration logs.")
+                                 description="Print iteration logs.",
+                                 status="beta")
 
     torch_compile_config: Optional[TorchCompileConfig] = Field(
-        default=None, description="Torch compile config.")
+        default=None, description="Torch compile config.", status="prototype")
 
     enable_autotuner: bool = Field(
         default=True,
-        description="Enable autotuner only when torch compile is enabled.")
+        description="Enable autotuner only when torch compile is enabled.",
+        status="prototype")
 
     enable_layerwise_nvtx_marker: bool = Field(
-        default=False, description="If true, enable layerwise nvtx marker.")
+        default=False,
+        description="If true, enable layerwise nvtx marker.",
+        status="beta")
 
     load_format: Union[str, LoadFormat] = Field(
         default=LoadFormat.AUTO,
@@ -1870,6 +1923,7 @@ class TorchLlmArgs(BaseLlmArgs):
         default=False,
         description=
         "If true, enable min-latency mode. Currently only used for Llama4.",
+        status="beta",
     )
 
     # TODO: make this a per-request parameter
@@ -1883,24 +1937,30 @@ class TorchLlmArgs(BaseLlmArgs):
     force_dynamic_quantization: bool = Field(
         default=False,
         description="If true, force dynamic quantization. Defaults to False.",
+        status="prototype",
     )
 
     allreduce_strategy: Optional[
         Literal['AUTO', 'NCCL', 'UB', 'MINLATENCY', 'ONESHOT', 'TWOSHOT',
-                'LOWPRECISION',
-                'MNNVL']] = Field(default='AUTO',
-                                  description="Allreduce strategy to use.")
+                'LOWPRECISION', 'MNNVL']] = Field(
+                    default='AUTO',
+                    description="Allreduce strategy to use.",
+                    status="beta",
+                )
+
     checkpoint_loader: Optional[object] = Field(
         default=None,
         description="The checkpoint loader to use for this LLM instance.",
         json_schema_extra={
             "type": "Optional[tensorrt_llm._torch.BaseCheckpointLoader]"
         },
+        status="prototype",
     )
 
     checkpoint_format: Optional[str] = Field(
         default=None,
         description="The format of the provided checkpoint.",
+        status="prototype",
     )
 
     # PrivateVars
@@ -2073,6 +2133,27 @@ class TorchLlmArgs(BaseLlmArgs):
             logger.warning(
                 f"Cannot sync quant_config.kv_cache_quant_algo with kv_cache_config.dtype of {self.kv_cache_config.dtype}, "
                 "please update the validator")
+
+        return self
+
+    def warn_on_unstable_feature_usage(self) -> 'TorchLlmArgs':
+        """Warn on unstable feature usage."""
+        set_fields = self.model_dump(exclude_unset=True).keys()
+
+        for field_name in set_fields:
+            field_info = self.model_fields.get(field_name)
+
+            if not field_info or not field_info.json_schema_extra:
+                continue
+
+            status = field_info.json_schema_extra.get('status', None)
+
+            if status in ('beta', 'prototype'):
+                logger.warning(
+                    f"The '{field_name}' knob is a '{status}' feature. "
+                    "It is not recommended for production use and may change or be removed.",
+                )
+
         return self
 
     # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
