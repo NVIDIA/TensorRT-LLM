@@ -17,6 +17,7 @@ CUBLAS_VER="12.9.0.13-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
 # https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
 NVRTC_VER="12.9.41-1"
+NVCC_VER=$NVRTC_VER
 CUDA_RUNTIME="12.9.37-1"
 CUDA_DRIVER_VERSION="575.51.03-1.el8"
 
@@ -93,6 +94,8 @@ install_rockylinux_requirements() {
         "cuda-toolkit-${CUBLAS_CUDA_VERSION}-config-common-${CUDA_RUNTIME}.noarch" \
         "cuda-toolkit-12-config-common-${CUDA_RUNTIME}.noarch" \
         "cuda-toolkit-config-common-${CUDA_RUNTIME}.noarch" \
+        "cuda-nvcc-${CUBLAS_CUDA_VERSION}-${NVCC_VER}.${ARCH1}" \
+        "cuda-nvrtc-${CUBLAS_CUDA_VERSION}-${NVRTC_VER}.${ARCH1}" \
         "libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}" \
         "libcublas-devel-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}"; do
         wget -q --timeout=180 --tries=3 "https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/${ARCH3}/${pkg}.rpm"
@@ -109,13 +112,14 @@ install_rockylinux_requirements() {
         cuda-toolkit-${CUBLAS_CUDA_VERSION}-config-common-${CUDA_RUNTIME}.noarch.rpm \
         cuda-toolkit-12-config-common-${CUDA_RUNTIME}.noarch.rpm \
         cuda-toolkit-config-common-${CUDA_RUNTIME}.noarch.rpm \
+        cuda-nvcc-${CUBLAS_CUDA_VERSION}-${NVCC_VER}.${ARCH1}.rpm \
+        cuda-nvrtc-${CUBLAS_CUDA_VERSION}-${NVRTC_VER}.${ARCH1}.rpm \
         libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}.rpm \
         libcublas-devel-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}.rpm
 
     # Clean up
     rm -f *.rpm
     dnf clean all
-    echo 'export PATH=/usr/local/cuda/bin:$PATH' >> "${ENV}"
     nvcc --version
 }
 
