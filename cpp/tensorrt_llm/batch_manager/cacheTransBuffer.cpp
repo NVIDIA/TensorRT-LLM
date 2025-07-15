@@ -259,7 +259,9 @@ size_t CacheTransBufferManager::preAllocBufferSize(
         TransferBufferSize = 0;
         for (auto const& [windowSize, cacheSizeBytesPerToken] : cacheSizeBytesPerTokenPerWindow)
         {
-            auto validTokenNum = (windowSize < maxNumTokens.value() ? windowSize : maxNumTokens.value());
+            auto validTokenNum
+                = (static_cast<size_t>(windowSize) < maxNumTokens.value() ? static_cast<size_t>(windowSize)
+                                                                          : maxNumTokens.value());
             TransferBufferSize += validTokenNum * cacheSizeBytesPerToken;
         }
     }
@@ -341,7 +343,7 @@ std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> CacheTransBuf
     size_t bufferCoverTargetNum = std::min(
         static_cast<size_t>(targetNum), mTransferBufferSize / (targetBufferEleSize * common::getDTypeSize(mDataType)));
     TLLM_LOG_DEBUG("getOrAllocateBuffers bufferCoverTargetNum:%d", bufferCoverTargetNum);
-    if (bufferCoverTargetNum < targetNum)
+    if (bufferCoverTargetNum < static_cast<size_t>(targetNum))
     {
         TLLM_LOG_WARNING(
             "CacheTransceiver getOrAllocateBuffers: bufferCoverTargetNum:%d < targetNum:%d, may use dynamic buffer, "
