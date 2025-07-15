@@ -917,7 +917,7 @@ def test_trtllm_bench_request_rate_and_concurrency(llm_root, llm_venv,
 
     benchmark_cmd = \
         f"trtllm-bench --model {model_name} --model_path {model_path} throughput " \
-        f"--engine_dir {engine_path} --dataset {dataset_path}"
+        f"--engine_dir {engine_path} --dataset {dataset_path} --backend tensorrt"
 
     if request_rate:
         benchmark_cmd += " --request_rate 100"
