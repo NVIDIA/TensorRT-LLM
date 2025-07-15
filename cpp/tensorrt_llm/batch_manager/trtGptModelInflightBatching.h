@@ -380,7 +380,7 @@ private:
     ///
     /// @param blocksPerWindow map of window size to number of blocks.
     /// @param failFastOnAttentionWindowTooLarge if true, the function will report a runtime error if the attention
-    /// window is too large.
+    /// window is too large to fit even a single sequence in the KV cache.
     /// @return pair of new blocks per window and new maxAttentionWindowVec
     [[nodiscard]] std::pair<BlocksPerWindow, std::vector<SizeType32>> clampWindowSizesToFitAtLeastOneSequence(
         BlocksPerWindow const& blocksPerWindow, bool const failFastOnAttentionWindowTooLarge = false);

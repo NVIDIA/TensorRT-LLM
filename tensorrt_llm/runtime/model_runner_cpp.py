@@ -199,7 +199,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
             gather_generation_logits (bool):
                 Enable gathering generation logits.
             fail_fast_on_attention_window_too_large (bool):
-                Whether to fail fast if the attention window is too large.
+                Whether to fail fast if the attention window(s) are too large to fit even a single sequence in the KVCache.
         Returns:
             ModelRunnerCpp: An instance of ModelRunnerCpp.
         """

@@ -596,7 +596,8 @@ TrtGptModelInflightBatching::clampWindowSizesToFitAtLeastOneSequence(
     if (failFastOnAttentionWindowTooLarge)
     {
         throw std::runtime_error(
-            "Attention window too large to fit at least one sequence in KV cache. "
+            "Attention window too large to fit even a single sequence in the KV cache. Failing fast rather than "
+            "attempting an adjustment of the window sizes. "
             "Old: "
             + common::vec2str(getMaxAttentionWindowVec()) + ", New: " + common::vec2str(newMaxAttentionWindowVec));
     }

@@ -1638,7 +1638,7 @@ private:
     /// @brief Controls whether preparation and TRT engine execution should be overlapped.
     bool mEnableTrtOverlap{false};
 
-    /// @brief Controls whether to fail fast when attention window is too large to fit at least one sequence in KV
+    /// @brief Controls whether to fail fast when attention window is too large to fit even a single sequence in the KV
     /// cache.
     bool mFailFastOnAttentionWindowTooLarge{false};
 };
