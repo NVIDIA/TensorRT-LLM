@@ -21,6 +21,7 @@
 #include "tensorrt_llm/batch_manager/llmRequest.h" // TODO forward declare
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/executor/executor.h"
+#include "tensorrt_llm/executor/transferAgent.h"
 #include "tensorrt_llm/kernels/kvCacheIndex.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -39,6 +40,8 @@
 #include <set>
 #include <unordered_map>
 #include <vector>
+
+using tensorrt_llm::executor::kv_cache::BaseLoopbackAgent;
 
 namespace tensorrt_llm::batch_manager::eviction_policy
 {
@@ -535,7 +538,7 @@ public:
         SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences, std::shared_ptr<runtime::CudaStream> stream,
         bool onboardBlocks, CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
         std::shared_ptr<KVCacheEventManager> eventManager, bool enableHashKey, bool enablePartialReuse,
-        bool copyOnPartialReuse);
+        bool copyOnPartialReuse, BaseLoopbackAgent* loopbackAgent = nullptr);
 
     ~WindowBlockManager();
 
@@ -823,6 +826,8 @@ private:
     std::shared_ptr<BaseEvictionPolicy> mEvictionPolicy;
     // Event manager
     std::shared_ptr<KVCacheEventManager> mEventManager;
+    // Pointer to parent loopback agent
+    BaseLoopbackAgent* mLoopbackAgent;
     // Transfer manager
     std::shared_ptr<KVCacheTransferManager> mTransferManager;
 
@@ -1166,6 +1171,8 @@ private:
     SizeType32 mNumLayers;
     SizeType32 mTokensPerBlock;
     std::shared_ptr<KVCacheEventManager> mEventManager;
+    std::unique_ptr<BaseLoopbackAgent> mLoopbackAgent;
+    std::string mAgentName;
     CudaStreamPtr mStream;
     CacheType mCacheType;
 
