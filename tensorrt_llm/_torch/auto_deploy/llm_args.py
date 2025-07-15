@@ -84,11 +84,8 @@ class AutoDeployConfig(BaseModel):
 
     ### RUNTIME FEATURES ###########################################################################
     disable_overlap_scheduler: bool = Field(
-        default=True,
-        description="Disable the overlap scheduler. This is a temporary field until the overlap "
-        "scheduler is supported (https://github.com/NVIDIA/TensorRT-LLM/issues/4364).",
-        frozen=True,
-        repr=False,
+        default=False,
+        description="Disable the overlap scheduler in trtllm runtime",
     )
 
     mixed_sampler: bool = Field(
@@ -112,6 +109,12 @@ class AutoDeployConfig(BaseModel):
         default="auto",
         description="Data type for KV cache. This is a temporary field until kv_cache_dtype is "
         "supported in AutoDeploy.",
+    )
+
+    max_beam_width: int = Field(
+        default=1,
+        description="The maximum beam width. >1 is not supported by AutoDeploy.",
+        frozen=True,
     )
 
     # INFERENCE OPTIMIZER CONFIG ###################################################################
