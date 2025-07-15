@@ -45,4 +45,7 @@ def test_llama_7b_multi_lora_tp2():
         LLM,
         max_lora_rank=8,
         tensor_parallel_size=2,
-        kv_cache_config=global_kv_cache_config)
+        kv_cache_config=global_kv_cache_config,
+        # Disable CUDA graph
+        # TODO: remove this once we have a proper fix for CUDA graph in LoRA
+        cuda_graph_config=None)
