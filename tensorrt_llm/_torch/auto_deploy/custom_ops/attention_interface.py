@@ -378,10 +378,11 @@ class SequenceInfo:
     def _update_position_ids(self) -> None:
         # set new position_ids as new tensor from input_pos and seq_len via torch.arange
         position_ids_list = [
-            torch.arange(in_pos, in_pos + seq_len, dtype=torch.long)
+            num
             for in_pos, seq_len in zip(self.input_positions, self.sequence_lengths)
+            for num in range(in_pos, in_pos + seq_len)
         ]
-        self.position_ids = torch.cat(position_ids_list, dim=0).to(self.device)
+        self.position_ids = torch.tensor(position_ids_list, dtype=torch.long).to(self.device)
 
         # use [b,1] shape to indicate generate-only batch, otherwise use [1,total_len]
         if self.is_generate:
@@ -398,13 +399,15 @@ class SequenceInfo:
         seq_lens = [len(ids) for ids in input_ids]
         self.seq_len.zero_()
         self.seq_len[: len(seq_lens)].copy_(torch.tensor(seq_lens), non_blocking=True)
-
+        # We'll preserve the dtype of the input_ids tensor if it is a tensor, otherwise we'll use int
+        dtype = input_ids.dtype if isinstance(input_ids, torch.Tensor) else torch.int
         # set new input_ids as new tensor from flattened input_ids
-        ids_tnsr_list = [
-            lst.detach() if isinstance(lst, torch.Tensor) else torch.tensor(lst, dtype=torch.int)
+        ids_list = [
+            val
             for lst in input_ids
+            for val in (lst.detach().tolist() if isinstance(lst, torch.Tensor) else lst)
         ]
-        self.input_ids = torch.cat(ids_tnsr_list, dim=0).to(self.device)
+        self.input_ids = torch.tensor(ids_list, dtype=dtype).to(self.device)
 
         # set derivative properties
         self._sequence_lengths = seq_lens
