@@ -1,5 +1,3 @@
-from collections import OrderedDict
-
 import pytest
 
 from tensorrt_llm import LLM
@@ -7,12 +5,15 @@ from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
+from .lora_test_utils import (
+    check_multi_unique_lora_adapters_from_request,
+    check_pytorch_llama_7b_multi_lora_from_request_test_harness)
 from .test_llm import (
     get_model_path, global_kvcache_config, llama_model_path,
     llm_get_stats_async_test_harness, llm_get_stats_test_harness, prompts,
     run_llm_abort_request, run_llm_with_postprocess_parallel_and_result_handler,
     tinyllama_logits_processor_test_harness, _test_llm_capture_request_error)
-from utils.util import EnvVarsContextManager, duplicate_list_to_length, flatten_list, force_ampere, run_function_in_sub_process, similar, skip_gpu_memory_less_than_40gb, skip_gpu_memory_less_than_80gb, skip_gpu_memory_less_than_138gb
+from utils.util import EnvVarsContextManager, force_ampere, run_function_in_sub_process, similar, skip_gpu_memory_less_than_40gb, skip_gpu_memory_less_than_80gb, skip_gpu_memory_less_than_138gb
 from utils.llm_data import llm_models_root
 from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
@@ -163,55 +164,6 @@ def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
         llm.shutdown()
 
 
-def llama_7b_multi_lora_from_request_test_harness(**llm_kwargs) -> None:
-    hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
-    hf_lora_dir1 = f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"
-    hf_lora_dir2 = f"{llm_models_root()}/llama-models/Japanese-Alpaca-LoRA-7b-v0"
-
-    # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
-    # (1) specify lora_target_modules, or
-    # (2) provide a lora_dir to infer the lora_target_modules.
-    lora_config = LoraConfig(lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
-                             max_lora_rank=8)
-    # Disable CUDA graph
-    # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-    llm = LLM(hf_model_dir,
-              lora_config=lora_config,
-              cuda_graph_config=None,
-              **llm_kwargs)
-
-    try:
-        prompts = [
-            "美国的首都在哪里? \n答案:",
-            "美国的首都在哪里? \n答案:",
-            "美国的首都在哪里? \n答案:",
-            "アメリカ合衆国の首都はどこですか? \n答え:",
-            "アメリカ合衆国の首都はどこですか? \n答え:",
-            "アメリカ合衆国の首都はどこですか? \n答え:",
-        ]
-        references = [
-            "沃尔玛\n\n## 新闻\n\n* ",
-            "美国的首都是华盛顿。\n\n美国的",
-            "纽约\n\n### カンファレンスの",
-            "Washington, D.C.\nWashington, D.C. is the capital of the United",
-            "华盛顿。\n\n英国の首都是什",
-            "ワシントン\nQ1. アメリカ合衆国",
-        ]
-        lora_req1 = LoRARequest("luotuo", 1, hf_lora_dir1)
-        lora_req2 = LoRARequest("Japanese", 2, hf_lora_dir2)
-        sampling_params = SamplingParams(max_tokens=20)
-        outputs = llm.generate(prompts,
-                               sampling_params,
-                               lora_request=[
-                                   None, lora_req1, lora_req2, None, lora_req1,
-                                   lora_req2
-                               ])
-        for output, ref in zip(outputs, references):
-            assert similar(output.outputs[0].text, ref)
-    finally:
-        llm.shutdown()
-
-
 @skip_gpu_memory_less_than_40gb
 def test_llama_7b_lora():
     llama_7b_lora_from_dir_test_harness()
@@ -251,65 +203,7 @@ def test_llama_7b_lora_default_modules() -> None:
 
 @skip_gpu_memory_less_than_40gb
 def test_llama_7b_multi_lora():
-    llama_7b_multi_lora_from_request_test_harness()
-
-
-def llama_7b_multi_unique_lora_adapters_from_request(
-        lora_adapter_count_per_call: list[int], max_loras: int,
-        max_cpu_loras: int, repeats: int, **llm_kwargs):
-    total_lora_adapters = sum(lora_adapter_count_per_call)
-
-    hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
-    hf_lora_dirs = [
-        f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1",
-        f"{llm_models_root()}/llama-models/Japanese-Alpaca-LoRA-7b-v0"
-    ]
-
-    # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
-    # (1) specify lora_target_modules, or
-    # (2) provide a lora_dir to infer the lora_target_modules.
-    lora_config = LoraConfig(lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
-                             max_lora_rank=8,
-                             max_loras=max_loras,
-                             max_cpu_loras=max_cpu_loras)
-    llm = LLM(hf_model_dir, lora_config=lora_config, **llm_kwargs)
-
-    # Each prompt should have a reference for every LoRA adapter dir (in the same order as in hf_lora_dirs)
-    prompt_to_references = OrderedDict({
-        "美国的首都在哪里? \n答案:": [
-            "美国的首都是华盛顿。\n\n美国的",
-            "纽约\n\n### カンファレンスの",
-        ],
-        "アメリカ合衆国の首都はどこですか? \n答え:": [
-            "华盛顿。\n\n英国の首都是什",
-            "ワシントン\nQ1. アメリカ合衆国",
-        ],
-    })
-
-    prompts_to_generate = duplicate_list_to_length(
-        flatten_list([[prompt] * len(hf_lora_dirs)
-                      for prompt in prompt_to_references.keys()]),
-        total_lora_adapters)
-    references = duplicate_list_to_length(
-        flatten_list(list(prompt_to_references.values())), total_lora_adapters)
-    lora_requests = [
-        LoRARequest(str(i), i, hf_lora_dirs[i % len(hf_lora_dirs)])
-        for i in range(total_lora_adapters)
-    ]
-
-    # Perform repeats of the same requests to test reuse and reload of adapters previously unloaded from cache
-    for i in range(repeats):
-        last_idx = 0
-        for adapter_count in lora_adapter_count_per_call:
-            sampling_params = SamplingParams(max_tokens=20)
-            outputs = llm.generate(
-                prompts_to_generate[last_idx:last_idx + adapter_count],
-                sampling_params,
-                lora_request=lora_requests[last_idx:last_idx + adapter_count])
-            for output, ref in zip(
-                    outputs, references[last_idx:last_idx + adapter_count]):
-                assert similar(output.outputs[0].text, ref)
-            last_idx += adapter_count
+    check_pytorch_llama_7b_multi_lora_from_request_test_harness()
 
 
 @pytest.mark.parametrize(
@@ -332,8 +226,35 @@ def llama_7b_multi_unique_lora_adapters_from_request(
 def test_llama_7b_multi_lora_evict_load_new_adapters(
         lora_adapter_count_per_call: list[int], max_loras: int,
         max_cpu_loras: int, repeats: int):
-    llama_7b_multi_unique_lora_adapters_from_request(
+    check_llama_7b_multi_unique_lora_adapters_from_request(
         lora_adapter_count_per_call, max_loras, max_cpu_loras, repeats)
+
+
+def check_llama_7b_multi_unique_lora_adapters_from_request(
+        lora_adapter_count_per_call: list[int], max_loras: int,
+        max_cpu_loras: int, repeats: int):
+    hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
+    hf_lora_dirs = [
+        f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1",
+        f"{llm_models_root()}/llama-models/Japanese-Alpaca-LoRA-7b-v0"
+    ]
+
+    # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
+    # (1) specify lora_target_modules, or
+    # (2) provide a lora_dir to infer the lora_target_modules.
+    lora_config = LoraConfig(lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
+                             max_lora_rank=8,
+                             max_loras=max_loras,
+                             max_cpu_loras=max_cpu_loras)
+
+    llm = LLM(hf_model_dir,
+              lora_config=lora_config,
+              # Disable CUDA graph
+              # TODO: remove this once we have a proper fix for CUDA graph in LoRA
+              cuda_graph_config=None)
+    check_multi_unique_lora_adapters_from_request(llm, hf_lora_dirs,
+                                                  lora_adapter_count_per_call,
+                                                  repeats)
 
 
 @pytest.mark.parametrize(
@@ -365,10 +286,12 @@ def test_llama_7b_multi_lora_load_previously_cpu_cache_evicted_adapter_fails(
 
     with EnvVarsContextManager({"TLLM_WORKER_USE_SINGLE_PROCESS": "1"}):
         child_stdout, child_stderr = run_function_in_sub_process(
-            target=llama_7b_multi_unique_lora_adapters_from_request,
+            target=check_llama_7b_multi_unique_lora_adapters_from_request,
             args=(lora_adapter_count_per_call, max_loras, max_cpu_loras,
                   repeats),
-            kwargs={},
+            # Disable CUDA graph
+            # TODO: remove this once we have a proper fix for CUDA graph in LoRA
+            kwargs={"cuda_graph_config": None},
             stop_waiting_criteria=_check_contains_expected_message)
 
     assert _check_contains_expected_message(child_stdout, child_stderr)
