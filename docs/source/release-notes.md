@@ -4,6 +4,72 @@
 
 All published functionality in the Release Notes has been fully tested and verified with known limitations documented. To share feedback about this release, access our [NVIDIA Developer Forum](https://forums.developer.nvidia.com/).
 
+## TensorRT-LLM Release 0.21.0
+
+### Key Features and Enhancements
+- **Model Support**
+  - Added Gemma3 VLM support
+- **Features**
+  - Added large-scale EP support
+  - Integrated NIXL into the communication layer of the disaggregated service
+  - Added fabric Memory support for KV Cache Transfer
+  - Added MCP in ScaffoldingLLM
+  - Added support for w4a8_mxfp4_fp8 quantization
+  - Added support for fp8 rowwise quantization
+  - Added generation logits support in TRTLLM Sampler
+  - Added log probs support in TRTLLM Sampler
+  - Optimized TRTLLM Sampler perf single beam single step
+  - Enabled Disaggregated serving for Qwen-3
+  - Added EAGLE3 support for Qwen-3
+  - Fused finalize and allreduce for Qwen-MoE model
+  - Refactored Fused MoE module
+  - Added chunked attention kernels
+  - Integrated Hopper chunked attention kernels
+  - Introduced sliding-window attention kernels for the generation phase on Blackwell
+  - Updated DeepSeek FP8 TRT-LLM Gen cubins
+  - Added FP8 block-scale GEMM support on SM89
+  - Enabled overlap scheduler between draft forwards
+  - Added Piecewise cuda graph support for MLA
+  - Added model-agnostic one-engine eagle3
+  - Enabled Finalize + Allreduce + add + rmsnorm fusion
+  - Integrated TRT-LLM Gen FP8 block scale MoE with Pytorch workflow kernel autotuner
+- Benchmark:
+  - Added all_reduce.py benchmark script for testing
+  - Added beam width to low latency
+  - Fixed trtllm-bench iter_stats and cuda_graph_batch_sizes errors
+  - Enabled trtllm-bench to run LoRA and add basic e2e perf testing capability for LoRA
+  - Supported post_proc for bench
+  - Added no_kv_cache_reuse option and streaming support for trtllm serve bench
+
+### Infrastructure Changes
+- The dependent TensorRT version is updated to 10.11.0
+- The dependent public PyTorch version is updated to 2.8.0
+- The dependent NVIDIA ModelOpt version is updated to 0.31.0
+- Upgrade gcc toolset version from 11 to 13
+
+### API Changes
+- Set _AutoDeployLlmArgs as primary config object
+- Removed decoder request from decoder interface
+- Enhanced the torch_compile_config in llm args
+- Removed the redundant use_kv_cache field from PytorchConfig
+- Moved allreduce_strategy from committed api to reference
+
+### Fixed Issues
+- Fixed disaggregated service hang when MNNVL two-shot AllReduce is enabled (#4678)
+- Fixed EP load balancer with MTP layer and route offset by EP rank (#4767)
+- Fixed cuda graph padding for spec decoding (#4853)
+- Fixed llama 4 long context issue (#4809)
+- Fixed max_num_sequences calculation with overlap scheduling (#4532)
+- Fixed chunked prefill + overlap scheduling (#5761)
+- Fixed trtllm-bench hang issue due to LLM API IPC (#4798)
+- Fixed index out of bounds error in spec decoding (#5954)
+- Fixed MTP illegal memory access in cuda graph warmup (#5947)
+- Fixed no free slots error with spec decode + disagg (#5975)
+
+### Known Issues
+- accuracy/test_cli_flow::TestGpt2::test_beam_search_large is broken
+- accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=2-overlap_scheduler=True] is broken
+
 ## TensorRT-LLM Release 0.20.0
 
 ### Key Features and Enhancements
