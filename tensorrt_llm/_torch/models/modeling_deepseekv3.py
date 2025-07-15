@@ -62,8 +62,7 @@ from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..peft.lora.layer import LoraLayer
 from ..speculative import MTPEagleWorker, MTPSpecMetadata, MTPWorker
-from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
-                     disable_fp4_allgather)
+from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              EagerFusionConfig, filter_weights,
                              register_auto_model)
@@ -524,9 +523,7 @@ class Deepseekv3MoE(nn.Module):
         if self.use_dp and self.mapping.tp_size > 1:
             # FP4 all_gather moves this bf16 allgather in to after topk and fp4 quantization
             # to reduce allreduce BW
-            if (disable_fp4_allgather()
-                    and not self.experts.enable_alltoall) or isinstance(
-                        self.experts, TRTLLMGenFusedMoE):
+            if isinstance(self.experts, TRTLLMGenFusedMoE):
                 hidden_states = allgather(hidden_states,
                                           self.mapping,
                                           dim=0,
