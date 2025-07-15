@@ -3,6 +3,7 @@ from typing import List, Optional
 
 import torch
 
+from ..._utils import nvtx_range
 from ...bindings.executor import GuidedDecodingConfig
 from .grammar_matcher import (GrammarMatcher, GrammarMatcherFactory,
                               LLGuidanceMatcherFactory, XGrammarMatcherFactory)
@@ -48,6 +49,7 @@ class GuidedDecoder:
     def bitmask_size(self) -> int:
         return math.ceil(self.vocab_size_padded / 32)
 
+    @nvtx_range("GuidedDecoder.build")
     def build(self, scheduled_requests: ScheduledRequests) -> None:
         for llm_req in scheduled_requests.all_requests():
             if llm_req.guided_decoding_params is None:
@@ -73,6 +75,7 @@ class GuidedDecoder:
                 self.bitmask[slot].copy_(self.bitmask_host[slot],
                                          non_blocking=True)
 
+    @nvtx_range("GuidedDecoder.execute")
     def execute(self, scheduled_requests: ScheduledRequests,
                 logits: torch.Tensor) -> None:
         assert logits.size(0) == len(scheduled_requests.context_requests) + len(
