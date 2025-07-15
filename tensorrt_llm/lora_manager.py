@@ -480,7 +480,7 @@ class LoraManager(object):
     def is_adapter_in_cpu_cache(self, adapter_uid: int) -> bool:
         """Best effort to check if a LoRA adapter is in the LoRA CPU cache.
 
-        If no peft_cache_manager instance wasn't given at the construction of this LoraManager instance,
+        If no peft_cache_manager instance was given at the construction of this LoraManager instance,
         then False is returned.
         """
         return (
