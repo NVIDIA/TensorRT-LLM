@@ -776,13 +776,7 @@ def collectTestResults(pipeline, testFilter)
                 --output-file=rerun/rerun_report.xml \
                 --input-files=${inputfiles}
             """
-            try {
-                trtllm_utils.uploadArtifacts("rerun/rerun_report.*", "${UPLOAD_PATH}/test-results/")
-            } catch (Exception e) {
-                echo "upload failed"
-                trtllm_utils.uploadArtifacts("rerun/rerun_report.html", "${UPLOAD_PATH}/test-results/")
-                trtllm_utils.uploadArtifacts("rerun/rerun_report.xml", "${UPLOAD_PATH}/test-results/")
-            }
+            trtllm_utils.uploadArtifacts("rerun/rerun_report.*", "${UPLOAD_PATH}/test-results/")
             echo "Rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/rerun_report.html"
             def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
             if (env.alternativeTRT || isOfficialPostMergeJob) {
