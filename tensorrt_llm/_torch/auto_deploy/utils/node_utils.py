@@ -25,7 +25,8 @@ except ImportError:
     modelopt_quantize_op = None
     modelopt_dynamic_block_quantize_op = None
 
-OperatorLike = Union[OpOverloadPacket, OpOverload, Callable]
+OpOrOverload = Union[OpOverloadPacket, OpOverload]
+OperatorLike = Union[OpOrOverload, Callable]
 
 
 @dataclass
@@ -203,6 +204,37 @@ def is_op(node: Node, ops: Union[OperatorLike, Iterable[OperatorLike]]) -> bool:
         is_match = False
 
     return is_match
+
+
+def filtered_nodes(
+    nodes: Iterable[Node], ops: Union[OperatorLike, Iterable[OperatorLike]]
+) -> Iterable[Node]:
+    """Iterate over nodes that are filtered by the given operations.
+
+    This utility function simplifies the common pattern of iterating through nodes
+    and filtering by operation type.
+
+    Args:
+        nodes: Iterable of nodes to filter (e.g., gm.graph.nodes)
+        ops: Operation(s) to match against
+
+    Yields:
+        Node: Nodes that match the given operations
+
+    Example:
+        # Instead of:
+        for node in gm.graph.nodes:
+            if not is_op(node, torch.ops.aten.linear):
+                continue
+            # process node
+
+        # Use:
+        for node in filtered_nodes(gm.graph.nodes, torch.ops.aten.linear):
+            # process node
+    """
+    for node in nodes:
+        if is_op(node, ops):
+            yield node
 
 
 def is_linear_op(node: Node, include_quantization: bool = False) -> bool:

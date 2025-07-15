@@ -11,9 +11,9 @@ from ..distributed import common as dist_ad
 from ..llm_args import AutoDeployConfig
 from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
+from ..transform.optimizer import InferenceOptimizer as ModularInferenceOptimizer
 from ..utils.logger import ad_logger
 from ._graph import canonicalize_graph, lift_to_meta, move_to_device
-from .export import torch_export_to_gm
 from .library import (
     column_row_shard,
     dp_bmm_shard,
@@ -58,19 +58,12 @@ class InferenceOptimizer:
             A nn.Module representing the optimized inference model.
         """
         ############################################################################################
-        # INITIALIZE MODEL
+        # RUN MODULAR INFERENCE OPTIMIZER FOR ALREADY-MIGRATED TRANSFORMS
         ############################################################################################
-        model = self.factory.build_model(device="meta")
+        new_optimizer = ModularInferenceOptimizer(self.factory, self.ad_config.transforms)
+        egm = new_optimizer(cm)
 
-        ############################################################################################
-        # EXPORT MODEL TO GRAPH MODULE
-        ############################################################################################
-
-        cm.info.set_example_sequence()
-        egm = torch_export_to_gm(model, args=cm.args, dynamic_shapes=cm.dynamic_shapes)
-        del model
-        ad_logger.debug("original graph: " + str(egm))
-        local_rank, world_size = dist_ad.get_rank_world_size()
+        # TODO (lucaslie): continue moving legacy transforms to the new optimizer
 
         ############################################################################################
         # RUN PATTERN MATCHER TRANSFORMATIONS TO STANDARDIZE GRAPH REPRESENTATION
@@ -109,6 +102,8 @@ class InferenceOptimizer:
         ############################################################################################
         # RUN TRANSFORMATIONS ON STANDARDIZED GRAPH REPRESENTATION
         ############################################################################################
+
+        local_rank, world_size = dist_ad.get_rank_world_size()
 
         # eliminate redundant transpose operations
         eliminate_redundant_transposes(egm)
