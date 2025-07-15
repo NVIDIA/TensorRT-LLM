@@ -73,6 +73,16 @@
 ### TRITON BACKEND ###
 
 ### INFRA ###
+/docker/ @NVIDIA/trt-llm-infra-codeowners
+/jenkins/ @NVIDIA/trt-llm-infra-codeowners
+/scripts/ @NVIDIA/trt-llm-infra-codeowners
+requirements.txt @NVIDIA/trt-llm-infra-codeowners
+requirements-dev.txt @NVIDIA/trt-llm-infra-codeowners
+setup.py @NVIDIA/trt-llm-infra-codeowners
+# github
+.github/ @NVIDIA/trt-llm-infra-codeowners
+
+
 
 ### EXAMPLES ###
 /examples/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
