@@ -2,13 +2,13 @@
 
 def createKubernetesPodConfig()
 {
-    def targetCould = "kubernetes-cpu"
+    def targetCloud = "kubernetes-cpu"
     def selectors = """
                   nvidia.com/node_type: builder
                   kubernetes.io/os: linux"""
     def image = "urm.nvidia.com/docker/ubuntu:22.04"
     def podConfig = [
-        cloud: targetCould,
+        cloud: targetCloud,
         namespace: "sw-tensorrt",
         yaml: """
             apiVersion: v1
@@ -43,12 +43,12 @@ def generate()
     sh "pwd && ls -alh"
 
     container("alpine") {
-        LLM_REPO = "https://gitlab-master.nvidia.com/ftp/tekit.git"
+        LLM_REPO = "https://github.com/yuanjingx87/TensorRT-LLM.git"
         sh "apt update"
         sh "apt install -y python3-dev git curl"
         sh "git config --global --add safe.directory ${env.WORKSPACE}"
-        sh "git config --global user.email \"yuanjingx@nvidia.com\""
-        sh "git config --global user.name \"Yuanjing Xue\""
+        sh "git config --global user.email \"tensorrt_llm@nvidia.com\""
+        sh "git config --global user.name \"TensorRT LLM\""
         trtllm_utils.checkoutSource(LLM_REPO, params.llmBranch, env.WORKSPACE, true, true)
         sh "python3 --version"
         sh "curl -sSL https://install.python-poetry.org | POETRY_VERSION=1.8.5 python3 -"
@@ -78,7 +78,7 @@ pipeline {
         kubernetes createKubernetesPodConfig()
     }
     parameters {
-        string(name: 'llmBranch', defaultValue: 'user/yuanjingx/release_0.21_with_lock_files', description: 'the branch to generate the lock files')
+        string(name: 'llmBranch', defaultValue: 'main', description: 'the branch to generate the lock files')
     }
     options {
         skipDefaultCheckout()

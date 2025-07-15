@@ -14,13 +14,10 @@ Generates pyproject.toml and poetry.lock files from requirements.txt
 Black Duck requires poetry lock files to perform security scans. TensorRT uses requirements.txt to define
 Python dependencies.
 This script parses through the requirements.txt files in the project and generates the poetry lock files
-required to perform the Nspect security scans.
+required to perform the security scans.
 
 Pip install requirements:
 pip3 install poetry
-
-Usage:
-make -j12 compile.release
 
 To generate pyproject.toml and poetry.lock recursively for all requirements.txt in the project:
 python3 scripts/generate_lock_files.py
