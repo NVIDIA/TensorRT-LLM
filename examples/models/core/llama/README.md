@@ -37,6 +37,10 @@ This document shows how to build and run a LLaMA model in TensorRT-LLM on both s
     - [Convert Checkpoint to TensorRT-LLM Unified Checkpoint](#convert-checkpoint-to-tensorrt-llm-unified-checkpoint)
     - [Build Engine](#build-engine)
     - [Run Inference](#run-inference)
+  - [Run LLaMa-3.3 70B Model on PyTorch Backend](#run-llama-33-70b-model-on-pytorch-backend)
+    - [Prepare TensorRT-LLM extra configs](#prepare-tensorrt-llm-extra-configs)
+    - [Launch trtllm-serve OpenAI-compatible API server](#launch-trtllm-serve-openai-compatible-api-server)
+    - [Run performance benchmarks](#run-performance-benchmarks)
 
 ## Overview
 
@@ -1541,4 +1545,52 @@ bash -c 'python ./examples/mmlu.py --test_trt_llm \
                                    --enable_chunked_context \
                                    --kv_cache_free_gpu_memory_fraction 0.999 \
                                    --max_tokens_in_paged_kv_cache 65064'
+```
+
+## Run LLaMa-3.3 70B Model on PyTorch Backend
+This section provides the steps to run LLaMa-3.3 70B model FP8 precision on PyTorch backend by launching TensorRT-LLM server and run performance benchmarks.
+
+
+### Prepare TensorRT-LLM extra configs
+```bash
+cat >./extra-llm-api-config.yml <<EOF
+stream_interval: 2
+cuda_graph_config:
+  max_batch_size: 1024
+  padding_enabled: true
+EOF
+```
+Explanation:
+- `stream_interval`: The iteration interval to create responses under the streaming mode.
+- `cuda_graph_config`: CUDA Graph config.
+  - `max_batch_size`: Max CUDA graph batch size to capture.
+  - `padding_enabled`: Whether to enable CUDA graph padding.
+
+
+### Launch trtllm-serve OpenAI-compatible API server
+TensorRT-LLM supports nvidia TensorRT Model Optimizer quantized FP8 checkpoint
+``` bash
+trtllm-serve nvidia/Llama-3.3-70B-Instruct-FP8 \
+    --backend pytorch \
+    --tp_size 8 \
+    --max_batch_size 1024 \
+    --trust_remote_code \
+    --num_postprocess_workers 2 \
+    --extra_llm_api_options ./extra-llm-api-config.yml
+```
+
+### Run performance benchmarks
+TensorRT-LLM provides a benchmark tool to benchmark `trtllm-serve`.
+
+Prepare a new terminal and run `benchmark_serving`.
+```bash
+python -m tensorrt_llm.serve.scripts.benchmark_serving \
+        --model nvidia/Llama-3.3-70B-Instruct-FP8 \
+        --dataset-name random \
+        --ignore-eos \
+        --num-prompts 8192 \
+        --random-input-len 1024 \
+        --random-output-len 2048 \
+        --random-ids \
+        --max-concurrency 1024 \
 ```

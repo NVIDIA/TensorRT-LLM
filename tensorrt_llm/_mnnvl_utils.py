@@ -406,9 +406,9 @@ class MnnvlMoe:
     @staticmethod
     def mnnvl_moe_alltoallv_prepare(
         gathered_target_rank_ids: torch.Tensor,
-        real_rank_token_count_cumsum: torch.Tensor,
+        real_rank_token_count_cumsum: Optional[torch.Tensor],
         gathered_expert_ids: torch.Tensor,
-        gathered_scales: torch.Tensor,
+        gathered_scales: Optional[torch.Tensor],
         max_token_count_per_rank: int,
         expert_count: int,
         top_k: int,
@@ -437,9 +437,15 @@ class MnnvlMoe:
         local_expert_ids = torch.empty(
             local_token_allocation_count, top_k, dtype=torch.int32, device=torch.device("cuda")
         )
-        local_scales = torch.empty(
-            local_token_allocation_count, top_k, dtype=torch.float32, device=torch.device("cuda")
-        )
+        if gathered_scales is None:
+            local_scales = None
+        else:
+            local_scales = torch.empty(
+                local_token_allocation_count,
+                top_k,
+                dtype=torch.float32,
+                device=torch.device("cuda"),
+            )
 
         torch.ops.trtllm.moe_local_gather(
             recv_rank_count_cumsum,

@@ -437,6 +437,8 @@ def DEBUG_MODE = "debug"
 @Field
 def DETAILED_LOG = "detailed_log"
 @Field
+def ONLY_DOCS_FILE_CHANGED = "only_docs_file_changed"
+@Field
 def testFilter = [
     (REUSE_STAGE_LIST): null,
     (ENABLE_SKIP_TEST): false,
@@ -453,6 +455,7 @@ def testFilter = [
     (DEBUG_MODE): false,
     (AUTO_TRIGGER_TAG_LIST): [],
     (DETAILED_LOG): false,
+    (ONLY_DOCS_FILE_CHANGED): false,
 ]
 
 @Field
@@ -1639,7 +1642,8 @@ def checkStageNameSet(stageNames, jobKeys, paramName) {
     echo "Validate stage names for the passed GitLab bot params [${paramName}]."
     invalidStageName = stageNames.findAll { !(it in jobKeys) }
     if (invalidStageName) {
-        throw new Exception("Cannot find the stage names [${invalidStageName}] from the passed params [${paramName}].")
+        def sortedJobKeys = jobKeys.sort()
+        throw new Exception("Cannot find the stage names [${invalidStageName}] from the passed params [${paramName}]. Available stage names (${sortedJobKeys.size()} total):\n${sortedJobKeys.collect { "    ${it}" }.join('\n')}")
     }
 }
 
@@ -1819,6 +1823,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     fullSet += SBSATestConfigs.keySet()
 
     SBSASlurmTestConfigs = [
+        "GB200-4_GPUs-PyTorch-1": ["gb200-4-gpus", "l0_gb200", 1, 1, 4],
         "GB200-4_GPUs-PyTorch-Post-Merge-1": ["gb200-4-gpus", "l0_gb200", 1, 1, 4],
     ]
     fullSet += SBSASlurmTestConfigs.keySet()
@@ -2016,11 +2021,19 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "[ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true")
                         }
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
-                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install python3-pip git rsync curl")
+                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install python3-pip git rsync curl wget")
                         trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install requests")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y tensorrt")
+                        if (values[5] != DLFW_IMAGE) {
+                            def ubuntu_version = key.contains("UB2404") ? "ubuntu2404" : "ubuntu2204"
+                            def platform = values[2] == X86_64_TRIPLE ? "x86_64" : "sbsa"
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://developer.download.nvidia.com/compute/cuda/repos/${ubuntu_version}/${platform}/cuda-keyring_1.1-1_all.deb")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "dpkg -i cuda-keyring_1.1-1_all.deb")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install cuda-toolkit-12-9")
+                        }
 
                         // Extra PyTorch CUDA 12.8 install
                         if (values[6]) {
@@ -2156,6 +2169,12 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         }
     }
 
+    if (testFilter[(ONLY_DOCS_FILE_CHANGED)]) {
+        echo "Only docs files are changed, run doc build stage only."
+        parallelJobsFiltered = docBuildJobs
+        println parallelJobsFiltered.keySet()
+    }
+
     // Check --stage-list, only run the stages in stage-list.
     if (testFilter[TEST_STAGE_LIST] != null) {
         echo "Use TEST_STAGE_LIST for filtering. Stages: ${testFilter[(TEST_STAGE_LIST)]}."
@@ -2250,7 +2269,8 @@ pipeline {
         {
             when {
                 expression {
-                    env.targetArch == X86_64_TRIPLE  // Only execute the check if running on x86
+                    // Only run the test list validation when necessary
+                    env.targetArch == X86_64_TRIPLE && testFilter[ONLY_DOCS_FILE_CHANGED] == false
                 }
             }
             steps

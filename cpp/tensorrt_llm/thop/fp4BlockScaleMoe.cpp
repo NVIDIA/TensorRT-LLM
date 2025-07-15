@@ -86,6 +86,7 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::Tensor const& r
 
     TORCH_CHECK(num_experts % 4 == 0, "Routing kernel expects that num_experts must be divisible by 4");
     TORCH_CHECK(num_experts > top_k, "num_experts must be greater than top_k");
+    TORCH_CHECK(num_experts <= 256, "num_experts must be less than or equal to 256");
 
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::MoERunnerArgs args;
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::MoEWorkspace workspace;
