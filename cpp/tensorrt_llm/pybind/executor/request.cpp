@@ -364,7 +364,7 @@ void initRequestBindings(pybind11::module_& m)
         return tle::KvCacheRetentionConfig(
             state[0].cast<std::vector<tle::KvCacheRetentionConfig::TokenRangeRetentionConfig>>(),
             state[1].cast<tle::RetentionPriority>(), state[2].cast<std::optional<std::chrono::milliseconds>>(),
-            state[3].cast<tle::KvCacheTransferMode>(), state[4].cast<std::optional<std::string>>());
+            state[3].cast<tle::KvCacheTransferMode>(), state[4].cast<std::string>());
     };
 
     auto kvCacheRetentionConfig = py::class_<tle::KvCacheRetentionConfig>(m, "KvCacheRetentionConfig");
@@ -386,7 +386,7 @@ void initRequestBindings(pybind11::module_& m)
     // TokenRangeRetentionPriority bindings have been defined.
     kvCacheRetentionConfig
         .def(py::init<std::vector<tle::KvCacheRetentionConfig::TokenRangeRetentionConfig>, tle::RetentionPriority,
-                 std::optional<std::chrono::milliseconds>, tle::KvCacheTransferMode, std::optional<std::string>>(),
+                 std::optional<std::chrono::milliseconds>, tle::KvCacheTransferMode, std::string>(),
             py::arg("token_range_retention_configs"),
             py::arg("decode_retention_priority") = tle::KvCacheRetentionConfig::kDefaultRetentionPriority,
             py::arg("decode_duration_ms") = py::none(),

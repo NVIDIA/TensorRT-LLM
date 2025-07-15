@@ -37,12 +37,12 @@ public:
     //! \brief Onboard a block to gpu memory.
     void onboard(BlockPtr const& offloadBlock, BlockPtr const& block, std::vector<KVCacheBlockPool> const& pools,
         int numTokensToCopy = 0, executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM,
-        std::optional<std::string> directory = std::nullopt);
+        std::string const& directory = "");
 
     //! \brief Offload a block to cpu memory.
     void offload(BlockPtr const& block, BlockPtr const& offloadBlock, std::vector<KVCacheBlockPool> const& pools,
         int numTokensToCopy = 0, executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM,
-        std::optional<std::string> directory = std::nullopt);
+        std::string const& directory = "");
 
     //! \brief Synchronize the offload/onboard streams with the bufferManager stream.
     void syncTransfers();
@@ -67,7 +67,7 @@ private:
      */
     void copyBlock(BlockPtr const& src, BlockPtr const& dst, std::vector<KVCacheBlockPool> const& pools, bool isOffload,
         int numTokensToCopy = 0, executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM,
-        std::optional<std::string> directory = std::nullopt);
+        std::string const& directory = "");
 
     runtime::BufferManager mBufferManager;
     runtime::BufferManager mOnboardManager;
