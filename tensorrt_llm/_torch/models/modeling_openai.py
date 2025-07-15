@@ -52,7 +52,7 @@ class OpenAIMoeConfig:
     torch_dtype: torch.dtype = torch.bfloat16
     rms_norm_eps: float = 1e-05
     # TODO: check what the real max_position_embeddings is
-    max_position_embeddings: int = 8192
+    max_position_embeddings: int = 131072
     model_type: str = "mixtral"
     tie_word_embeddings: bool = False
 
