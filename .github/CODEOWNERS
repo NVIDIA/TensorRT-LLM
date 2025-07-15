@@ -80,7 +80,13 @@ requirements.txt @NVIDIA/trt-llm-infra-codeowners
 requirements-dev.txt @NVIDIA/trt-llm-infra-codeowners
 setup.py @NVIDIA/trt-llm-infra-codeowners
 # github
-.github/ @NVIDIA/trt-llm-infra-codeowners
+.github/ @NVIDIA/trt-llm-infra-gh-workflow-codeowners @NVIDIA/trt-llm-infra-codeowners
+.github/scripts/label_communit_user.py @poweiw @NVIDIA/trt-llm-infra-gh-workflow-codeowners @NVIDIA/trt-llm-infra-codeowners
+.github/scripts/label_communit_user.py @poweiw @NVIDIA/trt-llm-infra-gh-workflow-codeowners @NVIDIA/trt-llm-infra-codeowners
+.github/workflows/auto-assign.yml @poweiw @NVIDIA/trt-llm-infra-gh-workflow-codeowners @NVIDIA/trt-llm-infra-codeowners
+.github/workflows/l0-test.yml @tburt-nv @NVIDIA/trt-llm-infra-gh-workflow-codeowners @NVIDIA/trt-llm-infra-codeowners
+.github/workflows/module-owners.json @kaiyux @poweiw @NVIDIA/trt-llm-infra-gh-workflow-codeowners @NVIDIA/trt-llm-infra-codeowners
+.github/CODEOWNERS @juney-nvidia @venkywonka @NVIDIA/trt-llm-infra-gh-workflow-codeowners @NVIDIA/trt-llm-infra-codeowners
 
 
 
