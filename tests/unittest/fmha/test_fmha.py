@@ -6,7 +6,7 @@ from subprocess import run
 build_run = partial(run, shell=True, check=True)
 
 current_dir = Path.cwd()
-project_dir = Path(__file__).parent.resolve().parent.parent
+project_dir = Path(__file__).parent.resolve().parent.parent.parent
 fmha_v2_dir = project_dir / "cpp/kernels/fmha_v2"
 
 try:
