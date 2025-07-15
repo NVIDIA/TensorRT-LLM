@@ -1,18 +1,16 @@
-from typing import OrderedDict
+from typing import OrderedDict, Type
 
 from utils.llm_data import llm_models_root
 from utils.util import duplicate_list_to_length, flatten_list, similar
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm.executor.request import LoRARequest
-from tensorrt_llm.llmapi.llm import BaseLLM, _TorchLLM, _TrtLLM
-from tensorrt_llm.llmapi.llm_utils import BuildConfig
-from tensorrt_llm.lora_manager import LoraConfig
+from tensorrt_llm.llmapi.llm import BaseLLM
 
 
-def check_multi_unique_lora_adapters_from_request(
-        llm: BaseLLM, hf_lora_dirs: list[str],
-        lora_adapter_count_per_call: list[int], repeats: int):
+def check_llama_7b_multi_unique_lora_adapters_from_request(
+        lora_adapter_count_per_call: list[int], repeats: int,
+        llm_class: Type[BaseLLM], **llm_kwargs):
     """Calls llm.generate s.t. for each C in lora_adapter_count_per_call, llm.generate is called with C requests,
     where each request is configured with a unique LoRA adapter ID. This entire process is done in a loop 'repeats'
     times with the same requests.
@@ -20,6 +18,11 @@ def check_multi_unique_lora_adapters_from_request(
     """  # noqa: D205
     total_lora_adapters = sum(lora_adapter_count_per_call)
 
+    hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
+    hf_lora_dirs = [
+        f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1",
+        f"{llm_models_root()}/llama-models/Japanese-Alpaca-LoRA-7b-v0"
+    ]
     # Each prompt should have a reference for every LoRA adapter dir (in the same order as in hf_lora_dirs)
     prompt_to_references = OrderedDict({
         "美国的首都在哪里? \n答案:": [
@@ -42,6 +45,7 @@ def check_multi_unique_lora_adapters_from_request(
         LoRARequest(str(i), i, hf_lora_dirs[i % len(hf_lora_dirs)])
         for i in range(total_lora_adapters)
     ]
+    llm = llm_class(hf_model_dir, **llm_kwargs)
 
     # Perform repeats of the same requests to test reuse and reload of adapters previously unloaded from cache
     try:
@@ -61,39 +65,9 @@ def check_multi_unique_lora_adapters_from_request(
         llm.shutdown()
 
 
-def check_pytorch_llama_7b_multi_lora_from_request_test_harness(
-        max_lora_rank: int = 8, **llm_kwargs) -> None:
+def check_llama_7b_multi_lora_from_request_test_harness(
+        llm_class: Type[BaseLLM], **llm_kwargs) -> None:
     hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
-
-    # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
-    # (1) specify lora_target_modules, or
-    # (2) provide a lora_dir to infer the lora_target_modules.
-    lora_config = LoraConfig(lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
-                             max_lora_rank=max_lora_rank)
-
-    llm = _TorchLLM(hf_model_dir, lora_config=lora_config, **llm_kwargs)
-    _check_llama_7b_multi_lora_from_request_test_harness(llm)
-
-
-def check_trt_python_llama_7b_multi_lora_from_request_test_harness(
-        max_lora_rank: int = 8, **llm_kwargs):
-    hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
-
-    # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
-    # (1) specify lora_target_modules, or
-    # (2) provide a lora_dir to infer the lora_target_modules.
-    build_config = BuildConfig(lora_config=LoraConfig(
-        lora_target_modules=['attn_q', 'attn_k', 'attn_v']))
-    llm = _TrtLLM(hf_model_dir,
-                  enable_lora=True,
-                  max_lora_rank=max_lora_rank,
-                  build_config=build_config,
-                  fast_build=True,
-                  **llm_kwargs)
-    _check_llama_7b_multi_lora_from_request_test_harness(llm)
-
-
-def _check_llama_7b_multi_lora_from_request_test_harness(llm: BaseLLM) -> None:
     hf_lora_dir1 = f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"
     hf_lora_dir2 = f"{llm_models_root()}/llama-models/Japanese-Alpaca-LoRA-7b-v0"
     prompts = [
@@ -123,6 +97,8 @@ def _check_llama_7b_multi_lora_from_request_test_harness(llm: BaseLLM) -> None:
     lora_req1 = LoRARequest("luotuo", 1, hf_lora_dir1)
     lora_req2 = LoRARequest("Japanese", 2, hf_lora_dir2)
     sampling_params = SamplingParams(max_tokens=20)
+
+    llm = llm_class(hf_model_dir, **llm_kwargs)
     try:
         outputs = llm.generate(
             prompts,

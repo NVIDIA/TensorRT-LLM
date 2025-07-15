@@ -50,8 +50,8 @@ from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
 from gc_utils import assert_resource_freed
 from llmapi.lora_test_utils import (
-    check_multi_unique_lora_adapters_from_request,
-    check_trt_python_llama_7b_multi_lora_from_request_test_harness)
+    check_llama_7b_multi_lora_from_request_test_harness,
+    check_llama_7b_multi_unique_lora_adapters_from_request)
 from utils.llm_data import llm_models_root
 from utils.util import force_ampere, similar, skip_gpu_memory_less_than_40gb, skip_pre_hopper, skip_single_gpu
 # isort: on
@@ -1385,12 +1385,6 @@ def llama_v2_13b_lora_from_dir_test_harness(**llm_kwargs):
 def test_llama_7b_multi_lora_evict_load_new_adapters(
         lora_adapter_count_per_call: list[int], max_loras: int,
         max_cpu_loras: int, repeats: int):
-    hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
-    hf_lora_dirs = [
-        f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1",
-        f"{llm_models_root()}/llama-models/Japanese-Alpaca-LoRA-7b-v0"
-    ]
-
     # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
     # (1) specify lora_target_modules, or
     # (2) provide a lora_dir to infer the lora_target_modules.
@@ -1399,13 +1393,16 @@ def test_llama_7b_multi_lora_evict_load_new_adapters(
         max_lora_rank=8,
         max_loras=max_loras,
         max_cpu_loras=max_cpu_loras))
-    llm = LLM(hf_model_dir,
-              enable_lora=True,
-              build_config=build_config,
-              fast_build=True)
-    check_multi_unique_lora_adapters_from_request(llm, hf_lora_dirs,
-                                                  lora_adapter_count_per_call,
-                                                  repeats)
+    check_llama_7b_multi_unique_lora_adapters_from_request(
+        lora_adapter_count_per_call,
+        repeats,
+        LLM,
+        enable_lora=True,
+        build_config=build_config,
+        fast_build=True,
+        max_lora_rank=8,
+        max_loras=max_loras,
+        max_cpu_loras=max_cpu_loras)
 
 
 @skip_gpu_memory_less_than_40gb
@@ -1415,8 +1412,18 @@ def test_llama_v2_13b_lora():
 
 @skip_gpu_memory_less_than_40gb
 def test_llama_7b_multi_lora():
-    check_trt_python_llama_7b_multi_lora_from_request_test_harness(
-        max_loras=1, max_cpu_loras=8)
+    # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
+    # (1) specify lora_target_modules, or
+    # (2) provide a lora_dir to infer the lora_target_modules.
+    build_config = BuildConfig(lora_config=LoraConfig(
+        lora_target_modules=['attn_q', 'attn_k', 'attn_v']))
+    check_llama_7b_multi_lora_from_request_test_harness(
+        LLM,
+        enable_lora=True,
+        build_config=build_config,
+        fast_build=True,
+        max_loras=1,
+        max_cpu_loras=8)
 
 
 def llama_v2_7b_prompt_adapter_test_harness(**llm_kwargs):
