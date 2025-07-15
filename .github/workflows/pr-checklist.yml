@@ -1,54 +1,88 @@
 name: PR Checklist
 on:
   pull_request_target:
-    types: [opened, reopened, ready_for_review]
+    types: [opened, reopened, ready_for_review, synchronize]
 
 permissions:
   pull-requests: write
-  contents: read
+  statuses: write
 
 jobs:
-  post-checklist:
+  checklist:
     runs-on: ubuntu-latest
     if: github.event.pull_request.draft == false
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          # Important: checkout the PR head for reading the checklist file
-          ref: ${{ github.event.pull_request.head.sha }}
-
-      - name: Post PR Checklist
+      - name: Manage PR Checklist
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const fs = require('fs');
+            const pr = context.payload.pull_request;
+            const checklistBody = `## 🚀 PR Checklist
 
-            // Read checklist from file
-            const checklistPath = process.env.GITHUB_WORKSPACE + '/.github/pr-checklist.md';
-            const checklistContent = fs.readFileSync(checklistPath, 'utf8');
+            Please review all applicable items before requesting a review:
 
-            // Check if we already posted a checklist comment
+            - [ ] PR title follows format: \`[JIRA/Issue][type] Description\`
+            - [ ] PR description explains both **what** you're doing and **why**
+            - [ ] Code conforms to coding conventions (see \`CODING_GUIDELINES.md\`)
+            - [ ] Inputs validated and possible nullptr dereferences checked
+            - [ ] Test cases added for new code
+            - [ ] All existing tests pass
+            - [ ] PR and commit messages cleaned up via \`git rebase -i\`
+
+            ---
+            **Please check the items and react with 👍 to acknowledge you've reviewed the checklist.**`;
+
+            // Get all comments
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.issue.number
+              issue_number: pr.number
             });
 
-            const checklistExists = comments.some(comment =>
+            // Find checklist comment
+            let checklistComment = comments.find(comment =>
               comment.user.login === 'github-actions[bot]' &&
               comment.body.includes('PR Checklist')
             );
 
-            if (!checklistExists) {
-              await github.rest.issues.createComment({
+            // Post checklist if not exists
+            if (!checklistComment && ['opened', 'reopened', 'ready_for_review'].includes(context.payload.action)) {
+              const { data: newComment } = await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body: checklistContent
+                issue_number: pr.number,
+                body: checklistBody
               });
-              console.log('Posted PR checklist comment');
-            } else {
-              console.log('Checklist already exists, skipping');
+              checklistComment = newComment;
+              console.log('Posted PR checklist');
             }
+
+            if (!checklistComment) {
+              console.log('No checklist comment found');
+              return;
+            }
+
+            // Check for thumbs up reactions
+            const { data: reactions } = await github.rest.reactions.listForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: checklistComment.id
+            });
+
+            const hasThumbsUp = reactions.some(reaction => reaction.content === '+1');
+
+            // Update commit status (using plain text to avoid Unicode issues)
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: pr.head.sha,
+              state: hasThumbsUp ? 'success' : 'pending',
+              context: 'PR Checklist',
+              description: hasThumbsUp
+                ? 'Checklist acknowledged'
+                : 'Please acknowledge the checklist with thumbs up',
+              target_url: checklistComment.html_url
+            });
+
+            console.log(`Status: ${hasThumbsUp ? 'success' : 'pending'}`);
