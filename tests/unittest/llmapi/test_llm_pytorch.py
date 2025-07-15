@@ -370,10 +370,7 @@ def test_llama_7b_multi_lora_load_previously_cpu_cache_evicted_adapter_fails(
                   repeats),
             kwargs={},
             stop_waiting_criteria=_check_contains_expected_message)
-    print("STDOUT:")
-    print(child_stdout)
-    print("STDERR:")
-    print(child_stderr)
+
     assert _check_contains_expected_message(child_stdout, child_stderr)
 
 
