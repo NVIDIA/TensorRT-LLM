@@ -49,7 +49,7 @@ fi
 pip3 install --no-cache-dir meson ninja pybind11
 git clone --depth 1 -b ${NIXL_VERSION} ${NIXL_REPO}
 cd nixl
-meson setup builddir -Ducx_path=${UCX_INSTALL_PATH} -Dstatic_plugins=UCX,GDS ${EXTRA_NIXL_ARGS}
+meson setup builddir -Ducx_path=${UCX_INSTALL_PATH} -Dstatic_plugins=UCX,GDS,GDS_MT ${EXTRA_NIXL_ARGS}
 cd builddir && ninja install
 cd ../..
 rm -rf nixl*  # Remove NIXL source tree to save space

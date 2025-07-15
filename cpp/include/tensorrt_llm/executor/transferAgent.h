@@ -270,6 +270,7 @@ struct BaseAgentConfig
 {
     std::string mName;
     bool useProgThread;
+    bool multiThread;
 };
 
 class BaseTransferAgent
