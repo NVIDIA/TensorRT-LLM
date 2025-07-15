@@ -346,7 +346,7 @@ class Qwen2VLInputProcessorBase(InputProcessor):
                                             mm_processor_kwargs).to(self.device)
 
         if not mm_data:
-            fused_input_ids = processed_inputs['input_ids']
+            fused_input_ids = processed_inputs['input_ids'][0]
             return fused_input_ids.to(torch.int32).tolist(), {}
 
         pixel_values = processed_inputs.get('pixel_values', None)
