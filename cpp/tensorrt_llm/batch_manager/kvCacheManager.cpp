@@ -505,15 +505,21 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
     std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs, nvinfer1::DataType dtype,
     SizeType32 sinkBubbleLength, bool onboardBlocks, CacheType cacheType,
     std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
-    std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse)
+    std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
+    std::optional<BaseAgentConfig> agentConfig)
     : mNumLayers{static_cast<SizeType32>(numKvHeadsPerLayer.size())}
     , mTokensPerBlock{tokensPerBlock}
     , mEventManager{std::move(eventManager)}
     , mStream{stream}
     , mCacheType{cacheType}
 {
-    BaseAgentConfig config{std::string("GDSAgent"), true};
-    mLoopbackAgent = makeLoopbackAgent("nixl", &config);
+    if (agentConfig.has_value())
+        mLoopbackAgent = makeLoopbackAgent("nixl", &agentConfig.value());
+    else
+    {
+        BaseAgentConfig config{std::string("GDSAgent"), true};
+        mLoopbackAgent = makeLoopbackAgent("nixl", &config);
+    }
 
     auto const uniqueWindowSizeToLayers
         = BaseKVCacheManager::groupLayersByWindowSize(maxAttentionWindowVec, mNumLayers);
