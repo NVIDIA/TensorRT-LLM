@@ -72,7 +72,6 @@ jobs:
 
             const hasThumbsUp = reactions.some(reaction => reaction.content === '+1');
 
-            // Update commit status
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -80,8 +79,8 @@ jobs:
               state: hasThumbsUp ? 'success' : 'pending',
               context: 'PR Checklist',
               description: hasThumbsUp
-                ? '✅ Checklist acknowledged'
-                : '⏳ Please 👍 the checklist to acknowledge',
+                ? 'Checklist acknowledged'
+                : 'Please acknowledge the checklist with thumbs up',
               target_url: checklistComment.html_url
             });
 
