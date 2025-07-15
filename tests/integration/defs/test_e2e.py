@@ -1459,10 +1459,9 @@ def test_openai_chat_structural_tag_example(llm_venv):
 def test_openai_chat_json_example(llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
 
-    llm_venv.run_cmd([
-        "-m", "pytest",
-        str(test_root / "_test_openai_chat_json.py")
-    ])
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_openai_chat_json.py")])
 
 
 @pytest.mark.skip_less_device(2)

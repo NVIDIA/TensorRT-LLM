@@ -7,7 +7,7 @@ import openai
 import pytest
 import yaml
 
-from ..test_llm import get_model_path, similar
+from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
 
 pytestmark = pytest.mark.threadleak(enabled=False)
@@ -25,7 +25,8 @@ def temp_extra_llm_api_options_file(request):
     try:
         extra_llm_api_options_dict = {
             "guided_decoding_backend": "xgrammar",
-            "disable_overlap_scheduler": True,  # Guided decoding is not supported with overlap scheduler
+            "disable_overlap_scheduler":
+            True,  # Guided decoding is not supported with overlap scheduler
         }
 
         with open(temp_file_path, "w") as f:
@@ -64,8 +65,14 @@ def user_profile_schema():
     return {
         "type": "object",
         "properties": {
-            "name": {"type": "string", "description": "The full name of the user."},
-            "age": {"type": "integer", "description": "The age of the user, in years."},
+            "name": {
+                "type": "string",
+                "description": "The full name of the user."
+            },
+            "age": {
+                "type": "integer",
+                "description": "The age of the user, in years."
+            },
         },
         "required": ["name", "age"],
     }
@@ -77,13 +84,17 @@ def test_chat_json_schema(client: openai.OpenAI, model_name: str):
     Adapted from https://github.com/vllm-project/vllm/blob/aae6927be06dedbda39c6b0c30f6aa3242b84388/tests/entrypoints/openai/test_chat.py#L413
     """
 
-    def _create_and_validate_response(messages: list[dict[str, Any]]) -> dict[str, any]:
+    def _create_and_validate_response(
+            messages: list[dict[str, Any]]) -> dict[str, any]:
         chat_completion = client.chat.completions.create(
             model=model_name,
             messages=messages,
             max_tokens=1000,
             temperature=0.0,
-            response_format={"type": "json", "schema": user_profile_schema},
+            response_format={
+                "type": "json",
+                "schema": user_profile_schema
+            },
         )
         message = chat_completion.choices[0].message
         assert message.content is not None
@@ -99,28 +110,31 @@ def test_chat_json_schema(client: openai.OpenAI, model_name: str):
         return message_json
 
     messages = [
-        {"role": "system", "content": "you are a helpful assistant"},
         {
-            "role": "user",
-            "content": f"Give an example JSON for an employee profile that "
+            "role": "system",
+            "content": "you are a helpful assistant"
+        },
+        {
+            "role":
+            "user",
+            "content":
+            f"Give an example JSON for an employee profile that "
             f"fits this schema: {user_profile_schema}",
         },
     ]
 
     first_json = _create_and_validate_response(messages)
 
-    messages.extend(
-        [
-            {
-                "role": "assistant",
-                "content": first_message.content,
-            },
-            {
-                "role": "user",
-                "content": "Give me another one with a different name and age.",
-            },
-        ]
-    )
+    messages.extend([
+        {
+            "role": "assistant",
+            "content": first_message.content,
+        },
+        {
+            "role": "user",
+            "content": "Give me another one with a different name and age.",
+        },
+    ])
     second_json = _create_and_validate_response(messages)
 
     assert (
