@@ -143,7 +143,7 @@ Qwen3/Qwen3-8B:
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 76.12
   - accuracy: 76.12
-  - spec_dec_algo: EAGLE3
+  - spec_dec_algo: Eagle
     accuracy: 76.12
 Qwen3/Qwen3-30B-A3B:
   - quant_algo: FP8_BLOCK_SCALES

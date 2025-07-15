@@ -152,7 +152,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
             pass
 
     cuda_graph_config = {
-        "padding_enabled": True,
+        "enable_padding": True,
         "max_batch_size": max_batch_size
     }
 

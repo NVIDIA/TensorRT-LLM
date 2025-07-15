@@ -72,7 +72,7 @@ class CudaGraphConfig(BaseModel):
     max_batch_size: int = Field(
         default=0, description="Maximum batch size for CUDA graphs.")
 
-    padding_enabled: bool = Field(
+    enable_padding: bool = Field(
         default=False,
         description=
         "If true, batches are rounded up to the nearest cuda_graph_batch_size. This is usually a net win for performance."
@@ -86,6 +86,30 @@ class CudaGraphConfig(BaseModel):
             raise ValueError(
                 "cuda_graph_config.max_batch_size must be non-negative")
         return v
+
+
+class MoeConfig(BaseModel):
+    """
+    Configuration for MoE.
+    """
+    backend: Literal["CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM",
+                     "VANILLA"] = Field(default='CUTLASS',
+                                        description="MoE backend to use.")
+
+    max_num_tokens: Optional[int] = Field(
+        default=None,
+        description=
+        "If set, at most max_num_tokens tokens will be sent to torch.ops.trtllm.fused_moe at the same time. If the number of tokens exceeds max_num_tokens, the input tensors will be split into chunks and a for loop will be used."
+    )
+
+    load_balancer: Optional[Union[object, str]] = Field(
+        default=None,
+        description="Configuration for MoE load balancing.",
+        json_schema_extra={"type": "Union[MoeLoadBalancerConfig, str]"})
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
 
 
 @dataclass
@@ -1757,7 +1781,7 @@ class TorchLlmArgs(BaseLlmArgs):
         "Lower values trigger more frequent garbage collection.")
 
     cuda_graph_config: Optional[CudaGraphConfig] = Field(
-        default=None,
+        default_factory=CudaGraphConfig,
         description="CUDA graph config.If true, use CUDA graphs for decoding. \
         CUDA graphs are only created for the batch sizes in cuda_graph_config.batch_sizes, \
         and are enabled for batches that consist of decoding requests *only* \
@@ -1768,25 +1792,11 @@ class TorchLlmArgs(BaseLlmArgs):
     disable_overlap_scheduler: bool = Field(
         default=False, description="Disable the overlap scheduler.")
 
-    moe_max_num_tokens: Optional[int] = Field(
-        default=None,
-        description=
-        "If set, at most moe_max_num_tokens tokens will be sent to torch.ops.trtllm.fused_moe at the same time. If the number of tokens exceeds moe_max_num_tokens, the input tensors will be split into chunks and a for loop will be used."
-    )
-
-    moe_load_balancer: Optional[Union[object, str]] = Field(
-        default=None,
-        description="Configuration for MoE load balancing.",
-        json_schema_extra={
-            "type":
-            "Union[tensorrt_llm._torch.model_config.MoeLoadBalancerConfig, str, None]"
-        })
+    moe_config: MoeConfig = Field(default_factory=MoeConfig,
+                                  description="MoE config.")
 
     attn_backend: str = Field(default='TRTLLM',
                               description="Attention backend to use.")
-
-    moe_backend: str = Field(default='CUTLASS',
-                             description="MoE backend to use.")
 
     enable_mixed_sampler: bool = Field(
         default=False,
@@ -1890,25 +1900,6 @@ class TorchLlmArgs(BaseLlmArgs):
         self._extra_resource_managers = value
 
     @model_validator(mode="after")
-    def validate_moe_load_balancer(self):
-        from .._torch.model_config import MoeLoadBalancerConfig
-        if isinstance(self.moe_load_balancer, str):
-            if not os.path.exists(self.moe_load_balancer):
-                raise FileNotFoundError(
-                    f"MoE load balancer config file not found: {self.moe_load_balancer}"
-                )
-            try:
-                with open(self.moe_load_balancer) as f:
-                    moe_load_balancer_config = yaml.safe_load(f)
-                self.moe_load_balancer = MoeLoadBalancerConfig(
-                    **moe_load_balancer_config)
-            except Exception as e:
-                raise ValueError(
-                    f"Failed to load MoE load balancer config file: {self.moe_load_balancer}"
-                ) from e
-        return self
-
-    @model_validator(mode="after")
     def validate_stream_interval(self):
         if self.stream_interval <= 0:
             raise ValueError(
@@ -1917,17 +1908,17 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @staticmethod
     def _generate_cuda_graph_batch_sizes(max_batch_size: int,
-                                         padding_enabled: bool) -> List[int]:
+                                         enable_padding: bool) -> List[int]:
         """Generate a list of batch sizes for CUDA graphs.
 
         Args:
             max_batch_size: Maximum batch size to generate up to
-            padding_enabled: Whether padding is enabled, which affects the batch size distribution
+            enable_padding: Whether padding is enabled, which affects the batch size distribution
 
         Returns:
             List of batch sizes to create CUDA graphs for
         """
-        if padding_enabled:
+        if enable_padding:
             batch_sizes = [1, 2, 4] + [i * 8 for i in range(1, 17)]
         else:
             batch_sizes = list(range(1, 32)) + [32, 64, 128]
@@ -1947,6 +1938,25 @@ class TorchLlmArgs(BaseLlmArgs):
 
         return batch_sizes
 
+    @model_validator(mode="after")
+    def validate_load_balancer(self) -> 'TorchLlmArgs':
+        from .._torch import MoeLoadBalancerConfig
+        if isinstance(self.moe_config.load_balancer, str):
+            if not os.path.exists(self.moe_config.load_balancer):
+                raise FileNotFoundError(
+                    f"MoE load balancer config file not found: {self.moe_config.load_balancer}"
+                )
+            try:
+                with open(self.moe_config.load_balancer) as f:
+                    moe_load_balancer_config = yaml.safe_load(f)
+                self.moe_config.load_balancer = MoeLoadBalancerConfig(
+                    **moe_load_balancer_config)
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to load MoE load balancer config file: {self.load_balancer}"
+                ) from e
+        return self
+
     @model_validator(mode='after')
     def validate_cuda_graph_config(self) -> 'TorchLlmArgs':
         """Validate CUDA graph configuration.
@@ -1965,7 +1975,7 @@ class TorchLlmArgs(BaseLlmArgs):
             config.batch_sizes = sorted(config.batch_sizes)
             if config.max_batch_size != 0:
                 if config.batch_sizes != self._generate_cuda_graph_batch_sizes(
-                        config.max_batch_size, config.padding_enabled):
+                        config.max_batch_size, config.enable_padding):
                     raise ValueError(
                         "Please don't set both cuda_graph_config.batch_sizes "
                         "and cuda_graph_config.max_batch_size.\n"
@@ -1977,7 +1987,7 @@ class TorchLlmArgs(BaseLlmArgs):
         else:
             max_batch_size = config.max_batch_size or 128
             generated_sizes = self._generate_cuda_graph_batch_sizes(
-                max_batch_size, config.padding_enabled)
+                max_batch_size, config.enable_padding)
             config.batch_sizes = generated_sizes
             config.max_batch_size = max_batch_size
 
@@ -1996,14 +2006,14 @@ class TorchLlmArgs(BaseLlmArgs):
             cuda_graph_max_batch_size=self.cuda_graph_config.max_batch_size
             if self.cuda_graph_config else
             CudaGraphConfig.model_fields['max_batch_size'].default,
-            cuda_graph_padding_enabled=self.cuda_graph_config.padding_enabled
+            cuda_graph_padding_enabled=self.cuda_graph_config.enable_padding
             if self.cuda_graph_config else
-            CudaGraphConfig.model_fields['padding_enabled'].default,
+            CudaGraphConfig.model_fields['enable_padding'].default,
             disable_overlap_scheduler=self.disable_overlap_scheduler,
-            moe_max_num_tokens=self.moe_max_num_tokens,
-            moe_load_balancer=self.moe_load_balancer,
+            moe_max_num_tokens=self.moe_config.max_num_tokens,
+            moe_load_balancer=self.moe_config.load_balancer,
             attn_backend=self.attn_backend,
-            moe_backend=self.moe_backend,
+            moe_backend=self.moe_config.backend,
             enable_mixed_sampler=self.enable_mixed_sampler,
             enable_trtllm_sampler=self.enable_trtllm_sampler,
             kv_cache_dtype=self.kv_cache_dtype,
@@ -2046,6 +2056,7 @@ def update_llm_args_with_extra_dict(
         "enable_build_cache": BuildCacheConfig,
         "speculative_config": DecodingBaseConfig,
         "lora_config": LoraConfig,
+        "moe_config": MoeConfig,
     }
     for field_name, field_type in field_mapping.items():
         if field_name in llm_args_dict:

@@ -51,6 +51,8 @@ def test_beam_search_output_shapes(gather_context_logits: bool,
         enable_trtllm_sampler=True,
         max_beam_width=max_beam_width,
         disable_overlap_scheduler=True,
+        #TODO: remove this once we have a proper fix for CUDA graph in beam search
+        cuda_graph_config=None,
     )
     sampling_params = SamplingParams(
         max_tokens=max_tokens,
