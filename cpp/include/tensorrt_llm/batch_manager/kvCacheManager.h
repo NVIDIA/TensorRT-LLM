@@ -854,6 +854,9 @@ public:
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enableHashKey = false,
         bool enablePartialReuse = true, bool copyOnPartialReuse = true);
 
+    BlockManager(BlockManager const&) = delete;
+    BlockManager& operator=(BlockManager const&) = delete;
+
     //! \brief Calculate the proportional share each window size receives of the total memory pool
     //! \details Example:       (uniqueWindowSizeToLayers={1024: [1], 4096: [0, 4, 5], 8192: [2, 3]})
     //!          Would Return:  {1024: 0.0345, 4096: 0.4138, 8192: 0.5517} [sums to 1.0].
