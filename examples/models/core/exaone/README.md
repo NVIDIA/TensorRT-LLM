@@ -52,15 +52,12 @@ git clone https://huggingface.co/LGAI-EXAONE/EXAONE-Deep-2.4B $HF_MODEL_DIR
 
 ### EXAONE-4.0
 
-Download he HuggingFace checkpoints of EXAONE-4.0 model. Here, we only use the `TODO: replace with REAL name, EXAONE-4.0` model for the example. From EXAONE-4.0 model, we support EXAONE models only on PyTorch flow.
+Download he HuggingFace checkpoints of EXAONE-4.0 model. Here, we only use the `EXAONE-4.0-32B` model for the example. From EXAONE-4.0 model, we support only on PyTorch flow.
 
 ```bash
 export HF_MODEL_DIR=hf_models/exaone4
-git clone ... $HF_MODEL_DIR (TODO Change ... to real HF directory)
+git clone https://huggingface.co/LGAI-EXAONE/EXAONE-4.0-32B $HF_MODEL_DIR
 ```
-
-## Usage
-The next section describe how to convert the weights from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT-LLM format. We will use llama's [convert_checkpoint.py](../llama/convert_checkpoint.py) for EXAONE model and then we build the model with `trtllm-build`.
 
 ### Pytorch flow
 
@@ -116,6 +113,9 @@ Temporarily switching to `DynamicCache` when creating PTQ models could help addr
 For models with sliding window attention, DynamicCache is less memory-efficient than HybridCache because it retains the entire key-value cache. However, this does not break the model's attention logic, as the cache implementation is separated from the attention computation itself. This trade-off is acceptable for the PTQ process, which is a one-time procedure. Our tests confirm that this workaround does not degrade accuracy on MMLU or GSM8K benchmarks with the default ModelOpt settings.
 
 ### TRT flow
+
+The next section describe how to convert the weights from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT-LLM format. We will use llama's [convert_checkpoint.py](../llama/convert_checkpoint.py) for EXAONE model and then we build the model with `trtllm-build`.
+
 ### Convert checkpoint and build TensorRT engine(s)
 
 ```bash
