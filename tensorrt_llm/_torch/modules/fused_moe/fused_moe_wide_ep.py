@@ -428,6 +428,8 @@ class WideEPMoE(MoE):
                 if not self.use_postquant_alltoall:
                     x, recv_topk_idx, token_final_scales, num_recv_tokens_per_expert_list, deep_ep_handle = \
                         self.deep_ep_buffer.dispatch(x, token_selected_slots.to(torch.int64), token_final_scales, self.num_slots)
+                    padded, x, _, recv_topk_idx, token_final_scales = self.pad_empty_recv_tensors(
+                        x, None, recv_topk_idx, token_final_scales)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                 if not self.use_postquant_alltoall:
                     deep_ep_topk_idx = token_selected_slots.to(torch.int64)
@@ -559,6 +561,8 @@ class WideEPMoE(MoE):
                     x_sf = x_sf.view(torch.float32)
                 (x, x_sf), recv_topk_idx, token_final_scales, num_recv_tokens_per_expert_list, deep_ep_handle = \
                     self.deep_ep_buffer.dispatch((x, x_sf), token_selected_slots.to(torch.int64), token_final_scales, self.num_slots)
+                padded, x, x_sf, recv_topk_idx, token_final_scales = self.pad_empty_recv_tensors(
+                    x, x_sf, recv_topk_idx, token_final_scales)
                 if x_sf is not None:
                     x_sf = x_sf.view(x_sf_dtype)
                     if self.has_nvfp4:
@@ -644,20 +648,6 @@ class WideEPMoE(MoE):
                 mask = token_selected_slots == -1
                 token_selected_slots += self.expert_size_per_partition * self.mapping.moe_ep_rank
                 token_selected_slots[mask] = self.num_slots
-                num_recv_token_is_zero = x.shape[0] == 0
-                if x.shape[0] == 0:
-                    x = torch.zeros((1, x.shape[1]),
-                                    dtype=x.dtype,
-                                    device=x.device)
-                    token_selected_slots = torch.full(
-                        (1, token_selected_slots.shape[1]),
-                        self.num_slots,
-                        dtype=token_selected_slots.dtype,
-                        device=token_selected_slots.device)
-                    token_final_scales = torch.ones(
-                        (1, token_final_scales.shape[1]),
-                        dtype=token_final_scales.dtype,
-                        device=token_final_scales.device)
 
         final_hidden_states = torch.ops.trtllm.fused_moe(
             x,
@@ -698,8 +688,8 @@ class WideEPMoE(MoE):
                 final_hidden_states = self.alltoall_combine(
                     final_hidden_states, alltoall_info, token_count)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
-                if num_recv_token_is_zero:
-                    final_hidden_states = final_hidden_states[:0]
+                final_hidden_states = self.unpad_tensors(
+                    padded, final_hidden_states)
                 final_hidden_states = self.deep_ep_buffer.combine(
                     final_hidden_states, deep_ep_handle)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
@@ -970,6 +960,40 @@ class WideEPMoE(MoE):
             top_k=top_k,
             token_count=token_count)
 
+        return final_hidden_states
+
+    def pad_empty_recv_tensors(
+        self, x: torch.Tensor, x_sf: Optional[torch.Tensor],
+        recv_topk_idx: torch.Tensor, token_final_scales: torch.Tensor
+    ) -> Tuple[bool, torch.Tensor, Optional[torch.Tensor], torch.Tensor,
+               torch.Tensor]:
+        """
+        Pad the output of DeepEP `dispatch` if the output length is zero.
+        We can remove the adapter if both `fused_moe` op and `swizzle_sf`
+        accept zero-length inputs.
+        """
+        if x.shape[0] == 0:
+            padded = True
+            x = torch.zeros((1, x.shape[1]), dtype=x.dtype, device=x.device)
+            if x_sf is not None:
+                x_sf = torch.zeros((1, x_sf.shape[1]),
+                                   dtype=x_sf.dtype,
+                                   device=x_sf.device)
+            recv_topk_idx = torch.full((1, recv_topk_idx.shape[1]),
+                                       self.num_slots,
+                                       dtype=recv_topk_idx.dtype,
+                                       device=recv_topk_idx.device)
+            token_final_scales = torch.ones((1, token_final_scales.shape[1]),
+                                            dtype=token_final_scales.dtype,
+                                            device=token_final_scales.device)
+        else:
+            padded = False
+        return padded, x, x_sf, recv_topk_idx, token_final_scales
+
+    def unpad_tensors(self, padded: bool,
+                      final_hidden_states: torch.Tensor) -> torch.Tensor:
+        if padded:
+            final_hidden_states = final_hidden_states[:0]
         return final_hidden_states
 
     def register_parameter_weight_slot_fn(self, weight_name: str,
