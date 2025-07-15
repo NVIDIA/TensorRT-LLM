@@ -12,7 +12,7 @@ def check_llama_7b_multi_unique_lora_adapters_from_request(
         lora_adapter_count_per_call: list[int], repeat_calls: int,
         repeats_per_call: int, llm_class: Type[BaseLLM], **llm_kwargs):
     """Calls llm.generate s.t. for each C in lora_adapter_count_per_call, llm.generate is called with C requests
-    repeated repeats_per_call times, where each request is configured with a unique LoRA adapter ID.
+    repeated 'repeats_per_call' times, where each request is configured with a unique LoRA adapter ID.
     This entire process is done in a loop 'repeats_per_call' times with the same requests.
     Asserts the output of each llm.generate call is similar to the expected.
     """  # noqa: D205
@@ -56,7 +56,8 @@ def check_llama_7b_multi_unique_lora_adapters_from_request(
                     prompts_to_generate[last_idx:last_idx + adapter_count] *
                     repeats_per_call,
                     sampling_params,
-                    lora_request=lora_requests[last_idx:last_idx + adapter_count] *
+                    lora_request=lora_requests[last_idx:last_idx +
+                                               adapter_count] *
                     repeats_per_call)
                 for output, ref in zip(
                         outputs, references[last_idx:last_idx + adapter_count] *
@@ -102,10 +103,12 @@ def check_llama_7b_multi_lora_from_request_test_harness(
 
     llm = llm_class(hf_model_dir, **llm_kwargs)
     try:
-        outputs = llm.generate(
-            prompts,
-            sampling_params,
-            lora_request=[None, lora_req1, lora_req2, None, lora_req1, lora_req2])
+        outputs = llm.generate(prompts,
+                               sampling_params,
+                               lora_request=[
+                                   None, lora_req1, lora_req2, None, lora_req1,
+                                   lora_req2
+                               ])
     finally:
         llm.shutdown()
     for output, ref, key_word in zip(outputs, references, key_words):
