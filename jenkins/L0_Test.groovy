@@ -1181,7 +1181,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
         }
     }
 
-    // Sed for Pytest result
+    // Specify the stage name correctly
     sh "cd ${WORKSPACE}/${stageName} && sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' *.xml || true"
 
     // generate rerun report
