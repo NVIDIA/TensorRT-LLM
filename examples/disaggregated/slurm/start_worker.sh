@@ -6,7 +6,7 @@ ctx_gpus=$3
 work_dir=$4
 
 export TLLM_LOG_LEVEL=INFO
-export TRTLLM_USE_MPI_KVCACHE=1
+export TRTLLM_USE_UCX_KVCACHE=1
 export TRTLLM_MNNVL_AR_ENABLED=1
 
 if [ "${enable_pdl}" = "true" ]; then
