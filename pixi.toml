@@ -36,6 +36,7 @@ OMPI_MCA_btl = "self,tcp"
 OMPI_MCA_mtl = "^psm,psm2"
 
 TLLM_FORCE_SINGLE_PROCESS = "1"
+CUDA_VISIBLE_DEVICES = "0"
 
 [pypi-options]
 # index-url = "https://pypi.org/simple"
