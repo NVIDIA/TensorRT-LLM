@@ -589,7 +589,7 @@ public:
     [[nodiscard]] RetentionPriority getDecodeRetentionPriority() const;
     [[nodiscard]] std::optional<std::chrono::milliseconds> getDecodeDurationMs() const;
     [[nodiscard]] KvCacheTransferMode getTransferMode() const;
-    [[nodiscard]] std::optional<std::string> getDirectory() const;
+    [[nodiscard]] std::optional<std::string> const& getDirectory() const;
 
     /// @brief Convert the token range data into an entry per kv block. Returns a tuple of vectors corresponding to the
     /// priorities and durations for each block.
