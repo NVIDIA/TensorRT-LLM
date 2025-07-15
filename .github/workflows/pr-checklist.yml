@@ -20,10 +20,9 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
-            const path = require('path');
 
             // Read checklist from file
-            const checklistPath = path.join(process.env.GITHUB_WORKSPACE, '.github', 'pr-checklist.md');
+            const checklistPath = process.env.GITHUB_WORKSPACE + '/.github/pr-checklist.md';
             const checklistContent = fs.readFileSync(checklistPath, 'utf8');
 
             // Check if we already posted a checklist comment
