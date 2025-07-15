@@ -1,55 +1,29 @@
-from dataclasses import dataclass
-from typing import List
+from itertools import chain
 
 from ordered_set import OrderedSet
 
-from ..pyexecutor.llm_request import LlmRequest
+from tensorrt_llm.logger import logger
+
+from ..pyexecutor.llm_request import *
 from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.scheduler import ScheduledRequests
-from .interface import SpecConfig, SpeculativeDecodingMode
-
-
-@dataclass
-class NGramConfig(SpecConfig):
-    """
-    Configuration for N-gram drafter.
-    """
-    # The name of speculative decoding.
-    spec_dec_name = "NGRAM"
-
-    num_extra_kv_tokens: int = 0
-    max_draft_tokens: int = 0
-
-    prompt_lookup_num_tokens: int = 5
-    max_matching_ngram_size: int = 5
-    end_id: int = -1
-    is_keep_all: bool = True
-    is_use_oldest: bool = True
-    is_public_pool: bool = True
-
-    def __post_init__(self) -> None:
-        self.spec_dec_mode = SpeculativeDecodingMode.from_string(
-            self.spec_dec_name)
-        self.max_draft_tokens = self.prompt_lookup_num_tokens
-
-    def update_from_model_config(self, model_config):
-        pass
+from .drafter import Drafter
 
 
 class NGramPoolManager(BaseResourceManager):
     """
-    This class maintains the pattern-matches pairs for NGram drafter.
+    Drafter for NGram. This class maintains the pattern-matches pairs for NGram drafter.
 
     For example, one of the existed pairs could be: ["I","love"] -> [["apple", "because", "it", "is"], ["banana", "and"]].
 
     Here we call ["I","love"] as `pattern`, and [["apple", "because", "it", "is"], ["banana", "and"]] as `matches`.
 
-    `pattern` is a list of token_ids. The pool provides corresponding draft tokens from the matches if the pattern appears at the tail of the sentence during generation.
+    `pattern` is a list of token ids. The pool emits corresponding draft tokens from the matches if the pattern appears at the tail of the generated sentence.
 
-    `matches` is a list of candidate draft token_ids attaching to a pattern.
+    `matches` is a list of candidate draft token ids attaching to a pattern.
 
     Arguments:
-        prompt_lookup_num_tokens: int
+        max_draft_len: int
             The length maximum of draft tokens (can be understood as length maximum of output draft tokens).
 
         max_matching_ngram_size: int
@@ -70,68 +44,102 @@ class NGramPoolManager(BaseResourceManager):
             If is_public_pool == False, it maps from request ID to the request-specific pool
 
         start_index: dict[int, int]
-            It maps from request ID to the index of the prompt to update the pool in the next step
+            It maps from request ID to the index of the prompt to update the pool in the next step.
     """
 
-    def __init__(self, config: NGramConfig, max_num_requests: int):
-
+    def __init__(self, spec_config: "NGramDecodingConfig",
+                 max_num_requests: int):
+        self.max_draft_len = spec_config.max_draft_len
+        self.max_matching_ngram_size = spec_config.max_matching_ngram_size
+        self.is_keep_all = spec_config.is_keep_all
+        self.is_use_oldest = spec_config.is_use_oldest  # TODO: remove this if updating strategy is supported
+        self.is_public_pool = spec_config.is_public_pool
         self.max_num_requests = max_num_requests
-        self.max_num_draft_tokens = config.max_draft_tokens
-
-        self.prompt_lookup_num_tokens = config.prompt_lookup_num_tokens
-        self.max_matching_ngram_size = config.max_matching_ngram_size
-        self.is_keep_all = config.is_keep_all
-        self.is_use_oldest = config.is_use_oldest  # TODO: remove this if updating strategy is supported
-        self.is_public_pool = config.is_public_pool
         self.pool = {}
         self.start_index = {}
 
+    def get_max_resource_count(self) -> int:
+        raise self.max_num_requests
+
+    def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
+        raise 0
+
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        # Update pool and provide draft tokens for the requests
-        for request in scheduled_batch.generation_requests:
-            num_draft_tokens = 0 if request.py_last_draft_tokens is None else \
-                len(request.py_last_draft_tokens)
-            num_accepted_tokens = getattr(request,
-                                          "py_num_accepted_draft_tokens", 0)
-            num_rejected_tokens = num_draft_tokens - num_accepted_tokens
-            assert num_rejected_tokens >= 0
-
-            # Generate draft tokens
-            draft_tokens = self._get_draft_tokens(
-                request.get_tokens()[0],
-                request.request_id,
-                request.py_end_id,
-                request.py_orig_prompt_len + request.py_max_new_tokens,
-            )
-
-            # Pad to max_draft_tokens
-            if draft_tokens is not None:
-                pad_length = self.max_num_draft_tokens - len(draft_tokens)
-                draft_tokens.extend([request.py_end_id] * pad_length)
-            request.py_draft_tokens = draft_tokens
+        pass
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
-        pass
-
-    def free_resources(self, request: LlmRequest):
         if self.is_public_pool:
-            return  # TODO: need to have a strategy to swap out the pairs
-        request_id = request.request_id
-        if request_id in self.pool:
-            self.pool.pop(request_id)
-            self.start_index.pop(request_id)
+            # TODO: Here should be an strategy to update the pool in public pool mode.
+            return
 
-    def add_dummy_requests(self, request_ids: List[int]):
-        pass
+        # Remove the pairs if the request is completed in private pool mode.
+        for request in chain(scheduled_batch.context_requests,
+                             scheduled_batch.generation_requests):
+            if request.state == LlmRequestState.GENERATION_COMPLETE:
+                request_id = request.request_id
+                if request_id in self.pool:
+                    self.pool.pop(request_id)
+                    self.start_index.pop(request_id)
 
-    def shutdown(self):
-        pass
+    def get_draft_tokens(
+        self,
+        prefix: list[int],
+        request_id: int,
+        end_id: int,
+        max_sequence_length: int,
+    ):
+        prefix_len = len(prefix)
+        max_draft_token_length_this_step = max_sequence_length - 1 - prefix_len
+        if max_draft_token_length_this_step <= 0:  # No draft token is need if the prefix is long enough
+            return [end_id]
+        if request_id not in self.start_index:  # Extend start_index and pool for a new request
+            self.start_index[request_id] = 0
+            if not self.is_public_pool:
+                self.pool[request_id] = {}
 
-    def get_max_resource_count(self) -> int:
-        return self.max_num_requests
+        pool = (self.pool if self.is_public_pool else self.pool[request_id])
 
-    def get_needed_resource_to_completion(self, request: LlmRequest):
-        return 0
+        # Update pool
+        sequence = prefix[self.start_index[request_id]:]
+        for size in range(min(self.max_matching_ngram_size, prefix_len - 1), 0,
+                          -1):
+            # Find each possible pattern-match combination, and use tuple for hash
+            for l in range(len(sequence) - size):
+                r = min(l + size + self.max_draft_len, len(sequence))
+                pattern = tuple(sequence[l:l + size])
+                new_match = tuple(sequence[l + size:r])
+                if pattern not in pool or \
+                    (not self.is_keep_all and len(new_match) > len(pool[pattern][0])):
+                    # Replace the match if
+                    # 1. the pattern does not exist in the pool
+                    # 2. only one match is kept, and the new match is longer (MRU)
+                    pool[pattern] = OrderedSet((new_match, ))
+                elif new_match not in pool[pattern]:
+                    # Update the matches if the pattern is already existed:
+                    # TODO: need a strategy to maintain the short candidates, now we just remove them
+                    # Drop all existed matches with small length
+                    for match in pool[pattern]:
+                        if len(match) < len(new_match):
+                            pool[pattern].remove(match)
+                    pool[pattern].add(new_match)
+
+        # Find match
+        draft_tokens = [end_id]  # fallback value
+        for size in range(min(self.max_matching_ngram_size, prefix_len - 1), 0,
+                          -1):
+            pattern = tuple(prefix[-size:])
+            if pattern not in pool:
+                continue
+            draft_tokens = pool[pattern][0 if self.is_use_oldest else -1]
+            draft_tokens = list(draft_tokens)[:max_draft_token_length_this_step]
+            break
+
+        # Update start_index
+        self.start_index[request_id] = max(
+            0, prefix_len -
+            (self.max_draft_len + self.max_matching_ngram_size - 1))
+
+        return draft_tokens
 
     def print_pool(self):  # For debug
         if self.is_public_pool:
@@ -150,61 +158,42 @@ class NGramPoolManager(BaseResourceManager):
                 output += str(match) + ", "
             logger.debug(output)
 
-    def _get_draft_tokens(
+
+class NGramDrafter(Drafter):
+
+    def __init__(
         self,
-        prefix: list[int],
-        request_id: int,
-        end_id: int,
-        max_sequence_length: int,
+        spec_config: "NGramDecodingConfig",
+        ngram_pool_manager: NGramPoolManager = None,
     ):
-        prefix_len = len(prefix)
-        max_draft_token_length = max_sequence_length - 1 - prefix_len
-        if max_draft_token_length <= 0:  # Skip search if prefix is long enough
-            return None
+        assert ngram_pool_manager is not None, "NGram needs a resource manager to maintain the pool."
+        super().__init__(spec_resource_manager=ngram_pool_manager)
+        self.max_draft_len = spec_config.max_draft_len
 
-        if request_id not in self.start_index:  # A new request
-            self.start_index[request_id] = 0
-            if not self.is_public_pool:
-                assert len(self.pool) + 1 <= self.max_num_requests
-                self.pool[request_id] = {}
-        pool = (self.pool if self.is_public_pool else self.pool[request_id])
+    def prepare_draft_tokens(
+        self,
+        scheduled_requests: ScheduledRequests,
+    ) -> None:
+        # Sort by request_id when py_batch_idx is None as a fallback.
+        # This happens in the disagg case: for a set of new requests, we draft
+        # before forward_step, so py_batch_idx is not assigned.
+        for request in sorted(
+                scheduled_requests.generation_requests,
+                key=lambda r:
+            (r.py_batch_idx is None, r.py_batch_idx or r.request_id),
+        ):
+            # Add new token to a copy of the generated tokens to find new draft tokens
+            prefix = list(request.get_tokens()[0])  # Get a copy
 
-        # Update pool
-        sequence = prefix[self.start_index[request_id]:]
-        for size in range(min(self.max_matching_ngram_size, prefix_len - 1), 0,
-                          -1):
-            # Find each possible pattern-match combination, and use tuple for hash
-            for l in range(len(sequence) - size):
-                r = min(l + size + self.prompt_lookup_num_tokens, len(sequence))
-                pattern = tuple(sequence[l:l + size])
-                new_match = tuple(sequence[l + size:r])
-                if pattern not in pool or \
-                    (not self.is_keep_all and len(match) > pool[pattern][0]):
-                    # Replace the match if
-                    # 1. the pattern does not exist in the pool
-                    # 2. only one match is kept, and the new match is longer (MRU)
-                    pool[pattern] = OrderedSet((new_match, ))
-                elif new_match not in pool[pattern]:
-                    # Update the matches if the pattern is already existed:
-                    # TODO: need a strategy to maintain the short candidates, now we just remove them
-                    # Drop all existed matches with small length
-                    for match in pool[pattern]:
-                        if len(match) < len(new_match):
-                            pool[pattern].remove(match)
-                    pool[pattern].add(new_match)
-
-        # Find match
-        draft_tokens = [end_id]
-        for size in range(min(self.max_matching_ngram_size, prefix_len - 1), 0,
-                          -1):
-            pattern = tuple(prefix[-size:])
-            if pattern not in pool:
-                continue
-            draft_tokens = pool[pattern][0 if self.is_use_oldest else -1]
-            draft_tokens = list(draft_tokens)[:max_draft_token_length]
-            break
-        self.start_index[request_id] = max(
-            0, prefix_len -
-            (self.prompt_lookup_num_tokens + self.max_matching_ngram_size - 1))
-
-        return draft_tokens
+            # Generate draft tokens
+            draft_tokens = self.spec_resource_manager.get_draft_tokens(
+                prefix,
+                request.request_id,
+                request.py_end_id,
+                request.py_orig_prompt_len + request.py_max_new_tokens,
+            )
+            # Pad length to `self.max_draft_len`
+            if len(draft_tokens) > 0:
+                pad_length = self.max_draft_len - len(draft_tokens)
+                draft_tokens.extend([request.py_end_id] * pad_length)
+            request.py_draft_tokens = draft_tokens

@@ -15,6 +15,8 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/dispatch_policy.hpp"
 #include "cutlass/epilogue/fusion/callbacks.hpp"
+#include "cutlass/epilogue/fusion/sm90_callbacks_tma_warpspecialized.hpp"
+#include "cutlass/epilogue/fusion/sm90_visitor_tma_warpspecialized.hpp"
 
 namespace cutlass::epilogue::fusion
 {
@@ -169,7 +171,7 @@ struct Sm100AllReduceArrive
                 tma_store_wait<0>();
 
                 int tile_idx = params_ptr->tile_layout(m, n);
-                SystemBarrier::arrive_inc(
+                SystemBarrier::arrive_inc<cuda::thread_scope::thread_scope_device>(
                     params_ptr->barrier_params, thread_idx, tile_idx, params_ptr->rank, params_ptr->world_size);
             }
         }

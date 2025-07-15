@@ -14,7 +14,8 @@
 # limitations under the License.
 import pytest
 
-from tensorrt_llm.llmapi import LLM, EagleDecodingConfig, KvCacheConfig
+from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm.llmapi import EagleDecodingConfig, KvCacheConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -57,16 +58,18 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    def test_guided_decoding(self):
-        llm = LLM(self.MODEL_PATH, guided_decoding_backend="xgrammar")
+    @pytest.mark.parametrize("backend", ["xgrammar"])
+    def test_guided_decoding(self, backend: str):
+        llm = LLM(self.MODEL_PATH, guided_decoding_backend=backend)
         with llm:
             task = JsonModeEval(self.MODEL_NAME)
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
-    def test_guided_decoding_4gpus(self):
+    @pytest.mark.parametrize("backend", ["xgrammar"])
+    def test_guided_decoding_4gpus(self, backend: str):
         llm = LLM(self.MODEL_PATH,
-                  guided_decoding_backend="xgrammar",
+                  guided_decoding_backend=backend,
                   tensor_parallel_size=2,
                   pipeline_parallel_size=2)
         with llm:
@@ -177,6 +180,7 @@ class TestMistral_Nemo_12B_Base(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mistral-Nemo-Base-2407"
     MODEL_PATH = f"{llm_models_root()}/Mistral-Nemo-Base-2407"
 
+    @skip_pre_ada
     def test_fp8(self):
         quant_config = QuantConfig(quant_algo=QuantAlgo.FP8,
                                    kv_cache_quant_algo=QuantAlgo.FP8)
@@ -389,7 +393,7 @@ class TestEagleVicuna_7B_v1_3(LlmapiAccuracyTestHarness):
 
     speculative_config = EagleDecodingConfig(
         max_draft_len=63,
-        speculative_model=f"{llm_models_root()}/EAGLE-Vicuna-7B-v1.3",
+        speculative_model_dir=f"{llm_models_root()}/EAGLE-Vicuna-7B-v1.3",
         num_eagle_layers=4,
         max_non_leaves_per_layer=10,
                             eagle_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
@@ -415,7 +419,7 @@ class TestEagle2Vicuna_7B_v1_3(LlmapiAccuracyTestHarness):
 
     speculative_config = EagleDecodingConfig(
         max_draft_len=63,
-        speculative_model=f"{llm_models_root()}/EAGLE-Vicuna-7B-v1.3",
+        speculative_model_dir=f"{llm_models_root()}/EAGLE-Vicuna-7B-v1.3",
         num_eagle_layers=4,
         max_non_leaves_per_layer=10,
         use_dynamic_tree=True,

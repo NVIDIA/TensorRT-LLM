@@ -3049,14 +3049,23 @@ def get_kernel_traits_code(specs_names):
     return code
 
 
+# For now:
+# 1. Hopper head_size 128 kernel uses cubins for performance regressions.
+# 2. Hopper sm89 with e4m3/e4m3_fp32 dtype uses cubins for accuracy regressions (will be fixed).
+# You should set the condition `use_cubin_header` to false if you have modified the source codes of those kernels that use cubins.
+# This ensures that the kernels will be recompiled using the updated source code rather than relying on precompiled cubins.
+def use_cubin_header(sm, head_size, dtype):
+    return (sm == 90 and head_size == 128) or (sm == 89 and 'e4m3' in dtype)
+
+
 def get_cubin_header(kernel_traits, specs_names):
     cubins = []
     cubin_lens = []
     cubins_dict = {}
     cubin_lens_dict = {}
     for kspec, fname, lname, kname in specs_names:
-        # only generate hopper cubin header
-        if generate_cu_trtllm and not 'sm90' in kname:
+        if generate_cu_trtllm and not use_cubin_header(
+                kspec.sm, kspec.head_size, kspec.dtype):
             continue
         name = fname.replace('.', '_')
         data = 'extern unsigned char cubin_{name}_cubin[];'.format(name=name)
@@ -3209,7 +3218,7 @@ def get_cubin_header(kernel_traits, specs_names):
             if generate_cu_trtllm:
 
                 def get_lname_from_kname(kname: str) -> str:
-                    if 'sm90' in kname:
+                    if use_cubin_header(int(sm), int(head_size), prec.lower()):
                         return 'nullptr'
                     lname = kname.replace('_kernel', '')
                     mask_types = [
@@ -3228,7 +3237,8 @@ def get_cubin_header(kernel_traits, specs_names):
 {cubin_name}_len, \"{kname}\", {smem}, {threads}, {meta_unroll_step}, {attention_mask_type_value}, \
 {attention_input_layout_value}, {is_il}, {is_flash_atten}, {is_warp_specialization}, {is_fp32_accu}, \
 {is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}, {lname}}}\
-'''.format(**locals()) if 'sm90' in kname else '''\
+'''.format(**locals()) if use_cubin_header(int(sm), int(head_size),
+                                           prec.lower()) else '''\
 {{ DATA_TYPE_{prec}, DATA_TYPE_{output_prec}, {seq_len}, {q_step}, {kv_step}, {head_size}, {head_size_v}, \
 {sage_block_sizes[0]}, {sage_block_sizes[1]}, {sage_block_sizes[2]}, kSM_{sm}, nullptr, \
 0, \"{kname}\", {smem}, {threads}, {meta_unroll_step}, {attention_mask_type_value}, \
@@ -3404,6 +3414,9 @@ static const struct TestMetaV2
     return code
 
 
+# This is used to add some kernels running in cubins.
+# The source code of paged context fmha kernels are not in this repo, but we have cubins for them.
+# Other kernels are for passing CI cases.
 def modify_cubin_header(cubin_header):
     # for paged context fmha cases
     target = "#ifndef EXCLUDE_SM_90"

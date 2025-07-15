@@ -42,7 +42,9 @@ at::Tensor run_fp8_block_scale_moe(at::Tensor const& routing_logits, at::Tensor 
     TORCH_CHECK(sm == 100, "Only SM100 is supported by FP8 block scale MOE");
     TORCH_CHECK(routing_logits.scalar_type() == at::ScalarType::Float, "routing_logits must be float.");
     TORCH_CHECK(routing_logits.dim() == 2, "routing_logits must be 2D.");
-    TORCH_CHECK(routing_logits.sizes()[1] == num_experts, "routing_logits has incorrect shape.");
+    TORCH_CHECK(routing_logits.sizes()[0] == hidden_states.sizes()[0],
+        "routing_logits and hidden_states must have the same number of tokens.");
+    TORCH_CHECK(routing_logits.sizes()[1] == num_experts, "routing_logits dim1 must match num_experts.");
     TORCH_CHECK(
         routing_bias.scalar_type() == at::ScalarType::BFloat16 || routing_bias.scalar_type() == at::ScalarType::Float,
         "routing_bias must be bfloat16 or float.");
@@ -109,7 +111,8 @@ at::Tensor run_fp8_block_scale_moe(at::Tensor const& routing_logits, at::Tensor 
         {args.num_tokens, args.top_k}, routing_bias.scalar_type(), routing_logits.device(), std::nullopt);
     at::Tensor expert_indexes = at::detail::empty_cuda(
         {args.num_tokens, args.top_k}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
-    at::Tensor expert_count_histogram = at::detail::empty_cuda({2 * 256},
+    int64_t const size_of_expert_count_histogram = std::max(num_experts * 2, int64_t(256 * 2));
+    at::Tensor expert_count_histogram = at::detail::empty_cuda({size_of_expert_count_histogram},
         at::ScalarType::Int, // 256 is the max number of threads per block and max number of experts
         routing_logits.device(), std::nullopt);
 
@@ -149,8 +152,9 @@ at::Tensor run_fp8_block_scale_moe(at::Tensor const& routing_logits, at::Tensor 
     TORCH_CHECK(hidden_states.scalar_type() == at::ScalarType::Float8_e4m3fn, "hidden_states must be fp8.");
     TORCH_CHECK(hidden_states_scale.scalar_type() == at::ScalarType::Float, "hidden_states_scale must be float.");
     TORCH_CHECK(hidden_states_scale.dim() == 2, "hidden_states_scale must be 2D.");
-    TORCH_CHECK(
-        hidden_states_scale.sizes()[0] == hidden_states.sizes()[1] / 128, "hidden_states_scale has incorrect shape.");
+    TORCH_CHECK(hidden_states_scale.sizes()[0] == hidden_states.sizes()[1] / 128,
+        "hidden_states_scale dim0 must match hidden_states dim1 / 128.");
+    TORCH_CHECK(hidden_states_scale.sizes()[1] == args.num_tokens, "hidden_states_scale dim1 must match num_tokens.");
     TORCH_CHECK(gemm1_weights.scalar_type() == at::ScalarType::Float8_e4m3fn, "gemm1_weights must be fp8.");
     TORCH_CHECK(gemm1_weights.dim() == 3, "gemm1_weights must be 3D.");
     TORCH_CHECK(gemm1_weights.sizes()[1] % 2 == 0, "the second dimension of weights must be even.");

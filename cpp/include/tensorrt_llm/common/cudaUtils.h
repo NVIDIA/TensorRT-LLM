@@ -303,7 +303,12 @@ inline int getSMVersion()
     int sm_minor = 0;
     check_cuda_error(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device));
     check_cuda_error(cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device));
-    return sm_major * 10 + sm_minor;
+    int sm = sm_major * 10 + sm_minor;
+    if (sm == 121)
+    {
+        return 120;
+    }
+    return sm;
 }
 
 inline int getDevice()
@@ -1339,10 +1344,10 @@ struct ConstExprWrapper
 };
 
 template <int VALUE>
-using Int = ConstExprWrapper<int, VALUE>;
+using ConstInt = ConstExprWrapper<int, VALUE>;
 
 template <bool VALUE>
-using Bool = ConstExprWrapper<bool, VALUE>;
+using ConstBool = ConstExprWrapper<bool, VALUE>;
 
 template <typename T>
 struct TmaDescType;

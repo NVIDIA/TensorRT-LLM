@@ -104,9 +104,6 @@ void RuntimeBuffers::create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
         logits = manager.emptyTensor(MemoryType::kGPU, logitsType);
     }
 
-    seqSlotRemappingHost = manager.emptyTensor(MemoryType::kPINNEDPOOL, nvinfer1::DataType::kINT32);
-    seqSlotRemappingDevice = manager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
-
     // TODO: check which tensors can be allocated as pinned for max size
     requestTypes = manager.emptyTensor(MemoryType::kCPU, TRTDataType<runtime::RequestType>::value);
 
@@ -129,7 +126,6 @@ void RuntimeBuffers::create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
     auto const maxBatchSizeShape = ITensor::makeShape({maxBatchSize});
     seqSlots = tensorrt_llm::runtime::BufferManager::pinnedPool(maxBatchSizeShape, nvinfer1::DataType::kINT32);
     seqSlotsDevice = manager.gpu(maxBatchSizeShape, nvinfer1::DataType::kINT32);
-    sortedSeqSlots = tensorrt_llm::runtime::BufferManager::pinnedPool(maxBatchSizeShape, nvinfer1::DataType::kINT32);
 
     cacheIndirDecoderIOBatchedCopySrcOffsets
         = tensorrt_llm::runtime::BufferManager::pinnedPool(maxBatchSizeShape, nvinfer1::DataType::kINT64);
@@ -383,9 +379,6 @@ void RuntimeBuffers::reshape(TllmRuntime const& runtime, ModelConfig const& mode
     auto const numRequestsShape = ITensor::makeShape({numRequests});
     seqSlots->reshape(numRequestsShape);
     seqSlotsDevice->reshape(numRequestsShape);
-    sortedSeqSlots->reshape(numRequestsShape);
-    seqSlotRemappingHost->reshape(numRequestsShape);
-    seqSlotRemappingDevice->reshape(numRequestsShape);
 
     auto const numTokens = getNumTokens();
     inputsIds->reshape(ITensor::makeShape({numTokens}));
@@ -451,8 +444,8 @@ void RuntimeBuffers::prepareBuffersForCudaGraph(SizeType32 maxSequenceLength)
 }
 
 void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, RequestVector const& genRequests,
-    SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow, DecoderBuffers& decoderBuffers,
-    runtime::decoder::DecoderState const& decoderState, kv_cache_manager::BaseKVCacheManager* kvCacheManagerPtr,
+    SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow, runtime::decoder::DecoderState const& decoderState,
+    kv_cache_manager::BaseKVCacheManager* kvCacheManagerPtr,
     kv_cache_manager::BaseKVCacheManager* crossKvCacheManagerPtr,
     rnn_state_manager::RnnStateManager* rnnStateManagerPtr, PeftTable const& peftTable,
     runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
@@ -619,12 +612,6 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
         {
             rnnStateBuffers->fillSlotMappings(contextRequests, rnnStateManagerPtr);
         }
-
-        if (transformerBuffers && maxBeamWidth > 1)
-        {
-            transformerBuffers->resetCacheIndirection(contextRequests, maxBeamWidth, maxAttentionWindow,
-                decoderBuffers.cacheIndirectionInput, decoderBuffers.cacheIndirectionOutput, manager);
-        }
     }
 
     // generation preparation loop
@@ -729,7 +716,7 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
 
         if (transformerBuffers && maxBeamWidth > 1)
         {
-            transformerBuffers->copyCacheIndirection(genRequests, decoderBuffers.cacheIndirectionOutput, stream);
+            transformerBuffers->copyCacheIndirection(genRequests, decoderState.getCacheIndirectionOutput(), stream);
         }
 
         numSequences = numContextRequests;
@@ -745,20 +732,6 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
             std::fill_n(contextLengthsHostPtr + numSequences, reqBeamWidth, contextQLength);
             std::fill_n(sequenceLengthsHostPtr + numSequences, reqBeamWidth, sequenceLen);
             numSequences += reqBeamWidth;
-        }
-        if (modelConfig.getSpeculativeDecodingMode().needsKVCacheRewind())
-        {
-            auto remappingSeqSlotIndices = BufferRange<SizeType32>(*seqSlotRemappingHost);
-            auto const* seqSlotIndices = bufferCast<SizeType32>(*seqSlots);
-
-            std::iota(remappingSeqSlotIndices.begin(), remappingSeqSlotIndices.end(), 0);
-            std::sort(remappingSeqSlotIndices.begin(), remappingSeqSlotIndices.end(),
-                [&seqSlotIndices](SizeType32 a, SizeType32 b) { return seqSlotIndices[a] < seqSlotIndices[b]; });
-            manager.copy(*seqSlotRemappingHost, *seqSlotRemappingDevice);
-
-            manager.copy(*seqSlots, *sortedSeqSlots);
-            auto sortedSeqSlotIndices = BufferRange<SizeType32>(*sortedSeqSlots);
-            std::sort(sortedSeqSlotIndices.begin(), sortedSeqSlotIndices.end());
         }
         if (modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding())
         {
@@ -821,10 +794,13 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
             auto contextInputsIds = ITensor::slice(inputsIds, 0, numContextTokens);
             manager.copy(inputHost.data(), *contextInputsIds);
 
-            auto generationInputsIds = ITensor::slice(inputsIds, numContextTokens);
-            auto seqSlotsDeviceSlice = ITensor::slice(seqSlotsDevice, numContextRequests);
-            runtime::kernels::invokeGatherBatch(
-                *generationInputsIds, *newOutputTokens, *seqSlotsDeviceSlice, maxBeamWidth, stream);
+            if (!genRequests.empty())
+            {
+                auto generationInputsIds = ITensor::slice(inputsIds, numContextTokens);
+                auto seqSlotsDeviceSlice = ITensor::slice(seqSlotsDevice, numContextRequests);
+                runtime::kernels::invokeGatherBatch(
+                    *generationInputsIds, *newOutputTokens, *seqSlotsDeviceSlice, maxBeamWidth, stream);
+            }
         }
         else
         {
@@ -891,6 +867,8 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
         }
     }
 
+    sync_check_cuda_error(stream.get());
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -925,7 +903,7 @@ void RuntimeBuffers::prepareEagleBuffers(RequestVector const& contextRequests, R
 
 std::tuple<SizeType32, RuntimeBuffers::TensorMap const&, RuntimeBuffers::TensorMap&> RuntimeBuffers::prepareStep(
     RequestVector const& contextRequests, RequestVector const& genRequests, SizeType32 maxBeamWidth,
-    SizeType32 maxAttentionWindow, DecoderBuffers& decoderBuffers, runtime::decoder::DecoderState const& decoderState,
+    SizeType32 maxAttentionWindow, runtime::decoder::DecoderState const& decoderState,
     kv_cache_manager::BaseKVCacheManager* kvCacheManager, kv_cache_manager::BaseKVCacheManager* crossKvCacheManager,
     rnn_state_manager::RnnStateManager* rnnStateManager, PeftTable const& peftTable, TllmRuntime const& runtime,
     ModelConfig const& modelConfig, WorldConfig const& worldConfig, bool gatherGenerationLogits, bool trtOverlap,
@@ -937,8 +915,8 @@ std::tuple<SizeType32, RuntimeBuffers::TensorMap const&, RuntimeBuffers::TensorM
     setBufferSizes(contextRequests, genRequests);
     reshape(runtime, modelConfig, worldConfig, gatherGenerationLogits);
 
-    setFromInputs(contextRequests, genRequests, maxBeamWidth, maxAttentionWindow, decoderBuffers, decoderState,
-        kvCacheManager, crossKvCacheManager, rnnStateManager, peftTable, runtime, modelConfig, worldConfig, trtOverlap,
+    setFromInputs(contextRequests, genRequests, maxBeamWidth, maxAttentionWindow, decoderState, kvCacheManager,
+        crossKvCacheManager, rnnStateManager, peftTable, runtime, modelConfig, worldConfig, trtOverlap,
         newOutputTokens);
 
     fillIOMaps(modelConfig, worldConfig);

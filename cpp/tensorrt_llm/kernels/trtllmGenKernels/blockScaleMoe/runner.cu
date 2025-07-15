@@ -68,7 +68,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     {
         TLLM_CHECK_WITH_INFO(topK <= 8, "For DeepSeek routing method, must have topK <= 8");
         TLLM_CHECK_WITH_INFO(topkGroup <= 4, "For DeepSeek routing method, must have topkGroup <= 4");
-        moe::dev::routing::Data routingData;
+        moe::dev::routing::routingDeepSeek::Data routingData;
         routingData.mDtypeExpW = btg::Dtype::Bfloat16;
         routingData.mUsePdl = true;
 
@@ -77,23 +77,17 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mPtrExpertCounts = expertCountHistogram;
         routingData.mPtrPermutedIdxSize = permutedIdxSize;
         routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
-        routingData.mPtrPermutedIdxToExpandedIdx = permutedIdxToExpandedIdx;
         routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
-        routingData.mPtrNumTokensPerExpert = numTokensPerExpert;
         routingData.mPtrExpertWeights = expertWeights;
 
         routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
         routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
         routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
-        routingData.mAllToAllRouteAct = false;
 
         // input:
-        // routingData.mPtrRoutingWeights = args.mRoutingWeights;  // routing weights (don't need if not using gemm)
         routingData.mPtrRoutingBias = routingBias;
         routingData.mPtrScores = reinterpret_cast<float*>(routingLogits);
-        // routingData.mPtrIn = args.mInputActs;
         routingData.mNumTokens = numTokens;
-        // routingData.mHiddenDim = args.mHiddenDim;
         routingData.mNumExperts = numExperts;
         routingData.mNumExpertGroups = nGroup;
         routingData.mNumLimitedGroups = topkGroup;
@@ -104,7 +98,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mNumLocalExperts = localNumExperts;
         routingData.mRouteScale = routedScalingFactor;
         routingData.mUseRoutingSoftmax = false;
-        moe::dev::routing::run(routingData, stream);
+        moe::dev::routing::routingDeepSeek::run(routingData, stream);
     }
     else if (routingMethodType == RoutingMethodType::Llama4)
     {
@@ -113,7 +107,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         {
             TLLM_LOG_WARNING("For Llama routing method, nGroup/topkGroup is ignored, got %d/%d.", nGroup, topkGroup);
         }
-        moe::dev::routingLlama4::Data routingData;
+        moe::dev::routing::routingLlama4::Data routingData;
         routingData.mDtypeExpW = btg::Dtype::Bfloat16;
         routingData.mUsePdl = true;
 
@@ -122,9 +116,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mPtrExpertCounts = expertCountHistogram;
         routingData.mPtrPermutedIdxSize = permutedIdxSize;
         routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
-        // routingData.mPtrPermutedIdxToExpandedIdx = permuted_idx_to_expanded_idx;
         routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
-        // routingData.mPtrNumTokensPerExpert = num_tokens_per_expert;
         routingData.mPtrExpertWeights = expertWeights;
 
         routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
@@ -149,12 +141,12 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mNumLocalExperts = localNumExperts;
         // routingData.mRouteScale = routed_scaling_factor;
         // routingData.mUseRoutingSoftmax = false;
-        moe::dev::routingLlama4::run(routingData, stream);
+        moe::dev::routing::routingLlama4::run(routingData, stream);
     }
     else if (routingMethodType == RoutingMethodType::Renormalize /* default */
         || routingMethodType == RoutingMethodType::RenormalizeNaive /* Softmax -> TopK */)
     {
-        moe::dev::routingQwen3::Data routingData;
+        moe::dev::routing::routingRenormalize::Data routingData;
 
         //
         // Config
@@ -196,7 +188,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mLocalExpertsStrideLog2 = 0;
         routingData.mNumLocalExperts = localNumExperts;
 
-        moe::dev::routingQwen3::run(routingData, stream);
+        moe::dev::routing::routingRenormalize::run(routingData, stream);
     }
     else
     {
@@ -469,9 +461,17 @@ std::vector<int64_t> Runner::getValidConfigIndices(
 int64_t Runner::getDefaultValidConfigIndex(
     int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numLocalExperts, int32_t numTokens) const
 {
-    auto const validIndices = getValidConfigIndices(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens);
 
-    return validIndices[0];
+    int32_t indexGemm1
+        = mPermuteGemm1.getDefaultValidConfigIndex(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens);
+    int32_t indexGemm2
+        = mGemm2.getDefaultValidConfigIndex(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens);
+
+    auto it = std::find_if(mPassingConfigs.begin(), mPassingConfigs.end(),
+        [indexGemm1, indexGemm2](MoEConfig cfg)
+        { return (cfg.gemm1Config == indexGemm1 && cfg.gemm2Config == indexGemm2); });
+    TLLM_CHECK_WITH_INFO(it != mPassingConfigs.end(), "No compatible configs found for the block scale MoE runner.");
+    return std::distance(mPassingConfigs.begin(), it);
 }
 
 void Runner::run(

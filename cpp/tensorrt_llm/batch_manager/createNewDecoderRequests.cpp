@@ -25,7 +25,6 @@
 #include "tensorrt_llm/runtime/decoderState.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
-#include "tensorrt_llm/runtime/gptDecoderBatched.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -137,8 +136,11 @@ CreateNewDecoderRequests::operator()(runtime::ModelConfig const& modelConfig, ru
     std::copy_if(contextRequests.begin(), contextRequests.end(), std::back_inserter(finishedContextRequests),
         [](auto const& llmReq) { return llmReq->isLastContextChunk(); });
 
-    copySequenceLengths(finishedContextRequests, inputBuffers, *decoderState.getSequenceLengths(), beamWidth,
-        bufferManager, runtimeStream);
+    if (!finishedContextRequests.empty())
+    {
+        copySequenceLengths(finishedContextRequests, inputBuffers, *decoderState.getSequenceLengths(), beamWidth,
+            bufferManager, runtimeStream);
+    }
 
     auto [lookaheadPrompt, lookaheadAlgoConfigs] = createDecoderRequests(finishedContextRequests,
         inputBuffers.inputsIds, decodingConfig, decoderState, bufferManager, logitsType, modelConfig, worldConfig,
@@ -306,6 +308,12 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
         auto parentIds = ITensor::slice(dJointOutput.parentIds, batchSlot, 1);
         parentIds->reshape(outputIdsShape);
         manager.setZero(*parentIds);
+
+        auto cacheIndirectionInput = ITensor::slice(dJointInput.cacheIndirection, batchSlot, 1);
+        manager.setZero(*cacheIndirectionInput);
+
+        auto cacheIndirectionOutput = ITensor::slice(dJointOutput.cacheIndirection, batchSlot, 1);
+        manager.setZero(*cacheIndirectionOutput);
 
         auto beamHypotheses = dJointOutput.beamHypotheses.slice(batchSlot, 1);
         beamHypotheses.init(manager, endId);

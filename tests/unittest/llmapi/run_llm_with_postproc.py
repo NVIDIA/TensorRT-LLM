@@ -6,64 +6,12 @@ from typing import Optional
 
 import click
 
-from tensorrt_llm.executor import GenerationResultBase
-from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
-from tensorrt_llm.llmapi import LLM, KvCacheConfig, SamplingParams
+from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm.executor.postproc_worker import PostprocParams
+from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.utils import print_colored
-from tensorrt_llm.serve.openai_protocol import (
-    ChatCompletionResponseStreamChoice, ChatCompletionStreamResponse,
-    DeltaMessage)
-
-
-def perform_faked_oai_postprocess(rsp: GenerationResultBase,
-                                  args: PostprocArgs):
-    first_iteration = len(rsp.outputs[0].token_ids) == 1
-    num_choices = 1
-    finish_reason_sent = [False] * num_choices
-    role = "assistant"
-    model = "LLaMA"
-
-    def yield_first_chat(idx: int, role: str = None, content: str = None):
-        choice_data = ChatCompletionResponseStreamChoice(index=idx,
-                                                         delta=DeltaMessage(
-                                                             role=role,
-                                                             content=content),
-                                                         finish_reason=None)
-        chunk = ChatCompletionStreamResponse(choices=[choice_data], model=model)
-
-        data = chunk.model_dump_json(exclude_unset=True)
-        return data
-
-    res = []
-    if first_iteration:
-        for i in range(num_choices):
-            res.append(f"data: {yield_first_chat(i, role=role)} \n\n")
-    first_iteration = False
-
-    for output in rsp.outputs:
-        i = output.index
-
-        if finish_reason_sent[i]:
-            continue
-
-        delta_text = output.text_diff
-        delta_message = DeltaMessage(content=delta_text)
-
-        choice = ChatCompletionResponseStreamChoice(index=i,
-                                                    delta=delta_message,
-                                                    finish_reason=None)
-        if output.finish_reason is not None:
-            choice.finish_reason = output.finish_reason
-            choice.stop_reason = output.stop_reason
-            finish_reason_sent[i] = True
-        chunk = ChatCompletionStreamResponse(choices=[choice], model=model)
-        data = chunk.model_dump_json(exclude_unset=True)
-        res.append(f"data: {data}\n\n")
-
-    if rsp._done:
-        res.append(f"data: [DONE]\n\n")
-
-    return res
+from tensorrt_llm.serve.postprocess_handlers import (ChatPostprocArgs,
+                                                     chat_stream_post_processor)
 
 
 @click.command()
@@ -98,9 +46,11 @@ def main(model_dir: str, tp_size: int, engine_dir: Optional[str], n: int,
                                      n=n,
                                      best_of=best_of,
                                      top_k=top_k)
+    postproc_args = ChatPostprocArgs(role="assistant",
+                                     model="TinyLlama-1.1B-Chat-v1.0")
     postproc_params = PostprocParams(
-        post_processor=perform_faked_oai_postprocess,
-        postproc_args=PostprocArgs(),
+        post_processor=chat_stream_post_processor,
+        postproc_args=postproc_args,
     )
 
     prompt = "A B C D E F"

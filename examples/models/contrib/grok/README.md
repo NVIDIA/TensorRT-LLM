@@ -29,7 +29,7 @@ The TensorRT-LLM Grok-1 implementation can be found in [tensorrt_llm/models/grok
 In addition, there are two shared files in the parent folder [`examples`](../../../) for inference and evaluation:
 
 * [`../../../run.py`](../../../run.py) to run the inference on an input text;
-* [`../../../summarize.py`](../../../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
+* [`../../../summarize.py`](../../../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset.
 
 ## Support Matrix
   * INT8 Weight-Only

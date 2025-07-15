@@ -26,18 +26,23 @@ ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-a
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 
 // Container configuration
-// available tags can be found in: https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm/
-// [base_image_name]-[arch]-[os](-[python_version])-[trt_version]-[torch_install_type]-[stage]-[date]-[mr_id]
-LLM_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.05-py3-x86_64-ubuntu24.04-trt10.11.0.33-skip-tritondevel-202506051650-4885"
-LLM_SBSA_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.05-py3-aarch64-ubuntu24.04-trt10.11.0.33-skip-tritondevel-202506051650-4885"
-LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.0-devel-rocky8-x86_64-rocky8-py310-trt10.11.0.33-skip-tritondevel-202506051650-4885"
-LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.0-devel-rocky8-x86_64-rocky8-py312-trt10.11.0.33-skip-tritondevel-202506051650-4885"
-
-// TODO: Move common variables to an unified location
-BUILD_CORES_REQUEST = "8"
-BUILD_CORES_LIMIT = "8"
-BUILD_MEMORY_REQUEST = "48Gi"
-BUILD_MEMORY_LIMIT = "48Gi"
+def getContainerURIs()
+{
+    // available tags can be found in: https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm/
+    // [base_image_name]-[arch]-[os](-[python_version])-[trt_version]-[torch_install_type]-[stage]-[date]-[mr_id]
+    tagProps = readProperties file: "${LLM_ROOT}/jenkins/current_image_tags.properties", interpolate: true
+    uris = [:]
+    keys = [
+        "LLM_DOCKER_IMAGE",
+        "LLM_SBSA_DOCKER_IMAGE",
+        "LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE",
+        "LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"
+    ]
+    for (key in keys) {
+        uris[key] = tagProps[key]
+    }
+    return uris
+}
 
 // Stage choices
 STAGE_CHOICE_NORMAL = "normal"
@@ -107,6 +112,8 @@ def AUTO_TRIGGER_TAG_LIST = "auto_trigger_tag_list"
 def DEBUG_MODE = "debug"
 @Field
 def DETAILED_LOG = "detailed_log"
+@Field
+def ONLY_DOCS_FILE_CHANGED = "only_docs_file_changed"
 
 def testFilter = [
     (REUSE_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get(REUSE_STAGE_LIST, null)?.tokenize(',')),
@@ -124,6 +131,7 @@ def testFilter = [
     (DEBUG_MODE): gitlabParamsFromBot.get(DEBUG_MODE, false),
     (AUTO_TRIGGER_TAG_LIST): [],
     (DETAILED_LOG): gitlabParamsFromBot.get(DETAILED_LOG, false),
+    (ONLY_DOCS_FILE_CHANGED): false,
 ]
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
@@ -203,34 +211,12 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                     resources:
                       requests:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
                       limits:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
-                    imagePullPolicy: Always"""
-        nodeLabelPrefix = "cpu"
-        break
-    case "build":
-        containerConfig = """
-                  - name: trt-llm
-                    image: ${image}
-                    command: ['cat']
-                    volumeMounts:
-                    - name: sw-tensorrt-pvc
-                      mountPath: "/mnt/sw-tensorrt-pvc"
-                      readOnly: false
-                    tty: true
-                    resources:
-                      requests:
-                        cpu: ${BUILD_CORES_REQUEST}
-                        memory: ${BUILD_MEMORY_REQUEST}
-                        ephemeral-storage: 200Gi
-                      limits:
-                        cpu: ${BUILD_CORES_LIMIT}
-                        memory: ${BUILD_MEMORY_LIMIT}
-                        ephemeral-storage: 200Gi
                     imagePullPolicy: Always"""
         nodeLabelPrefix = "cpu"
         break
@@ -243,11 +229,11 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                     resources:
                       requests:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
                       limits:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
                     imagePullPolicy: Always"""
         nodeLabelPrefix = "cpu"
@@ -288,11 +274,11 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                     resources:
                       requests:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
                       limits:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
                 qosClass: Guaranteed
                 volumes:
@@ -315,14 +301,17 @@ def echoNodeAndGpuInfo(pipeline, stageName)
 
 def setupPipelineEnvironment(pipeline, testFilter, globalVars)
 {
-    setupPipelineSpec = createKubernetesPodConfig(LLM_DOCKER_IMAGE, "build")
+    image = "urm.nvidia.com/docker/golang:1.22"
+    setupPipelineSpec = createKubernetesPodConfig(image, "package")
     trtllm_utils.launchKubernetesPod(pipeline, setupPipelineSpec, "trt-llm", {
         sh "env | sort"
         updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: 'running'
         echo "Using GitLab repo: ${LLM_REPO}."
         sh "git config --global --add safe.directory \"*\""
+        // NB: getContainerURIs reads files in ${LLM_ROOT}/jenkins/
         if (env.gitlabMergeRequestLastCommit) {
             env.gitlabCommit = env.gitlabMergeRequestLastCommit
+            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
         } else {
             branch = env.gitlabBranch ? env.gitlabBranch : "main"
             trtllm_utils.checkoutSource(LLM_REPO, branch, LLM_ROOT, true, true)
@@ -334,6 +323,10 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
         testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         testFilter[(ONLY_PYTORCH_FILE_CHANGED)] = getOnlyPytorchFileChanged(pipeline, testFilter, globalVars)
         testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
+        testFilter[(ONLY_DOCS_FILE_CHANGED)] = getOnlyDocsFileChanged(pipeline, testFilter, globalVars)
+        getContainerURIs().each { k, v ->
+            globalVars[k] = v
+        }
     })
 }
 
@@ -377,6 +370,7 @@ def launchReleaseCheck(pipeline)
                 ignoreList = [
                     "*/.git/*",
                     "*/3rdparty/*",
+                    "*/cpp/tensorrt_llm/deep_ep/nvshmem_src_*.txz",
                     "*/examples/scaffolding/contrib/mcp/weather/weather.py",
                     "*/tensorrt_llm_internal_cutlass_kernels_static.tar.xz"
                 ]
@@ -396,7 +390,7 @@ def launchReleaseCheck(pipeline)
 
     def image = "urm.nvidia.com/docker/golang:1.22"
     stageName = "Release Check"
-    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "build"), "trt-llm", {
+    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package"), "trt-llm", {
         stage("[${stageName}] Run") {
             if (RELESE_CHECK_CHOICE == STAGE_CHOICE_SKIP) {
                 echo "Release Check job is skipped due to Jenkins configuration"
@@ -569,8 +563,8 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "cpp/tensorrt_llm/executor/executorImpl.cpp",
         "cpp/tensorrt_llm/executor/executorImpl.h",
         "cpp/tensorrt_llm/runtime/ncclCommunicator.cpp",
-        "cpp/tensorrt_llm/kernels/allReduceFusionKernels.h",
-        "cpp/tensorrt_llm/kernels/allReduceFusionKernels.cu",
+        "cpp/tensorrt_llm/kernels/communicationKernels/",
+        "cpp/tensorrt_llm/thop/allreduceOp.cpp",
         "cpp/tensorrt_llm/kernels/customAllReduceKernels.h",
         "cpp/tensorrt_llm/kernels/customAllReduceKernels.cu",
         "cpp/tensorrt_llm/kernels/gptKernels.h",
@@ -578,6 +572,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "cpp/tensorrt_llm/kernels/unfusedAttentionKernels.h",
         "cpp/tensorrt_llm/kernels/unfusedAttentionKernels.cu",
         "cpp/tensorrt_llm/kernels/userbuffers/",
+        "cpp/tensorrt_llm/kernels/moe",
         "cpp/tensorrt_llm/pybind/",
         "cpp/tests/kernels/allReduce/",
         "cpp/tensorrt_llm/plugins/cpSplitPlugin/cpSplitPlugin.h",
@@ -602,11 +597,13 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/pyexecutor/py_executor.py",
         "tensorrt_llm/_torch/pyexecutor/_util.py",
         "tensorrt_llm/_torch/models/modeling_llama.py",
+        "tensorrt_llm/_torch/modules/fused_moe/",
         "tests/integration/defs/cpp/test_multi_gpu.py",
         "tests/integration/test_lists/test-db/l0_dgx_h100.yml",
         "tests/integration/test_lists/test-db/l0_dgx_h200.yml",
         "tests/unittest/_torch/multi_gpu/",
         "tests/unittest/_torch/multi_gpu_modeling/",
+        "tests/unittest/_torch/auto_deploy/unit/multigpu",
         "tests/unittest/llmapi/test_llm_multi_gpu.py",
         "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
         "jenkins/L0_Test.groovy",
@@ -687,6 +684,40 @@ def getOnlyPytorchFileChanged(pipeline, testFilter, globalVars) {
 
     pipeline.echo("Only PyTorch files changed: ${result}")
     return result
+}
+
+def getOnlyDocsFileChanged(pipeline, testFilter, globalVars) {
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (env.alternativeTRT || isOfficialPostMergeJob) {
+        pipeline.echo("Force set ONLY_DOCS_FILE_CHANGED false.")
+        return false
+    }
+
+    // TODO: Add more docs path to the list, e.g. *.md files in other directories
+    def docsFileList = [
+        "docs/",
+    ]
+
+    def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
+    if (!changedFileList || changedFileList.isEmpty()) {
+        return false
+    }
+
+    for (file in changedFileList) {
+        def isDocsFile = false
+        for (prefix in docsFileList) {
+            if (file.startsWith(prefix)) {
+                isDocsFile = true
+                break
+            }
+        }
+        if (!isDocsFile) {
+            pipeline.echo("Found non-docs file: ${file}")
+            return false
+        }
+    }
+    pipeline.echo("Only docs files changed.")
+    return true
 }
 
 def collectTestResults(pipeline, testFilter)
@@ -862,9 +893,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     String globalVarsJson = writeJSON returnText: true, json: globalVars
                     parameters += [
                         'enableFailFast': enableFailFast,
-                        'dockerImage': LLM_DOCKER_IMAGE,
-                        'wheelDockerImagePy310': LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE,
-                        'wheelDockerImagePy312': LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
+                        'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
+                        'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
+                        'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
                         'globalVars': globalVarsJson,
                     ]
 
@@ -897,15 +928,14 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                     try {
                         parameters = getCommonParameters()
-
                         String testFilterJson = writeJSON returnText: true, json: testFilter
                         String globalVarsJson = writeJSON returnText: true, json: globalVars
                         parameters += [
                             'enableFailFast': enableFailFast,
                             'testFilter': testFilterJson,
-                            'dockerImage': LLM_DOCKER_IMAGE,
-                            'wheelDockerImagePy310': LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE,
-                            'wheelDockerImagePy312': LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
+                            'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
+                            'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
+                            'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
                             'globalVars': globalVarsJson,
                         ]
 
@@ -956,13 +986,18 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     testStageName = "[Test-SBSA] Remote Run"
                 }
 
+                if (testFilter[(ONLY_DOCS_FILE_CHANGED)]) {
+                    echo "SBSA build job is skipped due to Jenkins configuration or conditional pipeline run"
+                    return
+                }
+
                 def stageName = "Build"
                 stage(stageName) {
                     def parameters = getCommonParameters()
                     String globalVarsJson = writeJSON returnText: true, json: globalVars
                     parameters += [
                         'enableFailFast': enableFailFast,
-                        "dockerImage": LLM_SBSA_DOCKER_IMAGE,
+                        "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
                         'globalVars': globalVarsJson,
                     ]
 
@@ -996,13 +1031,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                     try {
                         def parameters = getCommonParameters()
-
                         String testFilterJson = writeJSON returnText: true, json: testFilter
                         String globalVarsJson = writeJSON returnText: true, json: globalVars
                         parameters += [
                             'enableFailFast': enableFailFast,
                             'testFilter': testFilterJson,
-                            "dockerImage": LLM_SBSA_DOCKER_IMAGE,
+                            "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
                             'globalVars': globalVarsJson,
                         ]
 

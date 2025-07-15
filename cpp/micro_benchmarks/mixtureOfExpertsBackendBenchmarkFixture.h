@@ -20,7 +20,14 @@
 
 #include <nlohmann/json.hpp>
 
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
+#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
+#else
 #include "moe_kernels.h"
+#endif
+
+#include "tensorrt_llm/kernels/cutlass_kernels/include/cutlass_kernel_selector.h"
+
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
@@ -41,6 +48,12 @@ using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::cutlass_extensions;
+
+using namespace CUTLASS_MOE_GEMM_KERNELS_NAMESPACE;
+using CUTLASS_MOE_GEMM_NAMESPACE::TmaWarpSpecializedGroupedGemmInput;
+using CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::CutlassMoeFCRunner;
+using CUTLASS_MOE_GEMM_NAMESPACE::ActivationType;
+using CUTLASS_MOE_GEMM_NAMESPACE::isGatedActivation;
 
 static BufferManager::CudaStreamPtr streamPtr;
 static std::unique_ptr<BufferManager> bufferManager;
@@ -63,6 +76,7 @@ namespace
 // Abstract class for routing config
 struct RoutingConfig
 {
+    virtual void start(){};
     virtual void setRouting(int* selected_experts, int64_t num_experts, int64_t k, int64_t num_tokens) = 0;
     virtual std::string getName() = 0;
     virtual bool isDeterministic() const = 0;
@@ -130,6 +144,11 @@ struct RandomDistributionRoutingConfig : public RoutingConfig
             "Cannot create random routing distribution. Number of experts does not match the number of weights");
     }
 
+    void start()
+    {
+        twister.seed(0xD5);
+    }
+
     std::string getName() override
     {
         return name;
@@ -195,6 +214,11 @@ struct UniformRoutingConfig : public RoutingConfig
 {
     std::mt19937_64 twister{0xD5};
 
+    void start()
+    {
+        twister.seed(0xD5);
+    }
+
     std::string getName() override
     {
         return "uniform";
@@ -209,7 +233,30 @@ struct UniformRoutingConfig : public RoutingConfig
     {
         std::uniform_int_distribution<int> dist(0, num_experts - 1);
         std::vector<int> input(k * num_tokens);
-        std::generate(input.begin(), input.end(), [&] { return dist(twister); });
+        for (int i = 0; i < num_tokens; i++)
+        {
+            for (int j = 0; j < k; j++)
+            {
+                while (true)
+                {
+                    int expert_id = dist(twister);
+                    bool valid = true;
+                    for (int prev_j = 0; prev_j < j; prev_j++)
+                    {
+                        if (expert_id == input[i * k + prev_j])
+                        {
+                            valid = false;
+                            break;
+                        }
+                    }
+                    if (valid)
+                    {
+                        input[i * k + j] = expert_id;
+                        break;
+                    }
+                }
+            }
+        }
         check_cuda_error(cudaMemcpyAsync(
             selected_experts, input.data(), input.size() * sizeof(int), cudaMemcpyHostToDevice, streamPtr->get()));
         check_cuda_error(cudaStreamSynchronize(streamPtr->get()));
@@ -309,9 +356,8 @@ public:
     constexpr static int WEIGHT_ELEM_PER_BYTE = (INT4 || ANY_FP4) ? 2 : 1;
     int const BASE_HIDDEN_SIZE = 64 / sizeof(WeightType) * WEIGHT_ELEM_PER_BYTE;
 
-    constexpr static int64_t FP4_VECTOR_SIZE = NVFP4
-        ? tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize
-        : tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize;
+    constexpr static int64_t FP4_VECTOR_SIZE = NVFP4 ? TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize
+                                                     : TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize;
 
     std::vector<BufferManager::IBufferPtr> managed_buffers;
     int* mSelectedExperts{};
@@ -463,7 +509,7 @@ public:
     float* mExpertFP8Scale3{};
 
     float* mExpertFP4ActScale1{};
-    using ElementSF = tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::ElementSF;
+    using ElementSF = TmaWarpSpecializedGroupedGemmInput::ElementSF;
     ElementSF* mExpertFP4WeightSf1{};
     float* mExpertFP4GlobalScale1{};
     float* mExpertFP4ActScale2{};
@@ -485,15 +531,33 @@ public:
     bool mIsGated = false;
     int mGatedMultiplier = 1;
 
-    tensorrt_llm::ActivationType mActType = tensorrt_llm::ActivationType::Relu;
+    ActivationType mActType = ActivationType::Relu;
 
-    QuantParams mQuantParams{};
+    constexpr static int64_t NUM_BUFFERS = 32;
+
+    std::array<QuantParams, NUM_BUFFERS> mQuantParams{};
     bool mUseLora = false;
     bool mUsePrequantScale = false;
     int mGroupSize = -1;
-    LoraParams mLoraParams{};
+    std::array<LoraParams, NUM_BUFFERS> mLoraParams{};
 
     std::optional<tensorrt_llm::cutlass_extensions::CutlassGemmConfig> mSelectedConfig = std::nullopt;
+
+    int64_t mBufferIndex = 0;
+    size_t mWorkspaceSize = 0;
+    size_t mExpertWeight1Size = 0;
+    size_t mExpertWeight2Size = 0;
+    size_t mExpertBias1Size = 0;
+    size_t mExpertBias2Size = 0;
+    size_t mInputTensorSize = 0;
+    size_t mFinalOutputSize = 0;
+    size_t mSourceToExpandedMapSize = 0;
+    size_t mScaleProbsSize = 0;
+    size_t mSelectedExpertsSize = 0;
+    size_t mExpertFP4WeightSf1Size = 0;
+    size_t mExpertFP4WeightSf2Size = 0;
+    size_t mExpertIntScale1Size = 0;
+    size_t mExpertIntScale2Size = 0;
 
     template <class T>
     T* allocBuffer(size_t size)
@@ -519,34 +583,43 @@ public:
         mInterSize = inter_size / parallelism_config.tp_size;
         mNumExperts = num_experts;
         mK = k;
-        mIsGated = tensorrt_llm::isGatedActivation(mActType);
+        mIsGated = isGatedActivation(mActType);
         mGatedMultiplier = mIsGated ? 2 : 1;
         auto const gated_inter = mInterSize * mGatedMultiplier;
 
-        size_t workspace_size
-            = mMoERunner.getWorkspaceSize(mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK, mActType, {},
-                mUseLora, /*use_deepseek_fp8_block_scale=*/false, /*min_latency_mode=*/false, mUsePrequantScale);
+        mWorkspaceSize = mMoERunner.getWorkspaceSize(mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK, mActType,
+            {}, mUseLora, /*use_deepseek_fp8_block_scale=*/false, /*min_latency_mode=*/false, mUsePrequantScale);
 
-        mWorkspace = allocBuffer<char>(workspace_size);
+        mWorkspace = allocBuffer<char>(mWorkspaceSize * NUM_BUFFERS);
         size_t const expert_matrix_size = mNumExperts * mHiddenSize * mInterSize;
 
-        mExpertWeight1 = allocBuffer<WeightStorage>(expert_matrix_size * mGatedMultiplier / WEIGHT_ELEM_PER_BYTE);
-        mExpertWeight2 = allocBuffer<WeightStorage>(expert_matrix_size / WEIGHT_ELEM_PER_BYTE);
+        mExpertWeight1Size = expert_matrix_size * mGatedMultiplier / WEIGHT_ELEM_PER_BYTE;
+        mExpertWeight2Size = expert_matrix_size / WEIGHT_ELEM_PER_BYTE;
+        mExpertWeight1 = allocBuffer<WeightStorage>(mExpertWeight1Size * NUM_BUFFERS);
+        mExpertWeight2 = allocBuffer<WeightStorage>(mExpertWeight2Size * NUM_BUFFERS);
 
         mExpertBias1 = nullptr;
         mExpertBias2 = nullptr;
         if (mUseBias)
         {
-            mExpertBias1 = allocBuffer<DataType>(mNumExperts * gated_inter);
-            mExpertBias2 = allocBuffer<DataType>(mNumExperts * mHiddenSize);
+            mExpertBias1Size = mNumExperts * gated_inter;
+            mExpertBias2Size = mNumExperts * mHiddenSize;
+            mExpertBias1 = allocBuffer<DataType>(mExpertBias1Size * NUM_BUFFERS);
+            mExpertBias2 = allocBuffer<DataType>(mExpertBias2Size * NUM_BUFFERS);
         }
 
         if constexpr (INT_QUANT)
         {
-            mExpertIntScale1 = allocBuffer<DataType>(mNumExperts * gated_inter);
-            mExpertIntScale2 = allocBuffer<DataType>(mNumExperts * mHiddenSize);
+            mExpertIntScale1Size = mNumExperts * gated_inter;
+            mExpertIntScale2Size = mNumExperts * mHiddenSize;
+            mExpertIntScale1 = allocBuffer<DataType>(mExpertIntScale1Size * NUM_BUFFERS);
+            mExpertIntScale2 = allocBuffer<DataType>(mExpertIntScale2Size * NUM_BUFFERS);
 
-            mQuantParams = QuantParams::Int(mExpertIntScale1, mExpertIntScale2);
+            for (int i = 0; i < NUM_BUFFERS; i++)
+            {
+                mQuantParams[i] = QuantParams::Int(
+                    mExpertIntScale1 + mExpertIntScale1Size * i, mExpertIntScale2 + mExpertIntScale2Size * i);
+            }
         }
         else if constexpr (FP8)
         {
@@ -554,39 +627,57 @@ public:
             mExpertFP8Scale2 = allocBuffer<float>(1);
             mExpertFP8Scale3 = allocBuffer<float>(mNumExperts);
 
-            mQuantParams = QuantParams::FP8(mExpertFP8Scale1, mExpertFP8Scale2, mExpertFP8Scale3);
+            for (int i = 0; i < NUM_BUFFERS; i++)
+            {
+                mQuantParams[i] = QuantParams::FP8(mExpertFP8Scale1, mExpertFP8Scale2, mExpertFP8Scale3);
+            }
         }
         else if constexpr (ANY_FP4)
         {
             mExpertFP4ActScale1 = allocBuffer<float>(1);
-            mExpertFP4WeightSf1 = allocBuffer<ElementSF>(num_experts * gated_inter * mHiddenSize / FP4_VECTOR_SIZE);
+            mExpertFP4WeightSf1Size = num_experts * gated_inter * mHiddenSize / FP4_VECTOR_SIZE;
+            mExpertFP4WeightSf1 = allocBuffer<ElementSF>(mExpertFP4WeightSf1Size * NUM_BUFFERS);
             mExpertFP4GlobalScale1 = allocBuffer<float>(num_experts);
 
             mExpertFP4ActScale2 = allocBuffer<float>(1);
-            mExpertFP4WeightSf2 = allocBuffer<ElementSF>(num_experts * mInterSize * mHiddenSize / FP4_VECTOR_SIZE);
+            mExpertFP4WeightSf2Size = num_experts * mInterSize * mHiddenSize / FP4_VECTOR_SIZE;
+            mExpertFP4WeightSf2 = allocBuffer<ElementSF>(mExpertFP4WeightSf2Size * NUM_BUFFERS);
             mExpertFP4GlobalScale2 = allocBuffer<float>(num_experts);
 
             auto func = NVFP4 ? QuantParams::FP4 : QuantParams::FP8MXFP4;
-            mQuantParams = func(mExpertFP4ActScale1, mExpertFP4WeightSf1, mExpertFP4GlobalScale1, mExpertFP4ActScale2,
-                mExpertFP4WeightSf2, mExpertFP4GlobalScale2);
+            for (int i = 0; i < NUM_BUFFERS; i++)
+            {
+                mQuantParams[i] = func(mExpertFP4ActScale1, mExpertFP4WeightSf1 + mExpertFP4WeightSf1Size * i,
+                    mExpertFP4GlobalScale1, mExpertFP4ActScale2, mExpertFP4WeightSf2 + mExpertFP4WeightSf2Size * i,
+                    mExpertFP4GlobalScale2, false, false);
+            }
         }
 
-        mSelectedExperts = allocBuffer<int>(mTotalTokens * mK);
-        mScaleProbs = allocBuffer<float>(mTotalTokens * mK);
-        mInputTensor = allocBuffer<DataType>(mTotalTokens * mHiddenSize);
-        mFinalOutput = allocBuffer<OutputType>(mTotalTokens * mHiddenSize);
+        mSelectedExpertsSize = mTotalTokens * mK;
+        mSelectedExperts = allocBuffer<int>(mSelectedExpertsSize * NUM_BUFFERS);
+        mScaleProbsSize = mTotalTokens * mK;
+        mScaleProbs = allocBuffer<float>(mScaleProbsSize * NUM_BUFFERS);
+        mInputTensorSize = mTotalTokens * mHiddenSize;
+        mInputTensor = allocBuffer<DataType>(mInputTensorSize * NUM_BUFFERS);
+        mFinalOutputSize = mTotalTokens * mHiddenSize;
+        mFinalOutput = allocBuffer<OutputType>(mFinalOutputSize * NUM_BUFFERS);
 
-        mSourceToExpandedMap = allocBuffer<int>(mTotalTokens * mK);
+        mSourceToExpandedMapSize = mTotalTokens * mK;
+        mSourceToExpandedMap = allocBuffer<int>(mSourceToExpandedMapSize * NUM_BUFFERS);
 
         mRoutingConfigIndex = routing_config;
         auto tactic = routingConfigCache.at(routing_config);
-        tactic->setRouting(mSelectedExperts, mNumExperts, mK, mTotalTokens);
+        tactic->start();
+        for (int i = 0; i < NUM_BUFFERS; i++)
+        {
+            tactic->setRouting(mSelectedExperts + mSelectedExpertsSize * i, mNumExperts, mK, mTotalTokens);
+        }
 
         check_cuda_error(cudaStreamSynchronize(streamPtr->get()));
     }
 
-    cudaGraph_t mGraph{};
-    cudaGraphExec_t mGraphInstance{};
+    std::array<cudaGraph_t, NUM_BUFFERS> mGraph{};
+    std::array<cudaGraphExec_t, NUM_BUFFERS> mGraphInstance{};
 
     void createGraph(MOEParallelismConfig parallelism_config)
     {
@@ -595,11 +686,15 @@ public:
 
         NVTX3_SCOPED_RANGE(BuildGraph);
 
-        check_cuda_error(cudaGraphCreate(&mGraph, 0));
-        check_cuda_error(cudaStreamBeginCapture(streamPtr->get(), cudaStreamCaptureModeThreadLocal));
-        runMoEPermute(parallelism_config);
-        check_cuda_error(cudaStreamEndCapture(streamPtr->get(), &mGraph));
-        check_cuda_error(cudaGraphInstantiate(&mGraphInstance, mGraph, nullptr, nullptr, 0));
+        for (int i = 0; i < NUM_BUFFERS; i++)
+        {
+            mBufferIndex = i;
+            check_cuda_error(cudaGraphCreate(&mGraph[i], 0));
+            check_cuda_error(cudaStreamBeginCapture(streamPtr->get(), cudaStreamCaptureModeThreadLocal));
+            runMoEPermute(parallelism_config);
+            check_cuda_error(cudaStreamEndCapture(streamPtr->get(), &mGraph[i]));
+            check_cuda_error(cudaGraphInstantiate(&mGraphInstance[i], mGraph[i], nullptr, nullptr, 0));
+        }
     }
 
     void destroyGraph()
@@ -609,16 +704,20 @@ public:
 
         NVTX3_SCOPED_RANGE(DestroyGraph);
 
-        check_cuda_error(cudaGraphExecDestroy(mGraphInstance));
-        check_cuda_error(cudaGraphDestroy(mGraph));
+        for (int i = 0; i < NUM_BUFFERS; i++)
+        {
+            check_cuda_error(cudaGraphExecDestroy(mGraphInstance[i]));
+            check_cuda_error(cudaGraphDestroy(mGraph[i]));
+        }
     }
 
     float benchmarkLoop(MOEParallelismConfig parallelism_config)
     {
+        mBufferIndex = (mBufferIndex + 1) % NUM_BUFFERS;
         auto tactic = routingConfigCache.at(mRoutingConfigIndex);
         if (!tactic->isDeterministic())
         {
-            tactic->setRouting(mSelectedExperts, mNumExperts, mK, mTotalTokens);
+            tactic->setRouting(mSelectedExperts + mSelectedExpertsSize * mBufferIndex, mNumExperts, mK, mTotalTokens);
         }
 
         {
@@ -626,7 +725,7 @@ public:
             check_cuda_error(cudaEventRecord(mStartEvent, streamPtr->get()));
             if (useCudaGraph)
             {
-                cudaGraphLaunch(mGraphInstance, streamPtr->get());
+                cudaGraphLaunch(mGraphInstance[mBufferIndex], streamPtr->get());
             }
             else
             {
@@ -650,9 +749,15 @@ public:
             "Tactic Profiling GEMM " + std::to_string(static_cast<int>(gemm_to_profile)));
 
         GemmProfilerBackend profiler;
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
+        profiler.init(mMoERunner, gemm_to_profile, typeToDtypeID<DataType>(), typeToDtypeID<WeightType>(),
+            typeToDtypeID<OutputType>(), mNumExperts, mK, mHiddenSize, mInterSize, mGroupSize, mActType, mUseBias,
+            mUseLora, /*min_latency_mode=*/false, /*need_weights=*/true, parallelism_config, /*enable_alltoall=*/false);
+#else
         profiler.init(mMoERunner, gemm_to_profile, typeToDtypeID<DataType>(), typeToDtypeID<WeightType>(),
             typeToDtypeID<OutputType>(), mNumExperts, mK, mHiddenSize, mInterSize, mGroupSize, mActType, mUseBias,
             mUseLora, /*min_latency_mode=*/false, /*need_weights=*/true, parallelism_config);
+#endif
         auto workspace_size = profiler.getWorkspaceSize(mTotalTokens);
         auto workspace = bufferManager->gpu(workspace_size);
 
@@ -760,11 +865,31 @@ public:
     {
         auto stream = streamPtr->get();
         MoeMinLatencyParams min_latency_params;
-        mMoERunner.runMoe(mInputTensor, nullptr, mSelectedExperts, mUseFinalScale ? mScaleProbs : nullptr,
-            mExpertWeight1, mExpertBias1, mActType, mExpertWeight2, mExpertBias2, mQuantParams, mTotalTokens,
-            mHiddenSize, mInterSize, mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap,
-            parallelism_config, mUseLora, mLoraParams,
-            /*use_deepseek_fp8_block_scale=*/false, /*min_latency_mode=*/false, min_latency_params, stream);
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
+        mMoERunner.runMoe(mInputTensor + mInputTensorSize * mBufferIndex, nullptr,
+            mSelectedExperts + mSelectedExpertsSize * mBufferIndex,
+            mUseFinalScale ? mScaleProbs + mScaleProbsSize * mBufferIndex : nullptr,
+            mExpertWeight1 + mExpertWeight1Size * mBufferIndex, mExpertBias1 + mExpertBias1Size * mBufferIndex,
+            mActType, mExpertWeight2 + mExpertWeight2Size * mBufferIndex,
+            mExpertBias2 + mExpertBias2Size * mBufferIndex, mQuantParams[mBufferIndex], mTotalTokens, mHiddenSize,
+            mInterSize, mNumExperts, mK, mWorkspace + mWorkspaceSize * mBufferIndex,
+            mFinalOutput + mFinalOutputSize * mBufferIndex,
+            mSourceToExpandedMap + mSourceToExpandedMapSize * mBufferIndex, parallelism_config,
+            /*enable_alltoall=*/false, mUseLora, mLoraParams[mBufferIndex],
+            /*use_fp8_block_scaling=*/false, /*min_latency_mode=*/false, min_latency_params, stream);
+#else
+        mMoERunner.runMoe(mInputTensor + mInputTensorSize * mBufferIndex, nullptr,
+            mSelectedExperts + mSelectedExpertsSize * mBufferIndex,
+            mUseFinalScale ? mScaleProbs + mScaleProbsSize * mBufferIndex : nullptr,
+            mExpertWeight1 + mExpertWeight1Size * mBufferIndex, mExpertBias1 + mExpertBias1Size * mBufferIndex,
+            mActType, mExpertWeight2 + mExpertWeight2Size * mBufferIndex,
+            mExpertBias2 + mExpertBias2Size * mBufferIndex, mQuantParams[mBufferIndex], mTotalTokens, mHiddenSize,
+            mInterSize, mNumExperts, mK, mWorkspace + mWorkspaceSize * mBufferIndex,
+            mFinalOutput + mFinalOutputSize * mBufferIndex,
+            mSourceToExpandedMap + mSourceToExpandedMapSize * mBufferIndex, parallelism_config, mUseLora,
+            mLoraParams[mBufferIndex],
+            /*use_fp8_block_scaling=*/false, /*min_latency_mode=*/false, min_latency_params, stream);
+#endif
     }
 
     void runBenchmark(benchmark::State& state);
@@ -784,7 +909,7 @@ void MixtureOfExpertsBenchmark<TypeTuple_>::runBenchmark(benchmark::State& state
     int const num_tokens = state.range(7);
     mUseBias = state.range(8);
     mUseFinalScale = state.range(9);
-    mActType = static_cast<tensorrt_llm::ActivationType>(state.range(10));
+    mActType = static_cast<ActivationType>(state.range(10));
     int tactic_idx1 = state.range(11);
     int tactic_idx2 = state.range(12);
     int const routing_config = state.range(13);

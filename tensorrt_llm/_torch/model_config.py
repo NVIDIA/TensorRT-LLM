@@ -7,7 +7,9 @@ import torch
 import transformers
 
 from tensorrt_llm import logger
+from tensorrt_llm._torch.pyexecutor.config_utils import is_nemotron_hybrid
 from tensorrt_llm._utils import torch_dtype_to_binding
+from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -68,7 +70,7 @@ class ModelConfig(Generic[TConfig]):
     # to support mixed quantization.
     skip_create_weights_in_init: bool = False
 
-    spec_config: Optional["SpecConfig"] = None
+    spec_config: Optional["DecodingBaseConfig"] = None
     lora_config: Optional["LoraConfig"] = None
 
     is_generation: bool = True
@@ -86,6 +88,8 @@ class ModelConfig(Generic[TConfig]):
 
     # Allow models to select op according to whether CUDA Graphs are used.
     use_cuda_graph: bool = False
+
+    force_dynamic_quantization: bool = False
 
     extra_attrs: Dict = field(default_factory=dict, repr=False, init=False)
 
@@ -270,11 +274,19 @@ class ModelConfig(Generic[TConfig]):
         model_config._frozen = True
         return model_config
 
-    def get_bindings_model_config(self) -> "ModelConfigCpp":
+    def get_bindings_model_config(self,
+                                  tokens_per_block: Optional[int] = None
+                                  ) -> "ModelConfigCpp":
         """
         This method is used to construct the bindings config for the model.
         Currently it adheres to gptJsonConfig.cpp::createModelConfig, which assumes
         that an engine has been created.
+
+        Args:
+            tokens_per_block: The number of tokens per block. Please note that in PyTorch flow tokens_per_block is not available in the model config, instead it is defined in the executor config.
+
+        Returns:
+            The bindings model config.
         """
         # TODO smor- this isn't robust, and currently tested for LlamaConfig only
         # TODO smor- currently assuming no rnn layers, no MOE
@@ -287,12 +299,18 @@ class ModelConfig(Generic[TConfig]):
         model_config_cpp = ModelConfigCpp(
             vocab_size=self.pretrained_config.vocab_size,
             num_layers=self.pretrained_config.num_hidden_layers,
-            num_attention_layers=self.pretrained_config.num_hidden_layers,
+            num_attention_layers=self.get_num_attention_layers(),
             num_rnn_layers=0,
             num_heads=num_heads,
             hidden_size=hidden_size,
             data_type=torch_dtype_to_binding(
                 self.pretrained_config.torch_dtype))
+        if tokens_per_block is None:
+            logger.warning(
+                f"tokens_per_block is not set, using default value {model_config_cpp.tokens_per_block}"
+            )
+        else:
+            model_config_cpp.tokens_per_block = tokens_per_block
 
         mlp_hidden_size = None
         if self.pretrained_config.intermediate_size is not None:
@@ -323,6 +341,11 @@ class ModelConfig(Generic[TConfig]):
         model_config_cpp.mlp_hidden_size = mlp_hidden_size
         model_config_cpp.size_per_head = head_size
 
+        # NOTE: this method is not robust, for Gemma3ForCausalLM only
+        layer_types = self.get_layer_types()
+        if layer_types is not None:
+            model_config_cpp.layer_types = layer_types
+
         return model_config_cpp
 
     def _infer_nemotron_ffn_mult(self):
@@ -339,3 +362,24 @@ class ModelConfig(Generic[TConfig]):
             biggest_ffn_mult, self.pretrained_config.hidden_size)
 
         return mlp_hidden_size
+
+    def get_layer_types(self) -> Optional[List[LayerTypeCpp]]:
+        """
+        This method is a hack to support the effort to switch to KvCacheManagerCpp.
+        Currently, it is only tested for Gemma3ForCausalLM. For other models, it will return None.
+        """
+        if self.pretrained_config.architectures[0] in ["Gemma3ForCausalLM"]:
+            logger.debug(
+                f"Setting layer types for {self.pretrained_config.architectures}"
+            )
+            return [
+                LayerTypeCpp.ATTENTION,
+            ] * self.pretrained_config.num_hidden_layers
+        else:
+            return None
+
+    def get_num_attention_layers(self):
+        if is_nemotron_hybrid(self.pretrained_config):
+            return self.pretrained_config.hybrid_override_pattern.count("*")
+        else:
+            return self.pretrained_config.num_hidden_layers

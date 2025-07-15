@@ -17,14 +17,17 @@ l0_l40s:
   - unittest/_torch/modeling -k "modeling_mllama"
   - unittest/_torch/modeling -k "modeling_out_of_tree"
   - unittest/_torch/modeling -k "modeling_vila"
+  - unittest/_torch/modeling -k "modeling_siglip"
   - test_e2e.py::test_ptp_scaffolding[DeepSeek-R1-Distill-Qwen-7B-DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B]
-  - test_e2e.py::test_ptp_quickstart_multimodal[NVILA-8B-FP16-vila/NVILA-8B-image]
-  - test_e2e.py::test_ptp_quickstart_multimodal[NVILA-8B-FP16-vila/NVILA-8B-video]
-  - test_e2e.py::test_ptp_quickstart_multimodal[llava-v1.6-mistral-7b-llava-v1.6-mistral-7b-hf-image]
-  - test_e2e.py::test_ptp_quickstart_multimodal[qwen2-vl-7b-instruct-Qwen2-VL-7B-Instruct-image]
-  - test_e2e.py::test_ptp_quickstart_multimodal[qwen2-vl-7b-instruct-Qwen2-VL-7B-Instruct-video]
-  - test_e2e.py::test_ptp_quickstart_multimodal[qwen2.5-vl-7b-instruct-Qwen2.5-VL-7B-Instruct-image]
-  - test_e2e.py::test_ptp_quickstart_multimodal[qwen2.5-vl-7b-instruct-Qwen2.5-VL-7B-Instruct-video]
+  - test_e2e.py::test_ptp_quickstart_multimodal[NVILA-8B-FP16-vila/NVILA-8B-image-False]
+  - test_e2e.py::test_ptp_quickstart_multimodal[NVILA-8B-FP16-vila/NVILA-8B-video-False]
+  - test_e2e.py::test_ptp_quickstart_multimodal[llava-v1.6-mistral-7b-llava-v1.6-mistral-7b-hf-image-False]
+  - test_e2e.py::test_ptp_quickstart_multimodal[qwen2-vl-7b-instruct-Qwen2-VL-7B-Instruct-image-False]
+  - test_e2e.py::test_ptp_quickstart_multimodal[qwen2-vl-7b-instruct-Qwen2-VL-7B-Instruct-video-False]
+  - test_e2e.py::test_ptp_quickstart_multimodal[qwen2.5-vl-7b-instruct-Qwen2.5-VL-7B-Instruct-image-False]
+  - test_e2e.py::test_ptp_quickstart_multimodal[qwen2.5-vl-7b-instruct-Qwen2.5-VL-7B-Instruct-image-True]
+  - test_e2e.py::test_ptp_quickstart_multimodal[qwen2.5-vl-7b-instruct-Qwen2.5-VL-7B-Instruct-video-False]
+  - test_e2e.py::test_ptp_quickstart_multimodal[qwen2.5-vl-7b-instruct-Qwen2.5-VL-7B-Instruct-video-True]
   - test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
   - test_e2e.py::test_ptp_quickstart_bert[TRTLLM-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
 - condition:
@@ -46,7 +49,7 @@ l0_l40s:
   - unittest/trt/attention/test_gpt_attention.py -k "partition2"
   - unittest/trt/attention/test_gpt_attention.py -k "partition3"
   - unittest/trt/attention/test_gpt_attention.py -k "xqa_generic"
-  - unittest/trt/quantization TIMEOUT (60)
+  - unittest/trt/quantization
   - unittest/trt/functional # 37 mins
   - accuracy/test_cli_flow.py::TestLlama2_7B::test_fp8
   - accuracy/test_cli_flow.py::TestLlama3_1_8B::test_fp8_rowwise_meta_recipe
@@ -55,7 +58,7 @@ l0_l40s:
   - accuracy/test_llm_api.py::TestLlama3_1_8B::test_fp8_rowwise
   - examples/test_llama.py::test_llm_llama_v2_lora_1gpu[chinese-llama-2-lora-13b-llama-v2-13b-hf-lora_fp16-base_fp16]
   - examples/test_llama.py::test_llm_llama_v3_dora_1gpu[commonsense-llama-v3-8b-dora-r32-llama-v3-8b-hf-base_fp16]
-  - examples/test_llama.py::test_llm_llama_v1_1gpu_kv_cache_reuse_with_prompt_table[llama-7b] TIMEOUT (60)
+  - examples/test_llama.py::test_llm_llama_v1_1gpu_kv_cache_reuse_with_prompt_table[llama-7b]
   - examples/test_phi.py::test_llm_phi_lora_1gpu[Phi-3-mini-4k-instruct-ru-lora-Phi-3-mini-4k-instruct-lora_fp16-base_fp16]
   - examples/test_nemotron_nas.py::test_nemotron_nas_summary_1gpu[DeciLM-7B]
   - examples/test_gpt.py::test_llm_gpt_starcoder_lora_1gpu[peft-lora-starcoder2-15b-unity-copilot-starcoder2-lora_fp16-base_fp16]
@@ -63,14 +66,10 @@ l0_l40s:
   - llmapi/test_llm_examples.py::test_llmapi_example_inference
   - llmapi/test_llm_examples.py::test_llmapi_example_inference_async
   - llmapi/test_llm_examples.py::test_llmapi_example_inference_async_streaming
-  - llmapi/test_llm_examples.py::test_llmapi_example_logits_processor
   - llmapi/test_llm_examples.py::test_llmapi_example_multilora
   - llmapi/test_llm_examples.py::test_llmapi_example_guided_decoding
-  - llmapi/test_llm_examples.py::test_llmapi_example_customize
-  - llmapi/test_llm_examples.py::test_llmapi_example_quantization
+  - llmapi/test_llm_examples.py::test_llmapi_example_logits_processor
   - examples/test_llm_api_with_mpi.py::test_llm_api_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
-  - llmapi/test_llm_examples.py::test_llmapi_example_lookahead_decoding
-  - llmapi/test_llm_examples.py::test_llmapi_example_medusa_decoding_use_modelopt
 - condition:
     ranges:
       system_gpu_count:

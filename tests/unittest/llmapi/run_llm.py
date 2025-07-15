@@ -4,7 +4,9 @@ from typing import Optional
 
 import click
 
-from tensorrt_llm.llmapi import LLM, KvCacheConfig, SamplingParams
+from tensorrt_llm import LLM as TorchLLM
+from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
 
 
 @click.command()
@@ -20,7 +22,6 @@ def main(model_dir: str, tp_size: int, engine_dir: Optional[str], n: int,
          best_of: Optional[int], top_k: int, use_beam_search: bool,
          use_pytorch: bool):
     if use_pytorch:
-        from tensorrt_llm._torch.llm import LLM as TorchLLM
         llm = TorchLLM(
             model_dir,
             tensor_parallel_size=tp_size,

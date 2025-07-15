@@ -5,7 +5,7 @@ import groovy.transform.Field
 
 // Docker image registry
 IMAGE_NAME = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging"
-NGC_IMAGE_NAME = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/ngc"
+NGC_IMAGE_NAME = "${IMAGE_NAME}/ngc"
 
 // LLM repository configuration
 withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
@@ -90,8 +90,8 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
     {
     case "agent":
         containerConfig = """
-                  - name: alpine
-                    image: urm.nvidia.com/docker/alpine:latest
+                  - name: python3
+                    image: urm.nvidia.com/docker/python:3.12-slim
                     command: ['cat']
                     tty: true
                     resources:
@@ -491,6 +491,46 @@ pipeline {
                     writeFile file: "imageKeyToTag.json", text: imageKeyToTagJson
                     archiveArtifacts artifacts: 'imageKeyToTag.json', fingerprint: true
                     trtllm_utils.uploadArtifacts("imageKeyToTag.json", "${UPLOAD_PATH}/")
+                }
+            }
+        }
+        stage("Register Images for Security Checks") {
+            when {
+                expression {
+                    return params.nspect_id && params.action == "push"
+                }
+            }
+            steps {
+                script {
+                    container("python3") {
+                        trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade pip")
+                        trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade requests")
+                        def nspect_commit = "58ee430c8c3bd36bee2073405a547d3f8bc1932f"
+                        withCredentials([string(credentialsId: "TRTLLM_NSPECT_REPO", variable: "NSPECT_REPO")]) {
+                            trtllm_utils.checkoutSource("${NSPECT_REPO}", nspect_commit, "nspect")
+                        }
+                        def nspect_env = params.nspect_env ? params.nspect_env : "prod"
+                        def program_version_name = params.program_version_name ? params.program_version_name : "PostMerge"
+                        def cmd = """./nspect/nspect.py \
+                            --env ${nspect_env} \
+                            --nspect_id ${params.nspect_id} \
+                            --program_version_name '${program_version_name}' \
+                            """
+                        if (params.register_images) {
+                            cmd += "--register "
+                        }
+                        if (params.osrb_ticket) {
+                            cmd += "--osrb_ticket ${params.osrb_ticket} "
+                        }
+                        if (params.wait_success_seconds) {
+                            cmd += "--check_launch_api "
+                            cmd += "--wait_success ${params.wait_success_seconds} "
+                        }
+                        cmd += imageKeyToTag.values().join(" ")
+                        withCredentials([usernamePassword(credentialsId: "NSPECT_CLIENT-${nspect_env}", usernameVariable: 'NSPECT_CLIENT_ID', passwordVariable: 'NSPECT_CLIENT_SECRET')]) {
+                            sh cmd
+                        }
+                    }
                 }
             }
         }

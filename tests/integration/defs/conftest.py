@@ -1714,6 +1714,17 @@ def cmodel_dir(llm_venv):
         shutil.rmtree(model_dir)
 
 
+@pytest.fixture(scope="function")
+def cmodel_base_dir(llm_venv):
+    "converted base model dir for redrafter"
+    model_dir = os.path.join(llm_venv.get_working_directory(), "cmodels_base")
+
+    yield model_dir
+
+    if exists(model_dir):
+        shutil.rmtree(model_dir)
+
+
 @pytest.fixture(scope="module")
 def qcache_dir(llm_venv, llm_root):
     "get quantization cache dir"
@@ -1814,15 +1825,21 @@ def skip_by_device_count(request):
 
 @pytest.fixture(autouse=True)
 def skip_by_mpi_world_size(request):
-    "fixture for skip less device count"
+    "fixture for skip less mpi world size"
     if request.node.get_closest_marker('skip_less_mpi_world_size'):
         mpi_world_size = get_mpi_world_size()
+        device_count = get_device_count()
+        if mpi_world_size == 1:
+            # For mpi_world_size == 1 case, we only need to check device count since we can spawn mpi workers in the test itself
+            total_count = device_count
+        else:
+            # Otherwise, we follow the mpi world size setting
+            total_count = mpi_world_size
         expected_count = request.node.get_closest_marker(
             'skip_less_mpi_world_size').args[0]
-        if expected_count > int(mpi_world_size):
+        if expected_count > int(total_count):
             pytest.skip(
-                f'MPI world size {mpi_world_size} is less than {expected_count}'
-            )
+                f'Total world size {total_count} is less than {expected_count}')
 
 
 @pytest.fixture(autouse=True)
@@ -1932,8 +1949,26 @@ def get_device_memory():
             "nvidia-smi" + suffix, "--query-gpu=memory.total",
             "--format=csv,noheader"
         ])
-        output = check_output(cmd, shell=True, cwd=temp_dirname)
-        memory = int(output.strip().split()[0])
+        # Try to get memory from nvidia-smi first, if failed, fallback to system memory from /proc/meminfo
+        # This fallback is needed for systems with unified memory (e.g. DGX Spark)
+        try:
+            output = check_output(cmd, shell=True, cwd=temp_dirname)
+            memory_str = output.strip().split()[0]
+            # Check if nvidia-smi returned a valid numeric value
+            if "N/A" in memory_str:
+                raise ValueError("nvidia-smi returned invalid memory info")
+            memory = int(memory_str)
+        except (sp.CalledProcessError, ValueError, IndexError):
+            # Fallback to system memory from /proc/meminfo (in kB, convert to MiB)
+            try:
+                with open('/proc/meminfo', 'r') as f:
+                    for line in f:
+                        if line.startswith('MemTotal:'):
+                            memory = int(
+                                line.split()[1]) // 1024  # Convert kB to MiB
+                            break
+            except:
+                memory = 8192  # Default 8GB if all else fails
 
     return memory
 

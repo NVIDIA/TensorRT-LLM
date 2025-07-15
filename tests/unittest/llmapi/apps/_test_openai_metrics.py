@@ -4,7 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 from transformers import AutoTokenizer
 
-from tensorrt_llm._torch.llm import LLM as PyTorchLLM
+from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm.llmapi import BuildConfig, KvCacheConfig
 from tensorrt_llm.serve.openai_server import OpenAIServer
 

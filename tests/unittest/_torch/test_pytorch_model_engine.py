@@ -1,7 +1,6 @@
 import unittest
 from dataclasses import dataclass
 
-import pytest
 import torch
 
 import tensorrt_llm
@@ -18,7 +17,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
 # isort: on
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.llmapi import SamplingParams
+from tensorrt_llm.llmapi import CudaGraphConfig, LlmArgs, SamplingParams
 from tensorrt_llm.mapping import Mapping
 
 
@@ -43,6 +42,9 @@ class DummyModel(torch.nn.Module):
             torch_dtype=dtype))
         self.recorded_position_ids = None
 
+    def infer_max_seq_len(self):
+        return 2048
+
     @property
     def config(self):
         return self.model_config.pretrained_config
@@ -65,9 +67,9 @@ class DummyModelEngine(PyTorchModelEngine):
         mapping = Mapping(world_size=tensorrt_llm.mpi_world_size(),
                           tp_size=tensorrt_llm.mpi_world_size(),
                           rank=tensorrt_llm.mpi_rank())
-        super().__init__("",
-                         pytorch_backend_config,
-                         batch_size,
+        super().__init__(model_path="",
+                         pytorch_backend_config=pytorch_backend_config,
+                         batch_size=batch_size,
                          max_seq_len=max_seq_len,
                          mapping=mapping)
 
@@ -133,7 +135,6 @@ def create_model_engine_and_kvcache(config: PyTorchConfig = None):
     return model_engine, kv_cache_manager
 
 
-@pytest.mark.skip(reason="https://nvbugs/5324248")
 class PyTorchModelEngineTestCase(unittest.TestCase):
 
     def test_pad_generation_requests(self) -> None:
@@ -281,6 +282,42 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         self.assertEqual(model_engine._cuda_graph_batch_sizes,
                          [1, 2, 3, model_engine.max_seq_len])
+
+    def test_cuda_graph_enable(self):
+        # Test 1: Default behavior (no cuda_graph_config specified)
+        llm_args_default = LlmArgs.from_kwargs(model="dummy_model")
+        pytorch_config_default = llm_args_default.get_pytorch_backend_config()
+        self.assertTrue(pytorch_config_default.use_cuda_graph,
+                        "CUDA graphs should be enabled by default")
+
+        # Test 2: Explicit CudaGraphConfig()
+        llm_args_explicit = LlmArgs.from_kwargs(
+            model="dummy_model", cuda_graph_config=CudaGraphConfig())
+        pytorch_config_explicit = llm_args_explicit.get_pytorch_backend_config()
+        self.assertTrue(
+            pytorch_config_explicit.use_cuda_graph,
+            "CUDA graphs should be enabled when CudaGraphConfig() is provided")
+
+        # Test 3: cuda_graph_config=None (explicitly disabled)
+        llm_args_disabled = LlmArgs.from_kwargs(model="dummy_model",
+                                                cuda_graph_config=None)
+        pytorch_config_disabled = llm_args_disabled.get_pytorch_backend_config()
+        self.assertFalse(
+            pytorch_config_disabled.use_cuda_graph,
+            "CUDA graphs should be disabled when cuda_graph_config=None")
+
+        # Test 4: Custom CudaGraphConfig with specific settings
+        custom_config = CudaGraphConfig(max_batch_size=256,
+                                        padding_enabled=True)
+        llm_args_custom = LlmArgs.from_kwargs(model="dummy_model",
+                                              cuda_graph_config=custom_config)
+        pytorch_config_custom = llm_args_custom.get_pytorch_backend_config()
+        self.assertTrue(pytorch_config_custom.use_cuda_graph,
+                        "CUDA graphs should be enabled with custom config")
+        self.assertEqual(pytorch_config_custom.cuda_graph_max_batch_size, 256,
+                         "Custom max_batch_size should be respected")
+        self.assertTrue(pytorch_config_custom.cuda_graph_padding_enabled,
+                        "Custom padding_enabled should be respected")
 
 
 if __name__ == "__main__":

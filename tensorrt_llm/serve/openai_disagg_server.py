@@ -3,6 +3,7 @@ import asyncio
 import copy
 import os
 import signal
+import traceback
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import List, Optional, Type, Union
@@ -35,20 +36,20 @@ TIMEOUT_KEEP_ALIVE = 10  # seconds.
 class OpenAIDisaggServer:
 
     def __init__(self,
-                 ctx_servers: List[str] = None,
-                 gen_servers: List[str] = None,
+                 ctx_servers: List[str],
+                 gen_servers: List[str],
                  req_timeout_secs: int = 180,
                  server_start_timeout_secs: int = 180,
                  ctx_router_config: Optional[RouterConfig] = None,
                  gen_router_config: Optional[RouterConfig] = None,
                  conditional_disagg_config: Optional[ConditionalDisaggConfig] = None,
-                 metadata_server_cfg: MetadataServerConfig = None):
+                 metadata_server_cfg: Optional[MetadataServerConfig] = None):
 
         self.ctx_servers = ctx_servers
         self.gen_servers = gen_servers
         self.metadata_server = create_metadata_server(metadata_server_cfg)
-        self.ctx_router = create_router(ctx_router_config, ctx_servers, self.metadata_server)
-        self.gen_router = create_router(gen_router_config, gen_servers, self.metadata_server)
+        self.ctx_router = create_router(ctx_router_config, ctx_servers, metadata_server_cfg, self.metadata_server)
+        self.gen_router = create_router(gen_router_config, gen_servers, metadata_server_cfg, self.metadata_server)
         self.conditional_disagg_config = conditional_disagg_config
 
 
@@ -68,7 +69,7 @@ class OpenAIDisaggServer:
         async def lifespan(app: FastAPI):
             # Create a persistent aiohttp ClientSession
             self.session = aiohttp.ClientSession(
-                connector=aiohttp.TCPConnector(limit=0, limit_per_host=0, keepalive_timeout=300),
+                connector=aiohttp.TCPConnector(limit=0, limit_per_host=0, force_close=True),
                 timeout=aiohttp.ClientTimeout(total=req_timeout_secs))
 
             logger.info("Waiting for context and generation servers to be ready")
@@ -76,8 +77,8 @@ class OpenAIDisaggServer:
 
             if self.metadata_server:
                 logger.info("Starting server monitoring via metadata service")
-                await self.ctx_router.start_server_monitoring()
-                await self.gen_router.start_server_monitoring()
+                await self.ctx_router.start_server_monitoring(metadata_server_cfg.refresh_interval)
+                await self.gen_router.start_server_monitoring(metadata_server_cfg.refresh_interval)
 
             yield
 
@@ -168,12 +169,12 @@ class OpenAIDisaggServer:
 
     async def _handle_exception(self, exception):
         if isinstance(exception, CppExecutorError):
-            logger.error(exception)
+            logger.error(traceback.format_exc())
             signal.raise_signal(signal.SIGINT)
         elif isinstance(exception, HTTPException):
             raise exception  # Re-raise HTTP exceptions properly
         else:
-            logger.error(exception)
+            logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=f"Internal server error {str(exception)}")
 
     async def _send_context_request(self, ctx_server: str, ctx_req: Union[CompletionRequest, ChatCompletionRequest]):

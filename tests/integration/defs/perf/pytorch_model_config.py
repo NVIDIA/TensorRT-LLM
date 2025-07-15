@@ -29,8 +29,9 @@ def get_model_yaml_config(model_label: str,
         """
     base_config = {
         'print_iter_log': True,
-        'use_cuda_graph': True,
-        'cuda_graph_padding_enabled': True,
+        'cuda_graph_config': {
+            'padding_enabled': True,
+        },
     }
     if 'kv_cache_dtype' in model_label:
         base_config.update({
@@ -49,7 +50,7 @@ def get_model_yaml_config(model_label: str,
             ],
             'config': {
                 'enable_attention_dp': True,
-                'use_cuda_graph': True,
+                'cuda_graph_config': {},
                 'speculative_config': {
                     'decoding_type': 'MTP',
                     'num_nextn_predict_layers': 3
@@ -64,9 +65,10 @@ def get_model_yaml_config(model_label: str,
             ],
             'config': {
                 'enable_attention_dp': True,
-                'cuda_graph_padding_enabled': True,
-                'cuda_graph_batch_sizes':
-                [1, 2, 4, 8, 16, 32, 64, 128, 256, 384]
+                'cuda_graph_config': {
+                    'padding_enabled': True,
+                    'batch_sizes': [1, 2, 4, 8, 16, 32, 64, 128, 256, 384]
+                }
             }
         },
         # DeepSeek R1 model with specific batch size 128
@@ -75,7 +77,9 @@ def get_model_yaml_config(model_label: str,
             'deepseek_r1-bench-pytorch-float16-maxbs:128-maxnt:1127-input_output_len:1000,2000-quant:fp8-reqs:5120-con:1024-ep:8-gpus:8',
             'config': {
                 'enable_attention_dp': True,
-                'cuda_graph_batch_sizes': [128]
+                'cuda_graph_config': {
+                    'batch_sizes': [128]
+                }
             }
         },
         # Deepseek_v3_lite_cases
@@ -84,9 +88,17 @@ def get_model_yaml_config(model_label: str,
             'deepseek_v3_lite_nvfp4-bench-pytorch-streaming-float4-maxbs:2048-maxnt:8192-input_output_len:256,256-reqs:200',
             'config': {
                 'print_iter_log': True,
-                'use_cuda_graph': True,
-                'cuda_graph_padding_enabled': True,
-                'cuda_graph_batch_sizes': [1, 512, 1024, 2048]
+                'cuda_graph_config': {
+                    'padding_enabled': True,
+                    'batch_sizes': [1, 512, 1024, 2048]
+                }
+            }
+        },
+        # Deepseek default cases
+        {
+            'patterns': 'deepseek_r1',
+            'config': {
+                'enable_attention_dp': True,
             }
         },
         # Llama Nemotron models with attention_dp disabled to prevent hangs
@@ -138,13 +150,7 @@ def get_model_yaml_config(model_label: str,
         lora_config = {
             'lora_config': {
                 'lora_dir': lora_dirs if lora_dirs is not None else [],
-                'max_lora_rank': 64,
-                'lora_target_modules': ['attn_q', 'attn_k', 'attn_v'],
-                'trtllm_modules_to_hf_modules': {
-                    "attn_q": "q_proj",
-                    "attn_k": "k_proj",
-                    "attn_v": "v_proj"
-                }
+                'max_lora_rank': 64
             }
         }
         base_config.update(lora_config)

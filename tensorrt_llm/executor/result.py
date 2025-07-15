@@ -84,6 +84,7 @@ class CompletionOutput:
         stop_reason (int, str, optional): The stop string or token id that caused the completion to stop, None if the completion finished for some other reason. Defaults to None.
         generation_logits (torch.Tensor, optional): The logits on the generated output token ids. Defaults to None.
         disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Parameters needed for disaggregated serving. Includes the type of request, the first generated tokens, the context request id and the any additional state needing to be transferred from context and generation instances. Defaults to None.
+        request_perf_metrics (tensorrt_llm.bindings.executor.RequestPerfMetrics, optional): Performance metrics for the request. Defaults to None.
 
     Attributes:
         length (int): The number of generated tokens.
@@ -102,6 +103,7 @@ class CompletionOutput:
     stop_reason: Optional[Union[int, str]] = None
     generation_logits: Optional[torch.Tensor] = None
     disaggregated_params: Optional[DisaggregatedParams] = None
+    request_perf_metrics: Optional[tllm.RequestPerfMetrics] = None
 
     # hidden fields for tracking the diffs
     _last_text_len: int = field(default=0, init=False, repr=False)
@@ -237,6 +239,9 @@ class GenerationResultBase:
                 src_idx] == tllm.FinishReason.CANCELLED:
             output.finish_reason = 'cancelled'
 
+        if response_tensors.request_perf_metrics is not None:
+            output.request_perf_metrics = response_tensors.request_perf_metrics
+
         if self._done:
             if finish_reasons[src_idx] == tllm.FinishReason.END_ID:
                 output.finish_reason = 'stop'
@@ -355,9 +360,6 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
         self.tokenizer = tokenizer
         self._streaming = streaming
 
-    @nvtx_range_debug("handle_response",
-                      color="red",
-                      category="DetokenizedGenerationResultBase")
     def _handle_response(self, response: "GenerationExecutor.Response"):
         GenerationResultBase._handle_response(self, response)
 
@@ -374,17 +376,16 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
         if self.sampling_params.detokenize and self.tokenizer is not None:
             for beam_output in self.outputs:
                 beam_output._last_text_len = len(beam_output.text)
-                if hasattr(self.tokenizer, 'decode_incrementally'):
-                    if self._streaming and not self.sampling_params.use_beam_search:
-                        beam_output.text, beam_output._incremental_states = self.tokenizer.decode_incrementally(
-                            beam_output.token_ids_diff,
-                            prev_text=beam_output.text,
-                            states=beam_output._incremental_states,
-                            flush=self._done,
-                            **kwargs)
-                    else:
-                        beam_output.text, _ = self.tokenizer.decode_incrementally(
-                            beam_output.token_ids, flush=self._done, **kwargs)
+                if hasattr(
+                        self.tokenizer, 'decode_incrementally'
+                ) and self._streaming and not self.sampling_params.use_beam_search:
+                    beam_output.text, beam_output._incremental_states = self.tokenizer.decode_incrementally(
+                        beam_output.token_ids_diff,
+                        prev_text=beam_output.text,
+                        states=beam_output._incremental_states,
+                        flush=self._done,
+                        stream_interval=self.sampling_params._stream_interval,
+                        **kwargs)
                 else:
                     beam_output.text = self.tokenizer.decode(
                         beam_output.token_ids, **kwargs)

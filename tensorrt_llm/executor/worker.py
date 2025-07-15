@@ -119,7 +119,6 @@ class GenerationExecutorWorker(GenerationExecutor):
             args = {
                 "executor_config": executor_config,
                 "checkpoint_dir": executor_config.hf_model_dir,
-                "engine_dir": executor_config.trt_engine_dir,
             }
             if executor_config.backend == "pytorch":
                 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
@@ -135,7 +134,6 @@ class GenerationExecutorWorker(GenerationExecutor):
             else:
                 raise ValueError(
                     f"Unsupported backend config: {executor_config.backend}")
-
             return create_executor(**args)
 
         self.engine = _create_engine()
@@ -343,13 +341,16 @@ class GenerationExecutorWorker(GenerationExecutor):
         if mpi_rank() == 0:
             self.start_thread(self.dispatch_stats_thread)
 
-    def _load_lora_adapter(self, lora_request: LoRARequest):
-        self._lora_manager.load_from_ckpt(
+    def _load_lora_adapter(self, lora_request: LoRARequest) -> bool:
+        """Returns True if the adapter was loaded by this call, False if it was already loaded"""
+        adapter_id = str(lora_request.adapter_id)
+        newly_loaded_uids = self._lora_manager.load_from_ckpt(
             [lora_request.path],
             model_config=self._runtime_model_config if
             self._runtime_model_config is not None else self._lora_model_config,
             runtime_mapping=None,
-            uids=[str(lora_request.adapter_id)])
+            uids=[adapter_id])
+        return adapter_id in newly_loaded_uids
 
     def _load_prompt_adapter(self,
                              prompt_adapter_request: PromptAdapterRequest):
@@ -361,22 +362,20 @@ class GenerationExecutorWorker(GenerationExecutor):
     def _enqueue_request(self, request: GenerationRequest) -> int:
         assert request.id is not None
         if self._lora_manager is not None and request.lora_request is not None:
-            self._load_lora_adapter(request.lora_request)
+            loaded_new_lora_adapter = self._load_lora_adapter(
+                request.lora_request)
             uid = str(request.lora_request.adapter_id)
             lora_config = tllm.LoraConfig(
                 task_id=request.lora_request.adapter_id,
-                weights=self._lora_manager.cpp_lora_weights[uid],
-                config=self._lora_manager.cpp_lora_config[uid])
+                weights=self._lora_manager.cpp_lora_weights[uid]
+                if loaded_new_lora_adapter else None,
+                config=self._lora_manager.cpp_lora_config[uid]
+                if loaded_new_lora_adapter else None)
         else:
             lora_config = None
 
         prompt_token_ids = copy.deepcopy(request.prompt_token_ids)
         prompt_tuning_config = None
-        multimodal_embedding = None
-        mrope_config = None
-        multimodal_input = None
-        if request.multimodal_embedding is not None:
-            multimodal_embedding = request.multimodal_embedding
         if request.prompt_adapter_request is not None:
             self._load_prompt_adapter(request.prompt_adapter_request)
             uid = str(request.prompt_adapter_request.adapter_id)
@@ -387,15 +386,22 @@ class GenerationExecutorWorker(GenerationExecutor):
             prompt_token_ids = list(range(
                 vocab_size, vocab_size + pa_length)) + prompt_token_ids
 
-        if request.mrope_config is not None:
-            mrope_config = tllm.MropeConfig(**request.mrope_config)
-
-        if request.multimodal_input is not None:
-            multimodal_input = tllm.MultimodalInput(
-                multimodal_hashes=request.multimodal_input.multimodal_hashes,
-                multimodal_positions=request.multimodal_input.
-                multimodal_positions,
-                multimodal_lengths=request.multimodal_input.multimodal_lengths)
+        # MULTIMODAL
+        # NOTE: Since, we only support PyTorch backend for multimodal, we will send multimodal_data through the 'py_multimodal_data' field
+        # except `multimodal_input` as it needs to go through the C++ runtime.
+        multimodal_input = None
+        if request.multimodal_params is not None and request.multimodal_params.has_content(
+        ):
+            if request.multimodal_params.multimodal_input is not None:
+                multimodal_input = tllm.MultimodalInput(
+                    multimodal_hashes=request.multimodal_params.
+                    multimodal_input.multimodal_hashes,
+                    multimodal_positions=request.multimodal_params.
+                    multimodal_input.multimodal_positions,
+                    multimodal_lengths=request.multimodal_params.
+                    multimodal_input.multimodal_lengths)
+            # NOTE: Setting to None here to avoid sending multimodal_input again through the 'py_multimodal_data' field
+            request.multimodal_params.multimodal_input = None
 
         context_phase_params = None
         request_type = tllm.RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION
@@ -463,8 +469,9 @@ class GenerationExecutorWorker(GenerationExecutor):
                 lora_config=lora_config,
                 prompt_tuning_config=prompt_tuning_config,
                 multimodal_input=multimodal_input,
-                multimodal_embedding=multimodal_embedding,
-                mrope_config=mrope_config,
+                #NOTE: `multimodal_embedding` and `mrope_config` will be in MultimodalParams.multimodal_data. And this will be handled below by `py_multimodal_data`.
+                multimodal_embedding=None,
+                mrope_config=None,
                 logits_post_processor_name=(
                     tllm.Request.BATCHED_POST_PROCESSOR_NAME
                     if request.sampling_params.apply_batched_logits_processor
@@ -474,6 +481,10 @@ class GenerationExecutorWorker(GenerationExecutor):
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
                 type=request_type)
+
+            if self._is_pytorch_backend and request.multimodal_params is not None:
+                if request.multimodal_params.multimodal_data is not None:
+                    executor_request.py_multimodal_data = request.multimodal_params.multimodal_data
 
             if self._is_pytorch_backend and request.sampling_params.logits_processor:
                 # For PyTorch backend, we attach logits processors as a dynamic Python attribute

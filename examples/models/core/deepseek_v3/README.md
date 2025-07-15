@@ -43,6 +43,7 @@ Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/
       - [Activation calibration](#activation-calibration)
       - [Weight quantization and assembling](#weight-quantization-and-assembling)
     - [KV Cache Reuse](#kv-cache-reuse)
+    - [Chunked Prefill](#chunked-prefill)
   - [Notes and Troubleshooting](#notes-and-troubleshooting)
   - [Known Issues](#known-issues)
 
@@ -76,10 +77,10 @@ git clone https://huggingface.co/deepseek-ai/DeepSeek-V3 <YOUR_MODEL_DIR>
 ## Quick Start
 
 ### Run a single inference
-To quickly run DeepSeek-V3, [examples/pytorch/quickstart_advanced.py](../pytorch/quickstart_advanced.py):
+To quickly run DeepSeek-V3, [examples/llm-api/quickstart_advanced.py](../pytorch/quickstart_advanced.py):
 
 ```bash
-cd examples/pytorch
+cd examples/llm-api
 python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --tp_size 8
 ```
 
@@ -93,9 +94,9 @@ Prompt: 'The future of AI is', Generated text: ' a topic of great interest and s
 ```
 
 ### Multi-Token Prediction (MTP)
-To run with MTP, use [examples/pytorch/quickstart_advanced.py](../pytorch/quickstart_advanced.py) with additional options, see
+To run with MTP, use [examples/llm-api/quickstart_advanced.py](../pytorch/quickstart_advanced.py) with additional options, see
 ```bash
-cd examples/pytorch
+cd examples/llm-api
 python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_nextn N
 ```
 
@@ -122,7 +123,7 @@ When verifying and receiving draft tokens, there are two ways:
   Here is an example. We allow the first 15 (`--relaxed_topk 15`) tokens to be used as the initial candidate set, and use delta (`--relaxed_delta 0.5`) to filter out tokens with a large probability gap, which may be semantically different from the top-1 token.
 
   ```bash
-  cd examples/pytorch
+  cd examples/llm-api
   python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_nextn N --use_relaxed_acceptance_for_thinking --relaxed_topk 15 --relaxed_delta 0.5
   ```
 
@@ -140,9 +141,9 @@ python /app/tensorrt_llm/benchmarks/cpp/prepare_dataset.py \
         --num-requests 24 > /tmp/benchmarking_64k.txt
 
 cat <<EOF > /tmp/extra-llm-api-config.yml
-use_cuda_graph: true
-cuda_graph_padding_enabled: true
-cuda_graph_batch_sizes: [1, 4, 8, 12]
+cuda_graph_config:
+  padding_enabled: true
+  batch_sizes: [1, 4, 8, 12]
 EOF
 
 trtllm-bench -m deepseek-ai/DeepSeek-R1 --model_path ${DS_R1_NVFP4_MODEL_PATH} throughput \
@@ -167,9 +168,9 @@ python /app/tensorrt_llm/benchmarks/cpp/prepare_dataset.py \
         --num-requests 4 > /tmp/benchmarking_128k.txt
 
 cat <<EOF > /tmp/extra-llm-api-config.yml
-use_cuda_graph: true
-cuda_graph_padding_enabled: true
-cuda_graph_batch_sizes: [1, 2]
+cuda_graph_config:
+  padding_enabled: true
+  batch_sizes: [1, 2]
 moe_max_num_tokens: 16384
 EOF
 
@@ -191,7 +192,7 @@ Evaluate the model accuracy using `trtllm-eval`.
 1. (Optional) Prepare an advanced configuration file:
 ```bash
 cat >./extra-llm-api-config.yml <<EOF
-use_cuda_graph: true
+cuda_graph_config: {}
 enable_attention_dp: true
 EOF
 ```
@@ -235,19 +236,19 @@ To serve the model using `trtllm-serve`:
 
 ```bash
 cat >./extra-llm-api-config.yml <<EOF
-use_cuda_graph: true
-cuda_graph_padding_enabled: true
-cuda_graph_batch_sizes:
-  - 1
-  - 2
-  - 4
-  - 8
-  - 16
-  - 32
-  - 64
-  - 128
-  - 256
-  - 384
+cuda_graph_config:
+  padding_enabled: true
+  batch_sizes:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    - 64
+    - 128
+    - 256
+    - 384
 print_iter_log: true
 enable_attention_dp: true
 EOF
@@ -314,19 +315,19 @@ And you can launch two generation servers on port 8002 and 8003 with:
 export TRTLLM_USE_UCX_KVCACHE=1
 
 cat >./gen-extra-llm-api-config.yml <<EOF
-use_cuda_graph: true
-cuda_graph_padding_enabled: true
-cuda_graph_batch_sizes:
-  - 1
-  - 2
-  - 4
-  - 8
-  - 16
-  - 32
-  - 64
-  - 128
-  - 256
-  - 384
+cuda_graph_config:
+  padding_enabled: true
+  batch_sizes:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    - 64
+    - 128
+    - 256
+    - 384
 print_iter_log: true
 enable_attention_dp: true
 EOF
@@ -352,7 +353,7 @@ Finally, you can launch the disaggregated server which will accept requests from
 the orchestration between the context and generation servers with:
 
 ```bash
-cat >./disagg-config.yml <<EOF
+cat >./disagg-config.yaml <<EOF
 hostname: localhost
 port: 8000
 backend: pytorch
@@ -361,9 +362,10 @@ context_servers:
   urls:
       - "localhost:8001"
 generation_servers:
-  num_instances: 1
+  num_instances: 2
   urls:
       - "localhost:8002"
+      - "localhost:8003"
 EOF
 
 trtllm-serve disaggregated -c disagg-config.yaml
@@ -536,19 +538,19 @@ python3 /path/to/TensorRT-LLM/benchmarks/cpp/prepare_dataset.py \
     --input-mean=1024 --output-mean=2048 --input-stdev=0 --output-stdev=0 > /tmp/dataset.txt
 
 cat >/path/to/TensorRT-LLM/extra-llm-api-config.yml <<EOF
-use_cuda_graph: true
-cuda_graph_padding_enabled: true
-cuda_graph_batch_sizes:
-  - 1
-  - 2
-  - 4
-  - 8
-  - 16
-  - 32
-  - 64
-  - 128
-  - 256
-  - 384
+cuda_graph_config:
+  padding_enabled: true
+  batch_sizes:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    - 64
+    - 128
+    - 256
+    - 384
 print_iter_log: true
 enable_attention_dp: true
 EOF
@@ -787,13 +789,19 @@ The converted checkpoint could be used as `<YOUR_MODEL_DIR>` and consumed by oth
 ### KV Cache Reuse
 KV cache reuse is supported for MLA on SM90 and SM100. It is enabled by default. Due to extra operations like memcpy and GEMMs, GPU memory consumption may be higher and the E2E performance may have regression in some cases. Users could pass `KvCacheConfig(enable_block_reuse=False)` to LLM API to disable it.
 
+### Chunked Prefill
+Chunked Prefill is supported for MLA only on SM100 currently. You should add `--enable_chunked_prefill` to enable it. The GPU memory consumption is highly correlated with `max_num_tokens` and `max_batch_size`. If encountering out-of-memory errors, you may make these values smaller. (`max_num_tokens` must be divisible by kv cache's `tokens_per_block`)
+
+More specifically, we can imitate what we did in the [Quick Start](#quick-start):
+
+``` bash
+cd examples/llm-api
+python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --enable_chunked_prefill
+```
+
 ## Notes and Troubleshooting
 
 - **Model Directory:** Update `<YOUR_MODEL_DIR>` with the actual path where the model weights reside.
 - **GPU Memory:** Adjust `--max_batch_size` and `--max_num_tokens` if you encounter out-of-memory errors.
 - **Logs:** Check `/workspace/trt_bench.log` for detailed performance information and troubleshooting messages.
 - **Configuration Files:** Verify that the configuration files are correctly formatted to avoid runtime issues.
-
-## Known Issues
-
-- MTP + attention DP + CUDA graph + overlap scheduler might have accuracy issues. We'll fix it later.

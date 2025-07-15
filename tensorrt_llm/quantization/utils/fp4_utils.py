@@ -6,11 +6,6 @@ import torch
 SF_DTYPE = torch.uint8
 FLOAT4_E2M1X2 = torch.uint8
 
-
-def pad_up(x: int, y: int) -> int:
-    return ((x + y - 1) // y) * y
-
-
 # For GEMM autotuning.
 # Taken from https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime//modelConfig.h#L38
 # TODO: move to model config, tune for blackwell hardware
@@ -24,12 +19,16 @@ fp4_buckets = FP4_BUCKETS
 __all__ = ['float4_e2m1x2', 'float4_sf_dtype', 'pad_up', 'fp4_buckets']
 
 
+def pad_up(x: int, y: int) -> int:
+    return ((x + y - 1) // y) * y
+
+
 class FP4GemmType(IntEnum):
     W4A4_NVFP4_NVFP4 = 0
     W4A8_MXFP4_MXFP8 = 1
 
 
-def get_fp4_shape(input_shape, sf_vec_size):
+def get_fp4_shape(input_shape, sf_vec_size, is_swizzled_layout=True):
     m = 1
     for i in range(len(input_shape) - 1):
         m *= input_shape[i]
@@ -37,7 +36,9 @@ def get_fp4_shape(input_shape, sf_vec_size):
     output_shape = [i for i in input_shape]
     output_shape[-1] //= 2
 
-    scale_shape = pad_up(m, 128) * pad_up(input_shape[-1] // sf_vec_size, 4)
+    scale_shape = pad_up(m, 128) * pad_up(
+        input_shape[-1] // sf_vec_size,
+        4) if is_swizzled_layout else m * (input_shape[-1] // sf_vec_size)
     return output_shape, scale_shape
 
 
@@ -206,4 +207,4 @@ def shuffle_matrix_sf_a(
         input_tensor, row_indices.to(input_tensor.device))
 
     # 128x4
-    return torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(w_shuffled)
+    return torch.ops.trtllm.nvfp4_block_scale_interleave(w_shuffled)

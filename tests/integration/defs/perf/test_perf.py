@@ -52,6 +52,8 @@ MODEL_PATH_DICT = {
     "llama_v3.1_70b_instruct_fp8": "llama-3.1-model/Llama-3.1-70B-Instruct-FP8",
     "llama_v3.3_70b_instruct_fp8":
     "modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8",
+    "llama_v3.3_70b_instruct_fp4":
+    "modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4",
     "llama_v3.1_405b_instruct_fp4":
     "modelopt-hf-model-hub/Llama-3.1-405B-Instruct-fp4",
     "llama_v3.1_70b_instruct": "llama-3.1-model/Meta-Llama-3.1-70B-Instruct",
@@ -62,6 +64,8 @@ MODEL_PATH_DICT = {
     "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1",
     "llama_v3.3_nemotron_super_49b_fp8":
     "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-FP8",
+    "llama_v3.1_nemotron_ultra_253b":
+    "nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1",
     "llama_v3.1_nemotron_ultra_253b_fp8":
     "nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1-FP8",
     "llama_v4_scout_17b_16e_instruct":
@@ -76,8 +80,12 @@ MODEL_PATH_DICT = {
     "mixtral_8x7b_v0.1_instruct_fp8": "Mixtral-8x7B-Instruct-v0.1-fp8",
     "mixtral_8x7b_v0.1_instruct_fp4":
     "modelopt-hf-model-hub/Mixtral-8x7B-Instruct-v0.1-fp4",
+    "mistral_nemo_12b_base": "Mistral-Nemo-Base-2407",
+    "deepseek_r1_distill_qwen_32b": "DeepSeek-R1/DeepSeek-R1-Distill-Qwen-32B",
     "mixtral_8x22b_v0.1": "Mixtral-8x22B-v0.1",
     "mistral_7b_v0.1": "mistral-7b-v0.1",
+    "ministral_8b": "Ministral-8B-Instruct-2410",
+    "ministral_8b_fp8": "Ministral-8B-Instruct-2410-FP8",
     "deepseek_r1_fp8": "DeepSeek-R1/DeepSeek-R1",
     "deepseek_r1_nvfp4": "DeepSeek-R1/DeepSeek-R1-FP4",
     "deepseek_v3_lite_fp8": "DeepSeek-V3-Lite/fp8",
@@ -131,6 +139,7 @@ HF_MODEL_PATH = {
     "mixtral_8x7b_v0.1_hf": "mistralai/Mixtral-8x7B-v0.1",
     "mixtral_8x7b_v0.1_instruct_hf": "mistralai/Mixtral-8x7B-Instruct-v0.1",
     "mistral_7b_v0.1_hf": "mistralai/Mistral-7B-v0.1",
+    "ministral_8b_hf": "mistralai/Ministral-8B-Instruct-2410",
     "flan_t5_base_hf": "google/flan-t5-small",
     "phi_4_mini_instruct_hf": "microsoft/Phi-4-mini-instruct",
 }
@@ -138,6 +147,8 @@ LORA_MODEL_PATH = {
     "llama_v2_13b": "llama-models-v2/chinese-llama-2-lora-13b",
     "mixtral_8x7b_0.1": "chinese-mixtral-lora",
     "llama_v3.1_8b_instruct_fp8": "lora/llama-3-chinese-8b-instruct-v2-lora/",
+    "ministral_8b":
+    "lora/ministral/Ministral-8B-Instruct-2410-Loras-Dummy",  # Dummy LoRA for Ministral
 }
 
 TIMING_CACHE_DIR = os.environ.get("TIMING_CACHE_DIR", "")
@@ -1213,7 +1224,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             f"--report_json={report_path}",
         ]
         if self._config.backend != "pytorch":
-            benchmark_cmd += [f"--engine_dir={engine_dir}"]
+            benchmark_cmd += [
+                f"--backend=tensorrt", f"--engine_dir={engine_dir}"
+            ]
         else:
             benchmark_cmd += ["--backend=pytorch"]
         if self._config.num_reqs > 0:

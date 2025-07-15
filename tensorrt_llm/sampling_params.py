@@ -19,7 +19,7 @@ class GuidedDecodingParams:
         regex (str, optional): The generated text is amenable to the user-specified regular expression. Defaults to None.
         grammar (str, optional): The generated text is amenable to the user-specified extended Backus-Naur form (EBNF) grammar. Defaults to None.
         json_object (bool): If True, the generated text is amenable to json format. Defaults to False.
-        structural_tag (str, optional): The generated text is amenable to the user-specified structural tag. Defaults to None.
+        structural_tag (str, optional): The generated text is amenable to the user-specified structural tag. Structural tag is supported by xgrammar in PyTorch backend only. Defaults to None.
     """  # noqa: E501
 
     json: Optional[Union[str, BaseModel, dict]] = None
@@ -269,6 +269,9 @@ class SamplingParams:
     truncate_prompt_tokens: Optional[int] = None
     skip_special_tokens: bool = True
     spaces_between_special_tokens: bool = True
+    # Currently, _stream_interval is only used to pass llm.args.stream_interval to tokenizer.
+    # TODO: make this a per-request parameter.
+    _stream_interval: Optional[int] = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         if self.pad_id is None:

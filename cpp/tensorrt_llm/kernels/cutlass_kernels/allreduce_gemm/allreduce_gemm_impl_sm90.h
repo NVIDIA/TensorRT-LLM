@@ -33,9 +33,9 @@
 #include "cutlass_extensions/gemm_configs.h"
 
 #include "../include/allreduce_gemm_runner.h"
-#include "communication/sm90_allreduce_nvls_warpspecialized.hpp"
-#include "epilogue/sm90_visitor_allreduce_tma_warpspecialized.hpp"
-#include "kernel/sm90_gemm_allreduce_tma_warpspecialized_pingpong.hpp"
+#include "./communication/sm90_allreduce_nvls_warpspecialized.hpp"
+#include "./epilogue/sm90_visitor_allreduce_tma_warpspecialized.hpp"
+#include "./kernel/sm90_gemm_allreduce_tma_warpspecialized_pingpong.hpp"
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
@@ -100,8 +100,7 @@ public:
     using RasterOrderOptions =
         typename cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90Params::RasterOrderOptions;
 
-    using TileBarrierType = cutlass::MulticastSystemBarrier<cutlass::detail::SyncNoOp, true /* Safe across phases */,
-        true /* membar.gpu */>;
+    using TileBarrierType = cutlass::MulticastSystemBarrier<cutlass::detail::SyncNoOp, true /* Safe across phases */>;
 
     // 16B alignment for TMA
     static constexpr int AlignmentA = 16 / sizeof(ElementA);

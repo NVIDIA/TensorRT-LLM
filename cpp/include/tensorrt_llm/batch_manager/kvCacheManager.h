@@ -16,10 +16,11 @@
 
 #pragma once
 
-#include "tensorrt_llm/batch_manager/kvCacheConfig.h"
 #include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
+#include "tensorrt_llm/batch_manager/kvCacheType.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h" // TODO forward declare
 #include "tensorrt_llm/common/optionalRef.h"
+#include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/kernels/kvCacheIndex.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -551,6 +552,8 @@ public:
     std::vector<KVCacheBlock::IdType> getNewlyAllocatedBlockIds(GenerationRequest const& sequence) const;
 
     void storeBlocksForReuse(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
+
+    void storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
 
     //! \brief Release blocks of the sequence.
     void releaseBlocks(GenerationRequest& sequence);
@@ -1091,6 +1094,9 @@ public:
     //! \brief Store context blocks
     void storeContextBlocks(GenerationRequest& sequence, LlmRequest const& llmRequest);
 
+    //! \brief Store newest block for reuse
+    void storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
+
     [[nodiscard]] static bool isUseOneMoreBlock(
         SizeType32 windowSize, std::optional<SizeType32> maxSequenceLength, SizeType32 maxBeamWidth)
     {
@@ -1261,6 +1267,10 @@ public:
     //! \details These blocks become reusable from next step.
     virtual void storeContextBlocks(LlmRequest const& llmRequest) = 0;
 
+    //! \brief Store newest block for reuse.
+    //! \details This block become reusable from next step.
+    virtual void storeNewBlock(LlmRequest const& llmRequest) = 0;
+
     //! \brief Get the block ids of a request [per beam] **for a given window size block manager**
     [[nodiscard]] virtual std::vector<std::vector<SizeType32>> const& getCacheBlockIds(
         LlmRequest::RequestIdType requestId, SizeType32 windowSize) const
@@ -1309,7 +1319,7 @@ public:
     /// @param config KV cache configuration parameters
     /// @return Tuple containing the {.freePrimaryMemBytes, .freeSecondaryMemBytes}
     [[nodiscard]] static std::tuple<uint64_t, uint64_t> calculateFreeMemBytes(
-        runtime::BufferManager const& bufferManager, KvCacheConfig const& config);
+        runtime::BufferManager const& bufferManager, executor::KvCacheConfig const& config);
 
     /// @brief Calculate the maximum number of KV cache blocks that can be allocated based on available GPU memory.
     /// @details This function computes how many blocks each WindowBlockManager should receive based on the weighted
@@ -1327,8 +1337,8 @@ public:
     /// @param extraCostMemory Additional memory cost to account for CacheTransBufferManager::preAllocBufferSize
     /// @param kvFactor Factor for KV cache size calculation (typically 2 for key+value)
     /// @return Map from window size to tuple of (primary blocks, secondary blocks)
-    [[nodiscard]] static BlocksPerWindow calculateMaxNumBlocks(KvCacheConfig const& config, bool isCrossAttention,
-        nvinfer1::DataType dtype, tensorrt_llm::runtime::ModelConfig const& modelConfig,
+    [[nodiscard]] static BlocksPerWindow calculateMaxNumBlocks(executor::KvCacheConfig const& config,
+        bool isCrossAttention, nvinfer1::DataType dtype, tensorrt_llm::runtime::ModelConfig const& modelConfig,
         tensorrt_llm::runtime::WorldConfig const& worldConfig,
         std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers, uint64_t allottedPrimaryMemBytes,
         uint64_t allottedSecondaryMemBytes, size_t extraCostMemory, SizeType32 kvFactor);
@@ -1566,6 +1576,9 @@ public:
     //! \brief Store full context blocks contributed by llmRequest.
     //! \details These blocks become reusable from next step.
     void storeContextBlocks(LlmRequest const& llmRequest) override;
+
+    //! \brief Store newest blocks for reuse
+    void storeNewBlock(LlmRequest const& llmRequest) override;
 
     [[nodiscard]] static SizeType32 getSinkBubbleLength(SizeType32 sinkTokenLen, SizeType32 tokensPerBlock);
 

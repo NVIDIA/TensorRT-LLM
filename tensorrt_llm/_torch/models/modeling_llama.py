@@ -159,8 +159,11 @@ class Llama4Attention(Attention):
             q = self._attention_scaling(q, position_ids)
 
         out_scale = None
+        out_scale_sf = None
         if self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4 or self.o_proj.has_fp8_block_scales:
             out_scale = self.o_proj.inv_input_scale
+        if self.o_proj.has_nvfp4 and self.support_nvfp4_output:
+            out_scale_sf = self.o_proj.input_scale
 
         q, k, v = self.convert_qkv(q, k, v)
         attn_output = self.attn.forward(q,
@@ -168,6 +171,7 @@ class Llama4Attention(Attention):
                                         v,
                                         attn_metadata,
                                         out_scale=out_scale,
+                                        out_scale_sf=out_scale_sf,
                                         attention_mask=attention_mask,
                                         mrope_config=mrope_config)
 
@@ -201,9 +205,12 @@ class Llama4Attention(Attention):
                 **kwargs,
             )
         else:
-            return self._forward_nope(position_ids, hidden_states,
-                                      attn_metadata, attention_mask,
-                                      mrope_config, all_reduce_params)
+            return self._forward_nope(position_ids=position_ids,
+                                      hidden_states=hidden_states,
+                                      attn_metadata=attn_metadata,
+                                      attention_mask=attention_mask,
+                                      mrope_config=mrope_config,
+                                      all_reduce_params=all_reduce_params)
 
 
 class LlamaAttention(Attention):
@@ -277,11 +284,13 @@ class Llama4MoE(nn.Module):
             apply_router_weight_on_input=True,
             layer_idx=layer_idx)
 
-        self.router = Linear(hidden_size,
-                             num_experts,
-                             bias=False,
-                             dtype=config.torch_dtype,
-                             quant_config=None)
+        self.router = Linear(
+            hidden_size,
+            num_experts,
+            bias=False,
+            dtype=config.torch_dtype,
+            quant_config=None,
+            force_dynamic_quantization=model_config.force_dynamic_quantization)
 
         self.mapping = model_config.mapping
         self.all_reduce = AllReduce(
@@ -292,22 +301,22 @@ class Llama4MoE(nn.Module):
         self.aux_stream = aux_stream
 
     def compute_routed_output(self, hidden_states, all_rank_num_tokens,
+                              all_rank_max_num_tokens,
                               cutlass_min_latency_mode):
         use_dp_padding = False
         if self.enable_attention_dp and self.mapping.tp_size > 1:
             # Use padding here to keep the behavior unchanged
             use_dp_padding = True
-            max_num_token_across_dp_ranks = max(all_rank_num_tokens)
             hidden_states = torch.nn.functional.pad(
                 hidden_states,
-                (0, 0, 0,
-                 max_num_token_across_dp_ranks - hidden_states.shape[0]))
+                (0, 0, 0, all_rank_max_num_tokens - hidden_states.shape[0]))
         router_logits = self.router(hidden_states)
         routed_output = self.experts(
             hidden_states,
             router_logits,
             do_finalize=not cutlass_min_latency_mode,
             all_rank_num_tokens=all_rank_num_tokens,
+            all_rank_max_num_tokens=all_rank_max_num_tokens,
             use_dp_padding=use_dp_padding,
         )
         return routed_output
@@ -316,6 +325,7 @@ class Llama4MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         all_rank_num_tokens=None,
+        all_rank_max_num_tokens=None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         cutlass_min_latency_mode: Optional[bool] = False,
     ) -> torch.Tensor:
@@ -323,7 +333,8 @@ class Llama4MoE(nn.Module):
         # This design is mainly for low latency use case. Need to improve for max throughput use case.
         fn0 = lambda: self.shared_expert(hidden_states)
         fn1 = lambda: self.compute_routed_output(
-            hidden_states, all_rank_num_tokens, cutlass_min_latency_mode)
+            hidden_states, all_rank_num_tokens, all_rank_max_num_tokens,
+            cutlass_min_latency_mode)
         shared_output, routed_output = maybe_execute_in_parallel(
             fn0, fn1, self.moe_event[0], self.moe_event[1], self.aux_stream)
         if cutlass_min_latency_mode:
@@ -479,6 +490,7 @@ class Llama4DecoderLayer(DecoderLayer):
         hidden_states = self.feed_forward(
             hidden_states,
             all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+            all_rank_max_num_tokens=attn_metadata.all_rank_max_num_tokens,
             final_all_reduce_params=AllReduceParams(enable_allreduce=not (
                 self.fusion_config.POST_MOE_FUSION
                 or self.fusion_config.POST_MLP_FUSION
@@ -609,10 +621,10 @@ class Llama4Model(DecoderModel):
     def __init__(self, model_config: ModelConfig[LlamaConfig]):
         super().__init__(model_config)
         config = self.model_config.pretrained_config
-        self.padding_idx = config.pad_token_id
         self.num_hidden_layers = config.num_hidden_layers
         self.aux_stream = torch.cuda.Stream()
         self.mapping = model_config.mapping
+        self.preload_weight_modules = []
 
         if self.model_config.mapping.enable_attention_dp:
             self.embed_tokens = Embedding(
@@ -635,6 +647,7 @@ class Llama4Model(DecoderModel):
         if model_config.enable_min_latency:
             from .modeling_llama_min_latency import Llama4MinLatencyDecoderLayer
             DecoderLayerClass = Llama4MinLatencyDecoderLayer
+            self.preload_weight_modules = ["gate_up_proj"]
 
         self.layers = nn.ModuleList([
             DecoderLayerClass(
@@ -687,7 +700,6 @@ class LlamaModel(DecoderModel):
     def __init__(self, model_config: ModelConfig[LlamaConfig]):
         super().__init__(model_config)
         config = self.model_config.pretrained_config
-        self.padding_idx = config.pad_token_id
         self.num_hidden_layers = config.num_hidden_layers
 
         vocab_size = config.vocab_size
@@ -845,7 +857,10 @@ class Llama4InputProcessor(InputProcessor):
             mm_embeds = self.encoder.multi_modal_projector(mm_embeds)
             # for fuse_input_embeds
             token_ids[token_ids == self.image_token_index] = self.vocab_size + 1
-            return token_ids.tolist(), {"mm_embedding": mm_embeds}
+
+            multimodal_data = {}
+            multimodal_data["multimodal_embedding"] = mm_embeds
+            return token_ids.tolist(), {"multimodal_data": multimodal_data}
         else:
             return processed["input_ids"].squeeze().tolist(), {}
 
@@ -865,6 +880,7 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
         model_config.pretrained_config = model_config.pretrained_config.text_config
         model_config.pretrained_config.architectures = architectures
         super().__init__(Llama4Model(model_config), model_config)
+        self.preload_weight_modules = self.model.preload_weight_modules
 
     def forward(
         self,
@@ -876,10 +892,14 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
-        mm_embed = kwargs.get("multi_modal_data", [])
-        if mm_embed:
-            _, inputs_embeds = fuse_input_embeds(self.model.embed_tokens,
-                                                 input_ids, mm_embed)
+        multimodal_params = kwargs.get("multimodal_params", [])
+        if multimodal_params:
+            mm_embed = [
+                multimodal_param.multimodal_data["multimodal_embedding"]
+                for multimodal_param in multimodal_params
+            ]
+            input_ids, inputs_embeds = fuse_input_embeds(
+                self.model.embed_tokens, input_ids, mm_embed)
         return super().forward(attn_metadata,
                                input_ids,
                                position_ids,

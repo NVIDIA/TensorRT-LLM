@@ -1,4 +1,5 @@
 import json
+import os
 from abc import ABC, abstractmethod
 
 import llguidance
@@ -63,7 +64,14 @@ class XGrammarMatcherFactory(GrammarMatcherFactory):
                 xgrammar.VocabType.RAW,
                 vocab_size=vocab_size_padded,
                 stop_token_ids=guided_decoding_config.stop_token_ids)
-        self._xgrammar_compiler = xgrammar.GrammarCompiler(tokenizer_info)
+        # Default cache limit is 1GB.
+        cache_limit_gb = float(os.getenv("XGRAMMAR_CACHE_LIMIT_GB", "1"))
+        cache_limit_bytes = int(cache_limit_gb * 1024 * 1024 * 1024)
+        self._xgrammar_compiler = xgrammar.GrammarCompiler(
+            tokenizer_info,
+            cache_enabled=True,
+            cache_limit_bytes=cache_limit_bytes,
+        )
 
     def create(self,
                guided_decoding_params: GuidedDecodingParams) -> XGrammarMatcher:
@@ -96,7 +104,7 @@ class XGrammarMatcherFactory(GrammarMatcherFactory):
                 compiled_grammar = self._xgrammar_compiler.compile_structural_tag(
                     structures, triggers)
             case _:
-                raise ValueError(f"Unrecognized guide type: {guide_type}.")
+                raise ValueError(f"Unsupported guide type: {guide_type}.")
 
         matcher = xgrammar.GrammarMatcher(compiled_grammar)
         return XGrammarMatcher(matcher)
@@ -167,7 +175,7 @@ class LLGuidanceMatcherFactory(GrammarMatcherFactory):
                 # provide Lark-formatted grammar instead of standard EBNF.
                 grammar = llguidance.LLMatcher.grammar_from_lark(guide)
             case _:
-                raise ValueError(f"Unrecognized guide type: {guide_type}.")
+                raise ValueError(f"Unsupported guide type: {guide_type}.")
 
         matcher = llguidance.LLMatcher(self._tokenizer, grammar)
         if matcher.is_error():

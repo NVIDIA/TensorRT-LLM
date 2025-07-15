@@ -245,6 +245,7 @@ class TestLlama3_1NemotronNano8Bv1(CliFlowAccuracyTestHarness):
                  kv_cache_quant_algo=QuantAlgo.FP8)
 
 
+@pytest.mark.timeout(10800)
 class TestNemotronUltra(CliFlowAccuracyTestHarness):
     MODEL_NAME = "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1"
     MODEL_PATH = f"{llm_models_root()}/nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1"
@@ -764,8 +765,7 @@ class TestLlama3_1_8B(CliFlowAccuracyTestHarness):
             tp_size=4,
             extra_build_args=extra_build_args)
 
-    @skip_pre_ada
-    @skip_post_blackwell
+    @skip_pre_hopper
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize(
         "gemm_allreduce", [False, pytest.param(True, marks=skip_no_nvls)],

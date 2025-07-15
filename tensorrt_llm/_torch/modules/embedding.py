@@ -37,6 +37,10 @@ class LMHead(Linear):
         mapping = mapping or Mapping()
         tp_size = mapping.tp_size
 
+        # Attention DP doesn't work with embedding parallelization.
+        if mapping.enable_attention_dp:
+            tensor_parallel_mode = None
+
         if tensor_parallel_mode == TensorParallelMode.ROW:
             local_in_features = math.ceil(embedding_dim / tp_size)
             self.padding_size = tp_size * local_in_features - embedding_dim
@@ -123,7 +127,7 @@ def get_masked_input_and_mask(
 
 
 # We use torch.compile() to fuse the tiny pointwise ops before all_reduce/all_gather for Embedding module.
-@torch.compile(mode="max-autotune-no-cudagraphs")
+@torch.compile(options={"max-autotune": True})
 def pre_comm_embedding_ops(
     input_: torch.Tensor,
     weight: torch.Tensor,

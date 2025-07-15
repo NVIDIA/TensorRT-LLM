@@ -4,6 +4,7 @@ from typing import List, Optional, Tuple
 import torch
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+from tensorrt_llm._utils import get_sm_version
 
 from ..attention_backend.interface import AttentionInputType
 from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
@@ -22,12 +23,9 @@ def bmm_out(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
 class MoERunner(TunableRunner):
     # avoid overhead of creating a new runner in forward pass
     runner_dict = dict()
-    # TODO: only profile for min_latency_mode = False due to the error in the moe_kernels
     tuning_config = TuningConfig(dynamic_tensor_specs=(
         DynamicTensorSpec(0, 0, get_last_power_of_2_num_tokens_buckets(8192),
-                          lambda x: min(last_positive_power_of_2(x), 8192)),
-        DynamicTensorSpec(3, 0, (0, ), lambda x: x),
-    ))
+                          lambda x: min(last_positive_power_of_2(x), 8192)), ))
 
     def __init__(
         self,
@@ -44,6 +42,8 @@ class MoERunner(TunableRunner):
         enable_alltoall: bool,
         use_deepseek_fp8_block_scale: bool,
         use_w4a8_group_scaling: bool,
+        use_mxfp8_act_scaling: bool,
+        min_latency_mode: bool,
     ):
         self.x_dtype = x_dtype
         self.weight_dtype = weight_dtype
@@ -58,15 +58,18 @@ class MoERunner(TunableRunner):
         self.enable_alltoall = enable_alltoall
         self.use_deepseek_fp8_block_scale = use_deepseek_fp8_block_scale
         self.use_w4a8_group_scaling = use_w4a8_group_scaling
-
+        self.use_mxfp8_act_scaling = use_mxfp8_act_scaling
+        self.min_latency_mode = min_latency_mode
         instance_key = (x_dtype, weight_dtype, output_dtype,
-                        use_deepseek_fp8_block_scale, use_w4a8_group_scaling)
+                        use_deepseek_fp8_block_scale, use_w4a8_group_scaling,
+                        use_mxfp8_act_scaling)
 
         if instance_key not in MoERunner.runner_dict:
             MoERunner.runner_dict[
                 instance_key] = torch.classes.trtllm.FusedMoeRunner(
                     x_dtype, weight_dtype, output_dtype,
-                    use_deepseek_fp8_block_scale, use_w4a8_group_scaling)
+                    use_deepseek_fp8_block_scale, use_w4a8_group_scaling,
+                    use_mxfp8_act_scaling)
         self.fused_moe_runner = MoERunner.runner_dict[instance_key]
 
     def get_valid_tactics(
@@ -74,22 +77,7 @@ class MoERunner(TunableRunner):
         inputs: List[torch.Tensor],
         profile: OptimizationProfile,
     ) -> List[int]:
-        x, _, _, min_latency_mode_tensor = inputs
-        min_latency_mode = min_latency_mode_tensor.size(0) == 1
-        m = x.shape[0]
-
-        # Only profile m <= 128 for min latency mode = True
-        # Profile all valid buckets for min latency mode = False
-        # TODO: min_latency_mode = True will cause the following error:
-        # Cannot profile configuration 4: Cutlass GEMM Tactic
-        # [TensorRT-LLM][ERROR] Assertion failed: Failed to initialize cutlass TMA WS grouped gemm.
-        # Should be fixed in the moe_kernels in the future.
-        invalid = (m > 128 and
-                   min_latency_mode) or (m <= 128 and min_latency_mode and
-                                         (not self.weight_dtype == torch.int64))
-
-        return [] if invalid else list(
-            range(self.fused_moe_runner.get_tactic_num()))
+        return range(self.fused_moe_runner.get_tactic_num())
 
     def forward(
         self,
@@ -98,13 +86,13 @@ class MoERunner(TunableRunner):
         tactic: int = -1,
         do_preparation: bool = False,
     ):
-        x, fc1_expert_weights, fc2_expert_weights, min_latency_mode_tensor = inputs
-        min_latency_mode = min_latency_mode_tensor.size(0) == 1
-        # determine if we should use min latency mode according to the profiled seq len
+        x, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights, fc2_expert_biases = inputs
         self.fused_moe_runner.run_gemm_profile(
             x,
             fc1_expert_weights,
+            fc1_expert_biases,
             fc2_expert_weights,
+            fc2_expert_biases,
             self.top_k,
             self.tp_size,
             self.tp_rank,
@@ -113,7 +101,7 @@ class MoERunner(TunableRunner):
             self.cluster_size,
             self.cluster_rank,
             self.enable_alltoall,
-            min_latency_mode,
+            self.min_latency_mode,
             gemm_idx,
             tactic,
             do_preparation,
@@ -122,13 +110,11 @@ class MoERunner(TunableRunner):
     @classmethod
     @lru_cache(maxsize=None)
     def refine_tuning_config(cls, tune_max_num_tokens: int):
-        cls.tuning_config = TuningConfig(dynamic_tensor_specs=(
-            DynamicTensorSpec(
+        cls.tuning_config = TuningConfig(
+            dynamic_tensor_specs=(DynamicTensorSpec(
                 0, 0, get_last_power_of_2_num_tokens_buckets(
                     tune_max_num_tokens), lambda x: min(
-                        last_positive_power_of_2(x), tune_max_num_tokens)),
-            DynamicTensorSpec(3, 0, (0, ), lambda x: x),
-        ))
+                        last_positive_power_of_2(x), tune_max_num_tokens)), ))
 
 
 @torch.library.custom_op("trtllm::fused_moe", mutates_args=())
@@ -137,7 +123,9 @@ def fused_moe(
     token_selected_experts: torch.Tensor,
     token_final_scales: torch.Tensor,
     fc1_expert_weights: torch.Tensor,
+    fc1_expert_biases: Optional[torch.Tensor],
     fc2_expert_weights: torch.Tensor,
+    fc2_expert_biases: Optional[torch.Tensor],
     output_dtype: torch.dtype,
     quant_scales: List[torch.Tensor],
     input_sf: Optional[torch.Tensor] = None,
@@ -150,15 +138,13 @@ def fused_moe(
     enable_alltoall: bool = False,
     use_deepseek_fp8_block_scale: bool = False,
     use_w4a8_group_scaling: bool = False,
+    use_mxfp8_act_scaling: bool = False,
     min_latency_mode: bool = False,
     tune_max_num_tokens: int = 8192,
 ) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
     MoERunner.refine_tuning_config(tune_max_num_tokens)
-
-    # TODO: set min_latency_mode always to False due to the error in the moe_kernels
-    min_latency_tensor = torch.empty(0)
 
     # allocate workspace for profiling
     moe_runner = MoERunner(
@@ -175,13 +161,18 @@ def fused_moe(
         enable_alltoall=enable_alltoall,
         use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
         use_w4a8_group_scaling=use_w4a8_group_scaling,
+        use_mxfp8_act_scaling=use_mxfp8_act_scaling,
+        min_latency_mode=min_latency_mode,
     )
 
     _, gemm_tactic_1 = tuner.choose_one(
         "trtllm::fused_moe::gemm1",
         [moe_runner],
         MoERunner.tuning_config,
-        [input, fc1_expert_weights, fc2_expert_weights, min_latency_tensor],
+        [
+            input, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
+            fc2_expert_biases
+        ],
         gemm_idx=1,
     )
 
@@ -189,7 +180,10 @@ def fused_moe(
         "trtllm::fused_moe::gemm2",
         [moe_runner],
         MoERunner.tuning_config,
-        [input, fc1_expert_weights, fc2_expert_weights, min_latency_tensor],
+        [
+            input, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
+            fc2_expert_biases
+        ],
         gemm_idx=2,
     )
 
@@ -199,7 +193,9 @@ def fused_moe(
         token_selected_experts,
         token_final_scales,
         fc1_expert_weights,
+        fc1_expert_biases,
         fc2_expert_weights,
+        fc2_expert_biases,
         quant_scales,
         input_sf,
         tp_size,
@@ -222,7 +218,9 @@ def _(
     token_selected_experts: torch.Tensor,
     token_final_scales: torch.Tensor,
     fc1_expert_weights: torch.Tensor,
+    fc1_expert_biases: Optional[torch.Tensor],
     fc2_expert_weights: torch.Tensor,
+    fc2_expert_biases: Optional[torch.Tensor],
     output_dtype: torch.dtype,
     quant_scales: List[torch.Tensor],
     input_sf: Optional[torch.Tensor] = None,
@@ -232,8 +230,10 @@ def _(
     ep_rank: int = 0,
     cluster_size: int = 1,
     cluster_rank: int = 0,
+    enable_alltoall: bool = False,
     use_deepseek_fp8_block_scale: bool = False,
     use_w4a8_group_scaling: bool = False,
+    use_mxfp8_act_scaling: bool = False,
     min_latency_mode: bool = False,
     tune_max_num_tokens: int = 8192,
 ):
@@ -253,6 +253,93 @@ def _(
         ]
     else:
         return [input.new_empty([seq_len, hidden_size], dtype=output_dtype)]
+
+
+class FP8RowwiseGemmRunner(TunableRunner):
+    runner_dict = dict()
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2), ),
+        constraint_specs=(
+            ConstraintSpec(2, 0, lambda shapes: shapes[0][0]),
+            ConstraintSpec(3, 0, lambda shapes: shapes[1][0]),
+        ))
+
+    def __init__(
+        self,
+        to_userbuffers: bool,
+        output_dtype: torch.dtype,
+    ):
+        self.to_userbuffers = to_userbuffers
+        self.output_dtype = output_dtype
+        instance_key = (output_dtype, )
+        if instance_key not in FP8RowwiseGemmRunner.runner_dict:
+            FP8RowwiseGemmRunner.runner_dict[
+                instance_key] = torch.classes.trtllm.FP8RowwiseGemmRunner(
+                    output_dtype)
+        self.fp8_rowwise_gemm_runner = FP8RowwiseGemmRunner.runner_dict[
+            instance_key]
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+    ) -> List[int]:
+        return list(range(self.fp8_rowwise_gemm_runner.get_num_configs()))
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = -1,
+    ) -> torch.Tensor:
+        mat1, mat2, mat1_scale, mat2_scale = inputs
+        return self.fp8_rowwise_gemm_runner.run_gemm(
+            mat1,
+            mat2,
+            mat1_scale,
+            mat2_scale,
+            self.to_userbuffers,
+            tactic,
+        )
+
+
+@torch.library.custom_op("trtllm::fp8_rowwise_gemm", mutates_args=())
+def fp8_rowwise_gemm(
+    act: torch.Tensor,
+    weight: torch.Tensor,
+    act_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    to_userbuffers: bool = False,
+) -> torch.Tensor:
+
+    tuner = AutoTuner.get()
+
+    # allocate workspace for profiling
+    fp8_rowwise_gemm_runner = FP8RowwiseGemmRunner(to_userbuffers, output_dtype)
+
+    _, best_tactic = tuner.choose_one(
+        "trtllm::fp8_rowwise_gemm::gemm",
+        [fp8_rowwise_gemm_runner],
+        FP8RowwiseGemmRunner.tuning_config,
+        [act, weight, act_scale, weight_scale],
+    )
+
+    return fp8_rowwise_gemm_runner(
+        inputs=[act, weight, act_scale, weight_scale], tactic=best_tactic)
+
+
+@fp8_rowwise_gemm.register_fake
+def _(
+    act: torch.Tensor,
+    weight: torch.Tensor,
+    act_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    to_userbuffers: bool = False,
+) -> torch.Tensor:
+    return act.new_empty((act.size(0), weight.size(0)), dtype=output_dtype)
 
 
 class FP4GemmRunner(TunableRunner):
@@ -588,6 +675,84 @@ def _(
                              dtype=output_dtype)
 
 
+class W4A16GemmRunner(TunableRunner):
+    _runner_dict = dict()
+    MAX_SUPPORTED_SM_VERSION = 90
+
+    def __init__(self, activation_dtype: torch.dtype, quant_mode: int):
+        instance_key = (activation_dtype, quant_mode)
+        if instance_key not in W4A16GemmRunner._runner_dict:
+            W4A16GemmRunner._runner_dict[
+                instance_key] = torch.classes.trtllm.W4A16GemmRunner(
+                    activation_dtype, quant_mode)
+        self._w4a16_gemm_runner = W4A16GemmRunner._runner_dict[instance_key]
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+    ) -> List[int]:
+        return list(range(self._w4a16_gemm_runner.get_num_configs()))
+
+    def forward(self,
+                inputs: List[torch.Tensor],
+                tactic: int = -1,
+                do_preparation: bool = False,
+                **kwargs) -> torch.Tensor:
+
+        if get_sm_version() > self.MAX_SUPPORTED_SM_VERSION:
+            raise ValueError(
+                f"SM version {get_sm_version()} is not supported for W4A16 GEMM"
+            )
+
+        activation, weights_packed, scales = inputs
+
+        return self._w4a16_gemm_runner.run_gemm(
+            activation,
+            weights_packed,
+            scales,
+            kwargs["group_size"],
+            tactic,
+            kwargs["bias"],
+            kwargs["zeros"],
+        )
+
+
+@torch.library.custom_op("trtllm::w4a16_gemm", mutates_args=())
+def w4a16_gemm(input: torch.Tensor,
+               weight: torch.Tensor,
+               scales: torch.Tensor,
+               group_size: int,
+               has_zero_point: bool,
+               bias: Optional[torch.Tensor] = None,
+               zeros: Optional[torch.Tensor] = None) -> torch.Tensor:
+
+    assert not has_zero_point or zeros is not None, "Expected 'zeros' tensor when has_zero_point is True"
+
+    tuner = AutoTuner.get()
+
+    tuning_config = TuningConfig(dynamic_tensor_specs=(
+        # For tensor index 0 (input A), tune dimension 0 (M dimension)
+        DynamicTensorSpec(0, 0, (8192, 4096, 2048, 1024, 512, 256, 128, 64, 32,
+                                 16, 8, 4, 2, 1), last_positive_power_of_2), ))
+
+    # NOTE: qunant_mode equals 0 it means we use scale only (FINEGRAINED_SCALE_ONLY), zeros is not used, else we use scale and zero point
+    quant_mode = 1 if has_zero_point else 0
+    if quant_mode == 0:
+        assert zeros is None, "When quant_mode is 0 (FINEGRAINED_SCALE_ONLY), zeros must be None"
+
+    w4a16_gemm_runner = W4A16GemmRunner(input.dtype, quant_mode)
+
+    kwargs = {"group_size": group_size, "zeros": zeros, "bias": bias}
+    _, best_tactic = tuner.choose_one("trtllm::w4a16_gemm::gemm",
+                                      [w4a16_gemm_runner], tuning_config,
+                                      [input, weight, scales], **kwargs)
+
+    return w4a16_gemm_runner(inputs=[input, weight, scales],
+                             tactic=best_tactic,
+                             **kwargs)
+
+
 @torch.library.custom_op("trtllm::attention", mutates_args=())
 def attention(
     q: torch.Tensor,
@@ -633,11 +798,8 @@ def attention(
     rotary_embedding_dim: int,
     rotary_embedding_base: float,
     rotary_embedding_scale_type: int,
-    rotary_embedding_scale: float,
-    rotary_embedding_short_m_scale: float,
-    rotary_embedding_long_m_scale: float,
-    rotary_embedding_max_positions: int,
-    rotary_embedding_original_max_positions: int,
+    rotary_embedding_scales: List[float],
+    rotary_embedding_max_position_info: List[int],
     use_paged_context_fmha: bool,
     attention_input_type: Optional[int],
     is_mla_enable: bool,
@@ -651,6 +813,9 @@ def attention(
     mla_context_paged_kv: Optional[torch.Tensor],
     mla_context_kv_cache_block_offsets: Optional[torch.Tensor],
     attention_chunk_size: Optional[int],
+    softmax_stats_tensor: Optional[torch.Tensor],
+    spec_decoding_bool_params: List[bool],
+    spec_decoding_tensor_params: List[Optional[torch.Tensor]],
 ) -> List[torch.Tensor]:
     num_tokens = q.size(0)
     attention_input_type = (AttentionInputType(attention_input_type)
@@ -678,6 +843,8 @@ def attention(
         # NOTE(tizheng): Does this introduce overhead?
         output_sf = torch.empty(())  # Create a placeholder, which is not used.
 
+    # this function shouldn't maxed out 64 arguments
+    # https://github.com/pytorch/pytorch/blob/a2b0b2698d5b953861b2e4f3cdee11136f07bd3b/aten/src/ATen/core/dispatch/DispatchKeyExtractor.h#L235
     torch.ops.trtllm.attention_inplace(
         q, k, v, output_act, output_sf, out_dtype, workspace, sequence_length,
         host_past_key_value_lengths, context_lengths, host_context_lengths,
@@ -690,14 +857,15 @@ def attention(
         max_context_length, attention_window_size, sink_token_length,
         beam_width, mask_type, quant_mode, q_scaling, position_embedding_type,
         rotary_embedding_dim, rotary_embedding_base,
-        rotary_embedding_scale_type, rotary_embedding_scale,
-        rotary_embedding_short_m_scale, rotary_embedding_long_m_scale,
-        rotary_embedding_max_positions, rotary_embedding_original_max_positions,
-        use_paged_context_fmha, attention_input_type, is_mla_enable,
-        q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim,
-        v_head_dim, mrope_rotary_cos_sin, mrope_position_deltas,
-        mla_context_paged_kv, mla_context_kv_cache_block_offsets,
-        attention_chunk_size)
+        rotary_embedding_scale_type, rotary_embedding_scales,
+        rotary_embedding_max_position_info, use_paged_context_fmha,
+        attention_input_type, is_mla_enable, q_lora_rank, kv_lora_rank,
+        qk_nope_head_dim, qk_rope_head_dim, v_head_dim, mrope_rotary_cos_sin,
+        mrope_position_deltas, mla_context_paged_kv,
+        mla_context_kv_cache_block_offsets, attention_chunk_size,
+        softmax_stats_tensor, spec_decoding_bool_params,
+        spec_decoding_tensor_params)
+
     return output_act, output_sf
 
 
@@ -746,11 +914,8 @@ def _(
     rotary_embedding_dim: int,
     rotary_embedding_base: float,
     rotary_embedding_scale_type: int,
-    rotary_embedding_scale: float,
-    rotary_embedding_short_m_scale: float,
-    rotary_embedding_long_m_scale: float,
-    rotary_embedding_max_positions: int,
-    rotary_embedding_original_max_positions: int,
+    rotary_embedding_scales: List[float],
+    rotary_embedding_max_position_info: List[int],
     use_paged_context_fmha: bool,
     attention_input_type: Optional[int],
     is_mla_enable: bool,
@@ -764,6 +929,8 @@ def _(
     mla_context_paged_kv: Optional[torch.Tensor],
     mla_context_kv_cache_block_offsets: Optional[torch.Tensor],
     attention_chunk_size: Optional[int],
+    spec_decoding_bool_params: List[bool],
+    spec_decoding_tensor_params: List[Optional[torch.Tensor]],
 ) -> List[torch.Tensor]:
     num_tokens = q.size(0)
     attention_input_type = (AttentionInputType(attention_input_type)

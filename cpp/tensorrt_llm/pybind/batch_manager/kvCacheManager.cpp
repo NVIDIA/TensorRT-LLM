@@ -326,7 +326,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
         .def_static("calculate_max_num_blocks", &tbk::BaseKVCacheManager::calculateMaxNumBlocks, py::arg("config"),
             py::arg("is_cross_attention"), py::arg("dtype"), py::arg("model_config"), py::arg("world_config"),
             py::arg("window_size_to_layers"), py::arg("allotted_primary_mem_bytes"),
-            py::arg("allotted_secondary_mem_bytes"), py::arg("extra_cost_memory"), py::arg("kvFactor"))
+            py::arg("allotted_secondary_mem_bytes"), py::arg("extra_cost_memory"), py::arg("kv_factor"))
         .def("allocate_pools", &BaseKVCacheManager::allocatePools)
         .def("release_pools", &BaseKVCacheManager::releasePools)
         .def("start_scheduling", &BaseKVCacheManager::startScheduling)
@@ -392,13 +392,14 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
             })
         .def("copy_batch_block_offsets",
             [](tbk::BaseKVCacheManager& self, at::Tensor output,
-                std::vector<tb::LlmRequest::RequestIdType> const& requestIds)
+                std::vector<tb::LlmRequest::RequestIdType> const& requestIds, SizeType32 const beamWidth,
+                SizeType32 const offset)
             {
                 auto _output = from_torch(output);
                 TLLM_CHECK_WITH_INFO(_output.has_value(), "Invalid output tensor.");
                 for (size_t i = 0; i < requestIds.size(); ++i)
                 {
-                    self.copyBlockOffsets(*(_output.value()), i, requestIds[i]);
+                    self.copyBlockOffsets(*(_output.value()), i * beamWidth + offset, requestIds[i]);
                 }
             })
         .def(

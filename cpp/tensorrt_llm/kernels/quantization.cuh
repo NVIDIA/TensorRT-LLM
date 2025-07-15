@@ -275,7 +275,7 @@ __global__ void perTokenQuantization(QuantT* dst, T const* src, int64_t const nu
 // FP4 Quantization
 
 constexpr int CVT_FP4_ELTS_PER_THREAD = 8;
-// constexpr int CVT_FP4_SF_VEC_SIZE = 16;
+constexpr int CVT_FP4_SF_VEC_SIZE = 16;
 constexpr int CVT_FP4_THREADS_PER_WARP = 32;
 constexpr int CVT_FP8_TO_FP4_ELTS_PER_THREAD = 16;
 
@@ -398,6 +398,95 @@ struct PackedVec<__nv_fp8_e4m3>
         "Vector size should match the number of elements per thread.");
 };
 
+// Convert 4 float2 values into 8 e4m3 values (represented as one uint64_t).
+inline __device__ uint64_t fp32_vec_to_e4m3(float2 (&array)[4])
+{
+    union
+    {
+        uint64_t val;
+        __nv_fp8x2_e4m3 elts[4];
+    } u;
+
+    static_assert(sizeof(u.val) == sizeof(u.elts), "Expected to alias uint64_t and __nv_fp8x2_e4m3[4]");
+
+    u.elts[0] = __nv_fp8x2_e4m3(array[0]);
+    u.elts[1] = __nv_fp8x2_e4m3(array[1]);
+    u.elts[2] = __nv_fp8x2_e4m3(array[2]);
+    u.elts[3] = __nv_fp8x2_e4m3(array[3]);
+    return u.val;
+}
+
+// Quantizes the provided PackedVec into the uint64_t output
+template <class Type, int SF_VEC_SIZE>
+__device__ uint64_t cvt_warp_fp16_to_mxfp8(PackedVec<Type>& vec, uint8_t* SFout)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    // Get absolute maximum values among the local 8 values.
+    auto localMax = cuda_abs(vec.elts[0]);
+
+// Local maximum value.
+#pragma unroll
+    for (int i = 1; i < CVT_FP4_ELTS_PER_THREAD / 2; i++)
+    {
+        localMax = cuda_max(localMax, cuda_abs(vec.elts[i]));
+    }
+
+    constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD;
+    // Get the absolute maximum among all 16 values (two threads for 16, four threads for 32).
+    localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
+    if constexpr (CVT_NUM_THREADS_PER_SF == 4)
+    {
+        localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 2), localMax);
+    }
+    // Get the final absolute maximum values.
+    float vecMax = float(cuda_max(localMax.x, localMax.y));
+
+    // Get the SF (max value of the vector / max value of mxfp8).
+    float SFValue = vecMax * reciprocal_approximate_ftz(448.0f);
+    // 8 bits representation of the SF.
+    uint8_t fp8SFVal;
+    // Write the SF to global memory (STG.8).
+    __nv_fp8_e8m0 tmpSFVal;
+    tmpSFVal.__x = __nv_cvt_float_to_e8m0(SFValue, __NV_SATFINITE, cudaRoundPosInf);
+    float SFValueNarrow = static_cast<float>(tmpSFVal);
+    fp8SFVal = tmpSFVal.__x;
+    // Get the output scale (reciprocal of the SFValue).
+    float outputScale = SFValue != 0.f ? reciprocal_approximate_ftz(SFValueNarrow) : 0.0f;
+
+    if (SFout)
+    {
+        // Write the SF to global memory (STG.8).
+        *SFout = fp8SFVal;
+    }
+
+    // Convert the input to float.
+    float2 fp2Vals[CVT_FP4_ELTS_PER_THREAD / 2];
+
+#pragma unroll
+    for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 2; i++)
+    {
+        if constexpr (std::is_same_v<Type, half>)
+        {
+            fp2Vals[i] = __half22float2(vec.elts[i]);
+        }
+        else
+        {
+            fp2Vals[i] = __bfloat1622float2(vec.elts[i]);
+        }
+        fp2Vals[i].x *= outputScale;
+        fp2Vals[i].y *= outputScale;
+    }
+
+    // Convert to e4m3 values.
+    uint64_t e4m3Vec = fp32_vec_to_e4m3(fp2Vals);
+
+    // Write the e4m3 values to global memory.
+    return e4m3Vec;
+#else
+    return 0;
+#endif
+}
+
 // Quantizes the provided PackedVec into the uint32_t output
 template <class Type, int SF_VEC_SIZE, bool UE8M0_SF>
 __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal, uint8_t* SFout)
@@ -427,6 +516,7 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal,
     // maximum value of e2m1 = 6.0.
     // TODO: use half as compute data type.
     float SFValue = SFScaleVal * (vecMax * reciprocal_approximate_ftz(6.0f));
+    float SFValueNarrow;
     // 8 bits representation of the SF.
     uint8_t fp8SFVal;
     // Write the SF to global memory (STG.8).
@@ -434,7 +524,7 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal,
     {
         __nv_fp8_e8m0 tmp;
         tmp.__x = __nv_cvt_float_to_e8m0(SFValue, __NV_SATFINITE, cudaRoundPosInf);
-        SFValue = static_cast<float>(tmp);
+        SFValueNarrow = static_cast<float>(tmp);
         fp8SFVal = tmp.__x;
     }
     else
@@ -442,12 +532,12 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal,
         // Here SFValue is always positive, so E4M3 is the same as UE4M3.
         __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
         fp8SFVal = tmp.__x;
-        SFValue = static_cast<float>(tmp);
+        SFValueNarrow = static_cast<float>(tmp);
     }
     // Get the output scale.
     // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal))) * reciprocal(SFScaleVal))
     float outputScale
-        = SFValue != 0 ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal)) : 0.0f;
+        = SFValue != 0 ? reciprocal_approximate_ftz(SFValueNarrow * reciprocal_approximate_ftz(SFScaleVal)) : 0.0f;
 
     if (SFout)
     {
@@ -573,7 +663,7 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type>& vec, float SFScaleVal, 
 }
 
 template <int SF_VEC_SIZE>
-inline __device__ int64_t get_sf_out_offset_128x4(
+inline __device__ __host__ int64_t get_sf_out_offset_128x4(
     std::optional<int> batchIdx, int mIdx, int kIdx, std::optional<int> numRows, int numCols)
 {
     // SF layout [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]

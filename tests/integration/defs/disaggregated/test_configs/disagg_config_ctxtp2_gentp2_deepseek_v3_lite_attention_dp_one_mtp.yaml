@@ -3,7 +3,7 @@ port: 8000
 model: DeepSeek-V3-Lite/fp8
 free_gpu_memory_fraction: 0.25
 backend: "pytorch"
-use_cuda_graph: False
+cuda_graph_config: null
 disable_overlap_scheduler: True
 speculative_config:
   decoding_type: MTP

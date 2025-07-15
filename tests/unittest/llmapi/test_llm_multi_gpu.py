@@ -8,8 +8,9 @@ from typing import Optional
 import pytest
 from parameterized import parameterized
 
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.executor import GenerationExecutorProxy
-from tensorrt_llm.llmapi import LLM, BuildConfig, KvCacheConfig, SamplingParams
+from tensorrt_llm.llmapi import BuildConfig, KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import PretrainedConfig
@@ -20,9 +21,10 @@ from .test_llm import (
     DummyError, DummyExecutorWorker3, _test_llm_capture_request_error,
     _test_llm_generate_async, check_llm_return_context_logits,
     check_llm_return_generation_logits, llm_return_logprobs_test_harness,
-    default_model_name, get_model_path, llama_7b_multi_lora_test_harness,
-    llama_model_path, llama_v2_7b_prompt_adapter_test_harness,
-    llama_v2_13b_lora_test_harness, llm_check_output,
+    default_model_name, get_model_path,
+    llama_7b_multi_lora_from_request_test_harness, llama_model_path,
+    llama_v2_7b_prompt_adapter_test_harness,
+    llama_v2_13b_lora_from_dir_test_harness, llm_check_output,
     llm_get_stats_async_test_harness, llm_get_stats_test_harness,
     llm_test_harness, mixtral_model_name, prompts, test_llm_api_eagle,
     tinyllama_logits_processor_test_harness, run_llm_with_postprocess_parallel,
@@ -72,7 +74,6 @@ def engine_from_checkpoint() -> tempfile.TemporaryDirectory:
     return tmpdir
 
 
-@pytest.mark.skip(reason="https://nvbugs/5266240")
 @pytest.mark.gpu2
 @pytest.mark.part0
 def test_llm_loading_from_ckpt_for_tp2(
@@ -253,17 +254,18 @@ def test_tinyllama_logits_processor_tp2pp2():
 @pytest.mark.gpu2
 @pytest.mark.part3
 def test_llama_v2_13b_lora_tp2():
-    llama_v2_13b_lora_test_harness(tensor_parallel_size=2,
-                                   kv_cache_config=global_kv_cache_config)
+    llama_v2_13b_lora_from_dir_test_harness(
+        tensor_parallel_size=2, kv_cache_config=global_kv_cache_config)
 
 
 @pytest.mark.gpu2
 @pytest.mark.part3
 def test_llama_7b_multi_lora_tp2():
-    llama_7b_multi_lora_test_harness(tensor_parallel_size=2,
-                                     max_loras=1,
-                                     max_cpu_loras=8,
-                                     kv_cache_config=global_kv_cache_config)
+    llama_7b_multi_lora_from_request_test_harness(
+        tensor_parallel_size=2,
+        max_loras=1,
+        max_cpu_loras=8,
+        kv_cache_config=global_kv_cache_config)
 
 
 @pytest.mark.gpu2
@@ -323,7 +325,6 @@ def test_llm_multi_node_pytorch(nworkers: int):
 
 @skip_single_gpu
 def test_llm_multi_node_with_postproc():
-    pytest.skip("https://nvbugspro.nvidia.com/bug/5327706")
     nworkers = 2
     test_case_file = os.path.join(os.path.dirname(__file__),
                                   "run_llm_with_postproc.py")
@@ -453,7 +454,7 @@ def test_llm_get_stats_async_tp2(pytorch_backend):
 
 
 def test_llm_capture_request_error():
-    _test_llm_capture_request_error(tp_size=2)
+    _test_llm_capture_request_error(pytorch_backend=False, tp_size=2)
 
 
 def test_llm_with_postprocess_parallel_tp2():

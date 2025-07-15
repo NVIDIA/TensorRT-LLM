@@ -40,9 +40,11 @@ set(SRCS
     iTensor.cpp
     ipcUtils.cpp
     ipcSocket.cpp
-    ipcNvlsMemory.cpp
+    ipcNvlsMemory.cu
     mcastDeviceMemory.cpp
     memoryCounters.cpp
+    moeLoadBalancer/gdrwrap.cpp
+    moeLoadBalancer/hostAccessibleDeviceAllocator.cpp
     moeLoadBalancer/moeLoadBalancer.cpp
     moeLoadBalancer/topologyDetector.cpp
     ncclCommunicator.cpp
@@ -75,8 +77,10 @@ endif()
 add_library(runtime_src OBJECT ${SRCS})
 set_property(TARGET runtime_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET runtime_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+add_cuda_architectures(runtime_src 89)
 
 target_include_directories(runtime_src PRIVATE ${MPI_C_INCLUDE_DIRS})
+target_link_libraries(runtime_src PUBLIC ${CUDA_NVML_LIB})
 
 if(ENABLE_MULTI_DEVICE)
   target_link_libraries(runtime_src PUBLIC ${NCCL_LIB})

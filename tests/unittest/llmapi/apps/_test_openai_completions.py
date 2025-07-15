@@ -14,7 +14,7 @@ def model_name():
     return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 
-@pytest.fixture(scope="module", params=[None, 'pytorch'])
+@pytest.fixture(scope="module", params=["trt", 'pytorch'])
 def backend(request):
     return request.param
 
@@ -312,3 +312,60 @@ async def test_completion_stream_options(async_client: openai.AsyncOpenAI,
             temperature=0.0,
             stream=False,
             stream_options={"continuous_usage_stats": True})
+
+
+def test_detokenize_single(client: openai.OpenAI, model_name):
+    completion = client.completions.create(
+        model=model_name,
+        prompt="Hello, my name is",
+        max_tokens=5,
+        temperature=0.0,
+        extra_body=dict(detokenize=False),
+    )
+
+    choice = completion.choices[0]
+    assert choice.text == ""
+    assert isinstance(choice.token_ids, list)
+    assert len(choice.token_ids) > 0
+
+    # test using token IDs
+    completion = client.completions.create(
+        model=model_name,
+        prompt=[0, 0, 0, 0, 0],
+        max_tokens=5,
+        temperature=0.0,
+        extra_body=dict(detokenize=True),
+    )
+
+    assert completion.choices[0].token_ids is None
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_completion_streaming(async_client: openai.AsyncOpenAI,
+                                    model_name: str):
+    prompt = "Hello, my name is"
+
+    single_completion = await async_client.completions.create(
+        model=model_name,
+        prompt=prompt,
+        max_tokens=5,
+        temperature=0.0,
+        extra_body=dict(detokenize=False),
+    )
+    single_output = single_completion.choices[0].token_ids
+    stream = await async_client.completions.create(
+        model=model_name,
+        prompt=prompt,
+        max_tokens=5,
+        temperature=0.0,
+        stream=True,
+        extra_body=dict(detokenize=False),
+    )
+    tokens: List[int] = []
+
+    async for chunk in stream:
+        assert chunk.choices[0].text == ""
+        assert isinstance(chunk.choices[0].token_ids, list)
+        tokens.extend(chunk.choices[0].token_ids)
+
+    assert tokens == single_output

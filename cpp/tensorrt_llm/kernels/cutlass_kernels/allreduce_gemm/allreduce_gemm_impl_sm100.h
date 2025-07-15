@@ -20,14 +20,14 @@
 #include "cutlass/util/packed_stride.hpp"
 #include "cutlass_extensions/gemm_configs.h"
 
-#include "communication/sm90_allreduce_nvls_warpspecialized.hpp"
+#include "./communication/sm90_allreduce_nvls_warpspecialized.hpp"
+#include "./epilogue/sm100_visitor_allreduce_tma_warpspecialized.hpp"
+#include "./kernel/sm100_gemm_allreduce_tma_warpspecialized.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/tile_scheduler.hpp"
-#include "epilogue/sm100_visitor_allreduce_tma_warpspecialized.hpp"
-#include "kernel/sm100_gemm_allreduce_tma_warpspecialized.hpp"
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
@@ -138,7 +138,7 @@ public:
     // Epilogue
     ////////////////
     using FusionCallbacks = cutlass::epilogue::fusion::LinearCombination<ElementD, float, void, float>;
-    using TileBarrierType = cutlass::MulticastSystemBarrier<cutlass::detail::SyncNoOp, true, true>;
+    using TileBarrierType = cutlass::MulticastSystemBarrier<cutlass::detail::SyncNoOp, true>;
     using EpilogueScheduleType = typename MmaAdapter<MmaType, IsFP4>::EpilogueSchedule;
     using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
     using FusionOp

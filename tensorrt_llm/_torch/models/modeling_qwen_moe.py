@@ -85,11 +85,13 @@ class QwenMoE(nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_dim)
 
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        all_rank_max_num_tokens = attn_metadata.all_rank_max_num_tokens
         router_logits = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states,
             router_logits,
             all_rank_num_tokens=all_rank_num_tokens,
+            all_rank_max_num_tokens=all_rank_max_num_tokens,
             use_dp_padding=False)
 
         shared_expert_output = self.shared_expert(hidden_states)
@@ -191,7 +193,6 @@ class QwenMoeModel(DecoderModel):
     def __init__(self, model_config: ModelConfig[Qwen2MoeConfig]):
         super().__init__(model_config)
         config = self.model_config
-        self.padding_idx = config.pretrained_config.pad_token_id
         self.aux_stream = torch.cuda.Stream()
 
         self.embed_tokens = Embedding(
@@ -257,7 +258,7 @@ class Qwen2MoeForCausalLM(DecoderModelForCausalLM[QwenMoeModel,
 
     def load_weights(self, weights: Dict):
         tp_size = self.model_config.mapping.tp_size
-        head_dim = self.config.hidden_size // self.config.num_attention_heads
+        num_kv_heads = self.config.num_key_value_heads
 
         params_map = {
             'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
@@ -282,7 +283,7 @@ class Qwen2MoeForCausalLM(DecoderModelForCausalLM[QwenMoeModel,
                                 k:
                                 duplicate_kv_weight(
                                     weight=v[:],
-                                    head_dim=head_dim,
+                                    num_kv_heads=num_kv_heads,
                                     tensor_parallel_size=tp_size)
                                 if k in ["weight", "bias"] else v
                                 for k, v in fw.items()

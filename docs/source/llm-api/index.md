@@ -1,84 +1,53 @@
-# API Introduction
+# LLM API Introduction
 
-The LLM API is a high-level Python API and designed for LLM workflows.
-This API is under development and might have breaking changes in the future.
+The LLM API is a high-level Python API designed to streamline LLM inference workflows.
 
-## Supported Models
+It supports a broad range of use cases, from single-GPU setups to multi-GPU and multi-node deployments, with built-in support for various parallelism strategies and advanced features. The LLM API integrates seamlessly with the broader inference ecosystem, including NVIDIA [Dynamo](https://github.com/ai-dynamo/dynamo).
 
-* Llama (including variants Mistral, Mixtral, InternLM)
-* GPT (including variants Starcoder-1/2, Santacoder)
-* Gemma-1/2
-* Phi-1/2/3
-* ChatGLM (including variants glm-10b, chatglm, chatglm2, chatglm3, glm4)
-* QWen-1/1.5/2
-* Falcon
-* Baichuan-1/2
-* GPT-J
-* Mamba-1/2
+While the LLM API simplifies inference workflows with a high-level interface, it is also designed with flexibility in mind. Under the hood, it uses a PyTorch-native and modular backend, making it easy to customize, extend, or experiment with the runtime.
 
-## Model Preparation
 
-The `LLM` class supports input from any of following:
+## Quick Start Example
+A simple inference example with TinyLlama using the LLM API:
 
-1. **Hugging Face Hub**: Triggers a download from the Hugging Face model hub, such as `TinyLlama/TinyLlama-1.1B-Chat-v1.0`.
-2. **Local Hugging Face models**: Uses a locally stored Hugging Face model.
-3. **Local TensorRT-LLM engine**: Built by `trtllm-build` tool or saved by the Python LLM API.
+```{literalinclude} ../../examples/llm-api/quickstart_example.py
+    :language: python
+    :linenos:
+```
 
-Any of these formats can be used interchangeably with the ``LLM(model=<any-model-path>)`` constructor.
+For more advanced usage including distributed inference, multimodal, and speculative decoding, please refer to this [README](../../../examples/llm-api/README.md).
 
-The following sections describe how to use these different formats for the LLM API.
+## Model Input
 
-### Hugging Face Hub
+The `LLM()` constructor accepts either a Hugging Face model ID or a local model path as input.
 
-Using the Hugging Face Hub is as simple as specifying the repo name in the LLM constructor:
+### 1. Using a Model from the Hugging Face Hub
+
+To load a model directly from the [Hugging Face Model Hub]((https://huggingface.co/)), simply pass its model ID (i.e., repository name) to the LLM constructor. The model will be automatically downloaded:
 
 ```python
 llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 ```
 
-You can also directly load TensorRT Model Optimizer's [quantized checkpoints](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4) on Hugging Face Hub in the same way.
+You can also use [quantized checkpoints](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4) (FP4, FP8, etc) of popular models provided by NVIDIA in the same way.
 
-### Local Hugging Face Models
+### 2. Using a Local Hugging Face Model
 
-Given the popularity of the Hugging Face model hub, the API supports the Hugging Face format as one of the starting points.
-To use the API with Llama 3.1 models, download the model from the [Meta Llama 3.1 8B model page](https://huggingface.co/meta-llama/Meta-Llama-3.1-8B) by using the following command:
+To use a model from local storage, first download it manually:
 
 ```console
 git lfs install
 git clone https://huggingface.co/meta-llama/Meta-Llama-3.1-8B
 ```
 
-After the model download is complete, you can load the model:
+Then, load the model by specifying a local directory path:
 
 ```python
-llm = LLM(model=<path_to_meta_llama_from_hf>)
+llm = LLM(model=<local_path_to_model>)
 ```
 
-Using this model is subject to a [particular](https://ai.meta.com/resources/models-and-libraries/llama-downloads/) license. Agree to the terms and [authenticate with Hugging Face](https://huggingface.co/meta-llama/Meta-Llama-3-8B?clone=true) to begin the download.
+> **Note:** Some models require accepting specific [license agreements]((https://ai.meta.com/resources/models-and-libraries/llama-downloads/)). Make sure you have agreed to the terms and authenticated with Hugging Face before downloading.
 
-### Local TensorRT-LLM Engine
-
-There are two ways to build a TensorRT-LLM engine:
-
-1. You can build the TensorRT-LLM engine from the Hugging Face model directly with the [`trtllm-build`](../commands/trtllm-build.rst) tool and then save the engine to disk for later use.
-Refer to the [README](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/llama) in the [`examples/models/core/llama`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/llama) repository on GitHub.
-
-   After the engine building is finished, we can load the model:
-
-   ```python
-   llm = LLM(model=<path_to_trt_engine>)
-   ```
-
-2. Use an `LLM` instance to create the engine and persist to local disk:
-
-   ```python
-   llm = LLM(<model-path>)
-
-   # Save engine to local disk
-   llm.save(<engine-dir>)
-   ```
-
-   The engine can be loaded using the `model` argument as shown in the first approach.
 
 ## Tips and Troubleshooting
 
