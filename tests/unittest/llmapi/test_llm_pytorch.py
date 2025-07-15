@@ -257,7 +257,7 @@ def test_llama_7b_multi_lora_load_previously_cpu_cache_evicted_adapter_fails(
     message, as this feature is currently not supported in favor of the performance improvement of not
     sending the LoRA weights with every request after the first time.
     NOTE: This test assumes the requests are handled in the order they're sent, if that's not true, then this test
-          may not get the error it expects (and get no error) which would cause it to fail.
+          may not get any error at all, which would cause it to fail.
     """  # noqa: D205
 
     def _check_contains_expected_message(stdout: str, stderr: str):
@@ -275,9 +275,12 @@ def test_llama_7b_multi_lora_load_previously_cpu_cache_evicted_adapter_fails(
             target=check_llama_7b_multi_unique_lora_adapters_from_request,
             args=(lora_adapter_count_per_call, repeat_calls, repeats_per_call,
                   LLM),
-            # Disable CUDA graph
-            # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-            kwargs={"cuda_graph_config": None"lora_config": lora_config},
+            kwargs={
+                "lora_config": lora_config,
+                # Disable CUDA graph
+                # TODO: remove this once we have a proper fix for CUDA graph in LoRA
+                "cuda_graph_config": None
+            },
             stop_waiting_criteria=_check_contains_expected_message)
 
     assert _check_contains_expected_message(child_stdout, child_stderr)
