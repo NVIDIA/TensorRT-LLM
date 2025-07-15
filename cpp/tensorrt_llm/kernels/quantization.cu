@@ -413,6 +413,11 @@ __global__ void cvt_fp4_to_fp16(int m, int n, uint32_t const* input, uint32_t co
         if constexpr (PER_TOKEN_GLOBAL_SCALE)
         {
             globalScaleVal = globalScale[rowIdx];
+            // if globalScaleVal is inf, set it to 1.0f
+            if (__isinf(globalScaleVal))
+            {
+                globalScaleVal = 1.0f;
+            }
         }
         scaleFloat *= globalScaleVal;
 

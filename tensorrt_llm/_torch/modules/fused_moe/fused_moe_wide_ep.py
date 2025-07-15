@@ -210,8 +210,7 @@ class WideEPMoE(MoE):
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
-        self.low_precision_global_scale = torch.nn.Parameter(
-            torch.tensor(1.0, dtype=torch.float32))
+
         self.use_low_precision_alltoall_combine = os.environ.get(
             "TRTLLM_MOE_USE_LOW_PRECISION_ALLTOALL_COMBINE", "0") == "1"
 
@@ -688,7 +687,6 @@ class WideEPMoE(MoE):
                     self.dummy_allreduce()
                 final_hidden_states = self.alltoall_combine(
                     final_hidden_states, alltoall_info, token_count)
-
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
                 final_hidden_states = self.unpad_tensors(
                     padded, final_hidden_states)
@@ -950,8 +948,6 @@ class WideEPMoE(MoE):
             low_precision_global_scale = (
                 448 * 6) / final_hidden_states.abs().max(
                     dim=-1, keepdim=True).values.to(torch.float32)
-            # low_precision_global_scale = self.low_precision_global_scale.expand(final_hidden_states.shape[0]).contiguous()
-            # low_precision_global_scale = self.low_precision_global_scale
             final_hidden_states, final_hidden_states_sf = torch.ops.trtllm.fp4_quantize(
                 final_hidden_states, low_precision_global_scale, 16, False,
                 False)

@@ -567,11 +567,51 @@ class MnnvlMoe:
     ):
         assert x.dim() == 2, "2D tensor supported, please reshape."
         hidden_dim = x.shape[1]
+        hidden_dim_in_bytes = hidden_dim * x.element_size()
+
+        if x_sf is not None:
+            assert x_sf.dim() == 2, "2D tensor supported, please reshape."
+            hidden_dim *= 2
+            hidden_dim_in_bytes += x_sf.shape[1] * x_sf.element_size()
+            assert low_precision_global_scale is not None, (
+                "low_precision_global_scale is required when x_sf is not None"
+            )
+            assert low_precision_global_scale.dtype == torch.float32, (
+                "low_precision_global_scale should be float32"
+            )
+            assert low_precision_global_scale.numel() == x.shape[0], (
+                "low_precision_global_scale should have the same number of elements as x.shape[0]"
+            )
+            hidden_dim_in_bytes += 4
+            hidden_dim_in_bytes_pad = hidden_dim_in_bytes + 15 & ~15
+            concat_tensors = [
+                x.view(torch.uint8),
+                x_sf.view(torch.uint8),
+                low_precision_global_scale.view(torch.uint8).view(-1, 4),
+            ]
+            if hidden_dim_in_bytes_pad != hidden_dim_in_bytes:
+                concat_tensors.append(
+                    torch.zeros(
+                        x.shape[0],
+                        hidden_dim_in_bytes_pad - hidden_dim_in_bytes,
+                        dtype=torch.uint8,
+                        device=x.device,
+                    )
+                )
+            input = torch.cat(concat_tensors, dim=1)
+        else:
+            hidden_dim_in_bytes_pad = hidden_dim_in_bytes
+            input = x.view(torch.uint8)
+
         output_tensor = torch.zeros(
-            token_count * top_k, hidden_dim, dtype=x.dtype, device=torch.device("cuda")
+            token_count * top_k,
+            hidden_dim_in_bytes_pad,
+            dtype=torch.uint8,
+            device=torch.device("cuda"),
         )
+
         torch.ops.trtllm.moe_comm(
-            x,
+            input,
             alltoall_info.recv_rank_count_cumsum,
             alltoall_info.recv_rank_local_indices,
             output_tensor,
@@ -583,60 +623,27 @@ class MnnvlMoe:
         )
 
         if x_sf is not None:
-            assert low_precision_global_scale is not None, (
-                "low_precision_global_scale is required when x_sf is not None"
-            )
-            assert low_precision_global_scale.dtype == torch.float32, (
-                "low_precision_global_scale should be float32"
-            )
-
-            if low_precision_global_scale.numel() > 1:
-                low_precision_global_scale_pad = torch.nn.functional.pad(
-                    low_precision_global_scale.view(-1, 1), (0, 3), "constant", 0
-                )
-                output_global_scale = torch.ones(
-                    token_count * top_k, 4, dtype=torch.float32, device=torch.device("cuda")
-                )
-                torch.ops.trtllm.moe_comm(
-                    low_precision_global_scale_pad,
-                    alltoall_info.recv_rank_count_cumsum,
-                    alltoall_info.recv_rank_local_indices,
-                    output_global_scale,
-                    alltoall_info.send_rank_count_cumsum,
-                    alltoall_info.backward_recv_rank_local_indices,
-                    workspace,
-                    ep_rank,
-                    ep_size,
-                )
-                output_global_scale = output_global_scale[:, :1].contiguous()
-            else:
-                output_global_scale = low_precision_global_scale
-
-            assert x_sf.dim() == 2, "2D tensor supported, please reshape."
-            hidden_dim *= 2
-            output_sf_tensor = torch.zeros(
-                token_count * top_k, x_sf.shape[1], dtype=x_sf.dtype, device=torch.device("cuda")
-            )
-            torch.ops.trtllm.moe_comm(
-                x_sf,
-                alltoall_info.recv_rank_count_cumsum,
-                alltoall_info.recv_rank_local_indices,
-                output_sf_tensor,
-                alltoall_info.send_rank_count_cumsum,
-                alltoall_info.backward_recv_rank_local_indices,
-                workspace,
-                ep_rank,
-                ep_size,
+            x, x_sf, output_global_scale, _ = output_tensor.split(
+                [
+                    x.shape[1] * x.element_size(),
+                    x_sf.shape[1] * x_sf.element_size(),
+                    4,
+                    hidden_dim_in_bytes_pad - hidden_dim_in_bytes,
+                ],
+                dim=1,
             )
             output_tensor = torch.ops.trtllm.fp4_dequantize(
-                output_tensor,
-                output_sf_tensor,
-                1.0 / output_global_scale,
+                x.contiguous(),
+                x_sf.contiguous(),
+                1.0 / output_global_scale.view(torch.float32).contiguous(),
                 16,
                 False,
                 is_sf_swizzled,
                 "bfloat16",
             )
+        else:
+            output_tensor = output_tensor.view(x.dtype)
+
         return torch.sum(
             output_tensor.reshape(token_count, top_k, hidden_dim), dim=1, keepdim=False
         )
