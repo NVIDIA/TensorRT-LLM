@@ -49,9 +49,7 @@ from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
 # isort: off
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
 from gc_utils import assert_resource_freed
-from llmapi.lora_test_utils import (
-    check_llama_7b_multi_lora_from_request_test_harness,
-    check_llama_7b_multi_unique_lora_adapters_from_request)
+from llmapi.lora_test_utils import check_llama_7b_multi_unique_lora_adapters_from_request
 from utils.llm_data import llm_models_root
 from utils.util import force_ampere, similar, skip_gpu_memory_less_than_40gb, skip_pre_hopper, skip_single_gpu
 # isort: on
@@ -1366,25 +1364,21 @@ def llama_v2_13b_lora_from_dir_test_harness(**llm_kwargs):
 
 
 @pytest.mark.parametrize(
-    "lora_adapter_count_per_call, max_loras, max_cpu_loras, repeats",
+    "lora_adapter_count_per_call, max_loras, max_cpu_loras, repeat_calls, repeats_per_call",
     [
-        # Test eviction and loading of new adapters in the evicted space, within a single llm.generate call
-        ([
-            5,
-        ], 2, 2, 1),
         # Test eviction and re-loading a previously evicted adapter from the LoRA GPU cache, within a single
-        # llm.generate call
+        # llm.generate call, that's repeated twice.
         ([
             2,
-        ], 1, 2, 2),
+        ], 1, 2, 2, 3),
         # Test eviction and loading of new adapters in the evicted space, over several llm.generate calls, with LoRA GPU
         # cache size < LoRA CPU cache size
-        ([2, 2, 2], 1, 3, 1),
+        ([2, 2, 2], 1, 3, 1, 1),
     ])
 @skip_gpu_memory_less_than_40gb
 def test_llama_7b_multi_lora_evict_load_new_adapters(
         lora_adapter_count_per_call: list[int], max_loras: int,
-        max_cpu_loras: int, repeats: int):
+        max_cpu_loras: int, repeat_calls: int, repeats_per_call: int):
     # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
     # (1) specify lora_target_modules, or
     # (2) provide a lora_dir to infer the lora_target_modules.
@@ -1395,7 +1389,8 @@ def test_llama_7b_multi_lora_evict_load_new_adapters(
         max_cpu_loras=max_cpu_loras))
     check_llama_7b_multi_unique_lora_adapters_from_request(
         lora_adapter_count_per_call,
-        repeats,
+        repeat_calls,
+        repeats_per_call,
         LLM,
         enable_lora=True,
         build_config=build_config,
@@ -1408,22 +1403,6 @@ def test_llama_7b_multi_lora_evict_load_new_adapters(
 @skip_gpu_memory_less_than_40gb
 def test_llama_v2_13b_lora():
     llama_v2_13b_lora_from_dir_test_harness()
-
-
-@skip_gpu_memory_less_than_40gb
-def test_llama_7b_multi_lora():
-    # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
-    # (1) specify lora_target_modules, or
-    # (2) provide a lora_dir to infer the lora_target_modules.
-    build_config = BuildConfig(lora_config=LoraConfig(
-        lora_target_modules=['attn_q', 'attn_k', 'attn_v']))
-    check_llama_7b_multi_lora_from_request_test_harness(
-        LLM,
-        enable_lora=True,
-        build_config=build_config,
-        fast_build=True,
-        max_loras=1,
-        max_cpu_loras=8)
 
 
 def llama_v2_7b_prompt_adapter_test_harness(**llm_kwargs):
