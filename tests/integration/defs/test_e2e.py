@@ -2035,7 +2035,7 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
             "image": [
                 ["dramatic", "turbulent", "waves", "ocean", "overcast"],
                 ["half", "dome", "yosemite", "landmark", "rounded"],
-                ["flowing", "standstill", "vehicles", "road", "Changi"],
+                ["flowing", "traffic", "vehicles", "road", "Changi"],
             ],
         },
     }
