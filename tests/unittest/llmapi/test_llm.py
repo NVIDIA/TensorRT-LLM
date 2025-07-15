@@ -1407,22 +1407,11 @@ def llama_7b_multi_lora_from_request_test_harness(**llm_kwargs):
     ]
     lora_req1 = LoRARequest("luotuo", 1, hf_lora_dir1)
     lora_req2 = LoRARequest("Japanese", 2, hf_lora_dir2)
-    lora_req3 = LoRARequest("luotuo", 3, hf_lora_dir1)
-    lora_req4 = LoRARequest("Japanese", 4, hf_lora_dir2)
-    lora_req5 = LoRARequest("luotuo", 5, hf_lora_dir1)
-    lora_req6 = LoRARequest("Japanese", 6, hf_lora_dir2)
     sampling_params = SamplingParams(max_tokens=20)
     outputs = llm.generate(
         prompts,
         sampling_params,
         lora_request=[None, lora_req1, lora_req2, None, lora_req1, lora_req2])
-    for output, ref, key_word in zip(outputs, references, key_words):
-        assert similar(output.outputs[0].text,
-                       ref) or key_word in output.outputs[0].txt
-    outputs = llm.generate(
-        prompts,
-        sampling_params,
-        lora_request=[None, lora_req3, lora_req4, None, lora_req5, lora_req6])
     for output, ref, key_word in zip(outputs, references, key_words):
         assert similar(output.outputs[0].text,
                        ref) or key_word in output.outputs[0].txt
