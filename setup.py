@@ -115,6 +115,7 @@ package_data += [
     'tools/plugin_gen/templates/*',
     'bench/build/benchmark_config.yml',
     'evaluate/lm_eval_tasks/**/*',
+    "_torch/auto_deploy/config/*.yaml",
 ]
 
 
@@ -185,7 +186,7 @@ def extract_from_precompiled(precompiled_location: str, package_data: List[str],
 
     with zipfile.ZipFile(wheel_path) as wheel:
         for file in wheel.filelist:
-            if file.filename.endswith(".py"):
+            if file.filename.endswith((".py", ".yaml")):
                 continue
             for filename_pattern in package_data:
                 if fnmatch.fnmatchcase(file.filename,
