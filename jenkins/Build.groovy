@@ -314,7 +314,7 @@ def uploadArtifacts(artifacts, prefix = UPLOAD_PATH, retryTimes = 2, serverId = 
                         }
                     ]
                 }"""
-        echo "uploading ${filepath} as ${uploadpath}, spec: ${spec}"
+        echo "Uploading ${filepath} as ${uploadpath}. Spec: ${spec}"
         trtllm_utils.llmRetry(retryTimes, "uploadArtifacts", {
             rtUpload (
                 serverId: serverId,
