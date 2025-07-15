@@ -444,3 +444,46 @@ class ApiStabilityTestHarness:
                 snapshot.assert_equal(self.reference)
             except AssertionError as e:
                 raise AssertionError(self.error_msg) from e
+
+    def test_api_status(self):
+        """ Check that the API status (prototype | beta) matches the llm.yaml.
+        Note that, only the non-committed APIs are checked, the committed APIs
+        are treated as stable..
+        """
+        from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+        actual_fields = TorchLlmArgs.model_fields
+        reference_data = self.reference.to_dict()
+        committed_data = self.reference_committed.to_dict(
+        ) if self.reference_committed else {}
+
+        def get_actual_status(field_name):
+            if field_name in actual_fields:
+                field = actual_fields[field_name]
+                return field.json_schema_extra.get(
+                    'status') if field.json_schema_extra else None
+            return None
+
+        def check_status(field_name, reference_status, context=""):
+            actual_status = get_actual_status(field_name)
+            if actual_status != reference_status:
+                raise AssertionError(
+                    f"Status mismatch for {context}'{field_name}': "
+                    f"actual='{actual_status}', reference='{reference_status}'")
+
+        # Check non-committed methods and properties
+        for method_name, method_data in reference_data.get('methods',
+                                                           {}).items():
+            if method_name in committed_data.get('methods', {}):
+                continue
+            for param_name, param_data in method_data.get('parameters',
+                                                          {}).items():
+                check_status(
+                    param_name, param_data.get('status'),
+                    f"parameter '{param_name}' in method '{method_name}': ")
+
+        for prop_name, prop_data in reference_data.get('properties',
+                                                       {}).items():
+            if prop_name in committed_data.get('properties', {}):
+                continue
+            check_status(prop_name, prop_data.get('status'), f"property ")
