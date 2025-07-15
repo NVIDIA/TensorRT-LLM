@@ -71,7 +71,7 @@ MODEL_PATH_DICT = {
     "llama_v4_maverick_17b_128e_instruct":
     "llama4-models/Llama-4-Maverick-17B-128E-Instruct",
     "llama_v4_maverick_17b_128e_instruct_fp8":
-    "llama4-models/Llama-4-Maverick-17B-128E-Instruct-FP8",
+    "llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8",
     # "llama_30b": "llama-models/llama-30b-hf",
     "mixtral_8x7b_v0.1": "Mixtral-8x7B-v0.1",
     "mixtral_8x7b_v0.1_instruct": "Mixtral-8x7B-Instruct-v0.1",
@@ -348,6 +348,7 @@ class PerfTestConfig:
         tp_size: int = 1,
         pp_size: int = 1,
         num_gpus: int = 1,
+        kv_cache_free_gpu_mem_fraction: float = 0.9,
     ):
         # The model name.
         self.model_name = model_name
@@ -401,6 +402,8 @@ class PerfTestConfig:
         self.num_gpus = num_gpus
         # Just build engines
         self.build_only = False
+        # kv cache free gpu mem fraction
+        self.kv_cache_free_gpu_mem_fraction = kv_cache_free_gpu_mem_fraction
 
     def to_string(self,
                   custom_bs: int = None,
@@ -514,6 +517,10 @@ class PerfTestConfig:
         if self.num_gpus > 1:
             entries.append(f"gpus:{self.num_gpus}")
 
+        # Add kv cache free gpu mem fraction.
+        if self.kv_cache_free_gpu_mem_fraction != 0.9:
+            entries.append(f"kv_frac:{self.kv_cache_free_gpu_mem_fraction}")
+
         # Concatenate labels with "-".
         return "-".join(entries)
 
@@ -620,6 +627,11 @@ class PerfTestConfig:
         if len(labels) > 0:
             self.num_gpus = 1 if not labels[0].startswith("gpus:") else int(
                 labels.pop(0).replace("gpus:", ""))
+
+        if len(labels) > 0:
+            self.kv_cache_free_gpu_mem_fraction = 0.9 if not labels[
+                0].startswith("kv_frac:") else float(
+                    labels.pop(0).replace("kv_frac:", ""))
 
         assert len(
             labels
@@ -971,7 +983,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             f"--workspace={engine_dir}", f"--model={hf_model_name}",
             f"--model_path={model_dir}", "build", f"--dataset={dataset_path}",
             f"--tp_size={self._config.tp_size}",
-            f"--pp_size={self._config.pp_size}"
+            f"--pp_size={self._config.pp_size}",
+            f"--kv_cache_free_gpu_mem_fraction={self._config.kv_cache_free_gpu_mem_fraction}"
         ]
         max_seq_len = max(self._config.input_lens) + max(
             self._config.output_lens)
