@@ -145,8 +145,9 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
         // Packed QKV input layout, [B, S, H * D + H_kv * D + H_kv * Dv].
         mKernelParams.qkv_ptr = runnerParams.qkvPtr;
         mKernelParams.q_stride_in_bytes = mKernelParams.k_stride_in_bytes = mKernelParams.v_stride_in_bytes
-            = get_size_in_bytes(mFixedParams.numQHeads * mFixedParams.headSize + 
-                mFixedParams.numKvHeads * mFixedParams.headSize + mFixedParams.numKvHeads * mFixedParams.headSizeV,
+            = get_size_in_bytes(mFixedParams.numQHeads * mFixedParams.headSize
+                    + mFixedParams.numKvHeads * mFixedParams.headSize
+                    + mFixedParams.numKvHeads * mFixedParams.headSizeV,
                 mFixedParams.dataType);
     }
     else
@@ -159,12 +160,12 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
         // Separate q and kv buffers may have different q and kv sequence lengths.
         mKernelParams.cu_kv_seqlens = reinterpret_cast<int const*>(runnerParams.cuKvSeqLenPtr);
 
-        if (mFixedParams.attentionInputLayout == AttentionInputLayout::Q_CONTIGUOUS_KV) {
+        if (mFixedParams.attentionInputLayout == AttentionInputLayout::Q_CONTIGUOUS_KV)
+        {
             // Contiguous kv input layout, [B, S, H_kv * D + H_kv * Dv].
             mKernelParams.kv_ptr = runnerParams.kvPtr;
-            mKernelParams.k_stride_in_bytes = mKernelParams.v_stride_in_bytes
-                = get_size_in_bytes(mFixedParams.numKvHeads * (mFixedParams.headSize + mFixedParams.headSizeV),
-                    mFixedParams.dataType);
+            mKernelParams.k_stride_in_bytes = mKernelParams.v_stride_in_bytes = get_size_in_bytes(
+                mFixedParams.numKvHeads * (mFixedParams.headSize + mFixedParams.headSizeV), mFixedParams.dataType);
         }
         else if (mFixedParams.attentionInputLayout == AttentionInputLayout::Q_PAGED_KV)
         {
@@ -300,7 +301,7 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
         ? mFixedParams.headSize
         : pow(2, int(log2(mFixedParams.headSize)) + 1);
     // In fact, due to 128B swizzle mode of TMA, only 128 bytes alignment is required,
-    // so we pad head size to next multiply of 128B.    
+    // so we pad head size to next multiply of 128B.
     int d_per_group = 128 / get_size_in_bytes(mFixedParams.dataType);
     int d_groups = (mFixedParams.headSize + d_per_group - 1) / d_per_group;
     int padded_d_next_multiply_of_128byte = d_groups * d_per_group;
@@ -482,24 +483,23 @@ void FusedMHARunnerV2::setTmaDescriptors(MHARunnerParams runnerParams)
     uint32_t q_step = 0, kv_step = 0;
     xmmaKernel->getStepSize(q_step, kv_step, mKernelParams, mLaunchParams);
 
-    const auto layout = mFixedParams.attentionInputLayout;
+    auto const layout = mFixedParams.attentionInputLayout;
 
     // Q Layout: [total_seqlen, H, D]
-    const uint32_t tensor_size_q[3] = { d, h, total_q_seqlen };
+    const uint32_t tensor_size_q[3] = {d, h, total_q_seqlen};
 
     // Stride size in bytes. Assumes least significant dim is 1
-    const uint64_t tensor_stride_q[2] = { d_in_bytes,
-                                    uint64_t(mKernelParams.q_stride_in_bytes) };
+    const uint64_t tensor_stride_q[2] = {d_in_bytes, uint64_t(mKernelParams.q_stride_in_bytes)};
 
     // Starting memory address
-    const char *q_ptr = reinterpret_cast<const char *>(
+    char const* q_ptr = reinterpret_cast<char const*>(
         layout == AttentionInputLayout::PACKED_QKV ? mKernelParams.qkv_ptr : mKernelParams.q_ptr);
 
     // Box size of TMA
-    const uint32_t box_size_q[3] = { d_per_group, 1, q_step };
+    const uint32_t box_size_q[3] = {d_per_group, 1, q_step};
 
     // Traversal stride.
-    const uint32_t traversal_stride[3] = { 1, 1, 1 };
+    const uint32_t traversal_stride[3] = {1, 1, 1};
 
     // OOB fill zeros.
     const uint32_t oob_fill = 0;
@@ -519,165 +519,105 @@ void FusedMHARunnerV2::setTmaDescriptors(MHARunnerParams runnerParams)
     Multiple_tma_descriptor<3> qo_tma_descriptor;
 
     // Q
-    qo_tma_descriptor.set_tma_desctriptor(q_ptr,
-                                            desc_format,
-                                            cudaTmaDescInterleave::INTERLEAVE_DISABLED,
-                                            swizzle_mode,
-                                            cudaTmaDescPromotion::PROMOTION_DISABLED,
-                                            tensor_size_q,
-                                            tensor_stride_q,
-                                            traversal_stride,
-                                            box_size_q,
-                                            oob_fill,
-                                            fp32_to_tf32,
-                                            &mKernelParams.tma_desc_q);
+    qo_tma_descriptor.set_tma_desctriptor(q_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED, swizzle_mode,
+        cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_q, tensor_stride_q, traversal_stride, box_size_q,
+        oob_fill, fp32_to_tf32, &mKernelParams.tma_desc_q);
 
     // O
     if ((get_size_in_bytes(mFixedParams.dataTypeOut) == 1)
         && mLaunchParams.attention_mask_type != ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL)
     {
         // O Layout: [total_seqlen, H, DV]
-        const uint32_t tensor_size_o[3] = { dv, h, total_q_seqlen };
+        const uint32_t tensor_size_o[3] = {dv, h, total_q_seqlen};
 
-        const uint64_t tensor_stride_o[2] = { get_size_in_bytes(dv, mFixedParams.dataTypeOut),
-                                        uint64_t(mKernelParams.o_stride_in_bytes) };
+        const uint64_t tensor_stride_o[2]
+            = {get_size_in_bytes(dv, mFixedParams.dataTypeOut), uint64_t(mKernelParams.o_stride_in_bytes)};
 
-        char *o_ptr = reinterpret_cast<char *>(mKernelParams.o_ptr);
+        char* o_ptr = reinterpret_cast<char*>(mKernelParams.o_ptr);
 
         // Box size of TMA
-        const uint32_t box_size_o[3] = { d_per_group, 1, 16 };
+        const uint32_t box_size_o[3] = {d_per_group, 1, 16};
 
         // Yuxin: dataTypeOut may be different with dataType, so desc_format and swizzle_mode
         // may be incorrect. For example, QKV are in bf16 while O is in fp8.
         // Luckly, this case doesn't exist so far. But we should keep one eye on it.
-        qo_tma_descriptor.set_tma_desctriptor(
-            o_ptr,
-            desc_format,
-            cudaTmaDescInterleave::INTERLEAVE_DISABLED,
-            swizzle_mode,
-            cudaTmaDescPromotion::PROMOTION_DISABLED,
-            tensor_size_o,
-            tensor_stride_o,
-            traversal_stride,
-            box_size_o,
-            oob_fill,
-            fp32_to_tf32,
-            &mKernelParams.tma_desc_o);
+        qo_tma_descriptor.set_tma_desctriptor(o_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED,
+            swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_o, tensor_stride_o, traversal_stride,
+            box_size_o, oob_fill, fp32_to_tf32, &mKernelParams.tma_desc_o);
     }
 
-    if( layout == AttentionInputLayout::Q_PAGED_KV ) {
+    if (layout == AttentionInputLayout::Q_PAGED_KV)
+    {
         // KV in q_paged_kv uses 4D tensor
         // Layout: [INT32_MAX, H_KV, TokensPerBlock, D]
         const uint32_t tokens_per_block = mKernelParams.paged_kv_cache.mTokensPerBlock;
-        const uint32_t tensor_size_k[4] = { d, tokens_per_block, h_kv, INT_MAX };
-        const uint32_t tensor_size_v[4] = { dv, tokens_per_block, h_kv, INT_MAX };
+        const uint32_t tensor_size_k[4] = {d, tokens_per_block, h_kv, INT_MAX};
+        const uint32_t tensor_size_v[4] = {dv, tokens_per_block, h_kv, INT_MAX};
 
-        const uint64_t tensor_stride_k[3] = {
-            uint64_t(mKernelParams.k_stride_in_bytes / tokens_per_block),   // d
-            uint64_t(mKernelParams.k_stride_in_bytes),                      // d * 64
-            uint64_t(mKernelParams.paged_kv_cache.mBytesPerBlock)
-        };
-        const uint64_t tensor_stride_v[3] = {
-            // we cannot use dv * Kernel_traits::ELEMENT_BYTES because V may be padded (MLA)
-            uint64_t(mKernelParams.v_stride_in_bytes / tokens_per_block),  // dv
-            uint64_t(mKernelParams.v_stride_in_bytes),                     // dv * 64
-            uint64_t(mKernelParams.paged_kv_cache.mBytesPerBlock)
-        };
+        const uint64_t tensor_stride_k[3] = {uint64_t(mKernelParams.k_stride_in_bytes / tokens_per_block), // d
+            uint64_t(mKernelParams.k_stride_in_bytes),                                                     // d * 64
+            uint64_t(mKernelParams.paged_kv_cache.mBytesPerBlock)};
+        const uint64_t tensor_stride_v[3]
+            = {// we cannot use dv * Kernel_traits::ELEMENT_BYTES because V may be padded (MLA)
+                uint64_t(mKernelParams.v_stride_in_bytes / tokens_per_block), // dv
+                uint64_t(mKernelParams.v_stride_in_bytes),                    // dv * 64
+                uint64_t(mKernelParams.paged_kv_cache.mBytesPerBlock)};
 
-        const char *kv_ptr = reinterpret_cast<char *>(runnerParams.pagedKvCache.mPrimaryPoolPtr);
+        char const* kv_ptr = reinterpret_cast<char*>(runnerParams.pagedKvCache.mPrimaryPoolPtr);
 
-        const uint32_t box_size_kv[4] = {
-            d_per_group, std::min(tokens_per_block, kv_step), 1, 1
-        };
+        const uint32_t box_size_kv[4] = {d_per_group, std::min(tokens_per_block, kv_step), 1, 1};
 
         TLLM_CHECK(kv_step % tokens_per_block == 0 || tokens_per_block % kv_step == 0);
         mKernelParams.blocks_per_tma_load = std::max<uint32_t>(1, kv_step / tokens_per_block);
         mKernelParams.blocks_per_tma_load_log2 = log2(mKernelParams.blocks_per_tma_load);
 
-        const uint32_t traversal_stride[4] = { 1, 1, 1, 1 };
+        const uint32_t traversal_stride[4] = {1, 1, 1, 1};
 
         Multiple_tma_descriptor<4> kv_tma_descriptor;
         // K
-        kv_tma_descriptor.set_tma_desctriptor(
-            kv_ptr,
-            desc_format,
-            cudaTmaDescInterleave::INTERLEAVE_DISABLED,
-            swizzle_mode,
-            cudaTmaDescPromotion::PROMOTION_DISABLED,
-            tensor_size_k,
-            tensor_stride_k,
-            traversal_stride,
-            box_size_kv,
-            oob_fill,
-            fp32_to_tf32,
-            &mKernelParams.tma_desc_k);
+        kv_tma_descriptor.set_tma_desctriptor(kv_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED,
+            swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_k, tensor_stride_k, traversal_stride,
+            box_size_kv, oob_fill, fp32_to_tf32, &mKernelParams.tma_desc_k);
         // V
-        kv_tma_descriptor.set_tma_desctriptor(
-            kv_ptr,
-            desc_format,
-            cudaTmaDescInterleave::INTERLEAVE_DISABLED,
-            swizzle_mode,
-            cudaTmaDescPromotion::PROMOTION_DISABLED,
-            tensor_size_v,
-            tensor_stride_v,
-            traversal_stride,
-            box_size_kv,
-            oob_fill,
-            fp32_to_tf32,
-            &mKernelParams.tma_desc_v);
-    } else {
+        kv_tma_descriptor.set_tma_desctriptor(kv_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED,
+            swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_v, tensor_stride_v, traversal_stride,
+            box_size_kv, oob_fill, fp32_to_tf32, &mKernelParams.tma_desc_v);
+    }
+    else
+    {
         // Otherwise KV uses 3D tensor
-        const uint32_t tensor_size_k[3] = { d, h_kv, total_kv_seqlen };
-        const uint32_t tensor_size_v[3] = { dv, h_kv, total_kv_seqlen };
+        const uint32_t tensor_size_k[3] = {d, h_kv, total_kv_seqlen};
+        const uint32_t tensor_size_v[3] = {dv, h_kv, total_kv_seqlen};
 
-        const uint64_t tensor_stride_k[2] = { d_in_bytes,
-                                        uint64_t(mKernelParams.k_stride_in_bytes) };
-        const uint64_t tensor_stride_v[2] = { dv_in_bytes,
-                                        uint64_t(mKernelParams.v_stride_in_bytes) };
+        const uint64_t tensor_stride_k[2] = {d_in_bytes, uint64_t(mKernelParams.k_stride_in_bytes)};
+        const uint64_t tensor_stride_v[2] = {dv_in_bytes, uint64_t(mKernelParams.v_stride_in_bytes)};
 
-        const uint32_t box_size_kv[3] = { d_per_group, 1, kv_step };
+        const uint32_t box_size_kv[3] = {d_per_group, 1, kv_step};
 
-        const char *k_ptr, *v_ptr;
+        char const *k_ptr, *v_ptr;
 
-        if( layout == AttentionInputLayout::PACKED_QKV ) {
+        if (layout == AttentionInputLayout::PACKED_QKV)
+        {
             // Layout: [total_seqlen, (H, D) + (H_KV, D) + (H_KV, DV)]
             k_ptr = q_ptr + h * d_in_bytes;
             v_ptr = k_ptr + h_kv * d_in_bytes;
-        } else if( layout == AttentionInputLayout::Q_CONTIGUOUS_KV ) {
+        }
+        else if (layout == AttentionInputLayout::Q_CONTIGUOUS_KV)
+        {
             // Layout, [B, S, H_kv * D + H_kv * Dv].
-            k_ptr = reinterpret_cast<const char *>(mKernelParams.kv_ptr);
+            k_ptr = reinterpret_cast<char const*>(mKernelParams.kv_ptr);
             v_ptr = k_ptr + h_kv * d_in_bytes;
         }
 
         Multiple_tma_descriptor<3> kv_tma_descriptor;
         // K
-        kv_tma_descriptor.set_tma_desctriptor(
-            k_ptr,
-            desc_format,
-            cudaTmaDescInterleave::INTERLEAVE_DISABLED,
-            swizzle_mode,
-            cudaTmaDescPromotion::PROMOTION_DISABLED,
-            tensor_size_k,
-            tensor_stride_k,
-            traversal_stride,
-            box_size_kv,
-            oob_fill,
-            fp32_to_tf32,
-            &mKernelParams.tma_desc_k);
+        kv_tma_descriptor.set_tma_desctriptor(k_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED,
+            swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_k, tensor_stride_k, traversal_stride,
+            box_size_kv, oob_fill, fp32_to_tf32, &mKernelParams.tma_desc_k);
         // V
-        kv_tma_descriptor.set_tma_desctriptor(
-            v_ptr,
-            desc_format,
-            cudaTmaDescInterleave::INTERLEAVE_DISABLED,
-            swizzle_mode,
-            cudaTmaDescPromotion::PROMOTION_DISABLED,
-            tensor_size_v,
-            tensor_stride_v,
-            traversal_stride,
-            box_size_kv,
-            oob_fill,
-            fp32_to_tf32,
-            &mKernelParams.tma_desc_v);
+        kv_tma_descriptor.set_tma_desctriptor(v_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED,
+            swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_v, tensor_stride_v, traversal_stride,
+            box_size_kv, oob_fill, fp32_to_tf32, &mKernelParams.tma_desc_v);
     }
 }
 
