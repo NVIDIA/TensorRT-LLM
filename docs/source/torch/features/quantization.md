@@ -32,7 +32,7 @@ scripts/huggingface_example.sh --model <huggingface_model_card> --quant <fp8/int
 ```
 
 ### Model Inference
-Than run this using TensorRT-LLM
+Then run this using TensorRT-LLM
 ```python
 from tensorrt_llm import LLM
 from pathlib import Path
