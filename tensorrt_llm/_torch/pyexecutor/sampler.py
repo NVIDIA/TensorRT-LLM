@@ -536,8 +536,7 @@ class TRTLLMSampler(Sampler):
             "buffer_manager":
             buffer_manager,
             "decoder_input_buffers": [
-                DecoderInputBuffers(self.max_num_sequences,
-                                    self.executor_config.max_batch_size,
+                DecoderInputBuffers(self.executor_config.max_batch_size,
                                     self.MAX_DECODING_TOKENS, buffer_manager)
                 for _ in range(self.num_micro_batches)
             ],

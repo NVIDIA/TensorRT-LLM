@@ -1504,7 +1504,7 @@ void TrtGptModelInflightBatching::createBuffers(executor::DecodingConfig const& 
     for (SizeType32 i = 0; i < mNumMicroBatches; ++i)
     {
         mDecoderInputBuffers.emplace_back(
-            getMaxNumSequences(), getMaxBatchSize(), mModelConfig.getMaxDecodingTokens(), mRuntime->getBufferManager());
+            getMaxBatchSize(), mModelConfig.getMaxDecodingTokens(), mRuntime->getBufferManager());
         mDecoderInputBuffers.back().setupMedusaLogits(getMaxNumSequences(), mModelConfig);
         mDecoderOutputBuffers.emplace_back(getMaxNumSequences(), mOperatingBeamWidth, getMaxSequenceLen(),
             mModelConfig.getMaxDecodingTokens(), mRuntime->getBufferManager());
@@ -2003,7 +2003,6 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
     NVTX3_SCOPED_RANGE(decoderStepAsync);
 
     auto& decoderInputBuffers = mDecoderInputBuffers.at(getFusedBufferId());
-    auto& seqSlotLogits = decoderInputBuffers.logits;
 
     auto const contextBufferId = mCtxGenFusion ? getFusedBufferId() : getContextBufferId();
     auto& contextRuntimeBuffers = mBuffers.at(contextBufferId);
@@ -2023,22 +2022,20 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
         copyCacheIndirectionFromOutputsToInputs(scheduledRequests, genBufferId);
     }
 
-    mLogitsPostProcessorIsApplied = (*mLogitsPostProcessor)(scheduledRequests.contextRequests,
-        scheduledRequests.generationRequests, mReplicateLogitsPostProcessor, seqSlotLogits, mWorldConfig,
-        mRuntime->getStreamPtr(), mLogitsPostProcessorBatched);
+    mLogitsPostProcessorIsApplied = (*mLogitsPostProcessor)(decoderInputBuffers, mReplicateLogitsPostProcessor,
+        mWorldConfig, mRuntime->getStreamPtr(), mLogitsPostProcessorBatched);
 
     if (mGuidedDecoder)
     {
-        mGuidedDecoder->execute(scheduledRequests, mRuntime->getBufferManager(), seqSlotLogits);
+        mGuidedDecoder->execute(decoderInputBuffers, mRuntime->getBufferManager());
     }
 
     auto const fusedBufferId = getFusedBufferId();
     auto& fusedRuntimeBuffers = mBuffers.at(fusedBufferId);
 
     auto& decodingInput = mDecodingInputs.at(mMicroBatchId);
-    decodingInput = (*mMakeDecodingBatchInputOutput)(scheduledRequests.contextRequests,
-        scheduledRequests.generationRequests, mDecoderInputBuffers.at(fusedBufferId), *mDecoderState, mModelConfig,
-        getMaxNumSequences(), *fusedRuntimeBuffers);
+    decodingInput = (*mMakeDecodingBatchInputOutput)(mDecoderInputBuffers.at(fusedBufferId), *mDecoderState,
+        mModelConfig, getMaxNumSequences(), *fusedRuntimeBuffers);
 
     auto decoderFinishEvent = mDecoder->forwardAsync(*mDecoderState, *decodingInput);
 

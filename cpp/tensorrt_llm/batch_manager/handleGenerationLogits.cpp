@@ -22,6 +22,7 @@
 #include "tensorrt_llm/batch_manager/medusaBuffers.h"
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
 #include "tensorrt_llm/batch_manager/utils/inflightBatchingUtils.h"
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/utils/debugUtils.h"
@@ -82,6 +83,11 @@ void HandleGenerationLogits::operator()(DecoderInputBuffers& inputBuffers, Reque
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(HandleGenerationLogits);
 
+    auto& decoderRequests = inputBuffers.decoderRequests;
+    decoderRequests.reserve(decoderRequests.size() + generationRequests.size());
+    auto& allDecoderLogits = inputBuffers.logits;
+    allDecoderLogits.reserve(allDecoderLogits.size() + generationRequests.size());
+
     for (auto const& llmReq : generationRequests)
     {
         auto const reqBeamWidth = llmReq->getBeamWidthByIter();
@@ -101,8 +107,9 @@ void HandleGenerationLogits::operator()(DecoderInputBuffers& inputBuffers, Reque
         TensorPtr logitsView = ITensor::slice(logits, logitsIndex, numLogits);
         TLLM_CHECK_DEBUG_WITH_INFO(tru::tensorHasInvalid<float>(*logitsView, manager, "logits") == false,
             "Found invalid number (NaN or Inf) in logits");
-        auto& decoderLogits = inputBuffers.logits.at(seqSlot);
 
+        TLLM_CHECK(llmReq->isGenerationInProgressState());
+        TensorPtr decoderLogits;
         if (reqBeamWidth > 1)
         {
             decoderLogits = logitsView;
@@ -113,6 +120,8 @@ void HandleGenerationLogits::operator()(DecoderInputBuffers& inputBuffers, Reque
             decoderLogits = logitsView;
             decoderLogits->unsqueeze(1);
         }
+        decoderRequests.push_back(llmReq);
+        allDecoderLogits.emplace_back(std::move(decoderLogits));
 
         if (llmReq->getReturnGenerationLogits())
         {

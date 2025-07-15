@@ -29,6 +29,7 @@ class CudaStream;
 
 namespace tensorrt_llm::batch_manager
 {
+class DecoderInputBuffers;
 
 class LogitsPostProcessor : Algorithm
 {
@@ -44,10 +45,8 @@ public:
 
     LogitsPostProcessor() = default;
 
-    bool operator()(RequestVector const& contextRequests, RequestVector const& generationRequests,
-        bool replicateLogitsPostProcessor, std::vector<batch_manager::LlmRequest::TensorPtr>& seqSlotLogits,
+    bool operator()(DecoderInputBuffers& inputBuffers, bool replicateLogitsPostProcessor,
         runtime::WorldConfig const& worldConfig, CudaStreamPtr const& stream,
-        std::optional<LogitsPostProcessorBatched> logitsPostProcessorBatched = std::nullopt) const;
         std::optional<LogitsPostProcessorBatched> logitsPostProcessorBatched = std::nullopt) const;
 };
 
