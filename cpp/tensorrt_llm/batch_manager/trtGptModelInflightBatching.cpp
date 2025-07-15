@@ -2023,9 +2023,9 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
         copyCacheIndirectionFromOutputsToInputs(scheduledRequests, genBufferId);
     }
 
-    mLogitsPostProcessorIsApplied
-        = (*mLogitsPostProcessor)(scheduledRequests.contextRequests, scheduledRequests.generationRequests,
-            mReplicateLogitsPostProcessor, seqSlotLogits, mWorldConfig, *mRuntime, mLogitsPostProcessorBatched);
+    mLogitsPostProcessorIsApplied = (*mLogitsPostProcessor)(scheduledRequests.contextRequests,
+        scheduledRequests.generationRequests, mReplicateLogitsPostProcessor, seqSlotLogits, mWorldConfig,
+        mRuntime->getStreamPtr(), mLogitsPostProcessorBatched);
 
     if (mGuidedDecoder)
     {

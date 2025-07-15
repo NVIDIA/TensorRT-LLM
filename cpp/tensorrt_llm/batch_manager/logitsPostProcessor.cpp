@@ -21,21 +21,19 @@
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/runtime/iTensor.h"
-#include "tensorrt_llm/runtime/tllmRuntime.h"
 
 namespace tr = tensorrt_llm::runtime;
 
 namespace tensorrt_llm::batch_manager
 {
 
-using BufferManager = tensorrt_llm::runtime::BufferManager;
 using TensorPtr = runtime::ITensor::SharedPtr;
 using ITensor = runtime::ITensor;
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
 bool LogitsPostProcessor::operator()(RequestVector const& contextRequests, RequestVector const& generationRequests,
     bool replicateLogitsPostProcessor, std::vector<TensorPtr>& seqSlotLogits, tr::WorldConfig const& worldConfig,
-    tr::TllmRuntime& runtime, std::optional<LogitsPostProcessorBatched> logitsPostProcessorBatched) const
+    CudaStreamPtr const& stream, std::optional<LogitsPostProcessorBatched> logitsPostProcessorBatched) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(LogitsPostProcessor);
@@ -61,7 +59,7 @@ bool LogitsPostProcessor::operator()(RequestVector const& contextRequests, Reque
                     {
                         auto& logits = seqSlotLogits.at(llmReq->mSeqSlot.value());
                         (*llmReq->mLogitsPostProcessor)(
-                            llmReq->mRequestId, logits, llmReq->getTokens(), runtime.getStreamPtr(), llmReq->mClientId);
+                            llmReq->mRequestId, logits, llmReq->getTokens(), stream, llmReq->mClientId);
                     }
                 }
                 else if (llmReq->mApplyLogitsPostProcessorBatched)
@@ -84,7 +82,7 @@ bool LogitsPostProcessor::operator()(RequestVector const& contextRequests, Reque
         logitsPostProcessorIsApplied = true;
         if (replicateLogitsPostProcessor || worldConfig.isFirstTensorParallelRank())
         {
-            (*logitsPostProcessorBatched)(reqIdsVec, logitsVec, beamTokensVec, runtime.getStreamPtr(), clientIdsVec);
+            (*logitsPostProcessorBatched)(reqIdsVec, logitsVec, beamTokensVec, stream, clientIdsVec);
         }
     }
 
