@@ -206,6 +206,9 @@ class PyExecutor:
         self.enable_iter_perf_stats = model_engine.pytorch_backend_config.enable_iter_perf_stats
         self.enable_iter_req_stats = model_engine.pytorch_backend_config.enable_iter_req_stats
         self.stream_interval = model_engine.pytorch_backend_config.stream_interval
+        self.use_attention_dp_config = model_engine.pytorch_backend_config.use_attention_dp_config
+        self.attention_dp_time_out_iters = model_engine.pytorch_backend_config.attention_dp_time_out_iters
+        self.attention_dp_batching_wait_iters = model_engine.pytorch_backend_config.attention_dp_batching_wait_iters
         self.num_fetch_requests_cur_rank = 0
         self.num_fetch_requests = 0
         self.shutdown_event = threading.Event()
@@ -252,6 +255,9 @@ class PyExecutor:
             self.draft_model_engine.warmup(self.resource_manager)
 
         self.is_shutdown = False
+        self.max_batch_size = max_batch_size
+        self.adp_ctx_waiting_iters = 0
+        self.adp_ctx_batching_wait_iters = 0
 
         self.stats_lock = threading.Lock()
         self.stats = []
@@ -1196,7 +1202,16 @@ class PyExecutor:
     def _fetch_new_requests(self) -> List[RequestQueueItem]:
         if self.enable_attention_dp:
             all_ranks_num_active_requests = []
-            responses_list = self.dist.tp_allgather(len(self.active_requests))
+            num_active_requests = len(self.active_requests)
+            responses_list = self.dist.tp_allgather(num_active_requests)
+            # Debug check - remove after verification
+            if not all(isinstance(x, int) for x in responses_list):
+                raise RuntimeError(
+                    f"tp_allgather returned non-integer values: {responses_list} "
+                    +
+                    f"Expected all ranks to return int from {num_active_requests} and {self.active_requests}."
+                )
+
             for num_active_requests in responses_list:
                 all_ranks_num_active_requests.append(num_active_requests)
             total_num_active_requests = sum(all_ranks_num_active_requests)
@@ -1474,8 +1489,66 @@ class PyExecutor:
         scheduler_output = self.scheduler.schedule_request(
             self.active_requests, self.inflight_req_ids)
         scheduled_requests = ScheduledRequests()
+        context_requests = scheduler_output.context_requests
+        if self.enable_attention_dp:
+            num_scheduled_context_requests = len(
+                scheduler_output.context_requests)
+            num_scheduled_generation_requests = len(
+                scheduler_output.generation_requests)
+            num_scheduled_tokens = sum([
+                len(req.get_tokens(0)) for req in context_requests
+            ]) + num_scheduled_generation_requests
+            responses_list = self.dist.tp_allgather([
+                num_scheduled_context_requests,
+                num_scheduled_generation_requests, num_scheduled_tokens
+            ])
+            all_ranks_num_scheduled_context_requests = [
+                response[0] for response in responses_list
+            ]
+            all_ranks_num_scheduled_generation_requests = [
+                response[1] for response in responses_list
+            ]
+            all_ranks_num_scheduled_tokens = [
+                response[2] for response in responses_list
+            ]
 
-        scheduled_requests.context_requests = scheduler_output.context_requests
+            all_ranks_have_free_ctx_slots = all([
+                num_gen < self.max_batch_size
+                for num_gen in all_ranks_num_scheduled_generation_requests
+            ])
+            all_ranks_have_multi_gen = all([
+                num_gen > 1
+                for num_gen in all_ranks_num_scheduled_generation_requests
+            ])
+            all_ranks_have_ctx_requests = all([
+                num_ctx > 0
+                for num_ctx in all_ranks_num_scheduled_context_requests
+            ])
+
+            all_ranks_have_gen_requests = all([
+                num_gen > 0
+                for num_gen in all_ranks_num_scheduled_generation_requests
+            ])
+
+            if self.use_attention_dp_config:
+                # wait for all ranks have context requests
+                if all_ranks_have_free_ctx_slots and all_ranks_have_ctx_requests:
+                    self.adp_ctx_waiting_iters = 0
+                    # balance number of context requests across ranks
+                    if all_ranks_have_gen_requests:
+                        if self.adp_ctx_batching_wait_iters <= self.attention_dp_batching_wait_iters:
+                            self.adp_ctx_batching_wait_iters += 1
+                            context_requests = []
+                        else:
+                            self.adp_ctx_batching_wait_iters = 0
+                else:
+                    self.adp_ctx_waiting_iters += 1
+                    context_requests = []
+                    if self.adp_ctx_waiting_iters >= self.attention_dp_time_out_iters or not all_ranks_have_gen_requests:
+                        self.adp_ctx_waiting_iters = 0
+                        context_requests = scheduler_output.context_requests
+
+        scheduled_requests.context_requests = context_requests
         scheduled_requests.generation_requests = scheduler_output.generation_requests
         scheduled_requests.paused_requests = scheduler_output.paused_requests
         return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, scheduler_output.num_fitting_requests
