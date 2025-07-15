@@ -517,7 +517,7 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
         mLoopbackAgent = makeLoopbackAgent("nixl", &agentConfig.value());
     else
     {
-        BaseAgentConfig config{std::string("GDSAgent"), true};
+        BaseAgentConfig config{std::string("GDSAgent"), true, true};
         mLoopbackAgent = makeLoopbackAgent("nixl", &config);
     }
 
