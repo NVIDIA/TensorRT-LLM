@@ -98,6 +98,7 @@ setup.py @NVIDIA/trt-llm-infra-codeowners
 ### DOCS ###
 # TODO: create a team for this e.g. @NVIDIA/trt-llm-docs-devs
 /docs/* @nv-guomingz
+CODING_GUIDELINES.md @nv-guomingz
 docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 
 ### TESTS ###
