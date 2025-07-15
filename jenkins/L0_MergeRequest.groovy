@@ -908,7 +908,7 @@ def launchJob(jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64"
         parameters['reuseArtifactPath'] = "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${reuseBuild}"
     }
 
-    echo "trigger ${jobName} job, params: ${parameters}"
+    echo "Trigger ${jobName} job, params: ${parameters}"
 
     def status = triggerJob(jobName, parameters)
     if (status != "SUCCESS") {
@@ -980,13 +980,13 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 
                 if (singleGpuTestFailed) {
                     if (env.JOB_NAME ==~ /.*PostMerge.*/) {
-                        echo "For post-merge job, x86_64 single-GPU test failed, multi-GPU test is kept running"
+                        echo "In the official post-merge pipeline, single-GPU test failed, whereas multi-GPU test is still kept running."
                     } else {
                         stage("[Test-x86_64-Multi-GPU] Blocked") {
                             catchError(
                                 buildResult: 'FAILURE',
                                 stageResult: 'FAILURE') {
-                                error "This job need run multi-GPU test, but x86_64 single-GPU test failed"
+                                error "This pipeline requires running multi-GPU test, but single-GPU test has failed."
                             }
                         }
                         return
