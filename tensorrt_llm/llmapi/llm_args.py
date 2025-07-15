@@ -1433,7 +1433,7 @@ class BaseLlmArgs(BaseModel):
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.EAGLE
                 if self.speculative_config.eagle3_one_model:
-                    self.num_extra_kv_tokens = self.max_draft_len - 1
+                    self.speculative_config.num_extra_kv_tokens = self.speculative_config.max_draft_len - 1
                 if self.backend not in ['pytorch', '_autodeploy']:
                     eagle_config = _EagleConfig(
                         self.speculative_config.eagle_choices,
@@ -1757,7 +1757,7 @@ class TorchLlmArgs(BaseLlmArgs):
         "Lower values trigger more frequent garbage collection.")
 
     cuda_graph_config: Optional[CudaGraphConfig] = Field(
-        default=None,
+        default_factory=CudaGraphConfig,
         description="CUDA graph config.If true, use CUDA graphs for decoding. \
         CUDA graphs are only created for the batch sizes in cuda_graph_config.batch_sizes, \
         and are enabled for batches that consist of decoding requests *only* \

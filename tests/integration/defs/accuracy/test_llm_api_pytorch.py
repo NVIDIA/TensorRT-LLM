@@ -80,14 +80,10 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(32000)
     @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
     def test_chunked_prefill(self, attn_backend):
-        pytorch_config = dict(
-            attn_backend=attn_backend,
-            # https://nvbugspro.nvidia.com/bug/5345391
-            disable_overlap_scheduler=True)
         with LLM(self.MODEL_PATH,
+                 attn_backend=attn_backend,
                  enable_chunked_prefill=True,
-                 max_num_tokens=512,
-                 **pytorch_config) as llm:
+                 max_num_tokens=512) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -397,12 +393,15 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
                                                          (8, 1, 8)],
                              ids=["tp8", "tp8ep4", "tp8ep8"])
     def test_auto_dtype(self, cuda_graph, tp_size, pp_size, ep_size):
-        with LLM(self.MODEL_PATH,
-                 tensor_parallel_size=tp_size,
-                 pipeline_parallel_size=pp_size,
-                 moe_expert_parallel_size=ep_size,
-                 cuda_graph_config=CudaGraphConfig()
-                 if cuda_graph else None) as llm:
+        with LLM(
+                self.MODEL_PATH,
+                tensor_parallel_size=tp_size,
+                # Keep this low to avoid warmup OOM in CI
+                max_seq_len=8192,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                cuda_graph_config=CudaGraphConfig()
+                if cuda_graph else None) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
@@ -420,12 +419,15 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
                                                          (8, 1, 8)],
                              ids=["tp8", "tp8ep4", "tp8ep8"])
     def test_auto_dtype(self, cuda_graph, tp_size, pp_size, ep_size):
-        with LLM(self.MODEL_PATH,
-                 tensor_parallel_size=tp_size,
-                 pipeline_parallel_size=pp_size,
-                 moe_expert_parallel_size=ep_size,
-                 cuda_graph_config=CudaGraphConfig()
-                 if cuda_graph else None) as llm:
+        with LLM(
+                self.MODEL_PATH,
+                tensor_parallel_size=tp_size,
+                # Keep this low to avoid warmup OOM in CI
+                max_seq_len=8192,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                cuda_graph_config=CudaGraphConfig()
+                if cuda_graph else None) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
@@ -1082,8 +1084,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             pytest.skip("https://nvbugs/5252313")
         if torch_compile and pp_size > 1:
             pytest.skip("PP with torch.compile is not supported yet.")
-        if not attention_dp and (tp_size > 1 or ep_size > 1):
-            pytest.skip("https://nvbugs/5336321")
+
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         # Picewise Cuda Graph cannot be enabled for nvfp4 attention dp.
         torch_compile_config = TorchCompileConfig(

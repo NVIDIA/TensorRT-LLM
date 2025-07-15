@@ -2,6 +2,7 @@ hostname: localhost
 port: 8000
 model: DeepSeek-V3-Lite/fp8
 backend: "pytorch"
+cuda_graph_config: null
 free_gpu_memory_fraction: 0.2
 context_servers:
   num_instances: 1

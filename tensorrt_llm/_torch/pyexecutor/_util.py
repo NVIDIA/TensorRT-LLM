@@ -1,3 +1,4 @@
+import os
 import random
 from collections.abc import Iterable
 from typing import Dict, List, Optional
@@ -18,6 +19,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ..model_config import ModelConfig
 from ..speculative import get_spec_decoder
+from .config import PyTorchConfig
 from .config_utils import is_mla, is_nemotron_hybrid
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .llm_request import ExecutorResponse
@@ -718,3 +720,45 @@ def _try_infer_num_experts(model_config: ModelConfig) -> int:
         return 1
 
     return num_experts
+
+
+def _adjust_torch_mem_fraction(pytorch_backend_config: PyTorchConfig):
+    # FIXME: PyTorch only uses the garbage_collection_threshold setting
+    #        if a memory fraction is set, cf.
+    #   https://github.com/pytorch/pytorch/blob/cd995bfb2aac8891465809be3ce29543bd524287/c10/cuda/CUDACachingAllocator.cpp#L1357
+    logger.debug("Setting PyTorch memory fraction to 1.0")
+    torch.cuda.set_per_process_memory_fraction(1.0)
+
+    # FIXME: As soon as
+    #     torch.cuda._set_allocator_settings (added in PyTorch 2.8.0-rc1)
+    #   or a similar API is available, the warning below should be removed
+    #   and the allocator GC threshold be set via the new API instead.
+    torch_allocator_config = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    torch_mem_threshold_advised = (
+        torch.cuda.get_allocator_backend() == "native"
+        and "expandable_segments:True" not in torch_allocator_config)
+    torch_mem_threshold_set = "garbage_collection_threshold:" in torch_allocator_config
+    if torch_mem_threshold_advised and not torch_mem_threshold_set:
+        logger.warning(
+            "It is recommended to incl. 'garbage_collection_threshold:0.???' or 'backend:cudaMallocAsync'"
+            " or 'expandable_segments:True' in PYTORCH_CUDA_ALLOC_CONF.")
+
+    # NOTE: Even if a memory threshold was not set (cf. warning above), setting a memory
+    #       fraction < 1.0 is beneficial, because
+    #         https://github.com/pytorch/pytorch/blob/5228986c395dc79f90d2a2b991deea1eef188260/c10/cuda/CUDACachingAllocator.cpp#L2719
+    #       and
+    #         https://github.com/pytorch/pytorch/blob/5228986c395dc79f90d2a2b991deea1eef188260/c10/cuda/CUDACachingAllocator.cpp#L1240
+    #       lead PyTorch to release all unused memory before hitting the set fraction. This
+    #       still mitigates OOM, although at a higher performance impact, because it
+    #       effectively resets the allocator cache.
+    if not pytorch_backend_config._limit_torch_cuda_mem_fraction:
+        return
+    mem_reserved = torch.cuda.memory_reserved()
+    mem_free, mem_total = torch.cuda.mem_get_info()
+    safety_margin = 32 * 1024**2
+    mem_torch_max = mem_free + mem_reserved - safety_margin
+    mem_torch_fraction = mem_torch_max / mem_total
+    logger.info(
+        f"Setting PyTorch memory fraction to {mem_torch_fraction} ({mem_torch_max / 1024**3} GiB)"
+    )
+    torch.cuda.set_per_process_memory_fraction(mem_torch_fraction)
