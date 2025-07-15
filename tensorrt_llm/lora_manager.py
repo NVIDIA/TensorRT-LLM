@@ -440,13 +440,20 @@ def load_torch_nemo_lora(lora_config: LoraConfig):
     """Load NeMo LoRA checkpoint for PyTorch workflow.
 
     This is a PyTorch-specific loader for NeMo LoRA checkpoints, similar to
-    load_torch_hf_lora but handling NeMo checkpoint format.
+    load_torch_hf_lora but handling NeMo checkpoint format. NeMo uses a combined
+    "attn_qkv" module rather than separate Q, K, V modules, so no missing QKV
+    module handling is needed.
+
+    Note: This function only sets up the configuration. For PyTorch workflow,
+    the actual weight loading happens later via LoraManager when requests are
+    made with LoRA UIDs.
 
     Args:
         lora_config: LoRA configuration with lora_ckpt_source="nemo"
+
+    Raises:
+        ValueError: If NeMo LoRA directory is invalid or unsupported modules are specified
     """
-    # For NeMo, we need to set up module mappings differently
-    # NeMo uses "attn_qkv" as a combined module
     lora_config.trtllm_modules_to_hf_modules = {"attn_qkv": "attn_qkv"}
 
     assert len(lora_config.lora_dir) == 1, "Expecting only a single lora dir"
@@ -464,7 +471,6 @@ def load_torch_nemo_lora(lora_config: LoraConfig):
             "Please specify lora_target_modules or provide lora_dir to infer lora_target_modules."
         )
 
-    # Validate that NeMo LoRA only supports attn_qkv
     supported_modules = {"attn_qkv"}
     unsupported_modules = set(lora_config.lora_target_modules) - supported_modules
     if unsupported_modules:
@@ -473,13 +479,6 @@ def load_torch_nemo_lora(lora_config: LoraConfig):
             f"but got unsupported modules: {unsupported_modules}. "
             f"NeMo LoRA does not support embedding, lm_head, or MLP adapters."
         )
-
-    # NeMo only supports attn_qkv currently, no need for missing QKV module handling
-    # as it's already combined
-
-    # Note: For PyTorch workflow, the actual weight loading happens later
-    # via LoraManager when requests are made with LoRA UIDs. This function
-    # just sets up the configuration.
 
 
 def load_torch_lora(lora_config: LoraConfig):
