@@ -47,12 +47,10 @@ public:
 
     /// @brief Format the cache data into bytes for sending.
     /// @param session The transfer session.
-    /// @param llmRequest The request object to which the data belongs.
     virtual void format(TransferSession& session) = 0;
 
     /// @brief Unformat the cache data from received bytes.
     /// @param session The transfer session.
-    /// @param llmRequest The request object to which the data belongs.
     virtual void unformat(TransferSession& session) = 0;
 
     /// @brief Determine whether the sender is applicable to the source and target.

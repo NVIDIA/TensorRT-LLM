@@ -99,7 +99,7 @@ class TransferSession
 public:
     TransferSession(std::vector<Connection const*> connections, DataContext dataContext,
         executor::DataTransceiverState const& selfState, executor::DataTransceiverState otherState,
-        runtime::BufferManager& bufferManager, LlmRequest const* llmRequest = nullptr)
+        runtime::BufferManager const& bufferManager, LlmRequest const* llmRequest = nullptr)
         : mConnections(std::move(connections))
         , mDataContext(dataContext)
         , mSelfState(&selfState)
@@ -136,7 +136,7 @@ public:
         return mOtherState;
     }
 
-    [[nodiscard]] runtime::BufferManager& getBufferManager()
+    [[nodiscard]] runtime::BufferManager const& getBufferManager() const
     {
         return *mBufferManager;
     }
@@ -168,7 +168,7 @@ private:
     DataContext mDataContext;
     executor::DataTransceiverState const* mSelfState; // stored in DataRequester/DataResponder
     executor::DataTransceiverState mOtherState;
-    runtime::BufferManager* mBufferManager;
+    runtime::BufferManager const* mBufferManager;
     LlmRequest const* mRequest;
 };
 
