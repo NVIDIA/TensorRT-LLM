@@ -1,8 +1,8 @@
-# TRT-LLM Disaggregated Serving
+# Disaggregated Serving
 
-To run TRT-LLM in disaggregated mode, you must first launch context (prefill) and generation (decode) servers using `trtllm-serve`.
+To run TensorRT-LLM in disaggregated mode, you must first launch context (prefill) and generation (decode) servers using `trtllm-serve`.
 
-## Launching context and generation servers using multiple independent `trtllm-serve` commands
+## Launching disaggregated servers locally on single node
 
 We use the `cache_transceiver_config` configuration to set up disaggregated serving, which includes the following parameters:
 
@@ -23,12 +23,14 @@ for disaggregated serving. For example, you could launch two context servers and
 echo -e "disable_overlap_scheduler: True\ncache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048" > context_extra-llm-api-config.yml
 echo -e "cache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048" > gen_extra-llm-api-config.yml
 
-#Context servers
+# Context servers
 CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001 --backend pytorch --extra_llm_api_options ./context_extra-llm-api-config.yml &> log_ctx_0 &
 CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002 --backend pytorch --extra_llm_api_options ./context_extra-llm-api-config.yml &> log_ctx_1 &
-#Generation servers
+
+# Generation servers
 CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8003 --backend pytorch --extra_llm_api_options ./gen_extra-llm-api-config.yml &> log_gen_0 &
 ```
+
 Once the context and generation servers are launched, you can launch the disaggregated
 server, which will accept requests from clients and do the orchestration between context
 and generation servers. The disaggregated server can be launched with:
@@ -53,13 +55,17 @@ generation_servers:
       - "localhost:8003"
 ```
 
-Clients can then send requests to the disaggregated server at `localhost:8000`, which is an OpenAI compatible endpoint.
+Clients can then send requests to the disaggregated server at `localhost:8000`, which is an OpenAI API compatible endpoint.
+
+## Launching disaggregated servers on SLURM clusters
 
 ## Sending requests to the disaggregated server
 
 Once the context, generation and disaggregated servers are launched, you can send requests to the disaggregated server using curl:
 ```
-curl http://localhost:8000/v1/completions     -H "Content-Type: application/json"     -d '{
+curl http://localhost:8000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{
         "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
         "prompt": "NVIDIA is a great company because",
         "max_tokens": 16,
