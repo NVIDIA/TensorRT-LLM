@@ -19,7 +19,9 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
 from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.quantization.utils.fp8_utils import per_token_cast_to_fp8_e8m0
 
+from ..._utils import get_sm_version
 from ...models.modeling_utils import QuantConfig
 from ..utils import Fp4QuantizedTensor
 
@@ -541,10 +543,20 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
             input = input.to(torch.bfloat16) * module.input_scale
         assert input.dtype == torch.bfloat16
 
-        act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(input)
+        if get_sm_version() == 100:
+            import deep_gemm
+            a_tuple = per_token_cast_to_fp8_e8m0(input)
+            output = torch.empty((input.shape[0], module.weight.shape[0]),
+                                 device=input.device,
+                                 dtype=torch.bfloat16)
+            deep_gemm.fp8_gemm_nt(a_tuple, (module.weight, module.weight_scale),
+                                  output)
+        else:
+            act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
+                input)
 
-        output = torch.ops.trtllm.fp8_block_scaling_gemm(
-            act_input_fp8, module.weight, act_input_sf, module.weight_scale)
+            output = torch.ops.trtllm.fp8_block_scaling_gemm(
+                act_input_fp8, module.weight, act_input_sf, module.weight_scale)
         if bias is not None:
             output = output + bias
         return output
@@ -563,6 +575,9 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         scale_name = self._get_scale_name(weights)
         weight_scale = load_weight_shard(weights[0][scale_name], module.tp_size,
                                          module.tp_rank, module.tp_mode)
+        # if get_sm_version == 100:
+        #     weight, weight_scale = resmooth_to_fp8_e8m0(module.weight, weight_scale)
+        #     copy_weight(module.weight, weight)
         copy_weight(module.weight_scale, weight_scale)
         if "input_scale" in weights[0]:
             copy_weight(module.input_scale, weights[0]["input_scale"])
@@ -573,7 +588,6 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         q_weight, k_weight, v_weight = load_weights_fused_qkv_helper(
             module, weights)
         fused_weight = torch.cat((q_weight, k_weight, v_weight))
-        copy_weight(module.weight, fused_weight)
 
         scale_name = self._get_scale_name(weights)
         q_scale = load_weight_shard(weights[0][scale_name], module.tp_size,
@@ -583,6 +597,9 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         v_scale = load_weight_shard(weights[2][scale_name], module.tp_size,
                                     module.tp_rank, module.tp_mode)
         fused_fp8_block_scale = torch.cat((q_scale, k_scale, v_scale))
+        # if get_sm_version == 100:
+        #     fused_weight, fused_fp8_block_scale = resmooth_to_fp8_e8m0(fused_weight, fused_fp8_block_scale)
+        copy_weight(module.weight, fused_weight)
         copy_weight(module.weight_scale, fused_fp8_block_scale)
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
@@ -590,7 +607,6 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         gate_weight, up_weight = load_weights_fused_gate_up_helper(
             module, weights)
         fused_weight = torch.cat((gate_weight, up_weight))
-        copy_weight(module.weight, fused_weight)
 
         scale_name = self._get_scale_name(weights)
         left_scale = load_weight_shard(weights[0][scale_name], module.tp_size,
@@ -598,6 +614,9 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         right_scale = load_weight_shard(weights[1][scale_name], module.tp_size,
                                         module.tp_rank, module.tp_mode)
         fused_scale = torch.cat([left_scale, right_scale], dim=0)
+        # if get_sm_version == 100:
+        #     fused_weight, fused_scale = resmooth_to_fp8_e8m0(fused_weight, fused_scale)
+        copy_weight(module.weight, fused_weight)
         copy_weight(module.weight_scale, fused_scale)
 
 
