@@ -192,8 +192,12 @@ class WideEPMoE(MoE):
                     model_config.mapping)
                 self.deep_ep_buffer.reserve(hidden_size, dtype)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
-                self.deep_ep_max_num_tokens = min(model_config.max_num_tokens,
-                                                  self.moe_max_num_tokens)
+                self.deep_ep_max_num_tokens = int(
+                    os.environ.get(
+                        "TRTLLM_DEEP_EP_TOKEN_LIMIT",
+                        str(
+                            min(model_config.max_num_tokens,
+                                self.moe_max_num_tokens))))
                 self.deep_ep_buffer = buffer_pool.get_low_latency_buffer(
                     model_config.mapping)
                 self.deep_ep_buffer.reserve(self.deep_ep_max_num_tokens,
@@ -274,6 +278,25 @@ class WideEPMoE(MoE):
         """
         return self.alltoall_method_type != AlltoallMethodType.NotEnabled
 
+    def calculate_num_chunks(self, all_rank_num_tokens: List[int]) -> int:
+        num_rows = sum(all_rank_num_tokens)
+        return (num_rows + self.moe_max_num_tokens -
+                1) // self.moe_max_num_tokens
+
+    def can_use_alltoall(self, input, all_rank_num_tokens):
+        # Disable alltoall when chunking is used
+        if self.calculate_num_chunks(all_rank_num_tokens) > 1:
+            return False
+
+        num_tokens = input.shape[0]
+
+        # For DeepEPLowLatency, check if tokens exceed the threshold
+        if (self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency
+                and num_tokens > self.deep_ep_max_num_tokens):
+            return False
+
+        return self.enable_alltoall
+
     def _get_quant_method(self):
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
                 exclude_kv_cache=True):
@@ -316,11 +339,12 @@ class WideEPMoE(MoE):
     def reducescatter_or_allreduce(
         self,
         inputs,
+        use_all_to_all: bool,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
     ):
         outputs = inputs
-        if not self.enable_alltoall:
+        if not use_all_to_all:
             if self.enable_dummy_allreduce:
                 self.dummy_allreduce()
             outputs = reducescatter(
@@ -334,6 +358,7 @@ class WideEPMoE(MoE):
             self,
             x: Union[torch.Tensor, Fp4QuantizedTensor],
             router_logits: torch.Tensor,
+            use_all_to_all: bool,
             output_dtype: Optional[torch.dtype] = None,
             all_rank_num_tokens: Optional[List[int]] = None,
             all_rank_max_num_tokens: Optional[int] = None,
@@ -382,7 +407,7 @@ class WideEPMoE(MoE):
         ) and is_first_call:
             self.layer_load_balancer.maybe_cudagraph_done_wait()
 
-        use_allgather = not self.enable_alltoall
+        use_allgather = not use_all_to_all
 
         loadbalancer_local_statistic_info = None
         gathered_loadbalancer_local_statistic_info = None
@@ -391,7 +416,7 @@ class WideEPMoE(MoE):
             token_selected_slots = token_selected_experts
         else:
             if not self.layer_load_balancer.is_static_routing(
-            ) and self.enable_alltoall:
+            ) and use_all_to_all:
                 self.layer_load_balancer.local_statistic(
                     token_selected_experts,
                     is_first_stage=is_first_call,
@@ -400,7 +425,7 @@ class WideEPMoE(MoE):
                 token_selected_experts, self.use_dp)
             if not self.layer_load_balancer.is_static_routing():
                 # split into two part to get possible overlap with load balancer routing
-                if self.enable_alltoall:
+                if use_all_to_all:
                     if is_last_call:
                         loadbalancer_local_statistic_info = self.layer_load_balancer.get_local_statistic_tensor(
                         )
@@ -412,7 +437,9 @@ class WideEPMoE(MoE):
         ExpertStatistic.set_layer(self.layer_idx)
         ExpertStatistic.maybe_add_info(self.num_slots, token_selected_slots)
 
-        if self.enable_alltoall:
+        # If alltoall is disabled, we need also disable use_postquant_alltoall
+        use_postquant_alltoall = self.use_postquant_alltoall and use_all_to_all
+        if use_all_to_all:
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
                 if self.enable_dummy_allreduce:
                     self.dummy_allreduce()
@@ -423,15 +450,16 @@ class WideEPMoE(MoE):
                                                          x,
                                                          token_selected_slots,
                                                          token_final_scales,
+                                                         use_postquant_alltoall,
                                                          loadbalancer_local_statistic_info)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
-                if not self.use_postquant_alltoall:
+                if not use_postquant_alltoall:
                     x, recv_topk_idx, token_final_scales, num_recv_tokens_per_expert_list, deep_ep_handle = \
                         self.deep_ep_buffer.dispatch(x, token_selected_slots.to(torch.int64), token_final_scales, self.num_slots)
                     padded, x, _, recv_topk_idx, token_final_scales = self.pad_empty_recv_tensors(
                         x, None, recv_topk_idx, token_final_scales)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
-                if not self.use_postquant_alltoall:
+                if not use_postquant_alltoall:
                     deep_ep_topk_idx = token_selected_slots.to(torch.int64)
                     deep_ep_topk_weights = token_final_scales
                     x, recv_expert_count, deep_ep_handle = \
@@ -471,7 +499,7 @@ class WideEPMoE(MoE):
                 x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
                     x, self.fc31_input_dequant)
             elif self.has_nvfp4:
-                if use_allgather or self.use_postquant_alltoall:
+                if use_allgather or use_postquant_alltoall:
                     if isinstance(x, Fp4QuantizedTensor):
                         if use_allgather:
                             assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before allgather"
@@ -527,7 +555,7 @@ class WideEPMoE(MoE):
 
         if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
         ):
-            if self.enable_alltoall:
+            if use_all_to_all:
                 if is_last_call:
                     gathered_loadbalancer_local_statistic_info = gathered_loadbalancer_local_statistic_info.view(
                         (self.mapping.moe_ep_size, self.num_experts))
@@ -547,7 +575,7 @@ class WideEPMoE(MoE):
         cluster_rank = self.cluster_rank
         quant_scales = self.quant_scales
 
-        if self.use_postquant_alltoall:
+        if use_postquant_alltoall:
             if x_sf is not None and self.has_nvfp4:
                 assert not x_is_sf_swizzled, "Fp4 scaling factor should not be swizzled before Alltoall"
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
@@ -640,7 +668,7 @@ class WideEPMoE(MoE):
                     f"Not available alltoall method type: {self.alltoall_method_type!r}"
                 )
 
-        if self.enable_alltoall:
+        if use_all_to_all:
             # Adapter between `torch.ops.trtllm.fused_moe` and DeepEP
             # TODO: remove the adapter by changing APIs
             if self.alltoall_method_type == AlltoallMethodType.DeepEP:
@@ -666,7 +694,7 @@ class WideEPMoE(MoE):
             ep_rank=ep_rank,
             cluster_size=cluster_size,
             cluster_rank=cluster_rank,
-            enable_alltoall=self.enable_alltoall,
+            enable_alltoall=use_all_to_all,
             use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
             use_w4a8_group_scaling=use_w4a8_group_scaling,
             min_latency_mode=False,
@@ -681,7 +709,7 @@ class WideEPMoE(MoE):
         # Otherwise, the output should be unpacked as a single tensor.
         final_hidden_states = final_hidden_states[0]
 
-        if self.enable_alltoall:
+        if use_all_to_all:
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
                 if self.enable_dummy_allreduce:
                     self.dummy_allreduce()
@@ -737,11 +765,10 @@ class WideEPMoE(MoE):
     ) -> torch.Tensor:
         assert all_rank_num_tokens is not None
         assert use_dp_padding is not None
-        num_rows = sum(all_rank_num_tokens)
 
         # in case of num_rows is larger than max_chunk_size, we need to split the input into multiple chunks
-        num_chunks = (num_rows + self.moe_max_num_tokens -
-                      1) // self.moe_max_num_tokens
+        num_chunks = self.calculate_num_chunks(all_rank_num_tokens)
+        use_all_to_all = self.can_use_alltoall(x, all_rank_num_tokens)
 
         if use_dp_padding:
             all_rank_num_tokens_padded = [all_rank_max_num_tokens
@@ -754,6 +781,7 @@ class WideEPMoE(MoE):
             outputs = self.forward_chunk(
                 x,
                 router_logits,
+                use_all_to_all,
                 output_dtype,
                 all_rank_num_tokens=all_rank_num_tokens_padded,
                 all_rank_max_num_tokens=all_rank_max_num_tokens,
@@ -761,6 +789,7 @@ class WideEPMoE(MoE):
                 repeating_info=(is_first_call, is_last_call))
             outputs = self.reducescatter_or_allreduce(
                 outputs,
+                use_all_to_all,
                 all_rank_num_tokens=all_rank_num_tokens_padded,
                 use_dp_padding=use_dp_padding)
         else:
@@ -782,7 +811,7 @@ class WideEPMoE(MoE):
             all_rank_max_num_tokens_list = split_chunk(all_rank_max_num_tokens,
                                                        num_chunks)
             chunk_size_list = all_rank_chunk_size_list[self.rank]
-            if self.enable_alltoall:
+            if use_all_to_all:
                 all_rank_num_tokens_list = [[
                     1 if val == 0 else val for val in val_list
                 ] for val_list in all_rank_num_tokens_list]
@@ -794,7 +823,7 @@ class WideEPMoE(MoE):
             x_list = x.split(chunk_size_list)
             router_logits_list = router_logits.split(chunk_size_list)
 
-            if not self.enable_alltoall:
+            if not use_all_to_all:
                 self.event_dict[EventType.Main].record()
                 with torch.cuda.stream(self.aux_stream):
                     self.event_dict[EventType.Main].wait()
@@ -805,12 +834,13 @@ class WideEPMoE(MoE):
                     zip(x_list, router_logits_list)):
                 is_first_call = idx_chunk == 0 and self.repeat_idx == 0
                 is_last_call = idx_chunk == num_chunks - 1 and self.repeat_idx == self.repeat_count - 1
-                if not self.enable_alltoall:
+                if not use_all_to_all:
                     if idx_chunk % 2 == 0:
                         with torch.cuda.stream(self.aux_stream):
                             outputs = self.forward_chunk(
                                 x,
                                 router_logits,
+                                use_all_to_all,
                                 all_rank_num_tokens=all_rank_num_tokens_list[
                                     idx_chunk],
                                 all_rank_max_num_tokens=
@@ -820,6 +850,7 @@ class WideEPMoE(MoE):
                         if idx_chunk > 0:
                             outputs_list[-1] = self.reducescatter_or_allreduce(
                                 outputs_list[-1],
+                                use_all_to_all,
                                 all_rank_num_tokens=all_rank_num_tokens_list[
                                     idx_chunk - 1],
                                 use_dp_padding=use_dp_padding)
@@ -827,6 +858,7 @@ class WideEPMoE(MoE):
                         outputs = self.forward_chunk(
                             x,
                             router_logits,
+                            use_all_to_all,
                             all_rank_num_tokens=all_rank_num_tokens_list[
                                 idx_chunk],
                             all_rank_max_num_tokens=all_rank_max_num_tokens_list[
@@ -836,6 +868,7 @@ class WideEPMoE(MoE):
                         with torch.cuda.stream(self.aux_stream):
                             outputs_list[-1] = self.reducescatter_or_allreduce(
                                 outputs_list[-1],
+                                use_all_to_all,
                                 all_rank_num_tokens=all_rank_num_tokens_list[
                                     idx_chunk - 1],
                                 use_dp_padding=use_dp_padding)
@@ -843,22 +876,25 @@ class WideEPMoE(MoE):
                     outputs = self.forward_chunk(
                         x,
                         router_logits,
+                        use_all_to_all,
                         all_rank_num_tokens=all_rank_num_tokens_list[idx_chunk],
                         all_rank_max_num_tokens=all_rank_max_num_tokens_list[
                             idx_chunk],
                         repeating_info=(is_first_call, is_last_call))
 
                 outputs_list.append(outputs)
-            if not self.enable_alltoall:
+            if not use_all_to_all:
                 if num_chunks % 2 == 0:
                     outputs_list[-1] = self.reducescatter_or_allreduce(
                         outputs_list[-1],
+                        use_all_to_all,
                         all_rank_num_tokens=all_rank_num_tokens_list[-1],
                         use_dp_padding=use_dp_padding)
                 else:
                     with torch.cuda.stream(self.aux_stream):
                         outputs_list[-1] = self.reducescatter_or_allreduce(
                             outputs_list[-1],
+                            use_all_to_all,
                             all_rank_num_tokens=all_rank_num_tokens_list[-1],
                             use_dp_padding=use_dp_padding)
                 with torch.cuda.stream(self.aux_stream):
@@ -873,7 +909,7 @@ class WideEPMoE(MoE):
     def alltoall_prepare_maybe_dispatch(
             self, all_rank_max_num_tokens: int, x: torch.Tensor,
             token_selected_slots: torch.Tensor,
-            token_final_scales: torch.Tensor,
+            token_final_scales: torch.Tensor, use_postquant_alltoall: bool,
             local_statistic_tensor: Optional[torch.Tensor]):
         top_k = self.routing_method.experts_per_token
 
@@ -919,7 +955,7 @@ class WideEPMoE(MoE):
                 gathered_token_final_scales, all_rank_max_num_tokens,
                 self.num_slots, top_k, self.ep_rank, self.ep_size)
 
-        if not self.use_postquant_alltoall:
+        if not use_postquant_alltoall:
             assert not isinstance(
                 x, Fp4QuantizedTensor
             ), "pre-quant alltoall doesn't support fp4 tensor"
