@@ -540,7 +540,7 @@ void FusedMHARunnerV2::setTmaDescriptors(MHARunnerParams runnerParams)
 
         // Yuxin: dataTypeOut may be different with dataType, so desc_format and swizzle_mode
         // may be incorrect. For example, QKV are in bf16 while O is in fp8.
-        // Luckly, this case doesn't exist so far. But we should keep one eye on it.
+        // Luckily, this case doesn't exist so far. But we should keep one eye on it.
         qo_tma_descriptor.set_tma_desctriptor(o_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED,
             swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_o, tensor_stride_o, traversal_stride,
             box_size_o, oob_fill, fp32_to_tf32, &mKernelParams.tma_desc_o);
