@@ -223,6 +223,16 @@ uint16_t getIncrmentPort(uint16_t basePort)
     return list;
 }
 
+[[nodiscard]] nixl_reg_dlist_t NixlHelper::convertRegDlist(FileDescs const& descs)
+{
+    nixl_reg_dlist_t list(FILE_SEG);
+    for (auto const& desc : descs.getDescs())
+    {
+        list.addDesc(nixlBlobDesc{0, desc.getLen(), desc.getFd()});
+    }
+    return list;
+}
+
 [[nodiscard]] nixl_xfer_op_t NixlHelper::convert(TransferOp const& op)
 {
     switch (op)
@@ -241,6 +251,62 @@ uint16_t getIncrmentPort(uint16_t basePort)
         list.addDesc(nixlBasicDesc{desc.getAddr(), desc.getLen(), desc.getDeviceId()});
     }
     return list;
+}
+
+[[nodiscard]] nixl_xfer_dlist_t NixlHelper::convertXferDist(FileDescs const& descs)
+{
+    nixl_xfer_dlist_t list{FILE_SEG};
+    for (auto const& desc : descs.getDescs())
+    {
+        list.addDesc(nixlBasicDesc{0, desc.getLen(), desc.getFd()});
+    }
+    return list;
+}
+
+void NixlHelper::posixGpuToFileFallback(MemoryDescs const& memoryDescs, FileDescs const& fileDescs)
+{
+    auto const& memVec = memoryDescs.getDescs();
+    auto const& fileVec = fileDescs.getDescs();
+    std::size_t i;
+
+    for (i = 0; i < std::min(memVec.size(), fileVec.size()); i++)
+    {
+        auto& memDesc = memVec[i];
+        auto& fileDesc = fileVec[i];
+
+        ssize_t numBytes = static_cast<ssize_t>(memDesc.getLen());
+        std::vector<uint8_t> hostBuffer(numBytes);
+
+        cudaError_t cpyErr = cudaMemcpy(
+            hostBuffer.data(), reinterpret_cast<void*>(memDesc.getAddr()), numBytes, cudaMemcpyDeviceToHost);
+        TLLM_CHECK_WITH_INFO(cpyErr == cudaSuccess, "cudaMemcpy to host failed, error=%d", cpyErr);
+
+        ssize_t written = ::write(fileDesc.getFd(), hostBuffer.data(), numBytes);
+        TLLM_CHECK_WITH_INFO(written >= 0, "POSIX write error=%zd", written);
+    }
+}
+
+void NixlHelper::posixFileToGpuFallback(MemoryDescs const& memoryDescs, FileDescs const& fileDescs)
+{
+    auto const& memVec = memoryDescs.getDescs();
+    auto const& fileVec = fileDescs.getDescs();
+    std::size_t i;
+
+    for (i = 0; i < std::min(memVec.size(), fileVec.size()); i++)
+    {
+        auto& memDesc = memVec[i];
+        auto& fileDesc = fileVec[i];
+
+        ssize_t numBytes = static_cast<ssize_t>(memDesc.getLen());
+        std::vector<uint8_t> hostBuffer(numBytes);
+
+        ssize_t bytesRead = ::read(fileDesc.getFd(), hostBuffer.data(), numBytes);
+        TLLM_CHECK_WITH_INFO(bytesRead == numBytes, "POSIX read error=%zd", bytesRead);
+
+        cudaError_t cpyErr = cudaMemcpy(
+            reinterpret_cast<void*>(memDesc.getAddr()), hostBuffer.data(), numBytes, cudaMemcpyHostToDevice);
+        TLLM_CHECK_WITH_INFO(cpyErr == cudaSuccess, "cudaMemcpy to device failed, error=%d", cpyErr);
+    }
 }
 
 NixlTransferStatus::NixlTransferStatus(nixlAgent* agent, nixlXferReqH* handle)
@@ -457,6 +523,125 @@ NixlTransferAgent::~NixlTransferAgent()
     TLLM_LOG_DEBUG("NixlTransferAgent::~NixlTransferAgent");
 }
 
+NixlLoopbackAgent::NixlLoopbackAgent(BaseAgentConfig const& config)
+    : mName{config.mName}
+{
+    nixlAgentConfig nixlConfig{config.useProgThread};
+    nixlBackendH* backend;
+    nixl_status_t status;
+    nixl_b_params_t init;
+
+    mRawAgent = std::make_unique<nixlAgent>(config.mName, std::move(nixlConfig));
+    init["batch_pool_size"] = std::to_string(8);
+    init["batch_limit"] = std::to_string(128);
+    init["max_request_size"] = std::to_string(16 * 1024 * 1024);
+
+    status = mRawAgent->createBackend("GDS", init, backend);
+    if (status != NIXL_SUCCESS || !backend)
+    {
+        TLLM_THROW("Failed to create NIXL backend, status = %d", status);
+    }
+}
+
+int NixlLoopbackAgent::registerMemory(MemoryDescs const& descs)
+{
+    nixl_status_t status = mRawAgent->registerMem(NixlHelper::convertRegDlist(descs));
+    if (status != NIXL_SUCCESS)
+        return -1;
+
+    return 0;
+}
+
+int NixlLoopbackAgent::deregisterMemory(MemoryDescs const& descs)
+{
+    nixl_status_t status = mRawAgent->deregisterMem(NixlHelper::convertRegDlist(descs));
+    if (status != NIXL_SUCCESS)
+        return -1;
+
+    return 0;
+}
+
+int NixlLoopbackAgent::registerFiles(FileDescs const& descs)
+{
+    nixl_status_t status = mRawAgent->registerMem(NixlHelper::convertRegDlist(descs));
+    if (status != NIXL_SUCCESS)
+        return -1;
+
+    return 0;
+}
+
+int NixlLoopbackAgent::deregisterFiles(FileDescs const& descs)
+{
+    nixl_status_t status = mRawAgent->deregisterMem(NixlHelper::convertRegDlist(descs));
+    if (status != NIXL_SUCCESS)
+        return -1;
+
+    return 0;
+}
+
+std::unique_ptr<TransferStatus> NixlLoopbackAgent::submitLoopbackRequests(
+    MemoryDescs const& memoryDescs, FileDescs const& fileDescs, bool isOffload)
+{
+    nixl_xfer_dlist_t vram_seg = NixlHelper::convertXferDist(memoryDescs);
+    nixl_xfer_dlist_t file_seg = NixlHelper::convertXferDist(fileDescs);
+    nixl_xfer_dlist_t& src = isOffload ? vram_seg : file_seg;
+    nixl_xfer_dlist_t& dst = isOffload ? file_seg : vram_seg;
+    nixl_xfer_op_t op = isOffload ? NIXL_WRITE : NIXL_READ;
+    nixlXferReqH* handle = nullptr;
+
+    nixl_status_t status = mRawAgent->createXferReq(op, src, dst, mName, handle);
+    TLLM_CHECK(status == NIXL_SUCCESS && handle);
+    status = mRawAgent->postXferReq(handle);
+    TLLM_CHECK(status == NIXL_IN_PROG);
+
+    return std::make_unique<NixlTransferStatus>(mRawAgent.get(), handle);
+}
+
+void NixlLoopbackAgent::executeLoopbackRequest(
+    MemoryDescs const& memoryDescs, FileDescs const& fileDescs, bool isOffload)
+{
+    bool fallback = false;
+    int ret;
+
+    ret = this->registerFiles(fileDescs);
+    if (ret < 0)
+    { // register can fail if no GDS support
+        TLLM_LOG_DEBUG("NIXL GDS register files failed, using POSIX fallback");
+        fallback = true;
+    }
+    else
+    {
+        ret = this->registerMemory(memoryDescs);
+        if (ret < 0)
+        { // register can fail if no GDS support
+            TLLM_LOG_DEBUG("NIXL GDS register memory failed, using POSIX fallback");
+            this->deregisterFiles(fileDescs);
+            fallback = true;
+        }
+    }
+
+    if (fallback)
+    {
+        if (isOffload)
+        {
+            NixlHelper::posixGpuToFileFallback(memoryDescs, fileDescs);
+        }
+        else
+        {
+            NixlHelper::posixFileToGpuFallback(memoryDescs, fileDescs);
+        }
+
+        return;
+    }
+
+    std::unique_ptr<TransferStatus> status = this->submitLoopbackRequests(memoryDescs, fileDescs, isOffload);
+    TLLM_CHECK_WITH_INFO(status != nullptr, "submitLoopbackRequests failed");
+    status->wait();
+
+    this->deregisterMemory(memoryDescs);
+    this->deregisterFiles(fileDescs);
+}
+
 #if defined(__clang__)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wreturn-type-c-linkage"
@@ -468,6 +653,15 @@ extern "C"
     {
         TLLM_CHECK(config);
         return std::make_unique<NixlTransferAgent>(*config);
+    }
+}
+
+extern "C"
+{
+    std::shared_ptr<BaseLoopbackAgent> createNixlLoopbackAgent(BaseAgentConfig const* config)
+    {
+        TLLM_CHECK(config);
+        return std::make_shared<NixlLoopbackAgent>(*config);
     }
 }
 
