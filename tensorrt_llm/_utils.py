@@ -518,7 +518,7 @@ def mpi_allgather(obj):
 
 def mpi_isend(buf, dest, tag=0):
     # isend in buf-like objects (e.g. numpy array)
-    # return request handle if is_multi_device_enable()
+    # return request handle if ENABLE_MULTI_DEVICE
     if ENABLE_MULTI_DEVICE:
         return mpi_comm().Isend(buf, dest, tag=tag)
     return None
@@ -526,7 +526,7 @@ def mpi_isend(buf, dest, tag=0):
 
 def mpi_send(buf, dest, tag=0):
     # send in buf-like objects (e.g. numpy array)
-    # return request handle if is_multi_device_enable()
+    # return request handle if ENABLE_MULTI_DEVICE
     if ENABLE_MULTI_DEVICE:
         mpi_comm().Send(buf, dest, tag=tag)
     return None
