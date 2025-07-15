@@ -116,6 +116,7 @@ jobs:
             const lastCheckbox = matches[matches.length - 1];
             const isAcknowledged = lastCheckbox && lastCheckbox[1].toLowerCase() === 'x';
 
+
             // Determine status based on checked items
             let state, description;
             if (!isAcknowledged) {
