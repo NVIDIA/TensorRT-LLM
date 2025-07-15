@@ -4,6 +4,7 @@ import re
 import tarfile
 from collections import defaultdict
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
@@ -218,8 +219,69 @@ class HfLoraLoader:
         return list(lora_target_modules)
 
 
+@lru_cache(maxsize=32)
+def _find_nemo_files_cached(lora_dirs_tuple):
+    # Helper for caching: lora_dirs must be a tuple of strings
+    nemo_files = []
+
+    for lora_path in lora_dirs_tuple:
+        path = Path(lora_path)
+        if not path.exists():
+            raise ValueError(f"{path} does not exist")
+
+        if path.is_file():
+            if path.suffix == ".nemo":
+                nemo_files.append(str(path))
+            else:
+                raise ValueError(f"{path} is not a .nemo file")
+        elif path.is_dir():
+            nemo_files_in_dir = list(path.glob("*.nemo"))
+            if not nemo_files_in_dir:
+                raise ValueError(f"No .nemo files found in directory {path}")
+            nemo_files.extend([str(f) for f in nemo_files_in_dir])
+        else:
+            raise ValueError(f"{path} is neither a file nor a directory")
+
+    if not nemo_files:
+        raise ValueError("No .nemo files found in the provided paths")
+
+    return nemo_files
+
+
+def find_nemo_files(lora_dirs: List[str]) -> List[str]:
+    """Find all .nemo files from a list of directories or file paths.
+
+    This function is optimized for repeated calls by using an internal LRU cache.
+
+    Args:
+        lora_dirs: List of paths that can be either:
+                  - Direct paths to .nemo files
+                  - Directories containing .nemo files (will auto-detect *.nemo)
+
+    Returns:
+        List[str]: List of paths to .nemo files
+
+    Raises:
+        ValueError: If path doesn't exist, no .nemo files found, or invalid file type
+    """
+    if len(lora_dirs) == 0:
+        return []
+    return _find_nemo_files_cached(tuple(lora_dirs))
+
+
 class NemoLoraLoader:
     def __init__(self, lora_dirs: List[str]):
+        """Initialize NemoLoraLoader with paths to .nemo files or directories.
+
+        Args:
+            lora_dirs: List of paths that can be either:
+                      - Direct paths to .nemo files
+                      - Directories containing .nemo files (will auto-detect *.nemo)
+
+        Note: The parameter name 'lora_dirs' is misleading - it can accept both
+              directories and files. This is a design flaw that should be fixed
+              in a future version (e.g., rename to 'lora_paths').
+        """
         self.lora_target_modules = []
         self.is_valid = False
 
@@ -230,8 +292,6 @@ class NemoLoraLoader:
             path = Path(lora_file)
             if not path.exists():
                 raise ValueError(f"{path} does not exist")
-            if not path.is_file():
-                raise ValueError(f"{path} is not a file")
         self.is_valid = True
         # Hardcoded since LoraManager only supports this case now
         self.lora_target_modules = ["attn_qkv"]
@@ -243,6 +303,10 @@ class NemoLoraLoader:
 
 def load_nemo_lora(model, lora_config: LoraConfig):
     lora_loader = NemoLoraLoader(lora_config.lora_dir)
+
+    if not lora_loader.is_valid:
+        raise ValueError(f"Failed to load NeMo LoRA from {lora_config.lora_dir}")
+
     if len(lora_config.lora_target_modules) == 0:
         lora_config.lora_target_modules = lora_loader.lora_target_modules
 
@@ -591,8 +655,12 @@ class LoraManager(object):
                 uids=uids,
             )
         elif ckpt_source == "nemo":
+            # Find all .nemo files from directories or files
+            nemo_files = find_nemo_files(model_dirs_or_files)
+
+            # Pass the actual .nemo files to the loader
             return self.load_from_nemo(
-                model_files=model_dirs_or_files,
+                model_files=nemo_files,
                 model_config=model_config,
                 runtime_mapping=runtime_mapping,
                 uids=uids,
