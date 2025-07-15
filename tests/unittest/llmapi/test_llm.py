@@ -1514,7 +1514,7 @@ def test_llama_7b_multi_lora_load_previously_cpu_cache_evicted_adapter_fails(
     repeats = 2
     with EnvVarsContextManager({"TLLM_WORKER_USE_SINGLE_PROCESS": "1"}):
         child_stdout, child_stderr = run_function_in_sub_process(
-            target=llama_7b_multi_lora,
+            target=llama_7b_multi_unique_lora_adapters_from_request,
             args=(lora_adapter_count_per_call, max_loras, max_cpu_loras,
                   repeats),
             kwargs={},
