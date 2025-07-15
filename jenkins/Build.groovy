@@ -306,18 +306,19 @@ def uploadArtifacts(artifacts, prefix = UPLOAD_PATH, retryTimes = 2, serverId = 
     for (it in artifacts) {
         def uploadpath = it.key
         def filepath = it.value
-        echo "uploading ${filepath} as ${uploadpath}"
-        trtllm_utils.llmRetry(retryTimes, "uploadArtifacts", {
-            rtUpload (
-                serverId: serverId,
-                spec: """{
+        def spec = """{
                     "files": [
                         {
                         "pattern": "${filepath}",
                         "target": "${prefix}/${uploadpath}"
                         }
                     ]
-                }""",
+                }"""
+        echo "uploading ${filepath} as ${uploadpath}, spec: ${spec}"
+        trtllm_utils.llmRetry(retryTimes, "uploadArtifacts", {
+            rtUpload (
+                serverId: serverId,
+                spec: spec,
             )
         })
     }
