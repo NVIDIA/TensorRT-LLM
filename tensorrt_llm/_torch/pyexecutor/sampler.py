@@ -796,31 +796,31 @@ class BlockPredictionSampler(TorchSampler):
         Returns:
             SampleStateBlockPrediction with block prediction results
         """
-        # Add logging to verify block prediction is being called
-        logger.info(f"[BLOCK_PREDICTION] BlockPredictionSampler.sample_async called")
-        logger.info(f"[BLOCK_PREDICTION] Batch size: {scheduled_requests.batch_size}")
-        logger.info(f"[BLOCK_PREDICTION] Block size: {self.block_size}")
-        logger.info(f"[BLOCK_PREDICTION] Keep threshold: {self.keep_threshold}")
+        # Print statements to verify block prediction is being called
+        print(f"[BLOCK_PREDICTION] BlockPredictionSampler.sample_async called")
+        print(f"[BLOCK_PREDICTION] Batch size: {scheduled_requests.batch_size}")
+        print(f"[BLOCK_PREDICTION] Block size: {self.block_size}")
+        print(f"[BLOCK_PREDICTION] Keep threshold: {self.keep_threshold}")
         
         logits = model_outputs["logits"]
-        logger.info(f"[BLOCK_PREDICTION] Logits shape: {logits.shape}")
+        print(f"[BLOCK_PREDICTION] Logits shape: {logits.shape}")
         
         batch_size = scheduled_requests.batch_size
         
         # Initialize masked chunks for each request
         masked_chunks = torch.full((batch_size, self.block_size), 
                                   self.mask_token_id, 
-                                  dtype=torch.int, 
+                                  dtype=torch.int64, 
                                   device=logits.device)
         
-        logger.info(f"[BLOCK_PREDICTION] Initial masked_chunks: {masked_chunks.tolist()}")
+        print(f"[BLOCK_PREDICTION] Initial masked_chunks: {masked_chunks.cpu().tolist()}")
         
         # Track probabilities and predicted tokens
         block_probs = torch.zeros((batch_size, self.block_size), 
-                                 dtype=torch.float, 
+                                 dtype=logits.dtype, 
                                  device=logits.device)
         block_tokens = torch.zeros((batch_size, self.block_size), 
-                                  dtype=torch.int, 
+                                  dtype=torch.int64, 
                                   device=logits.device)
         
         # Perform iterative block prediction
@@ -828,11 +828,11 @@ class BlockPredictionSampler(TorchSampler):
         for iteration in range(self.max_iterations):
             iteration_count = iteration + 1
             
-            logger.info(f"[BLOCK_PREDICTION] Iteration {iteration_count}")
+            print(f"[BLOCK_PREDICTION] Iteration {iteration_count}")
             
             # Check if all tokens are unmasked
             if torch.all(masked_chunks != self.mask_token_id):
-                logger.info(f"[BLOCK_PREDICTION] All tokens unmasked, breaking")
+                print(f"[BLOCK_PREDICTION] All tokens unmasked, breaking")
                 break
                 
             # Extract logits for the block positions
@@ -909,9 +909,14 @@ class BlockPredictionSampler(TorchSampler):
                     masked_chunks[batch_idx, update_indices] = masked_pred_tokens[above_threshold]
                     block_probs[batch_idx, update_indices] = masked_confidences[above_threshold]
                     block_tokens[batch_idx, update_indices] = masked_pred_tokens[above_threshold]
+                    # Print the details of newly unmasked tokens for this batch
+                    newly_unmasked_tokens = masked_pred_tokens[above_threshold].cpu().tolist()
+                    print(
+                        f"[BLOCK_PREDICTION] Iter {iteration_count} - batch {batch_idx}: "
+                        f"unmasked {len(update_indices)} tokens -> {newly_unmasked_tokens}")
         
         # Create new tokens tensor for the first unmasked token of each request
-        new_tokens_device = torch.zeros(batch_size, dtype=torch.int, device=logits.device)
+        new_tokens_device = torch.zeros(batch_size, dtype=torch.int64, device=logits.device)
         for batch_idx in range(batch_size):
             # Find the first unmasked token
             unmasked_positions = (masked_chunks[batch_idx] != self.mask_token_id)

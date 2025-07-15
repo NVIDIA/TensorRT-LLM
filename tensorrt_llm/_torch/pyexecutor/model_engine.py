@@ -1331,11 +1331,17 @@ class PyTorchModelEngine(ModelEngine):
                 prompt_lengths.append(request.py_prompt_len)
                 request_ids.append(request.py_request_id)
 
+        # Initialize sequence_lengths for generation requests
+        # We'll update these in the loop below for block prediction
         sequence_lengths.extend([1] * len(generation_requests))
+        
+        # Initialize gather_ids for generation requests
+        # We'll update these in the loop below for block prediction
         gather_ids.extend(
             list(
                 range(len(position_ids),
                       len(position_ids) + len(generation_requests))))
+        
         for request in generation_requests:
             # the request has no previous tensor:
             # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
@@ -1345,7 +1351,37 @@ class PyTorchModelEngine(ModelEngine):
                 # skip adding input_ids of CUDA graph dummy requests so that new_tokens_device
                 # can be aligned to the correct positions.
                 if not request.is_cuda_graph_dummy:
-                    input_ids.append(request.get_last_tokens(0))
+                    input_token_id = request.get_token(0,
+                                                       request.get_num_tokens(0) - 1)
+                    
+                    # For block prediction, we need to add the entire block of tokens
+                    # (last real token + block_size mask tokens)
+                    if self.pytorch_backend_config.enable_block_prediction:
+                        block_size = self.pytorch_backend_config.block_size
+                        mask_token_id = self.pytorch_backend_config.mask_token_id
+                        
+                        input_ids.append(input_token_id)
+                        input_ids.extend([mask_token_id] * block_size)
+                        
+                        # Update position IDs for the entire block
+                        # First add position ID for the last real token, then for the mask tokens
+                        last_pos_id = position_ids[-1] if position_ids else request.max_beam_num_tokens - 1
+                        position_ids.append(last_pos_id + 1)  # Position for the last real token
+                        position_ids.extend(range(last_pos_id + 2, last_pos_id + 2 + block_size))  # Positions for mask tokens
+                        
+                        # Update sequence length for this request (replace the 1 we added earlier)
+                        sequence_lengths[-1] = 1 + block_size
+                        
+                        # Update gather IDs for the entire block
+                        # Remove the single gather_id we added earlier and add gather_ids for all block tokens
+                        gather_ids.pop()  # Remove the single gather_id we added earlier
+                        gather_ids.extend(range(len(position_ids) - block_size, len(position_ids)))
+                    else:
+                        input_ids.append(input_token_id)
+                        position_ids.append(request.max_beam_num_tokens - 1)
+                        # sequence_lengths already has 1 for this request
+                        # gather_ids already has the correct single gather_id
+                        
                 past_seen_token_num = request.max_beam_num_tokens - 1
             else:
                 # the request has previous tensor
@@ -1353,7 +1389,6 @@ class PyTorchModelEngine(ModelEngine):
                 past_seen_token_num = request.max_beam_num_tokens
 
             request_ids.append(request.py_request_id)
-            position_ids.append(past_seen_token_num)
             num_cached_tokens_per_seq.append(past_seen_token_num)
             prompt_lengths.append(request.py_prompt_len)
             draft_lens.append(0)
@@ -1368,6 +1403,12 @@ class PyTorchModelEngine(ModelEngine):
         total_num_tokens = len(position_ids)
         assert total_num_tokens <= self.max_num_tokens, (
             "total_num_tokens should be less than or equal to max_num_tokens")
+        
+        # Assert input_ids and position_ids match sum of sequence_lengths
+        assert len(input_ids) == len(position_ids) == sum(sequence_lengths), (
+            f"input_ids: {len(input_ids)}, position_ids: {len(position_ids)}, sum(sequence_lengths): {sum(sequence_lengths)}"
+        )
+        
         # if exist requests that do not have previous batch, copy input_ids and draft_tokens
         if num_tokens > 0:
             input_ids = torch.tensor(input_ids,
@@ -1476,6 +1517,13 @@ class PyTorchModelEngine(ModelEngine):
             self.spec_config.num_extra_kv_tokens)
         attn_metadata.kv_cache_manager = kv_cache_manager
 
+        # Print debug info before preparing attention metadata
+        print("[BLOCK_PREDICTION DEBUG] input_ids shape:", input_ids.shape if hasattr(input_ids, 'shape') else len(input_ids))
+        print("[BLOCK_PREDICTION DEBUG] position_ids shape:", position_ids.shape if hasattr(position_ids, 'shape') else len(position_ids))
+        print("[BLOCK_PREDICTION DEBUG] sequence_lengths:", sequence_lengths)
+        if not attn_metadata.is_cuda_graph:
+            print("[BLOCK_PREDICTION DEBUG] attn_metadata.seq_lens (before):", sequence_lengths)
+        print("[BLOCK_PREDICTION DEBUG] attn_metadata.num_seqs (before):", getattr(attn_metadata, 'num_seqs', None))
         attn_metadata.prepare()
 
         lora_params = self._get_lora_params_from_requests(
@@ -2123,7 +2171,7 @@ class PyTorchModelEngine(ModelEngine):
                     "seq_slot_manager")
                 self.guided_decoder.build(scheduled_requests, seq_slot_manager)
                 self.guided_decoder.execute(scheduled_requests,
-                                            outputs['logits'], seq_slot_manager)
+                                           outputs['logits'], seq_slot_manager)
 
             self._execute_logit_post_processors(scheduled_requests, outputs)
 

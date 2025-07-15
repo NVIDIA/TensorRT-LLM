@@ -9,6 +9,7 @@ This process repeats until all tokens are unmasked.
 """
 
 import torch
+from transformers import AutoTokenizer
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 
@@ -16,11 +17,12 @@ from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 def main():
     # Create an LLM with block prediction enabled
     llm = LLM(
-        model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",  # Using a supported model
+        model="Dream-org/Dream-v0-Instruct-7B",  # Using a supported model
+        tokenizer=AutoTokenizer.from_pretrained("Dream-org/Dream-v0-Instruct-7B", trust_remote_code=True),
         backend="pytorch",
         enable_block_prediction=True,
         block_size=8,  # Number of tokens to predict in each block
-        keep_threshold=0.8,  # Confidence threshold for keeping tokens
+        keep_threshold=0.6,  # Confidence threshold for keeping tokens
         mask_token_id=151666,  # Token ID to use as mask
         max_iterations=10,  # Maximum number of iterations
         max_batch_size=1,
@@ -54,6 +56,7 @@ def main():
         max_tokens=50,
         temperature=0.7,
         top_p=0.9,
+        end_id=151643,  # Add end_id to prevent ValueError
     )
     
     # Generate text with block prediction

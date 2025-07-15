@@ -1325,16 +1325,29 @@ class DreamForCausalLM(DecoderModelForCausalLM[DreamModel, DreamConfig]):
             lora_params=lora_params,
         )
 
+        # For block prediction, we need to return logits for the entire block
+        # (last real token + all mask tokens), not just the last token
         if not return_context_logits:
             if attn_metadata is not None and attn_metadata.seq_lens_cuda is not None:
-                last_tokens = torch.cumsum(
-                    attn_metadata.seq_lens_cuda,
-                    dim=0,
-                    dtype=torch.long,
-                ) - 1
-                hidden_states = hidden_states[last_tokens]
+                # Check if this is a block prediction request by looking at sequence lengths
+                # Block prediction will have sequence lengths > 1 for generation requests
+                is_block_prediction = any(seq_len > 1 for seq_len in attn_metadata.seq_lens_cuda)
+                
+                if is_block_prediction:
+                    # For block prediction, return all hidden states for the block
+                    # The gather_ids will be set up to select the appropriate tokens
+                    pass  # Return all hidden states
+                else:
+                    # For regular generation, return only the last token
+                    last_tokens = torch.cumsum(
+                        attn_metadata.seq_lens_cuda,
+                        dim=0,
+                        dtype=torch.long,
+                    ) - 1
+                    hidden_states = hidden_states[last_tokens]
             else:
-                hidden_states = hidden_states[-1]
+                # Fallback: return only the last token
+                hidden_states = hidden_states[:, -1]
 
         # Ensure hidden_states are in the correct dtype
         if hasattr(self.model, 'config') and hasattr(self.model.config, 'torch_dtype'):

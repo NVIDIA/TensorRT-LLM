@@ -1760,9 +1760,15 @@ class PyExecutor:
                 gather_context_logits=gather_context_logits)
 
         try:
-            gather_context_logits = any(
-                a.py_return_context_logits
-                for a in scheduled_requests.context_requests)
+            # For block prediction we need logits for every position in the newly allocated block, not
+            # just for the last token.  Force `gather_context_logits` to True when the block-prediction
+            # sampler is active so the model forward pass returns the full per-token logits tensor.
+            if hasattr(self, 'block_prediction_sampler') and self.block_prediction_sampler is not None:
+                gather_context_logits = True
+            else:
+                gather_context_logits = any(
+                    a.py_return_context_logits
+                    for a in scheduled_requests.context_requests)
             outputs = forward(scheduled_requests, self.resource_manager,
                               new_tensors_device, gather_context_logits)
             return outputs
@@ -1790,9 +1796,15 @@ class PyExecutor:
                 gather_context_logits=gather_context_logits)
 
         try:
-            gather_context_logits = any(
-                a.py_return_context_logits
-                for a in scheduled_requests.context_requests)
+            # For block prediction we need logits for every position in the newly allocated block, not
+            # just for the last token.  Force `gather_context_logits` to True when the block-prediction
+            # sampler is active so the model forward pass returns the full per-token logits tensor.
+            if hasattr(self, 'block_prediction_sampler') and self.block_prediction_sampler is not None:
+                gather_context_logits = True
+            else:
+                gather_context_logits = any(
+                    a.py_return_context_logits
+                    for a in scheduled_requests.context_requests)
             outputs = forward(scheduled_requests, self.resource_manager,
                               new_tensors_device, gather_context_logits)
             return outputs
@@ -1867,11 +1879,16 @@ class PyExecutor:
                     return self.block_prediction_sampler.sample_async(scheduled_batch, batch_outputs)
                 else:
                     return self.sampler.sample_async(scheduled_batch, batch_outputs)
+            else:
+                # Return a dummy sample state if no batch outputs
+                return SampleState(scheduled_requests=scheduled_batch)
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
+            # Return a dummy sample state to prevent None errors
+            return SampleState(scheduled_requests=scheduled_batch)
 
 
     @nvtx_range("_setup_sampler_step")
