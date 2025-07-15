@@ -443,8 +443,8 @@ def print_memory_info(module: torch.nn.Module, data_tensor,
             )
         else:
             delta_msg = ''
-            before_forward_info: MemoryInfo = memory_info[
-                module_path] if module_path in memory_info else None
+            before_forward_info: MemoryInfo = memory_info.pop(
+                module_path) if module_path in memory_info else None
             if before_forward_info is not None:
                 delta_total_used = (total_gpu_memory - end) - (
                     before_forward_info.gpu_total - before_forward_info.free)
