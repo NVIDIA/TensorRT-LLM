@@ -141,7 +141,7 @@ SizeType32 HandleContextLogits::operator()(DecoderInputBuffers& inputBuffers, Re
         if (reqBeamWidth > 1)
         {
             // Tile logits of context requests
-            auto const logitsShape = logitsView->getShape();
+            auto const& logitsShape = logitsView->getShape();
             auto const logitsType = logitsView->getDataType();
             decoderLogits = manager.gpu(ITensor::makeShape({reqBeamWidth, logitsShape.d[1]}), logitsType);
             tensorrt_llm::runtime::kernels::tileTensor(*decoderLogits, *logitsView, reqBeamWidth, manager.getStream());
@@ -149,9 +149,8 @@ SizeType32 HandleContextLogits::operator()(DecoderInputBuffers& inputBuffers, Re
         }
         else
         {
-            auto const logitsViewShape = logitsView->getShape();
-            decoderLogits
-                = ITensor::view(logitsView, ITensor::makeShape({logitsViewShape.d[0], 1, logitsViewShape.d[1]}));
+            decoderLogits = logitsView;
+            decoderLogits->unsqueeze(1);
         }
 
         ++batchIndex;

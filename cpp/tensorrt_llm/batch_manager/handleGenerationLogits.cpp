@@ -102,7 +102,7 @@ void HandleGenerationLogits::operator()(DecoderInputBuffers& inputBuffers, Reque
         TLLM_CHECK_DEBUG_WITH_INFO(tru::tensorHasInvalid<float>(*logitsView, manager, "logits") == false,
             "Found invalid number (NaN or Inf) in logits");
         auto& decoderLogits = inputBuffers.logits.at(seqSlot);
-        auto const logitsViewShape = logitsView->getShape();
+
         if (reqBeamWidth > 1)
         {
             decoderLogits = logitsView;
@@ -110,8 +110,8 @@ void HandleGenerationLogits::operator()(DecoderInputBuffers& inputBuffers, Reque
         }
         else
         {
-            decoderLogits
-                = ITensor::view(logitsView, ITensor::makeShape({logitsViewShape.d[0], 1, logitsViewShape.d[1]}));
+            decoderLogits = logitsView;
+            decoderLogits->unsqueeze(1);
         }
 
         if (llmReq->getReturnGenerationLogits())
