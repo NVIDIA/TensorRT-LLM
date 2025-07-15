@@ -14,7 +14,7 @@ def model_name():
     return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 
-@pytest.fixture(scope="module", params=[None, 'pytorch'])
+@pytest.fixture(scope="module", params=["trt", 'pytorch'])
 def backend(request):
     return request.param
 

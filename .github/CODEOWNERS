@@ -7,6 +7,12 @@
 # * @NVIDIA/trt-llm-release-branch-approval
 
 
+### LLM API ##
+/tensorrt_llm/llmapi @NVIDIA/trt-llm-llmapi-devs
+
+### Executor ###
+/tensorrt_llm/executor @NVIDIA/trt-llm-llmapi-devs
+
 ### BENCHMARKING ###
 ## TensorRT-LLM trtllm-bench Reviewers
 /tensorrt_llm/bench @NVIDIA/trtllm-bench-reviewers
