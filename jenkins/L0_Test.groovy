@@ -1640,7 +1640,7 @@ def checkStageNameSet(stageNames, jobKeys, paramName) {
     invalidStageName = stageNames.findAll { !(it in jobKeys) }
     if (invalidStageName) {
         def sortedJobKeys = jobKeys.sort()
-        throw new Exception("Cannot find the stage names [${invalidStageName}] from the passed params [${paramName}]. Available stage names (${sortedJobKeys.size()} total):\n${sortedJobKeys.collect { "  - ${it}" }.join('\n')}")
+        throw new Exception("Cannot find the stage names [${invalidStageName}] from the passed params [${paramName}]. Available stage names (${sortedJobKeys.size()} total):\n${sortedJobKeys.collect { "    ${it}" }.join('\n')}")
     }
 }
 
