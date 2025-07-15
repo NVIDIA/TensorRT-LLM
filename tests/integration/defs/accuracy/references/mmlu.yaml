@@ -256,3 +256,5 @@ LGAI-EXAONE/EXAONE-4.0-32B:
   - accuracy: 78.52
 OpenAI/BF16:
   - accuracy: 77.50
+OpenAI/MXFP4:
+  - accuracy: 75.50
