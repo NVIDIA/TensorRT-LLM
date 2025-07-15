@@ -18,7 +18,12 @@
 
 #include "cutlass_extensions/gemm_configs.h"
 #include "cutlass_extensions/weight_only_quant_op.h"
+#include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/fpA_intB_gemm.h"
+#include "tensorrt_llm/thop/thUtils.h"
+#include "tensorrt_llm/thop/userbuffersTensor.h"
+
 #include <torch/extension.h>
 
 using namespace tensorrt_llm::kernels::cutlass_kernels;
@@ -34,7 +39,7 @@ public:
     explicit WeightOnlyQuantGemmRunner(at::ScalarType activation_dtype, at::ScalarType weight_dtype);
 
     at::Tensor runGemm(at::Tensor const& mat_a, at::Tensor const& mat_b, at::Tensor const& weight_scales,
-        int64_t config_idx, std::optional<c10::ScalarType> out_dtype);
+        int64_t config_idx, bool to_userbuffers, std::optional<c10::ScalarType> out_dtype);
 
     int64_t getNumConfigs() const;
 

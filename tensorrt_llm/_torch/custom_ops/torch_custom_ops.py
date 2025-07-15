@@ -716,6 +716,7 @@ class WeightOnlyQuantGemmRunner(TunableRunner):
             weight,
             weight_scale,
             tactic,
+            self.to_userbuffers,
             self.output_dtype,
         )
 

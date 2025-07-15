@@ -58,6 +58,8 @@ def woq_tolerence_calculate(output, output_ref, b_dtype):
     [torch.int8, torch.quint4x2],
 )
 def test_weight_only_quant_gemm(a_dtype, b_dtype, m, k, n):
+    import tensorrt_llm  # noqa: F401
+
     torch.random.manual_seed(0)
 
     # generate a, int4/int8 b, and scales
