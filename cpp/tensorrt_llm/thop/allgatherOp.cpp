@@ -82,8 +82,8 @@ public:
             auto output = torch::empty(outputShape, input.options());
             if (use_nccl_allgather)
             {
-                NCCLCHECK_THROW(ncclAllGather(input.data_ptr(), output.mutable_data_ptr(), input.numel(),
-                    (*getDtypeMap())[type], *mNcclComm, stream));
+                ncclAllGather(input.data_ptr(), output.mutable_data_ptr(), input.numel(), (*getDtypeMap())[type],
+                    *mNcclComm, stream);
             }
             else
             {
@@ -93,15 +93,15 @@ public:
                 for (int root = 0; root < static_cast<int>(mGroup.size()); ++root)
                 {
                     auto split_size = sizes.value()[root];
-                    NCCLCHECK_THROW(ncclBroadcast(input.data_ptr(),
+                    ncclBroadcast(input.data_ptr(),
                         output.index({torch::indexing::Slice(split_offset, torch::indexing::None)}).mutable_data_ptr(),
-                        numel_base * split_size, (*getDtypeMap())[type], root, *mNcclComm, stream));
+                        numel_base * split_size, (*getDtypeMap())[type], root, *mNcclComm, stream);
                     split_offset += split_size;
                 }
             }
             output_list.push_back(output);
         }
-        ncclGroupEnd();
+        NCCLCHECK_THROW(ncclGroupEnd());
         return output_list;
     }
 

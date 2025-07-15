@@ -55,8 +55,7 @@ public:
         return 0;
     }
 
-    std::vector<torch::Tensor> run_list(
-        torch::TensorList input_list, torch::optional<torch::List<int64_t>> sizes) noexcept
+    std::vector<torch::Tensor> run_list(torch::TensorList input_list, torch::optional<torch::List<int64_t>> sizes)
     {
         TLLM_CHECK_WITH_INFO(mNcclComm.get() != nullptr, "mNcclComm should be initialized before used");
         bool use_nccl_reducescatter = !sizes.has_value()
@@ -93,8 +92,8 @@ public:
             auto output = torch::empty(outputShape, input.options());
             if (use_nccl_reducescatter)
             {
-                NCCLCHECK_THROW(ncclReduceScatter(input.data_ptr(), output.mutable_data_ptr(), output.numel(),
-                    (*getDtypeMap())[type], ncclSum, *mNcclComm, stream));
+                ncclReduceScatter(input.data_ptr(), output.mutable_data_ptr(), output.numel(), (*getDtypeMap())[type],
+                    ncclSum, *mNcclComm, stream);
             }
             else
             {
@@ -104,16 +103,15 @@ public:
                 for (int root = 0; root < static_cast<int>(mGroup.size()); ++root)
                 {
                     auto split_size = sizes.value()[root];
-                    NCCLCHECK_THROW(ncclReduce(
-                        input.index({torch::indexing::Slice(split_offset, torch::indexing::None)}).data_ptr(),
+                    ncclReduce(input.index({torch::indexing::Slice(split_offset, torch::indexing::None)}).data_ptr(),
                         output.mutable_data_ptr(), numel_base * split_size, (*getDtypeMap())[type], ncclSum, root,
-                        *mNcclComm, stream));
+                        *mNcclComm, stream);
                     split_offset += split_size;
                 }
             }
             output_list.push_back(output);
         }
-        ncclGroupEnd();
+        NCCLCHECK_THROW(ncclGroupEnd());
         return output_list;
     }
 
