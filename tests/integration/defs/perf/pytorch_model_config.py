@@ -139,7 +139,9 @@ def get_model_yaml_config(model_label: str,
             ],
             'config': {
                 'enable_attention_dp': False,
-                'moe_backend': 'TRTLLM'
+                'moe_config': {
+                    'backend': 'TRTLLM'
+                }
             }
         }
     ]
