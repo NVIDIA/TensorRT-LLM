@@ -73,7 +73,7 @@ class BindCapacityScheduler(CapacityScheduler):
         self,
         max_num_requests: int,
         kv_cache_manager,
-        peft_cache_manager,
+        peft_cache_manager: tb_internal.batch_manager.PeftCacheManager,
         scheduler_policy: tb_executor.CapacitySchedulerPolicy = tb_executor.
         CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         two_step_lookahead: bool = False,
