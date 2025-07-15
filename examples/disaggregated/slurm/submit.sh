@@ -1,36 +1,31 @@
-#! /bin/bash
+#!/bin/bash
+mtp_size=0
 
-slurm_file=disaggr_torch.slurm
-
-# ctx1dep4_gen1tep4, max_batch16
-for c in 1 2 4 8 16 32 48 64; do
-    sbatch --nodes=2 --ntasks=8 --ntasks-per-node=4  ${slurm_file} 1 4 1 8300 true 1 4 32 32 false "0.95" "$c" ctx1dep4_gen1tep4_${c}
+# dep8
+for b in 1 64 1024; do
+    concurrency=$((b * 8))
+    ctx_num=$(((concurrency + 5499)/5500))
+    total_gpu_num=$((ctx_num + 2))
+    total_tasks=$((total_gpu_num * 4))
+    sbatch --nodes=${total_gpu_num} --ntasks=${total_tasks} --ntasks-per-node=4 --segment=${total_gpu_num} disaggr_torch.slurm ${ctx_num} 4 4 4480 true 1 8 1024 1024 true "0.8" 0 "$mtp_size" "$concurrency"
 done
 
-# ctx2dep4_gen1tep4, max_batch 64
-for c in 64 96 128; do
-    sbatch --nodes=3 --ntasks=12 --ntasks-per-node=4  ${slurm_file} 2 4 1 8300 true 1 4 64 64 false "0.9" "$c" ctx2dep4_gen1tep4_${c}
+# dep16 eplb0, 256, 288
+for b in 1 64 1024; do
+    concurrency=$((b * 16))
+    ctx_num=$(((concurrency + 5499)/5500))
+    total_gpu_num=$((ctx_num + 4))
+    total_tasks=$((total_gpu_num * 4))
+    sbatch --nodes=${total_gpu_num} --ntasks=${total_tasks} --ntasks-per-node=4 --segment=${total_gpu_num} disaggr_torch.slurm ${ctx_num} 4 4 4480 true 1 16 1024 1024 true "0.7" 0 "$mtp_size" "$concurrency"
+    sbatch --nodes=${total_gpu_num} --ntasks=${total_tasks} --ntasks-per-node=4 --segment=${total_gpu_num} disaggr_torch.slurm ${ctx_num} 4 4 4480 true 1 16 1024 1024 true "0.7" 256 "$mtp_size" "$concurrency"
+    sbatch --nodes=${total_gpu_num} --ntasks=${total_tasks} --ntasks-per-node=4 --segment=${total_gpu_num} disaggr_torch.slurm ${ctx_num} 4 4 4480 true 1 16 1024 1024 true "0.7" 288 "$mtp_size" "$concurrency"
 done
 
-for c in 128 192 256; do
-    sbatch --nodes=4 --ntasks=16 --ntasks-per-node=4  ${slurm_file} 3 4 1 8300 true 1 4 32 32 true "0.9" "$c" ctx3dep4_gen1dep4_${c}
-done
-
-for c in 256 384 512; do
-    sbatch --nodes=5 --ntasks=20 --ntasks-per-node=4  ${slurm_file} 4 4 1 8300 true 1 4 64 64 true "0.9" "$c" ctx4dep4_gen1dep4_${c}
-done
-
-# ctx5dep4_gen1dep4, max_batch
-for c in 256 384 512; do
-    sbatch --nodes=6 --ntasks=24 --ntasks-per-node=4  ${slurm_file} 5 4 1 8300 true 1 4 64 64 true "0.9" "$c" ctx5dep4_gen1dep4_${c}
-done
-
-# ctx7dep4_gen1dep4
-for c in 512 768 1024; do
-    sbatch --nodes=8 --ntasks=32 --ntasks-per-node=4  ${slurm_file} 7 4 1 8300 true 1 4 128 128 true "0.9" "$c" ctx7dep4_gen1dep4_${c}
-done
-
-# ctx8dep4_gen1dep4
-for c in 512 768 1024; do
-    sbatch --nodes=9 --ntasks=36 --ntasks-per-node=4  ${slurm_file} 8 4 1 8300 true 1 4 128 128 true "0.9" "$c" ctx8dep4_gen1dep4_${c}
+# dep32 eplb288
+for b in 512; do
+    concurrency=$((b * 32))
+    ctx_num=$(((concurrency + 5499)/5500))
+    total_gpu_num=$((ctx_num + 8))
+    total_tasks=$((total_gpu_num * 4))
+    sbatch --nodes=${total_gpu_num} --ntasks=${total_tasks} --ntasks-per-node=4 --segment=${total_gpu_num} disaggr_torch.slurm ${ctx_num} 4 4 4480 true 1 32 1024 1024 true "0.7" 288 "$mtp_size" "$concurrency"
 done

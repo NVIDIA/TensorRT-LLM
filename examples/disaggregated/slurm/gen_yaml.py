@@ -26,8 +26,9 @@ def process_node_and_task() -> tuple[int, List[str], List[str]]:
 
     # Generate list of nodes
     if '[' in slurm_job_nodelist:
-        # Handle nodelist with range format (e.g., "ptyche[0065-0066]")
-        node_prefix = re.match(r'^[a-zA-Z]+', slurm_job_nodelist).group(0)
+        # Handle nodelist with range format
+        node_prefix = slurm_job_nodelist.split('[')[
+            0]  # Extract everything before '['
         node_range = re.search(r'\[(.*?)\]', slurm_job_nodelist).group(1)
         nodes = []
         for part in node_range.split(','):
@@ -46,7 +47,7 @@ def process_node_and_task() -> tuple[int, List[str], List[str]]:
                 # Preserve the original format for single numbers
                 nodes.append(f"{node_prefix}{part}")
     else:
-        # Handle single node format (e.g., "ptyche0065")
+        # Handle single node format
         nodes = [slurm_job_nodelist]
     print(f"Nodes: {nodes}")
 
@@ -99,7 +100,7 @@ def generate_urls(ctx_or_gen: str,
                 f"For {ctx_or_gen} instance {instance}, there are not enough tasks available. task_nodes_offset: {task_nodes_offset}, tasks_needed: {tasks_needed}, len(task_nodes): {len(task_nodes)}"
             )
 
-        min_node = (tasks_needed + max_tasks_per_node - 1) / max_tasks_per_node
+        min_node = (tasks_needed + max_tasks_per_node - 1) // max_tasks_per_node
         instance_nodes = set(task_nodes[task_nodes_offset:task_nodes_offset +
                                         tasks_needed])
         if len(instance_nodes) > min_node:
@@ -131,6 +132,8 @@ def gen_config_file(config_path: str,
                     gen_max_num_tokens: int,
                     gen_enable_attention_dp: bool,
                     gen_gpu_memory_fraction: float,
+                    eplb_num_slots: int,
+                    mtp_size: int = 0,
                     worker_start_port: int = 8001,
                     server_port: int = 8000) -> None:
     """
@@ -150,12 +153,15 @@ def gen_config_file(config_path: str,
         gen_max_num_tokens: Max number of tokens for generation servers
         gen_enable_attention_dp: Enable attention DP for generation servers
         gen_gpu_memory_fraction: GPU memory fraction for generation servers
+        eplb_num_slots: Number of slots for eplb
         worker_start_port: Start port for workers
         server_port: Server port
     """
     gen_cuda_graph_batch_sizes = [
-        1, 2, 4, 8, 16, 32, 64, 128, 256, gen_batch_size
+        1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024, 2048, gen_batch_size
     ]
+
+    gen_moe_backend = "WIDEEP"
 
     config = {
         'model': model_path,
@@ -166,8 +172,8 @@ def gen_config_file(config_path: str,
             'num_instances': num_ctx_servers,
             'max_batch_size': ctx_batch_size,
             'max_num_tokens': ctx_max_num_tokens,
-            'max_seq_len': 8300,
-            'free_gpu_memory_fraction': 0.7,
+            'max_seq_len': 1152,
+            'free_gpu_memory_fraction': 0.85,
             'tensor_parallel_size': ctx_tp_size,
             'moe_expert_parallel_size': ctx_tp_size,
             'enable_attention_dp': ctx_enable_attention_dp,
@@ -188,7 +194,7 @@ def gen_config_file(config_path: str,
             'pipeline_parallel_size': 1,
             'max_batch_size': gen_batch_size,
             'max_num_tokens': gen_max_num_tokens,
-            'max_seq_len': 8576,
+            'max_seq_len': 2176,
             'free_gpu_memory_fraction': gen_gpu_memory_fraction,
             'cuda_graph_config': {
                 'enable_padding': True,
@@ -196,9 +202,7 @@ def gen_config_file(config_path: str,
             },
             'print_iter_log': True,
             'kv_cache_dtype': 'fp8',
-            'moe_config': {
-                'backend': 'TRTLLM',
-            },
+            'moe_backend': gen_moe_backend,
             'cache_transceiver_config': {
                 'backend': 'default',
                 'max_tokens_in_buffer': 8320,
@@ -225,6 +229,31 @@ def gen_config_file(config_path: str,
 
     # set the hostname to the first node
     config['hostname'] = nodes[0]
+
+    if eplb_num_slots > 0:
+        moe_load_balancer_file = os.path.join(os.path.dirname(config_path),
+                                              "moe_load_balancer.yaml")
+        moe_load_balancer_config = {
+            'num_slots': eplb_num_slots,
+            'layer_updates_per_iter': 1
+        }
+        with open(moe_load_balancer_file, "w") as f:
+            yaml.dump(moe_load_balancer_config,
+                      f,
+                      default_flow_style=False,
+                      sort_keys=False)
+        config['generation_servers'][
+            'moe_load_balancer'] = moe_load_balancer_file
+
+    if mtp_size > 0:
+        config['context_servers']['speculative_config'] = {
+            'decoding_type': 'MTP',
+            'num_nextn_predict_layers': mtp_size
+        }
+        config['generation_servers']['speculative_config'] = {
+            'decoding_type': 'MTP',
+            'num_nextn_predict_layers': mtp_size
+        }
 
     # Write config to file
     with open(config_path, 'w') as f:
@@ -283,6 +312,14 @@ if __name__ == "__main__":
                         type=float,
                         required=True,
                         help="GPU memory fraction for generation servers")
+    parser.add_argument("--eplb_num_slots",
+                        type=int,
+                        default=0,
+                        help="Number of slots for eplb")
+    parser.add_argument("--mtp_size",
+                        type=int,
+                        default=0,
+                        help="Number of nextn layers for MTP")
     parser.add_argument("--worker_start_port",
                         type=int,
                         default=8336,
@@ -299,5 +336,5 @@ if __name__ == "__main__":
                     args.ctx_max_num_tokens, args.ctx_enable_attention_dp,
                     args.num_gen_servers, args.gen_tp_size, args.gen_batch_size,
                     args.gen_max_num_tokens, args.gen_enable_attention_dp,
-                    args.gen_gpu_memory_fraction, args.worker_start_port,
-                    args.server_port)
+                    args.gen_gpu_memory_fraction, args.eplb_num_slots,
+                    args.mtp_size, args.worker_start_port, args.server_port)
