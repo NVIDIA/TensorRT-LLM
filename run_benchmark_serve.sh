@@ -72,7 +72,7 @@ for model_info in "${models[@]}"; do
   cat >./extra-llm-api-config.yml<<EOF
   print_iter_log: ${PRINT_ITER_LOG}
   cuda_graph_config:
-      padding_enabled: true
+      enable_padding: true
       batch_sizes:
         - 1
         - 2
