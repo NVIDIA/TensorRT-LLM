@@ -59,6 +59,8 @@ Clients can then send requests to the disaggregated server at `localhost:8000`, 
 
 ## Launching disaggregated servers on SLURM clusters
 
+Refer to [Disaggregated Inference Benchmark Scripts](./slurm/README.md).
+
 ## Sending requests to the disaggregated server
 
 Once the context, generation and disaggregated servers are launched, you can send requests to the disaggregated server using curl:
