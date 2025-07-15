@@ -1111,7 +1111,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
     // Generate rerun test lists
     def failSignaturesList = trtllm_utils.getFailSignaturesList().join(",")
     sh """
-        python3 ${llmSrc}/tests/integration/defs/test_rerun.py \
+        python3 ${llmSrc}/jenkins/test_rerun.py \
         generate_rerun_tests_list \
         --output-dir=${WORKSPACE}/${stageName}/ \
         --input-file=${WORKSPACE}/${stageName}/results.xml \
@@ -1184,12 +1184,15 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
         }
     }
 
-    // generate rerun report
+    // Specify the stage name correctly
+    sh "cd ${WORKSPACE}/${stageName} && sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' *.xml || true"
+
+    // Generate rerun report
     inputFiles = ["${WORKSPACE}/${stageName}/results.xml",
                   "${WORKSPACE}/${stageName}/rerun_results_1.xml",
                   "${WORKSPACE}/${stageName}/rerun_results_2.xml"]
     sh """
-        python3 ${llmSrc}/tests/integration/defs/test_rerun.py \
+        python3 ${llmSrc}/jenkins/test_rerun.py \
         generate_rerun_report \
         --output-file=${WORKSPACE}/${stageName}/rerun_results.xml \
         --input-files=${inputFiles.join(",")}
@@ -1197,7 +1200,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
 
     // Update original results xml file with rerun results xml files for junit
     sh """
-        python3 ${llmSrc}/tests/integration/defs/test_rerun.py \
+        python3 ${llmSrc}/jenkins/test_rerun.py \
         merge_junit_xmls \
         --output-file=${WORKSPACE}/${stageName}/results.xml \
         --input-files=${inputFiles.join(",")} \
@@ -1642,7 +1645,8 @@ def checkStageNameSet(stageNames, jobKeys, paramName) {
     echo "Validate stage names for the passed GitLab bot params [${paramName}]."
     invalidStageName = stageNames.findAll { !(it in jobKeys) }
     if (invalidStageName) {
-        throw new Exception("Cannot find the stage names [${invalidStageName}] from the passed params [${paramName}].")
+        def sortedJobKeys = jobKeys.sort()
+        throw new Exception("Cannot find the stage names [${invalidStageName}] from the passed params [${paramName}]. Available stage names (${sortedJobKeys.size()} total):\n${sortedJobKeys.collect { "    ${it}" }.join('\n')}")
     }
 }
 
@@ -2015,6 +2019,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                     pipInstallSanitySpec = createKubernetesPodConfig(values[5], gpu_type, k8s_arch)
                     trtllm_utils.launchKubernetesPod(pipeline, pipInstallSanitySpec, "trt-llm", {
                         echo "###### Prerequisites Start ######"
+                        echoNodeAndGpuInfo(pipeline, toStageName(values[1], key))
                         // Clean up the pip constraint file from the base NGC PyTorch image.
                         if (values[5] == DLFW_IMAGE) {
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "[ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true")
@@ -2060,7 +2065,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                         }
                         withEnv(libEnv) {
                             sh "env | sort"
-                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, "${values[1]}-${key}-sanity-check" , 1, 1, true, null)
+                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, null)
                         }
                     })
                 }

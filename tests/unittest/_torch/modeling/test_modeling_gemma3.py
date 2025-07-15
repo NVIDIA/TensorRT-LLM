@@ -385,6 +385,8 @@ class TestGemma3(unittest.TestCase):
                                  dtype=torch.int,
                                  device=device)
 
+        # This initial setup is to populate KV cache so that attn_metadata has the info
+        # needed for generating mask.
         context_sequence_lengths = [3, 2, 1]
         sequence_lengths = context_sequence_lengths + [1, 1]
         past_seen_tokens = [0, 0, 0, 2, 1]
@@ -423,19 +425,17 @@ class TestGemma3(unittest.TestCase):
         )
         attn_metadata.prepare()
 
-        # Test for case where all tokens are text tokens. `test_gemma3_global_mask` and `test_gemma3_local_mask`
-        # test for individual requests where there's a mix of text and image tokens.
+        # First sample has 2 image tokens, second sample has 2 image tokens, third sample has none.
         image_token_mask = torch.tensor(
-            [False, False, False, False, False, False, False, False],
-            device=device)
+            [True, True, False, True, True, True, False, False], device=device)
         causal_mask = gemma3.get_flashinfer_attention_mask(
             image_token_mask=image_token_mask, attn_metadata=attn_metadata)
         # Causal mask for context request 1.
         ctx_request_1_mask = torch.tensor(
-            [[True, False, False], [True, True, False], [True, True, True]],
+            [[True, True, False], [True, True, False], [True, True, True]],
             device=device)
         # Causal mask for context request 2.
-        ctx_request_2_mask = torch.tensor([[True, False], [True, True]],
+        ctx_request_2_mask = torch.tensor([[True, True], [True, True]],
                                           device=device)
         # Causal mask for context request 3.
         ctx_request_3_mask = torch.tensor([[True]], device=device)
@@ -448,7 +448,8 @@ class TestGemma3(unittest.TestCase):
                                          dim=0)
         torch.testing.assert_close(causal_mask, expected_causal_mask)
 
-    def test_gemma3_global_context_mask(self) -> None:
+    def single_image_mask_test_helper(
+            self, effective_sliding_window: int) -> torch.Tensor:
         config_dict = deepcopy(GEMMA3_1B_CONFIG)
         gemma3_config = Gemma3TextConfig.from_dict(config_dict)
         device = torch.device('cuda')
@@ -458,53 +459,195 @@ class TestGemma3(unittest.TestCase):
 
         image_token_mask = torch.tensor(
             [False, False, True, True, True, True, False, False], device=device)
-        attention_mask = gemma3.get_context_mask(
-            image_token_mask=image_token_mask, effective_sliding_window=None)
+        return gemma3.get_context_mask(
+            image_token_mask=image_token_mask,
+            effective_sliding_window=effective_sliding_window)
+
+    @parameterized.expand([
+        "global",
+        "sliding_window_larger_than_seq",
+        "sliding_window_equal_to_seq",
+    ], lambda testcase_func, param_num, param:
+                          f"{testcase_func.__name__}[{param.args[0]}]")
+    def test_gemma3_global_context_mask_single_image(self,
+                                                     test_name: str) -> None:
+        device = torch.device('cuda')
+        effecive_sliding_window_map = {
+            # For global mask, don't mention sliding window size.
+            "global": None,
+            # For a sliding window larger than sequence length, the local mask is the same as the global mask.
+            "sliding_window_larger_than_seq": 10,
+            # For a sliding window same as sequence length, the local mask is the same as the global mask.
+            "sliding_window_equal_to_seq": 8,
+        }
+        effective_sliding_window = effecive_sliding_window_map[test_name]
+        attention_mask = self.single_image_mask_test_helper(
+            effective_sliding_window=effective_sliding_window)
+        # Text tokens attend to each other in causal fashion. Image tokens attend in causal fashion
+        # as well as to all other image tokens.
+        expected_attention_mask = torch.tensor(
+            [[1, 0, 0, 0, 0, 0, 0, 0], [1, 1, 0, 0, 0, 0, 0, 0],
+             [1, 1, 1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 1, 0, 0],
+             [1, 1, 1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 1, 0, 0],
+             [1, 1, 1, 1, 1, 1, 1, 0], [1, 1, 1, 1, 1, 1, 1, 1]],
+            device=device).bool()
+        torch.testing.assert_close(attention_mask, expected_attention_mask)
+
+    def test_gemma3_local_context_mask_single_image(self) -> None:
+        device = torch.device('cuda')
+        attention_mask = self.single_image_mask_test_helper(
+            effective_sliding_window=2)
+        expected_attention_mask = torch.tensor(
+            [[1, 0, 0, 0, 0, 0, 0, 0], [1, 1, 0, 0, 0, 0, 0, 0],
+             [0, 1, 1, 1, 1, 1, 0, 0], [0, 0, 1, 1, 1, 1, 0, 0],
+             [0, 0, 1, 1, 1, 1, 0, 0], [0, 0, 1, 1, 1, 1, 0, 0],
+             [0, 0, 0, 0, 0, 1, 1, 0], [0, 0, 0, 0, 0, 0, 1, 1]],
+            device=device).bool()
+        torch.testing.assert_close(attention_mask, expected_attention_mask)
+
+    def multi_image_mask_test_helper(
+            self, effective_sliding_window: int) -> torch.Tensor:
+        config_dict = deepcopy(GEMMA3_1B_CONFIG)
+        gemma3_config = Gemma3TextConfig.from_dict(config_dict)
+        device = torch.device('cuda')
+        model_config = ModelConfig(pretrained_config=gemma3_config,
+                                   attn_backend="FLASHINFER")
+        gemma3 = Gemma3ForCausalLM(model_config).to(device)
+
+        # 4 images with 4, 3, 2, 2 tokens respectively.
+        image_token_mask = torch.tensor(
+            [
+                # text blob.
+                False,
+                False,
+                # image1 blob.
+                True,
+                True,
+                True,
+                True,
+                # text blob.
+                False,
+                False,
+                # image2 blob.
+                True,
+                True,
+                True,
+                # text blob.
+                False,
+                False,
+                # image3 blob.
+                True,
+                True,
+                # text blob.
+                False,
+                False,
+                # image4 blob.
+                True,
+                True,
+                # text blob.
+                False,
+            ],
+            device=device)
+        return gemma3.get_context_mask(
+            image_token_mask=image_token_mask,
+            effective_sliding_window=effective_sliding_window)
+
+    @parameterized.expand([
+        "global",
+        "sliding_window_larger_than_seq",
+        "sliding_window_equal_to_seq",
+    ], lambda testcase_func, param_num, param:
+                          f"{testcase_func.__name__}[{param.args[0]}]")
+    def test_gemma3_global_context_mask_multi_image(self,
+                                                    test_name: str) -> None:
+        device = torch.device('cuda')
+        effecive_sliding_window_map = {
+            # Don't mention sliding window size for global mask.
+            "global": None,
+            # For a sliding window larger than sequence length, the local mask is the same as the global mask.
+            "sliding_window_larger_than_seq": 25,
+            # For a sliding window same as sequence length, the local mask is the same as the global mask.
+            "sliding_window_equal_to_seq": 20,
+        }
+        effective_sliding_window = effecive_sliding_window_map[test_name]
 
         # Text tokens attend to each other in causal fashion. Image tokens attend in causal fashion
         # as well as to all other image tokens.
         expected_attention_mask = torch.tensor(
-            [[True, False, False, False, False, False, False, False],
-             [True, True, False, False, False, False, False, False],
-             [True, True, True, True, True, True, False, False],
-             [True, True, True, True, True, True, False, False],
-             [True, True, True, True, True, True, False, False],
-             [True, True, True, True, True, True, False, False],
-             [True, True, True, True, True, True, True, False],
-             [True, True, True, True, True, True, True, True]],
-            device=device)
+            [
+                # text blob.
+                [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                # image1 blob.
+                [1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                # text blob.
+                [1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                # image2 blob.
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                # text blob.
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0],
+                # image3 blob.
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0],
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0],
+                # text blob.
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0],
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0],
+                # image4 blob.
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0],
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0],
+                # text blob.
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            ],
+            device=device).bool()
+        attention_mask = self.multi_image_mask_test_helper(
+            effective_sliding_window=effective_sliding_window)
         torch.testing.assert_close(attention_mask, expected_attention_mask)
 
-        # Even for a sliding window larger than sequence length, the attention mask is the same as the global mask.
-        attention_mask = gemma3.get_context_mask(
-            image_token_mask=image_token_mask, effective_sliding_window=10)
-        torch.testing.assert_close(attention_mask, expected_attention_mask)
-
-        # Even for sliding window same as sequence length, the attention mask is the same as the global mask.
-        attention_mask = gemma3.get_context_mask(
-            image_token_mask=image_token_mask, effective_sliding_window=8)
-        torch.testing.assert_close(attention_mask, expected_attention_mask)
-
-    def test_gemma3_local_context_mask(self) -> None:
-        config_dict = deepcopy(GEMMA3_1B_CONFIG)
-        gemma3_config = Gemma3TextConfig.from_dict(config_dict)
+    def test_gemma3_local_context_mask_multi_image(self) -> None:
         device = torch.device('cuda')
-        model_config = ModelConfig(pretrained_config=gemma3_config,
-                                   attn_backend="FLASHINFER")
-        gemma3 = Gemma3ForCausalLM(model_config).to(device)
+        attention_mask = self.multi_image_mask_test_helper(
+            effective_sliding_window=3)
 
-        image_token_mask = torch.tensor(
-            [False, False, True, True, True, True, False, False], device=device)
-        attention_mask = gemma3.get_context_mask(
-            image_token_mask=image_token_mask, effective_sliding_window=2)
+        # Text tokens attend to each other in causal fashion. Image tokens attend in causal fashion
+        # as well as to all other image tokens.
         expected_attention_mask = torch.tensor(
-            [[True, False, False, False, False, False, False, False],
-             [True, True, False, False, False, False, False, False],
-             [False, True, True, True, True, True, False, False],
-             [False, False, True, True, True, True, False, False],
-             [False, False, True, True, True, True, False, False],
-             [False, False, True, True, True, True, False, False],
-             [False, False, False, False, False, True, True, False],
-             [False, False, False, False, False, False, True, True]],
-            device=device)
+            [
+                # text blob.
+                [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                # image1 blob.
+                [1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                # text blob.
+                [0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                # image2 blob.
+                [0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                # text blob.
+                [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+                [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0],
+                # image3 blob.
+                [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0],
+                [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0],
+                # text blob.
+                [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0],
+                [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0],
+                # image4 blob.
+                [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0],
+                [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0],
+                # text blob.
+                [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1],
+            ],
+            device=device).bool()
         torch.testing.assert_close(attention_mask, expected_attention_mask)
