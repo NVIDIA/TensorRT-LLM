@@ -108,6 +108,8 @@ void GemmAllReducePlugin::allocatePersistentWorkspace()
 {
     TLLM_CHECK(mOptions.maxProblemShape.isInitialized());
 
+    mWorkspaceKey = "gemm_allreduce_workspace_m" + std::to_string(mOptions.maxProblemShape.maxM);
+
     cutlass_kernels::GemmAllReduceImplInterface::LaunchConfig smallest_tile_config
         = mGemm->getSupportedLaunchConfigs()[0];
     cutlass_kernels::GemmAllReduceImplInterface::ProblemArgs args;
@@ -123,7 +125,7 @@ void GemmAllReducePlugin::allocatePersistentWorkspace()
 
     // Register and allocate workspace
     mWorkspace = static_cast<GemmAllReducePersistentWorkspace*>(
-        getPluginRegistry()->acquirePluginResource(mWorkspaceKey, &unallocated_resource));
+        getPluginRegistry()->acquirePluginResource(mWorkspaceKey.c_str(), &unallocated_resource));
     TLLM_CHECK(mWorkspace != nullptr);
 }
 
@@ -395,6 +397,7 @@ int GemmAllReducePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensor
     auto const N = utils::computeNDimension(mOptions.transB, inputDesc[1].dims);
     auto const K = mOptions.transA ? inputDesc[0].dims.d[0] : inputDesc[0].dims.d[nbDimsA - 1];
 
+    TLLM_CHECK_WITH_INFO(M <= mOptions.maxProblemShape.maxM, "GemmAllReducePlugin M > maxM.");
     TLLM_CHECK_WITH_INFO(M > 0, "GemmAllReducePlugin M is 0.");
     TLLM_CHECK_WITH_INFO(N > 0, "GemmAllReducePlugin N is 0.");
     TLLM_CHECK_WITH_INFO(K > 0, "GemmAllReducePlugin K is 0.");
@@ -513,7 +516,7 @@ void GemmAllReducePlugin::terminate() noexcept
     // free mWorkspace
     if (mWorkspace)
     {
-        getPluginRegistry()->releasePluginResource(mWorkspaceKey);
+        getPluginRegistry()->releasePluginResource(mWorkspaceKey.c_str());
         mWorkspace = nullptr;
     }
 }

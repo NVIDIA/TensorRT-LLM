@@ -60,8 +60,9 @@ void GemmAllReducePluginProfiler::deserializeFromOwnFile(GemmIdCore gemmId, Gemm
 
 bool GemmAllReducePluginProfiler::useProfiler()
 {
-    char const* envDir = getenv("GEMM_AR_PLUGIN_PROFILE_DIR");
-    return envDir != nullptr;
+    // char const* envDir = getenv("GEMM_AR_PLUGIN_PROFILE_DIR");
+    // return envDir != nullptr;
+    return false;
 }
 
 std::string GemmAllReducePluginProfiler::getCacheFileName(GemmIdCore gemmId)
