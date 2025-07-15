@@ -669,7 +669,7 @@ class ModelRunner(ModelRunnerMixin):
             multi_block_mode (bool):
                 Whether to distribute the work across multiple CUDA thread-blocks on the GPU for masked MHA kernel.
             fail_fast_on_attention_window_too_large (bool):
-                Exit with runtime error when attention window is too large to fit at least one sequence in KV cache.
+                Exit with runtime error when attention window is too large to fit even a single sequence in the KV cache.
                 Note: This parameter is only applicable to C++ runtime (ModelRunnerCpp).
         Returns:
             ModelRunner: An instance of ModelRunner.

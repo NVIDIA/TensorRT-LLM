@@ -1577,7 +1577,7 @@ class TrtLlmArgs(BaseLlmArgs):
     fail_fast_on_attention_window_too_large: bool = Field(
         default=False,
         description=
-        "Fail fast when attention window is too large to fit at least one sequence in KV cache."
+        "Fail fast when attention window is too large to fit even a single sequence in the KV cache."
     )
 
     # BuildConfig is introduced to give users a familiar interface to configure the model building.
@@ -1795,7 +1795,7 @@ class TorchLlmArgs(BaseLlmArgs):
     fail_fast_on_attention_window_too_large: bool = Field(
         default=False,
         description=
-        "Fail fast when attention window is too large to fit at least one sequence in KV cache."
+        "Fail fast when attention window is too large to fit even a single sequence in the KV cache."
     )
 
     allreduce_strategy: Optional[

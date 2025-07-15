@@ -111,7 +111,7 @@ def parse_arguments(args=None):
         action='store_true',
         default=False,
         help=
-        'Exit with runtime error when attention window is too large to fit at least one sequence in KV cache.'
+        'Exit with runtime error when attention window is too large to fit even a single sequence in the KV cache.'
     )
 
     parser = add_common_args(parser)
