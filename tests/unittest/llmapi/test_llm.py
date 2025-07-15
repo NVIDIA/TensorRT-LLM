@@ -24,7 +24,6 @@ import datasets
 import pytest
 import torch
 import transformers
-from utils.util import skip_single_gpu
 
 from tensorrt_llm import LLM as LLM_torch
 from tensorrt_llm._tensorrt_engine import LLM
@@ -47,16 +46,14 @@ from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
                                           LogitsProcessor, SamplingParams)
 
-from .lora_test_utils import (
-    check_multi_unique_lora_adapters_from_request,
-    check_trt_python_llama_7b_multi_lora_from_request_test_harness)
-
 # isort: off
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
 from gc_utils import assert_resource_freed
-from utils.util import skip_single_gpu
+from llmapi.lora_test_utils import (
+    check_multi_unique_lora_adapters_from_request,
+    check_trt_python_llama_7b_multi_lora_from_request_test_harness)
 from utils.llm_data import llm_models_root
-from utils.util import force_ampere, similar, skip_gpu_memory_less_than_40gb, skip_pre_hopper
+from utils.util import force_ampere, similar, skip_gpu_memory_less_than_40gb, skip_pre_hopper, skip_single_gpu
 # isort: on
 
 # The unittests are based on the tiny-llama, which is fast to build and run.
