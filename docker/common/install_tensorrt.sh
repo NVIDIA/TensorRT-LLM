@@ -114,6 +114,7 @@ install_rockylinux_requirements() {
     # Clean up
     rm -f *.rpm
     dnf clean all
+    echo 'export PATH=/usr/local/cuda/bin:$PATH' >> "${ENV}"
     nvcc --version
 }
 
