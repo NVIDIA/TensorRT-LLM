@@ -607,7 +607,8 @@ def swizzle_weight_and_scale(weight_tensor: torch.Tensor,
     scale = perm_tensor_from_contig(scale, axis, swizzle_axis)
     actual_scale_shape = perm_tuple_from_contig(orig_scale_shape, axis,
                                                 swizzle_axis)
-    return quant_tensor, scale, actual_scale_shape
+    # If weights are not contiguous, Triton matmul will secretly transpose instead of throwing an error.
+    return quant_tensor.contiguous(), scale, actual_scale_shape
 
 
 # We inherit from TritonUnquantizedFusedMoEMethod to reuse the weight preprocessing logic
@@ -925,16 +926,21 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                     w1_weight_scale = weights[f"{expert_id}.w1.weight_scale"]
                     w3_weight_scale = weights[f"{expert_id}.w3.weight_scale"]
                     w2_weight_scale = weights[f"{expert_id}.w2.weight_scale"]
+                    need_to_transpose_scales = True
                 elif module.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
-                    # TODO: fix bug here
-                    w1_weight_scale = weights[f"gate_up_proj_weight_scale"]
-                    w3_weight_scale = weights[f"gate_up_proj_weight_scale"]
-                    w2_weight_scale = weights[f"down_proj_weight_scale"]
+                    # Reverse-engineered from the openai modeling class
+                    combined_weight_scale = weights[
+                        "gate_up_proj_weight_scale"][expert_id]
+                    out_dim = combined_weight_scale.shape[-1]
+                    w1_weight_scale = combined_weight_scale[..., :out_dim // 2]
+                    w3_weight_scale = combined_weight_scale[..., out_dim // 2:]
+                    w2_weight_scale = weights[f"down_proj_weight_scale"][
+                        expert_id]
+                    need_to_transpose_scales = False
                 else:
                     raise NotImplementedError(
                         f"Unknown weight loading mode in MoE: {module.weight_loading_mode}"
                     )
-                need_to_transpose_scales = True
             except KeyError:
                 # We will use dynamic quantization
                 w1_weight_scale = self.w1_scales[expert_id]
