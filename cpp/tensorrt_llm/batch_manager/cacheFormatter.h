@@ -70,9 +70,8 @@ public:
 
     [[nodiscard]] virtual BaseKVCacheManager* getCacheManager() const noexcept = 0;
 
-    [[nodiscard]] virtual std::vector<executor::kv_cache::Connection const*> pickRecvConnections(
-        std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
-        SizeType32 selfIdx, CacheState const& destConfig) const
+    [[nodiscard]] virtual std::vector<size_t> pickRecvConnections(
+        size_t numConnections, CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig) const
         = 0;
 
     /// @brief Destructor.
@@ -110,9 +109,8 @@ public:
     }
 
     static bool needSendCache(CacheState const& selfConfig, CacheState const& destConfig, runtime::SizeType32 selfIdx);
-    std::vector<executor::kv_cache::Connection const*> pickRecvConnections(
-        std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
-        SizeType32 selfIdx, CacheState const& destConfig) const override;
+    std::vector<size_t> pickRecvConnections(size_t numConnections, CacheState const& selfConfig, SizeType32 selfIdx,
+        CacheState const& destConfig) const override;
 
 private:
     BaseKVCacheManager* mCacheManager;

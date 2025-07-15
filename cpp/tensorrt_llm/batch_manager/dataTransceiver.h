@@ -116,9 +116,9 @@ public:
     }
 
     // should be called only during the initialization of the TransferSession
-    [[nodiscard]] std::vector<Connection const*>& getConnectionsMutable()
+    void setConnection(size_t idx, Connection const* conn)
     {
-        return mConnections;
+        mConnections.at(idx) = conn;
     }
 
     [[nodiscard]] DataContext const& getDataContext() const
@@ -141,14 +141,14 @@ public:
         return *mBufferManager;
     }
 
-    void send(Connection const* conn, void const* data, size_t size)
+    void send(size_t idx, void const* data, size_t size)
     {
-        conn->send(mDataContext, data, size);
+        mConnections.at(idx)->send(mDataContext, data, size);
     }
 
-    void recv(Connection const* conn, void* data, size_t size)
+    void recv(size_t idx, void* data, size_t size)
     {
-        conn->recv(mDataContext, data, size);
+        mConnections.at(idx)->recv(mDataContext, data, size);
     }
 
     [[nodiscard]] LlmRequest const& getLlmRequest() const
@@ -206,11 +206,11 @@ class DataReceiver
 public:
     /// @brief Send the request information.
     /// @param llmRequest The request object to which the information belongs.
-    virtual void sendRequestInfo(LlmRequest const& llmRequest) = 0;
+    virtual TransferSession sendRequestInfo(LlmRequest const& llmRequest) = 0;
 
     /// @brief Synchronously receive data.
-    /// @param llmRequest The request object to which the data belongs.
-    virtual void receiveSync(LlmRequest const& llmRequest) = 0;
+    /// @param session The transfer session.
+    virtual void receiveSync(TransferSession& session) = 0;
 
     /// @brief Destructor.
     virtual ~DataReceiver() = default;

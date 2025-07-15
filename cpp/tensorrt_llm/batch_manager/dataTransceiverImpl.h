@@ -77,9 +77,9 @@ public:
     DataReceiverImpl(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
         SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter);
 
-    void sendRequestInfo(LlmRequest const& llmRequest) override;
+    TransferSession sendRequestInfo(LlmRequest const& llmRequest) override;
 
-    void receiveSync(LlmRequest const& llmRequest) override;
+    void receiveSync(TransferSession& session) override;
 
 private:
     struct ReceiveCacheResource

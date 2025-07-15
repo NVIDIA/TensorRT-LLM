@@ -34,6 +34,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <future>
+#include <numeric>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
@@ -116,25 +117,26 @@ void checkAlternateWindow(BaseKVCacheManager* cacheManager, BaseCacheFormatter::
     }
 }
 
-std::vector<executor::kv_cache::Connection const*> CacheFormatter::pickRecvConnections(
-    std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
-    SizeType32 selfIdx, CacheState const& destConfig) const
+std::vector<size_t> CacheFormatter::pickRecvConnections(
+    size_t numConnections, CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig) const
 {
     auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
     if (targetInfo.mPeerDupHeadFactor <= 1)
     {
-        return connections;
+        std::vector<size_t> ret(numConnections);
+        std::iota(ret.begin(), ret.end(), 0);
+        return ret;
     }
-    TLLM_CHECK(connections.size() == targetInfo.mIRanks.size());
+    TLLM_CHECK(numConnections == targetInfo.mIRanks.size());
 
-    std::vector<executor::kv_cache::Connection const*> ret;
+    std::vector<size_t> ret;
     for (int i = 0; i < targetInfo.mDomainTPSize; i++)
     {
         if (i % targetInfo.mPeerDupHeadFactor == 0)
         {
             for (int j = 0; j < targetInfo.mDomainPPSize; j++)
             {
-                ret.push_back(connections.at((i * targetInfo.mDomainPPSize) + j));
+                ret.push_back((i * targetInfo.mDomainPPSize) + j);
             }
         }
     }
@@ -189,10 +191,10 @@ void CacheFormatter::format(TransferSession& session)
                     TLLM_LOG_DEBUG("Block %p of pool %d shape = %s", it->data(), poolIdx,
                         runtime::ITensor::toString(it->getShape()).c_str());
                 }
-                for (auto const& connection : connections)
+                for (size_t i = 0; i < connections.size(); i++)
                 {
                     TLLM_LOG_DEBUG("Send layer %d(%d-%d)", layerIdx, poolIdx, layerIdxInPool);
-                    session.send(connection, layer->data(), layer->getSizeInBytes());
+                    session.send(i, layer->data(), layer->getSizeInBytes());
                 }
             }
         }
@@ -250,13 +252,13 @@ void CacheFormatter::format(TransferSession& session)
             TLLM_CHECK(connections.size() == 1);
 
             TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
-            for (auto const& connection : connections)
+            for (size_t i = 0; i < connections.size(); i++)
             {
                 for (auto const& [window, blocks] : inputKvCacheBlocks)
                 {
                     for (auto const& block : blocks)
                     {
-                        session.send(connection, block->data(), block->getSizeInBytes());
+                        session.send(i, block->data(), block->getSizeInBytes());
                     }
                 }
             }
@@ -312,7 +314,7 @@ void CacheFormatter::format(TransferSession& session)
             {
 
                 size = outputSplitCaches[bufferIdx]->getSizeInBytes();
-                session.send(connections[processIdx], outputSplitCaches[bufferIdx]->data(), size);
+                session.send(processIdx, outputSplitCaches[bufferIdx]->data(), size);
             }
             else if (bufferCoverTargetNum > 0)
             {
@@ -321,7 +323,7 @@ void CacheFormatter::format(TransferSession& session)
                 bufferManager.copy(*outputSplitCaches[processIdx], *outputSplitCaches.at(sendBufferIdx));
                 bufferManager.getStream().synchronize();
                 size = outputSplitCaches.at(sendBufferIdx)->getSizeInBytes();
-                session.send(connections[processIdx], outputSplitCaches.at(sendBufferIdx)->data(), size);
+                session.send(processIdx, outputSplitCaches.at(sendBufferIdx)->data(), size);
             }
             else
             {
@@ -342,7 +344,7 @@ void CacheFormatter::format(TransferSession& session)
                     auto copyTargetSlice = runtime::ITensor::slice(preAllocSendBuffer, 0, sendSize);
                     bufferManager.copy(*copySlice, *copyTargetSlice);
                     bufferManager.getStream().synchronize();
-                    session.send(connections[processIdx], copyTargetSlice->data(), sendSize);
+                    session.send(processIdx, copyTargetSlice->data(), sendSize);
                     remainSendSize -= sendSize;
                 }
             }
@@ -416,7 +418,7 @@ void CacheFormatter::unformat(TransferSession& session)
     auto& bufferManager = session.getBufferManager();
     auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest);
 
-    auto pickUpConnections = pickRecvConnections(connections, selfConfig, selfIdx, destConfig);
+    auto pickUpConnections = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig);
 
     TLLM_LOG_DEBUG("pickUpConnections size: %d connections size: %d", pickUpConnections.size(), connections.size());
     std::vector<runtime::ITensor::SharedPtr> recvBufferTmps;
@@ -497,14 +499,14 @@ void CacheFormatter::unformat(TransferSession& session)
                         TLLM_LOG_DEBUG("Buffer %d of pool %d shape = %s", idx, poolIdx,
                             runtime::ITensor::toString(recvBufferTmps[idx]->getShape()).c_str());
                     }
-                    for (auto const& connection : pickUpConnections)
+                    for (size_t i = 0; i < pickUpConnections.size(); i++)
                     {
                         TLLM_LOG_DEBUG("Receive layer %d(%d-%d)", layerIdx, poolIdx, layerIdxInPool);
                         // Buffer dim: [numLayersInPool * layerVolume]
                         auto layer
                             = runtime::ITensor::slice(recvBufferTmps[idx], layerIdxInPool * layerVolume, layerVolume);
                         llmRequest.updateKvCacheSize((*layer).getSizeInBytes());
-                        session.recv(connection, layer->data(), layer->getSizeInBytes());
+                        session.recv(pickUpConnections[i], layer->data(), layer->getSizeInBytes());
                         idx++;
                     }
                 }
@@ -531,14 +533,14 @@ void CacheFormatter::unformat(TransferSession& session)
                 TLLM_CHECK(pickUpConnections.size() == 1);
 
                 TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
-                for (auto const& connection : pickUpConnections)
+                for (size_t i = 0; i < pickUpConnections.size(); i++)
                 {
                     for (auto const& [window, blocks] : outputBuffersPerWindow)
                     {
                         for (auto const& block : blocks)
                         {
                             llmRequest.updateKvCacheSize((*block).getSizeInBytes());
-                            session.recv(connection, block->data(), block->getSizeInBytes());
+                            session.recv(pickUpConnections[i], block->data(), block->getSizeInBytes());
                         }
                     }
                 }
@@ -589,7 +591,7 @@ void CacheFormatter::unformat(TransferSession& session)
                 else
                 {
                     auto* agentConnnecion
-                        = dynamic_cast<executor::kv_cache::AgentConnection const*>(pickUpConnections[0]);
+                        = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[pickUpConnections[0]]);
                     if (agentConnnecion != nullptr)
                     {
                         cacheBufferId = agentConnnecion->getCacheBufferId();

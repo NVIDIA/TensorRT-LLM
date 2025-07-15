@@ -38,20 +38,17 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
 // some context rank in connection
-std::vector<executor::kv_cache::Connection const*> MLACacheFormatter::pickRecvConnections(
-    std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
-    SizeType32 selfIdx, CacheState const& destConfig) const
+std::vector<size_t> MLACacheFormatter::pickRecvConnections(
+    size_t numConnections, CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig) const
 {
 
-    TLLM_CHECK(!connections.empty());
-
     auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
-    TLLM_CHECK(targetInfo.mIRanks.size() == connections.size());
-    std::vector<executor::kv_cache::Connection const*> ret;
+    TLLM_CHECK(numConnections == targetInfo.mIRanks.size());
+    std::vector<size_t> ret;
     // targetInfo , mRanks [tpranks, dpranks]
     for (int i = 0; i < targetInfo.mDomainPPSize; i++)
     {
-        ret.push_back(connections.at(i));
+        ret.push_back(i);
     }
     return ret;
 }
@@ -133,11 +130,11 @@ void MLACacheFormatter::format(TransferSession& session)
         NVTX3_SCOPED_RANGE(sendBufferFun);
 
         TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
-        for (auto const& connection : connections)
+        for (size_t i = 0; i < connections.size(); i++)
         {
             for (auto const& block : inputKvCacheBlocks)
             {
-                session.send(connection, block->data(), block->getSizeInBytes());
+                session.send(i, block->data(), block->getSizeInBytes());
             }
         }
 
@@ -196,7 +193,7 @@ void MLACacheFormatter::format(TransferSession& session)
         if (cacheIdx < bufferCoverTargetNum)
         {
             size = outputSplitCaches.at(cacheIdx)->getSizeInBytes();
-            session.send(connections.at(processIdx), outputSplitCaches.at(cacheIdx)->data(), size);
+            session.send(processIdx, outputSplitCaches.at(cacheIdx)->data(), size);
         }
         else if (bufferCoverTargetNum > 0)
         {
@@ -205,7 +202,7 @@ void MLACacheFormatter::format(TransferSession& session)
             size = outputSplitCaches.at(sendBufferIdx)->getSizeInBytes();
             bufferManager.copy(*outputSplitCaches.at(cacheIdx), *outputSplitCaches.at(sendBufferIdx));
             bufferManager.getStream().synchronize();
-            session.send(connections.at(processIdx), outputSplitCaches.at(sendBufferIdx)->data(), size);
+            session.send(processIdx, outputSplitCaches.at(sendBufferIdx)->data(), size);
         }
         else
         {
@@ -223,7 +220,7 @@ void MLACacheFormatter::format(TransferSession& session)
                 auto copyTargetSlice = runtime::ITensor::slice(preAllocSendBuffer, 0, sendSize);
                 bufferManager.copy(*copySlice, *copyTargetSlice);
                 bufferManager.getStream().synchronize();
-                session.send(connections.at(processIdx), copyTargetSlice->data(), sendSize);
+                session.send(processIdx, copyTargetSlice->data(), sendSize);
 
                 remainSendSize -= sendSize;
             }
@@ -294,7 +291,7 @@ void MLACacheFormatter::unformat(TransferSession& session)
     auto const& connections = session.getConnections();
     auto& bufferManager = session.getBufferManager();
     // diff start
-    auto pickUpConnections = pickRecvConnections(connections, selfConfig, selfIdx, destConfig);
+    auto pickUpConnections = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig);
     // diff end
     auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest);
     std::vector<runtime::ITensor::SharedPtr> recvBufferTmps;
@@ -324,11 +321,11 @@ void MLACacheFormatter::unformat(TransferSession& session)
         NVTX3_SCOPED_RANGE(recvBufferFun);
         TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
         TLLM_CHECK(pickUpConnections.size() == 1);
-        for (auto const& connection : pickUpConnections)
+        for (size_t i = 0; i < pickUpConnections.size(); i++)
         {
             for (auto const& block : outputBuffers)
             {
-                session.recv(connection, block->data(), block->getSizeInBytes());
+                session.recv(pickUpConnections[i], block->data(), block->getSizeInBytes());
             }
         }
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
