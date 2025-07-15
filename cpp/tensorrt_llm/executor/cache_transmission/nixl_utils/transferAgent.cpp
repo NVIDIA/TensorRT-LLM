@@ -536,10 +536,17 @@ NixlLoopbackAgent::NixlLoopbackAgent(BaseAgentConfig const& config)
     init["batch_limit"] = std::to_string(128);
     init["max_request_size"] = std::to_string(16 * 1024 * 1024);
 
-    status = mRawAgent->createBackend("GDS", init, backend);
-    if (status != NIXL_SUCCESS || !backend)
+    if (config.multiThread)
     {
-        TLLM_THROW("Failed to create NIXL backend, status = %d", status);
+        status = mRawAgent->createBackend("GDS_MT", init, backend);
+        if (status != NIXL_SUCCESS || !backend)
+            TLLM_THROW("Failed to create NIXL GDS_MT backend, status = %d", status);
+    }
+    else
+    {
+        status = mRawAgent->createBackend("GDS", init, backend);
+        if (status != NIXL_SUCCESS || !backend)
+            TLLM_THROW("Failed to create NIXL GDS backend, status = %d", status);
     }
 }
 
