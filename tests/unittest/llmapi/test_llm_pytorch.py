@@ -67,62 +67,58 @@ def create_mock_nemo_lora_checkpoint(
     Returns:
         Path to the created .nemo file
     """
-    # Create temporary directory for checkpoint contents
-    temp_dir = lora_dir / "temp_nemo"
-    temp_dir.mkdir(exist_ok=True)
-
-    # Create LoRA weights dict
-    weights_dict = {}
-
-    for layer_idx in range(num_layers):
-        # NeMo uses this key format for QKV adapters
-        key_prefix = f"model.layers.{layer_idx}.self_attention.adapter_layer.lora_kqv_adapter"
-
-        # Create linear_in weights [lora_rank, hidden_size] with small random values
-        linear_in_key = f"{key_prefix}.linear_in.weight"
-        weights_dict[linear_in_key] = torch.randn(
-            lora_rank, hidden_size, dtype=torch.float16) * 0.01
-
-        # Create linear_out weights [3 * hidden_size, lora_rank] for QKV combined
-        linear_out_key = f"{key_prefix}.linear_out.weight"
-        weights_dict[linear_out_key] = torch.randn(
-            3 * hidden_size, lora_rank, dtype=torch.float16) * 0.01
-
-    # Save checkpoint
-    ckpt_path = temp_dir / "model_weights.ckpt"
-    torch.save(weights_dict, ckpt_path)
-
-    # Create minimal config
-    config = {
-        "precision": "fp16",
-        "trainer": {
-            "num_nodes": 1,
-            "devices": tp_size,
-        },
-        "model": {
-            "hidden_size": hidden_size,
-            "num_layers": num_layers,
-        },
-        "lora": {
-            "rank": lora_rank,
-            "target_modules": ["attn_qkv"],
-        }
-    }
-
-    config_path = temp_dir / "model_config.yaml"
-    # Using JSON for simplicity since YAML parsing isn't critical for the test
-    with open(config_path, 'w') as f:
-        json.dump(config, f)
-
-    # Create .nemo tarfile
     nemo_path = lora_dir / "test_lora.nemo"
-    with tarfile.open(nemo_path, 'w') as tar:
-        tar.add(ckpt_path, arcname="model_weights.ckpt")
-        tar.add(config_path, arcname="model_config.yaml")
 
-    # Cleanup temp dir
-    import shutil
-    shutil.rmtree(temp_dir)
+    # Use temporary directory context manager for safe cleanup
+    with tempfile.TemporaryDirectory() as temp_dir_str:
+        temp_dir = Path(temp_dir_str)
+
+        # Create LoRA weights dict
+        weights_dict = {}
+
+        for layer_idx in range(num_layers):
+            # NeMo uses this key format for QKV adapters
+            key_prefix = f"model.layers.{layer_idx}.self_attention.adapter_layer.lora_kqv_adapter"
+
+            # Create linear_in weights [lora_rank, hidden_size] with small random values
+            linear_in_key = f"{key_prefix}.linear_in.weight"
+            weights_dict[linear_in_key] = torch.randn(
+                lora_rank, hidden_size, dtype=torch.float16) * 0.01
+
+            # Create linear_out weights [3 * hidden_size, lora_rank] for QKV combined
+            linear_out_key = f"{key_prefix}.linear_out.weight"
+            weights_dict[linear_out_key] = torch.randn(
+                3 * hidden_size, lora_rank, dtype=torch.float16) * 0.01
+
+        ckpt_path = temp_dir / "model_weights.ckpt"
+        torch.save(weights_dict, ckpt_path)
+
+        # Create minimal config
+        config = {
+            "precision": "fp16",
+            "trainer": {
+                "num_nodes": 1,
+                "devices": tp_size,
+            },
+            "model": {
+                "hidden_size": hidden_size,
+                "num_layers": num_layers,
+            },
+            "lora": {
+                "rank": lora_rank,
+                "target_modules": ["attn_qkv"],
+            }
+        }
+
+        config_path = temp_dir / "model_config.yaml"
+        # Using JSON for simplicity since YAML parsing isn't critical for the test
+        with open(config_path, 'w') as f:
+            json.dump(config, f)
+
+        # Create .nemo tarfile
+        with tarfile.open(nemo_path, 'w') as tar:
+            tar.add(ckpt_path, arcname="model_weights.ckpt")
+            tar.add(config_path, arcname="model_config.yaml")
 
     return nemo_path
 
