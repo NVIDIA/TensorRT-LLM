@@ -151,7 +151,7 @@ enable_language(C CXX CUDA)
 # after that CMake handles it just fine.
 setup_cuda_architectures()
 
-find_package(CUDAToolkit 11.2 REQUIRED COMPONENTS cudart_static cuda_driver
+find_package(CUDAToolkit 12.9 REQUIRED COMPONENTS cudart_static cuda_driver
                                                   cublas cublasLt curand nvml)
 
 set(CUBLAS_LIB CUDA::cublas)
