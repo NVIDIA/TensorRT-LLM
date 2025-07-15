@@ -438,8 +438,16 @@ class LoraManager(object):
         "mlp_gate_up": 18,
     }
 
-    def __init__(self, cpp_peft_cache_manager: tb_internal.batch_manager.PeftCacheManager | None):
-        """Constructor."""
+    def __init__(
+        self, cpp_peft_cache_manager: tb_internal.batch_manager.PeftCacheManager | None = None
+    ):
+        """Constructor.
+
+        Args:
+            cpp_peft_cache_manager (PeftCacheManager, optional): used by is_adapter_in_cpu_cache method, that's used for
+                a performance optimization with LoRA of not sending the LoRA adapter weights with every LLM request when
+                the adapter is already loaded in the LoRA CPU cache.
+        """
         # _lora_uid_to_low_ranks: dict[str -> dict[int -> dict[str -> int]]]
         # {
         #     uid: {
@@ -480,8 +488,8 @@ class LoraManager(object):
     def is_adapter_in_cpu_cache(self, adapter_uid: int) -> bool:
         """Best effort to check if a LoRA adapter is in the LoRA CPU cache.
 
-        If no peft_cache_manager instance was given at the construction of this LoraManager instance,
-        then False is returned.
+        If no cpp_peft_cache_manager instance was given at the construction of this LoraManager instance, then False is
+        returned.
         """
         return (
             self._cpp_peft_cache_manager.is_task_cached(adapter_uid)

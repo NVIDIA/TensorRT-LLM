@@ -151,10 +151,10 @@ class GenerationExecutorWorker(GenerationExecutor):
                 engine_config)
             if engine_config.build_config.plugin_config.lora_plugin:
                 # TODO(azuker): Passing peft cache manager to LoraManager is used for LoRA optimization
-                # of not sending adapter weights with LLM request when adapter is already loaded in LoRA
-                # CPU cache. Getting the peft cache manager from this point in the TRT flow is currently
-                # not supported (it's at the CPP Executor->ExecutorImpl->TrtGptModel->mPeftCacheManager)
-                # therefore for now this LoRA optimization is not available in TRT-python flow.
+                # (see LoraManager constructor docstring). Getting the peft cache manager from this
+                # point in the TRT flow is currently not supported (it's at the CPP
+                # Executor->ExecutorImpl->TrtGptModel->mPeftCacheManager) therefore for now this LoRA
+                # optimization is not available in TRT-python flow.
                 self._lora_manager = LoraManager(cpp_peft_cache_manager=None)
             if engine_config.build_config.max_prompt_embedding_table_size > 0:
                 self._prompt_adapter_manager = PromptAdapterManager()
