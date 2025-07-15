@@ -273,16 +273,6 @@ class MLPBlock(torch.nn.Module):
         if self.mapping.tp_size > 1 and all_rank_num_tokens is not None:
             if (isinstance(self.experts, (TRTLLMGenFusedMoE, TritonFusedMoE))):
                 t = allgather(t, self.mapping, dim=0, sizes=all_rank_num_tokens)
-            # Use padding when the experts have quantization that produces x_sf with different shape
-            # Check if the experts have FP4 quantization - check for all FP4 variants
-            # Also check for MXFP4 modes which also produce x_sf
-            elif (self.experts.has_nvfp4 or self.experts.has_w4a16_mxfp4
-                  or self.experts.has_w4a8_mxfp4_fp8
-                  or self.experts.has_w4a8_mxfp4_mxfp8):
-                use_dp_padding = True
-                # Pad the tensor to max size
-                t = torch.nn.functional.pad(
-                    t, (0, 0, 0, all_rank_max_num_tokens - t.shape[0]))
 
         g = self.gate(t)
         # Use ideal load balanced logits if enabled, otherwise use gate output
