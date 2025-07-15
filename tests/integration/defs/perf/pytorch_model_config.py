@@ -18,6 +18,15 @@ Model pytorch yaml config for trtllm-bench perf tests
 """
 
 
+def recursive_update(d, u):
+    for k, v in u.items():
+        if isinstance(v, dict) and isinstance(d.get(k), dict):
+            recursive_update(d[k], v)
+        else:
+            d[k] = v
+    return d
+
+
 def get_model_yaml_config(model_label: str,
                           lora_dirs: list[str] = None) -> dict:
     """
@@ -130,7 +139,9 @@ def get_model_yaml_config(model_label: str,
             ],
             'config': {
                 'enable_attention_dp': False,
-                'moe_backend': 'TRTLLM'
+                'moe_config': {
+                    'backend': 'TRTLLM'
+                }
             }
         }
     ]
@@ -142,7 +153,7 @@ def get_model_yaml_config(model_label: str,
             patterns = [patterns]
         for pattern in patterns:
             if pattern in model_label.lower():
-                base_config.update(pattern_config['config'])
+                recursive_update(base_config, pattern_config['config'])
                 break  # Stop checking other patterns for this config once we find a match
 
     # lora-specific change for pytorch
