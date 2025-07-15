@@ -129,11 +129,11 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
                                (self.ep_rank + 1) *
                                self.expert_size_per_partition,
                                device=x.device).view(-1, 1, 1)
-        matches = (token_selected_experts == experts).cpu()
+        matches = (token_selected_experts == experts)
         token_per_expert = matches.sum(dim=[-1, -2]).flatten()
         token_per_expert_padded = (token_per_expert + 127) // 128 * 128
         token_per_expert_offset_padded = torch.cat(
-            (torch.tensor([0], dtype=torch.int32),
+            (torch.zeros(1, dtype=torch.int32, device=x.device),
              torch.cumsum(token_per_expert_padded, dim=0)))
 
         permuted_data_tensor = torch.empty(token_per_expert_padded.sum(),
@@ -141,9 +141,11 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
                                            dtype=x.dtype,
                                            device=x.device)
         m_indices = torch.empty(permuted_data_tensor.shape[0],
-                                dtype=torch.int32)
+                                dtype=torch.int32,
+                                device=x.device)
         token_map = torch.zeros(permuted_data_tensor.shape[0],
-                                dtype=torch.int32)
+                                dtype=torch.int32,
+                                device=x.device)
         m = matches.nonzero()
         m_indices = torch.cat([
             torch.full((l, ), i, dtype=torch.int32)
