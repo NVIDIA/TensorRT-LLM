@@ -14,7 +14,7 @@ from tensorrt_llm.bindings.executor import DecodingMode, ExecutorConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import (LoraConfig,
                                        get_default_trtllm_modules_to_hf_modules,
-                                       load_torch_hf_lora)
+                                       load_torch_lora)
 from tensorrt_llm.mapping import Mapping
 
 from ..model_config import ModelConfig
@@ -438,11 +438,7 @@ def create_py_executor_instance(
 
         if len(lora_config.lora_dir) == 1:
             # Route to appropriate loader based on checkpoint source
-            if lora_config.lora_ckpt_source == "nemo":
-                from tensorrt_llm.lora_manager import load_torch_nemo_lora
-                load_torch_nemo_lora(lora_config)
-            else:
-                load_torch_hf_lora(lora_config)
+            load_torch_lora(lora_config)
         else:
             assert len(lora_config.lora_target_modules
                        ) >= 1, "Expecting at least one lora target module"
