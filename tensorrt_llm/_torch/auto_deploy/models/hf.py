@@ -28,6 +28,7 @@ from transformers.utils import (
 )
 
 from ..custom_ops.attention_interface import CacheConfig
+from ..utils._config import deep_merge_dicts
 from ..utils.logger import ad_logger
 from .factory import ModelFactory, ModelFactoryRegistry
 
@@ -62,25 +63,27 @@ def hf_load_state_dict_with_device(device: DeviceLikeType):
 
 @ModelFactoryRegistry.register("AutoModelForCausalLM")
 class AutoModelForCausalLMFactory(ModelFactory):
+    _tokenizer_defaults = {
+        "legacy": False,
+        "padding_side": "left",
+        "truncation_side": "left",
+        "trust_remote_code": True,
+        "use_fast": True,
+    }
+
+    _model_defaults = {
+        "use_cache": False,
+        "max_position_embeddings": 1024,
+    }
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         self._quant_config: Optional[Dict] = None
 
-        # Relevant default tokenizer kwargs for HF-style tokenizer
-        defaults = {
-            "legacy": False,
-            "padding_side": "left",
-            "truncation_side": "left",
-            "trust_remote_code": True,
-            "use_fast": True,
-        }
-        self.tokenizer_kwargs = {**defaults, **self.tokenizer_kwargs}
-
-        # NEVER use cache
-        self.model_kwargs["use_cache"] = False
-        # Ensure max_seq_len is propagated to model_kwargs
-        self.model_kwargs["max_position_embeddings"] = self.max_seq_len
+        # Ingest defaults for tokenizer and model kwargs
+        self.tokenizer_kwargs = deep_merge_dicts(self._tokenizer_defaults, self.tokenizer_kwargs)
+        self.model_kwargs = deep_merge_dicts(self._model_defaults, self.model_kwargs)
 
         # special handling for torch_dtype in model_kwargs since HF does not correctly update
         # torch_dtype string to an actual torch.dtype object (only with default)
@@ -114,7 +117,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
     def _recursive_update_config(self, config: PretrainedConfig, update_dict: Dict[str, Any]):
         """
-        Recursively update a PretrainedConfig object with values from update_dict.
+        Deep-merge a PretrainedConfig object with values from update_dict.
 
         Args:
             config: PretrainedConfig object to update
@@ -332,21 +335,14 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
 @ModelFactoryRegistry.register("AutoModelForImageTextToText")
 class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        # additional heuristic to propagate "important keys"
-        # TODO (lucaslie): WAR until we have better support on dashboard to control model_kwargs
-        keys_to_propagate = [
-            "num_hidden_layers",
-            "max_position_embeddings",
-            "use_cache",
-            "torch_dtype",
-        ]
-        self.model_kwargs["text_config"] = self.model_kwargs.get("text_config", {})
-        for key in keys_to_propagate:
-            if key in self.model_kwargs:
-                self.model_kwargs["text_config"][key] = self.model_kwargs[key]
+    _model_defaults = {
+        "use_cache": False,
+        "max_position_embeddings": 1024,
+        "text_config": {
+            "max_position_embeddings": 1024,
+            "use_cache": False,
+        },
+    }
 
     @property
     def automodel_from_config(self):
