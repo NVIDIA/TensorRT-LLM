@@ -6,22 +6,89 @@
 # Without approval from a member of this team, PRs cannot be merged to release branches.
 # * @NVIDIA/trt-llm-release-branch-approval
 
-# TensorRT-LLM Pytorch backend
-/tensorrt_llm/_torch @NVIDIA/trt-llm-torch-devs
-## TensorRT-LLM Pytorch backend - runtime
-/tensorrt_llm/_torch/pyexecutor @NVIDIA/trt-llm-torch-runtime-devs
-## TensorRT-LLM Pytorch backend - AutoDeploy flow
-/tensorrt_llm/_torch/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
-/tensorrt_llm/examples/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
 
+### LLM API ##
+/tensorrt_llm/llmapi @NVIDIA/trt-llm-llmapi-devs
+
+### Executor ###
+/tensorrt_llm/executor @NVIDIA/trt-llm-llmapi-devs
+
+### BENCHMARKING ###
 ## TensorRT-LLM trtllm-bench Reviewers
 /tensorrt_llm/bench @NVIDIA/trtllm-bench-reviewers
 /tensorrt_llm/commands/bench.py @NVIDIA/trtllm-bench-reviewers
+
+### SCRIPTS ###
+
+### TORCH BINDINGS ###
+# TensorRT-LLM Pytorch backend
+/tensorrt_llm/_torch @QiJune @hlu1 @NVIDIA/trt-llm-torch-devs
+## TensorRT-LLM Pytorch backend - runtime
+/tensorrt_llm/_torch/pyexecutor @dongxuy04 @funatiq @dcampora @HuiGao-NV @NVIDIA/trt-llm-torch-runtime-devs @NVIDIA/trt-llm-torch-devs
+## TensorRT-LLM Pytorch backend - AutoDeploy flow
+/tensorrt_llm/_torch/auto_deploy @lucaslie @suyoggupta @NVIDIA/trt-llm-torch-autodeploy-devs @NVIDIA/trt-llm-torch-devs
+## TensorRT-LLM Pytorch backend - attention backend
+# TODO: create a child team of @NVIDIA/trt-llm-torch-devs for this e.g. @NVIDIA/trt-llm-torch-attention-backend-devs
+/tensorrt_llm/_torch/attention_backend @yuxianq @hlu1 @NVIDIA/trt-llm-torch-devs
+## TensorRT-LLM Pytorch backend - compilation
+# TODO: create a child team of @NVIDIA/trt-llm-torch-devs for this e.g. @NVIDIA/trt-llm-torch-compilation-devs
+/tensorrt_llm/_torch/compilation @litaotju @yizhang-nv @liji-nv @NVIDIA/trt-llm-torch-devs
+## TensorRT-LLM Pytorch backend - custom ops
+# TODO: create a child team of @NVIDIA/trt-llm-torch-devs for this e.g. @NVIDIA/trt-llm-torch-custom-ops-devs
+/tensorrt_llm/_torch/custom_ops @yizhang-nv @NVIDIA/trt-llm-torch-devs
+## TensorRT-LLM Pytorch backend - distributed
+# TODO: create a child team of @NVIDIA/trt-llm-torch-devs for this e.g. @NVIDIA/trt-llm-torch-distributed-devs
+/tensorrt_llm/_torch/distributed @yilin-void @yuxianq @hyukn @yizhang-nv @hlu1 @NVIDIA/trt-llm-torch-devs
+## TensorRT-LLM Pytorch backend - peft
+# TODO: create a child team of @NVIDIA/trt-llm-torch-devs for this e.g. @NVIDIA/trt-llm-torch-peft-devs
+/tensorrt_llm/_torch/peft @byshiue @shaharmor98 @NVIDIA/trt-llm-torch-devs
+## TensorRT-LLM Pytorch backend - speculative
+# TODO: create a child team of @NVIDIA/trt-llm-torch-devs for this e.g. @NVIDIA/trt-llm-torch-speculative-devs
+/tensorrt_llm/_torch/speculative @lfr-0531 @mikeiovine @NVIDIA/trt-llm-torch-devs
+## TensorRT-LLM Pytorch backend - models
+# TODO: create a child team of @NVIDIA/trt-llm-torch-devs for this e.g. @NVIDIA/trt-llm-torch-models-devs
+/tensorrt_llm/_torch/models @NVIDIA/trt-llm-torch-devs
+/tensorrt_llm/_torch/models/modeling_deepseekv3.py @hlu1 @zongfeijing @NVIDIA/trt-llm-torch-devs
+/tensorrt_llm/_torch/models/modeling_llama.py @chang-l @mikeiovine @NVIDIA/trt-llm-torch-devs
+/tensorrt_llm/_torch/models/modeling_qwen3_moe.py @byshiue @NVIDIA/trt-llm-torch-devs
+/tensorrt_llm/_torch/models/modeling_qwen3.py @byshiue @NVIDIA/trt-llm-torch-devs
+## TensorRT-LLM Pytorch backend - modules
+# TODO: create a child team of @NVIDIA/trt-llm-torch-devs for this e.g. @NVIDIA/trt-llm-torch-modules-devs
+/tensorrt_llm/_torch/modules @NVIDIA/trt-llm-torch-devs
+/tensorrt_llm/_torch/modules/attention.py @yuxianq @hlu1 @NVIDIA/trt-llm-torch-devs
+/tensorrt_llm/_torch/modules/fused_moe.py @hlu1 @dongxuy04 @zongfeijing @HuiGao-NV @NVIDIA/trt-llm-torch-devs
+
+### CORE TENSORRT-LLM MODULES ###
+# Core autotuner
+/tensorrt_llm/autotuner.py @hyukn @litaotju
+# Pipeline interface
+/tensorrt_llm/pipeline_interface.py @amukkara @chang-l
+
+### LEGACY BINDINGS (TRT) ###
+
+### OTHER PYTHON MODULES ###
+
+### CPP ###
+
+### TRITON BACKEND ###
+
+### INFRA ###
+
+### EXAMPLES ###
+/examples/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
+# TODO: create a child team of @NVIDIA/trt-llm-torch-devs for this e.g. @NVIDIA/trt-llm-torch-examples-devs
+/examples/pytorch @QiJune @hlu1 @NVIDIA/trt-llm-torch-devs
+
+### DOCS ###
+# TODO: create a team for this e.g. @NVIDIA/trt-llm-docs-devs
+/docs/* @nv-guomingz
 docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 
-## TensorRT-LLM LLM API
-/tensorrt_llm/llmapi @NVIDIA/trt-llm-llmapi-devs
-/tensorrt_llm/executor @NVIDIA/trt-llm-llmapi-devs
+### TESTS ###
+## TensorRT-LLM Pytorch backend tests
+/tests/unittest/_torch @NVIDIA/trt-llm-torch-devs
+
+### API STABILITY ###
 
 # The rule below requires that any PR modifying public APIs must be approved by at least one member
 # of the NVIDIA/trt-llm-committed-api-review-committee or NVIDIA/trt-llm-noncommitted-api-review-committee team.
