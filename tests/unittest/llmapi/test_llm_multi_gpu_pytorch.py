@@ -3,8 +3,8 @@ import pytest
 # isort: off
 from .test_llm import tinyllama_logits_processor_test_harness
 from tensorrt_llm.llmapi import KvCacheConfig
-from .test_llm_pytorch import (llama_7b_lora_from_dir_test_harness,
-                               llama_7b_multi_lora_from_request_test_harness)
+from .lora_test_utils import check_pytorch_llama_7b_multi_lora_from_request_test_harness
+from .test_llm_pytorch import llama_7b_lora_from_dir_test_harness
 from .test_llm import _test_llm_capture_request_error
 # isort: on
 
@@ -40,5 +40,5 @@ def test_llama_7b_lora_tp2():
 
 @pytest.mark.gpu2
 def test_llama_7b_multi_lora_tp2():
-    llama_7b_multi_lora_from_request_test_harness(
+    check_pytorch_llama_7b_multi_lora_from_request_test_harness(
         tensor_parallel_size=2, kv_cache_config=global_kv_cache_config)
