@@ -259,7 +259,7 @@ class CutlassFusedMoE(MoE):
                 x = torch.nn.functional.pad(x, (0, pad_size))
                 # Update x_row and x_col to the padded shape
                 x_row, x_col = x.shape[0], x.shape[1]
-                if use_allgather:
+                if run_post_quant_allgather:
                     x, x_sf = torch.ops.trtllm.mxfp8_quantize(x, False)
                 else:
                     x, x_sf = torch.ops.trtllm.mxfp8_quantize(x, True)
