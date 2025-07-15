@@ -313,40 +313,52 @@ def llama_7b_multi_unique_lora_adapters_from_request(
 
 
 @pytest.mark.parametrize(
-    "lora_adapter_count_per_call, max_loras, max_cpu_loras", [
+    "lora_adapter_count_per_call, max_loras, max_cpu_loras, repeats",
+    [
+        # Test eviction and loading of new adapters in the evicted space, within a single llm.generate call
         ([
             5,
-        ], 2, 2),
-        ([2, 2, 2], 1, 3),
+        ], 2, 2, 1),
+        # Test eviction and re-loading a previously evicted adapter from the LoRA GPU cache
+        ([
+            2,
+        ], 1, 2, 2),
+        # Test eviction and loading of new adapters in the evicted space, over several llm.generate calls, with LoRA GPU cache size < LoRA CPU cache size
+        ([2, 2, 2], 1, 3, 1),
     ])
 @skip_gpu_memory_less_than_40gb
 def test_llama_7b_multi_lora_evict_load_new_adapters(
         lora_adapter_count_per_call: list[int], max_loras: int,
-        max_cpu_loras: int):
+        max_cpu_loras: int, repeats: int):
     llama_7b_multi_unique_lora_adapters_from_request(
-        lora_adapter_count_per_call, max_loras, max_cpu_loras, repeats=1)
+        lora_adapter_count_per_call, max_loras, max_cpu_loras, repeats)
 
 
 @pytest.mark.parametrize(
-    "lora_adapter_count_per_call, max_loras, max_cpu_loras",
+    "lora_adapter_count_per_call, max_loras, max_cpu_loras, repeats",
     [
-        ([1, 1], 1, 1),
-        #([5,], 2, 2),
-        #([2, 2], 1, 3),
+        # Test eviction, reloading new adapters and reloading previously evicted adapters from the LoRA CPU cache & GPU cache over more than a single llm.generate call
+        ([1, 1], 1, 1, 2),
+        # Test eviction, reloading new adapters and reloading previously evicted adapters from the LoRA CPU cache & GPU cache over a single llm.generate call
+        ([
+            5,
+        ], 2, 2, 2),
     ])
 @skip_gpu_memory_less_than_40gb
 def test_llama_7b_multi_lora_load_previously_cpu_cache_evicted_adapter_fails(
         lora_adapter_count_per_call: list[int], max_loras: int,
-        max_cpu_loras: int):
+        max_cpu_loras: int, repeats: int):
     """Tests that trying to load a LoRA adapter after it was evicted from CPU cache fails with the expected
     message, as this feature is currently not supported in favor of the performance improvement of not
     sending the LoRA weights with every request after the first time.
     """  # noqa: D205
 
     def _check_contains_expected_message(stdout: str, stderr: str):
-        return "not found in cache" in stderr
+        note_in_message = "Note that currently a request with LoRA task that was already loaded is sent" \
+                          " without its LoRA weights to save its serialization, copy and deserialization, so if this" \
+                          " LoRA task was evicted from LoRA CPU cache, then its reuse is currently not supported."
+        return note_in_message in stderr
 
-    repeats = 2
     with EnvVarsContextManager({"TLLM_WORKER_USE_SINGLE_PROCESS": "1"}):
         child_stdout, child_stderr = run_function_in_sub_process(
             target=llama_7b_multi_unique_lora_adapters_from_request,
@@ -354,6 +366,10 @@ def test_llama_7b_multi_lora_load_previously_cpu_cache_evicted_adapter_fails(
                   repeats),
             kwargs={},
             stop_waiting_criteria=_check_contains_expected_message)
+    print("STDOUT:")
+    print(child_stdout)
+    print("STDERR:")
+    print(child_stderr)
     assert _check_contains_expected_message(child_stdout, child_stderr)
 
 

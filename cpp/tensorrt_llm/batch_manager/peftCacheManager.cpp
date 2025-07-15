@@ -277,7 +277,9 @@ void PeftCacheManager::addRequestPeft(std::shared_ptr<LlmRequest> llmRequest, bo
         if (!isTaskCached(taskId))
         {
             std::string errMsg
-                = "LoRA task " + std::to_string(taskId) + " not found in cache. Please send LoRA weights with request";
+                = "LoRA task " + std::to_string(taskId) + " not found in cache. Please send LoRA weights with request."
+                " Note that currently a request with LoRA task that was already loaded is sent without its LoRA weights to save its serialization, copy and deserialization,"
+                " so if this LoRA task was evicted from LoRA CPU cache, then its reuse is currently not supported.";
             throw PeftTaskNotCachedException(errMsg);
         }
     }
