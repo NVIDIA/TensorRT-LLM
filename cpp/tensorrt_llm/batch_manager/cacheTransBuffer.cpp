@@ -214,12 +214,9 @@ CacheTransBufferManager::CacheTransBufferManager(
             bufferSizeFromMaxNumToken += validTokenNum * kvCacheByteSizePerTokenPerLayer;
         }
     }
-    auto kvCachePerToken
-        = (mCacheManager->getBlockManager().getBlockSize(0) * mCacheManager->getBlockManager().getNumLayers()
-              * (mCacheManager->getCacheType() == CacheType::kSELFKONLY ? 1 : 2))
-        / tokensPerBlock * common::getDTypeSize(mDataType);
-    mTransferBufferSize = maxNumTokens.has_value() ? maxNumTokens.value() * kvCachePerToken
-                                                   : common::getEnvMemSizeForKVCacheTransferBuffer();
+
+    mTransferBufferSize
+        = maxNumTokens.has_value() ? bufferSizeFromMaxNumToken : common::getEnvMemSizeForKVCacheTransferBuffer();
     mOnlyUseDynamicBuffer = mTransferBufferSize == 0;
     mRecvBufferCount = common::getEnvRequestKVCacheConcurrent() ? common::getEnvKVCacheRecvBufferCount() : 1;
     mSendBufferCount = common::getEnvParallelCacheSend() ? common::getEnvKVCacheSendMaxConcurrenceNum() : 1;
