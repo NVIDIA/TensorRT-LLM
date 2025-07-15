@@ -12,7 +12,7 @@ from tensorrt_llm.mapping import Mapping
 try:
     from tensorrt_llm.deep_ep import Buffer
     deep_ep_installed = True
-except ModuleNotFoundError:
+except ImportError:
     deep_ep_installed = False
 
 
