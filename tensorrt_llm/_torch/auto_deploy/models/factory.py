@@ -211,9 +211,7 @@ class ModelFactoryRegistry:
     _registry: Dict[str, Type[ModelFactory]] = {}
 
     @classmethod
-    def register(
-        cls: Type[ModelFactory], name: str
-    ) -> Callable[[Type[ModelFactory]], Type[ModelFactory]]:
+    def register(cls, name: str) -> Callable[[Type[ModelFactory]], Type[ModelFactory]]:
         def inner(fn: Type[ModelFactory]) -> Type[ModelFactory]:
             cls._registry[name] = fn
             return fn

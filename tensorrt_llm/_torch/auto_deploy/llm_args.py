@@ -1,29 +1,43 @@
-import json
+from importlib.resources import files
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Type, Union
 
 import torch
-from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
+from pydantic import Field, ValidationInfo, field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from ...llmapi.llm_args import BaseLlmArgs, BuildConfig, _ParallelConfig
 from ...llmapi.utils import get_type_repr
 from .models import ModelFactory, ModelFactoryRegistry
+from .utils._config import DynamicYamlMixInForSettings
 
 PathLike = Union[str, Path]
 
 
-def _try_decode_dict_with_str_values(value: Dict[str, Any]) -> Dict[str, Any]:
-    """Try to parse string values as JSON to convert to native types if possible."""
-    for k, v in value.items():
-        if isinstance(v, str):
-            try:
-                value[k] = json.loads(v)
-            except json.JSONDecodeError:
-                pass
+def _get_config_dict() -> SettingsConfigDict:
+    return SettingsConfigDict(
+        arbitrary_types_allowed=True,
+        extra="forbid",
+        yaml_file=str(files("tensorrt_llm._torch.auto_deploy.config") / "default.yaml"),
+        nested_model_default_partial_update=True,
+    )
+
+
+def _check_for_default_value_only(
+    cls: Type[BaseSettings], value: Any, info: ValidationInfo, msg: str
+) -> Any:
+    """Check if the value is the default value for the field.
+
+    If the value is not the default value, raise a ValueError.
+    """
+    field_name = info.field_name
+    assert field_name is not None, "field_name should be set for validated field."
+    if value != cls.model_fields[field_name].get_default(call_default_factory=True):
+        raise ValueError(msg)
     return value
 
 
-class AutoDeployConfig(BaseModel):
+class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
     """An argument class stripped down to AutoDeploy-specific configurations.
 
     This class be used as a drop-in replacement to simplify configuring the AutoDeploy backend and
@@ -32,6 +46,8 @@ class AutoDeployConfig(BaseModel):
     It is compatible with AutoDeploy's LLM API (``tensorrt_llm._torch.auto_deploy.llm.LLM``) and
     exposes the full set of parameters used in AutoDeploy's ``InferenceOptimizer``.
     """
+
+    model_config = _get_config_dict()
 
     ### MODEL AND TOKENIZER FACTORY ################################################################
     model: PathLike = Field(
@@ -117,7 +133,7 @@ class AutoDeployConfig(BaseModel):
         frozen=True,
     )
 
-    # INFERENCE OPTIMIZER CONFIG ###################################################################
+    ### INFERENCE OPTIMIZER CONFIG #################################################################
     attn_backend: Literal["flashinfer", "triton", "torch"] = Field(
         default="flashinfer", description="Attention backend to use."
     )
@@ -167,12 +183,6 @@ class AutoDeployConfig(BaseModel):
     )
 
     ### VALIDATION #################################################################################
-    @field_validator("model_kwargs", "tokenizer_kwargs", mode="after")
-    @classmethod
-    def validate_model_kwargs(cls, value: Dict[str, Any]) -> Dict[str, Any]:
-        """Try to parse string values as JSON to convert to native types if possible."""
-        return _try_decode_dict_with_str_values(value)
-
     @model_validator(mode="after")
     def update_attn_page_size(self):
         # NOTE force attn_page_size to equal max_seq_len for triton backend
@@ -184,10 +194,11 @@ class AutoDeployConfig(BaseModel):
     def create_factory(self) -> ModelFactory:
         """Create a model factory from the arguments."""
 
+        # TODO (lucaslie): consider supporting Path objects in the model factory
         return ModelFactoryRegistry.get(self.model_factory)(
-            model=self.model,
+            model=str(self.model),
             model_kwargs=self.model_kwargs,
-            tokenizer=self.tokenizer,
+            tokenizer=None if self.tokenizer is None else str(self.tokenizer),
             tokenizer_kwargs=self.tokenizer_kwargs,
             skip_loading_weights=self.skip_loading_weights,
             max_seq_len=self.max_seq_len,
@@ -202,7 +213,7 @@ class AutoDeployConfig(BaseModel):
         return LlmArgs(**self.to_dict())
 
 
-class LlmArgs(AutoDeployConfig, BaseLlmArgs):
+class LlmArgs(AutoDeployConfig, BaseLlmArgs, BaseSettings):
     """LlmArgs config class for providing full expert configurability of the AutoDeploy backend.
 
     Specifically, this class extends AutoDeployConfig with all the fields from BaseLlmArgs for
@@ -217,6 +228,8 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs):
     NOTE: this class may expose redundant fields from BaseLlmArgs or fields that are ignored or
     have overlapping functionality with AutoDeployConfig. Please be careful when using this class.
     """
+
+    model_config = _get_config_dict()
 
     build_config: Optional[object] = Field(
         default_factory=lambda: BuildConfig(),
@@ -241,8 +254,9 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs):
     ### VALIDATION #################################################################################
     @field_validator("build_config", mode="before")
     @classmethod
-    def ensure_no_build_config(cls, value: Any) -> Any:
-        raise ValueError("build_config is not in use by AutoDeploy's LlmArgs")
+    def ensure_no_build_config(cls, value: Any, info: ValidationInfo) -> Any:
+        msg = "build_config is not in use by AutoDeploy's LlmArgs"
+        return _check_for_default_value_only(cls, value, info, msg)
 
     @field_validator(
         "tensor_parallel_size",
@@ -257,13 +271,8 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs):
     )
     @classmethod
     def ensure_no_custom_parallel_config(cls, value: Any, info: ValidationInfo) -> Any:
-        field_name = info.field_name
-        assert field_name is not None, "field_name should be set for validated field."
-        if value != cls.model_fields[field_name].get_default(call_default_factory=True):
-            raise ValueError(
-                "AutoDeploy only supports parallelization via the `world_size` argument."
-            )
-        return value
+        msg = "AutoDeploy only supports parallelization via the `world_size` argument."
+        return _check_for_default_value_only(cls, value, info, msg)
 
     @model_validator(mode="after")
     def validate_parallel_config(self):

@@ -2,39 +2,57 @@
 
 import os
 from pathlib import Path
-from typing import Any, List
+from typing import Any, Dict, List, Union
 
+from omegaconf import DictConfig, OmegaConf
 from pydantic import Field
-from pydantic._internal._utils import deep_update
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, YamlConfigSettingsSource
 from pydantic_settings.sources.types import PathType
 
 
+def deep_merge_dicts(*confs: Union[Dict, DictConfig]) -> Dict:
+    """Deep merge a list of dictionaries via OmegaConf.merge.
+
+    Args:
+        *confs: A list of dictionaries or DictConfig objects to merge.
+
+    Returns:
+        A merged dictionary.
+    """
+    if len(confs) == 0:
+        return {}
+    merged_conf = OmegaConf.merge(*[OmegaConf.create(conf) for conf in confs])
+    result = OmegaConf.to_container(merged_conf, resolve=True)
+    assert isinstance(result, Dict), f"Expected dict, got {type(result)}"
+    return result
+
+
 class DynamicYamlWithDeepMergeSettingsSource(YamlConfigSettingsSource):
-    """YAML config settings source that dynamically loads files and merges them via deep update."""
+    """YAML config settings source that dynamically loads files and merges them via deep update.
+
+    We utilize the omegaconf library for deep merging.
+    """
 
     def _read_files(self, files: PathType | None) -> dict[str, Any]:
         if files is None:
             return {}
         if isinstance(files, (str, os.PathLike)):
             files = [files]
-        vars: dict[str, Any] = {}
+
+        confs = []
         for file in files:
             file_path = Path(file).expanduser()
             if file_path.is_file():
-                new_vars = self._read_file(file_path)
-                vars = deep_update(vars, new_vars)
-        return vars
+                confs.append(OmegaConf.load(file_path))
+
+        return deep_merge_dicts(*confs)
 
     def __call__(self):
         """Call additional config files based on current state."""
         yaml_data = self.yaml_data  # this points to the default yaml data now
-        # update and return from additional files
-        final_data = deep_update(
-            yaml_data,
-            self._read_files(self.current_state.get("yaml_configs", [])),
-        )
-        return final_data
+        additional_files_data = self._read_files(self.current_state.get("yaml_configs", []))
+
+        return deep_merge_dicts(yaml_data, additional_files_data)
 
 
 class DynamicYamlMixInForSettings:
