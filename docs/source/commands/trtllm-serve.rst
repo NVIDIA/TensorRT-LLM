@@ -108,10 +108,10 @@ Another example uses ``curl``:
     :language: bash
     :linenos:
 
-Multimodal Data and Modality Coverage
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Multimodal Modality Coverage
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-TRT-LLM multimodal supports the following data and modalities depending on the model. For each modality, TRT-LLM supports the following data types:
+TRT-LLM multimodal supports the following modalities and data types (depending on the model):
 
 **Text**
 
@@ -148,8 +148,8 @@ TRT-LLM multimodal supports the following data and modalities depending on the m
      ]}
 
 .. note::
-   To convert images to base64-encoded format, you can use the utility function
-   :func:`tensorrt_llm.utils.load_base64_image` or refer to the
+   To convert images to base64-encoded format, use the utility function
+   :func:`tensorrt_llm.utils.load_base64_image`. Refer to the
    `load_base64_image utility <https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/utils/load_base64_image.py>`__
    for implementation details.
 
