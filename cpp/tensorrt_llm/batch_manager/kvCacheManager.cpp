@@ -962,13 +962,17 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
     SizeType32 numMatchedTokens{0};
     auto searchRoot = mCachedBlocksRoot;
 
+    // Do not onboard blocks that fall outside of attention window
+    auto const startOfAttentionWindow = std::max(0, sequence.getNumTokens() - getWindowSize());
+    auto const tokensPerBlock = getTokensPerBlock();
+
     // The last block cannot be shared between beams because it will be written to.
     // Make sure a unique block is allocated per beam.
     auto const beamWidth = sequence.getBeamWidth();
     SizeType32 numSharedContextBlocks = beamWidth > 1 ? numContextBlocks - 1 : numContextBlocks;
 
     auto blockItr = blockKeys.begin();
-    for (int bi = 0; bi < numSharedContextBlocks; ++bi)
+    for (int bi = 0, nextBlockTokenIdx = tokensPerBlock; bi < numSharedContextBlocks; ++bi, nextBlockTokenIdx+=tokensPerBlock)
     {
         auto [partialMatch, numMatched, matchingBlock] = searchRoot != nullptr && blockItr != blockKeys.end()
             ? searchRoot->findMatchingBlock(*blockItr, mEnablePartialReuse, mCopyOnPartialReuse)
@@ -992,6 +996,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                 {
                     // Somebody else is using block or it is not a leaf, copy reusable tokens
                     auto newBlock = getFreeBlock(matchingBlock->getPriority(), matchingBlock->getDurationMs());
+                    // Copy the tokens we want into new block
                     mTransferManager->onboard(matchingBlock, newBlock, mPools, numMatched);
                     // TODO: (optional) Send out event
                     matchingBlock = newBlock;
@@ -1018,7 +1023,8 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                 addBlockToHashMap(matchingBlock);
                 searchRoot = matchingBlock;
             }
-            onboardBlock(matchingBlock);
+            // Onboard block if at least one token is inside attention window
+            if (startOfAttentionWindow < nextBlockTokenIdx) onboardBlock(matchingBlock);
             addBlockToAllBeams(matchingBlock, sequence);
             // TODO: only add once for reused blocks
             ++mReusedBlocks;
