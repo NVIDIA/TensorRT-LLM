@@ -2303,12 +2303,12 @@ pipeline {
                         echo "Only run single-GPU tests."
                         if (dgxJobs.size() > 0) {
                             if (globalVars[ACTION_INFO]['parents'].size() > 0) {
-                                // We add "Require Multi-GPU Testing:" to the parent job(L0_MergeRequest)'s description,
-                                // We will use this to determine whether to run multi-GPU test stage
+                                // We add a special marker to the parent job's description.
+                                // This will be used to decide whether to run multi-GPU test stage.
                                 def parentJob = globalVars[ACTION_INFO]['parents'][-2]
-                                trtllm_utils.appendBuildDescription(this, parentJob['name'], parentJob['build_number'], "Require Multi-GPU Testing:")
+                                trtllm_utils.appendBuildDescription(this, parentJob['name'], parentJob['build_number'], "====Require Multi-GPU Testing====<br/>")
                             } else {
-                                echo "No parent job to run multi-GPU tests."
+                                echo "No parent job found to add the special marker for executing multi-GPU test stage."
                             }
                         } else {
                             echo "Skip multi-GPU testing. No test to run."
@@ -2325,7 +2325,6 @@ pipeline {
                             dgxJobs.failFast = params.enableFailFast
                             parallel dgxJobs
                         } else {
-                            // For multi-GPU job, if not stage will run, we should not add it into queue.
                             error "Skip multi-GPU testing. No test to run."
                         }
                     }
