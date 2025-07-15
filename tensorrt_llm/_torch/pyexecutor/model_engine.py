@@ -386,6 +386,9 @@ class PyTorchModelEngine(ModelEngine):
         self._cuda_graphs = {}
         self._cuda_graph_mem_pool = self._torch_compile_backend._graph_pool_handle if self._torch_compile_enabled else None
         self._run_cuda_graphs = pytorch_backend_config.use_cuda_graph
+        if self._run_cuda_graphs and self.max_beam_width > 1:
+            raise NotImplementedError(
+                "CUDA Graph + beam search is not implemented yet.")
 
         self._cuda_graph_padding_enabled = pytorch_backend_config.cuda_graph_padding_enabled
 
@@ -2034,7 +2037,6 @@ class PyTorchModelEngine(ModelEngine):
             with MoeLoadBalancerIterContext(moe_load_balancer):
                 return self._forward_step(inputs, gather_ids,
                                           gather_context_logits)
-
         with self._maybe_pad_batch(scheduled_requests,
                                    kv_cache_manager) as scheduled_requests:
             maybe_graph = self._maybe_get_cuda_graph(

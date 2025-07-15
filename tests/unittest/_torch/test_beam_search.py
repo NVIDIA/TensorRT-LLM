@@ -38,17 +38,20 @@ def fixed_params():
 
 
 @pytest.fixture(scope="module")
-def llm(fixed_params):
+def llm(fixed_params, input_prompts):
     return LLM(
         model=os.path.join(llm_models_root(), "llama-models-v2",
                            "TinyLlama-1.1B-Chat-v1.0"),
         kv_cache_config=fixed_params["kvcache_config"],
-        max_batch_size=
-        128,  # reduce buffer sizes, specially for generation logits
+        max_batch_size=fixed_params["max_beam_width"] * len(
+            input_prompts
+        ),  # use small batch size to prevent large buffers from possibly hiding wrong data accesses.
         max_seq_len=32,
         enable_trtllm_sampler=True,
         max_beam_width=fixed_params["max_beam_width"],
         disable_overlap_scheduler=True,
+        #TODO: remove this once we have a proper fix for CUDA graph in beam search
+        cuda_graph_config=None,
     )
 
 
@@ -68,8 +71,6 @@ def test_beam_search_output_shapes(gather_context_logits: bool,
     if return_log_probs and num_prompts > 1:
         pytest.skip(
             "Beam search currently does not support return_log_probs with multiple prompts"
-        #TODO: remove this once we have a proper fix for CUDA graph in beam search
-        cuda_graph_config=None,
         )
     sampling_params = SamplingParams(
         max_tokens=fixed_params["max_tokens"],
