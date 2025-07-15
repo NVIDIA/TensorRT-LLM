@@ -59,7 +59,7 @@ Clients can then send requests to the disaggregated server at `localhost:8000`, 
 
 ## Launching disaggregated servers on SLURM clusters
 
-Refer to [Disaggregated Inference Benchmark Scripts](./slurm/README.md).
+Refer to [Disaggregated Inference Benchmark Scripts](./slurm/).
 
 ## Sending requests to the disaggregated server
 
