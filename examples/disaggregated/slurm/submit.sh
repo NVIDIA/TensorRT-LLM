@@ -1,31 +1,32 @@
 #!/bin/bash
-mtp_size=0
 
-# dep8
-for b in 1 64 1024; do
-    concurrency=$((b * 8))
-    ctx_num=$(((concurrency + 5499)/5500))
-    total_gpu_num=$((ctx_num + 2))
-    total_tasks=$((total_gpu_num * 4))
-    sbatch --nodes=${total_gpu_num} --ntasks=${total_tasks} --ntasks-per-node=4 --segment=${total_gpu_num} disaggr_torch.slurm ${ctx_num} 4 4 4480 true 1 8 1024 1024 true "0.8" 0 "$mtp_size" "$concurrency"
-done
+# concurrency 8
+concurrency=8
+ctx_num=1
+total_node_num=8
+ntasks_per_node=4 # 4 GPUs per GB200 node
+ntasks=$((total_node_num * ntasks_per_node))
 
-# dep16 eplb0, 256, 288
-for b in 1 64 1024; do
-    concurrency=$((b * 16))
-    ctx_num=$(((concurrency + 5499)/5500))
-    total_gpu_num=$((ctx_num + 4))
-    total_tasks=$((total_gpu_num * 4))
-    sbatch --nodes=${total_gpu_num} --ntasks=${total_tasks} --ntasks-per-node=4 --segment=${total_gpu_num} disaggr_torch.slurm ${ctx_num} 4 4 4480 true 1 16 1024 1024 true "0.7" 0 "$mtp_size" "$concurrency"
-    sbatch --nodes=${total_gpu_num} --ntasks=${total_tasks} --ntasks-per-node=4 --segment=${total_gpu_num} disaggr_torch.slurm ${ctx_num} 4 4 4480 true 1 16 1024 1024 true "0.7" 256 "$mtp_size" "$concurrency"
-    sbatch --nodes=${total_gpu_num} --ntasks=${total_tasks} --ntasks-per-node=4 --segment=${total_gpu_num} disaggr_torch.slurm ${ctx_num} 4 4 4480 true 1 16 1024 1024 true "0.7" 288 "$mtp_size" "$concurrency"
-done
+# `--segment` makes sure that all nodes are in the same NVLink domain
+# disaggr_torch.slurm arguments:
+#   num_ctx_servers=$1
+#   ctx_tp_size=$2
+#   ctx_batch_size=$3
+#   ctx_max_num_tokens=$4
+#   ctx_enable_attention_dp=$5
+#   num_gen_servers=$6
+#   gen_tp_size=$7
+#   gen_batch_size=$8
+#   gen_max_num_tokens=$9
+#   gen_enable_attention_dp=${10}
+#   gen_gpu_memory_fraction=${11}
+#   eplb_num_slots=${12}
+#   mtp_size=${13}
+#   concurrency=${14}
 
-# dep32 eplb288
-for b in 512; do
-    concurrency=$((b * 32))
-    ctx_num=$(((concurrency + 5499)/5500))
-    total_gpu_num=$((ctx_num + 8))
-    total_tasks=$((total_gpu_num * 4))
-    sbatch --nodes=${total_gpu_num} --ntasks=${total_tasks} --ntasks-per-node=4 --segment=${total_gpu_num} disaggr_torch.slurm ${ctx_num} 4 4 4480 true 1 32 1024 1024 true "0.7" 288 "$mtp_size" "$concurrency"
-done
+sbatch --nodes=${total_node_num} \
+    --ntasks=${ntasks} \
+    --ntasks-per-node=${ntasks_per_node} \
+    --segment=${total_node_num} \
+    disaggr_torch.slurm \
+        ${ctx_num} 4 4 4480 true 1 8 1024 1024 true "0.8" 0 0 "$concurrency"
