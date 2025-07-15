@@ -125,8 +125,12 @@ meta-llama/Llama-3.1-8B-Instruct:
   - dtype: float16
     spec_dec_algo: Medusa
     accuracy: 33.663
-  - extra_acc_spec: beam_width=4
-    accuracy: 31.525
+  - quant_algo: FP8
+    extra_acc_spec: temperature=0.8,top_p=0.95
+    accuracy: 28.631
+  - quant_algo: FP8
+    extra_acc_spec: beam_width=4
+    accuracy: 31.391
 meta-llama/Llama-3.2-1B:
   - accuracy: 27.427
   - quant_algo: W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN

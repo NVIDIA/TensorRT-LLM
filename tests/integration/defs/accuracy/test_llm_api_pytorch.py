@@ -217,10 +217,38 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                 top_p=0.95,
             )
 
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm,
+                          sampling_params=sampling_params,
+                          extra_acc_spec="temperature=0.8,top_p=0.95")
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm,
                           sampling_params=sampling_params,
                           extra_acc_spec="temperature=0.8,top_p=0.95")
+
+    def test_fp8_beam_search(self):
+        model_path = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
+        pytorch_config = dict(disable_overlap_scheduler=True)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
+        max_beam_width = 4
+        sampling_params = SamplingParams(n=max_beam_width,
+                                         best_of=max_beam_width,
+                                         use_beam_search=True)
+
+        llm = LLM(model=model_path,
+                  **pytorch_config,
+                  kv_cache_config=kv_cache_config,
+                  max_beam_width=max_beam_width,
+                  max_batch_size=16,
+                  max_seq_len=1024,
+                  enable_trtllm_sampler=True,
+                  build_config=None)
+
+        with llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm,
+                          sampling_params=sampling_params,
+                          extra_acc_spec="beam_width=4")
 
     def test_eagle3(self):
         pytorch_config = dict(
@@ -243,30 +271,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  build_config=None) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
-
-    def test_beam_search(self):
-        pytorch_config = dict(disable_overlap_scheduler=True, )
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9, )
-        max_beam_width = 4
-
-        sampling_params = SamplingParams(n=max_beam_width,
-                                         best_of=max_beam_width,
-                                         use_beam_search=True)
-
-        llm = LLM(model=self.MODEL_PATH,
-                  **pytorch_config,
-                  kv_cache_config=kv_cache_config,
-                  max_beam_width=max_beam_width,
-                  max_batch_size=16,
-                  max_seq_len=1024,
-                  enable_trtllm_sampler=True,
-                  build_config=None)
-
-        with llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm,
-                          sampling_params=sampling_params,
-                          extra_acc_spec="beam_width=4")
 
     def test_ngram(self):
         pytorch_config = dict(disable_overlap_scheduler=True)
