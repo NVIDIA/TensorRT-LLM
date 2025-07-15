@@ -223,6 +223,16 @@ uint16_t getIncrmentPort(uint16_t basePort)
     return list;
 }
 
+[[nodiscard]] nixl_reg_dlist_t NixlHelper::convertRegDlist(FileDescs const& descs)
+{
+    nixl_reg_dlist_t list(FILE_SEG);
+    for (auto const& desc : descs.getDescs())
+    {
+        list.addDesc(nixlBlobDesc{0, desc.getLen(), desc.getFd()});
+    }
+    return list;
+}
+
 [[nodiscard]] nixl_xfer_op_t NixlHelper::convert(TransferOp const& op)
 {
     switch (op)
@@ -239,6 +249,16 @@ uint16_t getIncrmentPort(uint16_t basePort)
     for (auto const& desc : descs.getDescs())
     {
         list.addDesc(nixlBasicDesc{desc.getAddr(), desc.getLen(), desc.getDeviceId()});
+    }
+    return list;
+}
+
+[[nodiscard]] nixl_xfer_dlist_t NixlHelper::convertXferDist(FileDescs const& descs)
+{
+    nixl_xfer_dlist_t list{FILE_SEG};
+    for (auto const& desc : descs.getDescs())
+    {
+        list.addDesc(nixlBasicDesc{0, desc.getLen(), desc.getFd()});
     }
     return list;
 }
@@ -457,6 +477,93 @@ NixlTransferAgent::~NixlTransferAgent()
     TLLM_LOG_DEBUG("NixlTransferAgent::~NixlTransferAgent");
 }
 
+NixlLoopbackAgent::NixlLoopbackAgent(BaseAgentConfig const& config)
+    : mName{config.mName}
+{
+    nixlBackendH* backend;
+    nixl_status_t status;
+    nixl_b_params_t init;
+
+    {
+        FileLock lock("/tmp/trtllm_nixl_port.lock");
+        if (!lock.lock())
+        {
+            TLLM_THROW("Failed to lock /tmp/trtllm_nixl_port.lock");
+        }
+        auto envPort = common::getEnvNixlPort();
+        uint16_t port = envPort > 0 ? getIncrmentPort(envPort) : getAvailablePort();
+        nixlAgentConfig nixlConfig{config.useProgThread, true, port};
+        mAddress = getAvailableIP() + ":" + std::to_string(port);
+        mRawAgent = std::make_unique<nixlAgent>(config.mName, std::move(nixlConfig));
+    }
+
+    init["batch_pool_size"] = std::to_string(8);
+    init["batch_limit"] = std::to_string(128);
+    init["max_request_size"] = std::to_string(16 * 1024 * 1024);
+
+    if (config.multiThread)
+    {
+        status = mRawAgent->createBackend("GDS_MT", init, backend);
+        if (status != NIXL_SUCCESS || !backend)
+            TLLM_THROW("Failed to create NIXL GDS_MT backend, status = %d", status);
+    }
+    else
+    {
+        status = mRawAgent->createBackend("GDS", init, backend);
+        if (status != NIXL_SUCCESS || !backend)
+            TLLM_THROW("Failed to create NIXL GDS backend, status = %d", status);
+    }
+
+    TLLM_LOG_INFO("NixlLoopbackAgent::NixlLoopbackAgent mAddress: %s", mAddress.c_str());
+}
+
+void NixlLoopbackAgent::registerMemory(MemoryDescs const& descs)
+{
+    nixl_status_t status = mRawAgent->registerMem(NixlHelper::convertRegDlist(descs));
+    TLLM_CHECK(status == NIXL_SUCCESS);
+}
+
+void NixlLoopbackAgent::deregisterMemory(MemoryDescs const& descs)
+{
+    nixl_status_t status = mRawAgent->deregisterMem(NixlHelper::convertRegDlist(descs));
+    TLLM_CHECK(status == NIXL_SUCCESS);
+}
+
+void NixlLoopbackAgent::registerFiles(FileDescs const& descs)
+{
+    nixl_status_t status = mRawAgent->registerMem(NixlHelper::convertRegDlist(descs));
+    TLLM_CHECK(status == NIXL_SUCCESS);
+}
+
+void NixlLoopbackAgent::deregisterFiles(FileDescs const& descs)
+{
+    nixl_status_t status = mRawAgent->deregisterMem(NixlHelper::convertRegDlist(descs));
+    TLLM_CHECK(status == NIXL_SUCCESS);
+}
+
+std::unique_ptr<TransferStatus> NixlLoopbackAgent::submitLoopbackRequests(
+    MemoryDescs const& memoryDescs, FileDescs const& filedescs, bool isOffload)
+{
+    nixl_xfer_dlist_t dram_seg = NixlHelper::convertXferDist(memoryDescs);
+    nixl_xfer_dlist_t file_seg = NixlHelper::convertXferDist(filedescs);
+    nixl_xfer_dlist_t& src = isOffload ? dram_seg : file_seg;
+    nixl_xfer_dlist_t& dst = isOffload ? file_seg : dram_seg;
+    nixl_xfer_op_t op = isOffload ? NIXL_WRITE : NIXL_READ;
+    nixlXferReqH* handle = nullptr;
+
+    nixl_status_t status = mRawAgent->createXferReq(op, src, dst, mName, handle);
+    TLLM_CHECK(status == NIXL_SUCCESS && handle);
+    status = mRawAgent->postXferReq(handle);
+    TLLM_CHECK(status == NIXL_IN_PROG);
+
+    return std::make_unique<NixlTransferStatus>(mRawAgent.get(), handle);
+}
+
+NixlLoopbackAgent::~NixlLoopbackAgent()
+{
+    TLLM_LOG_DEBUG("NixlLoopbackAgent::~NixlLoopbackAgent");
+}
+
 #if defined(__clang__)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wreturn-type-c-linkage"
@@ -468,6 +575,15 @@ extern "C"
     {
         TLLM_CHECK(config);
         return std::make_unique<NixlTransferAgent>(*config);
+    }
+}
+
+extern "C"
+{
+    std::unique_ptr<BaseLoopbackAgent> createNixlLoopbackAgent(BaseAgentConfig const* config)
+    {
+        TLLM_CHECK(config);
+        return std::make_unique<NixlLoopbackAgent>(*config);
     }
 }
 
