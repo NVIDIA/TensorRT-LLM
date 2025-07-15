@@ -143,6 +143,26 @@ def get_model_yaml_config(model_label: str,
                     'backend': 'TRTLLM'
                 }
             }
+        },
+        # Llama-v3.3 models with fp8 quantization
+        {
+            'patterns': [
+                'llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-input_output_len:500,2000-gpus:4',
+                'llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-input_output_len:1000,1000-gpus:4',
+                'llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-input_output_len:2000,500-gpus:4',
+                'llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-input_output_len:128,128-gpus:4',
+                'llama_v3.3_70b_instruct_fp8-bench-pytorch-bfloat16-maxbs:512-maxnt:2048-input_output_len:512,32-gpus:4',
+            ],
+            'config': {
+                'use_cuda_graph':
+                True,
+                'cuda_graph_padding_enabled':
+                True,
+                'cuda_graph_batch_sizes': [
+                    1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 1024, 2048,
+                    4096, 8192
+                ]
+            }
         }
     ]
 
