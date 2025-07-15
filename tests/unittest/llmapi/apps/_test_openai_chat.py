@@ -524,20 +524,23 @@ def test_stop_reason(client: openai.OpenAI, model_name: str, backend: str):
     )
     assert resp.choices[0].finish_reason == "stop"
     assert resp.choices[0].stop_reason == "two"
-    
+
 
 @pytest.mark.asyncio
 async def test_chat_completion_with_logit_bias(async_client: openai.AsyncOpenAI,
-                                              model_name: str):
+                                               model_name: str):
     """Test logit_bias in chat completions"""
     logit_bias = {
         "1000": 2.0,
         "2000": -2.0,
     }
-    
+
     chat_completion = await async_client.chat.completions.create(
         model=model_name,
-        messages=[{"role": "user", "content": "Tell me a fact about Paris"}],
+        messages=[{
+            "role": "user",
+            "content": "Tell me a fact about Paris"
+        }],
         max_tokens=20,
         logit_bias=logit_bias,
         temperature=0.0,
@@ -546,13 +549,16 @@ async def test_chat_completion_with_logit_bias(async_client: openai.AsyncOpenAI,
 
 
 @pytest.mark.asyncio
-async def test_chat_completion_with_invalid_logit_bias(async_client: openai.AsyncOpenAI,
-                                                 model_name: str):
+async def test_chat_completion_with_invalid_logit_bias(
+        async_client: openai.AsyncOpenAI, model_name: str):
     """Test with invalid token IDs (non-integer keys)"""
     with pytest.raises(openai.BadRequestError):
         await async_client.chat.completions.create(
             model=model_name,
-            messages=[{"role": "user", "content": "Tell me a fact about Paris"}],
+            messages=[{
+                "role": "user",
+                "content": "Tell me a fact about Paris"
+            }],
             logit_bias={"invalid_token": 1.0},  # Non-integer key
             max_tokens=5,
         )
