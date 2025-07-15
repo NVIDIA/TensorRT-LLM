@@ -3,6 +3,7 @@ import unittest
 from contextlib import contextmanager
 from difflib import SequenceMatcher
 from pathlib import Path
+from typing import Any, Generator
 
 import pynvml
 import pytest
@@ -397,3 +398,26 @@ def woq_groupwise_gt_matmul(mat1, ref_torch_weights, bias=None):
     if bias is not None:
         ref += bias
     return ref
+
+
+def flatten_list_generator(
+        nested_list: list[Any]) -> Generator[Any, None, None]:
+    if not isinstance(nested_list, list):
+        yield nested_list
+    else:
+        for item in nested_list:
+            yield from flatten_list_generator(item)
+
+
+def flatten_list(nested_list: list[Any]) -> list[Any]:
+    return list(flatten_list_generator(nested_list))
+
+
+def duplicate_list_to_length(list: list[Any], target_length: int) -> list[Any]:
+    if target_length < len(list):
+        return list[:target_length]
+    duplicated_list = list * (target_length // len(list))
+    remain = target_length % len(list)
+    if remain != 0:
+        duplicated_list += list[:remain]
+    return duplicated_list

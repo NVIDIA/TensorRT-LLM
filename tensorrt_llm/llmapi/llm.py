@@ -813,9 +813,9 @@ class _TrtLLM(BaseLLM):
                 len(lora_config.lora_target_modules + lora_config.missing_qkv_modules)
             self._executor_config.peft_cache_config = tllm.PeftCacheConfig(
                 num_device_module_layer=max_lora_rank * num_lora_modules *
-                self.args.max_loras,
+                lora_config.max_loras,
                 num_host_module_layer=max_lora_rank * num_lora_modules *
-                self.args.max_cpu_loras,
+                lora_config.max_cpu_loras,
             )
         if self.args.decoding_config is not None:
             self._executor_config.decoding_config = self.args.decoding_config

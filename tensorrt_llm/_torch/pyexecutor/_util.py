@@ -438,6 +438,7 @@ def create_py_executor_instance(
                 f"Cannot overwrite existing resource manager {key}.")
         resources[key] = value
 
+    peft_cache_manager = None
     if lora_config is not None:
         from tensorrt_llm.bindings import LoraModule
 
@@ -513,6 +514,7 @@ def create_py_executor_instance(
     capacity_scheduler = BindCapacityScheduler(
         max_num_sequences,
         kv_cache_manager.impl if kv_cache_manager is not None else None,
+        peft_cache_manager.impl if peft_cache_manager is not None else None,
         executor_config.scheduler_config.capacity_scheduler_policy,
         two_step_lookahead=mapping.has_pp())
     mb_scheduler = BindMicroBatchScheduler(executor_config.max_batch_size,

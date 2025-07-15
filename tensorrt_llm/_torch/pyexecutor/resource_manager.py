@@ -1224,7 +1224,7 @@ class PeftCacheManager(BaseResourceManager):
         pass
 
     def free_resources(self, request: LlmRequest):
-        pass
+        self.impl.mark_request_done(request)
 
     def shutdown(self):
         pass
