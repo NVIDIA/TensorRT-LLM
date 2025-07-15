@@ -74,7 +74,10 @@
 
 ### INFRA ###
 /docker/ @NVIDIA/trt-llm-infra-codeowners
+# jenkins
 /jenkins/ @NVIDIA/trt-llm-infra-codeowners
+/jenkins/L0_MergeRequest.groovy @NVIDIA/trt-llm-test-infra-codeowners
+/jenkins/L0_Test.groovy @NVIDIA/trt-llm-test-infra-codeowners
 /scripts/ @NVIDIA/trt-llm-infra-codeowners
 requirements.txt @NVIDIA/trt-llm-infra-codeowners
 requirements-dev.txt @NVIDIA/trt-llm-infra-codeowners
@@ -103,6 +106,7 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 ### TESTS ###
 ## TensorRT-LLM Pytorch backend tests
 /tests/unittest/_torch @NVIDIA/trt-llm-torch-devs
+/tests/integration/test_lists/waives.txt @NVIDIA/trt-llm-test-infra-codeowners
 
 ### API STABILITY ###
 
