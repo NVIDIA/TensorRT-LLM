@@ -12,7 +12,7 @@ from .test_llm import (
     llm_get_stats_async_test_harness, llm_get_stats_test_harness, prompts,
     run_llm_abort_request, run_llm_with_postprocess_parallel_and_result_handler,
     tinyllama_logits_processor_test_harness, _test_llm_capture_request_error)
-from utils.util import duplicate_list_to_length, flatten_list, force_ampere, similar, skip_gpu_memory_less_than_40gb, skip_gpu_memory_less_than_80gb, skip_gpu_memory_less_than_138gb
+from utils.util import EnvVarsContextManager, duplicate_list_to_length, flatten_list, force_ampere, run_function_in_sub_process, similar, skip_gpu_memory_less_than_40gb, skip_gpu_memory_less_than_80gb, skip_gpu_memory_less_than_138gb
 from utils.llm_data import llm_models_root
 from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
@@ -254,17 +254,8 @@ def test_llama_7b_multi_lora():
     llama_7b_multi_lora_from_request_test_harness()
 
 
-@pytest.mark.parametrize(
-    "lora_adapter_count_per_call, max_loras, max_cpu_loras, repeats", [
-        ([
-            5,
-        ], 4, 4, 2),
-    ])
-@skip_gpu_memory_less_than_40gb
-def test_llama_7b_multi_lora_eviction(lora_adapter_count_per_call: list[int],
-                                      max_loras: int, max_cpu_loras: int,
-                                      repeats: int):
-    print(f"{lora_adapter_count_per_call=}, {max_loras=}, {max_cpu_loras=}")
+def llama_7b_multi_unique_lora_adapters_from_request(lora_adapter_count_per_call: list[int], max_loras: int,
+                                                     max_cpu_loras: int, repeats: int, **llm_kwargs):
     total_lora_adapters = sum(lora_adapter_count_per_call)
 
     hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
@@ -273,11 +264,14 @@ def test_llama_7b_multi_lora_eviction(lora_adapter_count_per_call: list[int],
         f"{llm_models_root()}/llama-models/Japanese-Alpaca-LoRA-7b-v0"
     ]
 
+    # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
+    # (1) specify lora_target_modules, or
+    # (2) provide a lora_dir to infer the lora_target_modules.
     lora_config = LoraConfig(lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
                              max_lora_rank=8,
                              max_loras=max_loras,
                              max_cpu_loras=max_cpu_loras)
-    llm = LLM(hf_model_dir, lora_config=lora_config)
+    llm = LLM(hf_model_dir, lora_config=lora_config, **llm_kwargs)
 
     # Each prompt should have a reference for every LoRA adapter dir (in the same order as in hf_lora_dirs)
     prompt_to_references = OrderedDict({
@@ -315,6 +309,53 @@ def test_llama_7b_multi_lora_eviction(lora_adapter_count_per_call: list[int],
                     outputs, references[last_idx:last_idx + adapter_count]):
                 assert similar(output.outputs[0].text, ref)
             last_idx += adapter_count
+
+
+@pytest.mark.parametrize(
+    "lora_adapter_count_per_call, max_loras, max_cpu_loras", [
+        ([
+            5,
+        ], 2, 2),
+        ([2, 2, 2], 1, 3),
+    ])
+@skip_gpu_memory_less_than_40gb
+def test_llama_7b_multi_lora_evict_load_new_adapters(
+        lora_adapter_count_per_call: list[int], max_loras: int,
+        max_cpu_loras: int):
+    llama_7b_multi_unique_lora_adapters_from_request(lora_adapter_count_per_call,
+                                                     max_loras,
+                                                     max_cpu_loras,
+                                                     repeats=1)
+
+
+@pytest.mark.parametrize(
+    "lora_adapter_count_per_call, max_loras, max_cpu_loras",
+    [
+        ([1, 1], 1, 1),
+        #([5,], 2, 2),
+        #([2, 2], 1, 3),
+    ])
+@skip_gpu_memory_less_than_40gb
+def test_llama_7b_multi_lora_load_previously_cpu_cache_evicted_adapter_fails(
+        lora_adapter_count_per_call: list[int], max_loras: int,
+        max_cpu_loras: int):
+    """Tests that trying to load a LoRA adapter after it was evicted from CPU cache fails with the expected
+    message, as this feature is currently not supported in favor of the performance improvement of not
+    sending the LoRA weights with every request after the first time.
+    """  # noqa: D205
+
+    def _check_contains_expected_message(stdout: str, stderr: str):
+        return "not found in cache" in stderr
+
+    repeats = 2
+    with EnvVarsContextManager({"TLLM_WORKER_USE_SINGLE_PROCESS": "1"}):
+        child_stdout, child_stderr = run_function_in_sub_process(
+            target=llama_7b_multi_unique_lora_adapters_from_request,
+            args=(lora_adapter_count_per_call, max_loras, max_cpu_loras,
+                  repeats),
+            kwargs={},
+            stop_waiting_criteria=_check_contains_expected_message)
+    assert _check_contains_expected_message(child_stdout, child_stderr)
 
 
 # TODO smor: currently Nemotron-Super-49B-v1 with LoRA memory consumption is overly high
