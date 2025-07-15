@@ -923,6 +923,49 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
         <<<grid, 256, 0, stream>>>(params.attention_input_buf, params.latent_cache, kv_cache_buffer,
             params.cos_sin_cache, params.head_num, head_size, params.meta.kv_lora_rank, params.cu_q_seqlens,
             params.cache_seq_lens, params.max_input_seq_len, params.cache_type, params.quant_scale_kv);
+    if (params.attention_input_buf != nullptr && params.quant_attention_input_buf != nullptr
+        && params.cache_type == KvCacheDataType::FP8)
+    {
+        TLLM_LOG_DEBUG("MLA RoPE Context: Quantizing attention_input_buf to FP8");
+
+        int const dim_q_per_head = (params.meta.qk_nope_head_dim + params.meta.qk_rope_head_dim);
+        int const dim_k_per_head = (params.meta.qk_nope_head_dim + params.meta.qk_rope_head_dim);
+        int const dim_v_per_head = (params.meta.v_head_dim);
+
+        // Total dimension per token across all heads for Q, K, and V components respectively
+        int const total_q_dim_all_heads = params.head_num * dim_q_per_head;
+        int const total_k_dim_all_heads
+            = params.head_num * dim_k_per_head; // Assuming effective num_kv_heads = head_num for layout
+        int const total_v_dim_all_heads
+            = params.head_num * dim_v_per_head; // Assuming effective num_kv_heads = head_num for layout
+
+        int const num_total_qkv_elements
+            = params.acc_q_len * (total_q_dim_all_heads + total_k_dim_all_heads + total_v_dim_all_heads);
+        size_t headDim = params.meta.kv_lora_rank + params.meta.qk_rope_head_dim;
+        float const* device_qkv_scale_ptr = params.quant_scale_qkv;
+
+        if (num_total_qkv_elements > 0)
+        {
+            int const threads_per_block = 256;
+            int const num_blocks = (num_total_qkv_elements + threads_per_block - 1) / threads_per_block;
+
+            TLLM_LOG_DEBUG(
+                "Launching QuantizeCopyInputToFp8Kernel with num_blocks: %d, threads_per_block: %d, elements: %d",
+                num_blocks, threads_per_block, num_total_qkv_elements);
+
+            tensorrt_llm::kernels::QuantizeCopyInputToFp8Kernel<T><<<num_blocks, threads_per_block, 0, stream>>>(
+                static_cast<T const*>(params.attention_input_buf),             // Source
+                static_cast<__nv_fp8_e4m3*>(params.quant_attention_input_buf), // Destination
+                num_total_qkv_elements, device_qkv_scale_ptr);
+            sync_check_cuda_error(stream);
+
+            cudaStreamSynchronize(stream);
+        }
+        else
+        {
+            TLLM_LOG_WARNING("MLA RoPE Context: num_total_qkv_elements is 0, skipping quantization.");
+        }
+    }
 }
 
 template <typename T, typename KVCacheBuffer>
@@ -1037,6 +1080,17 @@ INSTANTIATE_SET_KVCACHE_MLA(float);
 INSTANTIATE_SET_KVCACHE_MLA(half);
 INSTANTIATE_SET_KVCACHE_MLA(__nv_bfloat16);
 
+template <typename T_IN>
+__global__ void QuantizeCopyInputToFp8Kernel(
+    T_IN const* input_buffer, __nv_fp8_e4m3* output_fp8_buffer, int num_total_elements, float const* device_scale_ptr)
+{
+    uint element_idx = threadIdx.x + blockDim.x * blockIdx.x;
+    if (element_idx < num_total_elements)
+    {
+        float scale_factor = (device_scale_ptr != nullptr) ? *device_scale_ptr : 1.0f;
+        output_fp8_buffer[element_idx] = __nv_fp8_e4m3(static_cast<float>(input_buffer[element_idx]) * scale_factor);
+    }
+}
 } // namespace kernels
 
 } // namespace tensorrt_llm
