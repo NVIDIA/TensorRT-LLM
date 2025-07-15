@@ -22,6 +22,7 @@
 #include "tensorrt_llm/batch_manager/llmRequest.h" // TODO forward declare
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/executor/executor.h"
+#include "tensorrt_llm/executor/transferAgent.h"
 #include "tensorrt_llm/kernels/kvCacheIndex.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -41,6 +42,8 @@
 #include <set>
 #include <unordered_map>
 #include <vector>
+
+namespace kvc = tensorrt_llm::executor::kv_cache;
 
 namespace tensorrt_llm::batch_manager::eviction_policy
 {
@@ -548,7 +551,8 @@ public:
         SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences, std::shared_ptr<runtime::CudaStream> stream,
         bool onboardBlocks, CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
         std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
-        std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager);
+        std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager,
+        std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent = nullptr);
 
     ~WindowBlockManager();
 
@@ -831,6 +835,8 @@ private:
     std::shared_ptr<BaseEvictionPolicy> mEvictionPolicy;
     // Event manager
     std::shared_ptr<KVCacheEventManager> mEventManager;
+    // Pointer to parent loopback agent
+    std::shared_ptr<kvc::BaseLoopbackAgent> mLoopbackAgent;
     // Transfer manager
     std::shared_ptr<KVCacheTransferManager> mTransferManager;
 
@@ -878,7 +884,8 @@ public:
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enablePartialReuse = true,
         bool copyOnPartialReuse = true,
-        std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr);
+        std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
+        std::optional<kvc::BaseAgentConfig> agentConfig = std::nullopt);
 
     BlockManager(BlockManager const&) = delete;
     BlockManager& operator=(BlockManager const&) = delete;
@@ -1172,6 +1179,7 @@ private:
     SizeType32 mNumLayers;
     SizeType32 mTokensPerBlock;
     std::shared_ptr<KVCacheEventManager> mEventManager;
+    std::shared_ptr<kvc::BaseLoopbackAgent> mLoopbackAgent;
     CudaStreamPtr mStream;
     CacheType mCacheType;
 
