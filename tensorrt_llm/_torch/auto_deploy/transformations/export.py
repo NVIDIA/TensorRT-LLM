@@ -1,5 +1,4 @@
 import importlib.metadata
-import math
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from functools import partial
@@ -11,7 +10,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from packaging import version
 from torch import fx
-from torch.utils._sympy.value_ranges import ValueRanges
 
 from ..utils.logger import ad_logger
 from ..utils.node_utils import is_op
@@ -171,34 +169,6 @@ def _clean_up_checks(gm: fx.GraphModule):
         if len(node.users) > 0 or not is_op(node, check_ops):
             continue
         graph.erase_node(node)
-    canonicalize_graph(gm)
-
-
-def _clean_up_input_constraints(gm: fx.GraphModule):
-    """This transformations updates the input constraints of the graph.
-
-    Specifically, we want to account for flattened sequences and hence the max constraint should
-    be updated to reflect the flattened sequence length.
-    """
-    graph: fx.Graph = gm.graph
-    input_node = graph.find_nodes(op="placeholder")[0]
-    sym_shape: torch.Size = input_node.meta["val"].shape
-
-    # get expressions in the symbolic shape
-    vrs: List[ValueRanges] = []
-    for s in sym_shape:
-        if isinstance(s, int):
-            vrs.append(ValueRanges(0, s))
-        elif isinstance(s, torch.SymInt):
-            vrs.append(gm.range_constraints[s.node.expr])
-        else:
-            raise TypeError(f"Unexpected type {type(s)} in symbolic shape.")
-
-    # update the max constraint for each vr
-    max_total = math.prod(vr.upper for vr in vrs)
-    for vr in vrs:
-        object.__setattr__(vr, "upper", max_total)
-
     canonicalize_graph(gm)
 
 
@@ -460,6 +430,9 @@ def torch_export_to_gm(
     # hooks back to the exported graph module.
     add_missing_load_hooks(egm, model)
 
+    # Add load hook to correctly load parameters that are aliased in the source model.
+    add_load_hook_for_aliased_params(egm, model)
+
     # Export will have LOTS of no-op slice nodes. Let's remove them to clean up the graph
     # representation
     _clean_up_no_op_slice_nodes(egm)
@@ -470,16 +443,13 @@ def torch_export_to_gm(
     # clean up devices in the graph
     _clean_up_device_info(egm)
 
-    # Add load hook to correctly load parameters that are aliased in the source model.
-    add_load_hook_for_aliased_params(egm, model)
-
     # deduplicate params and buffers
     _deduplicate_params_and_buffers(egm)
 
     # clean up shape checks and assertions
     _clean_up_checks(egm)
 
-    # clean up input constraints
-    _clean_up_input_constraints(egm)
+    # show exported graph
+    ad_logger.debug("exported graph: " + str(egm))
 
     return egm
