@@ -86,8 +86,6 @@ class WideEPMoE(MoE):
         assert self.parallel_size > 1, "WideEP should only be enabled with parallel_size > 1"
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
-        assert self.apply_router_weight_on_input is False, "WideEP doesn't support apply_router_weight_on_input."
-
         self.layer_idx = layer_idx
 
         moe_load_balancer = get_moe_load_balancer()
@@ -169,7 +167,7 @@ class WideEPMoE(MoE):
             model_config.mapping, routing_method.experts_per_token, dtype,
             model_config.use_cuda_graph)
         logger.info_once(
-            f"CutlassFusedMoE selects alltoall_method_type {self.alltoall_method_type!r}",
+            f"{self.__class__.__name__} selects alltoall_method_type {self.alltoall_method_type!r}",
             key="alltoall_method_type")
         self.use_postquant_alltoall = False
         if self.enable_alltoall:
@@ -215,6 +213,9 @@ class WideEPMoE(MoE):
 
     def _check_configs(self):
         assert self._weights_created
+
+        if self.apply_router_weight_on_input:
+            assert self.routing_method.top_k == 1, "Current walkaround only supports top-1 routing"
 
         if self.quant_config and self.quant_config.quant_mode.has_any_quant(
                 exclude_kv_cache=True):
@@ -365,6 +366,18 @@ class WideEPMoE(MoE):
         assert token_final_scales.dtype == torch.float32
         assert token_selected_experts.dtype == torch.int32
 
+        if self.apply_router_weight_on_input:
+            assert x.dtype != torch.float8_e4m3fn, "Current workaround for apply_router_weight_on_input does not support fp8 input"
+            x = x * token_final_scales.to(x.dtype)
+            # TODO: remove this once we have correct fusedmoe kernel ready
+            if self.alltoall_method_type in (
+                    AlltoallMethodType.DeepEP,
+                    AlltoallMethodType.DeepEPLowLatency):
+                # DeepEP doesn't support token_final_scales is None
+                token_final_scales = torch.ones_like(token_final_scales)
+            else:
+                token_final_scales = None
+
         if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
         ) and is_first_call:
             self.layer_load_balancer.maybe_cudagraph_done_wait()
@@ -445,6 +458,7 @@ class WideEPMoE(MoE):
                         x.shape[0], 1)
                     token_final_scales = torch.ones_like(
                         token_selected_slots, dtype=token_final_scales.dtype)
+
         x_sf = None
         x_is_sf_swizzled = x.is_sf_swizzled if isinstance(
             x, Fp4QuantizedTensor) else False
@@ -886,7 +900,8 @@ class WideEPMoE(MoE):
                     (0, 0, 0,
                      all_rank_max_num_tokens - token_selected_slots.shape[0]),
                     'constant', self.num_slots)
-            if all_rank_max_num_tokens > token_final_scales.shape[0]:
+            if token_final_scales is not None and all_rank_max_num_tokens > token_final_scales.shape[
+                    0]:
                 token_final_scales = torch.nn.functional.pad(
                     token_final_scales,
                     (0, 0, 0,
@@ -902,10 +917,11 @@ class WideEPMoE(MoE):
                 gathered_token_selected_slots.contiguous(),
                 start_dim=0,
                 end_dim=-2)
-            gathered_token_final_scales = torch.flatten(
-                gathered_token_final_scales.contiguous(),
-                start_dim=0,
-                end_dim=-2)
+            if gathered_token_final_scales is not None:
+                gathered_token_final_scales = torch.flatten(
+                    gathered_token_final_scales.contiguous(),
+                    start_dim=0,
+                    end_dim=-2)
             gathered_target_rank_ids = MnnvlMoe.compute_target_rank_id(
                 gathered_token_selected_slots, self.num_slots, self.ep_size)
             alltoall_info, token_selected_slots, token_final_scales = MnnvlMoe.mnnvl_moe_alltoallv_prepare(

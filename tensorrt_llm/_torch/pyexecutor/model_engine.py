@@ -657,6 +657,11 @@ class PyTorchModelEngine(ModelEngine):
             num_tokens_per_request = min(
                 min(available_tokens, self.max_seq_len - 1),
                 self.max_num_tokens)
+            # Number of tokens required per request must be rounded up to whole number of blocks
+            num_tokens_required_per_request = (
+                (num_tokens_per_request + kv_cache_manager.tokens_per_block - 1)
+                // kv_cache_manager.tokens_per_block
+            ) * kv_cache_manager.tokens_per_block
 
             available_blocks = kv_cache_manager.get_num_free_blocks()
 
@@ -666,8 +671,15 @@ class PyTorchModelEngine(ModelEngine):
 
             # Calculate number of full-length requests and remaining tokens
             # Each request has num_tokens_per_request tokens, except possibly the last one
-            full_len_request_num = maximum_tunable_num_tokens // num_tokens_per_request
-            remaining_tokens = maximum_tunable_num_tokens % num_tokens_per_request
+            # Calculations are also limited by how many KV cache blocks are available
+            full_len_request_num = min(
+                maximum_tunable_num_tokens // num_tokens_per_request,
+                max(1, available_tokens // num_tokens_required_per_request))
+            remaining_tokens = min(
+                maximum_tunable_num_tokens % num_tokens_per_request,
+                max(
+                    0, available_tokens -
+                    full_len_request_num * num_tokens_required_per_request))
 
             request_num = full_len_request_num if remaining_tokens == 0 else full_len_request_num + 1
 
@@ -1029,6 +1041,7 @@ class PyTorchModelEngine(ModelEngine):
             moe_max_num_tokens=moe_max_num_tokens,
             moe_load_balancer=moe_load_balancer,
             lora_config=lora_config,
+            allreduce_strategy=self.pytorch_backend_config.allreduce_strategy,
             **kwargs)
 
         validate_and_set_kv_cache_quant(

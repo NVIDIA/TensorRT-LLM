@@ -389,15 +389,15 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
 
 
 class MTPDecodingConfig(DecodingBaseConfig):
-    num_nextn_predict_layers: Optional[int] = 1
-    use_relaxed_acceptance_for_thinking: Optional[bool] = False
-    relaxed_topk: Optional[int] = 1
-    relaxed_delta: Optional[float] = 0.
-    use_mtp_vanilla: Optional[bool] = False
+    num_nextn_predict_layers: int = 1
+    use_relaxed_acceptance_for_thinking: bool = False
+    relaxed_topk: int = 1
+    relaxed_delta: float = 0.
+    use_mtp_vanilla: bool = False
 
     # TODO: remove this after distinguishing `max_draft_len` and `num_nextn_predict_layers`
     # Now we need a flag when MTPDecodingConfig is updated by PyTorchModelEngine.
-    num_nextn_predict_layers_from_model_config: Optional[int] = 1
+    num_nextn_predict_layers_from_model_config: int = 1
 
     # TODO: Hard code for DeepSeek R1
     # When encounter <think>, start thinking phase.
@@ -1433,7 +1433,7 @@ class BaseLlmArgs(BaseModel):
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.EAGLE
                 if self.speculative_config.eagle3_one_model:
-                    self.num_extra_kv_tokens = self.max_draft_len - 1
+                    self.speculative_config.num_extra_kv_tokens = self.speculative_config.max_draft_len - 1
                 if self.backend not in ['pytorch', '_autodeploy']:
                     eagle_config = _EagleConfig(
                         self.speculative_config.eagle_choices,
@@ -1757,7 +1757,7 @@ class TorchLlmArgs(BaseLlmArgs):
         "Lower values trigger more frequent garbage collection.")
 
     cuda_graph_config: Optional[CudaGraphConfig] = Field(
-        default=None,
+        default_factory=CudaGraphConfig,
         description="CUDA graph config.If true, use CUDA graphs for decoding. \
         CUDA graphs are only created for the batch sizes in cuda_graph_config.batch_sizes, \
         and are enabled for batches that consist of decoding requests *only* \

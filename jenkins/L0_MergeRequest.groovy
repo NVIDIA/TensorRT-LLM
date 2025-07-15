@@ -112,6 +112,8 @@ def AUTO_TRIGGER_TAG_LIST = "auto_trigger_tag_list"
 def DEBUG_MODE = "debug"
 @Field
 def DETAILED_LOG = "detailed_log"
+@Field
+def ONLY_DOCS_FILE_CHANGED = "only_docs_file_changed"
 
 def testFilter = [
     (REUSE_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get(REUSE_STAGE_LIST, null)?.tokenize(',')),
@@ -129,6 +131,7 @@ def testFilter = [
     (DEBUG_MODE): gitlabParamsFromBot.get(DEBUG_MODE, false),
     (AUTO_TRIGGER_TAG_LIST): [],
     (DETAILED_LOG): gitlabParamsFromBot.get(DETAILED_LOG, false),
+    (ONLY_DOCS_FILE_CHANGED): false,
 ]
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
@@ -320,6 +323,7 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
         testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         testFilter[(ONLY_PYTORCH_FILE_CHANGED)] = getOnlyPytorchFileChanged(pipeline, testFilter, globalVars)
         testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
+        testFilter[(ONLY_DOCS_FILE_CHANGED)] = getOnlyDocsFileChanged(pipeline, testFilter, globalVars)
         getContainerURIs().each { k, v ->
             globalVars[k] = v
         }
@@ -682,6 +686,40 @@ def getOnlyPytorchFileChanged(pipeline, testFilter, globalVars) {
     return result
 }
 
+def getOnlyDocsFileChanged(pipeline, testFilter, globalVars) {
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (env.alternativeTRT || isOfficialPostMergeJob) {
+        pipeline.echo("Force set ONLY_DOCS_FILE_CHANGED false.")
+        return false
+    }
+
+    // TODO: Add more docs path to the list, e.g. *.md files in other directories
+    def docsFileList = [
+        "docs/",
+    ]
+
+    def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
+    if (!changedFileList || changedFileList.isEmpty()) {
+        return false
+    }
+
+    for (file in changedFileList) {
+        def isDocsFile = false
+        for (prefix in docsFileList) {
+            if (file.startsWith(prefix)) {
+                isDocsFile = true
+                break
+            }
+        }
+        if (!isDocsFile) {
+            pipeline.echo("Found non-docs file: ${file}")
+            return false
+        }
+    }
+    pipeline.echo("Only docs files changed.")
+    return true
+}
+
 def collectTestResults(pipeline, testFilter)
 {
     collectResultPodSpec = createKubernetesPodConfig("", "agent")
@@ -946,6 +984,11 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 def testStageName = "[Test-SBSA] Run"
                 if (env.localJobCredentials) {
                     testStageName = "[Test-SBSA] Remote Run"
+                }
+
+                if (testFilter[(ONLY_DOCS_FILE_CHANGED)]) {
+                    echo "SBSA build job is skipped due to Jenkins configuration or conditional pipeline run"
+                    return
                 }
 
                 def stageName = "Build"
