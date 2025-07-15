@@ -180,6 +180,22 @@ _str_to_binding_dtype_dict = dict(
     fp8=DataType.FP8,
 )
 
+_binding_dtype_size = {
+    DataType.INT64: 8,
+    DataType.FLOAT: 4,
+    DataType.INT32: 4,
+    DataType.BF16: 2,
+    DataType.HALF: 2,
+    DataType.BOOL: 1,
+    DataType.FP8: 1,
+    DataType.INT8: 1,
+    DataType.UINT8: 1,
+}
+
+
+def binding_dtype_size(dtype: DataType):
+    return _binding_dtype_size[dtype]
+
 
 def str_dtype_to_binding(dtype):
     ret = _str_to_binding_dtype_dict.get(dtype)
