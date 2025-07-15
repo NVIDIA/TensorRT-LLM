@@ -53,8 +53,8 @@ from ..models.modeling_utils import ModelConfig, QuantConfig
 from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (CutlassFusedMoE, DeepSeekV3MoeRoutingMethod,
-                                 TRTLLMGenFusedMoE, WideEPMoE, create_moe,
+from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod, TRTLLMGenFusedMoE,
+                                 create_moe,
                                  moe_load_balancer_set_repeated_for_next_layer)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
@@ -518,13 +518,6 @@ class Deepseekv3MoE(nn.Module):
                                           self.mapping,
                                           dim=0,
                                           sizes=all_rank_num_tokens)
-            elif not isinstance(self.experts, (CutlassFusedMoE, WideEPMoE)) or (
-                    not self.experts.has_fp8_qdq and self.experts.has_nvfp4):
-                # Use padding when not using the cutlass path or when x_sf in self.experts is not None
-                use_dp_padding = True
-                hidden_states = torch.nn.functional.pad(
-                    hidden_states,
-                    (0, 0, 0, all_rank_max_num_tokens - hidden_states.shape[0]))
 
         router_logits = self.gate(hidden_states)
 
