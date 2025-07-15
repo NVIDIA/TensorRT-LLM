@@ -873,7 +873,7 @@ def test_trtllm_bench_latency_sanity(llm_root, llm_venv, engine_dir,
 
     benchmark_cmd = \
         f"trtllm-bench --model {model_name} --model_path {model_path} latency " \
-        f"--engine_dir {engine_path} --dataset {dataset_path}"
+        f"--engine_dir {engine_path} --dataset {dataset_path} --backend tensorrt"
     check_call(benchmark_cmd, shell=True)
 
 
