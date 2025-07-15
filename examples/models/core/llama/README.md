@@ -1580,8 +1580,9 @@ trtllm-serve nvidia/Llama-3.3-70B-Instruct-FP8 \
 ```
 
 ### Run performance benchmarks
-TensorRT-LLM provides a benchmark tool to benchmark trtllm-serve
-Prepare a new terminal and run `benchmark_serving`
+TensorRT-LLM provides a benchmark tool to benchmark `trtllm-serve`.
+
+Prepare a new terminal and run `benchmark_serving`.
 ```bash
 python -m tensorrt_llm.serve.scripts.benchmark_serving \
         --model nvidia/Llama-3.3-70B-Instruct-FP8 \
