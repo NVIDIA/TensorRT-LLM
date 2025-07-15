@@ -1,2 +1,0 @@
-#!/bin/bash
-pixi run /tmp/mroed/uv-envs/trtllm/bin/python "$@"
