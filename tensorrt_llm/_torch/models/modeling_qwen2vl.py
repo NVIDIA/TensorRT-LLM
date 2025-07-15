@@ -490,7 +490,6 @@ class Qwen2VLModelBase(PreTrainedModel):
         logger.info(f"{self.dtype=} {self.model_dtype=}")
         self.post_config()
         self.is_loaded = True
-        self.init_rotary_cos_sin_ori()
 
     def init_rotary_cos_sin_ori(self):
         _, rotary_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
@@ -510,6 +509,7 @@ class Qwen2VLModelBase(PreTrainedModel):
 
     def load_weights(self, weights):
         self.llm.load_weights(weights)
+        self.init_rotary_cos_sin_ori()
 
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
@@ -562,10 +562,6 @@ class Qwen2VLModelBase(PreTrainedModel):
         return batched_mrope_config
 
     def add_rotary_cos_sin(self, multimodal_params: List[MultimodalParams]):
-        if self.cos_ori.device != self.device:
-            self.cos_ori = self.cos_ori.to(self.device)
-            self.sin_ori = self.sin_ori.to(self.device)
-
         for param in multimodal_params:
             mrope_config = param.multimodal_data.get('mrope_config')
             if mrope_config:
