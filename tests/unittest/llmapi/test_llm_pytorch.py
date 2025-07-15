@@ -244,7 +244,8 @@ def test_llama_7b_multi_lora_evict_load_new_adapters(
         # - Send req0 with adapter 0 weights (because it was previously evicted)
         # - Send the other two requests without their adapter weights as they're already in LoRA CPU cache
         # Then, handling of req0 that has weights but not in the cache should evict one of the other two adapters from
-        # the cache, causing its request to fail because its weights aren't with the request and aren't in LoRA cache.
+        # the cache, causing that evicted adapter's request to fail because its weights aren't with the request and
+        # aren't in LoRA cache.
         ([
             3,
         ], 2, 2, 2, 1),
