@@ -366,65 +366,71 @@ class GenerationResultBase:
                 if not self._streaming or not self.sampling_params.stop:
                     print(f"DEBUG: ENTERING LENGTH PROCESSING!")
 
-                    print(
-                        f"DEBUG: self has tokenizer: {hasattr(self, 'tokenizer')}"
-                    )
-                    if hasattr(self, 'tokenizer'):
-                        print(f"DEBUG: tokenizer is: {self.tokenizer}")
-                    else:
-                        print(f"DEBUG: No tokenizer found!")
-                        output.finish_reason = 'length'
+                    tokenizer = None
+                    if (self.postproc_params
+                            and self.postproc_params.postproc_args
+                            and self.postproc_params.postproc_args.tokenizer):
+                        tokenizer = self.postproc_params.postproc_args.tokenizer
+                    elif hasattr(self,
+                                 'tokenizer') and self.tokenizer is not None:
+                        tokenizer = self.tokenizer
 
-                    print(
-                        f"DEBUG: About to detokenize {len(output.token_ids)} tokens"
-                    )
-                    print(f"DEBUG: Token IDs: {output.token_ids}")
+                    if tokenizer is not None:
+                        print(
+                            f"DEBUG: About to detokenize {len(output.token_ids)} tokens"
+                        )
+                        print(f"DEBUG: Token IDs: {output.token_ids}")
+                        generated_text = tokenizer.decode(
+                            output.token_ids, skip_special_tokens=True)
+                        print(f"DEBUG: Detokenized text: '{generated_text}'")
 
-                    generated_text = self.tokenizer.decode(
-                        output.token_ids, skip_special_tokens=True)
-                    print(f"DEBUG: Detokenized text: '{generated_text}'")
-
-                    print(
-                        f"DEBUG: About to check stop words: {self.sampling_params.stop}"
-                    )
-
-                    for stop_reason, _ in self.sampling_params._get_stop_reasons_and_words(
-                    ):
-                        print(f"DEBUG: Checking stop_reason: {stop_reason}")
-                        if isinstance(stop_reason,
-                                      str) and stop_reason in generated_text:
-                            print(
-                                f"DEBUG: FOUND STOP WORD '{stop_reason}' in text!"
-                            )
-                            output.finish_reason = 'stop'
-                            output.stop_reason = stop_reason
-
-                            stop_pos = generated_text.find(stop_reason)
-                            print(
-                                f"DEBUG: Stop word found at position: {stop_pos}"
-                            )
-
-                            if not self.sampling_params.include_stop_str_in_output:
-                                truncated_text = generated_text[:stop_pos]
-                                output.token_ids = self.tokenizer.encode(
-                                    truncated_text, add_special_tokens=False)
+                        print(
+                            f"DEBUG: About to check stop words: {self.sampling_params.stop}"
+                        )
+                        for stop_reason, _ in self.sampling_params._get_stop_reasons_and_words(
+                        ):
+                            print(f"DEBUG: Checking stop_reason: {stop_reason}")
+                            if isinstance(
+                                    stop_reason,
+                                    str) and stop_reason in generated_text:
                                 print(
-                                    f"DEBUG: Truncated text (excluded stop word): '{truncated_text}'"
+                                    f"DEBUG: FOUND STOP WORD '{stop_reason}' in text!"
                                 )
-                            else:
-                                truncated_text = generated_text[:stop_pos +
-                                                                len(stop_reason
-                                                                    )]
-                                output.token_ids = self.tokenizer.encode(
-                                    truncated_text, add_special_tokens=False)
+                                output.finish_reason = 'stop'
+                                output.stop_reason = stop_reason
+
+                                stop_pos = generated_text.find(stop_reason)
                                 print(
-                                    f"DEBUG: Truncated text (included stop word): '{truncated_text}'"
+                                    f"DEBUG: Stop word found at position: {stop_pos}"
                                 )
-                            break
+
+                                if not self.sampling_params.include_stop_str_in_output:
+                                    truncated_text = generated_text[:stop_pos]
+                                    output.token_ids = self.tokenizer.encode(
+                                        truncated_text,
+                                        add_special_tokens=False)
+                                    print(
+                                        f"DEBUG: Truncated text (excluded stop word): '{truncated_text}'"
+                                    )
+                                else:
+                                    truncated_text = generated_text[:stop_pos +
+                                                                    len(stop_reason
+                                                                        )]
+                                    output.token_ids = self.tokenizer.encode(
+                                        truncated_text,
+                                        add_special_tokens=False)
+                                    print(
+                                        f"DEBUG: Truncated text (included stop word): '{truncated_text}'"
+                                    )
+                                break
+                        else:
+                            print(
+                                f"DEBUG: No stop words found, setting finish_reason to 'length'"
+                            )
+                            output.finish_reason = 'length'
                     else:
                         print(
-                            f"DEBUG: No stop words found, setting finish_reason to 'length'"
-                        )
+                            f"DEBUG: No tokenizer available for detokenization")
                         output.finish_reason = 'length'
                 else:
                     # For streaming, stop detection already happened above
