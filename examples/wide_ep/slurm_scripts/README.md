@@ -17,8 +17,10 @@ Please note that:
 
 ### Core Scripts
 
-1. **`submit.sh`** - Main entry point for submitting benchmark jobs
-2. **`process_gen_iterlog.py`** - Processes benchmark results and generates reports
+Note that, core implementation of the slurm scripts are included in `examples/disaggregated/slurm`.
+
+1. `submit.sh` - Main entry point for submitting benchmark jobs
+2. `process_gen_iterlog.py` - Processes benchmark results and generates reports
 
 ## Usage
 
