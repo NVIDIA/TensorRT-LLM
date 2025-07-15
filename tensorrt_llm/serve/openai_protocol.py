@@ -18,6 +18,7 @@ from tensorrt_llm.llmapi import GuidedDecodingParams, SamplingParams
 
 from ..sampling_params import LogitBiasLogitsProcessor
 
+
 class OpenAIBaseModel(BaseModel):
     # OpenAI API does not allow extra fields & allow to initialize by both alias and field name
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
@@ -250,7 +251,8 @@ class CompletionRequest(OpenAIBaseModel):
             detokenize=self.detokenize,
 
             # logits_bias
-            logits_processor = None if not self.logit_bias else LogitBiasLogitsProcessor(self.logit_bias),
+            logits_processor=None if not self.logit_bias else
+            LogitBiasLogitsProcessor(self.logit_bias),
 
             # completion-extra-params
             add_special_tokens=self.add_special_tokens,
@@ -544,7 +546,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 self.response_format),
 
             # logits_bias
-            logits_processor = None if not self.logit_bias else LogitBiasLogitsProcessor(self.logit_bias),
+            logits_processor=None if not self.logit_bias else
+            LogitBiasLogitsProcessor(self.logit_bias),
 
             # chat-completion-extra-params
             add_special_tokens=self.add_special_tokens,
