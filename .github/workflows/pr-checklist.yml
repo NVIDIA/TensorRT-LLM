@@ -1,10 +1,11 @@
 name: PR Checklist
 on:
-  pull_request:
-    types: [opened, reopened]
+  pull_request_target:
+    types: [opened, reopened, ready_for_review]
 
 permissions:
   pull-requests: write
+  contents: read
 
 jobs:
   post-checklist:
@@ -13,6 +14,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          # Important: checkout the PR head for reading the checklist file
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Post PR Checklist
         uses: actions/github-script@v7
@@ -44,4 +48,7 @@ jobs:
                 issue_number: context.issue.number,
                 body: checklistContent
               });
+              console.log('Posted PR checklist comment');
+            } else {
+              console.log('Checklist already exists, skipping');
             }
