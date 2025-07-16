@@ -650,9 +650,8 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
             host_past_key_value_lengths, context_lengths, host_context_lengths, kv_cache_block_offsets,
             host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, cache_indirection,
             kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
-            block_ids_per_seq, mrope_rotary_cos_sin, additional_tensors[0], additional_tensors[1],
-            additional_tensors[2], additional_tensors[3], additional_tensors[4], additional_tensors[5],
-            spec_decoding_tensor_params);
+            block_ids_per_seq, additional_tensors[0], additional_tensors[1], additional_tensors[2],
+            additional_tensors[3], additional_tensors[4], additional_tensors[5], spec_decoding_tensor_params);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -667,9 +666,8 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
             host_past_key_value_lengths, context_lengths, host_context_lengths, kv_cache_block_offsets,
             host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, cache_indirection,
             kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
-            block_ids_per_seq, mrope_rotary_cos_sin, additional_tensors[0], additional_tensors[1],
-            additional_tensors[2], additional_tensors[3], additional_tensors[4], additional_tensors[5],
-            spec_decoding_tensor_params);
+            block_ids_per_seq, additional_tensors[0], additional_tensors[1], additional_tensors[2],
+            additional_tensors[3], additional_tensors[4], additional_tensors[5], spec_decoding_tensor_params);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);
