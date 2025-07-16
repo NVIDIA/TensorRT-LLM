@@ -508,7 +508,7 @@ def test_cpp_unit_tests(tritonserver_test_root, test_name, llm_root):
 
     run_shell_command(
         f"cd {llm_root}/triton_backend/inflight_batcher_llm/build && "
-        f"cmake .. -DTRTLLM_DIR={llm_root} -DCMAKE_INSTALL_PREFIX=install/ -DBUILD_TESTS=ON -DUSE_CXX11_ABI=ON "
+        f"cmake .. -DTRTLLM_DIR={llm_root} -DCMAKE_INSTALL_PREFIX=install/ -DBUILD_TESTS=ON  -DUSE_CXX11_ABI=ON -DTRITON_COMMON_REPO_TAG=r25.05 -DTRITON_CORE_REPO_TAG=r25.05 -DTRITON_THIRD_PARTY_REPO_TAG=r25.05 -DTRITON_BACKEND_REPO_TAG=r25.05 "
         "&& make -j8 install", llm_root)
 
     # Run the cpp unit tests
