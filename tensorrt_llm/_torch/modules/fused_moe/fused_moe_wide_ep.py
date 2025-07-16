@@ -209,6 +209,9 @@ class WideEPMoE(MoE):
 
         self.use_low_precision_alltoall_combine = os.environ.get(
             "TRTLLM_MOE_USE_LOW_PRECISION_ALLTOALL_COMBINE", "0") == "1"
+        self.low_precision_alltoall_combine_dtype = os.environ.get(
+            "TRTLLM_MOE_LOW_PRECISION_ALLTOALL_COMBINE_DTYPE", "fp4")
+        assert self.low_precision_alltoall_combine_dtype in ["fp8", "fp4"]
 
         # Debug function for eliminating imbalance during performance analysis.
         self.enable_dummy_allreduce = os.environ.get(
@@ -966,15 +969,25 @@ class WideEPMoE(MoE):
             final_hidden_states = final_hidden_states[0]
 
         if self.use_low_precision_alltoall_combine:
-            # Notes: this global scale is token-wise global scale
-            low_precision_global_scale = (
-                448 * 6) / final_hidden_states.abs().max(
-                    dim=-1, keepdim=True).values.to(torch.float32)
-            final_hidden_states, final_hidden_states_sf = torch.ops.trtllm.fp4_quantize(
-                final_hidden_states, low_precision_global_scale, 16, False,
-                False)
-            final_hidden_states_sf = final_hidden_states_sf.view(
-                final_hidden_states.shape[0], -1)
+            if self.low_precision_alltoall_combine_dtype == "fp4":
+                # Notes: this global scale is token-wise global scale
+                low_precision_global_scale = (
+                    448 * 6) / final_hidden_states.abs().max(
+                        dim=-1, keepdim=True).values.to(torch.float32)
+                final_hidden_states, final_hidden_states_sf = torch.ops.trtllm.fp4_quantize(
+                    final_hidden_states, low_precision_global_scale, 16, False,
+                    False)
+                final_hidden_states_sf = final_hidden_states_sf.view(
+                    final_hidden_states.shape[0], -1)
+            elif self.low_precision_alltoall_combine_dtype == "fp8":
+                # Notes: use fp8
+                final_hidden_states, low_precision_global_scale = torch.ops.tensorrt_llm.quantize_e4m3_activation(
+                    final_hidden_states)
+                final_hidden_states_sf = None
+            else:
+                raise ValueError(
+                    f"Invalid low_precision_alltoall_combine_dtype: {self.low_precision_alltoall_combine_dtype}"
+                )
         else:
             final_hidden_states_sf = None
             low_precision_global_scale = None

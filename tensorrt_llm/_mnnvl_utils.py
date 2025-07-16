@@ -575,6 +575,26 @@ class MnnvlMoe:
                     )
                 )
             input = torch.cat(concat_tensors, dim=1)
+        elif low_precision_global_scale is not None:
+            # Notes: this path is for fp8
+            hidden_dim_in_bytes += (
+                low_precision_global_scale.shape[1] * low_precision_global_scale.element_size()
+            )
+            hidden_dim_in_bytes_pad = hidden_dim_in_bytes + 15 & ~15
+            concat_tensors = [
+                x.view(torch.uint8),
+                low_precision_global_scale.view(torch.uint8),
+            ]
+            if hidden_dim_in_bytes_pad != hidden_dim_in_bytes:
+                concat_tensors.append(
+                    torch.zeros(
+                        x.shape[0],
+                        hidden_dim_in_bytes_pad - hidden_dim_in_bytes,
+                        dtype=torch.uint8,
+                        device=x.device,
+                    )
+                )
+            input = torch.cat(concat_tensors, dim=1)
         else:
             hidden_dim_in_bytes_pad = hidden_dim_in_bytes
             input = x.view(torch.uint8)
@@ -616,6 +636,20 @@ class MnnvlMoe:
                 False,
                 is_sf_swizzled,
                 "bfloat16",
+            )
+        elif low_precision_global_scale is not None:
+            # Notes: this path is for fp8
+            x, output_global_scale, _ = output_tensor.split(
+                [
+                    x.shape[1] * x.element_size(),
+                    low_precision_global_scale.element_size(),
+                    hidden_dim_in_bytes_pad - hidden_dim_in_bytes,
+                ],
+                dim=1,
+            )
+            output_tensor = torch.ops.tensorrt_llm.dequantize_e4m3_activation(
+                x.contiguous().view(torch.float8_e4m3fn),
+                output_global_scale.contiguous().view(low_precision_global_scale.dtype),
             )
         else:
             output_tensor = output_tensor.view(x.dtype)
