@@ -97,6 +97,10 @@ COPY --from=triton /opt/tritonserver/caches /opt/tritonserver/caches
 COPY docker/common/install_triton.sh install_triton.sh
 RUN bash ./install_triton.sh && rm install_triton.sh
 
+# Install UCX first
+COPY docker/common/install_ucx.sh install_ucx.sh
+RUN bash ./install_ucx.sh && rm install_ucx.sh
+
 # Install NIXL
 COPY docker/common/install_nixl.sh install_nixl.sh
 RUN bash ./install_nixl.sh && rm install_nixl.sh
