@@ -253,8 +253,8 @@ class OpenAIServer:
             tool_dicts = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
             ]
-            sampling_params = request.to_sampling_params()
             # TODO: better way to enable metrics
+            sampling_params = request.to_sampling_params(self.llm.args.gather_generation_logits, self.llm.args.backend)
             if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
                 sampling_params.return_perf_metrics = True
 
