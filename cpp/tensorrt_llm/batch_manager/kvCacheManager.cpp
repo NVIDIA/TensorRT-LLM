@@ -457,7 +457,9 @@ void BlockManager::createBlockScalePools(SizeType32 quantBlockSize)
     }
 }
 
-void BlockManager::allocatePools(nvinfer1::DataType dtype, bool useUvm)
+// ===== hstu modification start =====
+void BlockManager::allocatePools(nvinfer1::DataType dtype, bool useUvm, SizeType32 numReservedBlocks)
+// ===== hstu modification end =====
 {
     // TODO: make the block size configurable. Should we have an additional argument
     // to specify FP4 related parameters (scale dtypes, etc)? This can also be passed
@@ -497,10 +499,12 @@ void BlockManager::allocatePools(nvinfer1::DataType dtype, bool useUvm)
             poolDtype = nvinfer1::DataType::kINT8;
         }
 
-        nvinfer1::Dims const cacheShape = ITensor::makeShape({mNumPrimaryBlocks, pool.numLayers, mKVFactor, blockSize});
+        // ===== hstu modification start =====
+        nvinfer1::Dims const cacheShape = ITensor::makeShape({mNumPrimaryBlocks + numReservedBlocks, pool.numLayers, mKVFactor, blockSize});
 
-        TLLM_LOG_DEBUG("[BlockManager] Allocating primary pool with %d blocks for %d layers with %d kv heads",
-            mNumPrimaryBlocks, pool.numLayers, pool.numKvHeads);
+        TLLM_LOG_DEBUG("[BlockManager] Allocating primary pool with %d blocks (%d blocks reserved) for %d layers with %d kv heads",
+            mNumPrimaryBlocks + numReservedBlocks, numReservedBlocks, pool.numLayers, pool.numKvHeads);
+        // ===== hstu modification end =====
 
         if (useUvm)
             pool.primaryPtr = BufferManager::managed(cacheShape, poolDtype);
@@ -594,6 +598,49 @@ BlockPtr BlockManager::getFreeBlock(
 
     return block;
 }
+
+// ===== hstu modification start =====
+void BlockManager::evictBlocks(GenerationRequest& sequence, SizeType32 numBlocksToEvict)
+{
+    auto const requestId = sequence.getRequestId();
+    // TODO: add checks
+    auto& allocatedBlocks = mAllocatedBlocksPerSeq.at(requestId);
+    for (SizeType32 idx = 0; idx < numBlocksToEvict; ++idx) {
+        auto& block = allocatedBlocks[idx];
+        block->decRefCount();
+        mEvictionPolicy->releaseBlock(block);
+        removeBlockFromHashMap(block);
+    }
+    allocatedBlocks.erase(allocatedBlocks.begin(), allocatedBlocks.begin() + numBlocksToEvict);
+    sequence.evictBlocks(numBlocksToEvict, mTokensPerBlock);
+}
+
+void BlockManager::evictSequence(GenerationRequest& sequence)
+{
+    auto const requestId = sequence.getRequestId();
+    markSequenceEvicted(requestId);
+    releaseBlocks(sequence, {});
+}
+
+void BlockManager::markSequenceEvicted(LlmRequest::RequestIdType requestId)
+{
+    auto const tableIt = mSeqLRUTable.find(requestId);
+    if (mSeqLRUTable.end() != tableIt) {
+        mSeqLRUList.erase(tableIt->second);
+        mSeqLRUTable.erase(tableIt);
+    }
+}
+
+void BlockManager::markSequenceRetained(LlmRequest::RequestIdType requestId)
+{
+    auto const tableIt = mSeqLRUTable.find(requestId);
+    if (mSeqLRUTable.end() != tableIt) {
+        mSeqLRUList.erase(tableIt->second);
+    }
+    mSeqLRUList.push_front(requestId);
+    mSeqLRUTable[requestId] = mSeqLRUList.begin();
+}
+// ===== hstu modification end =====
 
 tk::KVCacheIndex BlockManager::getKOrVBlockIndex(
     KVCacheBlock::IdType blockId, SizeType32 fieldIdx, SizeType32 poolIdx) const
@@ -1199,12 +1246,15 @@ KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, Size
     SizeType32 maxNumSequences, SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec,
     SizeType32 temporaryAttentionWindow, SizeType32 sinkTokenLength, int64_t stream,
     std::optional<runtime::SizeType32> maxSequenceLength, bool enableBlockReuse, bool onboardBlocks,
-    CacheType cacheType, bool enablePartialReuse, bool copyOnPartialReuse)
+    CacheType cacheType, bool enablePartialReuse, bool copyOnPartialReuse,
+    // ===== hstu modification start =====
+    SizeType32 reservedBlocksInPrimaryPool)
+    // ===== hstu modification end =====
     : KVCacheManager(std::vector<SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksInPrimaryPool,
         blocksInSecondaryPool, maxNumSequences, maxBeamWidth, maxAttentionWindowVec, temporaryAttentionWindow,
         sinkTokenLength, std::make_shared<runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream)),
         maxSequenceLength, enableBlockReuse, onboardBlocks, cacheType, std::nullopt, nullptr, false, enablePartialReuse,
-        copyOnPartialReuse)
+        copyOnPartialReuse, reservedBlocksInPrimaryPool)
 {
 }
 
@@ -1214,12 +1264,15 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     SizeType32 temporaryAttentionWindow, SizeType32 sinkTokenLength, int64_t stream,
     std::optional<runtime::SizeType32> maxSequenceLength, bool enableBlockReuse, bool onboardBlocks,
     CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
-    std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse)
+    std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
+    // ===== hstu modification start =====
+    SizeType32 reservedBlocksInPrimaryPool)
+    // ===== hstu modification end =====
     : KVCacheManager(numKvHeadsPerLayer, sizePerHead, tokensPerBlock, blocksInPrimaryPool, blocksInSecondaryPool,
         maxNumSequences, maxBeamWidth, maxAttentionWindowVec, temporaryAttentionWindow, sinkTokenLength,
         std::make_shared<runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream)), maxSequenceLength,
         enableBlockReuse, onboardBlocks, cacheType, secondaryOffloadMinPriority, std::move(eventManager), false,
-        enablePartialReuse, copyOnPartialReuse)
+        enablePartialReuse, copyOnPartialReuse, reservedBlocksInPrimaryPool)
 {
 }
 
@@ -1230,8 +1283,12 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     std::optional<runtime::SizeType32> maxSequenceLength, bool enableBlockReuse, bool onboardBlocks,
     CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
     std::shared_ptr<KVCacheEventManager> eventManager, bool enableHashKey, bool enablePartialReuse,
-    bool copyOnPartialReuse)
-    : mMaxBeamWidth(maxBeamWidth)
+    bool copyOnPartialReuse,
+    // ===== hstu modification start =====
+    SizeType32 reservedBlocksInPrimaryPool)
+    : mMaxNumSequences(maxNumSequences)
+    // ===== hstu modification end =====
+    , mMaxBeamWidth(maxBeamWidth)
     , mMaxAttentionWindow(*std::max_element(maxAttentionWindowVec.begin(), maxAttentionWindowVec.end()))
     , mMinAttentionWindow(*std::min_element(maxAttentionWindowVec.begin(), maxAttentionWindowVec.end()))
     , mTemporaryAttentionWindow(temporaryAttentionWindow)
@@ -1244,6 +1301,9 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     // disable block reuse for sink bubble since chopVectorIntoBlocks does not match KV cache blocks in this case
     , mEnableBlockReuse{mSinkBubbleLength > 0 ? false : enableBlockReuse}
     , mEnableHashKey{enableHashKey}
+    // ===== hstu modification start =====
+    , mReservedBlocksInPrimaryPool(reservedBlocksInPrimaryPool)
+    // ===== hstu modification end =====
 {
     // The sink tokens are stored in blocks separate from other tokens.
     // If the last block of sink tokens is only partially filled,
@@ -1279,17 +1339,23 @@ KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, Size
     std::optional<runtime::SizeType32> maxSequenceLength, bool enableBlockReuse, bool onboardBlocks,
     CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
     std::shared_ptr<KVCacheEventManager> eventManager, bool enableHashKey, bool enablePartialReuse,
-    bool copyOnPartialReuse)
+    bool copyOnPartialReuse,
+    // ===== hstu modification start =====
+    SizeType32 reservedBlocksInPrimaryPool)
+    // ===== hstu modification end =====
     : KVCacheManager(std::vector<SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksInPrimaryPool,
         blocksInSecondaryPool, maxNumSequences, maxBeamWidth, maxAttentionWindowVec, temporaryAttentionWindow,
         sinkTokenLength, std::move(stream), maxSequenceLength, enableBlockReuse, onboardBlocks, cacheType,
-        secondaryOffloadMinPriority, std::move(eventManager), enableHashKey, enablePartialReuse, copyOnPartialReuse)
+        secondaryOffloadMinPriority, std::move(eventManager), enableHashKey, enablePartialReuse, copyOnPartialReuse,
+        reservedBlocksInPrimaryPool)
 {
 }
 
 void KVCacheManager::allocatePools(nvinfer1::DataType dtype, bool useUvm)
 {
-    mBlockManager.allocatePools(dtype, useUvm);
+    // ===== hstu modification start =====
+    mBlockManager.allocatePools(dtype, useUvm, mReservedBlocksInPrimaryPool);
+    // ===== hstu modification end =====
 
     if (tc::Logger::getLogger()->getLevel() == tc::Logger::INFO)
     {
@@ -1565,6 +1631,29 @@ void KVCacheManager::updateToken(GenerationRequest& sequence, bool addToken)
     }
 }
 
+// ====== hstu modification start =====
+void KVCacheManager::appendTokens(GenerationRequest& sequence, SizeType32 numTokens)
+{
+    auto currNumTokens = sequence.getNumTokens();
+
+    SizeType32 const cyclicTokenNum = mMaxTokenNum - mSinkBlockTokenLength;
+    SizeType32 const nextTokenIdxInCycle = (currNumTokens - mSinkBlockTokenLength) % cyclicTokenNum;
+    SizeType32 const nextTokenIdxInCache = mSinkBlockTokenLength + nextTokenIdxInCycle;
+
+    SizeType32 numTokensOffset = nextTokenIdxInCache % getTokensPerBlock();
+    SizeType32 const tokensIdxOffset = (numTokensOffset == 0) ? 0 : (getTokensPerBlock() - numTokensOffset);
+
+    for (SizeType32 tokenIdx = tokensIdxOffset; tokenIdx < numTokens; tokenIdx += getTokensPerBlock()) {
+        if (currNumTokens + tokenIdx < mMaxTokenNum) {
+            mBlockManager.allocateBlock(sequence, true);
+            cacheNewBlockOffsets(sequence);
+        }
+    }
+    // cacheNewBlockOffsets(sequence);
+    sequence.addNewTokens(numTokens);
+}
+// ====== hstu modification end =====
+
 void KVCacheManager::addToken(RequestIdType requestId)
 {
     auto& sequence = getSequence(requestId);
@@ -1704,6 +1793,9 @@ void KVCacheManager::removeSequence(RequestIdType requestId, OptionalRef<LlmRequ
         {
             mBlockManager.releaseBlocks(sequenceNode.mapped(), {});
         }
+        // ===== hstu modification start =====
+        mSeqCacheStartPos.erase(requestId);
+        // ===== hstu modification end =====
     }
     TLLM_LOG_TRACE("[%s]::%s stop", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__);
 }
@@ -1713,6 +1805,133 @@ void KVCacheManager::schedulingRemoveSequence(RequestIdType requestId)
     // Mimic Free all blocks for this sequence
     mBlockManager.schedulingReleaseBlocks(requestId);
 }
+
+// ===== hstu modification start =====
+void KVCacheManager::addSequenceWithEviction(
+    RequestIdType requestId, SizeType32 start_pos, SizeType32 length, SizeType32 beamWidth, OptionalRef<LlmRequest> llmRequest)
+{
+    TLLM_CHECK_WITH_INFO(length <= mMaxBlocksPerSeq * mTokensPerBlock, 
+        "Do not accept delta length %d, %d x %d.", length, mMaxBlocksPerSeq, mTokensPerBlock);
+
+    auto const oldSeqIt = mSequences.find(requestId);
+    if (mSequences.end() != oldSeqIt) {
+        SizeType32 curLength = oldSeqIt->second.getNumTokens();
+        TLLM_CHECK_WITH_INFO(start_pos == mSeqCacheStartPos[requestId] + curLength,
+            "Currently, KVCache only supports continuous input sequence. "
+            "Last seen position %d to %d -- current input position %d to %d ",
+            mSeqCacheStartPos[requestId], mSeqCacheStartPos[requestId] + curLength,
+            start_pos, start_pos + length);
+    }
+    if (mSequences.end() == oldSeqIt && (SizeType32)mSequences.size() == mMaxNumSequences) {
+        auto requestIdToEvict = mBlockManager.getRequestIdToEvict();
+        mSeqCacheStartPos.erase(requestIdToEvict);
+        auto node = mSequences.extract(requestIdToEvict);
+        mBlockManager.evictSequence(node.mapped());
+    }
+
+    SizeType32 curLength = (mSequences.end() == oldSeqIt) ? 0 : oldSeqIt->second.getNumTokens();
+    SizeType32 newLength = curLength + length;
+    SizeType32 curBlocks = (curLength + mTokensPerBlock - 1) / mTokensPerBlock;
+    SizeType32 newBlocks = (newLength + mTokensPerBlock - 1) / mTokensPerBlock;
+
+    // Default logic for sequence length exceeding limit.
+    // Need to be avoided with input-side data length check.
+    if (newBlocks > mMaxBlocksPerSeq) {
+        SizeType32 numBlocksSelfEvict = newBlocks - mMaxBlocksPerSeq;
+        if (numBlocksSelfEvict >= curBlocks) {
+            auto node = mSequences.extract(requestId);
+            mBlockManager.evictSequence(node.mapped());
+            curLength = 0;
+        }
+        else {
+            mBlockManager.markSequenceRetained(requestId);
+            auto& sequence = mSequences.at(requestId);
+            mBlockManager.evictBlocks(sequence, numBlocksSelfEvict);
+            // cacheBlockOffsets(sequence);
+            curLength = sequence.getNumTokens();
+        }
+        newLength = curLength + length;
+        curBlocks = (curLength + mTokensPerBlock - 1) / mTokensPerBlock;
+        newBlocks = (newLength + mTokensPerBlock - 1) / mTokensPerBlock;
+        start_pos = start_pos + length - newLength;
+    }
+
+    SizeType32 numBlocksRequired = newBlocks - curBlocks;
+    while (numBlocksRequired > getNumFreeBlocks()) {
+        auto requestIdToEvict = mBlockManager.getRequestIdToEvict();
+        // SizeType32 numBlocks = mSequences.at(requestIdToEvict).getCacheBlockIds().at(0).size();
+        // if (numBlocks + getNumFreeBlocks() > numBlocksRequired) {
+        //     SizeType32 numBlocksToEvict = numBlocksRequired - getNumFreeBlocks();
+        //     auto& sequence = mSequences.at(requestIdToEvict);
+        //     mBlockManager.evictBlocks(sequence, numBlocksToEvict);
+        //     cacheBlockOffsets(sequence);
+        //     break;
+        // }
+        mSeqCacheStartPos.erase(requestIdToEvict);
+        auto node = mSequences.extract(requestIdToEvict);
+        mBlockManager.evictSequence(node.mapped());
+    }
+
+    SizeType32 numAllocTotalBlocksPreRequest = mBlockManager.getNumAllocTotalBlocks();
+    SizeType32 numAllocNewBlocksPreRequest = mBlockManager.getNumAllocNewBlocks();
+    SizeType32 numReusedBlocksPreRequest = mBlockManager.getNumReusedBlocks();
+    SizeType32 numMissedBlocksPreRequest = mBlockManager.getNumMissedBlocks();
+
+    mBlockManager.markSequenceRetained(requestId);
+    if (mSequences.end() == mSequences.find(requestId)) {
+        auto kvCacheRetentionConfig = llmRequest
+            ? llmRequest->getKvCacheRetentionConfig().value_or(executor::KvCacheRetentionConfig())
+            : executor::KvCacheRetentionConfig();
+
+        auto const [seqIt, emplaceSucess]= mSequences.emplace(requestId,
+            GenerationRequest(requestId, newLength, beamWidth, mMaxBlocksPerSeq,
+                mMinAttentionWindow, // When the request has started cycling, disable reuse.
+                mBlockManager.getNumPools(), kvCacheRetentionConfig));
+        TLLM_CHECK(emplaceSucess);
+        auto& sequence = seqIt->second;
+        mBlockManager.addSequence(sequence, numBlocksRequired, numBlocksRequired);
+        cacheBlockOffsets(sequence);
+        mSeqCacheStartPos[requestId] = start_pos;
+    }
+    else {
+        auto& sequence = mSequences.at(requestId);
+        appendTokens(sequence, newLength - curLength);
+        cacheBlockOffsets(sequence);  // no need
+    }
+
+    if (llmRequest)
+    {
+        // Update statistics for block allocations/reuse per request.
+        llmRequest->updateAllocTotalBlocksPerRequest(
+            mBlockManager.getNumAllocTotalBlocks() - numAllocTotalBlocksPreRequest);
+        llmRequest->updateAllocNewBlocksPerRequest(mBlockManager.getNumAllocNewBlocks() - numAllocNewBlocksPreRequest);
+        llmRequest->updateReusedBlocksPerRequest(mBlockManager.getNumReusedBlocks() - numReusedBlocksPreRequest);
+        llmRequest->updateMissedBlocksPerRequest(mBlockManager.getNumMissedBlocks() - numMissedBlocksPreRequest);
+    }
+}
+
+void KVCacheManager::offloadSequence(RequestIdType requestId, std::optional<SizeType32> numTokens)
+{
+}
+
+SizeType32 KVCacheManager::getNumTokensCached(RequestIdType requestId) const
+{
+    auto const seq_it = mSequences.find(requestId);
+    if (mSequences.end() == seq_it) {
+        return 0;
+    }
+    return seq_it->second.getNumTokens();
+}
+
+SizeType32 KVCacheManager::getCacheStartPos(RequestIdType requestId) const
+{
+    auto const seq_it = mSeqCacheStartPos.find(requestId);
+    if (mSeqCacheStartPos.end() == seq_it) {
+        return -1;
+    }
+    return seq_it->second;
+}
+// ===== hstu modification end =====
 
 SizeType32 KVCacheManager::copyBlockOffsets(ITensor& output, SizeType32 outputSlotOffset, RequestIdType requestId) const
 {
@@ -1867,6 +2086,12 @@ bool KVCacheManager::schedulingHasFreeBlocks(SizeType32 numRequired) const
 
 std::vector<std::vector<SizeType32>> const& KVCacheManager::getCacheBlockIds(RequestIdType requestId) const
 {
+    // ===== hstu modification start =====
+    const static std::vector<std::vector<SizeType32>> empty(1);
+    if (mSequences.end() == mSequences.find(requestId)) {
+        return empty;
+    }
+    // ===== hstu modification end =====
     return getSequence(requestId).getCacheBlockIds();
 }
 

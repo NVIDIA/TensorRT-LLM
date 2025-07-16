@@ -323,6 +323,17 @@ public:
         mNumTokens += n;
     }
 
+    // ===== hstu modification start =====
+    void evictBlocks(SizeType32 numBlock, SizeType32 tokensPerBlock)
+    {
+        mNumTokens = (mNumTokens < numBlock * tokensPerBlock) ? 0 : (mNumTokens - numBlock * tokensPerBlock);
+        for (auto& beamBlockIds : mCacheBlockIds)
+        {
+            beamBlockIds.erase(beamBlockIds.begin(), beamBlockIds.begin() + numBlock);
+        }
+    }
+    // ===== hstu modification end =====
+
     void removeTokens(SizeType32 n)
     {
         TLLM_CHECK(n <= mNumTokens);
@@ -492,7 +503,9 @@ public:
 
     ~BlockManager();
 
-    void allocatePools(nvinfer1::DataType dtype, bool useUvm);
+    // ===== hstu modification start =====
+    void allocatePools(nvinfer1::DataType dtype, bool useUvm, SizeType32 numReservedBlocks = 0);
+    // ===== hstu modification end =====
 
     void releasePools();
 
@@ -501,6 +514,13 @@ public:
     //! \brief Assign blocks for new sequence. Try to reuse blocks.
     void addSequence(
         GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest);
+
+    // ===== hstu modification start =====
+    void evictSequence(GenerationRequest& sequence);
+    void evictBlocks(GenerationRequest& sequence, SizeType32 numBlocksToEvict);
+    void markSequenceEvicted(LlmRequest::RequestIdType requestId);
+    void markSequenceRetained(LlmRequest::RequestIdType requestId);
+    // ===== hstu modification end =====
 
     //! \brief Assign blocks for new sequence. Does not try to reuse blocks.
     void addSequence(GenerationRequest& sequence, SizeType32 numBlocks, SizeType32 unsharedBlockIdx);
@@ -672,6 +692,13 @@ public:
         return mBufferManager;
     }
 
+    // ===== hstu modification start =====
+    [[nodiscard]] LlmRequest::RequestIdType getRequestIdToEvict() const
+    {
+        return mSeqLRUList.back();
+    }
+    // ===== hstu modification end =====
+
     //! \brief Perform per-request bookkeeping
     void refreshBlocks();
 
@@ -737,6 +764,13 @@ private:
 
     // List of allocated blocks for each sequences
     std::unordered_map<LlmRequest::RequestIdType, std::vector<BlockPtr>> mAllocatedBlocksPerSeq;
+
+    // ===== hstu modification start =====
+    // List of sequences according to eviction order
+    std::list<LlmRequest::RequestIdType> mSeqLRUList;
+    std::unordered_map<LlmRequest::RequestIdType,
+                       typename std::list<LlmRequest::RequestIdType>::iterator> mSeqLRUTable;
+    // ===== hstu modification end =====
 
     // Pool per unique numKvHeads in the model
     std::vector<KVCacheBlockPool> mPools;
@@ -875,6 +909,18 @@ public:
 
     virtual void schedulingRemoveSequence(LlmRequest::RequestIdType requestId) = 0;
 
+    // ===== hstu modification start =====
+    virtual void addSequenceWithEviction(LlmRequest::RequestIdType requestId, SizeType32 start_pos, SizeType32 inputLength,
+        SizeType32 beamWidth, OptionalRef<LlmRequest> llmRequest = std::nullopt)
+        = 0;
+
+    virtual void offloadSequence(
+        LlmRequest::RequestIdType requestId, std::optional<SizeType32> numTokens = std::nullopt) = 0;
+
+    virtual SizeType32 getNumTokensCached(LlmRequest::RequestIdType requestId) const = 0;
+    virtual SizeType32 getCacheStartPos(LlmRequest::RequestIdType requestId) const = 0;
+    // ===== hstu modification end =====
+
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getBlockPoolPointers() const = 0;
 
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getLayerToPoolMapping() const = 0;
@@ -977,7 +1023,10 @@ public:
         CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enableHashKey = false,
-        bool enablePartialReuse = true, bool copyOnpartialReuse = true);
+        bool enablePartialReuse = true, bool copyOnpartialReuse = true,
+        // ===== hstu modification start =====
+        SizeType32 reservedBlocksInPrimaryPool = 0);
+        // ===== hstu modification end =====
 
     KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences,
@@ -987,7 +1036,10 @@ public:
         CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enablePartialReuse = true,
-        bool copyOnpartialReuse = true);
+        bool copyOnpartialReuse = true,
+        // ===== hstu modification start =====
+        SizeType32 reservedBlocksInPrimaryPool = 0);
+        // ===== hstu modification end =====
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences,
@@ -997,14 +1049,20 @@ public:
         CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enableHashKey = false,
-        bool enablePartialReuse = true, bool copyOnpartialReuse = true);
+        bool enablePartialReuse = true, bool copyOnpartialReuse = true,
+        // ===== hstu modification start =====
+        SizeType32 reservedBlocksInPrimaryPool = 0);
+        // ===== hstu modification end =====
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences,
         SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec,
         SizeType32 temporaryAttentionWindow, SizeType32 sinkTokenLength, int64_t stream,
         std::optional<SizeType32> maxSequenceLength, bool enableBlockReuse = false, bool onboardBlocks = true,
-        CacheType cacheType = CacheType::kSELF, bool enablePartialReuse = true, bool copyOnpartialReuse = true);
+        CacheType cacheType = CacheType::kSELF, bool enablePartialReuse = true, bool copyOnpartialReuse = true,
+        // ===== hstu modification start =====
+        SizeType32 reservedBlocksInPrimaryPool = 0);
+        // ===== hstu modification end =====
 
     ~KVCacheManager() override = default;
 
@@ -1118,6 +1176,17 @@ public:
 
     void removeSequence(
         LlmRequest::RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest = std::nullopt) override;
+    
+    // ===== hstu modification start =====
+    void addSequenceWithEviction(LlmRequest::RequestIdType requestId, SizeType32 start_pos, SizeType32 length,
+        SizeType32 beamWidth, OptionalRef<LlmRequest> llmRequest = std::nullopt);
+
+    void offloadSequence(
+        LlmRequest::RequestIdType requestId, std::optional<SizeType32> numTokens = std::nullopt) override;
+
+    SizeType32 getNumTokensCached(LlmRequest::RequestIdType requestId) const override;
+    SizeType32 getCacheStartPos(LlmRequest::RequestIdType requestId) const override;
+    // ===== hstu modification end =====
 
     void schedulingRemoveSequence(LlmRequest::RequestIdType requestId) override;
 
@@ -1257,6 +1326,9 @@ private:
     void cacheNewBlockOffsets(GenerationRequest& seq);
     void updateNewBlockPointer(GenerationRequest& seq, SizeType32 blockIdx);
     void updateToken(GenerationRequest& sequence, bool addToken);
+    // ===== hstu modification start =====
+    void appendTokens(GenerationRequest& sequence, SizeType32 numTokens);
+    // ===== hstu modification end =====
 
 private:
     // Maximum number of sequences
@@ -1297,6 +1369,13 @@ private:
     runtime::ITensor::SharedPtr mBlockPoolPointers;
     runtime::ITensor::SharedPtr mLayerToPoolMapping;
     runtime::ITensor::SharedPtr mBlockScalePoolPointers;
+
+    // ===== hstu modification start =====
+    // Number of reserved blocks mapped for host kv data
+    SizeType32 mReservedBlocksInPrimaryPool;
+    // Map of sequence starting position in KV cache
+    std::unordered_map<LlmRequest::RequestIdType, SizeType32> mSeqCacheStartPos;
+    // ===== hstu modification end =====
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager
