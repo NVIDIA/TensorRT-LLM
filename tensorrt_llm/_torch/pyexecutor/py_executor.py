@@ -1421,7 +1421,7 @@ class PyExecutor:
         self.executor_request_queue.update_waiting_queue()
 
         for request in self.active_requests:
-            req_id = request.py_request_id
+            req_id = request.py_request_id if not request.is_child else request.parent_request_id
             if req_id in self.executor_request_queue.get_canceled_req_ids():
                 # Mark requests as finished, then, we reuse all existing code
                 # to clean up the KV cache resources.
@@ -1435,7 +1435,7 @@ class PyExecutor:
             self.executor_request_queue.clear_canceled_req_ids()
 
     @nvtx_range("_enqueue_responses")
-    def _enqueue_responses(self, responses: Dict[int, LlmResponse]):
+    def _enqueue_responses(self, responses: List[Tuple[int, LlmResponse]]):
         if 0 not in self.dist.mapping.tp_group and not self.gather_all_responses:
             return
 
@@ -1447,18 +1447,18 @@ class PyExecutor:
             else:
                 responses_list = self.dist.allgather(responses)
             if self.dist.rank == 0 or self.gather_all_responses:
-                gather_responses = {}
+                gather_responses = []
                 if responses_list is not None:
                     for resp in responses_list:
                         if resp is not None:
-                            gather_responses.update(resp)
+                            gather_responses.append(resp)
                     responses = gather_responses
         logger.debug(
             f'after gather, rank = {self.dist.rank}, responses = {responses}')
 
         if self.dist.rank == 0 or self.gather_all_responses:
             with self.response_cv:
-                for req_id, resp in responses.items():
+                for req_id, resp in responses:
                     if req_id in self.responses.keys():
                         self.responses[req_id].append(resp)
                     else:
@@ -1467,20 +1467,20 @@ class PyExecutor:
 
     @nvtx_range("_handle_first_token_response")
     def _handle_first_token_response(self, scheduled_batch):
-        new_responses = {}
+        new_responses = []
         for req in scheduled_batch.generation_requests:
             if req.py_decoding_iter == 1:
                 logger.debug(
                     f'Send first token response for request {req.py_request_id}'
                 )
                 response = req.create_response(False, self.dist.rank)
-                new_responses.update({req.py_request_id: response})
+                new_responses.append((req.py_request_id, response))
 
         self._enqueue_responses(new_responses)
 
     @nvtx_range("_handle_responses")
     def _handle_responses(self):
-        new_responses = {}
+        new_responses = []
         requests_to_terminate = []
         new_active_requests = []
         logger.debug(
@@ -1514,14 +1514,17 @@ class PyExecutor:
                     request.py_decoding_iter % self.stream_interval == 0:
                 response = request.create_response(False, self.dist.rank)
                 if response:
-                    request_done = response.result.is_final
-                    new_responses.update({req_id: response})
+                    request_done = request.is_finished
+                    new_responses.append((req_id, response))
 
             if request_done:
                 if request.is_disagg_context_transmission_state:
                     self.ctx_in_transmission_requests.append(request)
                 else:
-                    requests_to_terminate.append(request)
+                    if response.result.is_final:
+                        requests_to_terminate.append(request)
+                        for child in request.children:
+                            requests_to_terminate.append(child)
             else:
                 new_active_requests.append(request)
         self.active_requests.clear()

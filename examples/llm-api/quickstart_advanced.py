@@ -107,6 +107,8 @@ def add_llm_args(parser):
     parser.add_argument("--top_k", type=int, default=None)
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument('--load_format', type=str, default='auto')
+    parser.add_argument('--n', type=int, default=1)
+    parser.add_argument('--best_of', type=int, default=None)
     parser.add_argument('--max_beam_width', type=int, default=1)
 
     # Speculative decoding
@@ -233,10 +235,12 @@ def setup_llm(args, **kwargs):
         temperature=args.temperature,
         top_k=args.top_k,
         top_p=args.top_p,
+        best_of=args.max_beam_width
+        if args.max_beam_width > 1 else args.best_of,
         return_context_logits=args.return_context_logits,
         return_generation_logits=args.return_generation_logits,
         logprobs=args.logprobs,
-        n=args.max_beam_width,
+        n=args.n,
         use_beam_search=args.max_beam_width > 1)
     return llm, sampling_params
 
@@ -250,23 +254,23 @@ def main():
 
     for i, output in enumerate(outputs):
         prompt = output.prompt
-        for beam_idx, beam in enumerate(output.outputs):
-            generated_text = beam.text
+        for sequence_idx, sequence in enumerate(output.outputs):
+            generated_text = sequence.text
             # Skip printing the beam_idx if no beam search was used
-            beam_id_text = f"[{beam_idx}]" if args.max_beam_width > 1 else ""
+            sequence_id_text = f"[{sequence_idx}]" if args.max_beam_width > 1 or args.n > 1 else ""
             print(
-                f"[{i}]{beam_id_text} Prompt: {prompt!r}, Generated text: {generated_text!r}"
+                f"[{i}]{sequence_id_text} Prompt: {prompt!r}, Generated text: {generated_text!r}"
             )
             if args.return_context_logits:
                 print(
-                    f"[{i}]{beam_id_text} Context logits: {output.context_logits}"
+                    f"[{i}]{sequence_id_text} Context logits: {output.context_logits}"
                 )
             if args.return_generation_logits:
                 print(
-                    f"[{i}]{beam_id_text} Generation logits: {beam.generation_logits}"
+                    f"[{i}]{sequence_id_text} Generation logits: {sequence.generation_logits}"
                 )
             if args.logprobs:
-                print(f"[{i}]{beam_id_text} Logprobs: {beam.logprobs}")
+                print(f"[{i}]{sequence_id_text} Logprobs: {sequence.logprobs}")
 
 
 if __name__ == '__main__':
