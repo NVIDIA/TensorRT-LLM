@@ -69,18 +69,12 @@ methods:
       disable_overlap_scheduler:
         annotation: bool
         default: False
-      moe_max_num_tokens:
-        annotation: Optional[int]
-        default: null
-      moe_load_balancer:
-        annotation: Union[tensorrt_llm._torch.MoeLoadBalancerConfig, str, None]
+      moe_config:
+        annotation: tensorrt_llm.llmapi.llm_args.MoeConfig
         default: null
       attn_backend:
         annotation: str
         default: TRTLLM
-      moe_backend:
-        annotation: str
-        default: CUTLASS
       enable_mixed_sampler:
         annotation: bool
         default: False

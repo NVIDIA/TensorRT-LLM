@@ -145,19 +145,23 @@ def split_weights_tp(config, weights, dtype):
                 -1, hidden_size)
             split_weight = torch.cat(
                 [split(x, tp_size, rank) for x in [q, k, v]], dim=0)
-
-            qkv_bias = qkv_bias.reshape(num_q_per_kv + 2, -1)
-            q = qkv_bias[:num_q_per_kv, :].reshape(-1)
-            k = qkv_bias[num_q_per_kv:num_q_per_kv + 1, :].reshape(-1)
-            v = qkv_bias[num_q_per_kv + 1:num_q_per_kv + 2, :].reshape(-1)
-            split_bias = torch.cat([split(x, tp_size, rank) for x in [q, k, v]],
-                                   dim=0)
+            if qkv_bias is not None:
+                qkv_bias = qkv_bias.reshape(num_q_per_kv + 2, -1)
+                q = qkv_bias[:num_q_per_kv, :].reshape(-1)
+                k = qkv_bias[num_q_per_kv:num_q_per_kv + 1, :].reshape(-1)
+                v = qkv_bias[num_q_per_kv + 1:num_q_per_kv + 2, :].reshape(-1)
+                split_bias = torch.cat(
+                    [split(x, tp_size, rank) for x in [q, k, v]], dim=0)
+            else:
+                split_bias = None
         else:
             split_weight = split_qkv_tp(qkv_weight, num_heads, hidden_size,
                                         tp_size, rank)
-            split_bias = split_qkv_bias_tp(qkv_bias, num_heads, hidden_size,
-                                           tp_size, rank)
-
+            if qkv_bias is not None:
+                split_bias = split_qkv_bias_tp(qkv_bias, num_heads, hidden_size,
+                                               tp_size, rank)
+            else:
+                split_bias = None
         weights.update(get_quant_weight(split_weight, prefix, split_bias))
 
         prefix = layer_prefix + 'attention.dense'
@@ -171,7 +175,10 @@ def split_weights_tp(config, weights, dtype):
             mlp_fc_weight, mlp_fc_bias = get_weight_and_bias(
                 weights, prefix, dtype)
             split_v = split_matrix_tp(mlp_fc_weight, tp_size, rank, dim=0)
-            bias = split_matrix_tp(mlp_fc_bias, tp_size, rank, dim=0)
+            if mlp_fc_bias is not None:
+                bias = split_matrix_tp(mlp_fc_bias, tp_size, rank, dim=0)
+            else:
+                bias = None
             weights.update(get_quant_weight(split_v, prefix, bias))
         else:
             mlp_fc_weight = get_weight(weights, prefix, dtype)

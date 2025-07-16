@@ -1609,7 +1609,7 @@ CUBIN_EXPORT __global__
 
     uint32_t const nbSeqIters = useKVCache ? divUp(cacheSeqLen, ctaTile.x) : 0;
 #if SPEC_DEC
-    uint32_t const nbSeqItersWithoutMask = (cacheSeqLen - qSeqLen) / ctaTile.x;
+    uint32_t const nbSeqItersWithoutMask = (cacheSeqLen - actualQSeqLen) / ctaTile.x;
 #endif
 
     uint32_t const seqStrideIters = nbSubSeqPerSeq;
