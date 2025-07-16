@@ -109,8 +109,10 @@ class CompletionOutput:
     text: str = ""
     token_ids: Optional[List[int]] = field(default_factory=list)
     cumulative_logprob: Optional[float] = None
-    logprobs: Optional[TokenLogprobs] = field(default_factory=list)
-    prompt_logprobs: Optional[TokenLogprobs] = field(default_factory=list)
+    logprobs: Optional[TokenLogprobs
+                       | list[float]] = field(default_factory=list)
+    prompt_logprobs: Optional[TokenLogprobs
+                              | list[float]] = field(default_factory=list)
     finish_reason: Optional[Literal['stop', 'length', 'timeout',
                                     'cancelled']] = None
     stop_reason: Optional[Union[int, str]] = None
@@ -244,10 +246,13 @@ class GenerationResultBase:
             output.cumulative_logprob = response_tensors.cum_log_probs[src_idx]
 
         if logprobs_result:
+            # update logprobs for TRT backend
+            output._last_logprobs_len = len(output.logprobs)
             output.prompt_logprobs = logprobs_result.prompt
-            output.logprobs = logprobs_result.generation
+            output.logprobs += logprobs_result.generation
 
-        if response_tensors.log_probs is not None:
+        if logprobs_result is None and response_tensors.log_probs is not None:
+            # update logprobs for both backends
             output._last_logprobs_len = len(output.logprobs)
             output.logprobs = response_tensors.log_probs[src_idx]
             # overcome some WAR in the cpp executor
