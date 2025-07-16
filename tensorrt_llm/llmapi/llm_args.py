@@ -2014,8 +2014,13 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode='after')
     def sync_quant_config_with_kv_cache_config_dtype(self) -> 'TorchLlmArgs':
+        if self.kv_cache_config is None:
+            return self
+
         assert self.quant_config is not None
-        if self.kv_cache_config.dtype == 'fp8':
+        if self.kv_cache_config.dtype == "auto":
+            return self
+        elif self.kv_cache_config.dtype == 'fp8':
             self.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
         else:
             logger.warning(
