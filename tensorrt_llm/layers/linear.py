@@ -149,6 +149,7 @@ class LinearBase(Module, metaclass=ABCMeta):
         dtype=None,
         tp_group=None,
         tp_size=1,
+        tp_rank=0,
         share_weight=None,
         strict_dtype=False,
         pad_lda=0,
@@ -181,6 +182,7 @@ class LinearBase(Module, metaclass=ABCMeta):
 
         self.tp_size = tp_size
         self.tp_group = tp_group
+        self.tp_rank = tp_rank
         self.strict_dtype = str_dtype_to_trt(
             self.dtype) if strict_dtype else None
 
@@ -449,6 +451,7 @@ class RowLinear(LinearBase):
         dtype=None,
         tp_group=None,
         tp_size=1,
+        tp_rank=0,
         strict_dtype: bool = False,
         pad_lda=0,
         prefer_managed_weight=True,
@@ -461,6 +464,7 @@ class RowLinear(LinearBase):
             dtype=dtype,
             tp_group=tp_group,
             tp_size=tp_size,
+            tp_rank=tp_rank,
             strict_dtype=strict_dtype,
             pad_lda=pad_lda,
             prefer_managed_weight=prefer_managed_weight,
@@ -468,7 +472,9 @@ class RowLinear(LinearBase):
 
         self.tp_dim = 1
         self.tp_size = tp_size
+        self.tp_rank = tp_rank
         self.is_expert = is_expert
+        print("DEBUG ROW LINEAR WEIGHT SHAPE:", self.weight.shape, "TP GROUP:", tp_group, "TP SIZE:", tp_size, "TP RANK:", tp_rank)
 
     @classmethod
     def tp_split_dim(cls) -> int:
@@ -521,9 +527,16 @@ class RowLinear(LinearBase):
                                             lora_hidden_state, **kwargs)
 
     def collect_and_bias(self, x, **kwargs):
+        import os
+        rank = int(os.environ.get('OMPI_COMM_WORLD_RANK', '0'))
+        print(f"[RANK {rank}] DEBUG TP GROUP: {self.tp_group}, TP SIZE: {self.tp_size}, TP RANK: {self.tp_rank}")
+        
         all_reduce_params: Optional[AllReduceParams] = kwargs.get(
             "all_reduce_params", None)
         if self.tp_size > 1 and self.tp_group is not None:
+            print(f"[RANK {rank}] DEBUG ABOUT TO ALLREDUCE - TP GROUP: {self.tp_group}, TP SIZE: {self.tp_size}, TP RANK: {self.tp_rank}")
+            print("DEBUG BEFORE ALLREDUCE - SHAPE:", x.shape, "DTYPE:", x.dtype, "NAME:", x.name)
+
             need_bias = self.bias is not None
             fuse_bias_into_all_reduce = (
                 need_bias and (all_reduce_params is not None)
@@ -542,6 +555,7 @@ class RowLinear(LinearBase):
                 if need_bias and not fuse_bias_into_all_reduce:
                     bias = cast(self.bias.value, x.dtype)
                     x = x + bias / self.tp_size
+            print("DEBUG AFTER ALLREDUCE - SHAPE:", x.shape, "DTYPE:", x.dtype, "NAME:", x.name)
             return x
 
         if self.bias is not None:
