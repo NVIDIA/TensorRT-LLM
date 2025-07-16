@@ -124,6 +124,7 @@ examples/test_llama.py::test_llm_llama_long_alpaca_8gpu_summary[pg64317-tp8pp1-n
 examples/test_llama.py::test_llm_llama_lookahead_single_gpu_summary[llama-3.1-8b]
 examples/test_llama.py::test_llm_llama_lookahead_xqa_fp8_1gpu[llama-3.1-8b]
 examples/test_llama.py::test_llm_llama_lookahead_xqa_fp8_1gpu[llama-3.2-1b]
+examples/test_llama.py::test_llm_api_lookahead_decoding_1gpu[Llama-3.1-8B-Instruct-llama-3.1-model/Llama-3.1-8B-Instruct]
 examples/test_llama.py::test_llm_llama_v1_2gpu_summary[llama-7b-nb:4-enable_auto_parallel]
 examples/test_llama.py::test_llm_llama_v1_4gpu_paged_kv_cache[llama-3.1-8b]
 examples/test_llama.py::test_llm_llama_v1_multiple_lora_1gpu[luotuo_japan-llama-7b-lora_fp16-base_fp16]
