@@ -1138,10 +1138,7 @@ class PyExecutor:
                                                        previous_tensors_device)
 
                     if self.previous_batch is not None:
-                        previous_batch_size = self.previous_batch.sample_state.scheduled_requests.batch_size
-                        if previous_batch_size > 0:  # first previous batch size is 0
-                            self._update_requests(
-                                self.previous_batch.sample_state)
+                        self._update_requests(self.previous_batch.sample_state)
 
                     if self.guided_decoder is not None:
                         self.guided_decoder.build(scheduled_batch)
