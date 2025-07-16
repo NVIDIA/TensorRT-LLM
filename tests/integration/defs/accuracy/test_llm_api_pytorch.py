@@ -1847,3 +1847,16 @@ class TestBielik11BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+class TestPhi4MM(LlmapiAccuracyTestHarness):
+    # phi4-mm can also support text input.
+    MODEL_NAME = "microsoft/Phi-4-multimodal-instruct"
+    MODEL_PATH = f"{llm_models_root()}/multimodals/Phi-4-multimodal-instruct"
+
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)

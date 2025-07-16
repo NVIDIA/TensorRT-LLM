@@ -199,3 +199,5 @@ mistralai/Ministral-8B-Instruct-2410:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 65.96
+microsoft/Phi-4-multimodal-instruct:
+  - accuracy: 69.69

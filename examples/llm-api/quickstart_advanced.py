@@ -145,7 +145,7 @@ def parse_arguments():
     return args
 
 
-def setup_llm(args):
+def setup_llm(args, **kwargs):
     kv_cache_config = KvCacheConfig(
         enable_block_reuse=not args.disable_kv_cache_reuse,
         free_gpu_memory_fraction=args.kv_cache_fraction,
@@ -222,7 +222,9 @@ def setup_llm(args):
         speculative_config=spec_config,
         trust_remote_code=args.trust_remote_code,
         gather_generation_logits=args.return_generation_logits,
-        max_beam_width=args.max_beam_width)
+        max_beam_width=args.max_beam_width,
+        **kwargs,
+    )
 
     sampling_params = SamplingParams(
         max_tokens=args.max_tokens,
