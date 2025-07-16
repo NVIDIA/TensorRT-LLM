@@ -42,10 +42,12 @@ All published functionality in the Release Notes has been fully tested and verif
   - Added no_kv_cache_reuse option and streaming support for trtllm serve bench
 
 ### Infrastructure Changes
-- The dependent TensorRT version is updated to 10.11.0
-- The dependent public PyTorch version is updated to 2.8.0
-- The dependent NVIDIA ModelOpt version is updated to 0.31.0
-- Upgrade gcc toolset version from 11 to 13
+- The base Docker image for TensorRT-LLM is updated to `nvcr.io/nvidia/pytorch:25.05-py3`.
+- The base Docker image for TensorRT-LLM Backend is updated to `nvcr.io/nvidia/tritonserver:25.05-py3`.
+- The dependent public PyTorch version is updated to 2.7.1.
+- The dependent TensorRT version is updated to 10.11.
+- The dependent NVIDIA ModelOpt version is updated to 0.31.
+- The dependent NCCL version is updated to 2.27.5.
 
 ### API Changes
 - Set _AutoDeployLlmArgs as primary config object
