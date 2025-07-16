@@ -1147,7 +1147,8 @@ class PyTorchModelEngine(ModelEngine):
             py_multimodal_runtime = MultimodalRuntimeData(
                 mm_token_lengths=request.multimodal_lengths,
                 mm_token_positions=request.multimodal_positions,
-                num_cached_tokens=past_seen_token_num) if request.multimodal_hashes is not None else None
+                num_cached_tokens=past_seen_token_num
+            ) if request.multimodal_hashes is not None else None
 
             multimodal_params = MultimodalParams(
                 multimodal_data=request.py_multimodal_data,
