@@ -2,6 +2,7 @@ import os
 import sys
 
 import pytest
+import torch
 import yaml
 
 sys.path.append(os.path.join(os.environ["LLM_ROOT"], "triton_backend"))
@@ -3633,6 +3634,9 @@ def test_llmapi_backend(E2E_MODEL_NAME, DECOUPLED_MODE, TRITON_MAX_BATCH_SIZE,
                         llm_backend_dataset_root):
     llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
 
+    if torch.cuda.device_count() < int(TENSOR_PARALLEL_SIZE):
+        pytest.skip("Skipping. Not enough GPUs.")
+
     # Prepare model repo
     new_model_repo = os.path.join(llm_backend_repo_root, "triton_repo")
     prepare_llmapi_model_repo(llm_backend_repo_root, new_model_repo)
@@ -3707,6 +3711,20 @@ def test_llmapi_backend(E2E_MODEL_NAME, DECOUPLED_MODE, TRITON_MAX_BATCH_SIZE,
 
             print_info("DEBUG:: run_cmd: python3 " + " ".join(run_cmd))
             venv_check_call(llm_backend_venv, run_cmd)
+
+            # Test request cancellation with stop request
+            run_cmd = [
+                f"{llm_backend_repo_root}/tools/llmapi_client.py",
+                "--request-output-len=200", '--stop-after-ms=25'
+            ]
+
+            output = venv_check_output(llm_backend_venv, run_cmd)
+            assert 'Request is cancelled' in output
+
+            # Test request cancellation with  request cancel
+            run_cmd += ['--stop-via-request-cancel']
+            output = venv_check_output(llm_backend_venv, run_cmd)
+            assert 'Request is cancelled' in output
 
 
 @pytest.mark.parametrize("E2E_MODEL_NAME", ["ensemble", "tensorrt_llm_bls"])

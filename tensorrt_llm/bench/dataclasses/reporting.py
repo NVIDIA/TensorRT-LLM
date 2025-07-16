@@ -11,6 +11,7 @@ from tensorrt_llm.bench.dataclasses.general import DatasetMetadata
 from tensorrt_llm.bench.dataclasses.statistics import (BenchmarkStatistics,
                                                        PercentileStats,
                                                        RequestRecord)
+from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.logger import Logger
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
@@ -275,8 +276,17 @@ class ReportUtility:
             model = self.rt_cfg.model_path or self.rt_cfg.model
             model_config = ModelConfig.from_pretrained(model,
                                                        trust_remote_code=True)
-            validate_and_set_kv_cache_quant(model_config,
-                                            self.kwargs["kv_cache_dtype"])
+            kv_cache_config = self.kwargs.get("kv_cache_config",
+                                              KvCacheConfig())
+            if isinstance(kv_cache_config, KvCacheConfig):
+                kv_cache_dtype = kv_cache_config.dtype
+            elif isinstance(kv_cache_config, dict):
+                kv_cache_dtype = kv_cache_config.get("dtype", "auto")
+            else:
+                raise ValueError(
+                    f"Invalid kv_cache_config type: {type(kv_cache_config)}.")
+
+            validate_and_set_kv_cache_quant(model_config, kv_cache_dtype)
 
             stats_dict["engine"] |= {
                 "backend":
