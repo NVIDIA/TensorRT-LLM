@@ -33,6 +33,7 @@ All published functionality in the Release Notes has been fully tested and verif
   - Enabled Finalize + Allreduce + add + rmsnorm fusion
   - Integrated TRT-LLM Gen FP8 block scale MoE with Pytorch workflow kernel autotuner
   - Added support for Eagle3 + disaggregated serving in two model speculative decoding flow
+  - Validated Llama 3.1 models on H200 NVL
 - Benchmark:
   - Added all_reduce.py benchmark script for testing
   - Added beam width to trtllm-bench latency command
