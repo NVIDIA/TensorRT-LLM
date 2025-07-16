@@ -134,8 +134,7 @@ class Qwen3MoE(nn.Module):
         if self.enable_attention_dp and self.mapping.tp_size > 1:
             # FP4 all_gather moves this bf16 allgather in to after topk and fp4 quantization
             # to reduce allreduce BW
-            if not self.experts.enable_alltoall or isinstance(
-                    self.experts, TRTLLMGenFusedMoE):
+            if isinstance(self.experts, TRTLLMGenFusedMoE):
                 hidden_states = allgather(hidden_states,
                                           self.mapping,
                                           dim=0,

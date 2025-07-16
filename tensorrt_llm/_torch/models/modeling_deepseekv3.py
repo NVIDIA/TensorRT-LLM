@@ -511,8 +511,7 @@ class Deepseekv3MoE(nn.Module):
         # max-throughput
         use_dp_padding = False
         if self.use_dp and self.mapping.tp_size > 1:
-            if not self.experts.enable_alltoall or isinstance(
-                    self.experts, TRTLLMGenFusedMoE):
+            if isinstance(self.experts, TRTLLMGenFusedMoE):
                 hidden_states = allgather(hidden_states,
                                           self.mapping,
                                           dim=0,
