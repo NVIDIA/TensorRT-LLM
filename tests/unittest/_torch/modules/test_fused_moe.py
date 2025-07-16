@@ -1161,6 +1161,132 @@ def test_fused_moe_mxfp4_mxpf8(moe_backend, bias):
     torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
 
 
+@skip_non_hopper_unittest
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("hidden_size", [768, 2880])
+def test_fused_moe_wfp4a16(dtype, hidden_size):
+
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+
+    with torch.device(f'cuda:{mapping.rank}'):
+        SEQ_LEN = 4
+        HIDDEN_SIZE = hidden_size
+        INTERMEDIATE_SIZE = 640
+        SCALING_GROUP_SIZE = 32
+        NUM_EXPERTS = 3
+        TOP_K = 2
+        routing_method = RenormalizeMoeRoutingMethod(top_k=TOP_K)
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+        x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda()
+        router_logits = torch.randn((SEQ_LEN, NUM_EXPERTS), dtype=dtype).cuda()
+
+        weights = {}
+        for expert_id in range(NUM_EXPERTS):
+            w1_weight = torch.randint(0,
+                                      256,
+                                      (INTERMEDIATE_SIZE, HIDDEN_SIZE // 2),
+                                      dtype=torch.uint8,
+                                      device='cuda')
+            w2_weight = torch.randint(0,
+                                      256,
+                                      (HIDDEN_SIZE, INTERMEDIATE_SIZE // 2),
+                                      dtype=torch.uint8,
+                                      device='cuda')
+            w3_weight = torch.randint(0,
+                                      256,
+                                      (INTERMEDIATE_SIZE, HIDDEN_SIZE // 2),
+                                      dtype=torch.uint8,
+                                      device='cuda')
+
+            w1_scale = torch.randint(
+                118,
+                123, (INTERMEDIATE_SIZE, HIDDEN_SIZE // SCALING_GROUP_SIZE),
+                dtype=torch.uint8,
+                device='cuda')
+            w2_scale = torch.randint(
+                118,
+                123, (HIDDEN_SIZE, INTERMEDIATE_SIZE // SCALING_GROUP_SIZE),
+                dtype=torch.uint8,
+                device='cuda')
+            w3_scale = torch.randint(
+                118,
+                123, (INTERMEDIATE_SIZE, HIDDEN_SIZE // SCALING_GROUP_SIZE),
+                dtype=torch.uint8,
+                device='cuda')
+
+            weights[f"{expert_id}.w1.weight"] = w1_weight
+            weights[f"{expert_id}.w2.weight"] = w2_weight
+            weights[f"{expert_id}.w3.weight"] = w3_weight
+            weights[f"{expert_id}.w1.weight_scale_inv"] = w1_scale
+            weights[f"{expert_id}.w2.weight_scale_inv"] = w2_scale
+            weights[f"{expert_id}.w3.weight_scale_inv"] = w3_scale
+
+        quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_MXFP4)
+        fused_moe = CutlassFusedMoE(
+            num_experts=NUM_EXPERTS,
+            routing_method=routing_method,
+            hidden_size=HIDDEN_SIZE,
+            intermediate_size=INTERMEDIATE_SIZE,
+            dtype=dtype,
+            reduce_results=False,
+            model_config=ModelConfig(quant_config=quant_config))
+        fused_moe.load_weights([weights])
+        fused_moe.cuda()
+
+        def ref():
+            results = torch.zeros_like(x)
+            selected_experts, final_scales = routing_method.apply(router_logits)
+            unpacker = torch.ops.trtllm.mxfp4_dequantize_unswizzled
+            for e_idx in range(NUM_EXPERTS):
+                mask = selected_experts == e_idx
+                activated_tokens = mask.sum(1).bool()
+                act = x[activated_tokens, :]
+                if act.shape[0] == 0:
+                    continue
+                final_scale = (final_scales *
+                               mask).sum(1)[activated_tokens].unsqueeze(1)
+
+                # weights and scales
+                w1 = weights[f"{e_idx}.w1.weight"]
+                s1 = weights[f"{e_idx}.w1.weight_scale_inv"]
+                w2 = weights[f"{e_idx}.w2.weight"]
+                s2 = weights[f"{e_idx}.w2.weight_scale_inv"]
+                w3 = weights[f"{e_idx}.w3.weight"]
+                s3 = weights[f"{e_idx}.w3.weight_scale_inv"]
+
+                # converted weights
+                w1 = unpacker(w1.cpu(), s1.cpu(), SCALING_GROUP_SIZE).to(
+                    dtype=x.dtype, device=x.device).T.contiguous()
+                w2 = unpacker(w2.cpu(), s2.cpu(), SCALING_GROUP_SIZE).to(
+                    dtype=x.dtype, device=x.device).T.contiguous()
+                w3 = unpacker(w3.cpu(), s3.cpu(), SCALING_GROUP_SIZE).to(
+                    dtype=x.dtype, device=x.device).T.contiguous()
+                w3_w1 = torch.cat([w3, w1], dim=-1)
+
+                fc1 = torch.matmul(act, w3_w1)
+                fc1, gate = fc1.chunk(2, dim=-1)
+                fc1 = fc1 * torch.nn.functional.silu(gate)
+                fc2 = torch.matmul(fc1, w2)
+                results[activated_tokens, :] += (fc2 * final_scale).to(
+                    results.dtype)
+            return results
+
+        AutoTuner.get().clear_cache()
+        with torch.inference_mode(), autotune():
+            fused_moe.forward(x, router_logits)
+
+        torch.cuda.synchronize()
+        with torch.inference_mode():
+            output = fused_moe.forward(x, router_logits)
+            ref_output = ref()
+
+        # compare
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
+
+
 @skip_pre_hopper
 @pytest.mark.parametrize("experts", [8, 128])
 @pytest.mark.parametrize(

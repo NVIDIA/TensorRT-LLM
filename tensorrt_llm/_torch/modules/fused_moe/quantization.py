@@ -62,6 +62,11 @@ class FusedMoEQuantScalesW4A8(NamedTuple):
     alpha_2: torch.Tensor
 
 
+class FusedMoEQuantScalesW4A16MXFP4(NamedTuple):
+    scale_1_interleaved: torch.Tensor
+    scale_2_interleaved: torch.Tensor
+
+
 class FusedMoEQuantScalesW4A8MXFP4FP8(NamedTuple):
     fc31_weight_block_scale: torch.Tensor
     fc31_dequant_scale: torch.Tensor
@@ -1022,6 +1027,197 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
         else:
             w2_scales = torch.stack(all_w2_scales).to(torch.bfloat16).view(
                 module.dtype)
+        w2_s_shape = w2_scales.shape
+        w2_scales_interleaved = w2_scales.reshape(
+            w2_s_shape[0], w2_s_shape[1],
+            (w2_s_shape[2] // module.interleave[1]), module.interleave[1])
+        w2_scales_interleaved = w2_scales_interleaved.permute(0, 2, 1, 3)
+        w2_scales_interleaved = w2_scales_interleaved.reshape(
+            w2_s_shape[0], w2_s_shape[2] // module.interleave[1],
+            w2_s_shape[1] * module.interleave[1])
+        module.fc2_weight_scale.data.copy_(w2_scales_interleaved.contiguous())
+
+
+class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
+
+    def create_weights(self, module: torch.nn.Module):
+        group_size = 32
+        module.sm_version = get_sm_version()
+        if module.sm_version == 90:
+            module.interleave = []
+            for k_shape in [
+                    module.hidden_size, module.intermediate_size_per_partition
+            ]:
+                module.interleave.append(128 // group_size)
+        else:
+            raise NotImplementedError(
+                f"WFP4A16 MoE is unsupported on SM{module.sm_version}.")
+        weight_dtype = torch.uint8
+        w3_w1_weight_shape = (module.expert_size_per_partition,
+                              module.intermediate_size_per_partition * 2,
+                              module.hidden_size // 2)
+        w2_weight_shape = (module.expert_size_per_partition, module.hidden_size,
+                           module.intermediate_size_per_partition // 2)
+
+        # col parallel
+        assert module.hidden_size % (group_size * module.interleave[0]) == 0
+        scale_dtype = torch.uint8
+        fc31_weight_scale = nn.Parameter(torch.empty(
+            module.expert_size_per_partition,
+            module.hidden_size // (group_size * module.interleave[0]),
+            module.intermediate_size_per_partition * 2 * module.interleave[0],
+            dtype=scale_dtype),
+                                         requires_grad=False)
+        module.register_parameter("fc31_weight_scale", fc31_weight_scale)
+
+        # row parallel
+        assert module.intermediate_size_per_partition % (
+            group_size * module.interleave[1]) == 0
+        fc2_weight_scale = nn.Parameter(
+            torch.empty(module.expert_size_per_partition,
+                        module.intermediate_size_per_partition //
+                        (group_size * module.interleave[1]),
+                        module.hidden_size * module.interleave[1],
+                        dtype=scale_dtype),
+            requires_grad=False)
+        module.register_parameter("fc2_weight_scale", fc2_weight_scale)
+
+        super().create_weights(module, weight_dtype, w3_w1_weight_shape,
+                               w2_weight_shape)
+        self.setup_quant_scales(module)
+
+    def setup_quant_scales(self, module: torch.nn.Module):
+        module.quant_scales = FusedMoEQuantScalesW4A16MXFP4(
+            scale_1_interleaved=module.fc31_weight_scale,
+            scale_2_interleaved=module.fc2_weight_scale)
+
+    def get_quant_scales(self, module: torch.nn.Module, slot_start,
+                         slot_end) -> tuple[torch.Tensor, ...]:
+        assert module.smart_router
+        return FusedMoEQuantScalesW4A16MXFP4(
+            scale_1_interleaved=module.fc31_weight_scale.narrow(
+                0, slot_start, slot_end - slot_start),
+            scale_2_interleaved=module.fc2_weight_scale.narrow(
+                0, slot_start, slot_end - slot_start))
+
+    def load_expert_w3_w1_weight(self, module: torch.nn.Module,
+                                 w1_weight: torch.Tensor,
+                                 w3_weight: torch.Tensor,
+                                 dst_w3_w1_weight: torch.Tensor):
+        """
+        Load w1 and w3 weights for each expert.
+        Override this method if you need to preprocess the weights differently.
+        """
+        device = dst_w3_w1_weight.device
+        assert device.type == "cuda"
+        w1_weight_shard = load_weight_shard(w1_weight,
+                                            module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.COLUMN,
+                                            device=device)
+        w3_weight_shard = load_weight_shard(w3_weight,
+                                            module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.COLUMN,
+                                            device=device)
+
+        pad_size = module.hidden_size // 2 - w3_weight_shard.shape[1]
+        w1_weight_shard = torch.nn.functional.pad(w1_weight_shard,
+                                                  (0, pad_size))
+        w3_weight_shard = torch.nn.functional.pad(w3_weight_shard,
+                                                  (0, pad_size))
+
+        w31_weight_shard = torch.cat([w3_weight_shard, w1_weight_shard], dim=0)
+
+        dst_w3_w1_weight.copy_(w31_weight_shard.view(dst_w3_w1_weight.dtype),
+                               non_blocking=True)
+
+    def load_expert_w2_weight(self, module: torch.nn.Module,
+                              w2_weight: torch.Tensor,
+                              dst_w2_weight: torch.Tensor):
+        """
+        Load w2 weight for each expert.
+        Override this method if you need to preprocess the weights differently.
+        """
+        device = dst_w2_weight.device
+        assert device.type == "cuda"
+        w2_weight_shard = load_weight_shard(w2_weight,
+                                            module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.ROW,
+                                            device=device)
+
+        pad_size = module.hidden_size - w2_weight_shard.shape[0]
+        w2_weight_shard = torch.nn.functional.pad(w2_weight_shard,
+                                                  (0, 0, 0, pad_size))
+
+        dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype),
+                            non_blocking=True)
+
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+        device = module.fc31_weight_scale.data.device
+        assert device.type == "cuda"
+
+        # fc31 scales
+        assert (len(module.interleave) == 2)
+
+        all_w3_scales = []
+        all_w1_scales = []
+        for expert_id in module.initial_local_expert_ids:
+            w3_scale_shard = load_weight_shard(
+                weights[f"{expert_id}.w3.weight_scale_inv"],
+                module.tp_size,
+                module.tp_rank,
+                TensorParallelMode.COLUMN,
+                device=device)
+            w1_scale_shard = load_weight_shard(
+                weights[f"{expert_id}.w1.weight_scale_inv"],
+                module.tp_size,
+                module.tp_rank,
+                TensorParallelMode.COLUMN,
+                device=device)
+
+            pad_size = module.hidden_size // 32 - w3_scale_shard.shape[1]
+            w3_scale_shard = torch.nn.functional.pad(w3_scale_shard,
+                                                     (0, pad_size))
+            w1_scale_shard = torch.nn.functional.pad(w1_scale_shard,
+                                                     (0, pad_size))
+
+            all_w3_scales.append(w3_scale_shard)
+            all_w1_scales.append(w1_scale_shard)
+
+        all_w3_w1_scales = torch.cat(
+            [torch.stack(all_w3_scales),
+             torch.stack(all_w1_scales)], dim=-2)
+
+        w3_w1_scales = all_w3_w1_scales.to(torch.bfloat16).view(module.dtype)
+        w3_w1_s_shape = w3_w1_scales.shape
+        w3_w1_scales_interleaved = w3_w1_scales.reshape(
+            w3_w1_s_shape[0], w3_w1_s_shape[1],
+            (w3_w1_s_shape[2] // module.interleave[0]), module.interleave[0])
+        w3_w1_scales_interleaved = w3_w1_scales_interleaved.permute(0, 2, 1, 3)
+        w3_w1_scales_interleaved = w3_w1_scales_interleaved.reshape(
+            w3_w1_s_shape[0], w3_w1_s_shape[2] // module.interleave[0],
+            w3_w1_s_shape[1] * module.interleave[0])
+        module.fc31_weight_scale.data.copy_(
+            w3_w1_scales_interleaved.contiguous())
+
+        # fc2 scales
+        all_w2_scales = []
+        for expert_id in module.initial_local_expert_ids:
+            w2_scales_shard = load_weight_shard(
+                weights[f"{expert_id}.w2.weight_scale_inv"],
+                module.tp_size,
+                module.tp_rank,
+                TensorParallelMode.ROW,
+                device=device)
+            pad_size = module.hidden_size - w2_scales_shard.shape[0]
+            w2_scales_shard = torch.nn.functional.pad(w2_scales_shard,
+                                                      (0, 0, 0, pad_size))
+            all_w2_scales.append(w2_scales_shard)
+
+        w2_scales = torch.stack(all_w2_scales).to(torch.bfloat16).view(
+            module.dtype)
         w2_s_shape = w2_scales.shape
         w2_scales_interleaved = w2_scales.reshape(
             w2_s_shape[0], w2_s_shape[1],
