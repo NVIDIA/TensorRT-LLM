@@ -219,7 +219,7 @@ class CutlassFusedMoE(MoE):
             # TODO: remove this once we have correct fusedmoe kernel ready
             token_final_scales = None
 
-        use_allgather = self.use_dp and self.parallel_size
+        use_allgather = self.use_dp and self.parallel_size > 1
 
         # quantize inputs
         use_deepseek_fp8_block_scale = False
