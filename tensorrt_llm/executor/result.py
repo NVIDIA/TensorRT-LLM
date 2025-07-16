@@ -348,8 +348,8 @@ class GenerationResultBase:
                     if output_id in self._streaming_state:
                         del self._streaming_state[output_id]
 
-            if finish_reasons[src_idx] == tllm.FinishReason.END_ID:
-                output.finish_reason = 'stop'
+            # if finish_reasons[src_idx] == tllm.FinishReason.END_ID:
+            #     output.finish_reason = 'stop'
             # elif finish_reasons[src_idx] == tllm.FinishReason.STOP_WORDS:
             #     output.finish_reason = 'stop'
             #     for stop_reason, stop_ids in self.sampling_params._get_stop_reasons_and_words(
@@ -361,7 +361,16 @@ class GenerationResultBase:
             #             break
             # elif finish_reasons[src_idx] == tllm.FinishReason.LENGTH:
             #     output.finish_reason = 'length'
-            elif finish_reasons[src_idx] == tllm.FinishReason.LENGTH:
+            if (finish_reasons[src_idx] == tllm.FinishReason.END_ID
+                    or finish_reasons[src_idx] == tllm.FinishReason.LENGTH):
+
+                # For END_ID, set finish_reason to 'stop' initially
+                if finish_reasons[src_idx] == tllm.FinishReason.END_ID:
+                    output.finish_reason = 'stop'
+                # For END_ID, set finish_reason to 'length' initially
+                elif finish_reasons[src_idx] == tllm.FinishReason.LENGTH:
+                    output.finish_reason = 'length'
+
                 # For non-streaming or when streaming is complete
                 if not self._streaming or not self.sampling_params.stop:
                     print(f"DEBUG: ENTERING LENGTH PROCESSING!")
@@ -428,14 +437,12 @@ class GenerationResultBase:
                             print(
                                 f"DEBUG: No stop words found, setting finish_reason to 'length'"
                             )
-                            output.finish_reason = 'length'
                     else:
                         print(
                             f"DEBUG: No tokenizer available for detokenization")
-                        output.finish_reason = 'length'
                 else:
                     # For streaming, stop detection already happened above
-                    output.finish_reason = 'length'
+                    pass
             elif finish_reasons[src_idx] == tllm.FinishReason.TIMED_OUT:
                 output.finish_reason = 'timeout'
             # For disaggregated serving, finish reason might be NOT_FINISHED which is ok
