@@ -15,9 +15,62 @@ from .routing import BaseMoeRoutingMethod
 
 
 @nvtx_range("[DG] act")
+@torch.compile(dynamic=True)
 def swiglu_fused_moe(x):
     x, gate = x.chunk(2, dim=-1)
     return F.silu(gate) * x
+
+
+@nvtx_range("[DG] indexing")
+@torch.compile(dynamic=True)
+def indexing(x, mask):
+    return x[mask > 0, :].contiguous()
+
+
+@nvtx_range("[DG] copy after permute")
+@torch.compile(dynamic=True)
+def copy_after(
+    expert_first_token_offset_tensor,
+    permuted_data_tensor,
+    base_indices,
+    hidden_size,
+):
+    token_per_expert = expert_first_token_offset_tensor[
+        1:] - expert_first_token_offset_tensor[:-1]
+    token_per_expert_padded = (token_per_expert + 127) // 128 * 128
+    expert_first_token_offset_tensor_padded = torch.cat(
+        (torch.zeros(1, dtype=torch.int32,
+                     device='cuda'), torch.cumsum(token_per_expert_padded,
+                                                  dim=0)))
+
+    token_num = token_per_expert.sum()
+    total_tokens_padded = token_per_expert_padded.sum()
+    m_indices = torch.repeat_interleave(base_indices,
+                                        token_per_expert_padded,
+                                        dim=0,
+                                        output_size=total_tokens_padded)
+    src_offsets = torch.repeat_interleave(expert_first_token_offset_tensor[:-1],
+                                          token_per_expert,
+                                          dim=0,
+                                          output_size=token_num)
+    dest_starts = torch.repeat_interleave(
+        expert_first_token_offset_tensor_padded[:-1],
+        token_per_expert,
+        dim=0,
+        output_size=token_num)
+    token_j_offset_in_expert = torch.arange(token_num,
+                                            device='cuda') - src_offsets
+    dest_indices = dest_starts + token_j_offset_in_expert
+
+    permuted_data_tensor_padded = torch.empty(total_tokens_padded,
+                                              hidden_size,
+                                              dtype=permuted_data_tensor.dtype,
+                                              device='cuda')
+    src_indices = torch.arange(dest_indices.shape[0], device='cuda')
+    permuted_data_tensor_padded.index_copy_(0, dest_indices,
+                                            permuted_data_tensor[src_indices])
+
+    return permuted_data_tensor_padded, m_indices, dest_indices
 
 
 @nvtx_range("[DG]")
@@ -28,6 +81,7 @@ def deepgemm_fp8_group_blockwise_gemm_ref(
     b_sf: torch.Tensor,
     m_indices: torch.Tensor,
 ) -> torch.Tensor:
+
     torch.cuda.synchronize()
     d = torch.empty((a.shape[0], b.shape[1]),
                     device=b.device,
@@ -51,6 +105,11 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         dtype (Optional[torch.dtype]): Data type for the weights.
         reduce_results (bool): Whether to reduce the results across devices.
         model_config (ModelConfig): Configuration object for the model.
+
+    This backend is composed of multiple custom ops:
+    1. moe_permute_op: permute the input tensor and the expert selected tensor.
+    2. cute_dsl_fp8_group_blockwise_gemm_ref: a reference implementation of the cute_dsl_fp8_group_blockwise_gemm.
+    3. moe_finalize_scale_op: finalize the scale of the output tensor.
     """
 
     def __init__(
@@ -83,6 +142,10 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
         )
+
+        self.base_indices = torch.arange(self.expert_size_per_partition,
+                                         device="cuda",
+                                         dtype=torch.int32)
 
     @nvtx_range("[DG] forward")
     def forward_chunk(
@@ -117,50 +180,53 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             token_final_scales = None
 
         # quantize inputs
+        use_deepseek_fp8_block_scale = False
+        x_sf = None
         if self.has_any_quant:
             if self.has_deepseek_fp8_block_scales:
-                pass
+                use_deepseek_fp8_block_scale = True
             else:
                 raise ValueError(
-                    f"unsupported quantization mode for DEEPGEMM backend: {self.quant_config.quant_mode}"
+                    f"unsupported quantization mode for CUTEDSL backend: {self.quant_config.quant_mode}"
                 )
 
-        experts = torch.arange(self.ep_rank * self.expert_size_per_partition,
-                               (self.ep_rank + 1) *
-                               self.expert_size_per_partition,
-                               device=x.device).view(-1, 1, 1)
-        matches = (token_selected_experts == experts)
-        token_per_expert = matches.sum(dim=[-1, -2]).flatten()
-        token_per_expert_padded = (token_per_expert + 127) // 128 * 128
-        token_per_expert_offset_padded = torch.cat(
-            (torch.zeros(1, dtype=torch.int32, device=x.device),
-             torch.cumsum(token_per_expert_padded, dim=0)))
+        (
+            permuted_row_to_unpermuted_row_tensor,
+            permuted_token_selected_experts_tensor,
+            permuted_data_tensor,
+            expert_first_token_offset_tensor,
+            permuted_token_final_scales_tensor,
+            unpermuted_row_to_permuted_row_tensor,
+        ) = torch.ops.trtllm.moe_permute_op(
+            x,
+            token_selected_experts,
+            token_final_scales,
+            None,  # w3_w1_weight.view(weight_dtype),
+            None,  # w2_weight.view(weight_dtype),
+            None,  # quant_scales,
+            input_sf=x_sf,
+            num_experts_on_rank=self.expert_size_per_partition,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+            ep_size=self.ep_size,
+            ep_rank=self.ep_rank,
+            cluster_size=self.cluster_size,
+            cluster_rank=self.cluster_rank,
+            min_latency_mode=False,
+            use_fp8_block_scaling=use_deepseek_fp8_block_scale,
+        )
 
-        permuted_data_tensor = torch.empty(token_per_expert_padded.sum(),
-                                           x.shape[1],
-                                           dtype=x.dtype,
-                                           device=x.device)
-        m_indices = torch.empty(permuted_data_tensor.shape[0],
-                                dtype=torch.int32,
-                                device=x.device)
-        token_map = torch.zeros(permuted_data_tensor.shape[0],
-                                dtype=torch.int32,
-                                device=x.device)
-        m = matches.nonzero()
-        m_indices = torch.cat([
-            torch.full((l, ), i, dtype=torch.int32)
-            for i, l in enumerate(token_per_expert_padded)
-        ])
-        for idx in range(experts.numel()):
-            token_map[token_per_expert_offset_padded[idx]:
-                      token_per_expert_offset_padded[idx] +
-                      token_per_expert[idx]] = 1
-        permuted_data_tensor[token_map > 0, :] = x[m[:, 1], :]
+        permuted_data_tensor_padded, m_indices, dest_indices = copy_after(
+            expert_first_token_offset_tensor,
+            permuted_data_tensor,
+            self.base_indices,
+            self.hidden_size,
+        )
 
-        if permuted_data_tensor.numel() == 0:
+        if permuted_data_tensor_padded.numel() == 0:
             return torch.zeros_like(x)
         act_input_fp8, act_input_sf = fp8_utils.per_token_cast_to_fp8_e8m0(
-            permuted_data_tensor)
+            permuted_data_tensor_padded)
         h1 = deepgemm_fp8_group_blockwise_gemm_ref(
             a=act_input_fp8,
             b=self.w3_w1_weight,
@@ -170,7 +236,6 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         )
         h2 = swiglu_fused_moe(h1)
         act_input_fp8, act_input_sf = fp8_utils.per_token_cast_to_fp8_e8m0(h2)
-
         h3 = deepgemm_fp8_group_blockwise_gemm_ref(
             a=act_input_fp8,
             b=self.w2_weight,
@@ -179,11 +244,24 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             m_indices=m_indices,
         )
 
-        res = (h3[token_map > 0, :] *
-               token_final_scales[m[:, 1], m[:, 2]].unsqueeze(1)).to(h3.dtype)
-
-        final_hidden_states = torch.zeros_like(x)
-        indices = m[:, 1].unsqueeze(1).expand(-1, res.size(1)).cuda()  # [N, D]
-        final_hidden_states.scatter_add_(0, indices, res)
+        permuted_data_tensor[0:dest_indices.shape[0]].copy_(h3[dest_indices])
+        final_hidden_states = torch.ops.trtllm.moe_finalize_scale_op(
+            permuted_data_tensor,
+            None,  # biases
+            token_final_scales,
+            unpermuted_row_to_permuted_row_tensor,
+            permuted_row_to_unpermuted_row_tensor,
+            token_selected_experts,
+            expert_first_token_offset_tensor,
+            False,  # enable_alltoall
+            x.shape[0],  # num_rows
+            x.shape[1],  # hidden_size
+            self.routing_method.top_k,
+            self.expert_size_per_partition,  # num_experts_per_node
+            self.tp_size,
+            self.tp_rank,
+            self.ep_size,
+            self.ep_rank,
+        )
 
         return final_hidden_states
