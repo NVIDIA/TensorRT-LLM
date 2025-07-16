@@ -354,8 +354,9 @@ class EagleDecodingConfig(DecodingBaseConfig):
 
 
 class UserProvidedDecodingConfig(DecodingBaseConfig):
-    # Type should be Drafter, but it leads to circular import
-    drafter: object
+    # Cannot use real type annotations due to circular imports
+    drafter: object  # Type is Drafter
+    resource_manager: object = None  # Type is Optional[ResourceManager]
 
     @classmethod
     def from_dict(cls, data: dict):
