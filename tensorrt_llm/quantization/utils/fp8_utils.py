@@ -70,6 +70,8 @@ def per_block_cast_to_fp8_e8m0(
 
 def resmooth_to_fp8_e8m0(weight: torch.Tensor,
                          sf: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    weight = weight.cuda()
+    sf = sf.cuda()
     if weight.dim() == 2:
         x = weight.float() * sf.repeat_interleave(128, dim=0).repeat_interleave(
             128, dim=1)[:weight.shape[0], :weight.shape[1]]

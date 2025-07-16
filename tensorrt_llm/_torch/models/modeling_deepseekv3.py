@@ -44,6 +44,7 @@ from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.llmapi.utils import enable_llm_debug
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.utils.fp8_utils import resmooth_to_fp8_e8m0
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
@@ -1209,11 +1210,6 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
 
             return kv_b_proj, k_nope_weight_trans
 
-        def check_weight_dtype(module_name: str, dtype):
-            weight_name = "weight"
-            w_dtype = weights[f"{module_name}.{weight_name}"].dtype
-            return w_dtype == dtype
-
         def load_kv_b_proj_and_k_b_proj_trans_dequant(
                 module_name: str) -> torch.Tensor:
             weight_name = "weight"
@@ -1285,6 +1281,16 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
 
         params_map = {'gate_up_proj': ['gate_proj', 'up_proj']}
         all_named_modules = dict(self.named_modules())
+
+        if self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
+        ) and get_sm_version() == 100:
+            for name in list(weights.keys()):
+                if name.endswith("weight_scale_inv"):
+                    weight_name = name.replace("weight_scale_inv", "weight")
+                    weight = weights[weight_name][:]
+                    scale = weights[name][:]
+                    weights[weight_name], weights[name] = resmooth_to_fp8_e8m0(
+                        weight, scale)
 
         for name, module in tqdm(all_named_modules.items(),
                                  desc="Loading weights"):
