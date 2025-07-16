@@ -57,7 +57,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc3';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -67,7 +67,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc2" />
+  <meta name="docsearch:version" content="1.0.0rc3" />
 
 
   </head>
@@ -341,6 +341,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
@@ -401,7 +402,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/kv-cache-management.html">KV Cache Management: Pools, Blocks, and Events</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/disaggregated-service.html">Disaggregated-Service (Experimental)</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul class="nav bd-sidenav">
@@ -506,6 +507,7 @@
 <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">PreTrainedTokenizerBase</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.inputs.data</span><span class="w"> </span><span class="kn">import</span> <span class="n">TextPrompt</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.inputs.multimodal</span><span class="w"> </span><span class="kn">import</span> <span class="n">MultimodalParams</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.inputs.registry</span><span class="w"> </span><span class="kn">import</span> <span class="n">DefaultInputProcessor</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">nvtx_range_debug</span>
@@ -856,9 +858,8 @@
                 <span class="n">sampling_params</span><span class="o">.</span><span class="n">add_special_tokens</span> <span class="o">=</span> <span class="kc">False</span>
 
         <span class="n">query_token_ids</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="n">multimodal_input</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="n">multimodal_embedding</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="n">mrope_config</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">multimodal_params</span> <span class="o">=</span> <span class="kc">None</span>
+
         <span class="k">if</span> <span class="s2">&quot;prompt_token_ids&quot;</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">:</span>
             <span class="c1"># TODO: if specify prompt_token_ids, the mm hashing is not supported yet</span>
             <span class="n">prompt_token_ids</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;prompt_token_ids&#39;</span><span class="p">]</span>
@@ -883,11 +884,15 @@
             <span class="n">prompt</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;prompt&#39;</span><span class="p">]</span>
             <span class="k">if</span> <span class="n">extra_processed_inputs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">query_token_ids</span> <span class="o">=</span> <span class="n">extra_processed_inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;query_token_ids&#39;</span><span class="p">)</span>
-                <span class="n">multimodal_embedding</span> <span class="o">=</span> <span class="n">extra_processed_inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
-                    <span class="s1">&#39;mm_embedding&#39;</span><span class="p">)</span>
-                <span class="n">mrope_config</span> <span class="o">=</span> <span class="n">extra_processed_inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;mrope_config&#39;</span><span class="p">)</span>
-                <span class="n">multimodal_input</span> <span class="o">=</span> <span class="n">extra_processed_inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
-                    <span class="s1">&#39;multimodal_input&#39;</span><span class="p">)</span>
+                <span class="c1"># Create unified MultimodalParams</span>
+                <span class="n">multimodal_params</span> <span class="o">=</span> <span class="n">MultimodalParams</span><span class="p">(</span>
+                    <span class="n">multimodal_input</span><span class="o">=</span><span class="n">extra_processed_inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+                        <span class="s1">&#39;multimodal_input&#39;</span><span class="p">),</span>
+                    <span class="n">multimodal_data</span><span class="o">=</span><span class="n">extra_processed_inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+                        <span class="s1">&#39;multimodal_data&#39;</span><span class="p">))</span>
+                <span class="c1"># Only pass it if it has content</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="n">multimodal_params</span><span class="o">.</span><span class="n">has_content</span><span class="p">():</span>
+                    <span class="n">multimodal_params</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">TypeError</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">&quot;The inputs must be type str or list of int, but got </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">inputs</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
@@ -907,12 +912,10 @@
             <span class="n">lora_request</span><span class="o">=</span><span class="n">lora_request</span><span class="p">,</span>
             <span class="n">prompt_adapter_request</span><span class="o">=</span><span class="n">prompt_adapter_request</span><span class="p">,</span>
             <span class="n">streaming</span><span class="o">=</span><span class="n">streaming</span><span class="p">,</span>
-            <span class="n">multimodal_input</span><span class="o">=</span><span class="n">multimodal_input</span><span class="p">,</span>
-            <span class="n">multimodal_embedding</span><span class="o">=</span><span class="n">multimodal_embedding</span><span class="p">,</span>
-            <span class="n">mrope_config</span><span class="o">=</span><span class="n">mrope_config</span><span class="p">,</span>
             <span class="n">kv_cache_retention_config</span><span class="o">=</span><span class="n">kv_cache_retention_config</span><span class="p">,</span>
             <span class="n">disaggregated_params</span><span class="o">=</span><span class="n">disaggregated_params</span><span class="p">,</span>
             <span class="n">postproc_params</span><span class="o">=</span><span class="n">_postproc_params</span><span class="p">,</span>
+            <span class="n">multimodal_params</span><span class="o">=</span><span class="n">multimodal_params</span><span class="p">,</span>
         <span class="p">)</span>
 
         <span class="k">return</span> <span class="n">RequestOutput</span><span class="o">.</span><span class="n">_from_generation_result</span><span class="p">(</span><span class="n">result</span><span class="p">,</span> <span class="n">prompt</span><span class="p">,</span>
@@ -996,8 +999,8 @@
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                     <span class="s2">&quot;tokenizer is required to initialize a default sampling_params, or you can explicitly specify a sampling_params&quot;</span>
                 <span class="p">)</span>
-            <span class="k">return</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">end_id</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">eos_token_id</span><span class="p">,</span>
-                                  <span class="n">pad_id</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">pad_token_id</span><span class="p">)</span>
+            <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">end_id</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">eos_token_id</span><span class="p">,</span>
+                                             <span class="n">pad_id</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">pad_token_id</span><span class="p">)</span>
         <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">sampling_params</span><span class="p">,</span> <span class="n">SamplingParams</span><span class="p">):</span>
             <span class="k">if</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">end_id</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
@@ -1005,20 +1008,25 @@
                         <span class="s2">&quot;tokenizer is required to reset end_id if it is None, or you can explicitly specify the end_id for sampling_params&quot;</span>
                     <span class="p">)</span>
                 <span class="n">sampling_params</span><span class="o">.</span><span class="n">_setup</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">)</span>
-            <span class="c1"># auto enabled context and/or generation logits flags, as they are required by logprob computation for TRT backend.</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">backend</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;pytorch&quot;</span><span class="p">,</span> <span class="s2">&quot;_autodeploy&quot;</span><span class="p">]:</span>
-                <span class="k">if</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">prompt_logprobs</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">return_context_logits</span><span class="p">:</span>
-                    <span class="n">sampling_params</span><span class="o">.</span><span class="n">return_context_logits</span> <span class="o">=</span> <span class="kc">True</span>
-                    <span class="n">sampling_params</span><span class="o">.</span><span class="n">_context_logits_auto_enabled</span> <span class="o">=</span> <span class="kc">True</span>
-                <span class="k">if</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">logprobs</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">return_generation_logits</span><span class="p">:</span>
-                    <span class="n">sampling_params</span><span class="o">.</span><span class="n">return_generation_logits</span> <span class="o">=</span> <span class="kc">True</span>
-                    <span class="n">sampling_params</span><span class="o">.</span><span class="n">_generation_logits_auto_enabled</span> <span class="o">=</span> <span class="kc">True</span>
-
-            <span class="k">return</span> <span class="n">sampling_params</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">TypeError</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">&quot;The sampling_params must be type SamplingParams or None, but got </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">sampling_params</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
             <span class="p">)</span>
+
+        <span class="c1"># auto enabled context and/or generation logits flags, as they are required by logprob computation for TRT backend.</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">backend</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;pytorch&quot;</span><span class="p">,</span> <span class="s2">&quot;_autodeploy&quot;</span><span class="p">]:</span>
+            <span class="k">if</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">prompt_logprobs</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">return_context_logits</span><span class="p">:</span>
+                <span class="n">sampling_params</span><span class="o">.</span><span class="n">return_context_logits</span> <span class="o">=</span> <span class="kc">True</span>
+                <span class="n">sampling_params</span><span class="o">.</span><span class="n">_context_logits_auto_enabled</span> <span class="o">=</span> <span class="kc">True</span>
+            <span class="k">if</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">logprobs</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">return_generation_logits</span><span class="p">:</span>
+                <span class="n">sampling_params</span><span class="o">.</span><span class="n">return_generation_logits</span> <span class="o">=</span> <span class="kc">True</span>
+                <span class="n">sampling_params</span><span class="o">.</span><span class="n">_generation_logits_auto_enabled</span> <span class="o">=</span> <span class="kc">True</span>
+
+        <span class="k">if</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">_stream_interval</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">sampling_params</span><span class="o">.</span><span class="n">_stream_interval</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">,</span>
+                                                       <span class="s2">&quot;stream_interval&quot;</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+
+        <span class="k">return</span> <span class="n">sampling_params</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_check_arguments</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">prompt_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">query_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
                          <span class="n">sampling_params</span><span class="p">:</span> <span class="n">SamplingParams</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
@@ -1642,9 +1650,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 06, 2025.</p>
+  <p>Last updated on July 14, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/66f299a">66f299a</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cfcb97a">cfcb97a</a>.</p>
   
 </div></div>
       

@@ -58,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc3';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -70,7 +70,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc2" />
+  <meta name="docsearch:version" content="1.0.0rc3" />
 
 
   </head>
@@ -348,6 +348,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
@@ -408,7 +409,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-management.html">KV Cache Management: Pools, Blocks, and Events</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/disaggregated-service.html">Disaggregated-Service (Experimental)</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul class="nav bd-sidenav">
@@ -497,31 +498,12 @@
   <section id="llm-api-introduction">
 <h1>LLM API Introduction<a class="headerlink" href="#llm-api-introduction" title="Link to this heading">#</a></h1>
 <p>The LLM API is a high-level Python API designed to streamline LLM inference workflows.</p>
-<p>It supports a broad range of use cases, from single-GPU setups to multi-GPU and multi-node deployments, with built-in support for various parallelism strategies and advanced features. The LLM API integrates seamlessly with the broader inference ecosystem, including NVIDIA <a class="reference external" href="https://github.com/ai-dynamo/dynamo">Dynamo</a> and the <a class="reference external" href="https://github.com/triton-inference-server/server">Triton Inference Server</a>.</p>
+<p>It supports a broad range of use cases, from single-GPU setups to multi-GPU and multi-node deployments, with built-in support for various parallelism strategies and advanced features. The LLM API integrates seamlessly with the broader inference ecosystem, including NVIDIA <a class="reference external" href="https://github.com/ai-dynamo/dynamo">Dynamo</a>.</p>
 <p>While the LLM API simplifies inference workflows with a high-level interface, it is also designed with flexibility in mind. Under the hood, it uses a PyTorch-native and modular backend, making it easy to customize, extend, or experiment with the runtime.</p>
-<section id="supported-models">
-<h2>Supported Models<a class="headerlink" href="#supported-models" title="Link to this heading">#</a></h2>
-<ul class="simple">
-<li><p>DeepSeek variants</p></li>
-<li><p>Llama (including variants Mistral, Mixtral, InternLM)</p></li>
-<li><p>GPT (including variants Starcoder-1/2, Santacoder)</p></li>
-<li><p>Gemma-1/2/3</p></li>
-<li><p>Phi-1/2/3/4</p></li>
-<li><p>ChatGLM (including variants glm-10b, chatglm, chatglm2, chatglm3, glm4)</p></li>
-<li><p>QWen-1/1.5/2/3</p></li>
-<li><p>Falcon</p></li>
-<li><p>Baichuan-1/2</p></li>
-<li><p>GPT-J</p></li>
-<li><p>Mamba-1/2</p></li>
-</ul>
-<blockquote>
-<div><p><strong>Note:</strong> For the most up-to-date list of supported models, you may refer to the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/models">TensorRT-LLM model definitions</a>.</p>
-</div></blockquote>
-</section>
 <section id="quick-start-example">
 <h2>Quick Start Example<a class="headerlink" href="#quick-start-example" title="Link to this heading">#</a></h2>
 <p>A simple inference example with TinyLlama using the LLM API:</p>
-<p>More examples can be found <a class="reference internal" href="#"><span class="xref myst">here</span></a>.</p>
+<p>For more advanced usage including distributed inference, multimodal, and speculative decoding, please refer to this <span class="xref myst">README</span>.</p>
 </section>
 <section id="model-input">
 <h2>Model Input<a class="headerlink" href="#model-input" title="Link to this heading">#</a></h2>
@@ -626,7 +608,6 @@
   </div>
   <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="visible nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#supported-models">Supported Models</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#quick-start-example">Quick Start Example</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#model-input">Model Input</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#using-a-model-from-the-hugging-face-hub">1. Using a Model from the Hugging Face Hub</a></li>
@@ -728,9 +709,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 06, 2025.</p>
+  <p>Last updated on July 14, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/66f299a">66f299a</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cfcb97a">cfcb97a</a>.</p>
   
 </div></div>
       

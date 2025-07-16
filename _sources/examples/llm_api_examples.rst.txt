@@ -21,6 +21,7 @@ _____________
    llm_guided_decoding
    llm_logits_processor
    llm_multilora
+   llm_speculative_decoding
 
 Slurm
 _____
