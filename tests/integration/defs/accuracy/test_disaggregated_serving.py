@@ -234,11 +234,17 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "kv_cache_config": kv_cache_config,
+            "cache_transceiver_config": {
+                "backend": "default"
+            }
         }
         gen_server_config = {
             "disable_overlap_scheduler": True,
             "speculative_config": speculative_decoding_config,
             "kv_cache_config": kv_cache_config,
+            "cache_transceiver_config": {
+                "backend": "default"
+            }
         }
         disaggregated_server_config = {
             "hostname": "localhost",
@@ -276,13 +282,19 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": True,
             "speculative_config": speculative_decoding_config,
             "kv_cache_config": kv_cache_config,
-            "max_num_tokens": 13393 * 2
+            "max_num_tokens": 13393 * 2,
+            "cache_transceiver_config": {
+                "backend": "default"
+            }
         }
         gen_server_config = {
             "disable_overlap_scheduler": not overlap_scheduler,
             "speculative_config": speculative_decoding_config,
             "kv_cache_config": kv_cache_config,
-            "max_num_tokens": 13393 * 2
+            "max_num_tokens": 13393 * 2,
+            "cache_transceiver_config": {
+                "backend": "default"
+            }
         }
         disaggregated_server_config = {
             "hostname": "localhost",
@@ -395,11 +407,17 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
     def test_auto_dtype(self, overlap_scheduler):
         ctx_server_config = {
             "disable_overlap_scheduler": True,
-            "cuda_graph_config": None
+            "cuda_graph_config": None,
+            "cache_transceiver_config": {
+                "backend": "default"
+            }
         }
         gen_server_config = {
             "disable_overlap_scheduler": overlap_scheduler,
-            "cuda_graph_config": None
+            "cuda_graph_config": None,
+            "cache_transceiver_config": {
+                "backend": "default"
+            }
         }
         ctx_server_config["kv_cache_config"] = {
             "max_attention_window": [512, 512, 512, 512, 512, 32768],
