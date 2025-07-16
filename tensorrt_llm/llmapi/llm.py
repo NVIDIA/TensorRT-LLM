@@ -970,7 +970,11 @@ class _TorchLLM(BaseLLM):
             speculative_config=self.args.speculative_config,
             hf_model_dir=self._hf_model_dir,
             max_input_len=self.args.max_input_len,
-            max_seq_len=max_seq_len)
+            max_seq_len=max_seq_len,
+            checkpoint_format=None if self.args.backend == "_autodeploy" else
+            self.args.checkpoint_format,
+            checkpoint_loader=None if self.args.backend == "_autodeploy" else
+            self.args.checkpoint_loader)
 
         # TODO: revisit gather_context_logits
         return_logits = self.args.gather_generation_logits
