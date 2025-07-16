@@ -64,7 +64,7 @@ from .utils import generate_api_docs_as_docstring, get_type_repr
 
 def Field(default: Any = ...,
           *,
-          status: Optional[Literal["prototype", "beta"]] = None,
+          status: Optional[Literal["prototype", "beta", "deprecated"]] = None,
           **kwargs: Any) -> Any:
     """Custom Field wrapper that adds status to json_schema_extra.
 
@@ -1045,16 +1045,23 @@ class BaseLlmArgs(BaseModel):
     max_lora_rank: Optional[int] = Field(
         default=None,
         description="The maximum LoRA rank.",
-        deprecated="Use lora_config.max_lora_rank instead.")
+        deprecated="Use lora_config.max_lora_rank instead.",
+        status="deprecated",
+    )
 
-    max_loras: int = Field(default=4,
-                           description="The maximum number of LoRA.",
-                           deprecated="Use lora_config.max_loras instead.")
+    max_loras: int = Field(
+        default=4,
+        description="The maximum number of LoRA.",
+        deprecated="Use lora_config.max_loras instead.",
+        status="deprecated",
+    )
 
     max_cpu_loras: int = Field(
         default=4,
         description="The maximum number of LoRA on CPU.",
-        deprecated="Use lora_config.max_cpu_loras instead.")
+        deprecated="Use lora_config.max_cpu_loras instead.",
+        status="deprecated",
+    )
 
     lora_config: Optional[LoraConfig] = Field(
         default=None, description="LoRA configuration for the model.")
@@ -1164,6 +1171,7 @@ class BaseLlmArgs(BaseModel):
         description="The backend to use for this LLM instance.",
         exclude_json_schema=True,  # hide from API references
         validate_default=True,
+        status="deprecated",
     )
 
     _parallel_config: Optional[object] = PrivateAttr(default=None)
@@ -1843,7 +1851,9 @@ class TorchLlmArgs(BaseLlmArgs):
         default=None,
         description="Build config.",
         exclude_from_json=True,
-        json_schema_extra={"type": f"Optional[{get_type_repr(BuildConfig)}]"})
+        json_schema_extra={"type": f"Optional[{get_type_repr(BuildConfig)}]"},
+        status="deprecated",
+    )
 
     # PyTorch backend specific configurations
     garbage_collection_gen0_threshold: int = Field(

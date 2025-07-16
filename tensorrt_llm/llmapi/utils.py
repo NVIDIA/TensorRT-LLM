@@ -493,7 +493,7 @@ def generate_api_docs_as_docstring(model: Type[BaseModel],
     for field_name, field_info in schema['properties'].items():
         if field_name.startswith("_"):  # skip private fields
             continue
-        if field_info.get("deprecated", False):
+        if field_info.get("status", None) == "deprecated":
             continue
 
         field_type = field_info.get('type', None)
