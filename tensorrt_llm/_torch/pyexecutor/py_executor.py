@@ -1154,11 +1154,6 @@ class PyExecutor:
                     # Add the masked chunk tokens
                     current_tokens.extend(masked_chunk.tolist())
                     
-                    # Create a new request with the updated tokens
-                    # This is a simplified approach - in a real implementation, you'd need to
-                    # properly clone the request with all its properties
-                    # print(f"[BLOCK_PREDICTION] Creating new request with {len(current_tokens)} tokens")
-                    
                     # For now, just mark the request as needing another iteration
                     request.py_needs_block_iteration = True
                     new_requests.append(request)
@@ -1662,9 +1657,18 @@ class PyExecutor:
             ctx_blocks_list = [0] * (block_size +
                                      self.dist.cp_config['cp_anchor_size'])
 
+            # Pass block prediction configuration if available
+            block_pred_config = None
+            if hasattr(self, 'block_prediction_sampler') and self.block_prediction_sampler is not None:
+                block_pred_config = {
+                    'enable_block_prediction': True,
+                    'block_size': self.block_prediction_sampler.block_size,
+                    'mask_token_id': self.block_prediction_sampler.mask_token_id
+                }
+
             req = executor_request_to_llm_request(
                 req_id, exe_req, self._should_exclude_last_generation_logits(),
-                ctx_blocks_list)
+                ctx_blocks_list, block_prediction_config=block_pred_config)
             req.gen_iters = 0
             req.ctx_iters = 0
             req.ctx_blocks = ctx_blocks
@@ -1687,10 +1691,20 @@ class PyExecutor:
             else:
                 raise NotImplementedError(f'unsupport cp type {cp_type}')
         else:
+            # Pass block prediction configuration if available
+            block_pred_config = None
+            if hasattr(self, 'block_prediction_sampler') and self.block_prediction_sampler is not None:
+                block_pred_config = {
+                    'enable_block_prediction': True,
+                    'block_size': self.block_prediction_sampler.block_size,
+                    'mask_token_id': self.block_prediction_sampler.mask_token_id
+                }
+            
             return [
                 executor_request_to_llm_request(
                     req_item.id, req_item.request,
-                    self._should_exclude_last_generation_logits())
+                    self._should_exclude_last_generation_logits(),
+                    block_prediction_config=block_pred_config)
                 for req_item in new_requests
             ]
 

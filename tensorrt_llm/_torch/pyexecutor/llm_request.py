@@ -356,11 +356,19 @@ def executor_request_to_llm_request(
         req_id: int,
         executor_request: ExecutorRequest,
         exclude_last_generation_logits: bool,
-        input_token_ids: Optional[List] = None) -> LlmRequest:
+        input_token_ids: Optional[List] = None,
+        block_prediction_config: Optional[dict] = None) -> LlmRequest:
     executor_sampling_config = executor_request.sampling_config
     sampling_config = SamplingConfig(executor_sampling_config)
 
     input_tokens = input_token_ids if input_token_ids is not None else executor_request.input_token_ids
+    
+    # If block prediction is enabled, append masked tokens to the input
+    if block_prediction_config and block_prediction_config.get('enable_block_prediction', False):
+        block_size = block_prediction_config.get('block_size', 8)
+        mask_token_id = block_prediction_config.get('mask_token_id', 151666)
+        # Append block_size masked tokens to the input
+        input_tokens = list(input_tokens) + [mask_token_id] * block_size
 
     llm_request_type = REQUEST_TYPE_MAPPING[executor_request.request_type]
     stop_words_list = convert_wordlist(

@@ -1334,6 +1334,8 @@ class DreamForCausalLM(DecoderModelForCausalLM[DreamModel, DreamConfig]):
                 is_block_prediction = any(seq_len > 1 for seq_len in attn_metadata.seq_lens_cuda)
                 
                 if is_block_prediction:
+                    ## NOTE: We're currently returning everything, but should just return the relevant block tokens
+
                     # For block prediction, return all hidden states for the block
                     # The gather_ids will be set up to select the appropriate tokens
                     pass  # Return all hidden states

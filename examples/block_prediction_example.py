@@ -46,7 +46,7 @@ def main():
     
     # Define sample prompts
     prompts = [
-        "The future of artificial intelligence is",
+        "The future of artificial intelligence is not the"+"<|mask|>"*8,
         "In a world where technology advances rapidly,",
         "The most important thing to remember is",
     ]
@@ -103,9 +103,7 @@ def main():
     - Always generates at least one token per iteration
     
     Use Cases:
-    - High-throughput text generation
     - Real-time applications requiring low latency
-    - Batch processing with multiple requests
     - Scenarios where some quality trade-off is acceptable for speed
     """)
 

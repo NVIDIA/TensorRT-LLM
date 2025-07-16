@@ -829,27 +829,33 @@ class BlockPredictionSampler(TorchSampler):
         if logits.dim() == 3:
             # Standard case: [batch_size, seq_len, vocab_size]
             if logits.size(1) >= self.block_size:
-                block_logits = logits[:, :self.block_size, :]
+                block_logits = logits[:, -self.block_size:, :]
             else:
                 # If sequence length is less than block size, pad or truncate
-                block_logits = torch.zeros(batch_size, self.block_size, logits.size(-1), 
-                                         device=logits.device, dtype=logits.dtype)
+                block_logits = torch.zeros((batch_size, self.block_size, logits.size(-1)),
+                                          device=logits.device, dtype=logits.dtype)
                 block_logits[:, :logits.size(1), :] = logits
         elif logits.dim() == 2:
-            # Single token case: [batch_size, vocab_size]
-            # Expand to block size
-            block_logits = logits.unsqueeze(1).expand(-1, self.block_size, -1)
+            # # Single token case: [batch_size, vocab_size]
+            # # Expand to block size
+            # block_logits = logits.unsqueeze(1).expand(-1, self.block_size, -1)
+
+            # Missing batch dimension, add it back in
+            block_logits = logits[-self.block_size:]
+            block_logits = block_logits.unsqueeze(0)
         else:
-            # Fallback: try to reshape
-            try:
-                block_logits = logits.view(batch_size, -1, logits.size(-1))[:, :self.block_size, :]
-            except:
-                block_logits = logits.view(batch_size, -1, logits.size(-1))[:, :min(self.block_size, logits.size(1)), :]
-                # Pad if necessary
-                if block_logits.size(1) < self.block_size:
-                    padding = torch.zeros(batch_size, self.block_size - block_logits.size(1), logits.size(-1),
-                                        device=logits.device, dtype=logits.dtype)
-                    block_logits = torch.cat([block_logits, padding], dim=1)
+            raise ValueError(f"Not implemented for shape {logits.shape}")
+        # else:
+        #     # Fallback: try to reshape
+        #     try:
+        #         block_logits = logits.view(batch_size, -1, logits.size(-1))[:, -self.block_size:, :]
+        #     except:
+        #         block_logits = logits.view(batch_size, -1, logits.size(-1))[:, :min(self.block_size, logits.size(1)), :]
+        #         # Pad if necessary
+        #         if block_logits.size(1) < self.block_size:
+        #             padding = torch.zeros(batch_size, self.block_size - block_logits.size(1), logits.size(-1),
+        #                                 device=logits.device, dtype=logits.dtype)
+        #             block_logits = torch.cat([block_logits, padding], dim=1)
         
         # Compute probabilities
         probs = torch.softmax(block_logits, dim=-1)
@@ -895,7 +901,7 @@ class BlockPredictionSampler(TorchSampler):
                 tokens_unmasked_this_iteration += len(update_indices)
                 
                 # Print the details of newly unmasked tokens for this batch
-                newly_unmasked_tokens = masked_pred_tokens[above_threshold].cpu().tolist()
+                # newly_unmasked_tokens = masked_pred_tokens[above_threshold].cpu().tolist()
                 # print(f"[BLOCK_PREDICTION] Iter {iteration_count} - batch {batch_idx}: "
                 #       f"unmasked {len(update_indices)} tokens -> {newly_unmasked_tokens}")
         
