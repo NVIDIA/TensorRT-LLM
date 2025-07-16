@@ -2647,7 +2647,7 @@ class MultimodalModelRunner:
                 )
                 image = None
         elif self.model_type in ['llava_onevision']:
-            pre_prompt = "<|im_start|>user "
+            pre_prompt = "<|im_start|>user " + "<video>" if self.args.video_path is not None else "<image>"
             if input_text is None:
                 input_text = "Question: which city is this? Answer:" if self.args.video_path is None else "Why is this video funny?"
             post_prompt = f"\n{input_text}<|im_end|><|im_start|>assistant\n"
@@ -2658,7 +2658,7 @@ class MultimodalModelRunner:
                                        text=prompt,
                                        return_tensors="pt")
             else:
-                image = self.processor(videos=raw_image,
+                image = self.processor(videos=list(raw_image),
                                        text=prompt,
                                        return_tensors="pt")
 
