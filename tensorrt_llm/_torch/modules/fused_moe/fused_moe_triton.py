@@ -27,8 +27,9 @@ try:
     if os.path.exists(triton_path) and triton_path not in sys.path:
         sys.path.insert(0, triton_path)
     import triton_kernels.swiglu
-    from triton_kernels.matmul_ogs import (FlexCtx, MicroscalingCtx,
-                                           PrecisionConfig, matmul_ogs)
+    from triton_kernels.matmul_ogs import (FlexCtx, FnSpecs, FusedActivation,
+                                           MicroscalingCtx, PrecisionConfig,
+                                           matmul_ogs)
     from triton_kernels.numerics import InFlexData
     from triton_kernels.numerics_details.mxfp import (
         SwizzlingType, perm_tensor_from_contig, perm_tuple_from_contig,
@@ -61,13 +62,23 @@ def shuffle_weight_for_activation_kernel(
     return w3_w1_weight
 
 
-# Helper function used for triton EP masking
+# This kernel remaps the global routing information (bitmatrix and indices)
+# to a local view for this specific EP worker.
+#
+# The bitmask is shifted so that the worker's slice of experts starts at bit 0.
+# Since the slice may not align with 32-bit word boundaries, this is done by
+# loading two consecutive words (v1, v2) and "stitching" the result together.
+# The expression `(v1 >> start_bit) | (v2 << (32 - start_bit))` takes the
+# upper bits from v1 and combines them with the lower bits from v2 to form the
+# new, correctly aligned word.
 @triton.jit
-def _routing_shift_bitmatrix(Bitmatrix, stride_bm, stride_bn, n_words, start,
-                             BLOCK_N: tl.constexpr):
+def _routing_shift_bitmatrix_range(Bitmatrix, stride_bm, stride_bn, Indices,
+                                   stride_im, stride_in, n_words, n_cols,
+                                   slice_start, slice_end,
+                                   BLOCK_N: tl.constexpr):
     pid_m = tl.program_id(0)
-    start_word = start // 32
-    start_bit = start % 32
+    start_word = slice_start // 32
+    start_bit = slice_start % 32
 
     for col0 in range(0, n_words, BLOCK_N):
         w = col0 + tl.arange(0, BLOCK_N)  # dst‐word indices
@@ -92,6 +103,20 @@ def _routing_shift_bitmatrix(Bitmatrix, stride_bm, stride_bn, n_words, start,
                  shifted.to(tl.int32),
                  mask=dst_mask)
 
+    # Fix the indices associated with the bitmatrix.
+    for col0 in range(0, n_cols, BLOCK_N):
+        offs = col0 + tl.arange(0, BLOCK_N)
+        mask_i = offs < n_cols
+
+        ptr = Indices + pid_m * stride_im + offs * stride_in
+        yi = tl.load(ptr, mask=mask_i, other=0).to(tl.int32)
+
+        yi = tl.where(yi < slice_end, yi - slice_start,
+                      yi)  # shift inside slice
+        yi = tl.where(yi < 0, yi + slice_end, yi)  # wrap negatives
+
+        tl.store(ptr, yi, mask=mask_i)
+
 
 class TritonEPRouter():
 
@@ -101,12 +126,17 @@ class TritonEPRouter():
         from triton_kernels.routing import _routing_clear_bitmatrix
         n_tokens_pad = expt_scal.shape[0]
         n_expts_tot = bitmatrix.shape_raw[-1]
-        _routing_shift_bitmatrix[(n_tokens_pad, )](
+        _routing_shift_bitmatrix_range[(n_tokens_pad, )](
             bitmatrix.handle,
             bitmatrix.handle.stride(0),
             bitmatrix.handle.stride(1),
+            expt_indx,
+            expt_indx.stride(0),
+            expt_indx.stride(1),
             bitmatrix.handle.shape[1],
+            expt_indx.shape[1],
             slice_start,
+            slice_end,
             BLOCK_N=512,
         )
         _routing_clear_bitmatrix[(n_tokens_pad, )](
@@ -117,9 +147,6 @@ class TritonEPRouter():
             slice_end - slice_start,
             BLOCK_N=512,
         )
-        expt_indx = torch.where(expt_indx < slice_end, expt_indx - slice_start,
-                                expt_indx)
-        expt_indx = torch.where(expt_indx < 0, expt_indx + slice_end, expt_indx)
         # perform compaction to update expt_scal / expt_indx
         expt_scal, expt_indx = compaction(expt_scal, expt_indx, bitmatrix)
         n_expts_tot = slice_end - slice_start
@@ -300,28 +327,21 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
                               allow_tf32=False,
                               out_dtype=module.dtype)
 
-        # Call the Triton kernel, which also does permutation
-        gemm1_output = matmul_ogs(hidden_states,
-                                  gemm1_weights,
-                                  module.w3_w1_bias if module.bias else None,
-                                  rdata,
-                                  gather_indx=gather_indx,
-                                  precision_config=pc1)
+        # Call the Triton gemm kernel, which also does permutation and activation
+        alpha = module.swiglu_alpha or 1.0
+        beta = module.swiglu_beta or 0.0
+        act = FusedActivation(
+            FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn,
+                    ("alpha", "beta", "limit")), (alpha, beta, None), 2)
+        act_out = matmul_ogs(hidden_states,
+                             gemm1_weights,
+                             module.w3_w1_bias if module.bias else None,
+                             rdata,
+                             gather_indx=gather_indx,
+                             precision_config=pc1,
+                             fused_activation=act)
 
-        # Step 3: Activation
-        # Setup quantization context
-        pcs = triton_kernels.swiglu.PrecisionConfig(limit=None)
-
-        # Call the Triton activation kernel
-        act_out = triton_kernels.swiglu.swiglu(
-            gemm1_output,
-            module.swiglu_alpha or 1.0,  # scale before sigmoid
-            module.swiglu_beta
-            or 0.0,  # bias added to the linear term of swiglu
-            pcs,
-            routing_data=rdata)
-
-        # Step 4: Gemm2
+        # Step 3: Gemm2
         # Setup quantization context
         pc2 = PrecisionConfig(flex_ctx=FlexCtx(),
                               allow_tf32=False,
@@ -514,31 +534,25 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                               allow_tf32=False,
                               out_dtype=module.dtype)
 
-        # Call the Triton kernel, which also does permutation
-        gemm1_output = matmul_ogs(hidden_states,
-                                  gemm1_weights,
-                                  module.w3_w1_bias if module.bias else None,
-                                  rdata,
-                                  gather_indx=gather_indx,
-                                  precision_config=pc1)
+        # Call the Triton gemm kernel, which also does permutation and activation
+        alpha = module.swiglu_alpha or 1.0
+        beta = module.swiglu_beta or 0.0
+        act = FusedActivation(
+            FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn,
+                    ("alpha", "beta", "limit")), (alpha, beta, None), 2)
+        act_out = matmul_ogs(hidden_states,
+                             gemm1_weights,
+                             module.w3_w1_bias if module.bias else None,
+                             rdata,
+                             gather_indx=gather_indx,
+                             precision_config=pc1,
+                             fused_activation=act)
 
-        # Step 3: Activation
-        # Setup quantization context
-        pcs = triton_kernels.swiglu.PrecisionConfig(limit=None)
-
-        # Call the Triton activation kernel
-        act_out = triton_kernels.swiglu.swiglu(
-            gemm1_output,
-            module.swiglu_alpha or 1.0,  # scale before sigmoid
-            module.swiglu_beta
-            or 0.0,  # bias added to the linear term of swiglu
-            pcs,
-            routing_data=rdata)
         # Quantize the activation output manually since the Triton activation kernel doesn't support bf16 in fp8 out
         act_out, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
             act_out, module.fc2_input_dequant)
 
-        # Step 4: Gemm2
+        # Step 3: Gemm2
         # Setup quantization context
         flex_ctx_2 = FlexCtx(
             lhs_data=InFlexData(scale=module.fc2_input_dequant),
@@ -1081,39 +1095,31 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                               allow_tf32=False,
                               out_dtype=module.dtype)
 
-        # Call the Triton kernel, which also does permutation
-        gemm1_output = matmul_ogs(hidden_states,
-                                  gemm1_weights,
-                                  module.w3_w1_bias if module.bias else None,
-                                  rdata,
-                                  gather_indx=gather_indx,
-                                  precision_config=pc1)
+        # Call the Triton gemm kernel, which also does permutation and activation
+        alpha = module.swiglu_alpha or 1.0
+        beta = module.swiglu_beta or 0.0
+        act = FusedActivation(
+            FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn,
+                    ("alpha", "beta", "limit")), (alpha, beta, None), 2)
+        act_out = matmul_ogs(hidden_states,
+                             gemm1_weights,
+                             module.w3_w1_bias if module.bias else None,
+                             rdata,
+                             gather_indx=gather_indx,
+                             precision_config=pc1,
+                             fused_activation=act)
 
         def _maybe_remove_padding(gemm_output, expected_size):
             assert gemm_output.dim() == 2
             if gemm_output.shape[-1] != expected_size:
                 assert self.swizzle_scale == SwizzlingType.HOPPER, "Only Hopper style swizzle can have padding"
                 assert gemm_output.shape[
-                    -1] % 256 == 0, "The padding is not done correctly"
+                    -1] % 128 == 0, "The padding is not done correctly"
                 gemm_output = gemm_output[:, :expected_size]
             return gemm_output
 
-        gemm1_output = _maybe_remove_padding(
-            gemm1_output,
-            module.intermediate_size_per_partition * 2).contiguous()
-
-        # Step 3: Activation
-        # Setup quantization context
-        pcs = triton_kernels.swiglu.PrecisionConfig(limit=None)
-
-        # Call the Triton activation kernel
-        act_out = triton_kernels.swiglu.swiglu(
-            gemm1_output,
-            module.swiglu_alpha or 1.0,  # scale before sigmoid
-            module.swiglu_beta
-            or 0.0,  # bias added to the linear term of swiglu
-            pcs,
-            routing_data=rdata)
+        act_out = _maybe_remove_padding(
+            act_out, module.intermediate_size_per_partition).contiguous()
 
         if self.activation_dtype == torch.float8_e4m3fn:
             # Quantize the activation output manually since the Triton activation kernel doesn't support bf16 in fp8 out
@@ -1125,7 +1131,7 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                     act_out, module.fc2_input_dequant)
                 act_scale = module.fc2_input_dequant
 
-        # Step 4: Gemm2
+        # Step 3: Gemm2
         # Setup quantization context
         mx_ctx_2 = MicroscalingCtx(
             weight_scale=gemm2_scales,
