@@ -20,7 +20,6 @@ import filelock
 import huggingface_hub
 import psutil
 import torch
-import yaml
 from huggingface_hub import snapshot_download
 from pydantic import BaseModel
 from tqdm.auto import tqdm
@@ -547,54 +546,3 @@ def get_type_repr(cls):
     if module_name == 'builtins':  # Special case for built-in types
         return cls.__qualname__
     return f"{module_name}.{cls.__qualname__}"
-
-
-class DocTagger:
-    TRT_ROOT = Path(__file__).parent.parent.parent
-
-    def __call__(self):
-        self.amend_llm_args()
-
-    def load_yaml(self, yaml_path: str) -> None:
-        with open(yaml_path, 'r') as f:
-            yaml_data = yaml.load(f, Loader=yaml.FullLoader)
-            return yaml_data
-
-    def amend_llm_args(self):
-        # background:
-        # There are two yaml files:
-        #  - references/llm.yaml: experimental APIs
-        #  - committed_references/llm.yaml: stable APIs
-        # We need to decorate the experimental fields with `:experimental:`
-        from .llm_args import LlmArgs
-
-        llm_args_yaml_path = self.TRT_ROOT / "tests" / "unittest" / "api_stability" / "references" / "llm.yaml"
-        assert llm_args_yaml_path.exists(
-        ), f"LLM args yaml path {llm_args_yaml_path} does not exist"
-        llm_args_yaml = self.load_yaml(llm_args_yaml_path)
-
-        experimental_fields = []
-        for field_name, field_info in llm_args_yaml["methods"]["__init__"][
-                "parameters"].items():
-            experimental_fields.append(field_name)
-        self.amend_pydantic_field_description_with_tags(LlmArgs,
-                                                        experimental_fields,
-                                                        "experimental")
-
-    def amend_pydantic_field_description_with_tags(self, cls: Type[BaseModel],
-                                                   field_names: list[str],
-                                                   tag: str) -> None:
-        """Amend the description of the fields with tags.
-        e.g. `:experimental:`
-
-        Args:
-            cls: The Pydantic BaseModel class.
-            field_names: The names of the fields to amend.
-            tag: The tag to add to the fields.
-        """
-        assert field_names
-        for field_name in field_names:
-            field = cls.model_fields[field_name]
-            cls.model_fields[
-                field_name].description = f":{tag}: {field.description}"
-        cls.model_rebuild(force=True)
