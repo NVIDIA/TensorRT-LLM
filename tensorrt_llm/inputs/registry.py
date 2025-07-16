@@ -61,7 +61,24 @@ class DefaultInputProcessor(InputProcessor):
         if sampling_params.truncate_prompt_tokens is not None:
             kwargs = dict(truncation=True,
                           max_length=sampling_params.truncate_prompt_tokens)
-
+        toktoken_special_tokens = {
+            "<|startoftext|>",
+            "<|endoftext|>",
+            "<|reserved_200000|>",
+            "<|reserved_200001|>",
+            "<|return|>",
+            "<|constrain|>",
+            "<|reserved_200004|>",
+            "<|channel|>",
+            "<|start|>",
+            "<|end|>",
+            "<|message|>",
+            "<|reserved_200009|>",
+            "<|reserved_200010|>",
+            "<|reserved_200011|>",
+            "<|call|>",
+            "<|reserved_200013|>",
+        }
         with nvtx_range_debug("tokenize prompt"):
             try:
                 token_ids = self.tokenizer.encode(
@@ -70,7 +87,8 @@ class DefaultInputProcessor(InputProcessor):
                     **kwargs)
             except:
                 # Tiktoken path
-                token_ids = self.tokenizer.encode(inputs["prompt"])
+                token_ids = self.tokenizer.encode(
+                    inputs["prompt"], allowed_special=toktoken_special_tokens)
 
         if "query" in inputs:
             with nvtx_range_debug("tokenize query"):
@@ -81,7 +99,10 @@ class DefaultInputProcessor(InputProcessor):
                         **kwargs)
                 except:
                     # Tiktoken path
-                    query_token_ids = self.tokenizer.encode(inputs["query"])
+                    query_token_ids = self.tokenizer.encode(
+                        inputs["query"],
+                        allowed_special=toktoken_special_tokens)
+
             return token_ids, {"query_token_ids": query_token_ids}
 
         return token_ids, None
