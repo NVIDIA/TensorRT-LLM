@@ -18,12 +18,15 @@ Our sharding algorithm for tensor parallelism (TP) is based on the following ste
 
 import math
 import operator
+from abc import ABC, abstractmethod
 from collections import defaultdict
+from enum import IntEnum
 from functools import partial
-from typing import Callable, DefaultDict, Dict, List, Set
+from typing import Callable, DefaultDict, Dict, List, Literal, Optional, Set
 
 import torch
 import torch.nn as nn
+from pydantic import BaseModel, ConfigDict, Field
 from torch.fx import GraphModule, Node
 
 from ...utils.logger import ad_logger
@@ -36,6 +39,115 @@ from ...utils.node_utils import (
 )
 from ...utils.quantization_utils import QuantizationImpl
 from .._graph import canonicalize_graph
+
+
+class SplitDimension(IntEnum):
+    """Enum for tensor split dimensions in sharding."""
+
+    ROW = 0  # Split along rows (first dimension)
+    COLUMN = 1  # Split along columns (second dimension)
+
+
+class ShardingTransformInfo(BaseModel, ABC):
+    """Abstract base class for transformation configurations."""
+
+    model_config = ConfigDict(frozen=True)  # Makes the model immutable and hashable
+
+    target_node: str
+    rank: int
+    world_size: int
+
+    @abstractmethod
+    def apply(self, gm: GraphModule, node: Node) -> None:
+        """Apply the transformation to the graph module.
+
+        This method must be implemented by each transformation class.
+        """
+        pass
+
+
+class ShardingConfig(BaseModel):
+    """Configuration for sharding the model."""
+
+    transformation_list: List[ShardingTransformInfo] = Field(default_factory=list)
+
+
+def sharding_transform_executor(gm: GraphModule, sharding_config: ShardingConfig) -> None:
+    """Apply transformations to the graph module.
+
+    Args:
+        gm: Graph module to apply transformations to
+        sharding_config: Transformation configuration containing list of transformations to apply
+    """
+    # create a node dict for faster lookup
+    node_dict = {n.name: n for n in gm.graph.nodes}
+
+    for transformation in sharding_config.transformation_list:
+        if transformation.target_node is None or transformation.target_node not in node_dict:
+            ad_logger.warning(
+                f"Skipping transformation {transformation} because target node "
+                + f"{transformation.target_node} not found in graph"
+            )
+            continue
+        transformation.apply(gm, node_dict[transformation.target_node])
+
+    # canonicalize and return
+    gm = canonicalize_graph(gm)
+    ad_logger.debug("After applying sharding transformations: " + str(gm))
+
+
+class TPShardingInfo(ShardingTransformInfo):
+    """Configuration for TP sharding transformations."""
+
+    split_dim: SplitDimension
+    dist_op: Optional[Literal["all_reduce", "all_gather"]] = None
+    min_local_shape: int = 1
+
+    def apply(self, gm: GraphModule, node: Node) -> None:
+        """Apply TP sharding transformation to the graph module."""
+
+        # first, verify whether the config is valid
+        if self.dist_op is not None:
+            if self.split_dim == SplitDimension.ROW:
+                assert self.dist_op == "all_gather", "Row split is only supported for all_gather"
+            if self.split_dim == SplitDimension.COLUMN:
+                assert self.dist_op == "all_reduce", "Column split is only supported for all_reduce"
+
+        _insert_sharded_matmul(
+            gm=gm,
+            node=node,
+            dim=self.split_dim.value,
+            rank=self.rank,
+            world_size=self.world_size,
+            add_dist=self.dist_op is not None,
+            min_local_shape=self.min_local_shape,
+        )
+
+
+class BMMShardingInfo(ShardingTransformInfo):
+    """Configuration for BMM sharding transformations."""
+
+    rank: int
+    world_size: int
+
+    def apply(self, gm: GraphModule, node: Node) -> None:
+        """Apply BMM sharding transformation to the graph module."""
+        # TODO: Implement BMM sharding logic
+        # This would involve slicing the batch dimension and adding all_gather
+        pass
+
+
+class EPShardingInfo(ShardingTransformInfo):
+    """Configuration for EP sharding transformations."""
+
+    rank: int
+    world_size: int
+
+    def apply(self, gm: GraphModule, node: Node) -> None:
+        """Apply EP sharding transformation to the graph module."""
+        # TODO: Implement EP sharding logic
+        # This would involve expert parallelism transformations
+        pass
 
 
 def _load_hook(
@@ -79,8 +191,8 @@ def _insert_sharded_matmul(
     world_size: int,
     add_dist: bool = False,
     min_local_shape: int = 1,
-):
-    """Replaces the matmul node with a new matmul node that accepts sharded weights.
+) -> None:
+    """Replace the matmul node with a new matmul node that accepts sharded weights.
 
     The state_dict is also updated to contain the sharded weights.
     """
@@ -200,22 +312,37 @@ def _insert_sharded_matmul(
         dist_node.replace_input_with(dist_node, node)
 
 
-def _simple_shard(
-    gm: GraphModule, nodes_linear: Dict[Node, List[Node]], rank: int, world_size: int
-):
+def _append_simple_shard(
+    nodes_linear: Dict[Node, List[Node]],
+    rank: int,
+    world_size: int,
+    sharding_config: ShardingConfig,
+) -> None:
     # for every linear node:
     # --> row_split (dim 0 of weight) + all_gather (dim -1 of output)
+    tp_shards: List[TPShardingInfo] = []
     for node_group in nodes_linear.values():
         for n in node_group:
-            _insert_sharded_matmul(gm, n, 0, rank, world_size, add_dist=True)
+            tp_shards.append(
+                TPShardingInfo(
+                    target_node=n.name,
+                    split_dim=SplitDimension.ROW,
+                    rank=rank,
+                    world_size=world_size,
+                    dist_op="all_gather",
+                    min_local_shape=1,
+                )
+            )
+    sharding_config.transformation_list.extend(tp_shards)
 
 
-def column_row_shard(
+def detect_column_row_shard(
     gm: GraphModule,
     rank: int,
     world_size: int,
+    sharding_config: ShardingConfig,
     simple_shard_only: bool = False,
-) -> None:
+) -> List[TPShardingInfo]:
     """A transformation to apply sharding to the model following tensor parallelism.
 
     The transformation is based on the following steps:
@@ -312,13 +439,13 @@ def column_row_shard(
 
         if simple_shard_only:
             ad_logger.debug(f"Forcing Simple Shard: Linear groups: {nodes_linear}")
-            _simple_shard(gm, nodes_linear, rank, world_size)
+            _append_simple_shard(nodes_linear, rank, world_size, sharding_config)
             continue
 
         # simple shard when we have != 2 groups of linear nodes
         if len(nodes_linear) != 2:
             ad_logger.debug(f"Linear groups: {nodes_linear}")
-            _simple_shard(gm, nodes_linear, rank, world_size)
+            _append_simple_shard(nodes_linear, rank, world_size, sharding_config)
             continue
 
         # let's look at the unnacounted nodes. They are okay as long as they fall before the
@@ -348,7 +475,7 @@ def column_row_shard(
         # check if any unaccounted nodes are left. If so, do a simply shard
         if unaccounted_nodes or attention_related_nodes:
             ad_logger.debug(f"Unaccounted nodes: {unaccounted_nodes}")
-            _simple_shard(gm, nodes_linear, rank, world_size)
+            _append_simple_shard(nodes_linear, rank, world_size, sharding_config)
             continue
 
         # If we can account for all sharded nodes, we can do a two-way shard
@@ -360,7 +487,7 @@ def column_row_shard(
                 # Column-row shard boundary region detection is probably wrong - there should be
                 # only one attention operation. Fall back to simple shard.
                 ad_logger.debug(f"More than one attention node: {unaccounted_nodes}")
-                _simple_shard(gm, nodes_linear, rank, world_size)
+                _append_simple_shard(nodes_linear, rank, world_size, sharding_config)
                 continue
             # Extract head dimension. We cannot shard below the head_dim size.
             # Assume that head_dim is the last (innermost) dimension of the tensor
@@ -369,14 +496,21 @@ def column_row_shard(
             min_local_shape = 1
         for i, group in enumerate(nodes_linear.values()):
             for n in group:
-                _insert_sharded_matmul(
-                    gm, n, i, rank, world_size, add_dist=i > 0, min_local_shape=min_local_shape
+                if i > 0:
+                    dist_op = "all_reduce"
+                else:
+                    dist_op = None
+                sharding_config.transformation_list.append(
+                    TPShardingInfo(
+                        target_node=n.name,
+                        split_dim=i,
+                        rank=rank,
+                        world_size=world_size,
+                        dist_op=dist_op,
+                        min_local_shape=min_local_shape,
+                    )
                 )
 
-    # canonicalize and return
-    if num_shards:
-        gm = canonicalize_graph(gm)
-    ad_logger.debug("After sharding: " + str(gm))
     ad_logger.info(f"Found {num_shards} TP shards")
 
 
