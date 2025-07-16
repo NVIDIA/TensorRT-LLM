@@ -58,6 +58,7 @@ SHUTDOWN_REQUEST_ID = -1
 class RequestQueueItem:
     id: int
     request: Optional[ExecutorRequest] = None
+    child_req_ids: Optional[list] = None
     is_canceled_request: bool = False
     query: Optional[list] = None  # only used in `StarAttention`
 
@@ -89,6 +90,13 @@ def _get_from_request_queue(
     return items
 
 
+def _get_num_child_requests(request: ExecutorRequest) -> int:
+    sampling_config = request.sampling_config
+    logger.info(sampling_config)
+    return 0 if sampling_config.beam_width > 1 else (
+        sampling_config.num_return_sequences or 1) - 1
+
+
 def _get_from_waiting_queue(
     waiting_queue: deque[RequestQueueItem],
     max_req_count: int,
@@ -109,8 +117,9 @@ def _get_from_waiting_queue(
     items = []
     req_count = 0
     while req_count < max_req_count and waiting_queue:
-        items.append(waiting_queue.popleft())
-        req_count += 1
+        req_item = waiting_queue.popleft()
+        items.append(req_item)
+        req_count += 1 + _get_num_child_requests(req_item.request)
     return items
 
 
@@ -362,9 +371,16 @@ class PyExecutor:
             start_time = time.time()
             for request in requests:
                 self.start_times[self.next_req_id] = start_time
-                self.request_queue.put(
-                    RequestQueueItem(self.next_req_id, request))
+                req_id = self.next_req_id
                 req_ids.append(self.next_req_id)
+
+                child_req_ids = []
+                num_child_requests = _get_num_child_requests(request)
+                for _ in range(num_child_requests):
+                    self.next_req_id += 1
+                    child_req_ids.append(self.next_req_id)
+                self.request_queue.put(
+                    RequestQueueItem(req_id, request, child_req_ids))
                 self.next_req_id += 1
         finally:
             self.enqueue_lock.release()
@@ -475,14 +491,23 @@ class PyExecutor:
         try:
             self.enqueue_lock.acquire()
             assert self.active, "PyExecutor has already been shutdown."
+            logger.info(
+                f"Enqueuing new Executor request with id {self.next_req_id}")
             req_id = self.next_req_id
             if self.enable_iter_perf_stats:
                 self.start_times[req_id] = time.time()
 
             if query is not None:
-                self.request_queue.put(RequestQueueItem(req_id, request, query))
+                self.request_queue.put(
+                    RequestQueueItem(req_id, request, [], False, query))
             else:
-                self.request_queue.put(RequestQueueItem(req_id, request))
+                child_req_ids = []
+                num_child_requests = _get_num_child_requests(request)
+                for _ in range(num_child_requests):
+                    self.next_req_id += 1
+                    child_req_ids.append(self.next_req_id)
+                self.request_queue.put(
+                    RequestQueueItem(req_id, request, child_req_ids))
             self.next_req_id += 1
         finally:
             self.enqueue_lock.release()
@@ -1520,12 +1545,15 @@ class PyExecutor:
             else:
                 raise NotImplementedError(f'unsupport cp type {cp_type}')
         else:
-            return [
-                executor_request_to_llm_request(
-                    req_item.id, req_item.request,
+            req_with_children = []
+            for req_item in new_requests:
+                req = executor_request_to_llm_request(
+                    req_item.id, req_item.request, req_item.child_req_ids,
                     self._should_exclude_last_generation_logits())
-                for req_item in new_requests
-            ]
+                req_with_children.append(req)
+                for child in req.children:
+                    req_with_children.append(child)
+            return req_with_children
 
     @nvtx_range("_schedule")
     def _schedule(self):
@@ -1814,7 +1842,7 @@ class PyExecutor:
                                    if req.id not in self.canceled_req_ids)
 
         for request in self.active_requests:
-            req_id = request.py_request_id
+            req_id = request.py_request_id if not request.is_child else request.parent_request_id
             if req_id in self.canceled_req_ids:
                 # Mark requests as finished, then, we reuse all existing code
                 # to clean up the KV cache resources.
@@ -1828,7 +1856,7 @@ class PyExecutor:
             self.canceled_req_ids.clear()
 
     @nvtx_range("_enqueue_responses")
-    def _enqueue_responses(self, responses: Dict[int, LlmResponse]):
+    def _enqueue_responses(self, responses: List[Tuple[int, LlmResponse]]):
         if 0 not in self.dist.mapping.tp_group and not self.gather_all_responses:
             return
 
@@ -1840,18 +1868,18 @@ class PyExecutor:
             else:
                 responses_list = self.dist.allgather(responses)
             if self.dist.rank == 0 or self.gather_all_responses:
-                gather_responses = {}
+                gather_responses = []
                 if responses_list is not None:
                     for resp in responses_list:
                         if resp is not None:
-                            gather_responses.update(resp)
+                            gather_responses.append(resp)
                     responses = gather_responses
         logger.debug(
             f'after gather, rank = {self.dist.rank}, responses = {responses}')
 
         if self.dist.rank == 0 or self.gather_all_responses:
             with self.response_cv:
-                for req_id, resp in responses.items():
+                for req_id, resp in responses:
                     if req_id in self.responses.keys():
                         self.responses[req_id].append(resp)
                     else:
@@ -1860,20 +1888,20 @@ class PyExecutor:
 
     @nvtx_range("_handle_first_token_response")
     def _handle_first_token_response(self, scheduled_batch):
-        new_responses = {}
+        new_responses = []
         for req in scheduled_batch.generation_requests:
             if req.py_decoding_iter == 1:
                 logger.debug(
                     f'Send first token response for request {req.py_request_id}'
                 )
                 response = req.create_response(False, self.dist.rank)
-                new_responses.update({req.py_request_id: response})
+                new_responses.append((req.py_request_id, response))
 
         self._enqueue_responses(new_responses)
 
     @nvtx_range("_handle_responses")
     def _handle_responses(self):
-        new_responses = {}
+        new_responses = []
         requests_to_terminate = []
         new_active_requests = []
         logger.debug(
@@ -1907,14 +1935,17 @@ class PyExecutor:
                     request.py_decoding_iter % self.stream_interval == 0:
                 response = request.create_response(False, self.dist.rank)
                 if response:
-                    request_done = response.result.is_final
-                    new_responses.update({req_id: response})
+                    request_done = request.is_finished
+                    new_responses.append((req_id, response))
 
             if request_done:
                 if request.is_disagg_context_transmission_state:
                     self.ctx_in_transmission_requests.append(request)
                 else:
-                    requests_to_terminate.append(request)
+                    if response.result.is_final:
+                        requests_to_terminate.append(request)
+                        for child in request.children:
+                            requests_to_terminate.append(child)
             else:
                 new_active_requests.append(request)
         self.active_requests = new_active_requests
