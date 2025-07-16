@@ -2,6 +2,8 @@ from typing import Tuple
 
 import torch
 
+from tensorrt_llm._utils import nvtx_range
+
 
 def ceil_div(x: int, y: int) -> int:
     """
@@ -25,6 +27,8 @@ def ceil_to_ue8m0(x: torch.Tensor):
     return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
 
 
+@nvtx_range("[DG] quantization")
+@torch.compile(dynamic=True)
 def per_token_cast_to_fp8_e8m0(
         x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2 and x.size(1) % 128 == 0

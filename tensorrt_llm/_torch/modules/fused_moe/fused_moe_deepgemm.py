@@ -82,13 +82,11 @@ def deepgemm_fp8_group_blockwise_gemm_ref(
     m_indices: torch.Tensor,
 ) -> torch.Tensor:
 
-    torch.cuda.synchronize()
     d = torch.empty((a.shape[0], b.shape[1]),
                     device=b.device,
                     dtype=torch.bfloat16)
     deep_gemm.m_grouped_fp8_gemm_nt_contiguous((a, a_sf), (b, b_sf), d,
                                                m_indices)
-    torch.cuda.synchronize()
     return d
 
 
