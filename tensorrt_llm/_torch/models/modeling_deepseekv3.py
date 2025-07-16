@@ -1207,7 +1207,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             weight_divisor = 1 if self.model_config.mapping.enable_attention_dp else tp_size
             local_num_heads = num_heads // weight_divisor
 
-            k_nope_weight_trans = k_nope_weight.transpose(2, 1)
+            k_nope_weight_trans = k_nope_weight.transpose(2, 1).contiguous()
 
             kv_b_proj = torch.concat([
                 k_nope_weight.reshape(local_num_heads * local_qk_nope_head_dim,
@@ -1253,7 +1253,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             weight_divisor = 1 if self.model_config.mapping.enable_attention_dp else tp_size
             local_num_heads = num_heads // weight_divisor
 
-            k_nope_weight_trans = k_nope_weight.transpose(2, 1)
+            k_nope_weight_trans = k_nope_weight.transpose(2, 1).contiguous()
 
             kv_b_proj = torch.concat([
                 k_nope_weight.reshape(local_num_heads * local_qk_nope_head_dim,
@@ -1346,6 +1346,27 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                             module.weight_scale.data, is_scale=True)
                         attn_module.v_b_proj_scale = nn.Parameter(
                             v_b_proj_scale, requires_grad=False)
+
+                        if attn_module.k_b_proj_trans_dequant is not None:
+                            attn_module.k_b_proj_trans_dequant.data.copy_(
+                                weight_dequant(
+                                    k_b_proj_trans.view(
+                                        -1, k_b_proj_trans.shape[-1]).cuda(),
+                                    k_b_proj_trans_scale.view(
+                                        -1,
+                                        k_b_proj_trans_scale.shape[-1]).cuda(),
+                                ).view(
+                                    *attn_module.k_b_proj_trans_dequant.shape).
+                                to(attn_module.k_b_proj_trans_dequant.dtype))
+                        if attn_module.v_b_proj_dequant is not None:
+                            attn_module.v_b_proj_dequant.data.copy_(
+                                weight_dequant(
+                                    v_b_proj.view(-1,
+                                                  v_b_proj.shape[-1]).cuda(),
+                                    v_b_proj_scale.view(
+                                        -1, v_b_proj_scale.shape[-1]).cuda(),
+                                ).view(*attn_module.v_b_proj_dequant.shape).to(
+                                    attn_module.v_b_proj_dequant.dtype))
 
                 elif names[-1] == "fused_a":
                     fused_a = weights[

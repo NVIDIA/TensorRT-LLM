@@ -47,10 +47,11 @@ def add_llm_args(parser):
                             'VANILLA', 'TRTLLM', 'FLASHINFER',
                             'FLASHINFER_STAR_ATTENTION'
                         ])
-    parser.add_argument('--moe_backend',
-                        type=str,
-                        default='CUTLASS',
-                        choices=['CUTLASS', 'TRTLLM', 'VANILLA', 'DEEPGEMM'])
+    parser.add_argument(
+        '--moe_backend',
+        type=str,
+        default='CUTLASS',
+        choices=['CUTLASS', 'TRTLLM', 'VANILLA', 'DEEPGEMM', 'CUTEDSL'])
     parser.add_argument('--enable_attention_dp',
                         default=False,
                         action='store_true')
