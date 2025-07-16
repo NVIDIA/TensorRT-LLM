@@ -1,6 +1,7 @@
 import pytest
 
 from tensorrt_llm import LLM
+from tensorrt_llm.llmapi.llm_args import CudaGraphConfig
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -430,3 +431,32 @@ def test_bielik_11b_v2_2_instruct_multi_lora() -> None:
                                lora_request=lora_requests)
 
         assert len(outputs) == 2
+
+def test_lora_dir_with_graph():
+    lora_req = LoRARequest(
+        "task-0", 0, f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1")
+
+    lora_config = LoraConfig(
+        lora_dir=[f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"],
+        max_lora_rank=8,
+        lora_request=[lora_req])
+
+    llm = LLM(model=f"{llm_models_root()}/llama-models/llama-7b-hf",
+              lora_config=lora_config,
+              cuda_graph_config=CudaGraphConfig(max_batch_size=1))
+    #   cuda_graph_config=None)
+
+    prompts = [
+        "美国的首都在哪里? \n答案:",
+    ]
+    references = [
+        "美国的首都是华盛顿。\n\n美国的",
+    ]
+    sampling_params = SamplingParams(max_tokens=20)
+    lora_request = [lora_req]
+
+    outputs = llm.generate(prompts, sampling_params, lora_request=lora_request)
+
+    assert similar(outputs[0].outputs[0].text, references[0])
+    print(f"lora output: {outputs[0].outputs[0].text}")
+    print(f"ref  output: {references[0]}")

@@ -279,6 +279,7 @@ class PyExecutor:
         self.inflight_req_ids = ReqIdsSet()
         self.canceled_req_ids = []
 
+        self.model_engine.prefetch_lora_dirs()
         self.model_engine.warmup(self.resource_manager)
         if self.draft_model_engine is not None:
             self.draft_model_engine.warmup(self.resource_manager)
@@ -315,6 +316,9 @@ class PyExecutor:
         self.worker_lock = threading.Lock()
         if start_worker:
             self.start_worker()
+
+    def get_lora_manager(self):
+        return self.model_engine.lora_manager
 
     def _event_loop_wrapper(self):
         try:

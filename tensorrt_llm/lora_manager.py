@@ -5,7 +5,7 @@ import tarfile
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import numpy as np
 import torch
@@ -146,6 +146,7 @@ class LoraConfig(DictConversion):
     trtllm_modules_to_hf_modules: Dict[str, str] = field(default_factory=dict)
     max_loras: int = 4
     max_cpu_loras: int = 4
+    lora_request: Optional[List[Any]] = None  # TODO smor fix
 
     def __post_init__(self):
         assert self.lora_ckpt_source in ["hf", "nemo"], (

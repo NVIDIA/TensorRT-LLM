@@ -34,6 +34,7 @@ class DecodingCUDAGraphRunner:
         attn_metadata: AttentionMetadata,
         spec_metadata: Optional[SpecMetadata] = None,
         use_mrope: bool = False,
+        lora_params: Optional[dict] = None,
     ) -> None:
         """
         Stores a CUDA graph and its associated input buffers.
@@ -68,6 +69,7 @@ class DecodingCUDAGraphRunner:
 
         self.attn_metadata = attn_metadata
         self.spec_metadata = spec_metadata
+        self.lora_params = lora_params
         self._output = None
         self._graph = None
         self.optional_extra_model_inputs = ["mrope_position_deltas"]
@@ -89,6 +91,9 @@ class DecodingCUDAGraphRunner:
             "spec_metadata": self.spec_metadata,
             "mrope_position_deltas": self.mrope_position_deltas,
         }
+
+        if self.lora_params is not None:
+            inputs["lora_params"] = self.lora_params
 
         # We have to do warm up runs to initialize PyTorch's
         # internal states according to the docs:
