@@ -20,7 +20,6 @@ from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE, MoE,
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
-from ..utils import disable_fp4_allgather
 from .modeling_qwen3 import Qwen3Attention
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, EagerFusionConfig,
@@ -133,11 +132,7 @@ class Qwen3MoE(nn.Module):
             assert not self.enable_attention_dp
 
         if self.enable_attention_dp and self.mapping.tp_size > 1:
-            # FP4 all_gather moves this bf16 allgather in to after topk and fp4 quantization
-            # to reduce allreduce BW
-            if (disable_fp4_allgather()
-                    and not self.experts.enable_alltoall) or isinstance(
-                        self.experts, TRTLLMGenFusedMoE):
+            if isinstance(self.experts, TRTLLMGenFusedMoE):
                 hidden_states = allgather(hidden_states,
                                           self.mapping,
                                           dim=0,
