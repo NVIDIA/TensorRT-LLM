@@ -1018,8 +1018,8 @@ class BaseLlmArgs(BaseModel):
 
     moe_cluster_parallel_size: Optional[int] = Field(
         default=None,
-        description="The cluster parallel size for MoE models's expert weights."
-    )
+        description="The cluster parallel size for MoE models's expert weights.",
+        status="beta")
 
     moe_tensor_parallel_size: Optional[int] = Field(
         default=None,
@@ -1851,7 +1851,8 @@ class TorchLlmArgs(BaseLlmArgs):
         status="beta")
 
     moe_config: MoeConfig = Field(default_factory=MoeConfig,
-                                  description="MoE config.")
+                                  description="MoE config.",
+                                  status="beta")
 
     attn_backend: str = Field(default='TRTLLM',
                               description="Attention backend to use.",
@@ -1870,7 +1871,9 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype")
 
     enable_iter_perf_stats: bool = Field(
-        default=False, description="Enable iteration performance statistics.")
+        default=False,
+        description="Enable iteration performance statistics.",
+        status="prototype")
 
     enable_iter_req_stats: bool = Field(
         default=False,
