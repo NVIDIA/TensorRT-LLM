@@ -8,12 +8,18 @@
 
 code.beta {
   display: inline-block;
-  background-color: #007bff;
-  color: #fff;
+  background-color: #6c757d;
+  color: #999;
 }
 
 code.prototype {
   display: inline-block;
   background-color: #fd7e14;
+  color: #fff;
+}
+
+code.deprecated {
+  display: inline-block;
+  background-color: red;
   color: #fff;
 }
