@@ -471,6 +471,30 @@ class TestMinistral8BInstruct(LlmapiAccuracyTestHarness):
             pytest.skip("FP8 pre-quantized Ministral-8B model not available")
 
 
+class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "google/gemma-3-27b-it"
+    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-27b-it/"
+
+    def test_auto_dtype(self):
+        # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=False,
+            enable_partial_reuse=False,
+        )
+        # We use FlashInfer as the attention backend for Gemma3 VLM to support custom mask for images.
+        # So, testing with it here.
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_cache_config,
+                 attn_backend="FLASHINFER",
+                 cuda_graph_config=None) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
 class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-3-1b-it"
     MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-1b-it/"

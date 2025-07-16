@@ -363,8 +363,8 @@ private:
             llmRequest.getContextPhaseParams().value().getReqId());
         llmRequest.setKvCacheTransferStart(std::chrono::steady_clock::now());
         TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
-        mReceiver->sendRequestInfo(llmRequest);
-        mReceiver->receiveSync(llmRequest);
+        auto session = mReceiver->sendRequestInfo(llmRequest);
+        mReceiver->receiveSync(session);
         llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
 
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
