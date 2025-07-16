@@ -18,21 +18,17 @@ Here is a simple example to show how to use `tensorrt_llm.LLM` API with Llama mo
     :linenos:
 ```
 
-## Models
-
-- [Supported Models](./torch/models/supported_models.md)
-- [Adding a New Model](./torch/models/adding_new_model.md)
-
 ## Features
 
-- [Feature Combination Matrix](./torch/features/feature_combination_matrix.md)
 - [Sampling](./torch/features/sampling.md)
 - [Quantization](./torch/features/quantization.md)
 - [Overlap Scheduler](./torch/features/overlap_scheduler.md)
+- [Feature Combination Matrix](./torch/features/feature_combination_matrix.md)
 
 ## Developer Guide
 
 - [Architecture Overview](./torch/arch_overview.md)
+- [Adding a New Model](./torch/adding_new_model.md)
 - [Examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/pytorch/README.md)
 
 ## Key Components

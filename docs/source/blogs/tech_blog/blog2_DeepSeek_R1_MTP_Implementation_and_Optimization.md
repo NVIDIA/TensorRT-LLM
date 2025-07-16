@@ -110,10 +110,10 @@ The MTP module follows the design in DeepSeek-V3. The embedding layer and output
 Attention is also a very important component in supporting MTP inference. The changes are mainly in the attention kernels for the generation phase. For the normal request, there will be only one input token in the generation phase, but for MTP, there will be $K+1$ input tokens. Since MTP sequentially predicts additional tokens, the predicted draft tokens are chained. Though we have an MTP Eagle path, currently, we only have the chain-based support for MTP Eagle. So, a causal mask is enough for the attention kernel to support MTP. In our implementation, TensorRT-LLM will use the fp8 flashMLA generation kernel on Hopper GPU, while using TRTLLM customized attention kernels on Blackwell for better performance.
 
 ### How to run DeepSeek models with MTP
-Run DeepSeek-V3/R1 models with MTP, use [examples/pytorch/quickstart_advanced.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/pytorch/quickstart_advanced.py) with additional options:
+Run DeepSeek-V3/R1 models with MTP, use [examples/llm-api/quickstart_advanced.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/llm-api/quickstart_advanced.py) with additional options:
 
 ```bash
-cd examples/pytorch
+cd examples/llm-api
 python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_nextn N
 ```
 
@@ -123,8 +123,9 @@ To benchmark min-latency performance with MTP, you need to follow [this document
 YOUR_DATA_PATH=<your dataset file following the format>
 
 cat >./extra-llm-api-config.yml<<EOF
-use_cuda_graph: true
-moe_backend: TRTLLM
+cuda_graph_config: {}
+moe_config:
+  backend: TRTLLM
 speculative_config:
     decoding_type: MTP
     num_nextn_predict_layers: 3
@@ -165,10 +166,10 @@ Note that the Relaxed Acceptance will only be used during the thinking phase, wh
 
 ### How to run the DeepSeek-R1 model with Relaxed Acceptance
 
-Run DeepSeek-R1 models with MTP Relaxed Acceptance, use [examples/pytorch/quickstart_advanced.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/pytorch/quickstart_advanced.py) with additional options:
+Run DeepSeek-R1 models with MTP Relaxed Acceptance, use [examples/llm-api/quickstart_advanced.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/llm-api/quickstart_advanced.py) with additional options:
 
 ```bash
-cd examples/pytorch
+cd examples/llm-api
 python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_nextn N --use_relaxed_acceptance_for_thinking --relaxed_topk 10 --relaxed_delta 0.6
 ```
 
@@ -178,8 +179,9 @@ To benchmark min-latency performance with MTP Relaxed Acceptance, you need to fo
 YOUR_DATA_PATH=<your dataset file following the format>
 
 cat >./extra-llm-api-config.yml<<EOF
-use_cuda_graph: true
-moe_backend: TRTLLM
+cuda_graph_config: {}
+moe_config:
+  backend: TRTLLM
 speculative_config:
     decoding_type: MTP
     num_nextn_predict_layers: 3
