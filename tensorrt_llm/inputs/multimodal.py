@@ -81,6 +81,7 @@ class MultimodalInput:
             torch.tensor(self.multimodal_positions, dtype=torch.int32),
             torch.tensor(self.multimodal_lengths, dtype=torch.int32))
 
+
 @dataclass
 class MultimodalRuntimeData:
     """Runtime data for tracking multimodal token caching and reuse per request sequence.
@@ -110,21 +111,30 @@ class MultimodalRuntimeData:
     def __post_init__(self):
         # Validate input data
         if len(self.mm_token_positions) != len(self.mm_token_lengths):
-            raise ValueError(f"mm_token_positions ({len(self.mm_token_positions)}) and mm_token_lengths ({len(self.mm_token_lengths)}) must have the same length")
+            raise ValueError(
+                f"mm_token_positions ({len(self.mm_token_positions)}) and mm_token_lengths ({len(self.mm_token_lengths)}) must have the same length"
+            )
 
         if self.num_cached_tokens < 0:
-            raise ValueError(f"num_cached_tokens must be non-negative, got {self.num_cached_tokens}")
+            raise ValueError(
+                f"num_cached_tokens must be non-negative, got {self.num_cached_tokens}"
+            )
 
         if any(length <= 0 for length in self.mm_token_lengths):
-            raise ValueError(f"All mm_token_lengths must be positive, got {self.mm_token_lengths}")
+            raise ValueError(
+                f"All mm_token_lengths must be positive, got {self.mm_token_lengths}"
+            )
 
         if any(pos < 0 for pos in self.mm_token_positions):
-            raise ValueError(f"All mm_token_positions must be non-negative, got {self.mm_token_positions}")
+            raise ValueError(
+                f"All mm_token_positions must be non-negative, got {self.mm_token_positions}"
+            )
 
         if self.num_cached_mm_tokens is None:
             # Compute cached multimodal tokens based on positions and cached tokens
             self.num_cached_mm_tokens = 0
-            for pos, length in zip(self.mm_token_positions, self.mm_token_lengths):
+            for pos, length in zip(self.mm_token_positions,
+                                   self.mm_token_lengths):
                 if pos + length <= self.num_cached_tokens:
                     self.num_cached_mm_tokens += length
                 elif pos < self.num_cached_tokens:
@@ -135,6 +145,7 @@ class MultimodalRuntimeData:
             f"num_cached_mm_tokens ({self.num_cached_mm_tokens}) must be less than or equal to num_cached_tokens ({self.num_cached_tokens})"
 
         self.total_mm_tokens = sum(self.mm_token_lengths)
+
 
 @dataclass
 class MultimodalParams:

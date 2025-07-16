@@ -1,12 +1,13 @@
+from unittest.mock import Mock
+
 import pytest
 import torch
-import numpy as np
-from unittest.mock import Mock
-from typing import List
 
 # Import the function to test
-from tensorrt_llm._torch.models.modeling_multimodal_utils import find_uncached_mm_embeds
-from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalRuntimeData
+from tensorrt_llm._torch.models.modeling_multimodal_utils import \
+    find_uncached_mm_embeds
+from tensorrt_llm.inputs.multimodal import (MultimodalParams,
+                                            MultimodalRuntimeData)
 
 
 class TestMultimodalRuntimeData:
@@ -41,7 +42,9 @@ class TestMultimodalRuntimeData:
         runtime = MultimodalRuntimeData(
             num_cached_tokens=30,
             mm_token_lengths=[3, 4, 5, 6, 7, 8],  # Total: 33 tokens
-            mm_token_positions=[0, 5, 10, 15, 25, 35]  # Positions: 0-3, 5-9, 10-15, 15-21, 25-32, 35-43
+            mm_token_positions=[
+                0, 5, 10, 15, 25, 35
+            ]  # Positions: 0-3, 5-9, 10-15, 15-21, 25-32, 35-43
         )
 
         # Expected caching:
@@ -59,16 +62,19 @@ class TestMultimodalRuntimeData:
 class TestFindUncachedMmEmbed:
     """Focused test cases for find_uncached_mm_embeds function - testing edge cases and potential bugs."""
 
-    def create_mock_runtime(self, num_cached_mm_tokens: int, total_mm_tokens: int):
+    def create_mock_runtime(self, num_cached_mm_tokens: int,
+                            total_mm_tokens: int):
         """Helper to create a mock MultimodalRuntimeData."""
         runtime = Mock(spec=MultimodalRuntimeData)
         runtime.num_cached_mm_tokens = num_cached_mm_tokens
         runtime.total_mm_tokens = total_mm_tokens
         return runtime
 
-    def create_multimodal_params(self, num_cached_mm_tokens: int, total_mm_tokens: int):
+    def create_multimodal_params(self, num_cached_mm_tokens: int,
+                                 total_mm_tokens: int):
         """Helper to create MultimodalParams with runtime data."""
-        runtime = self.create_mock_runtime(num_cached_mm_tokens, total_mm_tokens)
+        runtime = self.create_mock_runtime(num_cached_mm_tokens,
+                                           total_mm_tokens)
         return MultimodalParams(multimodal_runtime=runtime)
 
     def test_mm_embed_not_batched(self):
@@ -79,21 +85,21 @@ class TestFindUncachedMmEmbed:
         mm_embeds = [
             torch.randn(10, 512),  # Batch 1: 10 tokens
             torch.randn(15, 512),  # Batch 2: 15 tokens
-            torch.randn(8, 512)    # Batch 3: 8 tokens
+            torch.randn(8, 512)  # Batch 3: 8 tokens
         ]
         multimodal_params = [
-            self.create_multimodal_params(3, 10),   # 3 cached, 7 uncached
-            self.create_multimodal_params(8, 15),   # 8 cached, 7 uncached
-            self.create_multimodal_params(0, 8)     # 0 cached, 8 uncached
+            self.create_multimodal_params(3, 10),  # 3 cached, 7 uncached
+            self.create_multimodal_params(8, 15),  # 8 cached, 7 uncached
+            self.create_multimodal_params(0, 8)  # 0 cached, 8 uncached
         ]
 
         result = find_uncached_mm_embeds(mm_embeds, multimodal_params)
 
         # Should return individual slices for each batch
         assert len(result) == 3
-        assert result[0].shape == (7, 512)   # 10 - 3 = 7
-        assert result[1].shape == (7, 512)   # 15 - 8 = 7
-        assert result[2].shape == (8, 512)   # 8 - 0 = 8
+        assert result[0].shape == (7, 512)  # 10 - 3 = 7
+        assert result[1].shape == (7, 512)  # 15 - 8 = 7
+        assert result[2].shape == (8, 512)  # 8 - 0 = 8
 
         # Verify the slices are correct
         torch.testing.assert_close(result[0], mm_embeds[0][3:10])
@@ -105,11 +111,12 @@ class TestFindUncachedMmEmbed:
         Test batching (concatenated) mm_embeds with fused mm_embeds for each batch.
         This tests the case where len(mm_embeds) == 1
         """
-        mm_embeds = [torch.randn(33, 512)]  # Pre-concatenated: 10 + 13 + 10 tokens
+        mm_embeds = [torch.randn(33,
+                                 512)]  # Pre-concatenated: 10 + 13 + 10 tokens
         multimodal_params = [
-            self.create_multimodal_params(4, 10),   # 4 cached, 6 uncached
-            self.create_multimodal_params(7, 13),   # 7 cached, 6 uncached
-            self.create_multimodal_params(3, 10)    # 3 cached, 7 uncached
+            self.create_multimodal_params(4, 10),  # 4 cached, 6 uncached
+            self.create_multimodal_params(7, 13),  # 7 cached, 6 uncached
+            self.create_multimodal_params(3, 10)  # 3 cached, 7 uncached
         ]
 
         result = find_uncached_mm_embeds(mm_embeds, multimodal_params)
@@ -123,11 +130,13 @@ class TestFindUncachedMmEmbed:
         assert result[0].shape == (19, 512)
 
         # Verify the slices are correct
-        expected = torch.cat([
-            mm_embeds[0][4:10],    # Batch 1: 6 tokens
-            mm_embeds[0][17:23],   # Batch 2: 6 tokens
-            mm_embeds[0][26:33]    # Batch 3: 7 tokens
-        ], dim=0)
+        expected = torch.cat(
+            [
+                mm_embeds[0][4:10],  # Batch 1: 6 tokens
+                mm_embeds[0][17:23],  # Batch 2: 6 tokens
+                mm_embeds[0][26:33]  # Batch 3: 7 tokens
+            ],
+            dim=0)
         torch.testing.assert_close(result[0], expected)
 
     def test_mixed_caching_with_fully_cached_batches(self):
@@ -136,9 +145,11 @@ class TestFindUncachedMmEmbed:
         """
         mm_embeds = [torch.randn(25, 512)]  # Pre-concatenated: 8 + 9 + 8 tokens
         multimodal_params = [
-            self.create_multimodal_params(8, 8),    # All cached - should be skipped
-            self.create_multimodal_params(3, 9),    # 3 cached, 6 uncached
-            self.create_multimodal_params(8, 8)     # All cached - should be skipped
+            self.create_multimodal_params(8,
+                                          8),  # All cached - should be skipped
+            self.create_multimodal_params(3, 9),  # 3 cached, 6 uncached
+            self.create_multimodal_params(8,
+                                          8)  # All cached - should be skipped
         ]
 
         result = find_uncached_mm_embeds(mm_embeds, multimodal_params)
@@ -154,11 +165,12 @@ class TestFindUncachedMmEmbed:
         """
         Test edge case where all batches are fully cached.
         """
-        mm_embeds = [torch.randn(30, 512)]  # Pre-concatenated: 10 + 10 + 10 tokens
+        mm_embeds = [torch.randn(30,
+                                 512)]  # Pre-concatenated: 10 + 10 + 10 tokens
         multimodal_params = [
             self.create_multimodal_params(10, 10),  # All cached
             self.create_multimodal_params(10, 10),  # All cached
-            self.create_multimodal_params(10, 10)   # All cached
+            self.create_multimodal_params(10, 10)  # All cached
         ]
 
         result = find_uncached_mm_embeds(mm_embeds, multimodal_params)
@@ -170,11 +182,12 @@ class TestFindUncachedMmEmbed:
         """
         Test edge case where no batches have any cached tokens.
         """
-        mm_embeds = [torch.randn(30, 512)]  # Pre-concatenated: 10 + 10 + 10 tokens
+        mm_embeds = [torch.randn(30,
+                                 512)]  # Pre-concatenated: 10 + 10 + 10 tokens
         multimodal_params = [
-            self.create_multimodal_params(0, 10),   # No cached
-            self.create_multimodal_params(0, 10),   # No cached
-            self.create_multimodal_params(0, 10)    # No cached
+            self.create_multimodal_params(0, 10),  # No cached
+            self.create_multimodal_params(0, 10),  # No cached
+            self.create_multimodal_params(0, 10)  # No cached
         ]
 
         result = find_uncached_mm_embeds(mm_embeds, multimodal_params)
@@ -188,9 +201,14 @@ class TestFindUncachedMmEmbed:
         in individual batching mode.
         """
         mm_embeds = [torch.randn(10, 512), torch.randn(15, 512)]  # 2 embeddings
-        multimodal_params = [self.create_multimodal_params(0, 10)]  # Only 1 param
+        multimodal_params = [self.create_multimodal_params(0,
+                                                           10)]  # Only 1 param
 
-        with pytest.raises(ValueError, match="Number of mm_embeds \\(2\\) does not match number of multimodal params \\(1\\)"):
+        with pytest.raises(
+                ValueError,
+                match=
+                "Number of mm_embeds \\(2\\) does not match number of multimodal params \\(1\\)"
+        ):
             find_uncached_mm_embeds(mm_embeds, multimodal_params)
 
     def test_single_batch_scenarios(self):

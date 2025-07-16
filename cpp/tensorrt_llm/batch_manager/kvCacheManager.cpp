@@ -109,12 +109,11 @@ std::optional<std::vector<MmKey>> generateBlockHashExtraKeys(
         TLLM_CHECK_WITH_INFO(mmHashVector.size() == 8, "Multimodal hash vector has unexpected size: %zu (expected 8)",
             mmHashVector.size());
 
+#define GET_NTH_BYTE(hash_part, byte_idx) static_cast<uint8_t>((hash_part >> (24 - (byte_idx) *8)) & 0xFF)
         // mmHashVector[j] comes from Python's int(hex_chunk, 16)
         // where hex_chunk like "00010203" means 0x00 is MSB and 0x03 is LSB (big endian)
         // Convert 8x 32-bit integers into a 32-byte array preserving Blake3 hash byte order
         // Example: hashPart = 0x00010203 → mmHashArray[0:3] = [0x00, 0x01, 0x02, 0x03]
-        #define GET_NTH_BYTE(hash_part, byte_idx) static_cast<uint8_t>((hash_part >> (24 - (byte_idx) * 8)) & 0xFF)
-
         for (size_t j = 0; j < 8; ++j)
         {
             auto const& hashPart = mmHashVector[j];
@@ -123,7 +122,7 @@ std::optional<std::vector<MmKey>> generateBlockHashExtraKeys(
                 mmHashArray[j * 4 + byteIdx] = GET_NTH_BYTE(hashPart, byteIdx);
             }
         }
-        #undef GET_NTH_BYTE
+#undef GET_NTH_BYTE
 
         // Check if this multimodal content overlaps with the current block
         if (endTokenIdx > startPos && startTokenIdx < startPos + length)
@@ -187,7 +186,7 @@ size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) no
         seed ^= c + 0x9e3779b9 + (seed << 6) + (seed >> 2);
     }
 
-    // Add extra keys for multimodal data mixing in external mulitmodal item hash and token offset within this sequence
+    // Add extra keys for multimodal data mixing in external multimodal item hash and token offset within this sequence
     // block
     if (blockKey.extraKeys)
     {
