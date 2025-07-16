@@ -1803,7 +1803,9 @@ def preprocess_perlayer_weights(weights,
         # Interleave block scale for NVFP4 plugin.
         for name in list(weights):
             if name.endswith('weights_scaling_factor'):
-                out_features, in_features = weights[name].shape
+                # in some MoE cases, weights can have one more dimension for experts
+                # This is handled in nvfp4_block_scale_interleave as commented on NVFP4BlockScaleInterleave in cpp/tensorrt_llm/thop/fp4Op.cpp
+                *maybe_experts, out_features, in_features = weights[name].shape
                 nrows = fp4_utils.pad_up(out_features, 128)
                 ncols = fp4_utils.pad_up(in_features, 4)
                 new_name = name.replace('weights_scaling_factor',
@@ -1813,8 +1815,9 @@ def preprocess_perlayer_weights(weights,
                     new_name +
                     "_interleaved"] = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
                         weights[name].view(fp4_utils.float4_sf_dtype).cpu(
-                        ).contiguous()).reshape(nrows, ncols).view(
-                            fp4_utils.float4_sf_dtype)
+                        ).contiguous()).reshape(*maybe_experts, nrows,
+                                                ncols).view(
+                                                    fp4_utils.float4_sf_dtype)
                 weights.pop(name)
             if name.endswith('weights_scaling_factor_2'):
                 new_name = name.replace('weights_scaling_factor_2',
