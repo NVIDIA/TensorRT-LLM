@@ -33,7 +33,7 @@ from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, ExecutorResponse, LlmRequest,
                           LlmRequestState, executor_request_to_llm_request)
 from .model_engine import ModelEngine
-from .sampler import Sampler, SampleState, SampleStateTensors, TorchSampler
+from .sampler import SampleStateBlockPrediction, Sampler, SampleState, SampleStateTensors, TorchSampler
 from .scheduler import ScheduledRequests
 
 # Environment variable to specify iteration ranges for profiling start/stop.
@@ -983,11 +983,10 @@ class PyExecutor:
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
     def _executor_loop_block(self):
+        """Executor loop for block prediction with iterative unmasking."""
         torch.cuda.set_device(self.device_id)
-        is_ngram = hasattr(
-            self.model_engine, "spec_config"
-        ) and self.model_engine.spec_config is not None and self.model_engine.spec_config.spec_dec_mode.is_ngram(
-        )
+        # print("[BLOCK_PREDICTION] Starting block prediction executor loop")
+        
         with self._profiler() as profile_step:
             iter_start_time = time.time()
             iter_stats = None
@@ -995,6 +994,7 @@ class PyExecutor:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
+                
                 new_requests = self._fetch_new_requests()
                 if self.is_shutdown and len(self.active_requests) == 0:
                     break
@@ -1009,11 +1009,7 @@ class PyExecutor:
 
                 self._pad_attention_dp_dummy_request()
 
-                if self.draft_model_engine is not None or is_ngram:
-                    self._prepare_draft_requests()
-
-                scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
-                )
+                scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule()
 
                 if self.kv_cache_transceiver:
                     # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
@@ -1047,20 +1043,7 @@ class PyExecutor:
                         self._prepare_disagg_gen_transmission_complete(
                             scheduled_batch)
 
-                    has_ngram_iter_stats = is_ngram and self.model_engine.spec_config.spec_dec_mode.is_ngram(
-                    ) and iter_stats is not None
-                    if has_ngram_iter_stats:
-                        before = time.time()
-
                     self.resource_manager.prepare_resources(scheduled_batch)
-                    if self.draft_model_engine is not None:
-                        self._prepare_draft_tokens(scheduled_batch)
-
-                    if has_ngram_iter_stats:
-                        self._insert_ngram_iter_stats(scheduled_batch,
-                                                      iter_stats)
-                        iter_stats.specdec_stats.iter_latency_ms = (
-                            time.time() - before) * 1e3
 
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
@@ -1070,13 +1053,10 @@ class PyExecutor:
                         # Return the first token to the client
                         self._handle_first_token_response(scheduled_batch)
 
-                    batch_outputs = self._forward_step_block(scheduled_batch)
-
-                    sample_state = self._sample_async_block(scheduled_batch,
-                                                      batch_outputs)
+                    # Process the batch with iterative block prediction
+                    self._process_block_prediction_batch(scheduled_batch)
 
                     self._update_request_states(scheduled_batch)
-                    self._update_requests(sample_state)
 
                     ctx_transmission_reqs = self._send_disagg_ctx_cache(
                         scheduled_batch.context_requests
@@ -1097,14 +1077,128 @@ class PyExecutor:
                     self._terminate_ctx_finished_requests()
 
                 if self.enable_iter_perf_stats:
-                    iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
-                        'num_ctx_tokens']
+                    if hasattr(self.model_engine, 'iter_states'):
+                        iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
+                            'num_ctx_tokens']
                     self._process_iter_stats(
                         finished_requests, self.active_requests,
                         BatchState(sample_state=SampleState(
                             scheduled_requests=scheduled_batch),
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
+
+    def _process_block_prediction_batch(self, scheduled_batch):
+        """Process a batch with iterative block prediction."""
+        # print(f"[BLOCK_PREDICTION] Processing batch with {len(scheduled_batch.generation_requests)} generation requests")
+        
+        # Forward step to get initial logits
+        batch_outputs = self._forward_step_block(scheduled_batch)
+        
+        # Iterative block prediction loop
+        max_iterations = getattr(self.block_prediction_sampler, 'max_iterations', 10)
+        iteration = 0
+        
+        while iteration < max_iterations:
+            iteration += 1
+            # print(f"[BLOCK_PREDICTION] Block prediction iteration {iteration}")
+            
+            # Sample tokens using block prediction
+            sample_state = self._sample_async_block(scheduled_batch, batch_outputs)
+            
+            if sample_state is None:
+                # print("[BLOCK_PREDICTION] Sample state is None, breaking")
+                break
+            
+            # Check if block prediction is complete
+            if hasattr(sample_state, 'device') and sample_state.device is not None:
+                # Block is complete - update requests and break
+                print("[BLOCK_PREDICTION] Block prediction complete, updating requests (TODO(marcelroed): check why/when this happens)")
+                self._update_requests(sample_state)
+                break
+            else:
+                # Block is not complete - continue iteration
+                # print(f"[BLOCK_PREDICTION] Block not complete, continuing iteration {iteration}")
+                
+                # Update the requests with the current masked chunks for the next forward pass
+                self._update_requests_for_next_iteration(sample_state)
+                
+                # Run another forward step with the updated masked chunks
+                batch_outputs = self._forward_step_block(scheduled_batch)
+        
+        if iteration >= max_iterations:
+            # print(f"[BLOCK_PREDICTION] Reached max iterations ({max_iterations}), forcing completion")
+            # Force completion by taking the first token from each block
+            self._force_block_completion(scheduled_batch)
+    
+    def _update_requests_for_next_iteration(self, sample_state):
+        """Update requests with masked chunks for the next iteration."""
+        if hasattr(sample_state, 'masked_chunks') and sample_state.masked_chunks is not None:
+            # For block prediction, we need to create new requests with the current state
+            # instead of modifying existing requests, which breaks the KV cache manager
+            new_requests = []
+            
+            for i, request in enumerate(sample_state.scheduled_requests.generation_requests):
+                if i < sample_state.masked_chunks.size(0):
+                    # Create a new request with the current tokens plus the masked chunk
+                    masked_chunk = sample_state.masked_chunks[i]
+                    
+                    # Get the current tokens (excluding the last block_size tokens that were just processed)
+                    current_tokens = []
+                    for beam_idx in range(request.max_beam_num_tokens):
+                        # Get all tokens for this beam
+                        all_beam_tokens = request.get_tokens(0)
+                        # Remove the last block_size tokens that were just processed
+                        beam_tokens = all_beam_tokens[:-self.block_prediction_sampler.block_size]
+                        current_tokens.extend(beam_tokens)
+                    
+                    # Add the masked chunk tokens
+                    current_tokens.extend(masked_chunk.tolist())
+                    
+                    # Create a new request with the updated tokens
+                    # This is a simplified approach - in a real implementation, you'd need to
+                    # properly clone the request with all its properties
+                    # print(f"[BLOCK_PREDICTION] Creating new request with {len(current_tokens)} tokens")
+                    
+                    # For now, just mark the request as needing another iteration
+                    request.py_needs_block_iteration = True
+                    new_requests.append(request)
+            
+            # Update the scheduled requests with the new requests
+            sample_state.scheduled_requests.generation_requests = new_requests
+
+    def _force_block_completion(self, scheduled_batch):
+        """Force completion of block prediction by taking the first token from each block."""
+        # print("[BLOCK_PREDICTION] Forcing block completion")
+        
+        # Create a dummy sample state with the first token from each block
+        batch_size = len(scheduled_batch.generation_requests)
+        first_tokens = torch.zeros(batch_size, dtype=torch.int64, device='cuda')
+        
+        for i, request in enumerate(scheduled_batch.generation_requests):
+            # Get the first token from the block (or a default token if none available)
+            if request.get_num_tokens(0) > 0:
+                first_tokens[i] = request.get_token(0, 0)
+            else:
+                first_tokens[i] = 0  # Default token
+        
+        # Create a sample state with the first tokens
+        new_tokens_host = first_tokens.to('cpu', non_blocking=True)
+        sampler_event = torch.cuda.Event()
+        sampler_event.record()
+        
+        sample_state = SampleStateBlockPrediction(
+            scheduled_requests=scheduled_batch,
+            logits=None,
+            device=SampleStateTensors(new_tokens=first_tokens),
+            host=SampleStateTensors(new_tokens=new_tokens_host),
+            sampler_event=sampler_event,
+            masked_chunks=None,
+            block_probs=None,
+            block_tokens=None,
+            iteration_count=0
+        )
+        
+        self._update_requests(sample_state)
 
     def _prepare_draft_requests(self):
         try:

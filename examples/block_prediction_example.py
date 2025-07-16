@@ -26,8 +26,8 @@ def main():
         mask_token_id=151666,  # Token ID to use as mask
         max_iterations=10,  # Maximum number of iterations
         max_batch_size=1,
-        max_num_tokens=512,
-        max_seq_len=512,
+        max_num_tokens=1024,  # Reasonable value for block prediction
+        max_seq_len=2048,  # Reasonable value for block prediction
     )
     
     print("=== Block Prediction Example ===\n")

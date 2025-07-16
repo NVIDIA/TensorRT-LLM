@@ -24,7 +24,7 @@ from .llm_request import ExecutorResponse
 from .model_engine import (DRAFT_KV_CACHE_MANAGER_KEY, KV_CACHE_MANAGER_KEY,
                            PyTorchModelEngine)
 from .py_executor import PyExecutor
-from .resource_manager import (KVCacheManager, MambaHybridCacheManager,
+from .resource_manager import (BlockKVCacheManager, KVCacheManager, MambaHybridCacheManager,
                                PeftCacheManager, ResourceManager)
 from .sampler import (EarlyStopSampler, TorchSampler, TorchStarAttentionSampler,
                       TRTLLMSampler)
@@ -335,19 +335,34 @@ class KvCacheCreator:
                 spec_config=spec_config,
             )
         else:
-            kv_cache_manager = KVCacheManager(
-                executor_config.kv_cache_config,
-                tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-                num_layers=num_hidden_layers,
-                num_kv_heads=num_key_value_heads,
-                head_dim=head_dim,
-                tokens_per_block=executor_config.tokens_per_block,
-                max_seq_len=executor_config.max_seq_len,
-                max_batch_size=executor_config.max_batch_size,
-                mapping=mapping,
-                dtype=kv_cache_dtype,
-                spec_config=spec_config,
-            )
+            if model_engine.pytorch_backend_config.enable_block_prediction:
+                kv_cache_manager = BlockKVCacheManager(
+                    executor_config.kv_cache_config,
+                    tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+                    num_layers=num_hidden_layers,
+                    num_kv_heads=num_key_value_heads,
+                    head_dim=head_dim,
+                    tokens_per_block=executor_config.tokens_per_block,
+                    max_seq_len=executor_config.max_seq_len,
+                    max_batch_size=executor_config.max_batch_size,
+                    mapping=mapping,
+                    dtype=kv_cache_dtype,
+                    spec_config=spec_config,
+                )
+            else:
+                kv_cache_manager = KVCacheManager(
+                    executor_config.kv_cache_config,
+                    tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+                    num_layers=num_hidden_layers,
+                    num_kv_heads=num_key_value_heads,
+                    head_dim=head_dim,
+                    tokens_per_block=executor_config.tokens_per_block,
+                    max_seq_len=executor_config.max_seq_len,
+                    max_batch_size=executor_config.max_batch_size,
+                    mapping=mapping,
+                    dtype=kv_cache_dtype,
+                    spec_config=spec_config,
+                )
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to executor_config
         if model_engine.kv_cache_manager_key == KV_CACHE_MANAGER_KEY:
             executor_config.max_seq_len = kv_cache_manager.max_seq_len

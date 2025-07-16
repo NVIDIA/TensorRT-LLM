@@ -1357,6 +1357,7 @@ class PyTorchModelEngine(ModelEngine):
                     # For block prediction, we need to add the entire block of tokens
                     # (last real token + block_size mask tokens)
                     if self.pytorch_backend_config.enable_block_prediction:
+                        # print("In PTME block prediction")
                         block_size = self.pytorch_backend_config.block_size
                         mask_token_id = self.pytorch_backend_config.mask_token_id
                         
@@ -1518,12 +1519,12 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.kv_cache_manager = kv_cache_manager
 
         # Print debug info before preparing attention metadata
-        print("[BLOCK_PREDICTION DEBUG] input_ids shape:", input_ids.shape if hasattr(input_ids, 'shape') else len(input_ids))
-        print("[BLOCK_PREDICTION DEBUG] position_ids shape:", position_ids.shape if hasattr(position_ids, 'shape') else len(position_ids))
-        print("[BLOCK_PREDICTION DEBUG] sequence_lengths:", sequence_lengths)
-        if not attn_metadata.is_cuda_graph:
-            print("[BLOCK_PREDICTION DEBUG] attn_metadata.seq_lens (before):", sequence_lengths)
-        print("[BLOCK_PREDICTION DEBUG] attn_metadata.num_seqs (before):", getattr(attn_metadata, 'num_seqs', None))
+        # print("[BLOCK_PREDICTION DEBUG] input_ids shape:", input_ids.shape if hasattr(input_ids, 'shape') else len(input_ids))
+        # print("[BLOCK_PREDICTION DEBUG] position_ids shape:", position_ids.shape if hasattr(position_ids, 'shape') else len(position_ids))
+        # print("[BLOCK_PREDICTION DEBUG] sequence_lengths:", sequence_lengths)
+        # if not attn_metadata.is_cuda_graph:
+        #     print("[BLOCK_PREDICTION DEBUG] attn_metadata.seq_lens (before):", sequence_lengths)
+        # print("[BLOCK_PREDICTION DEBUG] attn_metadata.num_seqs (before):", getattr(attn_metadata, 'num_seqs', None))
         attn_metadata.prepare()
 
         lora_params = self._get_lora_params_from_requests(
