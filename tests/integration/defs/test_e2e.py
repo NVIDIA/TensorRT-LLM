@@ -1363,6 +1363,7 @@ def test_trtllm_serve_example(llm_root, llm_venv):
 
 
 def test_trtllm_serve_multimodal_example(llm_root, llm_venv):
+    pytest.fail("test")
     example_root = Path(os.path.join(llm_root, "examples", "serve"))
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([

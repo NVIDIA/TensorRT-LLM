@@ -776,7 +776,7 @@ def collectTestResults(pipeline, testFilter)
                 --output-file=rerun/rerun_report.xml \
                 --input-files=${inputfiles}
             """
-            trtllm_utils.uploadArtifacts("rerun/rerun_report.html", "${UPLOAD_PATH}/test-results/")
+            trtllm_utils.uploadArtifacts("rerun/rerun_report.*", "${UPLOAD_PATH}/test-results/")
             echo "Rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/rerun_report.html"
             def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
             if (env.alternativeTRT || isOfficialPostMergeJob) {
