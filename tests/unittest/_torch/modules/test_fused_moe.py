@@ -149,13 +149,17 @@ def test_fused_moe(moe_backend,
                 output = fused_moe.forward(x, router_logits)
                 ref_output = ref_fused_moe.forward(x, router_logits)
 
-        # Evaluate outputs
-        torch.cuda.synchronize()
-        # There can be one off mismatch in the outputs due to different kernel implementations
-        # Here we check 99% of the outputs are within the tolerance
-        # The CutlassFusedMoE case fails as well without this change on H100 for bf16
-        check_accuracy(output, ref_output, rtol=0.5, atol=0.5, percent=0.99)
-        m //= 2
+            # Evaluate outputs
+            torch.cuda.synchronize()
+            # There can be one off mismatch in the outputs due to different kernel implementations
+            # Here we check 99% of the outputs are within the tolerance
+            # The CutlassFusedMoE case fails as well without this change on H100 for bf16
+            check_accuracy(output,
+                           ref_output,
+                           rtol=0.2,
+                           atol=0.2,
+                           percent=0.984)
+            m //= 2
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
