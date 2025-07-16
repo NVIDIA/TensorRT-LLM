@@ -236,6 +236,11 @@ def serve_command(
     logger.info("Setting up throughput benchmark.")
     kwargs = kwargs | runtime_config.get_llm_args()
     kwargs['backend'] = backend
+    kwargs['tokenizer'] = checkpoint_path
+    kwargs['postprocess_tokenizer_dir'] = checkpoint_path
+    kwargs['trust_remote_code'] = True
+    kwargs['skip_tokenizer_init'] = False
+    kwargs["num_postprocess_workers"] = 0
 
     if runtime_config.backend == 'pytorch':
         if kwargs.pop("extended_runtime_perf_knob_config", None):
