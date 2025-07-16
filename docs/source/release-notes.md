@@ -23,7 +23,7 @@ All published functionality in the Release Notes has been fully tested and verif
   - Added EAGLE3 support for Qwen-3
   - Fused finalize and allreduce for Qwen-MoE model
   - Refactored Fused MoE module
-  - Added support for chunked MHA on Blackwell and Hopper
+  - Added support for chunked attention on Blackwell and Hopper
   - Introduced sliding-window attention kernels for the generation phase on Blackwell
   - Updated DeepSeek FP8 TRT-LLM Gen cubins
   - Added FP8 block-scale GEMM support on SM89
