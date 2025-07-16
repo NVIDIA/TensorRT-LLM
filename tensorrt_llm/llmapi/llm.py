@@ -953,9 +953,36 @@ class _TorchLLM(BaseLLM):
 
         # TODO: Properly load tokenizer.
         if self.tokenizer is None:
-            self.tokenizer = tiktoken.get_encoding("o200k_base")
-            self.tokenizer.eos_token_id = self.tokenizer.eot_token
-            self.tokenizer.pad_token_id = self.tokenizer.eot_token
+            logger.info("Using tiktoken")
+            o200k_base = tiktoken.get_encoding("o200k_base")
+            self.tokenizer = tiktoken.Encoding(
+                name="o200k_harmony",
+                pat_str=o200k_base._pat_str,
+                mergeable_ranks=o200k_base._mergeable_ranks,
+                special_tokens={
+                    **o200k_base._special_tokens,
+                    "<|startoftext|>": 199998,
+                    "<|endoftext|>": 199999,
+                    "<|reserved_200000|>": 200000,
+                    "<|reserved_200001|>": 200001,
+                    "<|return|>": 200002,
+                    "<|constrain|>": 200003,
+                    "<|reserved_200004|>": 200004,
+                    "<|channel|>": 200005,
+                    "<|start|>": 200006,
+                    "<|end|>": 200007,
+                    "<|message|>": 200008,
+                    "<|reserved_200009|>": 200009,
+                    "<|reserved_200010|>": 200010,
+                    "<|reserved_200011|>": 200011,
+                    "<|call|>": 200012,
+                    "<|reserved_200013|>": 200013,
+                },
+            )
+
+            self.tokenizer.bos_token_id = 199998  # <|startoftext|>
+            self.tokenizer.pad_token_id = 199998  # <|startoftext|>
+            self.tokenizer.eos_token_id = 200002  # <|return|>
 
         # Multimodal special handling:
         # 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor
