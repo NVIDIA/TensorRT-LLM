@@ -35,8 +35,12 @@ NCCL_P2P_LEVEL = "SYS"
 OMPI_MCA_btl = "self,tcp"
 OMPI_MCA_mtl = "^psm,psm2"
 
-TLLM_FORCE_SINGLE_PROCESS = "1"
+# Only use one GPU
 CUDA_VISIBLE_DEVICES = "0"
+
+# TensorRT-LLM debugging
+TLLM_WORKER_USE_SINGLE_PROCESS = "1"
+TLLM_LLM_ENABLE_DEBUG = "1"
 
 [pypi-options]
 # index-url = "https://pypi.org/simple"
