@@ -111,16 +111,19 @@ std::optional<std::vector<MmKey>> generateBlockHashExtraKeys(
 
         // mmHashVector[j] comes from Python's int(hex_chunk, 16)
         // where hex_chunk like "00010203" means 0x00 is MSB and 0x03 is LSB (big endian)
-        // The overall Blake3 output wants these bytes in order: 0x00, 0x01, 0x02, 0x03...
+        // Convert 8x 32-bit integers into a 32-byte array preserving Blake3 hash byte order
+        // Example: hashPart = 0x00010203 → mmHashArray[0:3] = [0x00, 0x01, 0x02, 0x03]
+        #define GET_NTH_BYTE(hash_part, byte_idx) static_cast<uint8_t>((hash_part >> (24 - (byte_idx) * 8)) & 0xFF)
+
         for (size_t j = 0; j < 8; ++j)
         {
-            auto const& hashPart = mmHashVector[j]; // e.g., 0x00010203
-            // Extract bytes in Big-Endian order from hashPart and place them sequentially into mmHashArray
-            mmHashArray[j * 4 + 0] = static_cast<uint8_t>((hashPart >> 24) & 0xFF); // Extract 0x00 (MSB of the int)
-            mmHashArray[j * 4 + 1] = static_cast<uint8_t>((hashPart >> 16) & 0xFF); // Extract 0x01
-            mmHashArray[j * 4 + 2] = static_cast<uint8_t>((hashPart >> 8) & 0xFF);  // Extract 0x02
-            mmHashArray[j * 4 + 3] = static_cast<uint8_t>(hashPart & 0xFF);         // Extract 0x03 (LSB of the int)
+            auto const& hashPart = mmHashVector[j];
+            for (size_t byteIdx = 0; byteIdx < 4; ++byteIdx)
+            {
+                mmHashArray[j * 4 + byteIdx] = GET_NTH_BYTE(hashPart, byteIdx);
+            }
         }
+        #undef GET_NTH_BYTE
 
         // Check if this multimodal content overlaps with the current block
         if (endTokenIdx > startPos && startTokenIdx < startPos + length)
