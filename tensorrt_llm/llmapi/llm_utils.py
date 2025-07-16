@@ -401,6 +401,9 @@ class ModelLoader:
                 logger.info(f"Setting {key}={value} from HF quant config.")
                 setattr(quant_config, key, value)
 
+            # Update the quant_config in llm_args for pytorch
+            self.llm_args.quant_config = quant_config
+
             return True
 
         hf_config_path = f"{self._model_dir}/config.json"
