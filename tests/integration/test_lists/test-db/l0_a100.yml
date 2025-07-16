@@ -111,4 +111,4 @@ l0_a100:
       stage: post_merge
       backend: fmha
   tests:
-  - unittest/fmha/test_fmha.py
+  - integration/defs/test_fmha.py
