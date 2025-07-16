@@ -305,12 +305,20 @@ class ModelConfig(Generic[TConfig]):
             hidden_size=hidden_size,
             data_type=torch_dtype_to_binding(
                 self.pretrained_config.torch_dtype))
+
+        # For kv cache size calculation: set tokens_per_block
         if tokens_per_block is None:
             logger.warning(
                 f"tokens_per_block is not set, using default value {model_config_cpp.tokens_per_block}"
             )
         else:
             model_config_cpp.tokens_per_block = tokens_per_block
+
+        # For kv cache size calculation: set num_kv_heads
+        num_kv_heads = getattr(
+            self.pretrained_config, "num_key_value_heads",
+            num_heads) // (self.mapping.tp_size * self.mapping.cp_size)
+        model_config_cpp.set_num_kv_heads(num_kv_heads)
 
         mlp_hidden_size = None
         if self.pretrained_config.intermediate_size is not None:
@@ -333,9 +341,16 @@ class ModelConfig(Generic[TConfig]):
                 f"Failed to infer mlp hidden size for model: {self.pretrained_config.model_type}"
             )
 
-        if "head_size" in self.pretrained_config:
-            head_size = self.pretrained_config.head_size
+        # For kv cache size calculation: set size_per_head
+        head_dim_names = ["head_size", "head_dim"]
+        for head_dim_name in head_dim_names:
+            if head_dim_name in self.pretrained_config:
+                head_size = getattr(self.pretrained_config, head_dim_name)
+                break
         else:
+            logger.warning(
+                f"head_size/head_dim is not set, using default value {hidden_size // num_heads}"
+            )
             head_size = hidden_size // num_heads
 
         model_config_cpp.mlp_hidden_size = mlp_hidden_size
