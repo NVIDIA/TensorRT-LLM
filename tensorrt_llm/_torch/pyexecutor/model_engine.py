@@ -309,7 +309,7 @@ def get_rank_model_storage(model):
 def _filter_cuda_graph_batch_sizes(cuda_graph_batch_sizes: list[int],
                                    max_batch_size: int, max_num_tokens: int,
                                    max_draft_len: int,
-                                   padding_enabled: bool) -> list[int]:
+                                   enable_padding: bool) -> list[int]:
     # This is the largest possible batch size for a pure decoding batch.
     max_cuda_graph_bs = min(max_batch_size,
                             int(max_num_tokens / (1 + max_draft_len)))
@@ -326,8 +326,8 @@ def _filter_cuda_graph_batch_sizes(cuda_graph_batch_sizes: list[int],
             # is that if the user is OK padding to a batch size B, they should also
             # be OK with padding to some size B' < B since the performance will generally
             # just be better in the smaller case.
-            if padding_enabled and (i == 0
-                                    or result[i - 1] != max_cuda_graph_bs):
+            if enable_padding and (i == 0
+                                   or result[i - 1] != max_cuda_graph_bs):
                 logger.warning(
                     "CUDA graph padding is enabled, but one of the given CUDA graph "
                     f"batch sizes ({bs}) is larger than the executor's max batch size "
@@ -1462,6 +1462,16 @@ class PyTorchModelEngine(ModelEngine):
             self.input_ids_cuda[num_tokens:num_tokens +
                                 previous_batch_len * self.max_beam_width].copy_(
                                     new_tokens.flatten(), non_blocking=True)
+
+        if (not self._disable_overlap_scheduler
+                and next_draft_tokens_device is None
+                and len(extend_requests) > 0):
+            # During warmup, for those generation requests, we don't have previous tensors,
+            # so we need to set the previous_pos_id_offsets and previous_kv_lens_offsets to zeros
+            # to skip the value changes in _preprocess_inputs. Otherwise, there will be illegal memory access
+            # when writing key/values to the KV cache.
+            self.previous_pos_id_offsets_cuda *= 0
+            self.previous_kv_lens_offsets_cuda *= 0
 
         position_ids = torch.tensor(position_ids,
                                     dtype=torch.int,

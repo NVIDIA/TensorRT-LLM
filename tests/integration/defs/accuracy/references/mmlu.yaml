@@ -92,6 +92,8 @@ mistralai/Mixtral-8x22B-v0.1:
     accuracy: 77.63
 google/gemma-2-9b-it:
   - accuracy: 73.05
+google/gemma-3-27b-it:
+  - accuracy: 77.80
 Qwen/Qwen2-0.5B-Instruct:
   - accuracy: 45.30
   - quant_algo: FP8
