@@ -511,8 +511,6 @@ class Deepseekv3MoE(nn.Module):
         # max-throughput
         use_dp_padding = False
         if self.use_dp and self.mapping.tp_size > 1:
-            # FP4 all_gather moves this bf16 allgather in to after topk and fp4 quantization
-            # to reduce allreduce BW
             if isinstance(self.experts, TRTLLMGenFusedMoE):
                 hidden_states = allgather(hidden_states,
                                           self.mapping,

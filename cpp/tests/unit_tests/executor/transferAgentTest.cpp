@@ -260,42 +260,43 @@ TEST_F(TransferAgentTest, SyncMessage)
     auto status = nixlAgent0->submitTransferRequests(writeReq);
     status->wait();
 
+    const size_t MAX_QUERY_TIMES = std::numeric_limits<size_t>::max();
     auto notif = nixlAgent1->getNotifiedSyncMessages();
+    for (size_t i = 0; i < MAX_QUERY_TIMES && notif.size() == 0; i++)
+    {
+        notif = nixlAgent1->getNotifiedSyncMessages();
+    }
     TLLM_CHECK(notif.size() == 1);
     TLLM_CHECK(notif[agent0].size() == 1);
     TLLM_CHECK(notif[agent0][0] == syncMessage);
+
     TLLM_CHECK(memory0 == memory1);
 
     std::string syncMessage2 = "two_agent_sync_message";
     nixlAgent0->notifySyncMessage(agent1, syncMessage2);
-    while (true)
+    auto notif2 = nixlAgent1->getNotifiedSyncMessages();
+    for (size_t i = 0; i < MAX_QUERY_TIMES && notif2.size() == 0; i++)
     {
-        auto notif2 = nixlAgent1->getNotifiedSyncMessages();
-        if (notif2.size() > 0)
-        {
-            TLLM_CHECK(notif2.size() == 1);
-            TLLM_CHECK(notif2[agent0].size() == 1);
-            TLLM_CHECK(notif2[agent0][0] == syncMessage2);
-            break;
-        }
+        notif2 = nixlAgent1->getNotifiedSyncMessages();
     }
+    TLLM_CHECK(notif2.size() == 1);
+    TLLM_CHECK(notif2[agent0].size() == 1);
+    TLLM_CHECK(notif2[agent0][0] == syncMessage2);
 
     // nixlAgent1->loadRemoteAgent(agent0);
     auto connectionInfo2 = nixlAgent0->getConnectionInfo();
     nixlAgent1->connectRemoteAgent(agent0, connectionInfo2);
     std::string syncMessage3 = "three_agent_sync_message";
     nixlAgent1->notifySyncMessage(agent0, syncMessage3);
-    while (true)
+    auto notif3 = nixlAgent0->getNotifiedSyncMessages();
+    for (size_t i = 0; i < MAX_QUERY_TIMES && notif3.size() == 0; i++)
     {
-        auto notif3 = nixlAgent0->getNotifiedSyncMessages();
-        if (notif3.size() > 0)
-        {
-            TLLM_CHECK(notif3.size() == 1);
-            TLLM_CHECK(notif3[agent1].size() == 1);
-            TLLM_CHECK(notif3[agent1][0] == syncMessage3);
-            break;
-        }
+        notif3 = nixlAgent0->getNotifiedSyncMessages();
     }
+    TLLM_CHECK(notif3.size() == 1);
+    TLLM_CHECK(notif3[agent1].size() == 1);
+    TLLM_CHECK(notif3[agent1][0] == syncMessage3);
+
     bool checked2 = false;
     do
     {
@@ -308,6 +309,10 @@ TEST_F(TransferAgentTest, SyncMessage)
     auto status1 = nixlAgent1->submitTransferRequests(writeReq1);
     status1->wait();
     auto notif4 = nixlAgent0->getNotifiedSyncMessages();
+    for (size_t i = 0; i < MAX_QUERY_TIMES && notif4.size() == 0; i++)
+    {
+        notif4 = nixlAgent0->getNotifiedSyncMessages();
+    }
     TLLM_CHECK(notif4.size() == 1);
     TLLM_CHECK(notif4[agent1].size() == 1);
     TLLM_CHECK(notif4[agent1][0] == syncMessage4);
@@ -322,20 +327,17 @@ TEST_F(TransferAgentTest, SyncMessage)
     Serialization::serialize(state, ss);
     std::string serializedState = ss.str();
     nixlAgent0->notifySyncMessage(agent1, serializedState);
-    while (true)
+    auto notif5 = nixlAgent1->getNotifiedSyncMessages();
+    for (size_t i = 0; i < MAX_QUERY_TIMES && notif5.size() == 0; i++)
     {
-        auto notif5 = nixlAgent1->getNotifiedSyncMessages();
-        if (notif5.size() > 0)
-        {
-            TLLM_CHECK(notif5.size() == 1);
-            TLLM_CHECK(notif5[agent0].size() == 1);
-            TLLM_CHECK(notif5[agent0][0] == serializedState);
-            std::stringstream ss2(notif5[agent0][0]);
-            auto state2 = Serialization::deserializeCommState(ss2);
-            TLLM_CHECK(state2 == state);
-            break;
-        }
+        notif5 = nixlAgent1->getNotifiedSyncMessages();
     }
+    TLLM_CHECK(notif5.size() == 1);
+    TLLM_CHECK(notif5[agent0].size() == 1);
+    TLLM_CHECK(notif5[agent0][0] == serializedState);
+    std::stringstream ss2(notif5[agent0][0]);
+    auto state2 = Serialization::deserializeCommState(ss2);
+    TLLM_CHECK(state2 == state);
 
     nixlAgent0->invalidateRemoteAgent(agent1);
     nixlAgent1->invalidateRemoteAgent(agent0);

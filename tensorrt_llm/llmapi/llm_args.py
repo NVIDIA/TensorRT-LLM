@@ -821,6 +821,10 @@ class KvCacheConfig(BaseModel, PybindMirror):
     use_uvm: bool = Field(default=False,
                           description="Whether to use UVM for the KV cache.")
 
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    dtype: str = Field(default="auto",
+                       description="The data type to use for the KV cache.")
+
     def _to_pybind(self):
         return _KvCacheConfig(
             enable_block_reuse=self.enable_block_reuse,
@@ -1024,10 +1028,6 @@ class BaseLlmArgs(BaseModel):
     lora_config: Optional[LoraConfig] = Field(
         default=None, description="LoRA configuration for the model.")
 
-    # Quantization and calibration configurations
-    quant_config: Optional[QuantConfig] = Field(
-        default=None, description="Quantization config.", validate_default=True)
-
     # Several options from ExecutorConfig, expanded here for less hierarchy
     kv_cache_config: KvCacheConfig = Field(default_factory=KvCacheConfig,
                                            description="KV cache config.")
@@ -1208,13 +1208,6 @@ class BaseLlmArgs(BaseModel):
                 raise RuntimeError("Pre SM 80 GPUs do not support bfloat16")
         return v
 
-    @field_validator("quant_config", mode='before')
-    @classmethod
-    def validate_quant_config(cls, v, info):
-        if v is None:
-            v = QuantConfig()
-        return v
-
     @field_validator("gpus_per_node", mode='before')
     @classmethod
     def validate_gpus_per_node(cls, v, info):
@@ -1286,7 +1279,8 @@ class BaseLlmArgs(BaseModel):
                 'pytorch', '_autodeploy'
         ]:
             # Load parallel_config from the engine.
-            model_format = get_model_format(self.model)
+            model_format = get_model_format(
+                self.model, trust_remote_code=self.trust_remote_code)
 
             if model_format is _ModelFormatKind.TLLM_ENGINE:
                 if self.build_config is not None:
@@ -1656,6 +1650,10 @@ class TrtLlmArgs(BaseLlmArgs):
     calib_config: Optional[CalibConfig] = Field(
         default=None, description="Calibration config.", validate_default=True)
 
+    # Quantization and calibration configurations
+    quant_config: Optional[QuantConfig] = Field(
+        default=None, description="Quantization config.", validate_default=True)
+
     embedding_parallel_mode: str = Field(
         default='SHARDING_ALONG_VOCAB',
         description="The embedding parallel mode.")
@@ -1691,6 +1689,13 @@ class TrtLlmArgs(BaseLlmArgs):
     def init_calib_config(cls, v):
         if v is None:
             return CalibConfig()
+        return v
+
+    @field_validator("quant_config", mode='before')
+    @classmethod
+    def validate_quant_config(cls, v, info):
+        if v is None:
+            v = QuantConfig()
         return v
 
     @model_validator(mode="after")
@@ -1735,6 +1740,11 @@ class TrtLlmArgs(BaseLlmArgs):
         if not isinstance(self.enable_build_cache, BuildCacheConfig):
             raise ValueError(
                 f"Invalid build_cache_config: {self.enable_build_cache}")
+        return self
+
+    @model_validator(mode="after")
+    def validate_kv_cache_dtype(self):
+        assert self.kv_cache_config.dtype == "auto", "KvCacheConfig.dtype is not supported by the TensorRT backend."
         return self
 
 
@@ -1810,9 +1820,6 @@ class TorchLlmArgs(BaseLlmArgs):
         "If true, will use the TRTLLM sampler instead of the PyTorch sampler. The TRTLLM sampler has a wide coverage of sampling strategies."
     )
 
-    kv_cache_dtype: str = Field(default="auto",
-                                description="Data type for KV cache.")
-
     enable_iter_perf_stats: bool = Field(
         default=False, description="Enable iteration performance statistics.")
 
@@ -1865,6 +1872,19 @@ class TorchLlmArgs(BaseLlmArgs):
                 'LOWPRECISION',
                 'MNNVL']] = Field(default='AUTO',
                                   description="Allreduce strategy to use.")
+
+    # PrivateVars
+    _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
+
+    @property
+    def quant_config(self) -> QuantConfig:
+        if self._quant_config is None:
+            self._quant_config = QuantConfig()
+        return self._quant_config
+
+    @quant_config.setter
+    def quant_config(self, value: QuantConfig):
+        self._quant_config = value
 
     # TODO: remove backend later
     @field_validator('backend', mode='before')
@@ -1993,6 +2013,22 @@ class TorchLlmArgs(BaseLlmArgs):
 
         return self
 
+    @model_validator(mode='after')
+    def sync_quant_config_with_kv_cache_config_dtype(self) -> 'TorchLlmArgs':
+        if self.kv_cache_config is None:
+            return self
+
+        assert self.quant_config is not None
+        if self.kv_cache_config.dtype == "auto":
+            return self
+        elif self.kv_cache_config.dtype == 'fp8':
+            self.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+        else:
+            logger.warning(
+                f"Cannot sync quant_config.kv_cache_quant_algo with kv_cache_config.dtype of {self.kv_cache_config.dtype}, "
+                "please update the validator")
+        return self
+
     # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
     def get_pytorch_backend_config(self) -> "PyTorchConfig":
         from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
@@ -2016,7 +2052,7 @@ class TorchLlmArgs(BaseLlmArgs):
             moe_backend=self.moe_config.backend,
             enable_mixed_sampler=self.enable_mixed_sampler,
             enable_trtllm_sampler=self.enable_trtllm_sampler,
-            kv_cache_dtype=self.kv_cache_dtype,
+            kv_cache_dtype=self.kv_cache_config.dtype,
             enable_iter_perf_stats=self.enable_iter_perf_stats,
             enable_iter_req_stats=self.enable_iter_req_stats,
             print_iter_log=self.print_iter_log,
@@ -2083,7 +2119,8 @@ def update_llm_args_with_extra_options(llm_args: Dict,
     return llm_args
 
 
-def get_model_format(model_dir: str) -> _ModelFormatKind:
+def get_model_format(model_dir: str,
+                     trust_remote_code: bool = False) -> _ModelFormatKind:
     ''' Get the format of the model.  '''
     if not (Path(model_dir) / 'config.json').exists():
         raise ValueError(
@@ -2102,7 +2139,8 @@ def get_model_format(model_dir: str) -> _ModelFormatKind:
             PretrainedConfig.from_checkpoint(model_dir)
         else:
             model_format = _ModelFormatKind.HF
-            AutoConfig.from_hugging_face(model_dir)
+            AutoConfig.from_hugging_face(model_dir,
+                                         trust_remote_code=trust_remote_code)
     except Exception as e:
         raise ValueError(
             f"Inferred model format {model_format}, but failed to load config.json: {e}"

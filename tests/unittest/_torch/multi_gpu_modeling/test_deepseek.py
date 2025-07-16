@@ -63,7 +63,6 @@ def test_deepseek_streaming(model_name, backend, quant, tp_size):
 
     pytorch_config = dict(
         disable_overlap_scheduler=True,
-        kv_cache_dtype="auto",
         attn_backend=backend,
     )
     moe_config = MoeConfig(max_num_tokens=moe_max_num_tokens)
