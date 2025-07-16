@@ -1,5 +1,5 @@
 # Sampling
-The PyTorch backend supports most of the sampling features that are supported on the C++ backend, such as temperature, top-k and top-p sampling, beam search, stop words, bad words, penalty, context and generation logits, and log probability.
+The PyTorch backend supports most of the sampling features that are supported on the C++ backend, such as temperature, top-k and top-p sampling, beam search, stop words, bad words, penalty, context and generation logits, log probability, guided decoding and logits processors
 
 ## General usage
 
@@ -59,3 +59,102 @@ sampling_params = SamplingParams(
 llm.generate(["Hello, my name is",
             "Hello, my name is"], sampling_params)
 ```
+
+## Guided decoding
+
+Guided decoding controls the generation outputs to conform to pre-defined structured formats, ensuring outputs follow specific schemas or patterns.
+
+The PyTorch backend supports guided decoding with the [XGrammar](https://github.com/mlc-ai/xgrammar) backend and the following formats:
+- JSON
+- Regular expressions
+- Extended Backus-Naur form (EBNF) grammar
+- Structural tags
+
+To enable guided decoding, you must:
+
+1. Set the `guided_decoding_backend` parameter to `'xgrammar'` in the `LLM` class
+2. Disable overlap scheduling using the `disable_overlap_scheduler` parameter of the `LLM` class
+3. Create a `GuidedDecodingParams` object with the desired format specification
+  * Note: Depending on the type of format, a different parameter needs to be chosen to construct the object (`json`, `regex`, `grammar`, `strucutral_tag`).
+4. Pass the `GuidedDecodingParams` object to the `guided_decoding` parameter of the `SamplingParams` object
+
+The following example demonstrates guided decoding with JSON format:
+
+```python
+from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm.llmapi import GuidedDecodingParams
+
+llm = LLM(model='nvidia/Llama-3.1-8B-Instruct-FP8',
+          guided_decoding_backend='xgrammar',
+          disable_overlap_scheduler=True)
+structure = '{"title": "Example JSON", "type": "object", "properties": {...}}'
+guided_decoding_params = GuidedDecodingParams(json=structure)
+sampling_params = SamplingParams(
+        guided_decoding=guided_decoding_params,
+    )
+llm.generate(["Generate a JSON response"], sampling_params)
+```
+
+You can find a more detailed example on guided decoding [here](../../../../examples/llm-api/llm_guided_decoding.py).
+
+## Logits processor
+
+Logits processors allow you to modify the logits produced by the network before sampling, enabling custom generation behavior and constraints.
+
+The PyTorch backend supports two types of logits processing:
+- **Per-prompt processing**: Processes logits for each prompt individually, providing fine-grained control
+- **Batched processing**: Processes logits for the entire batch together, optimizing performance for larger batch sizes
+
+### Per-prompt logits processing
+
+To use a custom logits processor for individual prompts:
+
+1. Create a custom class that inherits from `LogitsProcessor` and implements the `__call__` method
+2. Pass an instance of this class to the `logits_processor` parameter of `SamplingParams`
+
+The following example demonstrates per-prompt logits processing:
+
+```python
+from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm.sampling_params import LogitsProcessor
+
+class MyCustomLogitsProcessor(LogitsProcessor):
+    def __call__(self, input_ids, logits):
+        # Implement your custom logits processing logic
+        return logits
+
+llm = LLM(model='nvidia/Llama-3.1-8B-Instruct-FP8')
+sampling_params = SamplingParams(
+        logits_processor=MyCustomLogitsProcessor()
+    )
+llm.generate(["Hello, my name is"], sampling_params)
+```
+
+### Batched logits processing
+
+To use a custom logits processor for batch processing:
+
+1. Create a custom class that inherits from `BatchedLogitsProcessor` and implements the `__call__` method
+2. Pass an instance of this class to the `batched_logits_processor` parameter of the `LLM` class
+3. Set `apply_batched_logits_processor=True` in `SamplingParams`
+
+The following example demonstrates batched logits processing:
+
+```python
+from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm.sampling_params import BatchedLogitsProcessor
+
+class MyCustomBatchedLogitsProcessor(BatchedLogitsProcessor):
+    def __call__(self, input_ids, logits):
+        # Implement your custom batched logits processing logic
+        return logits
+
+llm = LLM(model='nvidia/Llama-3.1-8B-Instruct-FP8',
+          batched_logits_processor=MyCustomBatchedLogitsProcessor())
+sampling_params = SamplingParams(
+        apply_batched_logits_processor=True
+    )
+llm.generate(["Hello, my name is", "Hello, my name is"], sampling_params)
+```
+
+A detailed example for logits post processing is provided [here](../../../../examples/llm-api/llm_logits_processor.py).
