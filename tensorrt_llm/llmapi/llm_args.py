@@ -1286,7 +1286,8 @@ class BaseLlmArgs(BaseModel):
                 'pytorch', '_autodeploy'
         ]:
             # Load parallel_config from the engine.
-            model_format = get_model_format(self.model)
+            model_format = get_model_format(
+                self.model, trust_remote_code=self.trust_remote_code)
 
             if model_format is _ModelFormatKind.TLLM_ENGINE:
                 if self.build_config is not None:
@@ -2083,7 +2084,8 @@ def update_llm_args_with_extra_options(llm_args: Dict,
     return llm_args
 
 
-def get_model_format(model_dir: str) -> _ModelFormatKind:
+def get_model_format(model_dir: str,
+                     trust_remote_code: bool = False) -> _ModelFormatKind:
     ''' Get the format of the model.  '''
     if not (Path(model_dir) / 'config.json').exists():
         raise ValueError(
@@ -2102,7 +2104,8 @@ def get_model_format(model_dir: str) -> _ModelFormatKind:
             PretrainedConfig.from_checkpoint(model_dir)
         else:
             model_format = _ModelFormatKind.HF
-            AutoConfig.from_hugging_face(model_dir)
+            AutoConfig.from_hugging_face(model_dir,
+                                         trust_remote_code=trust_remote_code)
     except Exception as e:
         raise ValueError(
             f"Inferred model format {model_format}, but failed to load config.json: {e}"
