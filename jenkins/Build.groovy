@@ -306,18 +306,19 @@ def uploadArtifacts(artifacts, prefix = UPLOAD_PATH, retryTimes = 2, serverId = 
     for (it in artifacts) {
         def uploadpath = it.key
         def filepath = it.value
-        echo "uploading ${filepath} as ${uploadpath}"
-        trtllm_utils.llmRetry(retryTimes, "uploadArtifacts", {
-            rtUpload (
-                serverId: serverId,
-                spec: """{
+        def spec = """{
                     "files": [
                         {
                         "pattern": "${filepath}",
                         "target": "${prefix}/${uploadpath}"
                         }
                     ]
-                }""",
+                }"""
+        echo "Uploading ${filepath} as ${uploadpath}. Spec: ${spec}"
+        trtllm_utils.llmRetry(retryTimes, "uploadArtifacts", {
+            rtUpload (
+                serverId: serverId,
+                spec: spec,
             )
         })
     }
@@ -428,7 +429,8 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
 
     // Build tritonserver artifacts
     def llmPath = sh (script: "realpath ${LLM_ROOT}",returnStdout: true).trim()
-    sh "cd ${LLM_ROOT}/triton_backend/inflight_batcher_llm && mkdir build && cd build && cmake .. -DTRTLLM_DIR=${llmPath} -DUSE_CXX11_ABI=ON && make -j${BUILD_JOBS} install"
+    // TODO: Remove after the cmake version is upgraded to 3.31.8
+    sh "cd ${LLM_ROOT}/triton_backend/inflight_batcher_llm && mkdir build && cd build && cmake .. -DTRTLLM_DIR=${llmPath} -DTRITON_COMMON_REPO_TAG=r25.05 -DTRITON_CORE_REPO_TAG=r25.05 -DTRITON_THIRD_PARTY_REPO_TAG=r25.05 -DTRITON_BACKEND_REPO_TAG=r25.05 -DUSE_CXX11_ABI=ON && make -j${BUILD_JOBS} install"
 
     // Step 3: packaging wheels into tarfile
     sh "cp ${LLM_ROOT}/build/tensorrt_llm-*.whl TensorRT-LLM/"

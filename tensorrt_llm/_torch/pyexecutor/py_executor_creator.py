@@ -20,8 +20,8 @@ from tensorrt_llm.quantization import QuantAlgo
 from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..distributed import MPIDist
 from ..speculative import get_spec_drafter, get_spec_resource_manager
-from ._util import (KvCacheCreator, create_py_executor_instance,
-                    instantiate_sampler, is_mla)
+from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
+                    create_py_executor_instance, instantiate_sampler, is_mla)
 from .config import PyTorchConfig
 from .config_utils import is_mla
 from .model_engine import PyTorchModelEngine
@@ -431,6 +431,8 @@ def create_py_executor(
                 garbage_collection_gen0_threshold=
                 garbage_collection_gen0_threshold,
             )
+
+    _adjust_torch_mem_fraction(executor_config.pytorch_backend_config)
 
     py_executor.start_worker()
     return py_executor

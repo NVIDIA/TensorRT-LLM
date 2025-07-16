@@ -22,6 +22,8 @@ _KV_CACHE_MAP = {
     QuantAlgo.NVFP4.value: "fp8",
 }
 
+ALL_SUPPORTED_BACKENDS = ["pytorch", "_autodeploy", "tensorrt"]
+
 
 def get_settings_from_engine(
     engine_path: Path
@@ -152,7 +154,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
             pass
 
     cuda_graph_config = {
-        "padding_enabled": True,
+        "enable_padding": True,
         "max_batch_size": max_batch_size
     }
 
