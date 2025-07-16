@@ -20,8 +20,8 @@ import tensorrt as trt
 import torch
 
 from .._common import default_net, precision
-from .._utils import (fp32_array, get_sm_version, int32_array, is_same_dtype,
-                      set_obj_attrs, trt_dtype_to_np, trt_dtype_to_str)
+from .._utils import (fp32_array, int32_array, is_same_dtype, set_obj_attrs,
+                      trt_dtype_to_np, trt_dtype_to_str)
 
 # isort: off
 from ..functional import (
@@ -1755,8 +1755,6 @@ class BertAttention(Module):
         if default_net().plugin_config.bert_attention_plugin:
             # TRT plugin mode
             assert input_lengths is not None
-            assert get_sm_version() < 100 or get_sm_version() >= 120, \
-                "bert_attention_plugin does not support SM100"
             context = bert_attention(
                 qkv,
                 input_lengths,
