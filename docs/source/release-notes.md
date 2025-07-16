@@ -23,8 +23,7 @@ All published functionality in the Release Notes has been fully tested and verif
   - Added EAGLE3 support for Qwen-3
   - Fused finalize and allreduce for Qwen-MoE model
   - Refactored Fused MoE module
-  - Added chunked attention kernels
-  - Integrated Hopper chunked attention kernels
+  - Added support for chunked attention on Blackwell
   - Introduced sliding-window attention kernels for the generation phase on Blackwell
   - Updated DeepSeek FP8 TRT-LLM Gen cubins
   - Added FP8 block-scale GEMM support on SM89
@@ -33,9 +32,10 @@ All published functionality in the Release Notes has been fully tested and verif
   - Added model-agnostic one-engine eagle3
   - Enabled Finalize + Allreduce + add + rmsnorm fusion
   - Integrated TRT-LLM Gen FP8 block scale MoE with Pytorch workflow kernel autotuner
+  - Added support for Eagle3 + disaggregated serving in two model speculative decoding flow
 - Benchmark:
   - Added all_reduce.py benchmark script for testing
-  - Added beam width to low latency
+  - Added beam width to trtllm-bench latency command
   - Fixed trtllm-bench iter_stats and cuda_graph_batch_sizes errors
   - Enabled trtllm-bench to run LoRA and add basic e2e perf testing capability for LoRA
   - Supported post_proc for bench
@@ -65,6 +65,7 @@ All published functionality in the Release Notes has been fully tested and verif
 - Fixed index out of bounds error in spec decoding (#5954)
 - Fixed MTP illegal memory access in cuda graph warmup (#5947)
 - Fixed no free slots error with spec decode + disagg (#5975)
+- Fixed one-off attention window size for Gemma3 1B (#5564)
 
 ### Known Issues
 - accuracy/test_cli_flow::TestGpt2::test_beam_search_large is broken
