@@ -58,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc3';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -69,7 +69,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc2" />
+  <meta name="docsearch:version" content="1.0.0rc3" />
 
 
   </head>
@@ -347,6 +347,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
@@ -407,7 +408,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../advanced/kv-cache-management.html">KV Cache Management: Pools, Blocks, and Events</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/disaggregated-service.html">Disaggregated-Service (Experimental)</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul class="nav bd-sidenav">
@@ -614,8 +615,8 @@ For the draft stage in MTP, there are two different MTP methods, MTP vanilla and
 </section>
 <section id="how-to-run-deepseek-models-with-mtp">
 <h3>How to run DeepSeek models with MTP<a class="headerlink" href="#how-to-run-deepseek-models-with-mtp" title="Link to this heading">#</a></h3>
-<p>Run DeepSeek-V3/R1 models with MTP, use <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/pytorch/quickstart_advanced.py">examples/pytorch/quickstart_advanced.py</a> with additional options:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>examples/pytorch
+<p>Run DeepSeek-V3/R1 models with MTP, use <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/llm-api/quickstart_advanced.py">examples/llm-api/quickstart_advanced.py</a> with additional options:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>examples/llm-api
 python<span class="w"> </span>quickstart_advanced.py<span class="w"> </span>--model_dir<span class="w"> </span>&lt;YOUR_MODEL_DIR&gt;<span class="w"> </span>--spec_decode_algo<span class="w"> </span>MTP<span class="w"> </span>--spec_decode_nextn<span class="w"> </span>N
 </pre></div>
 </div>
@@ -663,8 +664,8 @@ trtllm-bench<span class="w"> </span>--model<span class="w"> </span>nvidia/DeepSe
 </section>
 <section id="how-to-run-the-deepseek-r1-model-with-relaxed-acceptance">
 <h3>How to run the DeepSeek-R1 model with Relaxed Acceptance<a class="headerlink" href="#how-to-run-the-deepseek-r1-model-with-relaxed-acceptance" title="Link to this heading">#</a></h3>
-<p>Run DeepSeek-R1 models with MTP Relaxed Acceptance, use <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/pytorch/quickstart_advanced.py">examples/pytorch/quickstart_advanced.py</a> with additional options:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>examples/pytorch
+<p>Run DeepSeek-R1 models with MTP Relaxed Acceptance, use <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/llm-api/quickstart_advanced.py">examples/llm-api/quickstart_advanced.py</a> with additional options:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>examples/llm-api
 python<span class="w"> </span>quickstart_advanced.py<span class="w"> </span>--model_dir<span class="w"> </span>&lt;YOUR_MODEL_DIR&gt;<span class="w"> </span>--spec_decode_algo<span class="w"> </span>MTP<span class="w"> </span>--spec_decode_nextn<span class="w"> </span>N<span class="w"> </span>--use_relaxed_acceptance_for_thinking<span class="w"> </span>--relaxed_topk<span class="w"> </span><span class="m">10</span><span class="w"> </span>--relaxed_delta<span class="w"> </span><span class="m">0</span>.6
 </pre></div>
 </div>
@@ -908,9 +909,9 @@ trtllm-bench<span class="w"> </span>--model<span class="w"> </span>nvidia/DeepSe
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 06, 2025.</p>
+  <p>Last updated on July 14, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/66f299a">66f299a</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cfcb97a">cfcb97a</a>.</p>
   
 </div></div>
       

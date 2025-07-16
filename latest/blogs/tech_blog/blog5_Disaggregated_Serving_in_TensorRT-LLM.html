@@ -58,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc3';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -68,7 +68,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc2" />
+  <meta name="docsearch:version" content="1.0.0rc3" />
 
 
   </head>
@@ -346,6 +346,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
@@ -406,7 +407,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../advanced/kv-cache-management.html">KV Cache Management: Pools, Blocks, and Events</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/disaggregated-service.html">Disaggregated-Service (Experimental)</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul class="nav bd-sidenav">
@@ -521,6 +522,11 @@
 <li><p><a class="reference internal" href="#ISL-4400---OSL-1200-Machine-Translation-Dataset"><span class="xref myst">ISL 4400 - OSL 1200 (Machine Translation Dataset)</span></a></p></li>
 <li><p><a class="reference internal" href="#ISL-8192---OSL-256-Synthetic-Dataset"><span class="xref myst">ISL 8192 - OSL 256 (Synthetic Dataset)</span></a></p></li>
 <li><p><a class="reference internal" href="#ISL-4096---OSL-1024-Machine-Translation-Dataset"><span class="xref myst">ISL 4096 - OSL 1024 (Machine Translation Dataset)</span></a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#Qwen-3"><span class="xref myst">Qwen 3</span></a></p>
+<ul>
+<li><p><a class="reference internal" href="#ISL-8192---OSL-1024-Machine-Translation-Dataset"><span class="xref myst">ISL 8192 - OSL 1024 (Machine Translation Dataset)</span></a></p></li>
 </ul>
 </li>
 <li><p><a class="reference internal" href="#Reproducing-Steps"><span class="xref myst">Reproducing Steps</span></a></p></li>
@@ -741,6 +747,19 @@ $\frac{\text{Total Output Tokens/sec}}{\left(\frac{\text{NumCtxGPUs} \times \tex
 <p>For Pareto curves with MTP = 1, 2, 3, it can be observed that disaggregated results show a <strong>1.7x</strong> improvement over aggregated results at 50 tokens/sec/user (20 ms latency). Enabling MTP provides a larger speedup at higher concurrencies.</p>
 </section>
 </section>
+<section id="qwen-3">
+<h3>Qwen 3<a class="headerlink" href="#qwen-3" title="Link to this heading">#</a></h3>
+<section id="isl-8192-osl-1024-machine-translation-dataset">
+<h4>ISL 8192 - OSL 1024 (Machine Translation Dataset)<a class="headerlink" href="#isl-8192-osl-1024-machine-translation-dataset" title="Link to this heading">#</a></h4>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture15.png" width="640" height="auto" alt="Qwen 3 Pareto curves">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 15. Qwen 3 Pareto curves.</em></sub></p>
+<p>We also conducted performance evaluations of Qwen 3 on GB200 GPUs. The data indicate that the speedups achieved by disaggregation over aggregation range from 1.7x to 6.11x.</p>
+</section>
+</section>
 <section id="reproducing-steps">
 <h3>Reproducing Steps<a class="headerlink" href="#reproducing-steps" title="Link to this heading">#</a></h3>
 <p>We provide a set of scripts to reproduce the performance data presented in this paper. Please refer to the usage instructions described in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/docs/source/scripts/disaggregated">this document</a>.</p>
@@ -812,6 +831,10 @@ $\frac{\text{Total Output Tokens/sec}}{\left(\frac{\text{NumCtxGPUs} \times \tex
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#isl-4400-osl-1200-machine-translation-dataset">ISL 4400 - OSL 1200 (Machine Translation Dataset)</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#isl-8192-osl-256-synthetic-dataset">ISL 8192 - OSL 256 (Synthetic Dataset)</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#isl-4096-osl-1024-machine-translation-dataset">ISL 4096 - OSL 1024 (Machine Translation Dataset)</a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen-3">Qwen 3</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#isl-8192-osl-1024-machine-translation-dataset">ISL 8192 - OSL 1024 (Machine Translation Dataset)</a></li>
 </ul>
 </li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#reproducing-steps">Reproducing Steps</a></li>
@@ -913,9 +936,9 @@ $\frac{\text{Total Output Tokens/sec}}{\left(\frac{\text{NumCtxGPUs} \times \tex
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 06, 2025.</p>
+  <p>Last updated on July 14, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/66f299a">66f299a</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cfcb97a">cfcb97a</a>.</p>
   
 </div></div>
       
