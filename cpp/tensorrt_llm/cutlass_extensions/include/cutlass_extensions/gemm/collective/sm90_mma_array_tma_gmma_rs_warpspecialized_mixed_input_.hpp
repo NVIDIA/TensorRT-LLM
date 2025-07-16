@@ -30,36 +30,11 @@
 #include "cute/atom/mma_atom.hpp"
 #include "cute/numeric/arithmetic_tuple.hpp"
 
-#define GROUP_SIZE 128
-
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass::gemm::collective
 {
 using namespace cute;
-
-template <int N>
-CUTE_HOST_DEVICE void warpgroup_wait_()
-{
-#if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
-    cutlass::arch::synclog_emit_warpgroup_wait(__LINE__, N);
-    asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
-#else
-    CUTE_INVALID_CONTROL_PATH("Attempting to use wgmma.wait_group<N> without CUTE_ARCH_MMA_SM90A_ENABLED");
-#endif
-}
-
-CUTLASS_DEVICE void warpgroup_wait_dispatch(int onthefly_count)
-{
-    switch (onthefly_count)
-    {
-    case 0: warpgroup_wait_<0>(); break;
-    case 4: warpgroup_wait_<4>(); break;
-    case 8: warpgroup_wait_<8>(); break;
-    case 12: warpgroup_wait_<12>(); break;
-    default: assert(false && "Invalid onthefly_count value");
-    }
-}
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -91,7 +66,7 @@ public:
 private:
     template <class T>
     friend struct detail::MixedGroupedGemmInputUtils;
-    using CollectiveType = CollectiveMma<DispatchPolicy, TileShape_, ElementAOptionalTuple, StrideA_,
+    using CollectiveType = CollectiveMmaArrayMixedInput<DispatchPolicy, TileShape_, ElementAOptionalTuple, StrideA_,
         ElementBOptionalTuple, StrideB_, TiledMma_, GmemTiledCopyA_, SmemLayoutAtomA_, SmemCopyAtomA_, TransformA_,
         GmemTiledCopyB_, SmemLayoutAtomB_, SmemCopyAtomB_, TransformB_>;
     using Utils = detail::MixedGroupedGemmInputUtils<CollectiveType>;
@@ -145,6 +120,11 @@ public:
 
     static_assert(cutlass::gemm::detail::is_mn_major<NonVoidStrideScale>(),
         "Scale must be MN major [Col Major if A is scaled, Row Major if B is scaled].");
+
+    static constexpr bool IsMXFP4 = cute::is_same_v<ElementA, cutlass::float_e2m1_t>;
+    // Group size 128 for int4 weights
+    // Group size 32 for mxfp4 weights
+    static constexpr int ScalingGroupSize = IsMXFP4 ? detail::mxfp4_group_size : detail::int4_group_size;
 
     using CtaShape_MNK = decltype(shape_div(TileShape{}, ClusterShape{}));
     using TiledMma = TiledMma_;
@@ -268,6 +248,8 @@ public:
         || KernelConversionMode == ConversionMode::ConvertAndScaleWithZero;
     static constexpr bool UseScaleLookupTable
         = KernelConversionMode == ConversionMode::ConvertAndScale && cutlass::detail::is_Array_v<ElementScale>;
+    static constexpr bool UseFP4ToBF16LookupTable = KernelConversionMode == ConversionMode::ConvertAndScale
+        && cute::is_same_v<ElementA, cutlass::float_e2m1_t> && cute::is_same_v<ElementB, cutlass::bfloat16_t>;
     static constexpr size_t SmemAlignmentA = cutlass::detail::alignment_for_swizzle(SmemLayoutA{});
     static constexpr size_t SmemAlignmentB = cutlass::detail::alignment_for_swizzle(SmemLayoutB{});
     static constexpr size_t SmemAlignmentScale = cute::max(SmemAlignmentA, SmemAlignmentB);
@@ -705,7 +687,7 @@ public:
         {
             // The real scale_k that actually works
             // auto scale_k = K / mainloop_params.chunk_size;
-            auto scale_k = K / GROUP_SIZE;
+            auto scale_k = K / ScalingGroupSize;
 
             Tensor mS_mkl = mainloop_params.tma_load_scale.get_tma_tensor(make_shape(M, scale_k, L)); // (m,scale_k,l)
             Tensor gS_mkl = local_tile(mS_mkl, ScaleTileShape{}, make_coord(_, _)); // (BLK_M,BLK_Scale_K,m,scale_k,l)
@@ -872,7 +854,6 @@ public:
                 }
                 else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero)
                 {
-                    // zero copy
                     auto tZgZ = get<2>(extra_input_partitions);
                     auto tZsZ = get<3>(extra_input_partitions);
                     if (cute::elect_one_sync())
@@ -979,7 +960,8 @@ public:
                 return make_tensor_like<RealSwappedElementA>(tCsA(_, _, _, Int<0>{}));
             }
         }();
-        Tensor tCsB = mma_warpgroup_slice.partition_B(sB);       // (MMA,MMA_N,MMA_K,PIPE)
+        Tensor tCsB = mma_warpgroup_slice.partition_B(sB); // (MMA,MMA_N,MMA_K,PIPE)
+        // tCrB is just a view of the tensor tCsB
         Tensor tCrB = mma_warpgroup_slice.make_fragment_B(tCsB); // (MMA,MMA_N,MMA_K,PIPE)
 
         //
@@ -1013,8 +995,8 @@ public:
 
         multiply_add<ElementAccumulator> fma;
 
-        constexpr int NumMMAsPerChunk = GROUP_SIZE / cute::get<0, 1>(tCsB.shape())();
-        constexpr int NumChunksPerTileK = cute::size<1>(sA.shape())() / GROUP_SIZE;
+        constexpr int NumMMAsPerChunk = ScalingGroupSize / cute::get<0, 1>(tCsB.shape())();
+        constexpr int NumChunksPerTileK = cute::size<1>(sA.shape())() / ScalingGroupSize;
         cute::array<decltype(make_fragment_like(accum)), NumChunksPerTileK> intermediate_array;
 
         constexpr int K_BLOCK_MAX = size<2>(tCrA_load);
@@ -1044,8 +1026,6 @@ public:
 
             // src: tCrA_load, dst: tCrA_mma
             Utils::convert_A_kblock(tCrA_load, tCrA_mma, 0);
-
-            tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
 
             // Unroll the K mode manually to set scale D to 1
             CUTLASS_PRAGMA_UNROLL
@@ -1079,10 +1059,11 @@ public:
                 }
             }
 
+            warpgroup_wait<0>();
+
             CUTLASS_PRAGMA_UNROLL
             for (int chunk_id_ = 0; chunk_id_ < NumChunksPerTileK; ++chunk_id_)
             {
-                warpgroup_wait_dispatch((NumChunksPerTileK - chunk_id_ - 1) * NumMMAsPerChunk);
                 warpgroup_fence_operand(intermediate_array[chunk_id_]);
 
                 // Apply the group-wise scaling
@@ -1129,7 +1110,6 @@ public:
                 Utils::copy_tensors_MK(smem_tiled_copy_A, tCsA, tCrA_copy_view, partitioned_extra_info,
                     copy_partitions_extra_info, 1, smem_pipe_read.index());
 
-                warpgroup_wait<K_WAIT_MAX>();
                 Utils::convert_A_kblock(tCrA_load, tCrA_mma, 0);
             }
         }
@@ -1169,8 +1149,6 @@ public:
                     tiled_mma.accumulate_ = GMMA::ScaleOut::One;
                     warpgroup_commit_batch();
 
-                    warpgroup_wait<K_WAIT_MAX>(); // We have K_BLOCK_MAX - 1 GMMA instructions pending for this stage,
-                                                  // so we can release prior barrier
                     if (k_block == K_BLOCK_MAX - 1)
                     {
                         pipeline.consumer_release(
@@ -1187,10 +1165,11 @@ public:
                     {
                         // The last k_block
 
+                        warpgroup_wait<0>();
+
                         CUTLASS_PRAGMA_UNROLL
                         for (int chunk_id_ = 0; chunk_id_ < NumChunksPerTileK; ++chunk_id_)
                         {
-                            warpgroup_wait_dispatch((NumChunksPerTileK - chunk_id_ - 1) * NumMMAsPerChunk);
                             warpgroup_fence_operand(intermediate_array[chunk_id_]);
 
                             // Apply the group-wise scaling
@@ -1257,7 +1236,6 @@ public:
                 tiled_mma.accumulate_ = GMMA::ScaleOut::One;
                 warpgroup_commit_batch();
 
-                warpgroup_wait<K_WAIT_MAX>();
                 if (k_block == K_BLOCK_MAX - 1)
                 {
                     // release prior barrier
@@ -1318,7 +1296,7 @@ public:
         smem_pipe_release.advance(k_tile_count);
 
         // Wait on all GMMAs to complete
-        warpgroup_wait<0>();
+        // warpgroup_wait<0>();
 
         for (int count = 0; count < prologue_mma_count; ++count)
         {
@@ -1462,7 +1440,7 @@ public:
         {
             NonVoidElementScale const* ptr_S = nullptr;
             // auto scale_k = K / mainloop_params.chunk_size;
-            auto scale_k = K / GROUP_SIZE;
+            auto scale_k = K / ScalingGroupSize;
             Tensor tensor_scale = make_tensor(
                 detail::get_logical_ptr(ptr_S), make_shape(M, scale_k, Int<1>{}), mainloop_params.dS[next_group]);
             cute::detail::fill_tma_gmem_shape_stride(
@@ -1472,7 +1450,7 @@ public:
         {
             ElementZero const* ptr_Z = nullptr;
             // auto scale_k = K / mainloop_params.chunk_size;
-            auto scale_k = K / GROUP_SIZE;
+            auto scale_k = K / ScalingGroupSize;
             Tensor tensor_zero = make_tensor(
                 detail::get_logical_ptr(ptr_Z), make_shape(M, scale_k, Int<1>{}), mainloop_params.dS[next_group]);
             cute::detail::fill_tma_gmem_shape_stride(

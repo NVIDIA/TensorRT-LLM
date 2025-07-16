@@ -419,7 +419,7 @@ public:
             CudaBuffer ref_scale(scale_out_size);
             // Here, we also only compare the accuracy of quantization. Since there are no differences in
             // computation order, atol is set to 0.
-            invokeFP4Quantization(token_num, hidden_dim, m_norm_out.device_data<DType>(),
+            invokeFP4Quantization(1, token_num, hidden_dim, m_norm_out.device_data<DType>(),
                 m_scale_factor.device_data<float>(), ref_output.device_data<int64_t>(),
                 ref_scale.device_data<int32_t>(), false, tensorrt_llm::QuantizationSFLayout::SWIZZLED, 128, 0);
             TLLM_CHECK(compare<int8_t>(
@@ -460,7 +460,7 @@ public:
 
     void run_fp4_quant(int token_num, int hidden_dim)
     {
-        invokeFP4Quantization(token_num, hidden_dim, m_norm_out.device_data<DType>(),
+        invokeFP4Quantization(1, token_num, hidden_dim, m_norm_out.device_data<DType>(),
             m_scale_factor.device_data<float>(), m_quant_out.device_data<int64_t>(), m_scale_out.device_data<int32_t>(),
             false, tensorrt_llm::QuantizationSFLayout::SWIZZLED, 128, m_stream->get());
     }

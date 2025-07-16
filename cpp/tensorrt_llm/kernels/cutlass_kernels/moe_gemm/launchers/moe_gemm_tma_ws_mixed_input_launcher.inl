@@ -85,15 +85,14 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, 
     /////////////////////////////////////////////////////////////////////////////////////////////////
 
     // A matrix configuration
-    // using ElementA = typename TllmToCutlassTypeAdapter<T>::type;
-    using ElementA = cutlass::float_e4m3_t;
+    using ElementA = typename TllmToCutlassTypeAdapter<T>::type;
     using LayoutA = cutlass::layout::RowMajor;         // Layout type for A matrix operand
     constexpr int AlignmentA
         = 128 / cutlass::sizeof_bits<ElementA>::value; // Alignment of A matrix in units of elements (up to 16 bytes)
 
     // B matrix configuration
-    // using ElementB = typename TllmToCutlassTypeAdapter<WeightType>::type;
-    using ElementB = typename cutlass::int4b_t;
+    using ElementB_ = typename TllmToCutlassTypeAdapter<WeightType>::type;
+    using ElementB = std::conditional_t<std::is_same_v<WeightType, cutlass::uint4b_t>, cutlass::int4b_t, ElementB_>;
     using LayoutB = cutlass::layout::ColumnMajor;      // Layout type for B matrix operand
     constexpr int AlignmentB
         = 128 / cutlass::sizeof_bits<ElementB>::value; // Memory access granularity/alignment of B matrix in units of
@@ -108,9 +107,13 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, 
     using StrideB = cute::remove_pointer_t<cutlass::detail::TagToStrideB_t<LayoutB*>>;
 
     // Scale configuration
-    constexpr int PackedScalesNum = get<2>(CTAShape{}) / 128;
-    using ElementScalePacked
-        = cutlass::Array<TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA, PackedScalesNum>;
+    constexpr bool use_wfp4a16 = std::is_same_v<ElementB, cutlass::float_e2m1_t>;
+    constexpr int group_size = use_wfp4a16 ? cutlass::gemm::collective::detail::mxfp4_group_size
+                                           : cutlass::gemm::collective::detail::int4_group_size;
+    constexpr int PackedScalesNum = get<2>(CTAShape{}) / group_size;
+    using ElementScale = std::conditional_t<use_wfp4a16, cutlass::float_ue8m0_t,
+        TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA>;
+    using ElementScalePacked = cutlass::Array<ElementScale, PackedScalesNum>;
     using LayoutScale = cutlass::layout::RowMajor;
 
     // C/D matrix configuration
@@ -170,20 +173,21 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, 
     Args arguments;
 
     decltype(arguments.epilogue.thread) fusion_args;
-    fusion_args.alpha = 0;
+    fusion_args.alpha = use_wfp4a16 ? 1 : 0;
     fusion_args.beta = 0;
     fusion_args.alpha_ptr = nullptr;
     fusion_args.beta_ptr = nullptr;
-    fusion_args.alpha_ptr_array = inputs.alpha_scales;
+    fusion_args.alpha_ptr_array = use_wfp4a16 ? nullptr : inputs.alpha_scales;
     fusion_args.beta_ptr_array = nullptr;
     // One alpha and beta per each group
-    fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 1};
-    fusion_args.dBeta = {cute::_0{}, cute::_0{}, 1};
+    fusion_args.dAlpha = {cute::_0{}, cute::_0{}, use_wfp4a16 ? 0 : 1};
+    fusion_args.dBeta = {cute::_0{}, cute::_0{}, use_wfp4a16 ? 0 : 1};
 
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = 0;
     hw_info.sm_count = sm_count_;
 
+    assert(group_size == int(inputs.groupwise_quant_group_size));
     if (workspace_size != nullptr)
     {
         const Args args{cutlass::gemm::GemmUniversalMode::kGrouped,
@@ -191,7 +195,7 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, 
             {reinterpret_cast<ElementB const**>(hopper_inputs.ptr_b), hopper_inputs.stride_b,
                 reinterpret_cast<ElementA const**>(hopper_inputs.ptr_a), hopper_inputs.stride_a,
                 reinterpret_cast<ElementScalePacked const**>(hopper_inputs.int4_groupwise_params.ptr_s_a),
-                hopper_inputs.int4_groupwise_params.stride_s_a, int(inputs.groupwise_quant_group_size)},
+                hopper_inputs.int4_groupwise_params.stride_s_a, group_size},
             {fusion_args, reinterpret_cast<ElementC const**>(hopper_inputs.ptr_c), hopper_inputs.stride_c,
                 reinterpret_cast<ElementD**>(hopper_inputs.default_epilogue.ptr_d),
                 hopper_inputs.default_epilogue.stride_d},
@@ -205,7 +209,7 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, 
         {reinterpret_cast<ElementB const**>(hopper_inputs.ptr_b), hopper_inputs.stride_b,
             reinterpret_cast<ElementA const**>(hopper_inputs.ptr_a), hopper_inputs.stride_a,
             reinterpret_cast<ElementScalePacked const**>(hopper_inputs.int4_groupwise_params.ptr_s_a),
-            hopper_inputs.int4_groupwise_params.stride_s_a, int(inputs.groupwise_quant_group_size)},
+            hopper_inputs.int4_groupwise_params.stride_s_a, group_size},
         {fusion_args, reinterpret_cast<ElementC const**>(hopper_inputs.ptr_c), hopper_inputs.stride_c,
             reinterpret_cast<ElementD**>(hopper_inputs.default_epilogue.ptr_d),
             hopper_inputs.default_epilogue.stride_d},

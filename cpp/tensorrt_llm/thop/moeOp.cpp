@@ -95,13 +95,13 @@ public:
     };
 
     FusedMoeRunner(c10::ScalarType activation_dtype, c10::ScalarType weight_dtype, c10::ScalarType output_dtype,
-        bool use_deepseek_fp8_block_scale, bool use_w4a8_group_scaling, bool use_mxfp8_act_scaling)
+        bool use_deepseek_fp8_block_scale, bool use_w4_group_scaling, bool use_mxfp8_act_scaling)
     {
         mActivationDtype = activation_dtype;
         mWeightDtype = weight_dtype;
         mOutputDtype = output_dtype;
         mUseDeepSeekFP8BlockScaling = use_deepseek_fp8_block_scale;
-        mUseW4A8GroupScaling = use_w4a8_group_scaling;
+        mUseW4GroupScaling = use_w4_group_scaling;
         mUseMxfp8ActScaling = use_mxfp8_act_scaling;
         mInnerDimMultiplier = 1;
 
@@ -151,6 +151,21 @@ public:
             }
         }
 
+        if (isWFP4A16Quant())
+        {
+            mInnerDimMultiplier = 2;
+            if (mActivationDtype == c10::ScalarType::Half)
+            {
+                mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<half, __nv_fp4_e2m1>>();
+            }
+#ifdef ENABLE_BF16
+            else if (mActivationDtype == c10::ScalarType::BFloat16)
+            {
+                mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, __nv_fp4_e2m1>>();
+            }
+#endif
+        }
+
 #endif
         if (isInt4Quant())
         {
@@ -158,7 +173,7 @@ public:
             if (mActivationDtype == c10::ScalarType::Half)
             {
 #ifdef ENABLE_FP8
-                if (mUseW4A8GroupScaling)
+                if (mUseW4GroupScaling)
                 {
                     mKernelRunner
                         = std::make_unique<kernels::CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, half, half>>();
@@ -175,7 +190,7 @@ public:
             else if (mActivationDtype == c10::ScalarType::BFloat16)
             {
 #ifdef ENABLE_FP8
-                if (mUseW4A8GroupScaling)
+                if (mUseW4GroupScaling)
                 {
                     mKernelRunner = std::make_unique<
                         kernels::CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, __nv_bfloat16, __nv_bfloat16>>();
@@ -544,7 +559,11 @@ public:
         int64_t const num_rows = input.sizes()[0];
         int64_t const hidden_size = fc2_expert_weights.sizes()[1];
         int64_t const inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
-        int64_t const group_size = isInt4Quant() ? 128 : -1;
+        int64_t const group_size_
+            = isInt4Quant() ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::int4_group_size : -1;
+        int64_t const group_size = isWFP4A16Quant()
+            ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::wfp4a16_group_size
+            : group_size_;
         int const num_experts = static_cast<int>(fc2_expert_weights.sizes()[0] * ep_size);
 
         // Get specific profile configs according to the profile_id.
@@ -571,7 +590,8 @@ public:
 
             bool const USE_BIAS = fc1_expert_biases.has_value() || fc2_expert_biases.has_value();
             bool const USE_LORA = false;
-            auto activation_dtype = mUseW4A8GroupScaling ? at::ScalarType::Float8_e4m3fn : mActivationDtype;
+            auto activation_dtype
+                = (mUseW4GroupScaling && !isWFP4A16Quant()) ? at::ScalarType::Float8_e4m3fn : mActivationDtype;
             activation_dtype = isNvfp4Quant() ? at::ScalarType::Long : activation_dtype;
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
             mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile,
@@ -620,7 +640,7 @@ private:
     char* mProfileWorkspace = nullptr;
 
     bool mUseDeepSeekFP8BlockScaling = false;
-    bool mUseW4A8GroupScaling = false;
+    bool mUseW4GroupScaling = false;
     bool mUseMxfp8ActScaling = false;
 
     using Profile = tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
@@ -669,7 +689,7 @@ private:
     {
         size_t moe_workspace_size = mKernelRunner->getWorkspaceSize(num_rows, hidden_size, inter_size, num_experts,
             experts_per_token, activation_type, parallelismConfig, /* use_lora */ false, mUseDeepSeekFP8BlockScaling,
-            min_latency_mode, mUseW4A8GroupScaling);
+            min_latency_mode, mUseW4GroupScaling);
         size_t src_to_dest_map_size = experts_per_token * num_rows * sizeof(int);
 
         std::vector<size_t> workspaces{moe_workspace_size, src_to_dest_map_size};
@@ -907,10 +927,23 @@ private:
             return kernels::QuantParams::FP8BlockScaling(
                 static_cast<float const*>(fc1_scales.data_ptr()), static_cast<float const*>(fc2_scales.data_ptr()));
         }
+        else if (isWFP4A16Quant())
+        {
+            TORCH_CHECK(quant_scales.has_value(), "Expecting quant scales for W4 quantization");
+            TORCH_CHECK(quant_scales.value().size() == 2, "Expecting 8 quant scales for W4A16 quantization");
+
+            auto& fc1_weight_scales = quant_scales.value()[0];
+            auto& fc2_weight_scales = quant_scales.value()[1];
+            int group_size = TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::wfp4a16_group_size;
+            return kernels::QuantParams::GroupWise(group_size, static_cast<void const*>(fc1_weight_scales.data_ptr()),
+                static_cast<void const*>(fc2_weight_scales.data_ptr()), nullptr, nullptr, nullptr, nullptr, nullptr,
+                nullptr);
+        }
         else if (isInt4Quant())
         {
-            TORCH_CHECK(quant_scales.has_value(), "Expecting quant scales for INT4 quantization");
-            TORCH_CHECK(quant_scales.value().size() == 8, "Expecting 8 quant scales for INT4 quantization");
+            TORCH_CHECK(quant_scales.has_value(), "Expecting quant scales for W4 quantization");
+            TORCH_CHECK(quant_scales.value().size() == 8, "Expecting 8 quant scales for W4A8 quantization");
+
             auto& fc1_weight_scales = quant_scales.value()[0];
             auto& fc2_weight_scales = quant_scales.value()[1];
             auto& fc1_act_scales = quant_scales.value()[2];
@@ -919,7 +952,7 @@ private:
             auto& fc2_weight_zeros = quant_scales.value()[5];
             auto& fc1_alpha = quant_scales.value()[6];
             auto& fc2_alpha = quant_scales.value()[7];
-            int group_size = 128;
+            int group_size = TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::int4_group_size;
             return kernels::QuantParams::GroupWise(group_size, static_cast<void const*>(fc1_weight_scales.data_ptr()),
                 static_cast<void const*>(fc2_weight_scales.data_ptr()),
                 static_cast<void const*>(fc1_act_scales.numel() > 0 ? fc1_act_scales.data_ptr() : nullptr),
@@ -945,6 +978,11 @@ private:
     {
         return mWeightDtype == c10::ScalarType::Long
             && mActivationDtype != c10::ScalarType::Float8_e4m3fn; // FP8 activation does not use FP4
+    }
+
+    bool isWFP4A16Quant() const
+    {
+        return mUseW4GroupScaling && mWeightDtype == c10::ScalarType::Byte;
     }
 
     bool isInt4Quant() const

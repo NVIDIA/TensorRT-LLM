@@ -12,7 +12,7 @@ from .quantization import (
     DeepSeekFP8BlockScalesFusedMoEMethod, FP8QDQFusedMoEMethod,
     MoEWeightLoadingMode, NVFP4CutlassFusedMoEMethod, UnquantizedFusedMoEMethod,
     W4A8MXFP4FP8CutlassFusedMoEMethod, W4A8MXFP4MXFP8CutlassFusedMoEMethod,
-    WInt4AFP8FusedMoEMethod)
+    WFP4A16FusedMoEMethod, WInt4AFP8FusedMoEMethod)
 # isort: on
 from .routing import BaseMoeRoutingMethod
 
@@ -64,6 +64,10 @@ class CutlassFusedMoE(MoE):
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
     ):
+
+        if model_config.quant_config and model_config.quant_config.layer_quant_mode.has_w4a16_mxfp4(
+        ):
+            hidden_size = ((hidden_size + 127) // 128) * 128
 
         super().__init__(
             routing_method=routing_method,
@@ -143,6 +147,7 @@ class CutlassFusedMoE(MoE):
                     | self.quant_config.quant_mode.
                     is_int4_weight_only_per_group()
                     | self.quant_config.quant_mode.has_w4a8_mxfp4_fp8()
+                    | self.quant_config.quant_mode.has_w4a16_mxfp4()
                     | self.quant_config.quant_mode.has_w4a8_mxfp4_mxfp8()):
                 raise ValueError(
                     f"unsupported quantization mode: {self.quant_config.quant_mode}"
@@ -168,6 +173,8 @@ class CutlassFusedMoE(MoE):
                 return WInt4AFP8FusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8():
                 return W4A8MXFP4FP8CutlassFusedMoEMethod()
+            elif self.quant_config.layer_quant_mode.has_w4a16_mxfp4():
+                return WFP4A16FusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_w4a8_mxfp4_mxfp8():
                 return W4A8MXFP4MXFP8CutlassFusedMoEMethod()
             else:
@@ -220,7 +227,7 @@ class CutlassFusedMoE(MoE):
         run_post_quant_allgather = self.use_dp and self.parallel_size > 1
         # quantize inputs
         use_deepseek_fp8_block_scale = False
-        use_w4a8_group_scaling = False
+        use_w4_group_scaling = False
         use_mxfp8_act_scaling = False
         weight_dtype = self.w3_w1_weight.dtype
         x_sf = None
@@ -231,8 +238,15 @@ class CutlassFusedMoE(MoE):
             elif self.has_deepseek_fp8_block_scales:
                 use_deepseek_fp8_block_scale = True
             elif self.has_w4afp8:
-                use_w4a8_group_scaling = True
+                use_w4_group_scaling = True
                 weight_dtype = torch.quint4x2
+            elif self.has_w4a16_mxfp4:
+                pad_size = self.hidden_size - x.shape[1]
+                original_hidden_size = x.shape[1]
+                x = torch.nn.functional.pad(x, (0, pad_size))
+
+                use_w4_group_scaling = True
+                weight_dtype = torch.uint8
             elif self.has_nvfp4:
                 if run_post_quant_allgather:
                     if isinstance(x, Fp4QuantizedTensor):
@@ -307,7 +321,7 @@ class CutlassFusedMoE(MoE):
             cluster_rank=self.cluster_rank,
             enable_alltoall=self.enable_alltoall,
             use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
-            use_w4a8_group_scaling=use_w4a8_group_scaling,
+            use_w4_group_scaling=use_w4_group_scaling,
             use_mxfp8_act_scaling=use_mxfp8_act_scaling,
             min_latency_mode=False,
             tune_max_num_tokens=self.tune_max_num_tokens,
@@ -319,6 +333,11 @@ class CutlassFusedMoE(MoE):
         # TODO: Fuse this for padded MXFP4.
         final_hidden_states = final_hidden_states[:, :self.
                                                   hidden_size].contiguous()
+
+        if self.has_w4a16_mxfp4:
+            final_hidden_states = final_hidden_states[:, :
+                                                      original_hidden_size].contiguous(
+                                                      )
 
         return final_hidden_states
 

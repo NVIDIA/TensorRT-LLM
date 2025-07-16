@@ -1160,7 +1160,12 @@ __device__ void computeTmaWarpSpecializedInputStrides(
     {
         layout_info.int4_groupwise_params.stride_s_a[out_idx]
             = cutlass::make_cute_packed_stride(TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::StrideSFA{},
-                cute::make_shape(gemm_n, gemm_k / 128, 1));
+                cute::make_shape(gemm_n,
+                    gemm_k
+                        / (layout_info.int4_groupwise_params.use_wfp4a16
+                                ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::wfp4a16_group_size
+                                : TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::int4_group_size),
+                    1));
     }
 }
 
@@ -1183,8 +1188,13 @@ __device__ void computeTmaWarpSpecializedInputPointers(TmaWarpSpecializedGrouped
     }
     if (layout_info.int4_groupwise_params.enabled)
     {
-        layout_info.int4_groupwise_params.ptr_s_a[out_idx]
-            = safe_inc_ptr(w4a8_weight_scale, expert * (gemm_n * gemm_k / 128));
+        // The group size of wfp4a16 is multiplied by 2 because each scale uses 1 byte instead of 2 bytes
+        layout_info.int4_groupwise_params.ptr_s_a[out_idx] = safe_inc_ptr(w4a8_weight_scale,
+            expert
+                * (gemm_n * gemm_k
+                    / (layout_info.int4_groupwise_params.use_wfp4a16
+                            ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::wfp4a16_group_size * 2
+                            : TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::int4_group_size)));
     }
 }
 
@@ -3499,7 +3509,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     MoeMinLatencyParams& min_latency_params, cudaStream_t stream)
 {
     static constexpr bool int_scales_required
-        = std::is_same<WeightType, uint8_t>::value || std::is_same<WeightType, cutlass::uint4b_t>::value;
+        = std::is_same<WeightType, uint8_t>::value || std::is_same<WeightType, cutlass::uint4b_t>::value || use_wfp4a16;
     static constexpr bool fp8_scales_required
         = std::is_same<WeightType, __nv_fp8_e4m3>::value || std::is_same<WeightType, __nv_fp8_e5m2>::value;
 
@@ -3610,7 +3620,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
             fc2_fp8_dequant == nullptr, "Scales are ignored for fp32/fp16/bf16 but received quant scale for FC2");
     }
 
-    bool use_awq = quant_params.groupwise.fc1.act_scales && quant_params.groupwise.fc2.act_scales;
+    bool use_awq = quant_params.groupwise.fc1.act_scales && quant_params.groupwise.fc2.act_scales && !use_wfp4a16;
     int const num_experts_per_node = full_num_experts / parallelism_config.ep_size;
 
     configureWsPtrs(workspace_ptr, num_rows, hidden_size, inter_size, num_experts_per_node, experts_per_token,
@@ -3667,7 +3677,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     else
     {
         bool fused_prologue_result = false;
-        if (!use_w4afp8)
+        if (!use_w4_groupwise)
         {
             // WAR: fusedBuildExpertMapsSortFirstToken kernel will lead to illegal memory access for W4AFP8
             fused_prologue_result = fusedBuildExpertMapsSortFirstToken(token_selected_experts,
@@ -3803,8 +3813,10 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
         layout_info2.alpha_scale_ptr_array = nullptr;
     }
 
-    layout_info1.int4_groupwise_params.enabled = use_w4afp8;
-    layout_info2.int4_groupwise_params.enabled = use_w4afp8;
+    layout_info1.int4_groupwise_params.enabled = use_w4_groupwise;
+    layout_info2.int4_groupwise_params.enabled = use_w4_groupwise;
+    layout_info1.int4_groupwise_params.use_wfp4a16 = use_wfp4a16;
+    layout_info2.int4_groupwise_params.use_wfp4a16 = use_wfp4a16;
 
     layout_info1.fpX_block_scaling_type = getScalingType();
     layout_info2.fpX_block_scaling_type = getScalingType();
@@ -3845,7 +3857,7 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType,
     UnfusedGemmOutputType* output2, int const* num_active_experts_per, int const* active_expert_global_ids,
     int start_expert, cudaStream_t stream)
 {
-    TLLM_CHECK_WITH_INFO(!use_w4afp8, "W4AFP8 is not supported in low latency mode");
+    TLLM_CHECK_WITH_INFO(!use_w4_groupwise, "W4AFP8 and WFP4A16 are not supported in low latency mode");
 
     // Always nullptr
     layout_info1.ptr_c = nullptr;
@@ -3870,6 +3882,8 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType,
 
     layout_info1.int4_groupwise_params.enabled = false;
     layout_info2.int4_groupwise_params.enabled = false;
+    layout_info1.int4_groupwise_params.use_wfp4a16 = false;
+    layout_info2.int4_groupwise_params.use_wfp4a16 = false;
 
     int const threads = std::min(1024, num_experts);
     int const blocks = (num_experts + threads - 1) / threads;
@@ -3912,7 +3926,7 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
         return std::make_pair(gemm1_tma_ws_input, gemm2_tma_ws_input);
     }
 
-    bool use_awq = quant_params.groupwise.fc1.act_scales && quant_params.groupwise.fc2.act_scales;
+    bool use_awq = quant_params.groupwise.fc1.act_scales && quant_params.groupwise.fc2.act_scales && !use_wfp4a16;
 
     bool is_gated_activation = isGatedActivation(fc1_activation_type);
     int64_t const fc1_out_size = is_gated_activation ? inter_size * 2 : inter_size;
@@ -3949,7 +3963,7 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
 
         bool apply_bias = parallelism_config.tp_rank == 0;
         bool using_hopper_fused_finalize
-            = !use_deterministic_hopper_reduce_ && gemm2_config_->sm_version == 90 && !use_w4afp8 && !use_lora;
+            = !use_deterministic_hopper_reduce_ && gemm2_config_->sm_version == 90 && !use_w4_groupwise && !use_lora;
         if (using_hopper_fused_finalize)
         {
             assert(min_latency_mode == false);
@@ -4219,6 +4233,8 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
     bool is_fp4_w_quant = mWType == nvinfer1::DataType::kFP4 || mWType == nvinfer1::DataType::kINT64;
     bool is_w4afp8_quant = is_int_groupwise_w_quant && is_fp8_act_quant;
     // bool is_wfp4afp8_quant = is_fp4_w_quant && is_fp8_act_quant;
+    bool is_wfp4a16_quant = (mDType == nvinfer1::DataType::kHALF || mDType == nvinfer1::DataType::kBF16)
+        && mWType == nvinfer1::DataType::kUINT8;
 
     // Int sizes
     size_t quant_1_size = is_int_w_quant ? fc1_out_size * num_experts_per_node * dtype_bytes : 0;
@@ -4228,7 +4244,7 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
         quant_1_size = fc1_out_size * num_experts_per_node * dtype_bytes;
         quant_2_size = hidden_size * num_experts_per_node * dtype_bytes;
     }
-    else if (is_int_groupwise_w_quant)
+    else if (is_int_groupwise_w_quant || is_wfp4a16_quant)
     {
         quant_1_size = fc1_out_size * num_experts_per_node * dtype_bytes * hidden_size / mGroupSize;
         quant_2_size = hidden_size * num_experts_per_node * dtype_bytes * inter_size / mGroupSize;
@@ -4265,7 +4281,7 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
             = TmaWarpSpecializedGroupedGemmInput::workspaceSize(num_experts_per_node, mScalingType)
             * (NUM_ROUTING_SAMPLES + 1);
 
-        if (is_w4afp8_quant)
+        if (is_w4afp8_quant || is_wfp4a16_quant)
         {
             quant_3_size = 0;
             quant_4_size = 0;
@@ -4284,7 +4300,7 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
         * sizeof(TmaWarpSpecializedGroupedGemmInput::ElementSF);
     size_t const fp4_act_scale_flat_size = std::max(fc1_fp4_act_scale_size, fc2_fp4_act_scale_size);
 
-    size_t w4a8_alpha_size = is_w4afp8_quant ? num_experts_per_node * sizeof(float) : 0;
+    size_t w4a8_alpha_size = (is_w4afp8_quant || is_wfp4a16_quant) ? num_experts_per_node * sizeof(float) : 0;
     size_t alpha_scale_ptr_array_size = num_experts_per_node * sizeof(float**);
     size_t gemm_workspace_size = mInterface->getGemmWorkspaceSize(num_experts_per_node);
 
@@ -4439,15 +4455,19 @@ void GemmProfilerBackend::prepareQuantParams(int num_tokens, char* workspace_ptr
     GET_WS_PTR(float const*, w4a8_alpha);
 #undef GET_WS_PTR
 
-    if ((mWType == nvinfer1::DataType::kINT8 || mWType == nvinfer1::DataType::kINT4) && mGroupSize < 0)
+    if ((mWType == nvinfer1::DataType::kINT8 || mWType == nvinfer1::DataType::kINT4
+            || mWType == nvinfer1::DataType::kUINT8)
+        && mGroupSize < 0)
     {
         TLLM_CHECK(quant_1 && quant_2);
         mQuantParams = QuantParams::Int(quant_1, quant_2);
     }
-    else if (mWType == nvinfer1::DataType::kINT4)
+    else if (mWType == nvinfer1::DataType::kINT4 || mWType == nvinfer1::DataType::kUINT8)
     {
         TLLM_CHECK(quant_1 && quant_2);
-        if (mDType == nvinfer1::DataType::kFP8)
+        if (mDType == nvinfer1::DataType::kFP8
+            || (mWType == nvinfer1::DataType::kUINT8
+                && (mDType == nvinfer1::DataType::kHALF || mDType == nvinfer1::DataType::kBF16)))
         {
             TLLM_CHECK(w4a8_alpha);
             mQuantParams = QuantParams::GroupWise(
@@ -4550,8 +4570,11 @@ void GemmProfilerBackend::prepareTmaWsInputs(
 
             bool apply_bias = true;
             bool use_w4afp8 = (mDType == nvinfer1::DataType::kFP8 && mWType == nvinfer1::DataType::kINT4);
+            bool use_wfp4a16 = ((mDType == nvinfer1::DataType::kHALF || mDType == nvinfer1::DataType::kBF16)
+                && mWType == nvinfer1::DataType::kUINT8);
+            bool use_w4_groupwise = use_w4afp8 || use_wfp4a16;
             bool using_fused_finalize
-                = !mInterface->use_deterministic_hopper_reduce_ && mSM == 90 && !mMinLatencyMode && !use_w4afp8;
+                = !mInterface->use_deterministic_hopper_reduce_ && mSM == 90 && !mMinLatencyMode && !use_w4_groupwise;
             if (using_fused_finalize)
             {
                 assert(!mMinLatencyMode);
@@ -4766,11 +4789,13 @@ template class CutlassMoeFCRunner<__nv_fp4_e2m1, __nv_fp4_e2m1, half>;
 template class CutlassMoeFCRunner<__nv_fp4_e2m1, __nv_fp4_e2m1, half, half>;
 template class CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp4_e2m1, half>;
 template class CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp4_e2m1, half, half>;
+template class CutlassMoeFCRunner<half, __nv_fp4_e2m1>;
 #ifdef ENABLE_BF16
 template class CutlassMoeFCRunner<__nv_fp4_e2m1, __nv_fp4_e2m1, __nv_bfloat16>;
 template class CutlassMoeFCRunner<__nv_fp4_e2m1, __nv_fp4_e2m1, __nv_bfloat16, __nv_bfloat16>;
 template class CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp4_e2m1, __nv_bfloat16>;
 template class CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp4_e2m1, __nv_bfloat16, __nv_bfloat16>;
+template class CutlassMoeFCRunner<__nv_bfloat16, __nv_fp4_e2m1>;
 #endif
 #endif
 

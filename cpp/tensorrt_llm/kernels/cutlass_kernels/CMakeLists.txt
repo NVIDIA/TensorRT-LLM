@@ -218,6 +218,11 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
   set(MOE_GEMM_SRC_CU_LAUNCHER ${MOE_GEMM_SRC_CU})
   list(FILTER MOE_GEMM_SRC_CU_LAUNCHER EXCLUDE REGEX ".*moe_gemm_kernels_.*")
   list(FILTER MOE_GEMM_SRC_CU INCLUDE REGEX ".*moe_gemm_kernels_.*")
+  set(MOE_GEMM_SRC_CU_HOPPER_FP4 ${MOE_GEMM_SRC_CU})
+  list(FILTER MOE_GEMM_SRC_CU_HOPPER_FP4 INCLUDE REGEX
+       ".*moe_gemm_kernels_(bf16|fp16)_fp4.*")
+  list(FILTER MOE_GEMM_SRC_CU EXCLUDE REGEX
+       ".*moe_gemm_kernels_(bf16|fp16)_fp4.*")
   set(MOE_GEMM_SRC_CU_FP4 ${MOE_GEMM_SRC_CU})
   list(FILTER MOE_GEMM_SRC_CU_FP4 INCLUDE REGEX ".*fp4.*")
   list(FILTER MOE_GEMM_SRC_CU EXCLUDE REGEX ".*fp4.*")
@@ -230,6 +235,10 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
   add_library(_moe_gemm_launcher OBJECT ${MOE_GEMM_SRC_CU_LAUNCHER})
   add_cuda_architectures(_moe_gemm_launcher 89)
 
+  add_library(_moe_gemm_hopper_fp4 OBJECT ${MOE_GEMM_SRC_CU_HOPPER_FP4})
+  set_cuda_architectures(_moe_gemm_hopper_fp4 90)
+  process_target(_moe_gemm_hopper_fp4 true false)
+
   add_library(_moe_gemm_fp4 OBJECT ${MOE_GEMM_SRC_CU_FP4})
   set_cuda_architectures(_moe_gemm_fp4 100f 120f)
   process_target(_moe_gemm_fp4 false true)
@@ -239,8 +248,9 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
   process_target(_moe_gemm_fp8 true true)
 
   add_instantiations(moe_gemm_src ${INSTANTIATION_GENERATION_DIR}/gemm_grouped)
-  target_link_libraries(moe_gemm_src PRIVATE _moe_gemm_launcher _moe_gemm_fp4
-                                             _moe_gemm_fp8)
+  target_link_libraries(
+    moe_gemm_src PRIVATE _moe_gemm_launcher _moe_gemm_hopper_fp4 _moe_gemm_fp4
+                         _moe_gemm_fp8)
   target_include_directories(
     moe_gemm_src
     PUBLIC ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include)

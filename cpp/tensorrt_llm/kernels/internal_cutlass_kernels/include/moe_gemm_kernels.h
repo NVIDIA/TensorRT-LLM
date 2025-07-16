@@ -211,7 +211,8 @@ struct TmaWarpSpecializedGroupedGemmInput
 
     struct INT4GroupwiseParams
     {
-        constexpr static int group_size = 128; // Unused, hard-coded to 128
+        constexpr static int int4_group_size = 128;
+        constexpr static int wfp4a16_group_size = 32;
         bool enabled = false;
         using SFA = __nv_bfloat16;
         using SFB = __nv_bfloat16; // Unused

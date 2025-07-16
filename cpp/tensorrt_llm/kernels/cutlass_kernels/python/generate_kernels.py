@@ -1,7 +1,7 @@
 import argparse
 import enum
 import os
-from itertools import product
+from itertools import chain, product
 
 from cutlass_library import *
 
@@ -111,7 +111,10 @@ CudaTypeName = {
     DataType.e4m3: "__nv_fp8_e4m3",
     DataType.bf16: "__nv_bfloat16",
     DataType.f16: "half",
-    DataType.f32: "float"
+    DataType.f32: "float",
+    DataType.e2m1: "__nv_fp4_e2m1",
+    DataType.ue8m0: "cutlass::float_ue8m0_t",
+    DataType.u4: "cutlass::uint4b_t"
 }
 
 
@@ -216,7 +219,7 @@ const {act_tag}*, const {weight_tag}*, const {scale_zero_tag}*, const {scale_zer
                 operation.act_type != DataType.e4m3
                 or operation.weight_type != e2m1):
             # Mixed MoE GEMM
-            weight_tag = DataTypeTag[operation.weight_type]
+            weight_tag = CudaTypeName[operation.weight_type]
             instantiation = f"""
 template void sm90_generic_mixed_moe_gemm_kernelLauncher<{act_tag}, {weight_tag}, {out_tag},
 {epi_tag}, {cute_cta_shape}, {cute_cga_shape}, {kernel_sched}, {epi_sched}, {quant_op}> (
@@ -542,9 +545,17 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
     if not is_arch_enabled:
         return []
     arch = 90
-    supported_dtypes = [
+
+    # act_type, weight_type, scalezero_type, bias_type, output_type
+    supported_dtypes_int4 = [
         (DataType.e4m3, DataType.u4, DataType.f16, DataType.f16, DataType.f16),
         (DataType.e4m3, DataType.u4, DataType.bf16, DataType.bf16,
+         DataType.bf16),
+    ]
+    supported_dtypes_fp4 = [
+        (DataType.f16, DataType.e2m1, DataType.ue8m0, DataType.f16,
+         DataType.f16),
+        (DataType.bf16, DataType.e2m1, DataType.ue8m0, DataType.bf16,
          DataType.bf16),
     ]
 
@@ -555,15 +566,24 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
     M_TILES = [64, 128]  # Currently M tile must be 128 for Grouped GEMM
     N_TILES = [16, 32, 64, 128]
     K_TILES = [128, 256, 512]
-    cta_shapes_mnk = list(product(M_TILES, N_TILES, K_TILES))
+    cta_shapes_mnk_int4 = list(product(M_TILES, N_TILES, K_TILES))
+
+    M_TILES = [64, 128]  # Currently M tile must be 128 for Grouped GEMM
+    N_TILES = [16, 32, 64]
+    K_TILES = [128, 256]
+    cta_shapes_mnk_fp4 = list(product(M_TILES, N_TILES, K_TILES))
+    cta_shapes_mnk_fp4.append((128, 128, 128))
 
     warp_shape = [0, 0, 0]  # ignored except for naming
     stages = 0  # auto
 
-    cga_shapes = product([1, 2], [1, 2], [1])
+    cga_shapes = list(product([1, 2], [1, 2], [1]))
 
-    partial_args = product(supported_dtypes, quant_ops, epi_tags,
-                           cta_shapes_mnk, cga_shapes)
+    partial_args_int4 = product(supported_dtypes_int4, quant_ops, epi_tags,
+                                cta_shapes_mnk_int4, cga_shapes)
+    partial_args_fp4 = product(supported_dtypes_fp4, quant_ops, epi_tags,
+                               cta_shapes_mnk_fp4, cga_shapes)
+    partial_args = chain(partial_args_int4, partial_args_fp4)
 
     operations = list()
     for dtype_combo, quant_op, epi_tag, cta_shape_mnk, cga_shape in partial_args:
