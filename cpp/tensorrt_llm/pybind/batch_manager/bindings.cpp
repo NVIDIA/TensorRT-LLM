@@ -360,7 +360,6 @@ void initBindings(pybind11::module_& m)
             py::arg("language_adapter_uid") = std::nullopt, py::arg("allotted_time_ms") = std::nullopt,
             py::arg("context_phase_params") = std::nullopt)
         .def(py::init<tb::LlmRequest const&>())
-        //.def(py::init<tb::LlmRequest&&>())
         .def("validate", &tb::LlmRequest::validate, py::arg("max_input_len"), py::arg("max_seq_len"),
             py::arg("max_draft_len"), py::arg("vocab_size_padded"), py::arg("max_endocer_input_len") = std::nullopt,
             py::arg("enable_kv_cache_reuse") = false)

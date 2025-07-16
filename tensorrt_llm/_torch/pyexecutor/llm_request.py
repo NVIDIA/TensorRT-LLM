@@ -1,3 +1,4 @@
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import List, Optional, Union
 
@@ -362,14 +363,20 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
     def create_child_request(self, child_id):
         child = super().create_child_request(child_id)
         py_request = LlmRequest(llm_request=child)
-        py_request.__dict__.update(**self.__dict__)
 
-        py_request.py_result = PyResult(
-            self.py_prompt_len, self.py_max_new_tokens,
-            self.py_return_logits_device_memory, self.streaming,
-            self.py_return_log_probs, self.py_return_context_logits,
-            self.py_return_generation_logits)
+        # Copy all py_* attributes from parent to child
+        for attr_name, attr_value in self.__dict__.items():
+            if attr_name.startswith('py_'):
+                attr_value = getattr(self, attr_name)
+                setattr(py_request, attr_name, deepcopy(attr_value))
+            elif attr_name in ['is_attention_dp_dummy', 'is_cuda_graph_dummy']:
+                setattr(py_request, attr_name, attr_value)
+
+        # Rewrite specific attributes that should use child_request values.
         py_request.py_request_id = child.request_id
+        py_request.py_batch_idx = None
+        py_request.py_seq_slot = None
+
         py_request.children = []
 
         assert py_request.is_child
@@ -377,7 +384,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         assert py_request.parent_request_id == self.request_id
         assert py_request.sampling_config.random_seed != self.sampling_config.random_seed
 
-        return py_request
+        self.children.append(py_request)
 
 
 def convert_wordlist(word_list) -> List[List[int]]:
@@ -507,8 +514,9 @@ def executor_request_to_llm_request(
                                    None))
     if child_req_ids:
         for child_id in child_req_ids:
-            llm_request.children.append(
-                llm_request.create_child_request(child_id))
+            llm_request.create_child_request(child_id)
+    #         llm_request.children.append(
+    #             llm_request.create_child_request(child_id))
 
     return llm_request
 

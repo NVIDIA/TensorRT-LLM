@@ -284,6 +284,32 @@ class PyExecutor:
     def __exit__(self):
         self.shutdown()
 
+    def _get_request_id(self):
+        # (next_req_id + 1) % UINT64_MAX
+        self.next_req_id = (self.next_req_id + 1) & ((1 << 64) - 1)
+        return self.next_req_id
+
+    def _generate_child_request_ids(
+            self, request: ExecutorRequest) -> List[int] | None:
+        """ Generate child request IDs if needed. """
+        child_req_ids = None
+        sampling_config = request.sampling_config
+        beam_width = (sampling_config.beam_width
+                      if sampling_config.beam_width else 1)
+        num_return_sequences = (sampling_config.num_return_sequences
+                                if sampling_config.num_return_sequences else 1)
+
+        # Create child requests if beam_width == 1 and num_return_sequences > 1.
+        if beam_width == 1 and num_return_sequences > 1:
+            child_req_ids = []
+            for _ in range(num_return_sequences - 1):
+                child_req_id = self._get_request_id()
+                if self.enable_iter_perf_stats:
+                    self.start_times[child_req_id] = time.time()
+                child_req_ids.append(child_req_id)
+
+        return child_req_ids
+
     def enqueue_requests(self, requests: List[ExecutorRequest]):
         """
         Enqueue new requests
@@ -1523,8 +1549,8 @@ class PyExecutor:
                 else:
                     if response.result.is_final:
                         requests_to_terminate.append(request)
-                        for child in request.children:
-                            requests_to_terminate.append(child)
+                        # for child in request.children:
+                        #     requests_to_terminate.append(child)
             else:
                 new_active_requests.append(request)
         self.active_requests.clear()
