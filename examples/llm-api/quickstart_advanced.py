@@ -195,6 +195,7 @@ def setup_llm(args, **kwargs):
         batch_sizes=args.cuda_graph_batch_sizes,
         enable_padding=args.cuda_graph_padding_enabled,
     ) if args.use_cuda_graph else None
+
     llm = LLM(
         model=args.model_dir,
         backend='pytorch',
@@ -230,18 +231,22 @@ def setup_llm(args, **kwargs):
         **kwargs,
     )
 
+    use_beam_search = args.max_beam_width > 1
+    if use_beam_search and args.n == 1:
+        # If beam search is used, set n to the beam width.
+        args.n = args.max_beam_width
+
     sampling_params = SamplingParams(
         max_tokens=args.max_tokens,
         temperature=args.temperature,
         top_k=args.top_k,
         top_p=args.top_p,
-        best_of=args.max_beam_width
-        if args.max_beam_width > 1 else args.best_of,
         return_context_logits=args.return_context_logits,
         return_generation_logits=args.return_generation_logits,
         logprobs=args.logprobs,
         n=args.n,
-        use_beam_search=args.max_beam_width > 1)
+        best_of=args.best_of or args.n,
+        use_beam_search=use_beam_search)
     return llm, sampling_params
 
 
