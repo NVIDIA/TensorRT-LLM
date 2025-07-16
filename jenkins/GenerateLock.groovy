@@ -63,7 +63,7 @@ def generate()
             sh "git status"
             sh "git add ."
             sh "git commit -m \"Check in most recent lock file from nightly pipeline\""
-            withCredentials([usernamePassword(credentialsId: 'svc_tensorrt_gitlab_api_token', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_PASS')]) {
+            withCredentials([usernamePassword(credentialsId: 'github-cred-trtllm-ci', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_PASS')]) {
                 def authedUrl = LLM_REPO.replaceFirst('https://', "https://${GIT_USER}:${GIT_PASS}@")
                 sh "git remote set-url origin ${authedUrl}"
                 sh "git push origin HEAD:${params.llmBranch}"
