@@ -414,8 +414,9 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     @pytest.mark.skip_less_mpi_world_size(8)
     @parametrize_with_ids("cuda_graph", [False, True])
-    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 8), (4, 1, 1)],
-                             ids=["tp8ep8", "tp4"])
+    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4),
+                                                         (8, 1, 8)],
+                             ids=["tp8", "tp8ep4", "tp8ep8"])
     def test_auto_dtype(self, cuda_graph, tp_size, pp_size, ep_size):
         model_path = f"{llm_models_root()}/llama4-models/Llama-4-Scout-17B-16E-Instruct"
         with LLM(
