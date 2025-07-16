@@ -113,4 +113,4 @@ def check_llama_7b_multi_lora_from_request_test_harness(
         llm.shutdown()
     for output, ref, key_word in zip(outputs, references, key_words):
         assert similar(output.outputs[0].text,
-                       ref) or key_word in output.outputs[0].txt
+                       ref) or key_word in output.outputs[0].text
