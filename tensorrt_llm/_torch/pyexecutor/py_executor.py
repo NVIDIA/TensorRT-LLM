@@ -90,13 +90,6 @@ def _get_from_request_queue(
     return items
 
 
-def _get_num_child_requests(request: ExecutorRequest) -> int:
-    sampling_config = request.sampling_config
-    logger.info(sampling_config)
-    return 0 if sampling_config.beam_width > 1 else (
-        sampling_config.num_return_sequences or 1) - 1
-
-
 def _get_from_waiting_queue(
     waiting_queue: deque[RequestQueueItem],
     max_req_count: int,
@@ -117,9 +110,13 @@ def _get_from_waiting_queue(
     items = []
     req_count = 0
     while req_count < max_req_count and waiting_queue:
-        req_item = waiting_queue.popleft()
-        items.append(req_item)
-        req_count += 1 + _get_num_child_requests(req_item.request)
+        req_item = waiting_queue[0]
+        num_children = len(
+            req_item.child_req_ids) if req_item.child_req_ids else 0
+        if 1 + num_children > max_req_count:
+            break
+        req_count += 1 + num_children
+        items.append(waiting_queue.popleft())
     return items
 
 
@@ -360,6 +357,32 @@ class PyExecutor:
     def __exit__(self):
         self.shutdown()
 
+    def _get_request_id(self):
+        # (next_req_id + 1) % UINT64_MAX
+        self.next_req_id = (self.next_req_id + 1) & ((1 << 64) - 1)
+        return self.next_req_id
+
+    def _generate_child_request_ids(
+            self, request: ExecutorRequest) -> List[int] | None:
+        """ Generate child request IDs if needed. """
+        child_req_ids = None
+        sampling_config = request.sampling_config
+        beam_width = (sampling_config.beam_width
+                      if sampling_config.beam_width else 1)
+        num_return_sequences = (sampling_config.num_return_sequences
+                                if sampling_config.num_return_sequences else 1)
+
+        # Create child requests if beam_width == 1 and num_return_sequences > 1.
+        if beam_width == 1 and num_return_sequences > 1:
+            child_req_ids = []
+            for _ in range(num_return_sequences - 1):
+                child_req_id = self._get_request_id()
+                if self.enable_iter_perf_stats:
+                    self.start_times[child_req_id] = time.time()
+                child_req_ids.append(child_req_id)
+
+        return child_req_ids
+
     def enqueue_requests(self, requests: List[ExecutorRequest]):
         """
         Enqueue new requests
@@ -368,20 +391,18 @@ class PyExecutor:
         try:
             self.enqueue_lock.acquire()
             assert self.active, "PyExecutor has already been shutdown."
-            start_time = time.time()
             for request in requests:
-                self.start_times[self.next_req_id] = start_time
-                req_id = self.next_req_id
-                req_ids.append(self.next_req_id)
+                req_id = self._get_request_id()
 
-                child_req_ids = []
-                num_child_requests = _get_num_child_requests(request)
-                for _ in range(num_child_requests):
-                    self.next_req_id += 1
-                    child_req_ids.append(self.next_req_id)
+                if self.enable_iter_perf_stats:
+                    self.start_times[req_id] = time.time()
+
+                child_req_ids = self._generate_child_request_ids(request)
                 self.request_queue.put(
-                    RequestQueueItem(req_id, request, child_req_ids))
-                self.next_req_id += 1
+                    RequestQueueItem(req_id, request, child_req_ids,
+                                     query=None))
+
+                req_ids.append(req_id)
         finally:
             self.enqueue_lock.release()
         return req_ids
@@ -491,24 +512,27 @@ class PyExecutor:
         try:
             self.enqueue_lock.acquire()
             assert self.active, "PyExecutor has already been shutdown."
-            logger.info(
+
+            req_id = self._get_request_id()
+
+            logger.debug(
                 f"Enqueuing new Executor request with id {self.next_req_id}")
-            req_id = self.next_req_id
+
             if self.enable_iter_perf_stats:
                 self.start_times[req_id] = time.time()
 
-            if query is not None:
-                self.request_queue.put(
-                    RequestQueueItem(req_id, request, [], False, query))
             else:
-                child_req_ids = []
-                num_child_requests = _get_num_child_requests(request)
-                for _ in range(num_child_requests):
-                    self.next_req_id += 1
-                    child_req_ids.append(self.next_req_id)
+                child_req_ids = self._generate_child_request_ids(request)
+                logger.debug(
+                    f"Executor request with id {req_id} has child requests: {child_req_ids}"
+                )
                 self.request_queue.put(
-                    RequestQueueItem(req_id, request, child_req_ids))
-            self.next_req_id += 1
+                    RequestQueueItem(
+                        req_id,
+                        request,
+                        child_req_ids=child_req_ids,
+                        query=query,
+                    ))
         finally:
             self.enqueue_lock.release()
         return req_id
@@ -1551,8 +1575,9 @@ class PyExecutor:
                     req_item.id, req_item.request, req_item.child_req_ids,
                     self._should_exclude_last_generation_logits())
                 req_with_children.append(req)
-                for child in req.children:
-                    req_with_children.append(child)
+                logger.info(f"Children to {req.request_id}: {req.children}")
+                if req.children:
+                    req_with_children.extend(req.children)
             return req_with_children
 
     @nvtx_range("_schedule")
@@ -1944,8 +1969,8 @@ class PyExecutor:
                 else:
                     if response.result.is_final:
                         requests_to_terminate.append(request)
-                        for child in request.children:
-                            requests_to_terminate.append(child)
+                        # for child in request.children:
+                        #     requests_to_terminate.append(child)
             else:
                 new_active_requests.append(request)
         self.active_requests = new_active_requests
