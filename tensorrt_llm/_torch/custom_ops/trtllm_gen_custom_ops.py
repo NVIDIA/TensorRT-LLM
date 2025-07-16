@@ -6,7 +6,8 @@ import torch
 
 from tensorrt_llm._torch.utils import (fp4_utils,
                                        get_last_power_of_2_num_tokens_buckets,
-                                       last_positive_power_of_2)
+                                       last_positive_power_of_2,
+                                       next_positive_power_of_2)
 
 from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                          OptimizationProfile, TunableRunner, TuningConfig)
@@ -14,23 +15,13 @@ from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
 
 def calculate_tile_tokens_dim(num_tokens: int, num_experts: int,
                               top_k: int) -> int:
+    # Guess tokens per expert assuming perfect expert distribution first.
     num_tokens_per_expert = num_tokens * top_k // num_experts
 
-    # Equivalent to the following:
-    # tile_tokens_dim = next_positive_power_of_2(num_tokens_per_expert)
-    # tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
-    #
-    # Torch dynamo cannot correctly track next_positive_power_of_2. Each shape
-    # passed to next_positive_power_of_2 will trigger a new recompile.
-    # Following code still triggers recompile. But it at most produces 4 additional recompiles.
-    if num_tokens_per_expert <= 8:
-        tile_tokens_dim = 8
-    elif num_tokens_per_expert <= 16:
-        tile_tokens_dim = 16
-    elif num_tokens_per_expert <= 32:
-        tile_tokens_dim = 32
-    else:
-        tile_tokens_dim = 64
+    # And pad the number to the next power of 2.
+    tile_tokens_dim = next_positive_power_of_2(num_tokens_per_expert)
+    # Cap to 8-64 tokens per CTA tile as it's the range supported by the kernel.
+    tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
 
     return tile_tokens_dim
 
