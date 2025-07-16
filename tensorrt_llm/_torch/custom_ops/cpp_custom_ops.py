@@ -559,3 +559,10 @@ def _register_fake():
     @torch.library.register_fake("trtllm::nvfp4_block_scale_interleave_reverse")
     def _(sf: torch.Tensor):
         return torch.empty_like(sf, dtype=torch.uint8)
+
+    @torch.library.register_fake("trtllm::alltoall")
+    def _(input_list, group, num_lists):
+        assert len(input_list) > 0
+        assert len(input_list) == len(group)
+
+        return [i.new_empty(i.shape) for i in input_list]

@@ -78,7 +78,7 @@ public:
         torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas,
         torch::optional<torch::Tensor> mla_context_paged_kv,
         torch::optional<torch::Tensor> mla_context_kv_cache_block_offsets,
-        torch::optional<torch::Tensor> softmax_stats_tensor,
+        torch::optional<torch::Tensor> softmax_stats_tensor, torch::optional<torch::Tensor> helix_position_offsets,
         c10::ArrayRef<std::optional<torch::Tensor>> spec_decoding_tensor_params) const
         = 0;
 };
@@ -130,7 +130,7 @@ public:
         torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas,
         torch::optional<torch::Tensor> mla_context_paged_kv,
         torch::optional<torch::Tensor> mla_context_kv_cache_block_offsets,
-        torch::optional<torch::Tensor> softmax_stats_tensor,
+        torch::optional<torch::Tensor> softmax_stats_tensor, torch::optional<torch::Tensor> helix_position_offsets,
         c10::ArrayRef<std::optional<torch::Tensor>> spec_decoding_tensor_params) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv.get_device());
@@ -191,6 +191,10 @@ public:
             mla_params.meta = op.mMLAParams;
 
             mla_params.workspace = workspace_ptr;
+            if (helix_position_offsets.has_value())
+            {
+                mla_params.helix_position_offsets = helix_position_offsets.value().data_ptr<int32_t>();
+            }
         }
 
         int const* context_lengths_ptr = context_lengths.slice(0, seq_offset).data_ptr<int>();
@@ -276,6 +280,13 @@ public:
         common_enqueue_params.context_lengths = context_lengths_ptr;
         common_enqueue_params.host_context_lengths = host_context_lengths.data_ptr<int32_t>();
         common_enqueue_params.workspace = workspace_ptr;
+        if (softmax_stats_tensor.has_value())
+        {
+            TLLM_CHECK_WITH_INFO(softmax_stats_tensor.value().size(-1) == 2,
+                "softmax_stats_tensor must be a float tensor with last dimension 2");
+            common_enqueue_params.softmax_stats
+                = reinterpret_cast<float2*>(softmax_stats_tensor.value().data_ptr<float>());
+        }
 
         if (is_context) // context stage
         {
@@ -283,10 +294,6 @@ public:
             AttentionOp::EnqueueContextParams<T> enqueue_params{common_enqueue_params};
             enqueue_params.host_block_offsets = host_block_offsets;
             enqueue_params.batch_size = num_seqs;
-            if (softmax_stats_tensor.has_value())
-            {
-                enqueue_params.softmaxStatsPtr = static_cast<float2*>(softmax_stats_tensor.value().data_ptr());
-            }
 
             if (op.isMLAEnabled())
             {
@@ -390,6 +397,8 @@ using RunnerPtr = std::shared_ptr<torch_ext::trtllm::attention::RunnerBase>;
 using torch_ext::trtllm::attention::Runner;
 using torch_ext::trtllm::attention::AttentionInputType;
 
+// note: we cannot exceed 64 arguments for some python builds, thus we use a vector
+// of additional tensors passed into this function for some optional tensors
 void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch::optional<torch::Tensor> v,
     torch::Tensor& output, torch::optional<torch::Tensor> output_sf, std::optional<torch::ScalarType> out_dtype,
     torch::optional<torch::Tensor> workspace_, torch::Tensor sequence_length, torch::Tensor host_past_key_value_lengths,
@@ -411,9 +420,7 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
     bool const use_paged_context_fmha, std::optional<int64_t> attention_input_type, bool is_mla_enable,
     std::optional<int64_t> q_lora_rank, std::optional<int64_t> kv_lora_rank, std::optional<int64_t> qk_nope_head_dim,
     std::optional<int64_t> qk_rope_head_dim, std::optional<int64_t> v_head_dim,
-    torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas,
-    std::optional<torch::Tensor> mla_context_paged_kv, std::optional<torch::Tensor> mla_context_kv_cache_block_offsets,
-    std::optional<int64_t> attention_chunk_size, std::optional<torch::Tensor> softmax_stats_tensor,
+    std::optional<int64_t> attention_chunk_size, std::vector<torch::optional<torch::Tensor>> additional_tensors,
     c10::List<bool> spec_decoding_bool_params, c10::ArrayRef<std::optional<torch::Tensor>> spec_decoding_tensor_params)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
@@ -643,8 +650,9 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
             host_past_key_value_lengths, context_lengths, host_context_lengths, kv_cache_block_offsets,
             host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, cache_indirection,
             kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
-            block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, mla_context_paged_kv,
-            mla_context_kv_cache_block_offsets, softmax_stats_tensor, spec_decoding_tensor_params);
+            block_ids_per_seq, mrope_rotary_cos_sin, additional_tensors[0], additional_tensors[1],
+            additional_tensors[2], additional_tensors[3], additional_tensors[4], additional_tensors[5],
+            spec_decoding_tensor_params);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -659,8 +667,9 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
             host_past_key_value_lengths, context_lengths, host_context_lengths, kv_cache_block_offsets,
             host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, cache_indirection,
             kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
-            block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, mla_context_paged_kv,
-            mla_context_kv_cache_block_offsets, softmax_stats_tensor, spec_decoding_tensor_params);
+            block_ids_per_seq, mrope_rotary_cos_sin, additional_tensors[0], additional_tensors[1],
+            additional_tensors[2], additional_tensors[3], additional_tensors[4], additional_tensors[5],
+            spec_decoding_tensor_params);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);
@@ -775,12 +784,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", int? qk_nope_head_dim"
         ", int? qk_rope_head_dim"
         ", int? v_head_dim"
-        ", Tensor? mrope_rotary_cos_sin"
-        ", Tensor? mrope_position_deltas"
-        ", Tensor? mla_context_paged_kv"
-        ", Tensor? mla_context_kv_cache_block_offsets"
         ", int? attention_chunk_size"
-        ", Tensor? softmax_stats_tensor"
+        ", Tensor?[] additional_tensors"
         ", bool[] spec_decoding_bool_params"
         ", Tensor?[] spec_decoding_tensor_params"
         ") -> ()");

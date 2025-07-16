@@ -814,6 +814,7 @@ def attention(
     mla_context_kv_cache_block_offsets: Optional[torch.Tensor],
     attention_chunk_size: Optional[int],
     softmax_stats_tensor: Optional[torch.Tensor],
+    helix_position_offsets: Optional[torch.Tensor],
     spec_decoding_bool_params: List[bool],
     spec_decoding_tensor_params: List[Optional[torch.Tensor]],
 ) -> List[torch.Tensor]:
@@ -860,11 +861,11 @@ def attention(
         rotary_embedding_scale_type, rotary_embedding_scales,
         rotary_embedding_max_position_info, use_paged_context_fmha,
         attention_input_type, is_mla_enable, q_lora_rank, kv_lora_rank,
-        qk_nope_head_dim, qk_rope_head_dim, v_head_dim, mrope_rotary_cos_sin,
-        mrope_position_deltas, mla_context_paged_kv,
-        mla_context_kv_cache_block_offsets, attention_chunk_size,
-        softmax_stats_tensor, spec_decoding_bool_params,
-        spec_decoding_tensor_params)
+        qk_nope_head_dim, qk_rope_head_dim, v_head_dim, attention_chunk_size, [
+            mrope_rotary_cos_sin, mrope_position_deltas, mla_context_paged_kv,
+            mla_context_kv_cache_block_offsets, softmax_stats_tensor,
+            helix_position_offsets
+        ], spec_decoding_bool_params, spec_decoding_tensor_params)
 
     return output_act, output_sf
 
@@ -929,6 +930,8 @@ def _(
     mla_context_paged_kv: Optional[torch.Tensor],
     mla_context_kv_cache_block_offsets: Optional[torch.Tensor],
     attention_chunk_size: Optional[int],
+    softmax_stats_tensor: Optional[torch.Tensor],
+    helix_position_offsets: Optional[torch.Tensor],
     spec_decoding_bool_params: List[bool],
     spec_decoding_tensor_params: List[Optional[torch.Tensor]],
 ) -> List[torch.Tensor]:

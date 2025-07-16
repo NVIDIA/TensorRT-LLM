@@ -29,7 +29,7 @@ from tensorrt_llm.bindings.executor import GuidedDecodingConfig
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import LoraConfig, LoraModelConfig
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
@@ -720,8 +720,9 @@ class PyTorchModelEngine(ModelEngine):
                             spec_resource_manager.free_resources(req)
 
         # TODO: current warmup_request is not suitable for star attention
+        # TODO: check whether warmup_request is suitable for Helix parallelism
         cp_type = self.mapping.cp_config.get('cp_type', None)
-        if cp_type == 'star_attention':
+        if cp_type == CpType.STAR:
             return
 
         with contextlib.ExitStack() as stack:

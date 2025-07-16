@@ -147,7 +147,7 @@ def extract_ctx_gen_cfgs(type: Literal['ctx', 'gen'],
 
     # Compute the number of ranks per instance
     instance_num_ranks = kwargs.get('tensor_parallel_size', 1) * kwargs.get(
-        'pipeline_parallel_size', 1)
+        'pipeline_parallel_size', 1) * kwargs.get('context_parallel_size', 1)
 
     cfgs = []
     for hostname, port in zip(hostnames, ports):

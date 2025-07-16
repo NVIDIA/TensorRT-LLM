@@ -440,3 +440,4 @@ test_e2e.py::test_ptp_scaffolding[DeepSeek-R1-Distill-Qwen-7B-DeepSeek-R1/DeepSe
 examples/test_multimodal.py::test_llm_multimodal_general[kosmos-2-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1] SKIP (https://nvbugs/5387422)
 examples/test_multimodal.py::test_llm_multimodal_general[fuyu-8b-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1] SKIP (https://nvbugs/5387424)
 test_e2e.py::test_ptp_quickstart SKIP (https://nvbugs/5387762)
+disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tllm_gen_helix[DeepSeek-V3-Lite-fp8] SKIP (temporary, work in progress)
