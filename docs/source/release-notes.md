@@ -70,6 +70,7 @@ All published functionality in the Release Notes has been fully tested and verif
 ### Known Issues
 - accuracy/test_cli_flow::TestGpt2::test_beam_search_large is broken
 - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=2-overlap_scheduler=True] is broken
+- Bidirectional attention mask support for image tokens in Gemma3 VLMs is missing. This feature is available on main though: #5976
 
 ## TensorRT-LLM Release 0.20.0
 
