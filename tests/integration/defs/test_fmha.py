@@ -3,6 +3,7 @@ from functools import partial
 from pathlib import Path
 from subprocess import run
 
+
 def test_fmha():
     build_run = partial(run, shell=True, check=True)
 
@@ -23,7 +24,8 @@ def test_fmha():
             "ENABLE_SM120": "1",
         })
 
-        build_run("rm -rf generated temp obj .pytest_cache __pycache__ bin cubin")
+        build_run(
+            "rm -rf generated temp obj .pytest_cache __pycache__ bin cubin")
         build_run("python3 setup.py", env=env)
         build_run("make -j 16", env=env)
         build_run("pytest fmha_test.py", env=env)
