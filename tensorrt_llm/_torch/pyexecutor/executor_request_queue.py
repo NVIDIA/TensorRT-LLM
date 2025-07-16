@@ -2,6 +2,7 @@ import dataclasses
 import datetime
 import heapq
 import queue
+import threading
 import time
 from collections import deque, namedtuple
 from typing import Dict, List, Optional, Tuple
@@ -35,24 +36,26 @@ class RequestQueueItem:
         return not (self.is_shutdown_request or self.is_canceled_request)
 
 
-class RequestFetcher:
+class ExecutorRequestQueue:
     """Handles fetching and processing of new requests from the request queue."""
 
-    def __init__(self, dist: Distributed,
-                 request_queue: queue.Queue[RequestQueueItem],
-                 waiting_queue: deque[RequestQueueItem],
-                 active_requests: List[LlmRequest], canceled_req_ids: List[int],
-                 enable_attention_dp: bool, max_beam_width: int,
-                 max_num_active_requests: int, is_disaggregated: bool):
+    def __init__(self, dist: Distributed, enable_attention_dp: bool,
+                 max_batch_size: int, max_beam_width: int,
+                 max_num_active_requests: int, enable_iter_perf_stats: bool,
+                 is_disaggregated: bool):
         self.dist = dist
-        self.request_queue = request_queue
-        self.waiting_queue = waiting_queue
-        self.active_requests = active_requests
-        self.canceled_req_ids = canceled_req_ids
+        self.request_queue: queue.Queue[RequestQueueItem] = queue.Queue()
+        self.waiting_queue: deque[RequestQueueItem] = deque()
+        self.canceled_req_ids = []
         self.enable_attention_dp = enable_attention_dp
         self.max_beam_width = max_beam_width
         self.max_num_active_requests = max_num_active_requests
         self.is_disaggregated = is_disaggregated
+        self.enqueue_lock = threading.Lock()
+        self.next_request_id = max_batch_size
+        self.enable_iter_perf_stats = enable_iter_perf_stats
+        self.start_times = {}
+        self.active = True
 
         # State tracking
         self.num_fetch_requests = 0
@@ -108,12 +111,66 @@ class RequestFetcher:
             req_count += 1
         return items
 
+    def enqueue_requests(self, requests: List[ExecutorRequest]):
+        req_ids = []
+        try:
+            self.enqueue_lock.acquire()
+            start_time = time.time()
+            for request in requests:
+                self.start_times[self.next_request_id] = start_time
+                self.request_queue.put(
+                    RequestQueueItem(self.next_request_id, request))
+                req_ids.append(self.next_request_id)
+                self.next_request_id += 1
+        finally:
+            self.enqueue_lock.release()
+        return req_ids
+
+    def enqueue_cancel_request(self, req_id: int):
+        try:
+            self.enqueue_lock.acquire()
+            self.request_queue.put(
+                RequestQueueItem(req_id, is_canceled_request=True))
+        finally:
+            self.enqueue_lock.release()
+
+    def enqueue_shutdown_request(self):
+        try:
+            self.enqueue_lock.acquire()
+            self.request_queue.put(RequestQueueItem(SHUTDOWN_REQUEST_ID))
+            self.active = False
+        finally:
+            self.enqueue_lock.release()
+
+    def enqueue_request(self,
+                        request: ExecutorRequest,
+                        query: Optional[list] = None):
+        try:
+            self.enqueue_lock.acquire()
+            assert self.active, "PyExecutor has already been shutdown."
+            req_id = self.next_request_id
+            if self.enable_iter_perf_stats:
+                self.start_times[req_id] = time.time()
+
+            if query is not None:
+                self.request_queue.put(RequestQueueItem(req_id, request, query))
+            else:
+                self.request_queue.put(RequestQueueItem(req_id, request))
+            self.next_request_id += 1
+        finally:
+            self.enqueue_lock.release()
+
+        return req_id
+
+    def can_enqueue_request(self) -> bool:
+        self.enqueue_lock.acquire()
+        can_enqueue = self.active
+        self.enqueue_lock.release()
+        return can_enqueue and self.dist.rank == 0
+
     def _fetch_and_process_requests(
-            self,
-            total_num_active_requests: int,
-            total_max_num_active_requests: int,
-            start_times: Dict[int, float],
-            enable_iter_perf_stats: bool = False) -> List[RequestQueueItem]:
+            self, total_num_active_requests: int,
+            total_max_num_active_requests: int) -> List[RequestQueueItem]:
         """Common logic for fetching and processing requests from the queue."""
         # Calculate timeout
         timeout = None if (total_num_active_requests == 0) and len(
@@ -144,51 +201,40 @@ class RequestFetcher:
             total_max_num_active_requests - total_num_active_requests)
 
         # Update performance metrics
-        if enable_iter_perf_stats and self.dist.rank == 0:
-            self._update_new_active_requests_queue_latency(
-                new_requests, start_times)
+        if self.enable_iter_perf_stats and self.dist.rank == 0:
+            self._update_new_active_requests_queue_latency(new_requests)
 
         return new_requests
 
     @nvtx_range("_fetch_new_requests")
     def fetch_new_requests(
-            self,
-            start_times: Dict[int, float],
-            enable_iter_perf_stats: bool = False) -> List[RequestQueueItem]:
+            self, active_requests: List[LlmRequest]) -> List[RequestQueueItem]:
 
         if self.enable_attention_dp:
-            return self._fetch_new_requests_attention_dp(
-                start_times, enable_iter_perf_stats)
+            return self._fetch_new_requests_attention_dp(active_requests)
         else:
-            return self._fetch_new_requests_attention_tp(
-                start_times, enable_iter_perf_stats)
+            return self._fetch_new_requests_attention_tp(active_requests)
 
     def _fetch_new_requests_attention_tp(
-            self,
-            start_times: Dict[int, float],
-            enable_iter_perf_stats: bool = False) -> List[RequestQueueItem]:
+            self, active_requests: List[LlmRequest]) -> List[RequestQueueItem]:
         """Handle standard (non-attention DP) request fetching."""
-        total_num_active_requests = len(self.active_requests)
+        total_num_active_requests = len(active_requests)
         total_max_num_active_requests = self.max_num_active_requests
 
         # Use common request fetching logic
         new_requests = self._fetch_and_process_requests(
-            total_num_active_requests, total_max_num_active_requests,
-            start_times, enable_iter_perf_stats)
+            total_num_active_requests, total_max_num_active_requests)
 
         # Merge requests and add to active list
         merged_requests = self._merge_requests(new_requests)
-        self.active_requests.extend(merged_requests)
         return merged_requests
 
     def _fetch_new_requests_attention_dp(
-            self,
-            start_times: Dict[int, float],
-            enable_iter_perf_stats: bool = False) -> List[RequestQueueItem]:
+            self, active_requests: List[LlmRequest]) -> List[RequestQueueItem]:
         """Handle attention DP request fetching with load balancing."""
         # Get active request counts across all ranks
         all_ranks_num_active_requests = []
-        responses_list = self.dist.tp_allgather(len(self.active_requests))
+        responses_list = self.dist.tp_allgather(len(active_requests))
         for num_active_requests in responses_list:
             all_ranks_num_active_requests.append(num_active_requests)
 
@@ -197,8 +243,7 @@ class RequestFetcher:
 
         # Use common request fetching logic
         new_requests = self._fetch_and_process_requests(
-            total_num_active_requests, total_max_num_active_requests,
-            start_times, enable_iter_perf_stats)
+            total_num_active_requests, total_max_num_active_requests)
 
         # Balance requests across ranks
         num_new_requests_all_ranks = len(new_requests)
@@ -212,9 +257,9 @@ class RequestFetcher:
             new_requests, all_ranks_num_active_requests)
 
         # Update performance metrics
-        if enable_iter_perf_stats and start_times:
+        if self.enable_iter_perf_stats and self.start_times:
             self._update_new_active_requests_queue_latency(
-                new_requests_cur_rank, start_times)
+                new_requests_cur_rank)
 
         # Update counters
         self.num_fetch_requests += num_new_requests_all_ranks
@@ -222,7 +267,6 @@ class RequestFetcher:
 
         # Merge requests and add to active list
         new_requests_cur_rank = self._merge_requests(new_requests_cur_rank)
-        self.active_requests.extend(new_requests_cur_rank)
         return new_requests_cur_rank
 
     def _handle_request_broadcasting(self,
@@ -382,13 +426,12 @@ class RequestFetcher:
                         setattr(item.request, attr_name, py_obj)
 
     def _update_new_active_requests_queue_latency(
-            self, new_requests: List[RequestQueueItem],
-            start_times: Dict[int, float]):
+            self, new_requests: List[RequestQueueItem]):
         """Update queue latency metrics for new requests."""
         now = time.time()
         for req_item in new_requests:
-            if req_item.id in start_times:
-                self.new_active_requests_queue_latency_ms += now - start_times.pop(
+            if req_item.id in self.start_times:
+                self.new_active_requests_queue_latency_ms += now - self.start_times.pop(
                     req_item.id)
 
     @nvtx_range("_merge_requests")
@@ -531,3 +574,29 @@ class RequestFetcher:
 
     def get_expected_num_active_requests(self) -> int:
         return self.expected_num_active_requests
+
+    def get_request_queue_size(self) -> int:
+        return self.request_queue.qsize()
+
+    def get_request_queue(self) -> queue.Queue[RequestQueueItem]:
+        return self.request_queue
+
+    def get_waiting_queue(self) -> deque[RequestQueueItem]:
+        return self.waiting_queue
+
+    def update_waiting_queue(self):
+        # Remove cancel request in the waiting queue
+        self.waiting_queue = deque(req for req in self.waiting_queue
+                                   if req.id not in self.canceled_req_ids)
+
+    def get_waiting_queue_size(self) -> int:
+        return len(self.waiting_queue)
+
+    def get_canceled_req_ids_size(self) -> int:
+        return len(self.canceled_req_ids)
+
+    def get_canceled_req_ids(self) -> List[int]:
+        return self.canceled_req_ids
+
+    def clear_canceled_req_ids(self):
+        self.canceled_req_ids.clear()

@@ -3,12 +3,10 @@ import datetime
 import functools
 import gc
 import os
-import queue
 import threading
 import time
 import traceback
 import weakref
-from collections import deque
 from contextlib import contextmanager
 from typing import Dict, List, Optional, Union
 
@@ -30,13 +28,15 @@ from tensorrt_llm.logger import logger
 
 from ..distributed import Distributed
 from ..speculative.drafter import Drafter
+<<<<<<< HEAD
 from .guided_decoder import GuidedDecoder
+=======
+from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
+>>>>>>> 00d9fed4c (Add executorRequestQueue)
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
                           LlmResponse)
 from .model_engine import ModelEngine
-from .request_fetcher import (SHUTDOWN_REQUEST_ID, RequestFetcher,
-                              RequestQueueItem)
 from .sampler import Sampler, SampleState, SampleStateTensors
 from .scheduler import RequestScheduler, ScheduledRequests
 
@@ -150,8 +150,6 @@ class PyExecutor:
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = global_mpi_rank()
-        self.request_queue: queue.Queue[RequestQueueItem] = queue.Queue()
-        self.waiting_queue: deque[RequestQueueItem] = deque()
 
         # profile config
         self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
@@ -174,7 +172,6 @@ class PyExecutor:
         self.draft_model_engine = draft_model_engine
 
         # enqueue and _fetch_new_requests used data
-        self.enqueue_lock = threading.Lock()
         self.active = True
         self.next_req_id = max_batch_size  # The first max_batch_size request IDs are reserved for dummy requests
         self.max_beam_width = max_beam_width
@@ -216,7 +213,6 @@ class PyExecutor:
         self.send_handles = [None] * self.num_micro_batches
 
         self.inflight_req_ids = ReqIdsSet()
-        self.canceled_req_ids = []
 
         self.model_engine.warmup(self.resource_manager)
         if self.draft_model_engine is not None:
@@ -225,23 +221,20 @@ class PyExecutor:
         self.is_shutdown = False
 
         # request fetcher initialization
-        self.request_fetcher = RequestFetcher(
+        self.executor_request_queue = ExecutorRequestQueue(
             dist=self.dist,
-            request_queue=self.request_queue,
-            waiting_queue=self.waiting_queue,
-            active_requests=self.active_requests,
-            canceled_req_ids=self.canceled_req_ids,
             enable_attention_dp=self.enable_attention_dp,
+            max_batch_size=max_batch_size,
             max_beam_width=self.max_beam_width,
             max_num_active_requests=self.max_num_active_requests,
+            enable_iter_perf_stats=self.enable_iter_perf_stats,
             is_disaggregated=kv_cache_transceiver is not None,
         )
-        self.request_fetcher.set_exclude_last_generation_logits(
+        self.executor_request_queue.set_exclude_last_generation_logits(
             self.disable_overlap_scheduler, self.sampler)
 
         self.stats_lock = threading.Lock()
         self.stats = []
-        self.start_times = {}
         self.gather_all_responses = False
 
         self.kv_cache_transceiver = kv_cache_transceiver
@@ -302,19 +295,7 @@ class PyExecutor:
         """
         Enqueue new requests
         """
-        req_ids = []
-        try:
-            self.enqueue_lock.acquire()
-            assert self.active, "PyExecutor has already been shutdown."
-            start_time = time.time()
-            for request in requests:
-                self.start_times[self.next_req_id] = start_time
-                self.request_queue.put(
-                    RequestQueueItem(self.next_req_id, request))
-                req_ids.append(self.next_req_id)
-                self.next_req_id += 1
-        finally:
-            self.enqueue_lock.release()
+        req_ids = self.executor_request_queue.enqueue_requests(requests)
         return req_ids
 
     def await_responses(
@@ -347,23 +328,13 @@ class PyExecutor:
         Args:
             id (int): The request id for which to cancel the response
         """
-        try:
-            self.enqueue_lock.acquire()
-            self.request_queue.put(
-                RequestQueueItem(id, is_canceled_request=True))
-        finally:
-            self.enqueue_lock.release()
+        self.executor_request_queue.enqueue_cancel_request(id)
 
     def shutdown(self):
         """
         Signals the server to shutdown.
         """
-        try:
-            self.enqueue_lock.acquire()
-            self.request_queue.put(RequestQueueItem(SHUTDOWN_REQUEST_ID))
-            self.active = False
-        finally:
-            self.enqueue_lock.release()
+        self.executor_request_queue.enqueue_shutdown_request()
         self.shutdown_event.wait()
         self.worker_thread.join()
         self.worker_started = False
@@ -378,10 +349,7 @@ class PyExecutor:
         """
         Indicates if the current process is allowed to enqueue requests
         """
-        self.enqueue_lock.acquire()
-        can_enqueue = self.active
-        self.enqueue_lock.release()
-        return can_enqueue and self.dist.rank == 0
+        return self.executor_request_queue.can_enqueue_request()
 
     def get_latest_iteration_stats(self):
         """
@@ -419,20 +387,8 @@ class PyExecutor:
         """
         Enqueue a new request, query is only used in `StarAttention`.
         """
-        try:
-            self.enqueue_lock.acquire()
-            assert self.active, "PyExecutor has already been shutdown."
-            req_id = self.next_req_id
-            if self.enable_iter_perf_stats:
-                self.start_times[req_id] = time.time()
+        req_id = self.executor_request_queue.enqueue_request(request, query)
 
-            if query is not None:
-                self.request_queue.put(RequestQueueItem(req_id, request, query))
-            else:
-                self.request_queue.put(RequestQueueItem(req_id, request))
-            self.next_req_id += 1
-        finally:
-            self.enqueue_lock.release()
         return req_id
 
     def set_gather_responses(self, gather_all_responses):
@@ -440,8 +396,8 @@ class PyExecutor:
 
     @property
     def should_stop_processing(self):
-        return self.is_shutdown and len(self.active_requests) == 0 and len(
-            self.waiting_queue) == 0
+        return self.is_shutdown and len(self.active_requests) == 0 and \
+            self.executor_request_queue.get_waiting_queue_size() == 0
 
     @contextmanager
     def _profiler(self):
@@ -580,7 +536,7 @@ class PyExecutor:
             req_stat.stage = req.stage
             req_stats.append(req_stat)
 
-        for req in list(self.request_queue.queue):
+        for req in list(self.executor_request_queue.get_request_queue().queue):
             if isinstance(req, RequestQueueItem):
                 req_stat = get_queued_req_stats(req.id)
                 req_stat.stage = RequestStage.QUEUED
@@ -597,7 +553,8 @@ class PyExecutor:
                            scheduled_batch) -> IterationStats:
         stats.iter_latency_ms = iter_latency_ms
 
-        stats.num_queued_requests = self.request_queue.qsize()
+        stats.num_queued_requests = self.executor_request_queue.get_request_queue_size(
+        )
         stats.num_completed_requests = num_completed_requests
         stats.max_num_active_requests = self.max_num_active_requests
 
@@ -710,7 +667,7 @@ class PyExecutor:
                 if self.enable_iter_perf_stats:
                     iter_stats = self._get_init_iter_stats(
                         len(new_requests),
-                        self.request_fetcher.
+                        self.executor_request_queue.
                         get_new_active_requests_queue_latency())
 
                 self._pad_attention_dp_dummy_request()
@@ -871,7 +828,7 @@ class PyExecutor:
                 if self.enable_iter_perf_stats:
                     iter_stats = self._get_init_iter_stats(
                         len(new_requests),
-                        self.request_fetcher.
+                        self.executor_request_queue.
                         get_new_active_requests_queue_latency())
 
                 self._pad_attention_dp_dummy_request()
@@ -991,9 +948,10 @@ class PyExecutor:
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)
         if self.dist.rank == 0 and not self.is_warmup and self.benchmark_req_queues_size > 0 and self.kv_cache_transceiver:
-            while self.request_queue.qsize() < self.benchmark_req_queues_size:
+            while self.executor_request_queue.get_request_queue_size(
+            ) < self.benchmark_req_queues_size:
                 logger.info(
-                    f"sleep 5 seconds, num_request_queue: {self.request_queue.qsize()}"
+                    f"sleep 5 seconds, num_request_queue: {self.executor_request_queue.get_request_queue_size()}"
                 )
                 time.sleep(5)
 
@@ -1014,7 +972,7 @@ class PyExecutor:
                 if self.enable_iter_perf_stats:
                     iter_stats = self._get_init_iter_stats(
                         len(new_requests),
-                        self.request_fetcher.
+                        self.executor_request_queue.
                         get_new_active_requests_queue_latency())
 
                 self._pad_attention_dp_dummy_request()
@@ -1149,13 +1107,12 @@ class PyExecutor:
 
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(self) -> List[RequestQueueItem]:
-        new_requests = self.request_fetcher.fetch_new_requests(
-            start_times=self.start_times,
-            enable_iter_perf_stats=self.enable_iter_perf_stats,
-        )
+        new_requests = self.executor_request_queue.fetch_new_requests(
+            self.active_requests)
+        self.active_requests.extend(new_requests)
 
-        self.is_shutdown = self.request_fetcher.is_shutdown
-        self.expected_num_active_requests = self.request_fetcher.get_expected_num_active_requests(
+        self.is_shutdown = self.executor_request_queue.is_shutdown
+        self.expected_num_active_requests = self.executor_request_queue.get_expected_num_active_requests(
         )
 
 <<<<<<< HEAD
@@ -1472,16 +1429,15 @@ class PyExecutor:
 
     @nvtx_range("_handle_canceled_requests")
     def _handle_canceled_requests(self):
-        if len(self.canceled_req_ids) == 0:
+        if self.executor_request_queue.get_canceled_req_ids_size() == 0:
             return
 
-        # cancel request in the waiting queue
-        self.waiting_queue = deque(req for req in self.waiting_queue
-                                   if req.id not in self.canceled_req_ids)
+        # Remove cancel request in the waiting queue
+        self.executor_request_queue.update_waiting_queue()
 
         for request in self.active_requests:
             req_id = request.py_request_id
-            if req_id in self.canceled_req_ids:
+            if req_id in self.executor_request_queue.get_canceled_req_ids():
                 # Mark requests as finished, then, we reuse all existing code
                 # to clean up the KV cache resources.
                 request.finish_by_reason(FinishReason.CANCELLED)
@@ -1491,7 +1447,7 @@ class PyExecutor:
             # TODO: revisit the cancel logic of attention dp
             # When enable attention dp, each rank does not have full copy of requests
             # so we need to remove the cancel requests not in the local rank
-            self.canceled_req_ids.clear()
+            self.executor_request_queue.clear_canceled_req_ids()
 
     @nvtx_range("_enqueue_responses")
     def _enqueue_responses(self, responses: Dict[int, LlmResponse]):
