@@ -25,7 +25,7 @@ All published functionality in the Release Notes has been fully tested and verif
   - Refactored Fused MoE module
   - Added support for chunked attention on Blackwell and Hopper
   - Introduced sliding-window attention kernels for the generation phase on Blackwell
-  - Updated DeepSeek FP8 TRT-LLM Gen cubins
+  - Updated DeepSeek FP8 TRT-LLM Gen cubins to improve performance in large batch size scenarios
   - Added FP8 block-scale GEMM support on SM89
   - Enabled overlap scheduler between draft forwards
   - Added Piecewise cuda graph support for MLA
