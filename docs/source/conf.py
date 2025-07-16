@@ -69,6 +69,8 @@ autodoc_pydantic_model_show_field_list = True  # Display field list with descrip
 autodoc_pydantic_model_member_order = "groupwise"
 autodoc_pydantic_model_hide_pydantic_methods = True
 autodoc_pydantic_field_list_validators = False
+autodoc_pydantic_settings_signature_prefix = ""  # remove any prefix
+autodoc_pydantic_settings_hide_reused_validator = True  # hide all the validator should be better
 
 myst_url_schemes = {
     "http":
@@ -153,25 +155,20 @@ html_css_files = [
 ]
 
 
-def experimental_role(name,
-                      rawtext,
-                      text,
-                      lineno,
-                      inliner,
-                      options={},
-                      content=[]):
-    """A custom role to mark fields as experimental."""
-    node = nodes.literal(text, text, classes=['experimental'])
+def tag_role(name, rawtext, text, lineno, inliner, options={}, content=[]):
+    """A custom role for displaying tags."""
+    tag_name = text.lower()
+    node = nodes.literal(text, text, classes=['tag', tag_name])
     return [node], []
 
 
 def setup(app):
     from helper import generate_examples, generate_llmapi
 
-    from tensorrt_llm.llmapi.utils import DocTagger
-    DocTagger()()
+    from tensorrt_llm.llmapi.utils import tag_llm_params
+    tag_llm_params()
 
-    app.add_role('experimental', experimental_role)
+    app.add_role('tag', tag_role)
 
     generate_examples()
     generate_llmapi()

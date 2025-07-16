@@ -40,7 +40,7 @@ from .tokenizer import (TokenizerBase, _llguidance_tokenizer_info,
                         _xgrammar_tokenizer_info)
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (append_docstring, exception_handler, get_device_count,
-                    print_colored_debug)
+                    print_colored_debug, set_api_status)
 
 
 class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
@@ -212,6 +212,7 @@ class BaseLLM:
         atexit.register(LLM._shutdown_wrapper, weakref.ref(self))
 
     @property
+    @set_api_status("beta")
     def llm_id(self) -> str:
         if self._llm_id is None:
             hostname = socket.gethostname()
@@ -422,6 +423,7 @@ class BaseLLM:
         return RequestOutput._from_generation_result(result, prompt,
                                                      self.tokenizer)
 
+    @set_api_status("beta")
     def get_stats(self, timeout: Optional[float] = 2) -> List[dict]:
         '''Get iteration statistics from the runtime.
         To collect statistics, call this function after prompts have been submitted with LLM().generate().
@@ -435,6 +437,7 @@ class BaseLLM:
         '''
         return self._executor.get_stats(timeout=timeout)
 
+    @set_api_status("beta")
     def get_stats_async(self, timeout: Optional[float] = 2) -> IterationResult:
         '''Get iteration statistics from the runtime.
         To collect statistics, you can call this function in an async coroutine or the /metrics endpoint (if you're using trtllm-serve)
@@ -448,6 +451,7 @@ class BaseLLM:
         '''
         return self._executor.aget_stats(timeout=timeout)
 
+    @set_api_status("beta")
     def get_kv_cache_events(self, timeout: Optional[float] = 2) -> List[dict]:
         '''Get iteration KV events from the runtime.
 
@@ -469,6 +473,7 @@ class BaseLLM:
         '''
         return self._executor.get_kv_events(timeout=timeout)
 
+    @set_api_status("beta")
     def get_kv_cache_events_async(self,
                                   timeout: Optional[float] = 2
                                   ) -> IterationResult:
@@ -659,6 +664,7 @@ class BaseLLM:
     def tokenizer(self, tokenizer: TokenizerBase):
         self._tokenizer = tokenizer
 
+    @set_api_status("beta")
     def shutdown(self) -> None:
         if hasattr(self, "_executor") and self._executor is not None:
             self._executor.shutdown()
@@ -1036,13 +1042,11 @@ class LLM(_TorchLLM):
                          revision, tokenizer_revision, **kwargs)
 
 
-_LLM_REPR = "TorchLLM"
-
 # sphinx will ignore the LLM's docstring if it is not explicitly set
 LLM.__doc__ = \
     f"""LLM class is the main class for running a LLM model.
 
-    This class is an alias of {_LLM_REPR}.
+    For more details about the arguments, please refer to :class:`TorchLlmArgs`.
 
     Parameters:
 """ + TORCH_LLM_DOCSTRING

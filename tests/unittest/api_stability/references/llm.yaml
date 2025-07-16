@@ -9,6 +9,7 @@ methods:
       moe_cluster_parallel_size:
         annotation: Optional[int]
         default: null
+        status: beta
       enable_attention_dp:
         annotation: bool
         default: False
@@ -69,9 +70,11 @@ methods:
       backend:
         annotation: Optional[str]
         default: null
+        status: deprecated
       build_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.BuildConfig]
         default: null
+        status: deprecated
       cuda_graph_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.CudaGraphConfig]
         default: null
@@ -87,6 +90,7 @@ methods:
       disable_overlap_scheduler:
         annotation: bool
         default: False
+        status: beta
       moe_config:
         annotation: tensorrt_llm.llmapi.llm_args.MoeConfig
         status: beta
@@ -110,6 +114,7 @@ methods:
       enable_iter_perf_stats:
         annotation: bool
         default: False
+        status: prototype
       enable_iter_req_stats:
         annotation: bool
         default: False
@@ -167,27 +172,32 @@ methods:
         annotation: Optional[float]
         default: 2
     return_annotation: List[dict]
+    status: beta
   get_kv_cache_events_async:
     parameters:
       timeout:
         annotation: Optional[float]
         default: 2
     return_annotation: tensorrt_llm.executor.result.IterationResult
+    status: beta
   get_stats:
     parameters:
       timeout:
         annotation: Optional[float]
         default: 2
     return_annotation: List[dict]
+    status: beta
   get_stats_async:
     parameters:
       timeout:
         annotation: Optional[float]
         default: 2
     return_annotation: tensorrt_llm.executor.result.IterationResult
+    status: beta
   shutdown:
     parameters: {}
     return_annotation: None
+    status: beta
 properties:
   llm_id:
     annotation: str

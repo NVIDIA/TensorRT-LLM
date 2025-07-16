@@ -1,0 +1,19 @@
+.tag {
+  padding: 2px 5px;
+  border-radius: 4px;
+  font-size: 0.8em;
+  margin-right: 5px;
+  color: #000;
+}
+
+code.beta {
+  display: inline-block;
+  background-color: #007bff;
+  color: #fff;
+}
+
+code.prototype {
+  display: inline-block;
+  background-color: #fd7e14;
+  color: #fff;
+}
