@@ -297,6 +297,27 @@ class ModelConfig(Generic[TConfig]):
 
         num_heads = self.pretrained_config.num_attention_heads // (
             self.mapping.tp_size * self.mapping.cp_size)
+
+        # Handle both uniform and per-layer KV heads
+        if hasattr(self.pretrained_config, 'num_kv_heads_per_layer'):
+            # For models with per-layer KV heads, use the first layer's value
+            num_kv_heads_raw = self.pretrained_config.num_kv_heads_per_layer[0]
+            # TRT-LLM LoRA requires uniform KV heads across layers
+            if self.lora_config is not None and not all(
+                    kv == num_kv_heads_raw
+                    for kv in self.pretrained_config.num_kv_heads_per_layer):
+                raise ValueError(
+                    f"TRT-LLM LoRA requires uniform KV heads across layers, got: {self.pretrained_config.num_kv_heads_per_layer}"
+                )
+        else:
+            # For uniform models, check: num_key_value_heads (standard) -> num_query_groups (NeMo) -> num_attention_heads
+            num_kv_heads_raw = getattr(
+                self.pretrained_config, 'num_key_value_heads',
+                getattr(self.pretrained_config, 'num_query_groups',
+                        self.pretrained_config.num_attention_heads))
+
+        num_kv_heads = num_kv_heads_raw // (self.mapping.tp_size *
+                                            self.mapping.cp_size)
         hidden_size = self.pretrained_config.hidden_size // self.mapping.tp_size
 
         model_config_cpp = ModelConfigCpp(
@@ -317,10 +338,6 @@ class ModelConfig(Generic[TConfig]):
         else:
             model_config_cpp.tokens_per_block = tokens_per_block
 
-        # For kv cache size calculation: set num_kv_heads
-        num_kv_heads = getattr(
-            self.pretrained_config, "num_key_value_heads",
-            num_heads) // (self.mapping.tp_size * self.mapping.cp_size)
         model_config_cpp.set_num_kv_heads(num_kv_heads)
 
         mlp_hidden_size = None

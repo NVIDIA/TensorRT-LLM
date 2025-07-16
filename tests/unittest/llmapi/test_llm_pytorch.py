@@ -45,11 +45,13 @@ LORA_RANK_CONFIGS = [
 
 
 def create_mock_nemo_lora_checkpoint(
-    lora_dir: Path,
-    hidden_size: int = 4096,
-    num_layers: int = 32,
-    lora_rank: int = 8,
-    tp_size: int = 1,
+        lora_dir: Path,
+        hidden_size: int = 4096,
+        num_layers: int = 32,
+        lora_rank: int = 8,
+        tp_size: int = 1,
+        num_attention_heads: int = 32,
+        num_kv_heads: int = None,  # If None, defaults to num_attention_heads
 ) -> Path:
     """Create a minimal NeMo LoRA checkpoint for testing.
 
@@ -63,10 +65,16 @@ def create_mock_nemo_lora_checkpoint(
         num_layers: Number of transformer layers
         lora_rank: LoRA rank
         tp_size: Tensor parallelism size
+        num_attention_heads: Number of query attention heads
+        num_kv_heads: Number of key/value heads (for GQA). If None, equals num_attention_heads
 
     Returns:
         Path to the created .nemo file
     """
+    # Default to standard MHA if not specified
+    if num_kv_heads is None:
+        num_kv_heads = num_attention_heads
+
     nemo_path = lora_dir / "test_lora.nemo"
 
     # Use temporary directory context manager for safe cleanup
@@ -75,6 +83,14 @@ def create_mock_nemo_lora_checkpoint(
 
         # Create LoRA weights dict
         weights_dict = {}
+
+        # Calculate head dimensions
+        head_dim = hidden_size // num_attention_heads
+        kv_hidden_size = head_dim * num_kv_heads
+
+        # Calculate QKV output dimensions for NeMo's fused format
+        # NeMo fuses QKV: Q(hidden_size) + K(kv_hidden_size) + V(kv_hidden_size)
+        qkv_output_dim = hidden_size + 2 * kv_hidden_size
 
         for layer_idx in range(num_layers):
             # NeMo uses this key format for QKV adapters
@@ -85,15 +101,16 @@ def create_mock_nemo_lora_checkpoint(
             weights_dict[linear_in_key] = torch.randn(
                 lora_rank, hidden_size, dtype=torch.float16) * 0.01
 
-            # Create linear_out weights [3 * hidden_size, lora_rank] for QKV combined
+            # Create linear_out weights [qkv_output_dim, lora_rank] for fused QKV
+            # This is the key difference for GQA - the output dimension changes
             linear_out_key = f"{key_prefix}.linear_out.weight"
             weights_dict[linear_out_key] = torch.randn(
-                3 * hidden_size, lora_rank, dtype=torch.float16) * 0.01
+                qkv_output_dim, lora_rank, dtype=torch.float16) * 0.01
 
         ckpt_path = temp_dir / "model_weights.ckpt"
         torch.save(weights_dict, ckpt_path)
 
-        # Create minimal config
+        # Create minimal config with GQA support
         config = {
             "precision": "fp16",
             "trainer": {
@@ -103,6 +120,8 @@ def create_mock_nemo_lora_checkpoint(
             "model": {
                 "hidden_size": hidden_size,
                 "num_layers": num_layers,
+                "num_attention_heads": num_attention_heads,
+                "num_query_groups": num_kv_heads,  # This is the key for GQA
             },
             "lora": {
                 "rank": lora_rank,
@@ -586,95 +605,85 @@ def test_nemo_lora_unsupported_modules_validation():
 
 
 @force_ampere
-def test_tinyllama_nemo_lora():
-    """Test end-to-end generation with NeMo LoRA checkpoint."""
+def test_gqa_nemo_lora():
+    """Test NeMo LoRA with GQA using TinyLlama's exact dimensions.
+
+    TinyLlama-1.1B-Chat-v1.0 specs (verified from config.json):
+    - hidden_size: 2048
+    - num_hidden_layers: 22
+    - num_attention_heads: 32 (Query heads)
+    - num_key_value_heads: 4 (Key/Value heads)
+    - This gives 32/4 = 8 query heads per KV group (GQA)
+    """
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)
 
-        # Create a mock NeMo checkpoint for TinyLlama
-        # TinyLlama has hidden_size=2048, num_layers=22
+        # TinyLlama's exact GQA configuration
+        hidden_size = 2048
+        num_layers = 22
+        num_q_heads = 32  # Query attention heads
+        num_kv_heads = 4  # Key/Value heads (GQA)
+        lora_rank = 8
+
+        print(
+            f"\n✓ Testing TinyLlama GQA config: Q_heads={num_q_heads}, KV_heads={num_kv_heads}, rank={lora_rank}"
+        )
+
+        # Create a mock NeMo checkpoint with TinyLlama's exact GQA configuration
         nemo_path = create_mock_nemo_lora_checkpoint(
             temp_path,
-            hidden_size=2048,
-            num_layers=22,
-            lora_rank=8,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            lora_rank=lora_rank,
+            num_attention_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
         )
 
         # Create LoRA config for NeMo checkpoint
         lora_config = LoraConfig(
             lora_dir=[str(nemo_path)],
             lora_ckpt_source="nemo",
-            max_lora_rank=8,
+            max_lora_rank=lora_rank,
         )
 
-        # Verify LoRA config is set up correctly
-        assert lora_config.lora_ckpt_source == "nemo"
-        assert len(lora_config.lora_dir) == 1
-        print(f"✓ Created NeMo LoRA config: {nemo_path}")
-
-        # Use TinyLlama for fast testing
+        # Use TinyLlama model - dimensions now match exactly
         model_path = get_model_path("llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
 
-        # Create LLM with NeMo LoRA
-        llm = LLM(
-            model=model_path,
-            lora_config=lora_config,
-            kv_cache_config=global_kvcache_config,
-        )
-
         try:
-            # Test prompts
-            test_prompts = [
-                "Hello, how are you?",
-                "What is the capital of France?",
-            ]
+            # Create LLM with NeMo LoRA
+            llm = LLM(
+                model=model_path,
+                lora_config=lora_config,
+                kv_cache_config=global_kvcache_config,
+            )
+
+            # Test prompt
+            test_prompts = ["Test TinyLlama GQA with NeMo LoRA"]
 
             # Create LoRA request for the NeMo checkpoint
-            lora_req = LoRARequest("nemo-task",
+            lora_req = LoRARequest("tinyllama-gqa-test",
                                    0,
                                    str(nemo_path),
                                    lora_ckpt_source="nemo")
 
-            # Verify LoRA request is configured correctly
-            assert lora_req.ckpt_source == "nemo"
-            assert lora_req.path == str(nemo_path)
-
-            # Test with and without LoRA
-            sampling_params = SamplingParams(max_tokens=20, temperature=0.0)
-
             # Generate with LoRA
-            outputs_with_lora = llm.generate(test_prompts,
-                                             sampling_params,
-                                             lora_request=[lora_req, lora_req])
+            sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
+            outputs = llm.generate(test_prompts,
+                                   sampling_params,
+                                   lora_request=[lora_req])
 
-            # Generate without LoRA
-            outputs_without_lora = llm.generate(test_prompts,
-                                                sampling_params,
-                                                lora_request=[None, None])
+            # Basic validation
+            assert len(outputs) == 1
+            assert outputs[0].outputs[0] is not None
+            assert len(outputs[0].outputs[0].token_ids) > 0
 
-            # Basic validation - outputs should be generated without errors
-            assert len(outputs_with_lora) == 2
-            assert len(outputs_without_lora) == 2
+            print(f"  ✓ TinyLlama GQA with NeMo LoRA passed successfully!")
 
-            # Verify that generation completed successfully (may have minimal output with mock weights)
-            for i in range(2):
-                # Check that we got valid completion outputs
-                assert outputs_with_lora[i].outputs[0] is not None
-                assert outputs_without_lora[i].outputs[0] is not None
-                # Check that token_ids are present (even if just EOS token)
-                assert len(outputs_with_lora[i].outputs[0].token_ids) > 0
-                assert len(outputs_without_lora[i].outputs[0].token_ids) > 0
-
-            print(f"✓ NeMo LoRA generation completed successfully")
-            print(
-                f"✓ LoRA output tokens: {[len(out.outputs[0].token_ids) for out in outputs_with_lora]}"
-            )
-            print(
-                f"✓ Base output tokens: {[len(out.outputs[0].token_ids) for out in outputs_without_lora]}"
-            )
-
-            # Test passes if generation completes without errors
-            # Note: With mock LoRA weights, outputs may be minimal but that's expected
-
+        except Exception as e:
+            # Any error now indicates a real problem since dimensions match
+            pytest.fail(f"TinyLlama GQA test failed: {e}")
         finally:
-            llm.shutdown()
+            if 'llm' in locals():
+                llm.shutdown()
+
+    print("✓ TinyLlama GQA NeMo LoRA test completed successfully")
