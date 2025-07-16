@@ -306,6 +306,131 @@ void invokeBlockScaleInterleaveReverse(
 
 // FP4 Dequantization
 
+// Template union for vectorized memory operations
+template <typename T>
+struct VectorizedStore
+{
+    static constexpr int elements_per_store = 1;
+    using store_type = T;
+};
+
+template <>
+struct VectorizedStore<float>
+{
+    static constexpr int elements_per_store = 4;
+    using store_type = float4;
+
+    union
+    {
+        float4 vec;
+        float elements[4];
+    };
+
+    __device__ VectorizedStore(float a, float b, float c, float d)
+    {
+        vec = make_float4(a, b, c, d);
+    }
+
+    __device__ void store(float* ptr)
+    {
+        *reinterpret_cast<float4*>(ptr) = vec;
+    }
+};
+
+template <>
+struct VectorizedStore<half>
+{
+    static constexpr int elements_per_store = 8;
+    using store_type = uint4; // 128-bit store
+
+    union
+    {
+        uint4 vec;
+        half elements[8];
+    };
+
+    __device__ VectorizedStore(half a, half b, half c, half d, half e, half f, half g, half h)
+    {
+        elements[0] = a;
+        elements[1] = b;
+        elements[2] = c;
+        elements[3] = d;
+        elements[4] = e;
+        elements[5] = f;
+        elements[6] = g;
+        elements[7] = h;
+    }
+
+    __device__ void store(half* ptr)
+    {
+        *reinterpret_cast<uint4*>(ptr) = vec;
+    }
+};
+
+#ifdef ENABLE_BF16
+template <>
+struct VectorizedStore<__nv_bfloat16>
+{
+    static constexpr int elements_per_store = 8;
+    using store_type = uint4; // 128-bit store
+
+    union
+    {
+        uint4 vec;
+        __nv_bfloat16 elements[8];
+    };
+
+    __device__ VectorizedStore(__nv_bfloat16 a, __nv_bfloat16 b, __nv_bfloat16 c, __nv_bfloat16 d, __nv_bfloat16 e,
+        __nv_bfloat16 f, __nv_bfloat16 g, __nv_bfloat16 h)
+    {
+        elements[0] = a;
+        elements[1] = b;
+        elements[2] = c;
+        elements[3] = d;
+        elements[4] = e;
+        elements[5] = f;
+        elements[6] = g;
+        elements[7] = h;
+    }
+
+    __device__ void store(__nv_bfloat16* ptr)
+    {
+        *reinterpret_cast<uint4*>(ptr) = vec;
+    }
+};
+#endif
+
+// Template function for vectorized output writing
+template <typename T>
+__device__ void writeVectorizedOutput(T* output, int baseIdx, float* scaledValues, int numElements)
+{
+    constexpr int store_size = VectorizedStore<T>::elements_per_store;
+
+    for (int i = 0; i < numElements; i += store_size)
+    {
+        if constexpr (store_size == 4)
+        {
+            // float4 stores (4 elements)
+            VectorizedStore<T> vs(scaledValues[i], scaledValues[i + 1], scaledValues[i + 2], scaledValues[i + 3]);
+            vs.store(output + baseIdx + i);
+        }
+        else if constexpr (store_size == 8)
+        {
+            // uint4 stores for half/bfloat16 (8 elements)
+            VectorizedStore<T> vs(cuda_cast<T>(scaledValues[i]), cuda_cast<T>(scaledValues[i + 1]),
+                cuda_cast<T>(scaledValues[i + 2]), cuda_cast<T>(scaledValues[i + 3]), cuda_cast<T>(scaledValues[i + 4]),
+                cuda_cast<T>(scaledValues[i + 5]), cuda_cast<T>(scaledValues[i + 6]),
+                cuda_cast<T>(scaledValues[i + 7]));
+            vs.store(output + baseIdx + i);
+        }
+        else
+        {
+            // Fallback to individual stores
+            output[baseIdx + i] = cuda_cast<T>(scaledValues[i]);
+        }
+    }
+}
+
 // Convert 8 e2m1 values (represented as one uint32_t) into 8 float32 values.
 inline __device__ void e2m1_to_fp32_vec(uint32_t e2m1Vec, float (&array)[8])
 {
@@ -434,15 +559,37 @@ __global__ void cvt_fp4_to_fp16(int m, int n, uint32_t const* input, uint32_t co
             float fp32Values[8];
             e2m1_to_fp32_vec(fp4Packed, fp32Values);
 
-            // Scale and convert to output type
+            // Scale and convert to output type using template-based vectorized stores
+            int const baseOutputIdx = rowIdx * n + colIdx + elemIdx;
+
+            // Apply scaling to all 8 values
+            float scaledValues[8];
 #pragma unroll
             for (int i = 0; i < 8; i++)
             {
-                int const outputIdx = rowIdx * n + colIdx + elemIdx + i;
-                if (outputIdx < m * n)
+                scaledValues[i] = fp32Values[i] * scaleFloat;
+            }
+
+            // Check alignment based on template store size
+            constexpr int store_size = VectorizedStore<T>::elements_per_store;
+            bool alignedForVectorized = (baseOutputIdx % store_size == 0);
+
+            if (baseOutputIdx + 7 < m * n && alignedForVectorized)
+            {
+                // Use template-based vectorized stores
+                writeVectorizedOutput<T>(output, baseOutputIdx, scaledValues, 8);
+            }
+            else
+            {
+                // Fallback to individual stores for boundary cases
+#pragma unroll
+                for (int i = 0; i < 8; i++)
                 {
-                    float scaledValue = fp32Values[i] * scaleFloat;
-                    output[outputIdx] = cuda_cast<T>(scaledValue);
+                    int const outputIdx = baseOutputIdx + i;
+                    if (outputIdx < m * n)
+                    {
+                        output[outputIdx] = cuda_cast<T>(scaledValues[i]);
+                    }
                 }
             }
         }

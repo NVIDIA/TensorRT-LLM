@@ -252,7 +252,7 @@ class WideEPMoE(MoE):
         if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
             return AlltoallMethodType.NotEnabled
 
-        if mapping.moe_ep_size <= top_k:
+        if mapping.moe_ep_size < top_k:
             return AlltoallMethodType.NotEnabled
 
         if MnnvlMemory.supports_mnnvl():
