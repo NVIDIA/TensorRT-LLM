@@ -448,7 +448,7 @@ class ApiStabilityTestHarness:
     def test_api_status(self):
         """ Check that the API status (prototype | beta) matches the llm.yaml.
         Note that, only the non-committed APIs are checked, the committed APIs
-        are treated as stable..
+        are treated as stable.
         """
         from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
@@ -466,6 +466,18 @@ class ApiStabilityTestHarness:
 
         def check_status(field_name, reference_status, context=""):
             actual_status = get_actual_status(field_name)
+            if actual_status is None:
+                raise AssertionError(
+                    f"Status is not set for the non-committed {context}'{field_name}', "
+                    "please update the field with Field(..., status='<status>'), "
+                    "status could be either 'beta' or 'prototype'.")
+
+            if reference_status is None:
+                raise AssertionError(
+                    f"Status is not set for {context}'{field_name}' in reference/llm.yaml, "
+                    "please update the field with Field(..., status='<status>'), "
+                    "status could be either 'beta' or 'prototype'.")
+
             if actual_status != reference_status:
                 raise AssertionError(
                     f"Status mismatch for {context}'{field_name}': "
