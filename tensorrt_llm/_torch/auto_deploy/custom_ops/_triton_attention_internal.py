@@ -100,8 +100,6 @@ def _paged_generate_mha(
         n_heads,
         d_head,
         SEQ_BLOCK_SIZE,
-        False,  # HAS_SINKS: no sink tokens used
-        None,  # sinks_ptr: no sink tokens used
     )
 
 
@@ -340,7 +338,6 @@ def _generate_mha_rope_fusion(
         d_head,
         SEQ_BLOCK_SIZE,
         HEAD_BLOCK_SIZE,
-        -1,  # SLIDING_WINDOW: -1 means no sliding window
     )
     attention_kv_stage2[(b, n_heads, 1)](
         stage1_output_values,
@@ -351,8 +348,6 @@ def _generate_mha_rope_fusion(
         n_heads,
         d_head,
         SEQ_BLOCK_SIZE,
-        False,  # HAS_SINKS: no sink tokens used
-        None,  # sinks_ptr: no sink tokens used
     )
 
 
@@ -419,9 +414,6 @@ def _flattened_context_mha_rope_fusion(
         d_head,
         SEQ_BLOCK,
         max_cache_seq_len,
-        -1,  # SLIDING_WINDOW: -1 means no sliding window
-        False,  # HAS_SINKS: no sink tokens used
-        None,  # sinks_ptr: no sink tokens used
         num_stages=2,
     )
 
