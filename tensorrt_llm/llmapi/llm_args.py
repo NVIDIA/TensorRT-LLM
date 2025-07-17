@@ -60,6 +60,23 @@ from .utils import (generate_api_docs_as_docstring, get_type_repr,
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 
 
+class AttentionDpConfig(BaseModel):
+    """
+    Configuration for attention DP.
+    """
+    enable_balance: bool = Field(default=False,
+                                 description="Whether to enable balance.")
+    batching_wait_iters: int = Field(
+        default=10,
+        description="The number of iterations to wait for batching.")
+    timeout_iters: int = Field(
+        default=500, description="The number of iterations to timeout.")
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+
 @dataclass
 class _ParallelConfig:
     ''' The model distribution configs for LLM.  '''
@@ -1655,6 +1672,11 @@ class TorchLlmArgs(BaseLlmArgs):
         "If true, batches are rounded up to the nearest cuda_graph_batch_size. This is usually a net win for performance."
     )
 
+    attention_dp_config: Optional[AttentionDpConfig] = Field(
+        default=None,
+        description=
+        "Attention DP config. If true, use attention DP optimized scheduler.")
+
     disable_overlap_scheduler: bool = Field(
         default=False, description="Disable the overlap scheduler.")
 
@@ -1794,6 +1816,29 @@ class TorchLlmArgs(BaseLlmArgs):
                 f"stream_interval must be positive, got {self.stream_interval}")
         return self
 
+    @model_validator(mode='after')
+    def validate_attention_dp_config(self) -> 'TorchLlmArgs':
+        """Validate attention DP configuration.
+
+        Ensures that:
+        1. If attention_dp_config.enable_balance is true, attention_dp_config.batching_wait_iters must be greater than 0
+        2. If attention_dp_config.enable_balance is true, attention_dp_config.timeout_iters must be greater than 0
+        """
+        if self.attention_dp_config is None:
+            return self
+
+        config = self.attention_dp_config
+        if config.enable_balance:
+            if config.batching_wait_iters < 0:
+                raise ValueError(
+                    "attention_dp_config.batching_wait_iters must be greater than 0 when enable_balance is true"
+                )
+            if config.timeout_iters < 0:
+                raise ValueError(
+                    "attention_dp_config.timeout_iters must be greater than 0 when enable_balance is true"
+                )
+        return self
+
     # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
     def get_pytorch_backend_config(self) -> "PyTorchConfig":
         from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
@@ -1830,7 +1875,14 @@ class TorchLlmArgs(BaseLlmArgs):
             enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
             load_format=self.load_format,
             enable_min_latency=self.enable_min_latency,
-            stream_interval=self.stream_interval)
+            stream_interval=self.stream_interval,
+            use_attention_dp_config=bool(self.attention_dp_config is not None),
+            attention_dp_time_out_iters=self.attention_dp_config.timeout_iters
+            if self.attention_dp_config is not None else
+            AttentionDpConfig.model_fields['timeout_iters'].default,
+            attention_dp_batching_wait_iters=self.attention_dp_config.
+            batching_wait_iters if self.attention_dp_config is not None else
+            AttentionDpConfig.model_fields['batching_wait_iters'].default)
 
     @field_validator('cuda_graph_max_batch_size')
     @classmethod
@@ -2034,6 +2086,7 @@ def update_llm_args_with_extra_dict(
         "extended_runtime_perf_knob_config": ExtendedRuntimePerfKnobConfig,
         "cache_transceiver_config": CacheTransceiverConfig,
         "lora_config": LoraConfig,
+        "attention_dp_config": AttentionDpConfig,
     }
     for field_name, field_type in field_mapping.items():
         if field_name in llm_args_dict:

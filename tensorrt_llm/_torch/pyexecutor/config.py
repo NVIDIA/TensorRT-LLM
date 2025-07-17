@@ -45,6 +45,10 @@ class PyTorchConfig:
     moe_max_num_tokens: Optional[int] = None
     moe_load_balancer: Optional[Union[MoeLoadBalancerConfig, dict, str]] = None
 
+    use_attention_dp_config: bool = False
+    attention_dp_time_out_iters: int = 500
+    attention_dp_batching_wait_iters: int = 0
+
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'
 
