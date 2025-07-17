@@ -1,0 +1,36 @@
+exec:
+  config:
+    context:
+      tp: 4
+      ep: 4
+      pp: 1
+      max_batch_size: 4
+      max_num_tokens: 1024
+      max_seq_len: 1024
+      config:
+        kv_cache_config:
+          free_gpu_memory_fraction: 0.75
+          enable_block_reuse: false
+        print_iter_log: true
+      dp: 1
+    generation:
+      tp: 4
+      ep: 4
+      pp: 1
+      max_batch_size: 1
+      max_num_tokens: 4096
+      max_seq_len: 2048
+      config:
+        print_iter_log: true
+        kv_cache_config:
+          free_gpu_memory_fraction: 0.75
+          enable_block_reuse: false
+      dp: 1
+  model_path: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+profile:
+  isl: 1024
+  osl: 1024
+  use_benchmark_serving: true
+  concurrency:
+  - 128
+  - 256
