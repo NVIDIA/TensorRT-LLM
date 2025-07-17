@@ -4,6 +4,7 @@ import functools
 import gc
 import heapq
 import os
+import pickle
 import queue
 import threading
 import time
@@ -1253,13 +1254,19 @@ class PyExecutor:
         else:
             py_request_objects = None
 
-        if self.dist.rank == 0:
-            # Preserve original `new_requests` on rank 0 since it may contain
-            # Python-only objects (e.g., custom logits processors) not serializable by pybind.
-            _ = self._broadcast_new_requests(new_requests, py_request_objects)
-        else:
-            new_requests, py_request_objects = self._broadcast_new_requests(
-                new_requests, py_request_objects)
+        try:
+            if self.dist.rank == 0:
+                # Preserve original `new_requests` on rank 0 since it may contain
+                # Python-only objects (e.g., custom logits processors) not serializable by pybind.
+                _ = self._broadcast_new_requests(new_requests,
+                                                 py_request_objects)
+            else:
+                new_requests, py_request_objects = self._broadcast_new_requests(
+                    new_requests, py_request_objects)
+        except (pickle.UnpicklingError, ValueError) as e:
+            raise ValueError(
+                f"broadcast new requests failed: {str(e)}, payload size: {len(pickle.dumps((new_requests, py_request_objects)))} bytes"
+            )
 
         # drop requests arriving after shutdown
         valid_new_requests = []
