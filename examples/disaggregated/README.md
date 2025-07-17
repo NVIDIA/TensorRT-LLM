@@ -143,3 +143,7 @@ Once the context and generation servers are launched, you can again launch the d
 ```
 trtllm-serve disaggregated -c disagg_config.yaml
 ```
+
+## Launching disaggregated serving using SLURM
+
+Please refer to the [SLURM example](./slurm/README.md) for an example of how to launch disaggregated serving using SLURM.
