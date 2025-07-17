@@ -67,7 +67,7 @@ def generate_examples():
 
     def collect_script_paths(examples_subdir: str) -> list[Path]:
         """Collect Python and shell script paths from an examples subdirectory."""
-        script_dir = root_dir / f"1.0/examples/{examples_subdir}"
+        script_dir = root_dir / f"examples/{examples_subdir}"
         script_paths = list(
             chain(script_dir.glob("*.py"), script_dir.glob("*.sh")))
         return [
@@ -150,7 +150,7 @@ def generate_examples():
             language = "python" if script_path.suffix == ".py" else "bash"
 
             # Make script_path relative to doc_path and call it include_path
-            include_path = '../../..' / script_path.relative_to(root_dir)
+            include_path = '../../../..' / script_path.relative_to(root_dir)
 
             # Extract metadata from the script file
             if meta := extract_meta_info(str(script_path)):
