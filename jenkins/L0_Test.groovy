@@ -492,7 +492,7 @@ String getShortenedJobName(String path)
         "L1_Custom": "l1-cus",
         "L1_Nightly": "l1-nt",
         "L1_Stable": "l1-stb",
-        "BuildDockerImageSanityTest": "l0-sanity",
+        "BuildDockerImageSanityTest": "img-check",
     ]
     def parts = path.split('/')
     // Apply nameMapping to the last part (jobName)
@@ -2273,14 +2273,14 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
             config: LINUX_AARCH64_CONFIG,
         ],
         "NGC Release Image amd64": [
-            name: "NGC-Release-Image-amd64-Sanity-Test",
+            name: "NGC-Release-Image-amd64-Sanity-Test-A10",
             gpuType: "a10",
             k8sArch: "amd64",
             wheelInstalled: true,
             config: VANILLA_CONFIG,
         ],
         "NGC Release Image arm64": [
-            name: "NGC-Release-Image-arm64-Sanity-Test",
+            name: "NGC-Release-Image-arm64-Sanity-Test-GH200",
             gpuType: "gh200",
             k8sArch: "arm64",
             wheelInstalled: true,
