@@ -38,6 +38,7 @@ from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
 
+from tensorrt_llm import logger
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
@@ -1285,12 +1286,17 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
         if self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
         ) and get_sm_version() == 100:
             for name in list(weights.keys()):
-                if name.endswith("weight_scale_inv"):
+                # Use ".experts." to exclude shared_experts.
+                if name.endswith(
+                        "weight_scale_inv") and ".experts." not in name:
                     weight_name = name.replace("weight_scale_inv", "weight")
+                    logger.debug(f"Resmoothing {weight_name}")
                     weight = weights[weight_name][:]
                     scale = weights[name][:]
                     weights[weight_name], weights[name] = resmooth_to_fp8_e8m0(
                         weight, scale)
+                    weights[weight_name] = weights[weight_name].cpu()
+                    weights[name] = weights[name].cpu()
 
         for name, module in tqdm(all_named_modules.items(),
                                  desc="Loading weights"):

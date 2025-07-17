@@ -4,10 +4,12 @@ from typing import Dict, List, NamedTuple, Union
 import torch
 from torch import nn
 
+from tensorrt_llm import logger
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.quantization.utils.fp4_utils import (
     float4_sf_dtype, get_reorder_rows_for_gated_act_gemm_row_indices,
     get_shuffle_matrix_a_row_indices, get_shuffle_matrix_sf_a_row_indices)
+from tensorrt_llm.quantization.utils.fp8_utils import resmooth_to_fp8_e8m0
 
 from ..linear import TensorParallelMode, load_weight_shard
 from .interface import MoEWeightLoadingMode
@@ -462,6 +464,20 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
                                   w2_weight_scaling_factor)
 
         self.setup_quant_scales(module)
+
+    def load_weights(self, module: torch.nn.Module, weights: List[Dict],
+                     weight_loading_mode: MoEWeightLoadingMode):
+
+        if get_sm_version() == 100:
+            for name in list(weights.keys()):
+                if name.endswith("weight_scale_inv"):
+                    weight_name = name.replace("weight_scale_inv", "weight")
+                    logger.debug(f"Resmoothing {weight_name}")
+                    weight = weights[weight_name][:]
+                    scale = weights[name][:]
+                    weights[weight_name], weights[name] = resmooth_to_fp8_e8m0(
+                        weight, scale)
+        super().load_weights(module, weights, weight_loading_mode)
 
     def setup_quant_scales(self, module: torch.nn.Module):
         module.quant_scales = FusedMoEQuantScalesDeepSeekFP8BlockScales(
