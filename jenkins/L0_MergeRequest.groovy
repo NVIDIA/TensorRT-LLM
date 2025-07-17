@@ -565,6 +565,8 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "cpp/tensorrt_llm/runtime/ncclCommunicator.cpp",
         "cpp/tensorrt_llm/kernels/communicationKernels/",
         "cpp/tensorrt_llm/thop/allreduceOp.cpp",
+        "cpp/tensorrt_llm/thop/allgatherOp.cpp",
+        "cpp/tensorrt_llm/thop/reducescatterOp.cpp",
         "cpp/tensorrt_llm/kernels/customAllReduceKernels.h",
         "cpp/tensorrt_llm/kernels/customAllReduceKernels.cu",
         "cpp/tensorrt_llm/kernels/gptKernels.h",
