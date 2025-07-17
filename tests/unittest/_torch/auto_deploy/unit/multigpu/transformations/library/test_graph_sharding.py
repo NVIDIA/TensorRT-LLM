@@ -11,7 +11,7 @@ from _dist_test_utils import get_device_counts
 from _graph_test_helpers import run_sharding_pattern_detection_test, run_test
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
-from tensorrt_llm._torch.auto_deploy.transformations.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transformations.library import (
     ShardingConfig,
     SplitDimension,

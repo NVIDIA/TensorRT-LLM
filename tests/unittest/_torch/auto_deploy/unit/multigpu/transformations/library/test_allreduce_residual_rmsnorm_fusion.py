@@ -3,10 +3,11 @@
 import pytest
 import torch
 from _dist_test_utils import get_device_counts
+from torch.export import export
 
 from tensorrt_llm._torch.auto_deploy.distributed import common as dist
 from tensorrt_llm._torch.auto_deploy.distributed.trtllm import is_trtllm_op_available
-from tensorrt_llm._torch.auto_deploy.transformations.export import torch_export, torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transformations.library.collectives import (
     fuse_allreduce_residual_rmsnorm,
 )
@@ -85,7 +86,7 @@ def _test_allreduce_fusion(port: int):
     )
 
     # check if we can still export the model as expected
-    torch_export(gm, args=args)
+    export(gm, args=args)
     torch_export_to_gm(gm, args=args)
 
 
