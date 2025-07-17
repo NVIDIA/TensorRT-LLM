@@ -74,10 +74,9 @@ The PyTorch backend supports guided decoding with the XGrammar and Low-level Gui
 To enable guided decoding, you must:
 
 1. Set the `guided_decoding_backend` parameter to `'xgrammar'` or `'llguidance'` in the `LLM` class
-2. Disable overlap scheduling using the `disable_overlap_scheduler` parameter of the `LLM` class
-3. Create a [`GuidedDecodingParams`](../../../../tensorrt_llm/sampling_params.py#L14) object with the desired format specification
+2. Create a [`GuidedDecodingParams`](../../../../tensorrt_llm/sampling_params.py#L14) object with the desired format specification
     * Note: Depending on the type of format, a different parameter needs to be chosen to construct the object (`json`, `regex`, `grammar`, `strucutral_tag`).
-4. Pass the `GuidedDecodingParams` object to the `guided_decoding` parameter of the `SamplingParams` object
+3. Pass the `GuidedDecodingParams` object to the `guided_decoding` parameter of the `SamplingParams` object
 
 The following example demonstrates guided decoding with JSON format:
 
@@ -86,8 +85,7 @@ from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import GuidedDecodingParams
 
 llm = LLM(model='nvidia/Llama-3.1-8B-Instruct-FP8',
-          guided_decoding_backend='xgrammar',
-          disable_overlap_scheduler=True)
+          guided_decoding_backend='xgrammar')
 structure = '{"title": "Example JSON", "type": "object", "properties": {...}}'
 guided_decoding_params = GuidedDecodingParams(json=structure)
 sampling_params = SamplingParams(
@@ -110,6 +108,9 @@ To use a custom logits processor:
 The following example demonstrates logits processing:
 
 ```python
+import torch
+from typing import List, Optional
+
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.sampling_params import LogitsProcessor
 
