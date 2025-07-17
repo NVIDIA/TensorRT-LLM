@@ -63,7 +63,7 @@ Manually searching YAML and Groovy files can be tedious.  The helper script
 ```bash
 python scripts/test_to_stage_mapping.py --tests "triton_server/test_triton.py::test_gpt_ib_ptuning[gpt-ib-ptuning]"
 python scripts/test_to_stage_mapping.py --tests gpt_ib_ptuning
-python scripts/test_to_stage_mapping.py --stages A100X-Triton-Python-[Post-Merge]-1
+python scripts/test_to_stage_mapping.py --stages A100X-Triton-Post-Merge-1
 python scripts/test_to_stage_mapping.py --test-list my_tests.txt
 python scripts/test_to_stage_mapping.py --test-list my_tests.yml
 ```
