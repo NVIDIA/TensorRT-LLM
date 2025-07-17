@@ -105,7 +105,6 @@ class InferenceOptimizer:
         ############################################################################################
 
         local_rank, world_size = dist_ad.get_rank_world_size()
-        world_size = 2
 
         # eliminate redundant transpose operations
         eliminate_redundant_transposes(egm)

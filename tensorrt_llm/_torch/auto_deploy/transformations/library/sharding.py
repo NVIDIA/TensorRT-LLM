@@ -91,13 +91,13 @@ class TPShardingInfo(ShardingTransformInfo):
         """Validate the transformation configuration."""
         if self.dist_op is not None:
             if self.split_dim == SplitDimension.ROW:
-                if self.dist_op == "all_gather":
+                if self.dist_op == "all_reduce":
                     ad_logger.warning(
                         f"Row split is only supported for all_gather. Skipping {self}."
                     )
                     return False
             if self.split_dim == SplitDimension.COLUMN:
-                if self.dist_op == "all_reduce":
+                if self.dist_op == "all_gather":
                     ad_logger.warning(
                         f"Column split is only supported for all_reduce. Skipping {self}."
                     )
