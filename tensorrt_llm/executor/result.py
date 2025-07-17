@@ -374,7 +374,7 @@ class GenerationResultBase:
                 output.finish_reason
             })
         processed_metrics_stat = _process_req_perf_metrics(
-            stats, len(output.token_ids))
+            stats, len(output.token_ids), self.sampling_params.n > 1)
         if processed_metrics_stat:
             metrics_stats.update(processed_metrics_stat)
         self.metrics_dict = metrics_stats
@@ -727,8 +727,11 @@ def compute_logprobs(
                           generation=generation_logprobs)
 
 
-def _process_req_perf_metrics(req_perf_metrics_dict: Optional[dict[str, float]],
-                              output_length: int) -> Optional[dict[str, float]]:
+def _process_req_perf_metrics(
+        req_perf_metrics_dict: Optional[dict[str, float]],
+        output_length: int,
+        is_multiple_response: Optional[bool] = False
+) -> Optional[dict[str, float]]:
     stat = {}
     if not req_perf_metrics_dict:
         return stat
@@ -743,7 +746,7 @@ def _process_req_perf_metrics(req_perf_metrics_dict: Optional[dict[str, float]],
         SupportedMetricNames.E2E: e2e,
         SupportedMetricNames.REQUEST_QUEUE_TIME: request_queue_time
     }
-    if output_length > 1:
+    if output_length > 1 and not is_multiple_response:
         tpot = (req_perf_metrics_dict.get(
             RequestEventTiming.LAST_TOKEN_TIME, 0) - req_perf_metrics_dict.get(
                 RequestEventTiming.FIRST_TOKEN_TIME, 0)) / (output_length - 1)
