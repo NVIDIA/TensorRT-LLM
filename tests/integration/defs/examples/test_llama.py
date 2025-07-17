@@ -4057,3 +4057,45 @@ def test_llm_llama_lookahead_single_gpu_summary(llama_example_root,
                                        lookahead_config='[7, 7, 7]')
 
     venv_check_call(llm_venv, summary_cmd)
+
+
+@pytest.mark.parametrize("model_name,model_path", [
+    ("Llama-3.1-8B-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct"),
+])
+def test_llm_api_lookahead_decoding_1gpu(model_name, model_path):
+    """
+    RCCA: https://nvbugs/5359218
+    """
+    from defs.conftest import llm_models_root
+
+    from tensorrt_llm.llmapi import (LLM, BuildConfig, KvCacheConfig,
+                                     LookaheadDecodingConfig, SamplingParams)
+    build_config = BuildConfig(max_batch_size=128,
+                               max_input_len=2048,
+                               max_seq_len=32768,
+                               max_num_tokens=8192,
+                               max_draft_len=111)
+    build_config.plugin_config.use_paged_context_fmha = True
+    build_config.plugin_config.multiple_profiles = True
+
+    lookahead_config = LookaheadDecodingConfig(max_window_size=8,
+                                               max_ngram_size=3,
+                                               max_verification_set_size=3)
+
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
+    llm = LLM(model=f"{llm_models_root()}/{model_path}",
+              kv_cache_config=kv_cache_config,
+              build_config=build_config,
+              speculative_config=lookahead_config,
+              enable_chunked_prefill=True)
+
+    prompt = """Write a C++ program to find the nth Fibonacci number using
+recursion. Now we define a sequence of numbers in which each number is the
+sum of the three preceding ones. The first three numbers are 0, -1, -1.
+Write a program to find the nth number.""" * 200  # around 13k tokens
+
+    sampling_params = SamplingParams(lookahead_config=lookahead_config)
+
+    output = llm.generate(prompt, sampling_params=sampling_params)
+
+    assert output is not None, "No output generated from LLM"

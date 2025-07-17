@@ -5,7 +5,6 @@ import shutil
 import tempfile
 import time
 import weakref
-from argparse import Namespace
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple, Union
@@ -35,7 +34,7 @@ from .llm_args import (CalibConfig, CudaGraphConfig, DraftTargetDecodingConfig,
                        LookaheadDecodingConfig, MedusaDecodingConfig,
                        MTPDecodingConfig, NGramDecodingConfig,
                        UserProvidedDecodingConfig, _ModelFormatKind,
-                       _ModelWrapper, _ParallelConfig, get_model_format,
+                       _ModelWrapper, _ParallelConfig,
                        update_llm_args_with_extra_dict,
                        update_llm_args_with_extra_options)
 from .mpi_session import MPINodeState, MpiSession
@@ -315,11 +314,6 @@ class ModelLoader:
             if tokenizer is not None:
                 tokenizer.save_pretrained(engine_dir)
 
-    @staticmethod
-    def get_model_format(model_dir: str) -> _ModelFormatKind:
-        ''' Get the format of the model.  '''
-        return get_model_format(model_dir)
-
     def _download_hf_model(self):
         ''' Download HF model from third-party model hub like www.modelscope.cn or huggingface.  '''
         model_dir = None
@@ -406,6 +400,9 @@ class ModelLoader:
             for key, value in hf_quant_config.items():
                 logger.info(f"Setting {key}={value} from HF quant config.")
                 setattr(quant_config, key, value)
+
+            # Update the quant_config in llm_args for pytorch
+            self.llm_args.quant_config = quant_config
 
             return True
 
@@ -567,21 +564,6 @@ class ModelLoader:
         self._engine = Engine.from_dir(self._model_dir)
 
     @staticmethod
-    def load_extra_build_configs_from_engine(
-            model_dir: str) -> Optional[Namespace]:
-        ''' Load the extra build configs from the engine directory, return None if model isn't an engine. '''
-        if ModelLoader.get_model_format(
-                model_dir) is not _ModelFormatKind.TLLM_ENGINE:
-            return None
-
-        with open(Path(model_dir) / "config.json", "r") as f:
-            engine_config = json.load(f)
-
-        build_config = engine_config['build_config']
-        build_config.pop("plugin_config")
-        return Namespace(**build_config)
-
-    @staticmethod
     def load_hf_tokenizer(
             model_dir,
             trust_remote_code: bool = True,
@@ -740,7 +722,8 @@ class CachedModelLoader:
             self._hf_model_dir,
             mapping=self.llm_args.parallel_config.to_mapping(),
             quant_config=self.llm_args.quant_config,
-            dtype=self.llm_args.dtype)
+            dtype=self.llm_args.dtype,
+            trust_remote_code=self.llm_args.trust_remote_code)
 
     def _build_model(self) -> Path:
         model_format = self.llm_args.model_format

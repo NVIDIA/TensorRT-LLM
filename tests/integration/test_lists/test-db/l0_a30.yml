@@ -15,6 +15,7 @@ l0_a30:
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/modeling -k "modeling_nemotron_nas"
+  - unittest/_torch/modeling -k "modeling_phi3"
   - unittest/_torch/modeling -k "modeling_qwen"
   - unittest/_torch/modeling -k "modeling_qwen_moe"
   - unittest/_torch/auto_deploy/unit/singlegpu

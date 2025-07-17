@@ -745,7 +745,7 @@ To serve the model using `trtllm-serve`:
 ```bash
 cat >./extra-llm-api-config.yml <<EOF
 cuda_graph_config:
-  padding_enabled: true
+  enable_padding: true
   batch_sizes:
   - 1
   - 2
@@ -821,7 +821,7 @@ export TRTLLM_USE_UCX_KVCACHE=1
 
 cat >./gen-extra-llm-api-config.yml <<EOF
 cuda_graph_config:
-  padding_enabled: true
+  enable_padding: true
   batch_sizes:
     - 1
     - 2

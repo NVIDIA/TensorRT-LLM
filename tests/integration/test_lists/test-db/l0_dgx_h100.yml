@@ -35,6 +35,7 @@ l0_dgx_h100:
   - accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_auto_dtype[False]
   - accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_auto_dtype[True]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ngram
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_eagle3[False]
   - test_e2e.py::test_ptp_quickstart_advanced_bs1
 - condition:
     ranges:
@@ -88,7 +89,7 @@ l0_dgx_h100:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_cuda_graph_padding_4gpus[attention_dp=True-mtp_nextn=0]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_cuda_graph_padding_4gpus[attention_dp=True-mtp_nextn=2]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus_static_eplb
-  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8[DeepSeek-V3-Lite-fp8]
+  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_mpi[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_ucx[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_nixl[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp[DeepSeek-V3-Lite-fp8]

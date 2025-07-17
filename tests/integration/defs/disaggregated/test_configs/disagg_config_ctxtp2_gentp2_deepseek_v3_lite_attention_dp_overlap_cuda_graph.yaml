@@ -9,6 +9,8 @@ context_servers:
   pipeline_parallel_size: 1
   enable_attention_dp: true
   disable_overlap_scheduler: True
+  cache_transceiver_config:
+    backend: default
   urls:
       - "localhost:8001"
 generation_servers:
@@ -17,7 +19,9 @@ generation_servers:
   pipeline_parallel_size: 1
   enable_attention_dp: true
   cuda_graph_config:
-    padding_enabled: False
+    enable_padding: False
   disable_overlap_scheduler: False
+  cache_transceiver_config:
+    backend: default
   urls:
       - "localhost:8002"

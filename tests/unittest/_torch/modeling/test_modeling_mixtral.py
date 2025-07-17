@@ -12,6 +12,8 @@ import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.checkpoints.hf.mixtral_weight_mapper import \
+    MixtralHfWeightMapper
 from tensorrt_llm._torch.models.modeling_mixtral import MixtralForCausalLM
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
     DecodingCUDAGraphRunner
@@ -206,7 +208,9 @@ class TestMixtral(unittest.TestCase):
             model_config = ModelConfig(pretrained_config=mixtral_config,
                                        attn_backend=backend)
             mixtral = MixtralForCausalLM(model_config)
-            mixtral.load_weights(hf_mixtral.state_dict())
+            weight_mapper = MixtralHfWeightMapper()
+            weight_mapper.init_model_and_config(mixtral, mixtral_config)
+            mixtral.load_weights(hf_mixtral.state_dict(), weight_mapper)
 
         num_blocks = 1
         tokens_per_block = 128

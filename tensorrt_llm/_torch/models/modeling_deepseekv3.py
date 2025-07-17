@@ -62,8 +62,7 @@ from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..peft.lora.layer import LoraLayer
 from ..speculative import MTPEagleWorker, MTPSpecMetadata, MTPWorker
-from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
-                     disable_fp4_allgather)
+from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              EagerFusionConfig, filter_weights,
                              register_auto_model)
@@ -512,11 +511,7 @@ class Deepseekv3MoE(nn.Module):
         # max-throughput
         use_dp_padding = False
         if self.use_dp and self.mapping.tp_size > 1:
-            # FP4 all_gather moves this bf16 allgather in to after topk and fp4 quantization
-            # to reduce allreduce BW
-            if (disable_fp4_allgather()
-                    and not self.experts.enable_alltoall) or isinstance(
-                        self.experts, TRTLLMGenFusedMoE):
+            if isinstance(self.experts, TRTLLMGenFusedMoE):
                 hidden_states = allgather(hidden_states,
                                           self.mapping,
                                           dim=0,
@@ -803,12 +798,12 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
 
-        # Note: this fusion pattern is only supported for TRTLLM-nvfp4 backend now
-        do_finalize = not (hidden_states.shape[0]
-                           <= self.moe_allreduce.max_token
-                           and self.fusion_config.POST_MOE_FUSION
-                           and self.model_config.moe_backend == 'TRTLLM'
-                           and self.mlp.experts.has_nvfp4)
+        # Note: this fusion pattern is only supported for single-node TRTLLM-nvfp4 backend now
+        do_finalize = self.mapping.is_multi_node() or (
+            not (hidden_states.shape[0] <= self.moe_allreduce.max_token
+                 and self.fusion_config.POST_MOE_FUSION
+                 and self.model_config.moe_backend == "TRTLLM"
+                 and self.mlp.experts.has_nvfp4))
 
         hidden_states = _run_MoE(hidden_states,
                                  hidden_states_fp4=None,

@@ -29,7 +29,7 @@ enable_attention_dp: true
 stream_interval: 2
 cuda_graph_config:
   max_batch_size: 512
-  padding_enabled: true
+  enable_padding: true
 EOF
 ```
 Explanation:
@@ -37,7 +37,7 @@ Explanation:
 - `stream_interval`: The iteration interval to create responses under the streaming mode.
 - `cuda_graph_config`: CUDA Graph config.
   - `max_batch_size`: Max CUDA graph batch size to capture.
-  - `padding_enabled`: Whether to enable CUDA graph padding.
+  - `enable_padding`: Whether to enable CUDA graph padding.
 
 
 #### 2. Launch trtllm-serve OpenAI-compatible API server
@@ -81,7 +81,7 @@ enable_min_latency: true
 stream_interval: 2
 cuda_graph_config:
   max_batch_size: 8
-  padding_enabled: true
+  enable_padding: true
 EOF
 ```
 Explanation:
@@ -90,7 +90,7 @@ Explanation:
 - `stream_interval`: The iteration interval to create responses under the streaming mode.
 - `cuda_graph_config`: CUDA Graph config.
   - `max_batch_size`: Max CUDA graph batch size to capture.
-  - `padding_enabled`: Whether to enable CUDA graph padding.
+  - `enable_padding`: Whether to enable CUDA graph padding.
 
 
 #### 2. Launch trtllm-serve OpenAI-compatible API server

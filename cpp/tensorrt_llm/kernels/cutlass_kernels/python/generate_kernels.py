@@ -359,7 +359,7 @@ def is_gemm_op_valid_sm100(op):
         # TODO 128x256x256 FP4 compiles but crashes
         # if tile_n % 64 != 0 or tile_n < 128:
         #     return False
-        if tile_n not in [64, 128] or tile_m != 128:
+        if tile_n not in [64, 128, 256] or tile_m != 128:
             return False
 
     # Shapes for fp8 small N shapes

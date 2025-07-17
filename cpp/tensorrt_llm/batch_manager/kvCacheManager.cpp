@@ -2235,13 +2235,8 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
         cacheSizeBytesPerTokenPerWindow[windowSize] = cacheSizeBytesPerToken;
     }
 
-    auto const extraCostMemoryBytes = extraCostMemory
-        * std::accumulate(cacheSizeBytesPerTokenPerWindow.cbegin(), cacheSizeBytesPerTokenPerWindow.cend(),
-            SizeType32{0}, [](SizeType32 acc, auto const cost) { return acc + cost.second; });
-
-    TLLM_LOG_DEBUG(
-        "extraCostMemoryBytes [all windows] [Gib]: %0.2f", extraCostMemoryBytes / static_cast<double>(1 << 30));
-
+    TLLM_LOG_DEBUG("extraCostMemory [Gib]: %0.2f", extraCostMemory / static_cast<double>(1 << 30));
+    allottedPrimaryMemBytes = allottedPrimaryMemBytes - extraCostMemory;
     auto const tokensPerBlock = modelConfig.getTokensPerBlock();
     auto const calculatePrimaryBlocks
         = [&](SizeType32 windowSize, float windowSizeShare, SizeType32 cacheSizeBytesPerToken)

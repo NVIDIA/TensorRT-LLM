@@ -50,7 +50,7 @@ McastDeviceMemory::McastDeviceMemory(
     , mMcHandle(0)
 {
 
-    cudaSetDevice(mDeviceIdx);
+    TLLM_CUDA_CHECK(cudaSetDevice(mDeviceIdx));
     // Check if the device support multicasting
     int multicast_supported{0};
     TLLM_CU_CHECK(cuDeviceGetAttribute(&multicast_supported, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, mDeviceIdx));
@@ -82,34 +82,41 @@ McastDeviceMemory::McastDeviceMemory(
     {
         allocNvlsMcastMem(mSignalPadOffset + kSIGNAL_PAD_SIZE);
     }
-    mSignalPadsDev.resize(mGroupSize);
+    // Initialize signal pads
+    mSignalPads.resize(mGroupSize);
     for (size_t i = 0; i < mGroupSize; i++)
     {
-        mSignalPadsDev[i] = mUcPtrs[i] + mSignalPadOffset;
+        mSignalPads[i] = mUcPtrs[i] + mSignalPadOffset;
         if (i == mGroupRank)
         {
-            cuMemsetD8(mSignalPadsDev[i], 0, kSIGNAL_PAD_SIZE);
+            cuMemsetD8(mSignalPads[i], 0, kSIGNAL_PAD_SIZE);
         }
     }
+    // Copy host array of pointers to device array
+    TLLM_CUDA_CHECK(cudaMalloc(&mSignalPadsDev, mGroupSize * sizeof(CUdeviceptr)));
+    TLLM_CUDA_CHECK(cudaMalloc(&mUcPtrsDev, mGroupSize * sizeof(CUdeviceptr)));
+    TLLM_CUDA_CHECK(
+        cudaMemcpy(mSignalPadsDev, mSignalPads.data(), mGroupSize * sizeof(CUdeviceptr), cudaMemcpyHostToDevice));
+    TLLM_CUDA_CHECK(cudaMemcpy(mUcPtrsDev, mUcPtrs.data(), mGroupSize * sizeof(CUdeviceptr), cudaMemcpyHostToDevice));
 }
 
 McastDeviceMemory::~McastDeviceMemory()
 {
     tensorrt_llm::common::unregisterMcastDevMemBuffer(this);
+    TLLM_CUDA_CHECK(cudaFree(mSignalPadsDev));
+    TLLM_CUDA_CHECK(cudaFree(mUcPtrsDev));
+
     if (mIsMNNvlink)
     {
         for (uint32_t rank = 0; rank < mGroupSize; rank++)
         {
-            if (rank == mGroupRank)
-            {
-                cuMemRelease(mUcHandles[rank]);
-            }
-            else
-            {
-                mUcHandles[rank] = 0;
-            }
+            TLLM_CU_CHECK(cuMemUnmap(mUcPtrs[rank], mAllocationSize));
+            // We need to release the handle on each rank
+            TLLM_CU_CHECK(cuMemRelease(mUcHandles[rank]));
         }
-        cuMemRelease(mMcHandle);
+        TLLM_CU_CHECK(cuMemUnmap(mMcPtr, mAllocationSize));
+        TLLM_CU_CHECK(cuMemAddressFree(mMcPtr, mAllocationSize));
+        TLLM_CU_CHECK(cuMemRelease(mMcHandle));
     }
     else
     {

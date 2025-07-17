@@ -117,12 +117,12 @@ cubin_meta_info_struct_suffix_text = R"""
 };
 """
 
-is_medusa = False
+is_spec_dec = False
 
 
 def generate_cubin_meta_info_line(arch: int, compile_macros: List[CompileMacro],
                                   function_name: str, cubin_size: int,
-                                  is_last: bool, is_medusa: bool):
+                                  is_last: bool, is_spec_dec: bool):
     data_type_str = None
     kv_data_type_str = None
     head_dim = None
@@ -160,7 +160,7 @@ def generate_cubin_meta_info_line(arch: int, compile_macros: List[CompileMacro],
             assert (tokens_per_page % 2 == 0)
             paged_kv_cache = 'true' if tokens_per_page > 0 else 'false'
 
-    use_medusa = 'true' if is_medusa else 'false'
+    use_medusa = 'true' if is_spec_dec else 'false'
     assert data_type_str is not None
     assert kv_data_type_str is not None
     assert head_dim is not None
@@ -376,7 +376,7 @@ def generate_compile_arch_macro_list(compile_macro_options: list):
                     option_macro_names, option_short_names, option_combination)
             ]
             if arch in (90, ) and option_combination[
-                    3] == 2 and option_combination[2] == 1 and not is_medusa:
+                    3] == 2 and option_combination[2] == 1 and not is_spec_dec:
                 input_file_name = "mha_sm90.cu"
             else:
                 input_file_name = "mha.cu"
@@ -387,7 +387,7 @@ def generate_compile_arch_macro_list(compile_macro_options: list):
 
 def generate_header_file_contents(
         all_arch_macros: List[CompileArchMacrosAndFile],
-        name_size_list: List[Tuple[str, int]], is_medusa: bool):
+        name_size_list: List[Tuple[str, int]], is_spec_dec: bool):
     cubin_data_array = []
     cubin_length_array = []
     meta_line_array = []
@@ -406,7 +406,7 @@ def generate_header_file_contents(
             generate_cubin_meta_info_line(arch, macros, function_name,
                                           cubin_size,
                                           i == len(all_arch_macros) - 1,
-                                          is_medusa))
+                                          is_spec_dec))
     cubin_data = ''.join(cubin_data_array)
     cubin_length = ''.join(cubin_length_array)
     meta_struct = ''.join([
@@ -422,8 +422,8 @@ if __name__ == "__main__":
         shutil.rmtree(cubin_dir)
     os.mkdir(cubin_dir)
 
-    if len(sys.argv) > 1 and sys.argv[1] == 'medusa':
-        is_medusa = True
+    if len(sys.argv) > 1 and sys.argv[1] == 'spec_dec':
+        is_spec_dec = True
         nvcc_flags = '-std=c++17 -O3 -cubin -DGENERATE_CUBIN=1 -DNDEBUG -DSPEC_DEC --use_fast_math -Xptxas=-v --allow-unsupported-compiler --expt-relaxed-constexpr -t 0'
         arch_options = [80, 86, 89, 90]
         config_list = [[
@@ -444,7 +444,7 @@ if __name__ == "__main__":
     with multiprocessing.Pool(processes=thread_count) as pool:
         name_size_list = pool.map(run_cubin_gen, arch_macro_lists)
     header_file_contents = generate_header_file_contents(
-        arch_macro_lists, name_size_list, is_medusa)
+        arch_macro_lists, name_size_list, is_spec_dec)
 
     with open(cubin_dir + build_func_name_prefix + '_cubin.h', "w") as f:
         f.write("".join(
