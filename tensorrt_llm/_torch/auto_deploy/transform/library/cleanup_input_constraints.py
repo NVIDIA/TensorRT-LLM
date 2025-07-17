@@ -10,6 +10,8 @@ from ...shim.interface import CachedSequenceInterface
 from ..interface import BaseTransform, TransformInfo, TransformRegistry
 
 
+# TODO (lucaslie): consider reconfiguring this transform to run before we switch to flattened
+# sequences which is done in update_in_out_nodes at the moment.
 @TransformRegistry.register("cleanup_input_constraints")
 class CleanupInputConstraints(BaseTransform):
     """Cleanup input constraints from the graph.

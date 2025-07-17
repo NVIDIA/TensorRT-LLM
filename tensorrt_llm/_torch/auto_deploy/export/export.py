@@ -17,6 +17,7 @@ from ..transformations._graph import (
     tree_to,
 )
 from ..utils.logger import ad_logger
+from ..utils.node_utils import is_op
 from .interface import ExportPatchRegistry, apply_export_patches
 
 try:
@@ -176,6 +177,24 @@ def _add_load_hook_for_aliased_params(gm: fx.GraphModule, model: nn.Module) -> N
     gm._register_load_state_dict_pre_hook(aliasing_load_pre_hook)
 
 
+def _clean_up_assertions(gm: fx.GraphModule):
+    """This transformations removes shape checks and assertions from the graph."""
+    check_ops = {
+        torch.ops.aten._assert_scalar,
+        torch.ops.aten.sym_constrain_range,
+        torch.ops.aten.sym_constrain_range_for_size,
+        torch.ops.aten._assert_tensor_metadata,
+        # torch.ops.aten._functional_sym_constrain_range,
+        # torch.ops.aten._functional_sym_constrain_range_for_size
+    }
+    graph: fx.Graph = gm.graph
+    for node in reversed(graph.nodes):
+        if len(node.users) > 0 or not is_op(node, check_ops):
+            continue
+        graph.erase_node(node)
+    canonicalize_graph(gm)
+
+
 def torch_export_to_gm(
     model: nn.Module,
     args: Tuple[Any, ...],
@@ -196,6 +215,7 @@ def torch_export_to_gm(
         3. Automatically extract the GraphModule from the exported program.
         4. Retain load hooks for state_dict loading from the original module.
         5. Manage parameter aliasing in the model.
+        6. Remove assertions from the graph.
 
     Args:
         model: The model to export
@@ -254,6 +274,9 @@ def torch_export_to_gm(
     # clean up devices in the graph
     # This is a consequence of lifting to meta during export.
     _clean_up_device_info(egm)
+
+    # clean up checks --> generally the sanity checks are overly conservative and we can remove them
+    _clean_up_assertions(egm)
 
     # show exported graph
     ad_logger.debug("exported graph: " + str(egm))
