@@ -2019,6 +2019,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                     pipInstallSanitySpec = createKubernetesPodConfig(values[5], gpu_type, k8s_arch)
                     trtllm_utils.launchKubernetesPod(pipeline, pipInstallSanitySpec, "trt-llm", {
                         echo "###### Prerequisites Start ######"
+                        echoNodeAndGpuInfo(pipeline, toStageName(values[1], key))
                         // Clean up the pip constraint file from the base NGC PyTorch image.
                         if (values[5] == DLFW_IMAGE) {
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "[ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true")
@@ -2064,7 +2065,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                         }
                         withEnv(libEnv) {
                             sh "env | sort"
-                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, "${values[1]}-${key}-sanity-check" , 1, 1, true, null)
+                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, null)
                         }
                     })
                 }
@@ -2273,7 +2274,7 @@ pipeline {
             when {
                 expression {
                     // Only run the test list validation when necessary
-                    env.targetArch == X86_64_TRIPLE && testFilter[ONLY_DOCS_FILE_CHANGED] == false
+                    env.targetArch == X86_64_TRIPLE && testFilter[ONLY_DOCS_FILE_CHANGED] == false && !(env.JOB_NAME ==~ /.*Multi-GPU.*/)
                 }
             }
             steps
@@ -2298,17 +2299,47 @@ pipeline {
                         dgxJobs = parallelJobs.findAll{dgxSigns.any{sign -> it.key.contains(sign)}}
                     }
 
-                    if (singleGpuJobs.size() > 0) {
-                        singleGpuJobs.failFast = params.enableFailFast
-                        parallel singleGpuJobs
-                    } else {
-                        echo "Skip single-GPU testing. No test to run."
-                    }
-
-                    if (dgxJobs.size() > 0) {
-                        stage(testPhase2StageName) {
+                    if (env.JOB_NAME ==~ /.*Single-GPU.*/) {
+                        echo "Only run single-GPU tests."
+                        if (dgxJobs.size() > 0) {
+                            if (globalVars[ACTION_INFO]['parents'].size() > 0) {
+                                // We add a special marker to the parent job's description.
+                                // This will be used to decide whether to run multi-GPU test stage.
+                                def parentJob = globalVars[ACTION_INFO]['parents'][-2]
+                                trtllm_utils.appendBuildDescription(this, parentJob['name'], parentJob['build_number'], "====Require Multi-GPU Testing====<br/>")
+                            } else {
+                                echo "No parent job found to add the special marker for executing multi-GPU test stage."
+                            }
+                        } else {
+                            echo "Skip multi-GPU testing. No test to run."
+                        }
+                        if (singleGpuJobs.size() > 0) {
+                            singleGpuJobs.failFast = params.enableFailFast
+                            parallel singleGpuJobs
+                        } else {
+                            echo "Skip single-GPU testing. No test to run."
+                        }
+                    } else if (env.JOB_NAME ==~ /.*Multi-GPU.*/) {
+                        echo "Only run multi-GPU tests."
+                        if (dgxJobs.size() > 0) {
                             dgxJobs.failFast = params.enableFailFast
                             parallel dgxJobs
+                        } else {
+                            error "Skip multi-GPU testing. No test to run."
+                        }
+                    } else {
+                        if (singleGpuJobs.size() > 0) {
+                            singleGpuJobs.failFast = params.enableFailFast
+                            parallel singleGpuJobs
+                        } else {
+                            echo "Skip single-GPU testing. No test to run."
+                        }
+
+                        if (dgxJobs.size() > 0) {
+                            stage(testPhase2StageName) {
+                                dgxJobs.failFast = params.enableFailFast
+                                parallel dgxJobs
+                            }
                         }
                     }
                 }

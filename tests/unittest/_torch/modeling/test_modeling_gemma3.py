@@ -14,6 +14,8 @@ from tensorrt_llm._torch.attention_backend import FlashInferAttentionMetadata
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.checkpoints.hf.gemma3_weight_mapper import \
+    Gemma3HfWeightMapper
 from tensorrt_llm._torch.models.modeling_gemma3 import Gemma3ForCausalLM
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -268,7 +270,9 @@ class TestGemma3(unittest.TestCase):
         model_config = ModelConfig(pretrained_config=gemma3_config,
                                    attn_backend=backend)
         gemma3 = Gemma3ForCausalLM(model_config).to(dtype).to(device)
-        gemma3.load_weights(hf_gemma3.state_dict())
+        weight_mapper = Gemma3HfWeightMapper()
+        weight_mapper.init_model_and_config(gemma3, model_config)
+        gemma3.load_weights(hf_gemma3.state_dict(), weight_mapper)
 
         kv_cache_manager = self.get_kv_cache_manager(
             dtype=dtype,

@@ -1,4 +1,4 @@
-from typing import Dict, Optional
+from typing import Optional
 
 import torch
 from torch import nn
@@ -16,7 +16,7 @@ from ..modules.fused_moe import RenormalizeMoeRoutingMethod, create_moe
 from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             filter_weights, register_auto_model)
+                             register_auto_model)
 
 
 class MixtralMoE(nn.Module):
@@ -215,27 +215,3 @@ class MixtralForCausalLM(DecoderModelForCausalLM[MixtralModel,
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
-
-    def load_weights(self, weights: Dict):
-
-        params_map = {
-            'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
-        }
-
-        for name, module in self.named_modules():
-            if len(module._parameters) > 0:
-                names = name.split('.')
-                if names[-1] in params_map:
-                    module_weights = []
-                    for new_name in params_map[names[-1]]:
-                        module_weights.append(
-                            filter_weights('.'.join(names[:-1] + [new_name]),
-                                           weights))
-                    module.load_weights(weights=module_weights)
-                else:
-                    module_weights = filter_weights(name, weights)
-                    if hasattr(module, 'load_weights'):
-                        module.load_weights(weights=[module_weights])
-                    else:
-                        for n, p in module.named_parameters():
-                            p.data.copy_(module_weights[n][:])

@@ -124,6 +124,7 @@ examples/test_llama.py::test_llm_llama_long_alpaca_8gpu_summary[pg64317-tp8pp1-n
 examples/test_llama.py::test_llm_llama_lookahead_single_gpu_summary[llama-3.1-8b]
 examples/test_llama.py::test_llm_llama_lookahead_xqa_fp8_1gpu[llama-3.1-8b]
 examples/test_llama.py::test_llm_llama_lookahead_xqa_fp8_1gpu[llama-3.2-1b]
+examples/test_llama.py::test_llm_api_lookahead_decoding_1gpu[Llama-3.1-8B-Instruct-llama-3.1-model/Llama-3.1-8B-Instruct]
 examples/test_llama.py::test_llm_llama_v1_2gpu_summary[llama-7b-nb:4-enable_auto_parallel]
 examples/test_llama.py::test_llm_llama_v1_4gpu_paged_kv_cache[llama-3.1-8b]
 examples/test_llama.py::test_llm_llama_v1_multiple_lora_1gpu[luotuo_japan-llama-7b-lora_fp16-base_fp16]
@@ -305,6 +306,7 @@ accuracy/test_cli_flow.py::TestPhi3Small8kInstruct::test_auto_dtype
 accuracy/test_cli_flow.py::TestPhi3Small128kInstruct::test_auto_dtype
 accuracy/test_cli_flow.py::TestPhi3_5MiniInstruct::test_auto_dtype
 accuracy/test_cli_flow.py::TestPhi4MiniInstruct::test_auto_dtype
+accuracy/test_cli_flow.py::TestPhi4MiniInstruct::test_tp2
 accuracy/test_cli_flow.py::TestLongAlpaca7B::test_auto_dtype
 accuracy/test_cli_flow.py::TestLongAlpaca7B::test_multiblock_aggressive
 accuracy/test_cli_flow.py::TestMamba130M::test_auto_dtype
@@ -434,6 +436,7 @@ accuracy/test_llm_api.py::TestMixtral8x7B::test_smooth_quant_tp2pp2
 accuracy/test_llm_api.py::TestMixtral8x7BInstruct::test_awq_tp2
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_llm_sampler
+accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_beam_search
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_ngram
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding[xgrammar]
@@ -452,6 +455,10 @@ accuracy/test_llm_api_pytorch.py::TestLlama4MaverickInstruct::test_auto_dtype[tp
 accuracy/test_llm_api_pytorch.py::TestLlama4ScoutInstruct::test_auto_dtype[tp8-cuda_graph=False]
 accuracy/test_llm_api_pytorch.py::TestLlama4ScoutInstruct::test_auto_dtype[tp8ep4-cuda_graph=True]
 accuracy/test_llm_api_pytorch.py::TestLlama4ScoutInstruct::test_auto_dtype[tp8ep8-cuda_graph=True]
+accuracy/test_llm_api_pytorch.py::TestLlama4ScoutInstruct::test_fp8[tp8ep8-cuda_graph=True]
+accuracy/test_llm_api_pytorch.py::TestLlama4ScoutInstruct::test_fp8[tp4-cuda_graph=True]
+accuracy/test_llm_api_pytorch.py::TestLlama4ScoutInstruct::test_fp4[tp8ep8-cuda_graph=True]
+accuracy/test_llm_api_pytorch.py::TestLlama4ScoutInstruct::test_fp4[tp4-cuda_graph=True]
 accuracy/test_llm_api_pytorch.py::TestMixtral8x7B::test_fp8_tp2
 accuracy/test_llm_api_pytorch.py::TestMixtral8x7B::test_nvfp4_tp2
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=0-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False]
@@ -481,6 +488,9 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4[latency_moe_tr
 accuracy/test_llm_api_pytorch.py::TestKanana_Instruct::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestBielik11BInstruct::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestBielik11BInstruct::test_fp8
+accuracy/test_llm_api_pytorch.py::TestMinistral8BInstruct::test_auto_dtype
+accuracy/test_llm_api_pytorch.py::TestMinistral8BInstruct::test_fp8
+accuracy/test_llm_api_pytorch.py::TestPhi4MM::test_auto_dtype
 
 test_e2e.py::test_llama_e2e[use_cpp_session-remove_input_padding-]
 test_e2e.py::test_llama_e2e[use_py_session-remove_input_padding-]
@@ -523,6 +533,9 @@ test_e2e.py::test_ptp_quickstart_multimodal[mistral-small-3.1-24b-instruct-Mistr
 test_e2e.py::test_ptp_quickstart_multimodal[mistral-small-3.1-24b-instruct-Mistral-Small-3.1-24B-Instruct-2503-image-False]
 test_e2e.py::test_ptp_quickstart_multimodal[gemma-3-27b-it-gemma/gemma-3-27b-it-image-False]
 test_e2e.py::test_ptp_quickstart_multimodal[gemma-3-27b-it-gemma/gemma-3-27b-it-image-True]
+test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[audio]
+test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[image]
+test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[image_audio]
 test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
 test_e2e.py::test_ptp_quickstart_bert[TRTLLM-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
 test_e2e.py::test_ptp_star_attention_example[Llama3.1-8B-BF16-llama-3.1-model/Meta-Llama-3.1-8B]
@@ -583,6 +596,7 @@ disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_att
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one_mtp[DeepSeek-V3-Lite-fp8]
 disaggregated/test_disaggregated.py::test_disaggregated_load_balance[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_cache_aware_balance[TinyLlama-1.1B-Chat-v1.0]
+disaggregated/test_disaggregated.py::test_disaggregated_trtllm_sampler[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_workers.py::test_workers_conditional_disaggregation[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_workers.py::test_workers_kv_cache_events[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_workers.py::test_workers_kv_cache_aware_router[TinyLlama-1.1B-Chat-v1.0]
