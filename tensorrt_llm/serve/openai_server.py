@@ -101,7 +101,7 @@ class OpenAIServer:
                 logger.info(f"trtllm/{self.llm.llm_id} is unregistered")
             self.llm.shutdown()
 
-        self.app = FastAPI(lifespan=lifespan)
+        self.app = FastAPI(lifespan=lifespan, debug=True)
 
         @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(_, exc):
@@ -450,9 +450,16 @@ class OpenAIServer:
     async def __call__(self, host, port):
         # Store the binding address for server registration
         self.binding_addr = f"http://{host}:{port}"
-        config = uvicorn.Config(self.app,
+
+        # Import the app module and replace the placeholder app with our actual app
+        import tensorrt_llm.serve.app as app_module
+        app_module.app = self.app
+
+        config = uvicorn.Config("tensorrt_llm.serve.app:app",
                                 host=host,
                                 port=port,
                                 log_level="info",
-                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
+                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
+                                reload=True,
+                                reload_includes=["tensorrt_llm/_torch/models/modeling_deepseekv3.py"])
         await uvicorn.Server(config).serve()
