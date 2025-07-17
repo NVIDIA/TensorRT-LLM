@@ -3,8 +3,10 @@ from typing import Dict, List, Optional
 
 import torch
 from torch import nn
-from tqdm import tqdm
 from transformers import Qwen3MoeConfig
+
+from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
+    BaseWeightMapper
 
 from ..attention_backend import AttentionMetadata
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
@@ -12,7 +14,7 @@ from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE, MoE,
+from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE,
                                  RenormalizeMoeRoutingMethod,
                                  RenormalizeNaiveMoeRoutingMethod,
                                  RoutingMethodType, TRTLLMGenFusedMoE,
@@ -20,12 +22,9 @@ from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE, MoE,
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
-from ..utils import disable_fp4_allgather
 from .modeling_qwen3 import Qwen3Attention
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import (DecoderModel, EagerFusionConfig,
-                             duplicate_kv_weight, filter_weights,
-                             register_auto_model)
+from .modeling_utils import DecoderModel, EagerFusionConfig, register_auto_model
 
 
 class Qwen3Gate(nn.Module):
@@ -133,11 +132,7 @@ class Qwen3MoE(nn.Module):
             assert not self.enable_attention_dp
 
         if self.enable_attention_dp and self.mapping.tp_size > 1:
-            # FP4 all_gather moves this bf16 allgather in to after topk and fp4 quantization
-            # to reduce allreduce BW
-            if (disable_fp4_allgather()
-                    and not self.experts.enable_alltoall) or isinstance(
-                        self.experts, TRTLLMGenFusedMoE):
+            if isinstance(self.experts, TRTLLMGenFusedMoE):
                 hidden_states = allgather(hidden_states,
                                           self.mapping,
                                           dim=0,
@@ -394,67 +389,9 @@ class Qwen3MoeForCausalLM(SpecDecOneEngineForCausalLM[Qwen3MoEModel,
             model_config,
         )
 
-    def load_weights(self, weights: Dict):
-        tp_size = self.model_config.mapping.tp_size
-        enable_attention_dp = self.model_config.mapping.enable_attention_dp
+    def load_weights(self, weights: dict, weight_mapper: BaseWeightMapper):
+        super().load_weights(weights, weight_mapper)
 
-        num_kv_heads = self.config.num_key_value_heads
-
-        params_map = {
-            "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-            "gate_up_proj": ["gate_proj", "up_proj"]
-        }
-        for name, module in tqdm(list(self.named_modules()),
-                                 desc="Loading weights"):
-            if len(module._parameters) > 0:
-                # skip load weights if tie word embeddings is enabled and layer is lm_head
-                if self.config.tie_word_embeddings and name.startswith(
-                        "lm_head") or name.startswith("draft_model"):
-                    continue
-
-                names = name.split(".")
-                if names[-1] in params_map:
-                    module_weights = []
-                    for new_name in params_map[names[-1]]:
-                        fw = filter_weights(".".join(names[:-1] + [new_name]),
-                                            weights)
-                        tensors_need_duplication = ["weight", "bias"]
-                        if module.quant_config.quant_mode.has_nvfp4():
-                            tensors_need_duplication.append("weight_scale")
-                        if module.quant_config.quant_mode.has_fp8_block_scales(
-                        ):
-                            tensors_need_duplication.append("weight_scale_inv")
-                        if new_name in ["k_proj", "v_proj"]:
-                            fw = {
-                                k: (duplicate_kv_weight(
-                                    weight=v[:],
-                                    num_kv_heads=num_kv_heads,
-                                    tensor_parallel_size=tp_size
-                                    if not enable_attention_dp else 1)
-                                    if k in tensors_need_duplication else v)
-                                for k, v in fw.items()
-                            }
-                        module_weights.append(fw)
-                    module.load_weights(weights=module_weights)
-                else:
-                    module_weights = filter_weights(name, weights)
-                    if isinstance(module, MoE):
-                        updated_module_weights = {}
-                        for weight_name, weight_value in module_weights.items():
-                            new_weight_name = (weight_name.replace(
-                                "gate_proj",
-                                "w1").replace("up_proj",
-                                              "w3").replace("down_proj", "w2"))
-                            updated_module_weights[
-                                new_weight_name] = weight_value
-                        del module_weights
-                        module.load_weights(weights=[updated_module_weights])
-                    elif hasattr(module, "load_weights"):
-                        module.load_weights(weights=[module_weights])
-                    else:
-                        for n, p in module._parameters.items():
-                            if p is not None:
-                                p.data.copy_(module_weights[n][:])
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:

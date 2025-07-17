@@ -267,7 +267,9 @@ def test_llm_with_dummy_weights(model_format):
         hf_config = transformers.AutoConfig.from_pretrained(llama_model_path)
         hf_config.save_pretrained(dummy_dir.name)
     else:
-        config = AutoConfig.from_hugging_face(llama_model_path, dtype='float16')
+        config = AutoConfig.from_hugging_face(llama_model_path,
+                                              dtype='float16',
+                                              trust_remote_code=True)
         config.to_json_file(os.path.join(dummy_dir.name, 'config.json'))
     tokenizer = transformers.AutoTokenizer.from_pretrained(llama_model_path)
     tokenizer.save_pretrained(dummy_dir.name)

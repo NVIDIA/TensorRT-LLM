@@ -4,6 +4,8 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
+from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
+    BaseWeightMapper
 from tensorrt_llm.functional import PositionEmbeddingType
 
 from ..attention_backend import AttentionMetadata
@@ -264,7 +266,7 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel, LlamaConfig]):
             return_context_logits,
         )
 
-    def load_weights(self, weights: Dict):
+    def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper):
         new_weights = {}
         for k, v in weights.items():
             if 'lm_head' not in k:
@@ -274,9 +276,12 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel, LlamaConfig]):
                 new_k = k
             new_weights[new_k] = v
         if self.load_lm_head_from_target:
-            super().load_weights(new_weights, skip_modules=['lm_head'])
+            super().load_weights(weights=new_weights,
+                                 weight_mapper=weight_mapper,
+                                 skip_modules=['lm_head'])
         else:
-            super().load_weights(new_weights)
+            super().load_weights(weights=new_weights,
+                                 weight_mapper=weight_mapper)
 
     def load_weights_from_target_model(self,
                                        target_model: torch.nn.Module) -> None:
@@ -402,9 +407,16 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
 
         return logits
 
-    def load_weights(self, weights: Dict):
-        super().load_weights(weights, skip_modules=["draft_model"])
+    def load_weights(self,
+                     weights: Dict,
+                     weight_mapper: Optional[BaseWeightMapper] = None):
+        super().load_weights(weights=weights,
+                             weight_mapper=weight_mapper,
+                             skip_modules=["draft_model"])
 
-    def load_draft_weights(self, weights: Dict):
-        self.draft_model.load_weights(weights)
+    def load_draft_weights(self,
+                           weights: Dict,
+                           weight_mapper: Optional[BaseWeightMapper] = None):
+        self.draft_model.load_weights(weights=weights,
+                                      weight_mapper=weight_mapper)
         self.draft_model.load_weights_from_target_model(self)
