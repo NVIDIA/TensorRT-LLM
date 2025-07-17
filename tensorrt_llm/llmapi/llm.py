@@ -401,7 +401,7 @@ class BaseLLM:
         self._check_arguments(
             len(prompt_token_ids),
             len(query_token_ids) if query_token_ids is not None else 0,
-            sampling_params)
+            sampling_params, disaggregated_params)
         if _postproc_params:
             _postproc_params.postproc_args.num_prompt_tokens = len(
                 prompt_token_ids)
@@ -528,8 +528,12 @@ class BaseLLM:
 
         return sampling_params
 
-    def _check_arguments(self, prompt_len: int, query_len: int,
-                         sampling_params: SamplingParams) -> None:
+    def _check_arguments(
+            self,
+            prompt_len: int,
+            query_len: int,
+            sampling_params: SamplingParams,
+            disaggregated_params: Optional[DisaggregatedParams] = None) -> None:
 
         if self.args.backend in ["pytorch", "_autodeploy"]:
             # TODO: remove these checks after PyTorch backend
@@ -544,11 +548,17 @@ class BaseLLM:
                 )
             # Check prompt length and query length against max_num_tokens to filter illegal requests.
             if self.args.backend == "pytorch" and not self.args.enable_chunked_prefill:
-                max_num_tokens = self.args.max_num_tokens
-                if max_num_tokens and prompt_len / self.args.parallel_config.cp_size + query_len > max_num_tokens:
-                    raise ValueError(
-                        f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}), query length ({query_len}) and max_tokens ({sampling_params.max_tokens}) should not exceed "
-                        f"max_num_tokens ({max_num_tokens})")
+                # ignore the check for generation_only request in pytorch backend
+                if (disaggregated_params is not None and
+                        disaggregated_params.request_type == "generation_only"
+                        and not self._on_trt_backend):
+                    pass
+                else:
+                    max_num_tokens = self.args.max_num_tokens
+                    if max_num_tokens and prompt_len / self.args.parallel_config.cp_size + query_len > max_num_tokens:
+                        raise ValueError(
+                            f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}) and query length ({query_len}) should not exceed "
+                            f"max_num_tokens ({max_num_tokens})")
             return
 
         build_config = self.args.build_config
