@@ -77,23 +77,17 @@ def create_mock_nemo_lora_checkpoint(
 
     nemo_path = lora_dir / "test_lora.nemo"
 
-    # Use temporary directory context manager for safe cleanup
     with tempfile.TemporaryDirectory() as temp_dir_str:
         temp_dir = Path(temp_dir_str)
 
-        # Create LoRA weights dict
         weights_dict = {}
 
-        # Calculate head dimensions
         head_dim = hidden_size // num_attention_heads
         kv_hidden_size = head_dim * num_kv_heads
 
-        # Calculate QKV output dimensions for NeMo's fused format
-        # NeMo fuses QKV: Q(hidden_size) + K(kv_hidden_size) + V(kv_hidden_size)
         qkv_output_dim = hidden_size + 2 * kv_hidden_size
 
         for layer_idx in range(num_layers):
-            # NeMo uses this key format for QKV adapters
             key_prefix = f"model.layers.{layer_idx}.self_attention.adapter_layer.lora_kqv_adapter"
 
             # Create linear_in weights [lora_rank, hidden_size] with small random values
@@ -110,7 +104,6 @@ def create_mock_nemo_lora_checkpoint(
         ckpt_path = temp_dir / "model_weights.ckpt"
         torch.save(weights_dict, ckpt_path)
 
-        # Create minimal config with GQA support
         config = {
             "precision": "fp16",
             "trainer": {
@@ -134,7 +127,6 @@ def create_mock_nemo_lora_checkpoint(
         with open(config_path, 'w') as f:
             json.dump(config, f)
 
-        # Create .nemo tarfile
         with tarfile.open(nemo_path, 'w') as tar:
             tar.add(ckpt_path, arcname="model_weights.ckpt")
             tar.add(config_path, arcname="model_config.yaml")
@@ -539,132 +531,125 @@ def test_bielik_11b_v2_2_instruct_multi_lora() -> None:
         assert len(outputs) == 2
 
 
-# NeMo LoRA tests
-@pytest.mark.parametrize("lora_rank,max_lora_rank,description",
-                         LORA_RANK_CONFIGS)
-def test_load_torch_nemo_lora_function(lora_rank, max_lora_rank, description):
+@pytest.mark.parametrize(
+    "lora_rank,max_lora_rank,description",
+    [
+        # (lora_rank, max_lora_rank, description)
+        (8, 8, "rank_8"),
+        (16, 16, "rank_16"),
+        (4, 8, "rank_4_max_8"),
+    ])
+def test_load_torch_nemo_lora_function(tmp_path, lora_rank, max_lora_rank,
+                                       description):
     """Test load_torch_nemo_lora function with different LoRA rank configurations."""
     from tensorrt_llm.lora_manager import load_torch_nemo_lora
 
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_path = Path(temp_dir)
+    nemo_path = create_mock_nemo_lora_checkpoint(
+        tmp_path,
+        hidden_size=2048,
+        num_layers=16,
+        lora_rank=lora_rank,
+    )
 
-        # Create a mock NeMo checkpoint
-        nemo_path = create_mock_nemo_lora_checkpoint(
-            temp_path,
-            hidden_size=2048,
-            num_layers=16,
-            lora_rank=lora_rank,
-        )
+    lora_config = LoraConfig(
+        lora_dir=[str(nemo_path)],
+        lora_ckpt_source="nemo",
+        max_lora_rank=max_lora_rank,
+    )
 
-        # Test load_torch_nemo_lora
-        lora_config = LoraConfig(
-            lora_dir=[str(nemo_path)],
-            lora_ckpt_source="nemo",
-            max_lora_rank=max_lora_rank,
-        )
+    # This should not raise an error
+    load_torch_nemo_lora(lora_config)
 
-        # This should not raise an error
-        load_torch_nemo_lora(lora_config)
-
-        # Verify configuration was set correctly
-        assert lora_config.lora_target_modules == [
-            "attn_qkv"
-        ], f"Expected attn_qkv modules for {description}"
-        assert lora_config.trtllm_modules_to_hf_modules == {
-            "attn_qkv": "attn_qkv"
-        }, f"Expected correct module mapping for {description}"
+    assert lora_config.lora_target_modules == [
+        "attn_qkv"
+    ], f"Expected attn_qkv modules for {description}"
+    assert lora_config.trtllm_modules_to_hf_modules == {
+        "attn_qkv": "attn_qkv"
+    }, f"Expected correct module mapping for {description}"
 
 
-def test_nemo_lora_unsupported_modules_validation():
+def test_nemo_lora_unsupported_modules_validation(tmp_path):
     """Test validation of unsupported modules in NeMo LoRA."""
     from tensorrt_llm.lora_manager import load_torch_nemo_lora
 
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_path = Path(temp_dir)
+    nemo_path = create_mock_nemo_lora_checkpoint(
+        tmp_path,
+        hidden_size=2048,
+        num_layers=16,
+        lora_rank=8,
+    )
 
-        # Create a mock NeMo checkpoint
-        nemo_path = create_mock_nemo_lora_checkpoint(
-            temp_path,
-            hidden_size=2048,
-            num_layers=16,
-            lora_rank=8,
-        )
+    # Test validation: should fail with unsupported modules
+    invalid_config = LoraConfig(
+        lora_dir=[str(nemo_path)],
+        lora_ckpt_source="nemo",
+        lora_target_modules=["attn_qkv",
+                             "mlp_h_to_4h"],  # mlp_h_to_4h not supported
+        max_lora_rank=8,
+    )
 
-        # Test validation: should fail with unsupported modules
-        invalid_config = LoraConfig(
-            lora_dir=[str(nemo_path)],
-            lora_ckpt_source="nemo",
-            lora_target_modules=["attn_qkv",
-                                 "mlp_h_to_4h"],  # mlp_h_to_4h not supported
-            max_lora_rank=8,
-        )
-
-        with pytest.raises(ValueError, match="NeMo LoRA only supports"):
-            load_torch_nemo_lora(invalid_config)
+    with pytest.raises(ValueError, match="NeMo LoRA only supports"):
+        load_torch_nemo_lora(invalid_config)
 
 
 @force_ampere
-def test_gqa_nemo_lora():
+def test_gqa_nemo_lora(tmp_path):
     """Test NeMo LoRA with GQA using TinyLlama.
 
     """
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_path = Path(temp_dir)
+    # TinyLlama's exact GQA configuration
+    hidden_size = 2048
+    num_layers = 22
+    num_q_heads = 32  # Query attention heads
+    num_kv_heads = 4  # Key/Value heads (GQA)
+    lora_rank = 8
 
-        # TinyLlama's exact GQA configuration
-        hidden_size = 2048
-        num_layers = 22
-        num_q_heads = 32  # Query attention heads
-        num_kv_heads = 4  # Key/Value heads (GQA)
-        lora_rank = 8
+    nemo_path = create_mock_nemo_lora_checkpoint(
+        tmp_path,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        lora_rank=lora_rank,
+        num_attention_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+    )
 
-        nemo_path = create_mock_nemo_lora_checkpoint(
-            temp_path,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            lora_rank=lora_rank,
-            num_attention_heads=num_q_heads,
-            num_kv_heads=num_kv_heads,
+    lora_config = LoraConfig(
+        lora_dir=[str(nemo_path)],
+        lora_ckpt_source="nemo",
+        max_lora_rank=lora_rank,
+    )
+
+    model_path = get_model_path("llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+
+    try:
+        llm = LLM(
+            model=model_path,
+            lora_config=lora_config,
+            kv_cache_config=global_kvcache_config,
         )
 
-        lora_config = LoraConfig(
-            lora_dir=[str(nemo_path)],
-            lora_ckpt_source="nemo",
-            max_lora_rank=lora_rank,
-        )
+        test_prompts = ["Test TinyLlama GQA with NeMo LoRA"]
 
-        model_path = get_model_path("llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+        lora_req = LoRARequest("tinyllama-gqa-test",
+                               0,
+                               str(nemo_path),
+                               lora_ckpt_source="nemo")
 
-        try:
-            llm = LLM(
-                model=model_path,
-                lora_config=lora_config,
-                kv_cache_config=global_kvcache_config,
-            )
+        sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
+        outputs = llm.generate(test_prompts,
+                               sampling_params,
+                               lora_request=[lora_req])
 
-            test_prompts = ["Test TinyLlama GQA with NeMo LoRA"]
+        # Basic validation
+        assert len(outputs) == 1
+        assert outputs[0].outputs[0] is not None
+        assert len(outputs[0].outputs[0].token_ids) > 0
 
-            lora_req = LoRARequest("tinyllama-gqa-test",
-                                   0,
-                                   str(nemo_path),
-                                   lora_ckpt_source="nemo")
+        print(f"  ✓ TinyLlama GQA with NeMo LoRA passed successfully!")
 
-            sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
-            outputs = llm.generate(test_prompts,
-                                   sampling_params,
-                                   lora_request=[lora_req])
-
-            # Basic validation
-            assert len(outputs) == 1
-            assert outputs[0].outputs[0] is not None
-            assert len(outputs[0].outputs[0].token_ids) > 0
-
-            print(f"  ✓ TinyLlama GQA with NeMo LoRA passed successfully!")
-
-        except Exception as e:
-            # Any error now indicates a real problem since dimensions match
-            pytest.fail(f"TinyLlama GQA test failed: {e}")
-        finally:
-            if 'llm' in locals():
-                llm.shutdown()
+    except Exception as e:
+        # Any error now indicates a real problem since dimensions match
+        pytest.fail(f"TinyLlama GQA test failed: {e}")
+    finally:
+        if 'llm' in locals():
+            llm.shutdown()

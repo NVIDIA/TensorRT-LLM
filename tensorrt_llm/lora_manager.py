@@ -485,7 +485,6 @@ def load_torch_lora(lora_config: LoraConfig):
     """Load LoRA checkpoint for PyTorch workflow.
 
     This function routes to the appropriate loader based on lora_ckpt_source.
-    It centralizes the routing logic that was previously scattered in _util.py.
 
     Args:
         lora_config: LoRA configuration with lora_ckpt_source set to "hf" or "nemo"
