@@ -155,7 +155,7 @@ class MPIDist(Distributed):
             )
 
         try:
-            return pickle.loads(serialized)
+            return pickle.loads(serialized)  # nosec B301
         except Exception as e:
             raise RuntimeError(f"Deserialization failed: {str(e)}") from e
 
