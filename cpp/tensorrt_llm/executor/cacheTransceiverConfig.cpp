@@ -30,7 +30,7 @@ CacheTransceiverConfig::CacheTransceiverConfig(
 
 bool CacheTransceiverConfig::operator==(CacheTransceiverConfig const& other) const
 {
-    return mMaxTokensInBuffer == other.mMaxTokensInBuffer;
+    return mMaxTokensInBuffer == other.mMaxTokensInBuffer && mBackendType == other.mBackendType;
 }
 
 void CacheTransceiverConfig::setBackendType(std::optional<BackendType> backendType)
