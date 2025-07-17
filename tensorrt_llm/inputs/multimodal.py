@@ -141,9 +141,10 @@ class MultimodalRuntimeData:
                     # Partial overlap - only count the cached portion
                     self.num_cached_mm_tokens += self.num_cached_tokens - pos
 
-        assert self.num_cached_mm_tokens <= self.num_cached_tokens, \
-            f"num_cached_mm_tokens ({self.num_cached_mm_tokens}) must be less than or equal to num_cached_tokens ({self.num_cached_tokens})"
-
+        if self.num_cached_mm_tokens > self.num_cached_tokens:
+            raise ValueError(
+                f"num_cached_mm_tokens ({self.num_cached_mm_tokens}) must be less than or equal to "
+                f"num_cached_tokens ({self.num_cached_tokens})")
         self.total_mm_tokens = sum(self.mm_token_lengths)
 
 
