@@ -11,7 +11,7 @@ import traceback
 import weakref
 from collections import deque, namedtuple
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 
@@ -1966,7 +1966,8 @@ class PyExecutor:
             if request_done:
                 if request.is_disagg_context_transmission_state:
                     self.ctx_in_transmission_requests.append(request)
-                requests_to_terminate.append(request)
+                else:
+                    requests_to_terminate.append(request)
             else:
                 new_active_requests.append(request)
         self.active_requests = new_active_requests
