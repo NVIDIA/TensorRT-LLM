@@ -21,7 +21,9 @@ def trtllm_fused_moe(
         selected_experts,
         routing_weights,
         w3_w1_stacked_weight,
+        None,  # w3_w1_stacked_bias
         w2_stacked_weight,
+        None,  # w2_stacked_bias
         x.dtype,
         quant_scales,
         tp_size=1,

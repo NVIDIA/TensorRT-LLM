@@ -81,12 +81,13 @@ class MoERunner(TunableRunner):
         tactic: int = -1,
         do_preparation: bool = False,
     ):
-        x, fc1_expert_weights, fc2_expert_weights = inputs
-        # determine if we should use min latency mode according to the profiled seq len
+        x, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights, fc2_expert_biases = inputs
         self.fused_moe_runner.run_gemm_profile(
             x,
             fc1_expert_weights,
+            fc1_expert_biases,
             fc2_expert_weights,
+            fc2_expert_biases,
             self.top_k,
             self.tp_size,
             self.tp_rank,
@@ -117,7 +118,9 @@ def fused_moe(
     token_selected_experts: torch.Tensor,
     token_final_scales: torch.Tensor,
     fc1_expert_weights: torch.Tensor,
+    fc1_expert_biases: Optional[torch.Tensor],
     fc2_expert_weights: torch.Tensor,
+    fc2_expert_biases: Optional[torch.Tensor],
     output_dtype: torch.dtype,
     quant_scales: List[torch.Tensor],
     input_sf: Optional[torch.Tensor] = None,
@@ -159,7 +162,10 @@ def fused_moe(
         "trtllm::fused_moe::gemm1",
         [moe_runner],
         MoERunner.tuning_config,
-        [input, fc1_expert_weights, fc2_expert_weights],
+        [
+            input, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
+            fc2_expert_biases
+        ],
         gemm_idx=1,
     )
 
@@ -167,7 +173,10 @@ def fused_moe(
         "trtllm::fused_moe::gemm2",
         [moe_runner],
         MoERunner.tuning_config,
-        [input, fc1_expert_weights, fc2_expert_weights],
+        [
+            input, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
+            fc2_expert_biases
+        ],
         gemm_idx=2,
     )
 
@@ -177,7 +186,9 @@ def fused_moe(
         token_selected_experts,
         token_final_scales,
         fc1_expert_weights,
+        fc1_expert_biases,
         fc2_expert_weights,
+        fc2_expert_biases,
         quant_scales,
         input_sf,
         tp_size,
@@ -200,7 +211,9 @@ def _(
     token_selected_experts: torch.Tensor,
     token_final_scales: torch.Tensor,
     fc1_expert_weights: torch.Tensor,
+    fc1_expert_biases: Optional[torch.Tensor],
     fc2_expert_weights: torch.Tensor,
+    fc2_expert_biases: Optional[torch.Tensor],
     output_dtype: torch.dtype,
     quant_scales: List[torch.Tensor],
     input_sf: Optional[torch.Tensor] = None,

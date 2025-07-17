@@ -306,6 +306,9 @@ protected:
     bool mUseLora = false;
     bool mUsePrequantScale = false;
 
+    // Run tests with per-expert act scale
+    bool mUsePerExpertActScale = true;
+
     bool mIsGated = false;
     int64_t mGatedMultiplier = 1;
     int64_t mGroupSize = -1;
@@ -480,12 +483,12 @@ protected:
         {
             // FP4 uses the same logic as FP8 to generate the global scales
             mExpertFPXScale1 = allocBuffer<float>(mNumExperts);
-            mExpertFPXScale2 = allocBuffer<float>(1);
+            mExpertFPXScale2 = allocBuffer<float>(mNumExperts); // mNumExperts or 1
             mExpertFPXScale3 = allocBuffer<float>(mNumExperts);
 
             if (ANY_FP4)
             {
-                mExpertFP4ActGlobalScale1 = allocBuffer<float>(1);
+                mExpertFP4ActGlobalScale1 = allocBuffer<float>(mNumExperts); // mNumExperts or 1
                 mExpertFP4WeightGlobalScale1 = allocBuffer<float>(mNumExperts);
                 mExpertFP4WeightGlobalScale2 = allocBuffer<float>(mNumExperts);
             }
@@ -665,23 +668,37 @@ protected:
         float scaleAct1 = getFPXActScalar(max_input);
 
         float maxFC1Output = calcMLPVal(max_input, maxIndex) / maxW2;
-        float scaleAct2 = getFPXActScalar(maxFC1Output);
+
+        std::vector<float> scales_1;
+        std::vector<float> scales_2;
+        std::vector<float> scales_3;
+        if (mUsePerExpertActScale)
+        {
+            scales_2 = std::vector<float>(mNumExperts);
+            for (int i = 0; i < mNumExperts; i++)
+            {
+                float maxExpertOutput = calcMLPVal(max_input, i) / applyExpertShift(mExpertWDiag2, i);
+                float scaleAct2 = getFPXActScalar(maxExpertOutput);
+                scales_2[i] = scaleAct2;
+            }
+        }
+        else
+        {
+            float scaleAct2 = getFPXActScalar(maxFC1Output);
+            scales_2 = std::vector<float>(mNumExperts, scaleAct2);
+        }
 
         ASSERT_NE(mExpertFPXScale1, nullptr);
         ASSERT_NE(mExpertFPXScale2, nullptr);
         ASSERT_NE(mExpertFPXScale3, nullptr);
 
-        std::vector<float> scales_1;
-        std::vector<float> scales_2;
-        std::vector<float> scales_3;
         if (ANY_FP4)
         {
             std::vector<float> scale_global_w1(mNumExperts);
             std::vector<float> scale_global_w2(mNumExperts);
 
-            std::vector<float> scales_0(1, scaleAct1);
+            std::vector<float> scales_0(mUsePerExpertActScale && NVFP4 ? mNumExperts : 1, scaleAct1);
             scales_1 = std::vector<float>(mNumExperts);
-            scales_2 = std::vector<float>(1, scaleAct2);
             scales_3 = std::vector<float>(mNumExperts);
 
             for (int i = 0; i < mNumExperts; i++)
@@ -695,7 +712,7 @@ protected:
 
                 // TODO Per expert scaling factors
                 scales_1[i] = 1.f / (scaleAct1 * scaleW1);
-                scales_3[i] = 1.f / (scaleAct2 * scaleW2);
+                scales_3[i] = 1.f / (scales_2[i] * scaleW2);
             }
 
             ASSERT_NE(mExpertFP4ActGlobalScale1, nullptr);
@@ -713,8 +730,17 @@ protected:
             mFP8WeightScalar1 = scaleW1;
             mFP8WeightScalar2 = scaleW2;
             scales_1 = std::vector<float>(mNumExperts, 1.f / (scaleW1 * scaleAct1));
-            scales_2 = std::vector<float>(1, scaleAct2);
-            scales_3 = std::vector<float>(mNumExperts, 1.f / (scaleW2 * scaleAct2));
+            scales_3 = std::vector<float>(mNumExperts);
+
+            for (int i = 0; i < mNumExperts; i++)
+            {
+                scales_3[i] = 1.f / (scaleW2 * scales_2[i]);
+            }
+        }
+
+        if (!mUsePerExpertActScale)
+        {
+            scales_2.resize(1);
         }
 
         check_cuda_error(cudaMemcpyAsync(mExpertFPXScale1, scales_1.data(), scales_1.size() * sizeof(float),
@@ -893,6 +919,10 @@ protected:
             ep_scale_1 = mExpertFPXScale1 + experts_per_node * parallelism_config.ep_rank;
             ep_scale_3 = mExpertFPXScale3 + experts_per_node * parallelism_config.ep_rank;
         }
+        if (mUsePerExpertActScale)
+        {
+            ep_scale_2 = mExpertFPXScale2 + experts_per_node * parallelism_config.ep_rank;
+        }
 
         // Slice weights for TP
         void* scale_1 = ep_scale_1;
@@ -1039,18 +1069,22 @@ protected:
         else if (FP8)
         {
             ASSERT_TRUE(scale1_ptr && scale2_ptr && scale3_ptr);
-            quant_params = QuantParams::FP8(static_cast<float const*>(scale1_ptr),
-                static_cast<float const*>(scale2_ptr), static_cast<float const*>(scale3_ptr));
+            quant_params
+                = QuantParams::FP8(static_cast<float const*>(scale1_ptr), static_cast<float const*>(scale2_ptr),
+                    static_cast<float const*>(scale3_ptr), nullptr, nullptr, mUsePerExpertActScale);
         }
         else if (ANY_FP4)
         {
             ASSERT_TRUE(mExpertFP4ActGlobalScale1);
             ASSERT_TRUE(mFP4ScalingFactorsW1 && mFP4ScalingFactorsW2);
             ASSERT_TRUE(scale1_ptr && scale2_ptr && scale3_ptr);
+            auto fc1_sf_offset = mUsePerExpertActScale && NVFP4
+                ? mNumExperts / parallelism_config.ep_size * parallelism_config.ep_rank
+                : 0;
             auto constructor = NVFP4 ? &QuantParams::FP4 : &QuantParams::FP8MXFP4;
-            quant_params
-                = constructor(mExpertFP4ActGlobalScale1, mFP4ScalingFactorsW1, static_cast<float const*>(scale1_ptr),
-                    static_cast<float const*>(scale2_ptr), mFP4ScalingFactorsW2, static_cast<float const*>(scale3_ptr));
+            quant_params = constructor(mExpertFP4ActGlobalScale1 + fc1_sf_offset, mFP4ScalingFactorsW1,
+                static_cast<float const*>(scale1_ptr), static_cast<float const*>(scale2_ptr), mFP4ScalingFactorsW2,
+                static_cast<float const*>(scale3_ptr), mUsePerExpertActScale && NVFP4, mUsePerExpertActScale);
         }
 
         if constexpr (WEIGHT_FP4)
@@ -1493,6 +1527,19 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteNoBias)
 {
     this->mUseBias = false;
     this->BasicPermuteTest();
+    this->BasicPermuteTest(2);
+    this->BasicPermuteTest(3);
+}
+
+TYPED_TEST(MixtureOfExpertsTest, PermuteSingletonScale)
+{
+    if (!this->ANY_FPX)
+    {
+        GTEST_SKIP() << "Only FPX cares about per-expert act scale";
+        return;
+    }
+    this->mUsePerExpertActScale = false;
+    this->BasicPermuteTest(1);
     this->BasicPermuteTest(2);
     this->BasicPermuteTest(3);
 }
@@ -2071,7 +2118,7 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
             backend.init(this->mMoERunner, GemmProfilerBackend::GemmToProfile::GEMM_1, nvinfer1::DataType::kHALF,
                 nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF, num_experts, k, 1024, 4096, mGroupSize, {}, false,
-                mUseLora, /*min_latency_mode=*/false, /*need_weights=*/true, MOEParallelismConfig{1, 0, ep, ep - 1},
+                mUseLora, /*min_latency_mode=*/false, /*need_weights=*/true, MOEParallelismConfig{1, 0, ep, 0},
                 /*enable_alltoall=*/false);
 #else
             backend.init(this->mMoERunner, GemmProfilerBackend::GemmToProfile::GEMM_1, nvinfer1::DataType::kHALF,
@@ -2089,33 +2136,46 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
 #define GET_WS_PTR(type, name) auto* name = reinterpret_cast<type>(workspace + workspaces.at(#name).second)
 
             GET_WS_PTR(int64_t*, expert_first_token_offset);
-            GET_WS_PTR(int*, source_to_dest);
-            GET_WS_PTR(int*, dest_to_source);
+            GET_WS_PTR(int*, unpermuted_row_to_permuted_row);
+            GET_WS_PTR(int*, permuted_row_to_unpermuted_row);
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
+            GET_WS_PTR(int*, token_selected_experts);
+#else
             GET_WS_PTR(int*, unpermuted_selected_experts);
-
+#endif
 #undef GET_WS_PTR
 
             for (int sample = 0; sample < backend.NUM_ROUTING_SAMPLES; sample++)
             {
                 auto host_expert_first_token_offset_size = getDataFromDevice(
                     expert_first_token_offset + sample * (num_experts_per_node + 1), num_experts_per_node + 1);
-                auto host_source_to_dest_map
-                    = getDataFromDevice(source_to_dest + sample * expanded_num_tokens, expanded_num_tokens);
-                auto host_dest_to_source_map
-                    = getDataFromDevice(dest_to_source + sample * expanded_num_tokens, expanded_num_tokens);
+                auto host_unpermuted_row_to_permuted_row_map = getDataFromDevice(
+                    unpermuted_row_to_permuted_row + sample * expanded_num_tokens, expanded_num_tokens);
+                auto host_permuted_row_to_unpermuted_row_map = getDataFromDevice(
+                    permuted_row_to_unpermuted_row + sample * expanded_num_tokens, expanded_num_tokens);
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
+                auto host_token_selected_experts
+                    = getDataFromDevice(token_selected_experts + sample * expanded_num_tokens, expanded_num_tokens);
+#else
                 auto host_token_selected_experts = getDataFromDevice(
                     unpermuted_selected_experts + sample * expanded_num_tokens, expanded_num_tokens);
+#endif
 
                 std::vector<int64_t> calculated_routing_values(num_experts_per_node + 1, 0);
                 int skipped = 0;
                 for (auto v : host_token_selected_experts)
                 {
+#ifndef USING_OSS_CUTLASS_MOE_GEMM
                     ASSERT_TRUE(v < num_experts_per_node || (v == num_experts_per_node && ep > 1))
                         << "v " << v << " num_experts_per_node " << num_experts_per_node << " ep " << ep;
-                    skipped += (v == num_experts_per_node);
+#endif
                     if (v < num_experts_per_node)
                     {
                         calculated_routing_values[v]++;
+                    }
+                    else
+                    {
+                        skipped++;
                     }
                 }
 
@@ -2159,14 +2219,18 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
                         int64_t idx = token_idx * k + k_idx;
                         int64_t expert_idx = host_token_selected_experts[idx];
 
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
+                        if (expert_idx < num_experts_per_node)
+#else
                         if (expert_idx < num_experts)
+#endif
                         {
-                            int64_t source_location = k_idx * num_tokens + token_idx;
-                            int64_t dest_location = host_expert_first_token_offset_size[expert_idx]
+                            int64_t unpermuted_row = k_idx * num_tokens + token_idx;
+                            int64_t permuted_row = host_expert_first_token_offset_size[expert_idx]
                                 + calculated_routing_values[expert_idx];
 
-                            ASSERT_EQ(host_source_to_dest_map[source_location], dest_location);
-                            ASSERT_EQ(host_dest_to_source_map[dest_location], source_location);
+                            ASSERT_EQ(host_unpermuted_row_to_permuted_row_map[unpermuted_row], permuted_row);
+                            ASSERT_EQ(host_permuted_row_to_unpermuted_row_map[permuted_row], unpermuted_row);
 
                             calculated_routing_values[expert_idx]++;
                         }
