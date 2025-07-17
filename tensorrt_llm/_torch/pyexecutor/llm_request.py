@@ -515,8 +515,6 @@ def executor_request_to_llm_request(
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)
-    #         llm_request.children.append(
-    #             llm_request.create_child_request(child_id))
 
     return llm_request
 

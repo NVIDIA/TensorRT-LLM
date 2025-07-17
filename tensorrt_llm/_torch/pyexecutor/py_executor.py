@@ -1546,11 +1546,7 @@ class PyExecutor:
             if request_done:
                 if request.is_disagg_context_transmission_state:
                     self.ctx_in_transmission_requests.append(request)
-                else:
-                    if response.result.is_final:
-                        requests_to_terminate.append(request)
-                        # for child in request.children:
-                        #     requests_to_terminate.append(child)
+                requests_to_terminate.append(request)
             else:
                 new_active_requests.append(request)
         self.active_requests.clear()
