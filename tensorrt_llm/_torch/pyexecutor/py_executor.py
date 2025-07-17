@@ -113,8 +113,9 @@ def _get_from_waiting_queue(
         req_item = waiting_queue[0]
         num_children = len(
             req_item.child_req_ids) if req_item.child_req_ids else 0
-        if 1 + num_children > max_req_count:
+        if (req_count + 1 + num_children) > max_req_count:
             break
+
         req_count += 1 + num_children
         items.append(waiting_queue.popleft())
     return items
@@ -1575,7 +1576,6 @@ class PyExecutor:
                     req_item.id, req_item.request, req_item.child_req_ids,
                     self._should_exclude_last_generation_logits())
                 req_with_children.append(req)
-                logger.info(f"Children to {req.request_id}: {req.children}")
                 if req.children:
                     req_with_children.extend(req.children)
             return req_with_children
@@ -1966,11 +1966,7 @@ class PyExecutor:
             if request_done:
                 if request.is_disagg_context_transmission_state:
                     self.ctx_in_transmission_requests.append(request)
-                else:
-                    if response.result.is_final:
-                        requests_to_terminate.append(request)
-                        # for child in request.children:
-                        #     requests_to_terminate.append(child)
+                requests_to_terminate.append(request)
             else:
                 new_active_requests.append(request)
         self.active_requests = new_active_requests
