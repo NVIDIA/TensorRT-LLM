@@ -510,7 +510,6 @@ class TRTLLMSampler(Sampler):
         self.max_num_sequences = mapping.pp_size * self.executor_config.max_batch_size
         self.max_seq_idle_microseconds = 180 * 1000 * 1000
         self.is_trt_overlap = not disable_overlap_scheduler
-        self.is_disagg = False
         self.num_micro_batches = mapping.pp_size if mapping.pp_size > 1 else (
             2 if self.is_trt_overlap else 1)
         self.micro_batch_idx = 0
