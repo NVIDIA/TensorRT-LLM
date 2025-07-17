@@ -117,14 +117,20 @@ class SequenceInfo:
         # if the provided max_num_tokens is less than the max_batch_size * max_seq_len,
         # we use the provided max_num_tokens to calculate the number of pages
         total_tokens = min(self.max_num_tokens, self.max_batch_size * max_seq_len_adjusted)
-        self._num_pages = (total_tokens) // self.page_size + (total_tokens % self.page_size > 0)
+        # Num pages can not be less than max_batch_size.
+        self._num_pages = max(
+            self.max_batch_size,
+            (total_tokens) // self.page_size + (total_tokens % self.page_size > 0),
+        )
         self.input_ids = torch.ones(self.max_batch_size, 1, dtype=torch.int)
         self.position_ids = torch.zeros(self.max_batch_size, 1, dtype=torch.long)
         self.seq_len = torch.empty(self.max_batch_size, dtype=torch.int)
         self.input_pos = torch.empty_like(self.seq_len)
         self.cache_loc = torch.empty(self.num_pages, dtype=torch.int)
         self.pages_per_seq = torch.empty_like(self.seq_len)
-
+        assert self.num_pages >= self.max_batch_size, (
+            "num_pages must be greater than max_batch_size"
+        )
         # dynamic shape descriptors for tensor args
         self._dynamic_shapes: Optional[Tuple[Dict[str, Dim]]] = None
 
