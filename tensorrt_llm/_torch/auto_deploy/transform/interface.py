@@ -6,7 +6,7 @@ This module defines the base classes and interfaces for all transforms.
 from abc import ABC, abstractmethod
 from enum import Enum
 from functools import total_ordering
-from typing import Any, Callable, Dict, Tuple, Type, Union, final
+from typing import Any, Callable, Dict, Mapping, Tuple, Type, Union, final
 
 from pydantic import BaseModel, Field
 from torch.fx import GraphModule
@@ -15,12 +15,6 @@ from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
 from ..transformations._graph import canonicalize_graph, lift_to_meta
 from ..utils.logger import ad_logger
-
-TransformHistory = Dict[str, "TransformInfo"]
-AutodeployMeta = Dict[str, Any]
-_UntypedInferenceOptimizerConfig = Dict[str, Any]
-_StrictInferenceOptimizerConfig = Dict[str, "TransformConfig"]
-InferenceOptimizerConfig = Dict[str, Union["TransformConfig", _UntypedInferenceOptimizerConfig]]
 
 
 class TransformError(Exception):
@@ -95,6 +89,12 @@ class TransformConfig(BaseModel):
     )
 
 
+AutodeployMeta = Dict[str, Any]
+_UntypedInferenceOptimizerConfig = Dict[str, Any]
+StrictInferenceOptimizerConfig = Dict[str, TransformConfig]
+InferenceOptimizerConfig = Mapping[str, Union[TransformConfig, _UntypedInferenceOptimizerConfig]]
+
+
 class TransformInfo(BaseModel):
     """Information about the result of a transform."""
 
@@ -121,6 +121,9 @@ class TransformInfo(BaseModel):
         "information of the graph. In other words, the transform does not change the shapes of the "
         "tensors in the graph and it preserves the has_valid_shapes flag of the last transform.",
     )
+
+
+TransformHistory = Dict[str, TransformInfo]
 
 
 class BaseTransform(ABC):

@@ -2,7 +2,7 @@ from typing import Optional
 
 import pytest
 import torch
-import torch.nn as nn
+from _graph_test_helpers import FakeFactory
 from _model_test_utils import GQA
 from _torch_test_utils import all_close
 
@@ -66,14 +66,6 @@ class GQAWithSdpa(GQA):
 
         # Apply output projection
         return self.o_proj(attn_output)
-
-
-class FakeFactory:
-    def __init__(self, model: nn.Module):
-        self.model = model
-
-    def build_model(self, device: str) -> nn.Module:
-        return self.model.to(device=device)
 
 
 def _get_optimizer_config() -> InferenceOptimizerConfig:

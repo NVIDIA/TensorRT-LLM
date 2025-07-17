@@ -2,7 +2,7 @@ import importlib.metadata
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.export as te
@@ -12,76 +12,12 @@ from packaging import version
 from torch import fx
 
 from ..utils.logger import ad_logger
-from ..utils.node_utils import is_op
 from ._graph import canonicalize_graph, lift_to_meta, load_buffers_and_params, tree_to
 
 try:
     from modelopt.torch.quantization.utils import export_torch_mode as torch_export_context
 except ImportError:
     torch_export_context = nullcontext
-
-
-def _clean_up_no_op_slice_nodes(gm: fx.GraphModule):
-    """Remove no-op slice nodes from the graph.
-
-    Those will be nodes that are used to represent a slice operation like ``t[:, :5]``. The graph IR
-    will represent it as ``t[:][:5]``, i.e., two nodes and the first slice being a no-op. This
-    function gets rid of such instances.
-    """
-    for node in gm.graph.nodes:
-        # looking for slice nodes
-        if not is_op(node, torch.ops.aten.slice):
-            continue
-        # only handling this parameter combination for now
-        # 4 args will be (input, dim, start, end)
-        if len(node.args) != 4 or len(node.kwargs) != 0:
-            continue
-        # check if dim is just an integer
-        if not isinstance(node.args[1], int):
-            continue
-        # check if the slice op is indeed a no-op
-        if node.args[2] != 0 or node.args[3] != torch.iinfo(torch.long).max:
-            continue
-        # extract input tensor node and remove the slice node
-        in_node = node.args[0]
-        assert [in_node] == node.all_input_nodes, "Slice node has unexpected input nodes."
-        node.replace_all_uses_with(in_node)
-        gm.graph.erase_node(node)
-
-    canonicalize_graph(gm)
-
-
-def _eliminate_no_op_add_nodes(gm: fx.GraphModule):
-    """Eliminate add nodes from the graph that are no-ops.
-
-    This would be any node that is just adding 0 to the input tensor. We can safely remove those.
-
-    NOTE: this function has one failure mode when the op ``out = tensor + zero_tensor`` is used
-    in such a way that``out`` will be broadcast to the shape of zero_tensor. After removing this op
-    then, out won't have the right shape anymore. This should e a rare case and we can handle it
-    when it comes up.
-    """
-    for node in gm.graph.nodes:
-        # looking for add nodes
-        if not is_op(node, torch.ops.aten.add):
-            continue
-        # only handling this parameter combination for now
-        if len(node.all_input_nodes) != 2:
-            continue
-
-        # check if any of the input nodes is just a constant tensor with value 0
-        if is_op(node.all_input_nodes[0], torch.ops.aten.zeros):
-            zero_node, true_node = node.all_input_nodes
-        elif is_op(node.all_input_nodes[1], torch.ops.aten.zeros):
-            true_node, zero_node = node.all_input_nodes
-        else:
-            continue
-
-        # do the replacement and clean-up
-        node.replace_all_uses_with(true_node)
-        gm.graph.erase_node(node)
-
-    canonicalize_graph(gm)
 
 
 def _clean_up_device_info(gm: fx.GraphModule):
@@ -151,24 +87,6 @@ def _deduplicate_params_and_buffers(gm: fx.GraphModule):
 
             ad_logger.debug(f"Deduplicated: {n.target} --> {node_kept.target}")
 
-    canonicalize_graph(gm)
-
-
-def _clean_up_checks(gm: fx.GraphModule):
-    """This transformations removes shape checks and assertions from the graph."""
-    check_ops = {
-        torch.ops.aten._assert_scalar,
-        torch.ops.aten.sym_constrain_range,
-        torch.ops.aten.sym_constrain_range_for_size,
-        torch.ops.aten._assert_tensor_metadata,
-        # torch.ops.aten._functional_sym_constrain_range,
-        # torch.ops.aten._functional_sym_constrain_range_for_size
-    }
-    graph: fx.Graph = gm.graph
-    for node in reversed(graph.nodes):
-        if len(node.users) > 0 or not is_op(node, check_ops):
-            continue
-        graph.erase_node(node)
     canonicalize_graph(gm)
 
 
@@ -341,10 +259,10 @@ def add_load_hook_for_aliased_params(gm: fx.GraphModule, model: nn.Module):
 
 
 @torch.inference_mode()
-def torch_export(model: nn.Module, *export_args, **export_kwargs) -> te.ExportedProgram:
+def torch_export(model: nn.Module, *args, **kwargs) -> te.ExportedProgram:
     """Just like torch.export except we decorate it to be in inference_mode."""
     with torch_export_context():
-        ep = te.export(model, *export_args, **export_kwargs)
+        ep = te.export(model, *args, **kwargs)
 
     # return the result
     return ep
@@ -355,9 +273,20 @@ def torch_export_to_gm(
     args: Tuple[Any, ...],
     kwargs: Optional[Dict[str, Any]] = None,
     clone: bool = False,  # clone or don't clone the model state_dict
-    **export_kwargs,
+    *,
+    dynamic_shapes: Optional[Union[dict[str, Any], tuple[Any], list[Any]]] = None,
+    strict: bool = False,
 ) -> fx.GraphModule:
-    """torch_export with wrapping into GraphModule + useful additions to the resulting module."""
+    """torch_export with wrapping into GraphModule + useful additions to the resulting module.
+
+    This utility improves over stock torch.export.export in the following aspects:
+
+        1. Provide patches for certain corner cases that torch.export does not support.
+        2. Standardize the export process to strictly run on the meta device.
+        3. Automatically extract the GraphModule from the exported program.
+        4. Retain load hooks for state_dict loading from the oroginal module.
+        5. Manage parameter aliasing in the model.
+    """
     # we need to better control how F.scaled_dot_product_attention is represented in the graph
     # there is no guarantee how it is represented and we need to make sure it is easily identifiable
     # in the graph.
@@ -395,10 +324,11 @@ def torch_export_to_gm(
             # assumptions around tracing. Strict mode uses torchdynamo (symbolic bytecode analysis),
             # which can be brittle since it relies on the exact bytecode representation of the model
             # see here as well: https://pytorch.org/docs/stable/export.html#non-strict-export
-            export_kwargs["strict"] = False
 
             # run export and extract graph module
-            egm: fx.GraphModule = torch_export(model, args, kwargs, **export_kwargs).module()
+            egm: fx.GraphModule = torch_export(
+                model, args, kwargs, dynamic_shapes=dynamic_shapes, strict=strict
+            ).module()
 
             # load state_dict into egm
             # NOTE: export might have removed unused params/buffers (hence we allow unexpected keys)
@@ -431,23 +361,15 @@ def torch_export_to_gm(
     add_missing_load_hooks(egm, model)
 
     # Add load hook to correctly load parameters that are aliased in the source model.
-    add_load_hook_for_aliased_params(egm, model)
-
-    # Export will have LOTS of no-op slice nodes. Let's remove them to clean up the graph
-    # representation
-    _clean_up_no_op_slice_nodes(egm)
-
-    # Export does not clean "no-op" element-wise add nodes. We can safely remove those.
-    _eliminate_no_op_add_nodes(egm)
-
-    # clean up devices in the graph
-    _clean_up_device_info(egm)
-
     # deduplicate params and buffers
+    # TODO (lucaslie, suyoggupta): seems there is some overlap here. I believe we should just have
+    # the deduplicate function and extend it to handle reading from state dict for any name.
+    add_load_hook_for_aliased_params(egm, model)
     _deduplicate_params_and_buffers(egm)
 
-    # clean up shape checks and assertions
-    _clean_up_checks(egm)
+    # clean up devices in the graph
+    # This is a consequence of lifting to meta during export.
+    _clean_up_device_info(egm)
 
     # show exported graph
     ad_logger.debug("exported graph: " + str(egm))

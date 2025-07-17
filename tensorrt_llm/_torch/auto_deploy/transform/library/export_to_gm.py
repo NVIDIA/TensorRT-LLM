@@ -1,6 +1,6 @@
 """A simple wrapper transform to export a model to a graph module."""
 
-from typing import Tuple
+from typing import Tuple, Type
 
 from pydantic import Field
 from torch.fx import GraphModule
@@ -33,6 +33,10 @@ class ExportToGM(BaseTransform):
     """A simple wrapper transform to export a model to a graph module."""
 
     config: ExportToGMConfig
+
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return ExportToGMConfig
 
     def _apply(
         self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory

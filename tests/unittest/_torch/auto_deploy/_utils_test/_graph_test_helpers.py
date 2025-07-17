@@ -11,6 +11,14 @@ from tensorrt_llm._torch.auto_deploy.transformations.export import torch_export,
 from tensorrt_llm._torch.auto_deploy.transformations.library.sharding import ShardingTransformInfo
 
 
+class FakeFactory:
+    def __init__(self, model: nn.Module):
+        self.model = model
+
+    def build_model(self, device: str) -> nn.Module:
+        return self.model.to(device=device)
+
+
 def count_parameters(model: torch.nn.Module):
     for n, p in model.named_parameters():
         print(n, p.shape)
