@@ -950,7 +950,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                 }
 
-                def requireMultiGpuTesting = currentBuild.description?.contains("Require Multi-GPU Testing") ?: false
+                def requireMultiGpuTesting = currentBuild.description?.contains("Require x86_64 Multi-GPU Testing") ?: false
                 echo "requireMultiGpuTesting: ${requireMultiGpuTesting}"
                 if (!requireMultiGpuTesting) {
                     if (singleGpuTestFailed) {
@@ -1007,10 +1007,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
             script {
                 def jenkinsUrl = ""
                 def credentials = ""
-                def testStageName = "[Test-SBSA] Run"
-                if (env.localJobCredentials) {
-                    testStageName = "[Test-SBSA] Remote Run"
-                }
+                def testStageName = "[Test-SBSA-Single-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                def singleGpuTestFailed = false
 
                 if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
                     echo "SBSA build job is skipped due to Jenkins configuration or conditional pipeline run"
@@ -1029,13 +1027,68 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         return
                     }
                     try {
+                        String testFilterJson = writeJSON returnText: true, json: testFilter
+                        def additionalParameters = [
+                            'testFilter': testFilterJson,
+                            "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
+                        ]
+
+                        launchJob("L0_Test-SBSA-Single-GPU", false, enableFailFast, globalVars, "SBSA", additionalParameters)
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        if (SBSA_TEST_CHOICE == STAGE_CHOICE_IGNORE) {
+                            catchError(
+                                buildResult: 'SUCCESS',
+                                stageResult: 'FAILURE') {
+                                error "SBSA test failed but ignored due to Jenkins configuration"
+                            }
+                        } else {
+                            catchError(
+                                buildResult: 'FAILURE',
+                                stageResult: 'FAILURE') {
+                                error "SBSA single-GPU test failed"
+                            }
+                            singleGpuTestFailed = true
+                        }
+                    }
+                }
+
+                def requireMultiGpuTesting = currentBuild.description?.contains("Require SBSA Multi-GPU Testing") ?: false
+                echo "requireMultiGpuTesting: ${requireMultiGpuTesting}"
+                if (!requireMultiGpuTesting) {
+                    return
+                }
+
+                if (singleGpuTestFailed) {
+                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+                        echo "In the official post-merge pipeline, SBSA single-GPU test failed, whereas multi-GPU test is still kept running."
+                    } else {
+                        stage("[Test-SBSA-Multi-GPU] Blocked") {
+                            catchError(
+                                buildResult: 'FAILURE',
+                                stageResult: 'FAILURE') {
+                                error "This pipeline requires running SBSA multi-GPU test, but single-GPU test has failed."
+                            }
+                        }
+                        return
+                    }
+                }
+
+                testStageName = "[Test-SBSA-Multi-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                stage(testStageName) {
+                    if (SBSA_TEST_CHOICE == STAGE_CHOICE_SKIP) {
+                        echo "SBSA test job is skipped due to Jenkins configuration"
+                        return
+                    }
+                    try {
                         def testFilterJson = writeJSON returnText: true, json: testFilter
                         def additionalParameters = [
                             'testFilter': testFilterJson,
                             "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
                         ]
 
-                        launchJob("L0_Test-SBSA", false, enableFailFast, globalVars, "SBSA", additionalParameters)
+                        launchJob("L0_Test-SBSA-Multi-GPU", false, enableFailFast, globalVars, "SBSA", additionalParameters)
 
                     } catch (InterruptedException e) {
                         throw e
