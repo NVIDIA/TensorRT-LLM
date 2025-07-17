@@ -12,6 +12,7 @@ from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.executor import GenerationExecutorProxy
 from tensorrt_llm.llmapi import BuildConfig, KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
+from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import PretrainedConfig
 from tensorrt_llm.models.llama.model import LLaMAForCausalLM
@@ -261,12 +262,21 @@ def test_llama_v2_13b_lora_tp2():
 @pytest.mark.gpu2
 @pytest.mark.part3
 def test_llama_7b_multi_lora_tp2():
+    # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
+    # (1) specify lora_target_modules, or
+    # (2) provide a lora_dir to infer the lora_target_modules.
+    lora_config = LoraConfig(lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
+                             max_lora_rank=8,
+                             max_loras=1,
+                             max_cpu_loras=8)
     check_llama_7b_multi_lora_from_request_test_harness(
         LLM,
-        tensor_parallel_size=2,
-        max_lora_rank=8,
-        max_loras=1,
-        max_cpu_loras=8,
+        enable_lora=True,
+        build_config=BuildConfig(lora_config=lora_config),
+        fast_build=True,
+        max_lora_rank=lora_config.max_lora_rank,
+        max_loras=lora_config.max_loras,
+        max_cpu_loras=lora_config.max_cpu_loras,
         kv_cache_config=global_kv_cache_config)
 
 

@@ -4,6 +4,7 @@ import pytest
 from .test_llm import tinyllama_logits_processor_test_harness
 from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import KvCacheConfig
+from tensorrt_llm.lora_manager import LoraConfig
 from .lora_test_utils import check_llama_7b_multi_lora_from_request_test_harness
 from .test_llm_pytorch import llama_7b_lora_from_dir_test_harness
 from .test_llm import _test_llm_capture_request_error
@@ -41,9 +42,16 @@ def test_llama_7b_lora_tp2():
 
 @pytest.mark.gpu2
 def test_llama_7b_multi_lora_tp2():
+    # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
+    # (1) specify lora_target_modules, or
+    # (2) provide a lora_dir to infer the lora_target_modules.
+    lora_config = LoraConfig(lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
+                             max_lora_rank=8,
+                             max_loras=1,
+                             max_cpu_loras=8)
     check_llama_7b_multi_lora_from_request_test_harness(
         LLM,
-        max_lora_rank=8,
+        lora_config=lora_config,
         tensor_parallel_size=2,
         kv_cache_config=global_kv_cache_config,
         # Disable CUDA graph
