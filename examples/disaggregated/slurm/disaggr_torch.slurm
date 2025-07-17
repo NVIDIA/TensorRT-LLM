@@ -4,19 +4,23 @@
 #SBATCH --ntasks-per-node=4
 #SBATCH --partition=${partition} # add your partition here
 #SBATCH --account=${account} # add your account here
-#SBATCH --time=01:00:00
+#SBATCH --time=02:00:00
 #SBATCH --job-name=${job_name} # add your job name here
 
 isl=1024
 osl=1024
-multi_round=1
+multi_round=10
 gen_yaml_file=gen_yaml.py
 container_image=${container_image} # add your container image here
 mount_dir=${mount_dir} # add your mount directory here
 workdir=${mount_dir}/bench-large-ep/slurm_scripts/
 model_dir=${model_dir} # add your model directory here
 logdir=${workdir}/bm_20250703_deepseek-r1-${isl}-${osl}/
-streaming=false
+streaming=true
+
+nsys_on=""
+# nsys_on=${full_logdir}
+
 mkdir -p ${logdir}
 
 container_name=disaggr-test
@@ -90,9 +94,6 @@ srun -l --container-name=${container_name} \
         --container-mounts=${mount_dir}:${mount_dir} \
         --mpi=pmix --overlap \
         pkill -f "trtllm-serve" || true
-
-nsys_on=""
-# nsys_on=${full_logdir}
 
 # start the workers
 srun -l --container-name=${container_name} \
