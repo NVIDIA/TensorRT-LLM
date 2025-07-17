@@ -334,9 +334,8 @@ class BaseLLM:
         # With pytorch backend, py_executor has logic to handle max_tokens of 1,
         # so set to 1 to avoid allocating unnecessary KV cache blocks for single request
         # TODO: Also support for trt backend
-        if (disaggregated_params is not None
-                and disaggregated_params.request_type == "context_only"
-                and not self._on_trt_backend):
+        is_context_only = disaggregated_params is not None and disaggregated_params.request_type == "context_only"
+        if is_context_only and not self._on_trt_backend:
             sampling_params.max_tokens = 1
 
         inputs = prompt_inputs(inputs)
@@ -401,7 +400,8 @@ class BaseLLM:
         self._check_arguments(
             len(prompt_token_ids),
             len(query_token_ids) if query_token_ids is not None else 0,
-            sampling_params)
+            sampling_params,
+            is_context_only=is_context_only)
         if _postproc_params:
             _postproc_params.postproc_args.num_prompt_tokens = len(
                 prompt_token_ids)
@@ -529,7 +529,8 @@ class BaseLLM:
         return sampling_params
 
     def _check_arguments(self, prompt_len: int, query_len: int,
-                         sampling_params: SamplingParams) -> None:
+                         sampling_params: SamplingParams,
+                         is_context_only: bool) -> None:
 
         if self.args.backend in ["pytorch", "_autodeploy"]:
             # TODO: remove these checks after PyTorch backend
@@ -543,7 +544,8 @@ class BaseLLM:
                     f"PyTorch backend currently only supports `logprobs=1`. Received `logprobs={sampling_params.logprobs}` (Top{sampling_params.logprobs} logprobs). Please set `logprobs=1` in `sampling_params` instead."
                 )
             # Check prompt length and query length against max_num_tokens to filter illegal requests.
-            if self.args.backend == "pytorch" and not self.args.enable_chunked_prefill:
+            # This is only applicable for context-only requests
+            if self.args.backend == "pytorch" and not self.args.enable_chunked_prefill and is_context_only:
                 max_num_tokens = self.args.max_num_tokens
                 if max_num_tokens and prompt_len / self.args.parallel_config.cp_size + query_len > max_num_tokens:
                     raise ValueError(
