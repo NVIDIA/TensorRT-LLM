@@ -232,9 +232,13 @@ def setup_llm(args, **kwargs):
     )
 
     use_beam_search = args.max_beam_width > 1
-    if use_beam_search and args.n == 1:
-        # If beam search is used, set n to the beam width.
-        args.n = args.max_beam_width
+    best_of = args.best_of or args.n
+    if use_beam_search:
+        if args.n == 1 and args.best_of is None:
+            args.n = args.max_beam_width
+        assert best_of <= args.max_beam_width, f"best_of: {best_of}, max_beam_width: {args.max_beam_width}"
+
+    assert best_of >= args.n, f"In sampling mode best_of value: {best_of} should be less or equal to n: {args.n}"
 
     sampling_params = SamplingParams(
         max_tokens=args.max_tokens,
@@ -245,7 +249,7 @@ def setup_llm(args, **kwargs):
         return_generation_logits=args.return_generation_logits,
         logprobs=args.logprobs,
         n=args.n,
-        best_of=args.best_of or args.n,
+        best_of=best_of,
         use_beam_search=use_beam_search)
     return llm, sampling_params
 
