@@ -175,6 +175,7 @@ class TrtllmAttentionWrapper:
         mla_context_paged_kv: Optional[torch.Tensor] = None,
         mla_context_kv_cache_block_offsets: Optional[torch.Tensor] = None,
         softmax_stats_tensor: Optional[torch.Tensor] = None,
+        helix_position_offsets: Optional[torch.Tensor] = None,
         is_spec_decoding_enabled: bool = False,
         use_spec_decoding: bool = False,
         spec_decoding_position_offsets: Optional[torch.Tensor] = None,
@@ -215,6 +216,7 @@ class TrtllmAttentionWrapper:
             mla_context_paged_kv (torch.Tensor): The paged KV cache for MLA context, for kv cache reuse/chunked context.
             mla_context_kv_cache_block_offsets (torch.Tensor): The block offsets for the paged KV cache for MLA context, for kv cache reuse/chunked context.
             softmax_stats_tensor (torch.Tensor): The tensor to store the softmax statistics (max/sum)
+            helix_position_offsets (torch.Tensor): The tensor to store the helix position offsets, with shape (num_tokens) on GPU.
         """
         self.layer_idx = layer_idx
         self.tokens_per_block = tokens_per_block
@@ -251,6 +253,7 @@ class TrtllmAttentionWrapper:
         self.mla_context_paged_kv = mla_context_paged_kv
         self.mla_context_kv_cache_block_offsets = mla_context_kv_cache_block_offsets
         self.softmax_stats_tensor = softmax_stats_tensor
+        self.helix_position_offsets = helix_position_offsets
 
         if max_sequence_length > self.rope_params.max_positions:
             self.rope_params.max_positions = max_sequence_length
@@ -462,12 +465,13 @@ class TrtllmAttentionWrapper:
             self.qk_nope_head_dim,
             self.qk_rope_head_dim,
             self.v_head_dim,
-            self.mrope_rotary_cos_sin,
-            self.mrope_position_deltas,
-            self.mla_context_paged_kv,
-            self.mla_context_kv_cache_block_offsets,
             self.attention_chunk_size,
-            self.softmax_stats_tensor,
+            [
+                self.mrope_rotary_cos_sin, self.mrope_position_deltas,
+                self.mla_context_paged_kv,
+                self.mla_context_kv_cache_block_offsets,
+                self.softmax_stats_tensor, self.helix_position_offsets
+            ],
             spec_decoding_bool_params,
             spec_decoding_tensor_params,
         )
@@ -1090,6 +1094,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         mla_context_paged_kv: Optional[torch.Tensor] = None,
         mla_context_kv_cache_block_offsets: Optional[torch.Tensor] = None,
         softmax_stats_tensor: Optional[torch.Tensor] = None,
+        helix_position_offsets: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,
         output_sf: Optional[torch.Tensor] = None,
         **kwargs,
@@ -1156,6 +1161,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             mla_context_kv_cache_block_offsets=
             mla_context_kv_cache_block_offsets,
             softmax_stats_tensor=softmax_stats_tensor,
+            helix_position_offsets=helix_position_offsets,
             is_spec_decoding_enabled=metadata.is_spec_decoding_enabled,
             use_spec_decoding=metadata.use_spec_decoding,
             spec_decoding_position_offsets=metadata.
