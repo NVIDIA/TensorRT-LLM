@@ -547,7 +547,7 @@ class BaseLLM:
                 max_num_tokens = self.args.max_num_tokens
                 if max_num_tokens and prompt_len / self.args.parallel_config.cp_size + query_len > max_num_tokens:
                     raise ValueError(
-                        f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}), query length ({query_len}) and max_tokens ({sampling_params.max_tokens}) should not exceed "
+                        f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}), query length ({query_len}) should not exceed "
                         f"max_num_tokens ({max_num_tokens})")
             return
 
