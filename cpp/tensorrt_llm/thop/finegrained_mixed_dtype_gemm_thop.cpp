@@ -53,19 +53,15 @@ finegrainedMixedDtypeGemmRunner::finegrainedMixedDtypeGemmRunner(
     {
         if (activationDtype == at::ScalarType::Half)
         {
-            if (outputDtype != activationDtype)
-            {
-                TORCH_CHECK(false, "Activation dtype needs to match Output stype", activationDtype);
-            }
+            TORCH_CHECK(
+                outputDtype == activationDtype, "Activation dtype needs to match Output stype", activationDtype);
             mGemmRunner = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<half,
                 cutlass::uint4b_t, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY, half, half, half>>();
         }
         else if (activationDtype == at::ScalarType::BFloat16)
         {
-            if (outputDtype != activationDtype)
-            {
-                TORCH_CHECK(false, "Activation dtype needs to match Output stype", activationDtype);
-            }
+            TORCH_CHECK(
+                outputDtype == activationDtype, "Activation dtype needs to match Output stype", activationDtype);
             mGemmRunner = std::make_shared<
                 tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<__nv_bfloat16, cutlass::uint4b_t,
                     cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16>>();
@@ -100,19 +96,15 @@ finegrainedMixedDtypeGemmRunner::finegrainedMixedDtypeGemmRunner(
     {
         if (activationDtype == at::ScalarType::Half)
         {
-            if (outputDtype != activationDtype)
-            {
-                TORCH_CHECK(false, "Activation dtype needs to match Output stype", activationDtype);
-            }
+            TORCH_CHECK(
+                outputDtype == activationDtype, "Activation dtype needs to match Output stype", activationDtype);
             mGemmRunner = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<half,
                 cutlass::uint4b_t, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS, half, half, half>>();
         }
         else if (activationDtype == at::ScalarType::BFloat16)
         {
-            if (outputDtype != activationDtype)
-            {
-                TORCH_CHECK(false, "Activation dtype needs to match Output stype", activationDtype);
-            }
+            TORCH_CHECK(
+                outputDtype == activationDtype, "Activation dtype needs to match Output stype", activationDtype);
             mGemmRunner
                 = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<__nv_bfloat16,
                     cutlass::uint4b_t, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS, __nv_bfloat16,
@@ -160,8 +152,7 @@ at::Tensor finegrainedMixedDtypeGemmRunner::runGemm(at::Tensor const& A, at::Ten
     TORCH_CHECK(B_packed.scalar_type() == torch::kQUInt4x2 || B_packed.scalar_type() == torch::kInt8
             || B_packed.scalar_type() == torch::kUInt8,
         "B_packed must be quint4x2, int8, or uint8 (view of quantized data)");
-    // TORCH_CHECK(scales.scalar_type() == torch::kFloat16 || scales.scalar_type() == torch::kBFloat16,
-    //     "Scales must be FP16 or BF 16");
+
     TORCH_CHECK(A.is_contiguous() && B_packed.is_contiguous() && scales.is_contiguous(),
         "All input tensors (A, B_packed, scales) must be contiguous");
 
@@ -222,7 +213,6 @@ at::Tensor finegrainedMixedDtypeGemmRunner::runGemm(at::Tensor const& A, at::Ten
         output_shape_vec.push_back(N_orig);
     }
 
-    // Set output dtype based on activation dtype
     torch::ScalarType output_dtype;
     if (mOutputDtype == at::ScalarType::Half)
     {

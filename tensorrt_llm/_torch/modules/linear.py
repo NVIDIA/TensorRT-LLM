@@ -916,7 +916,7 @@ class W4A16_AWQ_LinearMethod(LinearMethodBase):
         output = torch.ops.trtllm.finegrained_mixed_dtype_gemm(
             input=input.to(module.dtype).contiguous(),
             weight=module.weight,
-            scales=module.weight_scale.contiguous(),
+            scales=module.weight_scale,
             group_size=module.quant_config.group_size,
             has_zero_point=module.quant_config.has_zero_point,
             output_dtype=module.dtype or input.dtype,
@@ -966,7 +966,7 @@ class W4A16_AWQ_LinearMethod(LinearMethodBase):
                                          module.tp_mode, device)
 
         copy_weight(module.pre_quant_scale, pre_quant_scale)
-        copy_weight(module.weight_scale, weight_scale.T)
+        copy_weight(module.weight_scale, weight_scale.T.contiguous())
 
     def load_weights_fused_qkv_linear(self, module: Linear,
                                       weights: List[Dict]) -> None:
@@ -983,7 +983,7 @@ class W4A16_AWQ_LinearMethod(LinearMethodBase):
         weight_scales = self.load_weight_scales(weights)
 
         # Create concatenated weight scale tensor
-        cat_weight_scale = torch.cat(weight_scales, dim=0).T
+        cat_weight_scale = torch.cat(weight_scales, dim=0).T.contiguous()
         copy_weight(module.weight_scale, cat_weight_scale)
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
@@ -1005,7 +1005,7 @@ class W4A16_AWQ_LinearMethod(LinearMethodBase):
         right_scale = load_weight_shard(weights[1]['weight_scale'],
                                         module.tp_size, module.tp_rank,
                                         module.tp_mode, device).contiguous()
-        fused_scale = torch.cat([left_scale, right_scale], dim=0).T
+        fused_scale = torch.cat([left_scale, right_scale], dim=0).T.contiguous()
         copy_weight(module.weight_scale, fused_scale)
 
 
@@ -1051,14 +1051,26 @@ class W4A8_AWQ_LinearMethod(LinearMethodBase):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
-        # NOTE: modelopt flow for w4a8_awq: 1. multiply pre_quant_scale to input 2. quantize input to fp8 using input_scale
-        # 3. unpack_weights and multiply by weight_scales (int4 -> fp16) 4. divied by weight_scale_2 (fp16 -> fp8 to allow gemm in fp8). 5. apply gemm in fp8. 6. rescale using alpha which is input_scale * weight_scale_2
+        """
+        modelopt flow for w4a8_awq:
+         1. multiply pre_quant_scale to input
+         2. quantize input to fp8 using input_scale
+         3. unpack_weights and multiply by weight_scales (int4 -> fp16)
+         4. divied by weight_scale_2 (fp16 -> fp8 to allow gemm in fp8).
+         5. apply gemm in fp8.
+         6. rescale using alpha which is input_scale * weight_scale_2
 
+
+
+
+
+        """
         if module.pre_quant_scale is not None:
             input = input * module.pre_quant_scale
 
-        quantized_input = input
-        if input.dtype != torch.float8_e4m3fn:
+        if input.dtype == torch.float8_e4m3fn:
+            quantized_input = input
+        else:
             quantized_input, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
                 input, (module.input_scale))
 
@@ -1066,8 +1078,8 @@ class W4A8_AWQ_LinearMethod(LinearMethodBase):
 
         output = torch.ops.trtllm.finegrained_mixed_dtype_gemm(
             input=quantized_input.contiguous(),
-            weight=module.weight.contiguous(),
-            scales=module.weight_scale.contiguous(),
+            weight=module.weight,
+            scales=module.weight_scale,
             group_size=module.quant_config.group_size,
             has_zero_point=module.quant_config.has_zero_point,
             output_dtype=module.dtype
@@ -1141,7 +1153,7 @@ class W4A8_AWQ_LinearMethod(LinearMethodBase):
 
         assert len(weight_scale) == 1, "there should be only one weight scale"
 
-        weight_scale = weight_scale[0].T / weight_scale_2
+        weight_scale = (weight_scale[0].T / weight_scale_2).contiguous()
 
         copy_weight(module.weight_scale, weight_scale)
         copy_weight(module.input_scale, input_scale)
@@ -1169,14 +1181,15 @@ class W4A8_AWQ_LinearMethod(LinearMethodBase):
             tp_mode=module.tp_mode)
 
         # Create concatenated weight scale tensor
-        cat_weight_scale = torch.cat(weight_scales, dim=0).T / weight_scale_2
+        cat_weight_scale = (torch.cat(weight_scales, dim=0).T /
+                            weight_scale_2).contiguous()
         copy_weight(module.weight_scale, cat_weight_scale)
         copy_weight(module.input_scale, input_scale)
         copy_weight(module.alpha, alpha)
 
+        # NOTE: pre_quant_scale is the same for q,k,v since modelopt checks which layer shared the same input and create an avg pre_quant_scale
+        # Usually when modelopt exports the quantized model, pre_quant_Scale is fused in the layer norm (this case relevant if fused is disabled - modelopt internal)
         if "pre_quant_scale" in weights[0].keys():
-            # NOTE: pre_quant_scale is the same for q,k,v since modelopt checks which layer shared the same input and create an avg pre_quant_scale
-            # Usually when modelopt exports the quantized model, pre_quant_Scale is fused in the layer norm (this case relevant if fused is disabled - modelopt internal)
             pre_quant_scale = load_weight_shard(weights[0]['pre_quant_scale'],
                                                 module.tp_size,
                                                 module.tp_rank,
@@ -1208,7 +1221,8 @@ class W4A8_AWQ_LinearMethod(LinearMethodBase):
             tp_rank=module.tp_rank,
             tp_mode=module.tp_mode)
 
-        fused_scale = torch.cat(weight_scale, dim=0).T / weight_scale_2
+        fused_scale = (torch.cat(weight_scale, dim=0).T /
+                       weight_scale_2).contiguous()
         copy_weight(module.weight_scale, fused_scale)
         copy_weight(module.input_scale, input_scale)
         copy_weight(module.alpha, alpha)

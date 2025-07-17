@@ -675,18 +675,18 @@ def _(
                              dtype=output_dtype)
 
 
-class finegrainedMixedDtypeGemm(TunableRunner):
+class FinegrainedMixedDtypeGemm(TunableRunner):
     _runner_dict = dict()
     MAX_SUPPORTED_SM_VERSION = 90
 
     def __init__(self, activation_dtype: torch.dtype, output_dtype: torch.dtype,
                  quant_mode: int):
         instance_key = (activation_dtype, output_dtype, quant_mode)
-        if instance_key not in finegrainedMixedDtypeGemm._runner_dict:
-            finegrainedMixedDtypeGemm._runner_dict[
+        if instance_key not in FinegrainedMixedDtypeGemm._runner_dict:
+            FinegrainedMixedDtypeGemm._runner_dict[
                 instance_key] = torch.classes.trtllm.finegrainedMixedDtypeGemmRunner(
                     activation_dtype, output_dtype, quant_mode)
-        self._finegrained_mixed_dtype_gemm_runner = finegrainedMixedDtypeGemm._runner_dict[
+        self._finegrained_mixed_dtype_gemm_runner = FinegrainedMixedDtypeGemm._runner_dict[
             instance_key]
 
     def get_valid_tactics(
@@ -711,16 +711,10 @@ class finegrainedMixedDtypeGemm(TunableRunner):
         activation, weights_packed, scales = inputs
 
         alpha = 1.0 if kwargs.get("alpha") is None else kwargs["alpha"]
+
         return self._finegrained_mixed_dtype_gemm_runner.run_gemm(
-            activation,
-            weights_packed,
-            scales,
-            kwargs["group_size"],
-            tactic,
-            kwargs["bias"],
-            kwargs[
-                "zeros"],  # NOTE if qunant_mode is 0 (FINEGRAINED_SCALE_ONLY), zeros is not used --> needs to be None
-            alpha)
+            activation, weights_packed, scales, kwargs["group_size"], tactic,
+            kwargs["bias"], kwargs["zeros"], alpha)
 
 
 @torch.library.custom_op("trtllm::finegrained_mixed_dtype_gemm",
@@ -750,7 +744,7 @@ def finegrained_mixed_dtype_gemm(
     if quant_mode == 0:
         assert zeros is None, "When quant_mode is 0 (FINEGRAINED_SCALE_ONLY), zeros must be None"
 
-    finegrained_mixed_dtype_gemm_runner = finegrainedMixedDtypeGemm(
+    finegrained_mixed_dtype_gemm_runner = FinegrainedMixedDtypeGemm(
         input.dtype, output_dtype, quant_mode)
 
     kwargs = {

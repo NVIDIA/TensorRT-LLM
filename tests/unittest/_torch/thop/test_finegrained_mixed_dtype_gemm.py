@@ -4,7 +4,7 @@ from utils.util import woq_assert_near_eq, woq_groupwise_gt_matmul
 
 import tensorrt_llm
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
-    finegrainedMixedDtypeGemm
+    FinegrainedMixedDtypeGemm
 from tensorrt_llm._utils import get_sm_version
 
 
@@ -51,7 +51,7 @@ def test_matmul_activation_int4_input(m, n, k, group_size, activation_dtype,
     torch.manual_seed(0)
     device = "cuda"
 
-    if get_sm_version() > finegrainedMixedDtypeGemm.MAX_SUPPORTED_SM_VERSION:
+    if get_sm_version() > FinegrainedMixedDtypeGemm.MAX_SUPPORTED_SM_VERSION:
         pytest.skip(
             f"W4A16/W4A8 not supported for SM version {get_sm_version()}")
 

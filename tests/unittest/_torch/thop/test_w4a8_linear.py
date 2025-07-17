@@ -5,7 +5,7 @@ from torch.nn.parameter import Parameter
 import tensorrt_llm.quantization.functional
 from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
-    finegrainedMixedDtypeGemm
+    FinegrainedMixedDtypeGemm
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -18,13 +18,14 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 )
 def test_w4a8_linear(dtype, weights_dtype, has_zero=False):
 
-    if get_sm_version() > finegrainedMixedDtypeGemm.MAX_SUPPORTED_SM_VERSION:
+    if get_sm_version() > FinegrainedMixedDtypeGemm.MAX_SUPPORTED_SM_VERSION:
         pytest.skip(
             f"W4A16/W4A8 is not supported in this SM version {get_sm_version()}"
         )
 
     SEQ_LEN = 10
     HIDDEN_SIZE = 128
+    OUTPUT_SIZE = 512
     GROUP_SIZE = 128
     torch.manual_seed(0)
 
@@ -32,25 +33,25 @@ def test_w4a8_linear(dtype, weights_dtype, has_zero=False):
 
     x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda()
     w = torch.randint(0,
-                      2**32 - 1, (HIDDEN_SIZE, HIDDEN_SIZE // 8),
+                      2**32 - 1, (HIDDEN_SIZE, OUTPUT_SIZE // 8),
                       dtype=torch.uint32,
                       device=x.device)
     w = w.view(weights_dtype)
 
     pre_quant_scale = torch.rand(HIDDEN_SIZE, dtype=dtype).cuda()
-    weight_scale = torch.rand(total_groups, HIDDEN_SIZE,
+    weight_scale = torch.rand(total_groups, OUTPUT_SIZE,
                               dtype=torch.float16).cuda()
     weight_scale_2 = torch.rand(1, dtype=torch.float32).cuda()
     input_scale = Parameter(torch.tensor(1., dtype=torch.float32),
                             requires_grad=False).cuda()
-    bias = torch.randn(HIDDEN_SIZE, dtype=dtype).cuda().contiguous()
+    bias = torch.randn(OUTPUT_SIZE, dtype=dtype).cuda().contiguous()
 
     qc = QuantConfig(quant_algo=QuantAlgo.W4A8_AWQ,
                      group_size=GROUP_SIZE,
                      has_zero_point=has_zero)
 
     linear_w4a8 = Linear(in_features=HIDDEN_SIZE,
-                         out_features=HIDDEN_SIZE,
+                         out_features=OUTPUT_SIZE,
                          bias=True,
                          dtype=dtype,
                          quant_config=qc)

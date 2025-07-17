@@ -4,7 +4,7 @@ import torch
 import tensorrt_llm.quantization.functional
 from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
-    finegrainedMixedDtypeGemm
+    FinegrainedMixedDtypeGemm
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -17,7 +17,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 )
 def test_w4a16_linear(dtype, weights_dtype, has_zero=False):
 
-    if get_sm_version() > finegrainedMixedDtypeGemm.MAX_SUPPORTED_SM_VERSION:
+    if get_sm_version() > FinegrainedMixedDtypeGemm.MAX_SUPPORTED_SM_VERSION:
         pytest.skip(
             f"W4A16/W4A8 is not supported in this SM version {get_sm_version()}"
         )
