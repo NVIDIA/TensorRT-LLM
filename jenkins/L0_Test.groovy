@@ -2319,7 +2319,6 @@ pipeline {
                         } else {
                             echo "Skip single-GPU testing. No test to run."
                         }
-                        return
                     } else if (env.JOB_NAME ==~ /.*Multi-GPU.*/) {
                         echo "Only run multi-GPU tests."
                         if (dgxJobs.size() > 0) {
@@ -2328,19 +2327,19 @@ pipeline {
                         } else {
                             error "Skip multi-GPU testing. No test to run."
                         }
-                        return
-                    }
-                    if (singleGpuJobs.size() > 0) {
-                        singleGpuJobs.failFast = params.enableFailFast
-                        parallel singleGpuJobs
                     } else {
-                        echo "Skip single-GPU testing. No test to run."
-                    }
+                        if (singleGpuJobs.size() > 0) {
+                            singleGpuJobs.failFast = params.enableFailFast
+                            parallel singleGpuJobs
+                        } else {
+                            echo "Skip single-GPU testing. No test to run."
+                        }
 
-                    if (dgxJobs.size() > 0) {
-                        stage(testPhase2StageName) {
-                            dgxJobs.failFast = params.enableFailFast
-                            parallel dgxJobs
+                        if (dgxJobs.size() > 0) {
+                            stage(testPhase2StageName) {
+                                dgxJobs.failFast = params.enableFailFast
+                                parallel dgxJobs
+                            }
                         }
                     }
                 }
