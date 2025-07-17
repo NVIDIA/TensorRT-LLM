@@ -490,8 +490,6 @@ class WideEPMoE(MoE):
                         token_selected_slots, dtype=token_final_scales.dtype)
 
         x_sf = None
-        x_is_sf_swizzled = x.is_sf_swizzled if isinstance(
-            x, Fp4QuantizedTensor) else False
         x_row = x.shape[0]
         x_col = x.shape[1]
         if self.has_any_quant:
@@ -509,7 +507,6 @@ class WideEPMoE(MoE):
                         x_col = x.shape[1] * 2
                     else:
                         # for both postquant alltoall and allgather, we need non swizzle layout
-                        needed_sf_swizzle = False
                         x_row = x.shape[0]
                         x_col = x.shape[1]
                         x, x_sf = torch.ops.trtllm.fp4_quantize(
@@ -517,10 +514,8 @@ class WideEPMoE(MoE):
                             self.fc31_input_scale,
                             self.scaling_vector_size,
                             sfUseUE8M0=False,
-                            swizzedLayout=needed_sf_swizzle)
-                        if self.use_postquant_alltoall:
-                            x_sf = x_sf.view((x_row, -1))
-                        x_is_sf_swizzled = needed_sf_swizzle
+                            swizzedLayout=False)
+                    x_sf = x_sf.view((x_row, -1))
 
             elif self.has_deepseek_fp8_block_scales:
                 use_deepseek_fp8_block_scale = True
@@ -550,7 +545,6 @@ class WideEPMoE(MoE):
             x_row = x.shape[0]
             # Fp4 gemm has extra scaling factor
             if x_sf is not None:
-                assert not x_is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before allgather"
                 x_sf = swizzle_sf(x_sf, x_row, x_col, self.scaling_vector_size)
 
         if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
@@ -576,8 +570,6 @@ class WideEPMoE(MoE):
         quant_scales = self.quant_scales
 
         if use_postquant_alltoall:
-            if x_sf is not None and self.has_nvfp4:
-                assert not x_is_sf_swizzled, "Fp4 scaling factor should not be swizzled before Alltoall"
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
                 x, x_sf = self.alltoall_postquant_dispatch(
                     x, x_sf, alltoall_info)
@@ -597,7 +589,7 @@ class WideEPMoE(MoE):
                         x_sf = swizzle_sf(x_sf, x.shape[0], x.shape[1] * 2,
                                           self.scaling_vector_size)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
-                assert x_sf is not None and self.has_nvfp4 and not x_is_sf_swizzled
+                assert x_sf is not None and self.has_nvfp4
                 token_num = x_row
                 hidden_size = x_col
                 assert hidden_size % 32 == 0
