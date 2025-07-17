@@ -136,7 +136,8 @@ class TrtLlm_GemmLauncher:
                  mainloop_schedule,
                  epi_schedule,
                  epi_fusion=None,
-                 is_mx_fpx=False):
+                 is_mx_fpx=False,
+                 dynamic_cga=False):
         self.gemm_kind = gemm_kind
         self.arch = arch
         self.act_type = act_type
@@ -150,6 +151,7 @@ class TrtLlm_GemmLauncher:
         self.warp_shape = warp_shape
         self.stages = stages
         self.cga_shape = cga_shape
+        self.dynamic_cga = dynamic_cga
         self.mainloop_schedule = mainloop_schedule
         self.epi_schedule = epi_schedule
         self.epi_fusion = epi_fusion
@@ -228,18 +230,21 @@ GroupedGemmInput<{act_tag}, {weight_tag}, {out_tag}, {out_tag}>inputs, TmaWarpSp
                 KernelScheduleType.TmaWarpSpecializedCooperative,
                 KernelScheduleType.TmaWarpSpecializedCooperativeFP8FastAccum
             ]
-            assert operation.epi_schedule == EpilogueScheduleType.NoSmemWarpSpecialized
             kernel_sched.replace("::Kernel", "::KernelGrouped")
-            epi_sched += "Grouped"
-
+            # epi_sched += "Grouped"
             # arch_tag = f"cutlass::arch::Sm{operation.arch}"
             arch_tag = f"Sm{operation.arch}"
             weight_tag = CudaTypeName[operation.weight_type]
             assert operation.epi_fusion is not None
             epi_fusion = EpiFusion[operation.epi_fusion]
 
+            # We need to remove the '::' because this will break the instantiation macro
             epi_fusion = epi_fusion.split(':')[-1]
             epi_tag = epi_tag.split(':')[-1]
+            epi_sched = epi_sched.split(':')[-1]
+            epi_sched = epi_sched.replace(
+                "1Sm",
+                "")  # Hack to WAR missing `PtrArrayTmaWarpSpecialized` type
 
             guard_map = {
                 e2m1: "defined(ENABLE_FP4)",
@@ -260,7 +265,7 @@ GroupedGemmInput<{act_tag}, {weight_tag}, {out_tag}, {out_tag}>inputs, TmaWarpSp
             instantiation = f"""
 #if {guard_act} && {guard_weight}\n
         INSTANTIATE_TMA_WARP_SPECIALIZED_MOE_GEMM({arch_tag}, {act_tag}, {weight_tag}, {out_tag},
-                {epi_tag}, {epi_fusion}, {operation.cta_shape[0]}, {operation.cta_shape[1]}, {operation.cta_shape[2]}, {operation.cga_shape[0]}, {operation.cga_shape[1]}, {operation.cga_shape[2]}, {"true" if operation.is_mx_fpx else "false"}, false);\n
+                {epi_sched}, {epi_tag}, {epi_fusion}, {operation.cta_shape[0]}, {operation.cta_shape[1]}, {operation.cta_shape[2]}, {operation.cga_shape[0]}, {operation.cga_shape[1]}, {operation.cga_shape[2]}, {"true" if operation.is_mx_fpx else "false"}, {"true" if operation.dynamic_cga else "false"}, false);\n
 #endif
 """
     return instantiation
@@ -337,17 +342,14 @@ def write_file(launcher_inl_files, operations, output_file):
         f.write(content)
 
 
-from operator import mul, truediv
-
-
-def elementwise(x, y, f):
-    return tuple(f(a, b) for (a, b) in zip(x, y))
-
-
 def is_gemm_op_valid_sm100(op):
     # TODO These are much more restricted than theory dictates, investigate if more can be enabled in future
-    tile_m, tile_n, _ = elementwise(op.cta_shape, op.cga_shape, truediv)
-    cga_m, cga_n, _ = op.cga_shape
+    tile_m, tile_n, _ = op.cta_shape
+    cga_m, cga_n, cga_k = op.cga_shape
+
+    # We use a runtime cluster shape for SM100, so we only use cluster shapes to distinguish between 1SM and 2SM variants.
+    if cga_m > 2 or cga_n != 1 or cga_k != 1:
+        return False
 
     # Default shapes
     # This is epilogue tile size. For two CTA this is actually size 128/256 for the MMA
@@ -521,7 +523,7 @@ def generate_sm90_grouped_gemm_operations(is_arch_enabled):
         cta_shape_mnk = cta_shape_mn + (cta_shape_k, )
 
         mainloop_schedule = KernelScheduleType.TmaWarpSpecializedCooperative if dtype != DataType.e4m3 else KernelScheduleType.TmaWarpSpecializedCooperativeFP8FastAccum
-        epi_schedule = EpilogueScheduleType.NoSmemWarpSpecialized
+        epi_schedule = EpilogueScheduleType.PtrArrayNoSmemWarpSpecialized
 
         otypes = [dtype]
         if dtype == DataType.e4m3:
@@ -628,11 +630,10 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
 
     operations = list()
     for dtype, quant_op, epi_tag, epi_fusion, cta_shape_mnk, cga_shape in partial_args:
-        cga_tile_shape_mnk = elementwise(cta_shape_mnk, cga_shape, mul)
 
         # Ignored
         mainloop_schedule = KernelScheduleType.TmaWarpSpecializedCooperative
-        epi_schedule = EpilogueScheduleType.NoSmemWarpSpecialized
+        epi_schedule = EpilogueScheduleType.TmaWarpSpecialized
 
         otypes = [dtype]
         if dtype in [DataType.e4m3, e2m1]:
@@ -641,8 +642,8 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
         for otype in otypes:
             moe_gemm_operation = TrtLlm_GemmLauncher(
                 GemmKind.Grouped, arch, dtype, dtype, dtype, dtype, otype,
-                quant_op, epi_tag, cga_tile_shape_mnk, warp_shape, stages,
-                cga_shape, mainloop_schedule, epi_schedule, epi_fusion)
+                quant_op, epi_tag, cta_shape_mnk, warp_shape, stages, cga_shape,
+                mainloop_schedule, epi_schedule, epi_fusion)
 
             operations.append(moe_gemm_operation)
     return operations
@@ -675,48 +676,55 @@ def generate_sm100_grouped_gemm_operations(is_arch_enabled):
         # TrtLlm_EpilogueFusion.epilogue_fusion_finalize
     ]
 
-    cga_shapes = list(product([1, 2], [1, 2], [1]))
+    # Some shapes for SM100 are better with NoSmem, note the kernel will internally map to the 1 or 2 SM variants based on the cga_shape[0]
+    epi_schedules = [
+        EpilogueScheduleType.PtrArrayNoSmemWarpSpecialized1Sm,
+        EpilogueScheduleType.PtrArrayTmaWarpSpecialized1Sm
+    ]
+
+    # We will use dynamic cluster shapes for SM100, so we only need to indicate if we are using 1 or 2 SM version
+    cga_shapes = [(1, 1, 1), (2, 1, 1)]
 
     partial_args = product(supported_dtypes, quant_ops, epi_tags, epi_fusions,
-                           cta_shapes_mn, cga_shapes)
+                           cta_shapes_mn, cga_shapes, epi_schedules)
 
     operations = list()
-    for dtype, quant_op, epi_tag, epi_fusion, cta_shape_mn, cga_shape in partial_args:
+    for dtype, quant_op, epi_tag, epi_fusion, cta_shape_mn, cga_shape, epi_schedule in partial_args:
         if isinstance(dtype, tuple):
             dtype, weight_type = dtype
         else:
             weight_type = dtype
 
         cta_shape_mnk = calc_shape_mnk_sm100_grouped_gemm(cta_shape_mn, dtype)
-        cga_tile_shape_mnk = elementwise(cta_shape_mnk, cga_shape, mul)
 
         # Ignored
         mainloop_schedule = KernelScheduleType.TmaWarpSpecializedCooperative
-        epi_schedule = EpilogueScheduleType.NoSmemWarpSpecialized
 
         otypes = [dtype]
         if dtype in [DataType.e4m3, e2m1]:
             otypes = [DataType.f16, DataType.bf16]
 
         for otype in otypes:
-            moe_gemm_operation = TrtLlm_GemmLauncher(
-                GemmKind.Grouped,
-                arch,
-                dtype,
-                weight_type,
-                otype,
-                otype,
-                otype,
-                quant_op,
-                epi_tag,
-                cga_tile_shape_mnk,
-                warp_shape,
-                stages,
-                cga_shape,
-                mainloop_schedule,
-                epi_schedule,
-                epi_fusion,
-                is_mx_fpx=(dtype == DataType.e4m3 and weight_type == e2m1))
+            for dynamic_cga in [True, False]:
+                moe_gemm_operation = TrtLlm_GemmLauncher(
+                    GemmKind.Grouped,
+                    arch,
+                    dtype,
+                    weight_type,
+                    otype,
+                    otype,
+                    otype,
+                    quant_op,
+                    epi_tag,
+                    cta_shape_mnk,
+                    warp_shape,
+                    stages,
+                    cga_shape,
+                    mainloop_schedule,
+                    epi_schedule,
+                    epi_fusion,
+                    is_mx_fpx=(dtype == DataType.e4m3 and weight_type == e2m1),
+                    dynamic_cga=dynamic_cga)
 
             if is_op_valid(moe_gemm_operation):
                 operations.append(moe_gemm_operation)
