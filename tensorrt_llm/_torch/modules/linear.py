@@ -1059,11 +1059,6 @@ class W4A8_AWQ_LinearMethod(LinearMethodBase):
          4. divied by weight_scale_2 (fp16 -> fp8 to allow gemm in fp8).
          5. apply gemm in fp8.
          6. rescale using alpha which is input_scale * weight_scale_2
-
-
-
-
-
         """
         if module.pre_quant_scale is not None:
             input = input * module.pre_quant_scale
