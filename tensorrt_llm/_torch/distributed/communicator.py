@@ -103,7 +103,7 @@ class MPIDist(Distributed):
         super().__init__(mapping)
         self.create_tp_comm()
 
-    def broadcast(self, obj, root=0, chunk_size: int = 4 * 2024 * 1024):
+    def broadcast(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
         """
         Safely broadcasts potentially large objects by splitting into fixed-size chunks.
 
@@ -115,54 +115,50 @@ class MPIDist(Distributed):
         Returns:
             The broadcasted object on all ranks
         """
+        # Serialize and prepare chunks on root
         rank = mpi_rank()
-
         if rank == root:
             try:
                 serialized = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
                 total_size = len(serialized)
                 num_chunks = math.ceil(total_size / chunk_size)
-
-                # Broadcast metadata first
-                metadata = (total_size, num_chunks)
-                mpi_broadcast(metadata, root=root)
-
-                # Send chunks sequentially
-                for i in range(num_chunks):
-                    chunk = serialized[i * chunk_size:(i + 1) * chunk_size]
-                    mpi_send(chunk, dest=root, tag=i)
-
-                return obj
+                chunks = [
+                    serialized[i * chunk_size:(i + 1) * chunk_size]
+                    for i in range(num_chunks)
+                ]
             except Exception as e:
-                # Notify other ranks of failure
-                mpi_broadcast((None, None), root=root)
-                raise RuntimeError(f"Root rank serialization failed: {str(e)}")
+                mpi_broadcast((False, None, None), root=root)  # Signal failure
+                raise RuntimeError(f"Serialization failed: {str(e)}")
         else:
-            # Receive metadata
-            metadata = mpi_broadcast(None, root=root)
-            if metadata == (None, None):
-                raise RuntimeError("Broadcast failed at root rank")
+            chunks = None
 
-            total_size, num_chunks = metadata
-            chunks = []
+        # Broadcast metadata (success_flag, total_size, num_chunks)
+        metadata = mpi_broadcast(
+            (True, total_size, num_chunks) if rank == root else None, root=root)
 
-            try:
-                # Receive all chunks
-                for i in range(num_chunks):
-                    chunk = mpi_recv(source=root, tag=i)
-                    chunks.append(chunk)
+        if not metadata[0]:  # Check if root failed
+            raise RuntimeError("Root rank failed during serialization")
 
-                # Reconstruct the data
-                serialized = b''.join(chunks)
-                if len(serialized) != total_size:
-                    raise RuntimeError(
-                        f"Received {len(serialized)} bytes, expected {total_size}"
-                    )
+        _, total_size, num_chunks = metadata
 
-                return pickle.loads(serialized)
-            except Exception as e:
-                raise RuntimeError(
-                    f"Rank {rank} failed receiving broadcast: {str(e)}")
+        # Broadcast chunks
+        received_chunks = []
+        for i in range(num_chunks):
+            if rank == root:
+                chunk = chunks[i]
+            else:
+                chunk = None
+            # Broadcast each chunk to all ranks
+            received_chunks.append(mpi_broadcast(chunk, root=root))
+
+        # Reconstruct
+        serialized = b''.join(received_chunks)
+        if len(serialized) != total_size:
+            raise RuntimeError(
+                f"Data size mismatch: expected {total_size}, got {len(serialized)}"
+            )
+
+        return pickle.loads(serialized)
 
     def allgather(self, obj):
         return mpi_allgather(obj)
