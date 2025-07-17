@@ -11,6 +11,7 @@ import tensorrt_llm
 from tensorrt_llm._torch.attention_backend import (StarAttention,
                                                    StarAttentionMetadata)
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.pyexecutor.llm_request import create_dummy_requests
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -175,7 +176,11 @@ class TestStarAttention(unittest.TestCase):
             mapping=mapping,
             dtype=kv_cache_dtype,
         )
-        kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+        requests = create_dummy_requests(
+            request_ids=request_ids,
+            token_nums=token_nums,
+            is_cross_kv=kv_cache_manager.is_cross_kv)
+        kv_cache_manager.prepare_dummy_resources(requests)
 
         for i in range(kv_cache_manager.num_layers):
             buf = kv_cache_manager.get_buffers(i)
@@ -610,7 +615,11 @@ class TestStarAttention(unittest.TestCase):
             mapping=mapping,
             dtype=kv_cache_dtype,
         )
-        kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+        requests = create_dummy_requests(
+            request_ids=request_ids,
+            token_nums=token_nums,
+            is_cross_kv=kv_cache_manager.is_cross_kv)
+        kv_cache_manager.prepare_dummy_resources(requests)
 
         gen_qs = []
         gen_ks = []

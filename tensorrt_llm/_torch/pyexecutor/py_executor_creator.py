@@ -344,7 +344,7 @@ def create_py_executor(
         sampler = instantiate_sampler(model_engine, executor_config,
                                       pytorch_backend_config, mapping)
 
-    resources = {}
+    resources, draft_resources = {}, {}
     estimating_kv_cache = False
     kv_cache_creator = None
     if model_engine.model.model_config.is_generation:
@@ -358,7 +358,7 @@ def create_py_executor(
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.INIT_KV_CACHE
                 if estimating_kv_cache else _ExecutorCreationStage.KV_CACHE):
-            kv_cache_creator.build_managers(resources)
+            kv_cache_creator.build_managers(resources, draft_resources)
 
     # Resource managers for speculative decoding
     # For user-specified drafters, use extra_resource_managers in PyTorchBackend config
@@ -368,6 +368,9 @@ def create_py_executor(
     if spec_resource_manager is not None:
         resources[
             ResourceManagerType.SPEC_RESOURCE_MANAGER] = spec_resource_manager
+        if draft_resources:
+            draft_resources[ResourceManagerType.
+                            SPEC_RESOURCE_MANAGER] = spec_resource_manager
 
     # Drafter for speculative decoding
     with mem_monitor.observe_creation_stage(_ExecutorCreationStage.DRAFTER):
@@ -389,6 +392,7 @@ def create_py_executor(
             sampler=sampler,
             drafter=drafter,
             lora_config=lora_config,
+            draft_resources=draft_resources,
             garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
         )
 
@@ -397,7 +401,7 @@ def create_py_executor(
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.MODEL_EXTRA):
             kv_cache_creator.estimate_max_tokens(py_executor)
-        kv_cache_creator.teardown_managers(resources)
+        kv_cache_creator.teardown_managers(resources, draft_resources)
         del py_executor  # free before constructing new
 
         with mem_monitor.observe_creation_stage(
@@ -406,7 +410,7 @@ def create_py_executor(
             # create_kv_cache_manager above, which caps executor_config.max_seq_len. Restoring
             # the original value before creating the final KV cache.
             executor_config.max_seq_len = max_seq_len
-            kv_cache_creator.build_managers(resources)
+            kv_cache_creator.build_managers(resources, draft_resources)
 
             for eng in [model_engine, draft_model_engine]:
                 if eng is None:
@@ -431,6 +435,7 @@ def create_py_executor(
                 sampler=sampler,
                 drafter=drafter,
                 lora_config=lora_config,
+                draft_resources=draft_resources,
                 garbage_collection_gen0_threshold=
                 garbage_collection_gen0_threshold,
             )

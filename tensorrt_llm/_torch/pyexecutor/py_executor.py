@@ -15,7 +15,6 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._utils import (customized_gc_thresholds, global_mpi_rank,
                                  is_trace_enabled, nvtx_range, trace_func)
@@ -33,8 +32,10 @@ from ..distributed import Distributed
 from ..speculative.drafter import Drafter
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
-                          LlmResponse, executor_request_to_llm_request)
+                          LlmResponse, create_dummy_requests,
+                          executor_request_to_llm_request)
 from .model_engine import ModelEngine
+from .resource_manager import ResourceManager, ResourceManagerType
 from .sampler import Sampler, SampleState, SampleStateTensors, TorchSampler
 from .scheduler import RequestScheduler, ScheduledRequests
 
@@ -204,6 +205,7 @@ class PyExecutor:
                  max_draft_len: int = 0,
                  kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
                  draft_model_engine: Optional[ModelEngine] = None,
+                 draft_resource_manager: Optional[ResourceManager] = None,
                  garbage_collection_gen0_threshold: Optional[int] = None,
                  start_worker: bool = True):
         super(PyExecutor, self).__init__()
@@ -219,7 +221,10 @@ class PyExecutor:
         self.is_warmup = False  # During warmup, we don't enable the profiler
 
         # related modules
-        self.resource_manager = resource_manager
+        self.resource_manager = ResourceManager({
+            **resource_manager.resource_managers,
+            **(draft_resource_manager.resource_managers if draft_resource_manager else {})
+        })
         self.scheduler = scheduler
         self.model_engine = model_engine
         self.enable_attention_dp = model_engine.enable_attention_dp
@@ -282,9 +287,9 @@ class PyExecutor:
         self.inflight_req_ids = ReqIdsSet()
         self.canceled_req_ids = []
 
-        self.model_engine.warmup(self.resource_manager)
+        self.model_engine.warmup(resource_manager)
         if self.draft_model_engine is not None:
-            self.draft_model_engine.warmup(self.resource_manager)
+            self.draft_model_engine.warmup(draft_resource_manager)
 
         self.is_shutdown = False
 
@@ -1564,17 +1569,16 @@ class PyExecutor:
             ])
 
         if self.expected_num_active_requests - num_active_request > 0 and num_active_request == 0:
-            llm_request = self.kv_cache_manager.add_dummy_requests(
+            llm_request = create_dummy_requests(
                 request_ids=[0],
                 is_gen=not self.has_context_request,
-                prepare_resource=not self.has_context_request,
                 max_num_draft_tokens=self.max_draft_len,
+                is_cross_kv=self.kv_cache_manager.is_cross_kv,
             )[0]
             llm_request.is_attention_dp_dummy = True
-            spec_resource_manager = self.resource_manager.get_resource_manager(
-                ResourceManagerType.SPEC_RESOURCE_MANAGER)
-            if spec_resource_manager is not None:
-                spec_resource_manager.add_dummy_requests([0])
+            # If there is no context request, we need to prepare resources for the dummy request
+            if not self.has_context_request:
+                self.resource_manager.prepare_dummy_resources([llm_request])
             self.active_requests.append(llm_request)
 
     @nvtx_range("_prepare_disagg_gen_init")

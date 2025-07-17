@@ -380,25 +380,26 @@ class KvCacheCreator:
 
         return kv_cache_manager
 
-    def build_managers(self, resources: Dict) -> None:
+    def build_managers(self, resources: Dict, draft_resources: Dict) -> None:
         """Construct KV caches for model and draft model (if applicable)."""
         kv_cache_manager = self._create_kv_cache_manager(self._model_engine)
         draft_kv_cache_manager = self._create_kv_cache_manager(
             self._draft_model_engine
         ) if self._draft_model_engine is not None else None
         resources[ResourceManagerType.KV_CACHE_MANAGER] = kv_cache_manager
-        resources[
-            ResourceManagerType.DRAFT_KV_CACHE_MANAGER] = draft_kv_cache_manager
+        if self._draft_model_engine is not None:
+            draft_resources[ResourceManagerType.
+                            DRAFT_KV_CACHE_MANAGER] = draft_kv_cache_manager
 
-    def teardown_managers(self, resources: Dict) -> None:
+    def teardown_managers(self, resources: Dict, draft_resources: Dict) -> None:
         """Clean up KV caches for model and draft model (if applicable)."""
         resources[ResourceManagerType.KV_CACHE_MANAGER].shutdown()
         del resources[ResourceManagerType.KV_CACHE_MANAGER]
-        draft_kv_cache_manager = resources[
-            ResourceManagerType.DRAFT_KV_CACHE_MANAGER]
-        if draft_kv_cache_manager:
+        draft_kv_cache_manager = draft_resources.get(
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER, None)
+        if draft_kv_cache_manager is not None:
             draft_kv_cache_manager.shutdown()
-        del resources[ResourceManagerType.DRAFT_KV_CACHE_MANAGER]
+            del draft_resources[ResourceManagerType.DRAFT_KV_CACHE_MANAGER]
 
 
 def create_py_executor_instance(
@@ -415,6 +416,7 @@ def create_py_executor_instance(
         sampler,
         drafter,
         lora_config: Optional[LoraConfig] = None,
+        draft_resources: Optional[Dict] = None,
         garbage_collection_gen0_threshold: Optional[int] = None) -> PyExecutor:
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
 
@@ -503,6 +505,9 @@ def create_py_executor_instance(
         max_num_sequences)
 
     resource_manager = ResourceManager(resources)
+    draft_resource_manager = None
+    if draft_resources is not None and len(draft_resources) > 0:
+        draft_resource_manager = ResourceManager(draft_resources)
 
     # Make sure the kv cache manager is always invoked last as it could
     # depend on the results of other resource managers.
@@ -543,6 +548,7 @@ def create_py_executor_instance(
         if spec_config is not None else 0,
         kv_cache_transceiver=kv_cache_transceiver,
         draft_model_engine=draft_model_engine,
+        draft_resource_manager=draft_resource_manager,
         start_worker=start_worker,
         garbage_collection_gen0_threshold=garbage_collection_gen0_threshold)
 

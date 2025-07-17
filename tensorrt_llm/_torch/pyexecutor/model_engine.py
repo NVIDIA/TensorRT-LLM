@@ -55,6 +55,7 @@ from .config_utils import is_mla
 from .cuda_graph_runner import DecodingCUDAGraphRunner
 from .guided_decoder import GuidedDecoder
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
+from .llm_request import create_dummy_requests
 from .resource_manager import (BaseResourceManager, KVCacheManager,
                                ResourceManager, ResourceManagerType)
 from .scheduler import ScheduledRequests
@@ -494,25 +495,32 @@ class PyTorchModelEngine(ModelEngine):
                 result.context_requests = []
                 # Add (batch_size - 1) dummy requests with seq_len=1.
                 # Should only need one more page per request.
-                requests = kv_cache_manager.add_dummy_requests(
-                    list(range(batch_size - 1)),
+                requests = create_dummy_requests(
+                    request_ids=list(range(batch_size - 1)),
                     is_gen=True,
                     max_num_draft_tokens=self.max_draft_len,
                     use_mrope=use_mrope,
+                    is_cross_kv=kv_cache_manager.is_cross_kv,
                 )
+                # Prepare resources for the dummy requests
+                resource_manager.prepare_dummy_resources(requests)
+                # Get the number of available tokens
                 available_tokens = kv_cache_manager.get_num_available_tokens(
                     self.max_draft_len)
 
                 # Add one dummy request with the maximum possible sequence length.
                 # The sequence length is limited by both the max_seq_len and the number of available blocks.
                 token_num = max(1, min(available_tokens, self.max_seq_len - 1))
-                max_seq_len_request = kv_cache_manager.add_dummy_requests(
+                max_seq_len_request = create_dummy_requests(
                     request_ids=[batch_size - 1],
                     token_nums=[token_num],
                     is_gen=True,
                     max_num_draft_tokens=self.max_draft_len,
                     use_mrope=use_mrope,
+                    is_cross_kv=kv_cache_manager.is_cross_kv,
                 )[0]
+                # Prepare resources for the dummy request with max seq len
+                resource_manager.prepare_dummy_resources([max_seq_len_request])
                 # Add the longest request before all other seq_len=1 request to simulate the padding CUDA graph case.
                 # This batch contains both the longest request and the shortest requests,
                 # it also contains the maximum number of requests and the maximum token number,
@@ -520,9 +528,6 @@ class PyTorchModelEngine(ModelEngine):
                 # Thus we can replay this CUDA graph in all other cases.
                 requests.insert(0, max_seq_len_request)
                 result.generation_requests = requests
-                if spec_resource_manager is not None:
-                    spec_resource_manager.add_dummy_requests(
-                        request_ids=list(range(batch_size)))
             else:
                 result = None
             return result
@@ -534,16 +539,15 @@ class PyTorchModelEngine(ModelEngine):
                     num_tokens_per_request / kv_cache_manager.tokens_per_block):
                 # Should only need (at most) one more page per request.
                 is_gen = num_tokens_per_request == 1
-
-                requests = kv_cache_manager.add_dummy_requests(
-                    list(range(batch_size)), [num_tokens_per_request] *
+                requests = create_dummy_requests(
+                    request_ids=list(range(batch_size)),
+                    token_nums=[num_tokens_per_request] *
                     batch_size if not is_gen else None,
                     is_gen=is_gen,
-                    max_num_draft_tokens=self.max_draft_len)
-
-                if spec_resource_manager is not None:
-                    spec_resource_manager.add_dummy_requests(
-                        request_ids=list(range(batch_size)))
+                    max_num_draft_tokens=self.max_draft_len,
+                    is_cross_kv=kv_cache_manager.is_cross_kv)
+                # Prepare resources for the dummy requests
+                resource_manager.prepare_dummy_resources(requests)
 
                 result = ScheduledRequests()
                 result.context_requests = []
@@ -586,26 +590,25 @@ class PyTorchModelEngine(ModelEngine):
                     0, available_tokens -
                     full_len_request_num * num_tokens_required_per_request))
 
-            request_num = full_len_request_num if remaining_tokens == 0 else full_len_request_num + 1
-
-            requests = kv_cache_manager.add_dummy_requests(
+            # Create dummy requests for the full-length requests
+            requests = create_dummy_requests(
                 request_ids=list(range(full_len_request_num)),
                 token_nums=[num_tokens_per_request] * full_len_request_num,
                 is_gen=False,
-                max_num_draft_tokens=self.max_draft_len)
+                max_num_draft_tokens=self.max_draft_len,
+                is_cross_kv=kv_cache_manager.is_cross_kv)
 
+            # Add the final request with remaining tokens
             if remaining_tokens > 0:
-                final_request = kv_cache_manager.add_dummy_requests(
+                final_request = create_dummy_requests(
                     request_ids=[full_len_request_num],
                     token_nums=[remaining_tokens],
                     is_gen=False,
-                    max_num_draft_tokens=self.max_draft_len)
-
+                    max_num_draft_tokens=self.max_draft_len,
+                    is_cross_kv=kv_cache_manager.is_cross_kv)
                 requests += final_request
-
-            if spec_resource_manager is not None:
-                spec_resource_manager.add_dummy_requests(
-                    request_ids=list(range(request_num)))
+            # Prepare resources for the dummy requests
+            resource_manager.prepare_dummy_resources(requests)
 
             result = ScheduledRequests()
             result.context_requests = requests
@@ -793,7 +796,9 @@ class PyTorchModelEngine(ModelEngine):
         return self.spec_metadata
 
     def _get_padded_batch(self, scheduled_requests: ScheduledRequests,
-                          kv_cache_manager) -> int:
+                          resource_manager: ResourceManager) -> int:
+        kv_cache_manager = resource_manager.get_resource_manager(
+            self.kv_cache_manager_key)
         can_run_cuda_graph = scheduled_requests.can_run_cuda_graph
         batch_size = scheduled_requests.batch_size
         new_batch_size = batch_size
@@ -828,12 +833,16 @@ class PyTorchModelEngine(ModelEngine):
             if available_blocks < 1:
                 return 0
 
-            self.cuda_graph_dummy_request = kv_cache_manager.add_dummy_requests(
-                [MAX_UINT64 - 1],
+            self.cuda_graph_dummy_request = create_dummy_requests(
+                request_ids=[MAX_UINT64 - 1],
                 is_gen=True,
                 max_num_draft_tokens=self.max_draft_len,
-                use_mrope=self.use_mrope)[0]
+                use_mrope=self.use_mrope,
+                is_cross_kv=kv_cache_manager.is_cross_kv)[0]
             self.cuda_graph_dummy_request.is_cuda_graph_dummy = True
+            # Prepare resources for the dummy request
+            resource_manager.prepare_dummy_resources(
+                [self.cuda_graph_dummy_request])
 
         scheduled_requests.generation_requests.extend(
             [self.cuda_graph_dummy_request] * padding_size)
@@ -842,7 +851,7 @@ class PyTorchModelEngine(ModelEngine):
 
     @contextlib.contextmanager
     def _maybe_pad_batch(self, scheduled_requests: ScheduledRequests,
-                         kv_cache_manager):
+                         resource_manager: ResourceManager):
         """
         CUDA graphs can only be used for specific batch sizes.
 
@@ -851,7 +860,7 @@ class PyTorchModelEngine(ModelEngine):
         because the padded requests will be removed from scheduled requests.
         """
         padding_size = self._get_padded_batch(scheduled_requests,
-                                              kv_cache_manager)
+                                              resource_manager)
         try:
             yield scheduled_requests
         finally:
@@ -2046,7 +2055,7 @@ class PyTorchModelEngine(ModelEngine):
                                           gather_context_logits)
 
         with self._maybe_pad_batch(scheduled_requests,
-                                   kv_cache_manager) as scheduled_requests:
+                                   resource_manager) as scheduled_requests:
             maybe_graph = self._maybe_get_cuda_graph(
                 scheduled_requests, spec_config=self.spec_config)
             if maybe_graph is not None:

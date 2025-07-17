@@ -10,12 +10,11 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
-from tensorrt_llm.sampling_params import SamplingParams
 
 from ..._utils import binding_dtype_size, nvtx_range
 from ...logger import logger
 from ...mapping import Mapping
-from .llm_request import LlmRequest, LlmRequestState, SamplingConfig
+from .llm_request import LlmRequest, LlmRequestState
 from .scheduler import ScheduledRequests
 
 if ENABLE_MULTI_DEVICE:
@@ -66,6 +65,9 @@ class BaseResourceManager(ABC):
         pass
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
+        pass
+
+    def prepare_dummy_resources(self, dummy_requests: List[LlmRequest]):
         pass
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
@@ -285,6 +287,7 @@ class KVCacheManager(BaseResourceManager):
         self.num_pools = self.impl.num_pools
         self.max_blocks_per_seq = self.impl.max_blocks_per_seq
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
+        self.is_cross_kv = self.impl.cross_kv
 
     def shutdown(self):
         self.impl.release_pools()
@@ -359,60 +362,18 @@ class KVCacheManager(BaseResourceManager):
             for _ in range(len(req.py_draft_tokens)):
                 self.impl.add_token(req.py_request_id)
 
-    def add_dummy_requests(
-        self,
-        request_ids: List[int],
-        # Note that token_nums should be past_kv_len + input_len (without
-        # spec decoding). The draft tokens will be added in this function,
-        # so we don't need to take care of it in the caller. When preparing
-        # token_nums, we should not take the draft tokens into account, so
-        # don't use the kv_cache_manager.max_seq_len, which includes both
-        # extra tokens and draft tokens.
-        token_nums: Optional[List[int]] = None,
-        is_gen: bool = False,
-        prepare_resource: bool = True,
-        max_num_draft_tokens: int = 0,
-        use_mrope: bool = False,
-    ):
+    def prepare_dummy_resources(self, dummy_requests: List[LlmRequest]):
         beam_width = 1  # TODO: more than 1 beam?
-        requests = []
-        for i, req_id in enumerate(request_ids):
-            sampling_params = SamplingParams()
-            # Here 1+max_num_draft_tokens is used to extend the prompt length to
-            # a non-zero number to skip illegal memory access issue in MLA kernel
-            # during warmup.
-            token_num = token_nums[
-                i] if token_nums is not None else 1 + max_num_draft_tokens
-            encoder_input_tokens = [
-                1
-            ] * token_num if self.impl.cross_kv else None
-            # Using 1 instead of 0 prevents NaN during warmup in e.g. Deepseek
-            mrope_position_deltas = torch.zeros(
-                1, device="cuda", dtype=torch.int32) if use_mrope else None
-            req = LlmRequest(request_id=req_id,
-                             max_new_tokens=1,
-                             input_tokens=[1] * token_num,
-                             sampling_config=SamplingConfig(
-                                 sampling_params._get_sampling_config()),
-                             is_streaming=False,
-                             mrope_position_deltas=mrope_position_deltas,
-                             encoder_input_tokens=encoder_input_tokens)
-            req.is_dummy_request = True
-            req.paged_kv_block_ids = []
-            if prepare_resource:
-                self.impl.add_sequence(req_id, token_num, beam_width, req)
-                for _ in range(self.num_extra_kv_tokens):
-                    self.impl.add_token(req_id)
-            if is_gen:
-                req.state = LlmRequestState.GENERATION_IN_PROGRESS
-                req.prompt_len = token_num - 1
-                req.py_prompt_len = req.prompt_len
-                req.py_draft_tokens = [1] * max_num_draft_tokens
-                if prepare_resource:
-                    for _ in range(max_num_draft_tokens):
-                        self.impl.add_token(req_id)
-            requests.append(req)
-        return requests
+        for req in dummy_requests:
+            token_num = req.py_prompt_len
+            if req.state == LlmRequestState.GENERATION_IN_PROGRESS:
+                token_num += 1
+            self.impl.add_sequence(req.py_request_id, token_num, beam_width,
+                                   req)
+            for _ in range(self.num_extra_kv_tokens):
+                self.impl.add_token(req.py_request_id)
+            for _ in range(len(req.py_draft_tokens)):
+                self.impl.add_token(req.py_request_id)
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
         # rewind kv cache
@@ -1129,6 +1090,12 @@ class ResourceManager:
             if hasattr(resource_manager, "prepare_resources"):
                 resource_manager.prepare_resources(scheduled_batch)
 
+    @nvtx_range("prepare_dummy_resources")
+    def prepare_dummy_resources(self, dummy_requests: List[LlmRequest]):
+        for _, resource_manager in self.resource_managers.items():
+            if hasattr(resource_manager, "prepare_dummy_resources"):
+                resource_manager.prepare_dummy_resources(dummy_requests)
+
     @nvtx_range("update_resources")
     def update_resources(self, scheduled_batch: ScheduledRequests):
         for _, resource_manager in self.resource_managers.items():
@@ -1219,6 +1186,9 @@ class PeftCacheManager(BaseResourceManager):
             req.py_lora_task_layer_module_configs = py_lora_task_layer_module_configs[
                 req.
                 py_request_id] if req.py_request_id in py_lora_task_layer_module_configs else None
+
+    def prepare_dummy_resources(self, dummy_requests: List[LlmRequest]):
+        pass
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
         pass
