@@ -14,7 +14,7 @@ from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE,
+from ..modules.fused_moe import (BaseMoeRoutingMethod,
                                  RenormalizeMoeRoutingMethod,
                                  RenormalizeNaiveMoeRoutingMethod,
                                  RoutingMethodType, TRTLLMGenFusedMoE,
