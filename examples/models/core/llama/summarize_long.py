@@ -97,7 +97,7 @@ def TRTLLaMA(args, config):
     quantization_config = pretrained_config['quantization']
 
     build_config = config['build_config']
-    kv_cache_type = KVCacheType(build_config['kv_cache_type'])
+    kv_cache_type = KVCacheType.from_string(build_config['kv_cache_type'])
     plugin_config = build_config['plugin_config']
 
     dtype = pretrained_config['dtype']
