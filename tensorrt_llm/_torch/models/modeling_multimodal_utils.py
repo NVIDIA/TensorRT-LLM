@@ -19,7 +19,6 @@
 import math
 from typing import List, Optional, Tuple
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from einops import rearrange
@@ -79,32 +78,14 @@ def find_uncached_mm_embeds(
         return []
 
     # Partial caching, return the sliced mm_embeds
-    prefix_sum = np.cumsum([
-        param.multimodal_runtime.total_mm_tokens for param in multimodal_params
-    ])
     current_pos = 0
     slices = []
     for param in multimodal_params:
         runtime = param.multimodal_runtime
-        if runtime.num_cached_mm_tokens > 0:
-            if runtime.num_cached_mm_tokens == runtime.total_mm_tokens:
-                if len(
-                        mm_embeds
-                ) == 1:  # pre-concatenated mm_embeds, need global indices
-                    current_pos += runtime.total_mm_tokens
-                slices.append((current_pos, current_pos))
-                continue
-            runtime.total_mm_tokens - runtime.num_cached_mm_tokens
-            # TODO: support chunk prefill to extract partial mm_embeds
-            slices.append((current_pos + runtime.num_cached_mm_tokens,
-                           current_pos + runtime.total_mm_tokens))
-        else:  # == 0, no cached tokens
-            # All mm_embeds in this sequence are sliced out
-            # TODO: support chunk prefill to extract partial mm_embeds
-            slices.append((current_pos, current_pos + runtime.total_mm_tokens))
-
+        slices.append((current_pos + runtime.num_cached_mm_tokens,
+                       current_pos + runtime.total_mm_tokens))
         if len(mm_embeds
-               ) == 1:  # pre-concatenated mm_embeds, need global indices
+               ) == 1:  # pre-concatenated mm_embeds, need global offset
             current_pos += runtime.total_mm_tokens
 
     sliced_mm_embeds = []
