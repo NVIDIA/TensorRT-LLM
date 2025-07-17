@@ -673,7 +673,7 @@ class MTPWorker(nn.Module):
             mtp_past_hidden_states_pool.index_copy_(0, slot_ids,
                                                     new_mtp_past_hidden_states)
 
-    @torch.compile(mode="max-autotune-no-cudagraphs")
+    @torch.compile(options={"max-autotune": True})
     def topk_kernel(self, gen_logprobs, num_gens, mtp_num_modules,
                     spec_metadata):
         topk_value, topk_indices = torch.topk(gen_logprobs,
@@ -687,7 +687,7 @@ class MTPWorker(nn.Module):
             num_gens, mtp_num_modules)
         return topk_value, topk_indices, draft_tokens
 
-    @torch.compile(mode="max-autotune-no-cudagraphs")
+    @torch.compile(options={"max-autotune": True})
     def process_generation_logits(self, logits, num_contexts):
         gen_logits = logits[num_contexts:]
         gen_logprobs = torch.softmax(gen_logits, dim=-1)
@@ -1036,7 +1036,7 @@ class MTPWorker(nn.Module):
             "attn_metadata": attn_metadata,
         }
 
-    @torch.compile(mode="max-autotune-no-cudagraphs")
+    @torch.compile(options={"max-autotune": True})
     def get_local_max_and_combined(self, logits):
         local_max_values, local_argmax = torch.max(logits, dim=-1, keepdim=True)
         # Adjust indices based on TP rank and size
@@ -1054,7 +1054,7 @@ class MTPWorker(nn.Module):
             dim=-1).flatten(-2)
         return combined
 
-    @torch.compile(mode="max-autotune-no-cudagraphs")
+    @torch.compile(options={"max-autotune": True})
     def get_draft_tokens_from_gathered(self, gathered):
         gathered_indices_float = gathered[..., 0::2]  # Even positions: indices
         gathered_values_float = gathered[..., 1::2]  # Odd positions: values
@@ -1106,7 +1106,7 @@ class MTPEagleWorker(MTPWorker):
         self.model_config = model_config
         self.mtp_num_modules = spec_config.num_nextn_predict_layers
 
-    @torch.compile(mode="max-autotune-no-cudagraphs")
+    @torch.compile(options={"max-autotune": True})
     def update_draft_tokens(self, next_draft_tokens, new_draft_token,
                             hidden_states, gather_ids, inputs):
         next_draft_tokens.append(new_draft_token)
@@ -1142,7 +1142,7 @@ class MTPEagleWorker(MTPWorker):
             seq_len_cuda = attn_metadata._seq_lens_cuda[:batch_size].clone()
 
         # Prepare inputs for the 1st MTP layer
-        @torch.compile(mode="max-autotune-no-cudagraphs")
+        @torch.compile(options={"max-autotune": True})
         def prepare_position_ids_and_last_tokens(position_ids, attn_metadata):
             position_ids = position_ids.squeeze(0)
             last_tokens_idx = torch.cumsum(
@@ -1224,7 +1224,7 @@ class MTPEagleWorker(MTPWorker):
                         reorder_block_ids_per_seq, non_blocking=True)
             elif hasattr(attn_metadata, 'kv_lens_cuda'):
 
-                @torch.compile(mode="max-autotune-no-cudagraphs")
+                @torch.compile(options={"max-autotune": True})
                 def update_kv_lens(kv_lens_cuda, batch_size):
                     kv_lens_cuda[:batch_size] += 1
 
@@ -1242,7 +1242,7 @@ class MTPEagleWorker(MTPWorker):
             attn_metadata._seq_lens_cuda[:batch_size].copy_(seq_len_cuda)
             attn_metadata.on_update()
 
-        @torch.compile(mode="max-autotune-no-cudagraphs")
+        @torch.compile(options={"max-autotune": True})
         def prepare_next_tokens(next_draft_tokens, accepted_tokens,
                                 spec_metadata, batch_size, num_accepted_tokens):
             next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
@@ -1266,7 +1266,7 @@ class MTPEagleWorker(MTPWorker):
             'next_new_tokens': next_new_tokens
         }
 
-    @torch.compile(mode="max-autotune-no-cudagraphs")
+    @torch.compile(options={"max-autotune": True})
     def prepare_drafter_inputs(
         self,
         input_ids: torch.IntTensor,

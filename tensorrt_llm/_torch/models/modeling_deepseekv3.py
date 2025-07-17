@@ -136,7 +136,7 @@ class DeepseekV3MTPHead(nn.Module):
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)
 
-    @torch.compile(mode="max-autotune-no-cudagraphs")
+    @torch.compile(options={"max-autotune": True})
     def get_last_token_states(self, hidden_states, attn_metadata):
         last_tokens = torch.cumsum(
             attn_metadata.seq_lens_cuda,
