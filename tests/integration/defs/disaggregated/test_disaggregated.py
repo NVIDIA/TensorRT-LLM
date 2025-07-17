@@ -59,9 +59,17 @@ def get_test_config(test_desc, example_dir, test_root):
         "conditional": (2,
                         f"{test_configs_root}/disagg_config_conditional.yaml"),
         "ngram": (2, f"{test_configs_root}/disagg_config_ngram.yaml"),
-        "deepseek_v3_lite_fp8":
+        "deepseek_v3_lite_fp8_mpi":
         (4,
-         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite.yaml"
+         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_mpi.yaml"
+         ),
+        "deepseek_v3_lite_fp8_ucx":
+        (4,
+         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_ucx.yaml"
+         ),
+        "deepseek_v3_lite_fp8_nixl":
+        (4,
+         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_nixl.yaml"
          ),
         "deepseek_v3_lite_fp8_tp1":
         (2,
@@ -129,6 +137,8 @@ def run_disaggregated_test(example_dir,
                            cwd=None):
     """Run disaggregated test with given configuration."""
     cleanup_output_files()
+    run_env = env.copy()
+    run_env["UCX_TLS"] = "^ib"
 
     num_ranks, config_file = get_test_config(test_desc, example_dir,
                                              os.path.dirname(__file__))
@@ -151,14 +161,14 @@ def run_disaggregated_test(example_dir,
                 popen(workers_cmd,
                       stdout=output_workers,
                       stderr=subprocess.STDOUT,
-                      env=env,
+                      env=run_env,
                       cwd=cwd) as workers_proc,
                 # Start server
                 open('output_disagg.log', 'w') as output_disagg,
                 popen(server_cmd,
                       stdout=output_disagg,
                       stderr=subprocess.STDOUT,
-                      env=env,
+                      env=run_env,
                       cwd=cwd) as server_proc):
             client_dir = f"{example_dir}/clients"
             for _ in range(num_iters):
@@ -525,9 +535,10 @@ def test_disaggregated_ngram(disaggregated_test_root, llm_venv,
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
-def test_disaggregated_deepseek_v3_lite_fp8(disaggregated_test_root,
-                                            disaggregated_example_root,
-                                            llm_venv, deepseek_v3_model_root):
+def test_disaggregated_deepseek_v3_lite_fp8_mpi(disaggregated_test_root,
+                                                disaggregated_example_root,
+                                                llm_venv,
+                                                deepseek_v3_model_root):
     src_dst_dict = {
         deepseek_v3_model_root:
         f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
@@ -536,10 +547,11 @@ def test_disaggregated_deepseek_v3_lite_fp8(disaggregated_test_root,
         if not os.path.islink(dst):
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             os.symlink(src, dst, target_is_directory=True)
-
+    env = llm_venv._new_env.copy()
+    env["TRTLLM_USE_MPI_KVCACHE"] = "1"
     run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_fp8",
-                           env=llm_venv._new_env,
+                           "deepseek_v3_lite_fp8_mpi",
+                           env=env,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -607,7 +619,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx(disaggregated_test_root,
     env["TRTLLM_USE_UCX_KVCACHE"] = "1"
     env["UCX_TLS"] = "^ib"
     run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_fp8",
+                           "deepseek_v3_lite_fp8_ucx",
                            env=env,
                            cwd=llm_venv.get_working_directory())
 
@@ -633,7 +645,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
     env["TRTLLM_USE_NIXL_KVCACHE"] = "1"
     env["UCX_TLS"] = "^ib"
     run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_fp8",
+                           "deepseek_v3_lite_fp8_nixl",
                            env=env,
                            cwd=llm_venv.get_working_directory())
 

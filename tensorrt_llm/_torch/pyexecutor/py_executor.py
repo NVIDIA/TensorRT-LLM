@@ -1346,6 +1346,8 @@ class PyExecutor:
 
             # In disaggregated serving, we might get either context request or
             # generation request. In IFB, we only get context request from request queue
+            # In IFB, we only get context request from request queue
+
             if self.kv_cache_transceiver:
                 for req_item in new_requests_cur_rank:
                     if req_item.request.request_type == RequestType.REQUEST_TYPE_CONTEXT_ONLY:
