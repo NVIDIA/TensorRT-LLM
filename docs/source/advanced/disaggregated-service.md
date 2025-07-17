@@ -16,8 +16,6 @@ An [architectural and performance overview](../../../docs/source/blogs/tech_blog
 
 TRT-LLM uses some environment variables to control the behavior of disaggregated service.
 
-* `TRTLLM_USE_UCX_KVCACHE`: Specifies whether to use UCX for KV cache transfer. The default value is `0`. This must be enabled when using a disaggregated service.
-
 * `TRTLLM_PARALLEL_CACHE_SEND`: If set to `1`, contextExecutor will attempt to send KV cache for multiple requests in parallel. The default value is `0`.
 
 * `TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP`: If set to `1`, generationExecutor will not overlap KV cache transfer with model inference. The default value is `0`.
@@ -66,55 +64,19 @@ A. Yes, it's recommended that different executor use different GPUs . We support
 
 *Q. How to handle error `Disaggregated serving is not enabled, please check the configuration?`*
 
-A. Please set the environment variables
-```
-export TRTLLM_USE_UCX_KVCACHE=1
+A. please set `backendType` of `CacheTransceiverConfig`.
+```cpp
+ExecutorConfig executorConfig{...};
+
+executorConfig.setCacheTransceiverConfig(texec::CacheTransceiverConfig(BackendType::DEFAULT));
 ```
 
-*Q. Why do some profiling tools show that TRT-LLM's KV cache transfer does not utilize NVLink even on devices equipped with NVLink?*
-
-A. Please check version of `UCX` with `ucx_info -v`.
-If the version of UCX <=1.17, set the environment variables `UCX_RNDV_FRAG_MEM_TYPE=cuda` and `UCX_MEMTYPE_CACHE=n` to enable NVLink. For BlackWell architecture GPUs, UCX version >=1.19 is required to enable NVLink.
-If the version of UCX >=1.18, there are several ways to enable NVLink:
-1. Set the environment variables `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=0B`,`UCX_CUDA_COPY_ASYNC_MEM_TYPE=cuda`, `UCX_CUDA_COPY_DMABUF=no`, `UCX_MEMTYPE_CACHE=n` and `UCX_RNDV_PIPELINE_ERROR_HANDLING=y`.
-2. Set the environment variables `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=$Size`, `UCX_MEMTYPE_CACHE=n` and `UCX_RNDV_PIPELINE_ERROR_HANDLING=y`. $Size represents the size of the buffer for KV cache transfer, which is recommended to be larger than the size of the KV cache for the longest request.
+When the environment variable `TRTLLM_USE_MPI_KVCACHE=1` is set, TRT-LLM will transfer the KV cache using `CUDA-aware MPI`. All executor processes involved must share the same MPI world communicator. Consequently, with `TRTLLM_USE_MPI_KVCACHE=1`, TRT-LLM only supports launching multiple executors via `MPI`. Additionally, the `CommunicationMode` for the executors must be set to `kLEADER` or `kORCHESTRATOR` with `SpawnProcesses=false` for the `disaggregated-service`. These restrictions do not apply when `TRTLLM_USE_UCX_KVCACHE=1` is set.
 
 *Q. Does TRT-LLM support using GPU direct RDMA for inter-node KV Cache transfer?*
 
-A. Yes, TRT-LLM supports using GPU direct RDMA for inter-node KV cache transfer, but it is not enabled by default. There are several ways to enable GPU direct RDMA:
-1. Set the environment variables `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=0B`,`UCX_RNDV_FRAG_MEM_TYPE=cuda`, `UCX_MEMTYPE_CACHE=n` and `UCX_RNDV_PIPELINE_ERROR_HANDLING=y`.
-2. Set the environment variables `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=$Size`, `UCX_MEMTYPE_CACHE=n` and `UCX_RNDV_PIPELINE_ERROR_HANDLING=y`, $Size represents the size of the buffer for KV cache transfer, which is recommended to be larger than the size of the KV cache for the longest request.
+A. Yes, TRT-LLM supports using GPU direct RDMA for inter-node KV cache transfer.
 
-*Q. Are there any guidelines for performance tuning of KV cache transfer?*
+*Q. What causes the substantial bandwidth fluctuations in kvCache transfers, especially during the first few requests following service initialization?*
 
-A. Depending on the user's use case, certain sets of environment variables can help avoid poor KV cache transfer performance.
-
-Environment Variable Set A
-
-```
-export TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=0B
-export UCX_RNDV_FRAG_MEM_TYPES=cuda
-export UCX_MEMTYPE_CACHE=n
-export UCX_RNDV_PIPELINE_ERROR_HANDLING=y
-```
-This set allows KV cache transfers to utilize NVLink within nodes and GDRDMA between nodes.
-
-Environment Variable Set B
-
-```
-export TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=0B
-export UCX_CUDA_COPY_ASYNC_MEM_TYPE=cuda
-export UCX_CUDA_COPY_DMABUF=no
-export UCX_MEMTYPE_CACHE=n
-export UCX_RNDV_PIPELINE_ERROR_HANDLING=y
-```
-Set B may provide slightly better performance on a single node compared to Set A. However, when transferring KV cache across multiple nodes, it may cause program instability.
-
-Environment Variable Set C
-
-```
-export TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=$Size
-export UCX_MEMTYPE_CACHE=n
-export UCX_RNDV_PIPELINE_ERROR_HANDLING=y
-```
-Set C can achieve better performance than Sets A and B, both within and between nodes. However, if the KV cache size exceeds the specified $Size, performance may degrade.
+A. The communication for kvCache transfer between executors are established dynamically. The connection establishment process incurs significant overhead, which explains the apparently lower kvCache transfer bandwidth observed during the initial requests after service startup. This lower bandwidth reflects the inclusion of connection establishment overhead. When conducting benchmarks, it is recommended to perform a warm-up phase to ensure accurate performance measurements.

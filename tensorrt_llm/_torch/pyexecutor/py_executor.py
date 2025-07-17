@@ -31,6 +31,7 @@ from tensorrt_llm.logger import logger
 
 from ..distributed import Distributed
 from ..speculative.drafter import Drafter
+from .guided_decoder import GuidedDecoder
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
                           LlmResponse, executor_request_to_llm_request)
@@ -204,6 +205,7 @@ class PyExecutor:
                  max_draft_len: int = 0,
                  kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
                  draft_model_engine: Optional[ModelEngine] = None,
+                 guided_decoder: Optional[GuidedDecoder] = None,
                  garbage_collection_gen0_threshold: Optional[int] = None,
                  start_worker: bool = True):
         super(PyExecutor, self).__init__()
@@ -225,6 +227,7 @@ class PyExecutor:
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.sampler = sampler
         self.drafter = drafter
+        self.guided_decoder = guided_decoder
         self.dist = dist
         self.disable_overlap_scheduler = disable_overlap_scheduler
 
@@ -801,6 +804,12 @@ class PyExecutor:
                             if self._need_return_logits(scheduled_batch):
                                 logits_host = batch_outputs["logits"].to(
                                     "cpu", non_blocking=True)
+
+                            if self.guided_decoder is not None:
+                                self.guided_decoder.build(scheduled_batch)
+                                self.guided_decoder.execute(
+                                    scheduled_batch, batch_outputs['logits'])
+
                             sample_state = self._sample_async(
                                 scheduled_batch, batch_outputs)
                             sample_state.host.logits = logits_host
@@ -978,6 +987,11 @@ class PyExecutor:
 
                     batch_outputs = self._forward_step(scheduled_batch)
 
+                    if self.guided_decoder is not None:
+                        self.guided_decoder.build(scheduled_batch)
+                        self.guided_decoder.execute(scheduled_batch,
+                                                    batch_outputs['logits'])
+
                     sample_state = self._sample_async(scheduled_batch,
                                                       batch_outputs)
 
@@ -1126,6 +1140,14 @@ class PyExecutor:
                     batch_outputs = self._forward_step(scheduled_batch,
                                                        previous_tensors_device)
 
+                    if self.previous_batch is not None:
+                        self._update_requests(self.previous_batch.sample_state)
+
+                    if self.guided_decoder is not None:
+                        self.guided_decoder.build(scheduled_batch)
+                        self.guided_decoder.execute(scheduled_batch,
+                                                    batch_outputs['logits'])
+
                     sample_state = self._sample_async(scheduled_batch,
                                                       batch_outputs)
                     assert sample_state is not None, "Sampling failed"
@@ -1159,8 +1181,6 @@ class PyExecutor:
                     self._terminate_ctx_finished_requests()
 
     def _process_previous_batch(self):
-        self._update_requests(self.previous_batch.sample_state)
-
         if self.kv_cache_transceiver and self.previous_batch.ctx_transmission_reqs:
             for req in self.previous_batch.ctx_transmission_reqs:
                 req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
@@ -1346,6 +1366,8 @@ class PyExecutor:
 
             # In disaggregated serving, we might get either context request or
             # generation request. In IFB, we only get context request from request queue
+            # In IFB, we only get context request from request queue
+
             if self.kv_cache_transceiver:
                 for req_item in new_requests_cur_rank:
                     if req_item.request.request_type == RequestType.REQUEST_TYPE_CONTEXT_ONLY:
