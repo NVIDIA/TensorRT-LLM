@@ -13,7 +13,7 @@ Example usage::
        "triton_server/test_triton.py::test_gpt_ib_ptuning[gpt-ib-ptuning]"
    python scripts/test_to_stage_mapping.py --tests gpt_ib_ptuning
    python scripts/test_to_stage_mapping.py --stages \\
-       A100X-Triton-Python-[Post-Merge]-1
+       A100X-Triton-Python-Post-Merge-1
 
 Tests can also be provided via ``--test-list`` pointing to either a plain text
 file or a YAML list file. Quote individual test names on the command line so
