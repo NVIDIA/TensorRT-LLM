@@ -1564,7 +1564,9 @@ public:
     /// Returns whether the position is at the beginning of the context.
     [[nodiscard]] bool isFirstContextChunk() const noexcept
     {
-        return mContextCurrentPosition == 0;
+        // The number of cached token is encountered in mContextCurrentPosition,
+        // so the start position of the context is mPrepopulatedPromptLen.
+        return mContextCurrentPosition == mPrepopulatedPromptLen;
     }
 
     /// Move the cursor forward one chunk. When not chunked, move forward to the end of the context.

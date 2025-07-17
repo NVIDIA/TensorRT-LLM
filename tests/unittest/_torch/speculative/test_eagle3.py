@@ -18,6 +18,8 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
     [
         [True, "TRTLLM", True, False, False],
         [False, "TRTLLM", True, False, False],
+        [True, "TRTLLM", True, True, False],
+        [False, "TRTLLM", True, True, False],
         [True, "FLASHINFER", True, False, False],
         [False, "FLASHINFER", True, False, False],
         [False, "TRTLLM", False, True, True],
