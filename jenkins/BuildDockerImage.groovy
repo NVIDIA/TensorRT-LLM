@@ -511,7 +511,7 @@ pipeline {
                 }
             }
         }
-        stage("Wait for build jobs finish") {
+        stage("Wait for Build Jobs Complete") {
             when {
                 expression {
                     RUN_SANITY_CHECK
@@ -576,7 +576,7 @@ pipeline {
                 }
             }
         }
-        stage("Sanity Check") {
+        stage("Sanity Check for NGC Images") {
             when {
                 expression {
                     RUN_SANITY_CHECK
@@ -609,7 +609,7 @@ pipeline {
                 }
             }
         }
-        stage("Register Images for Security Checks") {
+        stage("Register NGC Images for Security Checks") {
             when {
                 expression {
                     return params.nspect_id && params.action == "push"
