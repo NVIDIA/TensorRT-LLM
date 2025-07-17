@@ -17,9 +17,9 @@ from ._graph import canonicalize_graph, lift_to_meta, move_to_device
 from .library import (
     ShardingConfig,
     detect_column_row_shard,
-    dp_bmm_shard,
+    detect_dp_bmm_shard,
+    detect_ep_shard,
     eliminate_redundant_transposes,
-    ep_shard,
     fuse_allreduce_residual_rmsnorm,
     fuse_collectives,
     insert_cached_attention,
@@ -105,6 +105,7 @@ class InferenceOptimizer:
         ############################################################################################
 
         local_rank, world_size = dist_ad.get_rank_world_size()
+        world_size = 2
 
         # eliminate redundant transpose operations
         eliminate_redundant_transposes(egm)
@@ -122,10 +123,10 @@ class InferenceOptimizer:
         )
 
         # run EP sharding across ranks
-        ep_shard(egm, local_rank, world_size)
+        detect_ep_shard(egm, local_rank, world_size, sharding_config)
 
         # run BMM sharding across ranks
-        dp_bmm_shard(egm, local_rank, world_size)
+        detect_dp_bmm_shard(egm, local_rank, world_size, sharding_config)
 
         sharding_transform_executor(egm, sharding_config)
 
