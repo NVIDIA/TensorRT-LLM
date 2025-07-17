@@ -236,7 +236,7 @@ def setup_llm(args, **kwargs):
     if use_beam_search:
         if args.n == 1 and args.best_of is None:
             args.n = args.max_beam_width
-        assert best_of <= args.max_beam_width, f"best_of: {best_of}, max_beam_width: {args.max_beam_width}"
+        assert best_of <= args.max_beam_width, f"beam width: {best_of}, should be less or equal to max_beam_width: {args.max_beam_width}"
 
     assert best_of >= args.n, f"In sampling mode best_of value: {best_of} should be less or equal to n: {args.n}"
 
