@@ -5,6 +5,7 @@ import tensorrt_llm
 from tensorrt_llm import logger
 from tensorrt_llm.bindings import WorldConfig
 from tensorrt_llm.bindings.executor import CacheTransceiverConfig
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from .llm_request import LlmRequest
@@ -31,29 +32,31 @@ def create_kv_cache_transceiver(
         mapping: Mapping, kv_cache_manager: KVCacheManager,
         attention_type: AttentionTypeCpp,
         cache_transceiver_config: CacheTransceiverConfig):
-    if cache_transceiver_config is None or (cache_transceiver_config.backend
-                                            is None):
+    if cache_transceiver_config is None or cache_transceiver_config.backend is None:
         logger.info("cache_transceiver is disabled")
         return None
-    if (cache_transceiver_config.backend == BackendTypeCpp.DEFAULT):
 
+    if cache_transceiver_config.backend == BackendTypeCpp.DEFAULT:
+        # UCX is the default backend
         backend_type = BackendTypeCpp.UCX
-        if getenv("TRTLLM_USE_UCX_KVCACHE"):
-            backend_type = BackendTypeCpp.UCX
-        elif getenv("TRTLLM_USE_NIXL_KVCACHE"):
+        if getenv("TRTLLM_USE_NIXL_KVCACHE") == "1":
             backend_type = BackendTypeCpp.NIXL
-        elif getenv("TRTLLM_USE_MPI_KVCACHE"):
+        elif getenv("TRTLLM_USE_MPI_KVCACHE") == "1":
             backend_type = BackendTypeCpp.MPI
         cache_transceiver_config.backend = backend_type
 
-    if (cache_transceiver_config.backend == BackendTypeCpp.MPI):
+    if cache_transceiver_config.backend == BackendTypeCpp.MPI:
         logger.warning(
             "MPI CacheTransceiver is deprecated, UCX or NIXL is recommended")
-    cache_transceiver = BindKvCacheTransceiver(mapping, kv_cache_manager,
+    elif cache_transceiver_config.backend == BackendTypeCpp.UCX:
+        logger.info(
+            f"Use UCX kv-cache transervier. If your devices are not in the same domain, please consider setting "
+            f"UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server hangs."
+        )
+
+    return BindKvCacheTransceiver(mapping, kv_cache_manager,
                                                attention_type,
                                                cache_transceiver_config)
-
-    return cache_transceiver
 
 
 class KvCacheTransceiver(ABC):

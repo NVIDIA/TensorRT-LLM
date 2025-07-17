@@ -283,6 +283,32 @@ class MnnvlMemory:
         support_nvlink_and_all_up = MnnvlMemory.support_nvlink(True)
         return is_on_aarch64 and support_nvlink_and_all_up
 
+    @staticmethod
+    def get_cluster_uuid() -> str:
+        # FIXME: pynvml returns empty fabric info and no explicit error is reported,
+        # while `nvidia-smi -q` can work. Consider use nvidia-smi via subprocess-call when clusterUUID is critical.
+        dev_id = torch.cuda.current_device()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(dev_id)
+
+        def get_fabric_info(func, info):
+            try:
+                func(info)
+                return info
+            except pynvml.NVMLError:
+                return None
+
+        fabric_info = get_fabric_info(
+            lambda fabric: pynvml.nvmlDeviceGetGpuFabricInfoV(handle, fabric),
+            pynvml.c_nvmlGpuFabricInfoV_t(),
+        )
+        if fabric_info is None:
+            # Try the old API.
+            fabric_info = get_fabric_info(
+                lambda fabric: pynvml.nvmlDeviceGetGpuFabricInfo(handle, fabric),
+                pynvml.c_nvmlGpuFabricInfo_t(),
+            )
+        return fabric_info.clusterUuid if fabric_info else ""
+
 
 @dataclass
 class MoEAlltoallInfo:
