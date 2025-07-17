@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +21,7 @@
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/kernels/delayStream.h"
+#include "tensorrt_llm/nanobind/common/customCasters.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/decoderState.h"
@@ -174,7 +175,7 @@ void initBindings(nb::module_& m)
         .def_rw("medusa_paths", &tr::decoder_batch::Request::medusaPaths)
         .def_rw("medusa_tree_ids", &tr::decoder_batch::Request::medusaTreeIds)
         .def_rw("lookahead_runtime_config", &tr::decoder_batch::Request::lookaheadRuntimeConfig);
-    nb::bind_vector<std::vector<tr::decoder_batch::Request>>(m, "VectorRequest");
+    nb::bind_vector<std::vector<tr::decoder_batch::Request>>(m, "RequestVector");
 
     nb::class_<tr::decoder_batch::Input>(m, "DecoderBatchInput")
         .def(nb::init<std::vector<std::vector<tr::ITensor::SharedConstPtr>>, tr::SizeType32>(), nb::arg("logits"),

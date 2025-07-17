@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/nanobind/common/customCasters.h"
 #include <nanobind/nanobind.h>
 #include <nanobind/operators.h>
 #include <nanobind/stl/bind_vector.h>
@@ -415,7 +416,7 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def("__setstate__", SamplingConfigSetState)
         .def("__eq__", &tr::SamplingConfig::operator==);
 
-    nb::bind_vector<std::vector<tr::SamplingConfig>>(m, "VectorSamplingConfig");
+    nb::bind_vector<std::vector<tr::SamplingConfig>>(m, "SamplingConfigVector");
 
     m.def("make_sampling_config", &makeSamplingConfig, nb::arg("configs"));
 

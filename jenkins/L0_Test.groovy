@@ -1728,7 +1728,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "A10-TensorRT-4": ["a10", "l0_a10", 4, 6],
         "A10-TensorRT-5": ["a10", "l0_a10", 5, 6],
         "A10-TensorRT-6": ["a10", "l0_a10", 6, 6],
-        "A10-Nanobind": ["a10", "l0_nanobind_test", 1, 1],
+        "A10-Nanobind": ["a10", "l0_a10_nanobind", 1, 1],
         "A30-Triton-1": ["a30", "l0_a30", 1, 1],
         "A30-PyTorch-1": ["a30", "l0_a30", 1, 2],
         "A30-PyTorch-2": ["a30", "l0_a30", 2, 2],

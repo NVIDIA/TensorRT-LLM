@@ -16,6 +16,7 @@
  */
 
 #include "modelSpecBinding.h"
+#include "tensorrt_llm/nanobind/common/customCasters.h"
 #include "tensorrt_llm/testing/modelSpec.h"
 
 #include <nanobind/nanobind.h>

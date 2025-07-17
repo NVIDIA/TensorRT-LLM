@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,6 +32,7 @@
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
 #include "tensorrt_llm/batch_manager/updateDecoderBuffers.h"
+#include "tensorrt_llm/nanobind/common/customCasters.h"
 #include "tensorrt_llm/runtime/decoderState.h"
 #include "tensorrt_llm/runtime/torch.h"
 #include "tensorrt_llm/runtime/torchView.h"
@@ -107,7 +108,7 @@ void tensorrt_llm::nanobind::batch_manager::algorithms::initBindings(nb::module_
             },
             nb::arg("decoder_input_buffers"), nb::arg("context_requests"), nb::arg("logits"),
             nb::arg("num_context_logits"), nb::arg("model_config"), nb::arg("buffer_manager"),
-            nb::arg("draft_buffers") = std::nullopt)
+            nb::arg("medusa_buffers") = std::nullopt)
         .def("name", [](HandleContextLogits const&) { return HandleContextLogits::name; });
 
     nb::class_<HandleGenerationLogits>(m, HandleGenerationLogits::name)
@@ -168,7 +169,7 @@ void tensorrt_llm::nanobind::batch_manager::algorithms::initBindings(nb::module_
             nb::arg("max_sequence_length"), nb::arg("beam_width"), nb::arg("medusa_buffers") = std::nullopt)
         .def("name", [](CreateNewDecoderRequests const&) { return CreateNewDecoderRequests::name; });
 
-    nb::class_<UpdateDecoderBuffers>(m, "UpdateDecoderBuffers")
+    nb::class_<UpdateDecoderBuffers>(m, UpdateDecoderBuffers::name)
         .def(nb::init<>())
         .def("__call__", &UpdateDecoderBuffers::operator(), nb::arg("model_config"), nb::arg("decoder_output_buffers"),
             nb::arg("copy_buffer_manager"), nb::arg("decoder_state"), nb::arg("return_log_probs"),

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +19,7 @@
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/nanobind/common/bindTypes.h"
+#include "tensorrt_llm/nanobind/common/customCasters.h"
 #include "tensorrt_llm/runtime/torch.h"
 #include "tensorrt_llm/runtime/torchView.h"
 
@@ -298,7 +299,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def_rw("alloc_new_blocks", &tbk::KvCacheStats::allocNewBlocks)
         .def_rw("reused_blocks", &tbk::KvCacheStats::reusedBlocks)
         .def_rw("missed_blocks", &tbk::KvCacheStats::missedBlocks)
-        .def_rw("cache_hit_rate", &tbk::KvCacheStats::cacheHitRate);
+        .def_rw("cache_hit_rate", &tbk::KvCacheStats::cacheHitRate)
+        .def_rw("num_free_blocks_per_window_size", &tbk::KvCacheStats::numFreeBlocksPerWindowSize);
 
     nb::class_<tbk::TempAttentionWindowInputs>(m, "TempAttentionWindowInputs")
         .def(nb::init<>())

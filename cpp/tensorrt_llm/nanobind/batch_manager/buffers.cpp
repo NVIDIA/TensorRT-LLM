@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +16,7 @@
  */
 
 #include "buffers.h"
+#include "tensorrt_llm/nanobind/common/customCasters.h"
 
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
@@ -24,7 +25,7 @@
 #include <ATen/ATen.h>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
-#include <nanobind/stl/unique_ptr.h>
+#include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/vector.h>
 #include <torch/extension.h>
 
@@ -85,8 +86,9 @@ void Buffers::initBindings(nb::module_& m)
             nb::arg("world_config"), nb::arg("decoding_config"), nb::arg("gather_generation_logits"),
             nb::arg("max_num_tokens") = std::nullopt)
         .def_prop_rw(
-            "transformer_buffers", [](tb::RuntimeBuffers& self) { return self.transformerBuffers.get(); },
-            [](tb::RuntimeBuffers& self, tb::TransformerBuffers* val) { self.transformerBuffers.reset(val); })
+            "transformer_buffers", [](tb::RuntimeBuffers& self) { return self.transformerBuffers; },
+            [](tb::RuntimeBuffers& self, std::shared_ptr<tb::TransformerBuffers> val)
+            { self.transformerBuffers = val; })
         .def_rw("num_context_logits", &tb::RuntimeBuffers::numContextLogits)
         .def_rw("cache_indir_decoder_io_batched_copy_src_offsets",
             &tb::RuntimeBuffers::cacheIndirDecoderIOBatchedCopySrcOffsets)
@@ -96,9 +98,6 @@ void Buffers::initBindings(nb::module_& m)
         .def_rw("logits", &tb::RuntimeBuffers::logits)
         .def_rw("seq_slots", &tb::RuntimeBuffers::seqSlots)
         .def_rw("seq_slots_device", &tb::RuntimeBuffers::seqSlotsDevice)
-        .def_rw("sorted_seq_slots", &tb::RuntimeBuffers::sortedSeqSlots)
-        .def_rw("seq_slot_remapping_host", &tb::RuntimeBuffers::seqSlotRemappingHost)
-        .def_rw("seq_slot_remapping_device", &tb::RuntimeBuffers::seqSlotRemappingDevice)
         .def_rw("cache_indir_decoder_io_batched_copy_src_offsets_slice_device",
             &tb::RuntimeBuffers::mCacheIndirDecoderIOBatchedCopySrcOffsetsSliceDevice)
         .def_rw("cache_indir_decoder_io_batched_copy_dst_offsets_slice_device",

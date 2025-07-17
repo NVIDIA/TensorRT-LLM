@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/tensor.h"
+#include "tensorrt_llm/nanobind/common/customCasters.h"
 
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
@@ -51,7 +52,7 @@ struct dtype_traits<half>
 
 namespace
 {
-// todo: improve the following code
+// todo: Properly support FP8 and BF16 and verify functionality
 tle::Tensor numpyToTensor(nb::ndarray<nb::numpy> const& array)
 {
     auto npDtype = array.dtype();
@@ -113,6 +114,7 @@ tle::Tensor numpyToTensor(nb::ndarray<nb::numpy> const& array)
 
     // todo: improve the following code
     std::vector<int64_t> dims;
+    dims.reserve(array.ndim());
     for (size_t i = 0; i < array.ndim(); ++i)
     {
         dims.push_back(static_cast<int64_t>(array.shape(i)));
@@ -148,10 +150,10 @@ Executor::Executor(nb::bytes const& engineBuffer, std::string const& jsonConfigS
     if (managedWeights.has_value() && !managedWeights.value().empty())
     {
         managedWeightsMap = std::map<std::string, tle::Tensor>();
-        for (auto const& item : managedWeights.value())
+        for (auto const& [rawName, rawArray] : managedWeights.value())
         {
-            std::string name = nb::cast<std::string>(item.first);
-            nb::ndarray<nb::numpy> array = nb::cast<nb::ndarray<nb::numpy>>(item.second);
+            std::string name = nb::cast<std::string>(rawName);
+            nb::ndarray<nb::numpy> array = nb::cast<nb::ndarray<nb::numpy>>(rawArray);
             managedWeightsMap->emplace(name, numpyToTensor(array));
         }
     }

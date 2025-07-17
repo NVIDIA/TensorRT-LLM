@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,6 +22,7 @@
 #include "tensorrt_llm/executor/serializeUtils.h"
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/executor/types.h"
+#include "tensorrt_llm/nanobind/common/customCasters.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 
 #include <nanobind/nanobind.h>
@@ -875,16 +876,8 @@ void initRequestBindings(nb::module_& m)
         .def_rw("context_phase_params", &tle::Result::contextPhaseParams)
         .def_rw("request_perf_metrics", &tle::Result::requestPerfMetrics)
         .def_rw("additional_outputs", &tle::Result::additionalOutputs)
-        .def_rw("context_phase_params", &tle::Result::contextPhaseParams)
         .def("__getstate__", resultGetstate)
         .def("__setstate__", resultSetstate);
-
-    m.def("deserialize_result",
-        [](std::string& x)
-        {
-            std::istringstream is(x);
-            return tle::serialize_utils::deserialize<tle::Result>(is);
-        });
 
     m.def("deserialize_result",
         [](nb::bytes& x)

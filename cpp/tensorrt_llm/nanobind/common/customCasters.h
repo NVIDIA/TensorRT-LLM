@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -311,7 +311,6 @@ struct type_caster<at::Tensor>
 
     bool from_python(nb::handle src, uint8_t, cleanup_list*) noexcept
     {
-
         nb::object capsule = nb::getattr(src, "__dlpack__")();
         DLManagedTensor* dl_managed = static_cast<DLManagedTensor*>(PyCapsule_GetPointer(capsule.ptr(), "dltensor"));
         PyCapsule_SetDestructor(capsule.ptr(), nullptr);

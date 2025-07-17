@@ -170,7 +170,6 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .value("CONTINUOUS", tr::ModelConfig::KVCacheType::kCONTINUOUS)
         .value("PAGED", tr::ModelConfig::KVCacheType::kPAGED)
         .value("DISABLED", tr::ModelConfig::KVCacheType::kDISABLED)
-        .def(py::init(&tr::ModelConfig::KVCacheTypeFromString))
         .def("from_string", &tr::ModelConfig::KVCacheTypeFromString);
 
     py::enum_<tr::ModelConfig::LayerType>(m, "LayerType")

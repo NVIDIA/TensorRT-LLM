@@ -2236,9 +2236,7 @@ def test_kv_event_stream_timeout(model_path):
     assert len(events) == 1
 
     start = datetime.datetime.now()
-    timeout = datetime.timedelta(
-        seconds=1) if _tb.binding_type == "pybind" else 1000
-    events = cache_manager.get_latest_events(timeout)
+    events = cache_manager.get_latest_events(1000)
     end = datetime.datetime.now()
     # Make sure that it actually waited
     assert abs(end - start) > datetime.timedelta(milliseconds=900)
