@@ -30,11 +30,7 @@ def expected_outputs():
 
 @pytest.fixture(scope="module")
 def fixed_params():
-    return {
-        "kvcache_config": KvCacheConfig(max_tokens=10000),
-        "max_tokens": 8,
-        "max_beam_width": 2
-    }
+    return {"max_tokens": 8, "max_beam_width": 2}
 
 
 @pytest.fixture(scope="module")
@@ -42,7 +38,7 @@ def llm(fixed_params, input_prompts):
     return LLM(
         model=os.path.join(llm_models_root(), "llama-models-v2",
                            "TinyLlama-1.1B-Chat-v1.0"),
-        kv_cache_config=fixed_params["kvcache_config"],
+        kv_cache_config=KvCacheConfig(max_tokens=10000),
         max_batch_size=fixed_params["max_beam_width"] * len(
             input_prompts
         ),  # use small batch size to prevent large buffers from possibly hiding wrong data accesses.
@@ -105,7 +101,7 @@ def test_beam_search_output_shapes(gather_context_logits: bool,
                 assert len(beam.logprobs) == sampling_params.max_tokens
             else:
                 assert len(beam.logprobs) == 0
-            if num_output_beams == fixed_params["max_beam_width"]:
-                assert similar(
-                    beam.text,
-                    expected_outputs[input_prompts[output_idx]][beam_idx])
+            # Check output similarity
+            assert similar(
+                beam.text,
+                expected_outputs[input_prompts[output_idx]][beam_idx])
