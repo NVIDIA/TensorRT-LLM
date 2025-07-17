@@ -438,9 +438,7 @@ class SamplingParams:
         return tllme.SamplingConfig(**llmapi_to_rt_param_map)
 
     def _get_output_config(
-            self,
-            is_pytorch_backend: bool = False,
-            return_perf_metrics: Optional[bool] = False
+        self, is_pytorch_backend: bool = False, return_perf_metrics: Optional[bool] = False
     ) -> tllme.OutputConfig:
         sampling_param_fields = set(dir(SamplingParams))
         fields = [

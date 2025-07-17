@@ -96,3 +96,10 @@ class MetricsCollector:
             self._log_histogram(self.histogram_queue_time_request,
                                 request_queue_time)
         self.last_log_time = time.time()
+
+    def log_metrics_dict(self, metrics_dict: dict[str, float]) -> None:
+        if finish_reason := metrics_dict.get(
+                MetricsCollector.labelname_finish_reason):
+            self.log_request_success(
+                1, {MetricsCollector.labelname_finish_reason: finish_reason})
+            self.log_histogram(metrics_dict)

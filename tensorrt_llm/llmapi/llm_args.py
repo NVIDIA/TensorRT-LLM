@@ -1311,9 +1311,9 @@ class BaseLlmArgs(StrictBaseModel):
         status="deprecated",
     )
 
-    return_perf_metrics: Optional[bool] = Field(
+    return_perf_metrics: bool = Field(
         default=False,
-        description="optionally returns perf metrics",
+        description="Return perf metrics",
     )
 
     _parallel_config: Optional[object] = PrivateAttr(default=None)
