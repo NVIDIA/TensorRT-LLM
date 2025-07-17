@@ -362,6 +362,7 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                     "--container-image=${container}",
                     "--container-workdir=/home/svc_tensorrt/bloom/scripts",
                     "--container-mounts=${mounts}",
+                    "--container-env=NVIDIA_IMEX_CHANNELS"
                 ].join(" ")
 
                 def scriptLaunch = "/home/svc_tensorrt/bloom/scripts/${jobUID}/slurm_launch.sh"
@@ -382,6 +383,7 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                     export perfMode=$perfMode
                     export resourcePathNode=$resourcePathNode
                     export MODEL_CACHE_DIR=$MODEL_CACHE_DIR
+                    export NVIDIA_IMEX_CHANNELS=0
                     chmod +x ${scriptRunNode}
                     ${srunCmd}
                 """.stripIndent()
