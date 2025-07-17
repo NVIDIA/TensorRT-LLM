@@ -158,6 +158,9 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) noexcept
 {
+    // Hashing algorithm adapted from StackOverflow:
+    // https://stackoverflow.com/questions/664014/what-integer-hash-function-are-good-that-accepts-an-integer-hash-key
+    // Constants provide very good distribution - each input bit affects each output bit with ~50% probability.
     size_t seed = blockKey.uniqueTokens.size() ^ parentHash * UINT64_C(0xbf58476d1ce4e5b9);
 
     for (auto const& uniqueToken : blockKey.uniqueTokens)
