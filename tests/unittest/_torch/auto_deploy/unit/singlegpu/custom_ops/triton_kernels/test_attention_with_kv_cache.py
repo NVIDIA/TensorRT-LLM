@@ -18,16 +18,10 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.triton_kernels.attention_with_kv
 )
 
 
-def torch_reference_stage2(values, logsumexp, sinks=None):
+def torch_reference_stage2(values, logsumexp):
     max_logsumexp = torch.max(logsumexp, axis=-1, keepdim=True)[0]  # [b, n_heads, 1]
     sumexp = torch.exp(logsumexp - max_logsumexp)  # [b, n_heads, num_blocks]
     aggregate_sumexp = torch.sum(sumexp, axis=-1)  # [b, n_heads]
-
-    # Add sinks contribution to the softmax denominator
-    if sinks is not None:
-        sinks_exp = torch.exp(sinks - max_logsumexp.squeeze(-1))  # [b, n_heads]
-        aggregate_sumexp += sinks_exp
-
     output = values * sumexp[:, :, :, None]  # [b, n_heads, num_blocks, d_head]
     output = output / aggregate_sumexp[:, :, None, None]
     output = torch.sum(output, axis=2)
@@ -204,8 +198,7 @@ def test_attention_kv_flash_decoding(d_head):
 @pytest.mark.parametrize("q_d_head", [16, 96])
 @pytest.mark.parametrize("v_d_head", [16, 96])
 @pytest.mark.parametrize("n_heads,n_kv_heads", [(8, 8), (8, 1)])
-@pytest.mark.parametrize("sliding_window", [-1, 16])
-def test_gqa_attention_kv_flash_decoding(q_d_head, v_d_head, n_heads, n_kv_heads, sliding_window):
+def test_gqa_attention_kv_flash_decoding(q_d_head, v_d_head, n_heads, n_kv_heads):
     DEVICE = "cuda"
     DTYPE = torch.float16
     BATCH_SIZE = 64
@@ -278,12 +271,10 @@ def test_gqa_attention_kv_flash_decoding(q_d_head, v_d_head, n_heads, n_kv_heads
             V_D_HEAD,
             SEQ_BLOCK_SIZE,
             HEAD_BLOCK_SIZE,
-            sliding_window,  # SLIDING_WINDOW: parameterized
         )
 
     run(q, k_cache, v_cache, output_tensor, output_logsumexp)
     # This needs to be another kernel if torch-trt doesn't support broadcast + div.
-    print(output_tensor, output_tensor.shape)
     output = torch_reference_stage2(output_tensor, output_logsumexp)
 
     ref = []
@@ -310,8 +301,7 @@ def test_gqa_attention_kv_flash_decoding(q_d_head, v_d_head, n_heads, n_kv_heads
     )
 
 
-@pytest.mark.parametrize("has_sinks", [False, True])
-def test_attention_with_kv_stage2(has_sinks):
+def test_attention_with_kv_stage2():
     DEVICE = "cuda"
     BATCH_SIZE = 4
     N_HEADS = 32
@@ -325,11 +315,6 @@ def test_attention_with_kv_stage2(has_sinks):
     )
     logsumexp = torch.randn(BATCH_SIZE, N_HEADS, num_blocks, device=DEVICE, dtype=torch.float32)
     output = torch.zeros(BATCH_SIZE, N_HEADS, D_HEAD, device=DEVICE, dtype=torch.float32)
-
-    # Create sink tokens if needed - kernel expects [BATCH_SIZE, N_HEADS] shape
-    sinks = (
-        torch.randn(BATCH_SIZE, N_HEADS, device=DEVICE, dtype=torch.float32) if has_sinks else None
-    )
 
     def run():
         attention_kv_stage2[
@@ -346,20 +331,15 @@ def test_attention_with_kv_stage2(has_sinks):
             N_HEADS,
             D_HEAD,
             SEQ_BLOCK_SIZE,
-            has_sinks,  # HAS_SINKS: parameterized
-            sinks,  # sinks_ptr: sink tokens tensor or None
         )
 
     run()
     ref = []
     for i in range(BATCH_SIZE):
         block_id = input_positions[i].item() // SEQ_BLOCK_SIZE + 1
-        batch_sinks = sinks[i : i + 1, :] if has_sinks else None  # [1, N_HEADS]
         ref.append(
             torch_reference_stage2(
-                values[i, :, :block_id, :].unsqueeze(0),
-                logsumexp[i, :, :block_id].unsqueeze(0),
-                batch_sinks,
+                values[i, :, :block_id, :].unsqueeze(0), logsumexp[i, :, :block_id].unsqueeze(0)
             )
         )
     ref = torch.cat(ref, dim=0)
@@ -426,6 +406,7 @@ def test_context_attention_kv(batch_size, q_d_head, v_d_head, n_heads, n_kv_head
         V_D_HEAD,
         SEQ_BLOCK,
         MAX_SEQ_LEN,
+        num_stages=2,
     )
 
     if N_HEADS != N_KV_HEADS:
@@ -444,10 +425,7 @@ def test_context_attention_kv(batch_size, q_d_head, v_d_head, n_heads, n_kv_head
 @pytest.mark.parametrize("n_heads,n_kv_heads", [(8, 8), (8, 1)])
 @pytest.mark.parametrize("q_d_head", [32, 96])
 @pytest.mark.parametrize("v_d_head", [32, 96])
-@pytest.mark.parametrize("sliding_window", [-1, 16])
-def test_context_attention_kv_flattened(
-    q_d_head, v_d_head, n_heads, n_kv_heads, dtype, sliding_window
-):
+def test_context_attention_kv_flattened(q_d_head, v_d_head, n_heads, n_kv_heads, dtype):
     DEVICE = "cuda"
     DTYPE = getattr(torch, dtype)
     N_HEADS = n_heads
@@ -490,34 +468,10 @@ def test_context_attention_kv_flattened(
                 kk = repeat_kv(q[i], kk)
                 vv = repeat_kv(q[i], vv)
 
-            # Create causal mask
             mask = torch.tril(
                 torch.ones(q[i].shape[1], kk.shape[1], dtype=torch.bool),
                 diagonal=kk.shape[1] - q[i].shape[1],
             )
-
-            # Apply sliding window constraints if enabled
-            if sliding_window > 0:
-                seq_len_q = q[i].shape[1]  # Current sequence length
-                seq_len_k = kk.shape[1]  # Total KV sequence length
-
-                # Create sliding window mask
-                sliding_mask = torch.zeros_like(mask)
-                for q_pos in range(seq_len_q):
-                    # For each query position, determine its absolute position in the cache
-                    abs_q_pos = INPUT_POS[i] + q_pos
-                    # Calculate sliding window range
-                    sliding_start = max(0, abs_q_pos - sliding_window + 1)
-                    sliding_end = abs_q_pos + 1
-                    # Apply to KV cache positions
-                    k_start = max(0, sliding_start)
-                    k_end = min(seq_len_k, sliding_end)
-                    if k_start < k_end:
-                        sliding_mask[q_pos, k_start:k_end] = True
-
-                # Combine causal and sliding window masks
-                mask = mask & sliding_mask
-
             ref.append(
                 torch.nn.functional.scaled_dot_product_attention(
                     q[i].transpose(1, 2),
@@ -581,11 +535,8 @@ def test_context_attention_kv_flattened(
         V_D_HEAD,
         SEQ_BLOCK,
         MAX_SEQ_LEN,
-        sliding_window,  # SLIDING_WINDOW: parameterized
-        False,  # HAS_SINKS: no sink tokens used
-        None,  # sinks_ptr: no sink tokens used
+        num_stages=2,
     )
-
     assert torch.allclose(ref, output_tensor, atol=1e-2, rtol=1e-2)
 
 

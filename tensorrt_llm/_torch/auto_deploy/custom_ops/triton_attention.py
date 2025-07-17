@@ -41,8 +41,6 @@ def _generate_mha(
     input_pos: torch.Tensor,
     scale: float,
     out: torch.Tensor,
-    sinks: Optional[torch.Tensor] = None,
-    sliding_window: Optional[int] = None,
 ):
     b, (n_heads, q_d_head) = q.shape[0], q.shape[-2:]
     max_seq_len, n_kv_heads = k_cache.shape[1:3]
@@ -99,11 +97,7 @@ def _generate_mha(
         v_d_head,
         SEQ_BLOCK_SIZE,
         HEAD_BLOCK_SIZE,
-        sliding_window if sliding_window is not None else -1,
     )
-
-    has_sinks = sinks is not None
-
     attention_kv_stage2[(b, n_heads, 1)](
         stage1_output_values,
         stage1_output_logsumexp,
@@ -113,8 +107,6 @@ def _generate_mha(
         n_heads,
         v_d_head,
         SEQ_BLOCK_SIZE,
-        has_sinks,
-        sinks if has_sinks else None,
     )
 
 
@@ -130,8 +122,6 @@ def _flattened_context_mha(
     seq_start: torch.Tensor,
     scale: float,
     out: torch.Tensor,
-    sinks: Optional[torch.Tensor] = None,
-    sliding_window: Optional[int] = None,
 ) -> None:
     # NOTE: s_total == sum(seq_len)
     s_total, n_heads, q_d_head = q.shape
@@ -159,8 +149,6 @@ def _flattened_context_mha(
 
     # TODO: use input_pos to get the correct cache locations
     grid = (BATCH_SIZE, n_heads, (max(seq_len) + SEQ_BLOCK - 1) // SEQ_BLOCK)
-    has_sinks = sinks is not None
-
     context_attention_kv_flattened[grid](
         q,
         seq_len,
@@ -177,9 +165,7 @@ def _flattened_context_mha(
         v_d_head,
         SEQ_BLOCK,
         max_cache_seq_len,
-        sliding_window if sliding_window is not None else -1,
-        has_sinks,
-        sinks if has_sinks else None,
+        num_stages=2,
     )
 
 
@@ -201,8 +187,6 @@ def flattened_mha_with_cache(
     # <none>
     # CONSTANTS
     scale: Optional[float],
-    sinks: Optional[torch.Tensor] = None,
-    sliding_window: Optional[int] = None,
 ) -> torch.Tensor:
     """Flattened MHA with cache that takes q, k, v in BSND layout.
 
@@ -239,9 +223,7 @@ def flattened_mha_with_cache(
     y = q.new_empty(*bs_view, num_heads, v_head_dim).contiguous()
     if s == 1:
         # generate-only phase
-        _generate_mha(
-            q, k, v, k_cache, v_cache, cache_loc, input_pos, scale, y, sinks, sliding_window
-        )
+        _generate_mha(q, k, v, k_cache, v_cache, cache_loc, input_pos, scale, y)
     else:
         # mixed context + generate phase
         _flattened_context_mha(
@@ -256,8 +238,6 @@ def flattened_mha_with_cache(
             seq_start,
             scale,
             y,
-            sinks,
-            sliding_window,
         )
 
     return y.view(*output_shape)
@@ -275,8 +255,6 @@ def flattened_mha_fake(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     scale: Optional[float],
-    sinks: Optional[torch.Tensor] = None,
-    sliding_window: Optional[int] = None,
 ):
     return q.new_empty(*q.shape[:-1], v.shape[-1]).contiguous()
 
@@ -411,12 +389,6 @@ class TritonAttention(AttentionDescriptor):
             ad_logger.warning("Provided scale is not a float, Using default scale instead.")
             scale = None
 
-        # Get sinks and sliding_window from args or kwargs
-        sinks = extract_op_args(source_attn_node, "sinks")[0]
-        sliding_window = extract_op_args(source_attn_node, "sliding_window")[0]
-
         return [
             scale,  # softmax scale
-            sinks,
-            sliding_window,
         ]
