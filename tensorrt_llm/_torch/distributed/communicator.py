@@ -115,50 +115,49 @@ class MPIDist(Distributed):
         Returns:
             The broadcasted object on all ranks
         """
-        # Serialize and prepare chunks on root
         rank = mpi_rank()
+        total_size = 0
+        num_chunks = 0
+
+        # Serialization phase
         if rank == root:
             try:
                 serialized = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
                 total_size = len(serialized)
                 num_chunks = math.ceil(total_size / chunk_size)
-                chunks = [
-                    serialized[i * chunk_size:(i + 1) * chunk_size]
-                    for i in range(num_chunks)
-                ]
             except Exception as e:
-                mpi_broadcast((False, None, None), root=root)  # Signal failure
-                raise RuntimeError(f"Serialization failed: {str(e)}")
-        else:
-            chunks = None
+                mpi_broadcast((False, None, None), root=root)
+                raise RuntimeError(f"Serialization failed: {str(e)}") from e
 
-        # Broadcast metadata (success_flag, total_size, num_chunks)
+        # Metadata broadcast
         metadata = mpi_broadcast(
             (True, total_size, num_chunks) if rank == root else None, root=root)
 
-        if not metadata[0]:  # Check if root failed
+        if not metadata[0]:
             raise RuntimeError("Root rank failed during serialization")
 
         _, total_size, num_chunks = metadata
 
-        # Broadcast chunks
+        # Chunked broadcast
         received_chunks = []
         for i in range(num_chunks):
             if rank == root:
-                chunk = chunks[i]
+                chunk = serialized[i * chunk_size:(i + 1) * chunk_size]
             else:
                 chunk = None
-            # Broadcast each chunk to all ranks
             received_chunks.append(mpi_broadcast(chunk, root=root))
 
-        # Reconstruct
+        # Reconstruction
         serialized = b''.join(received_chunks)
         if len(serialized) != total_size:
             raise RuntimeError(
                 f"Data size mismatch: expected {total_size}, got {len(serialized)}"
             )
 
-        return pickle.loads(serialized)
+        try:
+            return pickle.loads(serialized)
+        except Exception as e:
+            raise RuntimeError(f"Deserialization failed: {str(e)}") from e
 
     def allgather(self, obj):
         return mpi_allgather(obj)
