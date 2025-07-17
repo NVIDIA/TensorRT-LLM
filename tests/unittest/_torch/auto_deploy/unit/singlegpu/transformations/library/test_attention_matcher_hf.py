@@ -77,6 +77,7 @@ def test_match_llama_attention(config: Dict[str, Any], attn_implementation: str)
     dynamic_shapes = {0: Dim("batch_size", max=8), 1: Dim("seq_len", min=4, max=16)}
 
     model = HFWrapper(LlamaModel(LlamaConfig(**full_config))).to("cuda")
+    model.eval()
     x = torch.randint(
         0, full_config["vocab_size"], (batch_size, seq_len), dtype=torch.long, device="cuda"
     )

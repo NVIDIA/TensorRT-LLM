@@ -9,10 +9,10 @@ from _torch_test_utils import all_close
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import CacheConfig, SequenceInfo
 from tensorrt_llm._torch.auto_deploy.custom_ops.flashinfer_attention import FlashInferAttention
 from tensorrt_llm._torch.auto_deploy.custom_ops.triton_attention import TritonAttention
+from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transform.interface import InferenceOptimizerConfig
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
-from tensorrt_llm._torch.auto_deploy.transformations.export import torch_export, torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transformations.library import update_in_out_nodes
 from tensorrt_llm._torch.auto_deploy.transformations.library.kvcache import insert_cached_attention
 
@@ -225,6 +225,5 @@ def test_sdpa_with_kv_cache(dtype, attn_descriptor, gqa_config):
     assert all_close(y_model, y_with_cache, atol=atol, rtol=rtol)
 
     # Test 4: Exportability of the transformed model
-    torch_export(gm, args=cm.args)
     exported_gm = torch_export_to_gm(gm, args=cm.args)
     assert exported_gm is not None

@@ -5,6 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
 
+from ...export.interface import BaseExportPatch, ExportPatchRegistry
+
 
 def _forward_moe(self: MixtralSparseMoeBlock, hidden_states: torch.Tensor):
     # check if we can apply the patch
@@ -46,5 +48,28 @@ def _forward_moe(self: MixtralSparseMoeBlock, hidden_states: torch.Tensor):
     return final_hidden_states, router_logits
 
 
-MixtralSparseMoeBlock._original_forward = MixtralSparseMoeBlock.forward
-MixtralSparseMoeBlock.forward = _forward_moe
+@ExportPatchRegistry.register("hf_mixtral_moe")
+class MixtralMoePatch(BaseExportPatch):
+    """Patch for Mixtral MoE to make it compatible with torch.export.
+
+    This patch replaces the forward method of MixtralSparseMoeBlock with
+    a version that uses the torch_moe custom operator for better export compatibility.
+    """
+
+    def _apply_patch(self):
+        """Apply the Mixtral MoE patch."""
+        # Store original forward method
+        self.original_values["MixtralSparseMoeBlock.forward"] = MixtralSparseMoeBlock.forward
+
+        # Apply patch by replacing the forward method
+        MixtralSparseMoeBlock._original_forward = MixtralSparseMoeBlock.forward  # type: ignore
+        MixtralSparseMoeBlock.forward = _forward_moe  # type: ignore
+
+    def _revert_patch(self):
+        """Revert the Mixtral MoE patch."""
+        # Restore original forward method
+        MixtralSparseMoeBlock.forward = self.original_values["MixtralSparseMoeBlock.forward"]  # type: ignore
+
+        # Clean up the temporary attribute
+        if hasattr(MixtralSparseMoeBlock, "_original_forward"):
+            delattr(MixtralSparseMoeBlock, "_original_forward")

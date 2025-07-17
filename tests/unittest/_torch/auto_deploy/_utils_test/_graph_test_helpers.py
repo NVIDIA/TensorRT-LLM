@@ -5,9 +5,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 from _torch_test_utils import all_close, reset_parameters
+from torch.export import export
 from torch.fx import GraphModule
 
-from tensorrt_llm._torch.auto_deploy.transformations.export import torch_export, torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transformations.library.sharding import ShardingTransformInfo
 
 
@@ -112,7 +113,7 @@ def run_test(
         torch.testing.assert_close(y_model, y_loaded_from_transformed, atol=atol, rtol=rtol)
 
     # check if we can still export the model as expected
-    torch_export(gm, args=(x,))
+    export(gm, args=(x,))
 
     # return graph module for further testing
     return gm

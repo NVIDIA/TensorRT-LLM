@@ -173,4 +173,5 @@ def get_model_from_config_patched(config, **kwargs):
     return model
 
 
+# TODO: figure out how this can be incorporated into the export patch system
 AutoModelForCausalLM.from_config = get_model_from_config_patched

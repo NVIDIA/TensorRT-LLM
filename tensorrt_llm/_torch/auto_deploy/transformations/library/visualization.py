@@ -5,11 +5,10 @@ from typing import Tuple
 
 import model_explorer
 import torch
+import torch.export as te
 from model_explorer.graph_builder import GraphNode, KeyValue, MetadataItem
 from model_explorer.pytorch_exported_program_adater_impl import PytorchExportedProgramAdapterImpl
 from torch import fx
-
-from ..export import torch_export
 
 
 def print_tensor(self, tensor: torch.Tensor, size_limit: int = 16):
@@ -79,7 +78,7 @@ CUSTOM_OPS = (
 
 # TODO(yudong): make viz as non-block call.
 def visualize_namespace(gm: fx.GraphModule, args: Tuple[torch.Tensor, ...], dynamic_shapes):
-    ep = torch_export(gm, args=args, dynamic_shapes=dynamic_shapes)
+    ep = te.export(gm, args=args, dynamic_shapes=dynamic_shapes)
     graph = ep.graph
     # Ensure the ops land up in the right module for better viz
     for n in graph.nodes:

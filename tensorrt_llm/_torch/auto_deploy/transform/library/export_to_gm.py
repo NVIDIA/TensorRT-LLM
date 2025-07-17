@@ -1,13 +1,13 @@
 """A simple wrapper transform to export a model to a graph module."""
 
-from typing import Tuple, Type
+from typing import List, Optional, Tuple, Type
 
 from pydantic import Field
 from torch.fx import GraphModule
 
+from ...export import torch_export_to_gm
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ...transformations.export import torch_export_to_gm
 from ..interface import BaseTransform, TransformConfig, TransformInfo, TransformRegistry
 
 
@@ -25,6 +25,11 @@ class ExportToGMConfig(TransformConfig):
         description="Whether to clone the state_dict of the model. This is useful to avoid"
         "modifying the original state_dict of the model.",
         default=False,
+    )
+    patch_list: Optional[List[str]] = Field(
+        description="List of patch names to apply with export. "
+        "Default is to apply all registered patches.",
+        default=None,
     )
 
 
@@ -57,6 +62,7 @@ class ExportToGM(BaseTransform):
             dynamic_shapes=cm.dynamic_shapes,
             clone=self.config.clone_state_dict,
             strict=self.config.strict,
+            patch_list=self.config.patch_list,
         )
 
         # this is a clean graph by definition since it was just exported
