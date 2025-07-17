@@ -12,6 +12,7 @@ withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LL
     LLM_REPO = env.gitlabSourceRepoHttpUrl ? env.gitlabSourceRepoHttpUrl : "${DEFAULT_LLM_REPO}"
 }
 
+ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 
 LLM_ROOT = "llm"
@@ -439,7 +440,7 @@ def getCommonParameters()
     return [
         'gitlabSourceRepoHttpUrl': LLM_REPO,
         'gitlabCommit': env.gitlabCommit,
-        'artifactPath': env.artifactPath,
+        'artifactPath': ARTIFACT_PATH,
         'uploadPath': UPLOAD_PATH,
     ]
 }
@@ -518,8 +519,7 @@ pipeline {
             }
             steps {
                 script {
-                    collectResultPodSpec = createKubernetesPodConfig("agent")
-                    trtllm_utils.launchKubernetesPod(this, collectResultPodSpec, "python3", {
+                    container("python3") {
                         // Install wget
                         trtllm_utils.llmExecStepWithRetry(this, script: "apt-get update && apt-get -y install wget")
 
@@ -572,7 +572,7 @@ pipeline {
 
                         def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
                         error "Timeout waiting for build artifacts (${elapsedMinutes.intValue()} minutes)"
-                    })
+                    }
                 }
             }
         }
@@ -589,7 +589,6 @@ pipeline {
                     def parameters = getCommonParameters()
                     parameters += [
                         'enableFailFast': false,
-                        'branch': LLM_BRANCH,
                         'globalVars': globalVarsJson,
                     ]
 
