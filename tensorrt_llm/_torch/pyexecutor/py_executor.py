@@ -1263,7 +1263,7 @@ class PyExecutor:
             else:
                 new_requests, py_request_objects = self._broadcast_new_requests(
                     new_requests, py_request_objects)
-        except (pickle.UnpicklingError, ValueError) as e:
+        except Exception as e:
             raise ValueError(
                 f"broadcast new requests failed: {str(e)}, payload size: {len(pickle.dumps((new_requests, py_request_objects)))} bytes"
             )
