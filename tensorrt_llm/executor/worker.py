@@ -567,6 +567,12 @@ class GenerationExecutorWorker(GenerationExecutor):
             self.engine.shutdown()
             self.engine = None
 
+            if hasattr(
+                    self._executor_config, "checkpoint_loader"
+            ) and self._executor_config.checkpoint_loader is not None:
+                self._executor_config.checkpoint_loader.cleanup()
+                self._executor_config.checkpoint_loader = None
+
         # Check if there are any errors from the threads before shutdown.
         self._handle_background_error()
 

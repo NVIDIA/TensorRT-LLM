@@ -44,16 +44,18 @@ public:
 
     McastDeviceMemory(size_t bufSize, uint32_t groupSize, uint32_t groupRank, int deviceIdx, bool mnNvlink);
 
+    // We don't register the pointer in these two functions since we don't expect any python-level code would call
+    // to obtain the raw pointers.
     //! Get the raw array of signal pad pointers to all ranks (including self)
     void** getSignalPadPtrsDev()
     {
-        return reinterpret_cast<void**>(mSignalPadsDev.data());
+        return mSignalPadsDev;
     }
 
     //! Get the raw array of unicast pointers to all ranks (including self)
     void** getBufferPtrsDev()
     {
-        return reinterpret_cast<void**>(mUcPtrs.data());
+        return mUcPtrsDev;
     }
 
     //! Get the raw unicast pointer to a given rank
@@ -93,10 +95,16 @@ private:
     size_t mAllocationSize;
 
     CUdeviceptr mMcPtr;
-    std::vector<CUdeviceptr> mUcPtrs;
-    std::vector<CUdeviceptr> mSignalPadsDev;
     CUmemGenericAllocationHandle mMcHandle;
     std::vector<CUmemGenericAllocationHandle> mUcHandles;
+
+    // Host array of pointers
+    std::vector<CUdeviceptr> mUcPtrs;
+    std::vector<CUdeviceptr> mSignalPads;
+
+    // Device array of pointers
+    void** mUcPtrsDev;
+    void** mSignalPadsDev;
 
     // For intra-node mcast
     tensorrt_llm::runtime::IpcNvlsHandle* mNvlsHandle;

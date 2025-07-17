@@ -69,6 +69,7 @@ class DummyModelEngine(PyTorchModelEngine):
                           rank=tensorrt_llm.mpi_rank())
         super().__init__(model_path="",
                          pytorch_backend_config=pytorch_backend_config,
+                         checkpoint_loader=None,
                          batch_size=batch_size,
                          max_seq_len=max_seq_len,
                          mapping=mapping)
