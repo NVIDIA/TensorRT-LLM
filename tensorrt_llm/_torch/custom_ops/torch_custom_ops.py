@@ -1,5 +1,6 @@
 from functools import lru_cache
 from typing import List, Optional, Tuple
+from time import time
 
 import cutlass
 import cutlass.cute as cute
@@ -944,9 +945,34 @@ def _(
     ret = mat_a.new_empty(shape, dtype=torch.bfloat16)
     return ret
 
+# a_dist = dict()
+# b_dist = dict()
+# c_dist = dict()
+# a_sf_dist = dict()
+# b_sf_dist = dict()
 
+# import weakref
+# a_dist = weakref.WeakKeyDictionary()
+# b_dist = weakref.WeakKeyDictionary()
+# c_dist = weakref.WeakKeyDictionary()
+# a_sf_dist = weakref.WeakKeyDictionary()
+# b_sf_dist = weakref.WeakKeyDictionary()
+
+# class StrWrapper(str):
+#     pass
 class CuteDSLFp8BlackwellLinear(TunableRunner):
     kernel_dict = dict()
+    # a_dist = dict()
+    # b_dist = dict()
+    # c_dist = dict()
+    # a_sf_dist = dict()
+    # b_sf_dist = dict()
+    # a_dist = weakref.WeakKeyDictionary()
+    # b_dist = weakref.WeakKeyDictionary()
+    # c_dist = weakref.WeakKeyDictionary()
+    # a_sf_dist = weakref.WeakKeyDictionary()
+    # b_sf_dist = weakref.WeakKeyDictionary()
+    # stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     def __init__(self):
         super().__init__()
@@ -1053,35 +1079,99 @@ class CuteDSLFp8BlackwellLinear(TunableRunner):
             )
         """
 
-        with nvtx.annotate("gemm, empty", color="blue"):
-            a, b, a_sf, b_sf = inputs
-            m, n = a.shape[0], b.shape[0]
-            c = torch.empty(*(m, n), dtype=torch.bfloat16, device="cuda")
+        # with nvtx.annotate("gemm, empty", color="blue"):
+        a, b, a_sf, b_sf = inputs
+        m, n = a.shape[0], b.shape[0]
+        c = torch.empty(*(m, n), dtype=torch.bfloat16, device="cuda")
 
-        with nvtx.annotate("gemm, view as uint8", color="gray"):
-            a_tmp = a.view(torch.uint8)
-            b_tmp = b.view(torch.uint8)
+        # with nvtx.annotate("gemm, view as uint8", color="gray"):
+        # t1 = time()
+        # a_tmp = a.view(torch.uint8)
+        b_tmp = b.view(torch.uint8)
+        # t2 = time()
+        # print(f"      limin: view as uint8 time = {(t2 - t1)*1000000} us")
 
-        with nvtx.annotate("gemm, from_dlpack", color="green"):
-            mA = from_dlpack(
-                a_tmp, assumed_align=16).mark_layout_dynamic(leading_dim=1)
-            mB = from_dlpack(
-                b_tmp, assumed_align=16).mark_layout_dynamic(leading_dim=1)
-            mC = from_dlpack(
-                c, assumed_align=16).mark_layout_dynamic(leading_dim=1)
-            mA.element_type = cutlass.Float8E4M3FN
-            mB.element_type = cutlass.Float8E4M3FN
+        # t1 = time()
+        #with nvtx.annotate("gemm, from_dlpack", color="green"):
+        mA = from_dlpack(
+            a, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        mB = from_dlpack(
+            b_tmp, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        mC = from_dlpack(
+            c, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        mA.element_type = cutlass.Float8E4M3FN
+        mB.element_type = cutlass.Float8E4M3FN
 
-            # TODO: mSFA is column major
-            mSFA = from_dlpack(
-                a_sf, assumed_align=16).mark_layout_dynamic(leading_dim=1)
-            mSFB = from_dlpack(
-                b_sf, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        # TODO: mSFA is column major
+        mSFA = from_dlpack(
+            a_sf, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        mSFB = from_dlpack(
+            b_sf, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        # t2 = time()
+        # print(f"      limin: from_dlpack time = {(t2 - t1)*1000000} us")
+            
+        # #     ######caching from_dlapck results ######
+        # #     ## will lead to oom, so we don't use it here
+        # #     # k = a.shape[1]
+        # #     # b_key = str(n) + "_" + str(k)
+        # #     # a_key = str(m) + "_" + str(k)
+        # #     # c_key = str(m) + "_" + str(n)
+        # #     # b_key = StrWrapper(b_key)
+        # #     # a_key = StrWrapper(a_key)
+        # #     # c_key = StrWrapper(c_key)
 
-        # get stream
-        with nvtx.annotate("gemm, stream", color="yellow"):
-            torch_stream = torch.cuda.current_stream()
-            stream = cuda.CUstream(torch_stream.cuda_stream)
+        # #     # b_dist = CuteDSLFp8BlackwellLinear.b_dist
+        # #     # a_dist = CuteDSLFp8BlackwellLinear.a_dist
+        # #     # c_dist = CuteDSLFp8BlackwellLinear.c_dist
+        # #     # a_sf_dist = CuteDSLFp8BlackwellLinear.a_sf_dist
+        # #     # b_sf_dist = CuteDSLFp8BlackwellLinear.b_sf_dist
+
+        # #     # if b_key in b_dist:
+        # #     #     print(f"limin: b_key in b_dist, len(b_dist) = {len(b_dist)}")
+        # #     #     mB = b_dist[b_key]
+        # #     #     mB.reset_data_ptr(data_ptr=b_tmp.data_ptr())
+
+        # #     #     mSFB = b_sf_dist[b_key]
+        # #     #     mSFB.reset_data_ptr(data_ptr=b_sf.data_ptr())
+        # #     # else:
+        # #     #     print(f"limin: b_key not in b_dist")
+        # #     #     mB = from_dlpack(b_tmp, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        # #     #     mB.element_type = cutlass.Float8E4M3FN
+        # #     #     b_dist[b_key] = mB
+
+        # #     #     mSFB = from_dlpack(b_sf, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        # #     #     b_sf_dist[b_key] = mSFB
+
+        # #     # if a_key in a_dist:
+        # #     #     print(f"limin: a_key in a_dist, len(a_dist) = {len(a_dist)}")
+        # #     #     mA = a_dist[a_key]
+        # #     #     mA.reset_data_ptr(data_ptr=a_tmp.data_ptr())
+
+        # #     #     mSFA = a_sf_dist[a_key]
+        # #     #     mSFA.reset_data_ptr(data_ptr=a_sf.data_ptr())
+        # #     # else:
+        # #     #     print(f"limin: a_key not in a_dist")
+        # #     #     mA = from_dlpack(a_tmp, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        # #     #     mA.element_type = cutlass.Float8E4M3FN
+        # #     #     a_dist[a_key] = mA
+
+        # #     #     mSFA = from_dlpack(a_sf, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        # #     #     a_sf_dist[a_key] = mSFA
+
+        # #     # if c_key in c_dist:
+        # #     #     print(f"limin: c_key in c_dist, len(c_dist) = {len(c_dist)}")
+        # #     #     mC = c_dist[c_key]
+        # #     #     mC.reset_data_ptr(data_ptr=c.data_ptr())
+        # #     # else:
+        # #     #     print(f"limin: c_key not in c_dist")
+        # #     #     mC = from_dlpack(c, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        # #     #     c_dist[c_key] = mC
+
+        # # get stream
+        # with nvtx.annotate("gemm, stream", color="yellow"):
+        torch_stream = torch.cuda.current_stream()
+        stream = cuda.CUstream(torch_stream.cuda_stream)
+        # stream = CuteDSLFp8BlackwellLinear.stream
 
         cache_key = (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn,
                      use_tma_store)
@@ -1134,11 +1224,14 @@ class CuteDSLFp8BlackwellLinear(TunableRunner):
             compiled_gemm = CuteDSLFp8BlackwellLinear.kernel_dict[cache_key]
 
         # launch gemm kernel
-        with nvtx.annotate("gemm, launch", color="gray"):
-            compiled_gemm(mA, mB, mC, mSFA, mSFB, stream)
+        # with nvtx.annotate("gemm, launch", color="gray"):
+        # t1 = time()
+        compiled_gemm(mA, mB, mC, mSFA, mSFB, stream)
+        # t2 = time()
+        # print(f"      limin: launch time = {(t2 - t1)*1000000} us")
 
         # t_end = time()
-        # print(f"limin: linear host overhead all time = {(t_end - t_start)*1000000} us")
+        # print(f" limin: linear host overhead all time = {(t_end - t_start)*1000000} us")
         return c
 
 
@@ -1167,6 +1260,7 @@ def cute_dsl_fp8_gemm_blackwell(
     input_scale: torch.Tensor,
     weight_scale: torch.Tensor,
 ) -> torch.Tensor:
+    # t1 = time()
     tuner = AutoTuner.get()
     # allocate workspace for profiling
     cute_dsl_fp8_gemm_blackwell_runner = CuteDSLFp8BlackwellLinear()
@@ -1175,6 +1269,8 @@ def cute_dsl_fp8_gemm_blackwell(
         [cute_dsl_fp8_gemm_blackwell_runner],
         [input, weight, input_scale, weight_scale],
     )
+    # t2 = time()
+    # print(f"      limin: tuner time = {(t2 - t1)*1000000} us")
     return cute_dsl_fp8_gemm_blackwell_runner(
         inputs=[input, weight, input_scale, weight_scale],
         tactic=best_tactic,
@@ -1190,6 +1286,13 @@ def cute_dsl_fp8_gemm_blackwell(
     #     cluster_shape_mn=(1, 1),
     #     use_tma_store=True,
     # )
+
+    # m, n = input.shape[0], weight.shape[0]
+    # # t1 = time()
+    # c = torch.empty(*(m, n), dtype=torch.bfloat16, device="cuda")
+    # # t2 = time()
+    # # print(f"   limin: empty time = {(t2 - t1)*1000000} us")
+    # return c
 
 
 @torch.library.register_fake("trtllm::cute_dsl_fp8_gemm_blackwell")
@@ -1210,6 +1313,7 @@ def _(
 
 class CuteDSLFp8BlackwellBmm(TunableRunner):
     kernel_dict = dict()
+    # stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     def __init__(self):
         super().__init__()
@@ -1280,14 +1384,14 @@ class CuteDSLFp8BlackwellBmm(TunableRunner):
         :rtype: torch.Tensor, type: bf16
         """
         # t_start= time()
-        with nvtx.annotate("bmm, inputs", color="red"):
-            a, b, a_sf, b_sf, c = inputs
-            # l, m, n, k = a.shape[0], a.shape[1], b.shape[1], b.shape[2]
-            # w_n, w_k = b_sf.shape[1], b_sf.shape[2]
-            # if c.dtype != torch.bfloat16:
-            #     assert False, "c.dtype != bf16"
-            # if c.shape != (l, m, n):
-            #     assert False, "c.shape != (l, m, n)"
+        # with nvtx.annotate("bmm, inputs", color="red"):
+        a, b, a_sf, b_sf, c = inputs
+        # l, m, n, k = a.shape[0], a.shape[1], b.shape[1], b.shape[2]
+        # w_n, w_k = b_sf.shape[1], b_sf.shape[2]
+        # if c.dtype != torch.bfloat16:
+        #     assert False, "c.dtype != bf16"
+        # if c.shape != (l, m, n):
+        #     assert False, "c.shape != (l, m, n)"
         """
         # torch_tensor -> cute.tensor
         with nvtx.annotate("bmm a_b_c_weight_scale_tmp", color="gray"):
@@ -1325,37 +1429,36 @@ class CuteDSLFp8BlackwellBmm(TunableRunner):
             )
         """
         # t1 = time()
-        with nvtx.annotate("a/b view", color="green"):
-            a_tmp = a.view(torch.uint8)
-            b_tmp = b.view(torch.uint8)
+        # with nvtx.annotate("a/b view", color="green"):
+        # a_tmp = a.view(torch.uint8)
+        b_tmp = b.view(torch.uint8)
         # t2 = time()
         # print(f"limin: bmm a/b view time = {(t2 - t1)*1000000} us")
 
         # t3 = time()
-        with nvtx.annotate("bmm from_dlpack", color="gray"):
-            mA = from_dlpack(
-                a_tmp, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-            mB = from_dlpack(
-                b_tmp, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-            mC = from_dlpack(
-                c, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-            mA.element_type = cutlass.Float8E4M3FN
-            mB.element_type = cutlass.Float8E4M3FN
+        # with nvtx.annotate("bmm from_dlpack", color="gray"):
+        mA = from_dlpack(
+            a, assumed_align=16).mark_layout_dynamic(leading_dim=2)
+        mB = from_dlpack(
+            b_tmp, assumed_align=16).mark_layout_dynamic(leading_dim=2)
+        mC = from_dlpack(
+            c, assumed_align=16).mark_layout_dynamic(leading_dim=2)
+        mA.element_type = cutlass.Float8E4M3FN
+        mB.element_type = cutlass.Float8E4M3FN
 
-            # Note: mSFA is column major
-            mSFA = from_dlpack(
-                a_sf, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-            mSFB = from_dlpack(
-                b_sf, assumed_align=16).mark_layout_dynamic(leading_dim=2)
+        # Note: mSFA is column major
+        mSFA = from_dlpack(
+            a_sf, assumed_align=16).mark_layout_dynamic(leading_dim=2)
+        mSFB = from_dlpack(
+            b_sf, assumed_align=16).mark_layout_dynamic(leading_dim=2)
         # t4 = time()
         # print(f"limin: bmm from_dlpack time = {(t4 - t3)*1000000} us")
 
         # get stream
         # t5 = time()
-        with nvtx.annotate("gemm, stream", color="green"):
-            # torch_stream = torch.cuda.current_stream()
-            # stream = cuda.CUstream(torch_stream.cuda_stream)
-            stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        # with nvtx.annotate("gemm, stream", color="green"):
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        # stream = CuteDSLFp8BlackwellBmm.stream
         # t6 = time()
         # print(f"limin: bmm stream time = {(t6 - t5)*1000000} us")
 
@@ -1410,8 +1513,8 @@ class CuteDSLFp8BlackwellBmm(TunableRunner):
             compiled_gemm = CuteDSLFp8BlackwellBmm.kernel_dict[cache_key]
 
         # launch gemm kernel
-        with nvtx.annotate("bmm, launch", color="gray"):
-            compiled_gemm(mA, mB, mC, mSFA, mSFB, stream)
+        # with nvtx.annotate("bmm, launch", color="gray"):
+        compiled_gemm(mA, mB, mC, mSFA, mSFB, stream)
         # t8 = time()
         # print(f"limin: bmm launch time = {(t8 - t7)*1000000} us")
 
@@ -1497,6 +1600,7 @@ def _(
 
 class CuteDSLFp8BlackwellGroupGemm(TunableRunner):
     kernel_dict = dict()
+    # stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     def __init__(self):
         super().__init__()
@@ -1617,45 +1721,48 @@ class CuteDSLFp8BlackwellGroupGemm(TunableRunner):
             print(f"limin: group_offset_cute_tensor.shape = {group_offset_cute_tensor.shape}, group_offset_cute_tensor.stride = {group_offset_cute_tensor.stride}")
         """
 
-        with nvtx.annotate("gemm, empty", color="red"):
-            a, b, a_sf, b_sf, group_offset = inputs
-            m, n = a.shape[0], b.shape[1]
-            # assert b_k == k, "b_k must be equal to k"
-            c = torch.empty(*(m, n), dtype=torch.bfloat16, device="cuda")
-            # assert n%128 == 0, "n must be divisible by 128"
-            # assert k%128 == 0, "k must be divisible by 128"
-        a_tmp = a.view(torch.uint8)
-        b_tmp = b.view(torch.uint8)
-        with nvtx.annotate("gemm, from_dlpack", color="gray"):
-            mA = from_dlpack(
-                a_tmp, assumed_align=16).mark_layout_dynamic(leading_dim=1)
-            mB = from_dlpack(
-                b_tmp, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-            mC = from_dlpack(
-                c, assumed_align=16).mark_layout_dynamic(leading_dim=1)
-            mA.element_type = cutlass.Float8E4M3FN
-            mB.element_type = cutlass.Float8E4M3FN
+        # with nvtx.annotate("gemm, empty", color="red"):
+        a, b, a_sf, b_sf, group_offset = inputs
+        m, n = a.shape[0], b.shape[1]
+        # assert b_k == k, "b_k must be equal to k"
+        c = torch.empty(*(m, n), dtype=torch.bfloat16, device="cuda")
+        # assert n%128 == 0, "n must be divisible by 128"
+        # assert k%128 == 0, "k must be divisible by 128"
 
-            mSFB = from_dlpack(
-                b_sf, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-            mSFA = from_dlpack(
-                a_sf, assumed_align=16).mark_layout_dynamic(leading_dim=1)
-            group_offset_cute_tensor = from_dlpack(
-                group_offset).mark_layout_dynamic()
-            # print(f"limin: mA.shape = {mA.shape}, mA.stride = {mA.stride}")
-            # print(f"limin: mB.shape = {mB.shape}, mB.stride = {mB.stride}")
-            # print(f"limin: mC.shape = {mC.shape}, mC.stride = {mC.stride}")
-            # print(f"limin: mSFB.shape = {mSFB.shape}, mSFB.stride = {mSFB.stride}")
-            # print(f"limin: mSFA.shape = {mSFA.shape}, mSFA.stride = {mSFA.stride}")
-            # print(f"limin: group_offset_cute_tensor.shape = {group_offset_cute_tensor.shape}, group_offset_cute_tensor.stride = {group_offset_cute_tensor.stride}")
+        # a_tmp = a.view(torch.uint8)
+        b_tmp = b.view(torch.uint8)
+
+        # with nvtx.annotate("gemm, from_dlpack", color="gray"):
+        mA = from_dlpack(
+            a, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        mB = from_dlpack(
+            b_tmp, assumed_align=16).mark_layout_dynamic(leading_dim=2)
+        mC = from_dlpack(
+            c, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        mA.element_type = cutlass.Float8E4M3FN
+        mB.element_type = cutlass.Float8E4M3FN
+
+        mSFB = from_dlpack(
+            b_sf, assumed_align=16).mark_layout_dynamic(leading_dim=2)
+        mSFA = from_dlpack(
+            a_sf, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        group_offset_cute_tensor = from_dlpack(
+            group_offset).mark_layout_dynamic()
+        # print(f"limin: mA.shape = {mA.shape}, mA.stride = {mA.stride}")
+        # print(f"limin: mB.shape = {mB.shape}, mB.stride = {mB.stride}")
+        # print(f"limin: mC.shape = {mC.shape}, mC.stride = {mC.stride}")
+        # print(f"limin: mSFB.shape = {mSFB.shape}, mSFB.stride = {mSFB.stride}")
+        # print(f"limin: mSFA.shape = {mSFA.shape}, mSFA.stride = {mSFA.stride}")
+        # print(f"limin: group_offset_cute_tensor.shape = {group_offset_cute_tensor.shape}, group_offset_cute_tensor.stride = {group_offset_cute_tensor.stride}")
 
         # get stream
-        with nvtx.annotate("gemm, stream", color="green"):
-            # t1 = time()
-            torch_stream = torch.cuda.current_stream()
-            stream = cuda.CUstream(torch_stream.cuda_stream)
-            # t2 = time()
-            # print(f"    limin: get stream time = {(t2 - t1)*1000000} us")
+        # with nvtx.annotate("gemm, stream", color="green"):
+        #     # t1 = time()
+        torch_stream = torch.cuda.current_stream()
+        stream = cuda.CUstream(torch_stream.cuda_stream)
+        #     # t2 = time()
+        #     # print(f"    limin: get stream time = {(t2 - t1)*1000000} us")
+        # stream = CuteDSLFp8BlackwellGroupGemm.stream
 
         cache_key = (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn,
                      use_tma_store)
@@ -1736,11 +1843,11 @@ class CuteDSLFp8BlackwellGroupGemm(TunableRunner):
             compiled_gemm = CuteDSLFp8BlackwellGroupGemm.kernel_dict[cache_key]
 
         # launch gemm kernel
-        with nvtx.annotate("group_gemm, launch", color="gray"):
-            compiled_gemm(mA, mB, mC, mSFA, mSFB, group_offset_cute_tensor,
-                          stream)
+        # with nvtx.annotate("group_gemm, launch", color="gray"):
+        compiled_gemm(mA, mB, mC, mSFA, mSFB, group_offset_cute_tensor,
+                      stream)
         # t_end = time()
-        # print(f"limin: group gemm host overhead all time = {(t_end - t_start)*1000000} us")
+        # print(f" limin: group gemm host overhead all time = {(t_end - t_start)*1000000} us")
 
         return c
 
@@ -1801,7 +1908,6 @@ def cute_dsl_fp8_group_gemm_blackwell(
         cluster_shape_mn=(1, 1),
         use_tma_store=True,
     )
-
 
 # @torch.library.register_fake("trtllm::cute_dsl_fp8_group_gemm_blackwell")
 # def _(
@@ -2074,3 +2180,26 @@ def _(
         output_sf = torch.empty(())  # Create a placeholder, which is not used.
 
     return output_act, output_sf
+
+
+# @torch.library.custom_op("trtllm::custom_op_python_cost_test", mutates_args=())
+# def custom_op_python_cost_test(
+#     input: torch.Tensor,
+#     weight: torch.Tensor,
+#     input_sf: torch.Tensor,
+#     weight_sf: torch.Tensor,
+# ) -> torch.Tensor:
+#     output = torch.empty(input.size(0), input.size(1), device='cuda')
+#     return output
+#     return output.clone()
+
+@torch.library.custom_op("trtllm::custom_op_python_cost_test", mutates_args=())
+def custom_op_python_cost_test(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_sf: torch.Tensor,
+    weight_sf: torch.Tensor,
+) -> torch.Tensor:
+    stream = torch.cuda.current_stream()
+    return torch.empty(input.size(0), input.size(1), device='cuda')
+    # return None

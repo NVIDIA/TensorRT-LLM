@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Dict, List, Optional, Union
+from time import time
 
 import nvtx
 import torch
@@ -430,12 +431,20 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
 
         act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(input)
 
-        # output = torch.ops.trtllm.fp8_block_scaling_gemm(
-        #     act_input_fp8, module.weight, act_input_sf, module.weight_scale)
-        with nvtx.annotate("linear_cuda_dsl", color="blue"):
-            cute_dsl_fp8_gemm_func = select_cute_dsl_fp8_gemm_by_sm_version()
-            output = cute_dsl_fp8_gemm_func(act_input_fp8, module.weight,
-                                            act_input_sf, module.weight_scale)
+        # with nvtx.annotate("fp8_block_scaling_gemm", color="blue"):
+        #     t1 = time()
+        #     output = torch.ops.trtllm.fp8_block_scaling_gemm(
+        #         act_input_fp8.view(torch.float8_e4m3fn), module.weight.view(torch.float8_e4m3fn), 
+        #         act_input_sf, module.weight_scale)
+        #     t2 = time()
+        #     print(f"limin: fp8_block_scaling_gemm host time = {(t2 - t1)*1000000} us")
+        # with nvtx.annotate("linear_cuda_dsl", color="blue"):
+        # t1 = time()
+        cute_dsl_fp8_gemm_func = select_cute_dsl_fp8_gemm_by_sm_version()
+        output = cute_dsl_fp8_gemm_func(act_input_fp8, module.weight,
+                                        act_input_sf, module.weight_scale)
+        # t2 = time()
+        # print(f"limin: linear_cuda_dsl host overhead time = {(t2 - t1)*1000000} us\n")
         if bias is not None:
             output = output + bias
         return output

@@ -48,6 +48,7 @@ void runPermute(void const* input_activations_void, void const* input_sf_void, i
     bool use_fp8_block_scaling, bool min_latency_mode, cutlass_kernels::MoeMinLatencyParams& min_latency_params,
     cudaStream_t stream)
 {
+    // auto start = std::chrono::high_resolution_clock::now();
     TLLM_CHECK_WITH_INFO(experts_per_token * full_num_experts <= std::numeric_limits<int>::max(),
         "experts_per_token * num_experts is too large");
 
@@ -58,7 +59,11 @@ void runPermute(void const* input_activations_void, void const* input_sf_void, i
     int const num_experts_per_node = full_num_experts / parallelism_config.ep_size;
     int start_expert = num_experts_per_node * parallelism_config.ep_rank;
     int end_expert = start_expert + num_experts_per_node;
-
+    // auto end = std::chrono::high_resolution_clock::now();
+    // auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    // std::cout << "moe_permute_op host overhead part-2 time: " << duration.count() << " us" << std::endl;
+    
+    // start = std::chrono::high_resolution_clock::now();
     bool use_w4afp8 = false;
     bool fused_prologue_result = false;
     if (!use_w4afp8)
@@ -67,6 +72,11 @@ void runPermute(void const* input_activations_void, void const* input_sf_void, i
             permuted_row_to_unpermuted_row_, unpermuted_row_to_permuted_row, expert_first_token_offset_, num_rows,
             num_experts_per_node, experts_per_token, start_expert, end_expert, stream);
     }
+    // end = std::chrono::high_resolution_clock::now();
+    // duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    // std::cout << "moe_permute_op host overhead part-3 time: " << duration.count() << " us" << std::endl;
+
+    // start = std::chrono::high_resolution_clock::now();
     if (!fused_prologue_result)
     {
         TLLM_LOG_TRACE("Falling back to unfused prologue");
@@ -76,7 +86,11 @@ void runPermute(void const* input_activations_void, void const* input_sf_void, i
             blocked_row_to_unpermuted_row_, num_rows, num_experts_per_node, experts_per_token, start_expert, stream);
     }
     sync_check_cuda_error(stream);
+    // end = std::chrono::high_resolution_clock::now();
+    // duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    // std::cout << "moe_permute_op host overhead part-4 time: " << duration.count() << " us" << std::endl;
 
+    // start = std::chrono::high_resolution_clock::now();
     using ExpandedActivationsType = T;
     float const* token_topk_unpermuted_scales = token_final_scales;
     cutlass_kernels::expandInputRowsKernelLauncher(input_activations,
@@ -86,6 +100,9 @@ void runPermute(void const* input_activations_void, void const* input_sf_void, i
         expert_first_token_offset_,
         /* fc1_fp4_act_scale_ */ nullptr, input_sf, stream);
     sync_check_cuda_error(stream);
+    // end = std::chrono::high_resolution_clock::now();
+    // duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    // std::cout << "moe_permute_op host overhead part-5 time: " << duration.count() << " us" << std::endl;
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> moe_permute_op(
@@ -96,6 +113,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size,
     int64_t const cluster_rank, bool min_latency_mode, bool use_fp8_block_scaling)
 {
+    // auto start = std::chrono::high_resolution_clock::now();
     TORCH_CHECK(cluster_size == 1 && cluster_rank == 0, "smart_router is supported in min_latency mode");
     TORCH_CHECK(min_latency_mode == false, "min_latency_mode is not supported now");
 
@@ -161,6 +179,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     kernels::LoraParams lora_params{};
 
     auto data_type = input.scalar_type();
+
     switch (data_type)
     {
     case torch::kFloat32:
@@ -230,6 +249,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
         break;
     }
     expert_first_token_offset_tensor = expert_first_token_offset_tensor.to(torch::kInt32);
+    
+    // auto end = std::chrono::high_resolution_clock::now();
+    // auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    // std::cout << "moe_permute_op host overhead time: " << duration.count() << " us" << std::endl;
+
     return std::make_tuple(permuted_row_to_unpermuted_row_tensor, permuted_token_selected_experts_tensor,
         permuted_data_tensor, expert_first_token_offset_tensor, permuted_token_final_scales_tensor,
         unpermuted_row_to_permuted_row_tensor);

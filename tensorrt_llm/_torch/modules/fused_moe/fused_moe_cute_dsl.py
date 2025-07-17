@@ -1,5 +1,6 @@
 import math
 from typing import List, Optional, Union
+from time import time
 
 import nvtx
 import torch
@@ -226,6 +227,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         with nvtx.annotate(f"fused_moe_cuda_dsl, x.shape = {x.shape}",
                            color="red"):
             with nvtx.annotate("moe_permute_op", color="yellow"):
+                # t1 = time()
                 (
                     permuted_row_to_unpermuted_row_tensor,
                     permuted_token_selected_experts_tensor,
@@ -251,9 +253,14 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                     min_latency_mode=False,
                     use_fp8_block_scaling=use_deepseek_fp8_block_scale,
                 )
+                # t2 = time()
+                # print(f"limin: moe_permute_op host overhead time = {(t2 - t1)*1000000} us")
             with nvtx.annotate("fp8_quantize_1x128", color="gray"):
+                # t3 = time()
                 act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                     permuted_data_tensor)
+                # t4 = time()
+                # print(f"limin: fp8_quantize_1x128 host overhead time = {(t4 - t3)*1000000} us")
             # h1 = cute_dsl_fp8_group_blockwise_gemm_ref(
             #     a=act_input_fp8,
             #     b=self.w3_w1_weight.view(weight_dtype),
@@ -279,6 +286,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 # # #"""
                 # # else:
                 try:
+                    # t5 = time()
                     h1 = cute_dsl_fp8_group_gemm_blackwell(
                         input=act_input_fp8,
                         weight=self.w3_w1_weight.view(weight_dtype),
@@ -286,13 +294,21 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                         weight_scale=self.quant_scales[0],
                         group_offset=expert_first_token_offset_tensor,
                     )
+                    # t6 = time()
+                    # print(f"limin: cute_dsl_fp8_group_gemm_blackwell host overhead time = {(t6 - t5)*1000000} us")
                 except Exception as e:
                     print(f"limin: error = {e}")
                     assert False
             with nvtx.annotate("swiglu_fused_moe", color="gray"):
+                # t7 = time()
                 h2 = swiglu_fused_moe(h1)
+                # t8 = time()
+                # print(f"limin: swiglu_fused_moe host overhead time = {(t8 - t7)*1000000} us")
+            # t9 = time()
             act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                 h2)
+            # t10 = time()
+            # print(f"limin: fp8_quantize_1x128 host overhead time = {(t10 - t9)*1000000} us")
             # h3 = cute_dsl_fp8_group_blockwise_gemm_ref(
             #     a=act_input_fp8,
             #     b=self.w2_weight.view(weight_dtype),
@@ -300,6 +316,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             #     b_sf=self.quant_scales[1],
             #     offset_array=expert_first_token_offset_tensor,
             # )
+            # t11 = time()
             h3 = cute_dsl_fp8_group_gemm_blackwell(
                 input=act_input_fp8,
                 weight=self.w2_weight.view(weight_dtype),
@@ -307,6 +324,9 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 weight_scale=self.quant_scales[1],
                 group_offset=expert_first_token_offset_tensor,
             )
+            # t12 = time()
+            # print(f"limin: cute_dsl_fp8_group_gemm_blackwell host overhead time = {(t12 - t11)*1000000} us")
+            # t13 = time()
             final_hidden_states = torch.ops.trtllm.moe_finalize_scale_op(
                 h3,
                 None,  # biases
@@ -325,5 +345,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 self.ep_size,
                 self.ep_rank,
             )
+            # t14 = time()
+            # print(f"limin: moe_finalize_scale_op host overhead time = {(t14 - t13)*1000000} us\n")
 
         return final_hidden_states

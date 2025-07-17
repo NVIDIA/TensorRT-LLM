@@ -66,6 +66,7 @@ add_library(
   mambaConv1dOp.cpp
   moeOp.cpp
   moeUtilOp.cpp
+  customOpCostTest.cpp
   moeCommOp.cpp
   moeLoadBalanceOp.cpp
   fp8BlockScaleMoe.cpp

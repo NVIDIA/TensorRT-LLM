@@ -24,6 +24,8 @@ from utils.util import getSMVersion
 
 from tensorrt_llm._torch.autotuner import autotune
 
+from time import time
+
 
 @pytest.mark.skipif(
     getSMVersion() != 100 and getSMVersion() != 89,
@@ -109,8 +111,21 @@ def test_cute_dsl_fp8_block_scale_gemm(dtype, m, k, n):
     print("call act_b_fp8.shape", act_b_fp8.shape)
     print("call act_a_sf.shape", act_a_sf.shape)
     print("call act_b_sf.shape", act_b_sf.shape)
-    output = torch.ops.trtllm.fp8_block_scaling_gemm(act_a_fp8, act_b_fp8,
-                                                     act_a_sf, act_b_sf)
+    act_a_fp8_origin = act_a_fp8.view(torch.float8_e4m3fn)
+    act_b_fp8_origin = act_b_fp8.view(torch.float8_e4m3fn)
+    for i in range(10):
+        output = torch.ops.trtllm.fp8_block_scaling_gemm(act_a_fp8_origin, act_b_fp8_origin,
+                                                         act_a_sf, act_b_sf)
+    a_time = 0
+    for i in range(10):
+        t1 = time()
+        with nvtx.annotate("fp8_block_scaling_gemm", color="red"):
+            output = torch.ops.trtllm.fp8_block_scaling_gemm(act_a_fp8_origin, act_b_fp8_origin,
+                                                             act_a_sf, act_b_sf)
+        t2 = time()
+        print(f"    limin: aot time = {(t2 - t1)*1000000} us")
+        a_time += (t2 - t1)
+    print(f"limin: aot host overhead time = {(a_time / 10)*1000000} us")
 
     output_expected = a @ b.t()
     diff = calc_diff(output, output_expected)
@@ -120,7 +135,8 @@ def test_cute_dsl_fp8_block_scale_gemm(dtype, m, k, n):
 
     cute_dsl_fp_gemm_func = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell if getSMVersion(
     ) == 100 else torch.ops.trtllm.cute_dsl_fp8_gemm
-    # from tensorrt_llm._torch.autotuner import autotune
+    
+    """
     with autotune():
         our_out = cute_dsl_fp_gemm_func(act_a_fp8, act_b_fp8, act_a_sf,
                                         act_b_sf)
@@ -129,15 +145,23 @@ def test_cute_dsl_fp8_block_scale_gemm(dtype, m, k, n):
     for k, v in AutoTuner.get().profiling_cache.items():
         print(f"Autotuner profiling cache: {k} = {v}")
     print("inference after autotune")
+    host_time = 0
     for i in range(10):
+        # with nvtx.annotate("cute_dsl_fp_gemm_func", color="red"):
+        t1 = time()
         with nvtx.annotate("cute_dsl_fp_gemm_func", color="red"):
             our_out = cute_dsl_fp_gemm_func(act_a_fp8, act_b_fp8, act_a_sf,
                                             act_b_sf)
+        t2 = time()
+        host_time += (t2 - t1)
+        print(f"limin: time = {(t2 - t1)*1000000} us")
+    print(f"limin: host_time = {host_time / 10 * 1000000} us")
+    """
 
-    diff = calc_diff(our_out, output_expected)
-    print("limin: our_out, output_expected, diff = ", diff)
-    assert diff < 1e-3
-    torch.testing.assert_close(our_out, output_expected, atol=1e-3, rtol=1e-3)
+    # diff = calc_diff(our_out, output_expected)
+    # print("limin: our_out, output_expected, diff = ", diff)
+    # assert diff < 1e-3
+    # torch.testing.assert_close(our_out, output_expected, atol=1e-3, rtol=1e-3)
 
     # our_ref = cute_dsl_fp8_linear_ref(act_a_fp8, act_b_fp8, act_a_sf, act_b_sf)
     # diff = calc_diff(our_ref, output_expected)

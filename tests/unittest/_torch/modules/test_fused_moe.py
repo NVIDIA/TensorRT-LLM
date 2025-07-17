@@ -474,7 +474,8 @@ def test_fused_moe_fp8_blockwise(dtype,
         fused_moe.forward(x, router_logits)
 
     with torch.inference_mode():
-        output = fused_moe.forward(x, router_logits)
+        for i in range(10):
+            output = fused_moe.forward(x, router_logits)
         # output_origin = fused_moe_origin.forward(x, router_logits)
         ref_output = ref_fused_moe.forward(x, router_logits)
 
