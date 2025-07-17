@@ -49,7 +49,7 @@ def generate()
         sh "git config --global --add safe.directory ${env.WORKSPACE}"
         sh "git config --global user.email \"tensorrt_llm@nvidia.com\""
         sh "git config --global user.name \"TensorRT LLM\""
-        trtllm_utils.checkoutSource(LLM_REPO, params.llmBranch, env.WORKSPACE, true, true)
+        trtllm_utils.checkoutSource(LLM_REPO, params.llmBranch, env.WORKSPACE, false, false)
         sh "python3 --version"
         sh "curl -sSL https://install.python-poetry.org | POETRY_VERSION=1.8.5 python3 -"
         sh "cd ${env.WORKSPACE}"
