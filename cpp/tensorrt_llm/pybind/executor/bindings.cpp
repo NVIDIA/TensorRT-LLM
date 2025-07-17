@@ -244,7 +244,17 @@ void initBindings(pybind11::module_& m)
 
     py::class_<tle::KVCacheEventManager, std::shared_ptr<tle::KVCacheEventManager>>(
         executor_kv_cache, "KVCacheEventManager")
-        .def("get_latest_events", &tle::KVCacheEventManager::getLatestEvents, py::arg("timeout") = std::nullopt);
+        .def(
+            "get_latest_events",
+            [](tle::KVCacheEventManager& self, std::optional<double> timeout_ms = std::nullopt)
+            {
+                if (timeout_ms)
+                {
+                    return self.getLatestEvents(std::chrono::milliseconds(static_cast<int64_t>(*timeout_ms)));
+                }
+                return self.getLatestEvents(std::nullopt);
+            },
+            py::arg("timeout_ms") = std::nullopt);
 
     tensorrt_llm::pybind::executor::initRequestBindings(m);
     tensorrt_llm::pybind::executor::initConfigBindings(m);

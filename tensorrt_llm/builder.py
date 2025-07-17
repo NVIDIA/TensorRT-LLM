@@ -13,12 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+import dataclasses
 import json
 import math
 import os
 import shutil
 import time
 from dataclasses import dataclass, field
+from functools import cache
 from pathlib import Path
 from typing import Dict, Optional, Union
 
@@ -558,52 +560,88 @@ class BuildConfig:
             override_attri('paged_state', False)
 
     @classmethod
+    @cache
+    def get_build_config_defaults(cls):
+        return {
+            field.name: field.default
+            for field in dataclasses.fields(cls)
+            if field.default is not dataclasses.MISSING
+        }
+
+    @classmethod
     def from_dict(cls, config, plugin_config=None):
         config = copy.deepcopy(
             config
         )  # it just does not make sense to change the input arg `config`
-        max_input_len = config.pop('max_input_len')
-        max_seq_len = config.pop('max_seq_len')
-        max_batch_size = config.pop('max_batch_size')
-        max_beam_width = config.pop('max_beam_width')
-        max_num_tokens = config.pop('max_num_tokens')
-        opt_num_tokens = config.pop('opt_num_tokens')
-        opt_batch_size = config.pop('opt_batch_size', 8)
-        max_prompt_embedding_table_size = config.pop(
-            'max_prompt_embedding_table_size', 0)
 
-        kv_cache_type = KVCacheType(
-            config.pop('kv_cache_type')) if 'plugin_config' in config else None
-        gather_context_logits = config.pop('gather_context_logits', False)
-        gather_generation_logits = config.pop('gather_generation_logits', False)
-        strongly_typed = config.pop('strongly_typed', True)
-        force_num_profiles = config.pop('force_num_profiles', None)
-        weight_sparsity = config.pop('weight_sparsity', False)
+        defaults = cls.get_build_config_defaults()
+        max_input_len = config.pop('max_input_len',
+                                   defaults.get('max_input_len'))
+        max_seq_len = config.pop('max_seq_len', defaults.get('max_seq_len'))
+        max_batch_size = config.pop('max_batch_size',
+                                    defaults.get('max_batch_size'))
+        max_beam_width = config.pop('max_beam_width',
+                                    defaults.get('max_beam_width'))
+        max_num_tokens = config.pop('max_num_tokens',
+                                    defaults.get('max_num_tokens'))
+        opt_num_tokens = config.pop('opt_num_tokens',
+                                    defaults.get('opt_num_tokens'))
+        opt_batch_size = config.pop('opt_batch_size',
+                                    defaults.get('opt_batch_size'))
+        max_prompt_embedding_table_size = config.pop(
+            'max_prompt_embedding_table_size',
+            defaults.get('max_prompt_embedding_table_size'))
+
+        if "kv_cache_type" in config and config["kv_cache_type"] is not None:
+            kv_cache_type = KVCacheType.from_string(config.pop('kv_cache_type'))
+        else:
+            kv_cache_type = None
+        gather_context_logits = config.pop(
+            'gather_context_logits', defaults.get('gather_context_logits'))
+        gather_generation_logits = config.pop(
+            'gather_generation_logits',
+            defaults.get('gather_generation_logits'))
+        strongly_typed = config.pop('strongly_typed',
+                                    defaults.get('strongly_typed'))
+        force_num_profiles = config.pop('force_num_profiles',
+                                        defaults.get('force_num_profiles'))
+        weight_sparsity = config.pop('weight_sparsity',
+                                     defaults.get('weight_sparsity'))
         profiling_verbosity = config.pop('profiling_verbosity',
-                                         'layer_names_only')
-        enable_debug_output = config.pop('enable_debug_output', False)
-        max_draft_len = config.pop('max_draft_len', 0)
-        speculative_decoding_mode = config.pop('speculative_decoding_mode',
-                                               SpeculativeDecodingMode.NONE)
-        use_refit = config.pop('use_refit', False)
-        input_timing_cache = config.pop('input_timing_cache', None)
-        output_timing_cache = config.pop('output_timing_cache', None)
+                                         defaults.get('profiling_verbosity'))
+        enable_debug_output = config.pop('enable_debug_output',
+                                         defaults.get('enable_debug_output'))
+        max_draft_len = config.pop('max_draft_len',
+                                   defaults.get('max_draft_len'))
+        speculative_decoding_mode = config.pop(
+            'speculative_decoding_mode',
+            defaults.get('speculative_decoding_mode'))
+        use_refit = config.pop('use_refit', defaults.get('use_refit'))
+        input_timing_cache = config.pop('input_timing_cache',
+                                        defaults.get('input_timing_cache'))
+        output_timing_cache = config.pop('output_timing_cache',
+                                         defaults.get('output_timing_cache'))
         lora_config = LoraConfig.from_dict(config.get('lora_config', {}))
         auto_parallel_config = AutoParallelConfig.from_dict(
             config.get('auto_parallel_config', {}))
-        max_encoder_input_len = config.pop('max_encoder_input_len', 1024)
-        weight_streaming = config.pop('weight_streaming', False)
-        use_strip_plan = config.pop('use_strip_plan', False)
+        max_encoder_input_len = config.pop(
+            'max_encoder_input_len', defaults.get('max_encoder_input_len'))
+        weight_streaming = config.pop('weight_streaming',
+                                      defaults.get('weight_streaming'))
+        use_strip_plan = config.pop('use_strip_plan',
+                                    defaults.get('use_strip_plan'))
 
         if plugin_config is None:
             plugin_config = PluginConfig()
         if "plugin_config" in config.keys():
             plugin_config.update_from_dict(config["plugin_config"])
 
-        dry_run = config.pop('dry_run', False)
-        visualize_network = config.pop('visualize_network', None)
-        monitor_memory = config.pop('monitor_memory', False)
-        use_mrope = config.pop('use_mrope', False)
+        dry_run = config.pop('dry_run', defaults.get('dry_run'))
+        visualize_network = config.pop('visualize_network',
+                                       defaults.get('visualize_network'))
+        monitor_memory = config.pop('monitor_memory',
+                                    defaults.get('monitor_memory'))
+        use_mrope = config.pop('use_mrope', defaults.get('use_mrope'))
 
         return cls(
             max_input_len=max_input_len,

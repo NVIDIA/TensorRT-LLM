@@ -1,9 +1,11 @@
 from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler
 from tensorrt_llm._torch.speculative.interface import SpecMetadata
 
+from ..pyexecutor.seq_slot_manager import SeqSlotManager
 from .eagle3 import (Eagle3OneModelSampler, Eagle3OneModelSpecMetadata,
                      Eagle3OneModelWorker, Eagle3ResourceManager,
                      Eagle3SpecMetadata)
+from .model_drafter import ModelDrafter
 from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
 from .ngram import NGramDrafter, NGramPoolManager
@@ -55,9 +57,7 @@ def get_spec_metadata(spec_config,
     return None
 
 
-def get_spec_resource_manager(model_engine,
-                              draft_model_engine=None,
-                              drafter=None):
+def get_spec_resource_manager(model_engine, draft_model_engine=None):
     spec_config = model_engine.spec_config
     if spec_config is None:
         return None
@@ -93,9 +93,10 @@ def get_spec_resource_manager(model_engine,
             max_seq_len,
             max_num_tokens,
         )
-    if spec_dec_mode.is_ngram() or spec_dec_mode.is_user_provided():
-        assert drafter is not None, "Drafter is required for ngram or user provided speculative decoding."
-        return drafter.spec_resource_manager
+    if spec_dec_mode.is_ngram():
+        return NGramPoolManager(spec_config, max_num_requests)
+    if spec_dec_mode.is_user_provided():
+        return spec_config.resource_manager
     return None
 
 
@@ -113,16 +114,26 @@ def get_spec_decoder(sampler_args: TorchSampler.Args,
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 
 
-def get_spec_drafter(model_engine):
+def get_spec_drafter(model_engine, draft_model_engine, sampler,
+                     spec_resource_manager):
     spec_config = model_engine.spec_config
-    max_num_requests = model_engine.batch_size
     if spec_config is None:
         return None
-    if spec_config.spec_dec_mode.is_ngram():
-        return NGramDrafter(spec_config,
-                            NGramPoolManager(spec_config, max_num_requests))
+
     if spec_config.spec_dec_mode.is_user_provided():
         return spec_config.drafter
+
+    max_num_requests = model_engine.batch_size
+    if spec_config.spec_dec_mode.is_draft_target(
+    ) or spec_config.spec_dec_mode.is_eagle3():
+        return ModelDrafter(spec_config, draft_model_engine,
+                            spec_config.max_draft_len,
+                            SeqSlotManager(max_num_requests), sampler,
+                            spec_resource_manager)
+
+    if spec_config.spec_dec_mode.is_ngram():
+        return NGramDrafter(spec_config, spec_resource_manager)
+
     return None
 
 

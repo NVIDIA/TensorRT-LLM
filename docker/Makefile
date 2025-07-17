@@ -152,11 +152,11 @@ endif
     		$(if $(and $(filter 1,$(LOCAL_USER)),$(shell [ -w "$(USER_CACHE_DIR)" ] && echo 1)),--volume $(USER_CACHE_DIR):/home/$(USER_NAME)/.cache:rw) \
     		--env "CCACHE_DIR=$(CCACHE_DIR)" \
     		--env "CCACHE_BASEDIR=$(CODE_DIR)" \
-			--env "CONAN_HOME=$(CONAN_DIR)" \
+    		--env "CONAN_HOME=$(CONAN_DIR)" \
     		--workdir $(WORK_DIR) \
     		--hostname $(shell hostname)-$* \
     		--name $(CONTAINER_NAME)-$*-$(USER_NAME) \
-			--tmpfs /tmp:exec \
+    		--tmpfs /tmp:exec \
     		$(IMAGE_WITH_TAG)$(IMAGE_TAG_SUFFIX) $(RUN_CMD)
 
 devel_%: STAGE = devel
@@ -180,7 +180,8 @@ jenkins-aarch64_%: IMAGE_WITH_TAG = $(shell . ../jenkins/current_image_tags.prop
 jenkins-aarch64_%: STAGE = tritondevel
 
 # For x86_64
-jenkins-rockylinux8_%: IMAGE_WITH_TAG = $(shell . ../jenkins/current_image_tags.properties && echo $$LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE)
+jenkins-rockylinux8_%: PYTHON_VERSION_TAG_ID = $(if $(findstring 3.12,${PYTHON_VERSION}),PY312,$(if $(findstring 3.10,${PYTHON_VERSION}),PY310,$(error Unknown PYTHON_VERSION specified)))
+jenkins-rockylinux8_%: IMAGE_WITH_TAG = $(shell . ../jenkins/current_image_tags.properties && echo $$LLM_ROCKYLINUX8_${PYTHON_VERSION_TAG_ID}_DOCKER_IMAGE)
 jenkins-rockylinux8_%: STAGE = tritondevel
 jenkins-rockylinux8_%: BASE_IMAGE = nvidia/cuda
 jenkins-rockylinux8_%: BASE_TAG = 12.9.0-devel-rockylinux8

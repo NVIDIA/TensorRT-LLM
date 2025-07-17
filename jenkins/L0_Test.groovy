@@ -65,12 +65,16 @@ def LLVM_CONFIG = "LLVM"
 LINUX_AARCH64_CONFIG = "linux_aarch64"
 
 @Field
+def NANOBIND_CONFIG = "Nanobind"
+
+@Field
 def BUILD_CONFIGS = [
   // Vanilla TARNAME is used for packaging in runLLMPackage
   (VANILLA_CONFIG) : [(TARNAME) : "TensorRT-LLM.tar.gz"],
   (SINGLE_DEVICE_CONFIG) : [(TARNAME) : "single-device-TensorRT-LLM.tar.gz"],
   (LLVM_CONFIG) : [(TARNAME) : "llvm-TensorRT-LLM.tar.gz"],
   (LINUX_AARCH64_CONFIG) : [(TARNAME) : "TensorRT-LLM-GH200.tar.gz"],
+  (NANOBIND_CONFIG) : [(TARNAME) : "nanobind-TensorRT-LLM.tar.gz"],
 ]
 
 // TODO: Move common variables to an unified location
@@ -309,6 +313,7 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
             def llmSrcLocal = "${llmPath}/TensorRT-LLM/src"
             def scriptRunNode = "${jobWorkspace}/slurm_run.sh"
             def testListPathNode = "${jobWorkspace}/${testList}.txt"
+            def waivesListPathNode = "${jobWorkspace}/waives.txt"
             def isAarch64 = config.contains("aarch64")
             def pytestTestTimeout = "7200"
 
@@ -324,6 +329,10 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                 def scriptRunLocalPath = "${llmSrcLocal}/jenkins/scripts/slurm_run.sh"
                 Utils.exec(pipeline, script: "chmod +x ${scriptRunLocalPath}", returnStdout: true)
                 Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${scriptRunLocalPath} ${remote.user}@${remote.host}:${scriptRunNode}",)
+
+                // Upload waives.txt to Frontend node
+                def waivesListLocalPath = "${llmSrcLocal}/tests/integration/test_lists/waives.txt"
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${waivesListLocalPath} ${remote.user}@${remote.host}:${waivesListPathNode}",)
 
                 // Generate Test List and Upload to Frontend Node
                 def makoArgs = getMakoArgsFromStageName(stageName, true)
@@ -362,6 +371,7 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                     export stageName=$stageName
                     export testList=$testList
                     export testListPathNode=$testListPathNode
+                    export waivesListPathNode=$waivesListPathNode
                     export pytestTestTimeout=$pytestTestTimeout
                     export splits=$splits
                     export splitId=$splitId
@@ -1718,6 +1728,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "A10-TensorRT-4": ["a10", "l0_a10", 4, 6],
         "A10-TensorRT-5": ["a10", "l0_a10", 5, 6],
         "A10-TensorRT-6": ["a10", "l0_a10", 6, 6],
+        "A10-Nanobind": ["a10", "l0_a10_nanobind", 1, 1],
         "A30-Triton-1": ["a30", "l0_a30", 1, 1],
         "A30-PyTorch-1": ["a30", "l0_a30", 1, 2],
         "A30-PyTorch-2": ["a30", "l0_a30", 2, 2],
@@ -1793,6 +1804,9 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         }
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
+        }
+        if (key.contains("Nanobind")) {
+            config = NANOBIND_CONFIG
         }
         runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("Perf"), key, values[2], values[3])
     }]]}
@@ -2274,7 +2288,7 @@ pipeline {
             when {
                 expression {
                     // Only run the test list validation when necessary
-                    env.targetArch == X86_64_TRIPLE && testFilter[ONLY_DOCS_FILE_CHANGED] == false
+                    env.targetArch == X86_64_TRIPLE && testFilter[ONLY_DOCS_FILE_CHANGED] == false && !(env.JOB_NAME ==~ /.*Multi-GPU.*/)
                 }
             }
             steps
@@ -2299,17 +2313,47 @@ pipeline {
                         dgxJobs = parallelJobs.findAll{dgxSigns.any{sign -> it.key.contains(sign)}}
                     }
 
-                    if (singleGpuJobs.size() > 0) {
-                        singleGpuJobs.failFast = params.enableFailFast
-                        parallel singleGpuJobs
-                    } else {
-                        echo "Skip single-GPU testing. No test to run."
-                    }
-
-                    if (dgxJobs.size() > 0) {
-                        stage(testPhase2StageName) {
+                    if (env.JOB_NAME ==~ /.*Single-GPU.*/) {
+                        echo "Only run single-GPU tests."
+                        if (dgxJobs.size() > 0) {
+                            if (globalVars[ACTION_INFO]['parents'].size() > 0) {
+                                // We add a special marker to the parent job's description.
+                                // This will be used to decide whether to run multi-GPU test stage.
+                                def parentJob = globalVars[ACTION_INFO]['parents'][-2]
+                                trtllm_utils.appendBuildDescription(this, parentJob['name'], parentJob['build_number'], "====Require Multi-GPU Testing====<br/>")
+                            } else {
+                                echo "No parent job found to add the special marker for executing multi-GPU test stage."
+                            }
+                        } else {
+                            echo "Skip multi-GPU testing. No test to run."
+                        }
+                        if (singleGpuJobs.size() > 0) {
+                            singleGpuJobs.failFast = params.enableFailFast
+                            parallel singleGpuJobs
+                        } else {
+                            echo "Skip single-GPU testing. No test to run."
+                        }
+                    } else if (env.JOB_NAME ==~ /.*Multi-GPU.*/) {
+                        echo "Only run multi-GPU tests."
+                        if (dgxJobs.size() > 0) {
                             dgxJobs.failFast = params.enableFailFast
                             parallel dgxJobs
+                        } else {
+                            error "Skip multi-GPU testing. No test to run."
+                        }
+                    } else {
+                        if (singleGpuJobs.size() > 0) {
+                            singleGpuJobs.failFast = params.enableFailFast
+                            parallel singleGpuJobs
+                        } else {
+                            echo "Skip single-GPU testing. No test to run."
+                        }
+
+                        if (dgxJobs.size() > 0) {
+                            stage(testPhase2StageName) {
+                                dgxJobs.failFast = params.enableFailFast
+                                parallel dgxJobs
+                            }
                         }
                     }
                 }
