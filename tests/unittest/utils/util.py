@@ -474,17 +474,21 @@ def run_function_in_sub_process(target: Callable,
 
     child_stdout = ""
     child_stderr = ""
-    total_waiting_seconds = 0
-    while child_process.is_alive() and total_waiting_seconds < timeout_seconds:
-        child_stdout += _read_from_pipe(parent_stdout_pipe)
-        child_stderr += _read_from_pipe(parent_stderr_pipe)
-        if stop_waiting_criteria(child_stdout, child_stderr):
-            break
-        time.sleep(poll_interval_seconds)
-        total_waiting_seconds += poll_interval_seconds
-
-    if child_process.is_alive():
-        child_process.terminate()
+    try:
+        total_waiting_seconds = 0
+        while child_process.is_alive(
+        ) and total_waiting_seconds < timeout_seconds:
+            child_stdout += _read_from_pipe(parent_stdout_pipe)
+            child_stderr += _read_from_pipe(parent_stderr_pipe)
+            if stop_waiting_criteria(child_stdout, child_stderr):
+                break
+            time.sleep(poll_interval_seconds)
+            total_waiting_seconds += poll_interval_seconds
+    finally:
+        parent_stdout_pipe.close()
+        parent_stderr_pipe.close()
+        if child_process.is_alive():
+            child_process.terminate()
 
     assert total_waiting_seconds < timeout_seconds, "Reached timeout while waiting for target"
     return child_stdout, child_stderr
