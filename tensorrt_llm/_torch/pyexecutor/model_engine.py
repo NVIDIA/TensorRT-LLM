@@ -1340,6 +1340,10 @@ class PyTorchModelEngine(ModelEngine):
             self.draft_tokens_cuda[:len(draft_tokens)].copy_(draft_tokens,
                                                              non_blocking=True)
         if next_draft_tokens_device is not None:
+            # Initialize these two values to zeros
+            self.previous_pos_id_offsets_cuda *= 0
+            self.previous_kv_lens_offsets_cuda *= 0
+
             if previous_batch_len > 0:
                 previous_slots = previous_seq_slots_device()
                 # previous input ids
@@ -1362,26 +1366,37 @@ class PyTorchModelEngine(ModelEngine):
                 previous_pos_indices_host = torch.tensor(previous_pos_indices,
                                                          dtype=torch.int,
                                                          pin_memory=True)
+                new_tokens_len = new_tokens.shape[0]
                 self.previous_pos_indices_cuda[0:previous_batch_tokens].copy_(
                     previous_pos_indices_host, non_blocking=True)
+
+                # The order of request in Batch: ['requests that do not have previous batch', 'requests that already have previous batch', 'dummy requests']
+                # Therefore, both of self.previous_pos_id_offsets_cuda and self.previous_kv_lens_offsets_cuda are also 3 segments.
+                # 1) 'requests that do not have previous batch': disable overlap scheduler or the first step in the generation server of disaggregated serving.
+                #    Set these requests' previous_pos_id_offsets and previous_kv_lens_offsets to '0' to skip the value changes in _preprocess_inputs.
+                #    self.previous_pos_id_offsets_cuda[0 : new_tokens_len] *= 0
+                #    self.previous_kv_lens_offsets_cuda[0 : num_requests - previous_batch_len - len(extend_dummy_requests)] *= 0
+                #    Already set to '0' during initialization.
+                # 2) 'requests that already have previous batch': enable overlap scheduler.
+                #    Set their previous_pos_id_offsets and previous_kv_lens_offsets according to new_tokens_lens_device and kv_len_offsets_device.
+                #    self.previous_pos_id_offsets_cuda[new_tokens_len : new_tokens_len + previous_batch_tokens]
+                #    self.previous_kv_lens_offsets_cuda[num_requests - previous_batch_len - len(extend_dummy_requests) : num_requests - len(extend_dummy_requests)]
+                # 3) 'dummy requests': pad dummy requests for CUDA graph or attention dp.
+                #    self.previous_pos_id_offsets_cuda[new_tokens_len + previous_batch_tokens : num_requests * (1 + max_draft_len)]
+                #    self.previous_kv_lens_offsets_cuda[num_requests - len(extend_dummy_requests) : num_requests]
+                #    Already set to '0' during initialization.
                 self.previous_pos_id_offsets_cuda[
-                    0:previous_batch_tokens].copy_(
+                    new_tokens_len:new_tokens_len +
+                    previous_batch_tokens].copy_(
                         new_tokens_lens_device[self.previous_pos_indices_cuda[
                             0:previous_batch_tokens]],
                         non_blocking=True)
-                self.previous_kv_lens_offsets_cuda[0:previous_batch_len].copy_(
-                    kv_len_offsets_device[previous_slots], non_blocking=True)
-                # for the requests that do not have previous batch, set the previous_pos_id_offsets and
-                # previous_kv_lens_offsets to zeros to skip the value changes in _preprocess_inputs
-                self.previous_pos_id_offsets_cuda[
-                    previous_batch_tokens:num_requests *
-                    (1 + self.max_draft_len)] *= 0
                 self.previous_kv_lens_offsets_cuda[
-                    previous_batch_len:num_requests] *= 0
-            else:
-                # change the data to zeros to skip the value changes in _preprocess_inputs
-                self.previous_pos_id_offsets_cuda *= 0
-                self.previous_kv_lens_offsets_cuda *= 0
+                    num_requests - previous_batch_len -
+                    len(extend_dummy_requests):num_requests -
+                    len(extend_dummy_requests)].copy_(
+                        kv_len_offsets_device[previous_slots],
+                        non_blocking=True)
         elif new_tokens_device is not None:
             seq_slots_device = previous_seq_slots_device()
             max_draft_len = max(draft_lens)
