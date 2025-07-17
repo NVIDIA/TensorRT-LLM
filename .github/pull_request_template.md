@@ -1,6 +1,8 @@
 
 # PR title
 
+@coderabbitai
+
 Please write the PR title by following template:
 
 [JIRA ticket link/nvbug link/github issue link][fix/feat/doc/infra/...] \<summary of this PR\>
@@ -12,6 +14,8 @@ For example, assume I have a PR hope to support a new feature about cache manage
 ## Description
 
 Please explain the issue and the solution in short.
+
+@coderabbitai summary
 
 ## Test Coverage
 
