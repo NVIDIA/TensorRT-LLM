@@ -4,7 +4,7 @@ import functools
 import gc
 import heapq
 import os
-import pickle
+import pickle  # nosec B403
 import queue
 import threading
 import time
