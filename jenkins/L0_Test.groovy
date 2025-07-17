@@ -743,17 +743,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                                 values:
                                 - "core"
                 nodeSelector: ${selectors}
-                initContainers:
-                - name: init-container
-                  image: urm.nvidia.com/docker/alpine:latest
-                  command: ["/bin/sh", "-c"]
-                  args:
-                  - |
-                    echo "Pre-pulling image..."
-                    docker pull ${image} || echo "Pull failed"
-                    echo "Initialization completed"
-                  securityContext:
-                    privileged: true
                 containers:
                   ${containerConfig}
                     env:
