@@ -24,6 +24,7 @@ from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla)
 from .config import PyTorchConfig
 from .config_utils import is_mla
+from .guided_decoder import GuidedDecoder
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
 
@@ -237,7 +238,6 @@ def create_py_executor(
             attn_runtime_features=attn_runtime_features,
             dist=dist,
             spec_config=spec_config,
-            guided_decoding_config=executor_config.guided_decoding_config,
             lora_config=lora_config,
             checkpoint_loader=executor_config.checkpoint_loader,
         )
@@ -344,6 +344,17 @@ def create_py_executor(
         sampler = instantiate_sampler(model_engine, executor_config,
                                       pytorch_backend_config, mapping)
 
+    guided_decoder: Optional[GuidedDecoder] = None
+    if executor_config.guided_decoding_config is not None:
+        if spec_config is not None:
+            raise ValueError(
+                "Guided decoding is not supported with speculative decoding.")
+        if mapping.is_last_pp_rank():
+            guided_decoder = GuidedDecoder(
+                executor_config.guided_decoding_config,
+                executor_config.max_batch_size,
+                model_engine.model.vocab_size_padded)
+
     resources = {}
     estimating_kv_cache = False
     kv_cache_creator = None
@@ -371,7 +382,8 @@ def create_py_executor(
 
     # Drafter for speculative decoding
     with mem_monitor.observe_creation_stage(_ExecutorCreationStage.DRAFTER):
-        drafter = get_spec_drafter(model_engine, spec_resource_manager)
+        drafter = get_spec_drafter(model_engine, draft_model_engine, sampler,
+                                   spec_resource_manager)
 
     with mem_monitor.observe_creation_stage(
             _ExecutorCreationStage.INIT_EXTRA_RESOURCES
@@ -388,6 +400,7 @@ def create_py_executor(
             start_worker=False,
             sampler=sampler,
             drafter=drafter,
+            guided_decoder=guided_decoder,
             lora_config=lora_config,
             garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
         )
@@ -430,6 +443,7 @@ def create_py_executor(
                 start_worker=False,
                 sampler=sampler,
                 drafter=drafter,
+                guided_decoder=guided_decoder,
                 lora_config=lora_config,
                 garbage_collection_gen0_threshold=
                 garbage_collection_gen0_threshold,

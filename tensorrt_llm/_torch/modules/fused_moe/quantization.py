@@ -1096,10 +1096,13 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
 
         orig_shape = dst_w3_w1_weight_scale.shape
 
-        dst_w3_w1_weight_scale.copy_(
-            torch.ops.trtllm.nvfp4_block_scale_interleave(
-                dst_w3_w1_weight_scale.view(float4_sf_dtype)).view(
-                    self.block_scales_dtype).reshape(orig_shape))
+        dst_w3_w1_weight_scale_interleaved = torch.ops.trtllm.nvfp4_block_scale_interleave(
+            dst_w3_w1_weight_scale.view(float4_sf_dtype)).view(
+                self.block_scales_dtype).reshape(orig_shape)
+
+        torch.cuda.synchronize()
+
+        dst_w3_w1_weight_scale.copy_(dst_w3_w1_weight_scale_interleaved)
 
     def load_expert_w2_weight_scale_nvfp4(self, module: torch.nn.Module,
                                           w2_weight_scale: torch.Tensor,
@@ -1113,10 +1116,13 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
 
         orig_shape = dst_w2_weight_scale.shape
 
-        dst_w2_weight_scale.copy_(
-            torch.ops.trtllm.nvfp4_block_scale_interleave(
-                dst_w2_weight_scale.view(float4_sf_dtype)).view(
-                    self.block_scales_dtype).reshape(orig_shape))
+        dst_w2_weight_scale_interleaved = torch.ops.trtllm.nvfp4_block_scale_interleave(
+            dst_w2_weight_scale.view(float4_sf_dtype)).view(
+                self.block_scales_dtype).reshape(orig_shape)
+
+        torch.cuda.synchronize()
+
+        dst_w2_weight_scale.copy_(dst_w2_weight_scale_interleaved)
 
 
 class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):

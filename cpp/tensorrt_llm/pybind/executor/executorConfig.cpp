@@ -336,7 +336,7 @@ void initConfigBindings(pybind11::module_& m)
             throw std::runtime_error("Invalid extendedRuntimePerfKnobConfig state!");
         }
         return tle::ExtendedRuntimePerfKnobConfig(
-            state[0].cast<bool>(), state[1].cast<bool>(), state[2].cast<bool>(), state[2].cast<SizeType32>());
+            state[0].cast<bool>(), state[1].cast<bool>(), state[2].cast<bool>(), state[3].cast<SizeType32>());
     };
     auto extendedRuntimePerfKnobConfigGetstate = [](tle::ExtendedRuntimePerfKnobConfig const& self)
     {
@@ -407,21 +407,46 @@ void initConfigBindings(pybind11::module_& m)
             "stop_token_ids", &tle::GuidedDecodingConfig::getStopTokenIds, &tle::GuidedDecodingConfig::setStopTokenIds)
         .def(py::pickle(guidedDecodingConfigGetstate, guidedDecodingConfigSetstate));
 
-    auto cacheTransceiverConfigGetstate
-        = [](tle::CacheTransceiverConfig const& self) { return py::make_tuple(self.getMaxNumTokens()); };
+    auto cacheTransceiverConfigGetstate = [](tle::CacheTransceiverConfig const& self)
+    { return py::make_tuple(self.getBackendType(), self.getMaxTokensInBuffer()); };
     auto cacheTransceiverConfigSetstate = [](py::tuple const& state)
     {
-        if (state.size() != 1)
+        if (state.size() != 2)
         {
             throw std::runtime_error("Invalid CacheTransceiverConfig state!");
         }
-        return tle::CacheTransceiverConfig(state[0].cast<std::optional<size_t>>());
+        return tle::CacheTransceiverConfig(
+            state[0].cast<tle::CacheTransceiverConfig::BackendType>(), state[1].cast<std::optional<size_t>>());
     };
 
+    py::enum_<tle::CacheTransceiverConfig::BackendType>(m, "CacheTransceiverBackendType")
+        .value("DEFAULT", tle::CacheTransceiverConfig::BackendType::DEFAULT)
+        .value("MPI", tle::CacheTransceiverConfig::BackendType::MPI)
+        .value("UCX", tle::CacheTransceiverConfig::BackendType::UCX)
+        .value("NIXL", tle::CacheTransceiverConfig::BackendType::NIXL)
+        .def(py::init(
+            [](std::string const& str)
+            {
+                if (str == "DEFAULT" || str == "default")
+                    return tle::CacheTransceiverConfig::BackendType::DEFAULT;
+                if (str == "MPI" || str == "mpi")
+                    return tle::CacheTransceiverConfig::BackendType::MPI;
+                if (str == "UCX" || str == "ucx")
+                    return tle::CacheTransceiverConfig::BackendType::UCX;
+                if (str == "NIXL" || str == "nixl")
+                    return tle::CacheTransceiverConfig::BackendType::NIXL;
+                throw std::runtime_error("Invalid backend type: " + str);
+            }));
+
+    py::implicitly_convertible<std::string, tle::CacheTransceiverConfig::BackendType>();
+
     py::class_<tle::CacheTransceiverConfig>(m, "CacheTransceiverConfig")
-        .def(py::init<std::optional<size_t>>(), py::arg("max_num_tokens") = py::none())
-        .def_property("max_num_tokens", &tle::CacheTransceiverConfig::getMaxNumTokens,
-            &tle::CacheTransceiverConfig::setMaxNumTokens)
+        .def(py::init<std::optional<tle::CacheTransceiverConfig::BackendType>, std::optional<size_t>>(),
+            py::arg("backend") = std::nullopt, py::arg("max_tokens_in_buffer") = std::nullopt)
+        .def_property(
+            "backend", &tle::CacheTransceiverConfig::getBackendType, &tle::CacheTransceiverConfig::setBackendType)
+        .def_property("max_tokens_in_buffer", &tle::CacheTransceiverConfig::getMaxTokensInBuffer,
+            &tle::CacheTransceiverConfig::setMaxTokensInBuffer)
         .def(py::pickle(cacheTransceiverConfigGetstate, cacheTransceiverConfigSetstate));
 
     auto executorConfigGetState = [](py::object const& self)
