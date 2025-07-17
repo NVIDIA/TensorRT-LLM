@@ -541,22 +541,16 @@ pipeline {
                         while ((System.currentTimeMillis() - startTime) < maxWaitMs) {
                             def missingFiles = []
 
-                            try {
-                                trtllm_utils.llmExecStepWithRetry(this, script: "wget ${artifactBaseUrl} -O index.html", allowStepFailed: true)
-                                def indexContent = sh(script: "cat index.html 2>/dev/null || echo ''", returnStdout: true).trim()
+                            for (file in requiredFiles) {
+                                def fileUrl = "${artifactBaseUrl}${file}"
+                                def exitCode = sh(
+                                    script: "wget --spider --quiet --timeout=30 --tries=1 '${fileUrl}'",
+                                    returnStatus: true
+                                )
 
-                                for (file in requiredFiles) {
-                                    if (!indexContent.contains(file)) {
-                                        missingFiles.add(file)
-                                    }
+                                if (exitCode != 0) {
+                                    missingFiles.add(file)
                                 }
-
-                                sh(script: "rm -f index.html", returnStdout: false)
-
-                            } catch (Exception e) {
-                                echo "Error checking artifacts: ${e.message}"
-                                missingFiles = requiredFiles.clone()
-                                sh(script: "rm -f index.html", returnStdout: false)
                             }
 
                             if (missingFiles.isEmpty()) {
