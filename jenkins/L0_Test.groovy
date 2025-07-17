@@ -328,7 +328,7 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
 
                 // Upload waives.txt to Frontend node
                 def waivesListLocalPath = "${llmSrcLocal}/tests/integration/test_lists/waives.txt"
-                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${waivesListLocalPath} ${remote.user}@${remote.host}:${scriptRunNode}",)
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${waivesListLocalPath} ${remote.user}@${remote.host}:${waivesListPathNode}",)
 
                 // Generate Test List and Upload to Frontend Node
                 def makoArgs = getMakoArgsFromStageName(stageName, true)
