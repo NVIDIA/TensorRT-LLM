@@ -1352,7 +1352,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                               attention_dp, cuda_graph, overlap_scheduler,
                               max_batch_size, moe_backend):
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.85)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.80)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
@@ -1374,7 +1374,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                  enable_attention_dp=attention_dp,
                  speculative_config=mtp_config) as llm:
 
-            assert llm.args.moe_backend == moe_backend
+            assert llm.args.moe_config.backend == moe_backend
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
 
             task = MMLU(self.MODEL_NAME)
