@@ -140,10 +140,7 @@ class VariableLengthLowLatencyBuffer:
                              num_experts: int):
         if self.num_max_dispatch_tokens_per_rank is None:
             self.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
-        if num_max_dispatch_tokens_per_rank != self.num_max_dispatch_tokens_per_rank:
-            raise NotImplementedError(
-                "There are issues if `low_latency_dispatch` calls use different `num_max_dispatch_tokens_per_rank` values"
-            )
+        assert num_max_dispatch_tokens_per_rank <= self.num_max_dispatch_tokens_per_rank
 
         # Do MoE dispatch, compatible with CUDA graph (but you may restore some buffer status once you replay)
         recv_hidden_states, recv_expert_count, handle, event, hook = \
