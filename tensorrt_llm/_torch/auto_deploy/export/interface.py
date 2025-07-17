@@ -242,7 +242,7 @@ def apply_export_patches(patch_configs: Dict[str, Union[ExportPatchConfig, Dict[
             yield from _apply_patches(remaining_patches[1:])
 
     # log applied patches
-    ad_logger.info(
+    ad_logger.debug(
         f"applying export patches: {', '.join([patch.get_patch_key() for patch in patches])}"
     )
 

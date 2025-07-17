@@ -7,6 +7,7 @@ from .flashinfer_rope import *
 from .linear import *
 from .mla import *
 from .quant import *
+from .rms_norm import *
 from .torch_attention import *
 from .torch_backend_attention import *
 from .torch_moe import *

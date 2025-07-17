@@ -22,6 +22,7 @@ from .library import (
     ep_shard,
     fuse_allreduce_residual_rmsnorm,
     fuse_collectives,
+    fuse_rmsnorm,
     insert_cached_attention,
     match_attention_layout,
     match_causal_attn_mask,
@@ -162,6 +163,10 @@ class InferenceOptimizer:
 
         # check if we can fuse collectives
         fuse_collectives(egm)
+
+        # TODO (lucaslie): add backend selection as part of configurable inference optimizers
+        # check if we can fuse rmsnorm
+        fuse_rmsnorm(egm, "flashinfer")
 
         # visualize the final graph
         if self.ad_config.visualize:
