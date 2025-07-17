@@ -10,7 +10,6 @@ load_dotenv()  # load environment variables from .env
 
 
 class MCPClient:
-
     def __init__(self):
         # Initialize session and client objects
         self.session: Optional[ClientSession] = None
@@ -25,13 +24,12 @@ class MCPClient:
         return result
 
     async def connect_to_sse_server(self, server_url: str):
-        """Connect to an MCP server running with SSE transport"""
+        """Connect to an MCP server running with SSE transport."""
         streams_context = sse_client(url=server_url)
         streams = await self.exit_stack.enter_async_context(streams_context)
 
         session_context = ClientSession(*streams)
-        self.session = await self.exit_stack.enter_async_context(session_context
-                                                                 )
+        self.session = await self.exit_stack.enter_async_context(session_context)
 
         # Initialize session
         await self.session.initialize()
@@ -43,9 +41,7 @@ class MCPClient:
 
 async def main():
     if len(sys.argv) < 2:
-        print(
-            "Usage: uv run client.py <URL of SSE MCP server (i.e. http://localhost:8080/sse)>"
-        )
+        print("Usage: uv run client.py <URL of SSE MCP server (i.e. http://localhost:8080/sse)>")
         sys.exit(1)
 
     client = MCPClient()
@@ -57,4 +53,5 @@ async def main():
 
 if __name__ == "__main__":
     import sys
+
     asyncio.run(main())

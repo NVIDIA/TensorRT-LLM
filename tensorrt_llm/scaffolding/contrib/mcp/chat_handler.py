@@ -19,10 +19,8 @@ def add_param_if_not_none(params, key, candidate_values):
 def combine_params_with_chat_task(worker, params: dict, task: ChatTask):
     params["messages"] = task.messages
 
-    add_param_if_not_none(params, "max_tokens",
-                          [task.max_tokens, worker.max_tokens])
-    add_param_if_not_none(params, "temperature",
-                          [task.temperature, worker.temperature])
+    add_param_if_not_none(params, "max_tokens", [task.max_tokens, worker.max_tokens])
+    add_param_if_not_none(params, "temperature", [task.temperature, worker.temperature])
     add_param_if_not_none(params, "top_p", [task.top_p, worker.top_p])
 
     add_param_if_not_none(params, "tools", [task.tools])
@@ -50,5 +48,5 @@ async def chat_handler(worker, task: ChatTask) -> TaskStatus:
 
     except Exception as e:
         # Handle errors
-        print('Openai chat client get exception: ' + str(e))
+        print("Openai chat client get exception: " + str(e))
         return TaskStatus.WORKER_EXECEPTION

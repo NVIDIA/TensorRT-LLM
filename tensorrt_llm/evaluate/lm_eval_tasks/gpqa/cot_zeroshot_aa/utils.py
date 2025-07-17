@@ -10,7 +10,6 @@ def preprocess(text):
 
 
 def process_docs(dataset: datasets.Dataset) -> datasets.Dataset:
-
     def _process_doc(doc):
         choices = [
             preprocess(doc["Incorrect Answer 1"]),

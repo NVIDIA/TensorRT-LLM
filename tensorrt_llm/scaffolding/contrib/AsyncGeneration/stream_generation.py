@@ -16,16 +16,14 @@ class StreamGenerationTask(GenerationTask):
     # new tokens that have already been generated.
     streaming_step: Optional[int] = field(default=1)
 
-    #result field
+    # result field
     # worker set this field and identify the same task by this field
     request_handle: Any = field(default=None)
     # worker set this field to True when the generation is finished
     end_flag: bool = field(default=False)
 
 
-async def stream_generation_handler(worker,
-                                    task: StreamGenerationTask) -> TaskStatus:
-
+async def stream_generation_handler(worker, task: StreamGenerationTask) -> TaskStatus:
     async def get_step_or_more_tokens(task: StreamGenerationTask):
         if task.cancel_flag:
             task.end_flag = True
@@ -37,16 +35,14 @@ async def stream_generation_handler(worker,
             if task.request_handle._done:
                 break
         while not task.request_handle._done:
-            async_task = asyncio.create_task(
-                task.request_handle._aresult_step())
+            async_task = asyncio.create_task(task.request_handle._aresult_step())
             if not async_task.done():
                 async_task.cancel()
                 break
 
         task.output_str = task.request_handle.outputs[0].text
         task.output_tokens = task.request_handle.outputs[0].token_ids
-        task.cumulative_logprob = task.request_handle.outputs[
-            0].cumulative_logprob
+        task.cumulative_logprob = task.request_handle.outputs[0].cumulative_logprob
         task.logprobs = task.request_handle.outputs[0].logprobs
         if task.request_handle._done:
             task.end_flag = True
@@ -54,7 +50,8 @@ async def stream_generation_handler(worker,
     sampling_params = worker.convert_task_params(task)
     if task.request_handle is None:
         task.request_handle = worker.llm.generate_async(
-            task.input_str, sampling_params=sampling_params, streaming=True)
+            task.input_str, sampling_params=sampling_params, streaming=True
+        )
     await get_step_or_more_tokens(task)
 
     # TODO: error handle

@@ -9,7 +9,6 @@ from .mcp_utils import MCPClient
 
 
 class MCPWorker(Worker):
-
     def __init__(
         self,
         mcp_clients: List,
