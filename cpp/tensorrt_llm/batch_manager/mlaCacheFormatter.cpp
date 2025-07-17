@@ -108,6 +108,13 @@ void MLACacheFormatter::format(TransferSession& session)
     auto const numPools = mCacheManager->getBlockManager().getNumPools();
     auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest);
 
+    auto constexpr invalidTime = std::chrono::steady_clock::time_point::min();
+    auto lastTokenTime = llmRequest.getPerfMetrics().timingMetrics.lastTokenTime;
+    if (!llmRequest.getReturnPerfMetrics())
+    {
+        lastTokenTime = invalidTime;
+    }
+
     int blockNum = 0;
     std::vector<runtime::ITensor::SharedPtr> inputKvCacheBlocks;
     for (auto poolIdx = 0; poolIdx < numPools; poolIdx++)
@@ -226,9 +233,14 @@ void MLACacheFormatter::format(TransferSession& session)
             }
         }
         auto endTime = std::chrono::steady_clock::now();
+        double delay = 0.0;
+        if (lastTokenTime != invalidTime)
+        {
+            delay = std::chrono::duration<double, std::milli>(startTime - lastTokenTime).count();
+        }
         double cacheTransferTime
             = std::max(0.0, std::chrono::duration<double, std::milli>(endTime - startTime).count());
-        kvCacheMeasureHelper.appendKVCacheTransfer(llmRequest.mRequestId, cacheTransferTime, size);
+        kvCacheMeasureHelper.appendKVCacheTransfer(llmRequest.mRequestId, delay, cacheTransferTime, size);
     };
 
     if (connections.size() > 1)
@@ -282,14 +294,20 @@ void MLACacheFormatter::unformat(TransferSession& session)
     NVTX3_SCOPED_RANGE(MLACacheFormatter_unformat);
     auto const& llmRequest = session.getLlmRequest();
     TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently only supports beam width 1.");
+    auto const ctxReqId = llmRequest.getContextPhaseParams().value().getReqId();
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-        "Start receiving KV cache for request ID: %ld, context request ID: %ld.", llmRequest.mRequestId,
-        llmRequest.getContextPhaseParams().value().getReqId());
+        "Start receiving KV cache for request ID: %ld, context request ID: %ld.", llmRequest.mRequestId, ctxReqId);
     auto const& selfConfig = session.getSelfState().getCacheState().value();
     auto const& destConfig = session.getOtherState().getCacheState().value();
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
     auto const& connections = session.getConnections();
     auto& bufferManager = session.getBufferManager();
+    auto arrivalTime = llmRequest.getPerfMetrics().timingMetrics.arrivalTime;
+    auto constexpr invalidTime = std::chrono::steady_clock::time_point::min();
+    if (!llmRequest.getReturnPerfMetrics())
+    {
+        arrivalTime = invalidTime;
+    }
     // diff start
     auto pickUpConnections = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig);
     // diff end
@@ -375,11 +393,13 @@ void MLACacheFormatter::unformat(TransferSession& session)
         {
             NVTX3_SCOPED_RANGE(recvBufferFun);
             TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
-
+            auto startTime = std::chrono::steady_clock::now();
+            size_t size = 0;
             if (processIdx >= remainNoCoverTargetNum)
             {
                 auto& buffer = recvSplitCaches.at(processIdx);
                 llmRequest.updateKvCacheSize(buffer->getSizeInBytes());
+                size = buffer->getSizeInBytes();
                 session.recv(pickUpConnections.at(processIdx), buffer->data(), buffer->getSizeInBytes());
             }
             else if (bufferCoverTargetNum > 0)
@@ -388,6 +408,7 @@ void MLACacheFormatter::unformat(TransferSession& session)
                     + remainNoCoverTargetNum; // caches.at(recvBufferIdx) is allocated by cudaMalloc
                 auto& buffer = recvSplitCaches.at(recvBufferIdx);
                 llmRequest.updateKvCacheSize(buffer->getSizeInBytes());
+                size = buffer->getSizeInBytes();
                 session.recv(pickUpConnections.at(processIdx), buffer->data(), buffer->getSizeInBytes());
                 bufferManager.copy(*recvSplitCaches.at(recvBufferIdx), *recvSplitCaches.at(processIdx));
                 bufferManager.getStream().synchronize();
@@ -405,12 +426,22 @@ void MLACacheFormatter::unformat(TransferSession& session)
                     auto copySlice = runtime::ITensor::slice(
                         recvSplitCaches.at(processIdx), targetBufferSize - remainRecvSize, recvSize);
                     llmRequest.updateKvCacheSize(recvSlice->getSizeInBytes());
+                    size += recvSlice->getSizeInBytes();
                     session.recv(pickUpConnections.at(processIdx), recvSlice->data(), recvSlice->getSizeInBytes());
                     bufferManager.copy(*recvSlice, *copySlice);
                     bufferManager.getStream().synchronize();
                     remainRecvSize -= recvSize;
                 }
             }
+            auto endTime = std::chrono::steady_clock::now();
+            double delay = 0.0;
+            if (arrivalTime != invalidTime)
+            {
+                delay = std::chrono::duration<double, std::milli>(startTime - arrivalTime).count();
+            }
+            double cacheTransferTime
+                = std::max(0.0, std::chrono::duration<double, std::milli>(endTime - startTime).count());
+            kvCacheMeasureHelper.appendKVCacheTransfer(ctxReqId, delay, cacheTransferTime, size);
         };
 
         if (pickUpConnections.size() > 1)
