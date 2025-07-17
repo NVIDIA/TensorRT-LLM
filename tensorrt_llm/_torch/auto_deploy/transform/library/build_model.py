@@ -1,6 +1,6 @@
 """A simple wrapper transform to build a model via the model factory."""
 
-from typing import Tuple
+from typing import Tuple, Type
 
 from pydantic import Field
 from torch.fx import GraphModule
@@ -21,6 +21,10 @@ class BuildModel(BaseTransform):
     """A simple wrapper transform to build a model via the model factory."""
 
     config: BuildModelConfig
+
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return BuildModelConfig
 
     def _apply(
         self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory

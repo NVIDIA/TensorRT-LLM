@@ -1,5 +1,7 @@
 """High-level entrypoint to transform a model into an efficient inference model."""
 
+from typing import Optional
+
 import torch.nn as nn
 from torch.fx import Graph, GraphModule
 
@@ -8,9 +10,9 @@ from ..shim.interface import CachedSequenceInterface
 from .interface import (
     InferenceOptimizerConfig,
     Stages,
+    StrictInferenceOptimizerConfig,
     TransformConfig,
     TransformRegistry,
-    _StrictInferenceOptimizerConfig,
 )
 
 
@@ -19,7 +21,7 @@ class InferenceOptimizer:
         self.factory = factory
         self.config = self._clean_config(config)
 
-    def _clean_config(self, config: InferenceOptimizerConfig) -> _StrictInferenceOptimizerConfig:
+    def _clean_config(self, config: InferenceOptimizerConfig) -> StrictInferenceOptimizerConfig:
         """Get a typed checked ("strict") config with sorted keys according to stages."""
         # convert to nested kwargs, no TransformConfig objects allowed
         nested_kwargs = {
@@ -28,7 +30,7 @@ class InferenceOptimizer:
         # sort by stage
         keys_sorted = sorted(nested_kwargs.keys(), key=lambda k: Stages(nested_kwargs[k]["stage"]))
         # create strict config with correct config classes and correct order
-        strict_config: _StrictInferenceOptimizerConfig = {
+        strict_config: StrictInferenceOptimizerConfig = {
             k: TransformRegistry.get_config_class(k)(**nested_kwargs[k]) for k in keys_sorted
         }
         # return strict config
@@ -42,7 +44,9 @@ class InferenceOptimizer:
         """
         return GraphModule(nn.Module(), Graph())
 
-    def __call__(self, cm: CachedSequenceInterface) -> GraphModule:
+    def __call__(
+        self, cm: CachedSequenceInterface, gm: Optional[GraphModule] = None
+    ) -> GraphModule:
         """Transform a model into an optimized inference model.
 
         Args:
@@ -55,8 +59,9 @@ class InferenceOptimizer:
         # RUN THROUGH CONFIGURED TRANSFORMATIONS
         ############################################################################################
 
-        # start with an empty fake graph module
-        gm = self._init_gm()
+        # start with an empty fake graph module if not provided
+        if gm is None:
+            gm = self._init_gm()
 
         # iterate over all transforms sorted by stage in the config
         for t_name, t_config in self.config.items():
