@@ -606,14 +606,8 @@ def test_nemo_lora_unsupported_modules_validation():
 
 @force_ampere
 def test_gqa_nemo_lora():
-    """Test NeMo LoRA with GQA using TinyLlama's exact dimensions.
+    """Test NeMo LoRA with GQA using TinyLlama.
 
-    TinyLlama-1.1B-Chat-v1.0 specs (verified from config.json):
-    - hidden_size: 2048
-    - num_hidden_layers: 22
-    - num_attention_heads: 32 (Query heads)
-    - num_key_value_heads: 4 (Key/Value heads)
-    - This gives 32/4 = 8 query heads per KV group (GQA)
     """
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)
@@ -625,11 +619,6 @@ def test_gqa_nemo_lora():
         num_kv_heads = 4  # Key/Value heads (GQA)
         lora_rank = 8
 
-        print(
-            f"\n✓ Testing TinyLlama GQA config: Q_heads={num_q_heads}, KV_heads={num_kv_heads}, rank={lora_rank}"
-        )
-
-        # Create a mock NeMo checkpoint with TinyLlama's exact GQA configuration
         nemo_path = create_mock_nemo_lora_checkpoint(
             temp_path,
             hidden_size=hidden_size,
@@ -639,34 +628,28 @@ def test_gqa_nemo_lora():
             num_kv_heads=num_kv_heads,
         )
 
-        # Create LoRA config for NeMo checkpoint
         lora_config = LoraConfig(
             lora_dir=[str(nemo_path)],
             lora_ckpt_source="nemo",
             max_lora_rank=lora_rank,
         )
 
-        # Use TinyLlama model - dimensions now match exactly
         model_path = get_model_path("llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
 
         try:
-            # Create LLM with NeMo LoRA
             llm = LLM(
                 model=model_path,
                 lora_config=lora_config,
                 kv_cache_config=global_kvcache_config,
             )
 
-            # Test prompt
             test_prompts = ["Test TinyLlama GQA with NeMo LoRA"]
 
-            # Create LoRA request for the NeMo checkpoint
             lora_req = LoRARequest("tinyllama-gqa-test",
                                    0,
                                    str(nemo_path),
                                    lora_ckpt_source="nemo")
 
-            # Generate with LoRA
             sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
             outputs = llm.generate(test_prompts,
                                    sampling_params,
@@ -685,5 +668,3 @@ def test_gqa_nemo_lora():
         finally:
             if 'llm' in locals():
                 llm.shutdown()
-
-    print("✓ TinyLlama GQA NeMo LoRA test completed successfully")

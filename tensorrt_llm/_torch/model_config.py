@@ -299,25 +299,41 @@ class ModelConfig(Generic[TConfig]):
             self.mapping.tp_size * self.mapping.cp_size)
 
         # Handle both uniform and per-layer KV heads
-        if hasattr(self.pretrained_config, 'num_kv_heads_per_layer'):
-            # For models with per-layer KV heads, use the first layer's value
-            num_kv_heads_raw = self.pretrained_config.num_kv_heads_per_layer[0]
-            # TRT-LLM LoRA requires uniform KV heads across layers
-            if self.lora_config is not None and not all(
-                    kv == num_kv_heads_raw
-                    for kv in self.pretrained_config.num_kv_heads_per_layer):
-                raise ValueError(
-                    f"TRT-LLM LoRA requires uniform KV heads across layers, got: {self.pretrained_config.num_kv_heads_per_layer}"
-                )
+        if hasattr(
+                self.pretrained_config, 'num_kv_heads_per_layer'
+        ) and self.pretrained_config.num_kv_heads_per_layer is not None:
+            # For models with per-layer KV heads, like nemotron-nas
+            num_kv_heads_per_layer_raw = self.pretrained_config.num_kv_heads_per_layer
+            # Apply TP/CP scaling to each layer
+            num_kv_heads_per_layer = [
+                kv_heads // (self.mapping.tp_size * self.mapping.cp_size)
+                for kv_heads in num_kv_heads_per_layer_raw
+            ]
+            _use_per_layer_kv_heads = True
         else:
-            # For uniform models, check: num_key_value_heads (standard) -> num_query_groups (NeMo) -> num_attention_heads
-            num_kv_heads_raw = getattr(
-                self.pretrained_config, 'num_key_value_heads',
-                getattr(self.pretrained_config, 'num_query_groups',
-                        self.pretrained_config.num_attention_heads))
+            # Check if num_key_value_heads is a list (per-layer) or scalar (uniform)
+            num_kv_heads_raw = getattr(self.pretrained_config,
+                                       'num_key_value_heads', None)
 
-        num_kv_heads = num_kv_heads_raw // (self.mapping.tp_size *
-                                            self.mapping.cp_size)
+            if num_kv_heads_raw is not None and isinstance(
+                    num_kv_heads_raw, list):
+                # num_key_value_heads is a list - treat as per-layer KV heads
+                num_kv_heads_per_layer_raw = num_kv_heads_raw
+                # Apply TP/CP scaling to each layer
+                num_kv_heads_per_layer = [
+                    kv_heads // (self.mapping.tp_size * self.mapping.cp_size)
+                    for kv_heads in num_kv_heads_per_layer_raw
+                ]
+                _use_per_layer_kv_heads = True
+            else:
+                # num_key_value_heads is scalar or None - treat as uniform KV heads
+                if num_kv_heads_raw is None:
+                    num_kv_heads_raw = self.pretrained_config.num_attention_heads
+
+                num_kv_heads = num_kv_heads_raw // (self.mapping.tp_size *
+                                                    self.mapping.cp_size)
+                _use_per_layer_kv_heads = False
+
         hidden_size = self.pretrained_config.hidden_size // self.mapping.tp_size
 
         model_config_cpp = ModelConfigCpp(
@@ -338,7 +354,10 @@ class ModelConfig(Generic[TConfig]):
         else:
             model_config_cpp.tokens_per_block = tokens_per_block
 
-        model_config_cpp.set_num_kv_heads(num_kv_heads)
+        if _use_per_layer_kv_heads:
+            model_config_cpp.num_kv_heads_per_layer = num_kv_heads_per_layer
+        else:
+            model_config_cpp.set_num_kv_heads(num_kv_heads)
 
         mlp_hidden_size = None
         if self.pretrained_config.intermediate_size is not None:
@@ -388,8 +407,10 @@ class ModelConfig(Generic[TConfig]):
         # Nemotron-NAS has variable ffn_mult for each layer, we need to find the maximum
         # so that we don't set a too small mlp_hidden_size. This solution leads to a memory
         # consumption that is higher than required.
-        biggest_ffn_mult = max(
-            [x.ffn.ffn_mult for x in self.pretrained_config.block_configs])
+        biggest_ffn_mult = max([
+            (x.ffn.ffn_mult if x.ffn.ffn_mult is not None else 0)
+            for x in self.pretrained_config.block_configs
+        ])
 
         from tensorrt_llm._torch.models.modeling_nemotron_nas import \
             _ffn_mult_to_intermediate_size
