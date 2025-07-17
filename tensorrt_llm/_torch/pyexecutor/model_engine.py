@@ -21,7 +21,6 @@ from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
 from tensorrt_llm._torch.speculative.mtp import SampleStateTensorsMTP
 from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
                                  torch_dtype_to_str, trace_func)
-from tensorrt_llm.bindings.executor import GuidedDecodingConfig
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import LoraConfig, LoraModelConfig
@@ -53,7 +52,6 @@ from ..utils import (get_model_extra_attrs, set_torch_compiling,
 from .config import LoadFormat, PyTorchConfig
 from .config_utils import is_mla
 from .cuda_graph_runner import DecodingCUDAGraphRunner
-from .guided_decoder import GuidedDecoder
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .resource_manager import (BaseResourceManager, KVCacheManager,
                                ResourceManager, ResourceManagerType)
@@ -258,7 +256,6 @@ class PyTorchModelEngine(ModelEngine):
         attn_runtime_features: Optional[AttentionRuntimeFeatures] = None,
         dist: Optional[MPIDist] = None,
         spec_config: Optional["DecodingBaseConfig"] = None,
-        guided_decoding_config: Optional[GuidedDecodingConfig] = None,
         lora_config: Optional[LoraConfig] = None,
         is_draft_model: bool = False,
     ):
@@ -312,13 +309,6 @@ class PyTorchModelEngine(ModelEngine):
         self._torch_compile_backend = None
         self.dtype = self.model.config.torch_dtype
         self._init_model_capacity()
-
-        self.guided_decoder: Optional[GuidedDecoder] = None
-        if self.mapping.is_last_pp_rank(
-        ) and guided_decoding_config is not None:
-            self.guided_decoder = GuidedDecoder(guided_decoding_config,
-                                                self.batch_size,
-                                                self.model.vocab_size_padded)
 
         self._torch_compile_backend = None
 
@@ -2090,18 +2080,6 @@ class PyTorchModelEngine(ModelEngine):
                 else:
                     with MoeLoadBalancerIterContext(moe_load_balancer):
                         outputs = maybe_graph.run(inputs)
-
-            # Note: To overlap the CPU and GPU computation as much as possible,
-            # guided_decoder.build should be called immediately after the launch of the single step;
-            # while guided_decoder.execute should be called right before the samplings.
-            # We can insert other CPU computation between them in the future.
-            if self.mapping.is_last_pp_rank(
-            ) and self.guided_decoder is not None:
-                seq_slot_manager = resource_manager.get_resource_manager(
-                    ResourceManagerType.SEQ_SLOT_MANAGER)
-                self.guided_decoder.build(scheduled_requests, seq_slot_manager)
-                self.guided_decoder.execute(scheduled_requests,
-                                            outputs['logits'], seq_slot_manager)
 
             self._execute_logit_post_processors(scheduled_requests, outputs)
 
