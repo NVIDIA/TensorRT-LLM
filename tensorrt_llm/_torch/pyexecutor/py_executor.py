@@ -11,7 +11,8 @@ import traceback
 import weakref
 from collections import deque, namedtuple
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Union
+from itertools import repeat
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 
@@ -30,6 +31,7 @@ from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
 from tensorrt_llm.logger import logger
 
 from ..distributed import Distributed
+from ..models.modeling_utils import DecoderModelForCausalLM
 from ..speculative.drafter import Drafter
 from .guided_decoder import GuidedDecoder
 from .kv_cache_transceiver import KvCacheTransceiver
@@ -351,24 +353,36 @@ class PyExecutor:
     def __exit__(self):
         self.shutdown()
 
-    def enqueue_requests(self, requests: List[ExecutorRequest]):
+    def _enqueue_impl(
+        self, requests_and_queries: Iterable[Tuple[ExecutorRequest,
+                                                   Optional[List]]]
+    ) -> List[int]:
+        req_ids = []
+        with self.enqueue_lock:
+            assert self.active, "PyExecutor has already been shutdown."
+            start_time = time.time()
+            for request, query in requests_and_queries:
+                if self.enable_iter_perf_stats:
+                    self.start_times[self.next_req_id] = start_time
+                self.request_queue.put(
+                    RequestQueueItem(self.next_req_id, request, query))
+                req_ids.append(self.next_req_id)
+                self.next_req_id += 1
+        return req_ids
+
+    def enqueue_requests(self, requests: List[ExecutorRequest]) -> List[int]:
         """
         Enqueue new requests
         """
-        req_ids = []
-        try:
-            self.enqueue_lock.acquire()
-            assert self.active, "PyExecutor has already been shutdown."
-            start_time = time.time()
-            for request in requests:
-                self.start_times[self.next_req_id] = start_time
-                self.request_queue.put(
-                    RequestQueueItem(self.next_req_id, request))
-                req_ids.append(self.next_req_id)
-                self.next_req_id += 1
-        finally:
-            self.enqueue_lock.release()
-        return req_ids
+        return self._enqueue_impl(zip(requests, repeat(None)))
+
+    def enqueue_request(self,
+                        request: ExecutorRequest,
+                        query: Optional[List] = None):
+        """
+        Enqueue a new request, query is only used in `StarAttention`.
+        """
+        return self._enqueue_impl([(request, query)])
 
     def await_responses(
         self,
@@ -465,28 +479,6 @@ class PyExecutor:
 
     def wait_shutdown(self):
         self.shutdown_event.wait()
-
-    def enqueue_request(self,
-                        request: ExecutorRequest,
-                        query: Optional[List] = None):
-        """
-        Enqueue a new request, query is only used in `StarAttention`.
-        """
-        try:
-            self.enqueue_lock.acquire()
-            assert self.active, "PyExecutor has already been shutdown."
-            req_id = self.next_req_id
-            if self.enable_iter_perf_stats:
-                self.start_times[req_id] = time.time()
-
-            if query is not None:
-                self.request_queue.put(RequestQueueItem(req_id, request, query))
-            else:
-                self.request_queue.put(RequestQueueItem(req_id, request))
-            self.next_req_id += 1
-        finally:
-            self.enqueue_lock.release()
-        return req_id
 
     def set_gather_responses(self, gather_all_responses):
         self.gather_all_responses = gather_all_responses
@@ -756,7 +748,7 @@ class PyExecutor:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
-                new_requests = self._fetch_new_requests()
+                new_requests = self._fetch_and_activate_new_requests()
                 if self.should_stop_processing:
                     break
 
@@ -782,10 +774,6 @@ class PyExecutor:
                     can_queue = 0 not in tp_batch_sizes
                 else:
                     can_queue = scheduled_batch.batch_size > 0
-                    if not can_queue:
-                        assert len(self.inflight_req_ids) > 0, (
-                            "fail to schedule any pending request, probably run out of resource"
-                        )
 
                 if not can_queue:
                     self.micro_batches[microbatch_id] = None
@@ -913,7 +901,7 @@ class PyExecutor:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
-                new_requests = self._fetch_new_requests()
+                new_requests = self._fetch_and_activate_new_requests()
                 if self.should_stop_processing:
                     break
 
@@ -943,10 +931,6 @@ class PyExecutor:
                         )
                         self.kv_cache_transceiver.check_context_transfer_status(
                             1)
-                else:
-                    assert scheduled_batch.batch_size > 0, (
-                        "fail to schedule any pending request, "
-                        "probably run out of resource.")
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
                 logger.debug(
@@ -1060,7 +1044,7 @@ class PyExecutor:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
-                new_requests = self._fetch_new_requests()
+                new_requests = self._fetch_and_activate_new_requests()
                 if self.should_stop_processing:
                     break
 
@@ -1089,10 +1073,6 @@ class PyExecutor:
                         )
                         self.kv_cache_transceiver.check_context_transfer_status(
                             1)
-                else:
-                    assert scheduled_batch.batch_size > 0, (
-                        "fail to schedule any pending request, "
-                        "probably run out of resource.")
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
                 logger.debug(
@@ -1241,18 +1221,23 @@ class PyExecutor:
 
         return payloads
 
-    @nvtx_range("_fetch_new_requests")
-    def _fetch_new_requests(self) -> List[RequestQueueItem]:
+    def _count_active_requests_all_ranks(self) -> List[int]:
         if self.enable_attention_dp:
             all_ranks_num_active_requests = []
             responses_list = self.dist.tp_allgather(len(self.active_requests))
             for num_active_requests in responses_list:
                 all_ranks_num_active_requests.append(num_active_requests)
-            total_num_active_requests = sum(all_ranks_num_active_requests)
+        else:
+            all_ranks_num_active_requests = [len(self.active_requests)]
+        return all_ranks_num_active_requests
+
+    def _fetch_new_requests(self) -> List[LlmRequest]:
+        all_ranks_num_active_requests = self._count_active_requests_all_ranks()
+        if self.enable_attention_dp:
             total_max_num_active_requests = self.dist.tp_size * self.max_num_active_requests
         else:
-            total_num_active_requests = len(self.active_requests)
             total_max_num_active_requests = self.max_num_active_requests
+        total_num_active_requests = sum(all_ranks_num_active_requests)
 
         timeout = None if (total_num_active_requests == 0) and len(
             self.waiting_queue) == 0 else datetime.timedelta(0)
@@ -1307,7 +1292,6 @@ class PyExecutor:
         if not self.enable_attention_dp:
             self._update_new_active_requests_queue_latency(new_requests)
             new_requests = self._merge_requests(new_requests)
-            self.active_requests.extend(new_requests)
             return new_requests
 
         num_new_requests_all_ranks = len(new_requests)
@@ -1377,8 +1361,43 @@ class PyExecutor:
             new_requests_cur_rank)
 
         new_requests_cur_rank = self._merge_requests(new_requests_cur_rank)
-        self.active_requests.extend(new_requests_cur_rank)
         return new_requests_cur_rank
+
+    def _validate_request(self, request: LlmRequest):
+        if isinstance(self.model_engine.model, DecoderModelForCausalLM):
+            # Check token ID range
+            token_lists = request.get_tokens()
+            if any(
+                    min(tokens) < 0 or max(tokens) >
+                    self.model_engine.model.lm_head.num_embeddings - 1
+                    for tokens in token_lists):
+                raise ValueError("Token ID out of range")
+
+    @nvtx_range("_fetch_and_activate_new_requests")
+    def _fetch_and_activate_new_requests(self):
+
+        def _respond_if_invalid(request: LlmRequest) -> bool:
+            """Immediately fail invalid request.
+
+            Return True if invalid request was encountered and
+            handled.
+            """
+            try:
+                self._validate_request(request)
+                return False
+            except Exception as e:
+                self._handle_errors(str(e), requests=[request])
+                return True
+
+        new_requests_cur_rank = self._fetch_new_requests()
+
+        validated_requests = [
+            request for request in new_requests_cur_rank
+            if not _respond_if_invalid(request)
+        ]
+
+        self.active_requests.extend(validated_requests)
+        return validated_requests
 
     def _add_kv_cache_events(self):
         kv_cache_manager = self.resource_manager.resource_managers.get(
@@ -1456,8 +1475,8 @@ class PyExecutor:
             position_blocks.append(position_block.tolist()[0])
         return ctx_blocks, position_blocks, padding
 
-    def _merge_star_attention_requests(self,
-                                       new_requests: list[RequestQueueItem]):
+    def _merge_star_attention_requests(
+            self, new_requests: list[RequestQueueItem]) -> List[LlmRequest]:
         result = []
         for req_item in new_requests:
             req_id, exe_req, query_token_ids = req_item.id, req_item.request, req_item.query
@@ -1514,7 +1533,8 @@ class PyExecutor:
         return result
 
     @nvtx_range("_merge_requests")
-    def _merge_requests(self, new_requests: list[RequestQueueItem]):
+    def _merge_requests(
+            self, new_requests: list[RequestQueueItem]) -> List[LlmRequest]:
         cp_config = self.dist.cp_config
         if 'cp_type' in cp_config:
             cp_type = cp_config['cp_type']
@@ -1792,10 +1812,14 @@ class PyExecutor:
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
 
-    def _handle_errors(self, error_msg: Optional[str] = None):
+    def _handle_errors(self,
+                       error_msg: Optional[str] = None,
+                       *,
+                       requests: Optional[List[LlmRequest]] = None):
         error_responses = {}
         error_msg = error_msg or "error"
-        for request in self.active_requests:
+        failed_requests = requests if requests is not None else self.active_requests
+        for request in failed_requests:
             req_id = request.py_request_id
             request.state = LlmRequestState.GENERATION_COMPLETE
             self._terminate_request(request)
@@ -1803,7 +1827,13 @@ class PyExecutor:
                 request_id=req_id,
                 error_msg=error_msg,
                 client_id=request.py_client_id)
-        self.active_requests.clear()
+        if requests is None:
+            self.active_requests.clear()
+        else:
+            self.active_requests = [
+                request for request in self.active_requests
+                if request not in requests
+            ]
         self._enqueue_responses(error_responses)
 
     def _terminate_request(self, request: LlmRequest):
