@@ -26,7 +26,7 @@ LLM_SHORT_COMMIT = env.gitlabCommit ? env.gitlabCommit.substring(0, 7) : "undefi
 
 LLM_DEFAULT_TAG = env.defaultTag ?: "${LLM_SHORT_COMMIT}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}"
 
-RUN_SANITY_CHECK = env.runSanityCheck ?: false
+RUN_SANITY_CHECK = params.runSanityCheck ?: false
 
 BUILD_JOBS = "32"
 BUILD_JOBS_RELEASE_X86_64 = "32"
@@ -209,15 +209,11 @@ def buildImage(config, imageKeyToTag)
     def dependentImageWithTag = "${IMAGE_NAME}/${dependent.dockerfileStage}:${dependentTag}"
     def customImageWithTag = "${IMAGE_NAME}/${dockerfileStage}:${customTag}"
 
-    if (target == "ngc-release") {
-        if (params.triggerType == "post-merge") {
-            echo "Use NGC artifacts for post merge build"
-            dependentImageWithTag = "${NGC_IMAGE_NAME}:${dependentTag}"
-            imageWithTag = "${NGC_IMAGE_NAME}:${tag}"
-            customImageWithTag = "${NGC_IMAGE_NAME}:${customTag}"
-        }
-        imageKeyToTag["NGC Devel Image ${config.arch}"] = dependentImageWithTag
-        imageKeyToTag["NGC Release Image ${config.arch}"] = imageWithTag
+    if (target == "ngc-release" && params.triggerType == "post-merge") {
+        echo "Use NGC artifacts for post merge build"
+        dependentImageWithTag = "${NGC_IMAGE_NAME}:${dependentTag}"
+        imageWithTag = "${NGC_IMAGE_NAME}:${tag}"
+        customImageWithTag = "${NGC_IMAGE_NAME}:${customTag}"
     }
 
     args += " GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote"
@@ -272,6 +268,9 @@ def buildImage(config, imageKeyToTag)
                     """
                 }
                 args += " DEVEL_IMAGE=${dependentImageWithTag}"
+                if (target == "ngc-release") {
+                    imageKeyToTag["NGC Devel Image ${config.arch}"] = dependentImageWithTag
+                }
             }
         }
 
@@ -295,6 +294,9 @@ def buildImage(config, imageKeyToTag)
                 STAGE=${dockerfileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
                 """
+            }
+            if (target == "ngc-release") {
+                imageKeyToTag["NGC Release Image ${config.arch}"] = imageWithTag
             }
         }
 
@@ -529,7 +531,7 @@ pipeline {
                             "TensorRT-LLM-GH200.tar.gz",
                             "TensorRT-LLM.tar.gz"
                         ]
-                        def maxWaitMinutes = 180
+                        def maxWaitMinutes = 60
                         def pollIntervalSeconds = 60
 
                         echo "Waiting for build artifacts..."
