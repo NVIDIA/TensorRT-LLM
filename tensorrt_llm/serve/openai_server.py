@@ -252,7 +252,7 @@ class OpenAIServer:
             tool_dicts = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
             ]
-            sampling_params = request.to_sampling_params()
+            sampling_params = request.to_sampling_params(self.llm.args.gather_generation_logits, self.llm.args.backend)
             postproc_args = ChatPostprocArgs.from_request(request)
             disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
 
