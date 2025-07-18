@@ -57,7 +57,7 @@ FmhaDispatcher::FmhaDispatcher(MHARunnerFixedParams fixedParams)
     {
         TLLM_CHECK_WITH_INFO(mFixedParams.dataType == mFixedParams.dataTypeKv,
             "KV cache data type %s is not the same as input data type %s.",
-            data_type_to_string(mFixedParams.dataTypeKv), data_type_to_string(mFixedParams.dataType));
+            data_type_to_string(mFixedParams.dataTypeKv).c_str(), data_type_to_string(mFixedParams.dataType).c_str());
 
         // For FP8 MLA generation, the output type is BF16, which could be different from the input type.
         // So we shouldn't do this check anymore.
