@@ -28,16 +28,24 @@ def ceil_to_ue8m0(x: torch.Tensor):
 
 
 @nvtx_range("[DG] quantization")
-@torch.compile(dynamic=True)
 def per_token_cast_to_fp8_e8m0(
         x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert x.dim() == 2 and x.size(1) % 128 == 0
-    m, n = x.shape
-    x_view = x.view(m, -1, 128)
-    x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
-    sf = ceil_to_ue8m0(x_amax / 448.0)
-    return (x_view * (1.0 / sf.unsqueeze(2))).to(torch.float8_e4m3fn).view(
-        m, n), sf
+    if x.dim() == 2:
+        assert x.size(1) % 128 == 0
+        m, n = x.shape
+        x_view = x.view(m, -1, 128)
+        x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
+        sf = ceil_to_ue8m0(x_amax / 448.0)
+        return (x_view * (1.0 / sf.unsqueeze(2))).to(torch.float8_e4m3fn).view(
+            m, n), sf
+    else:
+        assert x.size(2) % 128 == 0
+        g, m, n = x.shape
+        x_view = x.view(g, m, -1, 128)
+        x_amax = x_view.abs().float().amax(dim=3).view(g, m, -1).clamp(1e-4)
+        sf = ceil_to_ue8m0(x_amax / 448.0)
+        return (x_view * (1.0 / sf.unsqueeze(3))).to(torch.float8_e4m3fn).view(
+            g, m, n), sf
 
 
 def per_block_cast_to_fp8_e8m0(
@@ -70,8 +78,6 @@ def per_block_cast_to_fp8_e8m0(
 
 def resmooth_to_fp8_e8m0(weight: torch.Tensor,
                          sf: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    weight = weight.cuda()
-    sf = sf.cuda()
     if weight.dim() == 2:
         x = weight.float() * sf.repeat_interleave(128, dim=0).repeat_interleave(
             128, dim=1)[:weight.shape[0], :weight.shape[1]]

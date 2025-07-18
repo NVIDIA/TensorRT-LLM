@@ -3,6 +3,8 @@ from typing import List, Optional, Union
 import deep_gemm
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._utils import nvtx_range
@@ -12,6 +14,105 @@ from ...utils import Fp4QuantizedTensor
 from .fused_moe_cutlass import CutlassFusedMoE
 from .quantization import MoEWeightLoadingMode
 from .routing import BaseMoeRoutingMethod
+
+
+@triton.jit
+def masked_index_copy_kernel(output_ptr, input_ptr, masked_m_ptr,
+                             start_offsets_ptr, col_size, dim_size,
+                             BLOCK_SIZE: tl.constexpr):
+    # get program id and block offset
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+
+    # compute mask and pointers
+    token_idx = offsets // dim_size
+    row_idx = token_idx // col_size
+    col_idx = token_idx % col_size
+    elem_idx = offsets % dim_size
+    num_cols = tl.load(masked_m_ptr + row_idx)
+    valid = col_idx < num_cols
+
+    # load start offset and input data
+    start_offset = tl.load(start_offsets_ptr + row_idx)
+    input_offset = (start_offset + col_idx) * dim_size + elem_idx
+    input = tl.load(input_ptr + input_offset, mask=valid)
+
+    # write output
+    output_offsets = row_idx * col_size * dim_size + col_idx * dim_size + elem_idx
+    tl.store(output_ptr + output_offsets, input, mask=valid)
+
+
+def triton_masked_index_copy(output, input, masked_m, start_offsets):
+    assert output.dtype == input.dtype, "Output and input must have the same dtype"
+    assert output.ndim == 3, "Input must be a 3D tensor, [row, col, dim]"
+    assert input.ndim == 2, "Input must be a 2D tensor"
+
+    row_size = output.shape[0]
+    col_size = output.shape[1]
+    dim_size = output.shape[2]
+    total_elems = row_size * col_size * dim_size
+
+    # launch kernel
+    grid = lambda meta: (triton.cdiv(total_elems, meta['BLOCK_SIZE']), )
+    masked_index_copy_kernel[grid](output,
+                                   input,
+                                   masked_m,
+                                   start_offsets,
+                                   col_size,
+                                   dim_size,
+                                   BLOCK_SIZE=1024)
+    return output
+
+
+@triton.jit
+def masked_index_gather_kernel(output_ptr, input_ptr, masked_m_ptr,
+                               start_offsets_ptr, col_size, dim_size,
+                               BLOCK_SIZE: tl.constexpr):
+    # get program id and block offset
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+
+    # compute mask and pointers
+    token_idx = offsets // dim_size
+    row_idx = token_idx // col_size
+    col_idx = token_idx % col_size
+    elem_idx = offsets % dim_size
+    num_cols = tl.load(masked_m_ptr + row_idx)
+    valid = col_idx < num_cols
+
+    # input data
+    input_offsets = row_idx * col_size * dim_size + col_idx * dim_size + elem_idx
+    input_vals = tl.load(input_ptr + input_offsets, mask=valid)
+
+    # get gather indices and store to output
+    start_offset = tl.load(start_offsets_ptr + row_idx)
+    gather_offset = (start_offset + col_idx) * dim_size + elem_idx
+    tl.store(output_ptr + gather_offset, input_vals, mask=valid)
+
+
+@torch.no_grad()
+def triton_masked_index_gather(output, input, masked_m, start_offsets):
+    assert output.ndim == 2, "Output must be a 2D tensor"
+    assert input.ndim == 3, "Input must be a 3D tensor, [row, col, dim]"
+    assert masked_m.ndim == 1, "Indices must be a 1D tensor"
+
+    row_size = input.shape[0]
+    col_size = input.shape[1]
+    dim_size = input.shape[2]
+    total_elems = row_size * col_size * dim_size
+
+    # launch kernel
+    grid = lambda meta: (triton.cdiv(total_elems, meta['BLOCK_SIZE']), )
+    masked_index_gather_kernel[grid](output,
+                                     input,
+                                     masked_m,
+                                     start_offsets,
+                                     col_size,
+                                     dim_size,
+                                     BLOCK_SIZE=1024)
+    return output
 
 
 @nvtx_range("[DG] act")
@@ -29,64 +130,31 @@ def indexing(x, mask):
 
 @nvtx_range("[DG] copy after permute")
 @torch.compile(dynamic=True)
-def copy_after(
-    expert_first_token_offset_tensor,
-    permuted_data_tensor,
-    base_indices,
-    hidden_size,
-):
-    token_per_expert = expert_first_token_offset_tensor[
+def preprocess_after_permute(expert_first_token_offset_tensor, ):
+    # get tokens per expert
+    masked_m = expert_first_token_offset_tensor[
         1:] - expert_first_token_offset_tensor[:-1]
-    token_per_expert_padded = (token_per_expert + 127) // 128 * 128
-    expert_first_token_offset_tensor_padded = torch.cat(
-        (torch.zeros(1, dtype=torch.int32,
-                     device='cuda'), torch.cumsum(token_per_expert_padded,
-                                                  dim=0)))
-
-    token_num = token_per_expert.sum()
-    total_tokens_padded = token_per_expert_padded.sum()
-    m_indices = torch.repeat_interleave(base_indices,
-                                        token_per_expert_padded,
-                                        dim=0,
-                                        output_size=total_tokens_padded)
-    src_offsets = torch.repeat_interleave(expert_first_token_offset_tensor[:-1],
-                                          token_per_expert,
-                                          dim=0,
-                                          output_size=token_num)
-    dest_starts = torch.repeat_interleave(
-        expert_first_token_offset_tensor_padded[:-1],
-        token_per_expert,
-        dim=0,
-        output_size=token_num)
-    token_j_offset_in_expert = torch.arange(token_num,
-                                            device='cuda') - src_offsets
-    dest_indices = dest_starts + token_j_offset_in_expert
-
-    permuted_data_tensor_padded = torch.empty(total_tokens_padded,
-                                              hidden_size,
-                                              dtype=permuted_data_tensor.dtype,
-                                              device='cuda')
-    src_indices = torch.arange(dest_indices.shape[0], device='cuda')
-    permuted_data_tensor_padded.index_copy_(0, dest_indices,
-                                            permuted_data_tensor[src_indices])
-
-    return permuted_data_tensor_padded, m_indices, dest_indices
+    masked_m_shift = torch.zeros_like(masked_m)
+    masked_m_shift[1:] = masked_m[:-1]
+    start_offsets = torch.cumsum(masked_m_shift, dim=0)
+    return masked_m.to(torch.int32), start_offsets
 
 
 @nvtx_range("[DG]")
-def deepgemm_fp8_group_blockwise_gemm_ref(
+def deepgemm_fp8_group_blockwise_gemm(
     a: torch.Tensor,
     b: torch.Tensor,
     a_sf: torch.Tensor,
     b_sf: torch.Tensor,
-    m_indices: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
 ) -> torch.Tensor:
 
-    d = torch.empty((a.shape[0], b.shape[1]),
+    d = torch.empty((a.shape[0], a.shape[1], b.shape[1]),
                     device=b.device,
                     dtype=torch.bfloat16)
-    deep_gemm.m_grouped_fp8_gemm_nt_contiguous((a, a_sf), (b, b_sf), d,
-                                               m_indices)
+    deep_gemm.fp8_m_grouped_gemm_nt_masked((a, a_sf), (b, b_sf), d,
+                                               masked_m, expected_m)
     return d
 
 
@@ -140,10 +208,6 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
         )
-
-        self.base_indices = torch.arange(self.expert_size_per_partition,
-                                         device="cuda",
-                                         dtype=torch.int32)
 
     @nvtx_range("[DG] forward")
     def forward_chunk(
@@ -214,35 +278,53 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             use_fp8_block_scaling=use_deepseek_fp8_block_scale,
         )
 
-        permuted_data_tensor_padded, m_indices, dest_indices = copy_after(
-            expert_first_token_offset_tensor,
-            permuted_data_tensor,
-            self.base_indices,
-            self.hidden_size,
-        )
-
-        if permuted_data_tensor_padded.numel() == 0:
+        if permuted_data_tensor.numel() == 0:
             return torch.zeros_like(x)
+
+        max_padded_tokens = (x.shape[0] + 128) // 128 * 128
+        permuted_data_tensor_padded = torch.empty(
+            (self.expert_size_per_partition, max_padded_tokens,
+             self.hidden_size),
+            dtype=self.dtype,
+            device='cuda')
+
+        masked_m, start_offsets = preprocess_after_permute(
+            expert_first_token_offset_tensor
+        )
+        m_max = (x.shape[0] + 127) // 128 * 128
+        expected_m = (token_selected_experts.numel() + self.expert_size_per_partition - 1) // self.expert_size_per_partition
+        permuted_data_tensor_padded = torch.empty(self.expert_size_per_partition,
+                                                  m_max,
+                                                  self.hidden_size,
+                                                  dtype=self.dtype,
+                                                  device='cuda')
+        triton_masked_index_copy(permuted_data_tensor_padded,
+                                 permuted_data_tensor, masked_m, start_offsets)
+
         act_input_fp8, act_input_sf = fp8_utils.per_token_cast_to_fp8_e8m0(
             permuted_data_tensor_padded)
-        h1 = deepgemm_fp8_group_blockwise_gemm_ref(
+        h1 = deepgemm_fp8_group_blockwise_gemm(
             a=act_input_fp8,
             b=self.w3_w1_weight,
             a_sf=act_input_sf,
             b_sf=self.quant_scales[0],
-            m_indices=m_indices,
+            masked_m=masked_m,
+            expected_m=expected_m,
         )
         h2 = swiglu_fused_moe(h1)
         act_input_fp8, act_input_sf = fp8_utils.per_token_cast_to_fp8_e8m0(h2)
-        h3 = deepgemm_fp8_group_blockwise_gemm_ref(
+        h3 = deepgemm_fp8_group_blockwise_gemm(
             a=act_input_fp8,
             b=self.w2_weight,
             a_sf=act_input_sf,
             b_sf=self.quant_scales[1],
-            m_indices=m_indices,
+            masked_m=masked_m,
+            expected_m=expected_m,
         )
 
-        permuted_data_tensor[0:dest_indices.shape[0]].copy_(h3[dest_indices])
+        triton_masked_index_gather(permuted_data_tensor, h3, masked_m,
+                                        start_offsets)
+
         final_hidden_states = torch.ops.trtllm.moe_finalize_scale_op(
             permuted_data_tensor,
             None,  # biases
