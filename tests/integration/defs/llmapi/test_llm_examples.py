@@ -90,35 +90,29 @@ def _run_llmapi_example(llm_root, engine_dir, llm_venv, script_name: str,
     venv_check_call(llm_venv, run_command)
 
 
-@pytest.mark.skip(reason="https://nvbugs/5365825")
 def test_llmapi_quickstart(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv, "quickstart_example.py")
 
 
-@pytest.mark.skip(reason="https://nvbugs/5365825")
 def test_llmapi_example_inference(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv, "llm_inference.py")
 
 
-@pytest.mark.skip(reason="https://nvbugs/5365825")
 def test_llmapi_example_inference_async(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv,
                         "llm_inference_async.py")
 
 
-@pytest.mark.skip(reason="https://nvbugs/5365825")
 def test_llmapi_example_inference_async_streaming(llm_root, engine_dir,
                                                   llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv,
                         "llm_inference_async_streaming.py")
 
 
-@pytest.mark.skip(reason="https://nvbugs/5365825")
 def test_llmapi_example_multilora(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv, "llm_multilora.py")
 
 
-@pytest.mark.skip(reason="https://nvbugs/5365825")
 def test_llmapi_example_guided_decoding(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv,
                         "llm_guided_decoding.py")
@@ -130,13 +124,12 @@ def test_llmapi_example_distributed_tp2(llm_root, engine_dir, llm_venv):
                         "llm_inference_distributed.py")
 
 
-@pytest.mark.skip(reason="https://nvbugs/5365825")
+@pytest.mark.skip(reason="https://nvbugs/5385576")
 def test_llmapi_example_logits_processor(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv,
                         "llm_logits_processor.py")
 
 
-@pytest.mark.skip(reason="https://nvbugs/5365825")
 def test_llmapi_quickstart_atexit(llm_root, engine_dir, llm_venv):
     script_path = Path(
         llm_root
@@ -144,20 +137,30 @@ def test_llmapi_quickstart_atexit(llm_root, engine_dir, llm_venv):
     llm_venv.run_cmd([str(script_path)])
 
 
-@pytest.mark.skip(reason="https://nvbugs/5365825")
+@pytest.mark.skip_less_device_memory(80000)
 def test_llmapi_speculative_decoding_mtp(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv,
                         "llm_speculative_decoding.py", "MTP", "--model",
                         f"{llm_models_root()}/DeepSeek-V3-Lite/bf16")
 
 
-@pytest.mark.skip(reason="https://nvbugs/5365825")
+@pytest.mark.skip_less_device_memory(80000)
 def test_llmapi_speculative_decoding_eagle3(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv,
                         "llm_speculative_decoding.py", "EAGLE3")
 
 
-@pytest.mark.skip(reason="https://nvbugs/5365825")
+@pytest.mark.skip_less_device_memory(80000)
 def test_llmapi_speculative_decoding_ngram(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv,
                         "llm_speculative_decoding.py", "NGRAM")
+
+
+@pytest.mark.skip(reason="https://nvbugs/5365825")
+def test_llmapi_sampling(llm_root, engine_dir, llm_venv):
+    _run_llmapi_example(llm_root, engine_dir, llm_venv, "llm_sampling.py")
+
+
+@pytest.mark.skip(reason="https://nvbugs/5365825")
+def test_llmapi_runtime(llm_root, engine_dir, llm_venv):
+    _run_llmapi_example(llm_root, engine_dir, llm_venv, "llm_runtime.py")

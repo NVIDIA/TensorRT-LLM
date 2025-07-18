@@ -11,6 +11,8 @@ from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
 
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, MoEAllReduce)
+from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
+    BaseWeightMapper
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import HfLoraLoader
@@ -624,6 +626,7 @@ class Llama4Model(DecoderModel):
         self.num_hidden_layers = config.num_hidden_layers
         self.aux_stream = torch.cuda.Stream()
         self.mapping = model_config.mapping
+        self.preload_weight_modules = []
 
         if self.model_config.mapping.enable_attention_dp:
             self.embed_tokens = Embedding(
@@ -646,6 +649,7 @@ class Llama4Model(DecoderModel):
         if model_config.enable_min_latency:
             from .modeling_llama_min_latency import Llama4MinLatencyDecoderLayer
             DecoderLayerClass = Llama4MinLatencyDecoderLayer
+            self.preload_weight_modules = ["gate_up_proj"]
 
         self.layers = nn.ModuleList([
             DecoderLayerClass(
@@ -878,6 +882,7 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
         model_config.pretrained_config = model_config.pretrained_config.text_config
         model_config.pretrained_config.architectures = architectures
         super().__init__(Llama4Model(model_config), model_config)
+        self.preload_weight_modules = self.model.preload_weight_modules
 
     def forward(
         self,
@@ -914,16 +919,8 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
 
         return super().infer_max_seq_len()
 
-    def load_weights(self, weights: Dict):
-        new_weights = {}
-        for key, tensor in weights.items():
-            if key.startswith("language_model."):
-                new_key = key[len("language_model."):]
-                new_weights[new_key] = tensor
-            else:
-                new_weights[key] = tensor
-
-        super().load_weights(new_weights)
+    def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper):
+        super().load_weights(weights, weight_mapper)
 
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):

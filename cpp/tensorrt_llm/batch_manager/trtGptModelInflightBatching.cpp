@@ -264,10 +264,35 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     }
     if (mModelConfig.isTransformerBased() && modelConfig.isKVCacheEnabled())
     {
+
+        auto calculateCacheSizePerToken
+            = [](ModelConfig const& modelConfig, WorldConfig const& worldConfig,
+                  std::vector<SizeType32> const& maxAttentionWindowVec, bool isCrossAttention, SizeType32 kvFactor)
+        {
+            auto [numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd] = modelConfig.getNumKvHeadsPerLayerLocalRange(
+                worldConfig.getPipelineParallelism(), worldConfig.getPipelineParallelRank(), isCrossAttention);
+            auto numKvHeadsPerLayer = std::vector<SizeType32>(numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd);
+            auto windowSizeLayers
+                = BaseKVCacheManager::groupLayersByWindowSize(maxAttentionWindowVec, modelConfig.getNbLayers());
+            std::map<SizeType32, SizeType32> cacheSizeBytesPerTokenPerWindow;
+            for (auto const& [windowSize, managedLayers] : windowSizeLayers)
+            {
+                auto const cacheSizePerToken = BaseKVCacheManager::calculateCacheSizePerTokenForSingleWindowSize(
+                    modelConfig, managedLayers, isCrossAttention, kvFactor);
+                auto const cacheSizeBytesPerToken
+                    = cacheSizePerToken * BufferDataType(modelConfig.getKvDataType()).getSize();
+                cacheSizeBytesPerTokenPerWindow[windowSize] = cacheSizeBytesPerToken;
+            }
+
+            return cacheSizeBytesPerTokenPerWindow;
+        };
         auto cacheTransceiverConfig
             = executorConfig.getCacheTransceiverConfig().value_or(executor::CacheTransceiverConfig());
-        auto cacheTransPreAllocaSize
-            = kv_cache_manager::CacheTransBufferManager::preAllocBufferSize(cacheTransceiverConfig.getMaxNumTokens());
+
+        auto const cacheSizeBytesPerTokenPerWindow = calculateCacheSizePerToken(
+            mModelConfig, mWorldConfig, getMaxAttentionWindowVec(), mModelConfig.useCrossAttention(), 2);
+        auto cacheTransPreAllocaSize = kv_cache_manager::CacheTransBufferManager::preAllocBufferSize(
+            cacheSizeBytesPerTokenPerWindow, cacheTransceiverConfig);
 
         auto const [freePrimaryMemBytes, freeSecondaryMemBytes]
             = BaseKVCacheManager::calculateFreeMemBytes(mRuntime->getBufferManager(), kvCacheConfig);
@@ -879,8 +904,9 @@ void TrtGptModelInflightBatching::forwardSync()
             {
                 // TODO: skip if sending layer-wise
                 {
-                    TLLM_CHECK_WITH_INFO(
-                        mCacheTransceiver, "Disaggregated serving is not enabled, please check the configuration.");
+                    TLLM_CHECK_WITH_INFO(mCacheTransceiver,
+                        "Disaggregated serving is not enabled, please check the configuration of "
+                        "cacheTransceiverConfig.");
                     mCacheTransceiver->respondAndSendAsync(llmReq.get());
                 }
                 mSeqSlotManager->freeSequenceSlot(llmReq->mRequestId);
@@ -929,6 +955,25 @@ void TrtGptModelInflightBatching::storeContextBlocks(std::shared_ptr<LlmRequest>
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
+void TrtGptModelInflightBatching::storeNewBlock(std::shared_ptr<LlmRequest> const& llmReq)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    // TMJ - Note
+    // Make context blocks reusable immediately after each generation step.
+
+    if (mKvCacheManager)
+    {
+        mKvCacheManager->storeNewBlock(*llmReq);
+    }
+    if (mCrossKvCacheManager)
+    {
+        mCrossKvCacheManager->storeNewBlock(*llmReq);
+    }
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
 void TrtGptModelInflightBatching::resetIterationStats()
 {
     mLastIterationStatsIFB = IterationStatsIFB{mMicroBatchId};
@@ -964,8 +1009,10 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
         if (fittingRequests.empty() && fittingDisaggGenInitRequests.empty())
         {
             TLLM_LOG_WARNING(
-                "CapacityScheduler didn't schedule any requests, probably because of insufficient resources such as KV "
-                "cache, will try wait for KV cache transfer to complete");
+                "CapacityScheduler didn't schedule any requests in iteration %lu, "
+                "probably because of insufficient resources such as KV cache, "
+                "will try wait for KV cache transfer to complete",
+                mIterCounter);
             if (mCacheTransceiver)
             {
                 mCacheTransceiver->checkContextTransferStatus(1);
@@ -1019,6 +1066,10 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
                 auto const contextBufferId = mCtxGenFusion ? getFusedBufferId() : getContextBufferId();
                 setupDecoderStep(currRequests.contextRequests, *mBuffers.at(contextBufferId),
                     mDecoderInputBuffers.at(getFusedBufferId()));
+                // WAR: Sync to ensure that the decoder setup is complete before the context phase starts.
+                // Without this, there may be a race condition between the decoder setup and the context phase
+                // which also leads to spurious test failure in trtGptModelRealDecoderTest.
+                mRuntime->getStream().synchronize();
             }
             else
             {
@@ -1099,6 +1150,7 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
                     }
                     else if (llmReq->isGenerationInProgressState())
                     {
+                        storeNewBlock(llmReq);
                         TLLM_LOG_DEBUG("request with ID %lu forwards a step in decoder gen phase", llmReq->mRequestId);
                     }
                 }
@@ -1754,8 +1806,8 @@ void TrtGptModelInflightBatching::executeStep(
         bufferCast<void*>(*mBuffers[bufferId]->transformerBuffers->contextProgressHost)[0] = progress.get();
         if (progress)
         {
-            TLLM_CHECK_WITH_INFO(
-                mCacheTransceiver, "Disaggregated serving is not enabled, please check the configuration.");
+            TLLM_CHECK_WITH_INFO(mCacheTransceiver,
+                "Disaggregated serving is not enabled, please check the configuration of cacheTransceiverConfig.");
             mCacheTransceiver->respondAndSendLayerWise(layerWiseRequests, progress);
         }
     }
@@ -2412,9 +2464,8 @@ void TrtGptModelInflightBatching::rewindKVCacheBlocks(SizeType32 numSequences)
     tensorrt_llm::runtime::kernels::invokeUpdateKVBlockArrayDraftTokenLocation(
         *mDecoderState->getAcceptedLengthsCumSum(), *mDecoderState->getAcceptedPackedPaths(),
         *runtimeBuffers.sequenceLengthsDevice, pointerArrayPtr, offsetArrayPtr, localNbLayers, numSequences,
-        mRewindInputs.numKvHeads, sizeInBytesPerKVHead, commonRewindLen, rewindLens,
-        *runtimeBuffers.seqSlotRemappingDevice, *runtimeBuffers.sortedSeqSlots, getMaxAttentionWindow(),
-        mRewindInputs.maxBlocksPerSeq, tokensPerBlock, mRewindInputs.isUseOneMoreBlock,
+        mRewindInputs.numKvHeads, sizeInBytesPerKVHead, commonRewindLen, rewindLens, *runtimeBuffers.seqSlots,
+        getMaxAttentionWindow(), mRewindInputs.maxBlocksPerSeq, tokensPerBlock, mRewindInputs.isUseOneMoreBlock,
         mRuntime->getStreamPtr()->get());
 
     sync_check_cuda_error(mRuntime->getStream().get());

@@ -309,6 +309,7 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
             def llmSrcLocal = "${llmPath}/TensorRT-LLM/src"
             def scriptRunNode = "${jobWorkspace}/slurm_run.sh"
             def testListPathNode = "${jobWorkspace}/${testList}.txt"
+            def waivesListPathNode = "${jobWorkspace}/waives.txt"
             def isAarch64 = config.contains("aarch64")
             def pytestTestTimeout = "7200"
 
@@ -324,6 +325,10 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                 def scriptRunLocalPath = "${llmSrcLocal}/jenkins/scripts/slurm_run.sh"
                 Utils.exec(pipeline, script: "chmod +x ${scriptRunLocalPath}", returnStdout: true)
                 Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${scriptRunLocalPath} ${remote.user}@${remote.host}:${scriptRunNode}",)
+
+                // Upload waives.txt to Frontend node
+                def waivesListLocalPath = "${llmSrcLocal}/tests/integration/test_lists/waives.txt"
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${waivesListLocalPath} ${remote.user}@${remote.host}:${waivesListPathNode}",)
 
                 // Generate Test List and Upload to Frontend Node
                 def makoArgs = getMakoArgsFromStageName(stageName, true)
@@ -362,6 +367,7 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                     export stageName=$stageName
                     export testList=$testList
                     export testListPathNode=$testListPathNode
+                    export waivesListPathNode=$waivesListPathNode
                     export pytestTestTimeout=$pytestTestTimeout
                     export splits=$splits
                     export splitId=$splitId
@@ -437,6 +443,8 @@ def DEBUG_MODE = "debug"
 @Field
 def DETAILED_LOG = "detailed_log"
 @Field
+def ONLY_DOCS_FILE_CHANGED = "only_docs_file_changed"
+@Field
 def testFilter = [
     (REUSE_STAGE_LIST): null,
     (ENABLE_SKIP_TEST): false,
@@ -453,6 +461,7 @@ def testFilter = [
     (DEBUG_MODE): false,
     (AUTO_TRIGGER_TAG_LIST): [],
     (DETAILED_LOG): false,
+    (ONLY_DOCS_FILE_CHANGED): false,
 ]
 
 @Field
@@ -1108,7 +1117,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
     // Generate rerun test lists
     def failSignaturesList = trtllm_utils.getFailSignaturesList().join(",")
     sh """
-        python3 ${llmSrc}/tests/integration/defs/test_rerun.py \
+        python3 ${llmSrc}/jenkins/test_rerun.py \
         generate_rerun_tests_list \
         --output-dir=${WORKSPACE}/${stageName}/ \
         --input-file=${WORKSPACE}/${stageName}/results.xml \
@@ -1181,12 +1190,15 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
         }
     }
 
-    // generate rerun report
+    // Specify the stage name correctly
+    sh "cd ${WORKSPACE}/${stageName} && sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' *.xml || true"
+
+    // Generate rerun report
     inputFiles = ["${WORKSPACE}/${stageName}/results.xml",
                   "${WORKSPACE}/${stageName}/rerun_results_1.xml",
                   "${WORKSPACE}/${stageName}/rerun_results_2.xml"]
     sh """
-        python3 ${llmSrc}/tests/integration/defs/test_rerun.py \
+        python3 ${llmSrc}/jenkins/test_rerun.py \
         generate_rerun_report \
         --output-file=${WORKSPACE}/${stageName}/rerun_results.xml \
         --input-files=${inputFiles.join(",")}
@@ -1194,7 +1206,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
 
     // Update original results xml file with rerun results xml files for junit
     sh """
-        python3 ${llmSrc}/tests/integration/defs/test_rerun.py \
+        python3 ${llmSrc}/jenkins/test_rerun.py \
         merge_junit_xmls \
         --output-file=${WORKSPACE}/${stageName}/results.xml \
         --input-files=${inputFiles.join(",")} \
@@ -1639,7 +1651,8 @@ def checkStageNameSet(stageNames, jobKeys, paramName) {
     echo "Validate stage names for the passed GitLab bot params [${paramName}]."
     invalidStageName = stageNames.findAll { !(it in jobKeys) }
     if (invalidStageName) {
-        throw new Exception("Cannot find the stage names [${invalidStageName}] from the passed params [${paramName}].")
+        def sortedJobKeys = jobKeys.sort()
+        throw new Exception("Cannot find the stage names [${invalidStageName}] from the passed params [${paramName}]. Available stage names (${sortedJobKeys.size()} total):\n${sortedJobKeys.collect { "    ${it}" }.join('\n')}")
     }
 }
 
@@ -1819,6 +1832,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     fullSet += SBSATestConfigs.keySet()
 
     SBSASlurmTestConfigs = [
+        "GB200-4_GPUs-PyTorch-1": ["gb200-4-gpus", "l0_gb200", 1, 1, 4],
         "GB200-4_GPUs-PyTorch-Post-Merge-1": ["gb200-4-gpus", "l0_gb200", 1, 1, 4],
     ]
     fullSet += SBSASlurmTestConfigs.keySet()
@@ -2011,16 +2025,25 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                     pipInstallSanitySpec = createKubernetesPodConfig(values[5], gpu_type, k8s_arch)
                     trtllm_utils.launchKubernetesPod(pipeline, pipInstallSanitySpec, "trt-llm", {
                         echo "###### Prerequisites Start ######"
+                        echoNodeAndGpuInfo(pipeline, toStageName(values[1], key))
                         // Clean up the pip constraint file from the base NGC PyTorch image.
                         if (values[5] == DLFW_IMAGE) {
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "[ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true")
                         }
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
-                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install python3-pip git rsync curl")
+                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install python3-pip git rsync curl wget")
                         trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install requests")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y tensorrt")
+                        if (values[5] != DLFW_IMAGE) {
+                            def ubuntu_version = key.contains("UB2404") ? "ubuntu2404" : "ubuntu2204"
+                            def platform = values[2] == X86_64_TRIPLE ? "x86_64" : "sbsa"
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://developer.download.nvidia.com/compute/cuda/repos/${ubuntu_version}/${platform}/cuda-keyring_1.1-1_all.deb")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "dpkg -i cuda-keyring_1.1-1_all.deb")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install cuda-toolkit-12-9")
+                        }
 
                         // Extra PyTorch CUDA 12.8 install
                         if (values[6]) {
@@ -2048,7 +2071,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                         }
                         withEnv(libEnv) {
                             sh "env | sort"
-                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, "${values[1]}-${key}-sanity-check" , 1, 1, true, null)
+                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, null)
                         }
                     })
                 }
@@ -2156,6 +2179,12 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         }
     }
 
+    if (testFilter[(ONLY_DOCS_FILE_CHANGED)]) {
+        echo "Only docs files are changed, run doc build stage only."
+        parallelJobsFiltered = docBuildJobs
+        println parallelJobsFiltered.keySet()
+    }
+
     // Check --stage-list, only run the stages in stage-list.
     if (testFilter[TEST_STAGE_LIST] != null) {
         echo "Use TEST_STAGE_LIST for filtering. Stages: ${testFilter[(TEST_STAGE_LIST)]}."
@@ -2250,7 +2279,8 @@ pipeline {
         {
             when {
                 expression {
-                    env.targetArch == X86_64_TRIPLE  // Only execute the check if running on x86
+                    // Only run the test list validation when necessary
+                    env.targetArch == X86_64_TRIPLE && testFilter[ONLY_DOCS_FILE_CHANGED] == false && !(env.JOB_NAME ==~ /.*Multi-GPU.*/)
                 }
             }
             steps
@@ -2275,17 +2305,47 @@ pipeline {
                         dgxJobs = parallelJobs.findAll{dgxSigns.any{sign -> it.key.contains(sign)}}
                     }
 
-                    if (singleGpuJobs.size() > 0) {
-                        singleGpuJobs.failFast = params.enableFailFast
-                        parallel singleGpuJobs
-                    } else {
-                        echo "Skip single-GPU testing. No test to run."
-                    }
-
-                    if (dgxJobs.size() > 0) {
-                        stage(testPhase2StageName) {
+                    if (env.JOB_NAME ==~ /.*Single-GPU.*/) {
+                        echo "Only run single-GPU tests."
+                        if (dgxJobs.size() > 0) {
+                            if (globalVars[ACTION_INFO]['parents'].size() > 0) {
+                                // We add a special marker to the parent job's description.
+                                // This will be used to decide whether to run multi-GPU test stage.
+                                def parentJob = globalVars[ACTION_INFO]['parents'][-2]
+                                trtllm_utils.appendBuildDescription(this, parentJob['name'], parentJob['build_number'], "====Require Multi-GPU Testing====<br/>")
+                            } else {
+                                echo "No parent job found to add the special marker for executing multi-GPU test stage."
+                            }
+                        } else {
+                            echo "Skip multi-GPU testing. No test to run."
+                        }
+                        if (singleGpuJobs.size() > 0) {
+                            singleGpuJobs.failFast = params.enableFailFast
+                            parallel singleGpuJobs
+                        } else {
+                            echo "Skip single-GPU testing. No test to run."
+                        }
+                    } else if (env.JOB_NAME ==~ /.*Multi-GPU.*/) {
+                        echo "Only run multi-GPU tests."
+                        if (dgxJobs.size() > 0) {
                             dgxJobs.failFast = params.enableFailFast
                             parallel dgxJobs
+                        } else {
+                            error "Skip multi-GPU testing. No test to run."
+                        }
+                    } else {
+                        if (singleGpuJobs.size() > 0) {
+                            singleGpuJobs.failFast = params.enableFailFast
+                            parallel singleGpuJobs
+                        } else {
+                            echo "Skip single-GPU testing. No test to run."
+                        }
+
+                        if (dgxJobs.size() > 0) {
+                            stage(testPhase2StageName) {
+                                dgxJobs.failFast = params.enableFailFast
+                                parallel dgxJobs
+                            }
                         }
                     }
                 }

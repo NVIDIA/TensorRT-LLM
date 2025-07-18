@@ -1,5 +1,6 @@
 # Adapted from
 # https://github.com/deepseek-ai/DeepEP/blob/aae9fa9a6dd0fec2a723fbb85ec4b22460fab670/README.md
+import os
 import weakref
 from typing import List, Tuple, Union
 
@@ -11,7 +12,7 @@ from tensorrt_llm.mapping import Mapping
 try:
     from tensorrt_llm.deep_ep import Buffer
     deep_ep_installed = True
-except ModuleNotFoundError:
+except ImportError:
     deep_ep_installed = False
 
 
@@ -58,7 +59,7 @@ class VariableLengthBuffer:
 
     def dispatch(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
                  topk_idx: torch.Tensor, topk_weights: torch.Tensor,
-                 num_experts: int) -> \
+                 num_experts: int, global_expert_id_offset: int) -> \
             Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], torch.Tensor, torch.Tensor, List, Tuple]:
         # NOTES: an optional `previous_event` means a CUDA event captured that you want to make it as a dependency
         # of the dispatch kernel, it may be useful with communication-computation overlap. For more information, please
@@ -75,7 +76,8 @@ class VariableLengthBuffer:
         recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, event = \
             self.buffer.dispatch(x, topk_idx=topk_idx, topk_weights=topk_weights,
                                  num_tokens_per_rank=num_tokens_per_rank, num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
-                                 is_token_in_rank=is_token_in_rank, num_tokens_per_expert=num_tokens_per_expert)
+                                 is_token_in_rank=is_token_in_rank, num_tokens_per_expert=num_tokens_per_expert,
+                                 global_expert_id_offset=global_expert_id_offset)
         assert event.event is None
 
         # For event management, please refer to the docs of the `EventOverlap` class
@@ -115,6 +117,8 @@ class VariableLengthLowLatencyBuffer:
         num_rdma_bytes = Buffer.get_low_latency_rdma_size_hint(
             num_max_dispatch_tokens_per_rank, hidden_size, world_size,
             num_experts)
+        allow_nvlink_for_low_latency_mode = (os.environ.get(
+            "TRTLLM_DEEP_EP_DISABLE_P2P_FOR_LOW_LATENCY_MODE", "0") == "0")
 
         # Allocate a buffer if not existed or not enough buffer size
         if self.buffer is None or self.buffer.num_rdma_bytes < num_rdma_bytes:
@@ -126,6 +130,8 @@ class VariableLengthLowLatencyBuffer:
                                  num_rdma_bytes,
                                  low_latency_mode=True,
                                  num_qps_per_rank=num_experts // world_size,
+                                 allow_nvlink_for_low_latency_mode=
+                                 allow_nvlink_for_low_latency_mode,
                                  comm=self.comm)
 
     def low_latency_dispatch(self, hidden_states: torch.Tensor,
@@ -162,6 +168,11 @@ class VariableLengthLowLatencyBuffer:
 
         # NOTES: the same behavior as described in the dispatch kernel
         return combined_hidden_states
+
+    def clean_low_latency_buffer(self, num_max_dispatch_tokens_per_rank: int,
+                                 hidden: int, num_experts: int) -> None:
+        self.buffer.clean_low_latency_buffer(num_max_dispatch_tokens_per_rank,
+                                             hidden, num_experts)
 
 
 class BufferPool:

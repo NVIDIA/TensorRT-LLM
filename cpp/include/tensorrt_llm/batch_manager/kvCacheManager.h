@@ -180,6 +180,8 @@ struct KvCacheStats
     SizeType32 missedBlocks;
     // Measuring the KV Cache reuse rate. cacheHitRate = reusedBlocks / (reusedBlocks + missedBlocks).
     float cacheHitRate;
+    // Number of free blocks for every configured attention-window size.
+    std::map<SizeType32, SizeType32> numFreeBlocksPerWindowSize;
 };
 
 // Basic building block of a paged KV cache - a single
@@ -553,6 +555,8 @@ public:
 
     void storeBlocksForReuse(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
 
+    void storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
+
     //! \brief Release blocks of the sequence.
     void releaseBlocks(GenerationRequest& sequence);
 
@@ -852,6 +856,9 @@ public:
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enableHashKey = false,
         bool enablePartialReuse = true, bool copyOnPartialReuse = true);
 
+    BlockManager(BlockManager const&) = delete;
+    BlockManager& operator=(BlockManager const&) = delete;
+
     //! \brief Calculate the proportional share each window size receives of the total memory pool
     //! \details Example:       (uniqueWindowSizeToLayers={1024: [1], 4096: [0, 4, 5], 8192: [2, 3]})
     //!          Would Return:  {1024: 0.0345, 4096: 0.4138, 8192: 0.5517} [sums to 1.0].
@@ -1092,6 +1099,9 @@ public:
     //! \brief Store context blocks
     void storeContextBlocks(GenerationRequest& sequence, LlmRequest const& llmRequest);
 
+    //! \brief Store newest block for reuse
+    void storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
+
     [[nodiscard]] static bool isUseOneMoreBlock(
         SizeType32 windowSize, std::optional<SizeType32> maxSequenceLength, SizeType32 maxBeamWidth)
     {
@@ -1261,6 +1271,10 @@ public:
     //! \brief Store full context blocks contributed by llmRequest.
     //! \details These blocks become reusable from next step.
     virtual void storeContextBlocks(LlmRequest const& llmRequest) = 0;
+
+    //! \brief Store newest block for reuse.
+    //! \details This block become reusable from next step.
+    virtual void storeNewBlock(LlmRequest const& llmRequest) = 0;
 
     //! \brief Get the block ids of a request [per beam] **for a given window size block manager**
     [[nodiscard]] virtual std::vector<std::vector<SizeType32>> const& getCacheBlockIds(
@@ -1445,6 +1459,11 @@ public:
         return mBlockManager.getNumMissedBlocks();
     }
 
+    [[nodiscard]] std::map<SizeType32, SizeType32> getNumFreeBlocksPerWindowSize() const
+    {
+        return mBlockManager.getNumFreeBlocksPerWindowSize();
+    }
+
     [[nodiscard]] KvCacheStats getKvCacheStats() const override
     {
         KvCacheStats kvCacheStats;
@@ -1459,6 +1478,7 @@ public:
         kvCacheStats.cacheHitRate = kvCacheStats.reusedBlocks == 0 ? 0
                                                                    : static_cast<float>(kvCacheStats.reusedBlocks)
                 / static_cast<float>(kvCacheStats.reusedBlocks + kvCacheStats.missedBlocks);
+        kvCacheStats.numFreeBlocksPerWindowSize = getNumFreeBlocksPerWindowSize();
         return kvCacheStats;
     }
 
@@ -1567,6 +1587,9 @@ public:
     //! \brief Store full context blocks contributed by llmRequest.
     //! \details These blocks become reusable from next step.
     void storeContextBlocks(LlmRequest const& llmRequest) override;
+
+    //! \brief Store newest blocks for reuse
+    void storeNewBlock(LlmRequest const& llmRequest) override;
 
     [[nodiscard]] static SizeType32 getSinkBubbleLength(SizeType32 sinkTokenLen, SizeType32 tokensPerBlock);
 

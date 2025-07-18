@@ -4,8 +4,7 @@ import torch
 
 from ...distributed import allgather, reducescatter
 from ...model_config import ModelConfig
-from ...utils import (EventType, Fp4QuantizedTensor, ceil_div,
-                      disable_fp4_allgather, swizzle_sf)
+from ...utils import EventType, Fp4QuantizedTensor, ceil_div, swizzle_sf
 from .interface import MoE
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            FP8QDQFusedMoEMethod, MoEWeightLoadingMode,
@@ -125,6 +124,7 @@ class CutlassFusedMoE(MoE):
 
         if self.apply_router_weight_on_input:
             assert self.routing_method.top_k == 1, "Current walkaround only supports top-1 routing"
+
         if self.quant_config and self.quant_config.quant_mode.has_any_quant(
                 exclude_kv_cache=True):
             if not (self.quant_config.quant_mode.has_nvfp4()
@@ -214,14 +214,12 @@ class CutlassFusedMoE(MoE):
         assert token_selected_experts.dtype == torch.int32
 
         if self.apply_router_weight_on_input:
-            assert self.routing_method.top_k == 1, "Current workaround only supports top-1 routing"
             assert x.dtype != torch.float8_e4m3fn, "Current workaround for apply_router_weight_on_input does not support fp8 input"
             x = x * token_final_scales.to(x.dtype)
             # TODO: remove this once we have correct fusedmoe kernel ready
             token_final_scales = None
 
-        use_allgather = self.use_dp and self.parallel_size > 1 and not disable_fp4_allgather(
-        )
+        use_allgather = self.use_dp and self.parallel_size > 1
 
         # quantize inputs
         use_deepseek_fp8_block_scale = False

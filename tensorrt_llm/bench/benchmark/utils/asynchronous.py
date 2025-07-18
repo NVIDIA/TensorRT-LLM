@@ -86,7 +86,7 @@ class LlmManager:
             request_perf_item = PerfItemTuple(
                 start_timestamp=request_start_timestamp,
                 end_timestamp=response_end_timestamp,
-                request_id=response.request_id,
+                request_id=response.id,
                 num_input_tokens=len(output.prompt_token_ids),
                 response_is_final=response.finished,
                 error=False,

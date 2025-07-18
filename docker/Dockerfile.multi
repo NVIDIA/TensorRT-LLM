@@ -66,6 +66,9 @@ RUN GITHUB_MIRROR=$GITHUB_MIRROR bash ./install_mpi4py.sh && rm install_mpi4py.s
 ARG TORCH_INSTALL_TYPE="skip"
 COPY docker/common/install_pytorch.sh install_pytorch.sh
 RUN bash ./install_pytorch.sh $TORCH_INSTALL_TYPE && rm install_pytorch.sh
+#
+# NB: PyTorch requires this to be < 1.0
+ENV PYTORCH_CUDA_ALLOC_CONF="garbage_collection_threshold:0.99999"
 
 # Install OpenCV with FFMPEG support
 RUN pip3 uninstall -y opencv && rm -rf /usr/local/lib/python3*/dist-packages/cv2/
@@ -75,10 +78,14 @@ RUN pip3 install opencv-python-headless --force-reinstall --no-deps --no-cache-d
 # * https://github.com/advisories/GHSA-vqfr-h8mv-ghfj
 # * https://github.com/advisories/GHSA-7cx3-6m66-7c5m
 # * https://github.com/advisories/GHSA-5rjg-fvgr-3xxf
+# * https://github.com/advisories/GHSA-8qvm-5x2c-j2w7
+# * https://github.com/advisories/GHSA-33p9-3p43-82vq
 RUN pip3 install --upgrade --no-cache-dir \
     "h11>=0.16" \
     "tornado>=6.5.0" \
-    "setuptools>=78.1.1,<80"
+    "setuptools>=78.1.1,<80" \
+    "protobuf>=4.25.8" \
+    "jupyter-core>=5.8.1"
 
 FROM ${TRITON_IMAGE}:${TRITON_BASE_TAG} AS triton
 
@@ -91,6 +98,10 @@ COPY --from=triton /opt/tritonserver/bin /opt/tritonserver/bin
 COPY --from=triton /opt/tritonserver/caches /opt/tritonserver/caches
 COPY docker/common/install_triton.sh install_triton.sh
 RUN bash ./install_triton.sh && rm install_triton.sh
+
+# Install UCX first
+COPY docker/common/install_ucx.sh install_ucx.sh
+RUN bash ./install_ucx.sh && rm install_ucx.sh
 
 # Install NIXL
 COPY docker/common/install_nixl.sh install_nixl.sh
