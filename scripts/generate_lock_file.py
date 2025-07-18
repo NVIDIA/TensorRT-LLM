@@ -38,16 +38,7 @@ sys.path.insert(0, os.getcwd())
 
 FOLDER_MAIN_TOML = "nspect_main_toml"
 
-url_mapping = {
-    'torch==1.9.0+cpu':
-    'https://download.pytorch.org/whl/cpu/torch-1.9.0%2Bcpu-cp310-cp310-linux_x86_64.whl',
-    'torchvision==0.10.0+cpu':
-    'https://download.pytorch.org/whl/cpu/torchvision-0.10.0%2Bcpu-cp310-cp310-linux_x86_64.whl',
-    'torch==1.11.0+cpu':
-    'https://download.pytorch.org/whl/cpu/torch-1.11.0%2Bcpu-cp310-cp310-linux_x86_64.whl',
-    'torchvision==0.12.0+cpu':
-    'https://download.pytorch.org/whl/cpu/torchvision-0.12.0%2Bcpu-cp310-cp310-linux_x86_64.whl'
-}
+url_mapping = {}
 
 target_env = {
     "python_version": 310,
