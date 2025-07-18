@@ -549,7 +549,7 @@ class LlamaDecoderLayer(DecoderLayer):
 
         self.fusion_config = EagerFusionConfig()
         self.enable_fusion = os.environ.get(
-            "TRTLLM_LLAMA_EAGER_FUSION_DISABLED", "0") == "0"
+            "TRTLLM_LLAMA_EAGER_FUSION_DISABLED", "0") == "1"
 
         self.is_fp8_quant = model_config.quant_config and model_config.quant_config.quant_mode.has_fp8_qdq(
         )
