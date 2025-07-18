@@ -469,8 +469,14 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
                      weight_loading_mode: MoEWeightLoadingMode):
 
         if get_sm_version() == 100:
+            expert_ids = set(module.initial_local_expert_ids)
+            if self.need_load_shared_weights(module):
+                expert_ids.update(
+                    module.layer_load_balancer.get_load_expert_ids())
             for name in list(weights.keys()):
                 if name.endswith("weight_scale_inv"):
+                    if int(name.split(".")[0]) not in expert_ids:
+                        continue
                     weight_name = name.replace("weight_scale_inv", "weight")
                     logger.debug(f"Resmoothing {weight_name}")
                     weight = weights[weight_name][:]

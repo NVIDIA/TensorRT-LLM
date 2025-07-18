@@ -12,7 +12,7 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
     BaseWeightLoader
 from tensorrt_llm._torch.models.modeling_utils import (
     register_checkpoint_weight_loader, run_concurrently)
-from tensorrt_llm._utils import local_mpi_rank, local_mpi_size
+from tensorrt_llm._utils import local_mpi_rank, local_mpi_size, mpi_barrier
 from tensorrt_llm.logger import logger
 
 
@@ -121,3 +121,5 @@ class HfWeightLoader(BaseWeightLoader):
                             len(local_file_names))
         with multiprocessing.Pool(processes=max_processes) as pool:
             pool.map(self._prefetch_one_file, local_file_names)
+        # Ensure that all ranks have finished prefetching before loading weights
+        mpi_barrier()
