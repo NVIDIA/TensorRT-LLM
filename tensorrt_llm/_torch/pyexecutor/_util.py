@@ -378,6 +378,182 @@ class KvCacheCreator:
 
         return kv_cache_manager
 
+    def _create_split_kv_cache_managers(
+            self, model_engine: PyTorchModelEngine, split_ratio: float = 0.5) -> Dict[str, KVCacheManager]:
+        """Create separate KV cache managers for batch halves.
+        
+        Args:
+            model_engine: The model engine
+            split_ratio: Ratio for first half (default 0.5)
+            
+        Returns:
+            Dictionary with 'half1' and 'half2' KV cache managers
+        """
+        executor_config = self._executor_config
+        mapping = self._mapping
+        assert model_engine.model.model_config.is_generation, "Only construct KV cache for generation models."
+
+        config = model_engine.model.model_config.pretrained_config
+        quant_config = model_engine.model.model_config.quant_config
+        spec_config = executor_config.speculative_config
+
+        hidden_size = config.hidden_size
+        num_attention_heads = config.num_attention_heads
+        num_key_value_heads = getattr(config, 'num_key_value_heads',
+                                      num_attention_heads)
+        head_dim = getattr(config, "head_dim",
+                           hidden_size // num_attention_heads)
+
+        if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
+            kv_cache_dtype = tensorrt_llm.bindings.DataType.FP8
+        else:
+            kv_cache_dtype = str_dtype_to_binding(
+                torch_dtype_to_str(model_engine.dtype))
+
+        num_hidden_layers = config.num_hidden_layers
+        
+        # Calculate split batch sizes
+        total_batch_size = executor_config.max_batch_size
+        split_point = int(total_batch_size * split_ratio)
+        half1_batch_size = split_point
+        half2_batch_size = total_batch_size - split_point
+        
+        print(f"[EXECUTOR_DEBUG] Creating split KV cache managers:")
+        print(f"[EXECUTOR_DEBUG]   Total batch size: {total_batch_size}")
+        print(f"[EXECUTOR_DEBUG]   Split ratio: {split_ratio}")
+        print(f"[EXECUTOR_DEBUG]   Half1 batch size: {half1_batch_size}")
+        print(f"[EXECUTOR_DEBUG]   Half2 batch size: {half2_batch_size}")
+
+        # Create KV cache config for splits
+        kv_cache_config = executor_config.kv_cache_config
+        
+        split_managers = {}
+        
+        if is_mla(config):
+            # MLA case
+            for half_name, batch_size in [('half1', half1_batch_size), ('half2', half2_batch_size)]:
+                split_managers[half_name] = KVCacheManager(
+                    kv_cache_config,
+                    tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
+                    num_layers=num_hidden_layers,
+                    num_kv_heads=1,
+                    head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
+                    tokens_per_block=executor_config.tokens_per_block,
+                    max_seq_len=executor_config.max_seq_len,
+                    max_batch_size=batch_size,  # Use split batch size
+                    mapping=mapping,
+                    dtype=kv_cache_dtype,
+                    spec_config=spec_config,
+                    max_beam_width=executor_config.max_beam_width,
+                )
+                print(f"[EXECUTOR_DEBUG] Created {half_name} KV cache manager with batch_size={batch_size}")
+                
+        elif is_nemotron_hybrid(config):
+            # Nemotron hybrid case
+            if executor_config.max_beam_width > 1:
+                raise ValueError("MambaHybridCacheManager + beam search is not supported yet.")
+            
+            num_layers = config.hybrid_override_pattern.count("*")
+            layer_mask = [char == "*" for char in config.hybrid_override_pattern]
+            mamba_num_layers = config.hybrid_override_pattern.count("M")
+            mamba_layer_mask = [char == "M" for char in config.hybrid_override_pattern]
+            
+            for half_name, batch_size in [('half1', half1_batch_size), ('half2', half2_batch_size)]:
+                split_managers[half_name] = MambaHybridCacheManager(
+                    # mamba cache parameters
+                    config.hidden_size,
+                    config.ssm_state_size,
+                    config.conv_kernel,
+                    config.expand,
+                    config.n_groups,
+                    config.mamba_head_dim,
+                    mamba_num_layers,
+                    mamba_layer_mask,
+                    config.torch_dtype,
+                    # kv cache parameters
+                    kv_cache_config,
+                    tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+                    num_layers=num_layers,
+                    layer_mask=layer_mask,
+                    num_kv_heads=num_key_value_heads,
+                    head_dim=head_dim,
+                    tokens_per_block=executor_config.tokens_per_block,
+                    max_seq_len=executor_config.max_seq_len,
+                    max_batch_size=batch_size,  # Use split batch size
+                    mapping=mapping,
+                    dtype=kv_cache_dtype,
+                    spec_config=spec_config,
+                )
+                print(f"[EXECUTOR_DEBUG] Created {half_name} MambaHybrid KV cache manager with batch_size={batch_size}")
+        else:
+            # Standard case
+            is_vswa = (kv_cache_config.max_attention_window is not None and 
+                      len(set(kv_cache_config.max_attention_window)) > 1)
+            binding_model_config = (model_engine.model.model_config.get_bindings_model_config(
+                tokens_per_block=executor_config.tokens_per_block
+            ) if is_vswa else None)
+
+            for half_name, batch_size in [('half1', half1_batch_size), ('half2', half2_batch_size)]:
+                split_managers[half_name] = KVCacheManager(
+                    kv_cache_config,
+                    tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+                    num_layers=num_hidden_layers,
+                    num_kv_heads=num_key_value_heads,
+                    head_dim=head_dim,
+                    tokens_per_block=executor_config.tokens_per_block,
+                    max_seq_len=executor_config.max_seq_len,
+                    max_batch_size=batch_size,  # Use split batch size
+                    mapping=mapping,
+                    dtype=kv_cache_dtype,
+                    spec_config=spec_config,
+                    max_num_tokens=executor_config.max_num_tokens,
+                    model_config=binding_model_config,
+                    max_beam_width=executor_config.max_beam_width,
+                )
+                print(f"[EXECUTOR_DEBUG] Created {half_name} standard KV cache manager with batch_size={batch_size}")
+
+        return split_managers
+
+    def build_split_managers(self, resources: Dict, split_ratio: float = 0.5) -> None:
+        """Construct split KV caches for model and draft model (if applicable)."""
+        print(f"[EXECUTOR_DEBUG] Building split KV cache managers with ratio {split_ratio}")
+        
+        # Create split managers for main model
+        main_split_managers = self._create_split_kv_cache_managers(self._model_engine, split_ratio)
+        resources[f"{ResourceManagerType.KV_CACHE_MANAGER}_half1"] = main_split_managers['half1']
+        resources[f"{ResourceManagerType.KV_CACHE_MANAGER}_half2"] = main_split_managers['half2']
+        
+        # Create split managers for draft model if applicable
+        if self._draft_model_engine is not None:
+            draft_split_managers = self._create_split_kv_cache_managers(self._draft_model_engine, split_ratio)
+            resources[f"{ResourceManagerType.DRAFT_KV_CACHE_MANAGER}_half1"] = draft_split_managers['half1']
+            resources[f"{ResourceManagerType.DRAFT_KV_CACHE_MANAGER}_half2"] = draft_split_managers['half2']
+        else:
+            resources[f"{ResourceManagerType.DRAFT_KV_CACHE_MANAGER}_half1"] = None
+            resources[f"{ResourceManagerType.DRAFT_KV_CACHE_MANAGER}_half2"] = None
+        
+        print(f"[EXECUTOR_DEBUG] Split KV cache managers created successfully")
+
+    def teardown_split_managers(self, resources: Dict) -> None:
+        """Clean up split KV caches for model and draft model (if applicable)."""
+        print(f"[EXECUTOR_DEBUG] Tearing down split KV cache managers")
+        
+        # Clean up main model split managers
+        for half_name in ['half1', 'half2']:
+            manager_key = f"{ResourceManagerType.KV_CACHE_MANAGER}_{half_name}"
+            if manager_key in resources and resources[manager_key] is not None:
+                resources[manager_key].shutdown()
+                del resources[manager_key]
+        
+        # Clean up draft model split managers
+        for half_name in ['half1', 'half2']:
+            manager_key = f"{ResourceManagerType.DRAFT_KV_CACHE_MANAGER}_{half_name}"
+            if manager_key in resources and resources[manager_key] is not None:
+                resources[manager_key].shutdown()
+                del resources[manager_key]
+        
+        print(f"[EXECUTOR_DEBUG] Split KV cache managers torn down successfully")
+
     def build_managers(self, resources: Dict) -> None:
         """Construct KV caches for model and draft model (if applicable)."""
         kv_cache_manager = self._create_kv_cache_manager(self._model_engine)
@@ -525,7 +701,8 @@ def create_py_executor_instance(
     kv_cache_transceiver = create_kv_cache_transceiver(
         mapping, kv_cache_manager, attention_type, cache_transceiver_config)
 
-    return PyExecutor(
+    # Create the PyExecutor
+    py_executor = PyExecutor(
         resource_manager,
         scheduler,
         model_engine=model_engine,
@@ -543,6 +720,16 @@ def create_py_executor_instance(
         draft_model_engine=draft_model_engine,
         start_worker=start_worker,
         garbage_collection_gen0_threshold=garbage_collection_gen0_threshold)
+    
+    # Set executor resources in the model if it supports it
+    # This allows the model to access split KV cache managers from the executor
+    if hasattr(model_engine.model, 'set_executor_resources'):
+        print(f"[EXECUTOR_DEBUG] Setting executor resources in model")
+        model_engine.model.set_executor_resources(resources)
+    else:
+        print(f"[EXECUTOR_DEBUG] Model does not support set_executor_resources")
+
+    return py_executor
 
 
 def create_torch_sampler_args(executor_config: ExecutorConfig, mapping: Mapping,

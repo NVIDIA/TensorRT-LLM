@@ -6,6 +6,7 @@ from itertools import chain
 from typing import Optional
 
 import torch
+import os
 
 import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
@@ -353,10 +354,19 @@ def create_py_executor(
                                           mapping=mapping,
                                           net_max_seq_len=net_max_seq_len)
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
+        
+        # Check if we want to use split KV cache managers
+        use_split_kv_cache = os.environ.get('USE_SPLIT_KV_CACHE', 'false').lower() == 'true'
+        split_ratio = float(os.environ.get('BATCH_SPLIT_RATIO', '0.5'))
+        
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.INIT_KV_CACHE
                 if estimating_kv_cache else _ExecutorCreationStage.KV_CACHE):
-            kv_cache_creator.build_managers(resources)
+            if use_split_kv_cache and not estimating_kv_cache:
+                logger.info(f"Creating split KV cache managers with ratio {split_ratio}")
+                kv_cache_creator.build_split_managers(resources, split_ratio)
+            else:
+                kv_cache_creator.build_managers(resources)
 
     # Resource managers for speculative decoding
     spec_resource_manager = get_spec_resource_manager(model_engine,
@@ -382,7 +392,12 @@ def create_py_executor(
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.MODEL_EXTRA):
             kv_cache_creator.estimate_max_tokens(py_executor)
-        kv_cache_creator.teardown_managers(resources)
+        
+        # Clean up KV cache managers (either split or standard)
+        if use_split_kv_cache:
+            kv_cache_creator.teardown_split_managers(resources)
+        else:
+            kv_cache_creator.teardown_managers(resources)
         del py_executor  # free before constructing new
 
         with mem_monitor.observe_creation_stage(
@@ -391,7 +406,13 @@ def create_py_executor(
             # create_kv_cache_manager above, which caps executor_config.max_seq_len. Restoring
             # the original value before creating the final KV cache.
             executor_config.max_seq_len = max_seq_len
-            kv_cache_creator.build_managers(resources)
+            
+            # Create final KV cache managers (either split or standard)
+            if use_split_kv_cache:
+                logger.info(f"Creating final split KV cache managers with ratio {split_ratio}")
+                kv_cache_creator.build_split_managers(resources, split_ratio)
+            else:
+                kv_cache_creator.build_managers(resources)
 
             for eng in [model_engine, draft_model_engine]:
                 if eng is None:

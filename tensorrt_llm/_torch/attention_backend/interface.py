@@ -136,14 +136,23 @@ class AttentionMetadata:
     _num_tokens: int = field(init=False, default=0, repr=False)
 
     def __post_init__(self) -> None:
+        print(f"[ATTENTION_METADATA_DEBUG] Creating AttentionMetadata:")
+        print(f"[ATTENTION_METADATA_DEBUG]   max_num_requests: {self.max_num_requests}")
+        print(f"[ATTENTION_METADATA_DEBUG]   max_num_tokens: {self.max_num_tokens}")
+        print(f"[ATTENTION_METADATA_DEBUG]   num_contexts: {self.num_contexts}")
+        print(f"[ATTENTION_METADATA_DEBUG]   kv_cache_manager: {type(self.kv_cache_manager).__name__}")
+        
         if self.is_cross:
             assert self.cross is None or self.cross is self, "Cross attention metadata should not have sub metadata"
             self.cross = self
+            print(f"[ATTENTION_METADATA_DEBUG]   Cross attention metadata initialized")
             return
 
         assert self.cross is None or type(self) is type(
             self.cross
         ), "Top level and cross attention sub metadata type mismatched"
+        
+        print(f"[ATTENTION_METADATA_DEBUG]   Self attention metadata initialized")
 
     def on_update(self):
         if (self._seq_lens is not None
@@ -156,6 +165,13 @@ class AttentionMetadata:
             self._num_tokens = self._seq_lens_kv.sum().item()
         elif self._seq_lens is not None:
             self._num_tokens = self._seq_lens.sum().item()
+        
+        print(f"[ATTENTION_METADATA_DEBUG] on_update() called:")
+        print(f"[ATTENTION_METADATA_DEBUG]   _num_ctx_tokens: {self._num_ctx_tokens}")
+        print(f"[ATTENTION_METADATA_DEBUG]   _num_generations: {self._num_generations}")
+        print(f"[ATTENTION_METADATA_DEBUG]   _num_tokens: {self._num_tokens}")
+        print(f"[ATTENTION_METADATA_DEBUG]   seq_lens shape: {self._seq_lens.shape if self._seq_lens is not None else None}")
+        print(f"[ATTENTION_METADATA_DEBUG]   seq_lens_kv shape: {self._seq_lens_kv.shape if self._seq_lens_kv is not None else None}")
 
     @property
     def all_rank_num_tokens(self) -> Optional[List[int]]:
@@ -166,6 +182,8 @@ class AttentionMetadata:
         value = value if value is not AttentionMetadata.all_rank_num_tokens else None
         self._all_rank_num_tokens = value
         self.all_rank_max_num_tokens = max(value) if value is not None else None
+        print(f"[ATTENTION_METADATA_DEBUG] all_rank_num_tokens set to: {value}")
+        print(f"[ATTENTION_METADATA_DEBUG] all_rank_max_num_tokens set to: {self.all_rank_max_num_tokens}")
 
     @property
     def seq_lens(self) -> Optional[torch.Tensor]:
@@ -175,6 +193,7 @@ class AttentionMetadata:
     def seq_lens(self, value: Optional[torch.Tensor]):
         # If value not explicitly given, dataclass tries to initialize using class attribute
         value = value if value is not AttentionMetadata.seq_lens else None
+        print(f"[ATTENTION_METADATA_DEBUG] seq_lens setter called with value shape: {value.shape if value is not None else None}")
         self._seq_lens = value
         self.on_update()
 
@@ -202,6 +221,7 @@ class AttentionMetadata:
     @num_contexts.setter
     def num_contexts(self, value: int):
         value = value if value is not AttentionMetadata.num_contexts else 0
+        print(f"[ATTENTION_METADATA_DEBUG] num_contexts setter called with value: {value}")
         self._num_contexts = value
         self.on_update()
 
@@ -269,12 +289,19 @@ class AttentionMetadata:
 
     @property
     def num_tokens(self) -> int:
+        print(f"[ATTENTION_METADATA_DEBUG] num_tokens property accessed, returning: {self._num_tokens}")
         return self._num_tokens
 
     def prepare(self):
         """
         Hook to be called before the forward step of the model.
         """
+        print(f"[ATTENTION_METADATA_DEBUG] prepare() called:")
+        print(f"[ATTENTION_METADATA_DEBUG]   max_num_tokens: {self.max_num_tokens}")
+        print(f"[ATTENTION_METADATA_DEBUG]   _num_tokens: {self._num_tokens}")
+        print(f"[ATTENTION_METADATA_DEBUG]   num_contexts: {self.num_contexts}")
+        print(f"[ATTENTION_METADATA_DEBUG]   seq_lens shape: {self._seq_lens.shape if self._seq_lens is not None else None}")
+        print(f"[ATTENTION_METADATA_DEBUG]   seq_lens_kv shape: {self._seq_lens_kv.shape if self._seq_lens_kv is not None else None}")
 
     def create_cuda_graph_metadata(self,
                                    max_batch_size: int,

@@ -874,12 +874,18 @@ void Executor::Impl::initializeLogitsPostProcessorBatched(LogitsPostProcessorCon
 
 IdType Executor::Impl::enqueueRequest(Request const& request)
 {
-    return enqueueRequests({&request, 1}).at(0);
+    TLLM_LOG_DEBUG("=== BEGIN enqueueRequest (single) ===");
+    auto result = enqueueRequests({&request, 1}).at(0);
+    TLLM_LOG_DEBUG("=== END enqueueRequest (single): returning ID %d ===", result);
+    return result;
 }
 
 std::vector<IdType> Executor::Impl::enqueueRequests(std::vector<Request> const& requests)
 {
-    return enqueueRequests({requests.data(), requests.size()});
+    TLLM_LOG_DEBUG("=== BEGIN enqueueRequests (vector): %lu requests ===", requests.size());
+    auto result = enqueueRequests({requests.data(), requests.size()});
+    TLLM_LOG_DEBUG("=== END enqueueRequests (vector): returning %lu IDs ===", result.size());
+    return result;
 }
 
 std::vector<IdType> Executor::Impl::enqueueRequests(common::ArrayView<Request const> const& requests)
@@ -887,16 +893,21 @@ std::vector<IdType> Executor::Impl::enqueueRequests(common::ArrayView<Request co
     TLLM_CHECK_WITH_INFO(!mShutdownCalled, "Shutdown called, cannot enqueue requests");
     checkParallelApiUsage(__func__);
 
-    TLLM_LOG_DEBUG("Enqueuing %lu requests", requests.size());
+    TLLM_LOG_DEBUG("=== BEGIN enqueueRequests: %lu requests ===", requests.size());
+    TLLM_LOG_DEBUG("Communication mode: %s", mCommMode == CommunicationMode::kLEADER ? "LEADER" : 
+                   (mCommMode == CommunicationMode::kORCHESTRATOR ? "ORCHESTRATOR" : "WORKER"));
+    
     std::vector<RequestWithId> requestWithIds;
     requestWithIds.reserve(requests.size());
 
     // First check valid of request in enqueue thread, so Exceptions can be thrown to user.
+    TLLM_LOG_DEBUG("Validating %lu requests...", requests.size());
     for (auto const& req : requests)
     {
         auto logitsPostProcessorName = req.getLogitsPostProcessorName();
         if (logitsPostProcessorName && logitsPostProcessorName.value() != Request::kBatchedPostProcessorName)
         {
+            TLLM_LOG_DEBUG("Getting logits post processor: %s", logitsPostProcessorName.value().c_str());
             getLogitsPostProcessor(*logitsPostProcessorName);
         }
     }
@@ -904,59 +915,80 @@ std::vector<IdType> Executor::Impl::enqueueRequests(common::ArrayView<Request co
     std::vector<IdType> ids;
     {
         auto now = std::chrono::steady_clock::now();
+        TLLM_LOG_DEBUG("Generating request IDs and processing child requests...");
         for (auto const& req : requests)
         {
             ids.emplace_back(generateReqId());
-            TLLM_LOG_DEBUG("Enqueue new request with id %d", ids.back());
+            TLLM_LOG_DEBUG("Generated request ID: %d", ids.back());
 
             std::vector<IdType> childReqIds;
             auto numChildRequests = getNumChildRequests(req);
+            TLLM_LOG_DEBUG("Request %d has %d child requests", ids.back(), numChildRequests);
+            
             if (numChildRequests > 0)
             {
                 childReqIds.reserve(numChildRequests);
                 for (int childId = 0; childId < numChildRequests; childId++)
                 {
                     childReqIds.emplace_back(generateReqId());
-                    TLLM_LOG_DEBUG("Add new child request with id %d", childReqIds.back());
+                    TLLM_LOG_DEBUG("Generated child request ID: %d for parent %d", childReqIds.back(), ids.back());
                 }
             }
             requestWithIds.emplace_back(RequestWithId{req, ids.back(), std::move(childReqIds), now});
         }
     }
 
+    TLLM_LOG_DEBUG("Processing requests based on communication mode...");
     if (mCommMode == CommunicationMode::kLEADER)
     {
+        TLLM_LOG_DEBUG("LEADER mode: Adding requests to queue");
         {
             std::scoped_lock<std::mutex> const lck(mQueuedReqMtx);
+            TLLM_LOG_DEBUG("Current queue size: %lu", mQueuedRequests.size());
+            
             if (mMaxQueueSize)
             {
                 auto const maxQueueSize = mMaxQueueSize.value();
+                TLLM_LOG_DEBUG("Max queue size: %d", maxQueueSize);
 
                 auto totalRequestSize = 0;
                 for (auto&& reqWithId : requestWithIds)
                 {
                     totalRequestSize += (getNumChildRequests(reqWithId.req) + 1);
                 }
+                TLLM_LOG_DEBUG("Total request size to add: %d", totalRequestSize);
 
                 if (maxQueueSize > 0 && mQueuedRequests.size() + totalRequestSize > static_cast<size_t>(maxQueueSize))
                 {
+                    TLLM_LOG_ERROR("Queue size limit exceeded: %lu + %d > %d", mQueuedRequests.size(), totalRequestSize, maxQueueSize);
                     TLLM_THROW("Maximum queue size of %d has been reached, please try again later", maxQueueSize);
                 }
             }
 
+            TLLM_LOG_DEBUG("Inserting %lu requests into queue", requestWithIds.size());
             for (auto&& req : requestWithIds)
             {
                 insertRequestInOrder(mQueuedRequests, std::move(req));
             }
+            TLLM_LOG_DEBUG("New queue size: %lu", mQueuedRequests.size());
         }
+        TLLM_LOG_DEBUG("Notifying queue condition variable");
         mQueuedReqCv.notify_one();
     }
     else if (mCommMode == CommunicationMode::kORCHESTRATOR)
     {
+        TLLM_LOG_DEBUG("ORCHESTRATOR mode: Sending requests via MPI");
         MpiMessage message(MpiId::PENDING_REQUEST);
         message.data = PendingRequestData{std::move(requestWithIds)};
         mSendQueue.push(std::move(message));
+        TLLM_LOG_DEBUG("Pushed message to send queue");
     }
+    else
+    {
+        TLLM_LOG_DEBUG("WORKER mode: No action taken for enqueueRequests");
+    }
+    
+    TLLM_LOG_DEBUG("=== END enqueueRequests: returning %lu request IDs ===", ids.size());
     return ids;
 }
 
@@ -964,33 +996,60 @@ std::vector<Response> Executor::Impl::awaitResponses(std::optional<std::chrono::
 {
     TLLM_CHECK_WITH_INFO(!mShutdownCalled, "Shutdown called");
     checkParallelApiUsage(__func__);
+    
+    TLLM_LOG_DEBUG("=== BEGIN awaitResponses ===");
+    if (timeout)
+    {
+        TLLM_LOG_DEBUG("Timeout specified: %ld ms", timeout.value().count());
+    }
+    else
+    {
+        TLLM_LOG_DEBUG("No timeout specified, waiting indefinitely");
+    }
+    
     std::unique_lock<std::mutex> lck(mResponsesMtx);
+    TLLM_LOG_DEBUG("Current responses map size: %lu", mResponses.size());
+    TLLM_LOG_DEBUG("Shutdown flag: %s", mShutdown ? "true" : "false");
+    
     auto pred = [this]() -> bool { return !mResponses.empty() || mShutdown; };
     auto storeResponses = [this]()
     {
+        TLLM_LOG_DEBUG("Storing responses from map...");
         std::vector<Response> responses;
         for (auto it = mResponses.begin(); it != mResponses.end();)
         {
+            TLLM_LOG_DEBUG("Processing responses for request ID: %d, count: %lu", it->first, it->second.size());
             responses.insert(responses.end(), it->second.begin(), it->second.end());
             addTerminatedReqId(it->second, it->first);
             it = mResponses.erase(it);
         }
+        TLLM_LOG_DEBUG("Total responses stored: %lu", responses.size());
         return responses;
     };
 
     std::vector<Response> responses;
     if (timeout)
     {
+        TLLM_LOG_DEBUG("Waiting with timeout...");
         if (mResponsesCv.wait_for(lck, timeout.value(), pred))
         {
+            TLLM_LOG_DEBUG("Condition met within timeout");
             responses = storeResponses();
+        }
+        else
+        {
+            TLLM_LOG_DEBUG("Timeout expired, no responses available");
         }
     }
     else
     {
+        TLLM_LOG_DEBUG("Waiting indefinitely for responses...");
         mResponsesCv.wait(lck, pred);
+        TLLM_LOG_DEBUG("Condition met, processing responses");
         responses = storeResponses();
     }
+    
+    TLLM_LOG_DEBUG("=== END awaitResponses: returning %lu responses ===", responses.size());
     return responses;
 }
 
@@ -999,15 +1058,31 @@ std::vector<Response> Executor::Impl::awaitResponses(
 {
     TLLM_CHECK_WITH_INFO(!mShutdownCalled, "Shutdown called");
     checkParallelApiUsage(__func__);
+    
+    TLLM_LOG_DEBUG("=== BEGIN awaitResponses for request ID: %d ===", reqId);
+    if (timeout)
+    {
+        TLLM_LOG_DEBUG("Timeout specified: %ld ms", timeout.value().count());
+    }
+    else
+    {
+        TLLM_LOG_DEBUG("No timeout specified, waiting indefinitely");
+    }
+    
     std::unique_lock<std::mutex> lck(mResponsesMtx);
+    TLLM_LOG_DEBUG("Current responses map size: %lu", mResponses.size());
+    TLLM_LOG_DEBUG("Shutdown flag: %s", mShutdown ? "true" : "false");
+    
     auto pred = [this, reqId]() -> bool
     { return (mResponses.find(reqId) != mResponses.end() && !mResponses.at(reqId).empty()) || mShutdown; };
     auto storeIdResponse = [this, reqId]()
     {
+        TLLM_LOG_DEBUG("Storing responses for request ID: %d", reqId);
         std::vector<Response> responses;
         responses.swap(mResponses.at(reqId));
         mResponses.erase(reqId);
         addTerminatedReqId(responses, reqId);
+        TLLM_LOG_DEBUG("Stored %lu responses for request ID: %d", responses.size(), reqId);
         return responses;
     };
 
@@ -1015,8 +1090,10 @@ std::vector<Response> Executor::Impl::awaitResponses(
     // with isFinal = true for a given requestId.
     if (mTerminatedReqIds.contains(reqId))
     {
+        TLLM_LOG_DEBUG("Request ID %d has already been terminated", reqId);
         if (mResponses.find(reqId) != mResponses.end())
         {
+            TLLM_LOG_ERROR("Request ID %d should already be removed from responses!", reqId);
             TLLM_THROW("ReqId should already be removed from responses!");
         }
         std::string const err = "ReqId " + std::to_string(reqId) + " has already been processed and was terminated.";
@@ -1028,16 +1105,26 @@ std::vector<Response> Executor::Impl::awaitResponses(
     std::vector<Response> responses;
     if (timeout)
     {
+        TLLM_LOG_DEBUG("Waiting with timeout for request ID: %d", reqId);
         if (mResponsesCv.wait_for(lck, timeout.value(), pred))
         {
+            TLLM_LOG_DEBUG("Condition met within timeout for request ID: %d", reqId);
             responses = storeIdResponse();
+        }
+        else
+        {
+            TLLM_LOG_DEBUG("Timeout expired for request ID: %d, no responses available", reqId);
         }
     }
     else
     {
+        TLLM_LOG_DEBUG("Waiting indefinitely for request ID: %d", reqId);
         mResponsesCv.wait(lck, pred);
+        TLLM_LOG_DEBUG("Condition met for request ID: %d", reqId);
         responses = storeIdResponse();
     }
+    
+    TLLM_LOG_DEBUG("=== END awaitResponses for request ID %d: returning %lu responses ===", reqId, responses.size());
     return responses;
 }
 

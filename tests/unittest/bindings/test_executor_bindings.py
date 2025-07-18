@@ -53,6 +53,7 @@ def get_expected_num_tokens(prompt_len, max_tokens, streaming,
 def test_executor_valid_ctor(model_files, model_path):
     executor_config = trtllm.ExecutorConfig(
         1, kv_cache_config=trtllm.KvCacheConfig(free_gpu_memory_fraction=0.5))
+    print(f"model_path: {model_path}")
     executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
                                executor_config)
 
