@@ -45,18 +45,12 @@ class Gemma3InputProcessor(InputProcessor):
             raise KeyError("Expected image data in multimodal data for Gemma3.")
 
         images = mm_data.get("image")
-        if images and len(images) != 1:
-            raise ValueError(
-                f"Expected at most one image for processing, got {len(images)}."
-            )
-
-        image = images[0] if images else None
         do_rescale = self.processor.image_processor.do_rescale
-        if isinstance(image, torch.Tensor):
+        if images is not None and isinstance(images[0], torch.Tensor):
             do_rescale = False
         processor_output = self.processor(
             text=text_prompt,
-            images=image,
+            images=images,
             do_rescale=do_rescale,
             return_tensors="pt",
             device=self.device).to(dtype=torch.bfloat16)
