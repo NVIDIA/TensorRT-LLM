@@ -1127,8 +1127,9 @@ class W4A16_AWQ_LinearMethod(LinearMethodBase):
     def load_weights_vanilla(self, module: Linear, weights: List[Dict]) -> None:
         load_weights_vanilla_helper(module, weights)
 
-        device = torch.device('cuda')
-
+        # Use the same device as the weight tensor
+        # as we register pre_quant_scale after sharded model weights are moved to respective gpus
+        device = module.weight.device
         pre_quant_scale = load_weight_shard(
             weights[0]["pre_quant_scale"],
             module.tp_size,
@@ -1308,7 +1309,9 @@ class W4A8_AWQ_LinearMethod(LinearMethodBase):
     def load_weights_vanilla(self, module: Linear, weights: List[Dict]):
         load_weights_vanilla_helper(module, weights)
 
-        device = torch.device('cuda')
+        # Use the same device as the weight tensor
+        # as we register pre_quant_scale after sharded model weights are moved to respective gpus
+        device = module.weight.device
         pre_quant_scale = load_weight_shard(
             weights[0]["pre_quant_scale"],
             module.tp_size,
@@ -1371,14 +1374,16 @@ class W4A8_AWQ_LinearMethod(LinearMethodBase):
         # NOTE: pre_quant_scale is the same for q,k,v since modelopt checks which layer shared the same input and create an avg pre_quant_scale
         # Usually when modelopt exports the quantized model, pre_quant_Scale is fused in the layer norm (this case relevant if fused is disabled - modelopt internal)
         if "pre_quant_scale" in weights[0].keys():
-
+            # Use the same device as the weight tensor
+            # as we register pre_quant_scale after sharded model weights are moved to respective gpus
+            device = module.weight.device
             pre_quant_scale = load_weight_shard(
                 weights[0]["pre_quant_scale"],
                 module.tp_size,
                 module.tp_rank,
                 # pre_quant_scale applies to activation as opposed to weight, so flip tp_mode the other way around
                 TensorParallelMode.flip(module.tp_mode),
-                torch.device('cuda'),
+                device,
             )
 
             module.pre_quant_scale = Parameter(
@@ -1413,13 +1418,16 @@ class W4A8_AWQ_LinearMethod(LinearMethodBase):
         copy_weight(module.alpha, alpha)
 
         if "pre_quant_scale" in weights[0].keys():
+            # Use the same device as the weight tensor
+            # as we register pre_quant_scale after sharded model weights are moved to respective gpus
+            device = module.weight.device
             pre_quant_scale = load_weight_shard(
                 weights[0]["pre_quant_scale"],
                 module.tp_size,
                 module.tp_rank,
                 # pre_quant_scale applies to activation as opposed to weight, so flip tp_mode the other way around
                 TensorParallelMode.flip(module.tp_mode),
-                torch.device('cuda'),
+                device,
             )
 
             # NOTE:Create this tensor in load_weights, since not all layer have this tensor and memory is not allocated for it (same as W4A16)
