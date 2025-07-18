@@ -382,7 +382,8 @@ def create_py_executor(
 
     # Drafter for speculative decoding
     with mem_monitor.observe_creation_stage(_ExecutorCreationStage.DRAFTER):
-        drafter = get_spec_drafter(model_engine, spec_resource_manager)
+        drafter = get_spec_drafter(model_engine, draft_model_engine, sampler,
+                                   spec_resource_manager)
 
     with mem_monitor.observe_creation_stage(
             _ExecutorCreationStage.INIT_EXTRA_RESOURCES
