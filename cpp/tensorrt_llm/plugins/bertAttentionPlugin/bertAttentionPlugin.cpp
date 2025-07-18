@@ -958,15 +958,14 @@ int BertAttentionPlugin::initialize() noexcept
             fmhaParams.saveSoftmax = true;
         }
 
-        // Load kernels from the pre-compiled cubins.
-        // // The KV input data type. The default is same as dataType.
+        // The KV input data type. The default is same as dataType.
         fmhaParams.dataTypeKv = data_type;
         fmhaParams.forceFp32Acc = false;
         fmhaParams.headSizeV = mHeadSize;
 
-        // Load kernels from the pre-compiled cubins for blackwell.
+        // Load kernels from the pre-compiled cubins.
         mFmhaDispatcher.reset(new FmhaDispatcher(fmhaParams));
-        // Fall back to unfused MHA kernels if not supported for blackwell.
+        // Fall back to unfused MHA kernels if not supported.
         mEnableContextFMHA = mFmhaDispatcher->isSupported();
     }
 
