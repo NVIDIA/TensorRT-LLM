@@ -59,7 +59,7 @@ class VariableLengthBuffer:
 
     def dispatch(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
                  topk_idx: torch.Tensor, topk_weights: torch.Tensor,
-                 num_experts: int) -> \
+                 num_experts: int, global_expert_id_offset: int) -> \
             Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], torch.Tensor, torch.Tensor, List, Tuple]:
         # NOTES: an optional `previous_event` means a CUDA event captured that you want to make it as a dependency
         # of the dispatch kernel, it may be useful with communication-computation overlap. For more information, please
@@ -76,7 +76,8 @@ class VariableLengthBuffer:
         recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, event = \
             self.buffer.dispatch(x, topk_idx=topk_idx, topk_weights=topk_weights,
                                  num_tokens_per_rank=num_tokens_per_rank, num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
-                                 is_token_in_rank=is_token_in_rank, num_tokens_per_expert=num_tokens_per_expert)
+                                 is_token_in_rank=is_token_in_rank, num_tokens_per_expert=num_tokens_per_expert,
+                                 global_expert_id_offset=global_expert_id_offset)
         assert event.event is None
 
         # For event management, please refer to the docs of the `EventOverlap` class
