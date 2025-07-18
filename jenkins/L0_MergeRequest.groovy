@@ -977,6 +977,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 def requireMultiGpuTesting = currentBuild.description?.contains("Require Multi-GPU Testing") ?: false
                 echo "requireMultiGpuTesting: ${requireMultiGpuTesting}"
                 if (!requireMultiGpuTesting) {
+                    error "Single-GPU test failed"
                     return
                 }
 
