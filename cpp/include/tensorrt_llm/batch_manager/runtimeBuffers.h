@@ -168,7 +168,7 @@ private:
 
 public:
     //! Additional buffers depending on model type
-    std::shared_ptr<TransformerBuffers> transformerBuffers;
+    std::unique_ptr<TransformerBuffers> transformerBuffers;
     std::unique_ptr<RnnStateBuffers> rnnStateBuffers;
 
     //! Encoder-Decoder

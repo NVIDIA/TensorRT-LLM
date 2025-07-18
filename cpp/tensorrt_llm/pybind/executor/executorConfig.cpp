@@ -336,7 +336,7 @@ void initConfigBindings(pybind11::module_& m)
             throw std::runtime_error("Invalid extendedRuntimePerfKnobConfig state!");
         }
         return tle::ExtendedRuntimePerfKnobConfig(
-            state[0].cast<bool>(), state[1].cast<bool>(), state[2].cast<bool>(), state[3].cast<SizeType32>());
+            state[0].cast<bool>(), state[1].cast<bool>(), state[2].cast<bool>(), state[2].cast<SizeType32>());
     };
     auto extendedRuntimePerfKnobConfigGetstate = [](tle::ExtendedRuntimePerfKnobConfig const& self)
     {
