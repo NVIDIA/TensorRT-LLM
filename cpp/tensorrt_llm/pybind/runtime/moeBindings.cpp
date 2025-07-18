@@ -16,7 +16,8 @@
  */
 
 #include "moeBindings.h"
-#include "tensorrt_llm/runtime/moeLoadBalancer.h"
+#include "tensorrt_llm/runtime/moeLoadBalancer/hostAccessibleDeviceAllocator.h"
+#include "tensorrt_llm/runtime/moeLoadBalancer/moeLoadBalancer.h"
 #include <pybind11/functional.h>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
@@ -98,6 +99,8 @@ void initMoeBindings(pybind11::module_& m)
     py::class_<tr::MoeLoadBalancer>(m, "MoeLoadBalancer")
         .def(py::init<int, int, int>(), py::arg("ep_rank"), py::arg("ep_size"), py::arg("layer_updates_per_iter"),
             "Initialize the MoeLoadBalancer with the specified expert parallel rank, size, and update frequency")
+        .def("set_use_gpu_memcpy", &tr::MoeLoadBalancer::setUseGpuMemcpy, py::arg("use_gpu_memcpy"),
+            "Set whether to use GPU memcpy for weight updates")
         .def("add_layer", &tr::MoeLoadBalancer::AddLayer, py::arg("expert_count"), py::arg("top_k"),
             py::arg("slot_count_per_rank"), "Add a new MOE layer to the load balancer")
         .def("finalize_model", &tr::MoeLoadBalancer::finalizeModel,
@@ -108,6 +111,9 @@ void initMoeBindings(pybind11::module_& m)
             py::arg("enable_update_weights"), "Start a new iteration with the given ID and settings")
         .def("end_iter", &tr::MoeLoadBalancer::endIter, py::arg("iter_id"), "End the iteration with the given ID")
         .def("shutdown", &tr::MoeLoadBalancer::shutdown, "Shutdown the load balancer and clean up resources");
+
+    m.def("is_host_accessible_device_memory_supported", &tr::HostAccessibleDeviceAllocator::isSupported,
+        "If current system support host accessible device memory");
 
     // Bind do_replication function for testing
     m.def("do_replication", &pyDoReplication, py::arg("meta_info"), py::arg("expert_load_factor"),

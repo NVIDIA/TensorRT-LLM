@@ -55,7 +55,9 @@ def mla_attn(q_nope, q_pe, compressed_kv, k_pe, wkv_b, softmax_scale):
     q_nope_proj = torch.einsum("bhsd,hdc->bhsc", q_nope, wkv_b_weight[:, :qk_nope_head_dim])
 
     # MLA ref operation
-    x = torch.ops.deepseek.mla(q_nope_proj, q_pe, compressed_kv, k_pe, None, softmax_scale)
+    x = torch.ops.auto_deploy.torch_attention_deepseek_mla(
+        q_nope_proj, q_pe, compressed_kv, k_pe, None, softmax_scale
+    )
 
     # Up project attention scores
     x = torch.einsum("bshc,hdc->bshd", x, wkv_b_weight[:, -v_head_dim:])

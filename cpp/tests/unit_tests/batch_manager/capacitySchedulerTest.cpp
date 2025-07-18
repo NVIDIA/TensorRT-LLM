@@ -129,9 +129,12 @@ protected:
         bool onboardBlocks = true;
         CudaStreamPtr streamPtr = std::make_shared<tensorrt_llm::runtime::CudaStream>();
 
+        using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
+        auto const blocksPerWindow = BlocksPerWindow{{maxNumTokensPerSeq, {maxNumBlocks, 0}}};
+
         // init KV cache block manager
         return std::make_shared<kv_cache_manager::KVCacheManager>(numLayers, nbKvHeads, sizePerHead, tokensPerBlock,
-            maxNumBlocks, 0, maxNumRequests, 1, std::vector<SizeType32>{maxNumTokensPerSeq}, std::nullopt, kvDtype,
+            blocksPerWindow, maxNumRequests, 1, std::vector<SizeType32>{maxNumTokensPerSeq}, std::nullopt, kvDtype,
             sinkTokenLength, streamPtr, std::nullopt, enableReuse, onboardBlocks, cacheType);
     }
 

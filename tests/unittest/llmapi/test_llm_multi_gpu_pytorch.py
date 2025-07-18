@@ -1,26 +1,19 @@
 import pytest
 
 # isort: off
-from .test_llm import (global_kvcache_config,
-                       tinyllama_guided_decoding_test_harness,
-                       tinyllama_logits_processor_test_harness)
+from .test_llm import tinyllama_logits_processor_test_harness
 from tensorrt_llm.llmapi import KvCacheConfig
-from .test_llm_pytorch import (llama_v2_13b_lora_test_harness,
-                               llama_7b_multi_lora_test_harness)
-
+from .test_llm_pytorch import (llama_7b_lora_from_dir_test_harness,
+                               llama_7b_multi_lora_from_request_test_harness)
+from .test_llm import _test_llm_capture_request_error
 # isort: on
 
 global_kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
 
 
-@pytest.mark.gpu4
-def test_tinyllama_guided_decoding_tp2pp2():
-    pytest.skip(reason="https://nvbugs/5244006")
-    tinyllama_guided_decoding_test_harness(
-        tensor_parallel_size=2,
-        pipeline_parallel_size=2,
-        kv_cache_config=global_kvcache_config,
-        backend='pytorch')
+@pytest.mark.gpu2
+def test_llm_capture_request_error():
+    _test_llm_capture_request_error(pytorch_backend=True, tp_size=2)
 
 
 @pytest.mark.gpu4
@@ -40,12 +33,12 @@ def test_tinyllama_logits_processor_2gpu(tp_size: int, pp_size: int):
 
 
 @pytest.mark.gpu2
-def test_llama_v2_13b_lora_tp2():
-    llama_v2_13b_lora_test_harness(tensor_parallel_size=2,
-                                   kv_cache_config=global_kv_cache_config)
+def test_llama_7b_lora_tp2():
+    llama_7b_lora_from_dir_test_harness(tensor_parallel_size=2,
+                                        kv_cache_config=global_kv_cache_config)
 
 
 @pytest.mark.gpu2
 def test_llama_7b_multi_lora_tp2():
-    llama_7b_multi_lora_test_harness(tensor_parallel_size=2,
-                                     kv_cache_config=global_kv_cache_config)
+    llama_7b_multi_lora_from_request_test_harness(
+        tensor_parallel_size=2, kv_cache_config=global_kv_cache_config)

@@ -180,6 +180,22 @@ _str_to_binding_dtype_dict = dict(
     fp8=DataType.FP8,
 )
 
+_binding_dtype_size = {
+    DataType.INT64: 8,
+    DataType.FLOAT: 4,
+    DataType.INT32: 4,
+    DataType.BF16: 2,
+    DataType.HALF: 2,
+    DataType.BOOL: 1,
+    DataType.FP8: 1,
+    DataType.INT8: 1,
+    DataType.UINT8: 1,
+}
+
+
+def binding_dtype_size(dtype: DataType):
+    return _binding_dtype_size[dtype]
+
 
 def str_dtype_to_binding(dtype):
     ret = _str_to_binding_dtype_dict.get(dtype)
@@ -779,6 +795,26 @@ class QuantModeWrapper:
 
     def __getitem__(self, index):
         return self.objs[index]
+
+
+PYTHON_DEFAULT_GC_THRESHOLDS = gc.get_threshold()
+
+
+@contextmanager
+def customized_gc_thresholds(gen0_threshold: Optional[int] = None):
+    try:
+        if gen0_threshold:
+            gc.set_threshold(gen0_threshold)
+            logger.debug(
+                f'Set Python GC threshold to customized value: {gen0_threshold}'
+            )
+        yield
+    finally:
+        if gen0_threshold:
+            gc.set_threshold(*PYTHON_DEFAULT_GC_THRESHOLDS)
+            logger.debug(
+                f'Reset Python GC thresholds to default value: {PYTHON_DEFAULT_GC_THRESHOLDS}'
+            )
 
 
 @contextmanager

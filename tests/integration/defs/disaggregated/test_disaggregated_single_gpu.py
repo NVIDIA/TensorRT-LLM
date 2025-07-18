@@ -9,10 +9,11 @@ from defs.conftest import skip_no_hopper
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 
-from tensorrt_llm import DisaggregatedParams, SamplingParams
-from tensorrt_llm._torch import LLM
+from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams
 from tensorrt_llm._utils import set_mpi_comm
-from tensorrt_llm.llmapi import KvCacheConfig, MpiCommSession
+from tensorrt_llm.llmapi import (CacheTransceiverConfig, CudaGraphConfig,
+                                 KvCacheConfig, MpiCommSession)
+from tensorrt_llm.llmapi.llm_args import EagleDecodingConfig
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(
@@ -34,11 +35,17 @@ def model_path(model_name):
     elif 'TinyLlama-1.1B-Chat-v1.0' in model_name:
         return os.path.join(llm_models_root, 'llama-models-v2',
                             'TinyLlama-1.1B-Chat-v1.0')
+    elif 'Llama-3.1-8B-Instruct' in model_name:
+        return os.path.join(llm_models_root, 'llama-3.1-model',
+                            'Llama-3.1-8B-Instruct/')
+    elif 'EAGLE3-LLaMA3.1-Instruct-8B' in model_name:
+        return os.path.join(llm_models_root, 'EAGLE3-LLaMA3.1-Instruct-8B')
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
 
-async def run_worker(kv_cache_config, pytorch_config, model_name, rank):
+async def run_worker(kv_cache_config, cache_transceiver_config, pytorch_config,
+                     model_name, rank):
     assert isinstance(pytorch_config, dict)
     print(f"Running worker {rank}")
     port_name = MPI.Lookup_name('my_port')
@@ -54,7 +61,8 @@ async def run_worker(kv_cache_config, pytorch_config, model_name, rank):
                   enable_chunked_prefill=False,
                   **pytorch_config,
                   _mpi_session=mpi_session,
-                  kv_cache_config=kv_cache_config)
+                  kv_cache_config=kv_cache_config,
+                  cache_transceiver_config=cache_transceiver_config)
         print(f"LLM created")
     except Exception as e:
         print(f"Error creating LLM: {e}")
@@ -98,9 +106,11 @@ def send_requests_to_worker(requests, worker_rank, intercomm):
     return responses
 
 
-def worker_entry_point(kv_cache_config, pytorch_config, model_name, rank):
+def worker_entry_point(kv_cache_config, cache_transceiver_config,
+                       pytorch_config, model_name, rank):
     return asyncio.run(
-        run_worker(kv_cache_config, pytorch_config, model_name, rank))
+        run_worker(kv_cache_config, cache_transceiver_config, pytorch_config,
+                   model_name, rank))
 
 
 def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
@@ -109,27 +119,30 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
 
     # Context worker
     worker_pytorch_configs.append(
-        dict(disable_overlap_scheduler=True,
-             kv_cache_dtype="auto",
-             use_cuda_graph=enable_cuda_graph))
+        dict(
+            disable_overlap_scheduler=True,
+            cuda_graph_config=CudaGraphConfig() if enable_cuda_graph else None))
 
     # Generation worker
     worker_pytorch_configs.append(
-        dict(disable_overlap_scheduler=not generation_overlap,
-             kv_cache_dtype="auto",
-             use_cuda_graph=enable_cuda_graph))
+        dict(
+            disable_overlap_scheduler=not generation_overlap,
+            cuda_graph_config=CudaGraphConfig() if enable_cuda_graph else None))
 
     kv_cache_configs = [KvCacheConfig(max_tokens=2048 * 8) for _ in range(2)]
+    cache_transceiver_configs = [
+        CacheTransceiverConfig(backend="default") for _ in range(2)
+    ]
     model_names = [model_path(model) for _ in range(2)]
     ranks = [0, 1]
     worker_args = list(
-        zip(kv_cache_configs, worker_pytorch_configs, model_names, ranks))
+        zip(kv_cache_configs, cache_transceiver_configs, worker_pytorch_configs,
+            model_names, ranks))
 
     port_name = MPI.Open_port()
     MPI.Publish_name('my_port', port_name)
 
-    with MPIPoolExecutor(max_workers=2, env={"TRTLLM_USE_MPI_KVCACHE":
-                                             "1"}) as executor:
+    with MPIPoolExecutor(max_workers=2, env={"UCX_TLS": "^ib"}) as executor:
         futures = []
         try:
             for worker_arg in worker_args:
@@ -230,32 +243,35 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
 
     # Context worker
     worker_pytorch_configs.append(
-        dict(disable_overlap_scheduler=True,
-             kv_cache_dtype="auto",
-             use_cuda_graph=enable_cuda_graph))
+        dict(
+            disable_overlap_scheduler=True,
+            cuda_graph_config=CudaGraphConfig() if enable_cuda_graph else None))
 
     # Generation worker
     worker_pytorch_configs.append(
-        dict(disable_overlap_scheduler=not generation_overlap,
-             kv_cache_dtype="auto",
-             use_cuda_graph=enable_cuda_graph))
+        dict(
+            disable_overlap_scheduler=not generation_overlap,
+            cuda_graph_config=CudaGraphConfig() if enable_cuda_graph else None))
 
     kv_cache_configs = [
-        KvCacheConfig(max_tokens=128, enable_block_reuse=False)
+        KvCacheConfig(max_tokens=128, enable_block_reuse=False, dtype="auto")
         for _ in range(2)
+    ]
+    cache_transceiver_configs = [
+        CacheTransceiverConfig(backend="default") for _ in range(2)
     ]
     model_names = [model_path(model) for _ in range(2)]
     ranks = [0, 1]
     worker_args = list(
-        zip(kv_cache_configs, worker_pytorch_configs, model_names, ranks))
+        zip(kv_cache_configs, cache_transceiver_configs, worker_pytorch_configs,
+            model_names, ranks))
 
     port_name = MPI.Open_port()
     MPI.Publish_name('my_port', port_name)
 
     prompt = "European Union is a political and economic union of 27 countries. The European Union is headquartered in Brussels, Belgium. The first president of the European Union was Jean-Claude Juncker. The current president is Ursula von der Leyen. The European Union is a major economic and political entity."
 
-    with MPIPoolExecutor(max_workers=2, env={"TRTLLM_USE_MPI_KVCACHE":
-                                             "1"}) as executor:
+    with MPIPoolExecutor(max_workers=2, env={"UCX_TLS": "^ib"}) as executor:
         futures = []
         try:
             for worker_arg in worker_args:
@@ -277,6 +293,108 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
             requests = []
             # Send 256 requests to make sure the context worker is saturated
             for _ in range(256):
+                requests.append(
+                    (prompt, SamplingParams(max_tokens=1, ignore_eos=True),
+                     DisaggregatedParams(request_type="context_only")))
+
+            intercomm.send(requests, dest=0, tag=MPI_REQUEST)
+
+            for _ in range(len(requests)):
+                output = intercomm.recv(source=0, tag=MPI_RESULT)
+                assert output[0].disaggregated_params is not None
+                assert output[
+                    0].disaggregated_params.request_type == "context_only"
+                assert len(output[0].token_ids) == 1
+
+                generation_request_disagg_params = output[
+                    0].disaggregated_params
+                generation_request_disagg_params.request_type = "generation_only"
+                requests = []
+                requests.append((prompt,
+                                 SamplingParams(max_tokens=max_tokens,
+                                                ignore_eos=True),
+                                 generation_request_disagg_params))
+
+                intercomm.send(requests, dest=1, tag=MPI_REQUEST)
+                output = intercomm.recv(source=1, tag=MPI_RESULT)
+
+        finally:
+            # Send termination requests
+            intercomm.send(None, dest=0, tag=MPI_REQUEST)
+            intercomm.send(None, dest=1, tag=MPI_REQUEST)
+            print("Sent termination requests to the workers.")
+
+            # Wait for all futures to complete
+            for future in futures:
+                future.result()
+            print("All workers terminated.")
+
+
+@pytest.mark.parametrize("model", ["Llama-3.1-8B-Instruct"])
+@pytest.mark.parametrize("spec_dec_model_path", ["EAGLE3-LLaMA3.1-Instruct-8B"])
+@pytest.mark.parametrize("generation_overlap", [False])
+def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
+                                                 generation_overlap):
+    # Test whether the batch slots are properly released when using speculative decoding
+    # with disaggregated serving.
+    spec_dec_config = EagleDecodingConfig(
+        speculative_model_dir=model_path(spec_dec_model_path),
+        eagle3_one_model=False,
+        max_draft_len=3)
+
+    worker_pytorch_configs = []
+
+    # Context worker
+    worker_pytorch_configs.append(
+        dict(disable_overlap_scheduler=True,
+             speculative_config=spec_dec_config,
+             max_batch_size=1))
+
+    # Generation worker
+    worker_pytorch_configs.append(
+        dict(disable_overlap_scheduler=not generation_overlap,
+             speculative_config=spec_dec_config,
+             max_batch_size=1))
+
+    kv_cache_configs = [
+        KvCacheConfig(max_tokens=128, enable_block_reuse=False)
+        for _ in range(2)
+    ]
+    cache_transceiver_configs = [
+        CacheTransceiverConfig(backend="default") for _ in range(2)
+    ]
+    model_names = [model_path(model) for _ in range(2)]
+    ranks = [0, 1]
+    worker_args = list(
+        zip(kv_cache_configs, cache_transceiver_configs, worker_pytorch_configs,
+            model_names, ranks))
+
+    port_name = MPI.Open_port()
+    MPI.Publish_name('my_port', port_name)
+
+    prompt = "What is the capital of Germany?"
+
+    with MPIPoolExecutor(max_workers=2, env={"UCX_TLS": "^ib"}) as executor:
+        futures = []
+        try:
+            for worker_arg in worker_args:
+                future = executor.submit(worker_entry_point, *worker_arg)
+                futures.append(future)
+        except Exception as e:
+            print(f"Error in worker {worker_arg}: {e}")
+            raise e
+
+        try:
+            print("Launched all the workers.")
+            intercomm = MPI.COMM_SELF.Accept(port_name)
+
+            for _ in range(2):
+                intercomm.recv(tag=MPI_READY)
+                print("Received ready signal.")
+            max_tokens = 25
+
+            requests = []
+            for _ in range(10):
                 requests.append(
                     (prompt, SamplingParams(max_tokens=1, ignore_eos=True),
                      DisaggregatedParams(request_type="context_only")))

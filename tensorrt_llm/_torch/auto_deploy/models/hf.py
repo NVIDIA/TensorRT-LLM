@@ -62,26 +62,34 @@ def hf_load_state_dict_with_device(device: DeviceLikeType):
 
 @ModelFactoryRegistry.register("AutoModelForCausalLM")
 class AutoModelForCausalLMFactory(ModelFactory):
-    def __init__(
-        self,
-        model_kwargs: Optional[Dict[str, Any]] = None,
-        tokenizer_kwargs: Optional[Dict[str, Any]] = None,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
-        self.model_kwargs = model_kwargs or {}
-        self.tokenizer_kwargs = tokenizer_kwargs or {}
-        self.tokenizer_kwargs.setdefault("trust_remote_code", True)
-        self._quant_config = None
+        self._quant_config: Optional[Dict] = None
 
-        # heuristic to disable use_cache
+        # Relevant default tokenizer kwargs for HF-style tokenizer
+        defaults = {
+            "legacy": False,
+            "padding_side": "left",
+            "truncation_side": "left",
+            "trust_remote_code": True,
+            "use_fast": True,
+        }
+        self.tokenizer_kwargs = {**defaults, **self.tokenizer_kwargs}
+
+        # NEVER use cache
         self.model_kwargs["use_cache"] = False
+        # Ensure max_seq_len is propagated to model_kwargs
+        self.model_kwargs["max_position_embeddings"] = self.max_seq_len
 
-        # prefetch the model+checkpoint
-        self.prefetch_checkpoint()
-        # load the quantization config
-        self._load_quantization_config()
+        # special handling for torch_dtype in model_kwargs since HF does not correctly update
+        # torch_dtype string to an actual torch.dtype object (only with default)
+        if "torch_dtype" in self.model_kwargs:
+            dtype = self.model_kwargs["torch_dtype"]
+            if isinstance(dtype, str):
+                dtype = getattr(torch, self.model_kwargs["torch_dtype"])
+            assert isinstance(dtype, torch.dtype), f"Invalid dtype: {dtype}"
+            self.model_kwargs["torch_dtype"] = dtype
 
     @property
     def autoconfig_from_pretrained(self):
@@ -133,7 +141,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
         return config
 
-    def build_model(self, device: DeviceLikeType) -> nn.Module:
+    def _build_model(self, device: DeviceLikeType) -> nn.Module:
         """Build the model on the desired device."""
         # We only support fp16 to fp4 conversion.
         if self._quant_config and self._quant_config.get("quant_algo", None) == "NVFP4":
@@ -284,17 +292,12 @@ class AutoModelForCausalLMFactory(ModelFactory):
         # at this point it should be a directory (either the original one or the download dir)
         assert os.path.isdir(fetched_dir), f"Checkpoint path {fetched_dir} is not a directory."
 
+        self._load_quantization_config()
+
         return fetched_dir
 
     def _load_checkpoint(self, model: nn.Module, device: DeviceLikeType):
         """Load the checkpoint into the model."""
-        # check if we skip loading weights
-        if self.skip_loading_weights:
-            return
-
-        # prefetch if needed
-        self.prefetch_checkpoint()
-
         # identify the most relevant checkpoint file
         ckpt_file = self._get_checkpoint_file(self.model)
         # reuse the load checkpoint utility from accelerate
@@ -302,6 +305,10 @@ class AutoModelForCausalLMFactory(ModelFactory):
             load_checkpoint_in_model(model, checkpoint=ckpt_file)
 
     def _load_quantization_config(self):
+        """Load the quantization config from the model directory if not done already."""
+        if self._quant_config is not None:
+            return
+
         assert self.model
         hf_quant_config_file = os.path.join(self.model, "hf_quant_config.json")
         if os.path.exists(hf_quant_config_file):
@@ -322,19 +329,18 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        # additional heuristic to disable use_cache
-        self.model_kwargs["text_config"] = self.model_kwargs.get("text_config", {})
-        self.model_kwargs["text_config"]["use_cache"] = False
-
-        self.model_kwargs["text_config"]["max_position_embeddings"] = self.model_kwargs[
-            "max_position_embeddings"
-        ]
-
-        # additional heuristic to propagate use of num_hidden_layers
+        # additional heuristic to propagate "important keys"
         # TODO (lucaslie): WAR until we have better support on dashboard to control model_kwargs
-        nhl_key = "num_hidden_layers"
-        if nhl_key in self.model_kwargs:
-            self.model_kwargs["text_config"][nhl_key] = self.model_kwargs[nhl_key]
+        keys_to_propagate = [
+            "num_hidden_layers",
+            "max_position_embeddings",
+            "use_cache",
+            "torch_dtype",
+        ]
+        self.model_kwargs["text_config"] = self.model_kwargs.get("text_config", {})
+        for key in keys_to_propagate:
+            if key in self.model_kwargs:
+                self.model_kwargs["text_config"][key] = self.model_kwargs[key]
 
     @property
     def automodel_from_config(self):

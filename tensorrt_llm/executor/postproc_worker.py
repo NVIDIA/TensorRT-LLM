@@ -8,8 +8,6 @@ from typing import (TYPE_CHECKING, Any, Callable, Dict, List, NamedTuple,
 import zmq
 import zmq.asyncio
 
-import tensorrt_llm.executor.serialization as serialization
-
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..llmapi.tokenizer import TransformersTokenizer, load_hf_tokenizer
@@ -79,7 +77,6 @@ class PostprocWorker:
         tokenizer_dir: str,
         record_creator: Callable[
             ["PostprocWorker.Input", TransformersTokenizer], Any],
-        BASE_ZMQ_CLASSES: Dict,
     ):
         '''
         Args:
@@ -88,11 +85,8 @@ class PostprocWorker:
             tokenizer_dir (str): The directory to load tokenizer.
             record_creator (Callable[["ResponsePostprocessWorker.Input"], Any]): A creator for creating a record for a request.
             result_handler (Optional[Callable[[GenerationResultBase], Any]]): A callback handles the final result.
-            BASE_ZMQ_CLASSES (Dict): The base classes for ZMQ serialization.
         '''
-        # Passed through from the parent process to ensure
-        # that children processes include any classes added at runtime (such as those from `register_approved_ipc_class`).
-        serialization.BASE_ZMQ_CLASSES = BASE_ZMQ_CLASSES
+
         self._records: Dict[int, GenerationResult] = {}
         self._record_creator = record_creator
         self._pull_pipe = ZeroMqQueue(address=pull_pipe_addr,
@@ -117,7 +111,6 @@ class PostprocWorker:
     ) -> "DetokenizedGenerationResultBase":
         from .result import DetokenizedGenerationResultBase
         assert inp.sampling_params is not None
-        assert tokenizer is not None
         return DetokenizedGenerationResultBase(
             inp.rsp.client_id,
             sampling_params=inp.sampling_params,
@@ -219,11 +212,9 @@ class PostprocWorker:
 @print_traceback_on_error
 def postproc_worker_main(feedin_ipc_addr: tuple[str, Optional[bytes]],
                          feedout_ipc_addr: tuple[str, Optional[bytes]],
-                         tokenizer_dir: str, record_creator: Callable,
-                         BASE_ZMQ_CLASSES: Dict):
+                         tokenizer_dir: str, record_creator: Callable):
     worker = PostprocWorker(feedin_ipc_addr,
                             feedout_ipc_addr,
                             tokenizer_dir=tokenizer_dir,
-                            record_creator=record_creator,
-                            BASE_ZMQ_CLASSES=BASE_ZMQ_CLASSES)
+                            record_creator=record_creator)
     worker.start()

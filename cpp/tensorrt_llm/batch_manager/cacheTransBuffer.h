@@ -18,6 +18,7 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include <atomic>
@@ -59,8 +60,8 @@ public:
     CacheTransBufferManager(
         KVCacheManager::BaseKVCacheManager* cacheManager, std::optional<size_t> maxNumTokens = std::nullopt);
 
-    static size_t preAllocBufferSize(
-        std::optional<size_t> maxNumTokens = std::nullopt, std::optional<size_t> kvCacheSizePerToken = std::nullopt);
+    static size_t preAllocBufferSize(std::map<SizeType32, SizeType32> const& cacheSizeBytesPerTokenPerWindow,
+        std::optional<executor::CacheTransceiverConfig> const& cacheTransceiverConfig = std::nullopt);
 
     std::optional<int> assignBufferIndexForSend();
     void freeBufferIndexForSend(std::optional<int> bufferId);

@@ -98,6 +98,9 @@ class Llama4MinLatencyLinear(Linear):
         # After loading weights, calculate the combined scale (input_scale * weight_scale) for special kernels and
         # trtllm-gen kernels.
         if self.has_fp8_qdq:
+            if self.weight_scale.device != self.input_scale.device:
+                self.weight_scale = torch.nn.Parameter(
+                    self.weight_scale.to(self.input_scale.device))
             self.combined_scale = self.input_scale * self.weight_scale
 
             # If this is gate_up_proj + swiglu and trtllm-gen kernels will be used, we need to reorder the weights
@@ -471,6 +474,7 @@ class Llama4MinLatencyFusedMoE(CutlassFusedMoE):
         if num_experts == 128 \
             and hidden_size == 5120 \
             and intermediate_size == 8192 \
+            and model_config.quant_config is not None \
             and model_config.quant_config.quant_mode.has_fp8_qdq() \
             and model_config.mapping.moe_tp_size == 8 \
             and model_config.mapping.moe_ep_size == 1 \
@@ -514,7 +518,7 @@ class Llama4MinLatencyFusedMoE(CutlassFusedMoE):
 
         return super().forward(x,
                                router_logits,
-                               cutlass_min_latency_mode=False,
+                               do_finalize=True,
                                output_dtype=output_dtype)
 
 

@@ -97,6 +97,7 @@ class SpeculativeDecodingMode(IntFlag):
     EXPLICIT_DRAFT_TOKENS = auto()
     EAGLE = auto()
     NGRAM = auto()
+    USER_PROVIDED = auto()
 
     @staticmethod
     def from_arguments(args: argparse.Namespace):
@@ -114,6 +115,8 @@ class SpeculativeDecodingMode(IntFlag):
             return SpeculativeDecodingMode.EAGLE
         elif args.speculative_decoding_mode == "ngram":
             return SpeculativeDecodingMode.NGRAM
+        elif args.speculative_decoding_mode == "user_provided":
+            return SpeculativeDecodingMode.USER_PROVIDED
         else:
             assert False, "Unknown speculative_decoding_mode " + args.speculative_decoding_mode
 
@@ -1811,7 +1814,7 @@ def preprocess_perlayer_weights(weights,
                 weights[new_name] = weights[name]
                 weights[
                     new_name +
-                    "_interleaved"] = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+                    "_interleaved"] = torch.ops.trtllm.nvfp4_block_scale_interleave(
                         weights[name].view(fp4_utils.float4_sf_dtype).cpu(
                         ).contiguous()).reshape(nrows, ncols).view(
                             fp4_utils.float4_sf_dtype)

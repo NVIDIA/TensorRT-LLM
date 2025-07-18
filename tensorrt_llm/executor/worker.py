@@ -12,7 +12,6 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
-import tensorrt_llm.executor.serialization as serialization
 from tensorrt_llm.logger import logger
 
 from .._utils import (KVCacheEventSerializer, global_mpi_rank, global_mpi_size,
@@ -59,6 +58,7 @@ class GenerationExecutorWorker(GenerationExecutor):
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
+        garbage_collection_gen0_threshold: Optional[int] = None,
     ) -> None:
         postproc_config = postproc_worker_config or PostprocWorkerConfig()
         super().__init__(
@@ -119,21 +119,21 @@ class GenerationExecutorWorker(GenerationExecutor):
             args = {
                 "executor_config": executor_config,
                 "checkpoint_dir": executor_config.hf_model_dir,
-                "engine_dir": executor_config.trt_engine_dir,
             }
             if executor_config.backend == "pytorch":
                 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
                     create_py_executor
                 create_executor = create_py_executor
                 args["lora_config"] = lora_config
-            elif executor_config.backend == "autodeploy":
+                args[
+                    "garbage_collection_gen0_threshold"] = garbage_collection_gen0_threshold
+            elif executor_config.backend == "_autodeploy":
                 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
                     create_autodeploy_executor
                 create_executor = create_autodeploy_executor
             else:
                 raise ValueError(
                     f"Unsupported backend config: {executor_config.backend}")
-
             return create_executor(**args)
 
         self.engine = _create_engine()
@@ -341,13 +341,16 @@ class GenerationExecutorWorker(GenerationExecutor):
         if mpi_rank() == 0:
             self.start_thread(self.dispatch_stats_thread)
 
-    def _load_lora_adapter(self, lora_request: LoRARequest):
-        self._lora_manager.load_from_ckpt(
+    def _load_lora_adapter(self, lora_request: LoRARequest) -> bool:
+        """Returns True if the adapter was loaded by this call, False if it was already loaded"""
+        adapter_id = str(lora_request.adapter_id)
+        newly_loaded_uids = self._lora_manager.load_from_ckpt(
             [lora_request.path],
             model_config=self._runtime_model_config if
             self._runtime_model_config is not None else self._lora_model_config,
             runtime_mapping=None,
-            uids=[str(lora_request.adapter_id)])
+            uids=[adapter_id])
+        return adapter_id in newly_loaded_uids
 
     def _load_prompt_adapter(self,
                              prompt_adapter_request: PromptAdapterRequest):
@@ -359,21 +362,20 @@ class GenerationExecutorWorker(GenerationExecutor):
     def _enqueue_request(self, request: GenerationRequest) -> int:
         assert request.id is not None
         if self._lora_manager is not None and request.lora_request is not None:
-            self._load_lora_adapter(request.lora_request)
+            loaded_new_lora_adapter = self._load_lora_adapter(
+                request.lora_request)
             uid = str(request.lora_request.adapter_id)
             lora_config = tllm.LoraConfig(
                 task_id=request.lora_request.adapter_id,
-                weights=self._lora_manager.cpp_lora_weights[uid],
-                config=self._lora_manager.cpp_lora_config[uid])
+                weights=self._lora_manager.cpp_lora_weights[uid]
+                if loaded_new_lora_adapter else None,
+                config=self._lora_manager.cpp_lora_config[uid]
+                if loaded_new_lora_adapter else None)
         else:
             lora_config = None
 
         prompt_token_ids = copy.deepcopy(request.prompt_token_ids)
         prompt_tuning_config = None
-        multimodal_embedding = None
-        mrope_config = None
-        if request.multimodal_embedding is not None:
-            multimodal_embedding = request.multimodal_embedding
         if request.prompt_adapter_request is not None:
             self._load_prompt_adapter(request.prompt_adapter_request)
             uid = str(request.prompt_adapter_request.adapter_id)
@@ -384,12 +386,30 @@ class GenerationExecutorWorker(GenerationExecutor):
             prompt_token_ids = list(range(
                 vocab_size, vocab_size + pa_length)) + prompt_token_ids
 
-        if request.mrope_config is not None:
-            mrope_config = tllm.MropeConfig(**request.mrope_config)
+        # MULTIMODAL
+        # NOTE: Since, we only support PyTorch backend for multimodal, we will send multimodal_data through the 'py_multimodal_data' field
+        # except `multimodal_input` as it needs to go through the C++ runtime.
+        multimodal_input = None
+        if request.multimodal_params is not None and request.multimodal_params.has_content(
+        ):
+            if request.multimodal_params.multimodal_input is not None:
+                multimodal_input = tllm.MultimodalInput(
+                    multimodal_hashes=request.multimodal_params.
+                    multimodal_input.multimodal_hashes,
+                    multimodal_positions=request.multimodal_params.
+                    multimodal_input.multimodal_positions,
+                    multimodal_lengths=request.multimodal_params.
+                    multimodal_input.multimodal_lengths)
+            # NOTE: Setting to None here to avoid sending multimodal_input again through the 'py_multimodal_data' field
+            request.multimodal_params.multimodal_input = None
 
         context_phase_params = None
         request_type = tllm.RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION
         if request.disaggregated_params is not None:
+            assert (
+                not self._is_pytorch_backend
+                or self.engine.kv_cache_transceiver is not None
+            ), "kv_cache_transceiver is disabled, please set 'cache_transceiver_config: backend:<backend_type>` in config file for disaggregated serving"
             request_type = request.disaggregated_params.get_request_type()
             if request_type == tllm.RequestType.REQUEST_TYPE_GENERATION_ONLY:
                 context_phase_params = request.disaggregated_params.get_context_phase_params(
@@ -452,8 +472,10 @@ class GenerationExecutorWorker(GenerationExecutor):
                 embedding_bias=request.sampling_params.embedding_bias,
                 lora_config=lora_config,
                 prompt_tuning_config=prompt_tuning_config,
-                multimodal_embedding=multimodal_embedding,
-                mrope_config=mrope_config,
+                multimodal_input=multimodal_input,
+                #NOTE: `multimodal_embedding` and `mrope_config` will be in MultimodalParams.multimodal_data. And this will be handled below by `py_multimodal_data`.
+                multimodal_embedding=None,
+                mrope_config=None,
                 logits_post_processor_name=(
                     tllm.Request.BATCHED_POST_PROCESSOR_NAME
                     if request.sampling_params.apply_batched_logits_processor
@@ -463,6 +485,10 @@ class GenerationExecutorWorker(GenerationExecutor):
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
                 type=request_type)
+
+            if self._is_pytorch_backend and request.multimodal_params is not None:
+                if request.multimodal_params.multimodal_data is not None:
+                    executor_request.py_multimodal_data = request.multimodal_params.multimodal_data
 
             if self._is_pytorch_backend and request.sampling_params.logits_processor:
                 # For PyTorch backend, we attach logits processors as a dynamic Python attribute
@@ -545,6 +571,12 @@ class GenerationExecutorWorker(GenerationExecutor):
             self.engine.shutdown()
             self.engine = None
 
+            if hasattr(
+                    self._executor_config, "checkpoint_loader"
+            ) and self._executor_config.checkpoint_loader is not None:
+                self._executor_config.checkpoint_loader.cleanup()
+                self._executor_config.checkpoint_loader = None
+
         # Check if there are any errors from the threads before shutdown.
         self._handle_background_error()
 
@@ -587,11 +619,8 @@ def worker_main(
     is_llm_executor: Optional[
         bool] = True,  # whether it's the main executor instance
     lora_config: Optional[LoraConfig] = None,
-    BASE_ZMQ_CLASSES: Dict = serialization.BASE_ZMQ_CLASSES,
+    garbage_collection_gen0_threshold: Optional[int] = None,
 ) -> None:
-    # The base classes for ZMQ serialization. Passed through from the parent process to ensure
-    # that children processes include any classes added at runtime (such as those from `register_approved_ipc_class`).
-    serialization.BASE_ZMQ_CLASSES = BASE_ZMQ_CLASSES
     mpi_comm().barrier()
     print_colored_debug(f"Worker {mpi_rank()} entering worker_main...\n",
                         "green")
@@ -600,7 +629,7 @@ def worker_main(
     cpus = os.sched_getaffinity(pid)
     if cpus:
         logger.warning(
-            f"Found worker process {pid} was bound to {cpus}, this may harm"
+            f"Found worker process {pid} was bound to {cpus}, this may harm "
             "performance.", )
         logger.warning(f"Will clear the cpu affinity")
         clear_sched_affinity(pid)
@@ -681,17 +710,17 @@ def worker_main(
             str, Optional[bytes]] = worker_queues.result_queue_addr
 
         assert result_queues is not None
-        assert postproc_worker_config.postprocess_tokenizer_dir is not None
         postproc_worker_pool = ProcessPoolExecutor(
             max_workers=postproc_worker_config.num_postprocess_workers)
         assert isinstance(proxy_result_queue, tuple)
         for i in range(postproc_worker_config.num_postprocess_workers):
             fut = postproc_worker_pool.submit(
-                postproc_worker_main, result_queues[i].address,
+                postproc_worker_main,
+                result_queues[i].address,
                 proxy_result_queue,
                 postproc_worker_config.postprocess_tokenizer_dir,
                 PostprocWorker.default_record_creator,
-                serialization.BASE_ZMQ_CLASSES)
+            )
             postprocess_worker_futures.append(fut)
 
     # Error handling in the Worker/MPI process
@@ -716,7 +745,8 @@ def worker_main(
             batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,
-            lora_config=lora_config)
+            lora_config=lora_config,
+            garbage_collection_gen0_threshold=garbage_collection_gen0_threshold)
     except Exception as e:
         logger.error(f"Failed to initialize executor on rank {mpi_rank()}: {e}")
         logger.error(traceback.format_exc())

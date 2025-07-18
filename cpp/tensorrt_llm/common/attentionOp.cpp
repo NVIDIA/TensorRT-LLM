@@ -204,6 +204,11 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     }
     else if (mKVCacheQuantMode.hasFp8KvCache())
     {
+        // Inputs to MLA is FP8 instead of BF16/FP16 when using FP8 KV cache.
+        if (xqaParams.isMLA())
+        {
+            xqaParams.data_type = DATA_TYPE_E4M3;
+        }
         xqaParams.kv_cache_data_type = DATA_TYPE_E4M3;
     }
     else
@@ -686,6 +691,11 @@ int AttentionOp::getHeadSize(bool checkInit) const
 size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t max_num_seq, int32_t input_seq_length,
     int32_t cross_kv_length, int32_t max_num_tokens) const noexcept
 {
+    if (max_num_tokens == 0)
+    {
+        return 0;
+    }
+
     int const local_hidden_units_qo = mNumAttnHeads * getHeadSize();
     int const local_hidden_units_kv = mNumAttnKVHeads * getHeadSize();
 
@@ -766,10 +776,16 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
 size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32_t max_num_seq,
     int32_t max_attention_window_size, int32_t max_num_tokens) const noexcept
 {
+    if (max_num_tokens == 0)
+    {
+        return 0;
+    }
+
     auto const size = tensorrt_llm::runtime::BufferDataType(type).getSize();
     int const batch_beam = max_num_seq;
 
     // Compute the workspace size for MLA.
+    size_t fmha_v2_mla_workspace_size = 0;
     if (mIsMLAEnabled)
     {
         size_t flash_mla_workspace_size = 0;
@@ -822,7 +838,7 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
         workspaces[8] = sizeof(float) * 256 * mMultiProcessorCount;
         workspaces[9] = flash_mla_workspace_size;
 
-        return tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
+        fmha_v2_mla_workspace_size = tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
     }
 
     size_t generation_workspace_size = 0;
@@ -867,12 +883,13 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
         // Scales used for trtllm-gen kernels.
         xqa_workspaces[4] = sizeof(float) * 2;
         xqa_workspaces[5] = sizeof(float);
-        xqa_workspaces[6] = mXqaDispatcher->getWorkspaceSize(max_num_tokens);
+        xqa_workspaces[6] = mXqaDispatcher->getWorkspaceSize(
+            std::min<uint32_t>(mSpecDecodingMaxGenerationLength * max_num_seq, max_num_tokens));
         xqa_workspace_size
             = tc::calculateTotalWorkspaceSize(xqa_workspaces, XQA_NUM_BUFFERS, mXqaDispatcher->getWorkspaceAlignment());
     }
 
-    return std::max(generation_workspace_size, xqa_workspace_size);
+    return std::max(std::max(generation_workspace_size, xqa_workspace_size), fmha_v2_mla_workspace_size);
 }
 
 int AttentionOp::getMaxNumSeqLenTile(int batch_beam_size) const
@@ -1167,6 +1184,35 @@ int AttentionOp::mlaGeneration(
     }
     else
     {
+        // Try XQA optimization first when CP is not used.
+        if (mCpSize == 1)
+        {
+            // NOTE: input_seq_length = num_medusa_tokens + 1 (new generated one from the original LM head)
+            // self attn
+            XQAParams xqaParams{};
+            this->template convertMMHAParamsToXQAParams<T, decltype(kv_cache_buffer)>(
+                xqaParams, generation_params, /*forConfigurePlugin=*/false);
+            xqaParams.quant_q_buffer_ptr = quant_q_buffer_ptr;
+            xqaParams.q_scaling
+                = 1 / (mQScaling * sqrtf((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)));
+            if (mEnableXQA && mXqaDispatcher->shouldUse(xqaParams))
+            {
+                TLLM_LOG_DEBUG("XQA kernels are selected in the generation phase.");
+                xqaParams.stream = stream;
+                mXqaDispatcher->run(xqaParams, kv_cache_buffer);
+                return 0;
+            }
+            else if (mIsSpecDecodingEnabled && mUseSpecDecoding)
+            {
+                TLLM_CHECK_WITH_INFO(false, "No available XQA kernels are found for speculative decoding mode.");
+            }
+            else if (mFuseFp4Quant)
+            {
+                TLLM_CHECK_WITH_INFO(false, "No available kernels are found for FP4 output.");
+            }
+        }
+
+        // Use FMHA otherwise.
         MHARunnerParams fmhaParams{};
         fmhaParams.b = batch_beam;
         fmhaParams.numGroupedHeads = params.head_num;
@@ -1667,6 +1713,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         fmhaParams.oSfScalePtr = params.attention_output_sf_scale;
         fmhaParams.stream = stream;
         fmhaParams.forceFp32Acc = mFMHAForceFP32Acc;
+        fmhaParams.softmaxStatsPtr = params.softmaxStatsPtr;
 
         if (mAttentionChunkSize)
         {
@@ -1994,7 +2041,7 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
     int const max_distance = mMaxDistance;
     bool const* finished = nullptr;
 
-    auto const quant_option = tc::QuantMode::fromDescription();
+    auto const quant_option = tc::QuantMode{};
     float const* qkv_scale_out = nullptr;
 
     int const* ia3_tasks = nullptr;
@@ -2362,21 +2409,22 @@ int AttentionOp::initialize() noexcept
     if (mFP8ContextFMHA)
     {
         TLLM_CHECK_WITH_INFO(mEnableContextFMHA, "FP8 FMHA cannot be enabled because Context FMHA is not supported.");
-        TLLM_CHECK_WITH_INFO(mSM == 89 || mSM == 90 || mSM == 100 || mSM == 120,
-            "FP8 FMHA can only be enabled on sm_89, sm_90, sm_100 or sm_120.");
+        TLLM_CHECK_WITH_INFO(mSM == 89 || mSM == 90 || mSM == 100 || mSM == 120 || mSM == 121,
+            "FP8 FMHA can only be enabled on sm_89, sm_90, sm_100, sm_120 or sm_121.");
     }
 
     // Pre-Check of FP8 Generation MLA.
     if (mFP8GenerationMLA)
     {
         TLLM_CHECK_WITH_INFO(mIsMLAEnabled, "FP8 Generation MLA cannot be enabled because MLA is not supported.");
-        TLLM_CHECK_WITH_INFO(mSM == 89 || mSM == 90 || mSM == 100 || mSM == 120,
+        TLLM_CHECK_WITH_INFO(mSM == 89 || mSM == 90 || mSM == 100 || mSM == 120 || mSM == 121,
             "FP8 Generation MLA is supported on Ada, Hopper or Blackwell architecture.");
     }
 
     // Check requirements for FP4 output.
     TLLM_CHECK_WITH_INFO(!mFuseFp4Quant || mEnableContextFMHA, "Context FMHA must enable if fuse_fp4_quant is enabled");
-    TLLM_CHECK_WITH_INFO(!mFuseFp4Quant || mSM == 100, "fuse_fp4_quant only supports SM100 devices.");
+    TLLM_CHECK_WITH_INFO(!mFuseFp4Quant || mSM == 100 || mSM == 120 || mSM == 121,
+        "fuse_fp4_quant only supports SM100 or SM120 or SM121 devices.");
 
     TLLM_CHECK(isRoPE() == (mRotaryEmbeddingDim != 0));
     TLLM_CHECK_WITH_INFO((mSM >= 80) || (mType != nvinfer1::DataType::kBF16),
@@ -2522,7 +2570,7 @@ int AttentionOp::initialize() noexcept
         // Deepseek-V2 Generation needs a differ fmha with different argumments
         if (mIsMLAEnabled)
         {
-            mEnableXQA = false;
+            mEnableXQA = (mSM == kSM_120);
             if (mUseTllmGen)
             {
                 Data_type qDataType = DATA_TYPE_FP32;
@@ -2632,6 +2680,7 @@ int AttentionOp::initialize() noexcept
         TLLM_LOG_DEBUG("Enabling XQA kernels for GPTAttention.");
 
         XqaFixedParams fixedParams{};
+        fixedParams.isMLA = mIsGenerationMLA;
         // TODO: support more combinations.
         // Update Q and O dtype.
         if (mType == nvinfer1::DataType::kHALF)

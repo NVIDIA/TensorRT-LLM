@@ -16,6 +16,7 @@
 import os
 
 import pytest
+import torch
 from defs.common import convert_weights, venv_check_call, venv_mpi_check_call
 from defs.conftest import get_device_memory, skip_post_blackwell, skip_pre_ada
 from defs.trt_test_alternative import check_call
@@ -75,11 +76,17 @@ def _test_llm_multimodal_general(llm_venv,
                                  cpp_e2e=False,
                                  num_beams=1):
 
+    # Empty the torch CUDA cache before each multimodal test to reduce risk of OOM errors.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     world_size = tp_size * pp_size
     print("Locate model checkpoints in test storage...")
     tllm_model_name, model_ckpt_path = multimodal_model_root
 
     if "neva-22b" in tllm_model_name and get_device_memory() < 80000:
+        pytest.skip("GPU memory is insufficient.")
+    if "Mistral-Small" in tllm_model_name and get_device_memory() < 80000:
         pytest.skip("GPU memory is insufficient.")
 
     print("Converting huggingface model into binary format...")

@@ -101,6 +101,8 @@ struct XQAParams
     float const* fp4_out_sf_scale = nullptr; // SF scale for FP4 output.
     int32_t start_token_idx_sf = 0;          // The start token index in SF tensor.
 
+    void* quant_q_buffer_ptr = nullptr;
+
     cudaStream_t stream = 0;
 
     std::string toString() const
@@ -173,6 +175,11 @@ struct XQAParams
            << "stream :" << stream;
 
         return ss.str();
+    }
+
+    bool isMLA() const
+    {
+        return head_size == 576 && num_q_heads == 128 && num_kv_heads == 1;
     }
 };
 

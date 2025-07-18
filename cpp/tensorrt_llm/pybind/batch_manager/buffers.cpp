@@ -17,7 +17,6 @@
 
 #include "buffers.h"
 
-#include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
 #include "tensorrt_llm/batch_manager/transformerBuffers.h"
@@ -52,9 +51,6 @@ void Buffers::initBindings(pybind11::module_& m)
             py::arg("buffer_manager"))
         .def("get_buffers", &tb::TransformerBuffers::getBuffers, py::arg("input_buffers"), py::arg("output_buffers"),
             py::arg("model_config"))
-        .def("reset_cache_indirection", &tb::TransformerBuffers::resetCacheIndirection, py::arg("context_requests"),
-            py::arg("max_beam_width"), py::arg("max_attention_window"), py::arg("decoder_cache_indirection_input"),
-            py::arg("decoder_cache_indirection_output"), py::arg("runtime"))
         .def("copy_position_ids", &tb::TransformerBuffers::copyPositionIds, py::arg("runtime"),
             py::arg("position_ids_host"), py::arg("is_chat_glm"), py::arg("decoder_position_ids"))
         .def("copy_kv_block_offsets", &tb::TransformerBuffers::copyKvBlockOffsets, py::arg("context_requests"),
@@ -99,9 +95,6 @@ void Buffers::initBindings(pybind11::module_& m)
         .def_readwrite("logits", &tb::RuntimeBuffers::logits)
         .def_readwrite("seq_slots", &tb::RuntimeBuffers::seqSlots)
         .def_readwrite("seq_slots_device", &tb::RuntimeBuffers::seqSlotsDevice)
-        .def_readwrite("sorted_seq_slots", &tb::RuntimeBuffers::sortedSeqSlots)
-        .def_readwrite("seq_slot_remapping_host", &tb::RuntimeBuffers::seqSlotRemappingHost)
-        .def_readwrite("seq_slot_remapping_device", &tb::RuntimeBuffers::seqSlotRemappingDevice)
         .def_readwrite("cache_indir_decoder_io_batched_copy_src_offsets_slice_device",
             &tb::RuntimeBuffers::mCacheIndirDecoderIOBatchedCopySrcOffsetsSliceDevice)
         .def_readwrite("cache_indir_decoder_io_batched_copy_dst_offsets_slice_device",

@@ -66,15 +66,18 @@ void invokePerTokenQuantization(QuantT* dst, T const* src, int64_t const numRows
     float const* clampPtr, float* scalePtr, float* sumPtr, tensorrt_llm::common::QuantMode quantMode,
     cudaStream_t stream = 0);
 
-template <typename T>
+template <typename T, int SF_VEC_SIZE = 16>
 void invokeFP4Quantization(int m, int n, T const* input, float const* globalScale, int64_t* output, int32_t* SFOuput,
     bool useUE8M0, FP4QuantizationSFLayout layout, int multiProcessorCount, cudaStream_t stream = 0);
 
-template <typename T>
+template <typename T, int SF_VEC_SIZE = 16>
 void invokeBatchedFP4Quantization(int b, int m, int n, T const* input, float const* globalScale, int64_t* output,
     int32_t* SFOuput, bool useUE8M0, int multiProcessorCount, cudaStream_t stream = 0);
 
-void invokeNVFP4BlockScaleInterleave(
+void invokeNVFP4BlockScaleInterleave(int b, int m, int m_padded, int n, int n_padded, uint8_t const* SFIn,
+    uint8_t* SFOutput, int multiProcessorCount, cudaStream_t stream = 0);
+
+void invokeNVFP4BlockScaleInterleaveReverse(
     int b, int m, int n, uint8_t const* SFIn, uint8_t* SFOutput, int multiProcessorCount, cudaStream_t stream = 0);
 
 } // namespace kernels

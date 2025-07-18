@@ -58,7 +58,7 @@ class MyThreadPoolExecutor(ThreadPoolExecutor):
 
         for future in self.futures:
             future.cancel()
-        self.shutdown(wait=False, cancel_futures=True)
+        self.shutdown(wait=True, cancel_futures=True)
         return False
 
 
@@ -91,6 +91,7 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
         trtllm_serve_path, model_name, "--host", "localhost", "--backend",
         "pytorch"
     ]
+
     if tensor_parallel_size > 1:
         common_args.append(f"--tp_size={tensor_parallel_size}")
 
@@ -103,18 +104,22 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
     env_gen["TRTLLM_USE_UCX_KVCACHE"] = "1"
     env_gen["CUDA_VISIBLE_DEVICES"] = ",".join(
         map(str, range(tensor_parallel_size, 2 * tensor_parallel_size)))
+    ctx_server_args = common_args + [
+        "--port", "8001", "--extra_llm_api_options", ctx_server_config_path
+    ]
+    gen_server_args = common_args + [
+        "--port", "8002", "--extra_llm_api_options", gen_server_config_path
+    ]
+    if "max_num_tokens" in ctx_server_config:
+        ctx_server_args.append(
+            f"--max_num_tokens={ctx_server_config['max_num_tokens']}")
+    if "max_num_tokens" in gen_server_config:
+        gen_server_args.append(
+            f"--max_num_tokens={gen_server_config['max_num_tokens']}")
 
-    with (MyThreadPoolExecutor(max_workers=16) as thread_pool, temp_dir,
-          popen(common_args + [
-              "--port", "8001", "--extra_llm_api_options",
-              ctx_server_config_path
-          ],
-                env=env_ctx) as ctx_server,
-          popen(common_args + [
-              "--port", "8002", "--extra_llm_api_options",
-              gen_server_config_path
-          ],
-                env=env_gen) as gen_server,
+    with (MyThreadPoolExecutor(max_workers=16) as
+          thread_pool, temp_dir, popen(ctx_server_args, env=env_ctx) as
+          ctx_server, popen(gen_server_args, env=env_gen) as gen_server,
           popen([
               trtllm_serve_path, "disaggregated", "-c",
               disaggregated_serving_config_path, "--server_start_timeout",
@@ -133,11 +138,12 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
         client = openai.OpenAI(api_key="1234567890",
                                base_url=f"http://localhost:8000/v1")
 
-        def send_request(prompt: str, sampling_params: SamplingParams):
+        def send_request(prompt: str, sampling_params: SamplingParams,
+                         streaming: bool):
             response = client.completions.create(
                 model=model_name,
                 prompt=prompt,
-                stream=False,
+                stream=streaming,
                 **({
                     "max_tokens": sampling_params.max_tokens,
                     "temperature": sampling_params.temperature,
@@ -157,22 +163,26 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
             return requested_output
 
         def generate_async(prompt: str,
-                           sampling_params: Optional[SamplingParams] = None):
-            future = thread_pool.submit(send_request, prompt, sampling_params)
+                           sampling_params: Optional[SamplingParams] = None,
+                           streaming: bool = False):
+            future = thread_pool.submit(send_request, prompt, sampling_params,
+                                        streaming)
             thread_pool.futures.append(future)
             return future
 
-        yield DuckLLM(args, generate_async)
+        try:
+            yield DuckLLM(args, generate_async)
+        finally:
+            ctx_server.terminate()
+            gen_server.terminate()
+            disaggregated_server.terminate()
 
-        ctx_server.terminate()
-        gen_server.terminate()
-        disaggregated_server.terminate()
-
-        ctx_server.wait()
-        gen_server.wait()
-        disaggregated_server.wait()
+            ctx_server.wait()
+            gen_server.wait()
+            disaggregated_server.wait()
 
 
+@pytest.mark.timeout(3600)
 class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
@@ -185,6 +195,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         gen_server_config = {
             "disable_overlap_scheduler": disable_overlap_scheduler
         }
+        ctx_server_config["cache_transceiver_config"] = {"backend": "default"}
+        gen_server_config["cache_transceiver_config"] = {"backend": "default"}
         disaggregated_server_config = {
             "hostname": "localhost",
             "port": 8000,
@@ -206,16 +218,116 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    def test_ngram(self):
+        speculative_decoding_config = {
+            "decoding_type": "NGram",
+            "max_draft_len": 4,
+            "max_matching_ngram_size": 4,
+            "is_keep_all": True,
+            "is_use_oldest": True,
+            "is_public_pool": True
+        }
+        kv_cache_config = {
+            "free_gpu_memory_fraction": 0.5,
+            "enable_block_reuse": False
+        }
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "kv_cache_config": kv_cache_config,
+            "cache_transceiver_config": {
+                "backend": "default"
+            }
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": True,
+            "speculative_config": speculative_decoding_config,
+            "kv_cache_config": kv_cache_config,
+            "cache_transceiver_config": {
+                "backend": "default"
+            }
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
+    @pytest.mark.parametrize("overlap_scheduler", [False])
+    def test_eagle3(self, overlap_scheduler):
+        speculative_decoding_config = {
+            "decoding_type": "Eagle",
+            "max_draft_len": 4,
+            "speculative_model_dir":
+            f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
+            "eagle3_one_model": False
+        }
+        kv_cache_config = {
+            "free_gpu_memory_fraction": 0.5,
+            "enable_block_reuse": False
+        }
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "speculative_config": speculative_decoding_config,
+            "kv_cache_config": kv_cache_config,
+            "max_num_tokens": 13393 * 2,
+            "cache_transceiver_config": {
+                "backend": "default"
+            }
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": not overlap_scheduler,
+            "speculative_config": speculative_decoding_config,
+            "kv_cache_config": kv_cache_config,
+            "max_num_tokens": 13393 * 2,
+            "cache_transceiver_config": {
+                "backend": "default"
+            }
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+@pytest.mark.skip_less_device_memory(140000)
+@pytest.mark.timeout(3600)
 class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama4-models/Llama-4-Scout-17B-16E-Instruct"
 
     @pytest.mark.parametrize("overlap_scheduler", [False, True])
     def test_auto_dtype(self, overlap_scheduler):
-        pytest.skip("https://nvbugs/5297821")
         ctx_server_config = {"disable_overlap_scheduler": True}
         gen_server_config = {"disable_overlap_scheduler": overlap_scheduler}
+        ctx_server_config["cache_transceiver_config"] = {"backend": "default"}
+        gen_server_config["cache_transceiver_config"] = {"backend": "default"}
         disaggregated_server_config = {
             "hostname": "localhost",
             "port": 8000,
@@ -240,6 +352,7 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+@pytest.mark.timeout(3600)
 class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
@@ -248,16 +361,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("mtp_nextn",
                           [0, pytest.param(2, marks=skip_pre_hopper)])
     def test_auto_dtype(self, overlap_scheduler, mtp_nextn):
-        ctx_server_config = {
-            "pytorch_backend_config": {
-                "disable_overlap_scheduler": True
-            }
-        }
-        gen_server_config = {
-            "pytorch_backend_config": {
-                "disable_overlap_scheduler": not overlap_scheduler
-            }
-        }
+        ctx_server_config = {"disable_overlap_scheduler": True}
+        gen_server_config = {"disable_overlap_scheduler": not overlap_scheduler}
+        ctx_server_config["cache_transceiver_config"] = {"backend": "default"}
+        gen_server_config["cache_transceiver_config"] = {"backend": "default"}
         if mtp_nextn > 0:
             ctx_server_config["speculative_config"] = {
                 "decoding_type": "MTP",
@@ -287,5 +394,54 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                       tensor_parallel_size=4) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+@pytest.mark.timeout(3600)
+class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "google/gemma-3-1b-it"
+    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-1b-it/"
+
+    @pytest.mark.parametrize("overlap_scheduler", [False, True])
+    def test_auto_dtype(self, overlap_scheduler):
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "cuda_graph_config": None,
+            "cache_transceiver_config": {
+                "backend": "default"
+            }
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": overlap_scheduler,
+            "cuda_graph_config": None,
+            "cache_transceiver_config": {
+                "backend": "default"
+            }
+        }
+        ctx_server_config["kv_cache_config"] = {
+            "max_attention_window": [512, 512, 512, 512, 512, 32768],
+            "enable_block_reuse": False
+        }
+        gen_server_config["kv_cache_config"] = {
+            "max_attention_window": [512, 512, 512, 512, 512, 32768],
+            "enable_block_reuse": False
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)

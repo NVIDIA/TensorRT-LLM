@@ -33,8 +33,7 @@ using TensorPtr = MakeDecodingBatchInputOutput::TensorPtr;
 
 std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::createDecoderBatchInputs(
     std::vector<SizeType32> const& activeSlots, runtime::decoder::DecoderState const& decoderState,
-    std::vector<TensorPtr> const& logits, SizeType32 maxNumSequences, std::vector<TensorPtr> const& batchSlots,
-    TensorPtr const& cacheIndirectionInput)
+    std::vector<TensorPtr> const& decoderLogits, SizeType32 maxNumSequences, std::vector<TensorPtr> const& batchSlots)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -48,42 +47,36 @@ std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::createDe
         batchSlots.at(step)->resize(maxNumSequences);
     }
 
-    std::vector<SizeType32> batchIdx(maxDecoderSteps);
+    auto constexpr singleRequest = 1;
+
+    std::vector<SizeType32> batchSizes(maxDecoderSteps);
+    std::vector<std::vector<tr::ITensor::SharedConstPtr>> batchLogits(maxDecoderSteps);
     auto maxActiveDecoderSteps = 1;
-    for (auto const slot : activeSlots)
+    for (size_t batchIdx = 0; batchIdx < activeSlots.size(); ++batchIdx)
     {
+        auto const slot = activeSlots.at(batchIdx);
+        auto const& logits = decoderLogits.at(batchIdx);
+
         auto const numDecoderSteps = common::ceilDiv(numDecodingEngineTokens.at(slot), maxDecodingDecoderTokens);
         maxActiveDecoderSteps = std::max(maxActiveDecoderSteps, numDecoderSteps);
         for (SizeType32 step = 0; step < numDecoderSteps; ++step)
         {
             auto batchSlotsRange = tr::BufferRange<SizeType32>(*batchSlots.at(step));
-            batchSlotsRange[batchIdx[step]] = slot;
-            batchIdx[step]++;
+            batchSlotsRange[batchSizes[step]] = slot;
+            batchSizes[step]++;
+            TensorPtr logitsSlice = tr::ITensor::slice(logits, step, singleRequest);
+            batchLogits[step].emplace_back(std::move(logitsSlice));
         }
     }
 
     for (SizeType32 step = 0; step < maxDecoderSteps; ++step)
     {
-        batchSlots.at(step)->resize(batchIdx[step]);
+        batchSlots.at(step)->resize(batchSizes[step]);
     }
+    batchLogits.resize(maxActiveDecoderSteps);
 
-    auto constexpr singleRequest = 1;
-    std::vector<std::vector<tr::ITensor::SharedConstPtr>> logitsVec(maxActiveDecoderSteps);
-    for (SizeType32 step = 0; step < maxActiveDecoderSteps; ++step)
-    {
-        auto batchSlotsRange = tr::BufferRange<SizeType32>(*batchSlots.at(step));
-
-        for (auto slot : batchSlotsRange)
-        {
-            auto const& targetLogits = logits.at(slot);
-            TensorPtr logitsSlice = tr::ITensor::slice(targetLogits, step, singleRequest);
-            logitsVec.at(step).push_back(logitsSlice);
-        }
-    }
-
-    auto decodingInput = std::make_unique<tr::decoder_batch::Input>(logitsVec, maxActiveDecoderSteps);
+    auto decodingInput = std::make_unique<tr::decoder_batch::Input>(batchLogits, maxActiveDecoderSteps);
     decodingInput->batchSlots = batchSlots;
-    decodingInput->cacheIndirection = cacheIndirectionInput;
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return decodingInput;
 }
@@ -91,78 +84,115 @@ std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::createDe
 namespace
 {
 
-std::pair<std::vector<SizeType32>, std::vector<SizeType32>> getActiveSlots(
-    RequestVector const& contextRequests, RequestVector const& generationRequests)
+std::pair<std::vector<SizeType32>, std::vector<SizeType32>> getActiveSlots(RequestVector const& decoderRequests)
 {
-    std::vector<std::pair<SizeType32, SizeType32>> slots;
-    for (auto const& requests : {contextRequests, generationRequests})
+    std::vector<SizeType32> activeSlots;
+    std::vector<SizeType32> generationSteps;
+    for (auto const& llmReq : decoderRequests)
     {
-        for (auto const& llmReq : requests)
-        {
-            if (llmReq->isGenerationInProgressState() || llmReq->isLastContextChunk())
-            {
-                slots.push_back({llmReq->mSeqSlot.value(), llmReq->getDecodingIter()});
-            }
-        }
-    }
-
-    std::sort(slots.begin(), slots.end(),
-        [](std::pair<SizeType32, SizeType32> const& a, std::pair<SizeType32, SizeType32> const& b)
-        { return a.first < b.first; });
-
-    std::vector<SizeType32> activeSlots, generationSteps;
-    for (auto const& slot : slots)
-    {
-        activeSlots.push_back(slot.first);
-        generationSteps.push_back(slot.second);
+        activeSlots.push_back(llmReq->mSeqSlot.value());
+        generationSteps.push_back(llmReq->getDecodingIter());
     }
 
     return {activeSlots, generationSteps};
 }
 
+//! @brief Sets inputs for explicit draft tokens.
+void setExplicitDraftTokensInputs(tr::DecodingInput& dInput, RuntimeBuffers const& fusedRuntimeBuffers)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    TLLM_CHECK(fusedRuntimeBuffers.mExplicitDraftTokensBuffers);
+    auto const& explicitDraftTokensInputs = fusedRuntimeBuffers.mExplicitDraftTokensBuffers->engineOutputs;
+    auto const& explicitDraftTokensLastInputs = fusedRuntimeBuffers.mExplicitDraftTokensBuffers->engineInputs;
+
+    dInput.explicitDraftTokensInputs = tr::DecodingInput::ExplicitDraftTokensInputs();
+    dInput.explicitDraftTokensInputs->nextDraftTokens = explicitDraftTokensInputs.nextDraftTokens;
+    dInput.explicitDraftTokensInputs->nextFlatTokens = explicitDraftTokensInputs.nextFlatTokens;
+    dInput.explicitDraftTokensInputs->nextDraftIndices = explicitDraftTokensInputs.nextDraftIndices;
+    dInput.explicitDraftTokensInputs->nextDraftProbs = explicitDraftTokensInputs.nextDraftProbs;
+    dInput.explicitDraftTokensInputs->lastDraftTokens = explicitDraftTokensLastInputs.draftTokens;
+    dInput.explicitDraftTokensInputs->lastDraftIndices = explicitDraftTokensLastInputs.draftIndices;
+    dInput.explicitDraftTokensInputs->lastPositionIdsBase = explicitDraftTokensLastInputs.positionIdsBase;
+    dInput.explicitDraftTokensInputs->masks = explicitDraftTokensInputs.masks;
+    dInput.explicitDraftTokensInputs->packedPositionIds = explicitDraftTokensInputs.packedPositionIds;
+    dInput.explicitDraftTokensInputs->bestPathLengths = explicitDraftTokensInputs.bestPathLengths;
+    dInput.explicitDraftTokensInputs->bestPathIndices = explicitDraftTokensInputs.bestPathIndices;
+    dInput.explicitDraftTokensInputs->nextGenerationLengths = explicitDraftTokensInputs.nextGenerationLengths;
+    dInput.explicitDraftTokensInputs->lastGenerationLengths = explicitDraftTokensLastInputs.generationLengths;
+    dInput.explicitDraftTokensInputs->maxGenLengthDevice = explicitDraftTokensInputs.maxGenToken;
+    // Slots in request order
+    dInput.explicitDraftTokensInputs->seqSlots = fusedRuntimeBuffers.seqSlots;
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+//! @brief Sets inputs for eagle decoding.
+void setEagleInputs(tr::DecodingInput& dInput, RuntimeBuffers const& fusedRuntimeBuffers)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    TLLM_CHECK(fusedRuntimeBuffers.mEagleBuffers);
+    auto const& eagleInputs = fusedRuntimeBuffers.mEagleBuffers->engineOutputs;
+    auto const& eagleLastInputs = fusedRuntimeBuffers.mEagleBuffers->engineInputs;
+
+    dInput.eagleInputs = tr::DecodingInput::EagleInputs();
+    dInput.eagleInputs->nextDraftTokens = eagleInputs.nextDraftTokens;
+    dInput.eagleInputs->nextDraftLens = eagleInputs.nextDraftLens;
+    dInput.eagleInputs->nextDraftPaths = eagleInputs.nextDraftPaths;
+    dInput.eagleInputs->lastDraftTokens = eagleLastInputs.draftTokens;
+    dInput.eagleInputs->lastDraftLens = eagleLastInputs.draftLens;
+    dInput.eagleInputs->lastDraftPaths = eagleLastInputs.draftPaths;
+    dInput.eagleInputs->acceptedTokens = eagleInputs.acceptedTokens;
+    dInput.eagleInputs->acceptedLens = eagleInputs.acceptedLens;
+    dInput.eagleInputs->acceptedPathIds = eagleInputs.acceptedPaths;
+    dInput.eagleInputs->chunkedContextNextTokens = eagleInputs.chunkedContextNextTokens;
+    // Slots in request order
+    dInput.eagleInputs->seqSlots = fusedRuntimeBuffers.seqSlots;
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
 } // namespace
 
-std::tuple<std::unique_ptr<tr::decoder_batch::Input>, std::unique_ptr<tr::decoder_batch::Output>>
-MakeDecodingBatchInputOutput::operator()(RequestVector const& contextRequests, RequestVector const& generationRequests,
-    DecoderBuffers& decoderBuffers, DecoderInputBuffers const& inputBuffers,
+std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::operator()(DecoderInputBuffers& inputBuffers,
     runtime::decoder::DecoderState& decoderState, runtime::ModelConfig const& modelConfig, SizeType32 maxNumSequences,
     OptionalRef<RuntimeBuffers> fusedRuntimeBuffers) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto [activeSlots, generationSteps] = getActiveSlots(contextRequests, generationRequests);
+    auto [activeSlots, generationSteps] = getActiveSlots(inputBuffers.decoderRequests);
 
-    auto decodingInput = createDecoderBatchInputs(activeSlots, decoderState, decoderBuffers.logits, maxNumSequences,
-        inputBuffers.forwardBatchSlots, decoderBuffers.cacheIndirectionInput);
-    decodingInput->generationSteps = generationSteps;
+    auto decodingInput = createDecoderBatchInputs(
+        activeSlots, decoderState, inputBuffers.logits, maxNumSequences, inputBuffers.forwardBatchSlots);
+
+    auto const maxBeamWidth = decoderState.getMaxBeamWidth();
+    if (maxBeamWidth > 1)
+    {
+        // For Variable-Beam-Width-Search
+        decoderState.getJointDecodingInput().generationSteps = generationSteps;
+    }
 
     if (modelConfig.getSpeculativeDecodingMode().hasDraftLogits())
     {
-        decodingInput->predictedDraftLogits = decoderBuffers.draftBuffers.predictedDraftLogits;
+        decoderState.getJointDecodingInput().medusaInputs->medusaLogits = inputBuffers.predictedDraftLogits;
     }
 
     if (modelConfig.getSpeculativeDecodingMode().isExplicitDraftTokens())
     {
         TLLM_CHECK(fusedRuntimeBuffers);
         // requires mCtxGenFusion == true
-        decodingInput->batchSlotsRequestOrder = fusedRuntimeBuffers->seqSlots;
-        decodingInput->explicitDraftTokensInputs = fusedRuntimeBuffers->explicitDraftTokensBuffers->engineOutputs;
-        decodingInput->explicitDraftTokensLastInputs = fusedRuntimeBuffers->explicitDraftTokensBuffers->engineInputs;
+        setExplicitDraftTokensInputs(decoderState.getJointDecodingInput(), *fusedRuntimeBuffers);
     }
     else if (modelConfig.getSpeculativeDecodingMode().isEagle())
     {
         TLLM_CHECK(fusedRuntimeBuffers);
         // requires mCtxGenFusion == true
-        decodingInput->batchSlotsRequestOrder = fusedRuntimeBuffers->seqSlots;
-        decodingInput->eagleInputs = fusedRuntimeBuffers->eagleBuffers->engineOutputs;
-        decodingInput->eagleLastInputs = fusedRuntimeBuffers->eagleBuffers->engineInputs;
+        setEagleInputs(decoderState.getJointDecodingInput(), *fusedRuntimeBuffers);
     }
 
-    auto decodingOutput = std::make_unique<tr::decoder_batch::Output>();
-    decodingOutput->cacheIndirection = decoderBuffers.cacheIndirectionOutput;
-
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return {std::move(decodingInput), std::move(decodingOutput)};
+    return decodingInput;
 }
 
 } // namespace tensorrt_llm::batch_manager

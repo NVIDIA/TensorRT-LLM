@@ -35,6 +35,8 @@ def run_test(
     test_load_hook: bool = True,
     strict_loading: bool = True,
     dynamic_shapes: Dict = None,
+    check_num_matches: int = None,  # Additional check of # patterns detected
+    skip_output_assert: bool = False,
     *args,  # Additional arguments for transform
 ) -> GraphModule:
     # run model once
@@ -51,10 +53,17 @@ def run_test(
     num_params_gm = count_parameters(gm)
 
     assert num_params_model == num_params_gm
-    torch.testing.assert_close(y_model, y_gm, atol=atol, rtol=rtol)
+    if not skip_output_assert:
+        torch.testing.assert_close(y_model, y_gm, atol=atol, rtol=rtol)
 
     # graph transformation + check
-    gm_transformed = transform(gm, *args)
+    if check_num_matches:
+        gm_transformed, num_matches = transform(gm, *args)
+        assert check_num_matches == num_matches, (
+            f"expect {check_num_matches} matches, but got {num_matches}"
+        )
+    else:
+        gm_transformed = transform(gm, *args)
     print(gm_transformed)
     # in case buffers or other tensors were added during the transform
     gm_transformed = gm_transformed.to("cuda")
@@ -69,11 +78,11 @@ def run_test(
     # check if the transformation worked
     assert check_transformed_graph(gm_transformed)
 
-    if strict_loading:
+    if strict_loading and not skip_output_assert:
         # check if output equals without loading state dict
         torch.testing.assert_close(y_model, y_transformed, atol=atol, rtol=rtol)
 
-    if test_load_hook:
+    if test_load_hook and not skip_output_assert:
         # check if loading hook works from original state dict
         reset_parameters(gm_transformed)
         y_random = gm_transformed(x)

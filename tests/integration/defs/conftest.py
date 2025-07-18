@@ -16,6 +16,7 @@
 
 import datetime
 import os
+import platform
 import re
 import shutil
 import subprocess as sp
@@ -36,6 +37,7 @@ import yaml
 from _pytest.mark import ParameterSet
 
 from tensorrt_llm.bindings import ipc_nvls_supported
+from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 
 from .perf.gpu_clock_lock import GPUClockLock
 from .perf.session_data_writer import SessionDataWriter
@@ -283,7 +285,6 @@ def gemma_example_root(llm_root, llm_venv):
     # and caused pipeline to fail. We manually install gemma dependency as a WAR.
     llm_venv.run_cmd(["-m", "pip", "install", "safetensors~=0.4.1", "nltk"])
     # Install Jax because it breaks dependency
-    import platform
     google_extension = [
         "-f",
         "https://storage.googleapis.com/jax-releases/jax_cuda_releases.html"
@@ -1713,6 +1714,17 @@ def cmodel_dir(llm_venv):
         shutil.rmtree(model_dir)
 
 
+@pytest.fixture(scope="function")
+def cmodel_base_dir(llm_venv):
+    "converted base model dir for redrafter"
+    model_dir = os.path.join(llm_venv.get_working_directory(), "cmodels_base")
+
+    yield model_dir
+
+    if exists(model_dir):
+        shutil.rmtree(model_dir)
+
+
 @pytest.fixture(scope="module")
 def qcache_dir(llm_venv, llm_root):
     "get quantization cache dir"
@@ -1721,8 +1733,6 @@ def qcache_dir(llm_venv, llm_root):
     cache_dir = os.path.join(llm_venv.get_working_directory(), "qcache")
 
     quantization_root = os.path.join(llm_root, "examples", "quantization")
-
-    import platform
 
     # Fix the issue that the requirements.txt is not available on aarch64.
     if "aarch64" not in platform.machine() and get_sm_version() >= 89:
@@ -1814,6 +1824,25 @@ def skip_by_device_count(request):
 
 
 @pytest.fixture(autouse=True)
+def skip_by_mpi_world_size(request):
+    "fixture for skip less mpi world size"
+    if request.node.get_closest_marker('skip_less_mpi_world_size'):
+        mpi_world_size = get_mpi_world_size()
+        device_count = get_device_count()
+        if mpi_world_size == 1:
+            # For mpi_world_size == 1 case, we only need to check device count since we can spawn mpi workers in the test itself
+            total_count = device_count
+        else:
+            # Otherwise, we follow the mpi world size setting
+            total_count = mpi_world_size
+        expected_count = request.node.get_closest_marker(
+            'skip_less_mpi_world_size').args[0]
+        if expected_count > int(total_count):
+            pytest.skip(
+                f'Total world size {total_count} is less than {expected_count}')
+
+
+@pytest.fixture(autouse=True)
 def skip_by_device_memory(request):
     "fixture for skip less device memory"
     if request.node.get_closest_marker('skip_less_device_memory'):
@@ -1829,6 +1858,22 @@ def get_sm_version():
     "get compute capability"
     prop = torch.cuda.get_device_properties(0)
     return prop.major * 10 + prop.minor
+
+
+def get_gpu_device_list():
+    "get device list"
+    with tempfile.TemporaryDirectory() as temp_dirname:
+        suffix = ".exe" if is_windows() else ""
+        # TODO: Use NRSU because we can't assume nvidia-smi across all platforms.
+        cmd = " ".join(["nvidia-smi" + suffix, "-L"])
+        output = check_output(cmd, shell=True, cwd=temp_dirname)
+    return [l.strip() for l in output.strip().split("\n")]
+
+
+def check_device_contain(keyword_list):
+    "check device not contain keyword"
+    device = get_gpu_device_list()[0]
+    return any(keyword in device for keyword in keyword_list)
 
 
 skip_pre_ada = pytest.mark.skipif(
@@ -1847,6 +1892,10 @@ skip_post_blackwell = pytest.mark.skipif(
     get_sm_version() >= 100,
     reason="This test is not supported in post-Blackwell architecture")
 
+skip_device_contain_gb200 = pytest.mark.skipif(
+    check_device_contain(["GB200"]),
+    reason="This test is not supported on GB200 or GB100")
+
 skip_no_nvls = pytest.mark.skipif(not ipc_nvls_supported(),
                                   reason="NVLS is not supported")
 skip_no_hopper = pytest.mark.skipif(
@@ -1854,7 +1903,11 @@ skip_no_hopper = pytest.mark.skipif(
     reason="This test is only  supported in Hopper architecture")
 
 skip_no_sm120 = pytest.mark.skipif(get_sm_version() != 120,
-                                   reason="This test is for Blackwell SM120")
+                                   reason="This test is for SM120")
+
+skip_arm = pytest.mark.skipif(
+    "aarch64" in platform.machine(),
+    reason="This test is not supported on ARM architecture")
 
 
 def skip_fp8_pre_ada(use_fp8):
@@ -1875,20 +1928,10 @@ def skip_device_not_contain(request):
     if request.node.get_closest_marker('skip_device_not_contain'):
         keyword_list = request.node.get_closest_marker(
             'skip_device_not_contain').args[0]
-        device = get_gpu_device_list()[0]
-        if not any(keyword in device for keyword in keyword_list):
+        if not check_device_contain(keyword_list):
             pytest.skip(
-                f"Device {device} does not contain keyword in {keyword_list}.")
-
-
-def get_gpu_device_list():
-    "get device list"
-    with tempfile.TemporaryDirectory() as temp_dirname:
-        suffix = ".exe" if is_windows() else ""
-        # TODO: Use NRSU because we can't assume nvidia-smi across all platforms.
-        cmd = " ".join(["nvidia-smi" + suffix, "-L"])
-        output = check_output(cmd, shell=True, cwd=temp_dirname)
-    return [l.strip() for l in output.strip().split("\n")]
+                f"Device {get_gpu_device_list()[0]} does not contain keyword in {keyword_list}."
+            )
 
 
 def get_device_count():
@@ -1906,8 +1949,26 @@ def get_device_memory():
             "nvidia-smi" + suffix, "--query-gpu=memory.total",
             "--format=csv,noheader"
         ])
-        output = check_output(cmd, shell=True, cwd=temp_dirname)
-        memory = int(output.strip().split()[0])
+        # Try to get memory from nvidia-smi first, if failed, fallback to system memory from /proc/meminfo
+        # This fallback is needed for systems with unified memory (e.g. DGX Spark)
+        try:
+            output = check_output(cmd, shell=True, cwd=temp_dirname)
+            memory_str = output.strip().split()[0]
+            # Check if nvidia-smi returned a valid numeric value
+            if "N/A" in memory_str:
+                raise ValueError("nvidia-smi returned invalid memory info")
+            memory = int(memory_str)
+        except (sp.CalledProcessError, ValueError, IndexError):
+            # Fallback to system memory from /proc/meminfo (in kB, convert to MiB)
+            try:
+                with open('/proc/meminfo', 'r') as f:
+                    for line in f:
+                        if line.startswith('MemTotal:'):
+                            memory = int(
+                                line.split()[1]) // 1024  # Convert kB to MiB
+                            break
+            except:
+                memory = 8192  # Default 8GB if all else fails
 
     return memory
 

@@ -1,12 +1,11 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,27 +14,35 @@
  * limitations under the License.
  */
 #pragma once
+#ifndef _WIN32
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstrict-aliasing"
+#endif // #ifndef _WIN32
 
-#include "allreduce_gemm_runner.h"
-
-#include "cutlass/util/packed_stride.hpp"
-#include "cutlass_extensions/gemm_configs.h"
-
+#include "cutlass/arch/arch.h"
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
+#include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
+#include "cutlass/gemm/gemm.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/gemm/kernel/tile_scheduler.hpp"
-#include "cutlass_extensions/communication/collective/sm90_allreduce_nvls_warpspecialized.hpp"
-#include "cutlass_extensions/gemm/kernel/sm90_gemm_allreduce_tma_warpspecialized_pingpong.hpp"
+#include "cutlass/util/packed_stride.hpp"
+
+#include "cutlass_extensions/gemm_configs.h"
+
+#include "../include/allreduce_gemm_runner.h"
+#include "./communication/sm90_allreduce_nvls_warpspecialized.hpp"
+#include "./epilogue/sm90_visitor_allreduce_tma_warpspecialized.hpp"
+#include "./kernel/sm90_gemm_allreduce_tma_warpspecialized_pingpong.hpp"
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm::kernels::cutlass_kernels
+namespace tensorrt_llm::kernels::opened_cutlass_kernels
 {
 //////////////////////////////////////////////
 // Sm90 Two-shot fusion
@@ -147,6 +154,7 @@ public:
 
         PersistentWorkspace(int64_t M, int64_t N, std::set<int> ranks)
             : _ranks(ranks)
+            , _num_elements(M * N)
         {
             assert(M > 0 && "M is 0.");
             assert(N > 0 && "N is 0.");
@@ -163,6 +171,10 @@ public:
         {
             _tile_barriers.reset(_num_tile_barriers, _ranks);
             _completion_barriers.reset(_num_completion_barriers, _ranks);
+            if (_ranks.size() == 2)
+            {
+                _stage_buf.reset(_num_elements, _ranks);
+            }
 
             TLLM_CUDA_CHECK(
                 cudaMemset(_tile_barriers.getUnicastPointer(), 0, _tile_barriers.getCapacity() * sizeof(BarrierT)));
@@ -174,9 +186,6 @@ public:
             {
                 MPI_group_barrier(_ranks);
             }
-
-            TLLM_CUDA_CHECK(cudaStreamCreate(&_memcpy_stream));
-            TLLM_CUDA_CHECK(cudaEventCreate(&_fork_join_event));
         }
 
         int free() override
@@ -184,6 +193,18 @@ public:
             _tile_barriers.free();
             _completion_barriers.free();
             return 0;
+        }
+
+        size_t size() override
+        {
+            size_t size_bytes = 0;
+            size_bytes += _num_tile_barriers * sizeof(BarrierT);
+            size_bytes += _num_completion_barriers * sizeof(BarrierT);
+            if (_ranks.size() == 2)
+            {
+                size_bytes += _num_elements * sizeof(ElementD);
+            }
+            return size_bytes;
         }
 
         /////////////////////////////////////////
@@ -203,11 +224,11 @@ public:
 
         size_t _num_tile_barriers = 0;
         size_t _num_completion_barriers = 0;
+        size_t _num_elements = 0;
         std::set<int> _ranks;
         DeviceAllocationNvls<BarrierT> _tile_barriers;
         DeviceAllocationNvls<BarrierT> _completion_barriers;
-        cudaStream_t _memcpy_stream;
-        cudaEvent_t _fork_join_event;
+        DeviceAllocationNvls<ElementD> _stage_buf;
     };
 
     GemmAllReduceImplTwoshot_Sm90()
@@ -263,22 +284,34 @@ private:
         auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(M, N, L));
         auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(M, N, L));
 
+        ElementD* ptr_D = reinterpret_cast<ElementD*>(problem.D);
+        ElementD* mc_ptr_D = reinterpret_cast<ElementD*>(problem.D_mc);
+        ElementD* mc_ptr_out = reinterpret_cast<ElementD*>(problem.D_mc);
+        ElementD** ipc_ptr_D = reinterpret_cast<ElementD**>(problem.D_ipc);
+        ElementD** ipc_ptr_out = reinterpret_cast<ElementD**>(problem.D_ipc);
+
+        // Pointers to GEMM output
+        if (workspace->_stage_buf.getCapacity() > 0)
+        {
+            ptr_D = workspace->_stage_buf.getUnicastPointer();
+            mc_ptr_D = workspace->_stage_buf.getMulticastPointer();
+            ipc_ptr_D = workspace->_stage_buf.getIpcUnicastPointers();
+        }
+
         return typename Gemm::Arguments{cutlass::gemm::GemmUniversalMode::kGemm, {M, N, K},
             {// Mainloop arguments
                 reinterpret_cast<ElementA const*>(problem.A), stride_A, reinterpret_cast<ElementB const*>(problem.B),
                 stride_B},
             {// Epilogue arguments
-                {problem.alpha, problem.beta, problem.alpha_ptr, nullptr, reinterpret_cast<ElementD*>(problem.D_mc),
-                    reinterpret_cast<ElementD*>(problem.D), stride_D,
+                {problem.alpha, problem.beta, problem.alpha_ptr, nullptr, mc_ptr_D, ptr_D, stride_D,
                     skip_AR ? typename TileBarrierType::Params{} : workspace->getTileBarrierParams(), problem.rank,
                     static_cast<int>(problem.ranks.size())},
                 reinterpret_cast<ElementC const*>(problem.C), stride_C, (ElementD*) nullptr, stride_D},
             {// AllReduce arguments
-                reinterpret_cast<ElementD*>(problem.D_mc), reinterpret_cast<ElementD**>(problem.D_ipc), stride_D,
+                mc_ptr_D, mc_ptr_out, ipc_ptr_D, ipc_ptr_out, stride_D,
                 skip_AR ? typename TileBarrierType::Params{} : workspace->getTileBarrierParams(),
                 skip_AR ? typename TileBarrierType::Params{} : workspace->getCompletionBarrierParams(), problem.rank,
-                static_cast<int>(problem.ranks.size()),
-                problem.launch_config.reduce_location == ReduceLocationType::kSWITCH},
+                static_cast<int>(problem.ranks.size())},
             _hw_info,
             {// TileScheduler arguments
                 1, RasterOrderOptions::AlongN}};
@@ -289,4 +322,4 @@ private:
     cutlass::KernelHardwareInfo _hw_info;
 };
 
-} // namespace tensorrt_llm::kernels::cutlass_kernels
+} // namespace tensorrt_llm::kernels::opened_cutlass_kernels

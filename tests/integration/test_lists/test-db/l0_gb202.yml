@@ -8,6 +8,7 @@ l0_gb202:
     wildcards:
       gpu:
       - '*gb202*'
+      - '*5090*'
       linux_distribution_name: ubuntu*
     terms:
       stage: pre_merge
@@ -16,7 +17,10 @@ l0_gb202:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/modeling -k "modeling_mllama"
   - unittest/_torch/modeling -k "modeling_out_of_tree"
+  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_nvfp4[dtype0]
+  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_nvfp4[dtype1]
   # - unittest/_torch/modeling -k "modeling_qwen" # https://nvbugs/5234573
   - unittest/_torch/test_attention_mla.py
   - test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
   - test_e2e.py::test_ptp_quickstart_bert[TRTLLM-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_bf16[latency]

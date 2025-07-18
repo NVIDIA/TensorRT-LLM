@@ -17,10 +17,11 @@
 
 #pragma once
 
-#include "tensorrt_llm/batch_manager/cacheTransBuffer.h"
-#include "tensorrt_llm/batch_manager/dataTransceiver.h"
+#include "cacheFormatter.h"
+#include "cacheTransBuffer.h"
+#include "dataTransceiver.h"
 #include "tensorrt_llm/common/envUtils.h"
-#include "tensorrt_llm/executor/cache_transmission/cacheConcatenate.h"
+#include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 
 namespace tensorrt_llm::batch_manager
 {
@@ -37,15 +38,15 @@ struct TransceiverTag
     static constexpr int32_t kINFO_TAG{32};
 };
 
+using BaseCacheFormatter = kv_cache_manager::BaseCacheFormatter;
+
 class DataSenderImpl : public DataSender, public TransceiverTag
 {
 public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
-    using RequestMapInfo
-        = std::vector<std::pair<executor::kv_cache::Connection const*, executor::DataTransceiverState>>;
 
     DataSenderImpl(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
-        SizeType32 selfIndex, std::unique_ptr<IOFormatter> formatter);
+        SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter);
 
     [[nodiscard]] RequestInfo recvRequestInfo() override;
 
@@ -61,9 +62,9 @@ public:
 
 private:
     executor::kv_cache::ConnectionManager* mManager;
-    std::map<LlmRequest::RequestIdType, RequestMapInfo> mRequestToComms;
+    std::map<LlmRequest::RequestIdType, TransferSession> mRequestToSession;
     executor::DataTransceiverState mSelfState;
-    std::unique_ptr<IOFormatter> mFormatter;
+    std::unique_ptr<BaseCacheFormatter> mFormatter;
     std::mutex mMtxForMap;
     runtime::BufferManager mBufferManager;
 };
@@ -74,11 +75,11 @@ public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
     DataReceiverImpl(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
-        SizeType32 selfIndex, std::unique_ptr<IOFormatter> formatter);
+        SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter);
 
-    void sendRequestInfo(LlmRequest const& llmRequest) override;
+    TransferSession sendRequestInfo(LlmRequest const& llmRequest) override;
 
-    void receiveSync(LlmRequest const& llmRequest) override;
+    void receiveSync(TransferSession& session) override;
 
 private:
     struct ReceiveCacheResource
@@ -99,7 +100,7 @@ private:
 
     executor::kv_cache::ConnectionManager* mManager;
     executor::DataTransceiverState mSelfState;
-    std::unique_ptr<IOFormatter> mFormatter;
+    std::unique_ptr<BaseCacheFormatter> mFormatter;
     std::unordered_map<std::string, std::unique_ptr<ReceiveCacheResource>> mProcessToResources;
     std::mutex mProcessIoResouceMutex;
 };

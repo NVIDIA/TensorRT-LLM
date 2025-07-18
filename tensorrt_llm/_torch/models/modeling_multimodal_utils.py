@@ -30,9 +30,9 @@ from tensorrt_llm._torch.modules.embedding import Embedding
 
 def fuse_input_embeds(
     embedding_layer: Embedding,
-    input_ids: torch.LongTensor,
+    input_ids: torch.IntTensor,
     mm_embeds: List[torch.Tensor],
-    mm_token_ids: Optional[torch.LongTensor] = None,
+    mm_token_ids: Optional[torch.IntTensor] = None,
 ) -> Tuple[Optional[torch.FloatTensor], Optional[torch.FloatTensor]]:
     """
     Fuse text and multimodal embeddings. input_ids is [text_total_length + mm_total_length] and mm_embed is [mm_total_length, hidden_dim]. We just need to fuse them into [text_total_length + mm_total_length, hidden_dim] by slice-and-assign to the corresponding entries.
@@ -64,6 +64,7 @@ def fuse_input_embeds(
         mm_token_mask = input_ids >= vocab_size
         text_token_mask = input_ids < vocab_size
     else:
+        mm_token_ids = mm_token_ids.to(input_ids.device)
         mm_token_mask = torch.isin(input_ids, mm_token_ids)
         text_token_mask = ~mm_token_mask
     text_token_indices = torch.where(text_token_mask)[0]

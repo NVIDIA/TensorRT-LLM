@@ -40,7 +40,7 @@ struct KVBlockArrayForContextFMHA
 {
     using DataType = KVCacheIndex const;
 
-    // Current number of sequences
+    // The maximum number of sequences supported by the kv-cache.
     int32_t mMaxSeqs;
     // Max number of blocks per sequence
     int32_t mMaxBlocksPerSeq;

@@ -129,6 +129,19 @@ void moeSetSignalForCpuStageForTest(MoeLoadBalanceSingleLayerSignal* signal)
 }
 
 template <typename TYPE>
+__global__ void zeroExpertTokenCountKernel(MoeLoadBalanceMetaInfo metaInfo, int* const enabled, int* expertTokenCount)
+{
+    if (*enabled == 0)
+    {
+        return;
+    }
+    TYPE oldExpertTokenCount = {0};
+    int* expertTokenCountPtr = expertTokenCount + metaInfo.expertCount * blockIdx.x;
+    TYPE* typedExpertTokenCountPtr = reinterpret_cast<TYPE*>(expertTokenCountPtr);
+    typedExpertTokenCountPtr[threadIdx.x] = oldExpertTokenCount;
+}
+
+template <typename TYPE>
 __global__ void shiftWindowKernel(MoeLoadBalanceMetaInfo metaInfo, int* const enabled, int* expertTokenCount)
 {
     if (*enabled == 0)
@@ -151,8 +164,8 @@ __global__ void shiftWindowKernel(MoeLoadBalanceMetaInfo metaInfo, int* const en
     typedExpertTokenCountPtr[threadIdx.x] = oldExpertTokenCount;
 }
 
-__global__ void statisticKernel(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalanceStatisticInfo statisticInfo,
-    int totalEltCount, int* const enabled, int* const gatheredRawExpertIds)
+__global__ void statisticKernel(MoeLoadBalanceMetaInfo metaInfo, int* expertTokenCount, int totalEltCount,
+    int* const enabled, int* const gatheredRawExpertIds)
 {
     extern __shared__ int sharedExpertCount[];
     if (*enabled == 0)
@@ -175,19 +188,19 @@ __global__ void statisticKernel(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalanceS
     __syncthreads();
     for (int i = threadIdx.x; i < metaInfo.expertCount; i += blockDim.x)
     {
-        atomicAdd_system(&statisticInfo.expertTokenCount[i], sharedExpertCount[i]);
+        atomicAdd_system(&expertTokenCount[i], sharedExpertCount[i]);
     }
 }
 
-__global__ void updateLoadFactorKernel(
-    MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalanceStatisticInfo statisticInfo, int* const enabled)
+__global__ void updateLoadFactorKernel(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalanceStatisticInfo statisticInfo,
+    int* expertTokenCountPtr, int* const enabled)
 {
     if (*enabled == 0)
     {
         return;
     }
     int expertIdx = blockIdx.x * blockDim.x + threadIdx.x;
-    int expertTokenCount = statisticInfo.expertTokenCount[expertIdx];
+    int expertTokenCount = expertTokenCountPtr[expertIdx];
     float* loadFactor = statisticInfo.expertLoadFactor;
     loadFactor[expertIdx] = loadFactor[expertIdx] * statisticInfo.decayFactor + expertTokenCount;
 }
@@ -233,7 +246,7 @@ void moeStatisticDevice(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalanceStatistic
         }
         int sharedMemorySize = metaInfo.expertCount * sizeof(int);
         statisticKernel<<<blockCount, threadCount, sharedMemorySize, stream>>>(
-            metaInfo, statisticInfo, totalEltCount, enabled, gatheredRawExpertIds);
+            metaInfo, statisticInfo.expertTokenCount, totalEltCount, enabled, gatheredRawExpertIds);
     }
 
     if (isLastStage)
@@ -241,7 +254,116 @@ void moeStatisticDevice(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalanceStatistic
         // only last stage need update load factor.
         int threadCount = 128;
         int blockCount = (metaInfo.expertCount + threadCount - 1) / threadCount;
-        updateLoadFactorKernel<<<blockCount, threadCount, 0, stream>>>(metaInfo, statisticInfo, enabled);
+        updateLoadFactorKernel<<<blockCount, threadCount, 0, stream>>>(
+            metaInfo, statisticInfo, statisticInfo.expertTokenCount, enabled);
+    }
+}
+
+void moeHierarchicalStatisticLocalDevice(MoeLoadBalanceMetaInfo metaInfo, int numTotalTokens,
+    int* localExpertTokenCount, int* const enabled, bool isFirstStage, bool isLastStage, int* const localRawExpertIds,
+    cudaStream_t stream)
+{
+    static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
+    if (isFirstStage)
+    {
+        // shift window and zero expertTokenCount
+        // only first stage need shift window.
+        int threadCount = metaInfo.expertCount;
+        auto* kernelFunc = zeroExpertTokenCountKernel<int>;
+        if (threadCount % 4 == 0)
+        {
+            threadCount /= 4;
+            kernelFunc = zeroExpertTokenCountKernel<int4>;
+        }
+        else if (threadCount % 2 == 0)
+        {
+            threadCount /= 2;
+            kernelFunc = zeroExpertTokenCountKernel<int2>;
+        }
+        dim3 gridDim(1);
+        dim3 blockDim(threadCount);
+        void* args[]
+            = {&metaInfo, static_cast<void*>(const_cast<int**>(&enabled)), static_cast<void*>(&localExpertTokenCount)};
+        TLLM_CHECK_WITH_INFO(
+            threadCount <= 1024, "expertCount=%d is too large and not supported now.", metaInfo.expertCount);
+        TLLM_CUDA_CHECK(cudaLaunchKernel(kernelFunc, gridDim, blockDim, &args[0], 0, stream));
+    }
+
+    {
+        // do the statistic into expertTokenCount and maybe also expertLoadFactor;
+        int threadCount = 1024;
+        int totalEltCount = numTotalTokens * metaInfo.topK;
+        int blockCount = (totalEltCount + threadCount - 1) / threadCount;
+        if (blockCount > smCount)
+        {
+            blockCount = smCount;
+        }
+        int sharedMemorySize = metaInfo.expertCount * sizeof(int);
+        statisticKernel<<<blockCount, threadCount, sharedMemorySize, stream>>>(
+            metaInfo, localExpertTokenCount, totalEltCount, enabled, localRawExpertIds);
+    }
+}
+
+void moeHierarchicalStatisticUpdate(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalanceStatisticInfo statisticInfo,
+    int* globalExpertTokenCount, int* const enabled, cudaStream_t stream)
+{
+    int threadCount = 128;
+    int blockCount = (metaInfo.expertCount + threadCount - 1) / threadCount;
+    updateLoadFactorKernel<<<blockCount, threadCount, 0, stream>>>(
+        metaInfo, statisticInfo, globalExpertTokenCount, enabled);
+}
+
+template <int MAX_EXPERT_COUNT = 1024, int THREAD_COUNT = 256, int ITEM_PER_THREAD = 4>
+__global__ void moeComputeRouteNoRedundantKernel(MoeLoadBalanceMetaInfo metaInfo, MoePlacementInfo placementInfo,
+    int* const tokenSelectedExperts, int* tokenRoutedSlotIds, int tokenCount)
+{
+    extern __shared__ int16_t sharedGlobalSlotIdsInfo[];
+    int expertIds[ITEM_PER_THREAD];
+    int slotIds[ITEM_PER_THREAD];
+    for (int slotId = threadIdx.x; slotId < metaInfo.epSize * metaInfo.slotCountPerRank; slotId += THREAD_COUNT)
+    {
+        sharedGlobalSlotIdsInfo[slotId] = placementInfo.globalSlotIds[slotId];
+    }
+
+    int blockOffset = blockIdx.x * THREAD_COUNT * ITEM_PER_THREAD;
+
+    for (; blockOffset < tokenCount * metaInfo.topK; blockOffset += gridDim.x * THREAD_COUNT * ITEM_PER_THREAD)
+    {
+        int tokenIdxBase = blockOffset + threadIdx.x;
+#pragma unroll
+        for (int i = 0; i < ITEM_PER_THREAD; i++)
+        {
+            int tokenIdx = tokenIdxBase + i * THREAD_COUNT;
+            expertIds[i]
+                = tokenIdx < tokenCount * metaInfo.topK ? tokenSelectedExperts[tokenIdx] : metaInfo.expertCount;
+        }
+#pragma unroll
+        for (int i = 0; i < ITEM_PER_THREAD; i++)
+        {
+            if (expertIds[i] < 0 || expertIds[i] >= metaInfo.expertCount)
+            {
+                expertIds[i] = metaInfo.expertCount;
+            }
+        }
+        if (blockOffset == blockIdx.x * THREAD_COUNT * ITEM_PER_THREAD)
+        {
+            __syncthreads();
+        }
+#pragma unroll
+        for (int i = 0; i < ITEM_PER_THREAD; i++)
+        {
+            slotIds[i] = expertIds[i] < metaInfo.expertCount ? sharedGlobalSlotIdsInfo[expertIds[i]]
+                                                             : metaInfo.epSize * metaInfo.slotCountPerRank;
+        }
+#pragma unroll
+        for (int i = 0; i < ITEM_PER_THREAD; i++)
+        {
+            int tokenIdx = tokenIdxBase + i * THREAD_COUNT;
+            if (tokenIdx < tokenCount * metaInfo.topK)
+            {
+                tokenRoutedSlotIds[tokenIdx] = slotIds[i];
+            }
+        }
     }
 }
 
@@ -249,8 +371,108 @@ template <int MAX_EXPERT_COUNT = 1024, int THREAD_COUNT = 256, int ITEM_PER_THRE
 __global__ void moeComputeRouteKernel(MoeLoadBalanceMetaInfo metaInfo, MoePlacementInfo placementInfo,
     int* const tokenSelectedExperts, int* tokenRoutedSlotIds, int tokenCount, bool offsetByEpRank)
 {
+    int warpId = threadIdx.x / 32;
+    int laneId = threadIdx.x % 32;
+    static int const kWarpCount = THREAD_COUNT / 32;
+    extern __shared__ int16_t sharedGlobalSlotIdsInfo[];
+    __shared__ int sharedExpertReplicaCountAndStartOffset[MAX_EXPERT_COUNT];
+
+    __shared__ int sharedArbitrateExpertId[THREAD_COUNT * ITEM_PER_THREAD];
+    __shared__ int sharedExpertCount[MAX_EXPERT_COUNT];
+    for (int expertIdx = threadIdx.x; expertIdx < metaInfo.expertCount; expertIdx += THREAD_COUNT)
+    {
+        int replicaCount = placementInfo.expertReplicaCount[expertIdx];
+        int replicaStartOffset = placementInfo.expertReplicaStartOffset[expertIdx];
+        sharedExpertReplicaCountAndStartOffset[expertIdx] = (replicaCount << 16) | replicaStartOffset;
+        sharedExpertCount[expertIdx] = 0;
+    }
+    for (int slotId = threadIdx.x; slotId < metaInfo.epSize * metaInfo.slotCountPerRank; slotId += THREAD_COUNT)
+    {
+        sharedGlobalSlotIdsInfo[slotId] = placementInfo.globalSlotIds[slotId];
+    }
+
+    int expertIds[ITEM_PER_THREAD];
+    int tokenIdxBase = blockIdx.x * THREAD_COUNT * ITEM_PER_THREAD + threadIdx.x;
+#pragma unroll
+    for (int i = 0; i < ITEM_PER_THREAD; i++)
+    {
+        int tokenIdx = tokenIdxBase + i * THREAD_COUNT;
+        expertIds[i] = tokenIdx < tokenCount * metaInfo.topK ? tokenSelectedExperts[tokenIdx] : metaInfo.expertCount;
+    }
+#pragma unroll
+    for (int i = 0; i < ITEM_PER_THREAD; i++)
+    {
+        if (expertIds[i] < 0 || expertIds[i] >= metaInfo.expertCount)
+        {
+            expertIds[i] = metaInfo.expertCount;
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < ITEM_PER_THREAD; i++)
+    {
+        int countAndStart
+            = expertIds[i] < metaInfo.expertCount ? sharedExpertReplicaCountAndStartOffset[expertIds[i]] : (1 << 16);
+        int arbitrateExpertId = (countAndStart >> 16) > 1 ? expertIds[i] : metaInfo.expertCount;
+        sharedArbitrateExpertId[threadIdx.x + i * THREAD_COUNT] = arbitrateExpertId;
+    }
+    __syncthreads();
+    int baseOffset = blockIdx.x + (offsetByEpRank ? metaInfo.epRank : 0);
+    if (warpId == 0)
+    {
+#pragma unroll
+        for (int i = 0; i < kWarpCount * ITEM_PER_THREAD; ++i)
+        {
+            int expertId = sharedArbitrateExpertId[laneId + i * 32];
+            __syncwarp();
+            unsigned match = __match_any_sync(0xFFFFFFFF, expertId);
+            int leader = __ffs(match) - 1;
+            int matchCount = __popc(match);
+            int oldVal = 0;
+            if (laneId == leader && expertId < metaInfo.expertCount)
+            {
+                oldVal = atomicAdd_block(&sharedExpertCount[expertId], matchCount);
+            }
+            __syncwarp();
+            oldVal = __shfl_sync(0XFFFFFFFF, oldVal, leader);
+            unsigned lowerMask = match & ((1u << laneId) - 1);
+            int rankInGroup = __popc(lowerMask);
+            int offset = oldVal + rankInGroup;
+            offset += baseOffset;
+            sharedArbitrateExpertId[laneId + i * 32] = offset;
+        }
+    }
+    __syncthreads();
+    int targetGlobalSlotId[ITEM_PER_THREAD];
+#pragma unroll
+    for (int i = 0; i < ITEM_PER_THREAD; i++)
+    {
+        int countAndStart
+            = expertIds[i] < metaInfo.expertCount ? sharedExpertReplicaCountAndStartOffset[expertIds[i]] : (1 << 16);
+        int count = countAndStart >> 16;
+        int offset = countAndStart & 0xFFFF;
+        int arbitratedIndex = sharedArbitrateExpertId[threadIdx.x + i * THREAD_COUNT];
+        offset += arbitratedIndex % count;
+        targetGlobalSlotId[i] = expertIds[i] < metaInfo.expertCount ? sharedGlobalSlotIdsInfo[offset]
+                                                                    : metaInfo.epSize * metaInfo.slotCountPerRank;
+    }
+#pragma unroll
+    for (int i = 0; i < ITEM_PER_THREAD; i++)
+    {
+        int tokenIdx = tokenIdxBase + i * THREAD_COUNT;
+        if (tokenIdx < tokenCount * metaInfo.topK)
+        {
+            tokenRoutedSlotIds[tokenIdx] = targetGlobalSlotId[i];
+        }
+    }
+}
+
+template <int MAX_EXPERT_COUNT = 1024, int THREAD_COUNT = 256, int ITEM_PER_THREAD = 4>
+__global__ void moeComputeRouteSortKernel(MoeLoadBalanceMetaInfo metaInfo, MoePlacementInfo placementInfo,
+    int* const tokenSelectedExperts, int* tokenRoutedSlotIds, int tokenCount, bool offsetByEpRank)
+{
     using BlockSort = cub::BlockRadixSort<int, THREAD_COUNT, 1>;
-    extern __shared__ int sharedGlobalSlotIdsInfo[];
+    extern __shared__ int16_t sharedGlobalSlotIdsInfo[];
 
     __shared__ typename BlockSort::TempStorage tempStorage;
 
@@ -361,9 +583,19 @@ void moeComputeRouteDevice(MoeLoadBalanceMetaInfo metaInfo, MoePlacementInfo pla
     constexpr int kThreadCount = 256;
     constexpr int kEltPerThread = 4;
     int blockCount = (tokenCount * metaInfo.topK + kThreadCount * kEltPerThread - 1) / (kThreadCount * kEltPerThread);
-    int dynamicShmSize = sizeof(int) * metaInfo.epSize * metaInfo.slotCountPerRank;
-    moeComputeRouteKernel<1024, kThreadCount, kEltPerThread><<<blockCount, kThreadCount, dynamicShmSize, stream>>>(
-        metaInfo, placementInfo, tokenSelectedExperts, tokenRoutedSlotIds, tokenCount, offsetByEpRank);
+    int dynamicShmSize = sizeof(int16_t) * metaInfo.epSize * metaInfo.slotCountPerRank;
+    if (metaInfo.expertCount == metaInfo.epSize * metaInfo.slotCountPerRank)
+    {
+        // no redundant expert, so we don't need complex routing, but just assign to the correct solt.
+        moeComputeRouteNoRedundantKernel<1024, kThreadCount, kEltPerThread>
+            <<<blockCount, kThreadCount, dynamicShmSize, stream>>>(
+                metaInfo, placementInfo, tokenSelectedExperts, tokenRoutedSlotIds, tokenCount);
+    }
+    else
+    {
+        moeComputeRouteKernel<1024, kThreadCount, kEltPerThread><<<blockCount, kThreadCount, dynamicShmSize, stream>>>(
+            metaInfo, placementInfo, tokenSelectedExperts, tokenRoutedSlotIds, tokenCount, offsetByEpRank);
+    }
 }
 
 void moeWaitSignalForCpuStageHost(MoeLoadBalanceSingleLayerSignal* signal)

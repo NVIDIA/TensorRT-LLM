@@ -11,10 +11,11 @@ import yaml
 from strenum import StrEnum
 from torch.cuda import device_count
 
-from tensorrt_llm._torch.llm import LLM as PyTorchLLM
+from tensorrt_llm import LLM as PyTorchLLM
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
-from tensorrt_llm.llmapi import (LLM, BuildConfig, CapacitySchedulerPolicy,
+from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
                                  DynamicBatchConfig, KvCacheConfig,
                                  SchedulerConfig)
 from tensorrt_llm.llmapi.disagg_utils import (CtxGenServerConfig,
@@ -292,6 +293,7 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
         metadata_server_config_file)
 
     if metadata_server_cfg is not None:
+        assert server_role is not None, "server_role is required when metadata_server_cfg is provided"
         try:
             server_role = ServerRole[server_role.upper()]
         except ValueError:
@@ -427,7 +429,6 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
         disagg_cfg.server_configs)
 
     logger.set_level(log_level)
-    os.environ['TRTLLM_USE_MPI_KVCACHE'] = "1"
     set_mpi_comm(sub_comm)
     logger.info(
         f"mpi_session is provided for LLM instance. Global MPI rank: {global_mpi_rank()}, sub-comm MPI rank: {mpi_rank()}"

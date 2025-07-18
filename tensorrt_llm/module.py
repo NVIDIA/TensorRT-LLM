@@ -19,19 +19,18 @@ from .logger import logger
 
 
 def _addindent(s_, numSpaces):
-    s = s_.split('\n')
+    s = s_.split("\n")
     # don't do anything for single-line stuff
     if len(s) == 1:
         return s_
     first = s.pop(0)
-    s = [(numSpaces * ' ') + line for line in s]
-    s = '\n'.join(s)
-    s = first + '\n' + s
+    s = [(numSpaces * " ") + line for line in s]
+    s = "\n".join(s)
+    s = first + "\n" + s
     return s
 
 
 class Module(object):
-
     def __init__(self) -> None:
         self._modules = {}
         self._parameters = {}
@@ -52,20 +51,20 @@ class Module(object):
             output = self.forward(*args, **kwargs)
             end_layer_idx = current_net.trt_network.num_layers
             current_net._module_call_stack.set_layer_range(
-                self, range(start_layer_idx, end_layer_idx))
+                self, range(start_layer_idx, end_layer_idx)
+            )
             return output
 
     def __getattr__(self, name):
-        parameters = self.__dict__.get('_parameters')
+        parameters = self.__dict__.get("_parameters")
         if parameters is not None and name in parameters:
             return parameters[name]
 
-        modules = self.__dict__.get('_modules')
+        modules = self.__dict__.get("_modules")
         if modules is not None and name in modules:
             return modules[name]
 
-        raise AttributeError("'{}' object has no attribute '{}'".format(
-            type(self).__name__, name))
+        raise AttributeError("'{}' object has no attribute '{}'".format(type(self).__name__, name))
 
     def __setattr__(self, name, value) -> None:
         from .parameter import Parameter
@@ -81,9 +80,9 @@ class Module(object):
             # - keep Parameter and Module attrs in this Module class
             # - leave all other attrs in base class
             if isinstance(value, Parameter):
-                self.__dict__.get('_parameters')[name] = value
+                self.__dict__.get("_parameters")[name] = value
             elif isinstance(value, Module):
-                self.__dict__.get('_modules')[name] = value
+                self.__dict__.get("_modules")[name] = value
             else:
                 super().__setattr__(name, value)
 
@@ -93,14 +92,14 @@ class Module(object):
             # - other types reset and remain in base class
             if isinstance(value, Parameter):
                 super().__delattr__(name)
-                self.__dict__.get('_parameters')[name] = value
+                self.__dict__.get("_parameters")[name] = value
             elif isinstance(value, Module):
                 super().__delattr__(name)
-                self.__dict__.get('_modules')[name] = value
+                self.__dict__.get("_modules")[name] = value
             else:
                 super().__setattr__(name, value)
 
-    def named_modules(self, memo=None, prefix='', remove_duplicate=True):
+    def named_modules(self, memo=None, prefix="", remove_duplicate=True):
         if memo is None:
             memo = set()
         if self not in memo:
@@ -110,16 +109,11 @@ class Module(object):
             for name, module in self._modules.items():
                 if module is None:
                     continue
-                submodule_prefix = prefix + ('.' if prefix else '') + name
-                for m in module.named_modules(memo, submodule_prefix,
-                                              remove_duplicate):
+                submodule_prefix = prefix + ("." if prefix else "") + name
+                for m in module.named_modules(memo, submodule_prefix, remove_duplicate):
                     yield m
 
-    def named_modules_with_parent(self,
-                                  memo=None,
-                                  prefix='',
-                                  parent=None,
-                                  remove_duplicate=True):
+    def named_modules_with_parent(self, memo=None, prefix="", parent=None, remove_duplicate=True):
         if memo is None:
             memo = set()
         if self not in memo:
@@ -130,7 +124,7 @@ class Module(object):
             if parent:
                 # Use the up-to-date module from the parent, to allow replacing
                 # layers while iterating this generator.
-                module_name = prefix.rsplit('.', 1)[-1]
+                module_name = prefix.rsplit(".", 1)[-1]
                 module = getattr(parent, module_name)
                 if module is None:
                     return
@@ -140,9 +134,10 @@ class Module(object):
             for child_name, child_module in module._modules.items():
                 if child_module is None:
                     continue
-                submodule_prefix = prefix + ('.' if prefix else '') + child_name
+                submodule_prefix = prefix + ("." if prefix else "") + child_name
                 for m in child_module.named_modules_with_parent(
-                        memo, submodule_prefix, module, remove_duplicate):
+                    memo, submodule_prefix, module, remove_duplicate
+                ):
                     yield m
 
     def named_children(self):
@@ -152,27 +147,26 @@ class Module(object):
                 memo.add(module)
                 yield name, module
 
-    def _named_members(self, get_members_fn, prefix='', recurse=True):
+    def _named_members(self, get_members_fn, prefix="", recurse=True):
         memo = set()
-        modules = self.named_modules(prefix=prefix) if recurse else [(prefix,
-                                                                      self)]
+        modules = self.named_modules(prefix=prefix) if recurse else [(prefix, self)]
         for module_prefix, module in modules:
             members = get_members_fn(module)
             for k, v in members:
                 if v is None or v in memo:
                     continue
                 memo.add(v)
-                name = module_prefix + ('.' if module_prefix else '') + k
+                name = module_prefix + ("." if module_prefix else "") + k
                 yield name, v
 
     def parameters(self, recurse=True):
         for name, param in self.named_parameters():
             yield param
 
-    def named_parameters(self, prefix='', recurse=True):
-        gen = self._named_members(lambda module: module._parameters.items(),
-                                  prefix=prefix,
-                                  recurse=recurse)
+    def named_parameters(self, prefix="", recurse=True):
+        gen = self._named_members(
+            lambda module: module._parameters.items(), prefix=prefix, recurse=recurse
+        )
         for elem in gen:
             yield elem
 
@@ -201,15 +195,15 @@ class Module(object):
     def named_network_outputs(self):
         for name, module in self.named_modules():
             for n, output in module._network_outputs.items():
-                yield name + ('.' if name else '') + n, output
+                yield name + ("." if name else "") + n, output
 
     def update_parameters(self, torch_module):
         m = {k: v for k, v in self.named_parameters()}
         tm = {k: v for k, v in torch_module.named_parameters()}
 
-        assert sorted(m.keys()) == sorted(
-            tm.keys()
-        ), 'The parameter names of the tensorrt-llm module must be the same with the torch module'
+        assert sorted(m.keys()) == sorted(tm.keys()), (
+            "The parameter names of the tensorrt-llm module must be the same with the torch module"
+        )
 
         for k, v in self.named_parameters():
             v.value = tm[k].detach().cpu().numpy()
@@ -223,17 +217,16 @@ class Module(object):
         for key, module in self._modules.items():
             mod_str = repr(module)
             mod_str = _addindent(mod_str, 2)
-            child_lines.append('(' + key + '): ' + mod_str)
-        main_str = self._get_name() + '('
+            child_lines.append("(" + key + "): " + mod_str)
+        main_str = self._get_name() + "("
         if child_lines:
             # simple one-liner info, which most builtin Modules will use
-            main_str += '\n  ' + '\n  '.join(child_lines) + '\n'
-        main_str += ')'
+            main_str += "\n  " + "\n  ".join(child_lines) + "\n"
+        main_str += ")"
         return main_str
 
 
 class ModuleList(Module):
-
     def __init__(self, modules) -> None:
         super(ModuleList, self).__init__()
         offset = len(self)
@@ -241,10 +234,10 @@ class ModuleList(Module):
             self._modules[str(offset + i)] = module
 
     def _get_abs_string_index(self, idx):
-        """Get the absolute index for the list of modules"""
+        """Get the absolute index for the list of modules."""
         idx = operator.index(idx)
         if not (-len(self) <= idx < len(self)):
-            raise IndexError('index {} is out of range'.format(idx))
+            raise IndexError("index {} is out of range".format(idx))
         if idx < 0:
             idx += len(self)
         return str(idx)

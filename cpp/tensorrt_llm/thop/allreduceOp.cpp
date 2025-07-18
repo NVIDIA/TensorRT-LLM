@@ -25,7 +25,6 @@
 #include "tensorrt_llm/kernels/communicationKernels/mnnvlTwoShotAllreduceKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/fp4_gemm.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
 #include "tensorrt_llm/runtime/mcastDeviceMemory.h"
@@ -159,7 +158,8 @@ public:
 
     std::vector<torch::Tensor> run(torch::Tensor const& input, torch::optional<torch::Tensor> const& residual,
         torch::optional<torch::Tensor> const& norm_weight, torch::optional<torch::Tensor> const& scale,
-        torch::optional<torch::Tensor> const& bias, torch::optional<torch::Tensor> workspace)
+        torch::optional<torch::Tensor> const& bias, bool trigger_completion_at_end,
+        torch::optional<torch::Tensor> workspace) noexcept
     {
         size_t size = input.numel();
         size_t seq_len = input.size(0);
@@ -180,7 +180,8 @@ public:
         case AllReduceStrategyType::MIN_LATENCY:
         case AllReduceStrategyType::ONESHOT:
         case AllReduceStrategyType::TWOSHOT:
-            return runFusionAllReduce(input, residual, norm_weight, scale, bias, workspace, runtime_strategy);
+            return runFusionAllReduce(
+                input, residual, norm_weight, scale, bias, trigger_completion_at_end, workspace, runtime_strategy);
         case AllReduceStrategyType::LOWPRECISION:
             return runLowPrecisionAllReduce(input, residual, norm_weight, scale, bias);
         default: TORCH_CHECK(false, "Invalid runtime strategy"); return {};
@@ -372,7 +373,8 @@ private:
     std::vector<torch::Tensor> runFusionAllReduce(torch::Tensor const& input,
         torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
         torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias,
-        torch::optional<torch::Tensor> workspace, AllReduceStrategyType strategy)
+        bool trigger_completion_at_end, torch::optional<torch::Tensor> workspace,
+        AllReduceStrategyType strategy) noexcept
     {
         // Should handle only Lamport implementation
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
@@ -408,6 +410,7 @@ private:
         allreduce_fusion_params.scale_out = nullptr;
         allreduce_fusion_params.residual_out = nullptr;
         allreduce_fusion_params.norm_out = nullptr;
+        allreduce_fusion_params.trigger_completion_at_end = trigger_completion_at_end;
 
         // Determine if using oneshot or twoshot allreduce kernel
         if (strategy == AllReduceStrategyType::MIN_LATENCY)
@@ -621,14 +624,12 @@ private:
 
     AllReduceStrategyType getRuntimeStrategy(size_t seq_len, size_t size)
     {
-        static char* force_nccl_all_reduce_strategy_char = std::getenv("FORCE_NCCL_ALL_REDUCE_STRATEGY");
-        bool force_nccl_all_reduce_strategy = (force_nccl_all_reduce_strategy_char != nullptr);
         AllReduceStrategyType runtime_strategy;
         if (mStrategy == AllReduceStrategyType::UB)
         {
             runtime_strategy = AllReduceStrategyType::UB;
         }
-        else if (force_nccl_all_reduce_strategy || mStrategy == AllReduceStrategyType::NCCL)
+        else if (mStrategy == AllReduceStrategyType::NCCL)
         {
             runtime_strategy = AllReduceStrategyType::NCCL;
         }
@@ -909,26 +910,23 @@ private:
         {
             strategy = AllReduceStrategyType::MIN_LATENCY;
         }
-        else if (world_size <= 4)
-        {
-            if (message_size_bytes < 1 * 1000 * 1000)
-            {
-                strategy = AllReduceStrategyType::MIN_LATENCY;
-            }
-            else
-            {
-                strategy = AllReduceStrategyType::NCCL;
-            }
-        }
         else
         {
-            if (message_size_bytes < 500 * 1000)
+            static char* threshold_ptr = std::getenv("ALLREDUCE_AUTO_HEURISTIC_MIN_LATENCY_THRESHOLD_TOKEN_NUM");
+            size_t threshold = 128;
+            if (threshold_ptr)
             {
-                strategy = AllReduceStrategyType::MIN_LATENCY;
+                threshold = static_cast<size_t>(std::atoi(threshold_ptr));
+            }
+            // Generally, NCCL is faster than MIN_LATENCY when the token number is greater than 256. I conservatively
+            // set the threshold here to 128 tokens.
+            if (seq_len > threshold)
+            {
+                strategy = AllReduceStrategyType::NCCL;
             }
             else
             {
-                strategy = AllReduceStrategyType::NCCL;
+                strategy = AllReduceStrategyType::MIN_LATENCY;
             }
         }
         return strategy;
@@ -936,10 +934,7 @@ private:
 
     bool isUsingLowPrecision(size_t message_size) const noexcept
     {
-        static char* force_low_precision_allreduce_strategy_char
-            = std::getenv("FORCE_LOW_PRECISION_ALL_REDUCE_STRATEGY");
-        bool force_low_precision = (force_low_precision_allreduce_strategy_char != nullptr)
-            || (mStrategy == AllReduceStrategyType::LOWPRECISION);
+        bool force_low_precision = mStrategy == AllReduceStrategyType::LOWPRECISION;
 
 #ifdef ENABLE_FP8
         // Use LowPrecision if PCIe and p2p support and message size is larger than 2MB
@@ -969,8 +964,9 @@ private:
 
 std::vector<torch::Tensor> allreduce(torch::Tensor const& input, torch::optional<torch::Tensor> const& residual,
     torch::optional<torch::Tensor> const& norm_weight, torch::optional<torch::Tensor> const& scale,
-    torch::optional<torch::Tensor> const& bias, torch::optional<torch::Tensor> const& workspace,
-    torch::List<int64_t> const& group_, int64_t const strategy_, int64_t const fusion_op_, double const eps_)
+    torch::optional<torch::Tensor> const& bias, torch::optional<torch::Tensor> workspace,
+    torch::List<int64_t> const& group_, int64_t const strategy_, int64_t const fusion_op_, double const eps_,
+    bool const trigger_completion_at_end_)
 {
 #if ENABLE_MULTI_DEVICE
     auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
@@ -984,7 +980,7 @@ std::vector<torch::Tensor> allreduce(torch::Tensor const& input, torch::optional
     }
     AllreduceOp op(group, dtype, strategy, fusion_op, eps);
     op.initialize();
-    return op.run(input, residual, norm_weight, scale, bias, workspace);
+    return op.run(input, residual, norm_weight, scale, bias, trigger_completion_at_end_, workspace);
 #else
     return {input};
 #endif // ENABLE_MULTI_DEVICE
@@ -1043,13 +1039,82 @@ std::vector<torch::Tensor> moe_allreduce(torch::Tensor const& residual, torch::T
     return {norm_out, residual_out};
 }
 
+// Pattern: MoE Reduction + Add + AR + ADD_RMS, see this torch reference implementation:
+// expert_reduction = finalize(input, expanded_idx_to_permuted_idx, expert_scale_factor)
+// output_add = expert_reduction + shared_expert_output
+// output_residual = output_add + residual
+// output_hidden_states = rms_norm(output_residual, norm_weight, eps)
+//
+// Note:
+//     input is the output of MoE FC2
+//     input [maxPermutedPaddedCount, hidden_dim]
+//     residual [m, hidden_dim]
+//     norm_weight [hidden_dim]
+//     expanded_idx_to_permuted_idx [m, top_k]
+//     expert_scale_factor [m, top_k]
+//     shared_expert_output [m, hidden_dim]
+std::vector<torch::Tensor> moe_finalize_allreduce(torch::Tensor const& input, torch::Tensor const& residual,
+    torch::Tensor const& norm_weight, torch::Tensor const& expanded_idx_to_permuted_idx,
+    torch::optional<torch::Tensor> const& shared_expert_output,
+    torch::optional<torch::Tensor> const& expert_scale_factor, torch::Tensor workspace, int64_t const rank,
+    int64_t const nranks, double const eps)
+{
+    auto allreduce_fusion_params = tensorrt_llm::kernels::ar_fusion::moe::MoeFinalizeAllReduceFusionParams();
+
+    int hidden_dim = residual.size(-1);
+    int top_k = expanded_idx_to_permuted_idx.size(-1);
+
+    allreduce_fusion_params.quant_out = nullptr;
+    allreduce_fusion_params.scale_out = nullptr;
+
+    allreduce_fusion_params.nranks = static_cast<int>(nranks);
+    allreduce_fusion_params.rank = static_cast<int>(rank);
+    allreduce_fusion_params.dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
+    // size: num_token * hidden_dim
+    allreduce_fusion_params.size = residual.numel();
+    allreduce_fusion_params.hidden_dim = hidden_dim;
+
+    // workspace: AR scratch space
+    allreduce_fusion_params.workspace = reinterpret_cast<void**>(workspace.mutable_data_ptr());
+    allreduce_fusion_params.rms_gamma = norm_weight.data_ptr();
+    allreduce_fusion_params.rms_eps = static_cast<float>(eps);
+    allreduce_fusion_params.residual_in = residual.data_ptr();
+    allreduce_fusion_params.stream = at::cuda::getCurrentCUDAStream(norm_weight.get_device());
+
+    // MOE Reduction specific params
+    allreduce_fusion_params.top_k = top_k;
+    allreduce_fusion_params.allreduce_in = input.data_ptr();
+    allreduce_fusion_params.expert_scale_factor
+        = expert_scale_factor.has_value() ? expert_scale_factor.value().data_ptr() : nullptr;
+    allreduce_fusion_params.scale_dtype = tensorrt_llm::runtime::TorchUtils::dataType(
+        expert_scale_factor.has_value() ? expert_scale_factor.value().scalar_type() : input.scalar_type());
+    TORCH_CHECK(
+        expanded_idx_to_permuted_idx.scalar_type() == torch::kInt32, "expanded_idx_to_permuted_idx must be int32");
+    allreduce_fusion_params.expanded_idx_to_permuted_idx
+        = static_cast<int32_t*>(expanded_idx_to_permuted_idx.data_ptr());
+    allreduce_fusion_params.shared_expert_output
+        = shared_expert_output.has_value() ? shared_expert_output.value().data_ptr() : nullptr;
+
+    // output tensors
+    torch::Tensor norm_out = torch::empty_like(residual);
+    torch::Tensor residual_out = torch::empty_like(residual);
+
+    allreduce_fusion_params.norm_out = norm_out.mutable_data_ptr();
+    allreduce_fusion_params.residual_out = residual_out.mutable_data_ptr();
+
+    tensorrt_llm::kernels::ar_fusion::moe::moefinalize_allreduce_fusion_op(allreduce_fusion_params);
+
+    return {norm_out, residual_out};
+}
+
 at::Tensor mnnvlTwoShotAllReduce(
-    at::Tensor& output, at::Tensor& input, at::Tensor& comm_buffer, at::Tensor& buffer_flags, bool wait_for_results)
+    at::Tensor& input, at::Tensor& comm_buffer, at::Tensor& buffer_flags, bool wait_for_results)
 {
     auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
     TORCH_CHECK(mcast_mem != nullptr, "two_shot_all_reduce: comm_buffer must be obtained from a mcastBuffer instance.");
 
     auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
+    at::Tensor output = torch::empty_like(input);
 
     auto allreduce_params = tensorrt_llm::kernels::mnnvl::AllReduceParams();
     allreduce_params.dtype = dtype;
@@ -1071,35 +1136,42 @@ at::Tensor mnnvlTwoShotAllReduce(
     return output;
 }
 
-void twoShotRMSNorm(torch::Tensor& prenorm_output, torch::Tensor& normed_output, torch::Tensor const& input,
-    torch::Tensor const& gamma, double epsilon, torch::Tensor const& residual, torch::Tensor& buffer_flags)
+std::vector<torch::Tensor> twoShotRMSNorm(torch::Tensor const& comm_buf, torch::Tensor const& gamma, double epsilon,
+    torch::Tensor const& residual, torch::Tensor& buffer_flags)
 {
-    auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
+    auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(comm_buf.scalar_type());
     auto rmsnorm_params = tensorrt_llm::kernels::mnnvl::RMSNormParams();
+
+    // Input is the communication buffer so we need to get the shape from residual
+    torch::Tensor normed_output = torch::empty_like(residual);
+    torch::Tensor prenorm_output = torch::empty_like(residual);
+
     rmsnorm_params.dtype = dtype;
     rmsnorm_params.residual_output = prenorm_output.data_ptr();
     rmsnorm_params.output = normed_output.data_ptr();
-    rmsnorm_params.input = input.data_ptr();
+    rmsnorm_params.input = comm_buf.data_ptr();
     rmsnorm_params.gamma = gamma.data_ptr();
     rmsnorm_params.epsilon = epsilon;
     rmsnorm_params.residual = residual.data_ptr();
     rmsnorm_params.buffer_flags = reinterpret_cast<uint32_t*>(buffer_flags.data_ptr());
     rmsnorm_params.batch = normed_output.size(0);
     rmsnorm_params.hidden_dim = normed_output.size(1);
-    rmsnorm_params.stream = at::cuda::getCurrentCUDAStream(input.get_device());
+    rmsnorm_params.stream = at::cuda::getCurrentCUDAStream(comm_buf.get_device());
 
     tensorrt_llm::kernels::mnnvl::twoshot_rmsnorm_op(rmsnorm_params);
+
+    return {normed_output, prenorm_output};
 }
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "mnnvl_twoshot_allreduce(Tensor(output!) output, Tensor(input!) input, Tensor(comm_buf!) comm_buffer, "
+        "mnnvl_twoshot_allreduce(Tensor(input!) input, Tensor(comm_buf!) comm_buffer, "
         "Tensor(buffer_flags!) buffer_flags, bool wait_for_result) -> Tensor");
     m.def(
-        "mnnvl_twoshot_rmsnorm(Tensor prenorm_output, Tensor normed_output, Tensor input, Tensor gamma, "
-        "float epsilon, Tensor residual, Tensor buffer_flags) -> ()");
+        "mnnvl_twoshot_rmsnorm(Tensor comm_buf, Tensor gamma, "
+        "float epsilon, Tensor residual, Tensor buffer_flags) -> Tensor[]");
     m.def(
         "allreduce("
         "Tensor input,"
@@ -1111,7 +1183,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int[] group,"
         "int strategy,"
         "int op,"
-        "float eps) -> Tensor[]");
+        "float eps,"
+        "bool trigger_completion_at_end) -> Tensor[]");
     m.def(
         "moe_allreduce("
         "Tensor residual,"
@@ -1125,6 +1198,18 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int nranks,"
         "float eps) -> Tensor[]");
     m.def("initialize_static_lowprecision_buffers(Tensor workspace, int tp_size) -> Tensor[]");
+    m.def(
+        "moe_finalize_allreduce("
+        "Tensor input,"
+        "Tensor residual,"
+        "Tensor norm_weight,"
+        "Tensor expanded_idx_to_permuted_idx,"
+        "Tensor? shared_expert_output,"
+        "Tensor? expert_scale_factor,"
+        "Tensor workspace,"
+        "int rank,"
+        "int nranks,"
+        "float eps) -> Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
@@ -1133,6 +1218,7 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("mnnvl_twoshot_rmsnorm", &torch_ext::twoShotRMSNorm);
     m.impl("allreduce", &torch_ext::allreduce);
     m.impl("moe_allreduce", &torch_ext::moe_allreduce);
+    m.impl("moe_finalize_allreduce", &torch_ext::moe_finalize_allreduce);
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CPU, m)

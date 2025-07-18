@@ -26,18 +26,23 @@ ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-a
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 
 // Container configuration
-// available tags can be found in: https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm/
-// [base_image_name]-[arch]-[os](-[python_version])-[trt_version]-[torch_install_type]-[stage]-[date]-[mr_id]
-LLM_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.04-py3-x86_64-ubuntu24.04-trt10.10.0.31-skip-tritondevel-202505211401-4539"
-LLM_SBSA_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.04-py3-aarch64-ubuntu24.04-trt10.10.0.31-skip-tritondevel-202505211401-4539"
-LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.0-devel-rocky8-x86_64-rocky8-py310-trt10.10.0.31-skip-tritondevel-202505211401-4539"
-LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.0-devel-rocky8-x86_64-rocky8-py312-trt10.10.0.31-skip-tritondevel-202505211401-4539"
-
-// TODO: Move common variables to an unified location
-BUILD_CORES_REQUEST = "8"
-BUILD_CORES_LIMIT = "8"
-BUILD_MEMORY_REQUEST = "48Gi"
-BUILD_MEMORY_LIMIT = "48Gi"
+def getContainerURIs()
+{
+    // available tags can be found in: https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm/
+    // [base_image_name]-[arch]-[os](-[python_version])-[trt_version]-[torch_install_type]-[stage]-[date]-[mr_id]
+    tagProps = readProperties file: "${LLM_ROOT}/jenkins/current_image_tags.properties", interpolate: true
+    uris = [:]
+    keys = [
+        "LLM_DOCKER_IMAGE",
+        "LLM_SBSA_DOCKER_IMAGE",
+        "LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE",
+        "LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"
+    ]
+    for (key in keys) {
+        uris[key] = tagProps[key]
+    }
+    return uris
+}
 
 // Stage choices
 STAGE_CHOICE_NORMAL = "normal"
@@ -105,6 +110,10 @@ def ONLY_PYTORCH_FILE_CHANGED = "only_pytorch_file_changed"
 def AUTO_TRIGGER_TAG_LIST = "auto_trigger_tag_list"
 @Field
 def DEBUG_MODE = "debug"
+@Field
+def DETAILED_LOG = "detailed_log"
+@Field
+def ONLY_DOCS_FILE_CHANGED = "only_docs_file_changed"
 
 def testFilter = [
     (REUSE_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get(REUSE_STAGE_LIST, null)?.tokenize(',')),
@@ -121,6 +130,8 @@ def testFilter = [
     (ONLY_PYTORCH_FILE_CHANGED): false,
     (DEBUG_MODE): gitlabParamsFromBot.get(DEBUG_MODE, false),
     (AUTO_TRIGGER_TAG_LIST): [],
+    (DETAILED_LOG): gitlabParamsFromBot.get(DETAILED_LOG, false),
+    (ONLY_DOCS_FILE_CHANGED): false,
 ]
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
@@ -175,7 +186,7 @@ String getShortenedJobName(String path)
     return parts.join('-').toLowerCase()
 }
 
-def createKubernetesPodConfig(image, type)
+def createKubernetesPodConfig(image, type, arch = "amd64")
 {
     def targetCould = "kubernetes-cpu"
     def selectors = """
@@ -185,6 +196,9 @@ def createKubernetesPodConfig(image, type)
     def nodeLabelPrefix = ""
     def jobName = getShortenedJobName(env.JOB_NAME)
     def buildID = env.BUILD_ID
+
+    def archSuffix = arch == "arm64" ? "arm" : "amd"
+    def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
 
     switch(type)
     {
@@ -197,34 +211,12 @@ def createKubernetesPodConfig(image, type)
                     resources:
                       requests:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
                       limits:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
-                    imagePullPolicy: Always"""
-        nodeLabelPrefix = "cpu"
-        break
-    case "build":
-        containerConfig = """
-                  - name: trt-llm
-                    image: ${image}
-                    command: ['cat']
-                    volumeMounts:
-                    - name: sw-tensorrt-pvc
-                      mountPath: "/mnt/sw-tensorrt-pvc"
-                      readOnly: false
-                    tty: true
-                    resources:
-                      requests:
-                        cpu: ${BUILD_CORES_REQUEST}
-                        memory: ${BUILD_MEMORY_REQUEST}
-                        ephemeral-storage: 200Gi
-                      limits:
-                        cpu: ${BUILD_CORES_LIMIT}
-                        memory: ${BUILD_MEMORY_LIMIT}
-                        ephemeral-storage: 200Gi
                     imagePullPolicy: Always"""
         nodeLabelPrefix = "cpu"
         break
@@ -237,11 +229,11 @@ def createKubernetesPodConfig(image, type)
                     resources:
                       requests:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
                       limits:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
                     imagePullPolicy: Always"""
         nodeLabelPrefix = "cpu"
@@ -277,16 +269,16 @@ def createKubernetesPodConfig(image, type)
                         fieldRef:
                           fieldPath: spec.nodeName
                   - name: jnlp
-                    image: urm.nvidia.com/docker/jenkins/inbound-agent:4.11-1-jdk11
+                    image: ${jnlpImage}
                     args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
                     resources:
                       requests:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
                       limits:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
                 qosClass: Guaranteed
                 volumes:
@@ -309,14 +301,17 @@ def echoNodeAndGpuInfo(pipeline, stageName)
 
 def setupPipelineEnvironment(pipeline, testFilter, globalVars)
 {
-    setupPipelineSpec = createKubernetesPodConfig(LLM_DOCKER_IMAGE, "build")
+    image = "urm.nvidia.com/docker/golang:1.22"
+    setupPipelineSpec = createKubernetesPodConfig(image, "package")
     trtllm_utils.launchKubernetesPod(pipeline, setupPipelineSpec, "trt-llm", {
         sh "env | sort"
         updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: 'running'
         echo "Using GitLab repo: ${LLM_REPO}."
         sh "git config --global --add safe.directory \"*\""
+        // NB: getContainerURIs reads files in ${LLM_ROOT}/jenkins/
         if (env.gitlabMergeRequestLastCommit) {
             env.gitlabCommit = env.gitlabMergeRequestLastCommit
+            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
         } else {
             branch = env.gitlabBranch ? env.gitlabBranch : "main"
             trtllm_utils.checkoutSource(LLM_REPO, branch, LLM_ROOT, true, true)
@@ -328,6 +323,10 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
         testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         testFilter[(ONLY_PYTORCH_FILE_CHANGED)] = getOnlyPytorchFileChanged(pipeline, testFilter, globalVars)
         testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
+        testFilter[(ONLY_DOCS_FILE_CHANGED)] = getOnlyDocsFileChanged(pipeline, testFilter, globalVars)
+        getContainerURIs().each { k, v ->
+            globalVars[k] = v
+        }
     })
 }
 
@@ -371,6 +370,7 @@ def launchReleaseCheck(pipeline)
                 ignoreList = [
                     "*/.git/*",
                     "*/3rdparty/*",
+                    "*/cpp/tensorrt_llm/deep_ep/nvshmem_src_*.txz",
                     "*/examples/scaffolding/contrib/mcp/weather/weather.py",
                     "*/tensorrt_llm_internal_cutlass_kernels_static.tar.xz"
                 ]
@@ -390,7 +390,7 @@ def launchReleaseCheck(pipeline)
 
     def image = "urm.nvidia.com/docker/golang:1.22"
     stageName = "Release Check"
-    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "build"), "trt-llm", {
+    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package"), "trt-llm", {
         stage("[${stageName}] Run") {
             if (RELESE_CHECK_CHOICE == STAGE_CHOICE_SKIP) {
                 echo "Release Check job is skipped due to Jenkins configuration"
@@ -563,8 +563,10 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "cpp/tensorrt_llm/executor/executorImpl.cpp",
         "cpp/tensorrt_llm/executor/executorImpl.h",
         "cpp/tensorrt_llm/runtime/ncclCommunicator.cpp",
-        "cpp/tensorrt_llm/kernels/allReduceFusionKernels.h",
-        "cpp/tensorrt_llm/kernels/allReduceFusionKernels.cu",
+        "cpp/tensorrt_llm/kernels/communicationKernels/",
+        "cpp/tensorrt_llm/thop/allreduceOp.cpp",
+        "cpp/tensorrt_llm/thop/allgatherOp.cpp",
+        "cpp/tensorrt_llm/thop/reducescatterOp.cpp",
         "cpp/tensorrt_llm/kernels/customAllReduceKernels.h",
         "cpp/tensorrt_llm/kernels/customAllReduceKernels.cu",
         "cpp/tensorrt_llm/kernels/gptKernels.h",
@@ -572,6 +574,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "cpp/tensorrt_llm/kernels/unfusedAttentionKernels.h",
         "cpp/tensorrt_llm/kernels/unfusedAttentionKernels.cu",
         "cpp/tensorrt_llm/kernels/userbuffers/",
+        "cpp/tensorrt_llm/kernels/moe",
         "cpp/tensorrt_llm/pybind/",
         "cpp/tests/kernels/allReduce/",
         "cpp/tensorrt_llm/plugins/cpSplitPlugin/cpSplitPlugin.h",
@@ -596,11 +599,13 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/pyexecutor/py_executor.py",
         "tensorrt_llm/_torch/pyexecutor/_util.py",
         "tensorrt_llm/_torch/models/modeling_llama.py",
+        "tensorrt_llm/_torch/modules/fused_moe/",
         "tests/integration/defs/cpp/test_multi_gpu.py",
         "tests/integration/test_lists/test-db/l0_dgx_h100.yml",
         "tests/integration/test_lists/test-db/l0_dgx_h200.yml",
         "tests/unittest/_torch/multi_gpu/",
         "tests/unittest/_torch/multi_gpu_modeling/",
+        "tests/unittest/_torch/auto_deploy/unit/multigpu",
         "tests/unittest/llmapi/test_llm_multi_gpu.py",
         "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
         "jenkins/L0_Test.groovy",
@@ -683,6 +688,40 @@ def getOnlyPytorchFileChanged(pipeline, testFilter, globalVars) {
     return result
 }
 
+def getOnlyDocsFileChanged(pipeline, testFilter, globalVars) {
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (env.alternativeTRT || isOfficialPostMergeJob) {
+        pipeline.echo("Force set ONLY_DOCS_FILE_CHANGED false.")
+        return false
+    }
+
+    // TODO: Add more docs path to the list, e.g. *.md files in other directories
+    def docsFileList = [
+        "docs/",
+    ]
+
+    def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
+    if (!changedFileList || changedFileList.isEmpty()) {
+        return false
+    }
+
+    for (file in changedFileList) {
+        def isDocsFile = false
+        for (prefix in docsFileList) {
+            if (file.startsWith(prefix)) {
+                isDocsFile = true
+                break
+            }
+        }
+        if (!isDocsFile) {
+            pipeline.echo("Found non-docs file: ${file}")
+            return false
+        }
+    }
+    pipeline.echo("Only docs files changed.")
+    return true
+}
+
 def collectTestResults(pipeline, testFilter)
 {
     collectResultPodSpec = createKubernetesPodConfig("", "agent")
@@ -734,7 +773,7 @@ def collectTestResults(pipeline, testFilter)
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add py3-pip")
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
             sh """
-                python3 llm/tests/integration/defs/test_rerun.py \
+                python3 llm/jenkins/test_rerun.py \
                 generate_rerun_report \
                 --output-file=rerun/rerun_report.xml \
                 --input-files=${inputfiles}
@@ -785,8 +824,8 @@ def collectTestResults(pipeline, testFilter)
 
                 sh "cd cov && coverage combine"
                 sh "cd cov && find . -type f"
-                sh "cd cov && coverage report"
-                sh "cd cov && coverage html -d test_coverage_html"
+                sh "cd cov && coverage report -i"   // -i: ignore errors. Ignore the error that the source code file cannot be found.
+                sh "cd cov && coverage html -d test_coverage_html -i"
                 trtllm_utils.uploadArtifacts("cov/test_coverage_html/*", "${UPLOAD_PATH}/test-results/coverage-report/")
                 echo "Test coverage report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/coverage-report/index.html"
             } // Test coverage
@@ -841,6 +880,45 @@ def triggerJob(jobName, parameters, jenkinsUrl = "", credentials = "")
     return status
 }
 
+def launchJob(jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64", additionalParameters = [:]) {
+    def parameters = getCommonParameters()
+    String globalVarsJson = writeJSON returnText: true, json: globalVars
+    parameters += [
+        'enableFailFast': enableFailFast,
+        'globalVars': globalVarsJson,
+    ] + additionalParameters
+
+    if (env.alternativeTRT && platform == "x86_64") {
+        parameters += [
+            'alternativeTRT': env.alternativeTRT,
+        ]
+    }
+
+    if (env.alternativeTrtSBSA && platform == "SBSA") {
+        parameters += [
+            'alternativeTRT': env.alternativeTrtSBSA,
+        ]
+    }
+
+    if (env.testPhase2StageName) {
+        parameters += [
+            'testPhase2StageName': env.testPhase2StageName,
+        ]
+    }
+
+    if (reuseBuild) {
+        parameters['reuseArtifactPath'] = "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${reuseBuild}"
+    }
+
+    echo "Trigger ${jobName} job, params: ${parameters}"
+
+    def status = triggerJob(jobName, parameters)
+    if (status != "SUCCESS") {
+        error "Downstream job did not succeed"
+    }
+    return status
+}
+
 def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 {
     stages = [
@@ -852,79 +930,87 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         "x86_64-linux": {
             script {
                 stage("Build") {
-                    def parameters = getCommonParameters()
-                    String globalVarsJson = writeJSON returnText: true, json: globalVars
-                    parameters += [
-                        'enableFailFast': enableFailFast,
-                        'dockerImage': LLM_DOCKER_IMAGE,
-                        'wheelDockerImagePy310': LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE,
-                        'wheelDockerImagePy312': LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
-                        'globalVars': globalVarsJson,
+                    def additionalParameters = [
+                        'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
+                        'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
+                        'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
                     ]
-
-                    if (env.alternativeTRT) {
-                        parameters += [
-                            'alternativeTRT': env.alternativeTRT,
-                        ]
-                    }
-
-                    if (reuseBuild) {
-                        parameters['reuseArtifactPath'] = "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${reuseBuild}"
-                    }
-
-                    echo "trigger x86_64 build job, params: ${parameters}"
-
-                    def status = triggerJob("/LLM/helpers/Build-x86_64", parameters)
-                    if (status != "SUCCESS") {
-                        error "Downstream job did not succeed"
-                    }
-
+                    launchJob("/LLM/helpers/Build-x86_64", reuseBuild, enableFailFast, globalVars, "x86_64", additionalParameters)
                 }
-                def testStageName = "[Test-x86_64] Run"
-                if (env.localJobCredentials) {
-                    testStageName = "[Test-x86_64] Remote Run"
-                }
+                def testStageName = "[Test-x86_64-Single-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                def singleGpuTestFailed = false
                 stage(testStageName) {
                     if (X86_TEST_CHOICE == STAGE_CHOICE_SKIP) {
                         echo "x86_64 test job is skipped due to Jenkins configuration"
                         return
                     }
                     try {
-                        parameters = getCommonParameters()
-
                         String testFilterJson = writeJSON returnText: true, json: testFilter
-                        String globalVarsJson = writeJSON returnText: true, json: globalVars
-                        parameters += [
-                            'enableFailFast': enableFailFast,
+                        def additionalParameters = [
                             'testFilter': testFilterJson,
-                            'dockerImage': LLM_DOCKER_IMAGE,
-                            'wheelDockerImagePy310': LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE,
-                            'wheelDockerImagePy312': LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
-                            'globalVars': globalVarsJson,
+                            'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
+                            'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
+                            'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
                         ]
 
-                        if (env.alternativeTRT) {
-                            parameters += [
-                                'alternativeTRT': env.alternativeTRT,
-                            ]
+                        launchJob("L0_Test-x86_64-Single-GPU", false, enableFailFast, globalVars, "x86_64", additionalParameters)
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        if (X86_TEST_CHOICE == STAGE_CHOICE_IGNORE) {
+                            catchError(
+                                buildResult: 'SUCCESS',
+                                stageResult: 'FAILURE') {
+                                error "x86_64 test failed but ignored due to Jenkins configuration"
+                            }
+                        } else {
+                            catchError(
+                                buildResult: 'FAILURE',
+                                stageResult: 'FAILURE') {
+                                error "x86_64 single-GPU test failed"
+                            }
+                            singleGpuTestFailed = true
                         }
+                    }
+                }
 
-                        if (env.testPhase2StageName) {
-                            parameters += [
-                                'testPhase2StageName': env.testPhase2StageName,
-                            ]
+                def requireMultiGpuTesting = currentBuild.description?.contains("Require Multi-GPU Testing") ?: false
+                echo "requireMultiGpuTesting: ${requireMultiGpuTesting}"
+                if (!requireMultiGpuTesting) {
+                    if (singleGpuTestFailed) {
+                        error "Single-GPU test failed"
+                    }
+                    return
+                }
+
+                if (singleGpuTestFailed) {
+                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+                        echo "In the official post-merge pipeline, single-GPU test failed, whereas multi-GPU test is still kept running."
+                    } else {
+                        stage("[Test-x86_64-Multi-GPU] Blocked") {
+                            error "This pipeline requires running multi-GPU test, but single-GPU test has failed."
                         }
+                        return
+                    }
+                }
 
-                        echo "trigger x86_64 test job, params: ${parameters}"
+                testStageName = "[Test-x86_64-Multi-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                stage(testStageName) {
+                    if (X86_TEST_CHOICE == STAGE_CHOICE_SKIP) {
+                        echo "x86_64 test job is skipped due to Jenkins configuration"
+                        return
+                    }
+                    try {
+                        def testFilterJson = writeJSON returnText: true, json: testFilter
+                        def additionalParameters = [
+                            'testFilter': testFilterJson,
+                            'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
+                            'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
+                            'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
+                        ]
 
-                        def status = triggerJob(
-                            "L0_Test-x86_64",
-                            parameters,
-                        )
+                        launchJob("L0_Test-x86_64-Multi-GPU", false, enableFailFast, globalVars, "x86_64", additionalParameters)
 
-                        if (status != "SUCCESS") {
-                            error "Downstream job did not succeed"
-                        }
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
@@ -950,38 +1036,16 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     testStageName = "[Test-SBSA] Remote Run"
                 }
 
-                def stageName = "Build"
-                stage(stageName) {
-                    def parameters = getCommonParameters()
-                    String globalVarsJson = writeJSON returnText: true, json: globalVars
-                    parameters += [
-                        'enableFailFast': enableFailFast,
-                        "dockerImage": LLM_SBSA_DOCKER_IMAGE,
-                        'globalVars': globalVarsJson,
+                if (testFilter[(ONLY_DOCS_FILE_CHANGED)]) {
+                    echo "SBSA build job is skipped due to Jenkins configuration or conditional pipeline run"
+                    return
+                }
+
+                stage("Build") {
+                    def additionalParameters = [
+                        "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
                     ]
-
-                    if (env.alternativeTrtSBSA) {
-                        parameters += [
-                            "alternativeTRT": env.alternativeTrtSBSA,
-                        ]
-                    }
-
-                    if (reuseBuild) {
-                        parameters['reuseArtifactPath'] = "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${reuseBuild}"
-                    }
-
-                    echo "trigger SBSA build job, params: ${parameters}"
-
-                    def status = triggerJob(
-                        "/LLM/helpers/Build-SBSA",
-                        parameters,
-                        jenkinsUrl,
-                        credentials,
-                    )
-
-                    if (status != "SUCCESS") {
-                        error "Downstream job did not succeed"
-                    }
+                    launchJob("/LLM/helpers/Build-SBSA", reuseBuild, enableFailFast, globalVars, "SBSA", additionalParameters)
                 }
                 stage(testStageName) {
                     if (SBSA_TEST_CHOICE == STAGE_CHOICE_SKIP) {
@@ -989,41 +1053,14 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         return
                     }
                     try {
-                        def parameters = getCommonParameters()
-
-                        String testFilterJson = writeJSON returnText: true, json: testFilter
-                        String globalVarsJson = writeJSON returnText: true, json: globalVars
-                        parameters += [
-                            'enableFailFast': enableFailFast,
+                        def testFilterJson = writeJSON returnText: true, json: testFilter
+                        def additionalParameters = [
                             'testFilter': testFilterJson,
-                            "dockerImage": LLM_SBSA_DOCKER_IMAGE,
-                            'globalVars': globalVarsJson,
+                            "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
                         ]
 
-                        if (env.alternativeTrtSBSA) {
-                            parameters += [
-                                "alternativeTRT": env.alternativeTrtSBSA,
-                            ]
-                        }
+                        launchJob("L0_Test-SBSA", false, enableFailFast, globalVars, "SBSA", additionalParameters)
 
-                        if (env.testPhase2StageName) {
-                            parameters += [
-                                'testPhase2StageName': env.testPhase2StageName,
-                            ]
-                        }
-
-                        echo "trigger SBSA test job, params: ${parameters}"
-
-                        def status = triggerJob(
-                            "L0_Test-SBSA",
-                            parameters,
-                            jenkinsUrl,
-                            credentials,
-                        )
-
-                        if (status != "SUCCESS") {
-                            error "Downstream job did not succeed"
-                        }
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
@@ -1045,30 +1082,23 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         "Build-Docker-Images": {
             script {
                 stage("[Build-Docker-Images] Remote Run") {
-                    def parameters = getCommonParameters()
-                    String globalVarsJson = writeJSON returnText: true, json: globalVars
                     def branch = env.gitlabBranch ? env.gitlabBranch : "main"
                     if (globalVars[GITHUB_PR_API_URL]) {
                         branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
                     }
 
-                    parameters += [
-                        'enableFailFast': enableFailFast,
+                    def additionalParameters = [
                         'branch': branch,
                         'action': "push",
-                        'globalVars': globalVarsJson,
+                        'triggerType': env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge",
                     ]
 
-                    echo "trigger BuildDockerImages job, params: ${parameters}"
-
-                    def status = triggerJob("/LLM/helpers/BuildDockerImages", parameters)
-                    if (status != "SUCCESS") {
-                        error "Downstream job did not succeed"
-                    }
+                    launchJob("/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
                 }
             }
         }
     ]
+
     if (env.JOB_NAME ==~ /.*PostMerge.*/) {
         stages += dockerBuildJob
     }

@@ -4,24 +4,24 @@
 
 TensorRT-LLM has a Model Definition API that can be used to define
 Large Language Models. This API is built on top of the powerful
-[TensorRT Python API](https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/index.html#)
+[TensorRT Python API](https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/python-api/index.html)
 to create graph representations of deep neural networks in TensorRT. To become
 familiar with the core concepts of the TensorRT API, refer to the
-[Core Concepts](https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/coreConcepts.html)
+[Core Concepts](https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/python-api/coreConcepts.html)
 section of the TensorRT documentation before proceeding further.
 
 In TensorRT-LLM, the [`tensorrt_llm.Builder`](source:tensorrt_llm/builder.py) class
 contains a
-[`tensorrt.Builder`](https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Core/Builder.html#tensorrt.Builder)
+[`tensorrt.Builder`](https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/python-api/infer/Core/Builder.html#id1)
 object. That instance is used in the `tensorrt_llm.Builder.create_network`
 method to create an instance of the
-[`tensorrt.INetworkDefinition`](https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Graph/Network.html#tensorrt.INetworkDefinition)
+[`tensorrt.INetworkDefinition`](https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/python-api/infer/Graph/Network.html#tensorrt.INetworkDefinition)
 class. The `INetworkDefinition` object can then be populated using the free
 functions defined in the
 [`tensorrt_llm.functional`](source:tensorrt_llm/functional.py).
 
 A simple example of such a free function is `tensorrt_llm.activation` that inserts a
-[`tensorrt.IActivationLayer`](https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Graph/Layers.html#tensorrt.IActivationLayer)
+[`tensorrt.IActivationLayer`](https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/python-api/infer/Graph/Layers.html#tensorrt.IActivationLayer)
 node in the graph of the model:
 
 ```python
@@ -56,23 +56,23 @@ def silu(input: Tensor) -> Tensor:
 When the TensorRT-LLM's Model Definition API is utilized, a graph of the network is
 assembled.  The graph can later be traversed or transformed using the graph
 traversal API exposed by the
-[`tensorrt.ILayer`](https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Graph/LayerBase.html#tensorrt.ILayer)
+[`tensorrt.ILayer`](https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/python-api/infer/Graph/LayerBase.html#tensorrt.ILayer)
 class. That graph will also be optimized by TensorRT during the compilation of
 the engine, as explained in the next section.
 
 # Compilation
 
 Once populated, the instance of the
-[`tensorrt.INetworkDefinition`](https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Graph/Network.html#tensorrt.INetworkDefinition),
+[`tensorrt.INetworkDefinition`](https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/python-api/infer/Graph/Network.html#tensorrt.INetworkDefinition),
 can be compiled into an efficient engine by the
-[`tensorrt.Builder`](https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Core/Builder.html#tensorrt.Builder)
+[`tensorrt.Builder`](https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/python-api/infer/Core/Builder.html#id1)
 In TensorRT-LLM, it is done through the `build_engine` member function of the
 `tensorrt_llm.Builder` class that calls the
-[`build_serialized_network`](https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Core/Builder.html#tensorrt.Builder.build_serialized_network)
+[`build_serialized_network`](https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/python-api/infer/Core/Builder.html#tensorrt.Builder.build_serialized_network
 method of the
-[`tensorrt.Builder`](https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Core/Builder.html#tensorrt.Builder)
+[`tensorrt.Builder`](https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/python-api/infer/Core/Builder.html#id1)
 object. That call, if everything works as expected, produces an instance of the
-[`tensorrt.IHostMemory`](https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/FoundationalTypes/HostMemory.html#tensorrt.IHostMemory)
+[`tensorrt.IHostMemory`](https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/python-api/infer/FoundationalTypes/HostMemory.html#tensorrt.IHostMemory)
 class. That object is an optimized TensorRT engine that can be stored as a
 binary file.
 

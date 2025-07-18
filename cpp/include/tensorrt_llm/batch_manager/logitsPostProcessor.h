@@ -24,32 +24,29 @@
 
 namespace tensorrt_llm::runtime
 {
-class TllmRuntime;
+class CudaStream;
 }
 
 namespace tensorrt_llm::batch_manager
 {
-
-class DecoderBuffers;
-
-namespace tr = tensorrt_llm::runtime;
+class DecoderInputBuffers;
 
 class LogitsPostProcessor : Algorithm
 {
 public:
+    using CudaStreamPtr = std::shared_ptr<runtime::CudaStream>;
+
     using LogitsPostProcessorBatched = std::function<void(std::vector<batch_manager::LlmRequest::RequestIdType> const&,
         std::vector<batch_manager::LlmRequest::TensorPtr>&,
-        std::vector<std::reference_wrapper<batch_manager::LlmRequest::BeamTokens const>> const&,
-        runtime::BufferManager::CudaStreamPtr const&,
+        std::vector<std::reference_wrapper<batch_manager::LlmRequest::BeamTokens const>> const&, CudaStreamPtr const&,
         std::vector<std::optional<batch_manager::LlmRequest::RequestIdType>> const&)>;
 
     constexpr static auto name{"LogitsPostProcessor"};
 
     LogitsPostProcessor() = default;
 
-    bool operator()(RequestVector const& contextRequests, RequestVector const& generationRequests,
-        bool replicateLogitsPostProcessor, DecoderBuffers& decoderBuffers, tr::WorldConfig const& worldConfig,
-        tr::TllmRuntime& runtime,
+    bool operator()(DecoderInputBuffers& inputBuffers, bool replicateLogitsPostProcessor,
+        runtime::WorldConfig const& worldConfig, CudaStreamPtr const& stream,
         std::optional<LogitsPostProcessorBatched> logitsPostProcessorBatched = std::nullopt) const;
 };
 

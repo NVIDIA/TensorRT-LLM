@@ -12,7 +12,7 @@ from openai.types.chat import \
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing_extensions import Annotated, Required, TypedDict
 
-from tensorrt_llm.executor.serialization import register_approved_ipc_class
+from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import GuidedDecodingParams, SamplingParams
 
@@ -20,14 +20,6 @@ from tensorrt_llm.llmapi import GuidedDecodingParams, SamplingParams
 class OpenAIBaseModel(BaseModel):
     # OpenAI API does not allow extra fields & allow to initialize by both alias and field name
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
-
-    def __init_subclass__(cls, **kwargs):
-        """
-        This method is called when a class inherits from OpenAIBaseModel.
-        """
-        # Register subclass as an approved class for deserialization across IPC boundaries.
-        super().__init_subclass__(**kwargs)
-        register_approved_ipc_class(cls)
 
 
 class StreamOptions(OpenAIBaseModel):
@@ -92,6 +84,7 @@ class CompletionLogProbs(OpenAIBaseModel):
 class CompletionResponseChoice(OpenAIBaseModel):
     index: int
     text: str
+    token_ids: Optional[List[int]] = None
     logprobs: Optional[CompletionLogProbs] = None
     context_logits: Optional[Union[List[float], List[List[
         float]]]] = None  # For reward models, the output is score logits instead of text.
@@ -115,12 +108,13 @@ class CompletionResponse(OpenAIBaseModel):
     usage: UsageInfo
     # Add prompt_tokens_ids to the response to remove the tokenization
     # in the generation server in disaggreated serving
-    prompt_token_ids: Optional[List[List[int]]] = None
+    prompt_token_ids: Optional[Union[List[List[int]], List[int]]] = None
 
 
 class CompletionResponseStreamChoice(OpenAIBaseModel):
     index: int
     text: str
+    token_ids: Optional[List[int]] = None
     logprobs: Optional[CompletionLogProbs] = None
     finish_reason: Optional[str] = None
     stop_reason: Optional[Union[int, str]] = Field(
@@ -179,6 +173,7 @@ class CompletionRequest(OpenAIBaseModel):
     temperature: Optional[float] = 1.0
     top_p: Optional[float] = 1.0
     user: Optional[str] = None
+    lora_request: Optional[LoRARequest] = None
 
     # doc: begin-completion-sampling-params
     use_beam_search: bool = False
@@ -196,6 +191,7 @@ class CompletionRequest(OpenAIBaseModel):
     spaces_between_special_tokens: bool = True
     truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
     return_context_logits: bool = False
+    detokenize: bool = True
     # doc: end-completion-sampling-params
 
     # doc: begin-completion-extra-params
@@ -250,6 +246,7 @@ class CompletionRequest(OpenAIBaseModel):
             return_context_logits=self.return_context_logits,
             guided_decoding=_response_format_to_guided_decoding_params(
                 self.response_format),
+            detokenize=self.detokenize,
 
             # completion-extra-params
             add_special_tokens=self.add_special_tokens,
@@ -456,6 +453,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     skip_special_tokens: bool = True
     spaces_between_special_tokens: bool = True
     truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
+    lora_request: Optional[LoRARequest] = None
     # doc: end-chat-completion-sampling-params
 
     # doc: begin-chat-completion-extra-params

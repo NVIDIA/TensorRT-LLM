@@ -596,12 +596,12 @@ def build_llava_engine(args):
         args.output_dir,
         args.max_batch_size)
     if args.model_type == "llava_next":
-        image_newline = model.image_newline.data
+        image_newline = model.model.image_newline.data
         tensor_img_newline = {"image_newline": image_newline}
         save_file(tensor_img_newline,
                   os.path.join(args.output_dir, "image_newlines.safetensors"))
     if args.model_type == "llava_onevision":
-        image_newline = model.image_newline.data
+        image_newline = model.model.image_newline.data
         tensor_img_newline = {"image_newline": image_newline}
         save_file(tensor_img_newline,
                   os.path.join(args.output_dir, "image_newlines.safetensors"))
@@ -1627,8 +1627,12 @@ def build_pixtral_engine(args):
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=0)
 
+        # attention_mask is of shape [batch, patches].
+        mask = attention_mask[:, None, None, :]
+
         attn_output = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=attention_mask).transpose(1, 2).contiguous()
+            q, k, v, attn_mask=mask).transpose(1, 2).contiguous()
+
         attn_output = attn_output.reshape(batch, patches, -1)
         attn_output = self.o_proj(attn_output)
 

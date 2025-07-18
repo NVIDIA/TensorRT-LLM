@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
+from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
+    BaseCheckpointLoader
 from tensorrt_llm.bindings.executor import ExecutorConfig
 
 from ...builder import BuildConfig
@@ -8,7 +10,6 @@ from ...llmapi.llm_args import LoadFormat
 from ...logger import logger
 from ...mapping import Mapping
 from ..model_config import MoeLoadBalancerConfig
-from ..speculative import SpecConfig
 from .resource_manager import BaseResourceManager
 
 
@@ -33,7 +34,7 @@ class PyTorchConfig:
     # it's hard to capture a single graph with prefill requests since the
     # input shapes are a function of the sequence lengths).
     # Note that each CUDA graph can use up to 200 MB of extra memory.
-    use_cuda_graph: bool = False
+    use_cuda_graph: bool = True
     cuda_graph_batch_sizes: Optional[List[int]] = None
     cuda_graph_max_batch_size: int = 0
     # If true, batches are rounded up to the nearest cuda_graph_batch_size.
@@ -48,7 +49,7 @@ class PyTorchConfig:
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'
 
-    mixed_sampler: bool = False
+    enable_mixed_sampler: bool = False
     """
     If true, will iterate over sampling_params of each request and use the
     corresponding sampling strategy, e.g. top-k, top-p, etc.
@@ -60,7 +61,6 @@ class PyTorchConfig:
     """
 
     kv_cache_dtype: str = "auto"
-    use_kv_cache: bool = True
     enable_iter_perf_stats: bool = False
     # If true, enables per request stats per iteration
     # Must also set enable_iter_perf_stats to true to get request stats
@@ -76,7 +76,7 @@ class PyTorchConfig:
 
     # Enable autotuner only when torch compile is enabled
     # TODO: after it can be work stable in warmup stage
-    autotuner_enabled: bool = True
+    enable_autotuner: bool = True
 
     # If true, enable layerwise nvtx marker
     enable_layerwise_nvtx_marker: bool = False
@@ -86,6 +86,18 @@ class PyTorchConfig:
 
     # If true, enable min-latency mode. Currently only used for Llama4.
     enable_min_latency: bool = False
+    allreduce_strategy: str = "AUTO"
+
+    # The iteration interval to create responses under the streaming mode.
+    # TODO: make this a per-request parameter
+    stream_interval: int = 1
+
+    force_dynamic_quantization: bool = False
+
+    # If true, adjust PyTorch CUDA memory fraction to correspond to the
+    # total GPU memory minus the statically allocated engine memory.
+    # If false, set the PyTorch CUDA memory fraction to 1.0.
+    _limit_torch_cuda_mem_fraction: bool = True
 
 
 EXETENDED_EXECUTOR_CONFIG_FIELDS = [
@@ -95,7 +107,6 @@ EXETENDED_EXECUTOR_CONFIG_FIELDS = [
     'tokens_per_block',
     'mapping',
     'hf_model_dir',
-    'trt_engine_dir',
 ]
 
 
@@ -105,11 +116,12 @@ def update_executor_config(
         pytorch_backend_config: Optional[PyTorchConfig] = None,
         mapping: Optional[Mapping] = None,
         build_config: Optional[BuildConfig] = None,
-        speculative_config: Optional[SpecConfig] = None,
+        speculative_config: Optional["DecodingBaseConfig"] = None,
         hf_model_dir: Optional[str] = None,
-        trt_engine_dir: Optional[str] = None,
         max_input_len: Optional[int] = None,
-        max_seq_len: Optional[int] = None):
+        max_seq_len: Optional[int] = None,
+        checkpoint_format: Optional[str] = None,
+        checkpoint_loader: Optional[BaseCheckpointLoader] = None):
     if backend is None:
         return
 
@@ -131,10 +143,37 @@ def update_executor_config(
     executor_config.tokens_per_block = executor_config.tokens_per_block or build_config.plugin_config.tokens_per_block
 
     executor_config.hf_model_dir = hf_model_dir
-    executor_config.trt_engine_dir = trt_engine_dir
 
     if max_input_len is not None:
         executor_config.max_input_len = max_input_len
 
     if max_seq_len is not None:
         executor_config.max_seq_len = max_seq_len
+
+    executor_config.checkpoint_loader = _construct_checkpoint_loader(
+        backend, checkpoint_loader, checkpoint_format)
+
+
+def _construct_checkpoint_loader(
+        backend: str, checkpoint_loader: Optional[BaseCheckpointLoader],
+        checkpoint_format: Optional[str]) -> Optional[BaseCheckpointLoader]:
+    if backend == "_autodeploy":
+        return None
+
+    from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
+        BaseCheckpointLoader
+    from tensorrt_llm._torch.models.modeling_utils import (
+        get_checkpoint_weight_loader, get_config_loader)
+
+    if checkpoint_loader is None:
+        checkpoint_weight_loader = get_checkpoint_weight_loader(
+            checkpoint_format)()
+        config_loader = get_config_loader(checkpoint_format)()
+
+        checkpoint_loader = BaseCheckpointLoader.get(
+            checkpoint_format=checkpoint_format,
+            weight_loader=checkpoint_weight_loader,
+            weight_mapper=None,
+            config_loader=config_loader)
+
+    return checkpoint_loader

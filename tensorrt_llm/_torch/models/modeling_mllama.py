@@ -83,7 +83,7 @@ class MllamaDecoderLayer(DecoderLayer):
 
     def forward(
         self,
-        position_ids: torch.LongTensor,
+        position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
@@ -146,8 +146,8 @@ class MllamaTextModel(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.LongTensor,
-        positions: Optional[torch.LongTensor],
+        input_ids: torch.IntTensor,
+        positions: Optional[torch.IntTensor],
         cross_attention_states: Optional[torch.LongTensor],
         cross_attention_mask: Optional[torch.LongTensor],
         full_text_row_masked_out_mask: Optional[Tuple[torch.Tensor,
@@ -211,8 +211,8 @@ class MllamaForCausalLM(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.LongTensor,
-        positions: Optional[torch.LongTensor],
+        input_ids: torch.IntTensor,
+        positions: Optional[torch.IntTensor],
         cross_attention_states: Optional[torch.LongTensor],
         cross_attention_mask: Optional[torch.LongTensor],
         full_text_row_masked_out_mask: Optional[Tuple[torch.Tensor,
@@ -303,8 +303,8 @@ class MllamaForConditionalGeneration(nn.Module):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: Optional[bool] = False,
         # TODO:  figure out the image-related inputs in kwargs
@@ -333,8 +333,8 @@ class MllamaForConditionalGeneration(nn.Module):
         tp_size = self.config.mapping.tp_size
         vision_config = self.config.pretrained_config.vision_config
         text_config = self.config.pretrained_config.text_config
-        text_head_dim = text_config.hidden_size // text_config.num_attention_heads
-        vision_head_dim = vision_config.hidden_size // vision_config.attention_heads
+        text_config.hidden_size // text_config.num_attention_heads
+        vision_config.hidden_size // vision_config.attention_heads
 
         params_map = {
             'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
@@ -347,7 +347,7 @@ class MllamaForConditionalGeneration(nn.Module):
                 # skip load weights if tie word embeddings is enabled and layer is lm_head
                 if text_config.tie_word_embeddings and "lm_head" in name:
                     continue
-                head_dim = vision_head_dim if "vision_model" in name else text_head_dim
+                num_kv_heads = vision_config.num_key_value_heads if "vision_model" in name else text_config.num_key_value_heads
 
                 names = name.split('.')
                 if names[-1] in params_map:
@@ -360,7 +360,7 @@ class MllamaForConditionalGeneration(nn.Module):
                                 k:
                                 duplicate_kv_weight(
                                     weight=v[:],
-                                    head_dim=head_dim,
+                                    num_kv_heads=num_kv_heads,
                                     tensor_parallel_size=tp_size)
                                 if k in ["weight", "bias"] else v
                                 for k, v in fw.items()

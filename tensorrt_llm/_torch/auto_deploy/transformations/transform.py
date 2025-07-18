@@ -8,8 +8,9 @@ from torch.fx import GraphModule
 from ..compile import compile_and_capture
 from ..custom_ops.attention_interface import AttentionRegistry
 from ..distributed import common as dist_ad
+from ..llm_args import LlmArgs
 from ..models.factory import ModelFactory
-from ..shim.interface import AutoDeployConfig, CachedSequenceInterface
+from ..shim.interface import CachedSequenceInterface
 from ..utils.logger import ad_logger
 from ._graph import canonicalize_graph, lift_to_meta, move_to_device
 from .export import torch_export_to_gm
@@ -23,13 +24,12 @@ from .library import (
     insert_cached_attention,
     match_attention_layout,
     match_causal_attn_mask,
-    match_complex_rope,
     match_eager_attention,
-    match_explicit_rope,
     match_grouped_attention,
     match_moe_pattern,
     match_repeat_kv,
     match_rope_layout,
+    match_rope_pattern,
     optimize_rope,
     quantize,
     resize_kv_cache,
@@ -38,33 +38,9 @@ from .library import (
 
 
 class InferenceOptimizer:
-    def __init__(
-        self,
-        factory: ModelFactory,
-        *,  # TODO: temporary until we have a better config system
-        ad_config: AutoDeployConfig,
-        visualize: bool = False,
-    ):
+    def __init__(self, factory: ModelFactory, ad_config: LlmArgs):
         self.factory = factory
-        self.attn_backend = ad_config.attn_backend
-        self.mla_backend = ad_config.mla_backend
-
         self.ad_config = ad_config
-        # Map Pytorch config to AutoDeploy compile backends.
-        if ad_config.use_cuda_graph and ad_config.torch_compile_enabled:
-            compile_backend = "torch-opt"
-        elif ad_config.use_cuda_graph:
-            compile_backend = "torch-cudagraph"
-        elif ad_config.torch_compile_enabled:
-            compile_backend = "torch-compile"
-        else:
-            compile_backend = "torch-simple"
-        self.compile_backend = compile_backend
-        self.visualize = visualize
-
-        # look up attention op
-        self.attention_op = AttentionRegistry.get(self.attn_backend)
-        self.mla_op = AttentionRegistry.get(self.mla_backend)
 
     def __call__(self, cm: CachedSequenceInterface) -> GraphModule:
         """Transform a model into an optimized inference model.
@@ -118,13 +94,15 @@ class InferenceOptimizer:
         egm = match_causal_attn_mask(egm)
 
         # Match attention layout expected by our backend
-        egm = match_attention_layout(egm, self.attention_op)
+        egm = match_attention_layout(egm, AttentionRegistry.get(self.ad_config.attn_backend))
 
         # Match rope
-        egm = match_explicit_rope(egm)
-        egm = match_complex_rope(egm)
+        egm, _ = match_rope_pattern(egm)
+
         # Match RoPE layout expected by our backend
-        egm = match_rope_layout(egm, self.attention_op.get_attention_layout())
+        egm = match_rope_layout(
+            egm, AttentionRegistry.get(self.ad_config.attn_backend).get_attention_layout()
+        )
 
         ############################################################################################
         # RUN TRANSFORMATIONS ON STANDARDIZED GRAPH REPRESENTATION
@@ -156,7 +134,7 @@ class InferenceOptimizer:
         ############################################################################################
 
         # load weights
-        self.factory.load_or_random_init(egm, device=cm.device)
+        self.factory.load_or_random_init(egm, device=self.ad_config.checkpoint_device or cm.device)
 
         # move remaining parts to device
         move_to_device(egm, cm.device)
@@ -181,7 +159,7 @@ class InferenceOptimizer:
         egm = fuse_collectives(egm)
 
         # visualize the final graph
-        if self.visualize:
+        if self.ad_config.visualize:
             try:
                 from .library import visualize_namespace
 
@@ -200,7 +178,8 @@ class InferenceOptimizer:
         egm = update_in_out_nodes(egm, cm)
 
         # detect attention op and replace with cache-aware op
-        for attn_descriptor in [self.attention_op, self.mla_op]:
+        for a_backend in [self.ad_config.attn_backend, self.ad_config.mla_backend]:
+            attn_descriptor = AttentionRegistry.get(a_backend)
             egm = insert_cached_attention(egm, cm, attn_descriptor, self.factory.get_cache_config())
 
         # initialize cache on correct device
@@ -220,7 +199,7 @@ class InferenceOptimizer:
         }
         egm_compiled = compile_and_capture(
             egm,
-            self.compile_backend,
+            self.ad_config.compile_backend,
             args=cm.args,
             dynamic_shapes=cm.dynamic_shapes,
             compiler_kwargs=compiler_kwargs,

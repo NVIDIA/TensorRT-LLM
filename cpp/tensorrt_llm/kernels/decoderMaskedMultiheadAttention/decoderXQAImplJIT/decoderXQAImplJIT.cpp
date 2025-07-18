@@ -13,19 +13,19 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/decoderXQAImplJIT.h"
 
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/decoderXQAImplJIT.h"
 #include "compileEngine.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/utils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/cubin/xqa_kernel_cubin.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAConstants.h"
-#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/decoderXQAImplJIT.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/kernelUtils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/tensorMapUtils.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
+#include "tensorrt_llm/kernels/xqaDispatcher.h"
 
 namespace
 {
@@ -37,7 +37,8 @@ using ::tensorrt_llm::kernels::XQAKernelMetaInfo;
 XQAKernelRuntimeHashKey getRuntimeHashKeyFromKernelMeta(XQAKernelMetaInfo const& kernelMeta)
 {
     return {kernelMeta.mKVDataType, kernelMeta.mHeadDim, kernelMeta.mBeamWidth, kernelMeta.mNumQHeadsOverKV,
-        kernelMeta.mMTileSize, kernelMeta.mTokensPerPage, kernelMeta.mPagedKVCache, kernelMeta.mMultiQueryTokens};
+        kernelMeta.mMTileSize, kernelMeta.mTokensPerPage, kernelMeta.mPagedKVCache, kernelMeta.mMultiQueryTokens,
+        0 /* xqa jit param is_fp8_output */};
 }
 
 } // anonymous namespace
@@ -48,6 +49,7 @@ namespace tensorrt_llm::kernels
 DecoderXQAImplJIT::DecoderXQAImplJIT(DecoderXQARunner* runner)
     : DecoderXQAImpl(runner)
     , mDriver(tensorrt_llm::common::CUDADriverWrapper::getInstance())
+    , mResource(DecoderXQARunner::getResourceGlobal())
     , mForceXQA(tensorrt_llm::common::forceXQAKernels())
     , mSM(tensorrt_llm::common::getSMVersion())
 {
@@ -57,7 +59,8 @@ bool DecoderXQAImplJIT::supportConfig(XQAParams const& xqaParams, bool forConfig
 {
 
     return jit::supportConfigQGMMA(xqaParams, mSM, forConfigurePlugin)
-        || jit::supportConfigHMMA(xqaParams, mSM, forConfigurePlugin);
+        || jit::supportConfigHMMA(xqaParams, mSM, forConfigurePlugin)
+        || jit::supportConfigMLA(xqaParams, mSM, forConfigurePlugin);
 }
 
 bool DecoderXQAImplJIT::mayHavePerfGain(XQAParams const& xqaParams) const
@@ -67,13 +70,19 @@ bool DecoderXQAImplJIT::mayHavePerfGain(XQAParams const& xqaParams) const
     {
         return true;
     }
+    // Always prefer XQA-based MLA over FMHA-base MLA for now.
+    if (xqaParams.isMLA())
+    {
+        return true;
+    }
     int num_kv_heads = xqaParams.num_kv_heads;
     int batch_size = static_cast<int>(xqaParams.batch_size);
     int multi_block_count = 1;
     if (xqaParams.multi_block_mode)
     {
         int history_length = xqaParams.max_past_kv_length;
-        multi_block_count = history_length / kMinHistoryTokensPerBlock;
+        // Always use at least 1 block regardless of history length
+        multi_block_count = std::max(1, history_length / kMinHistoryTokensPerBlock);
     }
     int block_count = num_kv_heads * batch_size * multi_block_count;
     return static_cast<float>(block_count) * kEnableMinBlockFactor >= static_cast<float>(mRunner->mMultiProcessorCount);
@@ -92,12 +101,25 @@ bool DecoderXQAImplJIT::shouldUse(XQAParams const& umbrellaXQAParams, bool forCo
                 return true;
             }
         }
+        TLLM_LOG_DEBUG("JIT XQA is not used: no supported configuration found for any beam_width");
         return false;
     }
     else
     {
         auto const& xqaParams = umbrellaXQAParams;
-        return supportConfig(xqaParams, forConfigurePlugin) && mayHavePerfGain(xqaParams);
+        bool isConfigSupported = supportConfig(xqaParams, forConfigurePlugin);
+        if (!isConfigSupported)
+        {
+            TLLM_LOG_DEBUG("JIT XQA is not used: unsupported configuration");
+            return false;
+        }
+        bool hasPerfGain = mayHavePerfGain(xqaParams);
+        if (!hasPerfGain)
+        {
+            TLLM_LOG_DEBUG("JIT XQA is not used: maybe no performance gain");
+            return false;
+        }
+        return true;
     }
 }
 
@@ -117,7 +139,7 @@ void DecoderXQAImplJIT::prepareForActualXQAParams(XQAParams const& xqaParams)
 
     jit::CompileEngine compileEngine(mSM, xqaParams);
 
-    auto registryGlobal = DecoderXQARunner::getResourceGlobal()->getCubinObjRegistry();
+    auto registryGlobal = mResource->getCubinObjRegistry();
 
     if (supportConfig(xqaParams, true))
     {
@@ -184,12 +206,15 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     int multiprocessor_count, cudaStream_t const& stream) const
 {
     jit::CubinObjKey const key = getCubinObjKeyFromXQAParams(xqaParams);
-    jit::CubinObj const* const cubinObj = DecoderXQARunner::getResourceGlobal()->getCubinObjRegistry()->getCubin(key);
+    jit::CubinObj const* const cubinObj = mResource->getCubinObjRegistry()->getCubin(key);
     TLLM_CHECK(cubinObj != nullptr && cubinObj->isInitialized());
     bool const isSpecDec = xqaParams.multi_query_tokens;
     bool const isGMMAKernel = (cubinObj->getKernelType() == XQAKernelType::kHOPPER_WARP_SPECIALIZED);
+    bool const isMLAKernel = (cubinObj->getKernelType() == XQAKernelType::kSM120_MLA);
     TLLM_CHECK_WITH_INFO(
-        !isSpecDec || isGMMAKernel, "speculative decoding is available for GMMA kernel only in JIT path for now.");
+        !isSpecDec || isGMMAKernel || (isMLAKernel && !xqaParams.spec_decoding_is_generation_length_variable),
+        "speculative decoding is available for GMMA/MLA kernel only in JIT path for now. For MLA, the input sequence "
+        "length must be uniform and draft tokens must be linear.");
     TLLM_CHECK_DEBUG(isGMMAKernel == jit::supportConfigQGMMA(xqaParams, mSM, false));
     // @fixme: also embed these compile-time flags in cubin directly
     // Whether RoPE is fused into the XQA kernel.
@@ -200,7 +225,8 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     bool const applyRoPEInXqaKernel = isGMMAKernel && !isSpecDec
         && tensorrt_llm::common::contains({PositionEmbeddingType::kLONG_ROPE, PositionEmbeddingType::kROPE_GPT_NEOX,
                                               PositionEmbeddingType::kROPE_GPTJ},
-            xqaParams.position_embedding_type);
+            xqaParams.position_embedding_type)
+        && !xqaParams.isMLA();
 
     unsigned int head_size = xqaParams.head_size;
     int num_q_heads = xqaParams.num_q_heads;
@@ -228,87 +254,94 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     void* xqa_q_input_ptr = (applyRoPEInXqaKernel ? nullptr : inputScratch);
     if (!applyRoPEInXqaKernel)
     {
-        // Build cu_seqlens, padding_offset, and rotary inv freq tensors
-        BuildDecoderInfoParams<T> decoder_params{};
-        decoder_params.seqQOffsets = launchParams.cu_seq_lens;
-        decoder_params.seqQLengths = xqaParams.spec_decoding_generation_lengths;
-        decoder_params.seqKVLengths = xqaParams.sequence_lengths;
-        decoder_params.tokensInfo = launchParams.tokens_info;
-        decoder_params.batchSize = int(batch_beam_size);
-        decoder_params.maxQSeqLength = xqaParams.generation_input_length;
-        decoder_params.numTokens = xqaParams.total_num_input_tokens;
-        decoder_params.removePadding = true;
-        TLLM_CHECK_WITH_INFO(!xqaParams.multi_query_tokens || xqaParams.spec_decoding_generation_lengths != nullptr,
-            "Spec_decoding_generation_lengths must be provided.");
-        // Rotary embedding inv_freq buffer.
-        decoder_params.rotaryEmbeddingScale = xqaParams.rotary_embedding_scale;
-        decoder_params.rotaryEmbeddingBase = xqaParams.rotary_embedding_base;
-        decoder_params.rotaryEmbeddingDim = xqaParams.rotary_embedding_dim;
-        decoder_params.rotaryScalingType = xqaParams.rotary_embedding_scale_type;
-        decoder_params.rotaryEmbeddingInvFreq = launchParams.rotary_inv_freq_buf;
-        decoder_params.rotaryEmbeddingInvFreqCache = xqaParams.rotary_embedding_inv_freq_cache;
-        decoder_params.rotaryEmbeddingMaxPositions = xqaParams.rotary_embedding_max_positions;
-        // The rotary_embedding_inv_freq_cache for QKVPreprocessing.
-        // Use the xqaParams.rotary_embedding_inv_freq_cache input when the buildDecoderInfoKernel is skipped.
-        float const* rotary_inv_freq_buf = xqaParams.rotary_embedding_inv_freq_cache;
-        if (decoder_params.isBuildDecoderInfoKernelNeeded() || xqaParams.multi_query_tokens)
+        if (!xqaParams.isMLA())
         {
-            rotary_inv_freq_buf = launchParams.rotary_inv_freq_buf;
-            invokeBuildDecoderInfo(decoder_params, stream);
+            // Build cu_seqlens, padding_offset, and rotary inv freq tensors
+            BuildDecoderInfoParams<T> decoder_params{};
+            decoder_params.seqQOffsets = launchParams.cu_seq_lens;
+            decoder_params.seqQLengths = xqaParams.spec_decoding_generation_lengths;
+            decoder_params.seqKVLengths = xqaParams.sequence_lengths;
+            decoder_params.tokensInfo = launchParams.tokens_info;
+            decoder_params.batchSize = int(batch_beam_size);
+            decoder_params.maxQSeqLength = xqaParams.generation_input_length;
+            decoder_params.numTokens = xqaParams.total_num_input_tokens;
+            decoder_params.removePadding = true;
+            TLLM_CHECK_WITH_INFO(!xqaParams.multi_query_tokens || xqaParams.spec_decoding_generation_lengths != nullptr,
+                "Spec_decoding_generation_lengths must be provided.");
+            // Rotary embedding inv_freq buffer.
+            decoder_params.rotaryEmbeddingScale = xqaParams.rotary_embedding_scale;
+            decoder_params.rotaryEmbeddingBase = xqaParams.rotary_embedding_base;
+            decoder_params.rotaryEmbeddingDim = xqaParams.rotary_embedding_dim;
+            decoder_params.rotaryScalingType = xqaParams.rotary_embedding_scale_type;
+            decoder_params.rotaryEmbeddingInvFreq = launchParams.rotary_inv_freq_buf;
+            decoder_params.rotaryEmbeddingInvFreqCache = xqaParams.rotary_embedding_inv_freq_cache;
+            decoder_params.rotaryEmbeddingMaxPositions = xqaParams.rotary_embedding_max_positions;
+            // The rotary_embedding_inv_freq_cache for QKVPreprocessing.
+            // Use the xqaParams.rotary_embedding_inv_freq_cache input when the buildDecoderInfoKernel is skipped.
+            float const* rotary_inv_freq_buf = xqaParams.rotary_embedding_inv_freq_cache;
+            if (decoder_params.isBuildDecoderInfoKernelNeeded() || xqaParams.multi_query_tokens)
+            {
+                rotary_inv_freq_buf = launchParams.rotary_inv_freq_buf;
+                invokeBuildDecoderInfo(decoder_params, stream);
+            }
+            sync_check_cuda_error(stream);
+
+            // The preprocessing kernel that applies RoPE and updates kv cache.
+            QKVPreprocessingParams<T, KVCacheBuffer> preprocessingParams;
+            memset(&preprocessingParams, 0, sizeof(preprocessingParams));
+            // Set parameters.
+            preprocessingParams.qkv_input = static_cast<T*>(const_cast<void*>(xqaParams.qkv));
+            preprocessingParams.q_output = static_cast<T*>(xqa_q_input_ptr);
+            preprocessingParams.kv_cache_buffer = kv_cache_buffer;
+            preprocessingParams.kv_cache_block_scales_buffer = {};
+            preprocessingParams.qkv_bias = static_cast<T const*>(xqaParams.qkv_bias);
+            // Buffers.
+            preprocessingParams.logn_scaling = xqaParams.logn_scaling_ptr;
+            preprocessingParams.tokens_info = launchParams.tokens_info;
+            preprocessingParams.seq_lens = xqaParams.spec_decoding_generation_lengths;
+            preprocessingParams.cache_seq_lens = xqaParams.sequence_lengths;
+            preprocessingParams.cu_seq_lens = xqaParams.multi_query_tokens ? launchParams.cu_seq_lens : nullptr;
+            preprocessingParams.rotary_embedding_inv_freq = rotary_inv_freq_buf;
+            preprocessingParams.rotary_coef_cache_buffer = xqaParams.rotary_cos_sin;
+            preprocessingParams.kvScaleOrigQuant = xqaParams.kv_scale_orig_quant;
+            preprocessingParams.kv_cache_scale_factors = nullptr;
+            preprocessingParams.spec_decoding_position_offsets = xqaParams.spec_decoding_position_offsets;
+            preprocessingParams.mrope_position_deltas = xqaParams.mrope_position_deltas;
+            // Scalar parameters.
+            preprocessingParams.batch_size = int(batch_beam_size);
+            preprocessingParams.max_input_seq_len = xqaParams.generation_input_length;
+            preprocessingParams.max_kv_seq_len = xqaParams.max_past_kv_length;
+            preprocessingParams.cyclic_kv_cache_len = xqaParams.cyclic_attention_window_size;
+            preprocessingParams.sink_token_len = xqaParams.sink_token_length;
+            preprocessingParams.token_num = xqaParams.total_num_input_tokens;
+            preprocessingParams.remove_padding = true;
+            preprocessingParams.cross_attention = false;
+            preprocessingParams.head_num = xqaParams.num_q_heads;
+            preprocessingParams.kv_head_num = xqaParams.num_kv_heads;
+            preprocessingParams.qheads_per_kv_head = xqaParams.num_q_heads / xqaParams.num_kv_heads;
+            preprocessingParams.size_per_head = xqaParams.head_size;
+            preprocessingParams.rotary_embedding_dim = xqaParams.rotary_embedding_dim;
+            preprocessingParams.rotary_embedding_base = xqaParams.rotary_embedding_base;
+            preprocessingParams.rotary_scale_type = xqaParams.rotary_embedding_scale_type;
+            preprocessingParams.rotary_embedding_scale = xqaParams.rotary_embedding_scale;
+            preprocessingParams.rotary_embedding_max_positions = xqaParams.rotary_embedding_max_positions;
+            preprocessingParams.position_embedding_type = xqaParams.position_embedding_type;
+            preprocessingParams.position_shift_enabled = xqaParams.position_shift_enabled;
+            preprocessingParams.cache_type = cache_type;
+            preprocessingParams.separate_q_kv_output = true;
+            preprocessingParams.quantized_fp8_output = false;
+            preprocessingParams.generation_phase = true;
+            preprocessingParams.multi_processor_count = multiprocessor_count;
+            preprocessingParams.rotary_vision_start = xqaParams.rotary_vision_start;
+            preprocessingParams.rotary_vision_length = xqaParams.rotary_vision_length;
+
+            invokeQKVPreprocessing<T, KVCacheBuffer>(preprocessingParams, stream);
+            sync_check_cuda_error(stream);
         }
-        sync_check_cuda_error(stream);
-
-        // The preprocessing kernel that applies RoPE and updates kv cache.
-        QKVPreprocessingParams<T, KVCacheBuffer> preprocessingParams;
-        memset(&preprocessingParams, 0, sizeof(preprocessingParams));
-        // Set parameters.
-        preprocessingParams.qkv_input = static_cast<T*>(const_cast<void*>(xqaParams.qkv));
-        preprocessingParams.q_output = static_cast<T*>(xqa_q_input_ptr);
-        preprocessingParams.kv_cache_buffer = kv_cache_buffer;
-        preprocessingParams.kv_cache_block_scales_buffer = {};
-        preprocessingParams.qkv_bias = static_cast<T const*>(xqaParams.qkv_bias);
-        // Buffers.
-        preprocessingParams.logn_scaling = xqaParams.logn_scaling_ptr;
-        preprocessingParams.tokens_info = launchParams.tokens_info;
-        preprocessingParams.seq_lens = xqaParams.spec_decoding_generation_lengths;
-        preprocessingParams.cache_seq_lens = xqaParams.sequence_lengths;
-        preprocessingParams.cu_seq_lens = xqaParams.multi_query_tokens ? launchParams.cu_seq_lens : nullptr;
-        preprocessingParams.rotary_embedding_inv_freq = rotary_inv_freq_buf;
-        preprocessingParams.rotary_coef_cache_buffer = xqaParams.rotary_cos_sin;
-        preprocessingParams.kvScaleOrigQuant = xqaParams.kv_scale_orig_quant;
-        preprocessingParams.kv_cache_scale_factors = nullptr;
-        preprocessingParams.spec_decoding_position_offsets = xqaParams.spec_decoding_position_offsets;
-        preprocessingParams.mrope_position_deltas = xqaParams.mrope_position_deltas;
-        // Scalar parameters.
-        preprocessingParams.batch_size = int(batch_beam_size);
-        preprocessingParams.max_input_seq_len = xqaParams.generation_input_length;
-        preprocessingParams.max_kv_seq_len = xqaParams.max_past_kv_length;
-        preprocessingParams.cyclic_kv_cache_len = xqaParams.cyclic_attention_window_size;
-        preprocessingParams.sink_token_len = xqaParams.sink_token_length;
-        preprocessingParams.token_num = xqaParams.total_num_input_tokens;
-        preprocessingParams.remove_padding = true;
-        preprocessingParams.cross_attention = false;
-        preprocessingParams.head_num = xqaParams.num_q_heads;
-        preprocessingParams.kv_head_num = xqaParams.num_kv_heads;
-        preprocessingParams.qheads_per_kv_head = xqaParams.num_q_heads / xqaParams.num_kv_heads;
-        preprocessingParams.size_per_head = xqaParams.head_size;
-        preprocessingParams.rotary_embedding_dim = xqaParams.rotary_embedding_dim;
-        preprocessingParams.rotary_embedding_base = xqaParams.rotary_embedding_base;
-        preprocessingParams.rotary_scale_type = xqaParams.rotary_embedding_scale_type;
-        preprocessingParams.rotary_embedding_scale = xqaParams.rotary_embedding_scale;
-        preprocessingParams.rotary_embedding_max_positions = xqaParams.rotary_embedding_max_positions;
-        preprocessingParams.position_embedding_type = xqaParams.position_embedding_type;
-        preprocessingParams.position_shift_enabled = xqaParams.position_shift_enabled;
-        preprocessingParams.cache_type = cache_type;
-        preprocessingParams.separate_q_kv_output = true;
-        preprocessingParams.quantized_fp8_output = false;
-        preprocessingParams.generation_phase = true;
-        preprocessingParams.multi_processor_count = multiprocessor_count;
-        preprocessingParams.rotary_vision_start = xqaParams.rotary_vision_start;
-        preprocessingParams.rotary_vision_length = xqaParams.rotary_vision_length;
-
-        invokeQKVPreprocessing<T, KVCacheBuffer>(preprocessingParams, stream);
-        sync_check_cuda_error(stream);
+        else
+        {
+            xqa_q_input_ptr = xqaParams.quant_q_buffer_ptr;
+        }
     }
 
     auto const makeSpecDecParams = [&]() -> SpecDecParams
@@ -330,61 +363,92 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         TLLM_CHECK(idxNextParam < kMAX_NB_KERNEL_PARAMS);
         kernelParams[idxNextParam++] = const_cast<void*>(static_cast<void const*>(p));
     };
-    appendParam(&launchParams.num_k_heads);
-    bool const allowSlidingWindow = !isSpecDec;
-    if (allowSlidingWindow)
+    void const* const kernel_input_tokens = (applyRoPEInXqaKernel ? launchParams.qkv : xqa_q_input_ptr);
+    if (isMLAKernel)
     {
-        appendParam(&launchParams.slidingWindowSize);
+        CUtensorMap const tensorMapQ = makeTensorMapForXqaMlaQ(mDriver, xqaParams, kernel_input_tokens);
+        appendParam(&tensorMapQ);
+        CUtensorMap const tensorMapK = makeTensorMapForXqaMlaKVCache(mDriver, xqaParams, kv_cache_buffer, true);
+        appendParam(&tensorMapK);
+        CUtensorMap const tensorMapV = makeTensorMapForXqaMlaKVCache(mDriver, xqaParams, kv_cache_buffer, false);
+        appendParam(&tensorMapV);
+        appendParam(&launchParams.qScale);
+        appendParam(&launchParams.output);
+        appendParam(&launchParams.kvCacheParams);
+        appendParam(&launchParams.batch_size);
+        appendParam(&launchParams.kv_scale_quant_orig);
+        appendParam(&launchParams.scratch);
+        appendParam(&launchParams.semaphores);
+        uint32_t const multi_block = computeMultiBlockCountForMLA(xqaParams, multiprocessor_count);
+        std::byte* const partialResults = static_cast<std::byte*>(launchParams.scratch)
+            + xqaMlaCgaXBufSize * multi_block * xqaParams.total_num_input_tokens;
+        appendParam(&partialResults);
+        kernelParams[idxNextParam] = nullptr; // one extra nullptr at end as guard.
+        uint32_t const inputSeqLen = (xqaParams.multi_query_tokens || xqaParams.isMLA())
+            ? static_cast<uint32_t>(xqaParams.generation_input_length)
+            : 1U;
+        dim3 const dimGrid{4 * inputSeqLen, multi_block, xqaParams.batch_size};
+        dim3 const blockDim(128 * 3, 1, 1);
+        cubinObj->launch(dimGrid, blockDim, stream, kernelParams);
     }
-    appendParam(&launchParams.qScale);
-    appendParam(&launchParams.output);
-    if (isFp8Out && !needOutputCvt)
+    else
     {
-        appendParam(&launchParams.rcpOutScale);
+        appendParam(&launchParams.num_k_heads);
+        bool const allowSlidingWindow = !isSpecDec;
+        if (allowSlidingWindow)
+        {
+            appendParam(&launchParams.slidingWindowSize);
+        }
+        appendParam(&launchParams.qScale);
+        appendParam(&launchParams.output);
+        if (isFp8Out && !needOutputCvt)
+        {
+            appendParam(&launchParams.rcpOutScale);
+        }
+        appendParam(&kernel_input_tokens);
+        if (applyRoPEInXqaKernel)
+        {
+            appendParam(&launchParams.ropeCosSin);
+        }
+        appendParam(&launchParams.kvCacheParams);
+        if (xqaParams.beam_width > 1)
+        {
+            appendParam(&launchParams.beamSearchParams.value());
+        }
+        appendParam(&launchParams.batch_size);
+        appendParam(&launchParams.kv_scale_quant_orig);
+        CUtensorMap tensorMap{};
+        if (isGMMAKernel)
+        {
+            tensorMap = makeTensorMapForHopperXqaKVCache(mDriver, xqaParams, kv_cache_buffer);
+            appendParam(&tensorMap);
+        }
+        uint32_t specDecBlocks = 1;
+        SpecDecParams specDecParams{};
+        if (isSpecDec)
+        {
+            TLLM_CHECK_WITH_INFO(
+                isGMMAKernel, "speculative decoding is available for GMMA kernel only in JIT path for now.");
+            TLLM_CHECK_DEBUG_WITH_INFO(xqaParams.max_past_kv_length + 1 <= xqaParams.cyclic_attention_window_size,
+                "SWA and speculative decoding cannot be used at the same time for now.");
+            specDecParams = makeSpecDecParams();
+            appendParam(&specDecParams);
+            specDecBlocks = divUp(specDecParams.qSeqLen, 64 / num_q_heads_over_kv);
+        }
+        appendParam(&launchParams.semaphores);
+        appendParam(&launchParams.scratch);
+        kernelParams[idxNextParam] = nullptr; // one extra nullptr at end as guard.
+        uint32_t multi_block = 1;
+        if (xqaParams.multi_block_mode)
+        {
+            multi_block = computeMultiBlockCount(xqaParams, xqaParams.batch_size, multiprocessor_count);
+        }
+        uint32_t const nbKVHeads = xqaParams.num_kv_heads;
+        auto const gridDim = (isGMMAKernel ? dim3{specDecBlocks, multi_block, nbKVHeads * xqaParams.batch_size}
+                                           : dim3{multi_block, nbKVHeads, xqaParams.batch_size});
+        dim3 const blockDim(128, 1, isGMMAKernel ? 3 : 2);
+        cubinObj->launch(gridDim, blockDim, stream, kernelParams);
     }
-    appendParam(applyRoPEInXqaKernel ? &launchParams.qkv : const_cast<void const**>(&xqa_q_input_ptr));
-    if (applyRoPEInXqaKernel)
-    {
-        appendParam(&launchParams.ropeCosSin);
-    }
-    appendParam(&launchParams.kvCacheParams);
-    if (xqaParams.beam_width > 1)
-    {
-        appendParam(&launchParams.beamSearchParams.value());
-    }
-    appendParam(&launchParams.batch_size);
-    appendParam(&launchParams.kv_scale_quant_orig);
-    CUtensorMap tensorMap{};
-    if (isGMMAKernel)
-    {
-        tensorMap = makeTensorMapForKVCache(mDriver, xqaParams, kv_cache_buffer);
-        appendParam(&tensorMap);
-    }
-    uint32_t specDecBlocks = 1;
-    SpecDecParams specDecParams{};
-    if (isSpecDec)
-    {
-        TLLM_CHECK_WITH_INFO(
-            isGMMAKernel, "speculative decoding is available for GMMA kernel only in JIT path for now.");
-        TLLM_CHECK_DEBUG_WITH_INFO(xqaParams.max_past_kv_length + 1 <= xqaParams.cyclic_attention_window_size,
-            "SWA and speculative decoding cannot be used at the same time for now.");
-        specDecParams = makeSpecDecParams();
-        appendParam(&specDecParams);
-        specDecBlocks = divUp(specDecParams.qSeqLen, 64 / num_q_heads_over_kv);
-    }
-    appendParam(&launchParams.semaphores);
-    appendParam(&launchParams.scratch);
-    kernelParams[idxNextParam] = nullptr; // one extra nullptr at end as guard.
-    uint32_t multi_block = 1;
-    if (xqaParams.multi_block_mode)
-    {
-        multi_block = computeMultiBlockCount(xqaParams, xqaParams.batch_size, multiprocessor_count);
-    }
-    uint32_t const nbKVHeads = xqaParams.num_kv_heads;
-    auto const gridDim = (isGMMAKernel ? dim3{specDecBlocks, multi_block, nbKVHeads * xqaParams.batch_size}
-                                       : dim3{multi_block, nbKVHeads, xqaParams.batch_size});
-    dim3 const blockDim(128, 1, isGMMAKernel ? 3 : 2);
-    cubinObj->launch(gridDim, blockDim, stream, kernelParams);
     sync_check_cuda_error(stream);
 
     if (needOutputCvt)

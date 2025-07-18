@@ -6,16 +6,20 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...model_config import ModelConfig
+from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
+from .fused_moe_wide_ep import WideEPMoE
 from .interface import MoE, MoEWeightLoadingMode
-from .moe_load_balancer import MoeLoadBalancer
+from .moe_load_balancer import get_moe_load_balancer
 from .routing import BaseMoeRoutingMethod
 
 
 def get_moe_cls(
         model_config: ModelConfig,
+        routing_method: BaseMoeRoutingMethod,
+        dtype: Optional[torch.dtype] = None,
         override_quant_config: Optional[QuantConfig] = None) -> Type[MoE]:
     moe_backend = model_config.moe_backend
     quant_config = model_config.quant_config
@@ -25,6 +29,8 @@ def get_moe_cls(
         return CutlassFusedMoE
     elif moe_backend.upper() == "VANILLA":
         return VanillaMoE
+    elif moe_backend.upper() == "CUTEDSL":
+        return CuteDslFusedMoE
     elif moe_backend.upper() == "TRTLLM":
         if quant_config is not None and (
                 quant_config.quant_mode.has_fp8_block_scales()
@@ -36,6 +42,8 @@ def get_moe_cls(
                 f"Check out details in quant_config: {quant_config}"
                 "Using CutlassFusedMoE instead.")
             return CutlassFusedMoE
+    elif moe_backend.upper() == "WIDEEP":
+        return WideEPMoE
     else:
         raise ValueError(f"Unsupported moe backend: {moe_backend}")
 
@@ -52,18 +60,17 @@ def create_moe(
     aux_stream: Optional[torch.cuda.Stream] = None,
     weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
     apply_router_weight_on_input: bool = False,
-    enable_alltoall: bool = False,
-    moe_load_balancer: Optional[MoeLoadBalancer] = None,
     layer_idx: Optional[int] = None,
-    pack_weights: bool = False,
 ) -> MoE:
-    moe_cls = get_moe_cls(model_config, override_quant_config)
+    moe_cls = get_moe_cls(model_config, routing_method, dtype,
+                          override_quant_config)
+
+    moe_load_balancer = get_moe_load_balancer()
+    if moe_load_balancer is not None:
+        assert moe_cls == WideEPMoE, "MoE Load Balance is only supported in WideEPMoE now."
 
     if moe_cls == TRTLLMGenFusedMoE:
         assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in TRTLLMGenFusedMoE."
-        assert not enable_alltoall, "enable_alltoall is not supported in TRTLLMGenFusedMoE."
-        assert moe_load_balancer is None, "moe_load_balancer is not supported in TRTLLMGenFusedMoE."
-        assert not pack_weights, "pack_weights is not supported in TRTLLMGenFusedMoE."
 
         return moe_cls(
             routing_method=routing_method,
@@ -77,8 +84,6 @@ def create_moe(
             layer_idx=layer_idx,
         )
     elif moe_cls == CutlassFusedMoE:
-        assert not pack_weights, "pack_weights is not supported in CutlassFusedMoE."
-
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -90,15 +95,37 @@ def create_moe(
             aux_stream=aux_stream,
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
-            enable_alltoall=enable_alltoall,
-            moe_load_balancer=moe_load_balancer,
+            layer_idx=layer_idx,
+        )
+    elif moe_cls == WideEPMoE:
+        return moe_cls(
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            reduce_results=reduce_results,
+            model_config=model_config,
+            aux_stream=aux_stream,
+            weight_loading_mode=weight_loading_mode,
+            apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
         )
     elif moe_cls == VanillaMoE:
         assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in VanillaMoE."
-        assert not enable_alltoall, "enable_alltoall is not supported in VanillaMoE."
-        assert moe_load_balancer is None, "moe_load_balancer is not supported in VanillaMoE."
 
+        return moe_cls(
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            reduce_results=reduce_results,
+            model_config=model_config,
+            weight_loading_mode=weight_loading_mode,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+        )
+    elif moe_cls == CuteDslFusedMoE:
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -110,10 +137,7 @@ def create_moe(
             aux_stream=aux_stream,
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
-            enable_alltoall=enable_alltoall,
-            moe_load_balancer=moe_load_balancer,
             layer_idx=layer_idx,
-            pack_weights=pack_weights,
         )
     else:
         raise ValueError(f"Unsupported moe backend: {moe_cls}")

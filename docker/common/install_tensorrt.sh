@@ -2,17 +2,16 @@
 
 set -ex
 
-TRT_VER="10.10.0.31"
+TRT_VER="10.11.0.33"
 # Align with the pre-installed cuDNN / cuBLAS / NCCL versions from
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-04.html#rel-25-04
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-05.html#rel-25-05
 CUDA_VER="12.9" # 12.9.0
 # Keep the installation for cuDNN if users want to install PyTorch with source codes.
 # PyTorch 2.x can compile with cuDNN v9.
-CUDNN_VER="9.9.0.52-1"
-# NCCL version 2.26.3 used in the NGC PyTorch 25.04 image but not existing in public.
-# Use NCCL version 2.26.5 instead.
-NCCL_VER="2.26.5-1+cuda12.9"
-# cuBLAS version 12.9.0.2 used in the NGC PyTorch 25.04 image but not existing in public.
+CUDNN_VER="9.10.1.4-1"
+# NCCL version 2.26.x used in the NGC PyTorch 25.05 image but has a performance regression issue.
+# Use NCCL version 2.27.5 which has the fixes.
+NCCL_VER="2.27.5-1+cuda12.9"
 # Use cuBLAS version 12.9.0.13 instead.
 CUBLAS_VER="12.9.0.13-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
@@ -68,6 +67,7 @@ install_ubuntu_requirements() {
     apt-get install -y --no-install-recommends \
         libcudnn9-cuda-12=${CUDNN_VER} \
         libcudnn9-dev-cuda-12=${CUDNN_VER} \
+	libcudnn9-headers-cuda-12=${CUDNN_VER} \
         libnccl2=${NCCL_VER} \
         libnccl-dev=${NCCL_VER} \
         libcublas-${CUBLAS_CUDA_VERSION}=${CUBLAS_VER} \
@@ -95,7 +95,7 @@ install_rockylinux_requirements() {
         "cuda-toolkit-config-common-${CUDA_RUNTIME}.noarch" \
         "libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}" \
         "libcublas-devel-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}"; do
-        wget -q "https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/${ARCH3}/${pkg}.rpm"
+        wget -q --timeout=180 --tries=3 "https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/${ARCH3}/${pkg}.rpm"
     done
 
     # Remove old packages
@@ -138,6 +138,14 @@ install_tensorrt() {
     pip3 install --no-cache-dir /usr/local/tensorrt/python/tensorrt-*-cp${PARSED_PY_VERSION}-*.whl
     rm -rf /tmp/TensorRT.tar
     echo 'export LD_LIBRARY_PATH=/usr/local/tensorrt/lib:$LD_LIBRARY_PATH' >> "${ENV}"
+
+    rm -f /usr/local/tensorrt/lib/libnvinfer_vc_plugin_static.a \
+          /usr/local/tensorrt/lib/libnvinfer_plugin_static.a \
+          /usr/local/tensorrt/lib/libnvinfer_static.a \
+          /usr/local/tensorrt/lib/libnvinfer_dispatch_static.a \
+          /usr/local/tensorrt/lib/libnvinfer_lean_static.a \
+          /usr/local/tensorrt/lib/libnvonnxparser_static.a \
+          /usr/local/tensorrt/lib/libnvinfer_builder_resource_win.so.10.10.0
 }
 
 # Install base packages depending on the base OS

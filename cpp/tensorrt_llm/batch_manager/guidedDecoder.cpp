@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/batch_manager/guidedDecoder.h"
+#include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/kernels/logitsBitmask.h"
 
@@ -35,6 +36,8 @@ GuidedDecoder::GuidedDecoder(executor::GuidedDecodingConfig const& guidedDecodin
     , mLogitsDtype{logitsDtype}
     , mCopyBufferManager{std::make_shared<CudaStream>()}
 {
+    TLLM_CHECK_WITH_INFO(mGuidedDecodingBackend != executor::GuidedDecodingConfig::GuidedDecodingBackend::kLLGUIDANCE,
+        "LLGuidance is not supported for guided decoding in C++ runtime.");
     if (mGuidedDecodingBackend == executor::GuidedDecodingConfig::GuidedDecodingBackend::kXGRAMMAR)
     {
         mXGrammarMatchers.resize(mMaxNumSequences);
@@ -134,8 +137,7 @@ void GuidedDecoder::build(ScheduledRequests const& scheduledRequests)
     }
 }
 
-void GuidedDecoder::execute(ScheduledRequests const& scheduledRequests, BufferManager const& runtimeBufferManager,
-    std::vector<TensorPtr> const& decoderBuffersLogits)
+void GuidedDecoder::execute(DecoderInputBuffers const& decoderInputBuffers, BufferManager const& runtimeBufferManager)
 {
     auto const& stream = runtimeBufferManager.getStream();
 
@@ -148,32 +150,28 @@ void GuidedDecoder::execute(ScheduledRequests const& scheduledRequests, BufferMa
     mCopyBufferManager.getStream().record(event);
     stream.wait(event);
 
-    SizeType32 batchIdx{0};
-    if (mGuidedDecodingBackend == executor::GuidedDecodingConfig::GuidedDecodingBackend::kXGRAMMAR)
+    if (mGuidedDecodingBackend == executor::GuidedDecodingConfig::GuidedDecodingBackend::kXGRAMMAR
+        && !decoderInputBuffers.decoderRequests.empty())
     {
-        for (auto const& requests : {scheduledRequests.contextRequests, scheduledRequests.generationRequests})
+        SizeType32 batchIdx{0};
+        for (size_t requestIdx = 0; requestIdx < decoderInputBuffers.decoderRequests.size(); ++requestIdx)
         {
-            for (auto const& llmReq : requests)
+            auto const& llmReq = decoderInputBuffers.decoderRequests.at(requestIdx);
+
+            auto const& guidedDecodingParams = llmReq->getGuidedDecodingParams();
+            if (guidedDecodingParams.has_value())
             {
-                if (llmReq->isContextInitState() && !llmReq->isLastContextChunk())
-                {
-                    continue;
-                }
-                auto const& guidedDecodingParams = llmReq->getGuidedDecodingParams();
-                if (guidedDecodingParams.has_value())
-                {
-                    auto const seqSlot = llmReq->mSeqSlot.value();
+                auto const seqSlot = llmReq->mSeqSlot.value();
 
-                    auto const& logits = decoderBuffersLogits.at(seqSlot);
-                    auto const logitsBitmask = ITensor::at(mLogitsBitmask, {seqSlot});
+                auto const& logits = decoderInputBuffers.logits.at(requestIdx);
+                auto const logitsBitmask = ITensor::at(mLogitsBitmask, {seqSlot});
 
-                    // Use void* to unify the code for different mLogitsDtype
-                    *reinterpret_cast<void**>(ITensor::at(mLogitsPtrVecHost, {batchIdx})->data()) = logits->data();
-                    *reinterpret_cast<void**>(ITensor::at(mLogitsBitmaskPtrVecHost, {batchIdx})->data())
-                        = logitsBitmask->data();
+                // Use void* to unify the code for different mLogitsDtype
+                *reinterpret_cast<void**>(ITensor::at(mLogitsPtrVecHost, {batchIdx})->data()) = logits->data();
+                *reinterpret_cast<void**>(ITensor::at(mLogitsBitmaskPtrVecHost, {batchIdx})->data())
+                    = logitsBitmask->data();
 
-                    ++batchIdx;
-                }
+                ++batchIdx;
             }
         }
         if (batchIdx > 0)

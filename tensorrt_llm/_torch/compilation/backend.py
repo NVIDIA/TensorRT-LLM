@@ -2,6 +2,7 @@ import os
 from typing import List, Optional
 
 import torch
+import torch._inductor.config as inductor_config
 from torch._functorch.aot_autograd import aot_module_simplified
 from torch._inductor.compile_fx import compile_fx, select_decomp_table
 from torch._inductor.pattern_matcher import PatternMatcherPass
@@ -44,6 +45,7 @@ class Backend:
                                        else [])
         self.piecewise_cuda_graph = enable_piecewise_cuda_graph
         self.no_optimization = False
+        inductor_config.enable_auto_functionalized_v2 = False
 
         if Backend._graph_pool_handle is None:
             Backend._graph_pool_handle = torch.cuda.graph_pool_handle()

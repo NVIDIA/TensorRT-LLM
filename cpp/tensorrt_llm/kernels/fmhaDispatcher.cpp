@@ -56,7 +56,8 @@ FmhaDispatcher::FmhaDispatcher(MHARunnerFixedParams fixedParams)
     else
     {
         TLLM_CHECK_WITH_INFO(mFixedParams.dataType == mFixedParams.dataTypeKv,
-            "KV cache data type should be the same as input data type.");
+            "KV cache data type %s is not the same as input data type %s.",
+            data_type_to_string(mFixedParams.dataTypeKv).c_str(), data_type_to_string(mFixedParams.dataType).c_str());
 
         // For FP8 MLA generation, the output type is BF16, which could be different from the input type.
         // So we shouldn't do this check anymore.
@@ -197,6 +198,8 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         // Set it to INT_MAX as the kv cache pageOffsets will ensure that there is no out-of-bounds access.
         tllmRunnerParams.mNumPagesInMemPool = INT_MAX;
         tllmRunnerParams.mSfStartTokenIdx = 0;
+        // For mla chunked prefill
+        tllmRunnerParams.softmaxStatsPtr = reinterpret_cast<float2*>(runnerParams.softmaxStatsPtr);
         tllmRunnerParams.stream = runnerParams.stream;
         mTllmGenFMHARunner->run(tllmRunnerParams);
     }

@@ -17,7 +17,7 @@ import os
 import subprocess
 
 import pytest
-from defs.conftest import skip_no_hopper
+from defs.conftest import skip_arm, skip_no_hopper
 from defs.trt_test_alternative import check_call, popen
 
 from tensorrt_llm.logger import logger
@@ -50,15 +50,26 @@ def get_test_config(test_desc, example_dir, test_root):
         (2, f"{test_configs_root}/disagg_config_cuda_graph_padding.yaml"),
         "mixed": (2, f"{test_configs_root}/disagg_config_mixed.yaml"),
         "overlap": (2, f"{test_configs_root}/disagg_config_overlap.yaml"),
+        "trtllm_sampler":
+        (2, f"{test_configs_root}/disagg_config_trtllm_sampler.yaml"),
         "load_balance":
         (4, f"{test_configs_root}/disagg_config_load_balance.yaml"),
         "cache_aware_balance":
         (4, f"{test_configs_root}/disagg_config_cache_aware_balance.yaml"),
         "conditional": (2,
                         f"{test_configs_root}/disagg_config_conditional.yaml"),
-        "deepseek_v3_lite_fp8":
+        "ngram": (2, f"{test_configs_root}/disagg_config_ngram.yaml"),
+        "deepseek_v3_lite_fp8_mpi":
         (4,
-         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite.yaml"
+         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_mpi.yaml"
+         ),
+        "deepseek_v3_lite_fp8_ucx":
+        (4,
+         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_ucx.yaml"
+         ),
+        "deepseek_v3_lite_fp8_nixl":
+        (4,
+         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_nixl.yaml"
          ),
         "deepseek_v3_lite_fp8_tp1":
         (2,
@@ -100,6 +111,16 @@ def get_test_config(test_desc, example_dir, test_root):
         (2,
          f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_one_mtp_attention_dp_overlap.yaml"
          ),
+        "deepseek_v3_lite_bf16_cache_aware_balance":
+        (4,
+         f"{test_configs_root}/disagg_config_cache_aware_balance_deepseek_v3.yaml"
+         ),
+        "deepseek_v3_lite_bf16_conditional":
+        (2, f"{test_configs_root}/disagg_config_conditional_deepseek_v3.yaml"),
+        "deepseek_v3_lite_fp8_tp1_two_mtp":
+        (2,
+         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_two_mtp.yaml"
+         ),
     }
 
     if test_desc not in config_map:
@@ -116,6 +137,8 @@ def run_disaggregated_test(example_dir,
                            cwd=None):
     """Run disaggregated test with given configuration."""
     cleanup_output_files()
+    run_env = env.copy()
+    run_env["UCX_TLS"] = "^ib"
 
     num_ranks, config_file = get_test_config(test_desc, example_dir,
                                              os.path.dirname(__file__))
@@ -138,15 +161,15 @@ def run_disaggregated_test(example_dir,
                 popen(workers_cmd,
                       stdout=output_workers,
                       stderr=subprocess.STDOUT,
-                      env=env,
-                      cwd=cwd),
+                      env=run_env,
+                      cwd=cwd) as workers_proc,
                 # Start server
                 open('output_disagg.log', 'w') as output_disagg,
                 popen(server_cmd,
                       stdout=output_disagg,
                       stderr=subprocess.STDOUT,
-                      env=env,
-                      cwd=cwd)):
+                      env=run_env,
+                      cwd=cwd) as server_proc):
             client_dir = f"{example_dir}/clients"
             for _ in range(num_iters):
                 client_cmd = [
@@ -156,31 +179,39 @@ def run_disaggregated_test(example_dir,
                     '--server-start-timeout',
                     str(server_start_timeout)
                 ]
-                check_call(client_cmd, env=env)
+                check_call(client_cmd,
+                           env=env,
+                           poll_procs=[workers_proc, server_proc])
 
                 # Streaming client run
                 streaming_client_cmd = client_cmd + [
                     '--streaming', '-o', 'output_streaming.json'
                 ]
-                check_call(streaming_client_cmd, env=env)
+                check_call(streaming_client_cmd,
+                           env=env,
+                           poll_procs=[workers_proc, server_proc])
 
                 # Run the chat completion endpoint test only for TinyLlama
-                if test_desc == "overlap":
+                if test_desc == "overlap" or test_desc == "trtllm_sampler":
                     chat_client_cmd = client_cmd + [
                         '-e', 'chat', '-o', 'output_chat.json'
                     ]
-                    check_call(chat_client_cmd, env=env)
+                    check_call(chat_client_cmd,
+                               env=env,
+                               poll_procs=[workers_proc, server_proc])
 
                     streaming_chat_client_cmd = chat_client_cmd + [
                         '--streaming', '-o', 'output_streaming_chat.json'
                     ]
-                    check_call(streaming_chat_client_cmd, env=env)
+                    check_call(streaming_chat_client_cmd,
+                               env=env,
+                               poll_procs=[workers_proc, server_proc])
 
                 # Verify outputs
                 not_expected_strings = ["Berlin Berlin"]
 
                 output_files = ['output.json', 'output_streaming.json']
-                if test_desc == "overlap":
+                if test_desc == "overlap" or test_desc == "trtllm_sampler":
                     # Disable streaming chat completion for overlap test
                     # due to bug
                     output_files.extend(['output_chat.json'])
@@ -212,6 +243,11 @@ def run_disaggregated_test(example_dir,
         with open('output_disagg.log', 'r') as f:
             logger.error(f.read())
         raise
+    finally:
+        server_proc.terminate()
+        workers_proc.terminate()
+        server_proc.wait()
+        workers_proc.wait()
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
@@ -399,6 +435,26 @@ def test_disaggregated_overlap(disaggregated_test_root, llm_venv,
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+def test_disaggregated_trtllm_sampler(disaggregated_test_root, llm_venv,
+                                      disaggregated_example_root,
+                                      llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "trtllm_sampler",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
 def test_disaggregated_load_balance(disaggregated_test_root, llm_venv,
                                     disaggregated_example_root,
                                     llama_model_root):
@@ -457,13 +513,32 @@ def test_disaggregated_conditional(disaggregated_test_root, llm_venv,
                            cwd=llm_venv.get_working_directory())
 
 
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_ngram(disaggregated_test_root, llm_venv,
+                             disaggregated_example_root, llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+    run_disaggregated_test(disaggregated_example_root,
+                           "ngram",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
 @skip_no_hopper
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
-def test_disaggregated_deepseek_v3_lite_fp8(disaggregated_test_root,
-                                            disaggregated_example_root,
-                                            llm_venv, deepseek_v3_model_root):
+def test_disaggregated_deepseek_v3_lite_fp8_mpi(disaggregated_test_root,
+                                                disaggregated_example_root,
+                                                llm_venv,
+                                                deepseek_v3_model_root):
     src_dst_dict = {
         deepseek_v3_model_root:
         f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
@@ -472,10 +547,11 @@ def test_disaggregated_deepseek_v3_lite_fp8(disaggregated_test_root,
         if not os.path.islink(dst):
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             os.symlink(src, dst, target_is_directory=True)
-
+    env = llm_venv._new_env.copy()
+    env["TRTLLM_USE_MPI_KVCACHE"] = "1"
     run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_fp8",
-                           env=llm_venv._new_env,
+                           "deepseek_v3_lite_fp8_mpi",
+                           env=env,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -522,6 +598,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu_mtp(
 
 
 @skip_no_hopper
+@skip_arm
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
@@ -542,12 +619,13 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx(disaggregated_test_root,
     env["TRTLLM_USE_UCX_KVCACHE"] = "1"
     env["UCX_TLS"] = "^ib"
     run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_fp8",
+                           "deepseek_v3_lite_fp8_ucx",
                            env=env,
                            cwd=llm_venv.get_working_directory())
 
 
 @skip_no_hopper
+@skip_arm
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
@@ -567,12 +645,13 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
     env["TRTLLM_USE_NIXL_KVCACHE"] = "1"
     env["UCX_TLS"] = "^ib"
     run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_fp8",
+                           "deepseek_v3_lite_fp8_nixl",
                            env=env,
                            cwd=llm_venv.get_working_directory())
 
 
 @skip_no_hopper
+@skip_arm
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu(
@@ -757,3 +836,67 @@ def test_disaggregated_deepseek_v3_lite_fp8_tp1_attention_dp_overlap_one_mtp(
         "deepseek_v3_lite_fp8_tp1_attention_dp_overlap_one_mtp",
         env=llm_venv._new_env,
         cwd=llm_venv.get_working_directory())
+
+
+@skip_no_hopper
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_bf16_cache_aware_balance(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    src_dst_dict = {
+        deepseek_v3_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/bf16",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "deepseek_v3_lite_bf16_cache_aware_balance",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@skip_no_hopper
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_bf16_conditional(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    src_dst_dict = {
+        deepseek_v3_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/bf16",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "deepseek_v3_lite_bf16_conditional",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@skip_no_hopper
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_fp8_tp1_two_mtp(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    src_dst_dict = {
+        deepseek_v3_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
+    }
+
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "deepseek_v3_lite_fp8_tp1_two_mtp",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())

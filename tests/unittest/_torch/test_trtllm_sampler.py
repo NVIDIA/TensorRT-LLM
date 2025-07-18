@@ -5,8 +5,8 @@ import pytest
 from utils.llm_data import llm_models_root
 from utils.util import similar
 
-from tensorrt_llm import SamplingParams
-from tensorrt_llm._torch import LLM
+from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm.llmapi import CudaGraphConfig
 from tensorrt_llm.llmapi import KvCacheConfig as TRT_KvCacheConfig
 
 
@@ -24,7 +24,7 @@ def model_path():
 
 def create_llm(model_dir):
     """Create LLM with specific overlap scheduler setting"""
-    pytorch_config = dict(use_cuda_graph=True, enable_trtllm_sampler=True)
+    pytorch_config = dict(enable_trtllm_sampler=True)
 
     trt_kv_cache_config = TRT_KvCacheConfig(enable_block_reuse=False)
 
@@ -33,6 +33,7 @@ def create_llm(model_dir):
         tensor_parallel_size=1,
         trust_remote_code=True,
         enable_chunked_prefill=True,
+        cuda_graph_config=CudaGraphConfig(),
         **pytorch_config,
         kv_cache_config=trt_kv_cache_config,
         max_num_tokens=
@@ -40,6 +41,7 @@ def create_llm(model_dir):
     )
 
 
+@pytest.mark.high_cuda_memory
 def test_trtllm_sampler(model_path, test_case):
     prompts = [
         "Magellan and Elcano lead the first",
@@ -77,4 +79,4 @@ def test_trtllm_sampler(model_path, test_case):
 
     # Verify outputs are consistent
     for text, expected in zip(texts, expected_outputs):
-        assert similar(text, expected)
+        assert similar(text, expected), f"text: {text}, expected: {expected}"

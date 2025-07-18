@@ -15,6 +15,8 @@
  */
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/kernelUtils.h"
 #include "tensorrt_llm/common/utils.h"
+#include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
+#include <list>
 
 namespace tensorrt_llm
 {
@@ -63,7 +65,8 @@ bool supportConfigCommon(XQAParams const& xqaParams, bool forConfigurePlugin)
         return false;
     }
     if (!contains({PositionEmbeddingType::kROPE_GPTJ, PositionEmbeddingType::kROPE_GPT_NEOX,
-                      PositionEmbeddingType::kROPE_M, PositionEmbeddingType::kLONG_ROPE},
+                      PositionEmbeddingType::kROPE_M, PositionEmbeddingType::kLONG_ROPE,
+                      PositionEmbeddingType::kLEARNED_ABSOLUTE, PositionEmbeddingType::kYARN},
             xqaParams.position_embedding_type))
     {
         return false;
@@ -167,6 +170,39 @@ bool supportConfigHMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlug
         return false;
     }
     if (xqaParams.paged_kv_cache && !contains({16, 32, 64, 128}, xqaParams.tokens_per_block))
+    {
+        return false;
+    }
+    return true;
+}
+
+bool supportConfigMLA(XQAParams const& xqaParams, int SM, bool forConfigurePlugin)
+{
+    if (!supportConfigCommon(xqaParams, forConfigurePlugin))
+    {
+        return false;
+    }
+    if (SM != kSM_120)
+    {
+        return false;
+    }
+    if (xqaParams.data_type != DATA_TYPE_E4M3)
+    {
+        return false;
+    }
+    if (xqaParams.kv_cache_data_type != DATA_TYPE_E4M3)
+    {
+        return false;
+    }
+    if (xqaParams.beam_width != 1)
+    {
+        return false;
+    }
+    if (!xqaParams.isMLA())
+    {
+        return false;
+    }
+    if (xqaParams.paged_kv_cache && !contains({8, 16, 32, 64, 128}, xqaParams.tokens_per_block))
     {
         return false;
     }

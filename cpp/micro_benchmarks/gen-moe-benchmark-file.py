@@ -14,7 +14,8 @@ template = '''{{
   {dtype_string}
   {routing_string}
   {tactic_string}
-  "bias": 0
+  "bias": 0,
+  "gemm_to_profile": {gemm_to_profile}
 }}'''
 
 
@@ -58,35 +59,46 @@ num_experts = 8
 k = 2
 hidden_size = 4096
 inter_size = 14336
-tp_size = 4
-ep_size = 1
+# tp_size = 8
+# ep_size = 1
 world_rank = 0
 act_fn = 3
 dtype_string = make_dtype_string()  # All dtypes
-routing_string = make_routing_string(
-    name="uniform",
-    is_distribution=True)  # Use the default uniform random distribution
 tactic_id1 = '"auto"'
 tactic_id2 = '"auto"'
+gemms_to_profile = [1, 2, 3]
 
 configs = []
-for num_tokens in [1, 8, 64, 2048, 65536]:
-    configs.append(
-        populate_benchmark_config(
-            num_experts=num_experts,
-            k=k,
-            hidden_size=hidden_size,
-            inter_size=inter_size,
-            tp_size=tp_size,
-            ep_size=ep_size,
-            world_rank=world_rank,
-            num_tokens=num_tokens,
-            act_fn=act_fn,
-            dtype_string=dtype_string,
-            routing_string=routing_string,
-            tactic_string=make_tactic_string(tactic_id1=tactic_id1,
-                                             tactic_id2=tactic_id2),
-        ))
+for ep_size in [1, num_experts]:
+    for num_tokens in [1, 8, 64, 2048, 16384]:
+        tp_size = 8 // ep_size
+        if inter_size % (tp_size * 128) != 0:
+            continue  # Insufficient alignment
+        if num_tokens <= num_experts:
+            routing_string = make_routing_string(
+                name="balanced",
+                is_distribution=False)  # Use the balanced distribution
+        else:
+            routing_string = make_routing_string(
+                name="uniform", is_distribution=True
+            )  # Use the default uniform random distribution
+        for gemm_to_profile in gemms_to_profile:
+            configs.append(
+                populate_benchmark_config(num_experts=num_experts,
+                                          k=k,
+                                          hidden_size=hidden_size,
+                                          inter_size=inter_size,
+                                          tp_size=tp_size,
+                                          ep_size=ep_size,
+                                          world_rank=world_rank,
+                                          num_tokens=num_tokens,
+                                          act_fn=act_fn,
+                                          dtype_string=dtype_string,
+                                          routing_string=routing_string,
+                                          tactic_string=make_tactic_string(
+                                              tactic_id1=tactic_id1,
+                                              tactic_id2=tactic_id2),
+                                          gemm_to_profile=gemm_to_profile))
 
 full_string = "[\n" + ",\n".join(configs) + "\n]"
 

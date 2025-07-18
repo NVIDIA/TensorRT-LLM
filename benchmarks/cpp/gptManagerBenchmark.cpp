@@ -829,6 +829,7 @@ texec::Request makeExecutorRequest(Sample const& sample, SizeType32 const& beamW
         std::nullopt,    // embeddingBias
         std::nullopt,    // speculativeDecoding
         std::nullopt,    // pTuning
+        std::nullopt,    // multimodalInput
         std::nullopt,    // multimodalEmbedding
         std::nullopt,    // mRopeConfig
         loraConfig,      // loraConfig

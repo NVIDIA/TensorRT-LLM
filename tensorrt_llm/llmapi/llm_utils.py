@@ -5,7 +5,6 @@ import shutil
 import tempfile
 import time
 import weakref
-from argparse import Namespace
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple, Union
@@ -30,10 +29,12 @@ from ..models.modeling_utils import PretrainedConfig, QuantAlgo, QuantConfig
 from ..module import Module
 from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
                           get_build_cache_config_from_env)
-from .llm_args import (CalibConfig, EagleDecodingConfig, KvCacheConfig, LlmArgs,
+from .llm_args import (CalibConfig, CudaGraphConfig, DraftTargetDecodingConfig,
+                       EagleDecodingConfig, KvCacheConfig, LlmArgs,
                        LookaheadDecodingConfig, MedusaDecodingConfig,
-                       MTPDecodingConfig, NGramDecodingConfig, _ModelFormatKind,
-                       _ModelWrapper, _ParallelConfig, get_model_format,
+                       MTPDecodingConfig, NGramDecodingConfig,
+                       UserProvidedDecodingConfig, _ModelFormatKind,
+                       _ModelWrapper, _ParallelConfig,
                        update_llm_args_with_extra_dict,
                        update_llm_args_with_extra_options)
 from .mpi_session import MPINodeState, MpiSession
@@ -108,8 +109,8 @@ class ModelLoader:
 
         self.model_obj = _ModelWrapper(self.llm_args.model)
         self.speculative_model_obj = _ModelWrapper(
-            self.llm_args.speculative_model
-        ) if self.llm_args.speculative_model is not None else None
+            self.llm_args.speculative_model_dir
+        ) if self.llm_args.speculative_model_dir is not None else None
 
         if isinstance(self.llm_args, TrtLlmArgs):
             self.convert_checkpoint_options = self.llm_args._convert_checkpoint_options
@@ -313,11 +314,6 @@ class ModelLoader:
             if tokenizer is not None:
                 tokenizer.save_pretrained(engine_dir)
 
-    @staticmethod
-    def get_model_format(model_dir: str) -> _ModelFormatKind:
-        ''' Get the format of the model.  '''
-        return get_model_format(model_dir)
-
     def _download_hf_model(self):
         ''' Download HF model from third-party model hub like www.modelscope.cn or huggingface.  '''
         model_dir = None
@@ -366,7 +362,11 @@ class ModelLoader:
 
             hf_quant_algo = hf_quant_config.pop("quant_algo", None)
             if hf_quant_algo is not None:
-                hf_quant_algo = QuantAlgo(hf_quant_algo)
+                # fp8_pb_wo from modelopt is the same as fp8_block_scales
+                if hf_quant_algo == "fp8_pb_wo":
+                    hf_quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+                else:
+                    hf_quant_algo = QuantAlgo(hf_quant_algo)
                 if quant_config.quant_algo is None:
                     logger.info(
                         f"Setting quant_algo={hf_quant_algo} form HF quant config."
@@ -405,6 +405,9 @@ class ModelLoader:
                 logger.info(f"Setting {key}={value} from HF quant config.")
                 setattr(quant_config, key, value)
 
+            # Update the quant_config in llm_args for pytorch
+            self.llm_args.quant_config = quant_config
+
             return True
 
         hf_config_path = f"{self._model_dir}/config.json"
@@ -438,8 +441,8 @@ class ModelLoader:
         model_cls = AutoModelForCausalLM.get_trtllm_model_class(
             self._model_dir, self.llm_args.trust_remote_code,
             self.llm_args.decoding_config.decoding_mode
-            if hasattr(self.llm_args, "speculative_model")
-            and self.llm_args.speculative_model else None)
+            if hasattr(self.llm_args, "speculative_model_dir")
+            and self.llm_args.speculative_model_dir else None)
 
         prequantized = self._update_from_hf_quant_config()
 
@@ -482,7 +485,7 @@ class ModelLoader:
                 load_model_on_cpu=
                 True,  # TODO:TRTLLM-195 to enhance the weights loading memory usage and chose best location
                 trust_remote_code=self.llm_args.trust_remote_code,
-                speculative_model=self._speculative_model_dir,
+                speculative_model_dir=self._speculative_model_dir,
                 speculative_config=self.llm_args.speculative_config
                 if not isinstance(self.llm_args.speculative_config,
                                   LookaheadDecodingConfig) else None,
@@ -565,21 +568,6 @@ class ModelLoader:
         self._engine = Engine.from_dir(self._model_dir)
 
     @staticmethod
-    def load_extra_build_configs_from_engine(
-            model_dir: str) -> Optional[Namespace]:
-        ''' Load the extra build configs from the engine directory, return None if model isn't an engine. '''
-        if ModelLoader.get_model_format(
-                model_dir) is not _ModelFormatKind.TLLM_ENGINE:
-            return None
-
-        with open(Path(model_dir) / "config.json", "r") as f:
-            engine_config = json.load(f)
-
-        build_config = engine_config['build_config']
-        build_config.pop("plugin_config")
-        return Namespace(**build_config)
-
-    @staticmethod
     def load_hf_tokenizer(
             model_dir,
             trust_remote_code: bool = True,
@@ -624,6 +612,9 @@ class CachedModelLoader:
         if self.llm_args.model_format is _ModelFormatKind.TLLM_ENGINE:
             return Path(self.llm_args.model), None
 
+        if self.llm_args.backend == "_autodeploy":
+            return None, ""
+
         self.engine_cache_stage: Optional[CachedStage] = None
 
         self._hf_model_dir = None
@@ -631,7 +622,7 @@ class CachedModelLoader:
         self.model_loader = ModelLoader(self.llm_args)
 
         if self.llm_args.backend is not None:
-            if self.llm_args.backend not in ["pytorch", "autodeploy"]:
+            if self.llm_args.backend not in ["pytorch", "_autodeploy"]:
                 raise ValueError(
                     f'backend {self.llm_args.backend} is not supported.')
 
@@ -735,7 +726,8 @@ class CachedModelLoader:
             self._hf_model_dir,
             mapping=self.llm_args.parallel_config.to_mapping(),
             quant_config=self.llm_args.quant_config,
-            dtype=self.llm_args.dtype)
+            dtype=self.llm_args.dtype,
+            trust_remote_code=self.llm_args.trust_remote_code)
 
     def _build_model(self) -> Path:
         model_format = self.llm_args.model_format
@@ -871,12 +863,15 @@ __all__ = [
     'MedusaDecodingConfig',
     'MTPDecodingConfig',
     'NGramDecodingConfig',
+    'DraftTargetDecodingConfig',
+    'UserProvidedDecodingConfig',
     'ContextChunkingPolicy',
     'CapacitySchedulerPolicy',
     'BuildConfig',
     'BuildCacheConfig',
     'QuantConfig',
     'CalibConfig',
+    'CudaGraphConfig',
     'KvCacheConfig',
     'CachedModelLoader',
     'EagleDecodingConfig',

@@ -123,6 +123,7 @@ In addition, older architectures can have limitations for newer software release
   - TensorRT-LLM requires Linux x86_64 or Linux aarch64.
 * - GPU Model Architectures
   -
+    - [NVIDIA GB200 NVL72](https://www.nvidia.com/en-us/data-center/gb200-nvl72/)
     - [NVIDIA Blackwell Architecture](https://www.nvidia.com/en-us/data-center/technologies/blackwell-architecture/)
     - [NVIDIA Grace Hopper Superchip](https://www.nvidia.com/en-us/data-center/grace-hopper-superchip/)
     - [NVIDIA Hopper Architecture](https://www.nvidia.com/en-us/data-center/technologies/hopper-architecture/)
@@ -142,9 +143,9 @@ The following table shows the supported software for TensorRT-LLM.
 * -
   - Software Compatibility
 * - Container
-  - [25.04](https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html)
+  - [25.05](https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html)
 * - TensorRT
-  - [10.10](https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html)
+  - [10.11](https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html)
 * - Precision
   -
     - Hopper (SM90) - FP32, FP16, BF16, FP8, INT8, INT4

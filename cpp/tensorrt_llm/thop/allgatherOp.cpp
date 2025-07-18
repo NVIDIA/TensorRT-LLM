@@ -55,56 +55,59 @@ public:
         return 0;
     }
 
-    torch::Tensor run(torch::Tensor input, torch::optional<torch::List<int64_t>> sizes)
-    {
-        TLLM_CHECK_WITH_INFO(mNcclComm.get() != nullptr, "mNcclComm should be initialized before used");
-        auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
-        auto type = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
-        std::vector<int64_t> outputShape = input.sizes().vec();
-        if (sizes.has_value())
-        {
-            outputShape[0] = std::accumulate(sizes.value().begin(), sizes.value().end(), 0, std::plus<>{});
-        }
-        else
-        {
-            outputShape[0] *= mGroup.size();
-        }
-        auto output = torch::empty(outputShape, input.options());
-        if (sizes.has_value())
-        {
-            size_t numel_base = std::accumulate(outputShape.cbegin() + 1, outputShape.cend(), 1, std::multiplies<>{});
-            int64_t split_offset = 0;
-            ncclGroupStart();
-            for (int root = 0; root < static_cast<int>(mGroup.size()); ++root)
-            {
-                auto split_size = sizes.value()[root];
-                NCCLCHECK_THROW(ncclBroadcast(input.data_ptr(),
-                    output.index({torch::indexing::Slice(split_offset, torch::indexing::None)}).mutable_data_ptr(),
-                    numel_base * split_size, (*getDtypeMap())[type], root, *mNcclComm, stream));
-                split_offset += split_size;
-            }
-            ncclGroupEnd();
-        }
-        else
-        {
-            NCCLCHECK_THROW(ncclAllGather(input.data_ptr(), output.mutable_data_ptr(), input.numel(),
-                (*getDtypeMap())[type], *mNcclComm, stream));
-        }
-        return output;
-    }
-
     std::vector<torch::Tensor> run_list(torch::TensorList input_list, torch::optional<torch::List<int64_t>> sizes)
     {
+        TLLM_CHECK_WITH_INFO(mNcclComm.get() != nullptr, "mNcclComm should be initialized before used");
+        bool use_nccl_allgather = !sizes.has_value()
+            || std::all_of(sizes.value().begin(), sizes.value().end(),
+                [&sizes](int64_t size) { return size == sizes.value()[0]; });
+        int64_t sum_sizes
+            = sizes.has_value() ? std::accumulate(sizes.value().begin(), sizes.value().end(), 0, std::plus<>{}) : 0;
         std::vector<torch::Tensor> output_list;
         output_list.reserve(input_list.size());
         ncclGroupStart();
         for (auto const& input : input_list)
         {
-            auto output = run(input, sizes);
+            auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+            auto type = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
+            std::vector<int64_t> outputShape = input.sizes().vec();
+            if (sizes.has_value())
+            {
+                outputShape[0] = sum_sizes;
+            }
+            else
+            {
+                outputShape[0] *= mGroup.size();
+            }
+            auto output = torch::empty(outputShape, input.options());
+            if (use_nccl_allgather)
+            {
+                ncclAllGather(input.data_ptr(), output.mutable_data_ptr(), input.numel(), (*getDtypeMap())[type],
+                    *mNcclComm, stream);
+            }
+            else
+            {
+                size_t numel_base
+                    = std::accumulate(outputShape.cbegin() + 1, outputShape.cend(), 1, std::multiplies<>{});
+                int64_t split_offset = 0;
+                for (int root = 0; root < static_cast<int>(mGroup.size()); ++root)
+                {
+                    auto split_size = sizes.value()[root];
+                    ncclBroadcast(input.data_ptr(),
+                        output.index({torch::indexing::Slice(split_offset, torch::indexing::None)}).mutable_data_ptr(),
+                        numel_base * split_size, (*getDtypeMap())[type], root, *mNcclComm, stream);
+                    split_offset += split_size;
+                }
+            }
             output_list.push_back(output);
         }
-        ncclGroupEnd();
+        NCCLCHECK_THROW(ncclGroupEnd());
         return output_list;
+    }
+
+    torch::Tensor run(torch::Tensor input, torch::optional<torch::List<int64_t>> sizes)
+    {
+        return run_list({input}, sizes)[0];
     }
 
 private:
@@ -155,8 +158,8 @@ std::vector<torch::Tensor> allgather_list(
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("allgather(Tensor input, int[]? sizes, int[] group) -> Tensor");
-    m.def("allgather_list(Tensor[] input_list, int[]? sizes, int[] group) -> Tensor[]");
+    m.def("allgather(Tensor input, SymInt[]? sizes, int[] group) -> Tensor");
+    m.def("allgather_list(Tensor[] input_list, SymInt[]? sizes, int[] group) -> Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

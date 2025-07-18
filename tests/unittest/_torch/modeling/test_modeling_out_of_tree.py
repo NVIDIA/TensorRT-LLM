@@ -2,7 +2,7 @@ import unittest
 
 from parameterized import parameterized
 
-from tensorrt_llm._torch import LLM
+from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -23,14 +23,14 @@ class TestOutOfTree(unittest.TestCase):
             sys.path.append(
                 os.path.join(
                     os.path.dirname(__file__),
-                    '../../../../examples/pytorch/out_of_tree_example'))
+                    '../../../../examples/llm-api/out_of_tree_example'))
             import modeling_opt  # noqa
 
         model_dir = str(llm_models_root() / "opt-125m")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
 
         if not import_oot_code:
-            with self.assertRaises(ValueError):
+            with self.assertRaises(RuntimeError):
                 # estimate_max_kv_cache_tokens will create a request of max_num_tokens for forward.
                 # Default 8192 will exceed the max length of absolute positional embedding in OPT, leading to out of range indexing.
                 llm = LLM(model=model_dir,

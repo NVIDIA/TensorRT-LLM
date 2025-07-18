@@ -54,8 +54,8 @@ void logitsBitmask(std::vector<torch::Tensor> const& logits, std::vector<torch::
         bitmaskPtrsHost[i] = reinterpret_cast<uint64_t>(bitmask[i].data_ptr());
     }
 
-    auto logitsPtrs = logitsPtrsHost.to(torch::kCUDA);
-    auto bitmaskPtrs = bitmaskPtrsHost.to(torch::kCUDA);
+    auto logitsPtrs = logitsPtrsHost.to(torch::kCUDA, /*non_blocking=*/true);
+    auto bitmaskPtrs = bitmaskPtrsHost.to(torch::kCUDA, /*non_blocking=*/true);
 
     auto stream = at::cuda::getCurrentCUDAStream(logits[0].get_device()).stream();
 
