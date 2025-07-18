@@ -1797,6 +1797,15 @@ class TorchCompileConfig(BaseModel):
         description=
         "The maximum number of CUDA streams to use for torch.compile.")
 
+    @field_validator('max_num_streams')
+    @classmethod
+    def validate_torch_compile_max_num_streams(cls, v):
+        """Validate torch_compile_config.max_num_streams >= 1."""
+        if v < 1:
+            raise ValueError(
+                "torch_compile_config.max_num_streams must be >= 1")
+        return v
+
 
 class TorchLlmArgs(BaseLlmArgs):
     # Just a dummy BuildConfig to allow code reuse with the TrtLlmArgs

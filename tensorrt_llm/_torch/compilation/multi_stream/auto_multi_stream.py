@@ -1,3 +1,4 @@
+import time
 from dataclasses import dataclass, field
 from operator import getitem
 from queue import PriorityQueue
@@ -13,7 +14,7 @@ from ..utils import inplace_info
 
 def is_symint_node(node: Node) -> bool:
     if node is not None and 'val' in node.meta:
-        # This is a symint cal happen on host. No need to count time on stream.
+        # This is a symint call that happens on host. No need to count time on stream.
         if isinstance(node.meta['val'], torch.SymInt):
             return True
     return False
@@ -23,7 +24,7 @@ def estimate_time(node: Node) -> int:
     if node is None:
         return 0
     if is_symint_node(node):
-        # This is a symint cal happen on host. No need to count time on stream.
+        # This is a symint call that happens on host. No need to count time on stream.
         return 0
 
     # Add cost model for ops that need special handling.
@@ -45,7 +46,7 @@ def estimate_time(node: Node) -> int:
         torch.ops.trtllm.nvfp4_gemm.default,
         torch.ops.trtllm.fp8_batched_gemm_trtllmgen.default,
         torch.ops.trtllm.w4a8_mxfp4_fp8_gemm.default,
-        torch.ops.trtllm.w4a16_gemm.default,
+        torch.ops.trtllm.finegrained_mixed_dtype_gemm.default,
         torch.ops.trtllm.bmm_out.default,
         torch.ops.trtllm.cublas_scaled_mm.default,
         torch.ops.trtllm.cublas_mm.default,
@@ -68,16 +69,20 @@ def estimate_time(node: Node) -> int:
     # is correctly scheduled. Adjust the estimation or add new ones
     # if the stream assignment is not desired.
 
+    MOE_OP_COST = 20
+    GEMM_OP_COST = 10
+    DEFAULT_OP_COST = 1
+
     # Adjust MOE weight to make the router -> MOE key path
     if node.op == "call_function" and node.target in moe_ops:
-        return 20
+        return MOE_OP_COST
 
     # GEMM ops
     if node.op == "call_function" and node.target in gemm_ops:
-        return 10
+        return GEMM_OP_COST
 
     # Refine the estimation of time for nodes.
-    return 1
+    return DEFAULT_OP_COST
 
 
 @dataclass
@@ -156,6 +161,20 @@ class MultiStreamDAG:
         latest_inplace_stat = {}
         inplace_map = inplace_info()
 
+        def flatten_args(args):
+            """Recursively flatten nested arguments into a flat list."""
+            args_new = []
+            stack = list(args)
+            while stack:
+                arg = stack.pop()
+                if isinstance(arg, dict):
+                    stack.extend(arg.values())
+                elif isinstance(arg, (list, tuple)):
+                    stack.extend(arg)
+                else:
+                    args_new.append(arg)
+            return args_new
+
         # Pop all the placeholders from gm
         # We know that the node is already in topological order
         for node in gm.graph.nodes:
@@ -164,24 +183,8 @@ class MultiStreamDAG:
                 self.placeholders.append(node)
                 continue
 
-            args = [a for a in node.args] + [a for a in node.kwargs.values()]
-
-            changed = True
-            while changed:
-                changed = False
-                args_new = []
-                for arg in args:
-                    if isinstance(arg, dict):
-                        for v in arg.values():
-                            args_new.append(v)
-                        changed = True
-                    elif isinstance(arg, (list, tuple)):
-                        for item in arg:
-                            args_new.append(item)
-                        changed = True
-                    else:
-                        args_new.append(arg)
-                args = args_new
+            args = flatten_args([a for a in node.args] +
+                                [a for a in node.kwargs.values()])
 
             in_edges = dict()
             for arg in args:
@@ -423,16 +426,14 @@ def multi_stream_schedule(gm: GraphModule, max_num_streams: int) -> int:
 
 # Following code is for debug purpose. Use print_dag_to_dot to print a MultiStreamDAG to dot file.
 
-call_cnt = 0
 
-
-def dump_dag_as_dot(dag: MultiStreamDAG) -> None:
-    global call_cnt
+def dump_dag_as_dot(dag: MultiStreamDAG, max_num_nodes: int = 500) -> None:
     COLORS = [
         "red", "chocolate", "cyan", "gold", "coral", "green", "blue", "orange",
         "purple", "brown"
     ]
-    with open(f"{call_cnt}.dot", 'w') as f:
+    filename = f"dag_{int(time.time())}.dot"
+    with open(filename, 'w') as f:
         f.write("digraph G {\n")
         f.write(
             f"id_entry [label=\"node=entry, distance={dag.entry_node.distance}\"]\n"
@@ -441,15 +442,15 @@ def dump_dag_as_dot(dag: MultiStreamDAG) -> None:
         for node in dag.nodes.values():
             color = "white" if node.stream is None else COLORS[node.stream.id]
             f.write(
-                f"id_{dag.node_to_id[node.node]} [label=\"node={node.node}, distance={node.distance}, weight={node.weight}\", color={color}, shape=oval]\n"
-            )
+                f"id_{dag.node_to_id[node.node]} [label=\"node={node.node}, "
+                f"distance={node.distance}, weight={node.weight}\", "
+                f"color={color}, shape=oval]\n")
             for in_edge in node.in_edges.values():
                 id = str(dag.node_to_id[
                     in_edge.node]) if in_edge.node is not None else "entry"
                 f.write(f"id_{id} -> id_{dag.node_to_id[node.node]}\n")
-            if cnt > 500:
+            if cnt > max_num_nodes:
                 break
             cnt += 1
         f.write("}\n")
         f.flush()
-        call_cnt += 1
