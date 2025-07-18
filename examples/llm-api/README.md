@@ -41,7 +41,7 @@ python3 quickstart_advanced.py \
     --model_dir meta-llama/Llama-3.1-8B-Instruct \
     --spec_decode_algo NGRAM \
     --max_matching_ngram_size=2 \
-    --spec_decode_nextn=4 \
+    --spec_decode_max_draft_len=4 \
     --disable_overlap_scheduler
 ```
 
@@ -50,7 +50,7 @@ python3 quickstart_advanced.py \
 python3 quickstart_advanced.py \
     --model_dir meta-llama/Llama-3.1-8B-Instruct \
     --spec_decode_algo draft_target \
-    --spec_decode_nextn 5 \
+    --spec_decode_max_draft_len 5 \
     --draft_model_dir meta-llama/Llama-3.2-1B-Instruct \
     --disable_overlap_scheduler
     --disable_kv_cache_reuse

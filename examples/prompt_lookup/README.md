@@ -91,5 +91,5 @@ python examples/summarize.py \
 ```bash
 python3 examples/llm-api/quickstart_advanced.py \
     --max_matching_ngram_size=2 \
-    --spec_decode_nextn=4
+    --spec_decode_max_draft_len=4
 ```
