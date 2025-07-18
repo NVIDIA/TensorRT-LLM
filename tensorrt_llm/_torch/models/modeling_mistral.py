@@ -296,6 +296,8 @@ class Mistral3VLM(PreTrainedModel):
 
         llm_model_config = self._get_sub_model_config(model_config,
                                                       "text_config")
+        # This is necessary for the auto weight mapper to figure out what it needs.
+        llm_model_config.pretrained_config.architectures = config.architectures
         self.llm = MistralForCausalLM(llm_model_config)
 
         self._device = "cuda"
