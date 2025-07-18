@@ -158,6 +158,16 @@ class BatchStatePP(BatchState):
     microbatch_id: int = -1
 
 
+@dataclasses.dataclass
+class PausedRequest:
+    py_request_id: int
+    origin_prompt_len: int
+    prompt_len: int
+    max_new_tokens: int
+    pause_time: datatime.datatime
+    evicted_prompt_len: int = 0
+
+
 class PyExecutor:
 
     def __init__(self,
@@ -280,6 +290,7 @@ class PyExecutor:
                 "Please disable disagg/pipeline parallelism/overlap scheduler.")
 
         self.garbage_collection_gen0_threshold = garbage_collection_gen0_threshold
+        self.paused_requests = {}
 
         self.worker_started = False
         self.worker_lock = threading.Lock()
@@ -1549,6 +1560,14 @@ class PyExecutor:
                         context_requests = scheduler_output.context_requests
 
         scheduled_requests.context_requests = context_requests
+        now = datetime.datetime.now()
+        for req in context_requests:
+            if req.py_request_id in self.paused_requests:
+                paused_req = self.paused_requests.pop(req.py_request_id)
+                print(
+                    f"Pause request {paused_req} is scheduled again after {now - paused_req.pause_time}."
+                )
+
         scheduled_requests.generation_requests = scheduler_output.generation_requests
         scheduled_requests.paused_requests = scheduler_output.paused_requests
         return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, scheduler_output.num_fitting_requests
@@ -2195,8 +2214,18 @@ class PyExecutor:
         #       Currently, self.inflight_req_ids is not.
         max_input_len = self.max_input_len
         for req in requests_to_pause:
+            paused_req = PausedRequests(py_request_id=req.py_request_id,
+                                        orig_prompt_len=req.py_orig_prompt_len,
+                                        prompt_len=req.py_prompt_len,
+                                        max_new_tokens=req.py_max_new_tokens,
+                                        pause_time=datatime.datatime.now())
             req.pause(max_input_len)
             self._terminate_request(req)
+            paused_req.evicted_prompt_len = paused_req.max_new_tokens - req.py_max_new_tokens
+            self.paused_requests[req.py_request_id] = paused_req
+            print(
+                f"Pause request {paused_req} is scheduled again after {now - paused_req.pause_time}."
+            )
 
     def _add_inflight_ids(self, scheduled_requests):
         """Add reqids of current requests to self.inflight_req_ids."""
