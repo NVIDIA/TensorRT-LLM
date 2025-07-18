@@ -1,4 +1,3 @@
-import requests
 import json
 from typing import List, Optional
 import asyncio
@@ -17,7 +16,7 @@ class APIDrafter(Drafter):
         self,
         spec_config: "ExternalAPIConfig",
     ):
-        super().__init__(spec_resource_manager=None)
+        super().__init__()
         self.max_draft_len = spec_config.max_draft_len
         self.endpoint = spec_config.endpoint
         assert self.endpoint is not None, "API endpoint is required for external API speculative decoding."
@@ -49,7 +48,7 @@ class APIDrafter(Drafter):
                 return []
         
         if not isinstance(current, list):
-            logger.warning(f"API response '{self.response_field}' must be a list. For request {request_id}, got type: {type(current)}")
+            logger.warning(f"API response '{self.response_field}' must be a list. Got type: {type(current)}")
             return []
         return current
     
@@ -92,7 +91,6 @@ class APIDrafter(Drafter):
             
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse JSON response for request {request_id}: {e}")
-            logger.debug(f"Raw response: {response.text[:500]}...")
             return []
 
         except Exception as e:
@@ -102,6 +100,7 @@ class APIDrafter(Drafter):
     async def prepare_draft_tokens(
         self,
         scheduled_requests: ScheduledRequests,
+        resource_manager: None,
     ) -> None:
         # Sort by request_id when py_batch_idx is None as a fallback.
         # This happens in the disagg case: for a set of new requests, we draft
@@ -123,7 +122,14 @@ class APIDrafter(Drafter):
             )
             tasks.append(task)
         
-        all_draft_tokens = await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            all_draft_tokens = await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True), 
+                timeout=10.0
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout occurred while getting draft tokens for batch of requests")
+            all_draft_tokens = [[] for _ in tasks]
 
         for request, draft_tokens in zip(sorted_requests, all_draft_tokens):
             if isinstance(draft_tokens, Exception):

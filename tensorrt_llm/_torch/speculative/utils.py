@@ -100,7 +100,7 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
     if spec_dec_mode.is_user_provided():
         return spec_config.resource_manager
     if spec_dec_mode.is_external_api():
-        return drafter.spec_resource_manager
+        return None
     return None
 
 
