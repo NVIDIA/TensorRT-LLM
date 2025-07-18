@@ -28,11 +28,8 @@ from tensorrt_llm.logger import logger
 
 from ..distributed import Distributed
 from ..speculative.drafter import Drafter
-<<<<<<< HEAD
-from .guided_decoder import GuidedDecoder
-=======
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
->>>>>>> 00d9fed4c (Add executorRequestQueue)
+from .guided_decoder import GuidedDecoder
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
                           LlmResponse)
@@ -1115,31 +1112,7 @@ class PyExecutor:
         self.expected_num_active_requests = self.executor_request_queue.get_expected_num_active_requests(
         )
 
-<<<<<<< HEAD
-            # In disaggregated serving, we might get either context request or
-            # generation request. In IFB, we only get context request from request queue
-            # In IFB, we only get context request from request queue
-
-            if self.kv_cache_transceiver:
-                for req_item in new_requests_cur_rank:
-                    if req_item.request.request_type == RequestType.REQUEST_TYPE_CONTEXT_ONLY:
-                        self.has_context_request = True
-                        break
-            else:
-                self.has_context_request = len(new_requests_cur_rank) > 0
-            self._update_new_active_requests_queue_latency(
-                new_requests_cur_rank)
-
-        self.num_fetch_requests = self.num_fetch_requests + num_new_requests_all_ranks
-        self.num_fetch_requests_cur_rank = self.num_fetch_requests_cur_rank + len(
-            new_requests_cur_rank)
-
-        new_requests_cur_rank = self._merge_requests(new_requests_cur_rank)
-        self.active_requests.extend(new_requests_cur_rank)
-        return new_requests_cur_rank
-=======
         return new_requests
->>>>>>> e173f8665 (Refactor fetching request logic)
 
     def _add_kv_cache_events(self):
         kv_cache_manager = self.resource_manager.resource_managers.get(

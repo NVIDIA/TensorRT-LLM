@@ -110,13 +110,9 @@ def test_enqueue_request_with_query(executor_queue):
     assert req_id == 8
 
     # Verify the item was enqueued with query
-    # Note: There's a bug in the original code where query gets passed as is_canceled_request
-    # This test documents the current behavior
     item = executor_queue.request_queue.get_nowait()
     assert item.id == req_id
     assert item.request == mock_request
-    # Due to the bug in the original code, query won't be set correctly
-    # assert item.query == query_data  # This would fail due to the bug
 
 
 def test_enqueue_cancel_request(executor_queue):
@@ -417,14 +413,7 @@ def test_full_workflow(integration_queue):
     # Filter and validate
     valid_items = integration_queue._validate_and_filter_requests(items)
 
-    # Should have 2 valid requests (one was canceled, excluding the cancel request itself)
-    # The _validate_and_filter_requests processes cancel requests but doesn't include them in valid_items
-    # So we should have 3 original requests, minus 1 canceled = 2 valid requests
-    # However the actual count is 3 because the cancelled request itself is not in items
-    # We get 3 regular requests, 1 cancel instruction - cancel removes one, so 2 remaining
-    # But cancel instruction just adds to canceled_req_ids, doesn't remove from valid items
-    assert len(valid_items
-               ) == 3  # All 3 requests are valid, cancel instruction separate
+    assert len(valid_items) == 3
     assert req_ids[1] in integration_queue.canceled_req_ids
 
 
