@@ -540,7 +540,7 @@ def fp8_block_scale_moe_runner(
 
 @fp8_block_scale_moe_runner.register_fake
 def _(
-    rrouting_logits: torch.Tensor,
+    routing_logits: torch.Tensor,
     routing_bias: torch.Tensor,
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor,
