@@ -60,6 +60,7 @@ class RequestQueueItem:
     request: Optional[ExecutorRequest] = None
     is_canceled_request: bool = False
     query: Optional[list] = None  # only used in `StarAttention`
+    child_req_ids: Optional[List[int]] = None  # for num_return_sequences > 1
 
     @property
     def is_shutdown_request(self):
@@ -237,7 +238,7 @@ class PyExecutor:
         # enqueue and _fetch_new_requests used data
         self.enqueue_lock = threading.Lock()
         self.active = True
-        self.next_req_id = max_batch_size  # The first max_batch_size request IDs are reserved for dummy requests
+        self._next_req_id = max_batch_size  # The first max_batch_size request IDs are reserved for dummy requests
         self.max_beam_width = max_beam_width
         self.max_draft_len = max_draft_len
         self.print_log = model_engine.pytorch_backend_config.print_iter_log
@@ -351,6 +352,32 @@ class PyExecutor:
     def __exit__(self):
         self.shutdown()
 
+    def _get_request_id(self):
+        # (next_req_id + 1) % UINT64_MAX
+        self._next_req_id = (self._next_req_id + 1) & ((1 << 64) - 1)
+        return self._next_req_id
+
+    def _generate_child_request_ids(
+            self, request: ExecutorRequest) -> List[int] | None:
+        """ Generate child request IDs if needed. """
+        child_req_ids = None
+        sampling_config = request.sampling_config
+        beam_width = (sampling_config.beam_width
+                      if sampling_config.beam_width else 1)
+        num_return_sequences = (sampling_config.num_return_sequences
+                                if sampling_config.num_return_sequences else 1)
+
+        # Create child requests if beam_width == 1 and num_return_sequences > 1.
+        if beam_width == 1 and num_return_sequences > 1:
+            child_req_ids = []
+            for _ in range(num_return_sequences - 1):
+                child_req_id = self._get_request_id()
+                if self.enable_iter_perf_stats:
+                    self.start_times[child_req_id] = time.time()
+                child_req_ids.append(child_req_id)
+
+        return child_req_ids
+
     def enqueue_requests(self, requests: List[ExecutorRequest]):
         """
         Enqueue new requests
@@ -359,13 +386,20 @@ class PyExecutor:
         try:
             self.enqueue_lock.acquire()
             assert self.active, "PyExecutor has already been shutdown."
-            start_time = time.time()
             for request in requests:
-                self.start_times[self.next_req_id] = start_time
+                req_id = self._get_request_id()
+
+                if self.enable_iter_perf_stats:
+                    self.start_times[req_id] = time.time()
+
+                # Reserve child request ids if needed.
+                child_req_ids = self._generate_child_request_ids(request)
                 self.request_queue.put(
-                    RequestQueueItem(self.next_req_id, request))
-                req_ids.append(self.next_req_id)
-                self.next_req_id += 1
+                    RequestQueueItem(req_id,
+                                     request,
+                                     query=None,
+                                     child_req_ids=child_req_ids))
+                req_ids.append(req_id)
         finally:
             self.enqueue_lock.release()
         return req_ids
@@ -406,6 +440,12 @@ class PyExecutor:
                 RequestQueueItem(id, is_canceled_request=True))
         finally:
             self.enqueue_lock.release()
+
+        # Also cancel all child requests if this is a parent request
+        # Look through active requests to find child requests
+        for request in self.active_requests:
+            if request.py_parent_request_id == id:
+                self.canceled_req_ids.insert(request.py_request_id)
 
     def shutdown(self):
         """
@@ -475,15 +515,19 @@ class PyExecutor:
         try:
             self.enqueue_lock.acquire()
             assert self.active, "PyExecutor has already been shutdown."
-            req_id = self.next_req_id
+            # Allocate the main request ID first
+            req_id = self._get_request_id()
+
             if self.enable_iter_perf_stats:
                 self.start_times[req_id] = time.time()
 
-            if query is not None:
-                self.request_queue.put(RequestQueueItem(req_id, request, query))
-            else:
-                self.request_queue.put(RequestQueueItem(req_id, request))
-            self.next_req_id += 1
+            # Reserve child request ids if needed.
+            child_req_ids = self._generate_child_request_ids(request)
+            self.request_queue.put(
+                RequestQueueItem(req_id,
+                                 request,
+                                 query=query,
+                                 child_req_ids=child_req_ids))
         finally:
             self.enqueue_lock.release()
         return req_id
@@ -1455,6 +1499,9 @@ class PyExecutor:
                                        new_requests: list[RequestQueueItem]):
         result = []
         for req_item in new_requests:
+            assert req_item.child_req_ids is None, (
+                "Star attention does not yet support sampling_config.num_return_sequences > 1"
+            )
             req_id, exe_req, query_token_ids = req_item.id, req_item.request, req_item.query
             ctx_len0 = len(exe_req.input_token_ids)
             ctx_blocks, position_blocks, last_block_padding_num = [
@@ -1520,12 +1567,18 @@ class PyExecutor:
             else:
                 raise NotImplementedError(f'unsupport cp type {cp_type}')
         else:
-            return [
-                executor_request_to_llm_request(
+            llm_reqs = []
+            for req_item in new_requests:
+                llm_req = executor_request_to_llm_request(
                     req_item.id, req_item.request,
                     self._should_exclude_last_generation_logits())
-                for req_item in new_requests
-            ]
+                if req_item.child_req_ids:
+                    # Create subrequests for n-returns using pre-generated child request ids.
+                    for child_req_id in req_item.child_req_ids:
+                        child_req = llm_req.create_child_request(child_req_id)
+                        llm_reqs.append(child_req)
+                llm_reqs.append(llm_req)
+            return llm_reqs
 
     @nvtx_range("_schedule")
     def _schedule(self):
@@ -1855,7 +1908,7 @@ class PyExecutor:
                     if req_id in self.responses.keys():
                         self.responses[req_id].append(resp)
                     else:
-                        self.responses.update({req_id: [resp]})
+                        self.responses[req_id] = [resp]
                 self.response_cv.notify_all()
 
     @nvtx_range("_handle_first_token_response")
@@ -1886,7 +1939,7 @@ class PyExecutor:
                 requests_to_terminate.append(request)
                 continue
 
-            if request.is_generation_only_request():
+            if request.is_generation_only():
                 # If request is in transmission, so we don't need to emit a response
                 # Also, for the first iteration with overlap, we should skip since first
                 # token has already been emitted previously
@@ -1907,7 +1960,7 @@ class PyExecutor:
                     request.py_decoding_iter % self.stream_interval == 0:
                 response = request.create_response(False, self.dist.rank)
                 if response:
-                    request_done = response.result.is_final
+                    request_done = request.is_finished
                     new_responses.update({req_id: response})
 
             if request_done:
