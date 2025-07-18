@@ -355,6 +355,7 @@ class TransformerBlock(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = ...,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
@@ -369,6 +370,11 @@ class TransformerBlock(DecoderLayer):
         x, residual = self.post_attention_layernorm(x, residual)
 
         x, residual = self.mlp(x, attn_metadata, residual)
+
+        if spec_metadata is not None:
+            spec_metadata.maybe_capture_hidden_states(self.layer_idx, x,
+                                                      residual)
+
         x, residual = self.next_layer_layernorm(x, residual)
         return x, residual
 
@@ -378,6 +384,7 @@ class TransformerBlock(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = ...,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
@@ -404,15 +411,30 @@ class TransformerBlock(DecoderLayer):
 
         x, residual = self.mlp(x, attn_metadata, residual)
 
-        x, residual = self.allreduce(
-            x,
-            all_reduce_params=AllReduceParams(
-                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                residual=residual,
-                norm_weight=self.next_layer_layernorm.weight,
-                eps=self.next_layer_layernorm.variance_epsilon,
-                trigger_completion_at_end=False,
-            ))
+        if spec_metadata is not None and spec_metadata.is_layer_capture(
+                self.layer_idx):
+            # In eagle3 mode, we capture the value in the boundary of decoder layer.
+            # If fusing rms in the next layer, the value is not correct. Thus, if
+            # this layer will be captured, we should not fuse the rms in the next
+            # layer.
+            x = self.allreduce(x,
+                               all_reduce_params=AllReduceParams(
+                                   fusion_op=AllReduceFusionOp.NONE,
+                                   trigger_completion_at_end=False,
+                               ))
+            spec_metadata.maybe_capture_hidden_states(self.layer_idx, x,
+                                                      residual)
+            x, residual = self.next_layer_layernorm(x, residual)
+        else:
+            x, residual = self.allreduce(
+                x,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    residual=residual,
+                    norm_weight=self.next_layer_layernorm.weight,
+                    eps=self.next_layer_layernorm.variance_epsilon,
+                    trigger_completion_at_end=False,
+                ))
 
         return x, residual
 
@@ -422,13 +444,18 @@ class TransformerBlock(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = ...,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if self.is_tp:
             _forward = self.forward_tp
         else:
             _forward = self.forward_normal
-        return _forward(position_ids, hidden_states, attn_metadata, residual,
+        return _forward(position_ids,
+                        hidden_states,
+                        attn_metadata,
+                        residual,
+                        spec_metadata=spec_metadata,
                         **kwargs)
 
 
@@ -487,18 +514,15 @@ class Transformer(DecoderModel):
         hidden_states = inputs_embeds or self.embedding(input_ids)
 
         residual = None
-        for i, block in enumerate(self.block):
+        for block in self.block:
             hidden_states, residual = block(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 residual=residual,
                 mrope_config=mrope_config,
+                spec_metadata=spec_metadata,
             )
-
-            if spec_metadata is not None:
-                spec_metadata.maybe_capture_hidden_states(
-                    i, hidden_states, residual)
 
         return hidden_states
 
