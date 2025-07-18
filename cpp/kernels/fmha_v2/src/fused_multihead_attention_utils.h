@@ -441,6 +441,8 @@ static inline void extract_and_transpose_output(void* dst_, void* src_, std::vec
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 static inline void store_q_and_contiguous_kv_cache(void* q_d, // [B, S, H, D]
+    void* k_d,                                                // [B, S, H_kv, D]
+    void* v_d,                                                // [B, S, H_kv, Dv]
     void* contiguous_kv_h,                                    // [B, S, 2, H, D]
     void* contiguous_kv_d,                                    // [B, S, 2, H, D]
     float const* qkv_packed_src,                              // [B, S, H, 3, D]
@@ -485,19 +487,21 @@ static inline void store_q_and_contiguous_kv_cache(void* q_d, // [B, S, H, D]
         }
     }
     FMHA_CHECK_CUDA(cudaMemcpy(q_d, q_tmp, q_sz, cudaMemcpyDefault));
+    free(q_tmp);
 
-    // DeepSeek MLA only use paged kv for now, will enable it in the future
-    if (d != dv)
-    {
-        return;
-    }
     // Handle contiguous KV [B, S, 2, H, D].
     // Group head size.
     int h_q_per_kv = h_q / h_kv;
     // The total number of kv tokens.
     size_t const total_kv_tokens = cu_kv_seqlens[b];
     // The kv cache size in bytes.
-    size_t const kv_size_in_bytes = get_size_in_bytes(total_kv_tokens * 2 * h_kv * d, dtype);
+    size_t const kv_size_in_bytes = get_size_in_bytes(total_kv_tokens * h_kv * (d + dv), dtype);
+    // Handle Separate K and V.
+    size_t k_size_in_bytes = get_size_in_bytes(total_kv_tokens * h_kv * d, dtype);
+    void* k_h = (void*) malloc(k_size_in_bytes);
+    size_t v_size_in_bytes = get_size_in_bytes(total_kv_tokens * h_kv * dv, dtype);
+    void* v_h = (void*) malloc(v_size_in_bytes);
+
     // Batch size.
     for (size_t bi = 0; bi < b; bi++)
     {
@@ -506,37 +510,61 @@ static inline void store_q_and_contiguous_kv_cache(void* q_d, // [B, S, H, D]
         // The actual kv sequence length.
         int const actual_kv_seqlen = cu_kv_seqlens[bi + 1] - cu_kv_seqlens[bi];
         // [B, S, H, 3, D]
-        float const* kv_packed_src = qkv_packed_src + seqlen_offset * h_q * 3 * d;
+        float const* kv_packed_src = qkv_packed_src + seqlen_offset * h_q * (2 * d + dv);
         // Head.
         for (size_t hi = 0; hi < h_kv; hi++)
         {
             // Sequence.
             for (size_t si = 0; si < actual_kv_seqlen; si++)
             {
-                // Head size.
+                // K
+                size_t dst_k_offset_1 = (seqlen_offset + si) * h_kv * (d + dv) + hi * d;
+                size_t dst_k_offset_2 = (seqlen_offset + si) * h_kv * d + hi * d;
+                size_t src_k_offset = (si * h_q + hi * h_q_per_kv) * (2 * d + dv) + d;
                 for (size_t di = 0; di < d; di++)
                 {
-                    size_t dst_k_offset = (seqlen_offset + si) * 2 * h_kv * d + hi * d + di;
-                    size_t dst_v_offset = dst_k_offset + h_kv * d;
-                    size_t src_k_offset = si * h_q * 3 * d + hi * h_q_per_kv * 3 * d + di + d;
-                    size_t src_v_offset = src_k_offset + d;
                     switch (dtype)
                     {
                     case DATA_TYPE_FP16:
-                        reinterpret_cast<half*>(contiguous_kv_h)[dst_k_offset] = half(kv_packed_src[src_k_offset]);
-                        reinterpret_cast<half*>(contiguous_kv_h)[dst_v_offset] = half(kv_packed_src[src_v_offset]);
+                        reinterpret_cast<half*>(contiguous_kv_h)[dst_k_offset_1 + di]
+                            = reinterpret_cast<half*>(k_h)[dst_k_offset_2 + di]
+                            = half(kv_packed_src[src_k_offset + di]);
                         break;
                     case DATA_TYPE_BF16:
-                        reinterpret_cast<__nv_bfloat16*>(contiguous_kv_h)[dst_k_offset]
-                            = __float2bfloat16(kv_packed_src[src_k_offset]);
-                        reinterpret_cast<__nv_bfloat16*>(contiguous_kv_h)[dst_v_offset]
-                            = __float2bfloat16(kv_packed_src[src_v_offset]);
+                        reinterpret_cast<__nv_bfloat16*>(contiguous_kv_h)[dst_k_offset_1 + di]
+                            = reinterpret_cast<__nv_bfloat16*>(k_h)[dst_k_offset_2 + di]
+                            = __float2bfloat16(kv_packed_src[src_k_offset + di]);
                         break;
                     case DATA_TYPE_E4M3:
-                        reinterpret_cast<__nv_fp8_e4m3*>(contiguous_kv_h)[dst_k_offset]
-                            = __nv_fp8_e4m3(kv_packed_src[src_k_offset]);
-                        reinterpret_cast<__nv_fp8_e4m3*>(contiguous_kv_h)[dst_v_offset]
-                            = __nv_fp8_e4m3(kv_packed_src[src_v_offset]);
+                        reinterpret_cast<__nv_fp8_e4m3*>(contiguous_kv_h)[dst_k_offset_1 + di]
+                            = reinterpret_cast<__nv_fp8_e4m3*>(k_h)[dst_k_offset_2 + di]
+                            = __nv_fp8_e4m3(kv_packed_src[src_k_offset + di]);
+                        break;
+                    default: assert(false);
+                    }
+                }
+                // V
+                size_t dst_v_offset_1 = (seqlen_offset + si) * h_kv * (d + dv) + h_kv * d + hi * dv;
+                size_t dst_v_offset_2 = (seqlen_offset + si) * h_kv * dv + hi * dv;
+                size_t src_v_offset = src_k_offset + d;
+                for (size_t di = 0; di < dv; di++)
+                {
+                    switch (dtype)
+                    {
+                    case DATA_TYPE_FP16:
+                        reinterpret_cast<half*>(contiguous_kv_h)[dst_v_offset_1 + di]
+                            = reinterpret_cast<half*>(v_h)[dst_v_offset_2 + di]
+                            = half(kv_packed_src[src_v_offset + di]);
+                        break;
+                    case DATA_TYPE_BF16:
+                        reinterpret_cast<__nv_bfloat16*>(contiguous_kv_h)[dst_v_offset_1 + di]
+                            = reinterpret_cast<__nv_bfloat16*>(v_h)[dst_v_offset_2 + di]
+                            = __float2bfloat16(kv_packed_src[src_v_offset + di]);
+                        break;
+                    case DATA_TYPE_E4M3:
+                        reinterpret_cast<__nv_fp8_e4m3*>(contiguous_kv_h)[dst_v_offset_1 + di]
+                            = reinterpret_cast<__nv_fp8_e4m3*>(v_h)[dst_v_offset_2 + di]
+                            = __nv_fp8_e4m3(kv_packed_src[src_v_offset + di]);
                         break;
                     default: assert(false);
                     }
@@ -546,6 +574,10 @@ static inline void store_q_and_contiguous_kv_cache(void* q_d, // [B, S, H, D]
     }
 
     FMHA_CHECK_CUDA(cudaMemcpy(contiguous_kv_d, contiguous_kv_h, kv_size_in_bytes, cudaMemcpyDefault));
+    FMHA_CHECK_CUDA(cudaMemcpy(k_d, k_h, k_size_in_bytes, cudaMemcpyDefault));
+    FMHA_CHECK_CUDA(cudaMemcpy(v_d, v_h, v_size_in_bytes, cudaMemcpyDefault));
+    free(k_h);
+    free(v_h);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

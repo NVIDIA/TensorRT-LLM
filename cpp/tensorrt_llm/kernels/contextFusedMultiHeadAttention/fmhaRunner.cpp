@@ -140,28 +140,47 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
     mKernelParams.softmax_stats_ptr = runnerParams.softmaxStatsPtr;
     mKernelParams.softmax_stats_stride_in_bytes = sizeof(float) * mFixedParams.numQHeads;
 
-    // Packed QKV input layout.
-    mKernelParams.qkv_stride_in_bytes = get_size_in_bytes(mFixedParams.numQHeads * mFixedParams.headSize
-            + mFixedParams.numKvHeads * mFixedParams.headSize + mFixedParams.numKvHeads * mFixedParams.headSizeV,
-        mFixedParams.dataType);
-    // Contiguous Q input layout.
-    mKernelParams.q_stride_in_bytes
-        = get_size_in_bytes(mFixedParams.numQHeads * mFixedParams.headSize, mFixedParams.dataType);
-    // Set the kv_stride_in_bytes when separate kv buffer is used.
-    if (mFixedParams.attentionInputLayout == AttentionInputLayout::Q_PAGED_KV)
+    if (mFixedParams.attentionInputLayout == AttentionInputLayout::PACKED_QKV)
     {
-        // Paged kv cache layout.
-        mKernelParams.kv_stride_in_bytes = get_size_in_bytes(
-            runnerParams.pagedKvCache.mTokensPerBlock * mFixedParams.headSize, mFixedParams.dataType);
-        // only for deepseek
-        mKernelParams.v_stride_in_bytes = mKernelParams.kv_stride_in_bytes;
+        // Packed QKV input layout, [B, S, H * D + H_kv * D + H_kv * Dv].
+        mKernelParams.qkv_ptr = runnerParams.qkvPtr;
+        mKernelParams.q_stride_in_bytes = mKernelParams.k_stride_in_bytes = mKernelParams.v_stride_in_bytes
+            = get_size_in_bytes(mFixedParams.numQHeads * mFixedParams.headSize
+                    + mFixedParams.numKvHeads * mFixedParams.headSize
+                    + mFixedParams.numKvHeads * mFixedParams.headSizeV,
+                mFixedParams.dataType);
     }
-    else if (mFixedParams.attentionInputLayout == AttentionInputLayout::Q_CONTIGUOUS_KV)
+    else
     {
-        // Contiguous kv input layout.
-        mKernelParams.kv_stride_in_bytes
-            = get_size_in_bytes(2 * mFixedParams.numKvHeads * mFixedParams.headSize, mFixedParams.dataType);
+        // Contiguous Q input layout, [B, S, H, D].
+        mKernelParams.q_ptr = runnerParams.qPtr;
+        mKernelParams.q_stride_in_bytes
+            = get_size_in_bytes(mFixedParams.numQHeads * mFixedParams.headSize, mFixedParams.dataType);
+
+        // Separate q and kv buffers may have different q and kv sequence lengths.
+        mKernelParams.cu_kv_seqlens = reinterpret_cast<int const*>(runnerParams.cuKvSeqLenPtr);
+
+        if (mFixedParams.attentionInputLayout == AttentionInputLayout::Q_CONTIGUOUS_KV)
+        {
+            // Contiguous kv input layout, [B, S, H_kv * D + H_kv * Dv].
+            mKernelParams.kv_ptr = runnerParams.kvPtr;
+            mKernelParams.k_stride_in_bytes = mKernelParams.v_stride_in_bytes = get_size_in_bytes(
+                mFixedParams.numKvHeads * (mFixedParams.headSize + mFixedParams.headSizeV), mFixedParams.dataType);
+        }
+        else if (mFixedParams.attentionInputLayout == AttentionInputLayout::Q_PAGED_KV)
+        {
+            // Paged kv cache layout.
+            mKernelParams.paged_kv_cache = runnerParams.pagedKvCache.copyKVBlockArrayForContextFMHA();
+            mKernelParams.k_stride_in_bytes = get_size_in_bytes(
+                runnerParams.pagedKvCache.mTokensPerBlock * mFixedParams.headSize, mFixedParams.dataType);
+            // If d == dv, then v_stride_in_bytes == k_stride_in_bytes.
+            // For DeepSeek MLA, which is the only case where d != dv, V is padded to the sizeof K.
+            // Thus, v_stride_in_bytes always equals to k_stride_in_bytes so far.
+            mKernelParams.v_stride_in_bytes = mKernelParams.k_stride_in_bytes;
+        }
     }
+
+    mKernelParams.o_ptr = runnerParams.outputPtr;
     // Set the output buffer stride in bytes.
     mKernelParams.o_stride_in_bytes
         = get_size_in_bytes(mFixedParams.numQHeads * mFixedParams.headSizeV, mFixedParams.dataTypeOut);
@@ -214,11 +233,6 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
             mFixedParams.numQHeads, runnerParams.kvSeqLen, mFixedParams.tpSize, mFixedParams.tpRank, scale_after_alibi);
     }
 
-    // Set device pointers.
-    mKernelParams.qkv_ptr = runnerParams.qkvPtr;
-    mKernelParams.q_ptr = runnerParams.qPtr;
-    mKernelParams.kv_ptr = runnerParams.kvPtr;
-    mKernelParams.o_ptr = runnerParams.outputPtr;
     if (mFixedParams.attentionMaskType == ContextAttentionMaskType::CUSTOM_MASK)
     {
         mKernelParams.packed_mask_ptr = runnerParams.packedMaskPtr;
@@ -235,18 +249,6 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
     {
         mKernelParams.scale_bmm1_d = reinterpret_cast<uint32_t const*>(runnerParams.scaleBmm1Ptr + scaleBmm1PtrOffset);
         mKernelParams.scale_bmm2_d = reinterpret_cast<uint32_t const*>(runnerParams.scaleBmm2Ptr);
-    }
-
-    // Separate q and kv buffers may have different q and kv sequence lengths.
-    if (mFixedParams.attentionInputLayout != AttentionInputLayout::PACKED_QKV)
-    {
-        mKernelParams.cu_kv_seqlens = reinterpret_cast<int const*>(runnerParams.cuKvSeqLenPtr);
-    }
-
-    // Paged kv fmha.
-    if (mFixedParams.attentionInputLayout == AttentionInputLayout::Q_PAGED_KV)
-    {
-        mKernelParams.paged_kv_cache = runnerParams.pagedKvCache.copyKVBlockArrayForContextFMHA();
     }
 
     // for sage attention
@@ -293,11 +295,18 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
     mLaunchParams.total_kv_seqlen
         = mFixedParams.isSPadded ? runnerParams.b * runnerParams.kvSeqLen : runnerParams.totalKvSeqLen;
 
-    // Next power of 2 head size.
     TLLM_CHECK_WITH_INFO(mFixedParams.headSize > 0, "Head size should be greater than 0.");
-    mLaunchParams.padded_d = (mFixedParams.headSize & (mFixedParams.headSize - 1)) == 0
+    // Pad head size to next power of 2.
+    int padded_d_next_power_of_2 = (mFixedParams.headSize & (mFixedParams.headSize - 1)) == 0
         ? mFixedParams.headSize
         : pow(2, int(log2(mFixedParams.headSize)) + 1);
+    // In fact, due to 128B swizzle mode of TMA, only 128 bytes alignment is required,
+    // so we pad head size to next multiply of 128B.
+    int d_per_group = 128 / get_size_in_bytes(mFixedParams.dataType);
+    int d_groups = (mFixedParams.headSize + d_per_group - 1) / d_per_group;
+    int padded_d_next_multiply_of_128byte = d_groups * d_per_group;
+    // Choose the smaller one to save SMEM.
+    mLaunchParams.padded_d = std::min(padded_d_next_power_of_2, padded_d_next_multiply_of_128byte);
 
     bool const isSm70 = (mSM == kSM_70);
     bool const isSm90 = (mSM == kSM_90);
@@ -453,273 +462,162 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // TMA descriptors are used as grid_constant parameters (remove MemCpyH2D operations)
-void FusedMHARunnerV2::setPackedQkvTmaDescriptors(MHARunnerParams runnerParams)
+void FusedMHARunnerV2::setTmaDescriptors(MHARunnerParams runnerParams)
 {
+    const uint32_t d = mKernelParams.d;
+    const uint32_t dv = mKernelParams.dv;
+    const uint32_t h = mKernelParams.h;
+    const uint32_t h_kv = mKernelParams.h_kv;
+    const uint32_t total_q_seqlen = mLaunchParams.total_q_seqlen;
+    const uint32_t total_kv_seqlen = mLaunchParams.total_kv_seqlen;
+
+    uint64_t const d_in_bytes = get_size_in_bytes(d, mFixedParams.dataType);
+    uint64_t const dv_in_bytes = get_size_in_bytes(dv, mFixedParams.dataType);
+
     // split D into multiple groups in order to match the TMA swizzle mode (128B)
-    uint32_t const d_in_bytes = get_size_in_bytes(mLaunchParams.padded_d, mFixedParams.dataType);
-    uint32_t const d_groups = d_in_bytes > 128 ? d_in_bytes / 128 : 1;
+    uint32_t const padded_d_in_bytes = get_size_in_bytes(mLaunchParams.padded_d, mFixedParams.dataType);
+    uint32_t const d_groups = padded_d_in_bytes > 128 ? padded_d_in_bytes / 128 : 1;
+    uint32_t const d_bytes_per_group = padded_d_in_bytes / d_groups;
+    uint32_t const d_per_group = mLaunchParams.padded_d / d_groups;
 
-    // separate q, k, v and o tma descriptors
-    Multiple_tma_descriptor<4> qkv_tma_descriptor;
+    uint32_t q_step = 0, kv_step = 0;
+    xmmaKernel->getStepSize(q_step, kv_step, mKernelParams, mLaunchParams);
 
-    // tensor size
-    uint32_t tensor_size_qkv[4];
-    if (mKernelParams.h_kv < mKernelParams.h)
+    auto const layout = mFixedParams.attentionInputLayout;
+
+    // Q Layout: [total_seqlen, H, D]
+    const uint32_t tensor_size_q[3] = {d, h, total_q_seqlen};
+
+    // Stride size in bytes. Assumes least significant dim is 1
+    const uint64_t tensor_stride_q[2] = {d_in_bytes, uint64_t(mKernelParams.q_stride_in_bytes)};
+
+    // Starting memory address
+    char const* q_ptr = reinterpret_cast<char const*>(
+        layout == AttentionInputLayout::PACKED_QKV ? mKernelParams.qkv_ptr : mKernelParams.q_ptr);
+
+    // Box size of TMA
+    const uint32_t box_size_q[3] = {d_per_group, 1, q_step};
+
+    // Traversal stride.
+    const uint32_t traversal_stride[3] = {1, 1, 1};
+
+    // OOB fill zeros.
+    const uint32_t oob_fill = 0;
+
+    // FP32 to TF32 conversion disabled.
+    const uint32_t fp32_to_tf32 = 0;
+
+    // GMMA descriptor mode.
+    cudaTmaDescSwizzle const swizzle_mode = (d_bytes_per_group > 64
+            ? cudaTmaDescSwizzle::SWIZZLE_128B
+            : (d_bytes_per_group > 32 ? cudaTmaDescSwizzle::SWIZZLE_64B : cudaTmaDescSwizzle::SWIZZLE_32B));
+
+    // Desc Format (data type).
+    cudaTmaDescFormat const desc_format
+        = (get_size_in_bytes(mFixedParams.dataType) == 1) ? cudaTmaDescFormat::U8 : cudaTmaDescFormat::F16_RN;
+
+    Multiple_tma_descriptor<3> qo_tma_descriptor;
+
+    // Q
+    qo_tma_descriptor.set_tma_desctriptor(q_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED, swizzle_mode,
+        cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_q, tensor_stride_q, traversal_stride, box_size_q,
+        oob_fill, fp32_to_tf32, &mKernelParams.tma_desc_q);
+
+    // O
+    if ((get_size_in_bytes(mFixedParams.dataTypeOut) == 1)
+        && mLaunchParams.attention_mask_type != ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL)
     {
-        // if multi-query or grouped-query
-        tensor_size_qkv[2] = 1;
-        tensor_size_qkv[1] = (mKernelParams.h + 2 * mKernelParams.h_kv);
-        tensor_size_qkv[0] = mKernelParams.d; // mKernelParams.d;
+        // O Layout: [total_seqlen, H, DV]
+        const uint32_t tensor_size_o[3] = {dv, h, total_q_seqlen};
+
+        const uint64_t tensor_stride_o[2]
+            = {get_size_in_bytes(dv, mFixedParams.dataTypeOut), uint64_t(mKernelParams.o_stride_in_bytes)};
+
+        char* o_ptr = reinterpret_cast<char*>(mKernelParams.o_ptr);
+
+        // Box size of TMA
+        const uint32_t box_size_o[3] = {d_per_group, 1, 16};
+
+        // Yuxin: dataTypeOut may be different with dataType, so desc_format and swizzle_mode
+        // may be incorrect. For example, QKV are in bf16 while O is in fp8.
+        // Luckily, this case doesn't exist so far. But we should keep one eye on it.
+        qo_tma_descriptor.set_tma_desctriptor(o_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED,
+            swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_o, tensor_stride_o, traversal_stride,
+            box_size_o, oob_fill, fp32_to_tf32, &mKernelParams.tma_desc_o);
+    }
+
+    if (layout == AttentionInputLayout::Q_PAGED_KV)
+    {
+        // KV in q_paged_kv uses 4D tensor
+        // Layout: [INT32_MAX, H_KV, TokensPerBlock, D]
+        const uint32_t tokens_per_block = mKernelParams.paged_kv_cache.mTokensPerBlock;
+        const uint32_t tensor_size_k[4] = {d, tokens_per_block, h_kv, INT_MAX};
+        const uint32_t tensor_size_v[4] = {dv, tokens_per_block, h_kv, INT_MAX};
+
+        const uint64_t tensor_stride_k[3] = {uint64_t(mKernelParams.k_stride_in_bytes / tokens_per_block), // d
+            uint64_t(mKernelParams.k_stride_in_bytes),                                                     // d * 64
+            uint64_t(mKernelParams.paged_kv_cache.mBytesPerBlock)};
+        const uint64_t tensor_stride_v[3]
+            = {// we cannot use dv * Kernel_traits::ELEMENT_BYTES because V may be padded (MLA)
+                uint64_t(mKernelParams.v_stride_in_bytes / tokens_per_block), // dv
+                uint64_t(mKernelParams.v_stride_in_bytes),                    // dv * 64
+                uint64_t(mKernelParams.paged_kv_cache.mBytesPerBlock)};
+
+        char const* kv_ptr = reinterpret_cast<char*>(runnerParams.pagedKvCache.mPrimaryPoolPtr);
+
+        const uint32_t box_size_kv[4] = {d_per_group, std::min(tokens_per_block, kv_step), 1, 1};
+
+        TLLM_CHECK(kv_step % tokens_per_block == 0 || tokens_per_block % kv_step == 0);
+        mKernelParams.blocks_per_tma_load = std::max<uint32_t>(1, kv_step / tokens_per_block);
+        mKernelParams.blocks_per_tma_load_log2 = log2(mKernelParams.blocks_per_tma_load);
+
+        const uint32_t traversal_stride[4] = {1, 1, 1, 1};
+
+        Multiple_tma_descriptor<4> kv_tma_descriptor;
+        // K
+        kv_tma_descriptor.set_tma_desctriptor(kv_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED,
+            swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_k, tensor_stride_k, traversal_stride,
+            box_size_kv, oob_fill, fp32_to_tf32, &mKernelParams.tma_desc_k);
+        // V
+        kv_tma_descriptor.set_tma_desctriptor(kv_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED,
+            swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_v, tensor_stride_v, traversal_stride,
+            box_size_kv, oob_fill, fp32_to_tf32, &mKernelParams.tma_desc_v);
     }
     else
     {
-        tensor_size_qkv[2] = 3;
-        tensor_size_qkv[1] = mKernelParams.h;
-        tensor_size_qkv[0] = mKernelParams.d; // mKernelParams.d;
-    }
+        // Otherwise KV uses 3D tensor
+        const uint32_t tensor_size_k[3] = {d, h_kv, total_kv_seqlen};
+        const uint32_t tensor_size_v[3] = {dv, h_kv, total_kv_seqlen};
 
-    // O : [TOTAL, 1, h, d]
-    uint32_t tensor_size_o[4];
-    tensor_size_o[0] = mKernelParams.d;
-    tensor_size_o[1] = mKernelParams.h;
-    tensor_size_o[2] = 1;
+        const uint64_t tensor_stride_k[2] = {d_in_bytes, uint64_t(mKernelParams.k_stride_in_bytes)};
+        const uint64_t tensor_stride_v[2] = {dv_in_bytes, uint64_t(mKernelParams.v_stride_in_bytes)};
 
-    // box size for k and v
-    uint32_t box_size[4];
-    // Update this on device?
-    box_size[2] = 1;
-    box_size[1] = 1;
-    box_size[0] = mLaunchParams.padded_d / d_groups;
+        const uint32_t box_size_kv[3] = {d_per_group, 1, kv_step};
 
-    // stride size in bytes. Assumes least significant dim is 1 (?)
-    uint64_t tensor_stride_qkv[3];
-    tensor_stride_qkv[0] = get_size_in_bytes(tensor_size_qkv[0], mFixedParams.dataType); // d
-    tensor_stride_qkv[1] = tensor_size_qkv[1] * tensor_stride_qkv[0];                    // d*h
-    tensor_stride_qkv[2] = mKernelParams.qkv_stride_in_bytes;
+        char const *k_ptr, *v_ptr;
 
-    uint64_t tensor_stride_o[3];
-    tensor_stride_o[0] = get_size_in_bytes(tensor_size_o[0], mFixedParams.dataTypeOut); // d
-    tensor_stride_o[1] = tensor_size_o[1] * tensor_stride_o[0];                         // d*h
-    tensor_stride_o[2] = tensor_size_o[2] * tensor_stride_o[1];                         // d*h*1
+        if (layout == AttentionInputLayout::PACKED_QKV)
+        {
+            // Layout: [total_seqlen, (H, D) + (H_KV, D) + (H_KV, DV)]
+            k_ptr = q_ptr + h * d_in_bytes;
+            v_ptr = k_ptr + h_kv * d_in_bytes;
+        }
+        else if (layout == AttentionInputLayout::Q_CONTIGUOUS_KV)
+        {
+            // Layout, [B, S, H_kv * D + H_kv * Dv].
+            k_ptr = reinterpret_cast<char const*>(mKernelParams.kv_ptr);
+            v_ptr = k_ptr + h_kv * d_in_bytes;
+        }
 
-    // traversal stride
-    uint32_t traversal_stride_qkv[4] = {1, 1, 1, 1};
-    uint32_t traversal_stride_o[4] = {1, 1, 1, 1};
-
-    // OOB fill zeros
-    uint32_t oob_fill = 0;
-
-    // FP32 to TF32 conversion disabled
-    uint32_t fp32_to_tf32 = 0;
-
-    // gmma descriptor mode
-    uint32_t const d_bytes_per_group = d_in_bytes / d_groups;
-    cudaTmaDescSwizzle const swizzle_mode = (d_bytes_per_group > 64
-            ? cudaTmaDescSwizzle::SWIZZLE_128B
-            : (d_bytes_per_group > 32 ? cudaTmaDescSwizzle::SWIZZLE_64B : cudaTmaDescSwizzle::SWIZZLE_32B));
-
-    uint32_t q_step = 0, kv_step = 0;
-    xmmaKernel->getStepSize(q_step, kv_step, mKernelParams, mLaunchParams);
-
-    // QKV [TOTAL, 3, h, d]
-    // NOTE: we may need to use actual seqlen to set oob_value
-    auto const* qkv_ptr = static_cast<char const*>(mKernelParams.qkv_ptr);
-    tensor_size_qkv[3] = mLaunchParams.total_q_seqlen;
-    // O [TOTAL, 1, h, d]
-    auto* o_ptr = static_cast<char*>(mKernelParams.o_ptr);
-    tensor_size_o[3] = mLaunchParams.total_q_seqlen;
-
-    // Q: STEP_Q
-    box_size[3] = q_step;
-    // Desc Format (data type).
-    cudaTmaDescFormat const desc_format
-        = (get_size_in_bytes(mFixedParams.dataType) == 1) ? cudaTmaDescFormat::U8 : cudaTmaDescFormat::F16_RN;
-    qkv_tma_descriptor.set_tma_desctriptor(qkv_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED,
-        swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_qkv, tensor_stride_qkv,
-        traversal_stride_qkv, box_size, oob_fill, fp32_to_tf32, &mKernelParams.tma_desc_q);
-
-    // K/V: STEP_KV
-    box_size[3] = kv_step;
-    qkv_tma_descriptor.set_tma_desctriptor(qkv_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED,
-        swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_qkv, tensor_stride_qkv,
-        traversal_stride_qkv, box_size, oob_fill, fp32_to_tf32, &mKernelParams.tma_desc_kv);
-
-    // Separate TMA descriptor for V when d != dv in packed qkv input layout, e.g. MLA + 192/128 dims
-    if (mKernelParams.d != mKernelParams.dv)
-    {
-        // view V as [total_seq_len, 1, h, dv]
-        tensor_size_qkv[0] = mKernelParams.dv;
-        tensor_size_qkv[1] = mKernelParams.h;
-        tensor_size_qkv[2] = 1;
-
-        tensor_stride_qkv[0] = get_size_in_bytes(tensor_size_qkv[0], mFixedParams.dataType);
-        tensor_stride_qkv[1] = 0; // not used
-
-        size_t v_offset = 2 * mKernelParams.h * mKernelParams.d * get_size_in_bytes(mFixedParams.dataType);
-        qkv_tma_descriptor.set_tma_desctriptor(qkv_ptr + v_offset, desc_format,
-            cudaTmaDescInterleave::INTERLEAVE_DISABLED, swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED,
-            tensor_size_qkv, tensor_stride_qkv, traversal_stride_qkv, box_size, oob_fill, fp32_to_tf32,
-            &mKernelParams.tma_desc_v);
-    }
-
-    // O: 16
-    // Note: sliding window causal kernel currently has reg spill when TMA store is enabled
-    box_size[3] = 16;
-    if ((get_size_in_bytes(mFixedParams.dataTypeOut) == 1)
-        && mLaunchParams.attention_mask_type != ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL)
-    {
-        qkv_tma_descriptor.set_tma_desctriptor(o_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED,
-            swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_o, tensor_stride_o, traversal_stride_o,
-            box_size, oob_fill, fp32_to_tf32, &mKernelParams.tma_desc_o);
-    }
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-// Contiguous in the shape of [B, S, H, D].
-// Contiguous KV in the shape of [B, S, 2, H, D].
-// Paged KV has [B, 2, NumBlocksPerSequence] buffers,
-//  and each points to the contiguous buffer with shape [H, TokensPerBlock, D]
-// TMA descriptors need cudaMemcpyAsync since we need multiple tma descriptors in device memory.
-void FusedMHARunnerV2::setSeparateQKvTmaDescriptors(MHARunnerParams runnerParams)
-{
-    // split D into multiple groups in order to match the TMA swizzle mode (128B)
-    uint32_t const d_in_bytes = get_size_in_bytes(mLaunchParams.padded_d, mFixedParams.dataType);
-    uint32_t const d_groups = d_in_bytes > 128 ? d_in_bytes / 128 : 1;
-
-    uint32_t q_step = 0, kv_step = 0;
-    xmmaKernel->getStepSize(q_step, kv_step, mKernelParams, mLaunchParams);
-
-    // Separate q, and paged kv tma descriptors.
-    Multiple_tma_descriptor<4> qo_tma_descriptor;
-    Multiple_tma_descriptor<4> kv_tma_descriptor;
-    // Contiguous Q
-    // query tensor size [B x S, 1, H, D]
-    uint32_t tensor_size_qo[4];
-    tensor_size_qo[3] = mLaunchParams.total_q_seqlen;
-    tensor_size_qo[2] = 1;
-    tensor_size_qo[1] = mKernelParams.h;
-    tensor_size_qo[0] = mKernelParams.d;
-
-    // box size for q and o
-    uint32_t box_size_qo[4];
-    box_size_qo[3] = q_step;
-    box_size_qo[2] = 1;
-    box_size_qo[1] = 1;
-    box_size_qo[0] = mLaunchParams.padded_d / d_groups;
-
-    // stride size in bytes.
-    uint64_t tensor_stride_qo[3];
-    tensor_stride_qo[0] = get_size_in_bytes(tensor_size_qo[0], mFixedParams.dataType);
-    tensor_stride_qo[1] = tensor_size_qo[1] * tensor_stride_qo[0];
-    tensor_stride_qo[2] = tensor_size_qo[2] * tensor_stride_qo[1];
-
-    // traversal stride
-    uint32_t traversal_stride[4] = {1, 1, 1, 1};
-
-    // OOB fill zeros
-    uint32_t oob_fill = 0;
-
-    // FP32 to TF32 conversion disabled
-    uint32_t fp32_to_tf32 = 0;
-
-    // Desc Format (data type).
-    cudaTmaDescFormat const desc_format
-        = (get_size_in_bytes(mFixedParams.dataType) == 1) ? cudaTmaDescFormat::U8 : cudaTmaDescFormat::F16_RN;
-
-    // gmma descriptor mode
-    uint32_t const d_bytes_per_group = d_in_bytes / d_groups;
-    cudaTmaDescSwizzle const swizzle_mode = (d_bytes_per_group > 64
-            ? cudaTmaDescSwizzle::SWIZZLE_128B
-            : (d_bytes_per_group > 32 ? cudaTmaDescSwizzle::SWIZZLE_64B : cudaTmaDescSwizzle::SWIZZLE_32B));
-
-    // Q ptr.
-    auto const* q_ptr = static_cast<char const*>(mKernelParams.q_ptr);
-
-    // Q: STEP_Q.
-    qo_tma_descriptor.set_tma_desctriptor(q_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED, swizzle_mode,
-        cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_qo, tensor_stride_qo, traversal_stride, box_size_qo,
-        oob_fill, fp32_to_tf32, &mKernelParams.tma_desc_q);
-
-    // O ptr.
-    auto const* o_ptr = static_cast<char const*>(mKernelParams.o_ptr);
-    // Note (added by Yuxin): TMA descriptor for o here might be problematic if d and dv are different.
-
-    // O: 16. Reuse
-    box_size_qo[3] = 16;
-    if ((get_size_in_bytes(mFixedParams.dataTypeOut) == 1)
-        && mLaunchParams.attention_mask_type != ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL)
-    {
-        qo_tma_descriptor.set_tma_desctriptor(o_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED,
-            swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_qo, tensor_stride_qo, traversal_stride,
-            box_size_qo, oob_fill, fp32_to_tf32, &mKernelParams.tma_desc_o);
-    }
-
-    // Contiguous KV layout [B, S, 2, H, D].
-    if (mFixedParams.attentionInputLayout == AttentionInputLayout::Q_CONTIGUOUS_KV)
-    {
-        // Per batch tensor size.
-        uint32_t tensor_size_kv[4];
-        // Maximum number of blocks in this device.
-        tensor_size_kv[3] = mLaunchParams.total_kv_seqlen;
-        tensor_size_kv[2] = 2;
-        tensor_size_kv[1] = mKernelParams.h_kv;
-        tensor_size_kv[0] = mKernelParams.d;
-
-        // Box size for k and v.
-        uint32_t box_size_kv[4];
-        box_size_kv[3] = kv_step;
-        box_size_kv[2] = 1;
-        box_size_kv[1] = 1;
-        box_size_kv[0] = mLaunchParams.padded_d / d_groups;
-
-        // Stride size in bytes.
-        uint64_t tensor_stride_kv[3];
-        tensor_stride_kv[0] = get_size_in_bytes(tensor_size_kv[0], mFixedParams.dataType);
-        tensor_stride_kv[1] = tensor_size_kv[1] * tensor_stride_kv[0];
-        tensor_stride_kv[2] = tensor_size_kv[2] * tensor_stride_kv[1];
-
-        // Set the paged_kv tma descriptor.
-        kv_tma_descriptor.set_tma_desctriptor(runnerParams.kvPtr, desc_format,
-            cudaTmaDescInterleave::INTERLEAVE_DISABLED, swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED,
-            tensor_size_kv, tensor_stride_kv, traversal_stride, box_size_kv, oob_fill, fp32_to_tf32,
-            &mKernelParams.tma_desc_kv);
-    }
-    else if (mFixedParams.attentionInputLayout == AttentionInputLayout::Q_PAGED_KV)
-    {
-        // Paged KV
-        // Per batch tensor size.
-        uint32_t tokens_per_block = uint32_t(mKernelParams.paged_kv_cache.mTokensPerBlock);
-        uint32_t tensor_size_kv[4];
-        // Maximum number of blocks in this device.
-        tensor_size_kv[3] = mLaunchParams.total_device_memory / mKernelParams.paged_kv_cache.mBytesPerBlock;
-        tensor_size_kv[2] = mKernelParams.h_kv;
-        tensor_size_kv[1] = tokens_per_block;
-        tensor_size_kv[0] = mKernelParams.d;
-
-        // Box size for k and v.
-        uint32_t box_size_kv[4];
-        box_size_kv[3] = 1;
-        box_size_kv[2] = 1;
-        box_size_kv[1] = std::min(tokens_per_block, kv_step);
-        box_size_kv[0] = mLaunchParams.padded_d / d_groups;
-
-        TLLM_CHECK_WITH_INFO(
-            tokens_per_block % 2 == 0, "FMHA with paged kv cache needs tokens_per_block to be power of 2 !");
-        mKernelParams.blocks_per_tma_load = std::max(1, int32_t(kv_step / tokens_per_block));
-        mKernelParams.blocks_per_tma_load_log2 = log2(mKernelParams.blocks_per_tma_load);
-
-        // Stride size in bytes.
-        uint64_t tensor_stride_kv[3];
-        tensor_stride_kv[0] = get_size_in_bytes(tensor_size_kv[0], mFixedParams.dataType);
-        tensor_stride_kv[1] = tensor_size_kv[1] * tensor_stride_kv[0];
-        tensor_stride_kv[2] = tensor_size_kv[2] * tensor_stride_kv[1];
-
-        // Set the paged_kv tma descriptor.
-        kv_tma_descriptor.set_tma_desctriptor(runnerParams.pagedKvCache.mPrimaryPoolPtr, desc_format,
-            cudaTmaDescInterleave::INTERLEAVE_DISABLED, swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED,
-            tensor_size_kv, tensor_stride_kv, traversal_stride, box_size_kv, oob_fill, fp32_to_tf32,
-            &mKernelParams.tma_desc_kv);
+        Multiple_tma_descriptor<3> kv_tma_descriptor;
+        // K
+        kv_tma_descriptor.set_tma_desctriptor(k_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED,
+            swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_k, tensor_stride_k, traversal_stride,
+            box_size_kv, oob_fill, fp32_to_tf32, &mKernelParams.tma_desc_k);
+        // V
+        kv_tma_descriptor.set_tma_desctriptor(v_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED,
+            swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_v, tensor_stride_v, traversal_stride,
+            box_size_kv, oob_fill, fp32_to_tf32, &mKernelParams.tma_desc_v);
     }
 }
 
@@ -734,13 +632,7 @@ void FusedMHARunnerV2::run(MHARunnerParams runnerParams)
     // Need to set tma descriptors additionally.
     if (mSM == kSM_90 && mLaunchParams.use_tma)
     {
-        switch (mFixedParams.attentionInputLayout)
-        {
-        case AttentionInputLayout::PACKED_QKV: setPackedQkvTmaDescriptors(runnerParams); break;
-        case AttentionInputLayout::Q_CONTIGUOUS_KV:
-        case AttentionInputLayout::Q_PAGED_KV: setSeparateQKvTmaDescriptors(runnerParams); break;
-        default: TLLM_CHECK_WITH_INFO(false, "Unsupported attention input layout.");
-        }
+        setTmaDescriptors(runnerParams);
     }
     // Check if the sliding window size is valid or not.
     if (mFixedParams.attentionInputLayout == AttentionInputLayout::Q_PAGED_KV

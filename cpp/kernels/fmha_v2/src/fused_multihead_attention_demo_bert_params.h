@@ -73,11 +73,15 @@ struct Fused_multihead_attention_params_v1
 
 struct Fused_multihead_attention_params_v2
 {
-    // The QKV matrices.
+    // The packed QKV matrices.
     void* qkv_ptr;
     // The separate Q matrice.
     void* q_ptr;
-    // The separate KV matrice.
+    // The separate K matrice.
+    void* k_ptr;
+    // The separate V matrice.
+    void* v_ptr;
+    // The separate KV matrice (contiguous KV).
     void* kv_ptr;
     // The separate paged kv cache.
     fmha::Kv_block_array paged_kv_cache;
@@ -88,14 +92,12 @@ struct Fused_multihead_attention_params_v2
     // The Softmax stats vector of layout [2, B, S, H], including softmax_sum and softmax_max
     void* softmax_stats_ptr;
 
-    // The stride between rows of the Q, K and V matrices.
-    int64_t qkv_stride_in_bytes;
-    // The stride between rows of the separate Q matrice.
+    // The stride between rows of Q.
     int64_t q_stride_in_bytes;
-    // The stride between rows of the separate KV matrice.
-    int64_t kv_stride_in_bytes;
-    // The stride between rows of the separate V matrice, set if it is not same as that of K.
-    int64_t v_stride_in_bytes = 0;
+    // The stride between rows of K.
+    int64_t k_stride_in_bytes;
+    // The stride between rows of V.
+    int64_t v_stride_in_bytes;
     // The stride between matrices of packed mask.
     int64_t packed_mask_stride_in_bytes;
     // The stride between rows of O.
@@ -110,7 +112,8 @@ struct Fused_multihead_attention_params_v2
     // Kv in packed qkv layout: [B, S, 3, H, D]
     // Contiguous kv layout: [B, 2, H, S, D].
     // Paged kv layout: [UINT32_MAX, H, Tokens_per_block, D].
-    fmha::cudaTmaDesc tma_desc_kv;
+    fmha::cudaTmaDesc tma_desc_k;
+    fmha::cudaTmaDesc tma_desc_v;
     // Tma descriptor for o
     fmha::cudaTmaDesc tma_desc_o;
 
