@@ -21,16 +21,188 @@ from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_utils import register_auto_model
 
+from .utils_phi4mm import Phi4MMImageEmbedding, Phi4MMAudioEmbedding
+from .configuration_phi4mm import Phi4MMConfig
+
 # Special tokens
 _IMAGE_SPECIAL_TOKEN_ID = 200010  # '<|endoftext10|>'
 _AUDIO_SPECIAL_TOKEN_ID = 200011  # '<|endoftext11|>'
+_COMPATIBLE_IMAGE_SPECIAL_TOKEN_ID_RANGE = [-9999, -1]  # For backward compatibility
+_COMPATIBLE_AUDIO_SPECIAL_TOKEN_ID_RANGE = [float('-inf'), -10000]  # For backward compatibility
 
 
-# Create a PreTrainedModel class for transformers=4.53.1 upgrade.
-# Core idea is to provide `prepare_inputs_for_generation` method from `GenerationMixin`.
-class NewPreTrainedModel(transformers.modeling_utils.PreTrainedModel,
-                         transformers.generation.GenerationMixin):
-    pass
+class HFPhi4MultimodalEncoder(transformers.PreTrainedModel, transformers.generation.GenerationMixin):
+    """
+    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`Phi4MMDecoderLayer`]
+
+    Args:
+        config: Phi4MMConfig
+    """
+
+    config_class = Phi4MMConfig
+    base_model_prefix = "model"
+    _tied_weights_keys = ["lm_head.weight"]
+    _supports_flash_attn_2 = True
+    _supports_sdpa = True
+    _supports_cache_class = True
+
+    def __init__(self, config: transformers.PretrainedConfig):
+        super().__init__(config)
+        self.padding_idx = config.pad_token_id
+
+        self.embed_tokens = torch.nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+
+        # Initialize embed_tokens_extend as a container to match HF model weights.
+        self.embed_tokens_extend = torch.nn.Module()
+
+        self._attn_implementation = config._attn_implementation
+        self.gradient_checkpointing = False
+
+        self.vocab_size = config.vocab_size
+
+        embedding_config = {
+            'embedding_cls': config.embd_layer['embedding_cls'],
+            **config.embd_layer
+        }
+        self.image_input_id = embedding_config.get('image_input_id', -1)
+        self.audio_input_id = embedding_config.get('audio_input_id', -10000)
+        assert self.image_input_id != self.audio_input_id, 'image_input_id and audio_input_id should be different'
+
+        self.image_embd_layer_kwargs = embedding_config['image_embd_layer']
+        self.embed_tokens_extend.image_embed = Phi4MMImageEmbedding(config, **self.image_embd_layer_kwargs)
+
+        self.audio_embd_layer_kwargs = embedding_config['audio_embd_layer']
+        self.embed_tokens_extend.audio_embed = Phi4MMAudioEmbedding(config, **self.audio_embd_layer_kwargs)
+
+        self.input_image_embeds = None
+        self.image_sizes = None
+        self.image_attention_mask = None
+        self.input_audio_embeds = None
+        self.audio_embed_sizes = None
+
+    def post_init(self, audio_config):
+        # post init for audio embedding
+        # ref: model.model.embed_tokens_extend.post_init(audio_config) in phyagi/getters/model.py
+        self.embed_tokens_extend.audio_embed.post_init(audio_config)
+
+    def set_input_image_embeds(self, input_image_embeds: torch.FloatTensor) -> None:
+        self.input_image_embeds = input_image_embeds
+
+    def set_image_sizes(self, image_sizes: torch.LongTensor) -> None:
+        self.image_sizes = image_sizes
+
+    def set_img_attn_mask(self, image_attention_mask: torch.FloatTensor) -> None:
+        self.image_attention_mask = image_attention_mask
+
+    def set_input_audio_embeds(self, input_audio_embeds: torch.FloatTensor) -> None:
+        self.input_audio_embeds = input_audio_embeds
+
+    def set_audio_embed_sizes(self, audio_embed_sizes: torch.LongTensor) -> None:
+        self.audio_embed_sizes = audio_embed_sizes
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        input_embeds,
+        input_image_embeds: Optional[torch.FloatTensor]=None,
+        input_audio_embeds: Optional[torch.FloatTensor]=None,
+        image_sizes=None,
+        image_attention_mask=None,
+        audio_embed_sizes=None,
+        audio_attention_mask=None,
+        audio_projection_mode='speech',
+        wte=None,
+    ) -> torch.FloatTensor:
+        MAX_INPUT_ID = int(1e9)
+        assert -MAX_INPUT_ID < self.audio_input_id < self.image_input_id
+
+        # override image and audio embeddings and sizes from object itself
+        # this is for inference
+        # ref: phyagi/eval/utils/text_generation_vision_audio_pipeline.py
+        if self.input_image_embeds is not None:
+            assert input_image_embeds is None
+            input_image_embeds = self.input_image_embeds.clone()
+            # NOTE weijian: set input_image_embeds to None after first call in for eval stage
+            #               during evaluation, it will call model's forward() multiple times
+            #               the first time input_ids contains the prompt (including <|image_{}|>) and input_embeds exists
+            #               from the second time, the input_ids will only contain the generated text
+            #               thus, the input_image_embeds is no longer needed
+            self.input_image_embeds = None
+
+        if self.image_sizes is not None:
+            assert image_sizes is None
+            image_sizes = self.image_sizes
+
+        if self.input_audio_embeds is not None:
+            assert input_audio_embeds is None
+            input_audio_embeds = self.input_audio_embeds.clone()
+            self.input_audio_embeds = None
+
+        if self.audio_embed_sizes is not None:
+            assert audio_embed_sizes is None
+            audio_embed_sizes = self.audio_embed_sizes.clone()
+
+        if self.image_attention_mask is not None:
+            assert image_attention_mask is None
+            image_attention_mask = self.image_attention_mask.clone()
+            self.image_attention_mask = None
+
+        input_shape = input_ids.size()
+        input_ids = input_ids.view(-1, input_shape[-1])
+
+        # backward compatibility
+        with torch.no_grad():
+            new_input_ids = input_ids.clone()
+            new_input_ids[(input_ids >= _COMPATIBLE_IMAGE_SPECIAL_TOKEN_ID_RANGE[0]) &
+                        (input_ids <= _COMPATIBLE_IMAGE_SPECIAL_TOKEN_ID_RANGE[1])] = _IMAGE_SPECIAL_TOKEN_ID
+            new_input_ids[(input_ids >= _COMPATIBLE_AUDIO_SPECIAL_TOKEN_ID_RANGE[0]) &
+                        (input_ids <= _COMPATIBLE_AUDIO_SPECIAL_TOKEN_ID_RANGE[1])] = _AUDIO_SPECIAL_TOKEN_ID
+            input_ids = new_input_ids
+
+        with torch.no_grad():
+            image_position_mask = input_ids == _IMAGE_SPECIAL_TOKEN_ID
+            non_image_position_mask = ~image_position_mask
+
+        assert input_embeds is None
+        if self.training:
+            assert input_image_embeds is not None or input_audio_embeds is not None
+
+        image_hidden_states = None
+        audio_hidden_states = None
+
+        if input_image_embeds is not None:
+            image_hidden_states = self.embed_tokens_extend.image_embed(
+                input_ids=input_ids,
+                input_embeds=input_image_embeds,
+                image_sizes=image_sizes,
+                wte=wte,
+                image_attention_mask=image_attention_mask
+            )
+        if input_audio_embeds is not None:
+            audio_hidden_states = self.embed_tokens_extend.audio_embed(
+                input_ids=input_ids,
+                input_embeds=input_audio_embeds,
+                audio_embed_sizes=audio_embed_sizes,
+                audio_attention_mask=audio_attention_mask,
+                wte=wte,
+                audio_projection_mode=audio_projection_mode,
+            )
+
+        # merge image and audio hidden states
+        # NOTE weijian: for non-image-audio tokens, here we use audio hidden states
+        #               actually, in the debug code above, the non-image-audio tokens from image_hidden_states and audio_hidden_states should be the same
+        if input_image_embeds is not None and input_audio_embeds is not None:
+            dtype = image_hidden_states.dtype
+            hidden_states = image_hidden_states * image_position_mask.to(dtype).unsqueeze(-1) + audio_hidden_states * non_image_position_mask.to(dtype).unsqueeze(-1)
+        elif input_image_embeds is not None:
+            hidden_states = image_hidden_states
+        elif input_audio_embeds is not None:
+            hidden_states = audio_hidden_states
+        else:
+            assert wte is not None
+            hidden_states = wte(input_ids)
+
+        return hidden_states
 
 
 class Phi4MMInputProcessor(InputProcessor):
@@ -58,24 +230,18 @@ class Phi4MMInputProcessor(InputProcessor):
             trust_remote_code=trust_remote_code,
             use_fast=self.use_fast)
 
-        # Build pure-pytorch model architecture for multimodal encoder.
-        # Model weights are also loaded here.
-        OldPreTrainedModel = transformers.modeling_utils.PreTrainedModel
-        transformers.modeling_utils.PreTrainedModel = NewPreTrainedModel
-        # TODO: Make separate Phi4VisionEncoder and Phi4AudioEncoder, and move them to LLM-side.
-        ref_phi4mm_model = transformers.AutoModelForCausalLM.from_pretrained(
+        self.hf_phi4mm_model = HFPhi4MultimodalEncoder.from_pretrained(
             model_path,
-            trust_remote_code=True,
+            trust_remote_code=False,
             # Flash_attn_2 only supports bf16 or fp16 and set in HF config.
             torch_dtype='auto',
             _attn_implementation='flash_attention_2',
         ).eval()
-        transformers.modeling_utils.PreTrainedModel = OldPreTrainedModel
-        self.phi4mm_modal_encoder = ref_phi4mm_model.model.embed_tokens_extend.to(
-            self.device)
-        # Required by Phi4MMImageAudioEmbedding.
-        # See link: https://huggingface.co/microsoft/Phi-4-multimodal-instruct/blob/main/modeling_phi4mm.py#L701
-        self.phi4mm_wte = ref_phi4mm_model.model.embed_tokens.to(self.device)
+        # Move the model to device and set dtype
+        self.hf_phi4mm_model = self.hf_phi4mm_model.to(self.device)
+
+        # Required by HFPhi4MultimodalEncoder.
+        self.phi4mm_wte = self.hf_phi4mm_model.embed_tokens.to(self.device)
 
     @torch.inference_mode()
     def __call__(
@@ -110,7 +276,7 @@ class Phi4MMInputProcessor(InputProcessor):
             audio_projection_mode = 'speech'
 
         # Processing with Phi4MMImageAudioEmbedding.
-        mm_features = self.phi4mm_modal_encoder(
+        mm_features = self.hf_phi4mm_model.forward(
             input_ids=inputs['input_ids'],
             input_embeds=None,
             input_image_embeds=inputs['input_image_embeds'],
