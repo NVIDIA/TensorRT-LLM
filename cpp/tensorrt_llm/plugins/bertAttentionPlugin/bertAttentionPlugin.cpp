@@ -964,9 +964,9 @@ int BertAttentionPlugin::initialize() noexcept
         fmhaParams.forceFp32Acc = false;
         fmhaParams.headSizeV = mHeadSize;
 
-        // Load kernels from the pre-compiled cubins for blackwell.
+        // Load kernels from the pre-compiled cubins.
         mFmhaDispatcher.reset(new FmhaDispatcher(fmhaParams));
-        // Fall back to unfused MHA kernels if not supported for blackwell.
+        // Fall back to unfused MHA kernels if not supported.
         mEnableContextFMHA = mFmhaDispatcher->isSupported();
     }
 
