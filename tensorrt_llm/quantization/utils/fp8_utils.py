@@ -28,6 +28,7 @@ def ceil_to_ue8m0(x: torch.Tensor):
 
 
 @nvtx_range("[DG] quantization")
+@torch.compile(dynamic=True)
 def per_token_cast_to_fp8_e8m0(
         x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     if x.dim() == 2:
