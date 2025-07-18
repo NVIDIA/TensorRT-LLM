@@ -6,7 +6,7 @@ from transformers import AutoTokenizer
 
 from tensorrt_llm import LLM
 from tensorrt_llm.executor import GenerationExecutor
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import create_kv_cache_config
 from tensorrt_llm.sampling_params import SamplingParams
 
 from .task import GenerationTask, Task, TaskStatus
@@ -151,8 +151,9 @@ class TRTLLMWorker(Worker):
         kv_cache_free_gpu_memory_fraction: float = 0.9,
         disable_overlap_scheduler: bool = False,
     ):
-        kv_cache_config = KvCacheConfig(
-            free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction, )
+        kv_cache_config = create_kv_cache_config(
+            free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
+            model_path=model_dir)
 
         tokenizer = AutoTokenizer.from_pretrained(
             model_dir,
