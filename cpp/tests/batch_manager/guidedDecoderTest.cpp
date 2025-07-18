@@ -17,9 +17,9 @@
 #include <fstream>
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
-#include <random>
 
 #include "tensorrt_llm/batch_manager/common.h"
+#include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/guidedDecoder.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/executor/executor.h"
@@ -128,11 +128,21 @@ public:
         RequestVector contextRequests{llmReq1, llmReq2};
         RequestVector generationRequests{};
         ScheduledRequests scheduledRequests{contextRequests, generationRequests};
+        DecoderInputBuffers decoderInputBuffers(mMaxNumRequests, 1, *mRuntimeBufferManager);
+
+        for (auto const& requests : {scheduledRequests.contextRequests, scheduledRequests.generationRequests})
+        {
+            for (auto const& llmReq : requests)
+            {
+                decoderInputBuffers.decoderRequests.push_back(llmReq);
+            }
+        }
+        decoderInputBuffers.logits = mLogits;
 
         // Context phase
         resetLogits();
         mGuidedDecoder->build(scheduledRequests);
-        mGuidedDecoder->execute(scheduledRequests, *mRuntimeBufferManager, mLogits);
+        mGuidedDecoder->execute(decoderInputBuffers, *mRuntimeBufferManager);
         syncLogitsToHost();
         mRuntimeBufferManager->getStream().synchronize();
 
@@ -143,8 +153,18 @@ public:
         generationRequests.push_back(llmReq1);
         llmReq2->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
         generationRequests.push_back(llmReq2);
-        EXPECT_EQ(countRejected(1), mExpectedNumRejected[0]);
-        EXPECT_EQ(countRejected(2), 0);
+
+        decoderInputBuffers.decoderRequests.clear();
+        for (auto const& requests : {scheduledRequests.contextRequests, scheduledRequests.generationRequests})
+        {
+            for (auto const& llmReq : requests)
+            {
+                decoderInputBuffers.decoderRequests.push_back(llmReq);
+            }
+        }
+
+        EXPECT_EQ(countRejected(0), mExpectedNumRejected[0]);
+        EXPECT_EQ(countRejected(1), 0);
 
         // Generation phase
         for (int i = 0; i < mOutputIds.size(); i++)
@@ -154,12 +174,12 @@ public:
 
             resetLogits();
             mGuidedDecoder->build(scheduledRequests);
-            mGuidedDecoder->execute(scheduledRequests, *mRuntimeBufferManager, mLogits);
+            mGuidedDecoder->execute(decoderInputBuffers, *mRuntimeBufferManager);
             syncLogitsToHost();
             mRuntimeBufferManager->getStream().synchronize();
 
-            EXPECT_EQ(countRejected(1), mExpectedNumRejected[i + 1]);
-            EXPECT_EQ(countRejected(2), 0);
+            EXPECT_EQ(countRejected(0), mExpectedNumRejected[i + 1]);
+            EXPECT_EQ(countRejected(1), 0);
         }
     }
 
