@@ -424,21 +424,44 @@ void initConfigBindings(nb::module_& m)
         .def("__getstate__", guidedDecodingConfigGetstate)
         .def("__setstate__", guidedDecodingConfigSetstate);
 
-    auto cacheTransceiverConfigGetstate
-        = [](tle::CacheTransceiverConfig const& self) { return nb::make_tuple(self.getMaxNumTokens()); };
+    auto cacheTransceiverConfigGetstate = [](tle::CacheTransceiverConfig const& self)
+    { return nb::make_tuple(self.getBackendType(), self.getMaxTokensInBuffer()); };
     auto cacheTransceiverConfigSetstate = [](tle::CacheTransceiverConfig& self, nb::tuple const& state)
     {
-        if (state.size() != 1)
+        if (state.size() != 2)
         {
             throw std::runtime_error("Invalid CacheTransceiverConfig state!");
         }
-        new (&self) tle::CacheTransceiverConfig(nb::cast<std::optional<size_t>>(state[0]));
+        new (&self) tle::CacheTransceiverConfig(
+            nb::cast<tle::CacheTransceiverConfig::BackendType>(state[0]), nb::cast<std::optional<size_t>>(state[1]));
     };
 
+    nb::enum_<tle::CacheTransceiverConfig::BackendType>(m, "CacheTransceiverBackendType")
+        .value("DEFAULT", tle::CacheTransceiverConfig::BackendType::DEFAULT)
+        .value("MPI", tle::CacheTransceiverConfig::BackendType::MPI)
+        .value("UCX", tle::CacheTransceiverConfig::BackendType::UCX)
+        .value("NIXL", tle::CacheTransceiverConfig::BackendType::NIXL)
+        .def("from_string",
+            [](std::string const& str)
+            {
+                if (str == "DEFAULT" || str == "default")
+                    return tle::CacheTransceiverConfig::BackendType::DEFAULT;
+                if (str == "MPI" || str == "mpi")
+                    return tle::CacheTransceiverConfig::BackendType::MPI;
+                if (str == "UCX" || str == "ucx")
+                    return tle::CacheTransceiverConfig::BackendType::UCX;
+                if (str == "NIXL" || str == "nixl")
+                    return tle::CacheTransceiverConfig::BackendType::NIXL;
+                throw std::runtime_error("Invalid backend type: " + str);
+            });
+
     nb::class_<tle::CacheTransceiverConfig>(m, "CacheTransceiverConfig")
-        .def(nb::init<std::optional<size_t>>(), nb::arg("max_num_tokens") = nb::none())
-        .def_prop_rw("max_num_tokens", &tle::CacheTransceiverConfig::getMaxNumTokens,
-            &tle::CacheTransceiverConfig::setMaxNumTokens)
+        .def(nb::init<std::optional<tle::CacheTransceiverConfig::BackendType>, std::optional<size_t>>(),
+            nb::arg("backend") = std::nullopt, nb::arg("max_tokens_in_buffer") = std::nullopt)
+        .def_prop_rw(
+            "backend", &tle::CacheTransceiverConfig::getBackendType, &tle::CacheTransceiverConfig::setBackendType)
+        .def_prop_rw("max_tokens_in_buffer", &tle::CacheTransceiverConfig::getMaxTokensInBuffer,
+            &tle::CacheTransceiverConfig::setMaxTokensInBuffer)
         .def("__getstate__", cacheTransceiverConfigGetstate)
         .def("__setstate__", cacheTransceiverConfigSetstate);
 

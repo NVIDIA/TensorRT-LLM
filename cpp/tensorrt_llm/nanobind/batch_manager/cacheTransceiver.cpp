@@ -84,21 +84,15 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
         .def("check_gen_transfer_status", &BaseCacheTransceiver::checkGenTransferStatus)
         .def("check_gen_transfer_complete", &BaseCacheTransceiver::checkGenTransferComplete);
 
-    nb::enum_<tb::CacheTransceiver::CommType>(m, "CommType")
-        .value("UNKNOWN", tb::CacheTransceiver::CommType::UNKNOWN)
-        .value("MPI", tb::CacheTransceiver::CommType::MPI)
-        .value("UCX", tb::CacheTransceiver::CommType::UCX)
-        .value("NIXL", tb::CacheTransceiver::CommType::NIXL);
-
     nb::enum_<executor::kv_cache::CacheState::AttentionType>(m, "AttentionType")
         .value("DEFAULT", executor::kv_cache::CacheState::AttentionType::kDEFAULT)
         .value("MLA", executor::kv_cache::CacheState::AttentionType::kMLA);
 
     nb::class_<tb::CacheTransceiver, tb::BaseCacheTransceiver>(m, "CacheTransceiver")
-        .def(nb::init<tb::kv_cache_manager::BaseKVCacheManager*, tb::CacheTransceiver::CommType,
-                 std::vector<SizeType32>, SizeType32, SizeType32, runtime::WorldConfig, nvinfer1::DataType,
-                 executor::kv_cache::CacheState::AttentionType, std::optional<executor::CacheTransceiverConfig>>(),
-            nb::arg("cache_manager"), nb::arg("comm_type"), nb::arg("num_kv_heads_per_layer"), nb::arg("size_per_head"),
+        .def(nb::init<tb::kv_cache_manager::BaseKVCacheManager*, std::vector<SizeType32>, SizeType32, SizeType32,
+                 runtime::WorldConfig, nvinfer1::DataType, executor::kv_cache::CacheState::AttentionType,
+                 std::optional<executor::CacheTransceiverConfig>>(),
+            nb::arg("cache_manager"), nb::arg("num_kv_heads_per_layer"), nb::arg("size_per_head"),
             nb::arg("tokens_per_block"), nb::arg("world_config"), nb::arg("dtype"), nb::arg("attention_type"),
             nb::arg("cache_transceiver_config") = std::nullopt);
 
@@ -106,5 +100,5 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
         .def(nb::init<tb::kv_cache_manager::BaseKVCacheManager*, std::optional<size_t>>(), nb::arg("cache_manager"),
             nb::arg("max_num_tokens") = std::nullopt)
         .def_static("pre_alloc_buffer_size", &tb::kv_cache_manager::CacheTransBufferManager::preAllocBufferSize,
-            nb::arg("max_num_tokens") = std::nullopt);
+            nb::arg("cache_size_bytes_per_token_per_window"), nb::arg("cache_transceiver_config") = nb::none());
 }
