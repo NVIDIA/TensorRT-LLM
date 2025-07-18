@@ -845,8 +845,7 @@ class TRTLLMSampler(Sampler):
                         })
 
                 if request.py_return_log_probs:
-                    cum_log_probs.append(
-                        cum_log_probs_host[seq_slot * beam_width + beam])
+                    cum_log_probs.append(cum_log_probs_host[seq_slot][beam])
 
                 finished_state = FinishedState(
                     finish_reasons[seq_slot * beam_width + beam])
