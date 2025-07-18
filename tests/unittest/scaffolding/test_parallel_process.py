@@ -4,8 +4,6 @@ import time
 from enum import Enum
 from typing import List
 
-import pytest
-
 from tensorrt_llm.scaffolding import (Controller, ParallelProcess,
                                       ScaffoldingLlm, Task, TaskStatus, Worker)
 
@@ -21,8 +19,6 @@ class DummyTask(Task):
         task = DummyTask(2)
         return task
 
-    # TODO: Fix when ScaffoldingOutput is replaced with GenerationResult
-    # def create_scaffolding_output(self) -> "ScaffoldingOutput":
     def create_scaffolding_output(self):
         self.verify()
         return None
@@ -34,8 +30,6 @@ class DummyTask(Task):
 
 class DummyControllerBase(Controller):
 
-    # TODO: Fix when ScaffoldingOutput is replaced with GenerationResult
-    # def generate(self, prompt: str, **kwargs) -> ScaffoldingOutput:
     def generate(self, prompt: str, **kwargs):
         task = DummyTask.create_from_prompt(prompt)
         yield from self.process([task], **kwargs)
@@ -125,7 +119,6 @@ def parallel_process_helper_run_and_verify(controllers):
     llm.shutdown()
 
 
-@pytest.skip(reason="ScaffoldingOutput removed in PR #5345, needs refactoring")
 def test_parallel_process_helper():
     NUM_CONTROLLERS = 3
     controllers = []
@@ -137,7 +130,6 @@ def test_parallel_process_helper():
     parallel_process_helper_run_and_verify(controllers)
 
 
-@pytest.skip(reason="ScaffoldingOutput removed in PR #5345, needs refactoring")
 def test_parallel_process_helper_with_two_level():
     NUM_CONTROLLERS_LEVEL_1 = 2
     NUM_CONTROLLERS_LEVEL_2 = 2
