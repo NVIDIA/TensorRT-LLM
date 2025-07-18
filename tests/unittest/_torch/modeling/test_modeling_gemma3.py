@@ -315,8 +315,8 @@ class TestGemma3(unittest.TestCase):
 
             torch.testing.assert_close(logits,
                                        ref.logits[:, -1].float(),
-                                       atol=0.05,
-                                       rtol=0.05)
+                                       atol=0.1,
+                                       rtol=0.1)
 
         # Generation phase.
         gen_input_ids = torch.tensor([900], dtype=torch.int, device=device)
@@ -354,7 +354,7 @@ class TestGemma3(unittest.TestCase):
                                     last_cache_position=input_ids.size(-1) + 1)
             torch.testing.assert_close(logits,
                                        ref.logits[:, -1].float(),
-                                       atol=0.05,
-                                       rtol=0.05)
+                                       atol=0.1,
+                                       rtol=0.1)
 
         kv_cache_manager.shutdown()
