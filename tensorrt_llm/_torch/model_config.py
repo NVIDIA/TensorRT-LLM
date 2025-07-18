@@ -202,6 +202,7 @@ class ModelConfig(Generic[TConfig]):
             json_quant_configs = quant_config_dict['quantization']
 
             quant_config.quant_algo = json_quant_configs.get('quant_algo', None)
+            # fp8_pb_wo from modelopt is the same as FP8_BLOCK_SCALES
             if quant_config.quant_algo == "fp8_pb_wo":
                 quant_config.quant_algo = 'FP8_BLOCK_SCALES'
             quant_config.kv_cache_quant_algo = json_quant_configs.get(
