@@ -586,7 +586,7 @@ pipeline {
                         'globalVars': globalVarsJson,
                     ]
 
-                    echo "trigger BuildDockerImageSanityTest job, params: ${parameters}"
+                    echo "Trigger BuildDockerImageSanityTest job, params: ${parameters}"
 
                     def status = ""
                     def jobName = "/LLM/helpers/BuildDockerImageSanityTest"
@@ -595,6 +595,7 @@ pipeline {
                         parameters: trtllm_utils.toBuildParameters(parameters),
                         propagate: false,
                     )
+                    echo "Triggered job: ${handle.absoluteUrl}"
                     status = handle.result
 
                     if (status != "SUCCESS") {
