@@ -108,12 +108,8 @@ void MLACacheFormatter::format(TransferSession& session)
     auto const numPools = mCacheManager->getBlockManager().getNumPools();
     auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest);
 
-    auto constexpr invalidTime = std::chrono::steady_clock::time_point::min();
     auto lastTokenTime = llmRequest.getPerfMetrics().timingMetrics.lastTokenTime;
-    if (!llmRequest.getReturnPerfMetrics())
-    {
-        lastTokenTime = invalidTime;
-    }
+    bool recordDelay = lastTokenTime != std::chrono::steady_clock::time_point();
 
     int blockNum = 0;
     std::vector<runtime::ITensor::SharedPtr> inputKvCacheBlocks;
@@ -234,7 +230,7 @@ void MLACacheFormatter::format(TransferSession& session)
         }
         auto endTime = std::chrono::steady_clock::now();
         double delay = 0.0;
-        if (lastTokenTime != invalidTime)
+        if (recordDelay)
         {
             delay = std::chrono::duration<double, std::milli>(startTime - lastTokenTime).count();
         }
@@ -303,11 +299,7 @@ void MLACacheFormatter::unformat(TransferSession& session)
     auto const& connections = session.getConnections();
     auto& bufferManager = session.getBufferManager();
     auto arrivalTime = llmRequest.getPerfMetrics().timingMetrics.arrivalTime;
-    auto constexpr invalidTime = std::chrono::steady_clock::time_point::min();
-    if (!llmRequest.getReturnPerfMetrics())
-    {
-        arrivalTime = invalidTime;
-    }
+    bool recordDelay = arrivalTime != std::chrono::steady_clock::time_point();
     // diff start
     auto pickUpConnections = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig);
     // diff end
@@ -435,7 +427,7 @@ void MLACacheFormatter::unformat(TransferSession& session)
             }
             auto endTime = std::chrono::steady_clock::now();
             double delay = 0.0;
-            if (arrivalTime != invalidTime)
+            if (recordDelay)
             {
                 delay = std::chrono::duration<double, std::milli>(startTime - arrivalTime).count();
             }
