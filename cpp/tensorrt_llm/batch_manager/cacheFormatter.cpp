@@ -167,11 +167,7 @@ void CacheFormatter::format(TransferSession& session)
     // TODO(oargov): are we sure the other side has the same number of pools? this might not hold for pp_size>1...
 
     auto lastTokenTime = llmRequest.getPerfMetrics().timingMetrics.lastTokenTime;
-    auto constexpr invalidTime = std::chrono::steady_clock::time_point::min();
-    if (!llmRequest.getReturnPerfMetrics())
-    {
-        lastTokenTime = invalidTime;
-    }
+    bool recordDelay = lastTokenTime != std::chrono::steady_clock::time_point();
 
     bool layerWise = common::getEnvDisaggLayerwise() && numPools == 1;
     if (layerWise)
@@ -358,7 +354,7 @@ void CacheFormatter::format(TransferSession& session)
 
             auto endTime = std::chrono::steady_clock::now();
             double delay = 0.0;
-            if (lastTokenTime != invalidTime)
+            if (recordDelay)
             {
                 delay = std::chrono::duration<double, std::milli>(startTime - lastTokenTime).count();
             }
@@ -431,11 +427,7 @@ void CacheFormatter::unformat(TransferSession& session)
     auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest);
 
     auto arrivalTime = llmRequest.getPerfMetrics().timingMetrics.arrivalTime;
-    auto constexpr invalidTime = std::chrono::steady_clock::time_point::min();
-    if (!llmRequest.getReturnPerfMetrics())
-    {
-        arrivalTime = invalidTime;
-    }
+    bool recordDelay = arrivalTime != std::chrono::steady_clock::time_point();
 
     auto pickUpConnections = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig);
 
@@ -714,7 +706,7 @@ void CacheFormatter::unformat(TransferSession& session)
                 }
                 auto endTime = std::chrono::steady_clock::now();
                 double delay = 0.0;
-                if (arrivalTime != invalidTime)
+                if (recordDelay)
                 {
                     delay = std::chrono::duration<double, std::milli>(startTime - arrivalTime).count();
                 }
