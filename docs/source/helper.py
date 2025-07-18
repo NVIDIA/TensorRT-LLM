@@ -286,6 +286,18 @@ def extract_all_and_eval(file_path):
     return local_vars
 
 
+def get_pydantic_methods() -> list[str]:
+    from pydantic import BaseModel
+
+    class Dummy(BaseModel):
+        pass
+
+    methods = set(
+        [method for method in dir(Dummy) if not method.startswith('_')])
+    methods.discard("__init__")
+    return list(methods)
+
+
 def generate_llmapi():
     root_dir = Path(__file__).parent.parent.parent.resolve()
 
@@ -301,14 +313,18 @@ def generate_llmapi():
     for cls_name in public_classes_names:
         cls_name = cls_name.strip()
         options = [
-            "    :members:", "    :undoc-members:", "    :show-inheritance:"
+            "    :members:",
+            "    :undoc-members:",
+            "    :show-inheritance:",
+            "    :special-members: __init__",
+            "    :member-order: groupwise",
         ]
 
-        if cls_name != 'LLM':  # Conditionally add :special-members: __init__
-            options.append("    :special-members: __init__")
-
-        if cls_name in ['TrtLLM', 'TorchLLM', 'LLM']:
-            options.append("    :inherited-members:")
+        options.append("    :inherited-members:")
+        if cls_name in ["TorchLlmArgs", "TrtLlmArgs"]:
+            # exclude tons of methods from Pydantic
+            options.append(
+                f"    :exclude-members: {','.join(get_pydantic_methods())}")
 
         content += f".. autoclass:: tensorrt_llm.llmapi.{cls_name}\n"
         content += "\n".join(options) + "\n\n"
