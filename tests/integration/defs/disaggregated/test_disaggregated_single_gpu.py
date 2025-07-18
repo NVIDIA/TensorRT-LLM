@@ -360,18 +360,21 @@ def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
         KvCacheConfig(max_tokens=128, enable_block_reuse=False)
         for _ in range(2)
     ]
+    cache_transceiver_configs = [
+        CacheTransceiverConfig(backend="default") for _ in range(2)
+    ]
     model_names = [model_path(model) for _ in range(2)]
     ranks = [0, 1]
     worker_args = list(
-        zip(kv_cache_configs, worker_pytorch_configs, model_names, ranks))
+        zip(kv_cache_configs, cache_transceiver_configs, worker_pytorch_configs,
+            model_names, ranks))
 
     port_name = MPI.Open_port()
     MPI.Publish_name('my_port', port_name)
 
     prompt = "What is the capital of Germany?"
 
-    with MPIPoolExecutor(max_workers=2, env={"TRTLLM_USE_MPI_KVCACHE":
-                                             "1"}) as executor:
+    with MPIPoolExecutor(max_workers=2, env={"UCX_TLS": "^ib"}) as executor:
         futures = []
         try:
             for worker_arg in worker_args:
