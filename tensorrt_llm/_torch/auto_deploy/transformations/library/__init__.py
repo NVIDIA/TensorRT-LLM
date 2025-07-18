@@ -3,7 +3,6 @@
 from .attention import *
 from .collectives import *
 from .eliminate_redundant_transposes import *
-from .ep_sharding import *
 from .fused_moe import *
 from .fusion import *
 from .kvcache import *
