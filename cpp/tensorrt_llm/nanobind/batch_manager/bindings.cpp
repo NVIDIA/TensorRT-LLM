@@ -387,16 +387,16 @@ void initBindings(nb::module_& m)
             nb::arg("max_num_sequences"), nb::arg("model_config"), nb::arg("world_config"), nb::arg("buffer_manager"));
 
     nb::class_<tb::DecoderInputBuffers>(m, "DecoderInputBuffers")
-        .def(nb::init<runtime::SizeType32, runtime::SizeType32, runtime::SizeType32, tr::BufferManager>(),
-            nb::arg("max_num_sequences"), nb::arg("max_batch_size"), nb::arg("max_tokens_per_engine_step"),
-            nb::arg("manager"))
+        .def(nb::init<runtime::SizeType32, runtime::SizeType32, tr::BufferManager>(), nb::arg("max_batch_size"),
+            nb::arg("max_tokens_per_engine_step"), nb::arg("manager"))
         .def_rw("setup_batch_slots", &tb::DecoderInputBuffers::setupBatchSlots)
         .def_rw("setup_batch_slots_device", &tb::DecoderInputBuffers::setupBatchSlotsDevice)
         .def_rw("fill_values", &tb::DecoderInputBuffers::fillValues)
         .def_rw("fill_values_device", &tb::DecoderInputBuffers::fillValuesDevice)
         .def_rw("inputs_ids", &tb::DecoderInputBuffers::inputsIds)
         .def_rw("forward_batch_slots", &tb::DecoderInputBuffers::forwardBatchSlots)
-        .def_rw("logits", &tb::DecoderInputBuffers::logits);
+        .def_rw("logits", &tb::DecoderInputBuffers::logits)
+        .def_rw("decoder_requests", &tb::DecoderInputBuffers::decoderRequests);
 
     nb::class_<tb::DecoderOutputBuffers>(m, "DecoderOutputBuffers")
         .def_rw("sequence_lengths_host", &tb::DecoderOutputBuffers::sequenceLengthsHost)

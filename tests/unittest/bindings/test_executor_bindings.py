@@ -2478,8 +2478,9 @@ def test_guided_decoding_config_pickle():
 
 
 def test_cache_transceiver_config_pickle():
-    config = trtllm.CacheTransceiverConfig(backend="UCX",
-                                           max_tokens_in_buffer=1024)
+    config = trtllm.CacheTransceiverConfig(
+        backend=trtllm.CacheTransceiverBackendType.UCX,
+        max_tokens_in_buffer=1024)
     config_copy = pickle.loads(pickle.dumps(config))
     assert config_copy.backend == config.backend
     assert config_copy.max_tokens_in_buffer == config.max_tokens_in_buffer

@@ -131,16 +131,16 @@ void tensorrt_llm::nanobind::batch_manager::algorithms::initBindings(nb::module_
 
     nb::class_<MakeDecodingBatchInputOutput>(m, MakeDecodingBatchInputOutput::name)
         .def(nb::init<>())
-        .def("__call__", &MakeDecodingBatchInputOutput::operator(), nb::arg("context_requests"),
-            nb::arg("generation_requests"), nb::arg("decoder_input_buffers"), nb::arg("decoder_state"),
-            nb::arg("model_config"), nb::arg("max_num_sequences"), nb::arg("fused_runtime_buffers") = std::nullopt)
+        .def("__call__", &MakeDecodingBatchInputOutput::operator(), nb::arg("decoder_input_buffers"),
+            nb::arg("decoder_state"), nb::arg("model_config"), nb::arg("max_num_sequences"),
+            nb::arg("fused_runtime_buffers") = std::nullopt)
         .def("name", [](MakeDecodingBatchInputOutput const&) { return MakeDecodingBatchInputOutput::name; });
 
     nb::class_<LogitsPostProcessor>(m, LogitsPostProcessor::name)
         .def(nb::init<>())
-        .def("__call__", &LogitsPostProcessor::operator(), nb::arg("context_requests"), nb::arg("generation_requests"),
-            nb::arg("replicate_logits_post_processor"), nb::arg("decoder_buffers"), nb::arg("world_config"),
-            nb::arg("runtime"), nb::arg("logits_post_processor_batched") = std::nullopt)
+        .def("__call__", &LogitsPostProcessor::operator(), nb::arg("decoder_input_buffers"),
+            nb::arg("replicate_logits_post_processor"), nb::arg("world_config"), nb::arg("stream"),
+            nb::arg("logits_post_processor_batched") = std::nullopt)
         .def("name", [](LogitsPostProcessor const&) { return LogitsPostProcessor::name; });
 
     nb::class_<CreateNewDecoderRequests>(m, CreateNewDecoderRequests::name)
