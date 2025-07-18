@@ -78,7 +78,7 @@ To enable guided decoding, you must:
     * Note: Depending on the type of format, a different parameter needs to be chosen to construct the object (`json`, `regex`, `grammar`, `strucutral_tag`).
 3. Pass the `GuidedDecodingParams` object to the `guided_decoding` parameter of the `SamplingParams` object
 
-The following example demonstrates guided decoding with JSON format:
+The following example demonstrates guided decoding with a JSON schema:
 
 ```python
 from tensorrt_llm import LLM, SamplingParams
@@ -91,7 +91,7 @@ guided_decoding_params = GuidedDecodingParams(json=structure)
 sampling_params = SamplingParams(
         guided_decoding=guided_decoding_params,
     )
-llm.generate(["Generate a JSON response"], sampling_params)
+llm.generate("Generate a JSON response", sampling_params)
 ```
 
 You can find a more detailed example on guided decoding [here](../../../../examples/llm-api/llm_guided_decoding.py).
@@ -123,7 +123,7 @@ class MyCustomLogitsProcessor(LogitsProcessor):
         client_id: Optional[int]
     ) -> None:
         # Implement your custom inplace logits processing logic
-        logits = 2 * logits
+        logits *= logits
 
 llm = LLM(model='nvidia/Llama-3.1-8B-Instruct-FP8')
 sampling_params = SamplingParams(
