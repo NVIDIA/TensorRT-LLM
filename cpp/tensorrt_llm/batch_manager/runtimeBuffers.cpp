@@ -84,7 +84,7 @@ void RuntimeBuffers::create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
 
     if (modelConfig.isTransformerBased())
     {
-        transformerBuffers = std::make_unique<TransformerBuffers>(maxBatchSize, maxBeamWidth, maxAttentionWindowVec,
+        transformerBuffers = std::make_shared<TransformerBuffers>(maxBatchSize, maxBeamWidth, maxAttentionWindowVec,
             maxAttentionWindow, sinkTokenLen, runtime, modelConfig, worldConfig);
     }
     if (modelConfig.isRnnBased())

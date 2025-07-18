@@ -593,7 +593,7 @@ class BuildConfig:
             defaults.get('max_prompt_embedding_table_size'))
 
         if "kv_cache_type" in config and config["kv_cache_type"] is not None:
-            kv_cache_type = KVCacheType(config.pop('kv_cache_type'))
+            kv_cache_type = KVCacheType.from_string(config.pop('kv_cache_type'))
         else:
             kv_cache_type = None
         gather_context_logits = config.pop(

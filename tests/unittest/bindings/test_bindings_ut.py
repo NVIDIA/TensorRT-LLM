@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 from utils.runtime_defaults import assert_runtime_defaults_are_parsed_correctly
 
@@ -309,6 +310,8 @@ def test_gpt_json_config():
                                                  strict_keys=strict_keys)
 
 
+@pytest.mark.skipif(_tb.binding_type == "nanobind",
+                    reason="Test not supported for nanobind yet")
 def test_llm_request():
     beam_width = 2
     sampling_config = _tb.SamplingConfig(beam_width)
@@ -418,6 +421,8 @@ def test_Mpicomm():
     assert size2 == session_size
 
 
+@pytest.mark.skipif(_tb.binding_type == "nanobind",
+                    reason="Test not supported for nanobind yet")
 def test_SamplingConfig_pickle():
     config = _tb.SamplingConfig()
     config.beam_width = 5
@@ -497,6 +502,8 @@ def test_KvCache_events_binding():
     torch.cuda.empty_cache()
 
 
+@pytest.mark.skipif(_tb.binding_type == "nanobind",
+                    reason="Test not supported for nanobind yet")
 def test_ReqIdsSet_pickle():
     ids = _tb.internal.batch_manager.ReqIdsSet()
     ids1 = pickle.loads(pickle.dumps(ids))
