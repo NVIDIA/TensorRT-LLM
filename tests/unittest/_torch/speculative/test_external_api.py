@@ -3,6 +3,7 @@ import sys
 import unittest
 import httpx
 import time
+import asyncio
 
 from fastapi import FastAPI
 import uvicorn
@@ -104,12 +105,12 @@ def test_llama_user_provided(setup_server, disable_overlap_scheduler: bool,
     # test that endpoint can be hit successfully
     extra_token = 3
     custom_prefix = [4, 5, 6]
-    get_draft = lambda drafter: drafter.get_draft_tokens(
+    get_draft = lambda drafter: asyncio.run(drafter.get_draft_tokens(
         prefix=custom_prefix,
         request_id=0,
         end_id=0,
         max_sequence_length=max_draft_len
-    )
+    ))
 
     # no template, no response field
     spec_config = ExternalAPIConfig(
@@ -156,12 +157,12 @@ def test_llama_user_provided(setup_server, disable_overlap_scheduler: bool,
     assert draft_tokens == custom_prefix + [extra_token]
 
     # test correct drafting length (max_draft_len = 4)
-    draft_tokens = spec_drafter.get_draft_tokens(
+    draft_tokens = asyncio.run(spec_drafter.get_draft_tokens(
         prefix=[0, 1, 2, 3, 4, 5, 6],
         request_id=0,
         end_id=0,
         max_sequence_length=max_draft_len
-    )
+    ))
     assert draft_tokens == [0, 1, 2, 3]
 
     # test nested response field

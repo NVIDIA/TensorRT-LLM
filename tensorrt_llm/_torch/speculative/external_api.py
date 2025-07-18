@@ -1,6 +1,8 @@
 import requests
 import json
 from typing import List, Optional
+import asyncio
+import aiohttp
 
 from tensorrt_llm.logger import logger
 
@@ -51,7 +53,7 @@ class APIDrafter(Drafter):
             return []
         return current
     
-    def get_draft_tokens(
+    async def get_draft_tokens(
         self,
         prefix: list[int],
         request_id: int,
@@ -66,26 +68,28 @@ class APIDrafter(Drafter):
                 "max_sequence_length": max_sequence_length,
             }
             if self.template:
-                request_data.update(self.template)  
-            response = requests.post(
-                url=self.endpoint,
-                json=request_data,
-                headers={"Content-Type": "application/json"},
-                timeout=10,
-            )
+                request_data.update(self.template)
             
-            # check for unsuccessful response
-            if response.status_code != 200:
-                logger.error(f"Failed to get draft tokens. API call failed for request {request_id} with status code {response.status_code} and message {response.text}")
-                return []
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url=self.endpoint,
+                    json=request_data,
+                    headers={"Content-Type": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as response:
+                
+                    # check for unsuccessful response
+                    if response.status != 200:
+                        logger.error(f"Failed to get draft tokens. API call failed for request {request_id} with status code {response.status}")
+                        return []
+                    
+                    result = await response.json()
+                    draft_tokens = self.get_nested_field_from_response(result)
+                    if len(draft_tokens) > self.max_draft_len:
+                        draft_tokens = draft_tokens[:self.max_draft_len]
+                    logger.debug(f"Retrieved draft tokens for request {request_id}")
+                    return draft_tokens
             
-            result = response.json()
-            draft_tokens = self.get_nested_field_from_response(result)
-            if len(draft_tokens) > self.max_draft_len:
-                draft_tokens = draft_tokens[:self.max_draft_len]
-            logger.debug(f"Retrieved draft tokens for request {request_id}")
-            return draft_tokens
-        
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse JSON response for request {request_id}: {e}")
             logger.debug(f"Raw response: {response.text[:500]}...")
@@ -95,7 +99,7 @@ class APIDrafter(Drafter):
             logger.error(f"Failed to get draft tokens. API call failed for request {request_id} with the following error: {e}")
             return []
 
-    def prepare_draft_tokens(
+    async def prepare_draft_tokens(
         self,
         scheduled_requests: ScheduledRequests,
     ) -> None:
@@ -111,7 +115,7 @@ class APIDrafter(Drafter):
             prefix = list(request.get_tokens()[0])  # Get a copy
 
             # Generate draft tokens
-            draft_tokens = self.get_draft_tokens(
+            draft_tokens = await self.get_draft_tokens(
                 prefix,
                 request.request_id,
                 request.py_end_id,
