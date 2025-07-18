@@ -1002,7 +1002,7 @@ public:
         std::optional<RetentionPriority> secondaryOffloadMinPriority = std::nullopt, size_t eventBufferMaxSize = 0,
         bool enablePartialReuse = true, bool copyOnPartialReuse = true, bool useUvm = false,
         std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults = std::nullopt,
-        std::optional<uint64_t> const& maxFreeGpuMemorySize = std::nullopt);
+        uint64_t const& maxGpuTotalBytes = 0);
 
     [[nodiscard]] bool getEnableBlockReuse() const;
     [[nodiscard]] bool getEnablePartialReuse() const;
@@ -1017,7 +1017,7 @@ public:
     [[nodiscard]] std::optional<RetentionPriority> getSecondaryOffloadMinPriority() const;
     [[nodiscard]] size_t getEventBufferMaxSize() const;
     [[nodiscard]] bool getUseUvm() const;
-    [[nodiscard]] std::optional<uint64_t> getMaxFreeGpuMemorySize() const;
+    [[nodiscard]] uint64_t getMaxGpuTotalBytes() const;
 
     void setEnableBlockReuse(bool enableBlockReuse);
     void setEnablePartialReuse(bool enablePartialReuse);
@@ -1032,7 +1032,7 @@ public:
     void setSecondaryOffloadMinPriority(std::optional<RetentionPriority> secondaryOffloadMinPriority);
     void setEventBufferMaxSize(size_t eventBufferMaxSize);
     void setUseUvm(bool useUvm);
-    void setMaxFreeGpuMemorySize(uint64_t maxFreeGpuMemorySize);
+    void setMaxGpuTotalBytes(uint64_t maxGpuTotalBytes);
 
     void fillEmptyFieldsFromRuntimeDefaults(tensorrt_llm::runtime::RuntimeDefaults const& runtimeDefaults);
 
@@ -1091,9 +1091,9 @@ private:
 
     /// @brief The maximum size in bytes of GPU memory that can be allocated for the KV cache.
     /// This is only used for VSWA case for now as a alternative to mMaxTokens.
-    /// If both mMaxFreeGpuMemorySize and mFreeGpuMemoryFraction are specified, memory corresponding to the minimum will
+    /// If both mMaxGpuTotalBytes and mFreeGpuMemoryFraction are specified, memory corresponding to the minimum will
     /// be allocated.
-    std::optional<uint64_t> mMaxFreeGpuMemorySize;
+    uint64_t mMaxGpuTotalBytes;
 };
 
 /// @brief Configuration class for the runtime perf knobs

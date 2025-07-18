@@ -640,13 +640,14 @@ class KVCacheManager(BaseResourceManager):
     @staticmethod
     def adjust_window_sizes_for_vswa(
         window_size_to_layers: Dict[int, List[int]],
+        max_attention_window_vec: List[int],
         kv_cache_config: KvCacheConfigCpp,
         model_config: ModelConfig,
         pool_memory_bytes: int,
         kv_factor: int,
         dtype: DataType,
         is_cross_attention: bool = False,
-    ) -> Dict[int, List[int]]:
+    ) -> Tuple[Dict[int, List[int]], List[int]]:
 
         assert is_cross_attention is False, 'Cross attention is not supported'
 
@@ -671,7 +672,8 @@ class KVCacheManager(BaseResourceManager):
 
         if required_mem_bytes_per_seq < pool_memory_bytes:
             # No need to adjust the window sizes.
-            return copy.deepcopy(window_size_to_layers)
+            return (copy.deepcopy(window_size_to_layers),
+                    max_attention_window_vec)
 
         logger.debug(
             f'Adjusting the window sizes {list(window_size_to_layers)} to fit '
@@ -684,6 +686,7 @@ class KVCacheManager(BaseResourceManager):
 
         accum_max_tokens = 0
         prev_window_size = 0
+        adjusted_max_attention_window_vec = max_attention_window_vec.copy()
 
         for window_size in sorted(window_size_to_layers):
             layers = window_size_to_layers[window_size]
@@ -725,13 +728,18 @@ class KVCacheManager(BaseResourceManager):
 
             if accum_max_tokens not in adjusted_window_size_to_layers:
                 adjusted_window_size_to_layers[accum_max_tokens] = layers.copy()
+                # also update adjusted_max_attention_window_vec
+                for i, v in enumerate(adjusted_max_attention_window_vec):
+                    if v == window_size:
+                        adjusted_max_attention_window_vec[i] = accum_max_tokens
             else:
                 adjusted_window_size_to_layers[accum_max_tokens].extend(layers)
 
             remaining_layers -= set(layers)
             prev_window_size = window_size
 
-        return adjusted_window_size_to_layers
+        return (adjusted_window_size_to_layers,
+                adjusted_max_attention_window_vec)
 
     def calculate_max_num_blocks_from_cpp(
             self,
@@ -768,13 +776,9 @@ class KVCacheManager(BaseResourceManager):
         logger.debug(f"window_size_to_layers: {window_size_to_layers}")
 
         free_mem, total_mem = torch.cuda.mem_get_info()
-        primary_pool_memory_bytes = int(free_mem)
-        if kv_cache_config.max_free_gpu_memory_size is not None:
-            # overwrite max_tokens in VSWA case, use max_free_gpu_memory_size instead
-            kv_cache_config.max_tokens = None
-            primary_pool_memory_bytes = min(
-                kv_cache_config.max_free_gpu_memory_size,
-                primary_pool_memory_bytes)
+        # Respect max_gpu_total_bytes if provided
+        primary_pool_memory_bytes = kv_cache_config.max_gpu_total_bytes if kv_cache_config.max_gpu_total_bytes > 0 else int(
+            free_mem * kv_cache_config.free_gpu_memory_fraction)
         secondary_pool_memory_bytes = 0
         logger.debug(
             f"primary_pool_memory_bytes is set to {primary_pool_memory_bytes/1024**3}GB, \n"
@@ -783,8 +787,9 @@ class KVCacheManager(BaseResourceManager):
 
         # Adjust the window sizes to fit the memory if even a single sequence
         # cannot fit in the memory.
-        window_size_to_layers = self.adjust_window_sizes_for_vswa(
+        window_size_to_layers, max_attention_window_vec = self.adjust_window_sizes_for_vswa(
             window_size_to_layers=window_size_to_layers,
+            max_attention_window_vec=self.max_attention_window_vec,
             model_config=model_config,
             kv_cache_config=kv_cache_config,
             pool_memory_bytes=primary_pool_memory_bytes,
@@ -792,6 +797,7 @@ class KVCacheManager(BaseResourceManager):
             dtype=self.dtype,
             is_cross_attention=is_cross_attention,
         )
+        self.max_attention_window_vec = max_attention_window_vec
 
         blocks_per_window = KVCacheManagerCpp.calculate_max_num_blocks(
             config=kv_cache_config,

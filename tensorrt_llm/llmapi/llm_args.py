@@ -926,7 +926,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "Number of sink tokens (tokens to always keep in attention window).")
     free_gpu_memory_fraction: Optional[float] = Field(
-        default=None,
+        default=0.9,
         description=
         "The fraction of GPU memory fraction that should be allocated for the KV cache. Default is 90%. If both `max_tokens` and `free_gpu_memory_fraction` are specified, memory corresponding to the minimum will be used."
     )
@@ -963,8 +963,8 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     )
     use_uvm: bool = Field(default=False,
                           description="Whether to use UVM for the KV cache.")
-    max_free_gpu_memory_size: Optional[int] = Field(
-        default=None,
+    max_gpu_total_bytes: int = Field(
+        default=0,
         description=
         "The maximum size in bytes of GPU memory that can be allocated for the KV cache. This is only used for VSWA case for now as a alternative to `max_tokens`. If both `max_free_gpu_memory_size` and `free_gpu_memory_fraction` are specified, memory corresponding to the minimum will be allocated."
     )
@@ -988,7 +988,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             enable_partial_reuse=self.enable_partial_reuse,
             copy_on_partial_reuse=self.copy_on_partial_reuse,
             use_uvm=self.use_uvm,
-            max_free_gpu_memory_size=self.max_free_gpu_memory_size)
+            max_gpu_total_bytes=self.max_gpu_total_bytes)
 
 
 @PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)
