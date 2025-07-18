@@ -130,7 +130,7 @@ def _run_pattern_detection_job(
 @pytest.mark.parametrize("device_count", get_device_counts())
 def test_sharding(device_count: int, num_experts_multiplier: int):
     dist_common.spawn_multiprocess_job(
-        job=partial(_run_job, num_experts_multiplier=num_experts_multiplier),
+        job=partial(_run_job, num_experts_multiplier),
         size=device_count,
     )
 
