@@ -477,9 +477,11 @@ class KVCacheManager(BaseResourceManager):
         free_mem, total_mem = torch.cuda.mem_get_info()
 
         assert free_mem_fraction < 1.0, f"Invalid freeMemFraction, freeMemFraction {free_mem_fraction} must be smaller than 1.0"
+        primary_pool_memory_bytes = int(free_mem * free_mem_fraction)
         # Respect max_gpu_total_bytes if provided
-        primary_pool_memory_bytes = kv_cache_config.max_gpu_total_bytes if kv_cache_config.max_gpu_total_bytes > 0 else int(
-            free_mem * free_mem_fraction)
+        if kv_cache_config.max_gpu_total_bytes > 0:
+            primary_pool_memory_bytes = min(primary_pool_memory_bytes,
+                                            kv_cache_config.max_gpu_total_bytes)
         max_tokens = primary_pool_memory_bytes / cache_size_bytes_per_token
 
         # If user specified a number of tokens
