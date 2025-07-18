@@ -28,7 +28,9 @@ cat > ./extra_llm_api_options.yaml <<EOF
 enable_attention_dp: true
 cuda_graph_config: {}
 moe_backend: WideEP
-moe_max_num_tokens: 8192
+moe_config:
+    backend: WideEP
+    max_num_tokens: 8192
 EOF
 
 trtllm-llmapi-launch \
@@ -117,9 +119,10 @@ Run 36-way expert parallelism inference with the EPLB configuration incorporated
 cat > ./extra_llm_api_options_eplb.yaml <<EOF
 enable_attention_dp: true
 cuda_graph_config: {}
-moe_backend: WideEP
-moe_max_num_tokens: 9216
-moe_load_balancer: ./moe_load_balancer.yaml
+moe_config:
+    backend: WideEP
+    max_num_tokens: 9216
+    load_balancer: ./moe_load_balancer.yaml
 EOF
 
 trtllm-llmapi-launch \
@@ -183,9 +186,10 @@ Run 36-way expert parallelism inference with the EPLB configuration incorporated
 cat > ./extra_llm_api_options_eplb.yaml <<EOF
 enable_attention_dp: true
 cuda_graph_config: {}
-moe_backend: WideEP
-moe_max_num_tokens: 9216
-moe_load_balancer: ./moe_load_balancer.yaml
+moe_config:
+    backend: WideEP
+    max_num_tokens: 9216
+    load_balancer: ./moe_load_balancer.yaml
 EOF
 
 trtllm-llmapi-launch \
@@ -204,9 +208,9 @@ trtllm-bench --model ${MODEL_NAME} \
 
 > **Note:** Similar to offline EP Load Balancer, you can enable expert ID counting to verify the effectiveness of EPLB, but remember to disable it when running inference for benchmarking or production purposes.
 
-> **Explanation on moe_max_num_tokens:** For Large Scale EP, there can be extreme conditions that all ranks send tokens to a single rank since they all want that expert.
+> **Explanation on max_num_tokens of moe_config:** For Large Scale EP, there can be extreme conditions that all ranks send tokens to a single rank since they all want that expert.
 In that case, that rank will have too many tokens to compute. In order not to make the hot rank OOM, there is one strategy that chunk the tokens if there are too much.
-`moe_max_num_tokens` is the parameter that controls the max chunk size. However, this may have performance penalty if there is enough since batch size is smaller.
+`max_num_tokens` of moe_config is the parameter that controls the max chunk size. However, this may have performance penalty if there is enough since batch size is smaller.
 So by default, it is set to some value that all tokens can complete in one wave. However, if EP size is large, we may need to trade off that in order not to OOM or got other runtime errors due to lack of memory.
-One good point is that if memory is OK, we can set `moe_max_num_tokens` to `max_batch_size * ep_size` to make all generation requests can be processed in one chunk.
-For example, if `ep_size` is 36 and `max_batch_size` is 256, we may set `moe_max_num_tokens` to 9216.
+One good point is that if memory is OK, we can set `max_num_tokens` to `max_batch_size * ep_size` to make all generation requests can be processed in one chunk.
+For example, if `ep_size` is 36 and `max_batch_size` is 256, we may set `max_num_tokens` to 9216.

@@ -20,6 +20,8 @@
 #include <cooperative_groups/reduce.h>
 #include <cub/cub.cuh>
 
+#include "tensorrt_llm/kernels/archCondition.h"
+
 namespace moe::dev::routing
 {
 
@@ -86,12 +88,8 @@ struct TopKRedType
 
     __device__ inline TypeCmp reduce(cg::thread_block_tile<WarpSize> const& warp)
     {
-#if defined(TLLM_GEN_HAS_FAST_REDUX)
-        static constexpr bool UseCg = false;
-#else
-        static constexpr bool UseCg = true;
-#endif
-        if constexpr (UseCg || sizeof(TypeCmp) == 8)
+        static constexpr bool hasFastRedux = tensorrt_llm::kernels::arch::is_major_v<10>;
+        if constexpr (!hasFastRedux || sizeof(TypeCmp) == 8)
         {
             return cg::reduce(warp, compVal, cg::greater<TypeCmp>{});
         }

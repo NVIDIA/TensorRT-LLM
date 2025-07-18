@@ -124,7 +124,7 @@ def top_p_sampling_batch(logits: torch.Tensor, top_p: float = 0.9):
     logits_dim = logits.dim()
     if logits_dim == 1:
         logits = logits.unsqueeze(0)
-    assert logits_dim == 2, "logits should be 2D： [batch_size, vocab_size]"
+    assert logits_dim == 2, "logits should be 2D: [batch_size, vocab_size]"
 
     # sort the logits of each sample in descending order
     sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
@@ -536,8 +536,7 @@ class TRTLLMSampler(Sampler):
             "buffer_manager":
             buffer_manager,
             "decoder_input_buffers": [
-                DecoderInputBuffers(self.max_num_sequences,
-                                    self.executor_config.max_batch_size,
+                DecoderInputBuffers(self.executor_config.max_batch_size,
                                     self.MAX_DECODING_TOKENS, buffer_manager)
                 for _ in range(self.num_micro_batches)
             ],
@@ -715,7 +714,8 @@ class TRTLLMSampler(Sampler):
     @torch.inference_mode()
     def update_requests(self, state: SampleStateTRTLLM):
         assert isinstance(state, SampleStateTRTLLM)
-        assert state.scheduled_requests.batch_size > 0
+        if state.scheduled_requests.batch_size == 0:
+            return
 
         if state.sampler_event:
             state.sampler_event.synchronize()
@@ -845,8 +845,7 @@ class TRTLLMSampler(Sampler):
                         })
 
                 if request.py_return_log_probs:
-                    cum_log_probs.append(
-                        cum_log_probs_host[seq_slot * beam_width + beam])
+                    cum_log_probs.append(cum_log_probs_host[seq_slot][beam])
 
                 finished_state = FinishedState(
                     finish_reasons[seq_slot * beam_width + beam])

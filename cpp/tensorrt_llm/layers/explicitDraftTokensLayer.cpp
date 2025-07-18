@@ -15,13 +15,12 @@
  */
 
 #include "explicitDraftTokensLayer.h"
+#include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/kernels/penaltyTypes.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/common.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/explicitDraftTokensKernels.h"
 #include "tensorrt_llm/layers/defaultDecodingParams.h"
 #include "tensorrt_llm/layers/layerUtils.h"
-
-#include <algorithm>
 
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::kernels;
@@ -75,6 +74,7 @@ void ExplicitDraftTokensLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWid
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(ExplicitDraftTokensLayer_setup);
 
     auto setupParams = std::dynamic_pointer_cast<ExplicitDraftTokensSetupParams>(baseSetupParams);
     workspace->initializeDeviceCurandStates(
@@ -115,6 +115,7 @@ void ExplicitDraftTokensLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutpu
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(ExplicitDraftTokensLayer_forwardAsync);
 
     auto inputs = std::dynamic_pointer_cast<ExplicitDraftTokensInputs>(baseInputs);
     auto outputs = std::dynamic_pointer_cast<ExplicitDraftTokensOutputs>(baseOutputs);
@@ -288,7 +289,7 @@ void ExplicitDraftTokensLayer<T>::packAcceptedPaths(ExplicitDraftTokensOutputs c
         numNewTokensCumSum != nullptr, "numNewTokensCumSum must be provided for ExplicitDraftTokensLayer");
     TLLM_CHECK_WITH_INFO(pathsOffsets != nullptr, "pathsOffsets must be provided for ExplicitDraftTokensLayer");
     invokePackAcceptedPaths(numNewTokensCumSum, pathsOffsets, numNewTokens, bestPathIndicesSlotsPtr,
-        lastDraftIndicesSlotsPtr, batchSlots, nullptr, batchSize, batchSize,
+        lastDraftIndicesSlotsPtr, batchSlots, batchSize, batchSize,
         mDecoderDomain.getSpeculativeDecodingModule()->getMaxNumPaths(),
         mDecoderDomain.getSpeculativeDecodingModule()->getMaxPathLen(), false, getStream());
 

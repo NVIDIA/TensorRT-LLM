@@ -54,6 +54,7 @@ MODEL_PATH_DICT = {
     "modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8",
     "llama_v3.3_70b_instruct_fp4":
     "modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4",
+    "llama_v3.3_70b_instruct": "llama-3.3-models/Llama-3.3-70B-Instruct",
     "llama_v3.1_405b_instruct_fp4":
     "modelopt-hf-model-hub/Llama-3.1-405B-Instruct-fp4",
     "llama_v3.1_70b_instruct": "llama-3.1-model/Meta-Llama-3.1-70B-Instruct",
@@ -64,6 +65,8 @@ MODEL_PATH_DICT = {
     "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1",
     "llama_v3.3_nemotron_super_49b_fp8":
     "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-FP8",
+    "llama_v3.1_nemotron_ultra_253b":
+    "nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1",
     "llama_v3.1_nemotron_ultra_253b_fp8":
     "nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1-FP8",
     "llama_v4_scout_17b_16e_instruct":

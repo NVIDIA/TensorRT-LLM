@@ -64,6 +64,7 @@ def fuse_input_embeds(
         mm_token_mask = input_ids >= vocab_size
         text_token_mask = input_ids < vocab_size
     else:
+        mm_token_ids = mm_token_ids.to(input_ids.device)
         mm_token_mask = torch.isin(input_ids, mm_token_ids)
         text_token_mask = ~mm_token_mask
     text_token_indices = torch.where(text_token_mask)[0]

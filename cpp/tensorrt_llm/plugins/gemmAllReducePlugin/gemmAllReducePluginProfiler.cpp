@@ -60,8 +60,12 @@ void GemmAllReducePluginProfiler::deserializeFromOwnFile(GemmIdCore gemmId, Gemm
 
 bool GemmAllReducePluginProfiler::useProfiler()
 {
-    char const* envDir = getenv("GEMM_AR_PLUGIN_PROFILE_DIR");
-    return envDir != nullptr;
+    // char const* envDir = getenv("GEMM_AR_PLUGIN_PROFILE_DIR");
+    // return envDir != nullptr;
+    // TODO(xsimmons): currently the profiler does not add any perf gain
+    // due to static heuristics being sufficient. We can re-enable this
+    // when we need more configurations.
+    return false;
 }
 
 std::string GemmAllReducePluginProfiler::getCacheFileName(GemmIdCore gemmId)

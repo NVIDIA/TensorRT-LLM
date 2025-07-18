@@ -322,7 +322,7 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
         modelConfig, worldConfig, manager);
 
     // set up inputs and outputs
-    tb::DecoderInputBuffers inputBuffers(batchSize, batchSize, maxGeneratedTokensPerStep, manager);
+    tb::DecoderInputBuffers inputBuffers(batchSize, maxGeneratedTokensPerStep, manager);
     auto batchSlotsRange = BufferRange<SizeType32>(*inputBuffers.setupBatchSlots);
     std::iota(batchSlotsRange.begin(), batchSlotsRange.end(), 0);
 
@@ -456,7 +456,7 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
         modelConfig, worldConfig, manager);
 
     // set up inputs and outputs
-    tb::DecoderInputBuffers inputBuffers(batchSize, batchSize, maxGeneratedTokensPerStep, manager);
+    tb::DecoderInputBuffers inputBuffers(batchSize, maxGeneratedTokensPerStep, manager);
 
     auto decoderInputs = createDecoderInputs(
         batchSize, vocabSizePadded, dataType, samplingConfigs, generatedTokensPerSteps, computeLogProbs, manager);
@@ -610,7 +610,7 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     }
 
     // set up inputs and outputs
-    tb::DecoderInputBuffers inputBuffers(batchSize, batchSize, maxGeneratedTokensPerStep, manager);
+    tb::DecoderInputBuffers inputBuffers(batchSize, maxGeneratedTokensPerStep, manager);
 
     auto decoderInputs = createDecoderInputs(
         batchSize, vocabSizePadded, dataType, samplingConfigs, generatedTokensPerSteps, false, manager);

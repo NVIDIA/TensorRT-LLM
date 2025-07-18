@@ -144,7 +144,7 @@ def setup_venv(project_dir: Path, requirements_file: Path, no_venv: bool):
         # Ensure PyPI PyTorch is not installed in the venv
         purelib_dir = Path(scheme["purelib"])
         pytorch_package_dir = purelib_dir / "torch"
-        if venv_prefix != sys.base_prefix and pytorch_package_dir.exists():
+        if str(venv_prefix) != sys.base_prefix and pytorch_package_dir.exists():
             warnings.warn(
                 f"Using the NVIDIA PyTorch container with PyPI distributed PyTorch may lead to compatibility issues.\n"
                 f"If you encounter any problems, please delete the environment at `{venv_prefix}` so that "

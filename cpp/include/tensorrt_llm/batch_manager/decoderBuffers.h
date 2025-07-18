@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
@@ -38,8 +39,8 @@ public:
     using SizeType32 = runtime::SizeType32;
     using TensorPtr = runtime::ITensor::SharedPtr;
 
-    explicit DecoderInputBuffers(SizeType32 maxNumSequences, SizeType32 maxBatchSize, SizeType32 maxDecoderSteps,
-        runtime::BufferManager const& manager);
+    explicit DecoderInputBuffers(
+        SizeType32 maxBatchSize, SizeType32 maxDecoderSteps, runtime::BufferManager const& manager);
 
     void setupMedusaLogits(SizeType32 maxNumSequences, runtime::ModelConfig const& modelConfig);
 
@@ -56,11 +57,13 @@ public:
 
     //! Buffers for decoder forward
 
+    //! Requests for considered in decoder forward
+    RequestVector decoderRequests;
+
     //! Batch slots for all decoder steps, [maxDecoderSteps][maxBatchSize]
     std::vector<TensorPtr> forwardBatchSlots;
 
-    //! Logits for all batch slots, [maxNumSequences]
-    //! The vector is sparse, only slots in forwardBatchSlots are used.
+    //! Logits of decoder requests
     std::vector<TensorPtr> logits;
 
     //! Logits for speculative decoding (Medusa)

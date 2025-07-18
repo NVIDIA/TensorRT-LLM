@@ -1,5 +1,4 @@
 import contextlib
-import os
 import threading
 from dataclasses import dataclass
 from enum import Enum
@@ -98,13 +97,6 @@ class Fp4QuantizedTensor:
     @property
     def shape(self):
         return self.fp4_tensor.shape
-
-
-_disable_fp4_allgather = os.getenv("TLLM_DISABLE_FP4_ALLGATHER", "0") == "1"
-
-
-def disable_fp4_allgather():
-    return _disable_fp4_allgather
 
 
 def compute_swizzled_sf_shape(row: int, col: int):

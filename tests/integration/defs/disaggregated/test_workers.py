@@ -64,21 +64,26 @@ def run_disaggregated_workers(
     return workers_proc, ctx_servers, gen_servers
 
 
+DEFAULT_TIMEOUT_SERVER_START = 900
+DEFAULT_TIMEOUT_REQUEST = 180
+
+
 class BasicWorkerTester:
 
     def __init__(self,
                  ctx_servers: List[str],
                  gen_servers: List[str],
-                 req_timeout_secs: int = 180,
-                 server_start_timeout_secs: int = 180):
+                 req_timeout_secs: int = DEFAULT_TIMEOUT_REQUEST,
+                 server_start_timeout_secs: int = DEFAULT_TIMEOUT_SERVER_START):
         self.ctx_servers = ctx_servers
         self.gen_servers = gen_servers
         self.req_timeout_secs = req_timeout_secs
         self.server_start_timeout_secs = server_start_timeout_secs
 
     async def new_session(self):
-        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(
-            total=self.req_timeout_secs))
+        session = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(force_close=True),
+            timeout=aiohttp.ClientTimeout(total=self.req_timeout_secs))
         await OpenAIDisaggServer.wait_for_all_servers_ready(
             session, self.ctx_servers, self.gen_servers,
             self.server_start_timeout_secs)
@@ -146,8 +151,8 @@ class ConditionalWorkerTester(BasicWorkerTester):
     def __init__(self,
                  ctx_servers: List[str],
                  gen_servers: List[str],
-                 req_timeout_secs: int = 180,
-                 server_start_timeout_secs: int = 180,
+                 req_timeout_secs: int = DEFAULT_TIMEOUT_REQUEST,
+                 server_start_timeout_secs: int = DEFAULT_TIMEOUT_SERVER_START,
                  model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"):
         super().__init__(ctx_servers, gen_servers, req_timeout_secs,
                          server_start_timeout_secs)
@@ -199,8 +204,8 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
     def __init__(self,
                  ctx_servers: List[str],
                  gen_servers: List[str],
-                 req_timeout_secs: int = 180,
-                 server_start_timeout_secs: int = 240,
+                 req_timeout_secs: int = DEFAULT_TIMEOUT_REQUEST,
+                 server_start_timeout_secs: int = DEFAULT_TIMEOUT_SERVER_START,
                  model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
                  model_path: Optional[str] = None):
         super().__init__(ctx_servers, gen_servers, req_timeout_secs,
@@ -316,8 +321,8 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
     def __init__(self,
                  ctx_servers: List[str],
                  gen_servers: List[str],
-                 req_timeout_secs: int = 180,
-                 server_start_timeout_secs: int = 180,
+                 req_timeout_secs: int = DEFAULT_TIMEOUT_REQUEST,
+                 server_start_timeout_secs: int = DEFAULT_TIMEOUT_SERVER_START,
                  model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
                  tokens_per_block: int = 32):
         super().__init__(ctx_servers, gen_servers, req_timeout_secs,

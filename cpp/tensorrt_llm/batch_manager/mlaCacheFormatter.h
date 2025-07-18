@@ -35,13 +35,9 @@ public:
         TLLM_CHECK(mCacheTransBufferManager);
     }
 
-    void formatOutput(LlmRequest const& llmRequest,
-        std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
-        SizeType32 selfIdx, CacheState const& destConfig, runtime::BufferManager const& bufferManager) override;
+    void format(TransferSession& session) override;
 
-    void formatInput(LlmRequest const& llmRequest,
-        std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
-        SizeType32 selfIdx, CacheState const& destConfig, runtime::BufferManager const& bufferManager) override;
+    void unformat(TransferSession& session) override;
 
     [[nodiscard]] bool inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const override;
 
@@ -57,9 +53,8 @@ public:
     }
 
     static bool needSendCache(CacheState const& selfConfig, CacheState const& destConfig, runtime::SizeType32 selfIdx);
-    std::vector<executor::kv_cache::Connection const*> pickRecvConnections(
-        std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
-        SizeType32 selfIdx, CacheState const& destConfig) const override;
+    std::vector<size_t> pickRecvConnections(size_t numConnections, CacheState const& selfConfig, SizeType32 selfIdx,
+        CacheState const& destConfig) const override;
 
 private:
     BaseKVCacheManager* mCacheManager;

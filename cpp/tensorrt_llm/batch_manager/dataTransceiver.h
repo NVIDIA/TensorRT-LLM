@@ -34,6 +34,11 @@
 namespace tensorrt_llm::batch_manager
 {
 
+// TODO: unify the following class into a namespace like tensorrt_llm::transmission
+using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
+using Connection = tensorrt_llm::executor::kv_cache::Connection;
+using ConnectionManager = tensorrt_llm::executor::kv_cache::ConnectionManager;
+
 // Used to store the information that needs to be sent to the context executor to ensure the generation
 // executor smoothly receives the data.
 class RequestInfo
@@ -89,6 +94,84 @@ private:
     executor::DataTransceiverState mTransState;
 };
 
+class TransferSession
+{
+public:
+    TransferSession(std::vector<Connection const*> connections, DataContext dataContext,
+        executor::DataTransceiverState const& selfState, executor::DataTransceiverState otherState,
+        runtime::BufferManager const& bufferManager, LlmRequest const* llmRequest = nullptr)
+        : mConnections(std::move(connections))
+        , mDataContext(dataContext)
+        , mSelfState(&selfState)
+        , mOtherState(std::move(otherState))
+        , mBufferManager(&bufferManager)
+        , mRequest(llmRequest)
+    {
+        TLLM_CHECK(!mConnections.empty());
+    }
+
+    [[nodiscard]] std::vector<Connection const*> const& getConnections() const
+    {
+        return mConnections;
+    }
+
+    // should be called only during the initialization of the TransferSession
+    void setConnection(size_t idx, Connection const* conn)
+    {
+        mConnections.at(idx) = conn;
+    }
+
+    [[nodiscard]] DataContext const& getDataContext() const
+    {
+        return mDataContext;
+    }
+
+    [[nodiscard]] executor::DataTransceiverState const& getSelfState() const
+    {
+        return *mSelfState;
+    }
+
+    [[nodiscard]] executor::DataTransceiverState const& getOtherState() const
+    {
+        return mOtherState;
+    }
+
+    [[nodiscard]] runtime::BufferManager const& getBufferManager() const
+    {
+        return *mBufferManager;
+    }
+
+    void send(size_t idx, void const* data, size_t size)
+    {
+        mConnections.at(idx)->send(mDataContext, data, size);
+    }
+
+    void recv(size_t idx, void* data, size_t size)
+    {
+        mConnections.at(idx)->recv(mDataContext, data, size);
+    }
+
+    [[nodiscard]] LlmRequest const& getLlmRequest() const
+    {
+        TLLM_CHECK(mRequest != nullptr);
+        return *mRequest;
+    }
+
+    // in DataSender, the LlmRequest is not available until the sendSync is called
+    void setLlmRequest(LlmRequest const& llmRequest)
+    {
+        mRequest = &llmRequest;
+    }
+
+private:
+    std::vector<Connection const*> mConnections;
+    DataContext mDataContext;
+    executor::DataTransceiverState const* mSelfState; // stored in DataRequester/DataResponder
+    executor::DataTransceiverState mOtherState;
+    runtime::BufferManager const* mBufferManager;
+    LlmRequest const* mRequest;
+};
+
 // Operators required for data transmission in specific communication protocols.
 class DataSender
 {
@@ -123,11 +206,11 @@ class DataReceiver
 public:
     /// @brief Send the request information.
     /// @param llmRequest The request object to which the information belongs.
-    virtual void sendRequestInfo(LlmRequest const& llmRequest) = 0;
+    virtual TransferSession sendRequestInfo(LlmRequest const& llmRequest) = 0;
 
     /// @brief Synchronously receive data.
-    /// @param llmRequest The request object to which the data belongs.
-    virtual void receiveSync(LlmRequest const& llmRequest) = 0;
+    /// @param session The transfer session.
+    virtual void receiveSync(TransferSession& session) = 0;
 
     /// @brief Destructor.
     virtual ~DataReceiver() = default;

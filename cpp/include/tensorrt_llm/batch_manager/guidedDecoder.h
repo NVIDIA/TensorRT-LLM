@@ -29,6 +29,7 @@ class GrammarCompiler;
 
 namespace tensorrt_llm::batch_manager
 {
+class DecoderInputBuffers;
 
 class GuidedDecoder
 {
@@ -40,8 +41,7 @@ public:
     GuidedDecoder(executor::GuidedDecodingConfig const& guidedDecodingConfig, SizeType32 maxNumSequences,
         SizeType32 vocabSizePadded, nvinfer1::DataType logitsDtype, runtime::BufferManager const& runtimeBufferManager);
     void build(ScheduledRequests const& scheduledRequests);
-    void execute(ScheduledRequests const& scheduledRequests, runtime::BufferManager const& runtimeBufferManager,
-        std::vector<TensorPtr> const& decoderBuffersLogits);
+    void execute(DecoderInputBuffers const& decoderInputBuffers, runtime::BufferManager const& runtimeBufferManager);
 
 private:
     executor::GuidedDecodingConfig::GuidedDecodingBackend mGuidedDecodingBackend;
