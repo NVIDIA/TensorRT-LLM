@@ -33,13 +33,13 @@ class APIDrafter(Drafter):
                     if isinstance(current, list) and 0 <= key < len(current):
                         current = current[key]
                     else:
-                        logger.warning(f"Response field {self.response_field} is a invalid for response {response}. Index {key} is invalid.")
+                        logger.warning(f"Response field {self.response_field} is invalid for response {response}. Index {key} is invalid.")
                         return []
                 else:
                     if isinstance(current, dict) and key in current:
                         current = current[key]
                     else:
-                        logger.warning(f"Response field {self.response_field} is a invalid for response {response}. Index {key} is invalid.")
+                        logger.warning(f"Response field {self.response_field} is invalid for response {response}. Index {key} is invalid.")
                         return []
             
             except (KeyError, ValueError, IndexError):
@@ -66,7 +66,7 @@ class APIDrafter(Drafter):
                 "max_sequence_length": max_sequence_length,
             }
             if self.template:
-                request_data.update(self.template)            
+                request_data.update(self.template)  
             response = requests.post(
                 url=self.endpoint,
                 json=request_data,
@@ -76,7 +76,7 @@ class APIDrafter(Drafter):
             
             # check for unsuccessful response
             if response.status_code != 200:
-                logger.warning(f"Failed to get draft tokens. API call failed for request {request_id} with status code {response.status_code} and message {response.text}")
+                logger.error(f"Failed to get draft tokens. API call failed for request {request_id} with status code {response.status_code} and message {response.text}")
                 return []
             
             result = response.json()
@@ -87,12 +87,12 @@ class APIDrafter(Drafter):
             return draft_tokens
         
         except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse JSON response for request {request_id}: {e}")
+            logger.error(f"Failed to parse JSON response for request {request_id}: {e}")
             logger.debug(f"Raw response: {response.text[:500]}...")
             return []
 
         except Exception as e:
-            logger.warning(f"Failed to get draft tokens. API call failed for request {request_id} with the following error: {e}")
+            logger.error(f"Failed to get draft tokens. API call failed for request {request_id} with the following error: {e}")
             return []
 
     def prepare_draft_tokens(
@@ -117,6 +117,8 @@ class APIDrafter(Drafter):
                 request.py_end_id,
                 request.py_orig_prompt_len + request.py_max_new_tokens,
             )
+            if len(draft_tokens) == 0:
+                logger.error(f"Draft tokens could not be generated. Set TLLM_LOG_LEVEL for more details.")
             # Pad length to `self.max_draft_len`
             if len(draft_tokens) > 0:
                 pad_length = self.max_draft_len - len(draft_tokens)
