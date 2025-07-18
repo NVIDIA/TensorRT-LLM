@@ -1,17 +1,24 @@
+@coderabbitai summary
 
-# PR title
+<!--
+Please write the PR title by following this template:
 
-Please write the PR title by following template:
+[JIRA ticket/NVBugs ID/GitHub issue][fix/feat/doc/infra/...] \<summary of this PR\>
 
-[JIRA ticket link/nvbug link/github issue link][fix/feat/doc/infra/...] \<summary of this PR\>
-
-For example, assume I have a PR hope to support a new feature about cache manager of Jira TRTLLM-1000 ticket, it would be like
+For example, assume I have a PR to support a new feature about cache manager for JIRA ticket TRTLLM-1000, it would be like:
 
 [TRTLLM-1000][feat] Support a new feature about cache manager
 
+Or I have a PR to fix a Llama3 accuracy issue:
+
+[https://nvbugs/1234567][fix] Fix Llama3 accuracy issue
+-->
+
 ## Description
 
+<!--
 Please explain the issue and the solution in short.
+-->
 
 ## Test Coverage
 
