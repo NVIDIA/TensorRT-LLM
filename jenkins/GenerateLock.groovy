@@ -55,13 +55,13 @@ def generate()
         sh "cd ${env.WORKSPACE}"
         sh "/root/.local/bin/poetry -h"
         sh "export PATH=\"/root/.local/bin:\$PATH\" && python3 scripts/generate_lock_file.py"
-        def count = sh(script: "git status --porcelain | wc -l", returnStdout: true).trim()
+        def count = sh(script: "git status --porcelain | grep -E '.toml\$|poetry.lock\$' | wc -l", returnStdout: true).trim()
         echo "Changed/untracked file count: ${count}"
         if (count == "0") {
             echo "No changes in Git"
         } else {
             sh "git status"
-            sh "git add ."
+            sh "git add \$(find . -type f \\( -name 'poetry.lock' -o -name 'pyproject.toml' \\))"
             sh "git commit -m \"Check in most recent lock file from nightly pipeline\""
             withCredentials([usernamePassword(credentialsId: 'github-cred-trtllm-ci', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_PASS')]) {
                 def authedUrl = LLM_REPO.replaceFirst('https://', "https://${GIT_USER}:${GIT_PASS}@")
