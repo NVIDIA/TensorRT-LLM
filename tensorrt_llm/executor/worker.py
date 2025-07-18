@@ -171,6 +171,9 @@ class GenerationExecutorWorker(GenerationExecutor):
             error_queue=self._error_queue,
             name="dispatch_stats_thread")
 
+        self.dump_stats_thread = ManagedThread(self.dump_stats_task,
+                                               name="dump_stats_thread")
+
         self.dispatch_kv_cache_events_thread = ManagedThread(
             self.dispatch_kv_cache_events_task,
             error_queue=self._error_queue,
@@ -312,6 +315,47 @@ class GenerationExecutorWorker(GenerationExecutor):
                                            self._iter_stats_result,
                                            stats_serializer)
 
+    def dump_stats_task(self) -> bool:
+
+        def stats_serializer(
+                stats: Tuple[tllm.IterationStats, tllm.RequestStats]) -> str:
+            iteration_stats, req_stats = stats
+            stats_dict = json.loads(iteration_stats.to_json_str())
+
+            if req_stats is not None and len(req_stats) > 0:
+                stats_dict["requestStats"] = []
+                for req_stat in req_stats:
+                    stats_dict["requestStats"].append(
+                        json.loads(req_stat.to_json_str()))
+
+            # Convert back to JSON string
+            return json.dumps(stats_dict)
+
+        def get_stats():
+            if isinstance(self.engine, tllm.Executor):
+                iter_stats = self.engine.get_latest_iteration_stats()
+                #TODO: Support req stats with TRT engine
+                #      This would require ensuring iter and req stats have same size
+                return [(iter_stat, None) for iter_stat in iter_stats]
+            else:
+                return self.engine.get_latest_iteration_stats()
+
+        data = stats_serializer(get_stats())
+
+        iter_dump_folder = os.getenv("ITER_STATS_FOLDER", default=None)
+        p = Path(iter_dump_folder)
+        p.mkdir(parents=True, exist_ok=True)
+        folder_path = p.absolute()
+        # Define a Callable to join iteration and request stats
+        file_path = os.path.join(folder_path,
+                                 f"rank_{self.rank}_iter_stats.log")
+        with open(file_path, encoding='utf-8') as outfile:
+            outfile.write(data)
+
+        return self._iteration_result_task(self.stats_queues, get_stats,
+                                           self._iter_stats_result,
+                                           stats_serializer)
+
     def dispatch_kv_cache_events_task(self) -> bool:
         if isinstance(self.engine, tllm.Executor):
             # Check if the engine has a kv cache event manager
@@ -340,6 +384,10 @@ class GenerationExecutorWorker(GenerationExecutor):
         self.start_thread(self.dispatch_kv_cache_events_thread)
         if mpi_rank() == 0:
             self.start_thread(self.dispatch_stats_thread)
+
+        iter_dump_folder = os.getenv("ITER_STATS_FOLDER", default=None)
+        if iter_dump_folder is not None:
+            self.start_thread(self.dump_stats_thread)
 
     def _load_lora_adapter(self, lora_request: LoRARequest) -> bool:
         """Returns True if the adapter was loaded by this call, False if it was already loaded"""
