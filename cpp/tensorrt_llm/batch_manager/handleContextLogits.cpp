@@ -79,7 +79,7 @@ SizeType32 HandleContextLogits::operator()(DecoderInputBuffers& inputBuffers, Re
     auto& decoderRequests = inputBuffers.decoderRequests;
     decoderRequests.clear();
     decoderRequests.reserve(contextRequests.size());
-    auto& allDecoderLogits = inputBuffers.logits;
+    auto& allDecoderLogits = inputBuffers.decoderLogits;
     allDecoderLogits.clear();
     allDecoderLogits.reserve(contextRequests.size());
 
