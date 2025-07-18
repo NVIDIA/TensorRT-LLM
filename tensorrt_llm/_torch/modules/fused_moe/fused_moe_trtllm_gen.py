@@ -4,7 +4,7 @@ import torch
 
 from ...distributed.ops import reducescatter
 from ...model_config import ModelConfig
-from ...utils import Fp4QuantizedTensor, next_positive_power_of_2
+from ...utils import Fp4QuantizedTensor
 from .interface import MoE, MoEWeightLoadingMode
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            NVFP4TRTLLMGenFusedMoEMethod)
@@ -90,19 +90,6 @@ class TRTLLMGenFusedMoE(MoE):
 
     def _check_configs(self):
         assert self.has_deepseek_fp8_block_scales or self.has_nvfp4, "TRTLLMGenFusedMoE only supports fp8_block_scaling and nvfp4 dtypes."
-
-    def _get_tile_tokens_dim(self, x: torch.Tensor):
-        top_k = self.routing_method.top_k
-        # Number of tokens in the input tensor.
-        num_tokens = x.shape[0]
-        # Guess tokens per expert assuming perfect expert distribution first.
-        num_tokens_per_expert = (num_tokens * top_k) // self.num_experts
-        # And pad the number to the next power of 2.
-        tile_tokens_dim = next_positive_power_of_2(num_tokens_per_expert)
-        # Cap to 8-64 tokens per CTA tile as it's the range supported by the kernel.
-        tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
-
-        return tile_tokens_dim
 
     def _get_quant_method(self):
         if self.quant_config is not None:
@@ -204,7 +191,6 @@ class TRTLLMGenFusedMoE(MoE):
                 slot_start,  # local_expert_start;  use ep_rank if stride!=1
                 self.expert_size_per_partition,  # local_expert_size
                 routed_scaling_factor,
-                self._get_tile_tokens_dim(x),
                 self.routing_method.routing_method_type,
             )
         elif self.has_nvfp4:
@@ -240,7 +226,6 @@ class TRTLLMGenFusedMoE(MoE):
                 slot_start,  # local_expert_start;  use ep_rank if stride!=1
                 self.expert_size_per_partition,  # local_expert_size
                 routed_scaling_factor,
-                self._get_tile_tokens_dim(x),
                 self.routing_method.routing_method_type,
                 do_finalize=do_finalize,
             )

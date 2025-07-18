@@ -5,7 +5,7 @@ from torch._higher_order_ops.auto_functionalize import (auto_functionalized,
                                                         auto_functionalized_v2)
 from torch.fx import Graph, Node
 
-from .utils import is_call_function
+from .utils import inplace_info, is_call_function
 
 aten = torch.ops.aten
 
@@ -46,19 +46,12 @@ def remove_copy_for_mutates_args(graph: Graph):
 
         inplace_func = node.args[0]
 
-        if inplace_func == torch.ops.trtllm.flashinfer_fused_add_rmsnorm.default:
-            remove_functionalize_inner(
-                node,
-                {
-                    1: "input",
-                    2: "residual"
-                },
-                is_v2=node.target == auto_functionalized_v2,
-            )
-        if inplace_func == torch.ops.trtllm.attention_inplace.default:
-            remove_functionalize_inner(node, {1: "output", 2: "output_sf"})
-        if inplace_func == torch.ops.trtllm.mla_custom_op_inplace.default:
-            remove_functionalize_inner(node, {1: "output"})
+        inplace_map = inplace_info()
+        if inplace_func not in inplace_map:
+            # We do not know the inplace op
+            continue
+
+        remove_functionalize_inner(node, inplace_map[inplace_func])
 
     for node in nodes_to_remove:
         graph.erase_node(node)
