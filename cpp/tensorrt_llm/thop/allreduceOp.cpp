@@ -166,10 +166,6 @@ public:
         size_t bytes_per_element = input.element_size();
         TLLM_LOG_DEBUG("All reduce message size is %zu", size * bytes_per_element);
 
-        if (std::getenv("TLLM_USE_NCCL_UB") && mStrategy == AllReduceStrategyType::UB)
-        {
-            return runNCCLAllReduceUB(input, residual, norm_weight, scale, bias);
-        }
         AllReduceStrategyType runtime_strategy = getRuntimeStrategy(seq_len, size);
 
         // Log runtime strategy
@@ -181,6 +177,8 @@ public:
         {
         case AllReduceStrategyType::UB: return runUBAllReduce(input, residual, norm_weight, scale, bias);
         case AllReduceStrategyType::NCCL: return runNCCLAllReduce(input, residual, norm_weight, scale, bias);
+        case AllReduceStrategyType::NCCL_SYMMETRIC:
+            return runNCCLAllReduceSymmetric(input, residual, norm_weight, scale, bias);
         case AllReduceStrategyType::MIN_LATENCY:
         case AllReduceStrategyType::ONESHOT:
         case AllReduceStrategyType::TWOSHOT:
@@ -307,7 +305,7 @@ private:
         return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, reduce_output);
     }
 
-    std::vector<torch::Tensor> runNCCLAllReduceUB(torch::Tensor const& input,
+    std::vector<torch::Tensor> runNCCLAllReduceSymmetric(torch::Tensor const& input,
         torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
         torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias) noexcept
     {
@@ -316,11 +314,20 @@ private:
         int size = input.numel();
         auto& ub_manager = tensorrt_llm::runtime::ub::UserBuffersManager::get_instance();
         auto ub_buffer0 = ub_manager.search_buffer(input.data_ptr());
+        if (ub_buffer0.invalid())
+        {
+            auto [symmetric_input, symmetric_ub_buffer0]
+                = torch_ext::create_userbuffers_tensor(input.sizes(), input.scalar_type());
+            cudaMemcpyAsync(symmetric_ub_buffer0.addr, input.data_ptr(), size * input.element_size(),
+                cudaMemcpyDeviceToDevice, stream);
+            ub_buffer0 = symmetric_ub_buffer0;
+        }
+
         TLLM_CHECK(!ub_buffer0.invalid());
         auto [norm_out, ub_buffer1] = torch_ext::create_userbuffers_tensor(input.sizes(), input.scalar_type());
 
         NCCLCHECK(ncclAllReduce(
-            input.data_ptr(), norm_out.mutable_data_ptr(), size, (*getDtypeMap())[mType], ncclSum, *mNcclComm, stream));
+            ub_buffer0.addr, norm_out.mutable_data_ptr(), size, (*getDtypeMap())[mType], ncclSum, *mNcclComm, stream));
 
         if (mOp == AllReduceFusionOp::NONE)
         {
@@ -661,6 +668,10 @@ private:
         {
             runtime_strategy = AllReduceStrategyType::NCCL;
         }
+        else if (mStrategy == AllReduceStrategyType::NCCL_SYMMETRIC)
+        {
+            runtime_strategy = AllReduceStrategyType::NCCL_SYMMETRIC;
+        }
         else
         {
             // This is for DEBUG and BENCHMARK purpose. It will overried the strategy if AUTO is set.
@@ -686,6 +697,11 @@ private:
             TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: NCCL", rank);
             break;
         }
+        case AllReduceStrategyType::NCCL_SYMMETRIC:
+        {
+            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: NCCL_SYMMETRIC", rank);
+            break;
+        }
         case AllReduceStrategyType::MIN_LATENCY:
         {
             TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: MIN_LATENCY", rank);
@@ -701,7 +717,7 @@ private:
             TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: LOWPRECISION", rank);
             break;
         }
-        default: break;
+        default: TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: UNKNOWN: %d", rank, strategy); break;
         }
     }
 

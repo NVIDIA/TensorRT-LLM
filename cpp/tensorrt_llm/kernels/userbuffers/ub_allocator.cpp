@@ -21,9 +21,7 @@ namespace tensorrt_llm::runtime::ub
 {
 UserBufferAllocator& UserBufferAllocator::Instance()
 {
-    // if environment variable TLLM_USE_NCCL_UB is set to 1, use NCCLUserBufferAllocator
-    char* useNCCLUB = std::getenv("TLLM_USE_NCCL_UB");
-    if (useNCCLUB != nullptr)
+    if (use_nccl_symmetric)
     {
         static NCCLUserBufferAllocator _;
         return _;
@@ -109,5 +107,7 @@ UBBuffer NCCLUserBufferAllocator::registerUBBuffer(size_t bytes)
     ub_buffer.size = bytes;
     return ub_buffer;
 }
+
+bool UserBufferAllocator::use_nccl_symmetric = false;
 
 }; // namespace tensorrt_llm::runtime::ub

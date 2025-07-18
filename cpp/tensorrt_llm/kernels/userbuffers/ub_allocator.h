@@ -59,6 +59,8 @@ public:
     communicator* comm();
     virtual UBBuffer registerUBBuffer(size_t bytes);
 
+    static bool use_nccl_symmetric;
+
 private:
     communicator* mUbComm;
 
