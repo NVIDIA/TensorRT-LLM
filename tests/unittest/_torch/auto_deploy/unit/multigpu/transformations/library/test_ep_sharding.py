@@ -49,7 +49,7 @@ def _run_ep_shard_job(num_experts: int, rank: int, world_size: int) -> None:
     run_test(
         model,
         x,
-        transform=partial(transform_func, rank=rank, world_size=world_size),
+        transform=transform_func,
         check_transformed_graph=lambda gm: any(is_op(n, op_expected) for n in gm.graph.nodes)
         == (world_size > 1),
         _get_expected_num_params=partial(_get_expected_num_params, rank, world_size),

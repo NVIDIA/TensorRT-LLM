@@ -79,7 +79,7 @@ def _run_job(
     run_test(
         model,
         x,
-        transform=partial(transform_func, rank=rank, world_size=world_size),
+        transform=transform_func,
         check_transformed_graph=lambda gm: any(is_op(n, op_expected) for n in gm.graph.nodes)
         == (world_size > 1),
         _get_expected_num_params=_get_expected_num_params,
