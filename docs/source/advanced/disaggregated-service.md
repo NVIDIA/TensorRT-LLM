@@ -80,3 +80,13 @@ A. Yes, TRT-LLM supports using GPU direct RDMA for inter-node KV cache transfer.
 *Q. What causes the substantial bandwidth fluctuations in kvCache transfers, especially during the first few requests following service initialization?*
 
 A. The communication for kvCache transfer between executors are established dynamically. The connection establishment process incurs significant overhead, which explains the apparently lower kvCache transfer bandwidth observed during the initial requests after service startup. This lower bandwidth reflects the inclusion of connection establishment overhead. When conducting benchmarks, it is recommended to perform a warm-up phase to ensure accurate performance measurements.
+
+*Q. Disaggregated server hangs, how to fix that?*
+
+There are some useful UCX environment variables that may help when server hangs, especially if your disaggregated services are running on different NVLink domains.
+
+* `UCX_CUDA_IPC_ENABLE_MNNVL`: Set to `n`. This also eases UCX timeout error like `UCX  ERROR   cuMemImportFromShareableHandle failed: invalid resource handle`.
+
+* `UCX_NET_DEVICES`: Check if this is set correctly, or unset this variable to allow UCX to use all possible devices.
+
+* `UCX_RNDV_SCHEME`: Set to `get_zcopy` or `put_zcopy`. The default value is `auto`.
