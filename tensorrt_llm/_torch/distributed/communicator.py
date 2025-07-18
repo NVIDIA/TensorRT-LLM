@@ -1,4 +1,6 @@
+import math
 import os
+import pickle  # nosec B403
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -8,7 +10,7 @@ import torch.distributed as dist
 
 from tensorrt_llm._utils import (mpi_allgather, mpi_barrier, mpi_broadcast,
                                  mpi_comm, mpi_isend, mpi_isend_object,
-                                 mpi_recv, mpi_recv_object, mpi_send,
+                                 mpi_rank, mpi_recv, mpi_recv_object, mpi_send,
                                  mpi_send_object)
 from tensorrt_llm.mapping import Mapping
 
@@ -101,8 +103,61 @@ class MPIDist(Distributed):
         super().__init__(mapping)
         self.create_tp_comm()
 
-    def broadcast(self, obj, root=0):
-        return mpi_broadcast(obj, root)
+    def broadcast(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
+        """
+        Safely broadcasts potentially large objects by splitting into fixed-size chunks.
+
+        Args:
+            obj: Python object to broadcast
+            root: Rank of the broadcasting process
+            chunk_size: Maximum size of each chunk in bytes (default: 4MB)
+
+        Returns:
+            The broadcasted object on all ranks
+        """
+        rank = mpi_rank()
+        total_size = 0
+        num_chunks = 0
+
+        # Serialization phase
+        if rank == root:
+            try:
+                serialized = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+                total_size = len(serialized)
+                num_chunks = math.ceil(total_size / chunk_size)
+            except Exception as e:
+                mpi_broadcast((False, None, None), root=root)
+                raise RuntimeError(f"Serialization failed: {str(e)}") from e
+
+        # Metadata broadcast
+        metadata = mpi_broadcast(
+            (True, total_size, num_chunks) if rank == root else None, root=root)
+
+        if not metadata[0]:
+            raise RuntimeError("Root rank failed during serialization")
+
+        _, total_size, num_chunks = metadata
+
+        # Chunked broadcast
+        received_chunks = []
+        for i in range(num_chunks):
+            if rank == root:
+                chunk = serialized[i * chunk_size:(i + 1) * chunk_size]
+            else:
+                chunk = None
+            received_chunks.append(mpi_broadcast(chunk, root=root))
+
+        # Reconstruction
+        serialized = b''.join(received_chunks)
+        if len(serialized) != total_size:
+            raise RuntimeError(
+                f"Data size mismatch: expected {total_size}, got {len(serialized)}"
+            )
+
+        try:
+            return pickle.loads(serialized)  # nosec B301
+        except Exception as e:
+            raise RuntimeError(f"Deserialization failed: {str(e)}") from e
 
     def allgather(self, obj):
         return mpi_allgather(obj)
