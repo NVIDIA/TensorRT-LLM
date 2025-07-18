@@ -458,6 +458,8 @@ class AllReduce(nn.Module):
                                          == False):
             return input
 
+        input = input.contiguous()  # Underlying op requires contiguous input
+
         allreduce_strategy = self.strategy
         if all_reduce_params is None:
             all_reduce_params = AllReduceParams()
