@@ -4,6 +4,8 @@ import signal  # Added import
 import subprocess  # nosec B404
 import sys
 from typing import Any, List, Optional
+import gc
+from contextlib import contextmanager
 
 import click
 import torch
@@ -129,6 +131,24 @@ def get_llm_args(model: str,
 
     return llm_args, llm_args_extra_dict
 
+@contextmanager
+def disabled_gc():
+    """
+    Temporarily turn off Python's cyclic?~@~Qgarbage collector.
+
+    Reference?~@~Qcount deallocation still happens; only the generational
+    cycle detector is disabled.  The previous GC state is restored
+    automatically when the block exits.
+    """
+    was_enabled = gc.isenabled()
+    if was_enabled:
+        gc.disable()
+    try:
+        yield
+    finally:
+        if was_enabled:
+            gc.enable()
+
 
 def launch_server(host: str,
                   port: int,
@@ -149,7 +169,8 @@ def launch_server(host: str,
                           server_role=server_role,
                           metadata_server_cfg=metadata_server_cfg)
 
-    asyncio.run(server(host, port))
+    with disabled_gc():
+        asyncio.run(server(host, port))
 
 
 @click.command("serve")
