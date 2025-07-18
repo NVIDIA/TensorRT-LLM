@@ -106,25 +106,35 @@ class APIDrafter(Drafter):
         # Sort by request_id when py_batch_idx is None as a fallback.
         # This happens in the disagg case: for a set of new requests, we draft
         # before forward_step, so py_batch_idx is not assigned.
-        for request in sorted(
-                scheduled_requests.generation_requests,
-                key=lambda r:
-            (r.py_batch_idx is None, r.py_batch_idx or r.request_id),
-        ):
-            # Add new token to a copy of the generated tokens to find new draft tokens
-            prefix = list(request.get_tokens()[0])  # Get a copy
+        sorted_requests = sorted(
+            scheduled_requests.generation_requests,
+            key=lambda r: (r.py_batch_idx is None, r.py_batch_idx or r.request_id),
+        )
 
-            # Generate draft tokens
-            draft_tokens = await self.get_draft_tokens(
+        tasks = []
+        for request in sorted_requests:
+            # Add new token to a copy of the generated tokens to find new draft tokens
+            prefix = list(request.get_tokens()[0]) # Get a copy
+            task = self.get_draft_tokens(
                 prefix,
                 request.request_id,
                 request.py_end_id,
                 request.py_orig_prompt_len + request.py_max_new_tokens,
             )
-            if len(draft_tokens) == 0:
-                logger.error(f"Draft tokens could not be generated. Set TLLM_LOG_LEVEL for more details.")
-            # Pad length to `self.max_draft_len`
-            if len(draft_tokens) > 0:
-                pad_length = self.max_draft_len - len(draft_tokens)
-                draft_tokens.extend([request.py_end_id] * pad_length)
+            tasks.append(task)
+        
+        all_draft_tokens = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for request, draft_tokens in zip(sorted_requests, all_draft_tokens):
+            if isinstance(draft_tokens, Exception):
+                logger.error(f"An exception occurred while getting draft tokens for request {request.request_id}. Set TLLM_LOG_LEVEL for more details.")
+                draft_tokens = []     
+            elif len(draft_tokens) == 0:
+                logger.error(f"Draft tokens could not be generated for request {request.request_id}. Set TLLM_LOG_LEVEL for more details.")
+            else:
+                # Pad length to `self.max_draft_len`
+                if len(draft_tokens) > 0:
+                    pad_length = self.max_draft_len - len(draft_tokens)
+                    draft_tokens.extend([request.py_end_id] * pad_length)
+            
             request.py_draft_tokens = draft_tokens
