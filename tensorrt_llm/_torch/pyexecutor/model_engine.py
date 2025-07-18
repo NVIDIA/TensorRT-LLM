@@ -386,6 +386,9 @@ class PyTorchModelEngine(ModelEngine):
         self._cuda_graphs = {}
         self._cuda_graph_mem_pool = self._torch_compile_backend._graph_pool_handle if self._torch_compile_enabled else None
         self._run_cuda_graphs = pytorch_backend_config.use_cuda_graph
+        if self._run_cuda_graphs and self.max_beam_width > 1:
+            raise NotImplementedError(
+                "CUDA Graph + beam search is not implemented yet.")
 
         self._cuda_graph_padding_enabled = pytorch_backend_config.cuda_graph_padding_enabled
 
@@ -2034,7 +2037,6 @@ class PyTorchModelEngine(ModelEngine):
             with MoeLoadBalancerIterContext(moe_load_balancer):
                 return self._forward_step(inputs, gather_ids,
                                           gather_context_logits)
-
         with self._maybe_pad_batch(scheduled_requests,
                                    kv_cache_manager) as scheduled_requests:
             maybe_graph = self._maybe_get_cuda_graph(
@@ -2173,7 +2175,7 @@ class PyTorchModelEngine(ModelEngine):
                 # Skip as we only need to apply logit processor on the last context request
                 continue
 
-            logits_row = logits_tensor[request.py_batch_idx]
+            logits_row = logits_tensor[idx]
             # Reshape to align w/ the shape used in the TRT backend,
             # so the same logit processors can be used across both backends.
             logits_row = logits_row.view(1, 1, -1)
@@ -2186,4 +2188,4 @@ class PyTorchModelEngine(ModelEngine):
                     "defined in `tensorrtllm.sampling_params`.")
                 lp(request.py_request_id, logits_row, token_ids, None, None)
 
-            logits_tensor[request.py_batch_idx] = logits_row.view(-1)
+            logits_tensor[idx] = logits_row.view(-1)

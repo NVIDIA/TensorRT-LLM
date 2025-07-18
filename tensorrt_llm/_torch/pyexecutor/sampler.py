@@ -536,8 +536,7 @@ class TRTLLMSampler(Sampler):
             "buffer_manager":
             buffer_manager,
             "decoder_input_buffers": [
-                DecoderInputBuffers(self.max_num_sequences,
-                                    self.executor_config.max_batch_size,
+                DecoderInputBuffers(self.executor_config.max_batch_size,
                                     self.MAX_DECODING_TOKENS, buffer_manager)
                 for _ in range(self.num_micro_batches)
             ],
@@ -751,8 +750,7 @@ class TRTLLMSampler(Sampler):
 
         reqs_with_new_tokens = [
             r for r in reqs
-            if (sequence_lengths_host_data[r.py_seq_slot] > r.get_num_tokens(0)
-                or self.is_trt_overlap)
+            if (sequence_lengths_host_data[r.py_seq_slot] > r.get_num_tokens(0))
         ]
 
         # Add new tokens
@@ -821,7 +819,6 @@ class TRTLLMSampler(Sampler):
             for beam in range(beam_width):
                 seq_len = sequence_lengths_host_data[seq_slot * beam_width +
                                                      beam]
-                seq_len = seq_len + 1 if self.is_trt_overlap else seq_len
                 num_new_tokens[beam] = min(
                     num_generated_tokens,
                     seq_len - request.get_num_tokens(beam))
@@ -846,8 +843,7 @@ class TRTLLMSampler(Sampler):
                         })
 
                 if request.py_return_log_probs:
-                    cum_log_probs.append(
-                        cum_log_probs_host[seq_slot * beam_width + beam])
+                    cum_log_probs.append(cum_log_probs_host[seq_slot][beam])
 
                 finished_state = FinishedState(
                     finish_reasons[seq_slot * beam_width + beam])
