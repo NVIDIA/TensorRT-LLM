@@ -24,14 +24,15 @@
 namespace torch_ext
 {
 
-class W4A16GemmRunner : public torch::CustomClassHolder
+class finegrainedMixedDtypeGemmRunner : public torch::CustomClassHolder
 {
 public:
-    explicit W4A16GemmRunner(at::ScalarType activationDtype, int64_t quant_mode = 0);
+    explicit finegrainedMixedDtypeGemmRunner(
+        at::ScalarType activationDtype, at::ScalarType outputDtype, int64_t quant_mode = 0);
 
     at::Tensor runGemm(at::Tensor const& A, at::Tensor const& B_packed, at::Tensor const& scales,
         int64_t group_size_long, int64_t configIdx = -1, std::optional<at::Tensor> bias = std::nullopt,
-        std::optional<at::Tensor> zeros = std::nullopt) const;
+        std::optional<at::Tensor> zeros = std::nullopt, double alpha = 1.0f) const;
 
     int64_t getNumConfigs() const;
 
@@ -39,6 +40,7 @@ private:
     std::shared_ptr<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunnerInterface> mGemmRunner;
     std::vector<tensorrt_llm::cutlass_extensions::CutlassGemmConfig> mConfigs;
     at::ScalarType mActivationDtype;
+    at::ScalarType mOutputDtype;
 };
 
 } // namespace torch_ext
