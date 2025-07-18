@@ -87,9 +87,9 @@ def main():
 
     device = "cuda"
     import torch
-    mm_embeds_1 = torch.load("maverick_mm_embed_seashore_v2.pt")
-    mm_embeds_2 = torch.load("maverick_mm_embed_inpaint_v2.pt")
-    mm_embeds_3 = torch.load("maverick_mm_embed_highway_61_v2.pt")
+    mm_embeds_1 = torch.load("scout_mm_embed_seashore_v2.pt")
+    mm_embeds_2 = torch.load("scout_mm_embed_inpaint_v2.pt")
+    mm_embeds_3 = torch.load("scout_mm_embed_highway_61_v2.pt")
     mm_embeds = [mm_embeds_1, mm_embeds_2, mm_embeds_3]
 
     inputs = default_multimodal_input_loader(tokenizer=llm.tokenizer,
