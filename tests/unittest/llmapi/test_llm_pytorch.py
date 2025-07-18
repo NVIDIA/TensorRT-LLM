@@ -5,12 +5,17 @@ from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
+from .lora_test_utils import check_llama_7b_multi_unique_lora_adapters_from_request
 from .test_llm import (
     get_model_path, global_kvcache_config, llama_model_path,
     llm_get_stats_async_test_harness, llm_get_stats_test_harness, prompts,
     run_llm_abort_request, run_llm_with_postprocess_parallel_and_result_handler,
     tinyllama_logits_processor_test_harness, _test_llm_capture_request_error)
-from utils.util import force_ampere, similar, skip_gpu_memory_less_than_40gb, skip_gpu_memory_less_than_80gb, skip_gpu_memory_less_than_138gb
+from utils.util import (EnvVarsContextManager, force_ampere,
+                        run_function_in_sub_process, similar,
+                        skip_gpu_memory_less_than_40gb,
+                        skip_gpu_memory_less_than_80gb,
+                        skip_gpu_memory_less_than_138gb)
 from utils.llm_data import llm_models_root
 from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
@@ -161,55 +166,6 @@ def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
         llm.shutdown()
 
 
-def llama_7b_multi_lora_from_request_test_harness(**llm_kwargs) -> None:
-    hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
-    hf_lora_dir1 = f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"
-    hf_lora_dir2 = f"{llm_models_root()}/llama-models/Japanese-Alpaca-LoRA-7b-v0"
-
-    # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
-    # (1) specify lora_target_modules, or
-    # (2) provide a lora_dir to infer the lora_target_modules.
-    lora_config = LoraConfig(lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
-                             max_lora_rank=8)
-    # Disable CUDA graph
-    # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-    llm = LLM(hf_model_dir,
-              lora_config=lora_config,
-              cuda_graph_config=None,
-              **llm_kwargs)
-
-    try:
-        prompts = [
-            "美国的首都在哪里? \n答案:",
-            "美国的首都在哪里? \n答案:",
-            "美国的首都在哪里? \n答案:",
-            "アメリカ合衆国の首都はどこですか? \n答え:",
-            "アメリカ合衆国の首都はどこですか? \n答え:",
-            "アメリカ合衆国の首都はどこですか? \n答え:",
-        ]
-        references = [
-            "沃尔玛\n\n## 新闻\n\n* ",
-            "美国的首都是华盛顿。\n\n美国的",
-            "纽约\n\n### カンファレンスの",
-            "Washington, D.C.\nWashington, D.C. is the capital of the United",
-            "华盛顿。\n\n英国の首都是什",
-            "ワシントン\nQ1. アメリカ合衆国",
-        ]
-        lora_req1 = LoRARequest("luotuo", 1, hf_lora_dir1)
-        lora_req2 = LoRARequest("Japanese", 2, hf_lora_dir2)
-        sampling_params = SamplingParams(max_tokens=20)
-        outputs = llm.generate(prompts,
-                               sampling_params,
-                               lora_request=[
-                                   None, lora_req1, lora_req2, None, lora_req1,
-                                   lora_req2
-                               ])
-        for output, ref in zip(outputs, references):
-            assert similar(output.outputs[0].text, ref)
-    finally:
-        llm.shutdown()
-
-
 @skip_gpu_memory_less_than_40gb
 def test_llama_7b_lora():
     llama_7b_lora_from_dir_test_harness()
@@ -247,9 +203,92 @@ def test_llama_7b_lora_default_modules() -> None:
         llm.shutdown()
 
 
+@pytest.mark.parametrize(
+    "lora_adapter_count_per_call, max_loras, max_cpu_loras, repeat_calls, repeats_per_call",
+    [
+        # Test eviction and re-loading a previously evicted adapter from the LoRA GPU cache, within a single
+        # llm.generate call, that's repeated twice.
+        ([
+            2,
+        ], 1, 2, 2, 3),
+        # Test eviction and loading of new adapters in the evicted space, over several llm.generate calls, with LoRA GPU
+        # cache size < LoRA CPU cache size
+        ([2, 2, 2], 1, 3, 1, 1),
+    ])
 @skip_gpu_memory_less_than_40gb
-def test_llama_7b_multi_lora():
-    llama_7b_multi_lora_from_request_test_harness()
+def test_llama_7b_multi_lora_evict_load_new_adapters(
+        lora_adapter_count_per_call: list[int], max_loras: int,
+        max_cpu_loras: int, repeat_calls: int, repeats_per_call: int):
+    # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
+    # (1) specify lora_target_modules, or
+    # (2) provide a lora_dir to infer the lora_target_modules.
+    lora_config = LoraConfig(lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
+                             max_lora_rank=8,
+                             max_loras=max_loras,
+                             max_cpu_loras=max_cpu_loras)
+    check_llama_7b_multi_unique_lora_adapters_from_request(
+        lora_adapter_count_per_call,
+        repeat_calls,
+        repeats_per_call,
+        LLM,
+        lora_config=lora_config,
+        # Disable CUDA graph
+        # TODO: remove this once we have a proper fix for CUDA graph in LoRA
+        cuda_graph_config=None)
+
+
+@pytest.mark.parametrize(
+    "lora_adapter_count_per_call, max_loras, max_cpu_loras, repeat_calls, repeats_per_call",
+    [
+        # Test eviction, reloading new adapters and reloading previously evicted adapters from the LoRA CPU cache & GPU
+        # cache over multiple llm.generate call repeated twice (two calls with the same requests):
+        # At the end of the 1st llm.generate call:
+        #   The LoRA caches should contain adapters 1, 2 and shouldn't contain adapter 0 (it should have been evicted).
+        # So in the 2nd call, the worker should:
+        # - Send req0 with adapter 0 weights (because it was previously evicted)
+        # - Send the other two requests without their adapter weights as they're already in LoRA CPU cache
+        # Then, handling of req0 that has weights but not in the cache should evict one of the other two adapters from
+        # the cache, causing that evicted adapter's request to fail because its weights aren't with the request and
+        # aren't in LoRA cache.
+        ([
+            3,
+        ], 2, 2, 2, 1),
+    ])
+@skip_gpu_memory_less_than_40gb
+def test_llama_7b_multi_lora_load_previously_cpu_cache_evicted_adapter_fails(
+        lora_adapter_count_per_call: list[int], max_loras: int,
+        max_cpu_loras: int, repeat_calls: int, repeats_per_call: int):
+    """Tests that trying to load a LoRA adapter after it was evicted from CPU cache fails with the expected
+    message, as this feature is currently not supported in favor of the performance improvement of not
+    sending the LoRA weights with every request after the first time.
+    NOTE: This test assumes the requests are handled in the order they're sent, if that's not true, then this test
+          may not get any error at all, which would cause it to fail.
+    """  # noqa: D205
+
+    def _check_contains_expected_message(stdout: str, stderr: str):
+        note_in_message = "Note that currently a request with LoRA task that was already loaded is sent" \
+                          " without its LoRA weights to save its serialization, copy and deserialization, so if this" \
+                          " LoRA task was evicted from LoRA CPU cache, then its reuse is currently not supported."
+        return note_in_message in stderr
+
+    lora_config = LoraConfig(lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
+                             max_lora_rank=8,
+                             max_loras=max_loras,
+                             max_cpu_loras=max_cpu_loras)
+    with EnvVarsContextManager({"TLLM_WORKER_USE_SINGLE_PROCESS": "1"}):
+        child_stdout, child_stderr = run_function_in_sub_process(
+            target=check_llama_7b_multi_unique_lora_adapters_from_request,
+            args=(lora_adapter_count_per_call, repeat_calls, repeats_per_call,
+                  LLM),
+            kwargs={
+                "lora_config": lora_config,
+                # Disable CUDA graph
+                # TODO: remove this once we have a proper fix for CUDA graph in LoRA
+                "cuda_graph_config": None
+            },
+            stop_waiting_criteria=_check_contains_expected_message)
+
+    assert _check_contains_expected_message(child_stdout, child_stderr)
 
 
 # TODO smor: currently Nemotron-Super-49B-v1 with LoRA memory consumption is overly high

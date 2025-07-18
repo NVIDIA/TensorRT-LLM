@@ -11,6 +11,8 @@ import numpy as np
 import torch
 import yaml
 
+from tensorrt_llm.bindings import internal as tb_internal
+
 from ._utils import DictConversion, pad_vocab_size, release_gc, str_dtype_to_torch, torch_to_numpy
 from .layers.linear import ColumnLinear
 from .mapping import Mapping
@@ -436,8 +438,16 @@ class LoraManager(object):
         "mlp_gate_up": 18,
     }
 
-    def __init__(self):
-        """Constructor."""
+    def __init__(
+        self, cpp_peft_cache_manager: tb_internal.batch_manager.PeftCacheManager | None = None
+    ):
+        """Constructor.
+
+        Args:
+            cpp_peft_cache_manager (PeftCacheManager, optional): used by is_adapter_in_cpu_cache method, that's used for
+                a performance optimization with LoRA of not sending the LoRA adapter weights with every LLM request when
+                the adapter is already loaded in the LoRA CPU cache.
+        """
         # _lora_uid_to_low_ranks: dict[str -> dict[int -> dict[str -> int]]]
         # {
         #     uid: {
@@ -473,6 +483,19 @@ class LoraManager(object):
         self._cpp_lora_weights: Dict[str, torch.Tensor] = {}  # on cpu
         self._cpp_lora_config: Dict[str, torch.Tensor] = {}  # on cpu
         self.lora_target_modules: List[str] = []
+        self._cpp_peft_cache_manager = cpp_peft_cache_manager
+
+    def is_adapter_in_cpu_cache(self, adapter_uid: int) -> bool:
+        """Best effort to check if a LoRA adapter is in the LoRA CPU cache.
+
+        If no cpp_peft_cache_manager instance was given at the construction of this LoraManager instance, then False is
+        returned.
+        """
+        return (
+            self._cpp_peft_cache_manager.is_task_cached(adapter_uid)
+            if self._cpp_peft_cache_manager
+            else False
+        )
 
     @staticmethod
     def get_missing_qkv_modules(lora_target_modules):
