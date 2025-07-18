@@ -126,8 +126,9 @@ def load_weights_from_hf_model(hf_model, config):
                 if "qkv." in key:
                     weights[key] = shuffle_qkv_weights(weights[key], config)
 
-    if config.architecture in ['Phi3SmallForCausalLM', "PhiMoEForCausalLM"
-                               ] and config.mapping.has_tp():
+    if config.architecture in [
+            'Phi3SmallForCausalLM', "PhiMoEForCausalLM", "Phi3ForCausalLM"
+    ] and config.mapping.has_tp():
         weights = split_weights_tp(config, weights, torch_dtype)
 
     return weights

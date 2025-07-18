@@ -2,7 +2,7 @@ import argparse
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import (CudaGraphConfig, DraftTargetDecodingConfig,
-                                 EagleDecodingConfig, KvCacheConfig,
+                                 EagleDecodingConfig, KvCacheConfig, MoeConfig,
                                  MTPDecodingConfig, NGramDecodingConfig,
                                  TorchCompileConfig)
 
@@ -50,7 +50,7 @@ def add_llm_args(parser):
     parser.add_argument('--moe_backend',
                         type=str,
                         default='CUTLASS',
-                        choices=['CUTLASS', 'TRTLLM', 'VANILLA'])
+                        choices=['CUTLASS', 'TRTLLM', 'VANILLA', 'WIDEEP'])
     parser.add_argument('--enable_attention_dp',
                         default=False,
                         action='store_true')
@@ -145,10 +145,11 @@ def parse_arguments():
     return args
 
 
-def setup_llm(args):
+def setup_llm(args, **kwargs):
     kv_cache_config = KvCacheConfig(
         enable_block_reuse=not args.disable_kv_cache_reuse,
         free_gpu_memory_fraction=args.kv_cache_fraction,
+        dtype=args.kv_cache_dtype,
     )
 
     spec_decode_algo = args.spec_decode_algo.upper(
@@ -188,13 +189,12 @@ def setup_llm(args):
 
     cuda_graph_config = CudaGraphConfig(
         batch_sizes=args.cuda_graph_batch_sizes,
-        padding_enabled=args.cuda_graph_padding_enabled,
+        enable_padding=args.cuda_graph_padding_enabled,
     ) if args.use_cuda_graph else None
     llm = LLM(
         model=args.model_dir,
         backend='pytorch',
         disable_overlap_scheduler=args.disable_overlap_scheduler,
-        kv_cache_dtype=args.kv_cache_dtype,
         kv_cache_config=kv_cache_config,
         attn_backend=args.attention_backend,
         cuda_graph_config=cuda_graph_config,
@@ -207,7 +207,7 @@ def setup_llm(args):
             enable_piecewise_cuda_graph= \
                 args.use_piecewise_cuda_graph)
         if args.use_torch_compile else None,
-        moe_backend=args.moe_backend,
+        moe_config=MoeConfig(backend=args.moe_backend),
         enable_trtllm_sampler=args.enable_trtllm_sampler,
         max_seq_len=args.max_seq_len,
         max_batch_size=args.max_batch_size,
@@ -222,7 +222,9 @@ def setup_llm(args):
         speculative_config=spec_config,
         trust_remote_code=args.trust_remote_code,
         gather_generation_logits=args.return_generation_logits,
-        max_beam_width=args.max_beam_width)
+        max_beam_width=args.max_beam_width,
+        **kwargs,
+    )
 
     sampling_params = SamplingParams(
         max_tokens=args.max_tokens,

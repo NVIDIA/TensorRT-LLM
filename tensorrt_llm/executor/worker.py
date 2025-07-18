@@ -406,6 +406,10 @@ class GenerationExecutorWorker(GenerationExecutor):
         context_phase_params = None
         request_type = tllm.RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION
         if request.disaggregated_params is not None:
+            assert (
+                not self._is_pytorch_backend
+                or self.engine.kv_cache_transceiver is not None
+            ), "kv_cache_transceiver is disabled, please set 'cache_transceiver_config: backend:<backend_type>` in config file for disaggregated serving"
             request_type = request.disaggregated_params.get_request_type()
             if request_type == tllm.RequestType.REQUEST_TYPE_GENERATION_ONLY:
                 context_phase_params = request.disaggregated_params.get_context_phase_params(
@@ -566,6 +570,12 @@ class GenerationExecutorWorker(GenerationExecutor):
 
             self.engine.shutdown()
             self.engine = None
+
+            if hasattr(
+                    self._executor_config, "checkpoint_loader"
+            ) and self._executor_config.checkpoint_loader is not None:
+                self._executor_config.checkpoint_loader.cleanup()
+                self._executor_config.checkpoint_loader = None
 
         # Check if there are any errors from the threads before shutdown.
         self._handle_background_error()

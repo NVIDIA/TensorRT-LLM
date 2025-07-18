@@ -82,7 +82,7 @@ class ScaffoldingLlm:
         ]
         await asyncio.gather(*async_tasks)
         for task in tasks:
-            if task.streaming:
+            if getattr(task, 'streaming', False):
                 await request.result.set_output_async(task.result)
                 self.streaming_event.clear()
                 await self.streaming_event.wait()

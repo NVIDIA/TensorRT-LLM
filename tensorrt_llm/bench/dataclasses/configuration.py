@@ -58,8 +58,6 @@ class RuntimeConfig(BaseModel):
             self.world_config.cluster_size,
             "trust_remote_code":
             True,
-            "kv_cache_config":
-            self.settings_config.get_kvcache_config(),
             "enable_chunked_prefill":
             self.settings_config.chunking,
             "extended_runtime_perf_knob_config":
@@ -81,6 +79,10 @@ class RuntimeConfig(BaseModel):
 
         if self.backend in backend_config_map:
             llm_args.update(backend_config_map[self.backend]())
+
+        kv_cache_config = self.settings_config.get_kvcache_config().__dict__
+        backend_cache_config = llm_args.pop("kv_cache_config", {})
+        llm_args["kv_cache_config"] = backend_cache_config | kv_cache_config
 
         return update_llm_args_with_extra_options(llm_args,
                                                   self.extra_llm_api_options)
@@ -112,7 +114,6 @@ class PerformanceOptions:
     def get_autodeploy_perf_config(self) -> Dict:
         AutoDeployPerfConfig = dict
         ad_config = AutoDeployPerfConfig()
-        ad_config["kv_cache_dtype"] = "auto"
         ad_config["attn_backend"] = "flashinfer"
         return ad_config
 

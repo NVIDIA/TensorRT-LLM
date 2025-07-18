@@ -13,7 +13,7 @@ OUTPUT_STR = "Yes."
 class DummyWorker(Worker):
 
     async def dummy_generation_handler(self, task: GenerationTask):
-        task.output_str = OUTPUT_STR
+        task.result = OUTPUT_STR
         return TaskStatus.SUCCESS
 
     task_handlers = {GenerationTask: dummy_generation_handler}
@@ -29,7 +29,7 @@ class DummyTaskCollection(TaskCollection):
         pass
 
     def after_yield(self, tasks: List[Task]):
-        self.output_len = len(tasks[0].output_str)
+        self.output_len = len(tasks[0].result)
 
 
 def test_scaffolding_benchmark():
@@ -52,8 +52,10 @@ def test_scaffolding_benchmark():
         async_scaffolding_benchmark(scaffolding_llm, task_collection_types,
                                     requests, concurrency))
 
+    scaffolding_llm.shutdown()
+
     assert len(results) == requests_num
     assert len(requests_execution_time) == requests_num
-    assert results[0].output.output_str == OUTPUT_STR
+    assert results[0].cur_output == OUTPUT_STR
     assert results[0].task_collections[
         "bench_dummy_collection"].output_len == len(OUTPUT_STR)

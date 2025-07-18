@@ -596,12 +596,12 @@ def build_llava_engine(args):
         args.output_dir,
         args.max_batch_size)
     if args.model_type == "llava_next":
-        image_newline = model.image_newline.data
+        image_newline = model.model.image_newline.data
         tensor_img_newline = {"image_newline": image_newline}
         save_file(tensor_img_newline,
                   os.path.join(args.output_dir, "image_newlines.safetensors"))
     if args.model_type == "llava_onevision":
-        image_newline = model.image_newline.data
+        image_newline = model.model.image_newline.data
         tensor_img_newline = {"image_newline": image_newline}
         save_file(tensor_img_newline,
                   os.path.join(args.output_dir, "image_newlines.safetensors"))

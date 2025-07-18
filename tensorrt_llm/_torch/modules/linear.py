@@ -562,7 +562,8 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
 
         scale_name = self._get_scale_name(weights)
         weight_scale = load_weight_shard(weights[0][scale_name], module.tp_size,
-                                         module.tp_rank, module.tp_mode)
+                                         module.tp_rank,
+                                         module.tp_mode).squeeze()
         copy_weight(module.weight_scale, weight_scale)
         if "input_scale" in weights[0]:
             copy_weight(module.input_scale, weights[0]["input_scale"])
@@ -582,7 +583,8 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
                                     module.tp_rank, module.tp_mode)
         v_scale = load_weight_shard(weights[2][scale_name], module.tp_size,
                                     module.tp_rank, module.tp_mode)
-        fused_fp8_block_scale = torch.cat((q_scale, k_scale, v_scale))
+        fused_fp8_block_scale = torch.cat((q_scale, k_scale, v_scale)).squeeze()
+
         copy_weight(module.weight_scale, fused_fp8_block_scale)
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
@@ -597,7 +599,7 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
                                        module.tp_rank, module.tp_mode)
         right_scale = load_weight_shard(weights[1][scale_name], module.tp_size,
                                         module.tp_rank, module.tp_mode)
-        fused_scale = torch.cat([left_scale, right_scale], dim=0)
+        fused_scale = torch.cat([left_scale, right_scale], dim=0).squeeze()
         copy_weight(module.weight_scale, fused_scale)
 
 

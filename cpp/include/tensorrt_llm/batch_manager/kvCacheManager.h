@@ -180,6 +180,8 @@ struct KvCacheStats
     SizeType32 missedBlocks;
     // Measuring the KV Cache reuse rate. cacheHitRate = reusedBlocks / (reusedBlocks + missedBlocks).
     float cacheHitRate;
+    // Number of free blocks for every configured attention-window size.
+    std::map<SizeType32, SizeType32> numFreeBlocksPerWindowSize;
 };
 
 // Basic building block of a paged KV cache - a single
@@ -854,6 +856,9 @@ public:
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enableHashKey = false,
         bool enablePartialReuse = true, bool copyOnPartialReuse = true);
 
+    BlockManager(BlockManager const&) = delete;
+    BlockManager& operator=(BlockManager const&) = delete;
+
     //! \brief Calculate the proportional share each window size receives of the total memory pool
     //! \details Example:       (uniqueWindowSizeToLayers={1024: [1], 4096: [0, 4, 5], 8192: [2, 3]})
     //!          Would Return:  {1024: 0.0345, 4096: 0.4138, 8192: 0.5517} [sums to 1.0].
@@ -1454,6 +1459,11 @@ public:
         return mBlockManager.getNumMissedBlocks();
     }
 
+    [[nodiscard]] std::map<SizeType32, SizeType32> getNumFreeBlocksPerWindowSize() const
+    {
+        return mBlockManager.getNumFreeBlocksPerWindowSize();
+    }
+
     [[nodiscard]] KvCacheStats getKvCacheStats() const override
     {
         KvCacheStats kvCacheStats;
@@ -1468,6 +1478,7 @@ public:
         kvCacheStats.cacheHitRate = kvCacheStats.reusedBlocks == 0 ? 0
                                                                    : static_cast<float>(kvCacheStats.reusedBlocks)
                 / static_cast<float>(kvCacheStats.reusedBlocks + kvCacheStats.missedBlocks);
+        kvCacheStats.numFreeBlocksPerWindowSize = getNumFreeBlocksPerWindowSize();
         return kvCacheStats;
     }
 

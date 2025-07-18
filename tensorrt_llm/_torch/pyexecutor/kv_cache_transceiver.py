@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from os import getenv
 
 import tensorrt_llm
+from tensorrt_llm import logger
 from tensorrt_llm.bindings import WorldConfig
 from tensorrt_llm.bindings.executor import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
@@ -10,9 +11,9 @@ from .llm_request import LlmRequest
 from .resource_manager import KVCacheManager
 
 CacheTransceiverCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransceiver
-CommTypeCpp = tensorrt_llm.bindings.internal.batch_manager.CommType
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 CacheTransBufferManagerCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransBufferManager
+BackendTypeCpp = tensorrt_llm.bindings.executor.CacheTransceiverBackendType
 
 
 def mapping_to_world_config(mapping: Mapping) -> WorldConfig:
@@ -30,21 +31,27 @@ def create_kv_cache_transceiver(
         mapping: Mapping, kv_cache_manager: KVCacheManager,
         attention_type: AttentionTypeCpp,
         cache_transceiver_config: CacheTransceiverConfig):
+    if cache_transceiver_config is None or (cache_transceiver_config.backend
+                                            is None):
+        logger.info("cache_transceiver is disabled")
+        return None
+    if (cache_transceiver_config.backend == BackendTypeCpp.DEFAULT):
 
-    comm_type = None
-    if getenv("TRTLLM_USE_UCX_KVCACHE"):
-        comm_type = CommTypeCpp.UCX
-    elif getenv("TRTLLM_USE_NIXL_KVCACHE"):
-        comm_type = CommTypeCpp.NIXL
-    elif getenv("TRTLLM_USE_MPI_KVCACHE"):
-        comm_type = CommTypeCpp.MPI
+        backend_type = BackendTypeCpp.UCX
+        if getenv("TRTLLM_USE_UCX_KVCACHE"):
+            backend_type = BackendTypeCpp.UCX
+        elif getenv("TRTLLM_USE_NIXL_KVCACHE"):
+            backend_type = BackendTypeCpp.NIXL
+        elif getenv("TRTLLM_USE_MPI_KVCACHE"):
+            backend_type = BackendTypeCpp.MPI
+        cache_transceiver_config.backend = backend_type
 
-    cache_transceiver = None
-    if comm_type is not None:
-        cache_transceiver = BindKvCacheTransceiver(mapping, comm_type,
-                                                   kv_cache_manager,
-                                                   attention_type,
-                                                   cache_transceiver_config)
+    if (cache_transceiver_config.backend == BackendTypeCpp.MPI):
+        logger.warning(
+            "MPI CacheTransceiver is deprecated, UCX or NIXL is recommended")
+    cache_transceiver = BindKvCacheTransceiver(mapping, kv_cache_manager,
+                                               attention_type,
+                                               cache_transceiver_config)
 
     return cache_transceiver
 
@@ -78,8 +85,7 @@ class KvCacheTransceiver(ABC):
 
 class BindKvCacheTransceiver(KvCacheTransceiver):
 
-    def __init__(self, mapping: Mapping, comm_type: CommTypeCpp,
-                 kv_cache_manager: KVCacheManager,
+    def __init__(self, mapping: Mapping, kv_cache_manager: KVCacheManager,
                  attention_type: AttentionTypeCpp,
                  cache_transceiver_config: CacheTransceiverConfig):
         world_config = mapping_to_world_config(mapping)
@@ -88,7 +94,7 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
         tokens_per_block = kv_cache_manager.tokens_per_block
         dtype = kv_cache_manager.dtype
 
-        self.impl = CacheTransceiverCpp(kv_cache_manager.impl, comm_type,
+        self.impl = CacheTransceiverCpp(kv_cache_manager.impl,
                                         num_kv_heads_per_layer, head_dim,
                                         tokens_per_block, world_config, dtype,
                                         attention_type,
@@ -120,7 +126,7 @@ class CacheTransBufferManager:
                                                max_num_tokens)
 
     @staticmethod
-    def pre_alloc_buffer_size(max_num_tokens: int,
-                              kv_cache_size_per_token: int):
+    def pre_alloc_buffer_size(kv_cache_size_per_token: int,
+                              cache_transceiver_config: CacheTransceiverConfig):
         return CacheTransBufferManagerCpp.pre_alloc_buffer_size(
-            max_num_tokens) * kv_cache_size_per_token
+            kv_cache_size_per_token, cache_transceiver_config)

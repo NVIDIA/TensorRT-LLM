@@ -186,9 +186,6 @@ public:
             {
                 MPI_group_barrier(_ranks);
             }
-
-            TLLM_CUDA_CHECK(cudaStreamCreate(&_memcpy_stream));
-            TLLM_CUDA_CHECK(cudaEventCreate(&_fork_join_event));
         }
 
         int free() override
@@ -232,8 +229,6 @@ public:
         DeviceAllocationNvls<BarrierT> _tile_barriers;
         DeviceAllocationNvls<BarrierT> _completion_barriers;
         DeviceAllocationNvls<ElementD> _stage_buf;
-        cudaStream_t _memcpy_stream;
-        cudaEvent_t _fork_join_event;
     };
 
     GemmAllReduceImplTwoshot_Sm90()

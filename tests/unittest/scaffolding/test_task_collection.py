@@ -2,8 +2,6 @@ import copy
 from enum import Enum
 from typing import List
 
-import pytest
-
 from tensorrt_llm.scaffolding import (Controller, ParallelProcess,
                                       ScaffoldingLlm, Task, TaskCollection,
                                       TaskStatus, Worker, with_task_collection)
@@ -20,8 +18,6 @@ class DummyTask(Task):
         task = DummyTask()
         return task
 
-    # TODO: Fix when ScaffoldingOutput is replaced with GenerationResult
-    # def create_scaffolding_output(self) -> "ScaffoldingOutput":
     def create_scaffolding_output(self):
         return None
 
@@ -55,8 +51,6 @@ class DummyControllerBase(Controller):
         super().__init__()
         self.expected_task_count = expected_task_count
 
-    # TODO: Fix when ScaffoldingOutput is replaced with GenerationResult
-    # def generate(self, prompt: str, **kwargs) -> ScaffoldingOutput:
     def generate(self, prompt: str, **kwargs):
         task = DummyTask.create_from_prompt(prompt)
         yield from self.process([task], **kwargs)
@@ -127,7 +121,6 @@ def run(controller, expected_task_count):
     llm.shutdown()
 
 
-@pytest.skip(reason="ScaffoldingOutput removed in PR #5345, needs refactoring")
 def test_dummy_task_collection():
     controller = DummyController(1)
     run(controller, 1)

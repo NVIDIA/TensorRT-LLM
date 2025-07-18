@@ -86,8 +86,6 @@ async def test_request_cancellation(server: RemoteOpenAIServer,
                                     model_name: str):
     # clunky test: send an ungodly amount of load in with short timeouts
     # then ensure that it still responds quickly afterwards
-    pytest.skip("https://nvbugs/5310314")
-
     chat_input = [{"role": "user", "content": "Write a long story"}]
     client = server.get_async_client(timeout=0.5, max_retries=3)
     tasks = []
