@@ -100,13 +100,13 @@ def test_fused_moe(moe_backend,
                 weights[f"{expert_id}.w3.bias"] = w3_bias
             w1_weight = torch.randn((INTERMEDIATE_SIZE, HIDDEN_SIZE),
                                     dtype=dtype,
-                                device="cuda")
+                                    device="cuda")
             w2_weight = torch.randn((HIDDEN_SIZE, INTERMEDIATE_SIZE),
                                     dtype=dtype,
-                                device="cuda")
+                                    device="cuda")
             w3_weight = torch.randn((INTERMEDIATE_SIZE, HIDDEN_SIZE),
                                     dtype=dtype,
-                                device="cuda")
+                                    device="cuda")
             weights[f"{expert_id}.w1.weight"] = w1_weight
             weights[f"{expert_id}.w2.weight"] = w2_weight
             weights[f"{expert_id}.w3.weight"] = w3_weight
@@ -145,21 +145,17 @@ def test_fused_moe(moe_backend,
                                     dtype=dtype,
                                     device="cuda")
 
-            with torch.inference_mode():
-                output = fused_moe.forward(x, router_logits)
-                ref_output = ref_fused_moe.forward(x, router_logits)
+        with torch.inference_mode():
+            output = fused_moe.forward(x, router_logits)
+            ref_output = ref_fused_moe.forward(x, router_logits)
 
-            # Evaluate outputs
-            torch.cuda.synchronize()
-            # There can be one off mismatch in the outputs due to different kernel implementations
-            # Here we check 99% of the outputs are within the tolerance
-            # The CutlassFusedMoE case fails as well without this change on H100 for bf16
-            check_accuracy(output,
-                           ref_output,
-                           rtol=0.2,
-                           atol=0.2,
-                           percent=0.984)
-            m //= 2
+        # Evaluate outputs
+        torch.cuda.synchronize()
+        # There can be one off mismatch in the outputs due to different kernel implementations
+        # Here we check 99% of the outputs are within the tolerance
+        # The CutlassFusedMoE case fails as well without this change on H100 for bf16
+        check_accuracy(output, ref_output, rtol=0.2, atol=0.2, percent=0.984)
+        m //= 2
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
@@ -321,8 +317,8 @@ def test_fused_moe_fp8(moe_backend, dtype, routing_cls, bias):
         _, x_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(x)
         x_scale = x_scale.float().squeeze()
         router_logits = torch.randn((SEQ_LEN, NUM_EXPERTS),
-                                dtype=dtype,
-                                device="cuda")
+                                    dtype=dtype,
+                                    device="cuda")
 
         weights = {}
         for expert_id in range(NUM_EXPERTS):
@@ -335,13 +331,13 @@ def test_fused_moe_fp8(moe_backend, dtype, routing_cls, bias):
                 weights[f"{expert_id}.w3.bias"] = w3_bias
             w1_weight = torch.randn((INTERMEDIATE_SIZE, HIDDEN_SIZE),
                                     dtype=dtype,
-                                device="cuda")
+                                    device="cuda")
             w2_weight = torch.randn((HIDDEN_SIZE, INTERMEDIATE_SIZE),
                                     dtype=dtype,
-                                device="cuda")
+                                    device="cuda")
             w3_weight = torch.randn((INTERMEDIATE_SIZE, HIDDEN_SIZE),
                                     dtype=dtype,
-                                device="cuda")
+                                    device="cuda")
 
             w1_weight_fp8, w1_weight_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(
                 w1_weight)
@@ -822,24 +818,24 @@ def test_fused_moe_nvfp4(dtype):
         x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype, device="cuda")
         x_sf_global = (448 * 6) / x.abs().max().float()
         router_logits = torch.randn((SEQ_LEN, NUM_EXPERTS),
-                                dtype=dtype,
-                                device="cuda")
+                                    dtype=dtype,
+                                    device="cuda")
 
         weights = {}
         for expert_id in range(NUM_EXPERTS):
             w1_weight = torch.randn((INTERMEDIATE_SIZE, HIDDEN_SIZE),
                                     dtype=dtype,
-                                device="cuda")
+                                    device="cuda")
             w1_sf_global = (448 * 6) / w1_weight.abs().max().float()
 
             w2_weight = torch.randn((HIDDEN_SIZE, INTERMEDIATE_SIZE),
                                     dtype=dtype,
-                                device="cuda")
+                                    device="cuda")
             w2_sf_global = (448 * 6) / w2_weight.abs().max().float()
 
             w3_weight = torch.randn((INTERMEDIATE_SIZE, HIDDEN_SIZE),
                                     dtype=dtype,
-                                device="cuda")
+                                    device="cuda")
             w3_sf_global = (448 * 6) / w3_weight.abs().max().float()
 
             w3_w1_global = min(
@@ -938,8 +934,8 @@ def test_fused_moe_w4afp8(dtype):
         torch.cuda.manual_seed(0)
         x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype, device="cuda")
         router_logits = torch.randn((SEQ_LEN, NUM_EXPERTS),
-                                dtype=dtype,
-                                device="cuda")
+                                    dtype=dtype,
+                                    device="cuda")
 
         affine_coeff = 0.005
 
@@ -961,15 +957,15 @@ def test_fused_moe_w4afp8(dtype):
             w1_scale = torch.randn(
                 (INTERMEDIATE_SIZE, HIDDEN_SIZE // SCALING_GROUP_SIZE),
                 dtype=dtype,
-            device="cuda") * affine_coeff
+                device="cuda") * affine_coeff
             w2_scale = torch.randn(
                 (HIDDEN_SIZE, INTERMEDIATE_SIZE // SCALING_GROUP_SIZE),
                 dtype=dtype,
-            device="cuda") * affine_coeff
+                device="cuda") * affine_coeff
             w3_scale = torch.randn(
                 (INTERMEDIATE_SIZE, HIDDEN_SIZE // SCALING_GROUP_SIZE),
                 dtype=dtype,
-            device="cuda") * affine_coeff
+                device="cuda") * affine_coeff
 
             w1_input = torch.randn(1, dtype=torch.float32, device="cuda") * 0.02
             w2_input = w1_input

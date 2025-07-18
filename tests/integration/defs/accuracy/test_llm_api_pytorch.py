@@ -2210,7 +2210,7 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             moe_expert_parallel_size=ep_size,
             **pytorch_config,
             enable_attention_dp=attention_dp,
-            moe_backend=moe_backend)
+            moe_config=MoeConfig(backend=moe_backend))
         with llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
@@ -2225,7 +2225,7 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
-            moe_backend=moe_backend)
+            moe_config=MoeConfig(backend=moe_backend))
 
         llm = LLM(
             f"{llm_models_root()}/mxfp4-qwen3/saved_models_Qwen3-30B-A3B_w4a16_mxfp4_kv_none_hf_moeonly",
@@ -2439,7 +2439,7 @@ class TestOpenAI(LlmapiAccuracyTestHarness):
             pipeline_parallel_size=1,
             moe_expert_parallel_size=1,
             **pytorch_config,
-            moe_backend=moe_backend)
+            moe_config=MoeConfig(backend=moe_backend))
 
         with llm:
             model_name = "OpenAI/MXFP4"
@@ -2475,7 +2475,7 @@ class TestOpenAI(LlmapiAccuracyTestHarness):
             moe_expert_parallel_size=ep_size,
             **pytorch_config,
             enable_attention_dp=attention_dp,
-            moe_backend=moe_backend)
+            moe_config=MoeConfig(backend=moe_backend))
 
         with llm:
             model_name = "OpenAI/MXFP4"
@@ -2508,7 +2508,7 @@ class TestOpenAI(LlmapiAccuracyTestHarness):
             moe_expert_parallel_size=ep_size,
             **pytorch_config,
             enable_attention_dp=attention_dp,
-            moe_backend=moe_backend)
+            moe_config=MoeConfig(backend=moe_backend))
         with llm:
             model_name = "OpenAI/BF16"
             task = MMLU(model_name)

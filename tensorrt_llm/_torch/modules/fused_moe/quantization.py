@@ -1529,7 +1529,7 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
 
         orig_shape = dst_w3_w1_weight_scale.shape
 
-        dst_w3_w1_weight_scale_interleaved = torch.ops.trtllm.nvfp4_block_scale_interleave(
+        dst_w3_w1_weight_scale_interleaved = torch.ops.trtllm.block_scale_interleave(
             dst_w3_w1_weight_scale.view(float4_sf_dtype)).view(
                 self.block_scales_dtype).reshape(orig_shape)
 
@@ -1553,7 +1553,7 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
 
         orig_shape = dst_w2_weight_scale.shape
 
-        dst_w2_weight_scale_interleaved = torch.ops.trtllm.nvfp4_block_scale_interleave(
+        dst_w2_weight_scale_interleaved = torch.ops.trtllm.block_scale_interleave(
             dst_w2_weight_scale.view(float4_sf_dtype)).view(
                 self.block_scales_dtype).reshape(orig_shape)
 
