@@ -912,10 +912,10 @@ class TestMoeFP8:
         output_dequant_reference, _ = run_moe_reference_dsfp8(args)
 
         check_accuracy(output_dequant_reference,
-                    output_dequant_actual,
-                    atol=0.1,
-                    rtol=0.85,
-                    percent=0.925)
+                       output_dequant_actual,
+                       atol=0.1,
+                       rtol=0.85,
+                       percent=0.925)
 
 
 @pytest.mark.skipif(
@@ -973,16 +973,17 @@ class TestMoeFp4:
                 },
                 id="RoutingRenormalize"),
             pytest.param(
-            {
-                "num_experts": 128,
-                "top_k": 4,
-                "n_groups": None,
-                "top_k_groups": None,
-                "routed_scaling": None,
-                "has_routing_bias": False,
-                "routing_method_type": RoutingMethodType.Renormalize
-            },
-            id="RoutingRenormalize_topk_4"),
+                {
+                    "num_experts": 128,
+                    "top_k": 4,
+                    "padding": 8,
+                    "n_groups": None,
+                    "top_k_groups": None,
+                    "routed_scaling": None,
+                    "has_routing_bias": False,
+                    "routing_method_type": RoutingMethodType.Renormalize
+                },
+                id="RoutingRenormalize_topk_4"),
             pytest.param(
                 {
                     "num_experts": 128,
@@ -1266,10 +1267,10 @@ class TestMoeFp4:
         output_dequant_actual = output[0].to(torch.float)
 
         check_accuracy(output_dequant_reference,
-                    output_dequant_actual,
-                    atol=0.1,
-                    rtol=0.85,
-                    percent=0.925)
+                       output_dequant_actual,
+                       atol=0.1,
+                       rtol=0.85,
+                       percent=0.925)
 
 
 @pytest.mark.skipif(

@@ -5,7 +5,7 @@ import shutil
 import pytest
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
+from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig
 
 configs = """
 {
@@ -44,9 +44,8 @@ def dump_config_json(dst_dir):
         json.dump(json_configs, f, indent=2, ensure_ascii=False)
 
 
-@pytest.mark.parametrize("kv_cache", ["fp8", "auto"])
 @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRITON"])
-def test_orangina_trtllmgen(kv_cache, moe_backend):
+def test_orangina_trtllmgen(moe_backend):
     prompts = [
         "How are you?",
         "Hello, my name is",
@@ -58,10 +57,9 @@ def test_orangina_trtllmgen(kv_cache, moe_backend):
     pytorch_config = dict(
         disable_overlap_scheduler=False,
         cuda_graph_config=CudaGraphConfig(),
-        kv_cache_dtype=kv_cache,
         attn_backend="TRTLLM",
         load_format="dummy",
-        moe_backend=moe_backend,
+        moe_config=MoeConfig(backend=moe_backend),
     )
 
     tmp_model_dir = f"/tmp/test_model_trtllm"

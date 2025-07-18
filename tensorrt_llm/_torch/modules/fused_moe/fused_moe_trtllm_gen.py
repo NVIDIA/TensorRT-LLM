@@ -202,13 +202,6 @@ class TRTLLMGenFusedMoE(MoE):
             assert do_finalize, "fp8_block_scale_moe_runner does not support do_finalize=False"
             x_val, x_scale = torch.ops.trtllm.fp8_quantize_1x128(x)
 
-            # FIXME: tile_tokens_dim is hardcoded for now
-            tile_tokens_dim = 8
-            if 256 < x.shape[0] and x.shape[0] <= 512:
-                tile_tokens_dim = 16
-            elif x.shape[0] > 512:
-                tile_tokens_dim = 32
-
             final_hidden_states = torch.ops.trtllm.fp8_block_scale_moe_runner(
                 router_logits,
                 routing_bias,
