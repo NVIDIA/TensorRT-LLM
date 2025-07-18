@@ -29,7 +29,7 @@ KvCacheConfig::KvCacheConfig(bool enableBlockReuse, std::optional<SizeType32> co
     size_t eventBufferMaxSize, bool enablePartialReuse, bool copyOnPartialReuse, bool useUvm,
     SizeType32 attentionDpEventsGatherPeriodMs,
     std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults,
-    std::optional<uint64_t> const& maxFreeGpuMemorySize)
+    std::optional<uint64_t> const& maxGpuTotalBytes)
     : mEnableBlockReuse(enableBlockReuse)
     , mHostCacheSize(hostCacheSize)
     , mOnboardBlocks(onboardBlocks)
@@ -39,6 +39,7 @@ KvCacheConfig::KvCacheConfig(bool enableBlockReuse, std::optional<SizeType32> co
     , mCopyOnPartialReuse{copyOnPartialReuse}
     , mUseUvm{useUvm}
     , mAttentionDpEventsGatherPeriodMs(attentionDpEventsGatherPeriodMs)
+    , mMaxGpuTotalBytes{maxGpuTotalBytes}
 {
     if (maxTokens)
     {
@@ -64,9 +65,9 @@ KvCacheConfig::KvCacheConfig(bool enableBlockReuse, std::optional<SizeType32> co
     {
         fillEmptyFieldsFromRuntimeDefaults(runtimeDefaults.value());
     }
-    if (maxFreeGpuMemorySize)
+    if (maxGpuTotalBytes)
     {
-        setMaxFreeGpuMemorySize(maxFreeGpuMemorySize.value());
+        setMaxGpuTotalBytes(maxGpuTotalBytes.value());
     }
     TLLM_CHECK_WITH_INFO(
         mAttentionDpEventsGatherPeriodMs > 0, "Attention DP events gather period must be greater than 0");
@@ -142,9 +143,9 @@ SizeType32 KvCacheConfig::getAttentionDpEventsGatherPeriodMs() const
     return mAttentionDpEventsGatherPeriodMs;
 }
 
-std::optional<uint64_t> KvCacheConfig::getMaxFreeGpuMemorySize() const
+uint64_t KvCacheConfig::getMaxGpuTotalBytes() const
 {
-    return mMaxFreeGpuMemorySize;
+    return mMaxGpuTotalBytes;
 }
 
 void KvCacheConfig::setEnableBlockReuse(bool enableBlockReuse)
@@ -232,9 +233,9 @@ void KvCacheConfig::setAttentionDpEventsGatherPeriodMs(SizeType32 attentionDpEve
     mAttentionDpEventsGatherPeriodMs = attentionDpEventsGatherPeriodMs;
 }
 
-void KvCacheConfig::setMaxFreeGpuMemorySize(uint64_t maxFreeGpuMemorySize)
+void KvCacheConfig::setMaxGpuTotalBytes(uint64_t maxGpuTotalBytes)
 {
-    mMaxFreeGpuMemorySize = maxFreeGpuMemorySize;
+    mMaxGpuTotalBytes = maxGpuTotalBytes;
 }
 
 void KvCacheConfig::fillEmptyFieldsFromRuntimeDefaults(tensorrt_llm::runtime::RuntimeDefaults const& runtimeDefaults)
