@@ -313,6 +313,8 @@ class PyTorchModelEngine(ModelEngine):
         self._torch_compile_backend = None
 
         try:
+            if pytorch_backend_config.allreduce_strategy == "NCCL_SYMMETRIC":
+                self._init_userbuffers(self.model.config.hidden_size)
             if pytorch_backend_config.torch_compile_enabled:
                 set_torch_compiling(True)
                 use_ub = pytorch_backend_config.torch_compile_enable_userbuffers and self._init_userbuffers(
@@ -928,7 +930,6 @@ class PyTorchModelEngine(ModelEngine):
                     moe_load_balancer: Optional[MoeLoadBalancerConfig] = None,
                     lora_config: Optional[LoraConfig] = None,
                     **kwargs):
-
         config = checkpoint_loader.load_config(
             checkpoint_dir,
             trust_remote_code=True,
@@ -2129,12 +2130,11 @@ class PyTorchModelEngine(ModelEngine):
         # Disable UB for unsupported platforms
         if not ub.ub_supported():
             return False
-        ub.initialize_userbuffers_manager(self.mapping.tp_size,
-                                          self.mapping.pp_size,
-                                          self.mapping.cp_size,
-                                          self.mapping.rank,
-                                          self.mapping.gpus_per_node,
-                                          hidden_size * self.max_num_tokens * 2)
+        ub.initialize_userbuffers_manager(
+            self.mapping.tp_size, self.mapping.pp_size, self.mapping.cp_size,
+            self.mapping.rank, self.mapping.gpus_per_node,
+            hidden_size * self.max_num_tokens * 2, True)
+
         return True
 
     def load_weights_from_target_model(self,
