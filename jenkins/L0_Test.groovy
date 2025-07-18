@@ -1883,7 +1883,6 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     docBuildConfigs = [
         "A10-Build_Docs": [docBuildSpec, {
             sh "rm -rf **/*.xml *.tar.gz"
-            sh "cd aaa/"
             runLLMDocBuild(pipeline, config=VANILLA_CONFIG)
         }],
     ]
