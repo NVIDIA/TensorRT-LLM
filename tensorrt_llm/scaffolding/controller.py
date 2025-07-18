@@ -1,7 +1,7 @@
 import copy
 from abc import ABC
 from enum import Enum
-from typing import Any, List, Mapping
+from typing import Any, List, Mapping, Tuple
 
 import torch
 from torch.nn import functional as F
@@ -231,13 +231,14 @@ class MajorityVoteController(Controller):
                               generation_kwargs_list)
 
         candidates = [tasks[0].output_str for tasks in tasks_list]
-        result = self.majority_vote(candidates, **majority_vote_kwargs)
+        majority_index, majority_answer = self.majority_vote(
+            candidates, **majority_vote_kwargs)
 
-        assert isinstance(result, str), "majority_vote failed"
+        assert isinstance(majority_answer, str), "majority_vote failed"
         # The task returned by majority vote does not have output_tokens and logits.
-        tasks[0].output_str = result
+        tasks[0].result = tasks_list[majority_index][0].result
 
-    def majority_vote(self, candidates: List[str], **kwargs) -> str:
+    def majority_vote(self, candidates: List[str], **kwargs) -> Tuple[int, str]:
         return get_digit_majority_vote_result(candidates)
 
 
@@ -292,7 +293,7 @@ class BestOfNController(Controller):
 
         best_task, best_idx = self.select_best(generation_tasks, reward_values,
                                                **select_best_kwargs)
-        task.output_str = best_task.output_str
+        task.result = best_task.result
 
     def select_best(self, tasks: List[Task], reward_values, **kwargs) -> Task:
         max_index = torch.argmax(torch.tensor(reward_values)).item()

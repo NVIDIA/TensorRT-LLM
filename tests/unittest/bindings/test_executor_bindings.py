@@ -14,7 +14,6 @@ import torch
 from binding_test_utils import *
 from pydantic import BaseModel
 
-import tensorrt_llm.bindings as _tb
 import tensorrt_llm.bindings.executor as trtllm
 import tensorrt_llm.version as trtllm_version
 from tensorrt_llm.models.modeling_utils import PretrainedConfig
@@ -485,8 +484,6 @@ def test_get_num_responses_ready(streaming: bool,
     assert executor.get_num_responses_ready() == num_expected_responses
 
 
-@pytest.mark.skipif(_tb.binding_type == "nanobind",
-                    reason="Test not supported for nanobind yet")
 @pytest.mark.parametrize("batching_type", [trtllm.BatchingType.INFLIGHT])
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("beam_width", [1])
@@ -691,8 +688,6 @@ def test_token_comparison(batching_type: trtllm.BatchingType, streaming: bool,
     verify_output(tokens, test_data, given_input_lengths)
 
 
-@pytest.mark.skipif(_tb.binding_type == "nanobind",
-                    reason="Test not supported for nanobind yet")
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("beam_width", [1])
 def test_finish_reason(streaming: bool, beam_width: int, model_files,
@@ -1117,8 +1112,6 @@ def test_spec_dec_fast_logits_info():
     assert fast_logits_info.draft_participant_id == 5
 
 
-@pytest.mark.skipif(_tb.binding_type == "nanobind",
-                    reason="Test not supported for nanobind yet")
 def test_result():
     result = trtllm.Result()
     result.is_final = True
@@ -1156,8 +1149,6 @@ def test_result():
     assert (additional_output.output == torch.ones(1, 4, 100)).all()
 
 
-@pytest.mark.skipif(_tb.binding_type == "nanobind",
-                    reason="Test not supported for nanobind yet")
 def test_result_pickle():
     result = trtllm.Result()
     result.is_final = True
@@ -1504,8 +1495,6 @@ def test_eagle_config():
         assert getattr(config, k) == v
 
 
-@pytest.mark.skipif(_tb.binding_type == "nanobind",
-                    reason="Test not supported for nanobind yet")
 def test_eagle_config_pickle():
     config = trtllm.EagleConfig([[0, 0], [0, 1]], False, 0.5)
     config_copy = pickle.loads(pickle.dumps(config))
@@ -1878,8 +1867,6 @@ def test_logits_post_processor(model_files, model_path):
     assert tokens[-max_tokens:] == [42] * max_tokens
 
 
-@pytest.mark.skipif(_tb.binding_type == "nanobind",
-                    reason="Test not supported for nanobind yet")
 def test_logits_post_processor_batched(model_files, model_path):
 
     # Define the logits post-processor callback
@@ -2154,8 +2141,6 @@ def test_request_perf_metrics_kv_cache(model_path):
     assert kv_cache_metrics.kv_cache_hit_rate == 1.0
 
 
-@pytest.mark.skipif(_tb.binding_type == "nanobind",
-                    reason="Test not supported for nanobind yet")
 @pytest.mark.parametrize("exclude_input_from_output", [False, True])
 def test_request_perf_metrics_draft(model_path_draft_tokens_external,
                                     exclude_input_from_output: bool):
@@ -2236,7 +2221,7 @@ def test_kv_event_stream_timeout(model_path):
     assert len(events) == 1
 
     start = datetime.datetime.now()
-    events = cache_manager.get_latest_events(1000)
+    events = cache_manager.get_latest_events(datetime.timedelta(seconds=1))
     end = datetime.datetime.now()
     # Make sure that it actually waited
     assert abs(end - start) > datetime.timedelta(milliseconds=900)

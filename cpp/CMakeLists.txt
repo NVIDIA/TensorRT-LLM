@@ -198,7 +198,7 @@ set(TRT_LIB TensorRT::NvInfer)
 get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
 
 set(3RDPARTY_DIR ${TRT_LLM_ROOT_DIR}/3rdparty)
-if(BINDING_TYPE STREQUAL "pybind" OR BUILD_DEEP_EP)
+if(BINDING_TYPE STREQUAL "pybind")
   add_subdirectory(${3RDPARTY_DIR}/pybind11
                    ${CMAKE_CURRENT_BINARY_DIR}/pybind11)
 endif()
@@ -217,7 +217,7 @@ include_directories(
   ${3RDPARTY_DIR}/cutlass/tools/util/include
   ${3RDPARTY_DIR}/NVTX/include
   ${3RDPARTY_DIR}/json/include)
-if(BINDING_TYPE STREQUAL "pybind" OR BUILD_DEEP_EP)
+if(BINDING_TYPE STREQUAL "pybind")
   include_directories(${3RDPARTY_DIR}/pybind11/include)
 endif()
 if(BINDING_TYPE STREQUAL "nanobind")

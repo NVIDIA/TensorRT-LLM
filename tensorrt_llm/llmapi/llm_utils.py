@@ -362,7 +362,11 @@ class ModelLoader:
 
             hf_quant_algo = hf_quant_config.pop("quant_algo", None)
             if hf_quant_algo is not None:
-                hf_quant_algo = QuantAlgo(hf_quant_algo)
+                # fp8_pb_wo from modelopt is the same as fp8_block_scales
+                if hf_quant_algo == "fp8_pb_wo":
+                    hf_quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+                else:
+                    hf_quant_algo = QuantAlgo(hf_quant_algo)
                 if quant_config.quant_algo is None:
                     logger.info(
                         f"Setting quant_algo={hf_quant_algo} form HF quant config."

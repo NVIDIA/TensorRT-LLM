@@ -37,7 +37,7 @@ The single-step flow of PyExecutor involves:
 
 The core component of `PyExecutor` is the `ModelEngine`, responsible for executing the model's forward pass efficiently on the GPU.
 The key method of `ModelEngine` is `forward`, which handles the forward pass computation.
-For the PyTorch backend, the derived class is `PyTorchModelEngine`, declared in [pytorch_model_engine.py](../../../tensorrt_llm/_torch/pyexecutor/pytorch_model_engine.py).
+For the PyTorch backend, the derived class is `PyTorchModelEngine`, declared in [model_engine.py](../../../tensorrt_llm/_torch/pyexecutor/model_engine.py).
 
 ## Decoder
 

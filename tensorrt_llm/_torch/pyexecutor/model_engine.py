@@ -2173,7 +2173,7 @@ class PyTorchModelEngine(ModelEngine):
                 # Skip as we only need to apply logit processor on the last context request
                 continue
 
-            logits_row = logits_tensor[request.py_batch_idx]
+            logits_row = logits_tensor[idx]
             # Reshape to align w/ the shape used in the TRT backend,
             # so the same logit processors can be used across both backends.
             logits_row = logits_row.view(1, 1, -1)
@@ -2186,4 +2186,4 @@ class PyTorchModelEngine(ModelEngine):
                     "defined in `tensorrtllm.sampling_params`.")
                 lp(request.py_request_id, logits_row, token_ids, None, None)
 
-            logits_tensor[request.py_batch_idx] = logits_row.view(-1)
+            logits_tensor[idx] = logits_row.view(-1)
