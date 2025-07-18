@@ -826,6 +826,7 @@ public:
         mState = mEncoderTokens.has_value() || mEncoderInputFeatures ? LlmRequestState::kENCODER_INIT
                                                                      : LlmRequestState::kCONTEXT_INIT;
         mContextCurrentPosition = 0;
+        mPrepopulatedPromptLen = 0;
         mContextChunkSize = mPromptLen;
         mSeqSlot.reset();
     }
