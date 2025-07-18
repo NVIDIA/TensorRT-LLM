@@ -804,6 +804,11 @@ class PyTorchModelEngine(ModelEngine):
                             torch.cuda.empty_cache()
 
     def _set_up_attn_metadata(self, kv_cache_manager: KVCacheManager):
+        print(f"[MODEL_ENGINE_DEBUG] Setting up attention metadata")
+        print(f"[MODEL_ENGINE_DEBUG] KV cache manager: {kv_cache_manager}")
+        print(f"[MODEL_ENGINE_DEBUG] Batch size: {self.batch_size}")
+        print(f"[MODEL_ENGINE_DEBUG] Max num tokens: {self.max_num_tokens}")
+        
         enable_paged_context_mla = is_mla(
             self.model.model_config.pretrained_config) and (
                 self.attn_runtime_features.cache_reuse
@@ -813,69 +818,66 @@ class PyTorchModelEngine(ModelEngine):
         use_split_attn_metadata = False
         if hasattr(self.model, 'enable_attention_metadata_splitting'):
             use_split_attn_metadata = self.model.enable_attention_metadata_splitting
+            print(f"[MODEL_ENGINE_DEBUG] Model has enable_attention_metadata_splitting: {use_split_attn_metadata}")
         
         if kv_cache_manager is None:
             if use_split_attn_metadata:
                 # Create split attention metadata for no-cache case
-                return self._create_split_attn_metadata_no_cache()
+                print(f"[MODEL_ENGINE_DEBUG] Creating split attention metadata for no-cache case")
+                split_metadata = self._create_split_attn_metadata_no_cache()
+                # Set the split metadata on the model
+                if hasattr(self.model, 'set_split_attention_metadata'):
+                    self.model.set_split_attention_metadata(split_metadata)
+                return split_metadata
             else:
+                print(f"[MODEL_ENGINE_DEBUG] Creating standard attention metadata for no-cache case")
                 return self.attn_backend.Metadata(
                     max_num_requests=self.batch_size,
                     max_num_tokens=self.max_num_tokens,
                     max_num_sequences=self.batch_size * self.max_beam_width,
                     kv_cache_manager=None,
-                    mapping=self.mapping,
-                    runtime_features=self.attn_runtime_features,
-                    enable_flash_mla=self.model.model_config.enable_flash_mla,
-                    enable_paged_context_mla=enable_paged_context_mla)
-
+                    enable_paged_context_mla=enable_paged_context_mla,
+                    attn_runtime_features=self.attn_runtime_features,
+                )
+        
         if use_split_attn_metadata:
-            # Create split attention metadata
-            return self._create_split_attn_metadata(kv_cache_manager)
+            # Create split attention metadata for cache case
+            print(f"[MODEL_ENGINE_DEBUG] Creating split attention metadata for cache case")
+            split_metadata = self._create_split_attn_metadata(kv_cache_manager)
+            # Set the split metadata on the model
+            if hasattr(self.model, 'set_split_attention_metadata'):
+                self.model.set_split_attention_metadata(split_metadata)
+            return split_metadata
         else:
-            # Standard single attention metadata
-            if self.attn_metadata is not None:
-                # This assertion can be relaxed if needed: just create a new metadata
-                # object if it changes.
-                assert self.attn_metadata.kv_cache_manager is kv_cache_manager
-                return self.attn_metadata
-
-            self.attn_metadata = self.attn_backend.Metadata(
+            print(f"[MODEL_ENGINE_DEBUG] Creating standard attention metadata for cache case")
+            return self.attn_backend.Metadata(
                 max_num_requests=self.batch_size,
                 max_num_tokens=self.max_num_tokens,
                 max_num_sequences=self.batch_size * self.max_beam_width,
                 kv_cache_manager=kv_cache_manager,
-                mapping=self.mapping,
-                runtime_features=self.attn_runtime_features,
-                enable_flash_mla=self.model.model_config.enable_flash_mla,
-                enable_paged_context_mla=enable_paged_context_mla)
-            return self.attn_metadata
+                enable_paged_context_mla=enable_paged_context_mla,
+                attn_runtime_features=self.attn_runtime_features,
+            )
 
     def _create_split_attn_metadata(self, kv_cache_manager: KVCacheManager):
         """Create split attention metadata for batch halves."""
+        print(f"[MODEL_ENGINE_DEBUG] Creating split attention metadata")
+        print(f"[MODEL_ENGINE_DEBUG] Original batch size: {self.batch_size}")
+        print(f"[MODEL_ENGINE_DEBUG] Original max num tokens: {self.max_num_tokens}")
+        
+        # Calculate split batch sizes
+        half1_batch_size = self.batch_size // 2
+        half2_batch_size = self.batch_size - half1_batch_size
+        
+        print(f"[MODEL_ENGINE_DEBUG] Half1 batch size: {half1_batch_size}")
+        print(f"[MODEL_ENGINE_DEBUG] Half2 batch size: {half2_batch_size}")
+        
         enable_paged_context_mla = is_mla(
             self.model.model_config.pretrained_config) and (
                 self.attn_runtime_features.cache_reuse
                 or self.attn_runtime_features.chunked_prefill)
         
-        # Get split ratio from model or use default
-        split_ratio = 0.5
-        if hasattr(self.model, 'batch_split_ratio'):
-            split_ratio = self.model.batch_split_ratio
-        
-        # Calculate split batch sizes
-        total_batch_size = self.batch_size
-        split_point = int(total_batch_size * split_ratio)
-        half1_batch_size = split_point
-        half2_batch_size = total_batch_size - split_point
-        
-        print(f"[MODEL_ENGINE_DEBUG] Creating split attention metadata:")
-        print(f"[MODEL_ENGINE_DEBUG]   Total batch size: {total_batch_size}")
-        print(f"[MODEL_ENGINE_DEBUG]   Split ratio: {split_ratio}")
-        print(f"[MODEL_ENGINE_DEBUG]   Half1 batch size: {half1_batch_size}")
-        print(f"[MODEL_ENGINE_DEBUG]   Half2 batch size: {half2_batch_size}")
-        
-        # Get split KV cache managers from executor resources if available
+        # Create separate KV cache managers for each half
         half1_kv_cache_manager = None
         half2_kv_cache_manager = None
         
@@ -883,32 +885,36 @@ class PyTorchModelEngine(ModelEngine):
             resources = self.model.executor_resources
             half1_kv_cache_manager = resources.get(f"{ResourceManagerType.KV_CACHE_MANAGER}_half1")
             half2_kv_cache_manager = resources.get(f"{ResourceManagerType.KV_CACHE_MANAGER}_half2")
-            print(f"[MODEL_ENGINE_DEBUG] Found split KV cache managers in executor resources")
+            print(f"[MODEL_ENGINE_DEBUG] Half1 KV cache manager: {half1_kv_cache_manager}")
+            print(f"[MODEL_ENGINE_DEBUG] Half2 KV cache manager: {half2_kv_cache_manager}")
         
-        # Create split attention metadata
-        split_attn_metadata = {
-            'half1': self.attn_backend.Metadata(
-                max_num_requests=half1_batch_size,
-                max_num_tokens=self.max_num_tokens // 2,  # Approximate split
-                max_num_sequences=half1_batch_size * self.max_beam_width,
-                kv_cache_manager=half1_kv_cache_manager or kv_cache_manager,
-                mapping=self.mapping,
-                runtime_features=self.attn_runtime_features,
-                enable_flash_mla=self.model.model_config.enable_flash_mla,
-                enable_paged_context_mla=enable_paged_context_mla),
-            'half2': self.attn_backend.Metadata(
-                max_num_requests=half2_batch_size,
-                max_num_tokens=self.max_num_tokens // 2,  # Approximate split
-                max_num_sequences=half2_batch_size * self.max_beam_width,
-                kv_cache_manager=half2_kv_cache_manager or kv_cache_manager,
-                mapping=self.mapping,
-                runtime_features=self.attn_runtime_features,
-                enable_flash_mla=self.model.model_config.enable_flash_mla,
-                enable_paged_context_mla=enable_paged_context_mla)
+        # Create attention metadata for half1
+        half1_metadata = self.attn_backend.Metadata(
+            max_num_requests=half1_batch_size,
+            max_num_tokens=self.max_num_tokens,
+            max_num_sequences=half1_batch_size * self.max_beam_width,
+            kv_cache_manager=half1_kv_cache_manager or kv_cache_manager,
+            enable_paged_context_mla=enable_paged_context_mla,
+            attn_runtime_features=self.attn_runtime_features,
+        )
+        
+        # Create attention metadata for half2
+        half2_metadata = self.attn_backend.Metadata(
+            max_num_requests=half2_batch_size,
+            max_num_tokens=self.max_num_tokens,
+            max_num_sequences=half2_batch_size * self.max_beam_width,
+            kv_cache_manager=half2_kv_cache_manager or kv_cache_manager,
+            enable_paged_context_mla=enable_paged_context_mla,
+            attn_runtime_features=self.attn_runtime_features,
+        )
+        
+        split_metadata = {
+            'half1': half1_metadata,
+            'half2': half2_metadata
         }
         
-        print(f"[MODEL_ENGINE_DEBUG] Split attention metadata created successfully")
-        return split_attn_metadata
+        print(f"[MODEL_ENGINE_DEBUG] Created split attention metadata: {list(split_metadata.keys())}")
+        return split_metadata
 
     def _create_split_attn_metadata_no_cache(self):
         """Create split attention metadata for no-cache case."""
@@ -961,6 +967,10 @@ class PyTorchModelEngine(ModelEngine):
                                    split_attn_metadata: Dict[str, AttentionMetadata],
                                    kv_cache_manager: KVCacheManager):
         """Prepare split attention metadata for batch halves."""
+        print(f"[MODEL_ENGINE_DEBUG] Preparing split attention metadata")
+        print(f"[MODEL_ENGINE_DEBUG] Total requests: {len(scheduled_requests.all_requests())}")
+        print(f"[MODEL_ENGINE_DEBUG] Split metadata keys: {list(split_attn_metadata.keys())}")
+        
         # Split the scheduled requests into two halves
         total_requests = len(scheduled_requests.all_requests())
         split_point = total_requests // 2
@@ -969,41 +979,41 @@ class PyTorchModelEngine(ModelEngine):
         half1_requests = scheduled_requests.all_requests()[:split_point]
         half2_requests = scheduled_requests.all_requests()[split_point:]
         
-        print(f"[MODEL_ENGINE_DEBUG] Preparing split attention metadata:")
-        print(f"[MODEL_ENGINE_DEBUG]   Total requests: {total_requests}")
-        print(f"[MODEL_ENGINE_DEBUG]   Half1 requests: {len(half1_requests)}")
-        print(f"[MODEL_ENGINE_DEBUG]   Half2 requests: {len(half2_requests)}")
+        print(f"[MODEL_ENGINE_DEBUG] Split point: {split_point}")
+        print(f"[MODEL_ENGINE_DEBUG] Half1 requests: {len(half1_requests)}")
+        print(f"[MODEL_ENGINE_DEBUG] Half2 requests: {len(half2_requests)}")
         
         # Create ScheduledRequests objects for each half
-        half1_scheduled = ScheduledRequests()
-        half2_scheduled = ScheduledRequests()
+        half1_scheduled_requests = ScheduledRequests(half1_requests)
+        half2_scheduled_requests = ScheduledRequests(half2_requests)
         
-        # Split context and generation requests
-        for request in half1_requests:
-            if hasattr(request, 'is_context_request') and request.is_context_request:
-                half1_scheduled.context_requests.append(request)
-            else:
-                half1_scheduled.generation_requests.append(request)
-        
-        for request in half2_requests:
-            if hasattr(request, 'is_context_request') and request.is_context_request:
-                half2_scheduled.context_requests.append(request)
-            else:
-                half2_scheduled.generation_requests.append(request)
+        print(f"[MODEL_ENGINE_DEBUG] Created scheduled requests for halves")
         
         # Prepare attention metadata for each half
         half1_metadata = split_attn_metadata['half1']
         half2_metadata = split_attn_metadata['half2']
         
-        # Return structured data for both halves
+        # Set sequence lengths for each half
+        if half1_requests:
+            half1_seq_lens = torch.tensor([req.num_tokens for req in half1_requests], 
+                                        dtype=torch.int32, device=self.device)
+            half1_metadata.seq_lens = half1_seq_lens
+            print(f"[MODEL_ENGINE_DEBUG] Set half1 seq_lens: {half1_seq_lens.shape}")
+        
+        if half2_requests:
+            half2_seq_lens = torch.tensor([req.num_tokens for req in half2_requests], 
+                                        dtype=torch.int32, device=self.device)
+            half2_metadata.seq_lens = half2_seq_lens
+            print(f"[MODEL_ENGINE_DEBUG] Set half2 seq_lens: {half2_seq_lens.shape}")
+        
         return {
             'half1': {
-                'scheduled_requests': half1_scheduled, 
-                'metadata': half1_metadata
+                'scheduled_requests': half1_scheduled_requests,
+                'attn_metadata': half1_metadata
             },
             'half2': {
-                'scheduled_requests': half2_scheduled, 
-                'metadata': half2_metadata
+                'scheduled_requests': half2_scheduled_requests,
+                'attn_metadata': half2_metadata
             }
         }
 
@@ -2208,6 +2218,10 @@ class PyTorchModelEngine(ModelEngine):
         gather_context_logits: bool = False,
         cache_indirection_buffer: Optional[torch.Tensor] = None,
     ):
+        print(f"[MODEL_ENGINE_DEBUG] Starting forward pass")
+        print(f"[MODEL_ENGINE_DEBUG] Number of requests: {len(scheduled_requests.all_requests())}")
+        print(f"[MODEL_ENGINE_DEBUG] Batch size: {self.batch_size}")
+        print(f"[MODEL_ENGINE_DEBUG] Max num tokens: {self.max_num_tokens}")
 
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
@@ -2218,14 +2232,15 @@ class PyTorchModelEngine(ModelEngine):
         use_split_attn_metadata = False
         if hasattr(self.model, 'enable_attention_metadata_splitting'):
             use_split_attn_metadata = self.model.enable_attention_metadata_splitting
+            print(f"[MODEL_ENGINE_DEBUG] Split attention metadata enabled: {use_split_attn_metadata}")
         
-        if use_split_attn_metadata and isinstance(attn_metadata, dict):
-            # Handle split attention metadata
-            print(f"[MODEL_ENGINE_DEBUG] Using split attention metadata for forward pass")
+        if use_split_attn_metadata and hasattr(self.model, 'split_attn_metadata'):
+            print(f"[MODEL_ENGINE_DEBUG] Using split attention metadata for batch halves")
             return self._forward_with_split_attn_metadata(
-                scheduled_requests, resource_manager, attn_metadata, 
+                scheduled_requests, resource_manager, self.model.split_attn_metadata,
                 new_tensors_device, gather_context_logits, cache_indirection_buffer)
         
+        print(f"[MODEL_ENGINE_DEBUG] Using standard attention metadata")
         # Standard single attention metadata processing
         if self.is_spec_decode:
             spec_resource_manager = resource_manager.get_resource_manager(
