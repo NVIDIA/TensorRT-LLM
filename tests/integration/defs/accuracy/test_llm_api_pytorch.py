@@ -1619,8 +1619,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
 
         draft_len = 4
         spec_config = EagleDecodingConfig(max_draft_len=draft_len,
-                                          speculative_model_dir=eagle_model_dir
-                                        )
+                                          speculative_model_dir=eagle_model_dir)
 
         llm = LLM(model=target_model_dir,
                   **pytorch_config,
