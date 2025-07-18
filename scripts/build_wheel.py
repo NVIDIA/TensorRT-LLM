@@ -723,27 +723,15 @@ def main(*,
                     if 'LD_LIBRARY_PATH' in env_ld:
                         new_library_path += f":{env_ld['LD_LIBRARY_PATH']}"
 
-                    result = build_run("find /usr -name *libnvidia-ml.so*",
+                    result = build_run("find /usr -name *libnvidia-ml.so.1",
                                        capture_output=True,
                                        text=True)
-                    assert result.returncode == 0, f"Failed to run find *libnvidia-ml.so*: {result.stderr}"
-
-                    # Build containers only contain stub version of libnvidia-ml.so and not the real version.
-                    # If real version not in system, we need to create symbolic link to stub version to prevent import errors.
+                    assert result.returncode == 0, f"Failed to run find *libnvidia-ml.so.1: {result.stderr}"
                     if "libnvidia-ml.so.1" not in result.stdout:
-                        if "libnvidia-ml.so" in result.stdout:
-                            line = result.stdout.splitlines()[0]
-                            path = os.path.dirname(line)
-                            new_library_path += f":{path}"
-                            sudo_prefix = "sudo " if os.geteuid() != 0 else ""
-                            build_run(
-                                f"{sudo_prefix}ln -s {line} {path}/libnvidia-ml.so.1"
-                            )
-                        else:
-                            print(
-                                f"Failed to find libnvidia-ml.so: {result.stderr}",
-                                file=sys.stderr)
-                            exit(1)
+                        print(
+                            f"Failed to find libnvidia-ml.so.1: {result.stderr}",
+                            file=sys.stderr)
+                        exit(1)
 
                     env_ld["LD_LIBRARY_PATH"] = new_library_path
                     if binding_type == "nanobind":
