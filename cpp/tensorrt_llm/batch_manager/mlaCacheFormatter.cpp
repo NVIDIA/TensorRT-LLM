@@ -325,6 +325,7 @@ void MLACacheFormatter::unformat(TransferSession& session)
         {
             for (auto const& block : outputBuffers)
             {
+                llmRequest.updateKvCacheSize(block->getSizeInBytes());
                 session.recv(pickUpConnections[i], block->data(), block->getSizeInBytes());
             }
         }
@@ -378,6 +379,7 @@ void MLACacheFormatter::unformat(TransferSession& session)
             if (processIdx >= remainNoCoverTargetNum)
             {
                 auto& buffer = recvSplitCaches.at(processIdx);
+                llmRequest.updateKvCacheSize(buffer->getSizeInBytes());
                 session.recv(pickUpConnections.at(processIdx), buffer->data(), buffer->getSizeInBytes());
             }
             else if (bufferCoverTargetNum > 0)
@@ -385,6 +387,7 @@ void MLACacheFormatter::unformat(TransferSession& session)
                 auto recvBufferIdx = processIdx % bufferCoverTargetNum
                     + remainNoCoverTargetNum; // caches.at(recvBufferIdx) is allocated by cudaMalloc
                 auto& buffer = recvSplitCaches.at(recvBufferIdx);
+                llmRequest.updateKvCacheSize(buffer->getSizeInBytes());
                 session.recv(pickUpConnections.at(processIdx), buffer->data(), buffer->getSizeInBytes());
                 bufferManager.copy(*recvSplitCaches.at(recvBufferIdx), *recvSplitCaches.at(processIdx));
                 bufferManager.getStream().synchronize();
@@ -401,6 +404,7 @@ void MLACacheFormatter::unformat(TransferSession& session)
                     auto recvSlice = runtime::ITensor::slice(preAllocRecvBuffer, 0, recvSize);
                     auto copySlice = runtime::ITensor::slice(
                         recvSplitCaches.at(processIdx), targetBufferSize - remainRecvSize, recvSize);
+                    llmRequest.updateKvCacheSize(recvSlice->getSizeInBytes());
                     session.recv(pickUpConnections.at(processIdx), recvSlice->data(), recvSlice->getSizeInBytes());
                     bufferManager.copy(*recvSlice, *copySlice);
                     bufferManager.getStream().synchronize();

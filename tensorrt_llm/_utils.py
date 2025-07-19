@@ -509,7 +509,7 @@ def mpi_barrier():
 
 
 def mpi_broadcast(obj, root=0):
-    return mpi_comm().bcast(obj, root) if ENABLE_MULTI_DEVICE else obj
+    return mpi_comm().bcast(obj, root) if is_multi_device_enable() else obj
 
 
 def mpi_allgather(obj):
@@ -1079,3 +1079,14 @@ class KVCacheEventSerializer:
             "token_id": data.token_id,
             "token_extra_id": data.token_extra_id
         }
+
+
+def is_multi_device_enable():
+    """
+    This method evaluates if we are running on multiple GPUs and the flag ENABLE_MULTI_DEVICE is set.
+    So we can avoid broadcast calls on single GPU.
+    Issue: https://github.com/NVIDIA/TensorRT-LLM/issues/5927
+    ENABLE_MULTI_DEVICE is true by default when building tensorrt-llm so we need to also check
+    the number of devices
+    """
+    return local_mpi_size() > 1
