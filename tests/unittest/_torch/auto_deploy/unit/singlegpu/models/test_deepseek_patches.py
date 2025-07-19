@@ -8,7 +8,7 @@ from _model_test_utils import _hf_model_dir_or_hub_id
 from transformers import AutoConfig, AutoModelForCausalLM
 from utils.llm_data import llm_models_root
 
-from tensorrt_llm._torch.auto_deploy.models.deepseek import (
+from tensorrt_llm._torch.auto_deploy.models.patches.deepseek import (
     deepseek_v3_attention,
     deepseek_v3_moe_exact,
 )

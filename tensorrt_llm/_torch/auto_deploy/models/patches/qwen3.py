@@ -5,6 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeSparseMoeBlock
 
+from ...export.interface import BaseExportPatch, ExportPatchRegistry
+
 
 def _forward_moe(self: Qwen3MoeSparseMoeBlock, hidden_states: torch.Tensor):
     # check if we can apply the patch
@@ -43,5 +45,28 @@ def _forward_moe(self: Qwen3MoeSparseMoeBlock, hidden_states: torch.Tensor):
     return final_hidden_states, router_logits
 
 
-Qwen3MoeSparseMoeBlock._original_forward = Qwen3MoeSparseMoeBlock.forward
-Qwen3MoeSparseMoeBlock.forward = _forward_moe
+@ExportPatchRegistry.register("hf_qwen3_moe")
+class Qwen3MoePatch(BaseExportPatch):
+    """Patch for Qwen3 MoE to make it compatible with torch.export and reduce export time.
+
+    This patch replaces the forward method of Qwen3MoeSparseMoeBlock with
+    a version that uses the torch_moe custom operator for better export compatibility.
+    """
+
+    def _apply_patch(self):
+        """Apply the Qwen3 MoE patch."""
+        # Store original forward method
+        self.original_values["Qwen3MoeSparseMoeBlock.forward"] = Qwen3MoeSparseMoeBlock.forward
+
+        # Apply patch by replacing the forward method
+        Qwen3MoeSparseMoeBlock._original_forward = Qwen3MoeSparseMoeBlock.forward  # type: ignore
+        Qwen3MoeSparseMoeBlock.forward = _forward_moe  # type: ignore
+
+    def _revert_patch(self):
+        """Revert the Qwen3 MoE patch."""
+        # Restore original forward method
+        Qwen3MoeSparseMoeBlock.forward = self.original_values["Qwen3MoeSparseMoeBlock.forward"]  # type: ignore
+
+        # Clean up the temporary attribute
+        if hasattr(Qwen3MoeSparseMoeBlock, "_original_forward"):
+            delattr(Qwen3MoeSparseMoeBlock, "_original_forward")

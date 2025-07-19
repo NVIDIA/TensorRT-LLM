@@ -119,7 +119,7 @@ def _explicit_not_interleaved(match: Match) -> bool:
     return not any(isinstance(n, Node) and _match_input_interleave_pattern(n) for n in (q, k))
 
 
-def match_rope_pattern(gm: GraphModule) -> GraphModule:
+def match_rope_pattern(gm: GraphModule) -> int:
     graph = gm.graph
     patterns = ADPatternMatcherPass()
 
@@ -174,12 +174,12 @@ def match_rope_pattern(gm: GraphModule) -> GraphModule:
     )
 
     num_matches = patterns.apply(graph)
-    gm = canonicalize_graph(gm)
+    canonicalize_graph(gm)
     ad_logger.info(f"Found and matched {num_matches} RoPE patterns")
-    return gm, num_matches
+    return num_matches
 
 
-def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> GraphModule:
+def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> None:
     """
     Match and transform input and output of rope ops to the layout specified to meet requirements of optimized ops.
     Supported layout is 'bsnd' (batch, seq, head, dim).
@@ -189,7 +189,7 @@ def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> GraphMo
         ad_logger.warning(
             f"Unsupported RoPE layout '{expected_layout}'; expected '{supported}'. Skipping RoPE layout matching."
         )
-        return gm
+        return
 
     ad_logger.info(f"Match RoPE layout to {expected_layout}")
 
@@ -291,12 +291,11 @@ def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> GraphMo
         k_rope_new.args = (k_rope_old, 1, 2)
 
     if num_rope_layout_matches:
-        gm = canonicalize_graph(gm)
+        canonicalize_graph(gm)
     ad_logger.info(f"Found {num_rope_layout_matches} RoPE layout matches")
-    return gm
 
 
-def optimize_rope(gm: GraphModule) -> GraphModule:
+def optimize_rope(gm: GraphModule) -> None:
     """
     Scan the FX graph and replace calls to the torch-reference RoPE ops with
     the optimized `rope::flashinfer` kernel.
@@ -317,9 +316,8 @@ def optimize_rope(gm: GraphModule) -> GraphModule:
             continue
         num_rope_optimizations += 1
     if num_rope_optimizations:
-        gm = canonicalize_graph(gm)
+        canonicalize_graph(gm)
     ad_logger.info(f"Found {num_rope_optimizations} RoPE optimizations")
-    return gm
 
 
 def _optimize_explicit(
