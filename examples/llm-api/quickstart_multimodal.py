@@ -138,7 +138,7 @@ def main():
             open(os.path.join(llm._hf_model_dir, 'config.json')))['model_type']
     assert model_type in ALL_SUPPORTED_MULTIMODAL_MODELS, f"Unsupported model_type: {model_type}"
 
-    device = "cuda"
+    device = "cpu"
     inputs = default_multimodal_input_loader(tokenizer=llm.tokenizer,
                                              model_dir=llm._hf_model_dir,
                                              model_type=model_type,

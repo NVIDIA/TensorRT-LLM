@@ -45,7 +45,7 @@ def load_base64_image(parsed_url: str) -> Image.Image:
 
 def load_image(image: str,
                format: str = "pt",
-               device: str = "cuda") -> Union[Image.Image, torch.Tensor]:
+               device: str = "cpu") -> Union[Image.Image, torch.Tensor]:
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
     parsed_url = urlparse(image)
@@ -67,7 +67,7 @@ def load_image(image: str,
 async def async_load_image(
         image: str,
         format: str = "pt",
-        device: str = "cuda") -> Union[Image.Image, torch.Tensor]:
+        device: str = "cpu") -> Union[Image.Image, torch.Tensor]:
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
     parsed_url = urlparse(image)
@@ -92,7 +92,7 @@ def load_video(
         video: str,
         num_frames: int = 10,
         format: str = "pt",
-        device: str = "cuda") -> Union[List[Image.Image], List[torch.Tensor]]:
+        device: str = "cpu") -> Union[List[Image.Image], List[torch.Tensor]]:
 
     # Keep this import local to avoid importing cv2 if not needed
     import cv2
@@ -141,7 +141,7 @@ async def async_load_video(
         video: str,
         num_frames: int = 10,
         format: str = "pt",
-        device: str = "cuda") -> Union[List[Image.Image], List[torch.Tensor]]:
+        device: str = "cpu") -> Union[List[Image.Image], List[torch.Tensor]]:
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
     parsed_url = urlparse(video)
@@ -480,7 +480,7 @@ def default_multimodal_input_loader(
         media: Union[List[str], List[List[str]]],
         image_data_format: str = "pt",
         num_frames: int = 8,
-        device: str = "cuda") -> List[dict[str, Union[str, torch.Tensor]]]:
+        device: str = "cpu") -> List[dict[str, Union[str, torch.Tensor]]]:
 
     def convert_to_conversation_message(prompt: str, media: Union[str,
                                                                   List[str]],
