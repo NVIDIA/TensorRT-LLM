@@ -54,6 +54,7 @@ testCmdLines=(
     "--csv=$resultsPath/report.csv"
     "--junit-xml $resultsPath/results.xml"
     "-o junit_logging=out-err"
+    "-s"
 )
 if [ "$perfMode" = "true" ]; then
     testCmdLines+=(
