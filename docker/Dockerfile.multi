@@ -127,7 +127,7 @@ RUN mkdir -p /root/.cache/pip /root/.cache/ccache
 ENV CCACHE_DIR=/root/.cache/ccache
 # Build the TRT-LLM wheel
 ARG GITHUB_MIRROR=""
-ARG BUILD_WHEEL_ARGS="--clean --python_bindings --benchmarks"
+ARG BUILD_WHEEL_ARGS="--clean --benchmarks"
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACHE_DIR} \
     GITHUB_MIRROR=$GITHUB_MIRROR python3 scripts/build_wheel.py ${BUILD_WHEEL_ARGS}
 
