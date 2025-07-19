@@ -239,7 +239,12 @@ struct KVCacheList;
 template <>
 struct KVCacheList<true>
 {
+#if PAGED_KV_CACHE_FORMAT == 1
+    GMemCacheHead* kCacheVLLM;
+    GMemCacheHead* vCacheVLLM;
+#else
     GMemKVCacheHead* pool;
+#endif
     KVCachePageIndex const* kvCachePageList; // shape: KVCachePageIndex[batchSize][beamWidth][2][maxNbPagesPerSeq].
     SeqLenDataType const* seqLenList;        // shape: [batchSize][beamWidth] (for compatibility)
     uint32_t maxNbPagesPerSeq;
