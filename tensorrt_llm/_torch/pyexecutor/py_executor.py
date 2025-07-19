@@ -11,7 +11,7 @@ import traceback
 import weakref
 from collections import deque, namedtuple
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 
@@ -58,6 +58,7 @@ SHUTDOWN_REQUEST_ID = -1
 class RequestQueueItem:
     id: int
     request: Optional[ExecutorRequest] = None
+    child_req_ids: Optional[list] = None
     is_canceled_request: bool = False
     query: Optional[list] = None  # only used in `StarAttention`
 
@@ -109,8 +110,14 @@ def _get_from_waiting_queue(
     items = []
     req_count = 0
     while req_count < max_req_count and waiting_queue:
+        req_item = waiting_queue[0]
+        num_children = len(
+            req_item.child_req_ids) if req_item.child_req_ids else 0
+        if (req_count + 1 + num_children) > max_req_count:
+            break
+
+        req_count += 1 + num_children
         items.append(waiting_queue.popleft())
-        req_count += 1
     return items
 
 
@@ -345,6 +352,32 @@ class PyExecutor:
     def __exit__(self):
         self.shutdown()
 
+    def _get_request_id(self):
+        # (next_req_id + 1) % UINT64_MAX
+        self.next_req_id = (self.next_req_id + 1) & ((1 << 64) - 1)
+        return self.next_req_id
+
+    def _generate_child_request_ids(
+            self, request: ExecutorRequest) -> List[int] | None:
+        """ Generate child request IDs if needed. """
+        child_req_ids = None
+        sampling_config = request.sampling_config
+        beam_width = (sampling_config.beam_width
+                      if sampling_config.beam_width else 1)
+        num_return_sequences = (sampling_config.num_return_sequences
+                                if sampling_config.num_return_sequences else 1)
+
+        # Create child requests if beam_width == 1 and num_return_sequences > 1.
+        if beam_width == 1 and num_return_sequences > 1:
+            child_req_ids = []
+            for _ in range(num_return_sequences - 1):
+                child_req_id = self._get_request_id()
+                if self.enable_iter_perf_stats:
+                    self.start_times[child_req_id] = time.time()
+                child_req_ids.append(child_req_id)
+
+        return child_req_ids
+
     def enqueue_requests(self, requests: List[ExecutorRequest]):
         """
         Enqueue new requests
@@ -353,13 +386,18 @@ class PyExecutor:
         try:
             self.enqueue_lock.acquire()
             assert self.active, "PyExecutor has already been shutdown."
-            start_time = time.time()
             for request in requests:
-                self.start_times[self.next_req_id] = start_time
+                req_id = self._get_request_id()
+
+                if self.enable_iter_perf_stats:
+                    self.start_times[req_id] = time.time()
+
+                child_req_ids = self._generate_child_request_ids(request)
                 self.request_queue.put(
-                    RequestQueueItem(self.next_req_id, request))
-                req_ids.append(self.next_req_id)
-                self.next_req_id += 1
+                    RequestQueueItem(req_id, request, child_req_ids,
+                                     query=None))
+
+                req_ids.append(req_id)
         finally:
             self.enqueue_lock.release()
         return req_ids
@@ -469,15 +507,27 @@ class PyExecutor:
         try:
             self.enqueue_lock.acquire()
             assert self.active, "PyExecutor has already been shutdown."
-            req_id = self.next_req_id
+
+            req_id = self._get_request_id()
+
+            logger.debug(
+                f"Enqueuing new Executor request with id {self.next_req_id}")
+
             if self.enable_iter_perf_stats:
                 self.start_times[req_id] = time.time()
 
-            if query is not None:
-                self.request_queue.put(RequestQueueItem(req_id, request, query))
             else:
-                self.request_queue.put(RequestQueueItem(req_id, request))
-            self.next_req_id += 1
+                child_req_ids = self._generate_child_request_ids(request)
+                logger.debug(
+                    f"Executor request with id {req_id} has child requests: {child_req_ids}"
+                )
+                self.request_queue.put(
+                    RequestQueueItem(
+                        req_id,
+                        request,
+                        child_req_ids=child_req_ids,
+                        query=query,
+                    ))
         finally:
             self.enqueue_lock.release()
         return req_id
@@ -1514,12 +1564,15 @@ class PyExecutor:
             else:
                 raise NotImplementedError(f'unsupport cp type {cp_type}')
         else:
-            return [
-                executor_request_to_llm_request(
-                    req_item.id, req_item.request,
+            req_with_children = []
+            for req_item in new_requests:
+                req = executor_request_to_llm_request(
+                    req_item.id, req_item.request, req_item.child_req_ids,
                     self._should_exclude_last_generation_logits())
-                for req_item in new_requests
-            ]
+                req_with_children.append(req)
+                if req.children:
+                    req_with_children.extend(req.children)
+            return req_with_children
 
     @nvtx_range("_schedule")
     def _schedule(self):
@@ -1808,7 +1861,7 @@ class PyExecutor:
                                    if req.id not in self.canceled_req_ids)
 
         for request in self.active_requests:
-            req_id = request.py_request_id
+            req_id = request.py_request_id if not request.is_child else request.parent_request_id
             if req_id in self.canceled_req_ids:
                 # Mark requests as finished, then, we reuse all existing code
                 # to clean up the KV cache resources.
@@ -1822,7 +1875,7 @@ class PyExecutor:
             self.canceled_req_ids.clear()
 
     @nvtx_range("_enqueue_responses")
-    def _enqueue_responses(self, responses: Dict[int, LlmResponse]):
+    def _enqueue_responses(self, responses: List[Tuple[int, LlmResponse]]):
         if 0 not in self.dist.mapping.tp_group and not self.gather_all_responses:
             return
 
@@ -1834,18 +1887,18 @@ class PyExecutor:
             else:
                 responses_list = self.dist.allgather(responses)
             if self.dist.rank == 0 or self.gather_all_responses:
-                gather_responses = {}
+                gather_responses = []
                 if responses_list is not None:
                     for resp in responses_list:
                         if resp is not None:
-                            gather_responses.update(resp)
+                            gather_responses.append(resp)
                     responses = gather_responses
         logger.debug(
             f'after gather, rank = {self.dist.rank}, responses = {responses}')
 
         if self.dist.rank == 0 or self.gather_all_responses:
             with self.response_cv:
-                for req_id, resp in responses.items():
+                for req_id, resp in responses:
                     if req_id in self.responses.keys():
                         self.responses[req_id].append(resp)
                     else:
@@ -1854,20 +1907,20 @@ class PyExecutor:
 
     @nvtx_range("_handle_first_token_response")
     def _handle_first_token_response(self, scheduled_batch):
-        new_responses = {}
+        new_responses = []
         for req in scheduled_batch.generation_requests:
             if req.py_decoding_iter == 1:
                 logger.debug(
                     f'Send first token response for request {req.py_request_id}'
                 )
                 response = req.create_response(False, self.dist.rank)
-                new_responses.update({req.py_request_id: response})
+                new_responses.append((req.py_request_id, response))
 
         self._enqueue_responses(new_responses)
 
     @nvtx_range("_handle_responses")
     def _handle_responses(self):
-        new_responses = {}
+        new_responses = []
         requests_to_terminate = []
         new_active_requests = []
         logger.debug(
@@ -1901,8 +1954,8 @@ class PyExecutor:
                     request.py_decoding_iter % self.stream_interval == 0:
                 response = request.create_response(False, self.dist.rank)
                 if response:
-                    request_done = response.result.is_final
-                    new_responses.update({req_id: response})
+                    request_done = request.is_finished
+                    new_responses.append((req_id, response))
 
             if request_done:
                 if request.is_disagg_context_transmission_state:
