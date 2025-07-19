@@ -454,7 +454,15 @@ class FP8BMMQuantizationImpl(QuantizationImpl):
                 if not is_column_major(param):
                     with torch.no_grad():
                         # Create column-major version
-                        param_cm = param.transpose(-2, -1).contiguous().transpose(-2, -1)
+                        # Handle on CPU to avoid OOM
+                        device = param.device
+                        param_cm = (
+                            param.to("cpu")
+                            .transpose(-2, -1)
+                            .contiguous()
+                            .transpose(-2, -1)
+                            .to(device)
+                        )
                         # Replace the parameter
                         setattr(
                             target_module,
