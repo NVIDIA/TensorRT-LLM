@@ -9,6 +9,7 @@ from .model_drafter import ModelDrafter
 from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
 from .ngram import NGramDrafter, NGramPoolManager
+from .external_api import APIDrafter
 
 
 def get_spec_metadata(spec_config,
@@ -48,7 +49,8 @@ def get_spec_metadata(spec_config,
         )
     if  spec_config.spec_dec_mode.is_draft_target() or \
         spec_config.spec_dec_mode.is_ngram() or \
-        spec_config.spec_dec_mode.is_user_provided():
+        spec_config.spec_dec_mode.is_user_provided() or \
+        spec_config.spec_dec_mode.is_external_api():
         return SpecMetadata(
             max_draft_len=spec_config.max_draft_len,
             spec_dec_mode=spec_config.spec_dec_mode,
@@ -97,6 +99,8 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
         return NGramPoolManager(spec_config, max_num_requests)
     if spec_dec_mode.is_user_provided():
         return spec_config.resource_manager
+    if spec_dec_mode.is_external_api():
+        return None
     return None
 
 
@@ -133,6 +137,9 @@ def get_spec_drafter(model_engine, draft_model_engine, sampler,
 
     if spec_config.spec_dec_mode.is_ngram():
         return NGramDrafter(spec_config, spec_resource_manager)
+    
+    if spec_config.spec_dec_mode.is_external_api():
+        return APIDrafter(spec_config)
 
     return None
 

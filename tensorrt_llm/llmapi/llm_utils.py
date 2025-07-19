@@ -33,8 +33,8 @@ from .llm_args import (CalibConfig, CudaGraphConfig, DraftTargetDecodingConfig,
                        EagleDecodingConfig, KvCacheConfig, LlmArgs,
                        LookaheadDecodingConfig, MedusaDecodingConfig,
                        MTPDecodingConfig, NGramDecodingConfig,
-                       UserProvidedDecodingConfig, _ModelFormatKind,
-                       _ModelWrapper, _ParallelConfig,
+                       UserProvidedDecodingConfig, ExternalAPIConfig, _ModelFormatKind,
+                       _ModelWrapper, _ParallelConfig, get_model_format,
                        update_llm_args_with_extra_dict,
                        update_llm_args_with_extra_options)
 from .mpi_session import MPINodeState, MpiSession
@@ -865,6 +865,7 @@ __all__ = [
     'NGramDecodingConfig',
     'DraftTargetDecodingConfig',
     'UserProvidedDecodingConfig',
+    'ExternalAPIConfig',
     'ContextChunkingPolicy',
     'CapacitySchedulerPolicy',
     'BuildConfig',

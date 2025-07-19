@@ -17,6 +17,7 @@ class SpeculativeDecodingMode(IntEnum):
     NGRAM = auto()
     DRAFT_TARGET = auto()
     USER_PROVIDED = auto()
+    EXTERNAL_API = auto()
     NONE = auto()
 
     def is_mtp(self):
@@ -39,6 +40,9 @@ class SpeculativeDecodingMode(IntEnum):
 
     def is_user_provided(self):
         return self == SpeculativeDecodingMode.USER_PROVIDED
+    
+    def is_external_api(self):
+        return self == SpeculativeDecodingMode.EXTERNAL_API
 
     def is_none(self):
         return self == SpeculativeDecodingMode.NONE
@@ -77,7 +81,7 @@ class SpeculativeDecodingMode(IntEnum):
         return self.is_mtp() or self.is_eagle3() or self.is_eagle3_one_model()
 
     def has_spec_drafter(self):
-        return self.is_ngram() or self.is_user_provided()
+        return self.is_ngram() or self.is_user_provided() or self.is_external_api()
 
     def extend_ctx(self, attention_backend: Type[AttentionBackend]):
         """
@@ -90,7 +94,7 @@ class SpeculativeDecodingMode(IntEnum):
         return ((self.is_eagle3() or self.is_draft_target())
                 and not (isinstance(attention_backend, TrtllmAttention)
                          and get_sm_version() == 100)
-                ) or self.is_ngram() or self.is_user_provided()
+                ) or self.is_ngram() or self.is_user_provided() or self.is_external_api()
 
     def attention_need_spec_dec_mode(self):
         """
