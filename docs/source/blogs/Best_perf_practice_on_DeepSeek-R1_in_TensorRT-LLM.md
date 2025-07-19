@@ -137,7 +137,6 @@ To do the benchmark, run the following command:
 YOUR_DATA_PATH=<your dataset file following the format>
 
 cat >./extra-llm-api-config.yml<<EOF
-cuda_graph_config: {}
 moe_config:
   backend: TRTLLM
 speculative_config:
@@ -318,7 +317,6 @@ To do the benchmark, run the following command:
 YOUR_DATA_PATH=<your dataset file following the format>
 
 cat >./extra-llm-api-config.yml<<EOF
-cuda_graph_config: {}
 speculative_config:
     decoding_type: MTP
     num_nextn_predict_layers: 3
