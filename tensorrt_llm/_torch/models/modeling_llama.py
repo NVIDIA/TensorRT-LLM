@@ -603,6 +603,8 @@ class LlamaDecoderLayer(DecoderLayer):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states = self.input_layernorm(hidden_states, residual)
 
         # Self Attention
         hidden_states = self.self_attn(
@@ -610,31 +612,31 @@ class LlamaDecoderLayer(DecoderLayer):
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             attention_mask=self.attention_mask,
-            all_reduce_params=AllReduceParams(
-                enable_allreduce=not (self.fusion_config.PRE_MLP_FUSION
-                                      or self.mapping.tp_size == 1)),
-            **kwargs,
+            # all_reduce_params=AllReduceParams(
+            #     enable_allreduce=not (self.fusion_config.PRE_MLP_FUSION
+            #                           or self.mapping.tp_size == 1)),
+            # **kwargs,
         )
 
-        if self.fusion_config.PRE_MLP_FUSION:
-            hidden_states, residual = self.all_reduce(
-                hidden_states,
-                all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                    residual=residual,
-                    norm_weight=self.post_attention_layernorm.weight,
-                    eps=self.post_attention_layernorm.variance_epsilon,
-                    trigger_completion_at_end=False,
-                ))
-        else:
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual)
+        # if self.fusion_config.PRE_MLP_FUSION:
+        #     hidden_states, residual = self.all_reduce(
+        #         hidden_states,
+        #         all_reduce_params=AllReduceParams(
+        #             fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+        #             residual=residual,
+        #             norm_weight=self.post_attention_layernorm.weight,
+        #             eps=self.post_attention_layernorm.variance_epsilon,
+        #             trigger_completion_at_end=False,
+        #         ))
+        # else:
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual)
 
         hidden_states = self.mlp(
             hidden_states,
-            final_all_reduce_params=AllReduceParams(
-                enable_allreduce=not (self.fusion_config.POST_MLP_FUSION
-                                      or self.mapping.tp_size == 1)),
+            # final_all_reduce_params=AllReduceParams(
+            #     enable_allreduce=not (self.fusion_config.POST_MLP_FUSION
+            #                           or self.mapping.tp_size == 1)),
             **kwargs)
 
         if spec_metadata is not None:
@@ -645,26 +647,26 @@ class LlamaDecoderLayer(DecoderLayer):
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,
                                                       hidden_states, residual)
 
-        if self.fusion_config.POST_MLP_FUSION and self.next_layer_layernorm is not None:
-            hidden_states, residual = self.all_reduce(
-                hidden_states,
-                all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                    residual=residual,
-                    norm_weight=self.next_layer_layernorm.weight,
-                    eps=self.next_layer_layernorm.variance_epsilon,
-                    trigger_completion_at_end=False,
-                ))
-        elif self.next_layer_layernorm:
-            hidden_states, residual = self.next_layer_layernorm(
-                hidden_states, residual)
-        elif self.fusion_config.POST_MLP_FUSION:
-            hidden_states, residual = self.all_reduce(
-                hidden_states,
-                all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.NONE,
-                    residual=residual,
-                ))
+        # if self.fusion_config.POST_MLP_FUSION and self.next_layer_layernorm is not None:
+        #     hidden_states, residual = self.all_reduce(
+        #         hidden_states,
+        #         all_reduce_params=AllReduceParams(
+        #             fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+        #             residual=residual,
+        #             norm_weight=self.next_layer_layernorm.weight,
+        #             eps=self.next_layer_layernorm.variance_epsilon,
+        #             trigger_completion_at_end=False,
+        #         ))
+        # elif self.next_layer_layernorm:
+        #     hidden_states, residual = self.next_layer_layernorm(
+        #         hidden_states, residual)
+        # elif self.fusion_config.POST_MLP_FUSION:
+        #     hidden_states, residual = self.all_reduce(
+        #         hidden_states,
+        #         all_reduce_params=AllReduceParams(
+        #             fusion_op=AllReduceFusionOp.NONE,
+        #             residual=residual,
+        #         ))
 
         return hidden_states, residual
 
@@ -847,16 +849,16 @@ class LlamaForCausalLM(SpecDecOneEngineForCausalLM[LlamaModel, LlamaConfig]):
     ):
         super().__init__(LlamaModel(model_config), model_config)
 
-    def load_weights(self, weights: Dict):
-        super().load_weights(weights)
+    # def load_weights(self, weights: Dict):
+    #     super().load_weights(weights)
 
-        for idx, layer in enumerate(
-                self.model.layers[:self.config.num_hidden_layers]):
-            if idx == self.config.num_hidden_layers - 1:
-                layer.next_layer_layernorm = self.model.norm
-            else:
-                layer.next_layer_layernorm = self.model.layers[
-                    idx + 1].input_layernorm
+    #     for idx, layer in enumerate(
+    #             self.model.layers[:self.config.num_hidden_layers]):
+    #         if idx == self.config.num_hidden_layers - 1:
+    #             layer.next_layer_layernorm = self.model.norm
+    #         else:
+    #             layer.next_layer_layernorm = self.model.layers[
+    #                 idx + 1].input_layernorm
 
 
 class Llama4InputProcessor(InputProcessor):
