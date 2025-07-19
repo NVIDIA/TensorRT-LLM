@@ -959,7 +959,7 @@ def preprocess_weights_for_mixed_gemm(tensor: torch.Tensor,
         tensor = tensor.unsqueeze(0)
     elif sm_ >= 90:
         sm_ = 80
-    if sm_ >= 120:
+    if sm_ > 90:
         sm_ = 80
 
     permutation_map = {
