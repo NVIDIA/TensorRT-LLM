@@ -168,7 +168,8 @@ MODEL_NAME_PATTERN_MAP = {
     "GraniteForCausalLM": "granite",
     "GraniteMoeForCausalLM": "granitemoe",
     "T5": "t5",
-    "Bart": "bart"
+    "Bart": "bart",
+    "Llama_Nemotron_Nano_VL": "llama_nemotron_nano_vl",
 }
 
 MULTIMODAL_DATASETS = ['scienceqa', 'science_qa']
@@ -337,6 +338,13 @@ def get_model(ckpt_path: str,
                                                       torch_dtype=torch_dtype,
                                                       trust_remote_code=True)
         model = EncDecModelWrapper(hf_model=model)
+    elif hf_config.model_type == "Llama_Nemotron_Nano_VL":
+        from transformers import AutoModel
+        model = AutoModel.from_pretrained(
+            ckpt_path,
+            device_map=device,
+        )
+        model = model.language_model
     else:
         model = model_cls.from_pretrained(
             ckpt_path,
@@ -716,6 +724,14 @@ def quantize_and_export(*,
                                   max_seq_length=tokenizer_max_seq_length,
                                   model_type=model_type,
                                   device=device)
+    elif model_type == "llama_nemotron_nano_vl":
+        tokenizer = get_tokenizer(model_dir,
+                                  max_seq_length=tokenizer_max_seq_length,
+                                  model_type=model_type)
+        IMG_CONTEXT_TOKEN = "<image>"  # nosec B105
+        img_context_token_id = tokenizer.convert_tokens_to_ids(
+            IMG_CONTEXT_TOKEN)
+        model.img_context_token_id = img_context_token_id
     else:
         tokenizer = get_tokenizer(model_dir,
                                   max_seq_length=tokenizer_max_seq_length,
