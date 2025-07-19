@@ -1383,7 +1383,7 @@ static __global__ void oneShotAllReduceKernel(AllReduceParams params)
 
     // Start and end offsets of the thread
     size_t const chunk_start = bidx * params.elts_per_block + tidx * PACKED_ELTS;
-    size_t const chunk_end = std::min((bidx + 1) * params.elts_per_block, params.elts_total);
+    size_t const chunk_end = min((bidx + 1) * params.elts_per_block, params.elts_total);
 
     T* buffers[RANKS_PER_NODE];
 #pragma unroll
@@ -1431,7 +1431,7 @@ static __global__ void oneShotAllReduceKernel(AllReduceParams params)
             if constexpr (PUSH_MODE)
             {
                 vals[ii].packed
-                    = *reinterpret_cast<int4 const*>(&buffers[params.local_rank][ii * params.elts_total + iter_offset]);
+                    = *reinterpret_cast<int4 const*>(&local_shared_buffer[ii * params.elts_total + iter_offset]);
             }
             else
             {
