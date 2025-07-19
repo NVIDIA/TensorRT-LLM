@@ -52,10 +52,11 @@ class StructuralTag(OpenAIBaseModel):
 
 
 class ResponseFormat(OpenAIBaseModel):
-    # type must be "json_object" or "text" or "structural_tag"
-    type: Literal["text", "json_object", "structural_tag"]
+    # type must be "json_object" or "text" or "structural_tag" or "json_schema"
+    type: Literal["text", "json_object", "structural_tag", "json_schema"]
     structures: Optional[List[StructuralTag]] = None
     triggers: Optional[List[str]] = None
+    json_schema: Optional[Dict[str, Any]] = None
 
 
 class DisaggregatedParams(OpenAIBaseModel):
@@ -144,6 +145,8 @@ def _response_format_to_guided_decoding_params(
         return None
     elif response_format.type == "json_object":
         return GuidedDecodingParams(json_object=True)
+    elif response_format.type == "json_schema":
+        return GuidedDecodingParams(json=response_format.json_schema)
     elif response_format.type == "structural_tag":
         return GuidedDecodingParams(
             structural_tag=response_format.model_dump_json(by_alias=True,
@@ -205,7 +208,7 @@ class CompletionRequest(OpenAIBaseModel):
         default=None,
         description=
         ("Similar to chat completion, this parameter specifies the format of "
-         "output. {'type': 'json_object'}, {'type': 'text' }, {'type': 'structural_tag'} are "
+         "output. {'type': 'json_object'}, {'type': 'text' }, {'type': 'structural_tag'}, {'type': 'json_schema'} are "
          "supported."),
     )
 
