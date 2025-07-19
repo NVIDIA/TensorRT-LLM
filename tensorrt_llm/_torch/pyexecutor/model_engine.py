@@ -1152,7 +1152,7 @@ class PyTorchModelEngine(ModelEngine):
             if multimodal_params.has_content():
                 multimodal_params_list.append(multimodal_params)
 
-            request.py_batch_idx = request.seq_slot
+            request.py_batch_idx = request.py_seq_slot
 
         num_ctx_requests = len(scheduled_requests.context_requests)
         num_ctx_tokens = len(input_ids)
@@ -1234,11 +1234,11 @@ class PyTorchModelEngine(ModelEngine):
                 num_cached_tokens_per_seq.append(past_seen_token_num)
                 request_ids.append(request.py_request_id)
                 # update batch index
-                request.py_batch_idx = request.seq_slot
+                request.py_batch_idx = request.py_seq_slot
             else:
                 # update batch index
                 previous_batch_idx = request.py_batch_idx
-                request.py_batch_idx = request.seq_slot
+                request.py_batch_idx = request.py_seq_slot
                 # inputs
                 # overlap scheduler can only support the speculative decoding
                 # methods with a fixed number of draft tokens
@@ -1292,8 +1292,8 @@ class PyTorchModelEngine(ModelEngine):
                 gather_ids.append(len(position_ids) - 1)
 
             request_ids.append(request.py_request_id)
-            gen_request_seq_slots.append(request.seq_slot)
-            request.py_batch_idx = request.seq_slot
+            gen_request_seq_slots.append(request.py_seq_slot)
+            request.py_batch_idx = request.py_seq_slot
 
         previous_batch_len = len(previous_batch_indices)
 
