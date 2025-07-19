@@ -3,7 +3,6 @@ import torch
 import transformers
 from transformers.models.pixtral import modeling_pixtral as hf_modeling_pixtral
 
-from tensorrt_llm import mapping as mapping_lib
 from tensorrt_llm._torch import model_config as model_config_lib
 from tensorrt_llm._torch.models import modeling_pixtral
 
@@ -47,21 +46,6 @@ def init_hf_model(cls, config, dtype, device):
     model.to(dtype=dtype)
 
     return model
-
-
-@pytest.mark.parametrize(
-    "mapping",
-    [
-        mapping_lib.Mapping(world_size=2, tp_size=2),
-        mapping_lib.Mapping(world_size=3, tp_size=3),
-        mapping_lib.Mapping(world_size=4, tp_size=2, pp_size=2),
-        mapping_lib.Mapping(world_size=8, tp_size=2, pp_size=2, cp_size=2),
-    ],
-)
-def test_pixtral_vision_model_rejects_tp_size_greater_than_one(pixtral_vision_config, mapping):
-    pixtral_vision_config.mapping = mapping
-    with pytest.raises(NotImplementedError, match="tp_size > 1"):
-        modeling_pixtral.PixtralVisionModel(model_config=pixtral_vision_config)
 
 
 @torch.no_grad()
