@@ -364,11 +364,13 @@ class DecoderModelForCausalLM(nn.Module,
             if (hasattr(config, 'lora_config')
                     and config.lora_config is not None
                     and len(config.lora_config.lora_dir) == 1):
-                lora_loader = HfLoraLoader(config.lora_config.lora_dir)
-                if lora_loader.lm_head is not None and lora_loader.vocab_size != 0:
-                    weight = lora_loader.lm_head
-                    self.has_custom_lm_head = True
-                    vocab_size = lora_loader.vocab_size
+                # Only check for custom lm_head in HF LoRA, not NeMo
+                if config.lora_config.lora_ckpt_source == "hf":
+                    lora_loader = HfLoraLoader(config.lora_config.lora_dir)
+                    if lora_loader.lm_head is not None and lora_loader.vocab_size != 0:
+                        weight = lora_loader.lm_head
+                        self.has_custom_lm_head = True
+                        vocab_size = lora_loader.vocab_size
 
             self.lm_head = LMHead(
                 vocab_size,

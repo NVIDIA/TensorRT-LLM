@@ -703,11 +703,13 @@ class LlamaModel(DecoderModel):
                 model_config,
                 'lora_config') and model_config.lora_config is not None and len(
                     model_config.lora_config.lora_dir) == 1:
-            lora_loader = HfLoraLoader(model_config.lora_config.lora_dir)
-            if lora_loader.vocab_size != 0 and lora_loader.embed_tokens is not None:
-                vocab_size = lora_loader.vocab_size
-                weight = lora_loader.embed_tokens
-                self.has_custom_embed_tokens = True
+            # Only check for custom vocab in HF LoRA, not NeMo
+            if model_config.lora_config.lora_ckpt_source == "hf":
+                lora_loader = HfLoraLoader(model_config.lora_config.lora_dir)
+                if lora_loader.vocab_size != 0 and lora_loader.embed_tokens is not None:
+                    vocab_size = lora_loader.vocab_size
+                    weight = lora_loader.embed_tokens
+                    self.has_custom_embed_tokens = True
 
         if self.model_config.mapping.enable_attention_dp:
             self.embed_tokens = Embedding(
