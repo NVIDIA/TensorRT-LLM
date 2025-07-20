@@ -472,7 +472,8 @@ void tb::BasePeftCacheManagerBindings::initBindings(nb::module_& m)
 
     nb::class_<tb::PeftCacheManager, tb::BasePeftCacheManager>(m, "PeftCacheManager")
         .def(nb::init<tb::PeftCacheManagerConfig, tr::ModelConfig, tr::WorldConfig, tr::BufferManager>(),
-            nb::arg("config"), nb::arg("model_config"), nb::arg("world_config"), nb::arg("buffer_manager"));
+            nb::arg("config"), nb::arg("model_config"), nb::arg("world_config"), nb::arg("buffer_manager"))
+        .def("is_task_cached", &tb::PeftCacheManager::isTaskCached, nb::arg("taskId"));
 
     nb::class_<tb::NoOpPeftCacheManager, tb::BasePeftCacheManager>(m, "NoOpPeftCacheManager").def(nb::init<>());
 }
