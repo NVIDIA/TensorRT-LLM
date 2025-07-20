@@ -675,24 +675,27 @@ def _(
                              dtype=output_dtype)
 
 
-class W4A16GemmRunner(TunableRunner):
+class FinegrainedMixedDtypeGemm(TunableRunner):
     _runner_dict = dict()
     MAX_SUPPORTED_SM_VERSION = 90
 
-    def __init__(self, activation_dtype: torch.dtype, quant_mode: int):
-        instance_key = (activation_dtype, quant_mode)
-        if instance_key not in W4A16GemmRunner._runner_dict:
-            W4A16GemmRunner._runner_dict[
-                instance_key] = torch.classes.trtllm.W4A16GemmRunner(
-                    activation_dtype, quant_mode)
-        self._w4a16_gemm_runner = W4A16GemmRunner._runner_dict[instance_key]
+    def __init__(self, activation_dtype: torch.dtype, output_dtype: torch.dtype,
+                 quant_mode: int):
+        instance_key = (activation_dtype, output_dtype, quant_mode)
+        if instance_key not in FinegrainedMixedDtypeGemm._runner_dict:
+            FinegrainedMixedDtypeGemm._runner_dict[
+                instance_key] = torch.classes.trtllm.finegrainedMixedDtypeGemmRunner(
+                    activation_dtype, output_dtype, quant_mode)
+        self._finegrained_mixed_dtype_gemm_runner = FinegrainedMixedDtypeGemm._runner_dict[
+            instance_key]
 
     def get_valid_tactics(
         self,
         inputs: List[torch.Tensor],
         profile: OptimizationProfile,
     ) -> List[int]:
-        return list(range(self._w4a16_gemm_runner.get_num_configs()))
+        return list(
+            range(self._finegrained_mixed_dtype_gemm_runner.get_num_configs()))
 
     def forward(self,
                 inputs: List[torch.Tensor],
@@ -707,25 +710,25 @@ class W4A16GemmRunner(TunableRunner):
 
         activation, weights_packed, scales = inputs
 
-        return self._w4a16_gemm_runner.run_gemm(
-            activation,
-            weights_packed,
-            scales,
-            kwargs["group_size"],
-            tactic,
-            kwargs["bias"],
-            kwargs["zeros"],
-        )
+        alpha = 1.0 if kwargs.get("alpha") is None else kwargs["alpha"]
+
+        return self._finegrained_mixed_dtype_gemm_runner.run_gemm(
+            activation, weights_packed, scales, kwargs["group_size"], tactic,
+            kwargs["bias"], kwargs["zeros"], alpha)
 
 
-@torch.library.custom_op("trtllm::w4a16_gemm", mutates_args=())
-def w4a16_gemm(input: torch.Tensor,
-               weight: torch.Tensor,
-               scales: torch.Tensor,
-               group_size: int,
-               has_zero_point: bool,
-               bias: Optional[torch.Tensor] = None,
-               zeros: Optional[torch.Tensor] = None) -> torch.Tensor:
+@torch.library.custom_op("trtllm::finegrained_mixed_dtype_gemm",
+                         mutates_args=())
+def finegrained_mixed_dtype_gemm(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        scales: torch.Tensor,
+        group_size: int,
+        has_zero_point: bool,
+        output_dtype: torch.dtype,
+        alpha: Optional[float] = None,
+        bias: Optional[torch.Tensor] = None,
+        zeros: Optional[torch.Tensor] = None) -> torch.Tensor:
 
     assert not has_zero_point or zeros is not None, "Expected 'zeros' tensor when has_zero_point is True"
 
@@ -741,16 +744,24 @@ def w4a16_gemm(input: torch.Tensor,
     if quant_mode == 0:
         assert zeros is None, "When quant_mode is 0 (FINEGRAINED_SCALE_ONLY), zeros must be None"
 
-    w4a16_gemm_runner = W4A16GemmRunner(input.dtype, quant_mode)
+    finegrained_mixed_dtype_gemm_runner = FinegrainedMixedDtypeGemm(
+        input.dtype, output_dtype, quant_mode)
 
-    kwargs = {"group_size": group_size, "zeros": zeros, "bias": bias}
-    _, best_tactic = tuner.choose_one("trtllm::w4a16_gemm::gemm",
-                                      [w4a16_gemm_runner], tuning_config,
-                                      [input, weight, scales], **kwargs)
+    kwargs = {
+        "group_size": group_size,
+        "zeros": zeros,
+        "bias": bias,
+        "alpha": alpha
+    }
 
-    return w4a16_gemm_runner(inputs=[input, weight, scales],
-                             tactic=best_tactic,
-                             **kwargs)
+    _, best_tactic = tuner.choose_one(
+        "trtllm::finegrained_mixed_dtype_gemm::gemm",
+        [finegrained_mixed_dtype_gemm_runner], tuning_config,
+        [input, weight, scales], **kwargs)
+
+    return finegrained_mixed_dtype_gemm_runner(inputs=[input, weight, scales],
+                                               tactic=best_tactic,
+                                               **kwargs)
 
 
 @torch.library.custom_op("trtllm::attention", mutates_args=())
