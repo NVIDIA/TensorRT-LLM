@@ -661,7 +661,6 @@ def test_generate_with_SamplingConfig(llm_for_sampling_params: LLM,
 @force_ampere
 @pytest.mark.part0
 def test_generate_with_seed(llm_for_sampling_params: LLM):
-    pytest.skip("https://nvbugs/5368507")
     prompts = ["The capital of France is"] * 10
     # Use a high temperature and large max_tokens to increase the diversity
     sampling_params = [
