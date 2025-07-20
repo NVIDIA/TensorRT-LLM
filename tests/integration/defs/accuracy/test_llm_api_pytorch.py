@@ -1844,7 +1844,7 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
             moe_config=MoeConfig(backend=moe_backend))
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
         with LLM(
                 f"{llm_models_root()}/Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
                 tensor_parallel_size=tp_size,
