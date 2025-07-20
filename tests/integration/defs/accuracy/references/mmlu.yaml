@@ -100,6 +100,11 @@ mistralai/Mistral-Small-3.1-24B-Instruct-2503:
   - accuracy: 81.7
 google/gemma-2-9b-it:
   - accuracy: 73.05
+google/gemma-3-1b-it:
+  - accuracy: 39.0
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 39.0
 google/gemma-3-27b-it:
   - accuracy: 77.80
 Qwen/Qwen2-0.5B-Instruct:
