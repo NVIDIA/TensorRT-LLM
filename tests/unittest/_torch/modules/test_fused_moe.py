@@ -18,12 +18,9 @@ from utils.util import (skip_neither_ada_nor_hopper_unittest,
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.fused_moe import (BaseMoeRoutingMethod,
-                                                   CutlassFusedMoE,
-                                                   DefaultMoeRoutingMethod,
-                                                   MoEWeightLoadingMode,
-                                                   RenormalizeMoeRoutingMethod,
-                                                   VanillaMoE, WideEPMoE)
+from tensorrt_llm._torch.modules.fused_moe import (  # yapf:skip
+    BaseMoeRoutingMethod, CutlassFusedMoE, DefaultMoeRoutingMethod,
+    MoEWeightLoadingMode, RenormalizeMoeRoutingMethod, VanillaMoE, WideEPMoE)
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import \
     CuteDslFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_wide_ep import \
@@ -645,7 +642,9 @@ def test_fused_moe_nvfp4(dtype):
 
 @skip_neither_ada_nor_hopper_unittest
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("weight_loading_mode", [MoEWeightLoadingMode.VANILLA, MoEWeightLoadingMode.CUSTOM_W4A8])
+@pytest.mark.parametrize(
+    "weight_loading_mode",
+    [MoEWeightLoadingMode.VANILLA, MoEWeightLoadingMode.CUSTOM_W4A8])
 def test_fused_moe_w4afp8(dtype, weight_loading_mode):
 
     SEQ_LEN = 4
@@ -665,15 +664,17 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
     affine_coeff = 0.005
 
     lut = {
-        "weight": "weight",
-        "weight_scale": (
-            "weight_scale_inv"
-            if weight_loading_mode == MoEWeightLoadingMode.CUSTOM_W4A8
-            else "weight_scale"
-        ),
-        "weight_scale_2": "weight_scale_2",
-        "pre_quant_scale": "pre_quant_scale",
-        "input_scale": "input_scale",
+        "weight":
+        "weight",
+        "weight_scale":
+        ("weight_scale_inv" if weight_loading_mode
+         == MoEWeightLoadingMode.CUSTOM_W4A8 else "weight_scale"),
+        "weight_scale_2":
+        "weight_scale_2",
+        "pre_quant_scale":
+        "pre_quant_scale",
+        "input_scale":
+        "input_scale",
     }
 
     weights = {}
@@ -697,7 +698,9 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
 
         # The pre-quant scale to be multiplied with the input activation.
         w1_pre_quant_scale = torch.ones(HIDDEN_SIZE, dtype=dtype, device="cuda")
-        w2_pre_quant_scale = torch.ones(INTERMEDIATE_SIZE, dtype=dtype, device="cuda")
+        w2_pre_quant_scale = torch.ones(INTERMEDIATE_SIZE,
+                                        dtype=dtype,
+                                        device="cuda")
         w3_pre_quant_scale = torch.ones(HIDDEN_SIZE, dtype=dtype, device="cuda")
 
         # The weight scale to dequantize int4 weights (by multiplication).
@@ -715,7 +718,8 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
             device="cuda") * affine_coeff
 
         # The input scale to quantize the input activation (by division).
-        w1_input_scale = torch.randn(1, dtype=torch.float32, device="cuda") * 0.2
+        w1_input_scale = torch.randn(1, dtype=torch.float32,
+                                     device="cuda") * 0.2
         w2_input_scale = w1_input_scale
         w3_input_scale = w1_input_scale
 
@@ -725,21 +729,21 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
         w3_weight_scale_2 = w1_weight_scale_2
 
         # Prepare weights.
-        weights[f"{expert_id}.w1.{lut["weight"]}"] = w1_weight
-        weights[f"{expert_id}.w2.{lut["weight"]}"] = w2_weight
-        weights[f"{expert_id}.w3.{lut["weight"]}"] = w3_weight
-        weights[f"{expert_id}.w1.{lut["input_scale"]}"] = w1_input_scale
-        weights[f"{expert_id}.w2.{lut["input_scale"]}"] = w2_input_scale
-        weights[f"{expert_id}.w3.{lut["input_scale"]}"] = w3_input_scale
-        weights[f"{expert_id}.w1.{lut["weight_scale"]}"] = w1_scale
-        weights[f"{expert_id}.w2.{lut["weight_scale"]}"] = w2_scale
-        weights[f"{expert_id}.w3.{lut["weight_scale"]}"] = w3_scale
-        weights[f"{expert_id}.w1.{lut["pre_quant_scale"]}"] = w1_pre_quant_scale
-        weights[f"{expert_id}.w2.{lut["pre_quant_scale"]}"] = w2_pre_quant_scale
-        weights[f"{expert_id}.w3.{lut["pre_quant_scale"]}"] = w3_pre_quant_scale
-        weights[f"{expert_id}.w1.{lut["weight_scale_2"]}"] = w1_weight_scale_2
-        weights[f"{expert_id}.w2.{lut["weight_scale_2"]}"] = w2_weight_scale_2
-        weights[f"{expert_id}.w3.{lut["weight_scale_2"]}"] = w3_weight_scale_2
+        weights[f"{expert_id}.w1.{lut['weight']}"] = w1_weight
+        weights[f"{expert_id}.w2.{lut['weight']}"] = w2_weight
+        weights[f"{expert_id}.w3.{lut['weight']}"] = w3_weight
+        weights[f"{expert_id}.w1.{lut['input_scale']}"] = w1_input_scale
+        weights[f"{expert_id}.w2.{lut['input_scale']}"] = w2_input_scale
+        weights[f"{expert_id}.w3.{lut['input_scale']}"] = w3_input_scale
+        weights[f"{expert_id}.w1.{lut['weight_scale']}"] = w1_scale
+        weights[f"{expert_id}.w2.{lut['weight_scale']}"] = w2_scale
+        weights[f"{expert_id}.w3.{lut['weight_scale']}"] = w3_scale
+        weights[f"{expert_id}.w1.{lut['pre_quant_scale']}"] = w1_pre_quant_scale
+        weights[f"{expert_id}.w2.{lut['pre_quant_scale']}"] = w2_pre_quant_scale
+        weights[f"{expert_id}.w3.{lut['pre_quant_scale']}"] = w3_pre_quant_scale
+        weights[f"{expert_id}.w1.{lut['weight_scale_2']}"] = w1_weight_scale_2
+        weights[f"{expert_id}.w2.{lut['weight_scale_2']}"] = w2_weight_scale_2
+        weights[f"{expert_id}.w3.{lut['weight_scale_2']}"] = w3_weight_scale_2
 
     quant_config = QuantConfig(quant_algo=QuantAlgo.W4A8_AWQ)
     fused_moe = CutlassFusedMoE(
@@ -773,37 +777,47 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
                     return unpacker(weight.cpu().T.contiguous()).cuda()
                 else:
                     return unpacker(weight.cpu()).T.contiguous().cuda()
+
             w1 = unpack_weights(weights[f"{e_idx}.w1.{lut['weight']}"])
             w2 = unpack_weights(weights[f"{e_idx}.w2.{lut['weight']}"])
             w3 = unpack_weights(weights[f"{e_idx}.w3.{lut['weight']}"])
             w3_w1 = torch.cat([w3, w1], dim=-1)
 
             # weight_scale
-            s1 = weights[f"{e_idx}.w1.{lut["weight_scale"]}"].T.contiguous().cuda()
-            s2 = weights[f"{e_idx}.w2.{lut["weight_scale"]}"].T.contiguous().cuda()
-            s3 = weights[f"{e_idx}.w3.{lut["weight_scale"]}"].T.contiguous().cuda()
+            s1 = weights[f"{e_idx}.w1.{lut['weight_scale']}"].T.contiguous(
+            ).cuda()
+            s2 = weights[f"{e_idx}.w2.{lut['weight_scale']}"].T.contiguous(
+            ).cuda()
+            s3 = weights[f"{e_idx}.w3.{lut['weight_scale']}"].T.contiguous(
+            ).cuda()
             s3_s1 = torch.cat([s3, s1], dim=-1)
 
             # input_scale
-            p1 = weights[f"{e_idx}.w1.{lut["input_scale"]}"].cuda()
-            p2 = weights[f"{e_idx}.w2.{lut["input_scale"]}"].cuda()
-            p3 = weights[f"{e_idx}.w3.{lut["input_scale"]}"].cuda()
+            p1 = weights[f"{e_idx}.w1.{lut['input_scale']}"].cuda()
+            p2 = weights[f"{e_idx}.w2.{lut['input_scale']}"].cuda()
+            p3 = weights[f"{e_idx}.w3.{lut['input_scale']}"].cuda()
             p3_p1 = torch.max(p1, p3)
 
             # pre_quant_scale
             a1 = a2 = a3 = a1_a3 = None
             if weight_loading_mode == MoEWeightLoadingMode.VANILLA:
-                a1 = weights[f"{e_idx}.w1.{lut["pre_quant_scale"]}"].T.contiguous().cuda()
-                a2 = weights[f"{e_idx}.w2.{lut["pre_quant_scale"]}"].T.contiguous().cuda()
-                a3 = weights[f"{e_idx}.w3.{lut["pre_quant_scale"]}"].T.contiguous().cuda()
+                a1 = weights[
+                    f"{e_idx}.w1.{lut['pre_quant_scale']}"].T.contiguous().cuda(
+                    )
+                a2 = weights[
+                    f"{e_idx}.w2.{lut['pre_quant_scale']}"].T.contiguous().cuda(
+                    )
+                a3 = weights[
+                    f"{e_idx}.w3.{lut['pre_quant_scale']}"].T.contiguous().cuda(
+                    )
                 a1_a3 = torch.max(a1, a3)
 
             # weight_scale_2
             q1 = q2 = q3 = q3_q1 = None
             if weight_loading_mode == MoEWeightLoadingMode.VANILLA:
-                q1 = weights[f"{e_idx}.w1.{lut["weight_scale_2"]}"].cuda()
-                q2 = weights[f"{e_idx}.w3.{lut["weight_scale_2"]}"].cuda()
-                q3 = weights[f"{e_idx}.w2.{lut["weight_scale_2"]}"].cuda()
+                q1 = weights[f"{e_idx}.w1.{lut['weight_scale_2']}"].cuda()
+                q2 = weights[f"{e_idx}.w3.{lut['weight_scale_2']}"].cuda()
+                q3 = weights[f"{e_idx}.w2.{lut['weight_scale_2']}"].cuda()
                 q3_q1 = torch.max(q3, q1)
 
             # forward pass
@@ -820,15 +834,11 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
                 if pre_quant_scale is not None:
                     act = act * pre_quant_scale
                 # print(f"DEBUG: {layer_name}_pre_quant.max() {abs(act.max())}")
-                act = (
-                    torch.clamp((act / input_scale), -448.0, 448.0)
-                    .to(torch.float8_e4m3fn)
-                    .to(dtype)
-                )
+                act = (torch.clamp((act / input_scale), -448.0,
+                                   448.0).to(torch.float8_e4m3fn).to(dtype))
                 # print(f"DEBUG: {layer_name}_quantized.max() {abs(act.max())}")
-                weight = (
-                    weight.float() * weight_scale.repeat_interleave(128, dim=0).float()
-                ).to(dtype)
+                weight = (weight.float() * weight_scale.repeat_interleave(
+                    128, dim=0).float()).to(dtype)
                 if weight_scale_2 is not None:
                     weight /= weight_scale_2
                 output = torch.matmul(act, weight) * input_scale
@@ -853,11 +863,16 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
             # print(f"DEBUG: fc1_act.max() {abs(fc1.max())}")
 
             # fc2
-            fc2 = process_layer(
-                fc1, w2, s2, p2, "fc2", pre_quant_scale=a2, weight_scale_2=q2
-            )
+            fc2 = process_layer(fc1,
+                                w2,
+                                s2,
+                                p2,
+                                "fc2",
+                                pre_quant_scale=a2,
+                                weight_scale_2=q2)
 
-            results[activated_tokens, :] += (fc2 * final_scale).to(results.dtype)
+            results[activated_tokens, :] += (fc2 * final_scale).to(
+                results.dtype)
         return results
 
     AutoTuner.get().clear_cache()
@@ -879,8 +894,10 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
     out_has_nan = torch.isnan(output).any()
     assert not ref_has_nan, "ref_output contains NaN"
     assert not out_has_nan, "output contains NaN"
-    assert torch.nonzero(output).numel() != 0 and torch.nonzero(ref_output).numel() != 0
+    assert torch.nonzero(output).numel() != 0 and torch.nonzero(
+        ref_output).numel() != 0
     assert success
+
 
 class RefGatedMLPFusedMoE(nn.Module):
 
