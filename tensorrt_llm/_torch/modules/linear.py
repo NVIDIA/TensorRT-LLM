@@ -116,17 +116,13 @@ def load_weights_vanilla_helper(module: Linear, weights: List[Dict]):
     weight = load_weight_shard(weights[0]['weight'], module.tp_size,
                                module.tp_rank, module.tp_mode, device)
 
-    if module.has_w4a16_awq or module.has_weight_only_quant:
+    if module.has_weight_only_quant:
         # NOTE: without the preprocess during the runtime, the gemm output nan's. in order to use the preprocess_weights_for_mixed_gemm
         # we need to cast the weight to int8 first.
         activation_dtype = torch.float8_e4m3fn if module.has_w4a8_awq else torch.float16
-        if module.has_w4a16_awq or module.quant_config.layer_quant_mode.is_int4_weight_only(
-        ):
-            quant_mode = torch.quint4x2
-        elif module.quant_config.layer_quant_mode.is_int8_weight_only():
-            quant_mode = torch.int8
+        weight_dtype, _ = get_weight_dtype_and_id(module)
         weight = preprocess_weights_for_mixed_gemm(
-            weight.T.to(torch.int8).contiguous().cpu(), quant_mode,
+            weight.T.to(torch.int8).contiguous().cpu(), weight_dtype,
             activation_dtype).cuda().contiguous()
 
     copy_weight(module.weight, weight)
@@ -179,6 +175,27 @@ def load_weights_fused_gate_up_helper(
                                     module.tp_rank, module.tp_mode, device)
         copy_weight(module.bias, torch.cat((up_bias, gate_bias)))
     return (gate_weight, up_weight)
+
+
+def get_weight_dtype_and_id(module: Linear) -> tuple[torch.dtype, int]:
+    """
+    Get weight dtype and weight_id for weight only quantization mode.
+
+    Returns:
+        tuple[torch.dtype, int]: (weight_dtype, weight_id) where:
+            - weight_dtype: torch.int8 for INT8 weights, torch.quint4x2 for INT4 weights
+            - weight_id: 1 for INT8, 2 for INT4 (used for weight packing)
+    """
+    assert module.quant_config is not None and module.quant_config.layer_quant_mode.is_weight_only(
+    ), "This function should only be called when the module has weight-only quantization enabled."
+
+    if module.quant_config.layer_quant_mode.is_int8_weight_only():
+        return torch.int8, 1
+    elif module.quant_config.layer_quant_mode.is_int4_weight_only():
+        return torch.quint4x2, 2
+    else:
+        raise ValueError(
+            f"Unsupported quant_mode: {module.quant_config.layer_quant_mode}")
 
 
 class LinearMethodBase(ABC):
@@ -238,20 +255,6 @@ class LinearMethodBase(ABC):
         Load weights for the FUSED_GATE_UP_LINEAR weight mode.
         """
         raise NotImplementedError
-
-    def _get_weight_dtype_and_id(self,
-                                 module: Linear) -> tuple[torch.dtype, int]:
-        """
-        get weight dtype and weight_id for weight only quantization mode
-        """
-        if module.quant_config.layer_quant_mode.is_int8_weight_only():
-            return torch.int8, 1
-        elif module.quant_config.layer_quant_mode.is_int4_weight_only():
-            return torch.quint4x2, 2
-        else:
-            raise ValueError(
-                f"Unsupported quant_mode: {module.quant_config.layer_quant_mode}"
-            )
 
 
 class UnquantizedLinearMethod(LinearMethodBase):
@@ -907,7 +910,7 @@ class WeightOnlyQuantLinearMethod(LinearMethodBase):
                        out_features: int, bias: bool,
                        dtype: torch.dtype) -> None:
 
-        _, weight_id = self._get_weight_dtype_and_id(module)
+        _, weight_id = get_weight_dtype_and_id(module)
 
         # Quantized weights (int4 weights are packed into int8)
         module.weight = Parameter(torch.empty(
@@ -927,12 +930,12 @@ class WeightOnlyQuantLinearMethod(LinearMethodBase):
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]) -> torch.Tensor:
 
-        weight_dtype, _ = self._get_weight_dtype_and_id(module)
+        weight_dtype, _ = get_weight_dtype_and_id(module)
         bias = bias.contiguous() if bias is not None else None
 
         output = torch.ops.trtllm.weight_only_quant_gemm(
-            input.to(module.dtype).contiguous(), module.weight, weight_dtype,
-            module.weight_scale, module.dtype)
+            input, module.weight, weight_dtype, module.weight_scale,
+            module.dtype)
 
         return output
 
@@ -979,7 +982,7 @@ class WeightOnlyQuantLinearMethod(LinearMethodBase):
 
         fused_weight = torch.cat((q_weight, k_weight, v_weight))
 
-        weight_dtype, _ = self._get_weight_dtype_and_id(module)
+        weight_dtype, _ = get_weight_dtype_and_id(module)
         fused_weight = preprocess_weights_for_mixed_gemm(
             fused_weight.to(torch.int8).T.contiguous().cpu(), weight_dtype,
             torch.float16).cuda().contiguous()
@@ -995,10 +998,10 @@ class WeightOnlyQuantLinearMethod(LinearMethodBase):
     def load_weights_fused_gate_up_linear(self, module: Linear,
                                           weights: List[Dict]) -> None:
         device = torch.device('cuda')
-        weight_dtype, _ = self._get_weight_dtype_and_id(module)
-
+        weight_dtype, _ = get_weight_dtype_and_id(module)
         gate_weight, up_weight = load_weights_fused_gate_up_helper(
             module, weights)
+
         fused_weight = torch.cat((gate_weight, up_weight))
 
         fused_weight = preprocess_weights_for_mixed_gemm(
