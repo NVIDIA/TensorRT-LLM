@@ -21,7 +21,8 @@ from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
 from tensorrt_llm._torch.speculative.mtp import SampleStateTensorsMTP
 from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
                                  torch_dtype_to_str, trace_func)
-from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalRuntimeData
+from tensorrt_llm.inputs.multimodal import (MultimodalParams,
+                                            MultimodalRuntimeData)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import LoraConfig, LoraModelConfig
 from tensorrt_llm.mapping import Mapping
