@@ -47,6 +47,12 @@ class TensorParallelMode(str, enum.Enum):
     def split_dim(cls, mode):
         return 1 if mode == cls.ROW else 0
 
+    # Helper to shard the corresponding per-channel activation scales
+    # Which shard along the dimension orthogonal to the weights
+    @classmethod
+    def flip(cls, mode):
+        return cls.ROW if mode == cls.COLUMN else cls.COLUMN
+
 
 def load_weight_shard(
         weight,
@@ -954,9 +960,16 @@ class W4A16_AWQ_LinearMethod(LinearMethodBase):
         load_weights_vanilla_helper(module, weights)
 
         device = torch.device('cuda')
-        pre_quant_scale = load_weight_shard(weights[0]['pre_quant_scale'],
-                                            module.tp_size, module.tp_rank,
-                                            module.tp_mode, device)
+
+        pre_quant_scale = load_weight_shard(
+            weights[0]["pre_quant_scale"],
+            module.tp_size,
+            module.tp_rank,
+            # pre_quant_scale applies to activation as opposed to weight, so flip tp_mode the other way around
+            TensorParallelMode.flip(module.tp_mode),
+            device,
+        )
+
         module.pre_quant_scale = Parameter(
             torch.ones((module.in_features, ), dtype=pre_quant_scale.dtype),
             requires_grad=False).to(device=device)
@@ -1128,9 +1141,14 @@ class W4A8_AWQ_LinearMethod(LinearMethodBase):
         load_weights_vanilla_helper(module, weights)
 
         device = torch.device('cuda')
-        pre_quant_scale = load_weight_shard(weights[0]['pre_quant_scale'],
-                                            module.tp_size, module.tp_rank,
-                                            module.tp_mode, device)
+        pre_quant_scale = load_weight_shard(
+            weights[0]["pre_quant_scale"],
+            module.tp_size,
+            module.tp_rank,
+            # pre_quant_scale applies to activation as opposed to weight, so flip tp_mode the other way around
+            TensorParallelMode.flip(module.tp_mode),
+            device,
+        )
 
         assert pre_quant_scale.dtype == module.dtype
 
@@ -1185,11 +1203,15 @@ class W4A8_AWQ_LinearMethod(LinearMethodBase):
         # NOTE: pre_quant_scale is the same for q,k,v since modelopt checks which layer shared the same input and create an avg pre_quant_scale
         # Usually when modelopt exports the quantized model, pre_quant_Scale is fused in the layer norm (this case relevant if fused is disabled - modelopt internal)
         if "pre_quant_scale" in weights[0].keys():
-            pre_quant_scale = load_weight_shard(weights[0]['pre_quant_scale'],
-                                                module.tp_size,
-                                                module.tp_rank,
-                                                module.tp_mode,
-                                                device=torch.device('cuda'))
+
+            pre_quant_scale = load_weight_shard(
+                weights[0]["pre_quant_scale"],
+                module.tp_size,
+                module.tp_rank,
+                # pre_quant_scale applies to activation as opposed to weight, so flip tp_mode the other way around
+                TensorParallelMode.flip(module.tp_mode),
+                torch.device('cuda'),
+            )
 
             module.pre_quant_scale = Parameter(
                 torch.ones((module.in_features, ), dtype=pre_quant_scale.dtype),
@@ -1223,11 +1245,14 @@ class W4A8_AWQ_LinearMethod(LinearMethodBase):
         copy_weight(module.alpha, alpha)
 
         if "pre_quant_scale" in weights[0].keys():
-            pre_quant_scale = load_weight_shard(weights[0]['pre_quant_scale'],
-                                                module.tp_size,
-                                                module.tp_rank,
-                                                module.tp_mode,
-                                                device=torch.device('cuda'))
+            pre_quant_scale = load_weight_shard(
+                weights[0]["pre_quant_scale"],
+                module.tp_size,
+                module.tp_rank,
+                # pre_quant_scale applies to activation as opposed to weight, so flip tp_mode the other way around
+                TensorParallelMode.flip(module.tp_mode),
+                torch.device('cuda'),
+            )
 
             # NOTE:Create this tensor in load_weights, since not all layer have this tensor and memory is not allocated for it (same as W4A16)
             module.pre_quant_scale = Parameter(
