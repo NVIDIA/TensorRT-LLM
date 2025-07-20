@@ -150,8 +150,8 @@ def fuse_input_embeds(
         raise ValueError(
             f"Multimodal token count mismatch: found {len(mm_token_indices)} image tokens in input_ids "
             f"but received {mm_embed.shape[0]} image embeddings. "
-            f"This is likely due to KV cache reuse, chunk prefill, or other optimizations that "
-            f"cause token count mismatches within the inference batch.")
+            "This is likely due to KV cache reuse, chunk prefill, or other optimizations that "
+            "cause token count mismatches within the inference batch.")
 
     text_embed = embedding_layer(input_ids[text_token_indices])
     input_embeds = torch.empty(input_ids.shape[0],

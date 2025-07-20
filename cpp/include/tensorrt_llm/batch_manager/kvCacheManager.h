@@ -113,7 +113,7 @@ struct BlockKey
 
     // Extra keys for multimodal data (similar to VLLM's approach)
     // Each extra key is a pair of (mm_hash, start_offset_in_block)
-    std::optional<std::vector<MmKey>> extraKeys = std::nullopt;
+    std::vector<MmKey> extraKeys;
 
     BlockKey() = default;
 
@@ -128,7 +128,7 @@ struct BlockKey
     }
 
     explicit BlockKey(bool usesExtraIds, std::optional<LoraTaskIdType> loraTaskId, VecUniqueTokens uniqueTokens,
-        std::optional<std::vector<MmKey>> extraKeys = std::nullopt)
+        std::vector<MmKey> extraKeys = {})
         : usesExtraIds{usesExtraIds}
         , loraTaskId{loraTaskId}
         , uniqueTokens{std::move(uniqueTokens)}

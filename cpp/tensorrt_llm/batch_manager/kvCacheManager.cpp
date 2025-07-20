@@ -76,7 +76,11 @@ std::list<std::vector<T>> chopVectorIntoBlocks(
     return blockedVectors;
 }
 
-std::optional<std::vector<MmKey>> generateBlockHashExtraKeys(
+inline uint8_t getNthByte(SizeType32 hashPart, uint8_t byteIdx) noexcept {
+    return static_cast<uint8_t>((hashPart >> (24 - byteIdx * 8)) & 0xFF);
+}
+
+std::vector<MmKey> generateBlockHashExtraKeys(
     tensorrt_llm::batch_manager::LlmRequest const& llmRequest, SizeType32 startTokenIdx, SizeType32 endTokenIdx)
 {
     auto const multimodalHashes = llmRequest.getMultimodalHashes();
@@ -87,17 +91,19 @@ std::optional<std::vector<MmKey>> generateBlockHashExtraKeys(
         || (*multimodalHashes)->empty() || !(*multimodalPositions) || (*multimodalPositions)->empty()
         || !(*multimodalLengths) || (*multimodalLengths)->empty())
     {
-        return std::nullopt;
+        return {};
     }
 
     if ((*multimodalHashes)->size() != (*multimodalPositions)->size()
         || (*multimodalPositions)->size() != (*multimodalLengths)->size())
     {
         TLLM_LOG_WARNING("Multimodal data arrays have mismatched sizes");
-        return std::nullopt;
+        return {};
     }
 
     std::vector<MmKey> extraKeys; // MmKey = std::pair<std::array<uint8_t, 32>, SizeType32>
+    extraKeys.reserve((*multimodalPositions)->size());
+    std::array<uint8_t, 32> mmHashArray;
 
     for (size_t i = 0; i < (*multimodalPositions)->size(); ++i)
     {
@@ -105,11 +111,9 @@ std::optional<std::vector<MmKey>> generateBlockHashExtraKeys(
         auto const& length = (*(*multimodalLengths))[i];
         auto const& mmHashVector = (*(*multimodalHashes))[i];
 
-        std::array<uint8_t, 32> mmHashArray;
         TLLM_CHECK_WITH_INFO(mmHashVector.size() == 8, "Multimodal hash vector has unexpected size: %zu (expected 8)",
             mmHashVector.size());
 
-#define GET_NTH_BYTE(hash_part, byte_idx) static_cast<uint8_t>((hash_part >> (24 - (byte_idx) *8)) & 0xFF)
         // mmHashVector[j] comes from Python's int(hex_chunk, 16)
         // where hex_chunk like "00010203" means 0x00 is MSB and 0x03 is LSB (big endian)
         // Convert 8x 32-bit integers into a 32-byte array preserving Blake3 hash byte order
@@ -117,12 +121,11 @@ std::optional<std::vector<MmKey>> generateBlockHashExtraKeys(
         for (size_t j = 0; j < 8; ++j)
         {
             auto const& hashPart = mmHashVector[j];
-            for (size_t byteIdx = 0; byteIdx < 4; ++byteIdx)
+            for (uint8_t byteIdx = 0; byteIdx < 4; ++byteIdx)
             {
-                mmHashArray[j * 4 + byteIdx] = GET_NTH_BYTE(hashPart, byteIdx);
+                mmHashArray[j * 4 + byteIdx] = getNthByte(hashPart, byteIdx);
             }
         }
-#undef GET_NTH_BYTE
 
         // Check if this multimodal content overlaps with the current block
         if (endTokenIdx > startPos && startTokenIdx < startPos + length)
@@ -132,7 +135,7 @@ std::optional<std::vector<MmKey>> generateBlockHashExtraKeys(
         }
     }
 
-    return extraKeys.empty() ? std::nullopt : std::make_optional(std::move(extraKeys));
+    return extraKeys;
 }
 
 std::vector<BlockKey> buildBlockKeys(
@@ -191,9 +194,9 @@ size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) no
 
     // Add extra keys for multimodal data mixing in external multimodal item hash and token offset within this sequence
     // block
-    if (blockKey.extraKeys)
+    if (!blockKey.extraKeys.empty())
     {
-        for (auto const& [mmHash, startOffset] : *blockKey.extraKeys)
+        for (auto const& [mmHash, startOffset] : blockKey.extraKeys)
         {
             // Hash the multimodal hash array in 32-bit chunks (more efficient)
             for (size_t i = 0; i < 32; i += 4)
