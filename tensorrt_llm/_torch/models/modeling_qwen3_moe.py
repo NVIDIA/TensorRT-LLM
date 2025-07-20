@@ -257,17 +257,28 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
 
         if self.fusion_config.POST_MOE_FUSION:
             if do_finalize:
-                if spec_metadata:
+                if spec_metadata is not None and spec_metadata.is_layer_capture(
+                        self.layer_idx):
+                    hidden_states = self.allreduce(
+                        hidden_states,
+                        all_reduce_params=AllReduceParams(
+                            fusion_op=AllReduceFusionOp.NONE,
+                            trigger_completion_at_end=False,
+                        ))
                     spec_metadata.maybe_capture_hidden_states(
                         self.layer_idx, hidden_states, residual)
-                hidden_states, residual = self.allreduce(
-                    hidden_states,
-                    all_reduce_params=AllReduceParams(
-                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                        residual=residual,
-                        norm_weight=self.next_layer_layernorm.weight,
-                        eps=self.next_layer_layernorm.variance_epsilon,
-                    ))
+                    hidden_states, residual = self.next_layer_layernorm(
+                        hidden_states, residual)
+                else:
+                    hidden_states, residual = self.allreduce(
+                        hidden_states,
+                        all_reduce_params=AllReduceParams(
+                            fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                            residual=residual,
+                            norm_weight=self.next_layer_layernorm.weight,
+                            eps=self.next_layer_layernorm.variance_epsilon,
+                        ))
+
             else:
                 assert len(
                     hidden_states
@@ -277,24 +288,38 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
                 expert_scale_factor = hidden_states[1]
                 expanded_idx_to_permuted_idx = hidden_states[2]
 
-                moe_all_reduce_params = MoEAllReduceParams(
-                    expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
-                    expert_scale_factor=expert_scale_factor,
-                    shared_expert_output=None,
-                    residual=residual,
-                    norm_weight=self.next_layer_layernorm.weight,
-                    eps=self.next_layer_layernorm.variance_epsilon,
-                    is_cutlass_min_latency=False,
-                )
-                hidden_states, residual = self.moe_allreduce(
-                    fc2_output, all_reduce_params=moe_all_reduce_params)
-
-                if spec_metadata:
+                if spec_metadata is not None and spec_metadata.is_layer_capture(
+                        self.layer_idx):
+                    moe_all_reduce_params = MoEAllReduceParams(
+                        expanded_idx_to_permuted_idx=
+                        expanded_idx_to_permuted_idx,
+                        expert_scale_factor=expert_scale_factor,
+                        shared_expert_output=None,
+                        is_cutlass_min_latency=False,
+                    )
+                    hidden_states = self.moe_allreduce(
+                        fc2_output, all_reduce_params=moe_all_reduce_params)
                     spec_metadata.maybe_capture_hidden_states(
                         self.layer_idx, hidden_states, residual)
+                    hidden_states, residual = self.next_layer_layernorm(
+                        hidden_states, residual)
+                else:
+                    moe_all_reduce_params = MoEAllReduceParams(
+                        expanded_idx_to_permuted_idx=
+                        expanded_idx_to_permuted_idx,
+                        expert_scale_factor=expert_scale_factor,
+                        shared_expert_output=None,
+                        residual=residual,
+                        norm_weight=self.next_layer_layernorm.weight,
+                        eps=self.next_layer_layernorm.variance_epsilon,
+                        is_cutlass_min_latency=False,
+                    )
+                    hidden_states, residual = self.moe_allreduce(
+                        fc2_output, all_reduce_params=moe_all_reduce_params)
 
         else:
-            if spec_metadata:
+            if spec_metadata is not None and spec_metadata.is_layer_capture(
+                    self.layer_idx):
                 spec_metadata.maybe_capture_hidden_states(
                     self.layer_idx, hidden_states, residual)
             if self.next_layer_layernorm is not None:
