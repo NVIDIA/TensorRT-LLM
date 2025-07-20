@@ -1258,19 +1258,22 @@ size_t Serialization::serializedSize(SchedulerConfig const& schedulerConfig)
 // CacheTransceiverConfig
 CacheTransceiverConfig Serialization::deserializeCacheTransceiverConfig(std::istream& is)
 {
-    auto maxNumTokens = su::deserialize<std::optional<size_t>>(is);
-    return CacheTransceiverConfig{maxNumTokens};
+    auto backendType = su::deserialize<std::optional<CacheTransceiverConfig::BackendType>>(is);
+    auto maxTokensInBuffer = su::deserialize<std::optional<size_t>>(is);
+    return CacheTransceiverConfig{backendType, maxTokensInBuffer};
 }
 
 void Serialization::serialize(CacheTransceiverConfig const& cacheTransceiverConfig, std::ostream& os)
 {
-    su::serialize(cacheTransceiverConfig.getMaxNumTokens(), os);
+    su::serialize(cacheTransceiverConfig.getBackendType(), os);
+    su::serialize(cacheTransceiverConfig.getMaxTokensInBuffer(), os);
 }
 
 size_t Serialization::serializedSize(CacheTransceiverConfig const& cacheTransceiverConfig)
 {
     size_t totalSize = 0;
-    totalSize += su::serializedSize(cacheTransceiverConfig.getMaxNumTokens());
+    totalSize += su::serializedSize(cacheTransceiverConfig.getBackendType());
+    totalSize += su::serializedSize(cacheTransceiverConfig.getMaxTokensInBuffer());
     return totalSize;
 }
 

@@ -2,7 +2,8 @@ from functools import partial
 from typing import (Any, Callable, Coroutine, Dict, Iterable, List, Literal,
                     Optional, Tuple, TypeAlias, TypedDict, Union, cast)
 
-from openai.types.chat import ChatCompletionContentPartImageParam
+from openai.types.chat import (ChatCompletionContentPartImageParam,
+                               ChatCompletionContentPartInputAudioParam)
 from openai.types.chat import \
     ChatCompletionContentPartParam as OpenAIChatCompletionContentPartParam
 from openai.types.chat import (ChatCompletionContentPartTextParam,
@@ -12,8 +13,8 @@ from typing_extensions import Required
 
 from tensorrt_llm.inputs import (ConversationMessage, MultimodalData,
                                  MultimodalDataTracker,
-                                 add_multimodal_placeholders, async_load_image,
-                                 async_load_video)
+                                 add_multimodal_placeholders, async_load_audio,
+                                 async_load_image, async_load_video)
 from tensorrt_llm.logger import logger
 
 
@@ -33,12 +34,16 @@ ChatCompletionContentPartParam: TypeAlias = Union[
     OpenAIChatCompletionContentPartParam, ChatCompletionContentPartVideoParam,
     str]
 
-VALID_MESSAGE_CONTENT_MM_PART_TYPES = ["text", "image_url", "video_url"]
+# TODO: Add "input_audio" to support byte_encoded audio input.
+VALID_MESSAGE_CONTENT_MM_PART_TYPES = [
+    "text", "image_url", "video_url", "audio_url"
+]
 
 # Parser Functions
 _TextParser = partial(cast, ChatCompletionContentPartTextParam)
 _ImageParser = partial(cast, ChatCompletionContentPartImageParam)
 _VideoParser = partial(cast, ChatCompletionContentPartVideoParam)
+_AudioParser = partial(cast, ChatCompletionContentPartInputAudioParam)
 
 MM_PARSER_MAP: dict[str, Callable[[ChatCompletionContentPartParam], Union[
     str, dict[str, str]]]] = {
@@ -48,6 +53,8 @@ MM_PARSER_MAP: dict[str, Callable[[ChatCompletionContentPartParam], Union[
         lambda part: _ImageParser(part).get("image_url", {}).get("url", None),
         "video_url":
         lambda part: _VideoParser(part).get("video_url", {}).get("url", None),
+        "audio_url":
+        lambda part: _AudioParser(part).get("audio_url", {}).get("url", None),
     }
 
 
@@ -74,7 +81,7 @@ def parse_chat_message_content_part(
 
     part_type, content = _parse_chat_message_content_mm_part(part)
 
-    # if part_type is text/image_url/video_url but content is None, log a warning and skip
+    # if part_type is text/image_url/video_url/audio_url but content is None, log a warning and skip
     if part_type in VALID_MESSAGE_CONTENT_MM_PART_TYPES and content is None:
         logger.warning(
             "Skipping multimodal part '%s' (type: '%s') with empty / unparsable content.",
@@ -107,6 +114,18 @@ def parse_chat_message_content_part(
                 return None
 
         return MultimodalData(modality="video", data=load_video_async())
+
+    if part_type == "audio_url":
+        str_content = cast(str, content)
+
+        async def load_audio_async():
+            try:
+                return await async_load_audio(str_content)
+            except Exception as e:
+                logger.error(f"Failed to load audio: {str(e)}")
+                return None
+
+        return MultimodalData(modality="audio", data=load_audio_async())
 
     raise NotImplementedError(f"Unknown part type: {part_type}")
 

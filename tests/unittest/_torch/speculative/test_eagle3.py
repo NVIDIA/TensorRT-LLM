@@ -4,13 +4,13 @@ import unittest
 
 import pytest
 import torch
+from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import (CudaGraphConfig, EagleDecodingConfig,
                                  KvCacheConfig)
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.llm_data import llm_models_root
 
 
 @pytest.mark.parametrize(
@@ -18,9 +18,12 @@ from utils.llm_data import llm_models_root
     [
         [True, "TRTLLM", True, False, False],
         [False, "TRTLLM", True, False, False],
+        [True, "TRTLLM", True, True, False],
+        [False, "TRTLLM", True, True, False],
         [True, "FLASHINFER", True, False, False],
         [False, "FLASHINFER", True, False, False],
-        #  [False, "TRTLLM", False, True, True], [True, "TRTLLM", False, True, True] # TODO: nvbugs/5379915
+        [False, "TRTLLM", False, True, True],
+        [True, "TRTLLM", False, True, True],
     ])
 @pytest.mark.high_cuda_memory
 def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,

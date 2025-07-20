@@ -286,7 +286,9 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
     resource_manager.resource_managers.move_to_end(ResourceManagerType.KV_CACHE_MANAGER, last=True)
 
     # scheduling
-    capacitor_scheduler = BindCapacityScheduler(ad_config.max_batch_size, kv_cache_manager.impl)
+    capacitor_scheduler = BindCapacityScheduler(
+        ad_config.max_batch_size, kv_cache_manager.impl, peft_cache_manager=None
+    )
     mb_scheduler = BindMicroBatchScheduler(
         ad_config.max_batch_size, engine.cache_seq_interface.info.max_num_tokens
     )

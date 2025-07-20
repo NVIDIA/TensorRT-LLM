@@ -1,8 +1,9 @@
+import copy
 import enum
 import math
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -11,7 +12,7 @@ import tensorrt_llm.bindings
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.sampling_params import SamplingParams
 
-from ..._utils import nvtx_range
+from ..._utils import binding_dtype_size, nvtx_range
 from ...logger import logger
 from ...mapping import Mapping
 from .llm_request import LlmRequest, LlmRequestState, SamplingConfig
@@ -192,10 +193,10 @@ class KVCacheManager(BaseResourceManager):
                              else 0)
 
         # Determine if this is VSWA (Variable Sliding Window Attention)
-        is_vswa = len(self.max_attention_window_vec) > 1
+        self.is_vswa = len(self.max_attention_window_vec) > 1
 
         # Calculate blocks per window using appropriate method
-        if is_vswa:
+        if self.is_vswa:
             # VSWA case: use C++ implementation for variable window sizes
             # model config check
             if model_config is None:
@@ -437,14 +438,10 @@ class KVCacheManager(BaseResourceManager):
         cache_size_per_token = kv_factor * sum(
             self.num_kv_heads_per_layer) * head_dim
 
-        if dtype == DataType.FP8:
-            kv_cache_dtype_bytes = 1
-        elif dtype in (DataType.HALF, DataType.BF16):
-            kv_cache_dtype_bytes = 2
-        elif dtype == DataType.FLOAT:
-            kv_cache_dtype_bytes = 4
-        else:
+        if dtype not in (DataType.FP8, DataType.HALF, DataType.BF16,
+                         DataType.FLOAT):
             raise ValueError(f'Cannot support {dtype} KV cache.')
+        kv_cache_dtype_bytes = binding_dtype_size(dtype)
 
         cache_size_bytes_per_token = cache_size_per_token * kv_cache_dtype_bytes
         free_mem, total_mem = torch.cuda.mem_get_info()
@@ -526,7 +523,14 @@ class KVCacheManager(BaseResourceManager):
         return result
 
     def get_num_free_blocks(self) -> int:
-        return self.impl.get_kv_cache_stats().free_num_blocks
+        if self.is_vswa:
+            logger.info(
+                f"For VSWA case, we return the minimum of the number of free blocks for each window size: {self.impl.get_kv_cache_stats().num_free_blocks_per_window_size}"
+            )
+            return min(self.impl.get_kv_cache_stats().
+                       num_free_blocks_per_window_size.values())
+        else:
+            return self.impl.get_kv_cache_stats().free_num_blocks
 
     def get_num_kv_blocks(self, num_tokens: int) -> int:
         return (num_tokens + self.tokens_per_block - 1) // self.tokens_per_block
@@ -603,6 +607,102 @@ class KVCacheManager(BaseResourceManager):
             window_size_to_layers_map[window_size].append(local_layer_idx)
         return window_size_to_layers_map
 
+    @staticmethod
+    def adjust_window_sizes_for_vswa(
+        window_size_to_layers: Dict[int, List[int]],
+        kv_cache_config: KvCacheConfigCpp,
+        model_config: ModelConfig,
+        pool_memory_bytes: int,
+        kv_factor: int,
+        dtype: DataType,
+        is_cross_attention: bool = False,
+    ) -> Dict[int, List[int]]:
+
+        assert is_cross_attention is False, 'Cross attention is not supported'
+
+        max_tokens_from_config = kv_cache_config.max_tokens
+
+        def calculate_cache_size_per_token(layers: Set[int]) -> int:
+            # Same as BaseKVCacheManager::calculateCacheSizePerTokenForSingleWindowSize
+            total_kv_heads = sum(model_config.num_kv_heads_per_layer[i]
+                                 for i in layers)
+            return total_kv_heads * kv_factor * model_config.head_size
+
+        # Calculate the required memory bytes per sequence.
+        required_mem_bytes_per_seq = 0
+        for window_size in sorted(window_size_to_layers):
+            layers = window_size_to_layers[window_size]
+            cache_size_per_token = calculate_cache_size_per_token(layers)
+            cache_size_bytes_per_token = cache_size_per_token * binding_dtype_size(
+                dtype)
+            required_mem_bytes_per_seq += window_size * cache_size_bytes_per_token
+        logger.debug(
+            f'Required memory per sequence: {required_mem_bytes_per_seq} bytes')
+
+        if required_mem_bytes_per_seq < pool_memory_bytes:
+            # No need to adjust the window sizes.
+            return copy.deepcopy(window_size_to_layers)
+
+        logger.debug(
+            f'Adjusting the window sizes {list(window_size_to_layers)} to fit '
+            f'the memory {pool_memory_bytes} bytes.')
+        adjusted_window_size_to_layers = {}
+
+        remaining_mem_bytes = pool_memory_bytes
+        remaining_layers = set(i for layers in window_size_to_layers.values()
+                               for i in layers)
+
+        accum_max_tokens = 0
+        prev_window_size = 0
+
+        for window_size in sorted(window_size_to_layers):
+            layers = window_size_to_layers[window_size]
+            if remaining_mem_bytes > 0 and remaining_layers:
+                # Calculate cache size per token for remaining layers only
+                cache_size_per_token = calculate_cache_size_per_token(
+                    remaining_layers)
+                cache_size_bytes_per_token = cache_size_per_token * binding_dtype_size(
+                    dtype)
+                logger.debug(
+                    f'Cache size per token for {len(remaining_layers)} layers: '
+                    f'{cache_size_bytes_per_token} bytes')
+                # Calculate max tokens that can fit in this window with remaining memory.
+                max_tokens_in_window = min(
+                    remaining_mem_bytes // cache_size_bytes_per_token,
+                    window_size - prev_window_size)
+                remaining_mem_bytes -= max_tokens_in_window * cache_size_bytes_per_token
+                accum_max_tokens += max_tokens_in_window
+                logger.debug(f'Remaining memory: {remaining_mem_bytes} bytes')
+                logger.debug(
+                    f'Max token of window {window_size}: {accum_max_tokens}')
+
+                if accum_max_tokens < window_size:
+                    logger.debug(
+                        f'Max tokens ({accum_max_tokens}) cannot fill the current window ({window_size}). '
+                        f'The larger windows will have the same max tokens.')
+                    remaining_mem_bytes = 0
+
+                # Clamp the sequence length if provided explicitly.
+                if max_tokens_from_config is not None:
+                    accum_max_tokens = min(max_tokens_from_config,
+                                           accum_max_tokens)
+                    # If max tokens from config is reached, stop allocating
+                    # more memory. Since the maximum number of tokens is
+                    # already reached, for the remaining windows maxTokens
+                    # will be set by the current value of accumMaxTokens.
+                    if accum_max_tokens == max_tokens_from_config:
+                        remaining_mem_bytes = 0
+
+            if accum_max_tokens not in adjusted_window_size_to_layers:
+                adjusted_window_size_to_layers[accum_max_tokens] = layers.copy()
+            else:
+                adjusted_window_size_to_layers[accum_max_tokens].extend(layers)
+
+            remaining_layers -= set(layers)
+            prev_window_size = window_size
+
+        return adjusted_window_size_to_layers
+
     def calculate_max_num_blocks_from_cpp(
             self,
             kv_cache_config: KvCacheConfigCpp,
@@ -622,6 +722,11 @@ class KVCacheManager(BaseResourceManager):
             A dict of (max_attention_window, (blocks_in_primary_pool, blocks_in_secondary_pool)).
         """
 
+        # VSWA on Torch backend has not supported the cross attention.
+        is_cross_attention = False
+        # check model config
+        assert model_config.layer_types is not None, "layer_types have to be set correctly for VSWA"
+
         # Construct WorldConfig from self.mapping
         world_config_cpp = WorldConfig(
             tensor_parallelism=self.mapping.tp_size,
@@ -636,12 +741,26 @@ class KVCacheManager(BaseResourceManager):
         primary_pool_memory_bytes = free_mem
         secondary_pool_memory_bytes = 0
         logger.debug(
-            f"primary_pool_memory_bytes is set to {primary_pool_memory_bytes/1024**3}GB, \nsecondary_pool_memory_bytes is set to {secondary_pool_memory_bytes/1024**3}GB"
+            f"primary_pool_memory_bytes is set to {primary_pool_memory_bytes/1024**3}GB, \n"
+            f"secondary_pool_memory_bytes is set to {secondary_pool_memory_bytes/1024**3}GB"
+        )
+
+        # Adjust the window sizes to fit the memory if even a single sequence
+        # cannot fit in the memory.
+        window_size_to_layers = self.adjust_window_sizes_for_vswa(
+            window_size_to_layers=window_size_to_layers,
+            model_config=model_config,
+            kv_cache_config=kv_cache_config,
+            pool_memory_bytes=primary_pool_memory_bytes,
+            kv_factor=self.kv_factor,
+            dtype=self.dtype,
+            is_cross_attention=is_cross_attention,
         )
 
         blocks_per_window = KVCacheManagerCpp.calculate_max_num_blocks(
             config=kv_cache_config,
-            is_cross_attention=False,  #TODO: support cross attention
+            # TODO: support cross attention
+            is_cross_attention=is_cross_attention,
             dtype=self.dtype,
             model_config=model_config,
             world_config=world_config_cpp,
@@ -1099,7 +1218,7 @@ class PeftCacheManager(BaseResourceManager):
         pass
 
     def free_resources(self, request: LlmRequest):
-        pass
+        self.impl.mark_request_done(request)
 
     def shutdown(self):
         pass
