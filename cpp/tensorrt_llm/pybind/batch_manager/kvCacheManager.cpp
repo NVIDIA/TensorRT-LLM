@@ -469,7 +469,8 @@ void tb::BasePeftCacheManagerBindings::initBindings(py::module_& m)
 
     py::classh<tb::PeftCacheManager, tb::BasePeftCacheManager>(m, "PeftCacheManager")
         .def(py::init<tb::PeftCacheManagerConfig, tr::ModelConfig, tr::WorldConfig, tr::BufferManager>(),
-            py::arg("config"), py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"));
+            py::arg("config"), py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"))
+        .def("is_task_cached", &tb::PeftCacheManager::isTaskCached, py::arg("taskId"));
 
     py::classh<tb::NoOpPeftCacheManager, tb::BasePeftCacheManager>(m, "NoOpPeftCacheManager").def(py::init());
 }
