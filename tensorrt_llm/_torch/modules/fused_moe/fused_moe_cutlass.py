@@ -275,6 +275,7 @@ class CutlassFusedMoE(MoE):
             output_dtype,
             quant_scales=self.quant_scales,
             input_sf=x_sf,
+            swizzled_input_sf=True,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             ep_size=self.ep_size,

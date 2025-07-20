@@ -1017,7 +1017,7 @@ __device__ uint32_t quantizePackedFP4Value(ComputeElem& post_act_val, float glob
 __device__ void writeSF(int64_t num_tokens_before_expert, int64_t expert_id, int64_t source_token_id, int64_t token_id,
     int64_t elem_idx, int64_t num_cols, int64_t max_tokens_per_expert,
     TmaWarpSpecializedGroupedGemmInput::ElementSF* act_sf_flat,
-    TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf)
+    TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, bool const swizzled_input_sf = true)
 {
     static constexpr int CVT_FP4_NUM_THREADS_PER_SF = NVFP4_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD;
 
@@ -1032,11 +1032,31 @@ __device__ void writeSF(int64_t num_tokens_before_expert, int64_t expert_id, int
         elem_idx, std::nullopt /* numRows */, num_cols, act_sf_expert, FP4QuantizationSFLayout::SWIZZLED);
     if (sf_out)
     {
-        auto const sf_in = cvt_quant_to_fp4_get_sf_out_offset<TmaWarpSpecializedGroupedGemmInput::ElementSF,
-            CVT_FP4_NUM_THREADS_PER_SF, NVFP4_VEC_SIZE>(std::nullopt /* batchIdx */, source_token_id, elem_idx,
-            std::nullopt /* numRows */, num_cols, const_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(input_sf),
-            FP4QuantizationSFLayout::SWIZZLED);
-        *sf_out = *sf_in;
+        if (input_sf)
+        {
+            if (swizzled_input_sf)
+            {
+                auto const sf_in = cvt_quant_to_fp4_get_sf_out_offset<TmaWarpSpecializedGroupedGemmInput::ElementSF,
+                    CVT_FP4_NUM_THREADS_PER_SF, NVFP4_VEC_SIZE>(std::nullopt /* batchIdx */, source_token_id, elem_idx,
+                    std::nullopt /* numRows */, num_cols,
+                    const_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(input_sf),
+                    FP4QuantizationSFLayout::SWIZZLED);
+                *sf_out = *sf_in;
+            }
+            else
+            {
+                auto const sf_in = cvt_quant_to_fp4_get_sf_out_offset<TmaWarpSpecializedGroupedGemmInput::ElementSF,
+                    CVT_FP4_NUM_THREADS_PER_SF, NVFP4_VEC_SIZE>(std::nullopt /* batchIdx */, source_token_id, elem_idx,
+                    std::nullopt /* numRows */, num_cols,
+                    const_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(input_sf),
+                    FP4QuantizationSFLayout::LINEAR);
+                *sf_out = *sf_in;
+            }
+        }
+        else
+        {
+            *sf_out = 0x00;
+        }
     }
 }
 
@@ -1428,7 +1448,8 @@ __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_inp
     int const* permuted_row_to_unpermuted_row, int64_t const num_rows, int64_t const cols, int64_t const k,
     float const* fc1_act_global_scale, bool use_per_expert_act_scale, int64_t const* expert_first_token_offset,
     TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
-    TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, int64_t const num_experts_per_node)
+    TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, bool const swizzled_input_sf,
+    int64_t const num_experts_per_node)
 {
 #ifdef ENABLE_FP4
     constexpr bool is_fp4 = std::is_same_v<ExpandedActivationsType, __nv_fp4_e2m1>;
@@ -1498,7 +1519,7 @@ __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_inp
                 {
                     assert(act_scale_idx == 0 && "Cannot use per-expert act scale for pre-quantized activations");
                     writeSF(num_tokens_before_expert, expert, source_row, permuted_row, elem_index, cols, num_rows,
-                        fc1_act_sf_flat, input_sf);
+                        fc1_act_sf_flat, input_sf, swizzled_input_sf);
                     dest_row_ptr[elem_index] = in_vec;
                 }
             }
@@ -1528,7 +1549,7 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
     int const* permuted_row_to_unpermuted_row, int64_t const num_rows, int64_t const cols, int const k,
     int const num_experts_per_node, float const* fc1_act_global_scale, bool use_per_expert_act_scale,
     int64_t* expert_first_token_offset, TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
-    TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, cudaStream_t stream)
+    TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, bool const swizzled_input_sf, cudaStream_t stream)
 {
 #ifdef ENABLE_FP4
     // TODO Currently this is a bit hacky because we assume we are in FP8_MXFP4 mode if activations are FP8.
@@ -1566,7 +1587,7 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
     config.attrs = attrs;
     cudaLaunchKernelEx(&config, func, unpermuted_input, permuted_output, unpermuted_scales, permuted_scales,
         permuted_row_to_unpermuted_row, num_rows, cols, k, fc1_act_global_scale, use_per_expert_act_scale,
-        expert_first_token_offset, fc1_act_sf_flat, input_sf, num_experts_per_node);
+        expert_first_token_offset, fc1_act_sf_flat, input_sf, swizzled_input_sf, num_experts_per_node);
 }
 
 enum class ScaleMode : int
@@ -3103,14 +3124,14 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
 
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType, class Enable>
 void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::runMoe(
-    void const* input_activations_void, void const* input_sf_void, int const* token_selected_experts,
-    float const* token_final_scales, void const* fc1_expert_weights_void, void const* fc1_expert_biases_void,
-    ActivationType fc1_activation_type, void const* fc2_expert_weights_void, void const* fc2_expert_biases_void,
-    QuantParams quant_params, int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
-    int const full_num_experts, int const experts_per_token, char* workspace_ptr, void* final_output_void,
-    int* unpermuted_row_to_permuted_row, MOEParallelismConfig parallelism_config, bool const enable_alltoall,
-    bool use_lora, LoraParams& lora_params, bool use_deepseek_fp8_block_scale, bool min_latency_mode,
-    MoeMinLatencyParams& min_latency_params, cudaStream_t stream)
+    void const* input_activations_void, void const* input_sf_void, bool const swizzled_input_sf,
+    int const* token_selected_experts, float const* token_final_scales, void const* fc1_expert_weights_void,
+    void const* fc1_expert_biases_void, ActivationType fc1_activation_type, void const* fc2_expert_weights_void,
+    void const* fc2_expert_biases_void, QuantParams quant_params, int64_t const num_rows, int64_t const hidden_size,
+    int64_t const inter_size, int const full_num_experts, int const experts_per_token, char* workspace_ptr,
+    void* final_output_void, int* unpermuted_row_to_permuted_row, MOEParallelismConfig parallelism_config,
+    bool const enable_alltoall, bool use_lora, LoraParams& lora_params, bool use_deepseek_fp8_block_scale,
+    bool min_latency_mode, MoeMinLatencyParams& min_latency_params, cudaStream_t stream)
 {
     static constexpr bool int_scales_required
         = std::is_same<WeightType, uint8_t>::value || std::is_same<WeightType, cutlass::uint4b_t>::value;
@@ -3314,7 +3335,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         expandInputRowsKernelLauncher(input_activations, reinterpret_cast<ExpandedActivationsType*>(permuted_data_),
             token_topk_unpermuted_scales, permuted_token_final_scales_, permuted_row_to_unpermuted_row_, num_rows,
             hidden_size, experts_per_token, num_experts_per_node, quant_params.fp4.fc1.act_global_scale,
-            use_per_expert_act_scale, expert_first_token_offset_, fc1_fp4_act_scale_, input_sf, stream);
+            use_per_expert_act_scale, expert_first_token_offset_, fc1_fp4_act_scale_, input_sf, swizzled_input_sf,
+            stream);
 
         sync_check_cuda_error(stream);
 

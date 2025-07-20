@@ -780,7 +780,7 @@ public:
         auto stream = streamPtr->get();
         MoeMinLatencyParams min_latency_params;
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
-        mMoERunner.runMoe(mInputTensor, nullptr, mSelectedExperts, mUseFinalScale ? mScaleProbs : nullptr,
+        mMoERunner.runMoe(mInputTensor, nullptr, true, mSelectedExperts, mUseFinalScale ? mScaleProbs : nullptr,
             mExpertWeight1, mExpertBias1, mActType, mExpertWeight2, mExpertBias2, mQuantParams, mTotalTokens,
             mHiddenSize, mInterSize, mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap,
             parallelism_config, /*enable_alltoall=*/false, mUseLora, mLoraParams,
