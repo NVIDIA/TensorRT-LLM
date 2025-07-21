@@ -151,11 +151,7 @@ class KvCacheCreator:
         )
         return total_extra_bytes
 
-    def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
-                        alloc_kv_tokens: int) -> int:
-        """
-        Calculate the max KV cache capacity.
-        """
+    def _get_kv_size_per_token(self):
         model_config = self._model_engine.model.model_config
         mapping = self._mapping
         kv_size_per_token = self._get_cache_size_per_token(
@@ -164,6 +160,14 @@ class KvCacheCreator:
             draft_model_config = self._draft_model_engine.model.model_config
             kv_size_per_token += self._get_cache_size_per_token(
                 draft_model_config, mapping)
+        return kv_size_per_token
+
+    def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
+                        alloc_kv_tokens: int) -> int:
+        """
+        Calculate the max KV cache capacity.
+        """
+        kv_size_per_token = self._get_kv_size_per_token()
 
         available_kv_mem = (total_gpu_memory - peak_memory +
                             alloc_kv_tokens * kv_size_per_token) * fraction
@@ -328,23 +332,42 @@ class KvCacheCreator:
             peak_memory, total_gpu_memory, fraction,
             kv_stats.max_num_blocks * kv_stats.tokens_per_block)
 
+        max_attention_window = executor_config.kv_cache_config.max_attention_window
+        is_vswa = max_attention_window and len(max_attention_window) > 1
+
+        # NOTE:
+        # KvCacheCreator currently controls KV-cache capacity using two parameters in KVCacheConfig:
+        #   • max_tokens
+        #   • max_gpu_total_bytes
+        # Ideally, the internal logic would rely solely on max_gpu_total_bytes,
+        # leaving max_tokens as a user-defined constraint.
+
+        # ---------------------------handle max_tokens---------------------------------
         # if user provided max_tokens, calculate max memory from max_tokens
         if self._max_kv_tokens_in is not None:
             # raise error if it is VSWA case
-            max_attention_window = executor_config.kv_cache_config.max_attention_window
-            if max_attention_window and len(max_attention_window) > 1:
+            if is_vswa:
                 logger.warning(
                     "max_tokens should not be set for VSWA case as it is ambiguous concept for VSWA."
                 )
             # calculate max memory from max_tokens
-            kv_cache_max_memory_from_max_tokens = self._max_kv_tokens_in * self._get_cache_size_per_token(
-                self._model_engine.model.model_config, self._mapping)
+            kv_cache_max_memory_from_max_tokens = self._max_kv_tokens_in * self._get_kv_size_per_token(
+            )
             kv_cache_max_memory = min(kv_cache_max_memory,
                                       kv_cache_max_memory_from_max_tokens)
             logger.info(
                 f"max_tokens is provided, max_memory is set to {kv_cache_max_memory / (GB):.2f} GiB"
             )
+        if is_vswa:
+            # For VSWA KvCacheManager now it can only use max_gpu_total_bytes
+            executor_config.kv_cache_config.max_tokens = None
+        else:
+            # For non-VSWA KvCacheManager, its logic still relies on max_tokens, need to improve in the future.
+            executor_config.kv_cache_config.max_tokens = int(
+                kv_cache_max_memory // self._get_kv_size_per_token())
+        # ---------------------------handle max_tokens---------------------------------
 
+        # ---------------------------handle max_gpu_total_bytes---------------------------------
         # if user provided max_gpu_total_bytes, set max memory from max_gpu_total_bytes
         if executor_config.kv_cache_config.max_gpu_total_bytes > 0:
             kv_cache_max_memory = min(
@@ -357,10 +380,9 @@ class KvCacheCreator:
         logger.info(
             f"Estimated max memory in KV cache : {kv_cache_max_memory / (GB):.2f} GiB"
         )
-        # KvCacheManager will only use max_gpu_total_bytes, make sure max_tokens is None.
-        executor_config.kv_cache_config.max_tokens = None
         # set max_gpu_total_bytes
         executor_config.kv_cache_config.max_gpu_total_bytes = kv_cache_max_memory
+        # ---------------------------handle max_gpu_total_bytes---------------------------------
 
     def _create_kv_cache_manager(
             self, model_engine: PyTorchModelEngine) -> KVCacheManager:
