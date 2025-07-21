@@ -193,7 +193,6 @@ Evaluate the model accuracy using `trtllm-eval`.
 1. (Optional) Prepare an advanced configuration file:
 ```bash
 cat >./extra-llm-api-config.yml <<EOF
-cuda_graph_config: {}
 enable_attention_dp: true
 EOF
 ```
