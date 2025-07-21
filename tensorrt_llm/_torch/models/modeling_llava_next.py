@@ -1,6 +1,6 @@
 import copy
 import os
-from typing import List, Optional, Tuple, Dict
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -195,7 +195,11 @@ class LlavaNextInputProcessor(InputProcessor):
         mm_features = mm_features.view(-1, mm_features.shape[-1])
         return fused_input_ids, mm_features
 
-    def attch_multimodal_embeddings(self, inputs: TextPrompt, multimodal_embedding: Dict[str, List[torch.Tensor]], sampling_params: SamplingParams) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+    def attch_multimodal_embeddings(
+        self, inputs: TextPrompt,
+        multimodal_embedding: Dict[str, List[torch.Tensor]],
+        sampling_params: SamplingParams
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         """
         Attach pre-processed multimodal embeddings into text token stream for Llama4 model.
 
@@ -216,7 +220,8 @@ class LlavaNextInputProcessor(InputProcessor):
 
         input_ids = self.tokenizer(
             text_prompt, return_tensors="pt").input_ids[0].to(self.device)
-        fused_input_ids, mm_features = self._postprocess(input_ids, multimodal_embedding['image'])
+        fused_input_ids, mm_features = self._postprocess(
+            input_ids, multimodal_embedding['image'])
         multimodal_data = {}
         multimodal_data["multimodal_embedding"] = mm_features
         return fused_input_ids.to(torch.int32).tolist(), {

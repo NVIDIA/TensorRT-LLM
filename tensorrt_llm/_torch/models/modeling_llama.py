@@ -1,6 +1,5 @@
 import copy
-import os
-from typing import Dict, List, Optional, Tuple, Union, Any
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from PIL.Image import Image
@@ -809,7 +808,7 @@ class Llama4InputProcessor(InputProcessor):
         self.vocab_size = model_config.text_config.vocab_size
         self.image_token_index = model_config.image_token_index
         # TODO: use tokenizer to get these special tokens/values
-        self.fake_image_token = "<|image|>" # this must be the same as placeholder prompt
+        self.fake_image_token = "<|image|>"  # this must be the same as placeholder prompt
         self.image_token = "<|patch|>"
         self.image_token_start_index = 200080
         self.image_token_end_index = 200081
@@ -822,7 +821,12 @@ class Llama4InputProcessor(InputProcessor):
         }).cuda()
         load_sharded_checkpoint(self.encoder, model_path, strict=False)
 
-    def attch_multimodal_embeddings(self, inputs: TextPrompt, multimodal_embedding: Dict[str, List[Dict[str, Any]]], sampling_params: SamplingParams) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+    def attch_multimodal_embeddings(
+        self, inputs: TextPrompt, multimodal_embedding: Dict[str,
+                                                             List[Dict[str,
+                                                                       Any]]],
+        sampling_params: SamplingParams
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         """
         Attach pre-processed multimodal embeddings into text token stream for Llama4 model.
 
@@ -851,15 +855,26 @@ class Llama4InputProcessor(InputProcessor):
 
         mm_embedding_info = multimodal_embedding['image']
         if not mm_embedding_info or not isinstance(mm_embedding_info[0], dict):
-            raise ValueError("Llama4 image embedding must contain special token information")
+            raise ValueError(
+                "Llama4 image embedding must contain special token information")
 
         # Extract embedding components
         try:
-            mm_embeddings = [mm_embedding['mm_embeddings'] for mm_embedding in mm_embedding_info]
-            mm_embedding_special_tokens = [mm_embedding['image_special_tokens'] for mm_embedding in mm_embedding_info]
-            mm_embedding_special_offsets = [mm_embedding['image_special_token_offsets'] for mm_embedding in mm_embedding_info]
+            mm_embeddings = [
+                mm_embedding['mm_embeddings']
+                for mm_embedding in mm_embedding_info
+            ]
+            mm_embedding_special_tokens = [
+                mm_embedding['image_special_tokens']
+                for mm_embedding in mm_embedding_info
+            ]
+            mm_embedding_special_offsets = [
+                mm_embedding['image_special_token_offsets']
+                for mm_embedding in mm_embedding_info
+            ]
         except KeyError as e:
-            raise ValueError(f"Missing required key in multimodal embedding: {e}")
+            raise ValueError(
+                f"Missing required key in multimodal embedding: {e}")
 
         # Validate embedding dimensions
         model_hidden_size = self.model_config.text_config.hidden_size
@@ -867,19 +882,19 @@ class Llama4InputProcessor(InputProcessor):
             if embedding.shape[-1] != model_hidden_size:
                 raise ValueError(
                     f"Multimodal embedding {i} hidden size {embedding.shape[-1]} "
-                    f"must match model hidden size {model_hidden_size}"
-                )
+                    f"must match model hidden size {model_hidden_size}")
 
         # Count image placeholders (number of images) in the prompt
         total_placeholders = text_prompt.count(self.fake_image_token)
         if total_placeholders == 0:
-            raise ValueError("No image placeholders found in the prompt, but multimodal embedding was provided")
+            raise ValueError(
+                "No image placeholders found in the prompt, but multimodal embedding was provided"
+            )
 
         if total_placeholders != len(mm_embeddings):
             raise ValueError(
                 f"Number of image placeholders ({total_placeholders}) "
-                f"does not match number of embeddings ({len(mm_embeddings)})"
-            )
+                f"does not match number of embeddings ({len(mm_embeddings)})")
 
         # Process prompt with image embeddings
         prompt_splits = text_prompt.split(self.fake_image_token)
@@ -890,14 +905,16 @@ class Llama4InputProcessor(InputProcessor):
 
             if local_image_index < total_placeholders:
                 # Calculate total tokens for this image
-                num_tokens = len(mm_embeddings[local_image_index]) + len(mm_embedding_special_tokens[local_image_index])
+                num_tokens = len(mm_embeddings[local_image_index]) + len(
+                    mm_embedding_special_tokens[local_image_index])
 
                 # Create image token sequence
                 image_tokens = [self.image_token] * num_tokens
 
                 # Replace special tokens with actual decoded tokens
-                for offset, token_id in zip(mm_embedding_special_offsets[local_image_index],
-                                          mm_embedding_special_tokens[local_image_index]):
+                for offset, token_id in zip(
+                        mm_embedding_special_offsets[local_image_index],
+                        mm_embedding_special_tokens[local_image_index]):
                     if offset < len(image_tokens):
                         image_tokens[offset] = self.tokenizer.decode([token_id])
 
@@ -911,14 +928,18 @@ class Llama4InputProcessor(InputProcessor):
         if sampling_params.truncate_prompt_tokens is not None:
             kwargs = dict(truncation=True,
                           max_length=sampling_params.truncate_prompt_tokens)
-        text_inputs = self.tokenizer(processed_text, add_special_tokens=sampling_params.add_special_tokens, **kwargs)
+        text_inputs = self.tokenizer(
+            processed_text,
+            add_special_tokens=sampling_params.add_special_tokens,
+            **kwargs)
         token_ids = text_inputs.input_ids.squeeze()
 
         # Replace image token indices with out-of-vocabulary tokens
         token_ids[token_ids == self.image_token_index] = self.vocab_size + 1
         # Concatenate all multimodal embeddings
         multimodal_data = {}
-        multimodal_data["multimodal_embedding"] = torch.cat(mm_embeddings, dim=0)
+        multimodal_data["multimodal_embedding"] = torch.cat(mm_embeddings,
+                                                            dim=0)
         return token_ids.tolist(), {"multimodal_data": multimodal_data}
 
     @torch.inference_mode()

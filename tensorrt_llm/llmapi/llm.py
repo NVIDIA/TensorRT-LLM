@@ -341,11 +341,10 @@ class BaseLLM:
 
         inputs = prompt_inputs(inputs)
 
-        if not inputs.get("prompt") and inputs.get(
-                "prompt_token_ids") and (inputs.get(
-                    "multi_modal_data") or inputs.get(
-                        "multi_modal_embeddings")) and not isinstance(
-                        self.input_processor, DefaultInputProcessor):
+        if not inputs.get("prompt") and inputs.get("prompt_token_ids") and (
+                inputs.get("multi_modal_data")
+                or inputs.get("multi_modal_embeddings")) and not isinstance(
+                    self.input_processor, DefaultInputProcessor):
             # VLMs need to process/tokenize the prompt in their own way
             prompt = self.tokenizer.decode(inputs['prompt_token_ids'])
             inputs = TextPrompt(
@@ -380,7 +379,8 @@ class BaseLLM:
                         inputs, sampling_params)
             elif 'multi_modal_embeddings' in inputs:
                 mm_embedding_info = inputs['multi_modal_embeddings']
-                prompt_token_ids, extra_processed_inputs = self.input_processor.attch_multimodal_embeddings(inputs, mm_embedding_info, sampling_params)
+                prompt_token_ids, extra_processed_inputs = self.input_processor.attch_multimodal_embeddings(
+                    inputs, mm_embedding_info, sampling_params)
             else:
                 with nvtx_range_debug("input_processor"):
                     prompt_token_ids, extra_processed_inputs = self.input_processor(
@@ -395,7 +395,8 @@ class BaseLLM:
                     multimodal_data=extra_processed_inputs.get(
                         'multimodal_data'))
                 # Convert to shared tensor handle to reduce IPC overhead
-                multimodal_params.to_handle("multimodal_data", key="multimodal_embedding")
+                multimodal_params.to_handle("multimodal_data",
+                                            key="multimodal_embedding")
                 # Only pass it if it has content
                 if not multimodal_params.has_content():
                     multimodal_params = None

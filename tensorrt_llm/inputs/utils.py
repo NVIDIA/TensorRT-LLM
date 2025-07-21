@@ -480,13 +480,16 @@ def default_multimodal_input_loader(
         media: Union[List[str], List[List[str]]],
         image_data_format: str = "pt",
         num_frames: int = 8,
-        mm_embeddings: Optional[Union[List[torch.Tensor], List[Dict[str, Any]]]] = None,
+        mm_embeddings: Optional[Union[List[torch.Tensor],
+                                      List[Dict[str, Any]]]] = None,
         device: str = "cpu") -> List[dict[str, Union[str, torch.Tensor]]]:
 
-    def convert_to_conversation_message(prompt: str, media: Union[str,
-                                                                  List[str]],
-                                        modality: str,
-                                        mm_embedding: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None) -> ConversationMessage:
+    def convert_to_conversation_message(
+        prompt: str,
+        media: Union[str, List[str]],
+        modality: str,
+        mm_embedding: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None
+    ) -> ConversationMessage:
         if isinstance(media, str):
             media = [media]
         if modality == "image":
@@ -495,13 +498,17 @@ def default_multimodal_input_loader(
                 if not isinstance(mm_embedding, list):
                     mm_embedding = [mm_embedding]
 
-                mm_data = [{'modality': modality, 'mm_embedding_info': mm} for mm in mm_embedding]
+                mm_data = [{
+                    'modality': modality,
+                    'mm_embedding_info': mm
+                } for mm in mm_embedding]
             else:
                 mm_data = [
                     MultimodalData(modality=modality,
-                                data=load_image(i,
-                                                format=image_data_format,
-                                                device=device)) for i in media
+                                   data=load_image(i,
+                                                   format=image_data_format,
+                                                   device=device))
+                    for i in media
                 ]
         elif modality == "video":
             mm_data = [
@@ -563,17 +570,20 @@ def default_multimodal_input_loader(
     for prompt_idx, (prompt, media) in enumerate(zip(prompts, media)):
         if mm_embeddings is not None:
             mm_embedding = mm_embeddings[prompt_idx]
-            conv = convert_to_conversation_message(prompt, media, modality, mm_embedding)
+            conv = convert_to_conversation_message(prompt, media, modality,
+                                                   mm_embedding)
         else:
             conv = convert_to_conversation_message(prompt, media, modality)
         mm_data_tracker = MultimodalDataTracker(model_type)
         for mdata in conv["media"]:
             # Check if mdata is a MultimodalData
-            if isinstance(mdata, dict) and "modality" in mdata and "data" in mdata:
+            if isinstance(mdata,
+                          dict) and "modality" in mdata and "data" in mdata:
                 mm_data_tracker.add_data(mdata["modality"], mdata["data"])
             else:
                 # Add embeddings to the tracker for placeholder handling
-                mm_data_tracker.add_data(mdata["modality"], mdata["mm_embedding_info"])
+                mm_data_tracker.add_data(mdata["modality"],
+                                         mdata["mm_embedding_info"])
         mm_placeholder_counts = mm_data_tracker.placeholder_counts()
         prompt = conv["content"]
         if mm_placeholder_counts:
@@ -589,13 +599,17 @@ def default_multimodal_input_loader(
 
         if mm_embeddings is not None:
             inputs.append({
-                "prompt": prompt,
-                "multi_modal_embeddings": mm_data_tracker.retrieve_all_sync()
+                "prompt":
+                prompt,
+                "multi_modal_embeddings":
+                mm_data_tracker.retrieve_all_sync()
             })
         else:
             inputs.append({
-                "prompt": prompt,
-                "multi_modal_data": mm_data_tracker.retrieve_all_sync()
+                "prompt":
+                prompt,
+                "multi_modal_data":
+                mm_data_tracker.retrieve_all_sync()
             })
 
     return inputs
