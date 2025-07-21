@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import sys
 from typing import Optional
 
 import click
@@ -30,21 +31,22 @@ from ..logger import logger, severity_map
 @click.group()
 @click.option(
     "--model",
-    required=True,
+    default=None,
     type=str,
-    help="model name | HF checkpoint path | TensorRT engine path",
+    help="HF model name | HF checkpoint path | TensorRT engine path",
 )
 @click.option("--tokenizer",
               type=str,
               default=None,
               help="Path | Name of the tokenizer."
               "Specify this value only if using TensorRT engine as model.")
-@click.option("--backend",
-              type=click.Choice(["pytorch", "tensorrt"]),
-              default="pytorch",
-              help="Set to 'pytorch' for pytorch path. Default is cpp path.")
+@click.option(
+    "--backend",
+    type=click.Choice(["pytorch", "tensorrt"]),
+    default="pytorch",
+    help="Set to 'tensorrt' for TensorRT backend. Default is PyTorch backend.")
 @click.option('--log_level',
-              type=click.Choice(severity_map.keys()),
+              type=click.Choice(list(severity_map.keys())),
               default='info',
               help="The logging level.")
 @click.option("--max_beam_width",
@@ -102,17 +104,17 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
          ep_size: Optional[int], gpus_per_node: Optional[int],
          kv_cache_free_gpu_memory_fraction: float, trust_remote_code: bool,
          extra_llm_api_options: Optional[str]):
+    if any(arg in ctx.help_option_names for arg in sys.argv):
+        return
+    if model is None:
+        raise ValueError(
+            "model (HF model name | HF checkpoint path | TensorRT engine path) is required."
+        )
+
     logger.set_level(log_level)
-    build_config = BuildConfig(max_batch_size=max_batch_size,
-                               max_num_tokens=max_num_tokens,
-                               max_beam_width=max_beam_width,
-                               max_seq_len=max_seq_len)
 
     kv_cache_config = KvCacheConfig(
         free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction)
-
-    if backend == "tensorrt":
-        backend = None
 
     llm_args = {
         "model": model,
@@ -122,9 +124,12 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
         "moe_expert_parallel_size": ep_size,
         "gpus_per_node": gpus_per_node,
         "trust_remote_code": trust_remote_code,
-        "build_config": build_config,
+        "max_batch_size": max_batch_size,
+        "max_num_tokens": max_num_tokens,
+        "max_beam_width": max_beam_width,
+        "max_seq_len": max_seq_len,
         "kv_cache_config": kv_cache_config,
-        "backend": backend,
+        "backend": None if backend == "tensorrt" else backend,
     }
 
     if extra_llm_api_options is not None:

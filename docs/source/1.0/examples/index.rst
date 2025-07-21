@@ -1,5 +1,5 @@
 =======================================================
-LLM Examples Introduction(trtllm-6068)
+LLM Examples Introduction
 =======================================================
 
 Here is a simple example to show how to use the LLM with TinyLlama.
@@ -14,7 +14,7 @@ The LLM API can be used for both offline or online usage. See more examples of t
     :maxdepth: 1
     :caption: LLM API Examples
 
-
+    %EXAMPLE_DOCS%
 
 For more details on how to fully utilize this API, check out:
 
