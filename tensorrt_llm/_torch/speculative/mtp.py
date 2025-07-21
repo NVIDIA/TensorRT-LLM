@@ -232,7 +232,7 @@ class MTPSampler(TorchSampler):
         assert not request.py_return_context_logits, "return_context_logits not implemented for MTPSampler"
         assert not request.py_return_generation_logits, "return_generation_logits not implemented for MTPSampler"
         assert not request.py_return_log_probs, "return_log_probs not implemented for MTPSampler"
-        request.py_draft_tokens = next_draft_tokens[request.seq_slot]
+        request.py_draft_tokens = next_draft_tokens[request.py_seq_slot]
         request.py_decoding_iter += 1
 
     def update_requests(self, state: SampleStateMTP) -> None:
@@ -253,7 +253,7 @@ class MTPSampler(TorchSampler):
         for req in state.scheduled_requests.generation_requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
-            num_new_tokens = new_tokens_lens[req.seq_slot]
+            num_new_tokens = new_tokens_lens[req.py_seq_slot]
             for i in range(num_new_tokens):
                 new_token = add_token(req, new_tokens, beam=beam_idx, step=i)
                 if self._handle_stop_criteria(req, new_token):
@@ -269,7 +269,7 @@ class MTPSampler(TorchSampler):
         # next_new_tokens_device: input tokens for the next iteration, device tensor, shape: batch_size, nextn + 1
 
         requests = scheduled_requests.all_requests()
-        slots = torch.as_tensor([r.seq_slot for r in requests])
+        slots = torch.as_tensor([r.py_seq_slot for r in requests])
         slots = slots.to(device="cuda", non_blocking=True)
 
         o_new_tokens = outputs['new_tokens'][:len(requests)]

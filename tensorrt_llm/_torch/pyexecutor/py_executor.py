@@ -258,12 +258,6 @@ class PyExecutor:
             ResourceManagerType.KV_CACHE_MANAGER)
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
 
-        if self.draft_model_engine is not None and self.kv_cache_manager is not None:
-            if self.kv_cache_manager.enable_block_reuse:
-                raise NotImplementedError(
-                    "Draft model engine + KV cache reuse is not supported yet. "
-                    "This will be fixed in the near future!")
-
         self.max_input_len = max_input_len
         # _executor_loop private data
         self.max_num_active_requests = model_engine.get_max_num_sequences()

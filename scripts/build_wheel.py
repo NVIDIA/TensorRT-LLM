@@ -298,7 +298,6 @@ def main(*,
          install: bool = False,
          skip_building_wheel: bool = False,
          linking_install_binary: bool = False,
-         python_bindings: bool = True,
          binding_type: str = "pybind",
          benchmarks: bool = False,
          micro_benchmarks: bool = False,
@@ -860,11 +859,6 @@ def add_arguments(parser: ArgumentParser):
         "--linking_install_binary",
         action="store_true",
         help="Install the built binary by symbolic linking instead of copying.")
-    parser.add_argument(
-        "--python_bindings",
-        "-p",
-        action="store_true",
-        help="(deprecated) Build the python bindings for the C++ runtime.")
     parser.add_argument("--binding_type",
                         choices=["pybind", "nanobind"],
                         default="pybind",

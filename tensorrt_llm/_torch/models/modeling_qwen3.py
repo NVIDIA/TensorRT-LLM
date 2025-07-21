@@ -16,8 +16,9 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
-from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             register_auto_model)
+from ..speculative import SpecMetadata
+from .modeling_speculative import SpecDecOneEngineForCausalLM
+from .modeling_utils import DecoderModel, register_auto_model
 
 
 class Qwen3Attention(Attention):
@@ -148,6 +149,7 @@ class Qwen3DecoderLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
         mrope_config: Optional[Tuple[torch.Tensor, int]] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         if residual is None:
@@ -170,6 +172,10 @@ class Qwen3DecoderLayer(DecoderLayer):
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+
+        if spec_metadata is not None:
+            spec_metadata.maybe_capture_hidden_states(self.layer_idx,
+                                                      hidden_states, residual)
 
         return hidden_states, residual
 
@@ -207,6 +213,7 @@ class Qwen3Model(DecoderModel):
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         mrope_config: Optional[Tuple[torch.Tensor, int]] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -227,6 +234,7 @@ class Qwen3Model(DecoderModel):
                 attn_metadata=attn_metadata,
                 residual=residual,
                 mrope_config=mrope_config,
+                spec_metadata=spec_metadata,
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
@@ -234,7 +242,7 @@ class Qwen3Model(DecoderModel):
 
 
 @register_auto_model("Qwen3ForCausalLM")
-class Qwen3ForCausalLM(DecoderModelForCausalLM[Qwen3Model, Qwen3Config]):
+class Qwen3ForCausalLM(SpecDecOneEngineForCausalLM[Qwen3Model, Qwen3Config]):
 
     def __init__(
         self,
@@ -242,33 +250,5 @@ class Qwen3ForCausalLM(DecoderModelForCausalLM[Qwen3Model, Qwen3Config]):
     ):
         super().__init__(
             Qwen3Model(model_config),
-            config=model_config,
-            hidden_size=model_config.pretrained_config.hidden_size,
-            vocab_size=model_config.pretrained_config.vocab_size,
-        )
-
-    # NOTE: Qwen2-VL needs special mrope_config so adding separate forward() function to accept 'mrope_config'.
-    def forward(
-        self,
-        attn_metadata: AttentionMetadata,
-        input_ids: torch.IntTensor = None,
-        position_ids: Optional[torch.IntTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        return_context_logits: bool = False,
-        mrope_config: Optional[dict] = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        output = self.model(
-            input_ids=input_ids,
-            attn_metadata=attn_metadata,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            mrope_config=mrope_config,
-        )
-
-        return self.logits_processor.forward(
-            output,
-            self.lm_head,
-            attn_metadata,
-            return_context_logits,
+            model_config,
         )

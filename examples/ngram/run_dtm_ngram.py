@@ -23,12 +23,12 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime import ModelRunnerCpp
 
 
-class PLDPool:  # Ngrams pool for Prompt-Lookup-Decoding
+class NgramPool:  # Ngrams pool for Ngram
 
     def __init__(
         self,
         input_batch_size: int,
-        prompt_lookup_num_tokens: int,
+        max_draft_len: int,
         max_matching_ngram_size: int,
         end_id: int,
         max_seq_len: list[int],
@@ -36,7 +36,7 @@ class PLDPool:  # Ngrams pool for Prompt-Lookup-Decoding
         is_use_oldest: bool = True,
     ):
         self.input_batch_size = input_batch_size
-        self.prompt_lookup_num_tokens = prompt_lookup_num_tokens
+        self.max_draft_len = max_draft_len
         self.max_matching_ngram_size = max_matching_ngram_size
         self.end_id = end_id
         self.max_seq_len = max_seq_len
@@ -45,7 +45,7 @@ class PLDPool:  # Ngrams pool for Prompt-Lookup-Decoding
         self.pool = [{} for _ in range(input_batch_size)]
         self.start_index = [0 for _ in range(input_batch_size)]
 
-        assert self.prompt_lookup_num_tokens > 0, f"prompt_lookup_num_tokens must be greater than 0, but got {self.prompt_lookup_num_tokens}"
+        assert self.max_draft_len > 0, f"max_draft_len must be greater than 0, but got {self.max_draft_len}"
         assert self.max_matching_ngram_size > 0, f"max_matching_ngram_size must be greater than 0, but got {self.max_matching_ngram_size}"
 
     def print_pool(self):
@@ -82,16 +82,15 @@ class PLDPool:  # Ngrams pool for Prompt-Lookup-Decoding
                     -1):
                 # Find each possible key-value combination, and use tuple for hash
                 for l in range(len(sequence) - size):
-                    r = min(l + size + self.prompt_lookup_num_tokens,
-                            len(sequence))
+                    r = min(l + size + self.max_draft_len, len(sequence))
                     key = tuple(sequence[l:l + size])
                     value = tuple(sequence[l + size:r])
                     if key not in self.pool[gbi] or not self.is_keep_all or \
-                        len(self.pool[gbi][key][0]) < self.prompt_lookup_num_tokens:
+                        len(self.pool[gbi][key][0]) < self.max_draft_len:
                         # Update the value if
                         # 1. the key does not exist
                         # 2. we only keep the newest one value for each key (MRU)
-                        # 3. the length of the value saved before is less than `prompt_lookup_num_tokens`
+                        # 3. the length of the value saved before is less than `max_draft_len`
                         self.pool[gbi][key] = OrderedSet((value, ))
                     elif value not in self.pool[gbi][key]:
                         # Extend the value if the key is already existed but count of values is not enough
@@ -113,26 +112,26 @@ class PLDPool:  # Ngrams pool for Prompt-Lookup-Decoding
                 break
             draft_tokens.append(chosen_ids)
             self.start_index[gbi] = max(
-                0, prefix_len[bi] - (self.prompt_lookup_num_tokens +
-                                     self.max_matching_ngram_size - 1))
+                0, prefix_len[bi] -
+                (self.max_draft_len + self.max_matching_ngram_size - 1))
 
         return draft_tokens, None
 
 
-def run_dtm_pld(batch_input_ids,
-                args,
-                runtime_rank,
-                end_id,
-                pad_id,
-                stop_words_list,
-                bad_words_list,
-                vocab_size,
-                *,
-                target_runner=None):
-    # `dtm` for Draft-Target-Model, `pld` for Prompt-Lookup-Decoding
+def run_dtm_ngram(batch_input_ids,
+                  args,
+                  runtime_rank,
+                  end_id,
+                  pad_id,
+                  stop_words_list,
+                  bad_words_list,
+                  vocab_size,
+                  *,
+                  target_runner=None):
+    # `dtm` for Draft-Target-Model, `ngram` for NGram
     is_dtm = (args.draft_target_model_config is not None)
-    is_pld = (args.prompt_lookup_config is not None)
-    assert is_dtm ^ is_pld, "`--draft_target_model_config` and `--prompt_lookup_config` can not be specified at the same time."
+    is_ngram = (args.ngram_config is not None)
+    assert is_dtm ^ is_ngram, "`--draft_target_model_config` and `--ngram_config` can not be specified at the same time."
     if is_dtm:
         assert args.draft_engine_dir is not None, "`--draft_engine_dir` must be specified in Draft-Target-Model."
         draft_len, draft_device_list, target_device_list, use_logits = ast.literal_eval(
@@ -142,12 +141,11 @@ def run_dtm_pld(batch_input_ids,
         logger.info(f"Device(s) for draft model: {draft_device_list}")
         logger.info(f"Device(s) for target model: {target_device_list}")
         logger.info(f"Use logits to accept tokens: {use_logits}")
-    if is_pld:
-        logger.info(
-            f"Using Prompt-Lookup-Decoding speculative decoding V1 workflow")
-        prompt_lookup_num_tokens, max_matching_ngram_size, target_device_list = ast.literal_eval(
-            args.prompt_lookup_config)
-        logger.info(f"prompt_lookup_num_tokens: {prompt_lookup_num_tokens}")
+    if is_ngram:
+        logger.info(f"Using NGram speculative decoding V1 workflow")
+        max_draft_len, max_matching_ngram_size, target_device_list = ast.literal_eval(
+            args.ngram_config)
+        logger.info(f"max_draft_len: {max_draft_len}")
         logger.info(f"max_matching_ngram_size: {max_matching_ngram_size}")
         logger.info(f"Device(s) for the model: {target_device_list}")
         use_logits = False  # `logits` is useless in this approach yet
@@ -166,9 +164,9 @@ def run_dtm_pld(batch_input_ids,
         n_draft_token = [0 for _ in range(input_batch_size)]
         n_accept_token = [0 for _ in range(input_batch_size)]
 
-    if is_pld:
-        pld_pool = PLDPool(input_batch_size, prompt_lookup_num_tokens,
-                           max_matching_ngram_size, end_id, max_seq_len)
+    if is_ngram:
+        ngram_pool = NgramPool(input_batch_size, max_draft_len,
+                               max_matching_ngram_size, end_id, max_seq_len)
 
     # Repack the output like the output of function `generate`
     outputs = {}
@@ -297,8 +295,8 @@ def run_dtm_pld(batch_input_ids,
                 if use_logits:
                     d_logits[bi] = draft["generation_logits"][bi, 0,
                                                               -d_len[bi]:, :]
-        if is_pld:
-            d_ids, d_logits = pld_pool.get_draft_tokens(prefix, batch_slot)
+        if is_ngram:
+            d_ids, d_logits = ngram_pool.get_draft_tokens(prefix, batch_slot)
             d_len = [len(i) for i in d_ids]
 
         # Run target model
@@ -310,8 +308,8 @@ def run_dtm_pld(batch_input_ids,
                                         draft_logits_list=d_logits)
         if is_dtm:
             max_new_tokens = draft_len + 1
-        if is_pld:
-            max_new_tokens = prompt_lookup_num_tokens + 1
+        if is_ngram:
+            max_new_tokens = max_draft_len + 1
         target_generation_kwargs.update(max_new_tokens=max_new_tokens)
         target = target_runner.generate(**target_generation_kwargs)
         torch.cuda.synchronize()

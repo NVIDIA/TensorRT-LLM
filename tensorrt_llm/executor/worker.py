@@ -150,13 +150,23 @@ class GenerationExecutorWorker(GenerationExecutor):
             self._runtime_model_config = _engine_config_to_model_config(
                 engine_config)
             if engine_config.build_config.plugin_config.lora_plugin:
-                self._lora_manager = LoraManager()
+                # TODO(azuker): Passing peft cache manager to LoraManager is used for LoRA optimization
+                # (see LoraManager constructor docstring). Getting the peft cache manager from this
+                # point in the TRT flow is currently not supported (it's at the CPP
+                # Executor->ExecutorImpl->TrtGptModel->mPeftCacheManager) therefore for now this LoRA
+                # optimization is not available in TRT-python flow.
+                self._lora_manager = LoraManager(cpp_peft_cache_manager=None)
             if engine_config.build_config.max_prompt_embedding_table_size > 0:
                 self._prompt_adapter_manager = PromptAdapterManager()
 
         if getattr(executor_config, "backend",
                    "") == "pytorch" and lora_config is not None:
-            self._lora_manager = LoraManager()
+            from tensorrt_llm._torch.pyexecutor.resource_manager import \
+                ResourceManagerType
+            peft_cache_manager = self.engine.resource_manager.resource_managers.get(
+                ResourceManagerType.PEFT_CACHE_MANAGER)
+            self._lora_manager = LoraManager(
+                cpp_peft_cache_manager=peft_cache_manager.impl)
             lora_model_config = self.engine.model_engine.lora_model_config
             assert lora_model_config is not None
             self._lora_model_config = lora_model_config
@@ -362,15 +372,16 @@ class GenerationExecutorWorker(GenerationExecutor):
     def _enqueue_request(self, request: GenerationRequest) -> int:
         assert request.id is not None
         if self._lora_manager is not None and request.lora_request is not None:
-            loaded_new_lora_adapter = self._load_lora_adapter(
-                request.lora_request)
+            adapter_in_cache = self._lora_manager.is_adapter_in_cpu_cache(
+                request.lora_request.adapter_id)
+            self._load_lora_adapter(request.lora_request)
             uid = str(request.lora_request.adapter_id)
             lora_config = tllm.LoraConfig(
                 task_id=request.lora_request.adapter_id,
                 weights=self._lora_manager.cpp_lora_weights[uid]
-                if loaded_new_lora_adapter else None,
+                if not adapter_in_cache else None,
                 config=self._lora_manager.cpp_lora_config[uid]
-                if loaded_new_lora_adapter else None)
+                if not adapter_in_cache else None)
         else:
             lora_config = None
 
