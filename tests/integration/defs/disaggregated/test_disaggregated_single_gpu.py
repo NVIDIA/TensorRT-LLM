@@ -240,11 +240,11 @@ def test_disaggregated_simple_qwen3(model, generation_overlap,
                                     enable_cuda_graph):
     verify_disaggregated(
         model, generation_overlap, enable_cuda_graph,
-        " What is the capital of Germany?",
-        " The capital of Germany is Berlin. \n\n2. What is the largest planet in our solar system? The largest planet in our",
+        " What is the capital of China?",
+        " The capital of China is Beijing. 2. What is the population of China? The population of China is about 1",
         [
-            576, 6722, 315, 9856, 374, 19846, 13, 4710, 17, 13, 3555, 374, 279,
-            7772, 11580, 304, 1039, 12941, 1849, 30, 576, 7772, 11580, 304, 1039
+            576, 6722, 315, 5616, 374, 26549, 13, 220, 17, 13, 3555, 374, 279,
+            7042, 315, 5616, 30, 576, 7042, 315, 5616, 374, 911, 220, 16
         ])
 
 
