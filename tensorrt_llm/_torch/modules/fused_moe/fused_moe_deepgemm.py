@@ -416,8 +416,22 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             masked_m=masked_m,
             expected_m=expected_m,
         )
-        h2 = swiglu_fused_moe(h1)
-        act_input_fp8, act_input_sf = fp8_utils.per_token_cast_to_fp8_e8m0(h2)
+        act_input_fp8 = torch.empty(h1.shape[0],
+                                    h1.shape[1],
+                                    h1.shape[2] // 2,
+                                    dtype=torch.float8_e4m3fn,
+                                    device='cuda')
+        act_input_sf = torch.empty(h1.shape[0],
+                                   h1.shape[1],
+                                   h1.shape[2] // 256,
+                                   dtype=torch.float32,
+                                   device='cuda')
+        fp8_utils.silu_and_mul_masked_post_quant_fwd(input=h1,
+                                                     output=act_input_fp8,
+                                                     output_scale=act_input_sf,
+                                                     quant_group_size=128,
+                                                     masked_m=masked_m,
+                                                     scale_ue8m0=True)
         h3 = deepgemm_fp8_group_blockwise_gemm(
             a=act_input_fp8,
             b=self.w2_weight,
