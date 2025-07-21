@@ -135,7 +135,14 @@ void tma_warp_specialized_generic_moe_gemm_kernelLauncher(TmaWarpSpecializedGrou
 #ifndef COMPILE_BLACKWELL_SM103_TMA_GROUPED_GEMMS
     else if constexpr (ArchTag::kMinComputeCapability == 103)
     {
-        TLLM_THROW("Please recompile with support for blackwell by passing 103-real as an arch to build_wheel.py.");
+        static bool first_time = true;
+        if (first_time)
+        {
+            TLLM_LOG_WARNING(
+                "Falling back to sm100f version. For best performance please recompile with support for blackwell by "
+                "passing 103-real as an arch to build_wheel.py.");
+            first_time = false;
+        }
     }
 #endif
 #ifndef COMPILE_BLACKWELL_SM120_TMA_GROUPED_GEMMS
@@ -344,13 +351,8 @@ using SafeBF16 = void;
             using EpilogueScheduleSM90 = cutlass::epilogue::PtrArrayNoSmemWarpSpecialized;                                                                                                                                                        \
                                                                                                                                                                                                                                                   \
             constexpr static bool Is2SM = IsBlackwell && (cute::size<0>(ClusterShape{}) % 2) == 0;                                                                                                                                                \
-            using EpilogueScheduleSM100 = std::conditional_t<Is2SM, cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm,                                                                                                                             \
+            using EpilogueScheduleSM10x = std::conditional_t<Is2SM, cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm,                                                                                                                             \
                 cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm>;                                                                                                                                                                                \
-            using EpilogueScheduleSM103                                                                                                                                                                                                           \
-                = std::conditional_t<Is2SM, cutlass::epilogue::PtrArrayNoSmemWarpSpecialized2Sm,                                                                                                                                                  \
-                    cutlass::epilogue::PtrArrayNoSmemWarpSpecialized1Sm>;                                                                                                                                                                         \
-            using EpilogueScheduleSM10x                                                                                                                                                                                                           \
-                = std::conditional_t<IsSM103FP4, EpilogueScheduleSM103, EpilogueScheduleSM100>;                                                                                                                                                   \
                                                                                                                                                                                                                                                   \
             using EpilogueScheduleSM120 = cutlass::epilogue::TmaWarpSpecialized;                                                                                                                                                                  \
             using EpilogueScheduleBW = std ::conditional_t<IsSM120, EpilogueScheduleSM120, EpilogueScheduleSM10x>;                                                                                                                                \

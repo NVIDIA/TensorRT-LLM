@@ -26,8 +26,8 @@ include(GoogleTest)
 include_directories(
   ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include
   ${PROJECT_SOURCE_DIR}/include
-  ${3RDPARTY_DIR}/dynamic-kernel-generator/cutlass/include
-  ${3RDPARTY_DIR}/dynamic-kernel-generator/cutlass/tools/util/include
+  ${3RDPARTY_DIR}/cutlass/include
+  ${3RDPARTY_DIR}/cutlass/tools/util/include
   ${PROJECT_SOURCE_DIR}/tests/batch_manager
   ${PROJECT_SOURCE_DIR}/tests/utils)
 

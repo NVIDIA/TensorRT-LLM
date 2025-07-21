@@ -105,7 +105,14 @@ void dispatchMoeGemmSelectBiasTmaWarpSpecialized(TmaWarpSpecializedGroupedGemmIn
 #ifndef COMPILE_BLACKWELL_SM103_TMA_GROUPED_GEMMS
     else if constexpr (Arch::kMinComputeCapability == 103)
     {
-        TLLM_THROW("Please recompile with support for blackwell by passing 103-real as an arch to build_wheel.py.");
+        static bool first_time = true;
+        if (first_time)
+        {
+            TLLM_LOG_WARNING(
+                "Falling back to sm100f version. For best performance please recompile with support for blackwell by "
+                "passing 103-real as an arch to build_wheel.py.");
+            first_time = false;
+        }
     }
 #endif
 #ifndef COMPILE_BLACKWELL_TMA_GROUPED_GEMMS

@@ -28,7 +28,7 @@ if(NOT Python3_EXECUTABLE)
 endif()
 
 execute_process(
-  WORKING_DIRECTORY ${3RDPARTY_DIR}/dynamic-kernel-generator/cutlass/python/
+  WORKING_DIRECTORY ${3RDPARTY_DIR}/cutlass/python/
   COMMAND ${Python3_EXECUTABLE} setup_library.py develop --user
   RESULT_VARIABLE _CUTLASS_LIBRARY_SUCCESS)
 
