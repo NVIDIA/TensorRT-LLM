@@ -590,7 +590,7 @@ def instantiate_sampler(engine: PyTorchModelEngine,
     if engine.spec_config is not None and engine.spec_config.spec_dec_mode.has_spec_decoder(
     ):
         return get_spec_decoder(sampler_args, engine.spec_config)
-    if pytorch_backend_config.enable_trtllm_sampler:
+    if pytorch_backend_config.enable_torch_sampler:
         decoding_mode = get_decoding_mode(executor_config)
         return TRTLLMSampler(executor_config, engine.model, engine.dtype,
                              mapping, decoding_mode,

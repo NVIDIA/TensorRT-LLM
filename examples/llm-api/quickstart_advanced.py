@@ -65,7 +65,7 @@ def add_llm_args(parser):
     parser.add_argument('--attention_dp_batching_wait_iters',
                         type=int,
                         default=0)
-    parser.add_argument('--enable_trtllm_sampler',
+    parser.add_argument('--use_torch_sampler',
                         default=False,
                         action='store_true')
     parser.add_argument('--tp_size', type=int, default=1)
@@ -227,7 +227,7 @@ def setup_llm(args, **kwargs):
                 args.use_piecewise_cuda_graph)
         if args.use_torch_compile else None,
         moe_config=MoeConfig(backend=args.moe_backend),
-        enable_trtllm_sampler=args.enable_trtllm_sampler,
+        enable_torch_sampler=args.enable_torch_sampler,
         max_seq_len=args.max_seq_len,
         max_batch_size=args.max_batch_size,
         max_num_tokens=args.max_num_tokens,

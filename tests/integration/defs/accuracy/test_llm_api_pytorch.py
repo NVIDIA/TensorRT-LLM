@@ -196,7 +196,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     def test_fp8_llm_sampler(self):
         model_path = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
-        with LLM(model_path, enable_trtllm_sampler=True,
+        with LLM(model_path, enable_torch_sampler=True,
                  max_batch_size=256) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
 
@@ -230,7 +230,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                   max_beam_width=max_beam_width,
                   max_batch_size=16,
                   max_seq_len=1024,
-                  enable_trtllm_sampler=True,
+                  enable_torch_sampler=False,
                   build_config=None)
 
         with llm:

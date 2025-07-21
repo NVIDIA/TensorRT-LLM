@@ -43,7 +43,7 @@ def llm(fixed_params, input_prompts):
             input_prompts
         ),  # use small batch size to prevent large buffers from possibly hiding wrong data accesses.
         max_seq_len=32,
-        enable_trtllm_sampler=True,
+        enable_torch_sampler=False,
         max_beam_width=fixed_params["max_beam_width"],
         disable_overlap_scheduler=True,
         cuda_graph_config=None,
