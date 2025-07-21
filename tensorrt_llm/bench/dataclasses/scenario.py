@@ -33,7 +33,7 @@ class BatchingConfiguration(BaseModel):
 
 
 class LlmRuntimeSpecification(BaseModel):
-    backend: Optional[Literal["pytorch", "_autodeploy", "tensorrt"]] = Field(
+    backend: Literal["pytorch", "_autodeploy", "tensorrt"] = Field(
         default="pytorch", description="The backend to use for benchmarking.")
     beam_width: Optional[int] = Field(
         default=None, description="The beam width to use for benchmarking.")
@@ -107,10 +107,16 @@ class TuningConstraints(BaseModel):
 
     @model_validator(mode="after")
     def validate_target_input_output_len(self) -> Self:
+        """Set the target input and output lengths if unspecified."""
         self.target_input_len = self.target_input_len or self.max_input_len
         self.target_output_len = self.target_output_len or self.max_output_len
 
         return self
+
+    @computed_field
+    def max_sequence_len(self) -> int:
+        """Compute the maximum sequence length."""
+        return max(self.max_input_len, self.max_output_len)
 
     @classmethod
     def from_dataset_metadata(cls,
@@ -353,7 +359,9 @@ class ScenarioSpecification(BaseModel):
                              f"{'\n'.join(invalid_values)}")
 
         if self.dataset_metadata is None:
-            logger.warning("Dataset metadata is not set, skipping max sequence length validation.")
+            logger.warning(
+                "Dataset metadata is not set, skipping max sequence length validation."
+            )
         else:
             # The engine config has a max sequence length, so we need to validate
             # that the dataset max sequence length is less than the engine max
@@ -460,12 +468,8 @@ class BenchmarkEnvironment(BaseModel):
         return self.get_bench_model_config().model_type
 
     def get_tllm_model_config(self) -> TllmModelConfig:
-        return TllmModelConfig.from_pretrained(
-            self.model_path,
-            trust_remote_code=True
-        )
+        return TllmModelConfig.from_pretrained(self.model_path,
+                                               trust_remote_code=True)
 
     def get_bench_model_config(self) -> ModelConfig:
         return get_model_config(self.model, self.checkpoint_path)
-
-

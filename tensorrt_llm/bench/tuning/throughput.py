@@ -1,10 +1,10 @@
 from typing import Any, Dict
 
-from tensorrt_llm._torch.pyexecutor.model_engine import validate_and_set_kv_cache_quant
+from tensorrt_llm._torch.pyexecutor.model_engine import \
+    validate_and_set_kv_cache_quant
 from tensorrt_llm.bench.build.build import get_benchmark_engine_settings
 from tensorrt_llm.bench.dataclasses.scenario import ScenarioSpecification
 from tensorrt_llm.bench.tuning import DefaultLlmHeuristic
-
 
 
 class PytMaxThroughputScenario(DefaultLlmHeuristic):
@@ -47,7 +47,7 @@ class PytMaxThroughputScenario(DefaultLlmHeuristic):
 
         # Update CUDA graph settings.
         cuda_graph_config = {
-            "padding_enabled": True,
+            "enable_padding": True,
             "max_batch_size": max_batch_size,
         }
 
@@ -72,6 +72,7 @@ class PytMaxThroughputScenario(DefaultLlmHeuristic):
 
 class TrtMaxThroughputScenario(DefaultLlmHeuristic):
     """Maximum throughput heuristic tuning for the TensorRT backend."""
+
     @classmethod
     def get_settings(cls, scenario: ScenarioSpecification) -> Dict[str, Any]:
         if scenario.mode == "benchmark":
@@ -82,7 +83,8 @@ class TrtMaxThroughputScenario(DefaultLlmHeuristic):
             raise ValueError(f"Invalid mode: {scenario.mode}")
 
     @classmethod
-    def get_benchmark_settings(cls, scenario: ScenarioSpecification) -> Dict[str, Any]:
+    def get_benchmark_settings(
+            cls, scenario: ScenarioSpecification) -> Dict[str, Any]:
         llm_args = super().get_settings(scenario)
         llm_args |= {
             "scheduler_config":
@@ -100,11 +102,12 @@ class TrtMaxThroughputScenario(DefaultLlmHeuristic):
                 multi_block_mode=True,
                 enable_context_fmha_fp32_acc=False,
             ),
-            "enable_chunked_prefill": True,
+            "enable_chunked_prefill":
+            True,
         }
         return llm_args
 
     @classmethod
-    def get_build_settings(cls, scenario: ScenarioSpecification) -> Dict[str, Any]:
+    def get_build_settings(cls,
+                           scenario: ScenarioSpecification) -> Dict[str, Any]:
         ...
-
