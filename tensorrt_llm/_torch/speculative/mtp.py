@@ -1102,7 +1102,7 @@ class MTPEagleWorker(MTPWorker):
 
     def __init__(self, spec_config: "MTPDecodingConfig",
                  model_config: ModelConfig):
-        super().__init__(spec_config)
+        super().__init__(spec_config, model_config)
         self.model_config = model_config
         self.mtp_num_modules = spec_config.num_nextn_predict_layers
 
