@@ -605,9 +605,6 @@ class WideEPMoE(MoE):
                     x, x_sf, recv_topk_idx, token_final_scales)
                 if x_sf is not None:
                     x_sf = x_sf.view(x_sf_dtype)
-                    if self.has_nvfp4:
-                        x_sf = swizzle_sf(x_sf, x.shape[0], x.shape[1] * 2,
-                                          self.scaling_vector_size)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                 token_num = x_row
                 hidden_size = x_col
@@ -662,6 +659,7 @@ class WideEPMoE(MoE):
             output_dtype,
             quant_scales=quant_scales,
             input_sf=x_sf,
+            swizzled_input_sf=False,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             ep_size=ep_size,

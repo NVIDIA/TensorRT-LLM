@@ -981,7 +981,7 @@ public:
             auto stream = streamPtr->get();
             MoeMinLatencyParams min_latency_params;
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
-            mMoERunner.runMoe(mInputTensor + mInputTensorSize * mBufferIndex, nullptr,
+            mMoERunner.runMoe(mInputTensor + mInputTensorSize * mBufferIndex, nullptr, true,
                 mSelectedExperts + mSelectedExpertsSize * mBufferIndex,
                 mUseFinalScale ? mScaleProbs + mScaleProbsSize * mBufferIndex : nullptr,
                 mExpertWeight1 + mExpertWeight1Size * mBufferIndex, mExpertBias1 + mExpertBias1Size * mBufferIndex,
@@ -993,7 +993,7 @@ public:
                 /*enable_alltoall=*/false, mUseLora, mLoraParams[mBufferIndex],
                 /*use_fp8_block_scaling=*/false, /*min_latency_mode=*/false, min_latency_params, stream);
 #else
-            mMoERunner.runMoe(mInputTensor + mInputTensorSize * mBufferIndex, nullptr,
+            mMoERunner.runMoe(mInputTensor + mInputTensorSize * mBufferIndex, nullptr, true,
                 mSelectedExperts + mSelectedExpertsSize * mBufferIndex,
                 mUseFinalScale ? mScaleProbs + mScaleProbsSize * mBufferIndex : nullptr,
                 mExpertWeight1 + mExpertWeight1Size * mBufferIndex, mExpertBias1 + mExpertBias1Size * mBufferIndex,
