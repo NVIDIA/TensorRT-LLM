@@ -11,7 +11,7 @@ import traceback
 import weakref
 from collections import deque, namedtuple
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Union
 
 import torch
 
@@ -258,12 +258,6 @@ class PyExecutor:
             ResourceManagerType.KV_CACHE_MANAGER)
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
 
-        if self.draft_model_engine is not None and self.kv_cache_manager is not None:
-            if self.kv_cache_manager.enable_block_reuse:
-                raise NotImplementedError(
-                    "Draft model engine + KV cache reuse is not supported yet. "
-                    "This will be fixed in the near future!")
-
         self.max_input_len = max_input_len
         # _executor_loop private data
         self.max_num_active_requests = model_engine.get_max_num_sequences()
@@ -308,7 +302,7 @@ class PyExecutor:
         if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
             self.event_loop = trace_func(self.event_loop)
 
-        if self.draft_model_engine is not None:
+        if self.drafter is not None:
             if self.event_loop.__name__ != self._executor_loop.__name__:
                 raise NotImplementedError(
                     "Drafting is not supported for selected executor loop. "
@@ -905,10 +899,6 @@ class PyExecutor:
 
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
-        is_ngram = hasattr(
-            self.model_engine, "spec_config"
-        ) and self.model_engine.spec_config is not None and self.model_engine.spec_config.spec_dec_mode.is_ngram(
-        )
         with self._profiler() as profile_step:
             sample_state = None
             iter_start_time = time.time()
@@ -931,7 +921,7 @@ class PyExecutor:
 
                 self._pad_attention_dp_dummy_request()
 
-                if self.draft_model_engine is not None or is_ngram or self.drafter is not None:
+                if self.drafter is not None:
                     self._prepare_draft_requests(self.active_requests)
 
                 scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
@@ -970,20 +960,13 @@ class PyExecutor:
                         self._prepare_disagg_gen_transmission_complete(
                             scheduled_batch)
 
-                    self.resource_manager.prepare_resources(scheduled_batch)
-                    if self.draft_model_engine is not None:
-                        self._prepare_draft_tokens(scheduled_batch)
-
-                    if self.drafter is not None:
-                        self.drafter.prepare_draft_tokens(scheduled_batch)
-
-                    if self.kv_cache_transceiver:
-                        # For generation requests which have completed KV cache transfer
-                        self._prepare_disagg_gen_transmission_complete(
-                            scheduled_batch)
-
                         # Return the first token to the client
                         self._handle_first_token_response(scheduled_batch)
+
+                    self.resource_manager.prepare_resources(scheduled_batch)
+                    if self.drafter is not None:
+                        self.drafter.prepare_draft_tokens(
+                            scheduled_batch, self.resource_manager)
 
                     batch_outputs = self._forward_step(scheduled_batch)
 
@@ -1796,188 +1779,6 @@ class PyExecutor:
             traceback.print_exc()
             error_msg = str(e)
             logger.error(f"Encountered an error in sampling: {error_msg}")
-            self._handle_errors(error_msg)
-
-    @nvtx_range("_prepare_draft_batch")
-    def _prepare_draft_batch(
-        self, scheduled_requests: ScheduledRequests
-    ) -> Tuple[ScheduledRequests, Dict[int, LlmRequest]]:
-        """
-        Prepares a batch for the draft model engine. Draft tokens are only produced
-        for generation requests.
-
-        The requests are prepared as follows:
-        1. The first time the draft engine sees a request, it's a context request.
-        2. Otherwise, if draft tokens were accepted on the last target model decoding
-        step, it's a chunked context request (we process all the accepted tokens together).
-        3. Otherwise, it's a generation request.
-        """
-        try:
-            draft_batch = ScheduledRequests()
-
-            for request in scheduled_requests.generation_requests:
-                if request.py_draft_pages_allocated == 0:
-                    # No space for draft tokens.
-                    continue
-
-                # Stop drafting when we hit the max seqlen. We still need dummy draft
-                # tokens attached to the requests to make sure everything works properly
-                # with CUDA graph. These dummy tokens are already added by
-                # _prepare_draft_requests to make the KV cache/scheduler aware of the fact
-                # that we want to do spec decoding, so no need to do anything else here.
-                # This makes the perf for this case suboptimal, but that's OK - this is
-                # a corner case for weird models like the llama 3.1 8b EAGLE3 implementation.
-                if request.max_beam_num_tokens - 1 >= self.draft_model_engine.max_seq_len:
-                    continue
-
-                num_draft_tokens = len(
-                    request.py_last_draft_tokens
-                ) if request.py_last_draft_tokens is not None else 0
-                request.py_draft_tokens = []
-
-                num_accepted_tokens = request.py_num_accepted_draft_tokens
-                num_rejected_tokens = num_draft_tokens - num_accepted_tokens
-                assert num_rejected_tokens >= 0
-
-                spec_config = self.model_engine.spec_config
-                beam_idx = 0
-                input_tokens = spec_config.get_draft_model_prompt(
-                    request.get_tokens()[beam_idx])
-
-                def create_new_request(input_tokens):
-                    return LlmRequest(
-                        request_id=request.py_request_id,
-                        max_new_tokens=request.py_max_new_tokens,
-                        input_tokens=input_tokens,
-                        sampling_config=request.sampling_config,
-                        return_perf_metrics=request.return_perf_metrics,
-                        is_streaming=False,
-                        is_draft=True)
-
-                if request.max_beam_num_tokens - 1 == request.py_prompt_len:
-                    # This is the first time the draft model is seeing this request.
-                    # Prepare a context request. We discard the first token and take
-                    # the newly decoded one - this is the convention for EAGLE 2 and 3.
-                    new_request = create_new_request(input_tokens)
-                    draft_batch.context_requests.append(new_request)
-                elif num_accepted_tokens == 0:
-                    new_request = create_new_request(input_tokens[:-1])
-                    # Explicitly add the last token so get_last_tokens() returns
-                    # the right value
-                    new_request.add_new_token(input_tokens[-1], beam_idx)
-                    new_request.state = LlmRequestState.GENERATION_IN_PROGRESS
-                    draft_batch.generation_requests.append(new_request)
-                else:
-                    new_request = create_new_request(input_tokens)
-                    new_request.context_chunk_size = num_accepted_tokens + 1
-                    new_request.context_current_position = len(
-                        input_tokens) - num_accepted_tokens - 1
-                    new_request.context_chunk_size = num_accepted_tokens + 1
-                    new_request.context_current_position = len(
-                        input_tokens) - num_accepted_tokens - 1
-
-                    draft_batch.context_requests.append(new_request)
-
-                new_request.py_stop_words_list = request.py_stop_words_list
-
-            return draft_batch
-
-        except Exception as e:
-            traceback.print_exc()
-            error_msg = str(e)
-            logger.error(f"Encountered an error in decode: {error_msg}")
-            self._handle_errors(error_msg)
-
-    @nvtx_range("_prepare_draft_tokens")
-    def _prepare_draft_tokens(self, scheduled_requests: ScheduledRequests):
-        if not self.draft_model_engine:
-            raise ValueError("Draft model engine is not set")
-
-        try:
-            draft_batch = self._prepare_draft_batch(scheduled_requests)
-
-            if draft_batch.batch_size == 0:
-                return
-            self.draft_seq_slot_manager.prepare_resources(draft_batch)
-
-            req_id_to_old_request = {
-                req.py_request_id: req
-                for req in scheduled_requests.all_requests()
-            }
-
-            # Disable cuda graph for the 1st draft model forward
-            if self.model_engine.spec_config.spec_dec_mode.needs_kv_cache_recompute(
-            ):
-                with self.draft_model_engine.no_cuda_graph():
-                    outputs = self.draft_model_engine.forward(
-                        draft_batch, self.resource_manager)
-            else:
-                outputs = self.draft_model_engine.forward(
-                    draft_batch, self.resource_manager)
-            if hasattr(self.draft_model_engine.model.model, 'd2t'):
-                outputs['d2t'] = self.draft_model_engine.model.model.d2t.data
-
-            sample_state = self._sample_async(draft_batch, outputs)
-            previous_batch = sample_state
-
-            self._update_request_states(draft_batch)
-
-            def _process_decoded_tokens(draft_batch):
-                new_requests = []
-                for req in draft_batch.all_requests():
-                    target_model_req = req_id_to_old_request[req.py_request_id]
-                    target_model_req.py_draft_tokens.append(
-                        req.get_last_tokens(0))
-                    if req.state != LlmRequestState.GENERATION_COMPLETE and len(
-                            target_model_req.py_draft_tokens
-                    ) < target_model_req.py_draft_pages_allocated:
-                        new_requests.append(req)
-                    else:
-                        self.draft_seq_slot_manager.free_resources(req)
-
-                return new_requests
-
-            # The TRTLLM attention kernels cannot handle generation requests with
-            # different seqlens. No issues with flashinfer, should we look into removing
-            # this? Just needs proper kernel support.
-            def _pad_to_max_draft_tokens():
-                for req in scheduled_requests.generation_requests:
-                    max_draft_len = self.max_draft_len
-                    num_draft_tokens = len(req.py_draft_tokens)
-                    req.py_draft_tokens.extend(
-                        0 for _ in range(max_draft_len - num_draft_tokens))
-
-            draft_batch.generation_requests = draft_batch.context_requests + draft_batch.generation_requests
-            draft_batch.context_requests = []
-
-            for i in range(self.max_draft_len - 1):
-                if len(draft_batch.generation_requests) == 0:
-                    break
-
-                outputs = self.draft_model_engine.forward(
-                    draft_batch,
-                    self.resource_manager,
-                    new_tensors_device=previous_batch.device)
-
-                if hasattr(self.draft_model_engine.model.model, 'd2t'):
-                    outputs[
-                        'd2t'] = self.draft_model_engine.model.model.d2t.data
-                sample_state = self._sample_async(draft_batch, outputs)
-                self._update_request_states(draft_batch)
-                self._update_requests(previous_batch)
-                new_requests = _process_decoded_tokens(
-                    previous_batch.scheduled_requests)
-                draft_batch.generation_requests = new_requests
-                previous_batch = sample_state
-            self._update_requests(previous_batch)
-            new_requests = _process_decoded_tokens(
-                previous_batch.scheduled_requests)
-            _pad_to_max_draft_tokens()
-
-        except Exception as e:
-            traceback.print_exc()
-            error_msg = str(e)
-            logger.error(f"Encountered an error in decode: {error_msg}")
             self._handle_errors(error_msg)
 
     def _handle_errors(self, error_msg: Optional[str] = None):

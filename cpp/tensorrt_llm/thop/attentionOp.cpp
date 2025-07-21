@@ -671,7 +671,8 @@ bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_
     bool const use_paged_context_fmha, bool is_mla_enable)
 {
     // Only Blackwell supports NVFP4 output.
-    if (tensorrt_llm::common::getSMVersion() < 100)
+    // SM 120 does not support NVFP4 output.
+    if (tensorrt_llm::common::getSMVersion() < 100 || tensorrt_llm::common::getSMVersion() == 120)
     {
         return false;
     }

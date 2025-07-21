@@ -101,9 +101,8 @@ def main():
         result = results[i]
         test_case = test_dataset[i]
         ref_answer = int(test_case["answer"])
-        result.result()
-        output = result.output
-        extracted_answer = extract_answer_from_boxed(output.output_str)
+        output = result.outputs[0]
+        extracted_answer = extract_answer_from_boxed(output.text)
         try:
             # print(f"[QUESTION]:\n{prompt}\n\n[OUTPUT]\n\n{output.output_str}\n\n")
             answer = int(extracted_answer)

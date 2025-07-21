@@ -536,16 +536,8 @@ class KVCacheManager(BaseResourceManager):
         return (num_tokens + self.tokens_per_block - 1) // self.tokens_per_block
 
     def get_num_available_tokens(self, max_num_draft_tokens: int = 0) -> int:
-        if self.max_attention_window_vec and len(
-                self.max_attention_window_vec) > 1:
-            # VSWA case, the available tokens should the the minimum of the available tokens for each window size
-            min_free_blocks = min(self.impl.get_kv_cache_stats().
-                                  num_free_blocks_per_window_size.values())
-            res = min_free_blocks * self.tokens_per_block - self.num_extra_kv_tokens - max_num_draft_tokens
-        else:
-            res = (self.get_num_free_blocks() * self.tokens_per_block -
-                   self.num_extra_kv_tokens - max_num_draft_tokens)
-        return res
+        return (self.get_num_free_blocks() * self.tokens_per_block -
+                self.num_extra_kv_tokens - max_num_draft_tokens)
 
     def get_buffers(self, layer_idx: int) -> Optional[torch.Tensor]:
         layer_offset = self.layer_offsets[layer_idx]
@@ -732,6 +724,8 @@ class KVCacheManager(BaseResourceManager):
 
         # VSWA on Torch backend has not supported the cross attention.
         is_cross_attention = False
+        # check model config
+        assert model_config.layer_types is not None, "layer_types have to be set correctly for VSWA"
 
         # Construct WorldConfig from self.mapping
         world_config_cpp = WorldConfig(
@@ -1224,7 +1218,7 @@ class PeftCacheManager(BaseResourceManager):
         pass
 
     def free_resources(self, request: LlmRequest):
-        pass
+        self.impl.mark_request_done(request)
 
     def shutdown(self):
         pass
