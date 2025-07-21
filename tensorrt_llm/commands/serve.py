@@ -154,7 +154,8 @@ def launch_server(host: str,
                   port: int,
                   llm_args: dict,
                   metadata_server_cfg: Optional[MetadataServerConfig] = None,
-                  server_role: Optional[ServerRole] = None):
+                  server_role: Optional[ServerRole] = None,
+                  disable_gc: bool = False):
 
     backend = llm_args["backend"]
     model = llm_args["model"]
@@ -169,7 +170,10 @@ def launch_server(host: str,
                           server_role=server_role,
                           metadata_server_cfg=metadata_server_cfg)
 
-    with disabled_gc():
+    if disable_gc:
+        with disabled_gc():
+            asyncio.run(server(host, port))
+    else:
         asyncio.run(server(host, port))
 
 
@@ -260,6 +264,10 @@ def launch_server(host: str,
     default=None,
     help="[Experimental] Specify the parser for reasoning models.",
 )
+@click.option("--disable_gc",
+              is_flag=True,
+              default=False,
+              help="Disable Python's garbage collector during server runtime for potentially better TTFT (time to first token) performance.")
 @click.option("--metadata_server_config_file",
               type=str,
               default=None,
@@ -278,7 +286,7 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
           kv_cache_free_gpu_memory_fraction: float,
           num_postprocess_workers: int, trust_remote_code: bool,
           extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
-          metadata_server_config_file: Optional[str],
+          disable_gc: bool, metadata_server_config_file: Optional[str],
           server_role: Optional[str]):
     """Running an OpenAI API compatible server
 
@@ -320,7 +328,7 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
         except ValueError:
             raise ValueError(f"Invalid server role: {server_role}. " \
                              f"Must be one of: {', '.join([role.name for role in ServerRole])}")
-    launch_server(host, port, llm_args, metadata_server_cfg, server_role)
+    launch_server(host, port, llm_args, metadata_server_cfg, server_role, disable_gc)
 
 
 def get_ctx_gen_server_urls(
