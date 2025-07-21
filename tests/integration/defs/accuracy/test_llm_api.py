@@ -16,7 +16,8 @@ import pytest
 
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.llmapi import (EagleDecodingConfig,
-                                 ExtendedRuntimePerfKnobConfig, KvCacheConfig)
+                                 ExtendedRuntimePerfKnobConfig, KvCacheConfig,
+                                 SamplingParams)
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -87,6 +88,15 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         with llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
+
+    def test_logprobs(self):
+        sampling_config = SamplingParams(logprobs=2)
+        llm = LLM(self.MODEL_PATH, gather_generation_logits=True)
+        with llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm,
+                          sampling_params=sampling_config,
+                          extra_acc_spec="logprobs=2")
 
 
 class TestLlama3_2_1B(LlmapiAccuracyTestHarness):
