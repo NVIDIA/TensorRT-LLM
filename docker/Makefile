@@ -183,16 +183,16 @@ jenkins-aarch64_%: STAGE = tritondevel
 jenkins-rockylinux8_%: IMAGE_WITH_TAG = $(shell grep '^[[:space:]]*LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
 jenkins-rockylinux8_%: STAGE = tritondevel
 jenkins-rockylinux8_%: BASE_IMAGE = nvidia/cuda
-jenkins-rockylinux8_%: BASE_TAG = 12.9.0-devel-rockylinux8
+jenkins-rockylinux8_%: BASE_TAG = 12.9.1-devel-rockylinux8
 
 rockylinux8_%: STAGE = tritondevel
 rockylinux8_%: BASE_IMAGE = nvidia/cuda
-rockylinux8_%: BASE_TAG = 12.9.0-devel-rockylinux8
+rockylinux8_%: BASE_TAG = 12.9.1-devel-rockylinux8
 
 # For x86_64 and aarch64
 ubuntu22_%: STAGE = tritondevel
 ubuntu22_%: BASE_IMAGE = nvidia/cuda
-ubuntu22_%: BASE_TAG = 12.9.0-devel-ubuntu22.04
+ubuntu22_%: BASE_TAG = 12.9.1-devel-ubuntu22.04
 
 trtllm_%: STAGE = release
 trtllm_%: PUSH_TO_STAGING := 0
