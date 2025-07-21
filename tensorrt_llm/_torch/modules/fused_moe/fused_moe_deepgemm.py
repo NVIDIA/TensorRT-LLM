@@ -57,10 +57,10 @@ def _masked_index_copy_group_quant_fp8(
     # quant
     _absmax = tl.maximum(tl.max(tl.abs(input)), eps)
     output_s = _absmax / 448.0
+    output_s = tl.exp2(tl.ceil(tl.log2(tl.abs(output_s))))
     output_s_inv = 1.0 / output_s
     output_q = tl.clamp(input * output_s_inv, -448.0,
                         448.0).to(out_q_ptr.dtype.element_ty)
-    output_s = tl.exp2(tl.ceil(tl.log2(tl.abs(output_s))))
 
     # write output
     s_dim_size = dim_size // group_size
