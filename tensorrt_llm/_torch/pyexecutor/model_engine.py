@@ -392,9 +392,6 @@ class PyTorchModelEngine(ModelEngine):
         self._cuda_graphs = {}
         self._cuda_graph_mem_pool = self._torch_compile_backend._graph_pool_handle if self._torch_compile_enabled else None
         self._run_cuda_graphs = pytorch_backend_config.use_cuda_graph
-        if self._run_cuda_graphs and self.max_beam_width > 1:
-            raise NotImplementedError(
-                "CUDA Graph + beam search is not implemented yet.")
 
         self._cuda_graph_padding_enabled = pytorch_backend_config.cuda_graph_padding_enabled
 
@@ -425,6 +422,16 @@ class PyTorchModelEngine(ModelEngine):
         self.lora_model_config: Optional[LoraModelConfig] = None
         self.cuda_graph_dummy_request = None
 
+        # Setup the local cache indirection buffer only once and reuse it.
+        # This way it can also be used for CUDA graphs.
+        if self.use_beam_search:
+            self.cache_indirection_attention = torch.zeros(
+                (self.batch_size, self.max_beam_width, self.max_seq_len),
+                device="cuda",
+                dtype=torch.int32)
+        else:
+            self.cache_indirection_attention = None
+
     def set_lora_model_config(self, lora_target_modules: list[str],
                               trtllm_modules_to_hf_modules: dict[str, str]):
         self.lora_model_config = LoraModelConfig(
@@ -443,6 +450,10 @@ class PyTorchModelEngine(ModelEngine):
             pass
         logger.info(f"Detected use_mrope: {use_mrope}")
         return use_mrope
+
+    @property
+    def use_beam_search(self):
+        return self.max_beam_width > 1
 
     @contextmanager
     def set_warmup_flag(self):
@@ -487,7 +498,9 @@ class PyTorchModelEngine(ModelEngine):
         self.cuda_graph_dummy_request = None
 
         def get_cuda_graph_warmup_request(batch_size):
-            available_blocks = kv_cache_manager.get_num_free_blocks()
+            # Divide by max_beam_width to get an approximation of the number of requests that can be run in parallel.
+            available_blocks = kv_cache_manager.get_num_free_blocks(
+            ) // self.max_beam_width
             if available_blocks >= batch_size:
                 result = ScheduledRequests()
                 result.context_requests = []
@@ -498,9 +511,10 @@ class PyTorchModelEngine(ModelEngine):
                     is_gen=True,
                     max_num_draft_tokens=self.max_draft_len,
                     use_mrope=use_mrope,
-                )
+                    max_beam_width=self.max_beam_width)
+                # Divide by max_beam_width to get an approximation of the number of tokens that can be added to the final request.
                 available_tokens = kv_cache_manager.get_num_available_tokens(
-                    self.max_draft_len)
+                    self.max_draft_len) // self.max_beam_width
 
                 # Add one dummy request with the maximum possible sequence length.
                 # The sequence length is limited by both the max_seq_len and the number of available blocks.
@@ -511,7 +525,7 @@ class PyTorchModelEngine(ModelEngine):
                     is_gen=True,
                     max_num_draft_tokens=self.max_draft_len,
                     use_mrope=use_mrope,
-                )[0]
+                    max_beam_width=self.max_beam_width)[0]
                 # Add the longest request before all other seq_len=1 request to simulate the padding CUDA graph case.
                 # This batch contains both the longest request and the shortest requests,
                 # it also contains the maximum number of requests and the maximum token number,
@@ -739,6 +753,11 @@ class PyTorchModelEngine(ModelEngine):
             self.model.model_config.pretrained_config) and (
                 self.attn_runtime_features.cache_reuse
                 or self.attn_runtime_features.chunked_prefill)
+        # Cache indirection is only used for beam search on generation requests with TRTLLM backend.
+        if self.attn_backend.Metadata is TrtllmAttentionMetadata:
+            kwargs = {"cache_indirection": self.cache_indirection_attention}
+        else:
+            kwargs = {}
         if kv_cache_manager is None:
             return self.attn_backend.Metadata(
                 max_num_requests=self.batch_size,
@@ -748,7 +767,8 @@ class PyTorchModelEngine(ModelEngine):
                 mapping=self.mapping,
                 runtime_features=self.attn_runtime_features,
                 enable_flash_mla=self.model.model_config.enable_flash_mla,
-                enable_paged_context_mla=enable_paged_context_mla)
+                enable_paged_context_mla=enable_paged_context_mla,
+                **kwargs)
 
         if self.attn_metadata is not None:
             # This assertion can be relaxed if needed: just create a new metadata
@@ -764,7 +784,9 @@ class PyTorchModelEngine(ModelEngine):
             mapping=self.mapping,
             runtime_features=self.attn_runtime_features,
             enable_flash_mla=self.model.model_config.enable_flash_mla,
-            enable_paged_context_mla=enable_paged_context_mla)
+            enable_paged_context_mla=enable_paged_context_mla,
+            **kwargs)
+
         return self.attn_metadata
 
     def _set_up_spec_metadata(
@@ -795,7 +817,8 @@ class PyTorchModelEngine(ModelEngine):
                           kv_cache_manager) -> int:
         can_run_cuda_graph = scheduled_requests.can_run_cuda_graph
         batch_size = scheduled_requests.batch_size
-        new_batch_size = batch_size
+        # The number of sequences in the batch is the number of prompts times the beam width.
+        new_batch_size = batch_size * self.max_beam_width
         if self._run_cuda_graphs and self.enable_attention_dp and self.mapping.tp_size > 1:
             graph_batch_size = self.dist.tp_allgather(
                 [can_run_cuda_graph, batch_size])
@@ -831,7 +854,8 @@ class PyTorchModelEngine(ModelEngine):
                 [MAX_UINT64 - 1],
                 is_gen=True,
                 max_num_draft_tokens=self.max_draft_len,
-                use_mrope=self.use_mrope)[0]
+                use_mrope=self.use_mrope,
+                max_beam_width=self.max_beam_width)[0]
             self.cuda_graph_dummy_request.is_cuda_graph_dummy = True
 
         scheduled_requests.generation_requests.extend(
@@ -903,19 +927,21 @@ class PyTorchModelEngine(ModelEngine):
         if batch_size not in self._cuda_graph_batch_sizes:
             return None
 
+        num_sequences_in_batch = batch_size * self.max_beam_width
         attn_metadata = self.attn_metadata.create_cuda_graph_metadata(
-            batch_size, False, spec_max_draft_tokens)
+            num_sequences_in_batch, False, spec_max_draft_tokens)
         assert attn_metadata.is_cuda_graph
 
         if self.is_spec_decode:
             spec_metadata = self.spec_metadata.create_cuda_graph_metadata(
-                batch_size)
+                num_sequences_in_batch)
             spec_metadata.draft_tokens = self.draft_tokens_cuda
         else:
             spec_metadata = None
 
         self._cuda_graphs[batch_size] = DecodingCUDAGraphRunner(
-            batch_size, "cuda", attn_metadata, spec_metadata, self.use_mrope)
+            num_sequences_in_batch, "cuda", attn_metadata, spec_metadata,
+            self.use_mrope)
         return self._cuda_graphs[batch_size]
 
     def __del__(self) -> None:
@@ -1439,16 +1465,16 @@ class PyTorchModelEngine(ModelEngine):
 
         num_generation_requests = len(scheduled_requests.generation_requests)
         # Cache indirection is only used for beam search on generation requests
-        if self.max_beam_width > 1 and num_generation_requests > 0 and cache_indirection_buffer is not None:
-            cache_indirection_attention = torch.zeros_like(
-                cache_indirection_buffer)
-            #Copy cache indirection to local buffer with offsets changing:  seq_slots[i] -> i
-            cache_indirection_attention[:num_generation_requests].copy_(
-                cache_indirection_buffer[gen_request_seq_slots])
-            attn_metadata.cache_indirection = cache_indirection_attention
-            attn_metadata.beam_width = self.max_beam_width
+        if self.use_beam_search and num_generation_requests > 0:
+            # CUDA Graph needs to set beam width during warmup (where the graph is captured), to ensure that cache indirection buffer is correctly picked up by the CUDA graph
+            is_cuda_graph_during_warmup = self.in_warmup and attn_metadata.is_cuda_graph
+            if cache_indirection_buffer is not None:
+                #Copy cache indirection to local buffer with offsets changing:  seq_slots[i] -> i
+                self.cache_indirection_attention[:num_generation_requests].copy_(
+                    cache_indirection_buffer[gen_request_seq_slots])
+            if cache_indirection_buffer is not None or is_cuda_graph_during_warmup:
+                attn_metadata.beam_width = self.max_beam_width
         else:
-            attn_metadata.cache_indirection = None
             attn_metadata.beam_width = 1
 
         attn_metadata.request_ids = request_ids

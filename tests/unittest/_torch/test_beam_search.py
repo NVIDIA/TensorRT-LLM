@@ -5,7 +5,7 @@ from utils.llm_data import llm_models_root
 from utils.util import force_ampere, similar
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi.llm_utils import KvCacheConfig
+from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
 
 
 @pytest.fixture(scope="module")
@@ -46,7 +46,6 @@ def llm(fixed_params, input_prompts):
         enable_trtllm_sampler=True,
         max_beam_width=fixed_params["max_beam_width"],
         disable_overlap_scheduler=True,
-        #TODO: remove this once we have a proper fix for CUDA graph in beam search
         cuda_graph_config=None,
     )
 
