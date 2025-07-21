@@ -72,6 +72,16 @@ trt_llm_release_perf_test:
   # reduced 'reqs' to fit timeout limit
   - perf/test_perf.py::test_perf[phi_4_mini_instruct-bench-bfloat16-maxbs:32-input_output_len:500,2000-reqs:8-con:1]
   - perf/test_perf.py::test_perf[phi_4_mini_instruct-bench-bfloat16-maxbs:32-input_output_len:500,2000-quant:fp8-reqs:8-con:1]
+  # Phi-4-multimodal-instruct
+  - perf/test_perf.py::test_perf[phi_4_multimodal_instruct-bench-pytorch-bfloat16-input_output_len:500,2000-con:250]
+  - perf/test_perf.py::test_perf[phi_4_multimodal_instruct-bench-pytorch-bfloat16-input_output_len:1000,1000-con:250]
+  - perf/test_perf.py::test_perf[phi_4_multimodal_instruct-bench-pytorch-bfloat16-input_output_len:128,128]
+  - perf/test_perf.py::test_perf[phi_4_multimodal_instruct-bench-pytorch-bfloat16-input_output_len:512,32]
+  # Bielik-11B-v2.2-Instruct
+  - perf/test_perf.py::test_perf[bielik_11b_v2.2_instruct-bench-pytorch-bfloat16-input_output_len:128,128]
+  - perf/test_perf.py::test_perf[bielik_11b_v2.2_instruct-bench-pytorch-bfloat16-input_output_len:512,32]
+  - perf/test_perf.py::test_perf[bielik_11b_v2.2_instruct-bench-pytorch-bfloat16-input_output_len:1000,1000-con:250]
+  - perf/test_perf.py::test_perf[bielik_11b_v2.2_instruct-bench-pytorch-bfloat16-input_output_len:2000,2000-con:250]
   # Test list validation
   - test_list_validation.py::test_list_validation
 
@@ -89,7 +99,9 @@ trt_llm_release_perf_test:
   - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-plugin_ifb-float16-mp-input_output_len:128,128+512,32] #oom for l40s, l20（cuda_runtime_error）#44, mpi abort on a100 36
   - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-plugin_ifb-bfloat16-gwp:0.0-input_output_len:128,128+512,32] #oom for l40s, l20, mpi abort on a100 35
   - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-plugin_ifb-bfloat16-gwp:0.5-input_output_len:128,128+512,32] #oom for l40s, l20
-  - perf/test_perf.py::test_perf[phi_4_mini_instruct-bench-bfloat16-maxbs:32-maxnt:5000-input_output_len:5000,500-reqs:10-con:1] # timeout for l20, l40s
+  - perf/test_perf.py::test_perf[phi_4_mini_instruct-bench-bfloat16-maxbs:32-input_output_len:5000,500-reqs:10-con:1] # timeout for l20, l40s
+  - perf/test_perf.py::test_perf[phi_4_multimodal_instruct_image-bench-pytorch-bfloat16-input_output_len:1000,1000-loras:1-con:250]
+  - perf/test_perf.py::test_perf[phi_4_multimodal_instruct_audio-bench-pytorch-bfloat16-input_output_len:1000,1000-loras:1-con:250]
 
   # Llama-3.1-Nemotron-Nano-8B-v1
   # cpp backend
@@ -158,6 +170,8 @@ trt_llm_release_perf_test:
   - perf/test_perf.py::test_perf[mistral_7b_v0.1-bench-float16-maxbs:256-input_output_len:500,2000-quant:fp8]
   - perf/test_perf.py::test_perf[phi_3_mini_4k_instruct-bench-float16-maxbs:128-input_output_len:1000,1000-quant:fp8]
   - perf/test_perf.py::test_perf[phi_3_mini_4k_instruct-bench-float16-maxbs:64-input_output_len:500,2000-quant:fp8]
+  - perf/test_perf.py::test_perf[bielik_11b_v2.2_instruct_fp8-bench-pytorch-float8-input_output_len:1000,1000-con:250]
+  - perf/test_perf.py::test_perf[bielik_11b_v2.2_instruct_fp8-bench-pytorch-float8-input_output_len:2000,2000-con:250]
 
 - condition:
     terms:

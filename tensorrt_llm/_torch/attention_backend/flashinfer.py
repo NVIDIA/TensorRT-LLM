@@ -297,10 +297,16 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self._positions[:positions.size(0)].copy_(positions,
                                                       non_blocking=True)
 
-        for plan_params in self._plan_params_to_wrappers:
-            # Re-plan the cached wrappers for a new set of requests.
-            self._plan_params_to_wrappers[plan_params].is_planned = False
-            self._plan_with_params(plan_params)
+        # Generally, plan_params with non-trivial attention_mask_data are relevant only the
+        # corresponding forward pass. So, flush them out here as they won't be relevant for
+        # subsequent forward calls.
+        for plan_params in list(self._plan_params_to_wrappers.keys()):
+            if plan_params.attention_mask_data is None:
+                # Re-plan the cached wrappers for a new set of requests.
+                self._plan_params_to_wrappers[plan_params].is_planned = False
+                self._plan_with_params(plan_params)
+            else:
+                del self._plan_params_to_wrappers[plan_params]
 
         if self.cross is not None and self.cross is not self:
             self.cross.prepare()
@@ -426,7 +432,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 kv_data_type=plan_params.kv_dtype,
             )
 
-        # Must sync after append_paged_kv_cache and before plan
+        # Must sync after append_paged_kv_cache and before plan.
         torch.cuda.current_stream().synchronize()
 
         if self.num_contexts > 0:
