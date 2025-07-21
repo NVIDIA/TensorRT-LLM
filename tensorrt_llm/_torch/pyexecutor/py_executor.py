@@ -279,6 +279,8 @@ class PyExecutor:
         self.inflight_req_ids = ReqIdsSet()
         self.canceled_req_ids = []
 
+        self.model_engine.set_lora_manager_cpp_peft_cache_manager(
+            self.resource_manager)
         self.model_engine.prefetch_lora_dirs()
         self.model_engine.warmup(self.resource_manager)
         if self.draft_model_engine is not None:
