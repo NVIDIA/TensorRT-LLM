@@ -132,6 +132,8 @@ meta-llama/Llama-3.1-8B-Instruct:
   - accuracy: 33.640
   - spec_dec_algo: Eagle
     accuracy: 33.640
+  - extra_acc_spec: logprobs=2
+    accuracy: 30.522
   - quant_algo: FP8
     accuracy: 33.841
   - quant_algo: FP8
