@@ -149,7 +149,6 @@ def setup_llm(args, **kwargs):
     kv_cache_config = KvCacheConfig(
         enable_block_reuse=not args.disable_kv_cache_reuse,
         free_gpu_memory_fraction=args.kv_cache_fraction,
-        dtype=args.kv_cache_dtype,
     )
 
     spec_decode_algo = args.spec_decode_algo.upper(
@@ -195,6 +194,7 @@ def setup_llm(args, **kwargs):
         model=args.model_dir,
         backend='pytorch',
         disable_overlap_scheduler=args.disable_overlap_scheduler,
+        kv_cache_dtype=args.kv_cache_dtype,
         kv_cache_config=kv_cache_config,
         attn_backend=args.attention_backend,
         cuda_graph_config=cuda_graph_config,

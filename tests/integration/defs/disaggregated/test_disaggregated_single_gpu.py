@@ -121,12 +121,14 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
     worker_pytorch_configs.append(
         dict(
             disable_overlap_scheduler=True,
+            kv_cache_dtype="auto",
             cuda_graph_config=CudaGraphConfig() if enable_cuda_graph else None))
 
     # Generation worker
     worker_pytorch_configs.append(
         dict(
             disable_overlap_scheduler=not generation_overlap,
+            kv_cache_dtype="auto",
             cuda_graph_config=CudaGraphConfig() if enable_cuda_graph else None))
 
     kv_cache_configs = [KvCacheConfig(max_tokens=2048 * 8) for _ in range(2)]
@@ -245,16 +247,18 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
     worker_pytorch_configs.append(
         dict(
             disable_overlap_scheduler=True,
+            kv_cache_dtype="auto",
             cuda_graph_config=CudaGraphConfig() if enable_cuda_graph else None))
 
     # Generation worker
     worker_pytorch_configs.append(
         dict(
             disable_overlap_scheduler=not generation_overlap,
+            kv_cache_dtype="auto",
             cuda_graph_config=CudaGraphConfig() if enable_cuda_graph else None))
 
     kv_cache_configs = [
-        KvCacheConfig(max_tokens=128, enable_block_reuse=False, dtype="auto")
+        KvCacheConfig(max_tokens=128, enable_block_reuse=False)
         for _ in range(2)
     ]
     cache_transceiver_configs = [

@@ -17,8 +17,6 @@
 Model pytorch yaml config for trtllm-bench perf tests
 """
 
-from tensorrt_llm.llmapi import KvCacheConfig
-
 
 def recursive_update(d, u):
     for k, v in u.items():
@@ -198,10 +196,5 @@ def get_model_yaml_config(model_label: str,
             }
             lora_config['lora_config']['max_lora_rank'] = 64
         base_config.update(lora_config)
-
-    kv_cache_config = base_config.get('kv_cache_config', KvCacheConfig())
-    if 'kv_cache_dtype' in base_config:
-        kv_cache_config.dtype = base_config.pop('kv_cache_dtype', 'auto')
-        base_config.update({'kv_cache_config': kv_cache_config})
 
     return base_config
