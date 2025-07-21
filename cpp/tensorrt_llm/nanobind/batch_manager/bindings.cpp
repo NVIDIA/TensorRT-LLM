@@ -187,6 +187,8 @@ void initBindings(nb::module_& m)
         .def_prop_ro("missed_blocks", &GenLlmReq::getMissedBlocksPerRequest)
         .def_prop_ro("kv_cache_hit_rate", &GenLlmReq::getKVCacheHitRatePerRequest)
         .def_prop_ro("llm_request_type", &GenLlmReq::getLlmRequestType)
+        .def_prop_ro("parent_request_id", &GenLlmReq::getParentRequestId)
+        .def_prop_ro("is_child", &GenLlmReq::isChild)
         .def_prop_ro("multimodal_hashes",
             [](GenLlmReq& self)
             {
@@ -356,6 +358,7 @@ void initBindings(nb::module_& m)
             nb::arg("enable_kv_cache_reuse") = false)
         .def("create_response", &tb::LlmRequest::createResponse, nb::arg("use_fast_logits") = false,
             nb::arg("mpi_world_rank") = 0)
+        .def("create_child_request", &tb::LlmRequest::createChildRequest, nb::arg("child_id"))
         .def("create_result", &tb::LlmRequest::createResult, nb::arg("use_fast_logits") = false,
             nb::arg("mpi_world_rank") = 0)
         .def("create_serialized_result",
