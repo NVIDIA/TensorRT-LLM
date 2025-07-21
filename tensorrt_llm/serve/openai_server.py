@@ -291,7 +291,7 @@ class OpenAIServer:
             
             lora_request = None
             if hasattr(request, 'lora_request') and request.lora_request:
-              lora_request = request.lora_reqeuest
+              lora_request = request.lora_request
             
 
             promise = self.llm.generate_async(
