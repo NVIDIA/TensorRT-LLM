@@ -19,8 +19,8 @@ from .routing import BaseMoeRoutingMethod
 
 
 @triton.jit
-def masked_index_copy_kernel(output_ptr, input_ptr, masked_m_ptr,
-                             start_offsets_ptr, col_size, dim_size,
+def masked_index_copy_kernel(output_ptr, input_ptr, start_offsets_ptr,
+                             row_indices_ptr, row_size, col_size, dim_size,
                              BLOCK_SIZE: tl.constexpr):
     # get program id and block offset
     pid = tl.program_id(0)
@@ -28,48 +28,50 @@ def masked_index_copy_kernel(output_ptr, input_ptr, masked_m_ptr,
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
 
     # compute mask and pointers
+    num_tokens = tl.load(start_offsets_ptr + row_size)
     token_idx = offsets // dim_size
-    row_idx = token_idx // col_size
-    col_idx = token_idx % col_size
+    valid = token_idx < num_tokens
+    row_idx = tl.load(row_indices_ptr + token_idx)
+    start_offset = tl.load(start_offsets_ptr + row_idx, mask=valid)
+    col_idx = token_idx - start_offset
     elem_idx = offsets % dim_size
-    num_cols = tl.load(masked_m_ptr + row_idx)
-    valid = col_idx < num_cols
 
-    # load start offset and input data
-    start_offset = tl.load(start_offsets_ptr + row_idx)
-    input_offset = (start_offset + col_idx) * dim_size + elem_idx
-    input = tl.load(input_ptr + input_offset, mask=valid)
+    # load input data
+    input = tl.load(input_ptr + offsets, mask=valid)
 
     # write output
     output_offsets = row_idx * col_size * dim_size + col_idx * dim_size + elem_idx
     tl.store(output_ptr + output_offsets, input, mask=valid)
 
 
-def triton_masked_index_copy(output, input, masked_m, start_offsets):
-    assert output.dtype == input.dtype, "Output and input must have the same dtype"
+def triton_masked_index_copy(output, input, start_offsets, row_indices):
     assert output.ndim == 3, "Input must be a 3D tensor, [row, col, dim]"
     assert input.ndim == 2, "Input must be a 2D tensor"
+    assert start_offsets.shape[
+        0] == output.shape[0] + 1, "Start offsets must be (num_experts + 1)"
 
+    num_tokens = input.shape[0]
     row_size = output.shape[0]
     col_size = output.shape[1]
     dim_size = output.shape[2]
-    total_elems = row_size * col_size * dim_size
+    total_elems = num_tokens * dim_size
 
     # launch kernel
     grid = lambda meta: (triton.cdiv(total_elems, meta['BLOCK_SIZE']), )
     masked_index_copy_kernel[grid](output,
                                    input,
-                                   masked_m,
                                    start_offsets,
+                                   row_indices,
+                                   row_size,
                                    col_size,
                                    dim_size,
                                    BLOCK_SIZE=1024)
-    return output
+    return
 
 
 @triton.jit
-def masked_index_gather_kernel(output_ptr, input_ptr, masked_m_ptr,
-                               start_offsets_ptr, col_size, dim_size,
+def masked_index_gather_kernel(output_ptr, input_ptr, start_offsets_ptr,
+                               row_indices_ptr, row_size, col_size, dim_size,
                                BLOCK_SIZE: tl.constexpr):
     # get program id and block offset
     pid = tl.program_id(0)
@@ -77,44 +79,46 @@ def masked_index_gather_kernel(output_ptr, input_ptr, masked_m_ptr,
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
 
     # compute mask and pointers
+    num_tokens = tl.load(start_offsets_ptr + row_size)
     token_idx = offsets // dim_size
-    row_idx = token_idx // col_size
-    col_idx = token_idx % col_size
+    valid = token_idx < num_tokens
+    row_idx = tl.load(row_indices_ptr + token_idx)
+    start_offset = tl.load(start_offsets_ptr + row_idx, mask=valid)
+    col_idx = token_idx - start_offset
     elem_idx = offsets % dim_size
-    num_cols = tl.load(masked_m_ptr + row_idx)
-    valid = col_idx < num_cols
 
     # input data
     input_offsets = row_idx * col_size * dim_size + col_idx * dim_size + elem_idx
     input_vals = tl.load(input_ptr + input_offsets, mask=valid)
 
     # get gather indices and store to output
-    start_offset = tl.load(start_offsets_ptr + row_idx)
-    gather_offset = (start_offset + col_idx) * dim_size + elem_idx
-    tl.store(output_ptr + gather_offset, input_vals, mask=valid)
+    tl.store(output_ptr + offsets, input_vals, mask=valid)
 
 
 @torch.no_grad()
-def triton_masked_index_gather(output, input, masked_m, start_offsets):
+def triton_masked_index_gather(output, input, start_offsets, row_indices):
     assert output.ndim == 2, "Output must be a 2D tensor"
     assert input.ndim == 3, "Input must be a 3D tensor, [row, col, dim]"
-    assert masked_m.ndim == 1, "Indices must be a 1D tensor"
+    assert start_offsets.shape[
+        0] == input.shape[0] + 1, "Start offsets must be (num_experts + 1)"
 
     row_size = input.shape[0]
     col_size = input.shape[1]
     dim_size = input.shape[2]
-    total_elems = row_size * col_size * dim_size
+    num_tokens = output.shape[0]
+    total_elems = num_tokens * dim_size
 
     # launch kernel
     grid = lambda meta: (triton.cdiv(total_elems, meta['BLOCK_SIZE']), )
     masked_index_gather_kernel[grid](output,
                                      input,
-                                     masked_m,
                                      start_offsets,
+                                     row_indices,
+                                     row_size,
                                      col_size,
                                      dim_size,
                                      BLOCK_SIZE=1024)
-    return output
+    return
 
 
 @nvtx_range("[DG] act")
@@ -130,16 +134,17 @@ def indexing(x, mask):
     return x[mask > 0, :].contiguous()
 
 
-@nvtx_range("[DG] copy after permute")
-@torch.compile(dynamic=True)
-def preprocess_after_permute(expert_first_token_offset_tensor, ):
+@nvtx_range("[DG] preprocess_after_permute")
+def preprocess_after_permute(expert_first_token_offset_tensor,
+                             permuted_data_tensor):
     # get tokens per expert
     masked_m = expert_first_token_offset_tensor[
         1:] - expert_first_token_offset_tensor[:-1]
-    masked_m_shift = torch.zeros_like(masked_m)
-    masked_m_shift[1:] = masked_m[:-1]
-    start_offsets = torch.cumsum(masked_m_shift, dim=0)
-    return masked_m.to(torch.int32), start_offsets
+    token_to_expert_map = torch.searchsorted(
+        expert_first_token_offset_tensor[1:],
+        torch.arange(permuted_data_tensor.shape[0], device='cuda'),
+        right=True)
+    return masked_m.to(torch.int32), token_to_expert_map
 
 
 @nvtx_range("[DG]")
@@ -332,8 +337,8 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             dtype=self.dtype,
             device='cuda')
 
-        masked_m, start_offsets = preprocess_after_permute(
-            expert_first_token_offset_tensor)
+        masked_m, token_to_expert_map = preprocess_after_permute(
+            expert_first_token_offset_tensor, permuted_data_tensor)
         m_max = (x.shape[0] + 127) // 128 * 128
         expected_m = (token_selected_experts.numel() +
                       self.expert_size_per_partition -
@@ -345,7 +350,9 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             dtype=self.dtype,
             device='cuda')
         triton_masked_index_copy(permuted_data_tensor_padded,
-                                 permuted_data_tensor, masked_m, start_offsets)
+                                 permuted_data_tensor,
+                                 expert_first_token_offset_tensor,
+                                 token_to_expert_map)
 
         act_input_fp8, act_input_sf = fp8_utils.per_token_cast_to_fp8_e8m0(
             permuted_data_tensor_padded)
@@ -368,8 +375,9 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             expected_m=expected_m,
         )
 
-        triton_masked_index_gather(permuted_data_tensor, h3, masked_m,
-                                   start_offsets)
+        triton_masked_index_gather(permuted_data_tensor, h3,
+                                   expert_first_token_offset_tensor,
+                                   token_to_expert_map)
 
         final_hidden_states = torch.ops.trtllm.moe_finalize_scale_op(
             permuted_data_tensor,
