@@ -423,7 +423,11 @@ def set_cuda_device():
               type=click.Choice(severity_map.keys()),
               default='info',
               help="The logging level.")
-def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
+@click.option("--disable_gc",
+              is_flag=True,
+              default=False,
+              help="Disable Python's garbage collector during server runtime for potentially better TTFT (time to first token) performance.")
+def disaggregated_mpi_worker(config_file: Optional[str], log_level: str, disable_gc: bool):
     """Launching disaggregated MPI worker"""
 
     from tensorrt_llm._utils import mpi_rank
@@ -451,7 +455,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
 
         # Ignore the non-LLM args
         llm_args.pop("router", None)
-        _launch_disaggregated_server(config_file, llm_args)
+        _launch_disaggregated_server(config_file, llm_args, disable_gc)
         return
 
     is_leader, instance_idx, sub_comm = split_world_comm(
@@ -491,7 +495,7 @@ class DisaggLauncherEnvs(StrEnum):
     TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT = "TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT"
 
 
-def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
+def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict, disable_gc: bool):
     # Launching the server
     instance_idx = os.environ.get(DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX)
     assert instance_idx is not None, f"{DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX} should be set by the launcher"
@@ -503,7 +507,8 @@ def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
 
     launch_server(host=server_cfg.hostname,
                   port=server_cfg.port,
-                  llm_args=llm_args)
+                  llm_args=llm_args,
+                  disable_gc=disable_gc)
 
 
 def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
