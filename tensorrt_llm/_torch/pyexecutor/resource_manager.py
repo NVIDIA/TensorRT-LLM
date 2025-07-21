@@ -3,7 +3,7 @@ import enum
 import math
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -165,6 +165,7 @@ class KVCacheManager(BaseResourceManager):
         max_beam_width: int = 1,
         is_draft: bool = False,
         kv_connector_manager: Optional[KvCacheConnectorManager] = None,
+        **kwargs,
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
@@ -542,6 +543,46 @@ class KVCacheManager(BaseResourceManager):
         assert cache_size % quant_vector_size == 0, "NVFP4 cache size must be divisible by quant vector size"
         return get_size_in_bytes(cache_size // quant_vector_size,
                                  scaling_factor_dtype)
+
+    def get_cache_size_per_token(model_config: ModelConfig,
+                                 executor_config: ExecutorConfig,
+                                 mapping: Mapping):
+        # get kv cache dtype bytes
+        mem_per_token = 2
+        quant_config = model_config.quant_config
+        if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
+        ):
+            mem_per_token = 1
+
+        # get num key value heads
+        config = model_config.pretrained_config
+        num_key_value_heads = getattr(config, 'num_key_value_heads',
+                                      config.num_attention_heads)
+        if isinstance(num_key_value_heads, Iterable):
+            num_key_value_heads = sum(num_key_value_heads) / len(
+                num_key_value_heads)
+
+        # get head dim
+        mla = hasattr(config, "kv_lora_rank")
+        if mla:
+            head_dim = config.kv_lora_rank + config.qk_rope_head_dim
+            kv_factor = 1
+        else:
+            tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
+            head_dim = getattr(config, "head_dim", None)
+            if not isinstance(head_dim, int):
+                head_dim = config.hidden_size // config.num_attention_heads
+            head_dim = head_dim * num_key_value_heads // tp_size
+            kv_factor = 2
+
+        # provide at least 1 layer to prevent division by zero cache size
+        num_attention_layers = max(
+            len(mapping.pp_layers(model_config.get_num_attention_layers())), 1)
+        mem_per_token *= num_attention_layers * head_dim
+
+        # K and V
+        mem_per_token *= kv_factor
+        return mem_per_token
 
     def calculate_max_num_blocks(self,
                                  kv_cache_config: KvCacheConfig,

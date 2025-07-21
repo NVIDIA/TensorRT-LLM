@@ -308,6 +308,8 @@ def create_py_executor(
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
         has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
 
+    sparse_attention_config = executor_config.sparse_attention_config
+
     # chunk_unit_size may be changed to 64 when using flash mla
     attn_runtime_features = AttentionRuntimeFeatures(
         chunked_prefill=enable_chunked_context,
@@ -331,6 +333,7 @@ def create_py_executor(
             attn_runtime_features=attn_runtime_features,
             dist=dist,
             spec_config=spec_config,
+            sparse_attention_config=sparse_attention_config,
             lora_config=lora_config,
             checkpoint_loader=checkpoint_loader,
         )
@@ -404,6 +407,11 @@ def create_py_executor(
 
     max_seq_len = model_engine_max_seq_len
     max_num_tokens = model_engine.max_num_tokens
+
+    # Vanilla attention backend does not support paged KV cache, so we set tokens_per_block to
+    # max_num_tokens to use it as a continuous KV cache.
+    if pytorch_backend_config.attn_backend == "VANILLA":
+        executor_config.tokens_per_block = model_engine.max_num_tokens
 
     config = model_engine.model.model_config.pretrained_config
     if is_mla(config):
@@ -568,6 +576,7 @@ def create_py_executor(
             kv_cache_config=kv_cache_config,
             pytorch_backend_config=pytorch_backend_config,
             speculative_config=spec_config,
+            sparse_attention_config=sparse_attention_config,
         )
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
         with mem_monitor.observe_creation_stage(

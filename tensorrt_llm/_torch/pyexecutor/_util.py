@@ -1,6 +1,5 @@
 import os
 import random
-from collections.abc import Iterable
 from typing import Dict, List, Optional
 
 import torch
@@ -13,13 +12,14 @@ from tensorrt_llm.bindings.executor import DecodingMode
 from tensorrt_llm.llmapi.llm_args import (EagleDecodingConfig, KvCacheConfig,
                                           MTPDecodingConfig, PeftCacheConfig,
                                           SamplerType, SpeculativeConfig,
-                                          TorchLlmArgs)
+                                          TorchLlmArgs, SparseAttentionConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
 from tensorrt_llm.lora_manager import load_torch_lora
 from tensorrt_llm.mapping import CpType, Mapping
 
+from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..model_config import ModelConfig
 from ..speculative import get_num_extra_kv_tokens, get_spec_decoder
 from .config import PyTorchConfig
@@ -42,6 +42,21 @@ from .seq_slot_manager import SeqSlotManager
 GB = 1 << 30
 
 
+def get_kv_cache_manager_cls(model_config: ModelConfig,
+                             executor_config: ExecutorConfig):
+    config = model_config.pretrained_config
+    sparse_attn_config = executor_config.sparse_attention_config
+    if is_mla(config):
+        return KVCacheManager
+    elif is_nemotron_hybrid(config):
+        return MambaHybridCacheManager
+    else:
+        if sparse_attn_config is not None:
+            return get_sparse_attn_kv_cache_manager(sparse_attn_config)
+        else:
+            return KVCacheManager
+
+
 class KvCacheCreator:
     """Groups together logic related to KV cache construction."""
 
@@ -61,6 +76,7 @@ class KvCacheCreator:
         kv_cache_config: KvCacheConfig,
         pytorch_backend_config: PyTorchConfig,
         speculative_config: SpeculativeConfig,
+        sparse_attention_config: SparseAttentionConfig,
     ):
         self._model_engine = model_engine
         self._draft_model_engine = draft_model_engine
@@ -72,11 +88,14 @@ class KvCacheCreator:
         self._kv_connector_manager = kv_connector_manager
         self._pytorch_backend_config = pytorch_backend_config
         self._speculative_config = speculative_config
+        self._sparse_attention_config = sparse_attention_config
         self._tokens_per_block = tokens_per_block
         self._max_seq_len = max_seq_len
         self._max_batch_size = max_batch_size
         self._net_max_seq_len = net_max_seq_len
         self._dummy_reqs = None
+        self._kv_cache_manager_cls = get_kv_cache_manager_cls(
+            model_engine.model.model_config, executor_config)
 
     @staticmethod
     def _get_cache_size_per_token(model_config: ModelConfig,
@@ -116,6 +135,7 @@ class KvCacheCreator:
         # K and V
         mem_per_token *= kv_factor
         return mem_per_token
+        
 
     def _get_free_gpu_memory_fraction(self) -> float:
         fraction = self._kv_cache_config.free_gpu_memory_fraction
@@ -126,12 +146,12 @@ class KvCacheCreator:
     def _get_kv_size_per_token(self):
         model_config = self._model_engine.model.model_config
         mapping = self._mapping
-        kv_size_per_token = self._get_cache_size_per_token(
-            model_config, mapping)
+        kv_size_per_token = self._kv_cache_manager_cls.get_cache_size_per_token(
+            model_config, self._executor_config, mapping)
         if self._draft_model_engine is not None:
             draft_model_config = self._draft_model_engine.model.model_config
-            kv_size_per_token += self._get_cache_size_per_token(
-                draft_model_config, mapping)
+            kv_size_per_token += self._kv_cache_manager_cls.get_cache_size_per_token(
+                draft_model_config, self._executor_config, mapping)
         return kv_size_per_token
 
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
@@ -231,6 +251,12 @@ class KvCacheCreator:
             estimating_kv_cache = True
             self._kv_cache_config.max_tokens = self._get_token_num_for_estimation(
             )
+        model_config = self._model_engine.model.model_config
+        if model_config.attn_backend == "VANILLA":
+            logger.info(
+                "KV cache size estimation is not supported for Vanilla attention backend, disable it."
+            )
+            estimating_kv_cache = False
         return estimating_kv_cache
 
     def configure_kv_cache_capacity(self, py_executor: PyExecutor) -> None:
@@ -374,6 +400,7 @@ class KvCacheCreator:
         config = model_engine.model.model_config.pretrained_config
         quant_config = model_engine.model.model_config.quant_config
         spec_config = self._speculative_config
+        sparse_attn_config = self._sparse_attention_config
 
         hidden_size = config.hidden_size
         num_attention_heads = config.num_attention_heads
@@ -396,7 +423,7 @@ class KvCacheCreator:
         num_hidden_layers = config.num_hidden_layers
 
         if is_mla(config):
-            kv_cache_manager = KVCacheManager(
+            kv_cache_manager = self._kv_cache_manager_cls(
                 self._kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.
                 SELFKONLY,
@@ -434,8 +461,7 @@ class KvCacheCreator:
             mamba_layer_mask = [
                 char == "M" for char in config.hybrid_override_pattern
             ]
-
-            kv_cache_manager = MambaHybridCacheManager(
+            kv_cache_manager = self._kv_cache_manager_cls(
                 # mamba cache parameters
                 config.ssm_state_size,
                 config.conv_kernel,
@@ -518,7 +544,7 @@ class KvCacheCreator:
             binding_model_config = model_engine.model.model_config.get_bindings_model_config(
                 tokens_per_block=self._tokens_per_block) if is_vswa else None
 
-            kv_cache_manager = KVCacheManager(
+            kv_cache_manager = self._kv_cache_manager_cls(
                 self._kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
                 num_layers=num_hidden_layers,
@@ -536,6 +562,7 @@ class KvCacheCreator:
                 is_draft=model_engine.is_draft_model,
                 kv_connector_manager=self._kv_connector_manager
                 if not estimating_kv_cache else None,
+                sparse_attn_config=sparse_attn_config,
             )
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to self
         if model_engine.kv_cache_manager_key == ResourceManagerType.KV_CACHE_MANAGER:

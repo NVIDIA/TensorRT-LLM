@@ -133,6 +133,59 @@ class CudaGraphConfig(StrictBaseModel):
                 "cuda_graph_config.max_batch_size must be non-negative")
         return v
 
+
+class SparseAttentionBaseConfig(BaseModel):
+    """
+    Configuration for sparse attention.
+    """
+    algorithm: Literal["rocket"] = Field(
+        default="rocket", description="The algorithm for sparse attention.")
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        # dispatch to the correct sparse attention config
+        config_classes = {
+            "Rocket": RocketSparseAttentionConfig,
+        }
+
+        config_class = config_classes.get("algorithm")
+        if config_class is None:
+            raise ValueError(f"Invalid algorithm")
+
+        return config_class(**data)
+
+    def _check_fields(self):
+        pass
+
+    def supports_backend(self, backend: str) -> bool:
+        """
+        Override if the speculation algorithm does not support
+        a subset of the possible backends.
+        """
+        return True
+
+
+class RocketSparseAttentionConfig(SparseAttentionBaseConfig):
+    """
+    Configuration for rocket sparse attention.
+    """
+    window_size: Optional[int] = Field(
+        default=None, description="The window size for snap KV.")
+    kernel_size: Optional[int] = Field(
+        default=None, description="The kernel size for snap KV.")
+    topr: Optional[Union[int, float]] = Field(default=76, description="Top-r")
+    topk: Optional[int] = Field(default=128, description="Top-k")
+    prompt_budget: Optional[int] = Field(default=1266,
+                                         description="Prompt budget")
+    page_size: Optional[int] = Field(default=3, description="Page size")
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
     @staticmethod
     def _generate_cuda_graph_batch_sizes(max_batch_size: int,
                                          enable_padding: bool) -> List[int]:
@@ -1103,6 +1156,10 @@ SpeculativeConfig: TypeAlias = Optional[Union[
     AutoDecodingConfig,
 ]]
 
+SparseAttentionConfig: TypeAlias = Optional[Union[
+    RocketSparseAttentionConfig,
+]]
+
 
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(StrictBaseModel, PybindMirror):
@@ -1479,6 +1536,10 @@ class BaseLlmArgs(StrictBaseModel):
         default=None,
         description="Cache transceiver config.",
         status="prototype")
+
+    # sparse attention config
+    sparse_attention_config: Optional[SparseAttentionConfig] = Field(
+        default=None, description="Sparse attention config.")
 
     # Speculative decoding parameters
     speculative_config: SpeculativeConfig = Field(
@@ -2321,6 +2382,9 @@ class TorchLlmArgs(BaseLlmArgs):
     moe_config: MoeConfig = Field(default_factory=MoeConfig,
                                   description="MoE config.",
                                   status="beta")
+
+    sparse_attention_config: Optional[SparseAttentionConfig] = Field(
+        default=None, description="Sparse attention config.")
 
     attn_backend: str = Field(default='TRTLLM',
                               description="Attention backend to use.",

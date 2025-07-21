@@ -259,7 +259,9 @@ class Attention(nn.Module):
 
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
-        attn_cls = get_attention_backend(self.attn_backend)
+        attn_cls = get_attention_backend(
+            self.attn_backend,
+            sparse_attn_config=config.sparse_attention_config)
 
         # These two modules are mutually exclusive - either splitted_qkv_lora or fused_qkv_lora will be used,
         # but never both at the same time. splitted_qkv_lora handles Q,K,V separately while fused_qkv_lora
@@ -314,6 +316,7 @@ class Attention(nn.Module):
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             q_scaling=self.q_scaling,
             attention_chunk_size=self.attention_chunk_size,
+            sparse_attention_config=config.sparse_attention_config,
         )
 
         self.support_fused_qkv = self.attn.support_fused_qkv()
@@ -855,6 +858,7 @@ class MLA(nn.Module):
             v_head_dim=self.v_head_dim,
             predicted_tokens_per_seq=self.predicted_tokens_per_seq,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
+            sparse_attention_config=config.sparse_attention_config,
         )
 
         self.mqa = create_attention(
@@ -874,6 +878,7 @@ class MLA(nn.Module):
             v_head_dim=self.kv_lora_rank,
             predicted_tokens_per_seq=self.predicted_tokens_per_seq,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
+            sparse_attention_config=config.sparse_attention_config,
         )
 
         self.aux_stream = aux_stream
