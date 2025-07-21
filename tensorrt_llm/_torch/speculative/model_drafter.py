@@ -3,6 +3,8 @@ from __future__ import annotations
 import traceback
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
+import torch
+
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
@@ -12,10 +14,23 @@ from ..pyexecutor.sampler import Sampler, SampleState
 from ..pyexecutor.scheduler import ScheduledRequests
 from ..pyexecutor.seq_slot_manager import SeqSlotManager
 from .drafter import Drafter
-from .utils import get_draft_model_prompt
 
 if TYPE_CHECKING:
     from ..pyexecutor.model_engine import ModelEngine
+    from .interface import SpeculativeDecodingMode
+
+
+# Place the tool function here to avoid circular import
+def get_draft_model_prompt(spec_dec_mode: SpeculativeDecodingMode,
+                           input_tokens: torch.Tensor) -> torch.Tensor:
+    """
+    Can be used to modify prompts for speculative algorithms that need to update tokens
+    before drafting.
+    """
+    if spec_dec_mode.is_eagle3():
+        # EAGLE3 always throws away the first token when processing draft inputs
+        return input_tokens[1:]
+    return input_tokens
 
 
 class ModelDrafter(Drafter):

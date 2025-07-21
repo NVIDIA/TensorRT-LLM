@@ -1,5 +1,3 @@
-import torch
-
 from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler
 from tensorrt_llm._torch.speculative.interface import SpecMetadata
 
@@ -7,7 +5,6 @@ from ..pyexecutor.seq_slot_manager import SeqSlotManager
 from .eagle3 import (Eagle3OneModelSampler, Eagle3OneModelSpecMetadata,
                      Eagle3OneModelWorker, Eagle3ResourceManager,
                      Eagle3SpecMetadata)
-from .interface import SpeculativeDecodingMode
 from .model_drafter import ModelDrafter
 from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
@@ -156,18 +153,6 @@ def get_spec_worker(spec_config, mapping):
     if spec_config.spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelWorker(spec_config, mapping)
     return None
-
-
-def get_draft_model_prompt(spec_dec_mode: SpeculativeDecodingMode,
-                           input_tokens: torch.Tensor) -> torch.Tensor:
-    """
-    Can be used to modify prompts for speculative algorithms that need to update tokens
-    before drafting.
-    """
-    if spec_dec_mode.is_eagle3():
-        # EAGLE3 always throws away the first token when processing draft inputs
-        return input_tokens[1:]
-    return input_tokens
 
 
 def get_num_extra_kv_tokens(spec_config):
