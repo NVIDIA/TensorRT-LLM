@@ -1,5 +1,4 @@
 import copy
-import os
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -545,20 +544,6 @@ class LlamaDecoderLayer(DecoderLayer):
         super().__init__()
         config = model_config.pretrained_config
         self.layer_idx = layer_idx
-        self.mapping = model_config.mapping
-
-        self.fusion_config = EagerFusionConfig()
-        self.enable_fusion = os.environ.get(
-            "TRTLLM_LLAMA_EAGER_FUSION_DISABLED", "0") == "1"
-
-        self.is_fp8_quant = model_config.quant_config and model_config.quant_config.quant_mode.has_fp8_qdq(
-        )
-        self.is_nvfp4 = model_config.quant_config and model_config.quant_config.quant_mode.has_nvfp4(
-        )
-
-        # Disable fusion for nvfp4
-        self.fusion_config.PRE_MLP_FUSION = self.enable_fusion and not self.is_nvfp4 and self.mapping.tp_size > 1
-        self.fusion_config.POST_MLP_FUSION = self.fusion_config.PRE_MLP_FUSION
 
         self.self_attn = LlamaAttention(
             model_config,
@@ -586,11 +571,6 @@ class LlamaDecoderLayer(DecoderLayer):
         if not model_config.is_generation:
             self.attention_mask = PredefinedAttentionMask.FULL
 
-        self.all_reduce = AllReduce(mapping=model_config.mapping,
-                                    strategy=model_config.allreduce_strategy,
-                                    dtype=config.torch_dtype)
-        self.next_layer_layernorm: RMSNorm = None
-
     def forward(
         self,
         position_ids: torch.IntTensor,
@@ -613,33 +593,13 @@ class LlamaDecoderLayer(DecoderLayer):
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             attention_mask=self.attention_mask,
-            # all_reduce_params=AllReduceParams(
-            #     enable_allreduce=not (self.fusion_config.PRE_MLP_FUSION
-            #                           or self.mapping.tp_size == 1)),
-            # **kwargs,
+            **kwargs,
         )
 
-        # if self.fusion_config.PRE_MLP_FUSION:
-        #     hidden_states, residual = self.all_reduce(
-        #         hidden_states,
-        #         all_reduce_params=AllReduceParams(
-        #             fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-        #             residual=residual,
-        #             norm_weight=self.post_attention_layernorm.weight,
-        #             eps=self.post_attention_layernorm.variance_epsilon,
-        #             trigger_completion_at_end=False,
-        #         ))
-        # else:
+        # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-
-        hidden_states = self.mlp(
-            hidden_states,
-            # final_all_reduce_params=AllReduceParams(
-            #     enable_allreduce=not (self.fusion_config.POST_MLP_FUSION
-            #                           or self.mapping.tp_size == 1)),
-            **kwargs)
-
+        hidden_states = self.mlp(hidden_states, **kwargs)
         if spec_metadata is not None:
             # We save the hidden states in the spec metadata here. In _prepare_draft_tokens,
             # PyExecutor will extract these from the model engine's spec metadata.
@@ -647,28 +607,6 @@ class LlamaDecoderLayer(DecoderLayer):
             # TODO: can we support multiple model outputs instead?
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,
                                                       hidden_states, residual)
-
-        # if self.fusion_config.POST_MLP_FUSION and self.next_layer_layernorm is not None:
-        #     hidden_states, residual = self.all_reduce(
-        #         hidden_states,
-        #         all_reduce_params=AllReduceParams(
-        #             fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-        #             residual=residual,
-        #             norm_weight=self.next_layer_layernorm.weight,
-        #             eps=self.next_layer_layernorm.variance_epsilon,
-        #             trigger_completion_at_end=False,
-        #         ))
-        # elif self.next_layer_layernorm:
-        #     hidden_states, residual = self.next_layer_layernorm(
-        #         hidden_states, residual)
-        # elif self.fusion_config.POST_MLP_FUSION:
-        #     hidden_states, residual = self.all_reduce(
-        #         hidden_states,
-        #         all_reduce_params=AllReduceParams(
-        #             fusion_op=AllReduceFusionOp.NONE,
-        #             residual=residual,
-        #         ))
-
         return hidden_states, residual
 
 
@@ -849,17 +787,6 @@ class LlamaForCausalLM(SpecDecOneEngineForCausalLM[LlamaModel, LlamaConfig]):
         model_config: ModelConfig[LlamaConfig],
     ):
         super().__init__(LlamaModel(model_config), model_config)
-
-    # def load_weights(self, weights: Dict):
-    #     super().load_weights(weights)
-
-    #     for idx, layer in enumerate(
-    #             self.model.layers[:self.config.num_hidden_layers]):
-    #         if idx == self.config.num_hidden_layers - 1:
-    #             layer.next_layer_layernorm = self.model.norm
-    #         else:
-    #             layer.next_layer_layernorm = self.model.layers[
-    #                 idx + 1].input_layernorm
 
 
 class Llama4InputProcessor(InputProcessor):
