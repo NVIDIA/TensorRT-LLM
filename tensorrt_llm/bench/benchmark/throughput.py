@@ -15,7 +15,7 @@ from tensorrt_llm.bench.build.build import get_model_config
 
 # isort: off
 from tensorrt_llm.bench.benchmark.utils.general import (
-    get_settings_from_engine, get_settings)
+    get_settings_from_engine, get_settings, ALL_SUPPORTED_BACKENDS)
 # isort: on
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm._tensorrt_engine import LLM
@@ -45,7 +45,7 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Path to a serialized TRT-LLM engine.",
 )
 @optgroup.option("--backend",
-                 type=click.Choice(["pytorch", "tensorrt", "_autodeploy"]),
+                 type=click.Choice(ALL_SUPPORTED_BACKENDS),
                  default="pytorch",
                  help="The backend to use when running benchmarking.")
 @optgroup.option(
@@ -223,6 +223,16 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Path where output should be written to.",
 )
 @optgroup.option(
+    "--request_json",
+    type=click.Path(dir_okay=False,
+                    writable=True,
+                    readable=False,
+                    path_type=Path,
+                    resolve_path=True),
+    required=False,
+    help="Path where per request information is written to.",
+)
+@optgroup.option(
     "--enable_chunked_context",
     is_flag=True,
     default=False,
@@ -262,6 +272,7 @@ def throughput_command(
     # Reporting options
     report_json: Path = params.pop("report_json")
     output_json: Path = params.pop("output_json")
+    request_json: Path = params.pop("request_json")
     iteration_log: Path = params.pop("iteration_log")
     iteration_writer = IterationWriter(iteration_log)
 
@@ -294,10 +305,11 @@ def throughput_command(
         logger.info(metadata.get_summary_for_print())
 
     # Engine configuration parsing
-    if backend and backend.lower() in ["pytorch", "_autodeploy"]:
+    if backend and backend.lower() in ALL_SUPPORTED_BACKENDS and backend.lower(
+    ) != "tensorrt":
         # If we're dealing with a model name, perform a snapshot download to
         # make sure we have a local copy of the model.
-        if checkpoint_path is None:
+        if bench_env.checkpoint_path is None:
             snapshot_download(model)
 
         exec_settings = get_settings(params, metadata, bench_env.model,
@@ -433,6 +445,10 @@ def throughput_command(
             with open(output_json, "w") as f:
                 output_token_info = report_utility.get_output_tokens(tokenizer)
                 f.write(json.dumps(output_token_info, indent=4))
+        if request_json:
+            logger.info(f"Writing request information to {request_json}.")
+            with open(request_json, "w") as f:
+                f.write(json.dumps(report_utility.get_request_info(tokenizer)))
         report_utility.report_statistics()
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt, exiting benchmark...")

@@ -1,15 +1,7 @@
 import asyncio
-from dataclasses import dataclass
 from typing import Mapping, Optional
 
 from tensorrt_llm.executor.result import GenerationResult
-
-
-@dataclass(slots=True)
-class ScaffoldingOutput:
-
-    def __init__(self):
-        self.output_str = None
 
 
 class ScaffoldingResult:
@@ -17,7 +9,7 @@ class ScaffoldingResult:
     def __init__(self, streaming_event: Optional[asyncio.Event] = None):
         super().__init__()
         self.aqueue = asyncio.Queue()
-        self.cur_output = None
+        self.cur_output: GenerationResult = None
         self._done = False
         self.task_collections = None
         self.streaming_event = streaming_event

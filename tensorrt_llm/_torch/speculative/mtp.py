@@ -10,7 +10,7 @@ from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import (SampleState, SampleStateTensors, TorchSampler,
                                   add_token, int_tensor)
 from ..pyexecutor.scheduler import ScheduledRequests
-from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
+from .interface import SpecMetadata
 
 
 @dataclass(kw_only=True)
@@ -25,52 +25,10 @@ class SampleStateMTP(SampleState):
     host: SampleStateTensorsMTP
 
 
-@dataclass
-class MTPConfig(SpecConfig):
-    """
-    Configuration for MTP.
-    """
-    # The name of speculative decoding.
-    spec_dec_name = "MTP"
-    # The number of MTP modules
-    num_nextn_predict_layers: int = 1
-    # The number of max batch size
-    max_batch_size: int = 8
-
-    # Whether to use relaxed acceptance during thinking phase for reasoning model
-    use_relaxed_acceptance_for_thinking: bool = False
-    # The top-N tokens are sampled from logits to obtain a candidate set.
-    relaxed_topk: int = 1
-    # The threshold to further filter the candidate set.
-    # Filter out tokens with a large probability gap between the top-1 token's log probability.
-    relaxed_delta: float = 0.
-
-    # Whether to use vanilla MTP
-    use_mtp_vanilla: bool = False
-
-    # TODO: Hard code for DeepSeek R1
-    # When encounter <think>, start thinking phase.
-    # When encounter </think>, end thinking phase.
-    # <think> [thinking phase] </think> [real output]
-    BEGIN_THINKING_PHASE_TOKEN: int = 128798
-    END_THINKING_PHASE_TOKEN: int = 128799
-
-    def __post_init__(self) -> None:
-        self.spec_dec_mode = SpeculativeDecodingMode.from_string(
-            self.spec_dec_name)
-        self.max_draft_tokens = self.num_nextn_predict_layers
-
-    def update_from_model_config(self, model_config):
-        assert self.num_nextn_predict_layers > 0
-        if model_config.num_nextn_predict_layers == 1 and not self.use_mtp_vanilla:
-            self.spec_dec_mode = SpeculativeDecodingMode.MTP_EAGLE
-            self.num_extra_kv_tokens = self.num_nextn_predict_layers - 1
-
-
 class MTPHiddenStatesManager(BaseResourceManager):
 
-    def __init__(self, config: MTPConfig, dtype: torch.dtype, hidden_size: int,
-                 max_num_requests: int):
+    def __init__(self, config: "MTPDecodingConfig", dtype: torch.dtype,
+                 hidden_size: int, max_num_requests: int):
         self.dtype = dtype
         self.num_nextn_predict_layers = config.num_nextn_predict_layers
         self.hidden_size = hidden_size
@@ -199,8 +157,8 @@ class MTPSpecMetadata(SpecMetadata):
                                      pin_memory=True)
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
                                                  non_blocking=True)
-        # MTP vanilla worker uses total max_draft_tokens input tokens in generation phase,
-        # while MTP Eagle worker uses (max_draft_tokens + 1) input tokens in the 1st draft
+        # MTP vanilla worker uses total max_draft_len input tokens in generation phase,
+        # while MTP Eagle worker uses (max_draft_len + 1) input tokens in the 1st draft
         # forward and only one input token in the following draft forward.
         # This num_tokens is used to set the all_rank_num_tokens for attention dp.
         if not self.spec_dec_mode.is_mtp_eagle():
@@ -274,7 +232,7 @@ class MTPSampler(TorchSampler):
         assert not request.py_return_context_logits, "return_context_logits not implemented for MTPSampler"
         assert not request.py_return_generation_logits, "return_generation_logits not implemented for MTPSampler"
         assert not request.py_return_log_probs, "return_log_probs not implemented for MTPSampler"
-        request.py_draft_tokens = next_draft_tokens[request.seq_slot]
+        request.py_draft_tokens = next_draft_tokens[request.py_seq_slot]
         request.py_decoding_iter += 1
 
     def update_requests(self, state: SampleStateMTP) -> None:
@@ -295,7 +253,7 @@ class MTPSampler(TorchSampler):
         for req in state.scheduled_requests.generation_requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
-            num_new_tokens = new_tokens_lens[req.seq_slot]
+            num_new_tokens = new_tokens_lens[req.py_seq_slot]
             for i in range(num_new_tokens):
                 new_token = add_token(req, new_tokens, beam=beam_idx, step=i)
                 if self._handle_stop_criteria(req, new_token):
@@ -311,7 +269,7 @@ class MTPSampler(TorchSampler):
         # next_new_tokens_device: input tokens for the next iteration, device tensor, shape: batch_size, nextn + 1
 
         requests = scheduled_requests.all_requests()
-        slots = torch.as_tensor([r.seq_slot for r in requests])
+        slots = torch.as_tensor([r.py_seq_slot for r in requests])
         slots = slots.to(device="cuda", non_blocking=True)
 
         o_new_tokens = outputs['new_tokens'][:len(requests)]
@@ -353,7 +311,7 @@ class MTPSampler(TorchSampler):
 
 class MTPWorker(nn.Module):
 
-    def __init__(self, spec_config: MTPConfig):
+    def __init__(self, spec_config: "MTPDecodingConfig"):
         super().__init__()
         self.spec_config = spec_config
         self.is_thop = False
@@ -742,7 +700,7 @@ class MTPWorker(nn.Module):
 
         Returns:
             accepted_tokens: torch.Tensor
-                [batch_size, (max_draft_tokens + 1)]
+                [batch_size, (max_draft_len + 1)]
                 Accepted token ids. Flattened.
 
             num_accepted_tokens: torch.Tensor
@@ -942,7 +900,7 @@ class MTPWorker(nn.Module):
                 Target model's hidden states.
 
             accepted_tokens: torch.Tensor
-                [batch_size, max_draft_tokens + 1]
+                [batch_size, max_draft_len + 1]
                 Accepted token ids. Flattened.
 
             num_accepted_tokens: torch.Tensor
@@ -1080,7 +1038,7 @@ class MTPWorker(nn.Module):
 
         Returns:
             draft_tokens: torch.Tensor
-                [batch_size * max_draft_tokens]
+                [batch_size * max_draft_len]
                 Draft token ids. Flattened.
         '''
 
@@ -1090,7 +1048,7 @@ class MTPWorker(nn.Module):
 
 class MTPEagleWorker(MTPWorker):
 
-    def __init__(self, spec_config: MTPConfig):
+    def __init__(self, spec_config: "MTPDecodingConfig"):
         super().__init__(spec_config)
         self.mtp_num_modules = spec_config.num_nextn_predict_layers
 

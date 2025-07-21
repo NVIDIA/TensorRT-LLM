@@ -48,10 +48,10 @@ def run_medusa_decoding(use_modelopt_ckpt=False, model_dir=None):
         model = "lmsys/vicuna-7b-v1.3"
 
         # The end user can customize the medusa decoding configuration by specifying the
-        # speculative_model, max_draft_len, medusa heads num and medusa choices
+        # speculative_model_dir, max_draft_len, medusa heads num and medusa choices
         # with the MedusaDecodingConfig class
         speculative_config = MedusaDecodingConfig(
-                                        speculative_model="FasterDecoding/medusa-vicuna-7b-v1.3",
+                                        speculative_model_dir="FasterDecoding/medusa-vicuna-7b-v1.3",
                                         max_draft_len=63,
                                         num_medusa_heads=4,
                                         medusa_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \

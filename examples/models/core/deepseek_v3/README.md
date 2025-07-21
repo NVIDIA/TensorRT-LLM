@@ -142,7 +142,7 @@ python /app/tensorrt_llm/benchmarks/cpp/prepare_dataset.py \
 
 cat <<EOF > /tmp/extra-llm-api-config.yml
 cuda_graph_config:
-  padding_enabled: true
+  enable_padding: true
   batch_sizes: [1, 4, 8, 12]
 EOF
 
@@ -169,9 +169,10 @@ python /app/tensorrt_llm/benchmarks/cpp/prepare_dataset.py \
 
 cat <<EOF > /tmp/extra-llm-api-config.yml
 cuda_graph_config:
-  padding_enabled: true
+  enable_padding: true
   batch_sizes: [1, 2]
-moe_max_num_tokens: 16384
+moe_config:
+  max_num_tokens: 16384
 EOF
 
 trtllm-bench -m deepseek-ai/DeepSeek-R1 --model_path ${DS_R1_NVFP4_MODEL_PATH} throughput \
@@ -192,7 +193,6 @@ Evaluate the model accuracy using `trtllm-eval`.
 1. (Optional) Prepare an advanced configuration file:
 ```bash
 cat >./extra-llm-api-config.yml <<EOF
-cuda_graph_config: {}
 enable_attention_dp: true
 EOF
 ```
@@ -237,7 +237,7 @@ To serve the model using `trtllm-serve`:
 ```bash
 cat >./extra-llm-api-config.yml <<EOF
 cuda_graph_config:
-  padding_enabled: true
+  enable_padding: true
   batch_sizes:
     - 1
     - 2
@@ -316,7 +316,7 @@ export TRTLLM_USE_UCX_KVCACHE=1
 
 cat >./gen-extra-llm-api-config.yml <<EOF
 cuda_graph_config:
-  padding_enabled: true
+  enable_padding: true
   batch_sizes:
     - 1
     - 2
@@ -353,7 +353,7 @@ Finally, you can launch the disaggregated server which will accept requests from
 the orchestration between the context and generation servers with:
 
 ```bash
-cat >./disagg-config.yml <<EOF
+cat >./disagg-config.yaml <<EOF
 hostname: localhost
 port: 8000
 backend: pytorch
@@ -362,9 +362,10 @@ context_servers:
   urls:
       - "localhost:8001"
 generation_servers:
-  num_instances: 1
+  num_instances: 2
   urls:
       - "localhost:8002"
+      - "localhost:8003"
 EOF
 
 trtllm-serve disaggregated -c disagg-config.yaml
@@ -538,7 +539,7 @@ python3 /path/to/TensorRT-LLM/benchmarks/cpp/prepare_dataset.py \
 
 cat >/path/to/TensorRT-LLM/extra-llm-api-config.yml <<EOF
 cuda_graph_config:
-  padding_enabled: true
+  enable_padding: true
   batch_sizes:
     - 1
     - 2

@@ -872,8 +872,8 @@ def test_trtllm_bench_latency_sanity(llm_root, llm_venv, engine_dir,
                                                                 streaming=True)
 
     benchmark_cmd = \
-        f"trtllm-bench --model {model_path} latency --engine_dir {engine_path} " \
-        f"--dataset {dataset_path}"
+        f"trtllm-bench --model {model_name} --model_path {model_path} latency " \
+        f"--engine_dir {engine_path} --dataset {dataset_path} --backend tensorrt"
     check_call(benchmark_cmd, shell=True)
 
 
@@ -916,8 +916,8 @@ def test_trtllm_bench_request_rate_and_concurrency(llm_root, llm_venv,
                                                                 streaming=False)
 
     benchmark_cmd = \
-        f"trtllm-bench --model {model_path} throughput --engine_dir {engine_path} " \
-        f"--dataset {dataset_path}"
+        f"trtllm-bench --model {model_name} --model_path {model_path} throughput " \
+        f"--engine_dir {engine_path} --dataset {dataset_path} --backend tensorrt"
 
     if request_rate:
         benchmark_cmd += " --request_rate 100"
@@ -1544,7 +1544,25 @@ def test_build_time_benchmark_sanity(llm_root, llm_venv):
     ])
 
 
-### Pivot-To-Python examples
+### PyTorch examples
+
+
+def parse_output(text):
+    results = []
+    text_lists = re.split(r"\[\d+\] Prompt:", text)
+    for item in text_lists:
+        item = item.replace(os.linesep, "")
+        while True:
+            match = re.search(r"(Generated text: \'(.*?)\')", item,
+                              re.MULTILINE)
+            if match is None:
+                break
+            _, end = match.span(1)
+            results.append(match.group(2))
+            item = item[end:]
+    return results
+
+
 def test_ptp_quickstart(llm_root, llm_venv):
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
 
@@ -1964,6 +1982,7 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
     ("qwen2-vl-7b-instruct", "Qwen2-VL-7B-Instruct"),
     ("qwen2.5-vl-7b-instruct", "Qwen2.5-VL-7B-Instruct"),
     ("mistral-small-3.1-24b-instruct", "Mistral-Small-3.1-24B-Instruct-2503"),
+    ("gemma-3-27b-it", "gemma/gemma-3-27b-it"),
 ])
 def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                                    modality, use_cuda_graph):
@@ -2064,6 +2083,13 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                 ["highway", "traffic", "directions", "lanes", "Jurong"],
             ],
         },
+        "gemma-3-27b-it": {
+            "image": [
+                ["dramatic", "turbulent", "waves", "ocean", "overcast"],
+                ["half", "dome", "yosemite", "landmark", "rounded"],
+                ["flowing", "standstill", "vehicles", "road", "Changi"],
+            ],
+        },
     }
 
     cmd = [
@@ -2083,22 +2109,15 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         cmd.append("--max_num_tokens=16384")
     if use_cuda_graph:
         cmd.append("--use_cuda_graph")
-    output = llm_venv.run_cmd(cmd, caller=check_output)
+    # Gemma3 VLM needs a custom mask which is only supported by flashinfer backend currently.
+    # Custom mask involves bidirectional masking of image tokens in context phase. To get this
+    # correct, chunked prefill and kv cache reuse need to be turned off.
+    if model_name == "gemma-3-27b-it":
+        cmd.append("--image_format=pil")
+        cmd.append("--attention_backend=FLASHINFER")
+        cmd.append("--disable_kv_cache_reuse")
 
-    def parse_output(text):
-        results = []
-        text_lists = re.split(r"\[\d+\] Prompt:", text)
-        for item in text_lists:
-            item = item.replace(os.linesep, "")
-            while True:
-                match = re.search(r"(Generated text: \'(.*?)\')", item,
-                                  re.MULTILINE)
-                if match is None:
-                    break
-                _, end = match.span(1)
-                results.append(match.group(2))
-                item = item[end:]
-        return results
+    output = llm_venv.run_cmd(cmd, caller=check_output)
 
     match_ratio = 4.0 / 5
     if model_name == "qwen2-vl-7b-instruct" and modality == "image":
@@ -2164,6 +2183,92 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         if model_name in mapping:
             peak, fraction = mapping[model_name]
             _check_mem_usage(running_log, [peak, 0, 0, 0])
+
+
+@pytest.mark.parametrize("modality", ["image", "audio", "image_audio"])
+def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, modality):
+    model_name = "Phi-4-multimodal-instruct"
+    model_path = "multimodals/Phi-4-multimodal-instruct"
+
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    test_data_root = Path(
+        os.path.join(llm_models_root(), "multimodals", "test_data"))
+    audio_data_root = Path(
+        os.path.join(llm_models_root(), "multimodals",
+                     "Phi-4-multimodal-instruct", "examples"))
+    print(f"Accuracy test {model_name} {modality} mode with example inputs.")
+    accuracy_inputs = {
+        "image": {
+            "prompt": [
+                "Describe the object and the weather condition in the image.",
+                "Describe the traffic condition on the road in the image.",
+            ],
+            "media": [
+                str(test_data_root / "inpaint.png"),
+                str(test_data_root / "61.jpg"),
+            ],
+        },
+        "audio": {
+            "prompt": [
+                "Transcribe the audio clip into text, please don't add other text.",
+                "Transcribe the audio clip into text, please don't add other text.",
+            ],
+            "media": [
+                str(audio_data_root /
+                    "what_is_the_traffic_sign_in_the_image.wav"),
+                str(audio_data_root / "what_is_shown_in_this_image.wav"),
+            ],
+        },
+        "image_audio": {
+            "prompt": [
+                "",
+            ],
+            "media": [
+                str(test_data_root / "inpaint.png"),
+                str(audio_data_root / "what_is_shown_in_this_image.wav"),
+            ],
+        }
+    }
+    expected_keywords = {
+        "image": [
+            ["clear", "sunny", "sky", "image", "object"],
+            ["road", "car", "lane", "strip", "bus"],
+        ],
+        "audio": [
+            ["what", "is", "the", "traffic", "sign", "in", "image"],
+            ["what", "is", "shown", "in", "this", "image"],
+        ],
+        "image_audio": [
+            ["Half", "Dome", "Park", "natural", "image"],
+        ],
+    }
+
+    cmd = [
+        str(example_root / "quickstart_multimodal.py"),
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--modality",
+        modality,
+        "--prompt",
+        *accuracy_inputs[modality]["prompt"],
+        "--media",
+        *accuracy_inputs[modality]["media"],
+        "--load_lora",
+        "--auto_model_name",
+        "Phi4MMForCausalLM",
+    ]
+    output = llm_venv.run_cmd(cmd, caller=check_output)
+
+    match_ratio = 0.6
+    for prompt_output, prompt_keywords in zip(parse_output(output),
+                                              expected_keywords[modality]):
+        matches = [
+            keyword in prompt_output.lower() for keyword in prompt_keywords
+        ]
+        obs_match_ratio = 1. * sum(matches) / len(matches)
+        assert obs_match_ratio >= match_ratio, f"Incorrect output!\nGenerated \"{prompt_output}\"\nExpected keywords \"{prompt_keywords}\"\n Matched keywords: {matches}\n Observed match ratio {obs_match_ratio} below threshold {match_ratio}"
+
+    print("All answers are correct!")
 
 
 @pytest.mark.parametrize("model_name,model_path", [

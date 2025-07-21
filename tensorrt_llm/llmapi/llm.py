@@ -334,9 +334,9 @@ class BaseLLM:
         # With pytorch backend, py_executor has logic to handle max_tokens of 1,
         # so set to 1 to avoid allocating unnecessary KV cache blocks for single request
         # TODO: Also support for trt backend
-        if (disaggregated_params is not None
-                and disaggregated_params.request_type == "context_only"
-                and not self._on_trt_backend):
+        is_ctx_only = disaggregated_params is not None and disaggregated_params.request_type == "context_only"
+        is_gen_only = disaggregated_params is not None and disaggregated_params.request_type == "generation_only"
+        if is_ctx_only and not self._on_trt_backend:
             sampling_params.max_tokens = 1
 
         inputs = prompt_inputs(inputs)
@@ -401,7 +401,8 @@ class BaseLLM:
         self._check_arguments(
             len(prompt_token_ids),
             len(query_token_ids) if query_token_ids is not None else 0,
-            sampling_params)
+            sampling_params,
+            is_gen_only=is_gen_only)
         if _postproc_params:
             _postproc_params.postproc_args.num_prompt_tokens = len(
                 prompt_token_ids)
@@ -499,8 +500,8 @@ class BaseLLM:
                 raise ValueError(
                     "tokenizer is required to initialize a default sampling_params, or you can explicitly specify a sampling_params"
                 )
-            return SamplingParams(end_id=self.tokenizer.eos_token_id,
-                                  pad_id=self.tokenizer.pad_token_id)
+            sampling_params = SamplingParams(end_id=self.tokenizer.eos_token_id,
+                                             pad_id=self.tokenizer.pad_token_id)
         elif isinstance(sampling_params, SamplingParams):
             if sampling_params.end_id is None:
                 if self.tokenizer is None:
@@ -508,23 +509,29 @@ class BaseLLM:
                         "tokenizer is required to reset end_id if it is None, or you can explicitly specify the end_id for sampling_params"
                     )
                 sampling_params._setup(self.tokenizer)
-            # auto enabled context and/or generation logits flags, as they are required by logprob computation for TRT backend.
-            if self.args.backend not in ["pytorch", "_autodeploy"]:
-                if sampling_params.prompt_logprobs and not sampling_params.return_context_logits:
-                    sampling_params.return_context_logits = True
-                    sampling_params._context_logits_auto_enabled = True
-                if sampling_params.logprobs and not sampling_params.return_generation_logits:
-                    sampling_params.return_generation_logits = True
-                    sampling_params._generation_logits_auto_enabled = True
-
-            return sampling_params
         else:
             raise TypeError(
                 f"The sampling_params must be type SamplingParams or None, but got {type(sampling_params)}"
             )
 
+        # auto enabled context and/or generation logits flags, as they are required by logprob computation for TRT backend.
+        if self.args.backend not in ["pytorch", "_autodeploy"]:
+            if sampling_params.prompt_logprobs and not sampling_params.return_context_logits:
+                sampling_params.return_context_logits = True
+                sampling_params._context_logits_auto_enabled = True
+            if sampling_params.logprobs and not sampling_params.return_generation_logits:
+                sampling_params.return_generation_logits = True
+                sampling_params._generation_logits_auto_enabled = True
+
+        if sampling_params._stream_interval is None:
+            sampling_params._stream_interval = getattr(self.args,
+                                                       "stream_interval", 1)
+
+        return sampling_params
+
     def _check_arguments(self, prompt_len: int, query_len: int,
-                         sampling_params: SamplingParams) -> None:
+                         sampling_params: SamplingParams,
+                         is_gen_only: bool) -> None:
 
         if self.args.backend in ["pytorch", "_autodeploy"]:
             # TODO: remove these checks after PyTorch backend
@@ -537,6 +544,14 @@ class BaseLLM:
                 raise ValueError(
                     f"PyTorch backend currently only supports `logprobs=1`. Received `logprobs={sampling_params.logprobs}` (Top{sampling_params.logprobs} logprobs). Please set `logprobs=1` in `sampling_params` instead."
                 )
+            # Check prompt length and query length against max_num_tokens to filter illegal requests.
+            # Skip check for gen-only requests
+            if self.args.backend == "pytorch" and not self.args.enable_chunked_prefill and not is_gen_only:
+                max_num_tokens = self.args.max_num_tokens
+                if max_num_tokens and prompt_len / self.args.parallel_config.cp_size + query_len > max_num_tokens:
+                    raise ValueError(
+                        f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}), query length ({query_len}) should not exceed "
+                        f"max_num_tokens ({max_num_tokens})")
             return
 
         build_config = self.args.build_config
@@ -553,7 +568,7 @@ class BaseLLM:
             (sampling_params.max_tokens or 0) > max_seq_len):
             raise ValueError(
                 f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}) and query length ({query_len}) max_tokens ({sampling_params.max_tokens}) should not exceed "
-                f"max_seq_len ({build_config.max_seq_len})")
+                f"max_seq_len ({max_seq_len})")
 
         if sampling_params.use_beam_search and sampling_params.best_of > build_config.max_beam_width:
             if sampling_params.n == sampling_params.best_of:
@@ -958,7 +973,11 @@ class _TorchLLM(BaseLLM):
             speculative_config=self.args.speculative_config,
             hf_model_dir=self._hf_model_dir,
             max_input_len=self.args.max_input_len,
-            max_seq_len=max_seq_len)
+            max_seq_len=max_seq_len,
+            checkpoint_format=None if self.args.backend == "_autodeploy" else
+            self.args.checkpoint_format,
+            checkpoint_loader=None if self.args.backend == "_autodeploy" else
+            self.args.checkpoint_loader)
 
         # TODO: revisit gather_context_logits
         return_logits = self.args.gather_generation_logits

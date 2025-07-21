@@ -7,7 +7,6 @@ import torch
 
 from ..._utils import get_sm_version
 from ..attention_backend.trtllm import AttentionBackend, TrtllmAttention
-from ..model_config import TConfig
 
 
 class SpeculativeDecodingMode(IntEnum):
@@ -107,38 +106,6 @@ class SpeculativeDecodingMode(IntEnum):
 
 
 @dataclass
-class SpecConfig:
-    """
-    Configuration for speculative decoding.
-    """
-    # The name of speculative decoding.
-    spec_dec_name = None
-    # The mode of speculative decoding.
-    spec_dec_mode: SpeculativeDecodingMode = SpeculativeDecodingMode.NONE
-    # The max number of draft tokens
-    max_draft_tokens: int = 1024
-    # The path to the draft model
-    draft_model_path: Optional[str] = None
-    # The number of extra kv tokens
-    num_extra_kv_tokens: int = 0
-
-    def __post_init__(self) -> None:
-        self.spec_dec_mode = SpeculativeDecodingMode.from_string(
-            self.spec_dec_name)
-
-    def update_from_model_config(self, model_config: TConfig):
-        pass
-
-    def get_draft_model_prompt(self,
-                               input_tokens: torch.Tensor) -> torch.Tensor:
-        """
-        Override for spec dec modes that need to preprocess prompt
-        tokens before passing them to the draft model.
-        """
-        return input_tokens
-
-
-@dataclass
 class SpecMetadata:
     """
     Metadata for speculative decoding.
@@ -146,7 +113,7 @@ class SpecMetadata:
     # The max number of requests in a single batch.
     max_num_requests: int
     # The max number of draft tokens.
-    max_draft_tokens: int
+    max_draft_len: int
     # The number of gen-phase sequences in the batch.
     num_generations: int = 0
     # Whether CUDA graph is enabled.
@@ -180,7 +147,7 @@ class SpecMetadata:
     # Some speculative decoding methods need to use different kv lengths for the
     # draft/target layers. But KVCacheManager can only support kv caches with the
     # same kv lengths for different layers. Add extra kv token in kv cache manager
-    # to haddle this issue.
+    # to handle this issue.
     num_extra_kv_tokens: Optional[int] = 0  # Number of layers in target model
     # The number of layers
     num_layers: int = 0

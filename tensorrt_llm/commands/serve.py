@@ -362,6 +362,7 @@ def disaggregated(config_file: Optional[str],
         gen_servers=gen_server_urls,
         req_timeout_secs=request_timeout,
         server_start_timeout_secs=server_start_timeout,
+        max_retries=disagg_cfg.max_retries,
         ctx_router_config=disagg_cfg.ctx_router_config,
         gen_router_config=disagg_cfg.gen_router_config,
         conditional_disagg_config=disagg_cfg.conditional_disagg_config,
@@ -429,7 +430,6 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
         disagg_cfg.server_configs)
 
     logger.set_level(log_level)
-    os.environ['TRTLLM_USE_MPI_KVCACHE'] = "1"
     set_mpi_comm(sub_comm)
     logger.info(
         f"mpi_session is provided for LLM instance. Global MPI rank: {global_mpi_rank()}, sub-comm MPI rank: {mpi_rank()}"

@@ -3,10 +3,11 @@ from typing import Dict, Optional, Tuple
 
 import torch
 from torch import nn
-from tqdm import tqdm
 from transformers import Gemma3TextConfig
 from transformers.activations import ACT2FN
 
+from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
+    BaseWeightMapper
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.mapping import Mapping
 
@@ -23,7 +24,6 @@ from ..modules.linear import Linear, TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             duplicate_kv_weight, filter_weights,
                              register_auto_model)
 
 
@@ -48,6 +48,7 @@ class Gemma3TextScaledWordEmbedding(Embedding):
         )
         self.embed_scale = torch.sqrt(torch.tensor(hidden_size)).to(self.dtype)
 
+    @torch.inference_mode()
     def forward(self, input_ids):
         return super().forward(input_ids) * self.embed_scale
 
@@ -97,6 +98,7 @@ class Gemma3Attention(Attention):
         self.aux_stream = torch.cuda.Stream()
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
+    @torch.inference_mode()
     def forward(
         self,
         position_ids: Optional[torch.IntTensor],
@@ -176,6 +178,7 @@ class Gemma3MLP(nn.Module):
                                 dtype=self.dtype)
         self.act_fn = ACT2FN[config.hidden_activation]
 
+    @torch.inference_mode()
     def forward(self, x):
         down_proj = self.down_proj(
             self.act_fn(self.gate_proj(x)) * self.up_proj(x))
@@ -192,7 +195,7 @@ class Gemma3DecoderLayer(DecoderLayer):
         super().__init__()
         self.layer_idx = layer_idx
         config = model_config.pretrained_config
-        is_sliding = bool((layer_idx + 1) % config.sliding_window_pattern)
+        is_sliding = (config.layer_types[layer_idx] == "sliding_attention")
         self.self_attn = Gemma3Attention(
             model_config,
             layer_idx=layer_idx,
@@ -215,6 +218,7 @@ class Gemma3DecoderLayer(DecoderLayer):
             eps=config.rms_norm_eps,
             dtype=config.torch_dtype)
 
+    @torch.inference_mode()
     def forward(
         self,
         position_ids: torch.IntTensor,
@@ -272,6 +276,7 @@ class Gemma3TextModel(DecoderModel):
                             eps=config.pretrained_config.rms_norm_eps,
                             dtype=config.pretrained_config.torch_dtype)
 
+    @torch.inference_mode()
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -318,6 +323,42 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
 
+    def _get_token_type_mask(self, image_token_mask: torch.BoolTensor):
+        device = image_token_mask.device
+        sequence_length = len(image_token_mask)
+
+        # Create a list of token type ids. 0 for text tokens, 1 for all image tokens (regardless of which image they belong to).
+        token_type_ids = torch.zeros(sequence_length,
+                                     dtype=torch.int32,
+                                     device=device)
+        token_type_ids[image_token_mask] = 1
+
+        # There could be image tokens from multiple images where those corresponding to the
+        # same image are contiguous. We assign a unique id to each contiguous blob of image tokens now.
+
+        # Pad with zero at the start to detect changes.
+        padded = torch.cat((torch.tensor([0], device=device), token_type_ids))
+
+        # Identify where blobs start (0->1 transitions)
+        starts = (padded[1:] > padded[:-1]).int()
+
+        # Cumulative sum of starts gives a unique id for each blob. Note that
+        # this assigns a unique id to the zeros separating the blobs.
+        blob_ids = torch.cumsum(starts, dim=0)
+
+        # Mask out zeros (positions where token_type_ids == 0).
+        token_type_ids *= blob_ids
+
+        # Create a mask where each blob is a unique id.
+        token_type_mask = token_type_ids.unsqueeze(
+            0) == token_type_ids.unsqueeze(1)
+
+        # If text token, do not change anything.
+        token_type_mask = torch.where(token_type_ids == 0, False,
+                                      token_type_mask)
+
+        return token_type_mask
+
     def get_context_mask(
         self,
         image_token_mask: torch.BoolTensor,
@@ -351,15 +392,7 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
             causal_mask = attention_mask_1 & attention_mask_2
 
         # Apply a bidirectional mask for image tokens.
-        token_type_ids = torch.zeros(sequence_length,
-                                     dtype=torch.int32,
-                                     device=device)
-        # 1 for image tokens, 0 for text tokens.
-        token_type_ids[image_token_mask] = 1
-        token_type_mask = token_type_ids.unsqueeze(
-            0) == token_type_ids.unsqueeze(1)
-        # If text token, do not change anything.
-        token_type_mask[token_type_ids == 0] = False
+        token_type_mask = self._get_token_type_mask(image_token_mask)
         causal_mask = causal_mask.masked_fill(token_type_mask, True)
         return causal_mask
 
@@ -411,6 +444,7 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
             context_mask_list.append(mask_i.flatten())
         return torch.cat(context_mask_list, dim=0).contiguous()
 
+    @torch.inference_mode()
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -452,61 +486,5 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
             return_context_logits,
         )
 
-    # This is a modified version of the load_weights function in modeling_utils.py with the
-    # minor change for Gemma3 RMSNorm.
-    def load_weights(self, weights: Dict):
-        tp_size = self.model_config.mapping.tp_size
-        num_kv_heads = self.config.num_key_value_heads
-
-        params_map = {
-            'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
-            'gate_up_proj': ['gate_proj', 'up_proj']
-        }
-
-        for name, module in tqdm(list(self.named_modules()),
-                                 desc="Loading weights"):
-            if len(module._parameters) > 0:
-                # skip load weights if tie word embeddings is enabled and layer is lm_head
-                if self.config.tie_word_embeddings and name.startswith(
-                        "lm_head"):
-                    continue
-
-                # Skip loading weights for embedding and lm_head if LoRA is enabled.
-                if hasattr(
-                        self.model_config, 'lora_config'
-                ) and self.model_config.lora_config is not None and len(
-                        self.model_config.lora_config.lora_dir) == 1 and (
-                            name == "model.embed_tokens" or name == "lm_head"):
-                    continue
-
-                names = name.split('.')
-                if names[-1] in params_map:
-                    module_weights = []
-                    for new_name in params_map[names[-1]]:
-                        fw = filter_weights('.'.join(names[:-1] + [new_name]),
-                                            weights)
-                        if new_name in ['k_proj', 'v_proj']:
-                            fw = {
-                                k:
-                                duplicate_kv_weight(
-                                    weight=v[:],
-                                    num_kv_heads=num_kv_heads,
-                                    tensor_parallel_size=tp_size)
-                                if k in ["weight", "bias"] else v
-                                for k, v in fw.items()
-                            }
-
-                        module_weights.append(fw)
-                    module.load_weights(weights=module_weights)
-                else:
-                    module_weights = filter_weights(name, weights)
-                    if hasattr(module, 'load_weights'):
-                        module.load_weights(weights=[module_weights])
-                    else:
-                        for n, p in module._parameters.items():
-                            if p is not None:
-                                # Gemma3 RMSNorm uses +1 just like LayerNorm-1P.
-                                if 'norm' in names[-1]:
-                                    p.data.copy_(module_weights[n][:] + 1)
-                                else:
-                                    p.data.copy_(module_weights[n][:])
+    def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper):
+        super().load_weights(weights, weight_mapper)
