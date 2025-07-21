@@ -822,24 +822,27 @@ class Llama4InputProcessor(InputProcessor):
         }).cuda()
         load_sharded_checkpoint(self.encoder, model_path, strict=False)
 
-    def postprocess(self, inputs: TextPrompt, multimodal_embedding: Dict[str, List[Dict[str, Any]]]) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+    def attch_multimodal_embeddings(self, inputs: TextPrompt, multimodal_embedding: Dict[str, List[Dict[str, Any]]], sampling_params: SamplingParams) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         """
-        Post-process multimodal embeddings for Llama4 model.
+        Attach pre-processed multimodal embeddings into text token stream for Llama4 model.
+
+        This method skips vision processing and works with externally provided embeddings.
+        It replaces/expands image placeholders in the text with appropriate tokens and prepares
+        the embeddings for model forward pass.
 
         Args:
             inputs: Text prompt containing image placeholders
-            multimodal_embedding: Dictionary containing image embedding data with special token information.
+            multimodal_embedding: Dictionary containing pre-processed image embedding data with special token information.
                                   Consider adding metadata fields (e.g., model_type, model_name, version) for validation.
         Returns:
             Tuple of (token_ids, extra_processed_inputs) where:
-            - token_ids: List of processed token IDs
+            - token_ids: List of processed token IDs with image placeholders
             - extra_processed_inputs: Optional dictionary containing multimodal embeddings
         """
         text_prompt = inputs.get("prompt")
         if not text_prompt:
             raise ValueError("Text prompt is required but not provided")
 
-        # Validate multimodal embedding structure
         if not isinstance(multimodal_embedding, dict):
             raise ValueError("multimodal_embedding must be a dictionary")
 
@@ -904,15 +907,19 @@ class Llama4InputProcessor(InputProcessor):
 
         # Combine all parts and tokenize
         processed_text = "".join(new_prompt_parts)
-        # TODO: pass sampling_params.add_special_tokens to tokenizer
-        text_inputs = self.tokenizer(processed_text, return_tensors="pt", add_special_tokens=True)
+        kwargs = {}
+        if sampling_params.truncate_prompt_tokens is not None:
+            kwargs = dict(truncation=True,
+                          max_length=sampling_params.truncate_prompt_tokens)
+        text_inputs = self.tokenizer(processed_text, add_special_tokens=sampling_params.add_special_tokens, **kwargs)
         token_ids = text_inputs.input_ids.squeeze()
 
         # Replace image token indices with out-of-vocabulary tokens
         token_ids[token_ids == self.image_token_index] = self.vocab_size + 1
         # Concatenate all multimodal embeddings
-        mm_embeds = torch.cat(mm_embeddings, dim=0)
-        return token_ids.tolist(), {"mm_embedding": mm_embeds}
+        multimodal_data = {}
+        multimodal_data["multimodal_embedding"] = torch.cat(mm_embeddings, dim=0)
+        return token_ids.tolist(), {"multimodal_data": multimodal_data}
 
     @torch.inference_mode()
     def __call__(

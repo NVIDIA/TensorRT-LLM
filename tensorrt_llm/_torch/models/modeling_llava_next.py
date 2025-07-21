@@ -1,6 +1,6 @@
 import copy
 import os
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 import torch
 import torch.nn as nn
@@ -194,6 +194,34 @@ class LlavaNextInputProcessor(InputProcessor):
         # [num_frames, feature_length, hidden_dim] -> [num_frames * feature_length, hidden_dim]
         mm_features = mm_features.view(-1, mm_features.shape[-1])
         return fused_input_ids, mm_features
+
+    def attch_multimodal_embeddings(self, inputs: TextPrompt, multimodal_embedding: Dict[str, List[torch.Tensor]], sampling_params: SamplingParams) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        """
+        Attach pre-processed multimodal embeddings into text token stream for Llama4 model.
+
+        This method skips vision processing and works with externally provided embeddings.
+        It replaces/expands image placeholders in the text with appropriate tokens and prepares
+        the embeddings for model forward pass.
+
+        Args:
+            inputs: Text prompt containing image placeholders
+            multimodal_embedding: Dictionary containing pre-processed image embedding data
+        Returns:
+            Tuple of (token_ids, extra_processed_inputs) where:
+            - token_ids: List of processed token IDs with image placeholders
+            - extra_processed_inputs: Optional dictionary containing multimodal embeddings
+        """
+        text_prompt = inputs.get("prompt")
+        assert 'image' in multimodal_embedding
+
+        input_ids = self.tokenizer(
+            text_prompt, return_tensors="pt").input_ids[0].to(self.device)
+        fused_input_ids, mm_features = self._postprocess(input_ids, multimodal_embedding['image'])
+        multimodal_data = {}
+        multimodal_data["multimodal_embedding"] = mm_features
+        return fused_input_ids.to(torch.int32).tolist(), {
+            "multimodal_data": multimodal_data
+        }
 
     @torch.inference_mode()
     def __call__(

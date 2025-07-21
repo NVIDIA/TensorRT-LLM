@@ -500,6 +500,8 @@ class GenerationExecutorWorker(GenerationExecutor):
 
             if self._is_pytorch_backend and request.multimodal_params is not None:
                 if request.multimodal_params.multimodal_data is not None:
+                    # Convert back to tensor, as opposite to `to_handle` in `llm.generate_async`
+                    request.multimodal_params.to_tensor("multimodal_data", key="multimodal_embedding")
                     executor_request.py_multimodal_data = request.multimodal_params.multimodal_data
 
             if self._is_pytorch_backend and request.sampling_params.logits_processor:
