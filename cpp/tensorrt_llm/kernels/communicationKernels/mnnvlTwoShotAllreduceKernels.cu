@@ -105,7 +105,11 @@ __global__ void twoshot_allreduce_kernel(T* output_ptr, T* shard_ptr, T** input_
     uint32_t buffer_group_size = flag.z << 1;
     uint32_t input_offset = flag.x * buffer_group_size;
     uint32_t clear_offset = flag.y * buffer_group_size;
-    uint32_t* offset_access_ptr = &buffer_flags[3];
+    // Capture the number of tokens from the last call so that we can properly clear the buffer
+    uint32_t num_tokens_to_clear = flag.w > num_tokens ? flag.w : num_tokens;
+    uint32_t* offset_access_ptr = &buffer_flags[4];
+
+    uint32_t clear_tokens_per_cta = (num_tokens_to_clear + gridDim.x - 1) / gridDim.x;
 
     if (elt < token_dim)
     {
@@ -117,21 +121,24 @@ __global__ void twoshot_allreduce_kernel(T* output_ptr, T* shard_ptr, T** input_
             val = fromFloat<T>(0.f);
         input_ptrs[dest_rank][input_offset + dest_token_offset * token_dim * WORLD_SIZE + rank * token_dim + elt] = val;
 
-        // Reduce and broadcast
+        // Clear the buffer used by the previous call. Note the number of tokens to clear could be larger than the
+        // number of tokens in the current call.
+        for (int clr_tok = 0; clr_tok < clear_tokens_per_cta; clr_tok++)
+        {
+            uint32_t clr_token_idx = token + clr_tok * gridDim.x;
+            if (clr_token_idx < buffer_M)
+            {
+                input_ptrs[rank][clear_offset + clr_token_idx * token_dim + elt] = fromFloat<T>(-0.f);
+            }
+        }
 
+        // Reduce and broadcast
         if ((token % WORLD_SIZE) == rank)
         {
             int local_token = token / WORLD_SIZE;
             float accum = 0.f;
 
             T values[WORLD_SIZE];
-
-            for (int r = 0; r < WORLD_SIZE; r++)
-            {
-                input_ptrs[rank][clear_offset + local_token * token_dim * WORLD_SIZE + r * token_dim + elt]
-                    = fromFloat<T>(-0.f);
-            }
-
             while (1)
             {
                 bool valid = true;
@@ -157,7 +164,16 @@ __global__ void twoshot_allreduce_kernel(T* output_ptr, T* shard_ptr, T** input_
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
 
-    input_ptrs[rank][clear_offset + buffer_M * token_dim + token * token_dim + elt] = fromFloat<T>(-0.f);
+    // Similarly clear broadcast buffer here
+    for (int clr_tok = 0; clr_tok < clear_tokens_per_cta; clr_tok++)
+    {
+        uint32_t clr_token_idx = token + clr_tok * gridDim.x;
+        if (clr_token_idx < buffer_M)
+        {
+            input_ptrs[rank][clear_offset + buffer_M * token_dim + clr_token_idx * token_dim + elt]
+                = fromFloat<T>(-0.f);
+        }
+    }
 
     // Optionally wait for results if the next layer isn't doing the Lamport check
     if (wait_for_results)
@@ -206,6 +222,8 @@ __global__ void twoshot_allreduce_kernel(T* output_ptr, T* shard_ptr, T** input_
             }
             buffer_flags[0] = (flag.x + 1) % 3;
             buffer_flags[1] = (flag.y + 1) % 3;
+            // Update the flags with the number of tokens in the current call
+            buffer_flags[3] = num_tokens;
             *(offset_access_ptr) = 0;
         }
     }
@@ -353,7 +371,7 @@ __global__ void __launch_bounds__(128, 1)
 
     int offsets[NUM_INPUTS][DIM / (1 * ELTS_PER_THREAD * NUM_THREADS)];
 
-    uint32_t* offset_access_ptr = &buffer_flags[3];
+    uint32_t* offset_access_ptr = &buffer_flags[4];
     uint4 flag = reinterpret_cast<uint4*>(buffer_flags)[0];
     // Buffer size is M * N, and we need two buffers for reduce-scatter and allgather
     uint32_t buffer_size = flag.z;
@@ -536,6 +554,7 @@ __global__ void __launch_bounds__(128, 1)
         }
         buffer_flags[0] = (flag.x + 1) % 3;
         buffer_flags[1] = (flag.y + 1) % 3;
+        buffer_flags[3] = batch_size;
         *(offset_access_ptr) = 0;
     }
 #endif

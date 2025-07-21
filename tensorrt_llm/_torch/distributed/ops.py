@@ -88,8 +88,8 @@ def get_allreduce_mnnvl_workspace(
 
         # This is a buffer to maintain the state of this allreduce Op
         # Should have the same lifetime with self._buffer
-        # [Buffer_ptr, Clear_ptr, Buffer_size, atomic access counter]
-        buffer_flags = torch.tensor([0, 2, max_num_elements, 0],
+        # [Buffer_ptr, Clear_ptr, Buffer_size, num_tokens_to_clear,atomic access counter]
+        buffer_flags = torch.tensor([0, 2, max_num_elements, 0, 0],
                                     dtype=torch.uint32,
                                     device=torch.device("cuda",
                                                         mapping.local_rank))
