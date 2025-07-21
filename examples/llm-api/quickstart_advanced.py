@@ -108,9 +108,9 @@ def add_llm_args(parser):
 
     # Speculative decoding
     parser.add_argument('--spec_decode_algo', type=str, default=None)
-    parser.add_argument('--spec_decode_max_draft_len', type=int, default=1)
+    parser.add_argument('--spec_decode_max_draft_len', type=int, default=0)
     parser.add_argument('--draft_model_dir', type=str, default=None)
-    parser.add_argument('--max_matching_ngram_size', type=int, default=5)
+    parser.add_argument('--max_matching_ngram_size', type=int, default=0)
     parser.add_argument('--use_one_model', default=False, action='store_true')
 
     # Relaxed acceptance
@@ -151,6 +151,11 @@ def setup_llm(args, **kwargs):
 
     spec_decode_algo = args.spec_decode_algo.upper(
     ) if args.spec_decode_algo is not None else None
+
+    # Update spec_decode_max_draft_len to 1 if unset by the user for non-NGRAM spec_decode_algo
+    # NGRAM spec_decode_algo will use default heuristic to set spec_decode_max_draft_len and max_matching_ngram_size
+    if spec_decode_algo != "NGRAM" and args.spec_decode_max_draft_len == 0:
+        args.spec_decode_max_draft_len = 1
 
     if spec_decode_algo == 'MTP':
         if not args.use_one_model:
