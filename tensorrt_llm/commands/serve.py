@@ -550,7 +550,7 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
     #      class.
     command = [
         "python3", sys.argv[0], "disaggregated_mpi_worker", "-c", config_file,
-        "--log_level", log_level
+        "--log_level", log_level, "--disable_gc"
     ]
     logger.info(
         f"rank {mpi_rank()} step1: preparing to launch command: {command}")
