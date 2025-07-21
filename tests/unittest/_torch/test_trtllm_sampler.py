@@ -24,7 +24,7 @@ def model_path():
 
 def create_llm(model_dir):
     """Create LLM with specific overlap scheduler setting"""
-    pytorch_config = dict(enable_trtllm_sampler=True)
+    pytorch_config = dict(enable_torch_sampler=False)
 
     trt_kv_cache_config = TRT_KvCacheConfig(enable_block_reuse=False)
 
