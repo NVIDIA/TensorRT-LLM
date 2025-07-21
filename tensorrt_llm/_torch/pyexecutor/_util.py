@@ -591,14 +591,13 @@ def instantiate_sampler(engine: PyTorchModelEngine,
     ):
         return get_spec_decoder(sampler_args, engine.spec_config)
     if pytorch_backend_config.enable_torch_sampler:
-        decoding_mode = get_decoding_mode(executor_config)
-        return TRTLLMSampler(executor_config, engine.model, engine.dtype,
-                             mapping, decoding_mode,
-                             pytorch_backend_config.disable_overlap_scheduler)
+        return TorchSampler(sampler_args)
     if not engine.model.model_config.is_generation:
         # NOTE: choose sampler based on model type
         return EarlyStopSampler()
-    return TorchSampler(sampler_args)
+    return TRTLLMSampler(executor_config, engine.model, engine.dtype, mapping,
+                         get_decoding_mode(executor_config),
+                         pytorch_backend_config.disable_overlap_scheduler)
 
 
 def get_decoding_mode(executor_config: ExecutorConfig) -> DecodingMode:
