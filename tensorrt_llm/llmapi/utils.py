@@ -365,6 +365,9 @@ class AsyncQueue:
             self._event.clear()
         return res
 
+    def __len__(self):
+        return len(self._q)
+
 
 class _SyncQueue:
     """
@@ -434,6 +437,9 @@ class _SyncQueue:
                 return self._aq.unsafe_get()
             except asyncio.QueueEmpty:
                 time.sleep(0.01)
+
+    def __len__(self):
+        return len(self._aq)
 
 
 def set_sched_setaffinity(required_cores: int):
