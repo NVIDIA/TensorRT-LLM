@@ -283,16 +283,14 @@ class WideEPMoE(MoE):
         return (num_rows + self.moe_max_num_tokens -
                 1) // self.moe_max_num_tokens
 
-    def can_use_alltoall(self, input, all_rank_num_tokens):
+    def can_use_alltoall(self, all_rank_num_tokens, all_rank_max_num_tokens):
         # Disable alltoall when chunking is used
         if self.calculate_num_chunks(all_rank_num_tokens) > 1:
             return False
 
-        num_tokens = input.shape[0]
-
         # For DeepEPLowLatency, check if tokens exceed the threshold
         if (self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency
-                and num_tokens > self.deep_ep_max_num_tokens):
+                and all_rank_max_num_tokens > self.deep_ep_max_num_tokens):
             return False
 
         return self.enable_alltoall
@@ -463,15 +461,14 @@ class WideEPMoE(MoE):
                 if not use_postquant_alltoall:
                     deep_ep_topk_idx = token_selected_slots
                     deep_ep_topk_weights = token_final_scales
+                    assert all_rank_max_num_tokens <= self.deep_ep_max_num_tokens
                     x, recv_expert_count, deep_ep_handle = \
-                        self.deep_ep_buffer.low_latency_dispatch(x, deep_ep_topk_idx, self.deep_ep_max_num_tokens, self.num_slots)
-                    # x shape: [#local experts, EP size * deep_ep_max_num_tokens, hidden_size]
+                        self.deep_ep_buffer.low_latency_dispatch(x, deep_ep_topk_idx, all_rank_max_num_tokens, self.num_slots)
+                    # x shape: [#local experts, EP size * all_rank_max_num_tokens, hidden_size]
                     # recv_expert_count shape: [#local experts]
 
                     # Adapter between `torch.ops.trtllm.fused_moe` and DeepEP
                     # TODO: remove the adapter by changing `torch.ops.trtllm.fused_moe` API
-                    x = x[:, :self.mapping.moe_ep_size *
-                          all_rank_max_num_tokens]
                     mask = torch.arange(
                         x.shape[1], dtype=torch.int32, device=x.device).expand(
                             x.shape[0],
@@ -615,26 +612,14 @@ class WideEPMoE(MoE):
 
                 deep_ep_topk_idx = token_selected_slots
                 deep_ep_topk_weights = token_final_scales
-                # Each LL combine/dispatch kernel call requires that the `dispatch_rdma_recv_count_buffer` be properly cleaned.
-                # However, the offset of this buffer within the entire RDMA buffer changes according to the hidden size.
-                # Therefore, if the hidden size for the next LL dispatch/combine call is different from the current kernel call, manual cleaning is necessary.
-                if packed_hidden_size != hidden_size:
-                    self.deep_ep_buffer.clean_low_latency_buffer(
-                        self.deep_ep_max_num_tokens, packed_hidden_size,
-                        self.num_slots)
+
+                assert all_rank_max_num_tokens <= self.deep_ep_max_num_tokens
                 fp4_packed_tensor, recv_expert_count, deep_ep_handle = \
-                    self.deep_ep_buffer.low_latency_dispatch(fp4_packed_tensor, deep_ep_topk_idx, self.deep_ep_max_num_tokens, self.num_slots)
-                if packed_hidden_size != hidden_size:
-                    self.deep_ep_buffer.clean_low_latency_buffer(
-                        self.deep_ep_max_num_tokens, hidden_size,
-                        self.num_slots)
+                    self.deep_ep_buffer.low_latency_dispatch(fp4_packed_tensor, deep_ep_topk_idx, all_rank_max_num_tokens, self.num_slots)
                 deep_ep_handle = list(deep_ep_handle)
                 deep_ep_handle[3] = hidden_size
                 deep_ep_handle = tuple(deep_ep_handle)
 
-                fp4_packed_tensor = fp4_packed_tensor[:, :self.mapping.
-                                                      moe_ep_size *
-                                                      all_rank_max_num_tokens]
                 assert fp4_packed_tensor.ndim == 3 and fp4_packed_tensor.shape[
                     2] == packed_hidden_size
                 x_sf = fp4_packed_tensor[:, :, x.shape[1]:x.shape[1] +
@@ -707,23 +692,9 @@ class WideEPMoE(MoE):
                     final_hidden_states, deep_ep_handle)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                 num_tokens_per_expert_for_fused_moe = self.mapping.moe_ep_size * all_rank_max_num_tokens
-                num_tokens_per_expert_for_deep_ep = self.deep_ep_max_num_tokens * self.mapping.moe_ep_size
                 final_hidden_states = final_hidden_states.view(
                     self.expert_size_per_partition,
                     num_tokens_per_expert_for_fused_moe, self.hidden_size)
-                if num_tokens_per_expert_for_deep_ep != num_tokens_per_expert_for_fused_moe:
-                    # Adapter between fused_moe num_tokens and DeepEP num_tokens
-                    # This adapter can be removed if fused_moe accepts DeepEP num_tokens without overhead
-                    final_hidden_states_for_fused_moe = final_hidden_states
-                    final_hidden_states = torch.empty(
-                        self.expert_size_per_partition,
-                        self.deep_ep_max_num_tokens * self.mapping.moe_ep_size,
-                        self.hidden_size,
-                        dtype=final_hidden_states.dtype,
-                        device=final_hidden_states.device)
-                    final_hidden_states[:, :
-                                        num_tokens_per_expert_for_fused_moe] = final_hidden_states_for_fused_moe
-                    del final_hidden_states_for_fused_moe  # Release memory
                 final_hidden_states = self.deep_ep_buffer.low_latency_combine(
                     final_hidden_states, deep_ep_topk_idx, deep_ep_topk_weights,
                     deep_ep_handle)
@@ -753,7 +724,8 @@ class WideEPMoE(MoE):
 
         # in case of num_rows is larger than max_chunk_size, we need to split the input into multiple chunks
         num_chunks = self.calculate_num_chunks(all_rank_num_tokens)
-        use_all_to_all = self.can_use_alltoall(x, all_rank_num_tokens)
+        use_all_to_all = self.can_use_alltoall(all_rank_num_tokens,
+                                               all_rank_max_num_tokens)
 
         if use_dp_padding:
             all_rank_num_tokens_padded = [all_rank_max_num_tokens

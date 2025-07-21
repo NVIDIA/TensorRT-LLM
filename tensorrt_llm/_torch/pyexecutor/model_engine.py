@@ -323,7 +323,9 @@ class PyTorchModelEngine(ModelEngine):
                     enable_piecewise_cuda_graph=pytorch_backend_config.
                     torch_compile_piecewise_cuda_graph,
                     cuda_graph_batch_sizes=pytorch_backend_config.
-                    cuda_graph_batch_sizes)
+                    cuda_graph_batch_sizes,
+                    max_num_streams=pytorch_backend_config.
+                    torch_compile_max_num_streams)
                 if isinstance(self.model, DecoderModelForCausalLM):
                     self.model.model = torch.compile(
                         self.model.model,
@@ -2092,6 +2094,14 @@ class PyTorchModelEngine(ModelEngine):
         assert attrs is not None, "Model extra attrs is not set"
         attrs["attention_metadata"] = weakref.ref(kwargs['attn_metadata'])
         attrs.update(self.model.model_config.extra_attrs)
+
+        if self._torch_compile_backend is not None:
+            # Register aux streams and events to model extra attrs.
+            # The streams and events are list which could be updated during compilation.
+            attrs["aux_streams"] = weakref.ref(
+                self._torch_compile_backend.aux_streams)
+            attrs["events"] = weakref.ref(self._torch_compile_backend.events)
+            attrs["global_stream"] = torch.cuda.current_stream()
 
         if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
             return trace_func(self.model.forward)(**kwargs)
