@@ -604,7 +604,8 @@ class LlamaDecoderLayer(DecoderLayer):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states = self.input_layernorm(hidden_states, residual)
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual)
 
         # Self Attention
         hidden_states = self.self_attn(
