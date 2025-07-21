@@ -65,16 +65,12 @@ def LLVM_CONFIG = "LLVM"
 LINUX_AARCH64_CONFIG = "linux_aarch64"
 
 @Field
-def NANOBIND_CONFIG = "Nanobind"
-
-@Field
 def BUILD_CONFIGS = [
   // Vanilla TARNAME is used for packaging in runLLMPackage
   (VANILLA_CONFIG) : [(TARNAME) : "TensorRT-LLM.tar.gz"],
   (SINGLE_DEVICE_CONFIG) : [(TARNAME) : "single-device-TensorRT-LLM.tar.gz"],
   (LLVM_CONFIG) : [(TARNAME) : "llvm-TensorRT-LLM.tar.gz"],
   (LINUX_AARCH64_CONFIG) : [(TARNAME) : "TensorRT-LLM-GH200.tar.gz"],
-  (NANOBIND_CONFIG) : [(TARNAME) : "nanobind-TensorRT-LLM.tar.gz"],
 ]
 
 // TODO: Move common variables to an unified location
@@ -1714,6 +1710,24 @@ def runInKubernetes(pipeline, podSpec, containerName)
 def launchTestJobs(pipeline, testFilter, dockerNode=null)
 {
     def dockerArgs = "-v /mnt/scratch.trt_llm_data:/scratch.trt_llm_data:ro -v /tmp/ccache:${CCACHE_DIR}:rw -v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw --cap-add syslog"
+
+    // IMPORTANT: Stage Configuration Syntax Requirement
+    //
+    // The test_to_stage_mapping.py script expects stage definitions in the following format:
+    // "Stage-Name": ["platform", "yaml_file", split_id, split_count, gpu_count]
+    //
+    // Where:
+    // - Stage-Name: Must be quoted string, used to identify the Jenkins stage
+    // - platform: Hardware platform identifier (e.g., "a10", "h100-cr")
+    // - yaml_file: Test database YAML filename without .yml extension (e.g., "l0_a10")
+    // - split_id: Current split number (1-based)
+    // - split_count: Total number of splits
+    // - gpu_count: Number of GPUs required (optional, defaults to 1)
+    //
+    // This format is parsed by scripts/test_to_stage_mapping.py to provide bidirectional
+    // mapping between test names and Jenkins stage names. Any changes to this syntax
+    // may break the mapping functionality.
+
     x86TestConfigs = [
         "DGX_H100-4_GPUs-PyTorch-DeepSeek-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 2, 4],
         "DGX_H100-4_GPUs-PyTorch-DeepSeek-2": ["dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
@@ -1728,7 +1742,6 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "A10-TensorRT-4": ["a10", "l0_a10", 4, 6],
         "A10-TensorRT-5": ["a10", "l0_a10", 5, 6],
         "A10-TensorRT-6": ["a10", "l0_a10", 6, 6],
-        "A10-Nanobind": ["a10", "l0_a10_nanobind", 1, 1],
         "A30-Triton-1": ["a30", "l0_a30", 1, 1],
         "A30-PyTorch-1": ["a30", "l0_a30", 1, 2],
         "A30-PyTorch-2": ["a30", "l0_a30", 2, 2],
@@ -1804,9 +1817,6 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         }
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
-        }
-        if (key.contains("Nanobind")) {
-            config = NANOBIND_CONFIG
         }
         runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("Perf"), key, values[2], values[3])
     }]]}

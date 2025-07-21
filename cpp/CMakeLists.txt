@@ -30,6 +30,7 @@ project(tensorrt_llm LANGUAGES CXX)
 option(BUILD_PYT "Build in PyTorch TorchScript class mode" ON)
 option(BUILD_TESTS "Build Google tests" ON)
 option(BUILD_BENCHMARKS "Build benchmarks" ON)
+option(BUILD_DEEP_EP "Build the Deep EP module" ON)
 option(BUILD_MICRO_BENCHMARKS "Build C++ micro benchmarks" OFF)
 option(NVTX_DISABLE "Disable all NVTX features" ON)
 option(WARNING_IS_ERROR "Treat all warnings as errors" OFF)
@@ -198,7 +199,7 @@ set(TRT_LIB TensorRT::NvInfer)
 get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
 
 set(3RDPARTY_DIR ${TRT_LLM_ROOT_DIR}/3rdparty)
-if(BINDING_TYPE STREQUAL "pybind" OR BUILD_DEEP_EP)
+if(BINDING_TYPE STREQUAL "pybind")
   add_subdirectory(${3RDPARTY_DIR}/pybind11
                    ${CMAKE_CURRENT_BINARY_DIR}/pybind11)
 endif()
@@ -217,7 +218,7 @@ include_directories(
   ${3RDPARTY_DIR}/cutlass/tools/util/include
   ${3RDPARTY_DIR}/NVTX/include
   ${3RDPARTY_DIR}/json/include)
-if(BINDING_TYPE STREQUAL "pybind" OR BUILD_DEEP_EP)
+if(BINDING_TYPE STREQUAL "pybind")
   include_directories(${3RDPARTY_DIR}/pybind11/include)
 endif()
 if(BINDING_TYPE STREQUAL "nanobind")

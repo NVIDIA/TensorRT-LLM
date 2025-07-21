@@ -97,10 +97,10 @@ examples/test_draft_target_model.py::test_llm_draft_target_model_1gpu[no_streami
 examples/test_draft_target_model.py::test_llm_draft_target_model_1gpu[streaming-llama_v2-use_cpp_session-use_logits-draft_len_4-float16-bs2]
 examples/test_draft_target_model.py::test_llm_draft_target_llama_1gpu
 examples/test_draft_target_model.py::test_llm_draft_target_llama_fp8_2gpu
-examples/test_prompt_lookup.py::test_llm_prompt_lookup_1gpu[no_streaming-gpt2-use_cpp_session-use_tokens-max_matching_ngram_size_2-prompt_lookup_num_tokens_8-float16-bs1]
-examples/test_prompt_lookup.py::test_llm_prompt_lookup_1gpu[no_streaming-gpt2-use_cpp_session-use_tokens-max_matching_ngram_size_2-prompt_lookup_num_tokens_8-float16-bs2]
-examples/test_prompt_lookup.py::test_llm_prompt_lookup_1gpu[streaming-gpt2-use_cpp_session-use_tokens-max_matching_ngram_size_2-prompt_lookup_num_tokens_8-float16-bs1]
-examples/test_prompt_lookup.py::test_llm_prompt_lookup_1gpu[streaming-gpt2-use_cpp_session-use_tokens-max_matching_ngram_size_2-prompt_lookup_num_tokens_8-float16-bs2]
+examples/test_ngram.py::test_llm_ngram_1gpu[no_streaming-gpt2-use_cpp_session-use_tokens-max_matching_ngram_size_2-max_draft_len_8-float16-bs1]
+examples/test_ngram.py::test_llm_ngram_1gpu[no_streaming-gpt2-use_cpp_session-use_tokens-max_matching_ngram_size_2-max_draft_len_8-float16-bs2]
+examples/test_ngram.py::test_llm_ngram_1gpu[streaming-gpt2-use_cpp_session-use_tokens-max_matching_ngram_size_2-max_draft_len_8-float16-bs1]
+examples/test_ngram.py::test_llm_ngram_1gpu[streaming-gpt2-use_cpp_session-use_tokens-max_matching_ngram_size_2-max_draft_len_8-float16-bs2]
 examples/test_internlm.py::test_llm_internlm2_7b_1node_1gpu[bfloat16-enable_context_fmha-enable_gemm_plugin-enable_attention_plugin-nb:2]
 examples/test_llama.py::test_llm_llama_1gpu_streaming_llm[ailab-deepseek-coder-6.7b-instruct]
 examples/test_llama.py::test_llm_llama_2gpu_fp8_summary[llama-7b-enable_reduce_fusion-disable_fp8_context_fmha_xqa]
@@ -591,6 +591,7 @@ disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun_t
 disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_mpi[DeepSeek-V3-Lite-fp8]
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_ucx[DeepSeek-V3-Lite-fp8]
+disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_nixl[DeepSeek-V3-Lite-fp8]
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp[DeepSeek-V3-Lite-fp8]
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one[DeepSeek-V3-Lite-fp8]
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one_mtp[DeepSeek-V3-Lite-fp8]
