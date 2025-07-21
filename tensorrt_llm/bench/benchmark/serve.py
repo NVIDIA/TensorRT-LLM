@@ -5,6 +5,7 @@ from pathlib import Path
 import click
 from click_option_group import optgroup
 from huggingface_hub import snapshot_download
+from transformers import AutoTokenizer
 
 # isort: off
 from tensorrt_llm.bench.benchmark.utils.general import (
@@ -236,11 +237,11 @@ def serve_command(
     logger.info("Setting up throughput benchmark.")
     kwargs = kwargs | runtime_config.get_llm_args()
     kwargs['backend'] = backend
-    kwargs['tokenizer'] = checkpoint_path
-    kwargs['postprocess_tokenizer_dir'] = checkpoint_path
+    kwargs['tokenizer'] = AutoTokenizer.from_pretrained(checkpoint_path)
+    kwargs['postprocess_tokenizer_dir'] = None
     kwargs['trust_remote_code'] = True
     kwargs['skip_tokenizer_init'] = False
-    kwargs["num_postprocess_workers"] = 0
+    kwargs["num_postprocess_workers"] = 10
 
     if runtime_config.backend == 'pytorch':
         if kwargs.pop("extended_runtime_perf_knob_config", None):

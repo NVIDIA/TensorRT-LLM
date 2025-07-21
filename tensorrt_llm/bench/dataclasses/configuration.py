@@ -222,6 +222,7 @@ class ExecutorSettingsConfig(BaseModel):
         return KvCacheConfig(
             free_gpu_memory_fraction=self.kv_cache_percent,
             enable_block_reuse=False,
+            enable_partial_reuse=False,
         )
 
     def get_scheduler_config(self) -> SchedulerConfig:
