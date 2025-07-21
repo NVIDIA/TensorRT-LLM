@@ -4,6 +4,8 @@ import signal  # Added import
 import subprocess  # nosec B404
 import sys
 from typing import Any, List, Optional
+import gc
+from contextlib import contextmanager
 
 import click
 import torch
@@ -129,12 +131,31 @@ def get_llm_args(model: str,
 
     return llm_args, llm_args_extra_dict
 
+@contextmanager
+def disabled_gc():
+    """
+    Temporarily turn off Python's cyclic?~@~Qgarbage collector.
+
+    Reference?~@~Qcount deallocation still happens; only the generational
+    cycle detector is disabled.  The previous GC state is restored
+    automatically when the block exits.
+    """
+    was_enabled = gc.isenabled()
+    if was_enabled:
+        gc.disable()
+    try:
+        yield
+    finally:
+        if was_enabled:
+            gc.enable()
+
 
 def launch_server(host: str,
                   port: int,
                   llm_args: dict,
                   metadata_server_cfg: Optional[MetadataServerConfig] = None,
-                  server_role: Optional[ServerRole] = None):
+                  server_role: Optional[ServerRole] = None,
+                  disable_gc: bool = False):
 
     backend = llm_args["backend"]
     model = llm_args["model"]
@@ -149,7 +170,11 @@ def launch_server(host: str,
                           server_role=server_role,
                           metadata_server_cfg=metadata_server_cfg)
 
-    asyncio.run(server(host, port))
+    if disable_gc:
+        with disabled_gc():
+            asyncio.run(server(host, port))
+    else:
+        asyncio.run(server(host, port))
 
 
 @click.command("serve")
@@ -239,6 +264,10 @@ def launch_server(host: str,
     default=None,
     help="[Experimental] Specify the parser for reasoning models.",
 )
+@click.option("--disable_gc",
+              is_flag=True,
+              default=False,
+              help="Disable Python's garbage collector during server runtime for potentially better TTFT (time to first token) performance.")
 @click.option("--metadata_server_config_file",
               type=str,
               default=None,
@@ -257,7 +286,7 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
           kv_cache_free_gpu_memory_fraction: float,
           num_postprocess_workers: int, trust_remote_code: bool,
           extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
-          metadata_server_config_file: Optional[str],
+          disable_gc: bool, metadata_server_config_file: Optional[str],
           server_role: Optional[str]):
     """Running an OpenAI API compatible server
 
@@ -299,7 +328,7 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
         except ValueError:
             raise ValueError(f"Invalid server role: {server_role}. " \
                              f"Must be one of: {', '.join([role.name for role in ServerRole])}")
-    launch_server(host, port, llm_args, metadata_server_cfg, server_role)
+    launch_server(host, port, llm_args, metadata_server_cfg, server_role, disable_gc)
 
 
 def get_ctx_gen_server_urls(
@@ -394,7 +423,11 @@ def set_cuda_device():
               type=click.Choice(severity_map.keys()),
               default='info',
               help="The logging level.")
-def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
+@click.option("--disable_gc",
+              is_flag=True,
+              default=False,
+              help="Disable Python's garbage collector during server runtime for potentially better TTFT (time to first token) performance.")
+def disaggregated_mpi_worker(config_file: Optional[str], log_level: str, disable_gc: bool):
     """Launching disaggregated MPI worker"""
 
     from tensorrt_llm._utils import mpi_rank
@@ -422,7 +455,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
 
         # Ignore the non-LLM args
         llm_args.pop("router", None)
-        _launch_disaggregated_server(config_file, llm_args)
+        _launch_disaggregated_server(config_file, llm_args, disable_gc)
         return
 
     is_leader, instance_idx, sub_comm = split_world_comm(
@@ -462,7 +495,7 @@ class DisaggLauncherEnvs(StrEnum):
     TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT = "TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT"
 
 
-def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
+def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict, disable_gc: bool):
     # Launching the server
     instance_idx = os.environ.get(DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX)
     assert instance_idx is not None, f"{DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX} should be set by the launcher"
@@ -474,7 +507,8 @@ def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
 
     launch_server(host=server_cfg.hostname,
                   port=server_cfg.port,
-                  llm_args=llm_args)
+                  llm_args=llm_args,
+                  disable_gc=disable_gc)
 
 
 def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
@@ -516,7 +550,7 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
     #      class.
     command = [
         "python3", sys.argv[0], "disaggregated_mpi_worker", "-c", config_file,
-        "--log_level", log_level
+        "--log_level", log_level, "--disable_gc"
     ]
     logger.info(
         f"rank {mpi_rank()} step1: preparing to launch command: {command}")
