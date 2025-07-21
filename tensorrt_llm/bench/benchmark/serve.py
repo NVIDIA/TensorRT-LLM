@@ -5,7 +5,6 @@ from pathlib import Path
 import click
 from click_option_group import optgroup
 from huggingface_hub import snapshot_download
-from transformers import AutoTokenizer
 
 # isort: off
 from tensorrt_llm.bench.benchmark.utils.general import (
@@ -146,6 +145,10 @@ from tensorrt_llm.logger import logger
                  default="localhost",
                  help="Hostname of the server.")
 @optgroup.option("--port", type=int, default=8000, help="Port of the server.")
+@optgroup.option("--post_workers",
+                 type=int,
+                 default=10,
+                 help="Number of post-processing workers.")
 @click.pass_obj
 def serve_command(
     bench_env: BenchmarkEnvironment,
@@ -169,6 +172,7 @@ def serve_command(
     checkpoint_path: Path = bench_env.checkpoint_path or bench_env.model
     engine_dir: Path = params.pop("engine_dir")
     backend: str = params.get("backend")
+    post_workers: int = params.pop("post_workers")
     tuning_constraints = TuningConstraints(
         average_isl=target_input_len,
         average_osl=target_output_len,
@@ -234,14 +238,16 @@ def serve_command(
     # Construct the runtime configuration dataclass.
     runtime_config = RuntimeConfig(**exec_settings)
 
-    logger.info("Setting up throughput benchmark.")
+    logger.info("Configuring server for benchmarking...")
     kwargs = kwargs | runtime_config.get_llm_args()
     kwargs['backend'] = backend
-    kwargs['tokenizer'] = AutoTokenizer.from_pretrained(checkpoint_path)
+
+    # Configure the server for benchmarking.
+    kwargs['tokenizer'] = checkpoint_path
     kwargs['postprocess_tokenizer_dir'] = None
     kwargs['trust_remote_code'] = True
     kwargs['skip_tokenizer_init'] = False
-    kwargs["num_postprocess_workers"] = 10
+    kwargs["num_postprocess_workers"] = post_workers
 
     if runtime_config.backend == 'pytorch':
         if kwargs.pop("extended_runtime_perf_knob_config", None):
@@ -253,4 +259,5 @@ def serve_command(
                 "Ignore extended_runtime_perf_knob_config for _autodeploy backend."
             )
 
+    logger.info("Launching server...")
     launch_server(host, port, kwargs)
