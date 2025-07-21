@@ -1382,21 +1382,23 @@ class PyTorchModelEngine(ModelEngine):
                 #       Set their previous_pos_id_offsets and previous_kv_lens_offsets according to new_tokens_lens_device and kv_len_offsets_device.
                 #   For 3) 'dummy requests': pad dummy requests for CUDA graph or attention dp.
                 #       Already set to '0' during initialization.
+
+                num_extend_reqeust_wo_dummy = len(extend_requests) - len(
+                    extend_dummy_requests)
                 self.previous_pos_id_offsets_cuda[
-                    (len(extend_requests) - len(extend_dummy_requests) -
-                     previous_batch_len) * (1 + self.max_draft_len):
-                    (len(extend_requests) - len(extend_dummy_requests) -
-                     previous_batch_len) * (1 + self.max_draft_len) +
-                    previous_batch_tokens].copy_(
+                    (num_extend_reqeust_wo_dummy - previous_batch_len) *
+                    (1 + self.max_draft_len):num_extend_reqeust_wo_dummy *
+                    (1 + self.max_draft_len)].copy_(
                         new_tokens_lens_device[self.previous_pos_indices_cuda[
                             0:previous_batch_tokens]],
                         non_blocking=True)
+
                 self.previous_kv_lens_offsets_cuda[
-                    len(extend_requests) - previous_batch_len -
-                    len(extend_dummy_requests):len(extend_requests) -
-                    len(extend_dummy_requests)].copy_(
+                    num_extend_reqeust_wo_dummy -
+                    previous_batch_len:num_extend_reqeust_wo_dummy].copy_(
                         kv_len_offsets_device[previous_slots],
                         non_blocking=True)
+
         elif new_tokens_device is not None:
             seq_slots_device = previous_seq_slots_device()
             max_draft_len = max(draft_lens)
