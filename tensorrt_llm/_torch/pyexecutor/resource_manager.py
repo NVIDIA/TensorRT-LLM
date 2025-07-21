@@ -691,6 +691,7 @@ class KVCacheManager(BaseResourceManager):
 
         accum_max_tokens = 0
         prev_window_size = 0
+        adjusted_dict = {}
         adjusted_max_attention_window_vec = max_attention_window_vec.copy()
 
         for window_size in sorted(window_size_to_layers):
@@ -733,12 +734,14 @@ class KVCacheManager(BaseResourceManager):
 
             if accum_max_tokens not in adjusted_window_size_to_layers:
                 adjusted_window_size_to_layers[accum_max_tokens] = layers.copy()
-                # also update adjusted_max_attention_window_vec
-                for i, v in enumerate(adjusted_max_attention_window_vec):
-                    if v == window_size:
-                        adjusted_max_attention_window_vec[i] = accum_max_tokens
             else:
                 adjusted_window_size_to_layers[accum_max_tokens].extend(layers)
+            adjusted_dict[window_size] = accum_max_tokens
+            # also update adjusted_max_attention_window_vec
+            adjusted_max_attention_window_vec = [
+                adjusted_dict.get(v, v)
+                for v in adjusted_max_attention_window_vec
+            ]
 
             remaining_layers -= set(layers)
             prev_window_size = window_size
