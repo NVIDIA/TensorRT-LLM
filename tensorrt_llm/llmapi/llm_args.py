@@ -395,6 +395,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
     num_eagle_layers: Optional[int] = None
     max_non_leaves_per_layer: Optional[int] = None
     eagle3_one_model: Optional[bool] = True
+    num_capture_layers: Optional[int] = 3
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -497,7 +498,9 @@ class MTPDecodingConfig(DecodingBaseConfig):
 
     @classmethod
     def from_dict(cls, data: dict):
-        return cls(**data)
+        out = cls(**data)
+        out.max_draft_len = out.num_nextn_predict_layers
+        return out
 
     decoding_type: ClassVar[str] = "MTP"
 

@@ -35,9 +35,10 @@ class Eagle3ResourceManager(BaseResourceManager):
         # empty hidden states tensor
         max_num_tokens = min(max_num_tokens,
                              max_num_requests * self.max_seq_len)
-        self.hidden_states = torch.empty((max_num_tokens, self.hidden_size * 3),
-                                         dtype=self.dtype,
-                                         device='cuda')
+        self.hidden_states = torch.empty(
+            (max_num_tokens, self.hidden_size * config.num_capture_layers),
+            dtype=self.dtype,
+            device='cuda')
         # sequence length, only used for metadata preparation
         self.seq_lens = {i: 0 for i in range(max_num_requests)}
         # start indices of each slot
@@ -90,8 +91,8 @@ class Eagle3SpecMetadata(SpecMetadata):
     eagle3_resource_manager: Optional[Eagle3ResourceManager] = None
 
     def __post_init__(self):
-        if self.num_layers == 1:
-            self.layers_to_capture = (0, )
+        if self.num_layers == 1 or self.num_capture_layers == 1:
+            self.layers_to_capture = (self.num_layers - 1, )
         else:
             if self.num_layers <= 5:
                 raise ValueError("Not enough hidden layers for EAGLE")
