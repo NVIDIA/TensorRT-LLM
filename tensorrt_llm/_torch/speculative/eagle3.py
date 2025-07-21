@@ -186,6 +186,8 @@ class Eagle3SpecMetadata(SpecMetadata):
 class Eagle3OneModelSpecMetadata(SpecMetadata):
     # The hidden states
     hidden_states: Optional[torch.Tensor] = None
+    # The number of layers to be captured
+    num_capture_layers: int = 3
     # The layers to be captured
     layers_to_capture: Tuple[int, ...] = field(init=False)
     # The hidden size of the hidden states
@@ -198,8 +200,8 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     batch_indices_cuda: Optional[torch.Tensor] = None
 
     def __post_init__(self):
-        if self.num_layers == 1:
-            self.layers_to_capture = (1, )
+        if self.num_layers == 1 or self.num_capture_layers == 1:
+            self.layers_to_capture = (self.num_layers - 1, )
         else:
             if self.num_layers <= 5:
                 raise ValueError("Not enough hidden layers for EAGLE")
