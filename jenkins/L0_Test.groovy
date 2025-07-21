@@ -261,7 +261,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
             }
 
             if (CloudManager.isNodeOnline(nodeName)) {
-                def dockerArgs = "--gpus ${gpuCount} --cap-add=SYS_ADMIN --ipc=host --security-opt seccomp=unconfined  -u root:root -v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro -v /tmp/ccache:${CCACHE_DIR}:rw -v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw --cap-add syslog"
+                def dockerArgs = "--gpus ${gpuCount} --cap-add=SYS_ADMIN --ipc=host --security-opt seccomp=unconfined  -u root:root -v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro -v /tmp/ccache:${CCACHE_DIR}:rw -v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw --cap-add syslog -e NVIDIA_IMEX_CHANNELS=0"
                 slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, false)
                 executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner)
             } else {
@@ -362,6 +362,7 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                     "--container-image=${container}",
                     "--container-workdir=/home/svc_tensorrt/bloom/scripts",
                     "--container-mounts=${mounts}",
+                    "--container-env=NVIDIA_IMEX_CHANNELS"
                 ].join(" ")
 
                 def scriptLaunch = "/home/svc_tensorrt/bloom/scripts/${jobUID}/slurm_launch.sh"
@@ -382,6 +383,7 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                     export perfMode=$perfMode
                     export resourcePathNode=$resourcePathNode
                     export MODEL_CACHE_DIR=$MODEL_CACHE_DIR
+                    export NVIDIA_IMEX_CHANNELS=0
                     chmod +x ${scriptRunNode}
                     ${srunCmd}
                 """.stripIndent()
