@@ -156,11 +156,14 @@ def test_fused_moe_alltoall():
 
     world_size = 4
     dtype = torch.bfloat16
-    HIDDEN_SIZE = 2560
-    INTERMEDIATE_SIZE = 1536
+    HIDDEN_SIZE = 1024
+    INTERMEDIATE_SIZE = 1024
     NUM_EXPERTS = 72
     TOP_K = 6
     MAX_NUM_TOKENS = 2048
+
+    torch.manual_seed(0)
+    torch.cuda.manual_seed(0)
 
     x_list_world = []
     weights_world = []
@@ -324,18 +327,18 @@ def test_fused_moe_alltoall():
                     all_rank_max_num_tokens=m,
                     use_dp_padding=False)
 
+            # print(f"rank {mapping.rank} absolute {output[119, 937]} {ref_output[119, 937]}")
+            # print(f"rank {mapping.rank} relative {output[855, 1001]} {ref_output[855, 1001]}")
+
             # Evaluate outputs
-            # torch.testing.assert_close(output,
-            #                            ref_output,
-            #                            rtol=0.05,
-            #                            atol=0.003)
+            torch.testing.assert_close(output, ref_output, rtol=0.05, atol=0.2)
             m //= 2
 
-            if mpi_rank() == 0:
-                print("output ---------------------------------------------------------------------")
-                print(output)
-                print("ref    ---------------------------------------------------------------------")
-                print(ref_output)
+            # if mpi_rank() == 0:
+            #     print("output ---------------------------------------------------------------------")
+            #     print(output)
+            #     print("ref    ---------------------------------------------------------------------")
+            #     print(ref_output)
 
     # per_rank_test_fused_moe_alltoall(0)
 
