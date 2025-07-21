@@ -420,6 +420,7 @@ accuracy/test_cli_flow.py::TestQwen2_57B_A14B::test_tp4
 accuracy/test_cli_flow.py::TestQwen2_57B_A14B::test_tp2pp2
 accuracy/test_llm_api.py::TestLlama3_1_8BInstruct::test_guided_decoding[xgrammar]
 accuracy/test_llm_api.py::TestLlama3_1_8BInstruct::test_guided_decoding_4gpus[xgrammar]
+accuracy/test_llm_api.py::TestLlama3_1_8BInstruct::test_gather_generation_logits_cuda_graph
 accuracy/test_llm_api.py::TestQwen2_5_1_5BInstruct::test_auto_dtype
 accuracy/test_llm_api.py::TestQwen2_5_1_5BInstruct::test_weight_only
 accuracy/test_llm_api.py::TestLlama3_1_8B::test_fp8_rowwise
