@@ -1817,6 +1817,11 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
     )
     def test_nvfp4(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
                    overlap_scheduler, moe_backend):
+        if moe_backend == "TRTLLM":
+            pytest.skip(
+                "TRTLLM moe backend has accuracy issues: https://nvbugspro.nvidia.com/bug/5404726"
+            )
+
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
