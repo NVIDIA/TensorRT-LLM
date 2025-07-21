@@ -1105,7 +1105,7 @@ class PyExecutor:
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(self) -> List[RequestQueueItem]:
         new_requests = self.executor_request_queue.fetch_new_requests(
-            self.active_requests)
+            len(self.active_requests))
         self.active_requests.extend(new_requests)
 
         self.is_shutdown = self.executor_request_queue.is_shutdown

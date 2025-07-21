@@ -13,8 +13,7 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.bindings.executor import RequestType
 
 from ..distributed import Distributed
-from .llm_request import (ExecutorRequest, LlmRequest,
-                          executor_request_to_llm_request)
+from .llm_request import ExecutorRequest, executor_request_to_llm_request
 from .sampler import Sampler, TorchSampler
 
 SHUTDOWN_REQUEST_ID = -1
@@ -207,18 +206,18 @@ class ExecutorRequestQueue:
         return new_requests
 
     @nvtx_range("_fetch_new_requests")
-    def fetch_new_requests(
-            self, active_requests: List[LlmRequest]) -> List[RequestQueueItem]:
+    def fetch_new_requests(self,
+                           num_active_requests: int) -> List[RequestQueueItem]:
 
         if self.enable_attention_dp:
-            return self._fetch_new_requests_attention_dp(active_requests)
+            return self._fetch_new_requests_attention_dp(num_active_requests)
         else:
-            return self._fetch_new_requests_attention_tp(active_requests)
+            return self._fetch_new_requests_attention_tp(num_active_requests)
 
     def _fetch_new_requests_attention_tp(
-            self, active_requests: List[LlmRequest]) -> List[RequestQueueItem]:
+            self, num_active_requests: int) -> List[RequestQueueItem]:
         """Handle standard (non-attention DP) request fetching."""
-        total_num_active_requests = len(active_requests)
+        total_num_active_requests = num_active_requests
         total_max_num_active_requests = self.max_num_active_requests
 
         # Use common request fetching logic
@@ -230,11 +229,11 @@ class ExecutorRequestQueue:
         return merged_requests
 
     def _fetch_new_requests_attention_dp(
-            self, active_requests: List[LlmRequest]) -> List[RequestQueueItem]:
+            self, num_active_requests: int) -> List[RequestQueueItem]:
         """Handle attention DP request fetching with load balancing."""
         # Get active request counts across all ranks
         all_ranks_num_active_requests = []
-        responses_list = self.dist.tp_allgather(len(active_requests))
+        responses_list = self.dist.tp_allgather(num_active_requests)
         for num_active_requests in responses_list:
             all_ranks_num_active_requests.append(num_active_requests)
 

@@ -375,14 +375,14 @@ def test_fetch_new_requests_routing(executor_queue, enable_attention_dp):
         with patch.object(executor_queue,
                           '_fetch_new_requests_attention_dp') as mock_dp:
             mock_dp.return_value = []
-            executor_queue.fetch_new_requests(mock_active_requests)
-            mock_dp.assert_called_once_with(mock_active_requests)
+            executor_queue.fetch_new_requests(len(mock_active_requests))
+            mock_dp.assert_called_once_with(len(mock_active_requests))
     else:
         with patch.object(executor_queue,
                           '_fetch_new_requests_attention_tp') as mock_tp:
             mock_tp.return_value = []
-            executor_queue.fetch_new_requests(mock_active_requests)
-            mock_tp.assert_called_once_with(mock_active_requests)
+            executor_queue.fetch_new_requests(len(mock_active_requests))
+            mock_tp.assert_called_once_with(len(mock_active_requests))
 
 
 # Integration tests
