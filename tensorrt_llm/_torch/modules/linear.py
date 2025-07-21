@@ -116,12 +116,13 @@ def load_weights_vanilla_helper(module: Linear, weights: List[Dict]):
     weight = load_weight_shard(weights[0]['weight'], module.tp_size,
                                module.tp_rank, module.tp_mode, device)
 
-    if module.has_w4a16_awq or module.has_w4a8_awq:
+    if module.has_weight_only_quant:
         # NOTE: without the preprocess during the runtime, the gemm output nan's. in order to use the preprocess_weights_for_mixed_gemm
         # we need to cast the weight to int8 first.
-        activation_dtype = torch.float16 if module.has_w4a16_awq else torch.float8_e4m3fn
+        activation_dtype = torch.float8_e4m3fn if module.has_w4a8_awq else torch.float16
+        weight_dtype, _ = get_weight_dtype_and_id(module)
         weight = preprocess_weights_for_mixed_gemm(
-            weight.T.to(torch.int8).contiguous().cpu(), torch.quint4x2,
+            weight.T.to(torch.int8).contiguous().cpu(), weight_dtype,
             activation_dtype).cuda().contiguous()
 
     copy_weight(module.weight, weight)
@@ -174,6 +175,27 @@ def load_weights_fused_gate_up_helper(
                                     module.tp_rank, module.tp_mode, device)
         copy_weight(module.bias, torch.cat((up_bias, gate_bias)))
     return (gate_weight, up_weight)
+
+
+def get_weight_dtype_and_id(module: Linear) -> tuple[torch.dtype, int]:
+    """
+    Get weight dtype and weight_id for weight only quantization mode.
+
+    Returns:
+        tuple[torch.dtype, int]: (weight_dtype, weight_id) where:
+            - weight_dtype: torch.int8 for INT8 weights, torch.quint4x2 for INT4 weights
+            - weight_id: 1 for INT8, 2 for INT4 (used for weight packing)
+    """
+    assert module.quant_config is not None and module.quant_config.layer_quant_mode.is_weight_only(
+    ), "This function should only be called when the module has weight-only quantization enabled."
+
+    if module.quant_config.layer_quant_mode.is_int8_weight_only():
+        return torch.int8, 1
+    elif module.quant_config.layer_quant_mode.is_int4_weight_only():
+        return torch.quint4x2, 2
+    else:
+        raise ValueError(
+            f"Unsupported quant_mode: {module.quant_config.layer_quant_mode}")
 
 
 class LinearMethodBase(ABC):
@@ -882,6 +904,122 @@ class W4A8MXFP4FP8LinearMethod(LinearMethodBase):
         copy_weight(module.weight_scale, weight_scale)
 
 
+class WeightOnlyQuantLinearMethod(LinearMethodBase):
+
+    def create_weights(self, module: Linear, in_features: int,
+                       out_features: int, bias: bool,
+                       dtype: torch.dtype) -> None:
+
+        _, weight_id = get_weight_dtype_and_id(module)
+
+        # Quantized weights (int4 weights are packed into int8)
+        module.weight = Parameter(torch.empty(
+            (in_features, out_features // weight_id), dtype=torch.int8),
+                                  requires_grad=False)
+
+        module.weight_scale = Parameter(torch.empty((out_features),
+                                                    dtype=dtype),
+                                        requires_grad=False)
+
+        if bias:
+            module.bias = Parameter(torch.empty((out_features), dtype=dtype),
+                                    requires_grad=False)
+        else:
+            module.register_parameter("bias", None)
+
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]) -> torch.Tensor:
+
+        weight_dtype, _ = get_weight_dtype_and_id(module)
+        bias = bias.contiguous() if bias is not None else None
+
+        output = torch.ops.trtllm.weight_only_quant_gemm(
+            input, module.weight, weight_dtype, module.weight_scale,
+            module.dtype)
+
+        return output
+
+    def load_weight_scales(
+            self,
+            weights: List[Dict],
+            tp_size: int = 1,
+            tp_rank: int = 0,
+            tp_mode: Optional[TensorParallelMode] = None) -> List[torch.Tensor]:
+        device = torch.device("cuda")
+        q_weight_scale = load_weight_shard(weights[0]['weight_scale'],
+                                           tp_size,
+                                           tp_rank,
+                                           tp_mode,
+                                           device=device)
+        k_weight_scale = load_weight_shard(weights[1]['weight_scale'],
+                                           tp_size,
+                                           tp_rank,
+                                           tp_mode,
+                                           device=device)
+        v_weight_scale = load_weight_shard(weights[2]['weight_scale'],
+                                           tp_size,
+                                           tp_rank,
+                                           tp_mode,
+                                           device=device)
+        weight_scales = [q_weight_scale, k_weight_scale, v_weight_scale]
+
+        return weight_scales
+
+    def load_weights_vanilla(self, module: Linear, weights: List[Dict]) -> None:
+        load_weights_vanilla_helper(module, weights)
+
+        device = torch.device('cuda')
+        weight_scale = load_weight_shard(weights[0]['weight_scale'],
+                                         module.tp_size, module.tp_rank,
+                                         module.tp_mode, device)
+
+        copy_weight(module.weight_scale, weight_scale)
+
+    def load_weights_fused_qkv_linear(self, module: Linear,
+                                      weights: List[Dict]) -> None:
+        q_weight, k_weight, v_weight = load_weights_fused_qkv_helper(
+            module, weights)
+
+        fused_weight = torch.cat((q_weight, k_weight, v_weight))
+
+        weight_dtype, _ = get_weight_dtype_and_id(module)
+        fused_weight = preprocess_weights_for_mixed_gemm(
+            fused_weight.to(torch.int8).T.contiguous().cpu(), weight_dtype,
+            torch.float16).cuda().contiguous()
+
+        copy_weight(module.weight, fused_weight)
+
+        weight_scales = self.load_weight_scales(weights)
+
+        # Create concatenated weight scale tensor
+        cat_weight_scale = torch.cat(weight_scales, dim=0)
+        copy_weight(module.weight_scale, cat_weight_scale)
+
+    def load_weights_fused_gate_up_linear(self, module: Linear,
+                                          weights: List[Dict]) -> None:
+        device = torch.device('cuda')
+        weight_dtype, _ = get_weight_dtype_and_id(module)
+        gate_weight, up_weight = load_weights_fused_gate_up_helper(
+            module, weights)
+
+        fused_weight = torch.cat((gate_weight, up_weight))
+
+        fused_weight = preprocess_weights_for_mixed_gemm(
+            fused_weight.to(torch.int8).T.contiguous().cpu(), weight_dtype,
+            torch.float16).cuda().contiguous()
+
+        copy_weight(module.weight, fused_weight)
+
+        left_scale = load_weight_shard(weights[0]['weight_scale'],
+                                       module.tp_size, module.tp_rank,
+                                       module.tp_mode, device).contiguous()
+        right_scale = load_weight_shard(weights[1]['weight_scale'],
+                                        module.tp_size, module.tp_rank,
+                                        module.tp_mode, device).contiguous()
+        fused_scale = torch.cat([left_scale, right_scale], dim=0)
+        copy_weight(module.weight_scale, fused_scale)
+
+
 class W4A16_AWQ_LinearMethod(LinearMethodBase):
 
     def create_weights(self, module: Linear, in_features: int,
@@ -1278,6 +1416,9 @@ def get_quant_method(quant_config: Optional[QuantConfig] = None):
         return NVFP4LinearMethod()
     if quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8():
         return W4A8MXFP4FP8LinearMethod()
+    if quant_config.layer_quant_mode.is_weight_only(
+    ) and not quant_config.layer_quant_mode.has_per_group_scaling():
+        return WeightOnlyQuantLinearMethod()
     if quant_config.layer_quant_mode.is_int4_weight_only_per_group(
     ) and quant_config.quant_algo == QuantAlgo.W4A16_AWQ:
         return W4A16_AWQ_LinearMethod()
@@ -1400,6 +1541,12 @@ class Linear(nn.Module):
     def has_nvfp4(self):
         assert self._weights_created
         return self.quant_config is not None and self.quant_config.layer_quant_mode.has_nvfp4(
+        )
+
+    @property
+    def has_weight_only_quant(self):
+        assert self._weights_created
+        return self.quant_config is not None and self.quant_config.layer_quant_mode.is_weight_only(
         )
 
     @property
