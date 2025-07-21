@@ -11,6 +11,7 @@ from deep_gemm.utils.layout import MajorTypeAB
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._utils import nvtx_range
 
+from ...distributed import allgather
 from ...model_config import ModelConfig
 from ...utils import Fp4QuantizedTensor
 from .fused_moe_cutlass import CutlassFusedMoE
@@ -301,6 +302,14 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
                     f"unsupported quantization mode for CUTEDSL backend: {self.quant_config.quant_mode}"
                 )
 
+        use_allgather = self.use_dp and self.parallel_size > 1
+        if use_allgather:
+            x, x_sf, token_selected_experts, token_final_scales = allgather(
+                [x, x_sf, token_selected_experts, token_final_scales],
+                self.mapping,
+                dim=0,
+                sizes=None if use_dp_padding else all_rank_num_tokens)
+
         (
             permuted_row_to_unpermuted_row_tensor,
             permuted_token_selected_experts_tensor,
@@ -330,15 +339,9 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         if permuted_data_tensor.numel() == 0:
             return torch.zeros_like(x)
 
-        max_padded_tokens = (x.shape[0] + 128) // 128 * 128
-        permuted_data_tensor_padded = torch.empty(
-            (self.expert_size_per_partition, max_padded_tokens,
-             self.hidden_size),
-            dtype=self.dtype,
-            device='cuda')
-
         masked_m, token_to_expert_map = preprocess_after_permute(
             expert_first_token_offset_tensor, permuted_data_tensor)
+
         m_max = (x.shape[0] + 127) // 128 * 128
         expected_m = (token_selected_experts.numel() +
                       self.expert_size_per_partition -
