@@ -863,7 +863,7 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                           skip_modules: List[str] = [],
                           params_map: Optional[Dict[str, str]] = None,
                           preload_weight_modules: Optional[List[str]] = None):
-    # TODO: remove preload_weight_modules - it is a workaround for min-latency llama4 model loading where
+    # TODO: remove preload_weight_modules - it is a workaround for min-latency llama4 and Qwen3 model loading where
     # we need some order in the module loading. Once this is resolved, we can remove this workaround.
     weight_mapper.add_skip_modules(skip_modules)
     if params_map is not None:
