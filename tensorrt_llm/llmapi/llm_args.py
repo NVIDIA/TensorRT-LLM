@@ -262,6 +262,7 @@ class DecodingBaseConfig(BaseModel):
             "NGram": NGramDecodingConfig,
             "DraftTarget": DraftTargetDecodingConfig,
             "UserProvided": UserProvidedDecodingConfig,
+            "AUTO": AutoDecodingConfig,
         }
 
         config_class = config_classes.get(decoding_type)
@@ -437,6 +438,29 @@ class MTPDecodingConfig(DecodingBaseConfig):
         if self.num_nextn_predict_layers_from_model_config == 1 and not self.use_mtp_vanilla:
             return TorchSpeculativeDecodingMode.MTP_EAGLE
         return TorchSpeculativeDecodingMode.MTP
+
+
+class AutoDecodingConfig(DecodingBaseConfig):
+    """
+    Configuration for auto speculative decoding.
+
+    This config is used to automatically select the best speculative decoding algorithm.
+
+    According to benchmark results, the best algorithm in general is NGRAM with low concurrency <= 32.
+    Default heuristic:
+        With concurrency <= 4, max_draft_len = 5, max_matching_ngram_size = 3
+        With concurrency <= 32, max_draft_len = 3, max_matching_ngram_size = 5
+        With concurrency > 32, speculative decoding is disabled.
+    """
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+    decoding_type: ClassVar[str] = "AUTO"
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
 
 
 class PybindMirror(ABC):
@@ -742,6 +766,7 @@ SpeculativeConfig: TypeAlias = Optional[Union[
     MTPDecodingConfig,
     NGramDecodingConfig,
     UserProvidedDecodingConfig,
+    AutoDecodingConfig,
 ]]
 
 
@@ -1165,7 +1190,6 @@ class BaseLlmArgs(BaseModel):
             tensorrt_llm.llmapi.llm_utils.BaseLlmArgs: The `BaseLlmArgs` instance.
         """
         kwargs = BaseLlmArgs._check_consistency(dict(kwargs))
-
         ret = cls(**kwargs)
         return ret
 
@@ -1491,6 +1515,11 @@ class BaseLlmArgs(BaseModel):
                             UserProvidedDecodingConfig):
                 assert self.backend in ['pytorch', '_autodeploy']
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.USER_PROVIDED
+                self.build_config.max_draft_len = self.speculative_config.max_draft_len
+
+            elif isinstance(self.speculative_config, AutoDecodingConfig):
+                assert self.backend in ['pytorch', '_autodeploy']
+                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.AUTO
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
 
             else:
