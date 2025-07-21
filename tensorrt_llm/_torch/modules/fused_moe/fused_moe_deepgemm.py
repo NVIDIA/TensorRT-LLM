@@ -1,12 +1,10 @@
-import functools
 from typing import List, Optional, Union
 
+import deep_gemm
 import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from deep_gemm.jit_kernels.impls import sm100_fp8_gemm_1d1d
-from deep_gemm.utils.layout import MajorTypeAB
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._utils import nvtx_range
@@ -157,54 +155,11 @@ def deepgemm_fp8_group_blockwise_gemm(
     masked_m: torch.Tensor,
     expected_m: int,
 ) -> torch.Tensor:
-
     d = torch.empty((a.shape[0], a.shape[1], b.shape[1]),
                     device=b.device,
                     dtype=torch.bfloat16)
-    compiled_dims = 'nk'
-
-    # NOTES: shape must be `[G, M, K] @ [G, N, K].mT`
-    assert a.stride(-1) == 1
-    assert b.stride(-1) == 1
-    assert masked_m.is_contiguous()
-
-    num_groups, m, k = a.shape
-    num_groups_, n, k_ = b.shape
-    num_groups__, m_, n_ = d.shape
-    num_groups___ = masked_m.numel()
-
-    # Type and shape checks
-    assert num_groups == num_groups_ == num_groups__ == num_groups___
-    assert m == m_ and n == n_ and k == k_
-    assert expected_m > 0 and m > 0 and n > 0 and k > 0 and num_groups > 0
-    assert a.dtype == torch.float8_e4m3fn
-    assert b.dtype == torch.float8_e4m3fn
-    assert d.dtype == torch.bfloat16
-    assert masked_m.dtype == torch.int32
-
-    # D must be N-major
-    assert d.stride(-1) == 1
-
-    # Transform SFA and SFB into compute-required layout
-    recipe = (1, 128, 128)
-    sfa = fp8_utils.transform_sf_into_required_layout(sfa,
-                                                      mn=m,
-                                                      k=k,
-                                                      recipe=recipe,
-                                                      num_groups=num_groups,
-                                                      is_sfa=True)
-    sfb = fp8_utils.transform_sf_into_required_layout(sfb,
-                                                      mn=n,
-                                                      k=k,
-                                                      recipe=recipe,
-                                                      num_groups=num_groups,
-                                                      is_sfa=False)
-
-    impl = functools.partial(sm100_fp8_gemm_1d1d.fp8_m_grouped_gemm_nt_masked,
-                             major_a=MajorTypeAB.KMajor,
-                             major_b=MajorTypeAB.KMajor,
-                             compiled_dims=compiled_dims)
-    impl(a, sfa, b, sfb, d, masked_m, expected_m)
+    deep_gemm.fp8_m_grouped_gemm_nt_masked((a, sfa), (b, sfb), d, masked_m,
+                                           expected_m)
     return d
 
 
