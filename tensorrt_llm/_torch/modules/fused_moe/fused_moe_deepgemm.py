@@ -18,34 +18,77 @@ from .routing import BaseMoeRoutingMethod
 
 
 @triton.jit
-def masked_index_copy_kernel(output_ptr, input_ptr, start_offsets_ptr,
-                             row_indices_ptr, row_size, col_size, dim_size,
-                             BLOCK_SIZE: tl.constexpr):
+def _masked_index_copy_group_quant_fp8(
+    input_ptr,
+    out_q_ptr,
+    out_s_ptr,
+    # mask indices
+    start_offsets_ptr,
+    row_indices_ptr,
+    # group size
+    group_size,
+    # output size
+    row_size,
+    col_size,
+    dim_size,
+    # avoid to divide zero
+    eps,
+    # block size
+    BLOCK: tl.constexpr,
+):
     # get program id and block offset
     pid = tl.program_id(0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    block_start = pid * group_size
 
     # compute mask and pointers
+    offsets = block_start + tl.arange(0, BLOCK)
+    mask = offsets < (block_start + group_size)
     num_tokens = tl.load(start_offsets_ptr + row_size)
     token_idx = offsets // dim_size
-    valid = token_idx < num_tokens
-    row_idx = tl.load(row_indices_ptr + token_idx)
+    valid = (token_idx < num_tokens) & mask
+    row_idx = tl.load(row_indices_ptr + token_idx, mask=valid)
     start_offset = tl.load(start_offsets_ptr + row_idx, mask=valid)
     col_idx = token_idx - start_offset
     elem_idx = offsets % dim_size
 
     # load input data
-    input = tl.load(input_ptr + offsets, mask=valid)
+    input = tl.load(input_ptr + offsets, mask=valid, other=0.0).to(tl.float32)
+
+    # quant
+    _absmax = tl.maximum(tl.max(tl.abs(input)), eps)
+    output_s = _absmax / 448.0
+    output_s_inv = 1.0 / output_s
+    output_q = tl.clamp(input * output_s_inv, -448.0,
+                        448.0).to(out_q_ptr.dtype.element_ty)
+    output_s = tl.exp2(tl.ceil(tl.log2(tl.abs(output_s))))
 
     # write output
-    output_offsets = row_idx * col_size * dim_size + col_idx * dim_size + elem_idx
-    tl.store(output_ptr + output_offsets, input, mask=valid)
+    s_dim_size = dim_size // group_size
+    out_offsets = row_idx * col_size * dim_size + col_idx * dim_size + elem_idx
+    group_in_token = elem_idx // group_size
+    out_s_offset = row_idx * col_size * s_dim_size + col_idx * s_dim_size + group_in_token
+
+    # Only store scaling factor for the first element in each group to avoid race conditions
+    is_first_in_group = elem_idx % group_size == 0
+    tl.store(out_q_ptr + out_offsets, output_q, mask=valid)
+    tl.store(out_s_ptr + out_s_offset, output_s, mask=valid & is_first_in_group)
 
 
-def triton_masked_index_copy(output, input, start_offsets, row_indices):
-    assert output.ndim == 3, "Input must be a 3D tensor, [row, col, dim]"
+def masked_index_copy_group_quant_fp8(
+    output: torch.Tensor,
+    output_s: torch.Tensor,
+    input: torch.Tensor,
+    start_offsets: torch.Tensor,
+    row_indices: torch.Tensor,
+    group_size: int,
+    eps: float = 1e-10,
+):
+    assert (
+        input.shape[-1] % group_size == 0
+    ), "the last dimension of `input` cannot be divisible by `group_size`"
+    assert input.is_contiguous(), "`input` is not contiguous"
     assert input.ndim == 2, "Input must be a 2D tensor"
+    assert output.ndim == 3, "Input must be a 3D tensor, [row, col, dim]"
     assert start_offsets.shape[
         0] == output.shape[0] + 1, "Start offsets must be (num_experts + 1)"
 
@@ -55,16 +98,24 @@ def triton_masked_index_copy(output, input, start_offsets, row_indices):
     dim_size = output.shape[2]
     total_elems = num_tokens * dim_size
 
-    # launch kernel
-    grid = lambda meta: (triton.cdiv(total_elems, meta['BLOCK_SIZE']), )
-    masked_index_copy_kernel[grid](output,
-                                   input,
-                                   start_offsets,
-                                   row_indices,
-                                   row_size,
-                                   col_size,
-                                   dim_size,
-                                   BLOCK_SIZE=1024)
+    M = total_elems // group_size
+    BLOCK = triton.next_power_of_2(group_size)
+    # heuristics for number of warps
+    num_warps = min(max(BLOCK // 256, 1), 8)
+    _masked_index_copy_group_quant_fp8[(M, )](
+        input,
+        output,
+        output_s,
+        start_offsets,
+        row_indices,
+        group_size,
+        row_size,
+        col_size,
+        dim_size,
+        eps,
+        BLOCK=BLOCK,
+        num_warps=num_warps,
+    )
     return
 
 
@@ -342,19 +393,21 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         expected_m = (token_selected_experts.numel() +
                       self.expert_size_per_partition -
                       1) // self.expert_size_per_partition
-        permuted_data_tensor_padded = torch.empty(
-            self.expert_size_per_partition,
-            m_max,
-            self.hidden_size,
-            dtype=self.dtype,
+        act_input_fp8 = torch.empty(
+            (self.expert_size_per_partition, m_max, self.hidden_size),
+            dtype=torch.float8_e4m3fn,
             device='cuda')
-        triton_masked_index_copy(permuted_data_tensor_padded,
-                                 permuted_data_tensor,
-                                 expert_first_token_offset_tensor,
-                                 token_to_expert_map)
+        act_input_sf = torch.empty(
+            (self.expert_size_per_partition, m_max, self.hidden_size // 128),
+            dtype=torch.float32,
+            device='cuda')
+        masked_index_copy_group_quant_fp8(act_input_fp8,
+                                          act_input_sf,
+                                          permuted_data_tensor,
+                                          expert_first_token_offset_tensor,
+                                          token_to_expert_map,
+                                          group_size=128)
 
-        act_input_fp8, act_input_sf = fp8_utils.per_token_cast_to_fp8_e8m0(
-            permuted_data_tensor_padded)
         h1 = deepgemm_fp8_group_blockwise_gemm(
             a=act_input_fp8,
             b=self.w3_w1_weight,
