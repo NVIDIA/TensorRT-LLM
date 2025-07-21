@@ -1576,33 +1576,6 @@ __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_inp
                     assert(act_scale_idx == 0 && "Cannot use per-expert act scale for pre-quantized activations");
                     writeSF<VecSize, ELEM_PER_THREAD>(num_tokens_before_expert, expert, source_row, permuted_row,
                         elem_index, padded_hidden_size, fc1_act_sf_flat, input_sf, swizzled_input_sf);
-
-                    // if (blockIdx.x == 0 && threadIdx.x == 0) {
-
-                    //     if (swizzled_input_sf)
-                    //     {
-                    //         for (int i=0; i<20; i++){
-                    //             printf("%u+~", *(reinterpret_cast<const uint8_t *>(input_sf) + i));
-                    //         }
-                    //         printf("\n");
-                    //         for (int i=0; i<20; i++){
-                    //             printf("%u-~", *(reinterpret_cast<uint8_t *>(fc1_act_sf_flat) + i));
-                    //         }
-                    //         printf("\n");
-                    //     }
-                    //     else
-                    //     {
-                    //         for (int i=0; i<20; i++){
-                    //             printf("%u++", *(reinterpret_cast<const uint8_t *>(input_sf) + i));
-                    //         }
-                    //         printf("\n");
-                    //         for (int i=0; i<20; i++){
-                    //             printf("%u--", *(reinterpret_cast<uint8_t *>(fc1_act_sf_flat) + i));
-                    //         }
-                    //         printf("\n");
-                    //     }
-                    // }
-
                     dest_row_ptr[elem_index] = in_vec;
                 }
             }
