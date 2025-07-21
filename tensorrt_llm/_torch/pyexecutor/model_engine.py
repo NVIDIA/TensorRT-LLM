@@ -284,7 +284,12 @@ class PyTorchModelEngine(ModelEngine):
         attn_backend = pytorch_backend_config.attn_backend
         self.lora_manager: Optional[LoraManager] = None
         if lora_config is not None:
-            self.lora_manager = LoraManager()
+            from tensorrt_llm._torch.pyexecutor.resource_manager import \
+                ResourceManagerType
+            peft_cache_manager = self.engine.resource_manager.resource_managers.get(
+                ResourceManagerType.PEFT_CACHE_MANAGER)
+            self.lora_manager = LoraManager(
+                cpp_peft_cache_manager=peft_cache_manager.impl)
 
         self.lora_prefetch_requests_list = None  # TODO smor - fix "LoRARequest" import
         if lora_config is not None and lora_config.lora_request is not None:

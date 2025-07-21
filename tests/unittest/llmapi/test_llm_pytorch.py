@@ -432,6 +432,7 @@ def test_bielik_11b_v2_2_instruct_multi_lora() -> None:
 
         assert len(outputs) == 2
 
+
 def test_lora_dir_with_graph():
     lora_req = LoRARequest(
         "task-0", 0, f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1")
