@@ -11,7 +11,8 @@ from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
                        DynamicBatchConfig, EagleDecodingConfig,
                        ExtendedRuntimePerfKnobConfig, KvCacheConfig, LlmArgs,
                        LookaheadDecodingConfig, MedusaDecodingConfig, MoeConfig,
-                       MTPDecodingConfig, NGramDecodingConfig, SchedulerConfig,
+                       MTPDecodingConfig, NGramDecodingConfig,
+                       RocketSparseAttentionConfig, SchedulerConfig,
                        TorchCompileConfig, TorchLlmArgs, TrtLlmArgs,
                        UserProvidedDecodingConfig)
 from .llm_utils import (BuildConfig, KvCacheRetentionConfig, QuantAlgo,
@@ -59,4 +60,5 @@ __all__ = [
     'AutoDecodingConfig',
     'AttentionDpConfig',
     'LoRARequest',
+    'RocketSparseAttentionConfig',
 ]
