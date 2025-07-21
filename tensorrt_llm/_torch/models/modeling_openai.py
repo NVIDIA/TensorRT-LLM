@@ -6,13 +6,13 @@ from torch import nn
 from torch.nn.parameter import Parameter
 from tqdm import tqdm
 
-from tensorrt_llm._torch.distributed import AllReduceParams, allgather
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
                                            PredefinedAttentionMask, RopeParams)
-from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams
+from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
+                           allgather)
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
@@ -51,7 +51,6 @@ class OpenAIMoeConfig:
     # added for TRT-LLM
     torch_dtype: torch.dtype = torch.bfloat16
     rms_norm_eps: float = 1e-05
-    # TODO: check what the real max_position_embeddings is
     max_position_embeddings: int = 131072
     model_type: str = "mixtral"
     tie_word_embeddings: bool = False
@@ -267,9 +266,6 @@ class MLPBlock(torch.nn.Module):
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
         all_rank_max_num_tokens = attn_metadata.all_rank_max_num_tokens
 
-        # Check if we should use padding instead of allgather
-        # This is needed when using FP4 quantization because x_sf has different shape
-        use_dp_padding = False
         if self.mapping.tp_size > 1 and all_rank_num_tokens is not None:
             if (isinstance(self.experts, (TRTLLMGenFusedMoE, TritonFusedMoE))):
                 t = allgather(t, self.mapping, dim=0, sizes=all_rank_num_tokens)
@@ -291,7 +287,7 @@ class MLPBlock(torch.nn.Module):
             router_logits=g,
             all_rank_num_tokens=all_rank_num_tokens,
             all_rank_max_num_tokens=all_rank_max_num_tokens,
-            use_dp_padding=use_dp_padding)
+            use_dp_padding=False)
 
         expert_output = expert_output.view(orig_shape)
         return expert_output, residual
@@ -532,7 +528,7 @@ class OpenAIMoeForCausalLM(DecoderModelForCausalLM[Transformer,
                                                    OpenAIMoeConfig]):
 
     params_map = {
-        # TRTLLM module name : Orangina module name
+        # TRTLLM module name : OpenAIMoe module name
         "qkv_proj": "qkv",
         "o_proj": "out",
         "lm_head": "unembedding",
@@ -564,7 +560,7 @@ class OpenAIMoeForCausalLM(DecoderModelForCausalLM[Transformer,
 
         super().apply_quant_config_exclude_modules()
 
-        for name, module in self.named_modules():
+        for _, module in self.named_modules():
             if callable(getattr(module, "create_weights", None)):
                 module.create_weights()
 
