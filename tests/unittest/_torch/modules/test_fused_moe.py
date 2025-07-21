@@ -18,9 +18,12 @@ from utils.util import (skip_neither_ada_nor_hopper_unittest,
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.fused_moe import (  # yapf:skip
+
+# isort: off
+from tensorrt_llm._torch.modules.fused_moe import (
     BaseMoeRoutingMethod, CutlassFusedMoE, DefaultMoeRoutingMethod,
     MoEWeightLoadingMode, RenormalizeMoeRoutingMethod, VanillaMoE, WideEPMoE)
+# isort: on
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import \
     CuteDslFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_wide_ep import \
@@ -884,19 +887,16 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
         output = fused_moe.forward(x, router_logits)
         ref_output = ref()
 
-    # compare
     torch.cuda.synchronize()
-    success = torch.allclose(output, ref_output, rtol=1e-2, atol=0.1)
     print(f"ref_output: {ref_output}")
     print(f"output: {output}")
-    # assert that result does not contain NaN
-    ref_has_nan = torch.isnan(ref_output).any()
-    out_has_nan = torch.isnan(output).any()
-    assert not ref_has_nan, "ref_output contains NaN"
-    assert not out_has_nan, "output contains NaN"
-    assert torch.nonzero(output).numel() != 0 and torch.nonzero(
-        ref_output).numel() != 0
-    assert success
+    # assert that result does not contain NaN or is all 0s
+    assert not torch.isnan(ref_output).any(), "ref_output contains NaN"
+    assert not torch.isnan(output).any(), "output contains NaN"
+    assert torch.nonzero(output).numel() > 0, "output is empty"
+    assert torch.nonzero(ref_output).numel() > 0, "ref_output is empty"
+    # compare
+    torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
 
 
 class RefGatedMLPFusedMoE(nn.Module):
