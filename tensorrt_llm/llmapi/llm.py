@@ -410,6 +410,8 @@ class BaseLLM:
                 # Only pass it if it has content
                 if not multimodal_params.has_content():
                     multimodal_params = None
+                else:
+                    multimodal_params.to_shared_tensor("multimodal_data")
         else:
             raise TypeError(
                 f"The inputs must be type str or list of int, but got {type(inputs)}"

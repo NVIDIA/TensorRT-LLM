@@ -1227,11 +1227,15 @@ class PyTorchModelEngine(ModelEngine):
             multimodal_params = MultimodalParams(
                 multimodal_data=request.py_multimodal_data,
                 multimodal_runtime=py_multimodal_runtime)
-            multimodal_params.to_device("multimodal_data",
-                                        "cuda",
-                                        pin_memory=True)
 
             if multimodal_params.has_content():
+                multimodal_params.from_shared_tensor("multimodal_data")
+                multimodal_params.to_device("multimodal_data",
+                                            "cuda",
+                                            pin_memory=True)
+                # re-assign the recovered SharedTensorContainer to the request for generation usage
+                setattr(request, "py_multimodal_data",
+                        multimodal_params.multimodal_data)
                 multimodal_params_list.append(multimodal_params)
 
             request.py_batch_idx = request.py_seq_slot
@@ -1264,11 +1268,11 @@ class PyTorchModelEngine(ModelEngine):
             # Multimodal
             multimodal_params = MultimodalParams(
                 multimodal_data=request.py_multimodal_data)
-            multimodal_params.strip_for_generation()
-            multimodal_params.to_device("multimodal_data",
-                                        "cuda",
-                                        pin_memory=True)
             if multimodal_params.has_content():
+                multimodal_params.strip_for_generation()
+                # re-assign the recovered SharedTensorContainer to the request after strip_for_generation
+                setattr(request, "py_multimodal_data",
+                        multimodal_params.multimodal_data)
                 multimodal_params_list.append(multimodal_params)
         extend_requests += extend_dummy_requests
 
