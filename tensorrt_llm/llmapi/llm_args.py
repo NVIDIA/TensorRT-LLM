@@ -372,11 +372,6 @@ class NGramDecodingConfig(DecodingBaseConfig):
         is_public_pool: bool = True
             Whether to use a common pool for all requests, or the pool is private for each request if False.
     """
-    # If max_draft_len or max_matching_ngram_size are not set by user
-    # Default heuristic will be use
-    # With concurrency <= 4, max_draft_len = 5, max_matching_ngram_size = 3
-    # With concurrency <= 32, max_draft_len = 3, max_matching_ngram_size = 5
-    max_draft_len: int = 0
     max_matching_ngram_size: int = 0
     is_keep_all: bool = True
     is_use_oldest: bool = True
