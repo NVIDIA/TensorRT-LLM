@@ -21,7 +21,7 @@ from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import Fp4QuantizedTensor, get_model_extra_attrs
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
-from .rms_norm import RMSNorm
+from .rms_norm import RMSNorm, group_rms_norm
 from .rotary_embedding import RotaryEmbedding
 
 
@@ -498,6 +498,7 @@ class MLA(nn.Module):
                                     1) // tp_size
 
         rms_norm_eps = config.pretrained_config.rms_norm_eps
+        self.rms_norm_eps = rms_norm_eps
         quant_config = config.get_quant_config()
         self.quant_config = quant_config
 
@@ -751,14 +752,10 @@ class MLA(nn.Module):
             q, compressed_kv, k_pe = self.fused_a(hidden_states).split(
                 [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim],
                 -1)
-
-            q, compressed_kv = maybe_execute_in_parallel(
-                lambda: self.q_a_layernorm(q),
-                lambda: self.kv_a_layernorm(compressed_kv),
-                self.ln_events[0],
-                self.ln_events[1],
-                self.aux_stream,
-            )
+            q, compressed_kv = group_rms_norm(
+                [q, compressed_kv],
+                eps=self.rms_norm_eps,
+                weights=[self.q_a_layernorm.weight, self.kv_a_layernorm.weight])
 
         q, latent_cache = maybe_execute_in_parallel(
             lambda: self.q_b_proj(q),

@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <map>
 #include <numeric>
 
 #include "tensorrt_llm/common/envUtils.h"
@@ -208,6 +209,8 @@ __global__ void GroupRMSNormBaseKernel(GroupRMSParams<n> params, int rounds)
     if (idx_round0 < input_dim + block_offset)
     {
         PackedType packed_output;
+        uint32_t output_idx = idx_round0 - block_offset + batch_idx * params.output_strides[input_idx];
+
 #pragma unroll
         for (uint32_t j = 0; j < kPackedSize; j++)
         {
@@ -223,19 +226,19 @@ __global__ void GroupRMSNormBaseKernel(GroupRMSParams<n> params, int rounds)
                     static_cast<float>(reinterpret_cast<DType*>(&input_cache)[j]) * smem_rsqrts[input_idx]);
             }
         }
-        output_ptr[idx_round0 / kPackedSize] = packed_output;
+        output_ptr[output_idx / kPackedSize] = packed_output;
     }
 
     if constexpr (MultiRounds)
     {
         for (uint32_t i = 1; i < rounds; i++)
         {
-            uint32_t idx
-                = block_offset + local_warp_idx * round_offset * rounds + i * round_offset + lane_idx * kPackedSize;
+            uint32_t idx = idx_round0 + i * round_offset;
             if (idx < input_dim + block_offset)
             {
                 PackedType packed_input = input_ptr[idx / kPackedSize];
                 PackedType packed_output;
+                uint32_t output_idx = idx - block_offset + batch_idx * params.output_strides[input_idx];
 
 #pragma unroll
                 for (uint32_t j = 0; j < kPackedSize; j++)
@@ -254,7 +257,7 @@ __global__ void GroupRMSNormBaseKernel(GroupRMSParams<n> params, int rounds)
                             = static_cast<float>(reinterpret_cast<DType*>(&packed_input)[j]) * smem_rsqrts[input_idx];
                     }
                 }
-                output_ptr[idx / kPackedSize] = packed_output;
+                output_ptr[output_idx / kPackedSize] = packed_output;
             }
         }
     }
@@ -456,6 +459,8 @@ __global__ void GroupRMSNormKernelLargeBatch(
     if (idx_0 < block_offset_0 + input_dim_0)
     {
         PackedType packed_output;
+        uint32_t output_idx_0 = idx_0 - block_offset_0 + batch_idx * params.output_strides[0];
+
 #pragma unroll
         for (uint32_t j = 0; j < kPackedSize; j++)
         {
@@ -471,19 +476,19 @@ __global__ void GroupRMSNormKernelLargeBatch(
                     static_cast<float>(reinterpret_cast<DType*>(&input_0_cache)[j]) * smem_rsqrts[0][0]);
             }
         }
-        output_ptr_0[idx_0 / kPackedSize] = packed_output;
+        output_ptr_0[output_idx_0 / kPackedSize] = packed_output;
     }
 
     if constexpr (MultiRounds_0)
     {
         for (uint32_t i = 1; i < rounds_0; i++)
         {
-            uint32_t idx
-                = block_offset_0 + warp_idx * round_offset * rounds_0 + i * round_offset + lane_idx * kPackedSize;
+            uint32_t idx = idx_0 + i * round_offset;
             if (idx < block_offset_0 + input_dim_0)
             {
                 PackedType packed_input = input_ptr_0[idx / kPackedSize];
                 PackedType packed_output;
+                uint32_t output_idx_0 = idx - block_offset_0 + batch_idx * params.output_strides[0];
 
 #pragma unroll
                 for (uint32_t j = 0; j < kPackedSize; j++)
@@ -502,7 +507,7 @@ __global__ void GroupRMSNormKernelLargeBatch(
                             static_cast<float>(reinterpret_cast<DType*>(&packed_input)[j]) * smem_rsqrts[0][0]);
                     }
                 }
-                output_ptr_0[idx / kPackedSize] = packed_output;
+                output_ptr_0[output_idx_0 / kPackedSize] = packed_output;
             }
         }
     }
@@ -510,6 +515,7 @@ __global__ void GroupRMSNormKernelLargeBatch(
     if (idx_1 < block_offset_1 + input_dim_1)
     {
         PackedType packed_output;
+        uint32_t output_idx_1 = idx_1 - block_offset_1 + batch_idx * params.output_strides[1];
 #pragma unroll
         for (uint32_t j = 0; j < kPackedSize; j++)
         {
@@ -525,19 +531,19 @@ __global__ void GroupRMSNormKernelLargeBatch(
                     static_cast<float>(reinterpret_cast<DType*>(&input_1_cache)[j]) * smem_rsqrts[1][0]);
             }
         }
-        output_ptr_1[idx_1 / kPackedSize] = packed_output;
+        output_ptr_1[output_idx_1 / kPackedSize] = packed_output;
     }
 
     if constexpr (MultiRounds_1)
     {
         for (uint32_t i = 1; i < rounds_1; i++)
         {
-            uint32_t idx
-                = block_offset_1 + warp_idx * round_offset * rounds_1 + i * round_offset + lane_idx * kPackedSize;
+            uint32_t idx = idx_1 + i * round_offset;
             if (idx < block_offset_1 + input_dim_1)
             {
                 PackedType packed_input = input_ptr_1[idx / kPackedSize];
                 PackedType packed_output;
+                uint32_t output_idx_1 = idx - block_offset_1 + batch_idx * params.output_strides[1];
 
 #pragma unroll
                 for (uint32_t j = 0; j < kPackedSize; j++)
@@ -556,7 +562,7 @@ __global__ void GroupRMSNormKernelLargeBatch(
                             static_cast<float>(reinterpret_cast<DType*>(&packed_input)[j]) * smem_rsqrts[1][0]);
                     }
                 }
-                output_ptr_1[idx / kPackedSize] = packed_output;
+                output_ptr_1[output_idx_1 / kPackedSize] = packed_output;
             }
         }
     }
@@ -772,6 +778,13 @@ int getComputeCapabilityMajor()
 
 bool prefer_base_kernel(int batch, int base_warps, float scheduling_efficiency_ratio)
 {
+    static std::map<std::tuple<int, int, float>, bool> cache;
+    auto key = std::make_tuple(batch, base_warps, scheduling_efficiency_ratio);
+    if (cache.find(key) != cache.end())
+    {
+        return cache[key];
+    }
+
     int sm_major = getComputeCapabilityMajor();
     bool found_match = false;
     for (auto const& [known_model, model] : gpu_models)
@@ -782,7 +795,8 @@ bool prefer_base_kernel(int batch, int base_warps, float scheduling_efficiency_r
                 + model.scheduling_efficiency_ratio * scheduling_efficiency_ratio + model.intercept;
             p = 1.0f / (1.0f + std::exp(-p));
             found_match = true;
-            return p > 0.5f;
+            cache[key] = p > 0.5f;
+            return cache[key];
         }
     }
     if (!found_match)
@@ -791,6 +805,7 @@ bool prefer_base_kernel(int batch, int base_warps, float scheduling_efficiency_r
             "GroupRMSNorm: Failed to find heuristic for GPU compute capability %d. Falling back to the base kernel.",
             sm_major);
     }
+    cache[key] = true;
     return true;
 }
 
