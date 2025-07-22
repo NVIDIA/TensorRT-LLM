@@ -661,15 +661,14 @@ def test_generate_with_SamplingConfig(llm_for_sampling_params: LLM,
 @force_ampere
 @pytest.mark.part0
 def test_generate_with_seed(llm_for_sampling_params: LLM):
-    pytest.skip("https://nvbugs/5368507")
     prompts = ["The capital of France is"] * 10
     # Use a high temperature and large max_tokens to increase the diversity
     sampling_params = [
         SamplingParams(temperature=100, top_k=100, max_tokens=100)
         for _ in range(10)
     ]
-    # Fix the seed for the first 5 prompts
-    for i in range(5):
+    # Fix the seed for the second 5 prompts
+    for i in range(5, 10):
         sampling_params[i].seed = 515
 
     llm = llm_for_sampling_params
