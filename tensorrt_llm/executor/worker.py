@@ -520,6 +520,9 @@ class GenerationExecutorWorker(GenerationExecutor):
                 executor_request.py_logits_post_processors = lp if isinstance(
                     lp, list) else [lp]
 
+            if self._is_pytorch_backend and request.schedule_params is not None:
+                executor_request.py_schedule_params = request.schedule_params
+
             if request.query_token_ids is not None:
                 # pytorch star attention workflow
                 # a workaround to avoid public interface update
