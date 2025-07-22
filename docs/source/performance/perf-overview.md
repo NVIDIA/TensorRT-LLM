@@ -12,6 +12,8 @@ Tuning batch sizes, parallelism configurations, and other options may lead to im
 
 For DeepSeek R1 performance, please check out our [performance guide](../blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md)
 
+For more information on benchmarking with `trtllm-bench` see this NVIDIA [blog post](https://developer.nvidia.com/blog/llm-inference-benchmarking-performance-tuning-with-tensorrt-llm/).
+
 ## Throughput Measurements
 
 The below table shows performance data where a local inference client is fed requests at an infinite rate (no delay between messages),
@@ -216,7 +218,7 @@ a model name (HuggingFace reference or path to a local model), a [generated data
 trtllm-bench --model $model_name throughput --dataset $dataset_file --backend pytorch --extra_llm_api_options $llm_options
 ```
 
-The data collected for the v0.20 benchmarks was run with the following file:
+The data collected for the v0.21 benchmarks was run with the following file:
 
 `llm_options.yml`
 ```yaml
