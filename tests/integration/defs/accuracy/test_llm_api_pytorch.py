@@ -149,6 +149,10 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                 f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
                 **pytorch_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            if kv_cache_dtype == "nvfp4":
+                # This test reuses FP8 KV checkpoint for testing, need to manually change the KV cache dtype.
+                # It can be removed when NVFP4 KV checkpoint is available in the model repository.
+                llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
