@@ -423,10 +423,10 @@ struct KernelParams
         // When storeTransformedKvInTmem is true, the dimensions reflect FP4 element dimensions, thus
         // no need to divide.
 
-        auto shape = std::vector<uint64_t>{
-            static_cast<uint64_t>(storeTransformedKvInTmem ? headDim : headDim / colIdxDivisor),
-            static_cast<uint64_t>(numKeys), static_cast<uint64_t>(options.mNumHeadsKv),
-            static_cast<uint64_t>(batchSize)};
+        auto shape
+            = std::vector<uint64_t>{static_cast<uint64_t>(storeTransformedKvInTmem ? headDim : headDim / colIdxDivisor),
+                static_cast<uint64_t>(numKeys), static_cast<uint64_t>(options.mNumHeadsKv),
+                static_cast<uint64_t>(batchSize)};
         auto stride = std::vector<uint64_t>{1, static_cast<uint64_t>(strideKeys / colIdxDivisor),
             static_cast<uint64_t>(strideHeads / colIdxDivisor), static_cast<uint64_t>(strideBatch / colIdxDivisor)};
 
@@ -674,7 +674,7 @@ struct KernelParams
         // Do we have to transform K/V before MMA?
         bool const transformsKv{kernelMeta.mDataTypeKv != kernelMeta.mDataTypeQ};
         // Whether store transformed K/V in TMEM.
-        bool const isSwapsMmaAb{strstr(kernelMeta.mFuncName, "SwapsMmaAb") != nullptr};
+        bool const isSwapsMmaAb{strstr(kernelMeta.mFuncName, "Swaps") != nullptr};
         bool const storeTransformedKvInTmem{kernelMeta.mDataTypeKv == DATA_TYPE_E2M1
             && kernelMeta.mDataTypeQ == DATA_TYPE_E4M3 && maxHeadDimKv == 128 && isSwapsMmaAb};
 

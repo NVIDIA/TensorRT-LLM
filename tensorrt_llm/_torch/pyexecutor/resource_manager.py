@@ -444,7 +444,8 @@ class KVCacheManager(BaseResourceManager):
                          DataType.FLOAT, DataType.NVFP4):
             raise ValueError(f'Cannot support {dtype} KV cache.')
 
-        cache_size_bytes_per_token = get_size_in_bytes(cache_size_per_token, dtype)
+        cache_size_bytes_per_token = get_size_in_bytes(cache_size_per_token,
+                                                       dtype)
         if dtype == DataType.NVFP4:
             # NVFP4 needs additional block scales. Vector Size is 16. Each scaling factor is 1 byte.
             cache_size_bytes_per_token += cache_size_per_token / 16
@@ -638,7 +639,11 @@ class KVCacheManager(BaseResourceManager):
         for window_size in sorted(window_size_to_layers):
             layers = window_size_to_layers[window_size]
             cache_size_per_token = calculate_cache_size_per_token(layers)
-            cache_size_bytes_per_token = get_size_in_bytes(cache_size_per_token, dtype)
+            cache_size_bytes_per_token = get_size_in_bytes(
+                cache_size_per_token, dtype)
+            if dtype == DataType.NVFP4:
+                # NVFP4 needs additional block scales. Vector Size is 16. Each scaling factor is 1 byte.
+                cache_size_bytes_per_token += cache_size_per_token / 16
             required_mem_bytes_per_seq += window_size * cache_size_bytes_per_token
         logger.debug(
             f'Required memory per sequence: {required_mem_bytes_per_seq} bytes')
@@ -665,7 +670,11 @@ class KVCacheManager(BaseResourceManager):
                 # Calculate cache size per token for remaining layers only
                 cache_size_per_token = calculate_cache_size_per_token(
                     remaining_layers)
-                cache_size_bytes_per_token = get_size_in_bytes(cache_size_per_token, dtype)
+                cache_size_bytes_per_token = get_size_in_bytes(
+                    cache_size_per_token, dtype)
+                if dtype == DataType.NVFP4:
+                    # NVFP4 needs additional block scales. Vector Size is 16. Each scaling factor is 1 byte.
+                    cache_size_bytes_per_token += cache_size_per_token / 16
                 logger.debug(
                     f'Cache size per token for {len(remaining_layers)} layers: '
                     f'{cache_size_bytes_per_token} bytes')

@@ -684,10 +684,11 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
             /*num_seqs=*/num_contexts, token_offset,
             /*num_tokens=*/num_ctx_tokens, predicted_tokens_per_seq, workspace, output, output_sf, qkv, sequence_length,
             host_past_key_value_lengths, context_lengths, host_context_lengths, kv_cache_block_offsets,
-            host_kv_cache_block_offsets, host_kv_cache_block_scale_pool_pointers, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, cache_indirection,
-            kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
-            block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, mla_context_paged_kv,
-            mla_context_kv_cache_block_offsets, softmax_stats_tensor, spec_decoding_tensor_params);
+            host_kv_cache_block_offsets, host_kv_cache_block_scale_pool_pointers, host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping, cache_indirection, kv_scale_orig_quant, kv_scale_quant_orig, out_scale,
+            rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe, block_ids_per_seq, mrope_rotary_cos_sin,
+            mrope_position_deltas, mla_context_paged_kv, mla_context_kv_cache_block_offsets, softmax_stats_tensor,
+            spec_decoding_tensor_params);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -700,10 +701,11 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
             /*num_seqs=*/num_generations, token_offset,
             /*num_tokens=*/num_gen_tokens, predicted_tokens_per_seq, workspace, output, output_sf, qkv, sequence_length,
             host_past_key_value_lengths, context_lengths, host_context_lengths, kv_cache_block_offsets,
-            host_kv_cache_block_offsets, host_kv_cache_block_scale_pool_pointers, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, cache_indirection,
-            kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
-            block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, mla_context_paged_kv,
-            mla_context_kv_cache_block_offsets, softmax_stats_tensor, spec_decoding_tensor_params);
+            host_kv_cache_block_offsets, host_kv_cache_block_scale_pool_pointers, host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping, cache_indirection, kv_scale_orig_quant, kv_scale_quant_orig, out_scale,
+            rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe, block_ids_per_seq, mrope_rotary_cos_sin,
+            mrope_position_deltas, mla_context_paged_kv, mla_context_kv_cache_block_offsets, softmax_stats_tensor,
+            spec_decoding_tensor_params);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);
