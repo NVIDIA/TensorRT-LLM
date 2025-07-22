@@ -37,6 +37,7 @@ Before running the scripts, ensure you have:
 ```bash
 # Refer to `examples/disaggregated/slurm/`
 # Please find the `disaggr_torch.slurm` script in the `examples/disaggregated/slurm/` directory.
+# Make sure that SLURM parameters are correctly set in `disaggr_torch.slurm` before executing this script.
 ./submit.sh
 ```
 

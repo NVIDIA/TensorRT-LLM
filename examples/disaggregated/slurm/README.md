@@ -81,13 +81,14 @@ This script orchestrates the execution of the benchmark client. It waits for the
 
 ## Workflow
 
-1.  The user runs `./submit.sh`.
-2.  `submit.sh` submits one or more jobs to SLURM by calling `sbatch disaggr_torch.slurm` with different parameters.
-3.  For each job, SLURM allocates resources and runs `disaggr_torch.slurm`.
-4.  `disaggr_torch.slurm` runs `gen_yaml.py` to create a `config.yaml`.
-5.  `disaggr_torch.slurm` uses `srun` to launch `start_worker.sh` on all nodes, starting the MPI workers.
-6.  `disaggr_torch.slurm` starts the main `trtllm-serve` process.
-7.  `disaggr_torch.slurm` runs `run_benchmark.sh` which waits for the server to be ready.
-8.  `run_benchmark.sh` executes the benchmark for each concurrency level specified.
-9.  After the benchmark, `run_benchmark.sh` and `disaggr_torch.slurm` attempt to kill the server and worker processes.
-10. Logs for each run are stored in a subdirectory specified by the `sub_file` parameter.
+1.  Make sure that SLURM parameters are correctly set in `disaggr_torch.slurm`.
+2.  The user runs `./submit.sh`.
+3.  `submit.sh` submits one or more jobs to SLURM by calling `sbatch disaggr_torch.slurm` with different parameters.
+4.  For each job, SLURM allocates resources and runs `disaggr_torch.slurm`.
+5.  `disaggr_torch.slurm` runs `gen_yaml.py` to create a `config.yaml`.
+6.  `disaggr_torch.slurm` uses `srun` to launch `start_worker.sh` on all nodes, starting the MPI workers.
+7.  `disaggr_torch.slurm` starts the main `trtllm-serve` process.
+8.  `disaggr_torch.slurm` runs `run_benchmark.sh` which waits for the server to be ready.
+9.  `run_benchmark.sh` executes the benchmark for each concurrency level specified.
+10.  After the benchmark, `run_benchmark.sh` and `disaggr_torch.slurm` attempt to kill the server and worker processes.
+11. Logs for each run are stored in a subdirectory specified by the `sub_file` parameter.

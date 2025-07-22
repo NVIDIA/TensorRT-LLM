@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# !!!
+# Make sure that SLURM parameters are correctly set in `disaggr_torch.slurm` before executing this script.
+# !!!
+
 # concurrency 8
 concurrency=8
 ctx_num=1
