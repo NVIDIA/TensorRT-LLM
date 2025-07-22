@@ -34,7 +34,9 @@ void UserBuffersManager::initialize(int64_t tp_size, int64_t pp_size, int64_t cp
 {
     std::lock_guard<std::mutex> lock(mutex_);
     tensorrt_llm::runtime::WorldConfig world_config(tp_size, pp_size, cp_size, rank, gpus_per_node);
+#if ENABLE_MULTI_DEVICE
     UserBufferAllocator::Instance().use_nccl_symmetric = use_nccl_symmetric;
+#endif
     tensorrt_llm::runtime::ub::ub_initialize(world_config);
     TLLM_CHECK(tensorrt_llm::runtime::ub::ub_is_initialized());
     buffer_size_ = buffer_size;

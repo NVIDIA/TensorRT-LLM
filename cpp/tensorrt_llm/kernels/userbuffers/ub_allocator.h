@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #pragma once
+#include "nccl.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 #if ENABLE_MULTI_DEVICE
 #include "userbuffers.h"
