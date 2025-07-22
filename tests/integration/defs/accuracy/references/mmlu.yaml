@@ -246,3 +246,7 @@ microsoft/Phi-4-multimodal-instruct-long-rope:
   - accuracy: 65.98
 LGAI-EXAONE/EXAONE-4.0-32B:
   - accuracy: 78.52
+mistralai/Mistral-Nemo-12b-Base:
+  - accuracy: 69.66
+  - quant_algo: FP8
+    accuracy: 69.66

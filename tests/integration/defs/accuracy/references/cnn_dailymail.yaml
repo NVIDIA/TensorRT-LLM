@@ -201,10 +201,11 @@ mistralai/Mistral-7B-Instruct-v0.3:
     accuracy: 31.201
 mistralai/Mistral-Small-3.1-24B-Instruct-2503:
   - accuracy: 29.20
-mistralai/Mistral-Nemo-Base-2407:
+mistralai/Mistral-Nemo-12b-Base:
+  - accuracy: 28.906
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
-    accuracy: 24.0
+    accuracy: 28.663
 nvidia/Mistral-NeMo-Minitron-8B-Instruct:
   - quant_algo: FP8
     accuracy: 32.553
