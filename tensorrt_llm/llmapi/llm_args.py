@@ -1894,7 +1894,8 @@ class TorchLlmArgs(BaseLlmArgs):
         default=None,
         description="The checkpoint loader to use for this LLM instance.",
         json_schema_extra={
-            "type": "Optional[tensorrt_llm._torch.models.checkpoints.BaseCheckpointLoader]"
+            "type":
+            "Optional[tensorrt_llm._torch.models.checkpoints.BaseCheckpointLoader]"
         },
     )
 
