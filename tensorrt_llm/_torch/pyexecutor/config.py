@@ -9,7 +9,7 @@ from ...builder import BuildConfig
 from ...llmapi.llm_args import LoadFormat, SamplerType
 from ...logger import logger
 from ...mapping import Mapping
-from ..model_config import MoeLoadBalancerConfig
+from ..model_config import MoeLoadBalancerConfig, MoEPrefetchConfig
 from .resource_manager import BaseResourceManager
 
 
@@ -54,6 +54,8 @@ class PyTorchConfig:
 
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'
+
+    moe_prefetch_config: Optional[MoEPrefetchConfig] = None
 
     moe_disable_finalize_fusion: bool = False
 
