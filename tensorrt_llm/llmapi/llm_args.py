@@ -966,7 +966,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     max_gpu_total_bytes: int = Field(
         default=0,
         description=
-        "The maximum size in bytes of GPU memory that can be allocated for the KV cache. This is only used for VSWA case for now as a alternative to `max_tokens`. If both `max_free_gpu_memory_size` and `free_gpu_memory_fraction` are specified, memory corresponding to the minimum will be allocated."
+        "The maximum size in bytes of GPU memory that can be allocated for the KV cache. If both `max_gpu_total_bytes` and `free_gpu_memory_fraction` are specified, memory corresponding to the minimum will be allocated."
     )
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
