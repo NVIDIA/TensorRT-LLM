@@ -170,7 +170,7 @@ class PyExecutor:
         self.disable_overlap_scheduler = disable_overlap_scheduler
 
         # enqueue and _fetch_new_requests used data
-        self.next_req_id = max_batch_size  # The first max_batch_size request IDs are reserved for dummy requests
+        self.active = True
         self.max_beam_width = max_beam_width
         self.max_draft_len = max_draft_len
         self.print_log = model_engine.pytorch_backend_config.print_iter_log
@@ -283,32 +283,6 @@ class PyExecutor:
 
     def __exit__(self):
         self.shutdown()
-
-    def _get_request_id(self):
-        # (next_req_id + 1) % UINT64_MAX
-        self.next_req_id = (self.next_req_id + 1) & ((1 << 64) - 1)
-        return self.next_req_id
-
-    def _generate_child_request_ids(
-            self, request: ExecutorRequest) -> List[int] | None:
-        """ Generate child request IDs if needed. """
-        child_req_ids = None
-        sampling_config = request.sampling_config
-        beam_width = (sampling_config.beam_width
-                      if sampling_config.beam_width else 1)
-        num_return_sequences = (sampling_config.num_return_sequences
-                                if sampling_config.num_return_sequences else 1)
-
-        # Create child requests if beam_width == 1 and num_return_sequences > 1.
-        if beam_width == 1 and num_return_sequences > 1:
-            child_req_ids = []
-            for _ in range(num_return_sequences - 1):
-                child_req_id = self._get_request_id()
-                if self.enable_iter_perf_stats:
-                    self.start_times[child_req_id] = time.time()
-                child_req_ids.append(child_req_id)
-
-        return child_req_ids
 
     def enqueue_requests(self, requests: List[ExecutorRequest]):
         """

@@ -1,6 +1,7 @@
 import os
 
 import pytest
+from utils.llm_data import llm_models_root
 from utils.util import force_ampere, similar
 
 from tensorrt_llm import LLM, SamplingParams
@@ -33,7 +34,8 @@ def expected_outputs():
 
 @pytest.fixture(scope="module")
 def llm():
-    return LLM(model=os.path.join("/model"),
+    return LLM(model=os.path.join(llm_models_root(), "llama-models-v2",
+                                  "TinyLlama-1.1B-Chat-v1.0"),
                kv_cache_config=KvCacheConfig(max_tokens=1000),
                max_batch_size=8,
                max_seq_len=64,

@@ -83,7 +83,8 @@ class ExecutorRequestQueue:
         except queue.Empty:
             pass
         return items
-    
+
+    @staticmethod
     def _get_num_child_requests(request: ExecutorRequest) -> int:
         sampling_config = request.sampling_config
         return 0 if sampling_config.beam_width > 1 else (
@@ -161,9 +162,9 @@ class ExecutorRequestQueue:
         return False
 
     def _get_request_id(self):
-        # (next_req_id + 1) % UINT64_MAX
-        self.next_req_id = (self.next_req_id + 1) & ((1 << 64) - 1)
-        return self.next_req_id
+        # (next_request_id + 1) % UINT64_MAX
+        self.next_request_id = (self.next_request_id + 1) & ((1 << 64) - 1)
+        return self.next_request_id
 
     def _generate_child_request_ids(
             self, request: ExecutorRequest) -> List[int] | None:
@@ -575,6 +576,10 @@ class ExecutorRequestQueue:
             if req_item.id in self.start_times:
                 self.new_active_requests_queue_latency_ms += now - self.start_times.pop(
                     req_item.id)
+            if req_item.child_req_ids:
+                for child_id in req_item.child_req_ids:
+                    self.new_active_requests_queue_latency_ms += now - self.start_times.pop(
+                        child_id)
 
     @nvtx_range("_merge_requests")
     def _merge_requests(self, new_requests: list[RequestQueueItem]):
@@ -597,7 +602,7 @@ class ExecutorRequestQueue:
                 if req.children:
                     req_with_children.extend(req.children)
             return req_with_children
-        
+
     def _merge_star_attention_requests(self,
                                        new_requests: list[RequestQueueItem]):
         result = []
