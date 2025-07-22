@@ -158,21 +158,11 @@ def row_linear_residual_norm_fusion_forward(
 @pytest.mark.parametrize(
     "seq_len",
     [
-        [
-            1,
-        ],
-        [
-            4,
-        ],
-        [
-            15,
-        ],
-        [
-            32,
-        ],
-        [
-            128,
-        ],
+        [1],
+        [4],
+        [15],
+        [32],
+        [128],
         [31, 11, 27, 4],
     ],
     ids=lambda x: f"seqlen:{x}",
