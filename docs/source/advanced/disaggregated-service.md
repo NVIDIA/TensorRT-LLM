@@ -81,12 +81,12 @@ A. Yes, TRT-LLM supports using GPU direct RDMA for inter-node KV cache transfer.
 
 A. The communication for kvCache transfer between executors are established dynamically. The connection establishment process incurs significant overhead, which explains the apparently lower kvCache transfer bandwidth observed during the initial requests after service startup. This lower bandwidth reflects the inclusion of connection establishment overhead. When conducting benchmarks, it is recommended to perform a warm-up phase to ensure accurate performance measurements.
 
-*Q. Disaggregated server hangs, how to fix that?*
+*Q. When my servers are running on different NVLink domains, some servers hang or have a lower performance. How to fix that?
 
-There are some useful UCX environment variables that may help when server hangs, especially if your disaggregated services are running on different NVLink domains.
+A. NVLink domain can be found with `nvidia-smi -q` in the `Fabric.ClusterUUID` field. A few UCX environment variables can be adjusted when your servers have different NVLink domains:
 
-* `UCX_CUDA_IPC_ENABLE_MNNVL`: Set to `n`. This also eases UCX timeout error like `UCX  ERROR   cuMemImportFromShareableHandle failed: invalid resource handle`.
+* `UCX_CUDA_IPC_ENABLE_MNNVL`: Set to `n`. This also can reduce UCX timeout error messages like `UCX  ERROR   cuMemImportFromShareableHandle failed: invalid resource handle`, although these errors don't necessarily cause your trtllm-serve to fail.
 
 * `UCX_NET_DEVICES`: Check if this is set correctly, or unset this variable to allow UCX to use all possible devices.
 
-* `UCX_RNDV_SCHEME`: Set to `get_zcopy` or `put_zcopy`. The default value is `auto`.
+* `UCX_RNDV_SCHEME`: Set to `get_zcopy` or `put_zcopy` on GB200 for better performance. The default value is `auto`.

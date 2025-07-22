@@ -36,13 +36,19 @@ def create_kv_cache_transceiver(
         return None
 
     if cache_transceiver_config.backend == BackendTypeCpp.DEFAULT:
+        # When cache_transceiver_config.backend is not set, fallback to env_vars settings
         # UCX is the default backend
-        backend_type = BackendTypeCpp.UCX
-        if getenv("TRTLLM_USE_NIXL_KVCACHE") == "1":
-            backend_type = BackendTypeCpp.NIXL
-        elif getenv("TRTLLM_USE_MPI_KVCACHE") == "1":
-            backend_type = BackendTypeCpp.MPI
-        cache_transceiver_config.backend = backend_type
+        cache_transceiver_config.backend = BackendTypeCpp.UCX
+        # Ordered by priority
+        env_vars = [("TRTLLM_USE_NIXL_KVCACHE", BackendTypeCpp.NIXL),
+                    ("TRTLLM_USE_MPI_KVCACHE", BackendTypeCpp.MPI)]
+        for env_var, be_type in env_vars:
+            if getenv(env_var) == "1":
+                logger.warning(
+                    f"{env_var}=1 is set, but it's recommended to set cache_transceiver_config.backend in yaml config"
+                )
+                cache_transceiver_config.backend = be_type
+                break
 
     if cache_transceiver_config.backend == BackendTypeCpp.MPI:
         logger.warning(
@@ -50,8 +56,8 @@ def create_kv_cache_transceiver(
     elif cache_transceiver_config.backend == BackendTypeCpp.UCX:
         logger.info(
             f"Using UCX kv-cache transceiver. If your devices are not in the same domain, please consider setting "
-            f"UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server hangs."
-        )
+            f"UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
+            f"hangs or lower-than-expected performance.")
 
     return BindKvCacheTransceiver(mapping, kv_cache_manager, attention_type,
                                   cache_transceiver_config)
