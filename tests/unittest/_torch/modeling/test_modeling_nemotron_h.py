@@ -36,6 +36,7 @@ def create_nemotron_h_llm(use_cuda_graph,
                           max_num_tokens=None):
     """Create LLM with specific overlap scheduler setting"""
     model_dir = f"{llm_models_root(check=True)}/Nemotron-H-8B-Base-8K"
+    # model_dir = f"{llm_models_root(check=True)}/Qwen3/Qwen3-8B/"
     return LLM(
         model=model_dir,
         tensor_parallel_size=1,
@@ -175,6 +176,10 @@ def test_nemotron_h_correctness():
                                    prefill_logprobs_ref_mcore,
                                    atol=mcore_atol,
                                    rtol=0.0)
+        print(
+            f"max mcore prefill diff: {torch.max(torch.abs(prefill_logprobs_no_batching[0]- prefill_logprobs_ref_mcore))}"
+        )
+        print()
 
         for i in range(num_prompts):
             # compare prompt logprobs with initial implementation
@@ -183,11 +188,17 @@ def test_nemotron_h_correctness():
                 prefill_logprobs_ref_initial_no_batching[i],
                 atol=initial_impl_atol,
                 rtol=0.0)
+            print(
+                f"max prefill without batching diff: {torch.max(torch.abs(prefill_logprobs_no_batching[i] - prefill_logprobs_ref_initial_no_batching[i]))}"
+            )
             torch.testing.assert_close(
                 prefill_logprobs_batching[i],
                 prefill_logprobs_ref_initial_with_batching[i],
                 atol=initial_impl_atol,
                 rtol=0.0)
+            print(
+                f"max prefill with batching diff: {torch.max(torch.abs(prefill_logprobs_batching[i] - prefill_logprobs_ref_initial_with_batching[i]))}"
+            )
 
             # compare expected completion
             assert completions_batching[i] == expected_completions[i]
@@ -199,21 +210,34 @@ def test_nemotron_h_correctness():
                 decode_logprobs_ref_initial_no_batching[i],
                 atol=initial_impl_atol,
                 rtol=0.0)
+            print(
+                f"max decode without batching diff: {torch.max(torch.abs(decode_logprobs_no_batching[i] - decode_logprobs_ref_initial_no_batching[i]))}"
+            )
             torch.testing.assert_close(
                 decode_logprobs_batching[i],
                 decode_logprobs_ref_initial_with_batching[i],
                 atol=initial_impl_atol,
                 rtol=0.0)
+            print(
+                f"max decode with batching diff: {torch.max(torch.abs(decode_logprobs_batching[i] - decode_logprobs_ref_initial_with_batching[i]))}"
+            )
 
             # compare logprobs with and without batching, tolerace by diff in initial implementation
             torch.testing.assert_close(prefill_logprobs_batching[i],
                                        prefill_logprobs_no_batching[i],
                                        atol=batching_atol,
                                        rtol=0.0)
+            print(
+                f"max batching diff (prefill): {torch.max(torch.abs(prefill_logprobs_batching[i] - prefill_logprobs_no_batching[i]))}"
+            )
             torch.testing.assert_close(decode_logprobs_batching[i],
                                        decode_logprobs_no_batching[i],
                                        atol=batching_atol,
                                        rtol=0.0)
+            print(
+                f"max batching diff (decode): {torch.max(torch.abs(decode_logprobs_batching[i] - decode_logprobs_no_batching[i]))}"
+            )
+            print()
 
         # now let's test that decodes match prefill logprobs
         text_prompts_with_completions = [
@@ -237,6 +261,9 @@ def test_nemotron_h_correctness():
                                        prefill_decode_logprobs,
                                        atol=mcore_atol,
                                        rtol=0.0)
+            print(
+                f"max full sequence diff: {torch.max(torch.abs(full_sequence_logprobs[i] - prefill_decode_logprobs))}"
+            )
 
     finally:
         nemotron_h.shutdown()
@@ -309,6 +336,8 @@ def test_nemotron_h_cuda_graph_overlap_scheduler():
 
 def test_nemotron_h_chunked_prefill():
     # Long prompts (~100 tokens) to make sure chunked prefill is enabled
+    # (At the time of development, tokens_per_block isn't configurable from the LLM API,
+    # and max_tokens (i.e. chunk size) needs to be a multiple of tokens_per_block)
     prompts = [
         "Artificial Intelligence in Healthcare: Artificial intelligence (AI) is transforming healthcare by improving diagnostics, treatment plans, and patient care. AI algorithms can analyze medical images with high accuracy, assist in early disease detection, and personalize treatment plans based on patient data. Additionally, AI-powered chatbots and virtual assistants provide support to patients, enhancing accessibility and efficiency in healthcare services. As AI technology continues to advance, its integration into healthcare systems promises to deliver better outcomes and reduce costs. With continuous research and development, AI in healthcare is poised to",
         "The Role of Cloud Computing: Cloud computing has revolutionized the way businesses operate by providing scalable, on-demand access to computing resources. This technology allows organizations to store and process data remotely, reducing the need for physical infrastructure and enabling greater flexibility. Cloud services facilitate collaboration, enhance data security, and support the deployment of innovative applications. As businesses increasingly adopt cloud solutions, they benefit from improved efficiency, cost savings, and the ability to rapidly adapt to changing market conditions. Companies leveraging cloud computing are better positioned to",
@@ -316,8 +345,9 @@ def test_nemotron_h_chunked_prefill():
         "The Importance of Cybersecurity: In today's digital age, cybersecurity has become essential to protect sensitive information and maintain the integrity of systems. With the rise of cyber threats such as hacking, phishing, and ransomware, organizations must implement robust security measures to safeguard their data. Cybersecurity involves a combination of technologies, processes, and practices designed to defend against unauthorized access and attacks. By staying vigilant and updating security protocols, businesses can mitigate risks and ensure the safety of their digital assets. Proactive cybersecurity strategies are crucial in",
         "The Impact of Artificial Intelligence on Education: Artificial intelligence is reshaping education by providing personalized learning experiences and automating administrative tasks. AI-driven educational tools can adapt to individual student needs, offering tailored feedback and resources to enhance learning outcomes. Additionally, AI can streamline administrative processes, allowing educators to focus more on teaching and student engagement. As AI continues to evolve, its role in education will expand, offering new opportunities for innovation and efficiency. The integration of AI in classrooms promises to revolutionize how students learn and how educators manage their",
     ]
-    sampling_config = SamplingParams(max_tokens=12,
+    sampling_config = SamplingParams(max_tokens=10,
                                      temperature=0.0,
+                                     return_context_logits=True,
                                      return_generation_logits=True)
 
     with create_nemotron_h_llm(use_cuda_graph=False,
@@ -336,5 +366,38 @@ def test_nemotron_h_chunked_prefill():
                                                sampling_params=sampling_config,
                                                use_tqdm=True)
 
-    for output, chunked_prefill_output in zip(outputs, chunked_prefill_outputs):
+    for i, (output, chunked_prefill_output) in enumerate(
+            zip(outputs, chunked_prefill_outputs)):
+        # assert same output
+        print('---------------')
+        print(output.outputs[0].text)
+        print(chunked_prefill_output.outputs[0].text)
         assert output.outputs[0].text == chunked_prefill_output.outputs[0].text
+
+        # assert same prefill logprobs. Same atol as diff between mcore and initial impl
+        prefill_logprobs = extract_prefill_logprobs(output)
+        chunked_prefill_logprobs = extract_prefill_logprobs(
+            chunked_prefill_output)
+        torch.testing.assert_close(prefill_logprobs,
+                                   chunked_prefill_logprobs,
+                                   atol=0.3,
+                                   rtol=0.05,
+                                   msg=f"Prompt {i} prefill logprobs ")
+
+        # Decode logprobs shouldn't be affected by chunked prefill - tolerance like batching tolerance
+        decode_logprobs = extract_decode_logprobs(output)
+        chunked_decode_logprobs = extract_decode_logprobs(
+            chunked_prefill_output)
+        torch.testing.assert_close(decode_logprobs,
+                                   chunked_decode_logprobs,
+                                   atol=0.2,
+                                   rtol=0.05,
+                                   msg=f"Prompt {i} decode logprobs ")
+        print(
+            f"Prompt {i} prefill logprobs max diff: {torch.abs(prefill_logprobs - chunked_prefill_logprobs).max()}"
+        )
+        print(
+            f"Prompt {i} decode logprobs max diff: {torch.abs(decode_logprobs - chunked_decode_logprobs).max()}"
+        )
+        print('---------------')
+        print()
