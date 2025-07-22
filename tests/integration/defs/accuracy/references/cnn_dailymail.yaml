@@ -240,6 +240,10 @@ mistralai/Mixtral-8x22B-v0.1:
     accuracy: 25.519
   - quant_algo: W8A16
     accuracy: 27.427
+microsoft/Phi-4-mini-instruct:
+  - accuracy: 32.958
+  - quant_algo: FP8
+    accuracy: 32.823
 google/gemma-2b:
   - accuracy: 23.194
   - quant_algo: W8A16

@@ -232,6 +232,8 @@ nvidia/Nemotron-H-56B-Base-8K:
     accuracy: 83.82
 microsoft/Phi-4-mini-instruct:
   - accuracy: 68.98
+  - quant_algo: FP8
+    accuracy: 68.30
 bigcode/starcoder2-7b:
   - accuracy: 41.35
   - quant_algo: FP8
