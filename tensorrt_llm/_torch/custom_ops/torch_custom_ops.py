@@ -851,6 +851,26 @@ def finegrained_mixed_dtype_gemm(
                                                **kwargs)
 
 
+@finegrained_mixed_dtype_gemm.register_fake
+def _(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    has_zero_point: bool,
+    output_dtype: torch.dtype,
+    alpha: Optional[float] = None,
+    bias: Optional[torch.Tensor] = None,
+    zeros: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    # For a typical GEMM: input [M, K] @ weight [K, N] -> output [M, N]
+    # Weight is typically packed, so we need to infer the output dimension
+    M = input.size(0)
+    # Assuming weight is packed and the output dimension can be inferred from weight.size(1)
+    N = weight.size(1) if weight.dim() > 1 else weight.size(0)
+    return input.new_empty((M, N), dtype=output_dtype)
+
+
 @torch.library.custom_op("trtllm::attention", mutates_args=())
 def attention(
     q: torch.Tensor,
