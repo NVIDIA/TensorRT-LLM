@@ -24,9 +24,12 @@ ntasks=$((total_node_num * ntasks_per_node))
 #   mtp_size=${13}
 #   concurrency=${14}
 
+# This command starts a job with 8 nodes, 32 GPUs in total.
+# The server will include 4 context workers with DEP4, and 1 generation worker with DEP8.
 sbatch --nodes=${total_node_num} \
     --ntasks=${ntasks} \
     --ntasks-per-node=${ntasks_per_node} \
+    --gres=gpu:${ntasks_per_node} \
     --segment=${total_node_num} \
     disaggr_torch.slurm \
         ${ctx_num} 4 4 4480 true 1 8 1024 1024 true "0.8" 0 0 "$concurrency"

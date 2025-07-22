@@ -11,6 +11,7 @@ isl=1024
 osl=1024
 multi_round=10
 gen_yaml_file=gen_yaml.py
+streaming=true
 container_image=${container_image} # add your container image here
 mount_dir=${mount_dir} # add your mount directory here
 workdir=${workdir} # add your path to the slurm scripts here
@@ -19,7 +20,6 @@ model_dir=${model_dir} # add your model directory here
 mounts=${mount_dir}:${mount_dir}
 logdir=${workdir}/benchmark-${isl}-${osl}/
 mkdir -p ${logdir}
-streaming=true
 
 container_name=disaggr-test
 
