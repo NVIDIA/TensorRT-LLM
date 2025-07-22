@@ -524,10 +524,11 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
 
     op->mAttentionChunkSize = attention_chunk_size;
 
-    TORCH_CHECK(spec_decoding_bool_params.size() == 2,
-        "Expecting 2 bools for spec-dec mode, is_spec_decoding_enabled and use_spec_decoding.");
+    TORCH_CHECK(spec_decoding_bool_params.size() == 3,
+        "Expecting 3 bools for spec-dec mode, is_spec_decoding_enabled, use_spec_decoding, and is_spec_dec_tree.");
     op->mIsSpecDecodingEnabled = spec_decoding_bool_params[0]; // is_spec_decoding_enabled
     op->mUseSpecDecoding = spec_decoding_bool_params[1];       // use_spec_decoding
+    op->mIsSpecDecTree = spec_decoding_bool_params[2];         // is_spec_dec_tree
     op->mMultiBlockMode = op->mIsSpecDecodingEnabled ? false : true;
 
     if (is_mla_enable)

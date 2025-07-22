@@ -155,7 +155,13 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refAttenti
     {
         qF32[i] = toF32Head(q[i]);
     }
+#if SPEC_DEC && SLIDING_WINDOW
+    // In Spec-dec + SLIDING WINDOW mode, only allow linear tree or !rtIsReallySliding.
+    assert(!IS_SPEC_DEC_TREE || seqLen < slidingWinSize);
+    uint32_t const seqBeg = (seqLen < (slidingWinSize - q_len) ? 0 : seqLen - (slidingWinSize - q_len));
+#else
     uint32_t const seqBeg = (seqLen < slidingWinSize ? 0 : seqLen - slidingWinSize);
+#endif
     gemm0Acc.leftCols(seqBeg).fill(-INFINITY);
     for (uint32_t j = seqBeg; j < seqLen; j++)
     {

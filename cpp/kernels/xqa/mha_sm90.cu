@@ -347,21 +347,19 @@ __device__ inline uint32_t getInputTokOffset(SpecDecParams const& params, uint32
     return (params.qCuSeqLens == nullptr) ? params.qSeqLen * idxReq : params.qCuSeqLens[idxReq];
 }
 
-static_assert(!allowSlidingWindow, "SpecDec is not supported for sliding window");
-
 struct SpecDec
 {
     static inline constexpr uint32_t tileSize = gemm0CtaTileNbTokens;
     static inline constexpr uint32_t ctaMaxQSeqLen = exactDiv(ctaNbQHeads, headGrpSize);
     using TileMaskRow = Vec<uint32_t, exactDiv(tileSize, 32)>;
 
-    __device__ inline SpecDec(SpecDecParams const& params, uint32_t idxReq, uint32_t ctaIdxY, uint32_t seqLen)
+    __device__ inline SpecDec(SpecDecParams const& params, uint32_t idxReq, uint32_t idxInputSubSeq, uint32_t seqLen)
         : params(params)
-        , ctaIdxY(ctaIdxY)
+        , idxInputSubSeq(idxInputSubSeq)
         , seqLen(seqLen)
     {
         inputSeqLen = getInputSeqLen(params, idxReq);
-        baseOffset = divUp(params.qSeqLen, 32U) * (getInputTokOffset(params, idxReq) + ctaMaxQSeqLen * ctaIdxY);
+        baseOffset = divUp(params.qSeqLen, 32U) * (getInputTokOffset(params, idxReq) + ctaMaxQSeqLen * idxInputSubSeq);
     }
 
     __device__ inline uint32_t unmaskedSeqLen() const
@@ -371,8 +369,8 @@ struct SpecDec
 
     __device__ inline bool needMask(uint32_t idxTile, uint32_t idxQTokInCta) const
     {
-        return tileSize * (idxTile + 1) > unmaskedSeqLen() && ctaMaxQSeqLen * ctaIdxY + idxQTokInCta < inputSeqLen
-            && params.mask != nullptr;
+        return tileSize * (idxTile + 1) > unmaskedSeqLen()
+            && ctaMaxQSeqLen * idxInputSubSeq + idxQTokInCta < inputSeqLen && params.mask != nullptr;
     }
 
     __device__ inline int32_t maskColBeg(uint32_t idxTile) const
@@ -408,14 +406,17 @@ struct SpecDec
     }
 
     SpecDecParams const& params;
-    uint32_t const ctaIdxY;
+    uint32_t const idxInputSubSeq;
     uint32_t const seqLen;
     uint32_t inputSeqLen;
     uint32_t baseOffset;
 };
 
-__device__ void warpGrpApplyMask(
-    Gemm0Acc& acc, SpecDec const& specDec, uint32_t cacheSeqLen, uint32_t idxTile, uint32_t warpRank);
+__device__ void warpGrpApplyMask(Gemm0Acc& acc, SpecDec const& specDec,
+#if SLIDING_WINDOW && !IS_SPEC_DEC_TREE
+    int32_t tok0WinBeg,
+#endif
+    uint32_t cacheSeqLen, uint32_t idxTile, uint32_t warpRank);
 #endif
 
 #if SWAP_AB
@@ -684,9 +685,32 @@ CUBIN_EXPORT __global__
     uint32_t const cacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
     static_assert(gemm0CtaTileNbTokens == gemm1CtaTileNbTokens);
     constexpr uint32_t tileSize = gemm0CtaTileNbTokens;
-    static_assert(!(allowSlidingWindow && useSpecDec), "Sliding window is not yet supported in spec-dec mode");
-#if SLIDING_WINDOW
+    // static_assert(!(allowSlidingWindow && useSpecDec), "Sliding window is not yet supported in spec-dec mode");
+#if SPEC_DEC
+    uint32_t const idxInputSubSeq = blockIdx.x;
+    uint32_t const inputSeqLen = reqInputTokEnd - reqInputTokBeg;
+    uint32_t const ctaTokOffset = inputTokensPerCta * idxInputSubSeq;
+    uint32_t const ctaNbValidTokens = mha::min(uint32_t{inputTokensPerCta}, inputSeqLen - ctaTokOffset);
+
+    if (ctaTokOffset >= inputSeqLen)
+    {
+        return;
+    }
+#else
+    uint32_t const idxInputSubSeq = 0;
+    uint32_t const inputSeqLen = 1;
+    uint32_t const ctaTokOffset = 0;
+    uint32_t const ctaNbValidTokens = 1;
+#endif
+#if SLIDING_WINDOW && SPEC_DEC && !IS_SPEC_DEC_TREE
+    // get the actual start position depending on ctaTokOffset, which is the draft token position per CTA
+    uint32_t const tok0SeqLen = cacheSeqLen - inputSeqLen + 1 + ctaTokOffset;
+    int32_t const tok0WinBeg = int32_t(tok0SeqLen) - int32_t(slidingWinSize);
+    uint32_t const nbTotalSkipTokens = mha::max(0, tok0WinBeg);
+#elif SLIDING_WINDOW
     bool const rtIsReallySliding = (cacheSeqLen > slidingWinSize);
+    // if SPEC_DEC && SLIDING_WINDOW && IS_SPEC_DEC_TREE, it should not do sliding
+    assert(!SPEC_DEC || !rtIsReallySliding);
     uint32_t const nbTotalSkipTokens = rtIsReallySliding ? cacheSeqLen - slidingWinSize : 0;
 #else
     constexpr bool rtIsReallySliding = false;
@@ -720,21 +744,6 @@ CUBIN_EXPORT __global__
     {
         return;
     }
-#if SPEC_DEC
-    uint32_t const idxInputSubSeq = blockIdx.x;
-    uint32_t const inputSeqLen = reqInputTokEnd - reqInputTokBeg;
-    uint32_t const ctaTokOffset = inputTokensPerCta * idxInputSubSeq;
-    uint32_t const ctaNbValidTokens = mha::min(uint32_t{inputTokensPerCta}, inputSeqLen - ctaTokOffset);
-    if (ctaTokOffset >= inputSeqLen)
-    {
-        return;
-    }
-#else
-    uint32_t const idxInputSubSeq = 0;
-    uint32_t const inputSeqLen = 1;
-    uint32_t const ctaTokOffset = 0;
-    uint32_t const ctaNbValidTokens = 1;
-#endif
     uint32_t const ctaInputTokBeg = reqInputTokBeg + ctaTokOffset;
     auto const warpIdx = getWarpIdx(uint3{128, 1, 3});
     auto const wid = warpIdx.z * 4 + warpIdx.x;
@@ -886,10 +895,13 @@ CUBIN_EXPORT __global__
 #endif
             // apply qkScale
             acc = acc * qkScale;
-
             // apply mask
 #if SPEC_DEC
-            warpGrpApplyMask(acc, specDec, cacheSeqLen, idxKTile, warpRank);
+            warpGrpApplyMask(acc, specDec,
+#if SLIDING_WINDOW && !IS_SPEC_DEC_TREE
+                tok0WinBeg,
+#endif
+                cacheSeqLen, idxKTile, warpRank);
 #else
             bool const isFirstTile = (idxKTile == nbSkipLeadingTiles);
             bool const needMaskLeading = (rtIsReallySliding && isFirstTile && tile0NbSkipTokens > 0);
@@ -1342,7 +1354,6 @@ CUBIN_EXPORT __global__
                 kTilePartLoader.loadPages(idxKTile);
 #if USE_INPUT_KV || ENABLE_PDL == 2
 #if SPEC_DEC
-                static_assert(SLIDING_WINDOW == 0);
                 bool const anyNewTokens = (gemm0CtaTileNbTokens * (idxKTile + 1) > cacheSeqLen - inputSeqLen);
 #else
                 bool const anyNewTokens = (gemm0CtaTileNbTokens * (idxKTile + 1) >= cacheSeqLen);
@@ -1411,7 +1422,6 @@ CUBIN_EXPORT __global__
                 vTileLoader.loadPages(idxVTile);
 #if USE_INPUT_KV || ENABLE_PDL == 2
 #if SPEC_DEC
-                static_assert(SLIDING_WINDOW == 0);
                 bool const anyNewTokens = (gemm0CtaTileNbTokens * (idxVTile + 1) > cacheSeqLen - inputSeqLen);
 #else
                 bool const anyNewTokens = (gemm0CtaTileNbTokens * (idxVTile + 1) >= cacheSeqLen);
@@ -1838,8 +1848,11 @@ __device__ inline GMemKVCacheHead& KVTilePartLoader::getHead(uint32_t pos)
 
 #if SWAP_AB
 #if SPEC_DEC
-__device__ inline void warpGrpApplyMask(
-    Gemm0Acc& acc, SpecDec const& specDec, uint32_t cacheSeqLen, uint32_t idxTile, uint32_t warpRank)
+__device__ inline void warpGrpApplyMask(Gemm0Acc& acc, SpecDec const& specDec,
+#if SLIDING_WINDOW && !IS_SPEC_DEC_TREE
+    uint32_t nbTotalSkipTokens, uint32_t slidingWinSize,
+#endif
+    uint32_t cacheSeqLen, uint32_t idxTile, uint32_t warpRank)
 {
     constexpr uint32_t tileSize = gemm0CtaTileNbTokens;
     static_assert(SPEC_Q_SEQ_LEN <= sizeof(MaskType) * 8, "not implemented");
@@ -2215,22 +2228,40 @@ __device__ inline RegRowWiseVec computeWarpGrpRowMax_sync(
 }
 
 #if SPEC_DEC
-__device__ inline void warpGrpApplyMask(
-    Gemm0Acc& acc, SpecDec const& specDec, uint32_t cacheSeqLen, uint32_t idxTile, uint32_t warpRank)
+__device__ inline void warpGrpApplyMask(Gemm0Acc& acc, SpecDec const& specDec,
+#if SLIDING_WINDOW && !IS_SPEC_DEC_TREE
+    int32_t tok0WinBeg,
+#endif
+    uint32_t cacheSeqLen, uint32_t idxTile, uint32_t warpRank)
 {
-    static_assert(!SLIDING_WINDOW, "SpecDec is not supported for sliding window");
     constexpr uint32_t tileSize = gemm0CtaTileNbTokens;
+    auto const inputSeqLen = specDec.inputSeqLen;
+    auto const idxInputSubSeq = specDec.idxInputSubSeq;
+    constexpr uint64_t fullMask = ~uint64_t{0};
+    static_assert(tileSize == sizeof(fullMask) * 8);
+#if SLIDING_WINDOW && !IS_SPEC_DEC_TREE
+    uint32_t const ctaTokOffset = inputTokensPerCta * idxInputSubSeq;
+    Range const tileRange = {tileSize * idxTile, tileSize * idxTile + tileSize};
+    Range const maxMaskOutRange = {0, mha::max(0, tok0WinBeg) + (inputTokensPerCta - 1)};
+    bool const ctaNeedBegMask = tileRange.beg < maxMaskOutRange.end;
+    assert(ctaNeedBegMask == overlap(tileRange, maxMaskOutRange));
+    int32_t const tok0NbMaskOut = int32_t(tok0WinBeg) - int32_t(tileSize * idxTile);
+#else
+    constexpr bool ctaNeedBegMask = false;
+    uint64_t const begMask = fullMask;
+    int32_t const tok0NbMaskOut = -2147483648;
+#endif
     uint32_t const offset = tileSize * idxTile;
     uint32_t const nbValidCols = mha::min(offset < cacheSeqLen ? cacheSeqLen - offset : 0U, tileSize);
     bool const ctaNeedEndMask = (nbValidCols < tileSize);
     bool const ctaNeedSpecDecMask = specDec.needMask(idxTile, 0);
-    bool const needMask = ctaNeedEndMask || ctaNeedSpecDecMask;
+    bool const needMask = ctaNeedBegMask || ctaNeedEndMask || ctaNeedSpecDecMask;
     if (!needMask)
     {
         return;
     }
     static_assert(tileSize == 64, "not implemented");
-    auto const endMask = (~uint64_t{0} >> (tileSize - nbValidCols));
+    auto const endMask = fullMask >> (tileSize - nbValidCols);
 
     uint32_t const idxInQuad = laneId() % 4;
     uint32_t const idxQuad = laneId() / 4;
@@ -2241,10 +2272,17 @@ __device__ inline void warpGrpApplyMask(
         for (uint32_t i = 0; i < GmmaAccCoreMat::rows; i++)
         {
             uint32_t const row = gmma::instM * m + gmma::instM / 4 * warpRank + 8 * i + idxQuad;
-            auto const specDecMask = specDec.needMask(idxTile, row / headGrpSize)
-                ? specDec.loadTileMaskRow(idxTile, row / headGrpSize)
+            uint32_t const idxQTokInCta = row / headGrpSize;
+            auto const specDecMask = specDec.needMask(idxTile, idxQTokInCta)
+                ? specDec.loadTileMaskRow(idxTile, idxQTokInCta)
                 : SpecDec::TileMaskRow{~0U, ~0U};
-            auto const mask = endMask & reinterpret_cast<uint64_t const&>(specDecMask);
+#if SLIDING_WINDOW && !IS_SPEC_DEC_TREE
+            int32_t const begNbMaskOut = tok0NbMaskOut + int32_t(idxQTokInCta);
+            uint64_t const begMask = (begNbMaskOut > 0 ? fullMask << begNbMaskOut : fullMask);
+#else
+            uint64_t const begMask = fullMask;
+#endif
+            auto const mask = begMask & endMask & reinterpret_cast<uint64_t const&>(specDecMask);
             if (mask == ~uint64_t{0})
             {
                 continue;

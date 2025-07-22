@@ -634,21 +634,6 @@ void FusedMHARunnerV2::run(MHARunnerParams runnerParams)
     {
         setTmaDescriptors(runnerParams);
     }
-    // Check if the sliding window size is valid or not.
-    if (mFixedParams.attentionInputLayout == AttentionInputLayout::Q_PAGED_KV
-        && mLaunchParams.attention_mask_type == ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL)
-    {
-        uint32_t q_step = 0, kv_step = 0;
-        xmmaKernel->getStepSize(q_step, kv_step, mKernelParams, mLaunchParams);
-        // The sliding window size needs to be multiple of kv_step, so that the paged context fmha can read the cyclic
-        // kv cache correctly.
-        if (runnerParams.kvSeqLen > runnerParams.slidingWindowSize)
-        {
-            TLLM_CHECK_WITH_INFO(mKernelParams.sliding_window_size % kv_step == 0,
-                "The sliding window size doesn't work with paged context fmha kv_step_size = %d.", kv_step);
-        }
-    }
-
     // Select the kernel and run it.
     xmmaKernel->run(mKernelParams, mLaunchParams, runnerParams.stream);
 }

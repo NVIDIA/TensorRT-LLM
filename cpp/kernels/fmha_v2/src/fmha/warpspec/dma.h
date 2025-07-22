@@ -199,7 +199,7 @@ struct DMA
                 // The kv_offset_start.
                 int kv_offset_start = is_chunked_attention
                     ? ((q_step_offset >> params.log2_chunked_attention_size) << params.log2_chunked_attention_size)
-                    : max(0, q_step_offset - params.sliding_window_size);
+                    : max(0, q_step_offset + 1 - params.sliding_window_size);
                 kv_idx_start = kv_offset_start / STEP_KV;
             }
 
@@ -388,51 +388,6 @@ struct DMA
                 elect_one_, {-1, -1, -1, -1, -1, -1, -1, -1});
         }
 
-        // Calculate the start tile idx.
-        inline __device__ int remap_kv_tile_idx(
-            int kv_tile_idx, int num_kv_cache_tiles, int past_kv_length, int sliding_window_size)
-        {
-
-            // The remapped kv tile idx.
-            int remapped_kv_tile_idx = kv_tile_idx;
-            // This will be removed later as the remapping will be handled by the kvCacheManger in TRTLLM.
-#ifdef GENERATE_CUBIN
-            // Sliding window attention + chunked context needs special handling.
-            if constexpr (SLIDING_OR_CHUNKED_ATTENTION)
-            {
-                // For chunked context (i.e. separate q and kv layout), the kv cache might be
-                // overwritten after last chunk is processed.
-                // To deal with this issue, the new tokens' kv will be appended to the kv cache first,
-                // and overwrite the kv cache after FMHA is done.
-                // The kv input layout is like: [cyclic kv cache] + [new tokens' kv].
-                // There are two possible cases:
-                // 1. The kv cache hasn't been overwritten while processing previous chunks, so we can
-                //    take it normally, where we have full kv cache.
-                // 2. The kv cache has been overwritten while processing previous chunks. we need to
-                //    mask out the tokens in the kv cache based on the sliding window size. It needs
-                //    to track the last kv cache token's position in a circular way.
-
-                // Remap the kv tile index when kv cache has been overwritten in a circular way.
-                if (past_kv_length > sliding_window_size)
-                {
-                    // Map the kv tile index to the new tokens' kv.
-                    if (kv_tile_idx * STEP_KV >= past_kv_length)
-                    {
-                        remapped_kv_tile_idx
-                            = num_kv_cache_tiles + int((kv_tile_idx * STEP_KV - past_kv_length) / STEP_KV);
-                    }
-                    else
-                    {
-                        // Map the kv tile index to the cyclic kv cache.
-                        remapped_kv_tile_idx = kv_tile_idx % num_kv_cache_tiles;
-                    }
-                }
-            }
-#endif
-            // Return the remapped kv tile idx.
-            return remapped_kv_tile_idx;
-        }
-
         // Support contiguous Q + contiguous/paged KV separate cache.
         inline __device__ void run_separate_q_and_kv(
             bert::Fused_multihead_attention_params_v2 const& params, Shared* shared)
@@ -560,24 +515,20 @@ struct DMA
                     // Iterate over the kv tiles for this q step.
                     for (int kv_step_idx = kv_idx_start; kv_step_idx < kv_idx_end; kv_step_idx++)
                     {
-                        // Remap the kv tile idx if sliding window attention is enabled.
-                        // Sliding_window_size should be multiple of STEP_KV.
-                        int remapped_kv_step_idx = remap_kv_tile_idx(kv_step_idx, params.sliding_window_size / STEP_KV,
-                            past_kv_length, params.sliding_window_size);
                         // The barrier id.
                         int bar_id;
                         // Load paged kv input.
                         if constexpr (PAGED_KV_INPUT)
                         {
-                            bar_id = load_paged_kv(bidh_kv, remapped_kv_step_idx * STEP_KV, num_valid_kv_blocks,
+                            bar_id = load_paged_kv(bidh_kv, kv_step_idx * STEP_KV, num_valid_kv_blocks,
                                 params.paged_kv_cache.mTokensPerBlockLog2, params.blocks_per_tma_load,
                                 params.blocks_per_tma_load_log2, params.paged_kv_cache.mMaxBlocksPerSeq,
                                 paged_block_offsets, desc_k, desc_v, shared, cbw_k, cbw_v, cbw_v_scratch);
                         }
                         else
                         {
-                            bar_id = load_kv(bidh_kv, remapped_kv_step_idx * STEP_KV, desc_k, desc_v, shared, cbw_k,
-                                cbw_v, cbw_v_scratch);
+                            bar_id = load_kv(
+                                bidh_kv, kv_step_idx * STEP_KV, desc_k, desc_v, shared, cbw_k, cbw_v, cbw_v_scratch);
                         }
 
                         // Opportunistically hide headinfo in the shadow of UTMALDGs of the QKV tensor

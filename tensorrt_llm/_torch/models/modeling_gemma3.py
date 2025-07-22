@@ -69,7 +69,7 @@ class Gemma3Attention(Attention):
             rope_params.theta = config.rope_local_base_freq
             rope_params.scale_type = RotaryScalingType.none
             rope_params.scale = 1.0
-            self.attention_window_size = config.sliding_window - 1  # Gemma3 sliding window isn't inclusive.
+            self.attention_window_size = config.sliding_window
         pos_embd_params = PositionalEmbeddingParams(
             type=PositionEmbeddingType.rope_gpt_neox,
             rope=rope_params,

@@ -502,6 +502,11 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         else:
             raise ValueError("Unexpected attention mask type")
 
+        # FlashInfer's sliding window attention is inclusive, while the attention window size defined in TRTLLM is exclusive.
+        # So we need to subtract 1 from the attention window size for a consistent behavior.
+        if attention_window_size is not None:
+            attention_window_size = attention_window_size - 1
+
         return forward_pattern(q=q,
                                k=k,
                                v=v,

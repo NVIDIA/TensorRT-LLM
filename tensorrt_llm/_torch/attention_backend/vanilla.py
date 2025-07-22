@@ -44,13 +44,11 @@ def generate_sliding_window_mask(batch_size: int, target_length: int,
                                  cache_position: torch.Tensor,
                                  device: torch.device,
                                  attention_window_size: int):
-    # TRTLLM's sliding window attention is inclusive.
-    effective_window_size = attention_window_size + 1
     attention_mask_1 = torch.arange(
         target_length,
         device=device).unsqueeze(0) <= cache_position.unsqueeze(-1)
     attention_mask_2 = torch.arange(target_length, device=device).unsqueeze(
-        0) > cache_position.unsqueeze(-1) - effective_window_size
+        0) > cache_position.unsqueeze(-1) - attention_window_size
     attention_mask = attention_mask_1 & attention_mask_2
     attention_mask = attention_mask[None,
                                     None, :, :].expand(batch_size, 1, -1, -1)
