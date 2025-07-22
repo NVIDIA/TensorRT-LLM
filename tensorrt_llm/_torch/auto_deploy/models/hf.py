@@ -60,58 +60,6 @@ def hf_load_state_dict_with_device(device: DeviceLikeType):
         modeling.load_state_dict = original_load_state_dict
 
 
-@contextmanager
-def handle_quantized_llama4(model_factory: ModelFactory):
-    """Patch HF load_state_dict to add language_model prefix for quantized Llama-4 checkpoints.
-
-    ModelOpt only export text model for quantized Llama-4 checkpoints, but the config is for the full model,
-    so we need to add a prefix to the keys to load the checkpoint into the correct module.
-    """
-    # get model config
-    model_config = AutoConfig.from_pretrained(model_factory.model)
-    quant_config = model_factory.get_quant_config()
-    is_llama4 = (
-        hasattr(model_config, "architectures")
-        and model_config.architectures[0] == "Llama4ForConditionalGeneration"
-    )
-    is_quantized = (
-        quant_config is not None
-        and hasattr(quant_config, "quant_algo")
-        and quant_config["quant_algo"] is not None
-    )
-
-    if is_llama4 and is_quantized:
-        yield
-        return
-
-    # save the original load_state_dict method
-    original_load_state_dict = modeling.load_state_dict
-
-    # Define and apply the patched version
-    def load_state_dict_with_prefix(checkpoint_file, device_map=None):
-        state_dict = original_load_state_dict(checkpoint_file, device_map=device_map)
-
-        # Add language_model prefix
-        modified_state_dict = {}
-        for key, value in state_dict.items():
-            # Add language_model prefix to keys that don't already have it
-            if not key.startswith("language_model."):
-                new_key = f"language_model.{key}"
-                modified_state_dict[new_key] = value
-            else:
-                modified_state_dict[key] = value
-        return modified_state_dict
-
-    # Apply the patch
-    modeling.load_state_dict = load_state_dict_with_prefix
-
-    try:
-        yield
-    finally:
-        # Restore the original method, even if an exception occurred
-        modeling.load_state_dict = original_load_state_dict
-
-
 @ModelFactoryRegistry.register("AutoModelForCausalLM")
 class AutoModelForCausalLMFactory(ModelFactory):
     def __init__(self, *args, **kwargs):
@@ -353,7 +301,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
         # identify the most relevant checkpoint file
         ckpt_file = self._get_checkpoint_file(self.model)
         # reuse the load checkpoint utility from accelerate
-        with hf_load_state_dict_with_device(device), handle_quantized_llama4(self):
+        with hf_load_state_dict_with_device(device):
             load_checkpoint_in_model(model, checkpoint=ckpt_file)
 
     def _load_quantization_config(self):
