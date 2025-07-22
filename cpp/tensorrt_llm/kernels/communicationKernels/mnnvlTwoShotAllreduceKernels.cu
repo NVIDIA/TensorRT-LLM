@@ -61,18 +61,6 @@ inline __device__ __nv_bfloat16 fromFloat<__nv_bfloat16>(float val)
     return __float2bfloat16(val);
 }
 
-__device__ float4 loadfloat4(void const* ptr)
-{
-
-    float return_value[4];
-
-    asm volatile("ld.volatile.global.v4.f32 {%0, %1, %2, %3}, [%4];\n"
-                 : "=f"(return_value[0]), "=f"(return_value[1]), "=f"(return_value[2]), "=f"(return_value[3])
-                 : "l"(ptr));
-
-    return *(float4*) return_value;
-}
-
 __device__ __inline__ float2 loadfloat2(void const* ptr)
 {
 
@@ -84,6 +72,13 @@ __device__ __inline__ float2 loadfloat2(void const* ptr)
                  : "memory");
 
     return *(float2*) return_value;
+}
+
+template <typename T>
+inline __device__ T max3(T in_a, T in_b, T in_c)
+{
+    T max_ab = in_a > in_b ? in_a : in_b;
+    return max_ab > in_c ? max_ab : in_c;
 }
 
 template <int WORLD_SIZE, typename T>
@@ -106,7 +101,9 @@ __global__ void twoshot_allreduce_kernel(T* output_ptr, T* shard_ptr, T** input_
     uint32_t input_offset = flag.x * buffer_group_size;
     uint32_t clear_offset = flag.y * buffer_group_size;
     // Capture the number of tokens from the last call so that we can properly clear the buffer
+    // The scatter stage will use the buffer in WORLD_SIZE granularity, thus we need to round up
     uint32_t num_tokens_to_clear = flag.w > num_tokens ? flag.w : num_tokens;
+    num_tokens_to_clear = (num_tokens_to_clear + WORLD_SIZE - 1) / WORLD_SIZE * WORLD_SIZE;
     uint32_t* offset_access_ptr = &buffer_flags[4];
 
     uint32_t clear_tokens_per_cta = (num_tokens_to_clear + gridDim.x - 1) / gridDim.x;
@@ -343,6 +340,18 @@ inline __device__ float block_reduce_sum(float val)
     val = lane_id < warp_num ? smem[lane_id] : 0.f;
     val = warpReduceSum(val);
     return val;
+}
+
+__device__ float4 loadfloat4(void const* ptr)
+{
+
+    float return_value[4];
+
+    asm volatile("ld.volatile.global.v4.f32 {%0, %1, %2, %3}, [%4];\n"
+                 : "=f"(return_value[0]), "=f"(return_value[1]), "=f"(return_value[2]), "=f"(return_value[3])
+                 : "l"(ptr));
+
+    return *(float4*) return_value;
 }
 
 template <int DIM, int NUM_THREADS, int NUM_INPUTS, typename T_OUT, typename T_IN>
