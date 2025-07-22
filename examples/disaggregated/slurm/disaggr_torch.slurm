@@ -13,8 +13,10 @@ multi_round=10
 gen_yaml_file=gen_yaml.py
 container_image=${container_image} # add your container image here
 mount_dir=${mount_dir} # add your mount directory here
-workdir=${mount_dir}/bench-large-ep/slurm_scripts/
+workdir=${workdir} # add your path to the slurm scripts here
 model_dir=${model_dir} # add your model directory here
+
+mounts=${mount_dir}:${mount_dir}
 logdir=${workdir}/benchmark-${isl}-${osl}/
 mkdir -p ${logdir}
 streaming=true
@@ -57,13 +59,13 @@ nsys_on=""
 # start the container
 srun -l --container-image=${container_image} \
         --container-name=${container_name} \
-        --container-mounts=${mount_dir}:${mount_dir} \
+        --container-mounts=${mounts} \
         --mpi=pmix \
         echo "Container up."
 
 # generate the yaml file
 srun -l --container-name=${container_name} \
-        --container-mounts=${mount_dir}:${mount_dir} \
+        --container-mounts=${mounts} \
         --mpi=pmix --overlap \
         python3 ${workdir}/${gen_yaml_file} --config ${full_logdir}/config.yaml \
             --model ${model_dir} \
@@ -88,32 +90,32 @@ echo "server host name: $hostname_value"
 
 # try to kill the server and workers
 srun -l --container-name=${container_name} \
-        --container-mounts=${mount_dir}:${mount_dir} \
+        --container-mounts=${mounts} \
         --mpi=pmix --overlap \
         pkill -f "trtllm-serve" || true
 
 # start the workers
 srun -l --container-name=${container_name} \
-        --container-mounts=${mount_dir}:${mount_dir} \
+        --container-mounts=${mounts} \
     --mpi=pmix --overlap \
     bash ${workdir}/start_worker.sh ${full_logdir}/config.yaml "${concurrency}" "${enable_pdl}" ${ctx_gpus} ${nsys_on} &> ${full_logdir}/output_workers.log &
 
 # start the server
 srun -l --container-name=${container_name} \
-        --container-mounts=${mount_dir}:${mount_dir} \
+        --container-mounts=${mounts} \
         --mpi=pmix --overlap -N 1 -n 1 \
         -w ${hostname_value} \
         bash ${workdir}/start_server.sh ${full_logdir}/config.yaml &> ${full_logdir}/output_server.log &
 
 # start benchmarking
 srun -l --container-name=${container_name} \
-        --container-mounts=${mount_dir}:${mount_dir} \
+        --container-mounts=${mounts} \
         --mpi=pmix --overlap -N 1 -n 1 \
         bash ${workdir}/run_benchmark.sh ${isl} ${osl} ${multi_round} ${model_dir} "${concurrency}" ${streaming} ${full_logdir}/ > ${full_logdir}/benchmark.log 2>&1
 
 # try to kill the server and workers
 srun -l --container-name=${container_name} \
-        --container-mounts=${mount_dir}:${mount_dir} \
+        --container-mounts=${mounts} \
         --mpi=pmix --overlap \
         kill -9 $(ps aux | grep '[t]rtllm-serve' | awk '{print $2}') >/dev/null 2>&1 || true
 wait
