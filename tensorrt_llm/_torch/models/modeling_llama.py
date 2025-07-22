@@ -930,6 +930,7 @@ class Llama4InputProcessor(InputProcessor):
                           max_length=sampling_params.truncate_prompt_tokens)
         text_inputs = self.tokenizer(
             processed_text,
+            return_tensors="pt",
             add_special_tokens=sampling_params.add_special_tokens,
             **kwargs)
         token_ids = text_inputs.input_ids.squeeze()
