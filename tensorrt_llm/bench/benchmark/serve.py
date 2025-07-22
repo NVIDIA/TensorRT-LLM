@@ -17,6 +17,11 @@ from tensorrt_llm.llmapi import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 # isort: on
 
+POLICY_MAP = {
+    "guaranteed_no_evict": CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+    "max_utilization": CapacitySchedulerPolicy.MAX_UTILIZATION,
+}
+
 
 @click.command(name="serve")
 @optgroup.group("Engine run configuration.",
@@ -225,8 +230,8 @@ def serve_command(
     exec_settings["settings_config"]["max_batch_size"] = runtime_max_bs
     exec_settings["settings_config"]["max_num_tokens"] = runtime_max_tokens
     exec_settings["settings_config"]["beam_width"] = beam_width
-    exec_settings["settings_config"][
-        "scheduler_policy"] = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT if scheduler_policy == "guaranteed_no_evict" else CapacitySchedulerPolicy.MAX_UTILIZATION
+    exec_settings["settings_config"]["scheduler_policy"] = POLICY_MAP[
+        scheduler_policy]
     exec_settings["settings_config"]["chunking"] = enable_chunked_context
 
     # Dynamic runtime features.
