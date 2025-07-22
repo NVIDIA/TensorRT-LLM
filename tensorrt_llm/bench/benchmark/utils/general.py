@@ -10,8 +10,8 @@ import yaml
 
 from tensorrt_llm._torch.pyexecutor.model_engine import \
     validate_and_set_kv_cache_quant
-from tensorrt_llm.bench.build.build import (get_benchmark_engine_settings,
-                                            get_model_config)
+from tensorrt_llm.bench.tuning.utils import get_model_config
+from tensorrt_llm.bench.build.build import get_benchmark_engine_settings
 from tensorrt_llm.bench.dataclasses.general import (DatasetMetadata,
                                                     InferenceRequest)
 from tensorrt_llm.logger import logger

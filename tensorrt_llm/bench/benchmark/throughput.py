@@ -7,23 +7,30 @@ from pathlib import Path
 import click
 from click_option_group import (MutuallyExclusiveOptionGroup, OptionGroup,
                                 optgroup)
-from huggingface_hub import snapshot_download
 
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
 from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
-from tensorrt_llm.bench.build.build import get_model_config
 
 # isort: off
 from tensorrt_llm.bench.benchmark.utils.general import (
+<<<<<<< HEAD
     get_settings_from_engine, get_settings, ALL_SUPPORTED_BACKENDS)
 # isort: on
+=======
+    get_settings_from_engine, get_settings)
+>>>>>>> c1880441d (Move snapshot download.)
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
-from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
+from tensorrt_llm.bench.dataclasses.scenario import (
+    BatchingConfiguration, BenchmarkEnvironment, LlmRuntimeSpecification,
+    ReportingConfiguration, ScenarioSpecification, TuningConstraints,
+    WorldConfig)
+from tensorrt_llm.bench.tuning.factory import HeuristicFactory
+# isort: on
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
@@ -253,150 +260,86 @@ def throughput_command(
     """Run a throughput test on a TRT-LLM engine."""
 
     logger.info("Preparing to run throughput benchmark...")
-    # Parameters from CLI
-    # Model, experiment, and engine params
-    dataset_path: Path = params.pop("dataset")
-    eos_id: int = params.pop("eos_id")
+    # Local variables:
+    concurrency: int = params.get("concurrency")
     warmup: int = params.get("warmup")
-    num_requests: int = params.pop("num_requests")
-    max_seq_len: int = params.pop("max_seq_len")
-    model: str = bench_env.model
-    checkpoint_path: Path = bench_env.checkpoint_path or bench_env.model
-    engine_dir: Path = params.pop("engine_dir")
-    concurrency: int = params.pop("concurrency")
-    backend: str = params.get("backend")
-    modality: str = params.pop("modality")
-    max_input_len: int = params.pop("max_input_len")
-    model_type = get_model_config(model, checkpoint_path).model_type
+    modality: str = params.get("modality")
+    post_proc_params = None  # No detokenization
+    streaming: bool = params.get("streaming")
+    llm = None
 
-    # Reporting options
-    report_json: Path = params.pop("report_json")
-    output_json: Path = params.pop("output_json")
-    request_json: Path = params.pop("request_json")
-    iteration_log: Path = params.pop("iteration_log")
-    iteration_writer = IterationWriter(iteration_log)
+    LLM_CLS_MAP = {
+        "pytorch": PyTorchLLM,
+        "tensorrt": LLM,
+    }
 
-    # Runtime kwargs and option tracking.
-    kwargs = {}
+    # Populate the benchmark specification with the parameters from the CLI.
+    benchmark_specification = ScenarioSpecification(
+        **params,
+        environment=bench_env,
+        batching_config=BatchingConfiguration(**params),
+        llm_config=LlmRuntimeSpecification(**params),
+        world=WorldConfig(**params),
+        reporting_config=ReportingConfiguration(**params),
+    )
 
     # Initialize the HF tokenizer for the specified model.
-    tokenizer = initialize_tokenizer(checkpoint_path)
+    tokenizer = initialize_tokenizer(benchmark_specification.checkpoint)
 
     # Dataset Loading and Preparation
-    with open(dataset_path, "r") as dataset:
+    with open(benchmark_specification.dataset_path, "r") as dataset:
         metadata, requests = create_dataset_from_stream(
             tokenizer,
             dataset,
-            num_requests=num_requests,
-            model_dir=checkpoint_path,
-            model_type=model_type,
-            modality=modality,
-            max_input_seq_len_for_multimodal=max_input_len)
-        metadata.dataset_path = dataset_path
-        params["target_input_len"] = params.get(
-            "target_input_len") or metadata.avg_isl
-        params["target_output_len"] = params.get(
-            "target_output_len") or metadata.avg_osl
+            model_dir=benchmark_specification.checkpoint,
+            num_requests=benchmark_specification.num_requests,
+            model_type=benchmark_specification.environment.model_type,
+            modality=benchmark_specification.modality,
+            max_input_seq_len_for_multimodal=benchmark_specification.
+            batching_config.max_seq_len)
 
-    if modality is None:
+    benchmark_specification.constraints = TuningConstraints.from_dataset_metadata(
+        metadata)
+    benchmark_specification.dataset_metadata = metadata
+
+    if benchmark_specification.modality == "text":
         # Log dataset info
         # NOTE: This table is only accurate for non-multimodal models.
         #       The accurate table for multimodal models will be logged after the benchmark is done.
-        logger.info(metadata.get_summary_for_print())
+        logger.info(benchmark_specification.get_dataset_summary())
 
-    # Engine configuration parsing
-    if backend and backend.lower() in ALL_SUPPORTED_BACKENDS and backend.lower(
-    ) != "tensorrt":
-        # If we're dealing with a model name, perform a snapshot download to
-        # make sure we have a local copy of the model.
-        if bench_env.checkpoint_path is None:
-            snapshot_download(model)
+    print(benchmark_specification)
 
-        exec_settings = get_settings(params, metadata, bench_env.model,
-                                     bench_env.checkpoint_path)
-        kwargs_max_sql = max_seq_len or metadata.max_sequence_length
-        logger.info(f"Setting PyTorch max sequence length to {kwargs_max_sql}")
-        kwargs["max_seq_len"] = kwargs_max_sql
-    elif backend.lower() == "tensorrt":
-        assert max_seq_len is None, (
-            "max_seq_len is not a runtime parameter for C++ backend")
-        exec_settings, build_cfg = get_settings_from_engine(engine_dir)
-        engine_max_seq_len = build_cfg["max_seq_len"]
+    heuristic_cls = HeuristicFactory.get_heuristic(benchmark_specification.llm_config.backend, "throughput")
+    kwargs = heuristic_cls.get_settings(benchmark_specification)
+    kwargs['backend'] = benchmark_specification.llm_config.backend
+    backend = kwargs['backend']
+    iteration_log = benchmark_specification.reporting_config.iteration_log
 
-        # TODO: Verify that the engine can handle the max/min ISL/OSL.
-        if metadata.max_sequence_length > engine_max_seq_len:
-            raise RuntimeError(
-                f"Engine supports a max sequence of {engine_max_seq_len}. "
-                "Provided dataset contains a maximum sequence of "
-                f"{metadata.max_sequence_length}. Please rebuild a new engine "
-                "to support this dataset.")
-    else:
-        raise RuntimeError(
-            f"Invalid backend: {backend}, please use one of the following: "
-            "pytorch, tensorrt, _autodeploy.")
+    if backend == "pytorch" and iteration_log is not None:
+        kwargs["enable_iter_perf_stats"] = True
 
-    exec_settings["model"] = model
-    engine_bs = exec_settings["settings_config"]["max_batch_size"]
-    engine_tokens = exec_settings["settings_config"]["max_num_tokens"]
+    # NOTE: We need to separate what is considered a benchmark setting and
+    # what is considered a tuning setting (for potential future re-use).
+    # Update to disable block reuse and partial reuse
+    kwargs["kv_cache_config"] |= {
+        "enable_block_reuse": False,
+        "enable_partial_reuse": False,
+    }
+    # Sample Parameters
+    sampling_params = \
+        SamplingParams(
+            end_id=benchmark_specification.llm_config.eos_id,
+            pad_id=benchmark_specification.llm_config.eos_id,
+            n=benchmark_specification.llm_config.beam_width,
+            use_beam_search=benchmark_specification.llm_config.beam_width > 1
+        )
 
-    # Runtime Options
-    runtime_max_bs = params.pop("max_batch_size")
-    runtime_max_tokens = params.pop("max_num_tokens")
-    runtime_max_bs = runtime_max_bs or engine_bs
-    runtime_max_tokens = runtime_max_tokens or engine_tokens
-    kv_cache_percent = params.pop("kv_cache_free_gpu_mem_fraction")
-    beam_width = params.pop("beam_width")
-    streaming: bool = params.pop("streaming")
-    enable_chunked_context: bool = params.pop("enable_chunked_context")
-    scheduler_policy: str = params.pop("scheduler_policy")
 
-    # Update configuration with runtime options
-    exec_settings["settings_config"]["kv_cache_percent"] = kv_cache_percent
-    exec_settings["settings_config"]["max_batch_size"] = runtime_max_bs
-    exec_settings["settings_config"]["max_num_tokens"] = runtime_max_tokens
-    exec_settings["settings_config"]["beam_width"] = beam_width
-    exec_settings["settings_config"][
-        "scheduler_policy"] = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT if scheduler_policy == "guaranteed_no_evict" else CapacitySchedulerPolicy.MAX_UTILIZATION
-    exec_settings["settings_config"]["chunking"] = enable_chunked_context
-
-    # Dynamic runtime features.
-    exec_settings["settings_config"]["dynamic_max_batch_size"] = True
-
-    # LlmArgs
-    exec_settings["extra_llm_api_options"] = params.pop("extra_llm_api_options")
-    exec_settings["iteration_log"] = iteration_log
-
-    # Construct the runtime configuration dataclass.
-    runtime_config = RuntimeConfig(**exec_settings)
-    llm = None
     try:
         logger.info("Setting up throughput benchmark.")
-        kwargs = kwargs | runtime_config.get_llm_args()
-        kwargs['backend'] = backend
-
-        if backend == "pytorch" and iteration_log is not None:
-            kwargs["enable_iter_perf_stats"] = True
-
-        if runtime_config.backend == 'pytorch':
-            if kwargs.pop("extended_runtime_perf_knob_config", None):
-                logger.warning(
-                    "Ignore extended_runtime_perf_knob_config for pytorch backend."
-                )
-            llm = PyTorchLLM(**kwargs)
-        elif runtime_config.backend == "_autodeploy":
-            if kwargs.pop("extended_runtime_perf_knob_config", None):
-                logger.warning(
-                    "Ignore extended_runtime_perf_knob_config for _autodeploy backend."
-                )
-            llm = AutoDeployLLM(**kwargs)
-        else:
-            llm = LLM(**kwargs)
-
-        sampling_params = SamplingParams(end_id=eos_id,
-                                         pad_id=eos_id,
-                                         n=beam_width,
-                                         use_beam_search=beam_width > 1)
-        post_proc_params = None  # No detokenization
+        llm_cls = LLM_CLS_MAP[backend]
+        llm = llm_cls(**kwargs)
 
         # Perform warmup if requested.
         if warmup > 0:
@@ -417,6 +360,8 @@ def throughput_command(
             llm._executor._iter_stats_result = None
             logger.info("Warmup done.")
 
+        iteration_writer = IterationWriter(
+            benchmark_specification.reporting_config.iteration_log)
         with iteration_writer.capture():
             statistics = asyncio.run(
                 async_benchmark(llm,
