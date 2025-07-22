@@ -504,8 +504,7 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
     std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs, nvinfer1::DataType dtype,
     SizeType32 sinkBubbleLength, bool onboardBlocks, CacheType cacheType,
     std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
-    std::shared_ptr<KVCacheEventManager> eventManager, bool enableHashKey, bool enablePartialReuse,
-    bool copyOnPartialReuse)
+    std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse)
     : mNumLayers{static_cast<SizeType32>(numKvHeadsPerLayer.size())}
     , mTokensPerBlock{tokensPerBlock}
     , mEventManager{std::move(eventManager)}
@@ -530,7 +529,7 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
         TLLM_CHECK(allottedPrimaryBlocks > 0); // You can't have a model with negative primary blocks...
         mWindowBlockManagers.try_emplace(windowSize, dtype, windowSize, layersWithWindowSize, numKvHeadsPerLayer,
             sizePerHead, tokensPerBlock, allottedPrimaryBlocks, allottedSecondaryBlocks, maxNumSequences, stream,
-            onboardBlocks, cacheType, secondaryOffloadMinPriority, mEventManager, enableHashKey, enablePartialReuse,
+            onboardBlocks, cacheType, secondaryOffloadMinPriority, mEventManager, enablePartialReuse,
             copyOnPartialReuse);
     }
 
@@ -573,8 +572,7 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     SizeType32 sizePerHead, SizeType32 tokensPerBlock, SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool,
     SizeType32 maxNumSequences, std::shared_ptr<runtime::CudaStream> stream, bool onboardBlocks, CacheType cacheType,
     std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
-    std::shared_ptr<KVCacheEventManager> eventManager, bool enableHashKey, bool enablePartialReuse,
-    bool copyOnPartialReuse)
+    std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse)
     : mDataType{dtype}
     , mWindowSize{windowSize}
     , mNumPrimaryBlocks{blocksInPrimaryPool}
@@ -596,7 +594,6 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     , mLogPrefix{tensorrt_llm::common::fmtstr("BlockManager[windowSize=%u]", mWindowSize)}
     , mReusedTokens{0.0}
     , mTotalInputTokens{0.0}
-    , mEnableHashKey{enableHashKey}
     , mEnablePartialReuse{enablePartialReuse}
     , mCopyOnPartialReuse{copyOnPartialReuse}
 {
@@ -920,50 +917,6 @@ void BlockManager::setOffsets(tk::KVCacheIndex* offsetsPtr, nvinfer1::Dims const
     mWindowBlockManagers.at(windowSize).setOffsets(offsetsPtr, offsetsShape, beamIdx, blockIdx, blockId);
 }
 
-void WindowBlockManager::addBlockToHashMap(BlockPtr const& block)
-{
-    if (!mEnableHashKey)
-    {
-        return;
-    }
-    auto range = mContextBlocksByHash.equal_range(block->getHash());
-    for (auto it = range.first; it != range.second; ++it)
-    {
-        if (it->second == block)
-        {
-            // TODO: change to assert when reused block is added only once
-            TLLM_LOG_TRACE(
-                "Block %d by %zx exists", block->getBlockId(), block->getHash(), mContextBlocksByHash.size());
-            return;
-        }
-    }
-    TLLM_LOG_TRACE(
-        "Add block %d by %zx, block n = %zu", block->getBlockId(), block->getHash(), mContextBlocksByHash.size());
-    mContextBlocksByHash.emplace(block->getHash(), std::move(block));
-}
-
-void WindowBlockManager::removeBlockFromHashMap(BlockPtr const& block)
-{
-    if (mContextBlocksByHash.empty() || block->getBlockKey().uniqueTokens.empty())
-    {
-        // Hash key not enabled / Empty block
-        return;
-    }
-    auto range = mContextBlocksByHash.equal_range(block->getHash());
-    TLLM_LOG_TRACE(
-        "Remove block %d by %zx, block n = %zu", block->getBlockId(), block->getHash(), mContextBlocksByHash.size());
-    for (auto it = range.first; it != range.second; ++it)
-    {
-        if (it->second == block)
-        {
-            mContextBlocksByHash.erase(it);
-            return;
-        }
-    }
-    // TODO: should be unreachable
-    TLLM_LOG_DEBUG("Trying to remove block %d by %zx that is not in hash map", block->getBlockId(), block->getHash());
-}
-
 void BlockManager::onboardBlock(BlockPtr const& offloadBlock, SizeType32 windowSize)
 {
     mWindowBlockManagers.at(windowSize).onboardBlock(offloadBlock);
@@ -1104,7 +1057,6 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                         matchingBlock, perBlockRetentions[bi].retentionPriority, perBlockRetentions[bi].durationMs);
                     TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Reused partially filled block %d", mLogPrefix.c_str(),
                         matchingBlockId);
-                    addBlockToHashMap(matchingBlock);
                 }
                 searchRoot = nullptr; // no matching needed for following blocks
             }
@@ -1114,7 +1066,6 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                 mEvictionPolicy->claimBlock(
                     matchingBlock, perBlockRetentions[bi].retentionPriority, perBlockRetentions[bi].durationMs);
                 TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Matched full block %d", mLogPrefix.c_str(), matchingBlockId);
-                addBlockToHashMap(matchingBlock);
                 searchRoot = matchingBlock;
             }
             onboardBlock(matchingBlock);
@@ -1145,7 +1096,6 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                 ++blockItr;
             }
             freeBlock->setHash();
-            addBlockToHashMap(freeBlock);
             ++mMissedBlocks;
         }
     }
@@ -1169,7 +1119,6 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                 ++blockItr;
             }
             freeBlock->setHash();
-            addBlockToHashMap(freeBlock);
             TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Beam %d. Allocated non-shared block %d for bi %d",
                 mLogPrefix.c_str(), beamIdx, freeBlock->getBlockId(), bi);
         }
@@ -1369,9 +1318,7 @@ void WindowBlockManager::storeBlocks(
             if (oldHash != newHash)
             {
                 TLLM_LOG_DEBUG("#%d block hash %zx -> %zx", block->getBlockId(), oldHash, newHash);
-                removeBlockFromHashMap(block);
                 block->setHash(newHash);
-                addBlockToHashMap(block);
             }
             searchRoot = block;
         }
@@ -1408,7 +1355,6 @@ void WindowBlockManager::replaceSharedBlock(GenerationRequest& sequence, SizeTyp
         if (!block->hasRefs())
         {
             mEvictionPolicy->releaseBlock(block);
-            removeBlockFromHashMap(block);
         }
     }
 
@@ -1473,7 +1419,6 @@ void WindowBlockManager::releaseLastBlock(GenerationRequest& sequence)
     if (!block->hasRefs())
     {
         mEvictionPolicy->releaseBlock(block, true);
-        removeBlockFromHashMap(block);
     }
     // Remove block from allocated blocks
     allocatedBlocks.pop_back();
@@ -1616,7 +1561,6 @@ void WindowBlockManager::releaseBlocks(GenerationRequest& sequence)
         if (!block->hasRefs())
         {
             mEvictionPolicy->releaseBlock(block);
-            removeBlockFromHashMap(block);
         }
     }
     // Remove stored block ids in sequence
@@ -1654,8 +1598,7 @@ KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, Size
     : KVCacheManager(std::vector<SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, maxBeamWidth, maxAttentionWindowVec, tempAttentionWindowInputs, dtype, sinkTokenLength,
         std::make_shared<runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream)), maxSequenceLength,
-        enableBlockReuse, onboardBlocks, cacheType, std::nullopt, nullptr, false, enablePartialReuse,
-        copyOnPartialReuse)
+        enableBlockReuse, onboardBlocks, cacheType, std::nullopt, nullptr, enablePartialReuse, copyOnPartialReuse)
 {
 }
 
@@ -1682,8 +1625,7 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     SizeType32 sinkTokenLength, CudaStreamPtr stream, std::optional<runtime::SizeType32> maxSequenceLength,
     bool enableBlockReuse, bool onboardBlocks, CacheType cacheType,
     std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
-    std::shared_ptr<KVCacheEventManager> eventManager, bool enableHashKey, bool enablePartialReuse,
-    bool copyOnPartialReuse)
+    std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse)
     : mMaxBeamWidth(maxBeamWidth)
     , mDataType(dtype)
     , mMaxAttentionWindow(*std::max_element(maxAttentionWindowVec.begin(), maxAttentionWindowVec.end()))
@@ -1693,10 +1635,9 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     , mBlockManager(numKvHeadsPerLayer, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
           std::move(stream), maxSequenceLength, maxBeamWidth, maxAttentionWindowVec, tempAttentionWindowInputs, dtype,
           mSinkBubbleLength, onboardBlocks, cacheType, secondaryOffloadMinPriority, std::move(eventManager),
-          enableHashKey, enablePartialReuse, copyOnPartialReuse)
+          enablePartialReuse, copyOnPartialReuse)
     // disable block reuse for sink bubble since chopVectorIntoBlocks does not match KV cache blocks in this case
     , mEnableBlockReuse{mSinkBubbleLength > 0 ? false : enableBlockReuse}
-    , mEnableHashKey{enableHashKey}
 {
     TLLM_CHECK_DEBUG(std::find(maxAttentionWindowVec.begin(), maxAttentionWindowVec.end(), mMaxAttentionWindow)
         != maxAttentionWindowVec.end());
@@ -1716,12 +1657,11 @@ KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, Size
     SizeType32 sinkTokenLength, CudaStreamPtr stream, std::optional<runtime::SizeType32> maxSequenceLength,
     bool enableBlockReuse, bool onboardBlocks, CacheType cacheType,
     std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
-    std::shared_ptr<KVCacheEventManager> eventManager, bool enableHashKey, bool enablePartialReuse,
-    bool copyOnPartialReuse)
+    std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse)
     : KVCacheManager(std::vector<SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, maxBeamWidth, maxAttentionWindowVec, tempAttentionWindowInputs, dtype, sinkTokenLength,
         std::move(stream), maxSequenceLength, enableBlockReuse, onboardBlocks, cacheType, secondaryOffloadMinPriority,
-        std::move(eventManager), enableHashKey, enablePartialReuse, copyOnPartialReuse)
+        std::move(eventManager), enablePartialReuse, copyOnPartialReuse)
 {
 }
 
@@ -2085,30 +2025,6 @@ void KVCacheManager::addSequence(
                     llmRequest->mRequestId);
             }
             mBlockManager.addSequence(sequence, numContextBlocks, unsharedBlockIdx, windowSize);
-            if (mEnableHashKey && llmRequest.has_value() && beamWidth == 1)
-            {
-                constexpr SizeType32 beamIdx = 0;
-                auto const& blockIds = sequence.getCacheBlockIds(windowSize).at(beamIdx);
-                auto const& uniqueTokens = llmRequest->getUniqueTokens(beamIdx);
-                auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(
-                    uniqueTokens, uniqueTokens.size() - 1, getTokensPerBlock(), true);
-                auto blockKeys = buildBlockKeys(blockedUniqueTokens, *llmRequest);
-                auto tokensPerBlock = static_cast<size_t>(getTokensPerBlock());
-                for (size_t i = 0; i < blockIds.size(); i++)
-                {
-                    auto const& block = mBlockManager.getBlockById(blockIds[i], windowSize);
-                    if (i < blockKeys.size())
-                    {
-                        block->setBlockKey(blockKeys[i], blockKeys[i].uniqueTokens.size() == tokensPerBlock);
-                    }
-                    else
-                    {
-                        block->setBlockKey({}, false);
-                    }
-                    block->setHash();
-                    mBlockManager.addBlockToHashMap(block, windowSize);
-                }
-            }
         }
         cacheBlockOffsets(sequence, windowSize);
     }
