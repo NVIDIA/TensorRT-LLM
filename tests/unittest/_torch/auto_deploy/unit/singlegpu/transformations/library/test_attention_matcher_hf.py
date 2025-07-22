@@ -44,13 +44,12 @@ class HFWrapper(nn.Module):
         return self.model(x)[0]
 
 
-def _joint_transform(gm: GraphModule) -> GraphModule:
-    gm = match_repeat_kv(gm)
-    gm = match_eager_attention(gm)
-    gm = match_grouped_attention(gm)
-    gm = match_causal_attn_mask(gm)
-    gm = match_attention_layout(gm, MockAttentionDescriptor())
-    return gm
+def _joint_transform(gm: GraphModule) -> None:
+    match_repeat_kv(gm)
+    match_eager_attention(gm)
+    match_grouped_attention(gm)
+    match_causal_attn_mask(gm)
+    match_attention_layout(gm, MockAttentionDescriptor())
 
 
 @pytest.mark.parametrize(
@@ -78,6 +77,7 @@ def test_match_llama_attention(config: Dict[str, Any], attn_implementation: str)
     dynamic_shapes = {0: Dim("batch_size", max=8), 1: Dim("seq_len", min=4, max=16)}
 
     model = HFWrapper(LlamaModel(LlamaConfig(**full_config))).to("cuda")
+    model.eval()
     x = torch.randint(
         0, full_config["vocab_size"], (batch_size, seq_len), dtype=torch.long, device="cuda"
     )
