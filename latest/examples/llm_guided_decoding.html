@@ -58,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -70,7 +70,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc3" />
+  <meta name="docsearch:version" content="1.0.0rc4" />
 
 
   </head>
@@ -345,6 +345,8 @@
 <li class="toctree-l2"><a class="reference internal" href="llm_logits_processor.html">Control generated text using logits processor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_sampling.html">Sampling Techniques Showcase</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
@@ -380,6 +382,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-bench.html">trtllm-bench</a></li>
+
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
 </ul>
@@ -503,47 +507,44 @@
 <span class="linenos"> 4</span>
 <span class="linenos"> 5</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
 <span class="linenos"> 6</span>
-<span class="linenos"> 7</span>    <span class="c1"># Specify the guided decoding backend; xgrammar is supported currently.</span>
-<span class="linenos"> 8</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span>
-<span class="linenos"> 9</span>        <span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">,</span>
-<span class="linenos">10</span>        <span class="n">guided_decoding_backend</span><span class="o">=</span><span class="s1">&#39;xgrammar&#39;</span><span class="p">,</span>
-<span class="linenos">11</span>        <span class="n">disable_overlap_scheduler</span><span class="o">=</span><span class="kc">True</span>  <span class="c1"># Not supported by xgrammar mode</span>
-<span class="linenos">12</span>    <span class="p">)</span>
+<span class="linenos"> 7</span>    <span class="c1"># Specify the guided decoding backend; xgrammar and llguidance are supported currently.</span>
+<span class="linenos"> 8</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">,</span>
+<span class="linenos"> 9</span>              <span class="n">guided_decoding_backend</span><span class="o">=</span><span class="s1">&#39;xgrammar&#39;</span><span class="p">)</span>
+<span class="linenos">10</span>
+<span class="linenos">11</span>    <span class="c1"># An example from json-mode-eval</span>
+<span class="linenos">12</span>    <span class="n">schema</span> <span class="o">=</span> <span class="s1">&#39;{&quot;title&quot;: &quot;WirelessAccessPoint&quot;, &quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {&quot;ssid&quot;: {&quot;title&quot;: &quot;SSID&quot;, &quot;type&quot;: &quot;string&quot;}, &quot;securityProtocol&quot;: {&quot;title&quot;: &quot;SecurityProtocol&quot;, &quot;type&quot;: &quot;string&quot;}, &quot;bandwidth&quot;: {&quot;title&quot;: &quot;Bandwidth&quot;, &quot;type&quot;: &quot;string&quot;}}, &quot;required&quot;: [&quot;ssid&quot;, &quot;securityProtocol&quot;, &quot;bandwidth&quot;]}&#39;</span>
 <span class="linenos">13</span>
-<span class="linenos">14</span>    <span class="c1"># An example from json-mode-eval</span>
-<span class="linenos">15</span>    <span class="n">schema</span> <span class="o">=</span> <span class="s1">&#39;{&quot;title&quot;: &quot;WirelessAccessPoint&quot;, &quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {&quot;ssid&quot;: {&quot;title&quot;: &quot;SSID&quot;, &quot;type&quot;: &quot;string&quot;}, &quot;securityProtocol&quot;: {&quot;title&quot;: &quot;SecurityProtocol&quot;, &quot;type&quot;: &quot;string&quot;}, &quot;bandwidth&quot;: {&quot;title&quot;: &quot;Bandwidth&quot;, &quot;type&quot;: &quot;string&quot;}}, &quot;required&quot;: [&quot;ssid&quot;, &quot;securityProtocol&quot;, &quot;bandwidth&quot;]}&#39;</span>
-<span class="linenos">16</span>
-<span class="linenos">17</span>    <span class="n">prompt</span> <span class="o">=</span> <span class="p">[{</span>
-<span class="linenos">18</span>        <span class="s1">&#39;role&#39;</span><span class="p">:</span>
-<span class="linenos">19</span>        <span class="s1">&#39;system&#39;</span><span class="p">,</span>
-<span class="linenos">20</span>        <span class="s1">&#39;content&#39;</span><span class="p">:</span>
-<span class="linenos">21</span>        <span class="s2">&quot;You are a helpful assistant that answers in JSON. Here&#39;s the json schema you must adhere to:</span><span class="se">\n</span><span class="s2">&lt;schema&gt;</span><span class="se">\n</span><span class="s2">{&#39;title&#39;: &#39;WirelessAccessPoint&#39;, &#39;type&#39;: &#39;object&#39;, &#39;properties&#39;: {&#39;ssid&#39;: {&#39;title&#39;: &#39;SSID&#39;, &#39;type&#39;: &#39;string&#39;}, &#39;securityProtocol&#39;: {&#39;title&#39;: &#39;SecurityProtocol&#39;, &#39;type&#39;: &#39;string&#39;}, &#39;bandwidth&#39;: {&#39;title&#39;: &#39;Bandwidth&#39;, &#39;type&#39;: &#39;string&#39;}}, &#39;required&#39;: [&#39;ssid&#39;, &#39;securityProtocol&#39;, &#39;bandwidth&#39;]}</span><span class="se">\n</span><span class="s2">&lt;/schema&gt;</span><span class="se">\n</span><span class="s2">&quot;</span>
-<span class="linenos">22</span>    <span class="p">},</span> <span class="p">{</span>
-<span class="linenos">23</span>        <span class="s1">&#39;role&#39;</span><span class="p">:</span>
-<span class="linenos">24</span>        <span class="s1">&#39;user&#39;</span><span class="p">,</span>
-<span class="linenos">25</span>        <span class="s1">&#39;content&#39;</span><span class="p">:</span>
-<span class="linenos">26</span>        <span class="s2">&quot;I&#39;m currently configuring a wireless access point for our office network and I need to generate a JSON object that accurately represents its settings. The access point&#39;s SSID should be &#39;OfficeNetSecure&#39;, it uses WPA2-Enterprise as its security protocol, and it&#39;s capable of a bandwidth of up to 1300 Mbps on the 5 GHz band. This JSON object will be used to document our network configurations and to automate the setup process for additional access points in the future. Please provide a JSON object that includes these details.&quot;</span>
-<span class="linenos">27</span>    <span class="p">}]</span>
-<span class="linenos">28</span>    <span class="n">prompt</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">apply_chat_template</span><span class="p">(</span><span class="n">prompt</span><span class="p">,</span> <span class="n">tokenize</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-<span class="linenos">29</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
+<span class="linenos">14</span>    <span class="n">prompt</span> <span class="o">=</span> <span class="p">[{</span>
+<span class="linenos">15</span>        <span class="s1">&#39;role&#39;</span><span class="p">:</span>
+<span class="linenos">16</span>        <span class="s1">&#39;system&#39;</span><span class="p">,</span>
+<span class="linenos">17</span>        <span class="s1">&#39;content&#39;</span><span class="p">:</span>
+<span class="linenos">18</span>        <span class="s2">&quot;You are a helpful assistant that answers in JSON. Here&#39;s the json schema you must adhere to:</span><span class="se">\n</span><span class="s2">&lt;schema&gt;</span><span class="se">\n</span><span class="s2">{&#39;title&#39;: &#39;WirelessAccessPoint&#39;, &#39;type&#39;: &#39;object&#39;, &#39;properties&#39;: {&#39;ssid&#39;: {&#39;title&#39;: &#39;SSID&#39;, &#39;type&#39;: &#39;string&#39;}, &#39;securityProtocol&#39;: {&#39;title&#39;: &#39;SecurityProtocol&#39;, &#39;type&#39;: &#39;string&#39;}, &#39;bandwidth&#39;: {&#39;title&#39;: &#39;Bandwidth&#39;, &#39;type&#39;: &#39;string&#39;}}, &#39;required&#39;: [&#39;ssid&#39;, &#39;securityProtocol&#39;, &#39;bandwidth&#39;]}</span><span class="se">\n</span><span class="s2">&lt;/schema&gt;</span><span class="se">\n</span><span class="s2">&quot;</span>
+<span class="linenos">19</span>    <span class="p">},</span> <span class="p">{</span>
+<span class="linenos">20</span>        <span class="s1">&#39;role&#39;</span><span class="p">:</span>
+<span class="linenos">21</span>        <span class="s1">&#39;user&#39;</span><span class="p">,</span>
+<span class="linenos">22</span>        <span class="s1">&#39;content&#39;</span><span class="p">:</span>
+<span class="linenos">23</span>        <span class="s2">&quot;I&#39;m currently configuring a wireless access point for our office network and I need to generate a JSON object that accurately represents its settings. The access point&#39;s SSID should be &#39;OfficeNetSecure&#39;, it uses WPA2-Enterprise as its security protocol, and it&#39;s capable of a bandwidth of up to 1300 Mbps on the 5 GHz band. This JSON object will be used to document our network configurations and to automate the setup process for additional access points in the future. Please provide a JSON object that includes these details.&quot;</span>
+<span class="linenos">24</span>    <span class="p">}]</span>
+<span class="linenos">25</span>    <span class="n">prompt</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">apply_chat_template</span><span class="p">(</span><span class="n">prompt</span><span class="p">,</span> <span class="n">tokenize</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos">26</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
+<span class="linenos">27</span>
+<span class="linenos">28</span>    <span class="n">output</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompt</span><span class="p">,</span> <span class="n">sampling_params</span><span class="o">=</span><span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">50</span><span class="p">))</span>
+<span class="linenos">29</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Generated text (unguided): </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
 <span class="linenos">30</span>
-<span class="linenos">31</span>    <span class="n">output</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompt</span><span class="p">,</span> <span class="n">sampling_params</span><span class="o">=</span><span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">50</span><span class="p">))</span>
-<span class="linenos">32</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Generated text (unguided): </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
-<span class="linenos">33</span>
-<span class="linenos">34</span>    <span class="n">output</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span>
-<span class="linenos">35</span>        <span class="n">prompt</span><span class="p">,</span>
-<span class="linenos">36</span>        <span class="n">sampling_params</span><span class="o">=</span><span class="n">SamplingParams</span><span class="p">(</span>
-<span class="linenos">37</span>            <span class="n">max_tokens</span><span class="o">=</span><span class="mi">50</span><span class="p">,</span> <span class="n">guided_decoding</span><span class="o">=</span><span class="n">GuidedDecodingParams</span><span class="p">(</span><span class="n">json</span><span class="o">=</span><span class="n">schema</span><span class="p">)))</span>
-<span class="linenos">38</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Generated text (guided): </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
-<span class="linenos">39</span>
-<span class="linenos">40</span>    <span class="c1"># Got output like</span>
-<span class="linenos">41</span>    <span class="c1"># Prompt: &quot;&lt;|system|&gt;\nYou are a helpful assistant that answers in JSON. Here&#39;s the json schema you must adhere to:\n&lt;schema&gt;\n{&#39;title&#39;: &#39;WirelessAccessPoint&#39;, &#39;type&#39;: &#39;object&#39;, &#39;properties&#39;: {&#39;ssid&#39;: {&#39;title&#39;: &#39;SSID&#39;, &#39;type&#39;: &#39;string&#39;}, &#39;securityProtocol&#39;: {&#39;title&#39;: &#39;SecurityProtocol&#39;, &#39;type&#39;: &#39;string&#39;}, &#39;bandwidth&#39;: {&#39;title&#39;: &#39;Bandwidth&#39;, &#39;type&#39;: &#39;string&#39;}}, &#39;required&#39;: [&#39;ssid&#39;, &#39;securityProtocol&#39;, &#39;bandwidth&#39;]}\n&lt;/schema&gt;\n&lt;/s&gt;\n&lt;|user|&gt;\nI&#39;m currently configuring a wireless access point for our office network and I need to generate a JSON object that accurately represents its settings. The access point&#39;s SSID should be &#39;OfficeNetSecure&#39;, it uses WPA2-Enterprise as its security protocol, and it&#39;s capable of a bandwidth of up to 1300 Mbps on the 5 GHz band. This JSON object will be used to document our network configurations and to automate the setup process for additional access points in the future. Please provide a JSON object that includes these details.&lt;/s&gt;\n&quot;</span>
-<span class="linenos">42</span>    <span class="c1"># Generated text (unguided): &#39;&lt;|assistant|&gt;\nHere\&#39;s a JSON object that accurately represents the settings of a wireless access point for our office network:\n\n```json\n{\n  &quot;title&quot;: &quot;WirelessAccessPoint&quot;,\n  &quot;&#39;</span>
-<span class="linenos">43</span>    <span class="c1"># Generated text (guided): &#39;{&quot;ssid&quot;: &quot;OfficeNetSecure&quot;, &quot;securityProtocol&quot;: &quot;WPA2-Enterprise&quot;, &quot;bandwidth&quot;: &quot;1300 Mbps&quot;}&#39;</span>
-<span class="linenos">44</span>
-<span class="linenos">45</span>
-<span class="linenos">46</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
-<span class="linenos">47</span>    <span class="n">main</span><span class="p">()</span>
+<span class="linenos">31</span>    <span class="n">output</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span>
+<span class="linenos">32</span>        <span class="n">prompt</span><span class="p">,</span>
+<span class="linenos">33</span>        <span class="n">sampling_params</span><span class="o">=</span><span class="n">SamplingParams</span><span class="p">(</span>
+<span class="linenos">34</span>            <span class="n">max_tokens</span><span class="o">=</span><span class="mi">50</span><span class="p">,</span> <span class="n">guided_decoding</span><span class="o">=</span><span class="n">GuidedDecodingParams</span><span class="p">(</span><span class="n">json</span><span class="o">=</span><span class="n">schema</span><span class="p">)))</span>
+<span class="linenos">35</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Generated text (guided): </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
+<span class="linenos">36</span>
+<span class="linenos">37</span>    <span class="c1"># Got output like</span>
+<span class="linenos">38</span>    <span class="c1"># Prompt: &quot;&lt;|system|&gt;\nYou are a helpful assistant that answers in JSON. Here&#39;s the json schema you must adhere to:\n&lt;schema&gt;\n{&#39;title&#39;: &#39;WirelessAccessPoint&#39;, &#39;type&#39;: &#39;object&#39;, &#39;properties&#39;: {&#39;ssid&#39;: {&#39;title&#39;: &#39;SSID&#39;, &#39;type&#39;: &#39;string&#39;}, &#39;securityProtocol&#39;: {&#39;title&#39;: &#39;SecurityProtocol&#39;, &#39;type&#39;: &#39;string&#39;}, &#39;bandwidth&#39;: {&#39;title&#39;: &#39;Bandwidth&#39;, &#39;type&#39;: &#39;string&#39;}}, &#39;required&#39;: [&#39;ssid&#39;, &#39;securityProtocol&#39;, &#39;bandwidth&#39;]}\n&lt;/schema&gt;\n&lt;/s&gt;\n&lt;|user|&gt;\nI&#39;m currently configuring a wireless access point for our office network and I need to generate a JSON object that accurately represents its settings. The access point&#39;s SSID should be &#39;OfficeNetSecure&#39;, it uses WPA2-Enterprise as its security protocol, and it&#39;s capable of a bandwidth of up to 1300 Mbps on the 5 GHz band. This JSON object will be used to document our network configurations and to automate the setup process for additional access points in the future. Please provide a JSON object that includes these details.&lt;/s&gt;\n&quot;</span>
+<span class="linenos">39</span>    <span class="c1"># Generated text (unguided): &#39;&lt;|assistant|&gt;\nHere\&#39;s a JSON object that accurately represents the settings of a wireless access point for our office network:\n\n```json\n{\n  &quot;title&quot;: &quot;WirelessAccessPoint&quot;,\n  &quot;&#39;</span>
+<span class="linenos">40</span>    <span class="c1"># Generated text (guided): &#39;{&quot;ssid&quot;: &quot;OfficeNetSecure&quot;, &quot;securityProtocol&quot;: &quot;WPA2-Enterprise&quot;, &quot;bandwidth&quot;: &quot;1300 Mbps&quot;}&#39;</span>
+<span class="linenos">41</span>
+<span class="linenos">42</span>
+<span class="linenos">43</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
+<span class="linenos">44</span>    <span class="n">main</span><span class="p">()</span>
 </pre></div>
 </div>
 </section>
@@ -676,9 +677,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 14, 2025.</p>
+  <p>Last updated on July 19, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cfcb97a">cfcb97a</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/69e9f6d">69e9f6d</a>.</p>
   
 </div></div>
       
