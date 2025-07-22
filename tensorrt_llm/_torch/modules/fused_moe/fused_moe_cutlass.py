@@ -130,6 +130,7 @@ class CutlassFusedMoE(MoE):
             if not (self.quant_config.quant_mode.has_nvfp4()
                     | self.quant_config.quant_mode.has_fp8_block_scales()
                     | self.quant_config.quant_mode.has_fp8_qdq()
+                    | self.quant_config.quant_mode.has_fp8_rowwise()
                     | self.quant_config.quant_mode.
                     is_int4_weight_only_per_group()):
                 raise ValueError(
@@ -145,7 +146,8 @@ class CutlassFusedMoE(MoE):
     def _get_quant_method(self):
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
                 exclude_kv_cache=True):
-            if self.quant_config.layer_quant_mode.has_fp8_qdq():
+            if self.quant_config.layer_quant_mode.has_fp8_qdq(
+            ) or self.quant_config.quant_mode.has_fp8_rowwise():
                 return FP8QDQFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_fp8_block_scales():
                 return DeepSeekFP8BlockScalesFusedMoEMethod()
@@ -226,7 +228,7 @@ class CutlassFusedMoE(MoE):
         weight_dtype = self.w3_w1_weight.dtype
         x_sf = None
         if self.has_any_quant:
-            if self.has_fp8_qdq:
+            if self.has_fp8_qdq or self.has_fp8_rowwise:
                 x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
                     x, self.fc31_input_dequant)
             elif self.has_deepseek_fp8_block_scales:

@@ -269,6 +269,21 @@ class ModelConfig(Generic[TConfig]):
                     128,
                     128), "FP8_BLOCK_SCALES only supports block_size=(128,128)"
                 quant_config.group_size = block_size[0]
+            elif hf_quant_config.get(
+                    "quant_method"
+            ) == "compressed-tensors" and hf_quant_config.get(
+                    "format") == "float-quantized":
+                # Llama4 FP8 ckpt
+                quant_config.quant_algo = QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
+                exclude_modules = hf_quant_config.get("ignore", None)
+                exclude_modules = [
+                    s.removeprefix("language_model.") for s in exclude_modules
+                ]
+                exclude_modules = [
+                    s.replace("q_proj", "qkv_proj") for s in exclude_modules
+                ]
+                quant_config.exclude_modules = exclude_modules
+                quant_config.use_meta_recipe = True
 
         model_config = cls(pretrained_config=pretrained_config,
                            quant_config=quant_config,
