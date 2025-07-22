@@ -8,6 +8,7 @@ from .fused_moe_wide_ep import WideEPMoE
 from .interface import MoE, MoEWeightLoadingMode
 from .moe_load_balancer import (MoeLoadBalancer,
                                 moe_load_balancer_set_repeated_for_next_layer)
+from .moe_prefetch_manager import MoEPrefetchManager, MoEPrefetchProxy
 from .quantization import FusedMoEQuantScalesFP8
 from .routing import (BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
                       DefaultMoeRoutingMethod,
@@ -42,4 +43,6 @@ __all__ = [
     "TRTLLMGenFusedMoE",
     "VanillaMoE",
     "WideEPMoE",
+    "MoEPrefetchManager",
+    "MoEPrefetchProxy",
 ]

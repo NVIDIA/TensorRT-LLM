@@ -21,7 +21,8 @@ from ..distributed.communicator import pp_recv, pp_send
 from ..model_config import ModelConfig, TConfig
 from ..modules.attention import Attention
 from ..modules.embedding import Embedding, LMHead
-from ..modules.fused_moe import MoE, VanillaMoE
+from ..modules.fused_moe import (MoE, MoEPrefetchManager, MoEPrefetchProxy,
+                                 VanillaMoE)
 from ..modules.linear import Linear, TensorParallelMode, WeightMode
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
@@ -239,6 +240,29 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
         self.prologue = []
         self.epilogue = []
         self.keep_embed_tokens = False
+
+    def __moe_prefetch_init__(self,
+                              model_config: ModelConfig,
+                              moe_layer_freq: int = 1,
+                              add_moe_layer_offset: bool = False,
+                              first_k_dense_replace: int = 0):
+        self.use_moe_prefetch = False
+        self.moe_prefetch_manager = None
+        self.moe_prefetch_proxy_list = [
+            None
+            for _ in range(model_config.pretrained_config.num_hidden_layers)
+        ]
+
+        if model_config.moe_prefetch_config is not None:
+            self.use_moe_prefetch = True
+            self.moe_prefetch_manager = MoEPrefetchManager(
+                model_config.pretrained_config.num_hidden_layers,
+                moe_layer_freq, add_moe_layer_offset, first_k_dense_replace,
+                model_config.moe_prefetch_config.prefetch_depth,
+                model_config.moe_prefetch_config.prefetch_stride)
+            for layer_idx in self.moe_prefetch_manager.prefetch_layer_indices:
+                self.moe_prefetch_proxy_list[layer_idx] = MoEPrefetchProxy(
+                    layer_idx, self.moe_prefetch_manager)
 
     def forward(
         self,
