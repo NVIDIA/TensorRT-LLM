@@ -45,6 +45,8 @@ microsoft/Phi-3.5-mini-instruct:
   - accuracy: 31.354
 microsoft/Phi-4-mini-instruct:
   - accuracy: 32.921
+  - quant_algo: FP8
+    accuracy: 32.823
 bigcode/starcoder2-7b:
   - accuracy: 26.611
   - quant_algo: FP8
@@ -209,7 +211,8 @@ mistralai/Mistral-7B-Instruct-v0.3:
     accuracy: 31.201
 mistralai/Mistral-Small-3.1-24B-Instruct-2503:
   - accuracy: 29.20
-mistralai/Mistral-Nemo-Base-2407:
+mistralai/Mistral-Nemo-12b-Base:
+  - accuracy: 28.906
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 24.0
@@ -240,10 +243,6 @@ mistralai/Mixtral-8x22B-v0.1:
     accuracy: 25.519
   - quant_algo: W8A16
     accuracy: 27.427
-microsoft/Phi-4-mini-instruct:
-  - accuracy: 32.958
-  - quant_algo: FP8
-    accuracy: 32.823
 google/gemma-2b:
   - accuracy: 23.194
   - quant_algo: W8A16

@@ -435,7 +435,9 @@ accuracy/test_llm_api.py::TestQwen2_5_7BInstruct::test_fp8_kvcache
 accuracy/test_llm_api.py::TestMistral7B_0_3::test_quant_tp4[int4]
 accuracy/test_llm_api.py::TestMistral7B_0_3::test_quant_tp4[int4_awq]
 accuracy/test_llm_api.py::TestMistral7B_0_3::test_quant_tp4[int8_awq]
-accuracy/test_llm_api.py::TestMistral_Nemo_12B_Base::test_fp8
+accuracy/test_llm_api.py::TestMistralNemo12B::test_auto_dtype
+accuracy/test_llm_api.py::TestMistralNemo12B::test_auto_dtype_tp2
+accuracy/test_llm_api.py::TestMistralNemo12B::test_fp8
 accuracy/test_llm_api.py::TestMistral_NeMo_Minitron_8B_Instruct::test_fp8
 accuracy/test_llm_api.py::TestMixtral8x7B::test_tp2
 accuracy/test_llm_api.py::TestMixtral8x7B::test_smooth_quant_tp2pp2
@@ -580,6 +582,8 @@ accuracy/test_llm_api_pytorch.py::TestPhi4MiniInstruct::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestEXAONE4::test_auto_dtype
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_nixl_backend
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_nixl_backend
+accuracy/test_llm_api_pytorch.py::TestMistralNemo12B::test_auto_dtype
+accuracy/test_llm_api_pytorch.py::TestMistralNemo12B::test_auto_dtype_tp2
 
 test_e2e.py::test_llama_e2e[use_cpp_session-remove_input_padding-]
 test_e2e.py::test_llama_e2e[use_py_session-remove_input_padding-]

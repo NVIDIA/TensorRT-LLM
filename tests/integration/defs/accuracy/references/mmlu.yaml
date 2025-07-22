@@ -277,3 +277,7 @@ GPT-OSS/MXFP4:
     accuracy: 75.50
   - quant_algo: W4A8_MXFP4_FP8
     accuracy: 75.50
+mistralai/Mistral-Nemo-12b-Base:
+  - accuracy: 69.66
+  - quant_algo: FP8
+    accuracy: 69.66
