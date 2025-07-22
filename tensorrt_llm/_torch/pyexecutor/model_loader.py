@@ -302,6 +302,7 @@ class ModelLoader:
             moe_max_num_tokens=self.llm_args.moe_config.max_num_tokens,
             moe_load_balancer=self.llm_args.moe_config.load_balancer,
             lora_config=self.lora_config,
+<<<<<<< HEAD
             allreduce_strategy=self.llm_args.allreduce_strategy,
             mm_encoder_only=self.llm_args.mm_encoder_only,
             attn_backend=self.llm_args.attn_backend,
@@ -309,6 +310,16 @@ class ModelLoader:
             moe_disable_finalize_fusion=self.llm_args.moe_config.
             disable_finalize_fusion,
             use_low_precision_moe_combine=self.llm_args.moe_config.
+=======
+            allreduce_strategy=self.pytorch_backend_config.allreduce_strategy,
+            mm_encoder_only=self.pytorch_backend_config.mm_encoder_only,
+            attn_backend=self.pytorch_backend_config.attn_backend,
+            moe_backend=self.pytorch_backend_config.moe_backend,
+            moe_disable_finalize_fusion=self.pytorch_backend_config.
+            moe_disable_finalize_fusion,
+            moe_prefetch_config=self.pytorch_backend_config.moe_prefetch_config,
+            use_low_precision_moe_combine=self.pytorch_backend_config.
+>>>>>>> ff0a57e5c (add moe weight prefetching in fused moe module for cutlass backend)
             use_low_precision_moe_combine)
 
         validate_and_set_kv_cache_quant(config,

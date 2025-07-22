@@ -115,6 +115,13 @@ def add_llm_args(parser):
     parser.add_argument('--apply_chat_template',
                         default=False,
                         action='store_true')
+    parser.add_argument(
+        '--use_moe_prefetch',
+        default=False,
+        action='store_true',
+        help='Enable MoE weight prefetching to reduce GPU memory usage')
+    parser.add_argument('--moe_prefetch_depth', type=int, default=None)
+    parser.add_argument('--moe_prefetch_stride', type=int, default=None)
 
     # Sampling
     parser.add_argument("--max_tokens", type=int, default=64)
@@ -248,7 +255,11 @@ def setup_llm(args, **kwargs):
             enable_piecewise_cuda_graph= \
                 args.use_piecewise_cuda_graph)
         if args.use_torch_compile else None,
-        moe_config=MoeConfig(backend=args.moe_backend, use_low_precision_moe_combine=args.use_low_precision_moe_combine),
+        moe_config=MoeConfig(backend=args.moe_backend,
+                             use_low_precision_moe_combine=args.use_low_precision_moe_combine,
+                             use_moe_prefetch=args.use_moe_prefetch,
+                             moe_prefetch_depth=args.moe_prefetch_depth,
+                             moe_prefetch_stride=args.moe_prefetch_stride,),
         sampler_type=args.sampler_type,
         max_seq_len=args.max_seq_len,
         max_batch_size=args.max_batch_size,

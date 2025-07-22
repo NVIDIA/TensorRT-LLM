@@ -1973,6 +1973,32 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm, is_integration_test=True)
 
+    @pytest.mark.skip_less_device(4)
+    @parametrize_with_ids("quant_dtype", [
+        pytest.param("none", marks=skip_pre_hopper),
+        pytest.param("fp8", marks=skip_no_hopper),
+        pytest.param("nvfp4", marks=skip_pre_blackwell)
+    ])
+    @pytest.mark.parametrize("tp_size,ep_size", [(4, 1), (4, 4)],
+                             ids=["tp4", "tep4"])
+    def test_weight_prefetching(self, quant_dtype, tp_size, ep_size):
+        model_path = self.MODEL_PATH
+        if quant_dtype == "fp8":
+            model_path = f"{llm_models_root()}/DeepSeek-V3-Lite/fp8"
+        elif quant_dtype == "nvfp4":
+            model_path = f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only"
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
+        pytorch_config = dict(moe_config=MoeConfig(use_moe_prefetch=True), )
+
+        with LLM(model_path,
+                 tensor_parallel_size=tp_size,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
 
 @pytest.mark.timeout(14400)
 @pytest.mark.skip_less_device_memory(80000)
