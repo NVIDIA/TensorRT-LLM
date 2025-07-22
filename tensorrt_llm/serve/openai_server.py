@@ -288,11 +288,6 @@ class OpenAIServer:
                 if request.stream else chat_response_post_processor,
                 postproc_args=postproc_args,
             )
-            
-            lora_request = None
-            if hasattr(request, 'lora_request') and request.lora_request:
-              lora_request = request.lora_request
-            
 
             promise = self.llm.generate_async(
                 inputs=prompt,
