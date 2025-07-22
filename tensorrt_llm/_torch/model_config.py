@@ -299,17 +299,12 @@ class ModelConfig(Generic[TConfig]):
             self.mapping.tp_size * self.mapping.cp_size)
 
         # Handle both uniform and per-layer KV heads
-        if hasattr(
-                self.pretrained_config, 'num_kv_heads_per_layer'
-        ) and self.pretrained_config.num_kv_heads_per_layer is not None:
+        num_kv_heads_per_layer = getattr(self.pretrained_config,
+                                         'num_kv_heads_per_layer', None)
+        if num_kv_heads_per_layer is not None:
             # For models with per-layer KV heads, like nemotron-nas
             num_kv_heads_per_layer_raw = self.pretrained_config.num_kv_heads_per_layer
-            # Apply TP/CP scaling to each layer
-            num_kv_heads_per_layer = [
-                kv_heads // (self.mapping.tp_size * self.mapping.cp_size)
-                for kv_heads in num_kv_heads_per_layer_raw
-            ]
-            _use_per_layer_kv_heads = True
+            use_per_layer_kv_heads = True
         else:
             # Check if num_key_value_heads is a list (per-layer) or scalar (uniform)
             num_kv_heads_raw = getattr(self.pretrained_config,
@@ -319,20 +314,33 @@ class ModelConfig(Generic[TConfig]):
                     num_kv_heads_raw, list):
                 # num_key_value_heads is a list - treat as per-layer KV heads
                 num_kv_heads_per_layer_raw = num_kv_heads_raw
-                # Apply TP/CP scaling to each layer
-                num_kv_heads_per_layer = [
-                    kv_heads // (self.mapping.tp_size * self.mapping.cp_size)
-                    for kv_heads in num_kv_heads_per_layer_raw
-                ]
-                _use_per_layer_kv_heads = True
+                use_per_layer_kv_heads = True
             else:
                 # num_key_value_heads is scalar or None - treat as uniform KV heads
                 if num_kv_heads_raw is None:
-                    num_kv_heads_raw = self.pretrained_config.num_attention_heads
+                    # For uniform models, check: num_key_value_heads (standard) -> num_query_groups (NeMo) -> num_attention_heads
+                    num_kv_heads_raw = getattr(
+                        self.pretrained_config, 'num_query_groups',
+                        self.pretrained_config.num_attention_heads)
 
                 num_kv_heads = num_kv_heads_raw // (self.mapping.tp_size *
                                                     self.mapping.cp_size)
-                _use_per_layer_kv_heads = False
+                use_per_layer_kv_heads = False
+
+        if use_per_layer_kv_heads:
+            # TRT-LLM LoRA requires uniform KV heads across layers
+            if self.lora_config is not None and not all(
+                    kv == num_kv_heads_per_layer_raw[0]
+                    for kv in num_kv_heads_per_layer_raw):
+                kv_heads_list = self.pretrained_config.num_kv_heads_per_layer
+                raise ValueError(
+                    f"TRT-LLM LoRA requires uniform KV heads across layers, "
+                    f"got: {kv_heads_list}")
+            # Apply TP/CP scaling to each layer
+            num_kv_heads_per_layer = [
+                kv_heads // (self.mapping.tp_size * self.mapping.cp_size)
+                for kv_heads in num_kv_heads_per_layer_raw
+            ]
 
         hidden_size = self.pretrained_config.hidden_size // self.mapping.tp_size
 
@@ -354,7 +362,7 @@ class ModelConfig(Generic[TConfig]):
         else:
             model_config_cpp.tokens_per_block = tokens_per_block
 
-        if _use_per_layer_kv_heads:
+        if use_per_layer_kv_heads:
             model_config_cpp.num_kv_heads_per_layer = num_kv_heads_per_layer
         else:
             model_config_cpp.set_num_kv_heads(num_kv_heads)
