@@ -14,9 +14,9 @@ import torch
 from binding_test_utils import *
 from pydantic import BaseModel
 
-import tensorrt_llm.bindings as _tb
 import tensorrt_llm.bindings.executor as trtllm
 import tensorrt_llm.version as trtllm_version
+from tensorrt_llm._utils import torch_to_numpy
 from tensorrt_llm.models.modeling_utils import PretrainedConfig
 
 _sys.path.append(_os.path.join(_os.path.dirname(__file__), '..'))
@@ -65,6 +65,40 @@ def test_executor_from_memory(model_files, model_path):
     json_config_str = open(model_path / "config.json", 'r').read()
     executor = trtllm.Executor(engine_buffer, json_config_str,
                                trtllm.ModelType.DECODER_ONLY, executor_config)
+
+
+def test_executor_with_managed_weights(model_files, model_path):
+    """Test executor constructor with standard dtypes in managed weights."""
+
+    executor_config = trtllm.ExecutorConfig(
+        1, kv_cache_config=trtllm.KvCacheConfig(free_gpu_memory_fraction=0.5))
+    engine_buffer = open(model_path / "rank0.engine", mode="rb").read()
+    json_config_str = open(model_path / "config.json", 'r').read()
+
+    managed_weights = {
+        "weight_float32":
+        np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
+        "weight_int32":
+        np.array([[1, 2], [3, 4]], dtype=np.int32),
+        "weight_int64":
+        np.array([[1, 2], [3, 4]], dtype=np.int64),
+        "weight_int8":
+        np.array([[1, 2], [3, 4]], dtype=np.int8),
+        "weight_fp16":
+        np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float16),
+        "weight_bf16":
+        torch_to_numpy(
+            torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.bfloat16)),
+        "weight_fp8":
+        torch_to_numpy(
+            torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float8_e4m3fn)),
+    }
+
+    executor = trtllm.Executor(engine_buffer, json_config_str,
+                               trtllm.ModelType.DECODER_ONLY, executor_config,
+                               managed_weights)
+
+    assert executor.can_enqueue_requests() == True
 
 
 def test_executor_invalid_ctor():
@@ -485,8 +519,6 @@ def test_get_num_responses_ready(streaming: bool,
     assert executor.get_num_responses_ready() == num_expected_responses
 
 
-@pytest.mark.skipif(_tb.binding_type == "nanobind",
-                    reason="Test not supported for nanobind yet")
 @pytest.mark.parametrize("batching_type", [trtllm.BatchingType.INFLIGHT])
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("beam_width", [1])
@@ -691,8 +723,6 @@ def test_token_comparison(batching_type: trtllm.BatchingType, streaming: bool,
     verify_output(tokens, test_data, given_input_lengths)
 
 
-@pytest.mark.skipif(_tb.binding_type == "nanobind",
-                    reason="Test not supported for nanobind yet")
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("beam_width", [1])
 def test_finish_reason(streaming: bool, beam_width: int, model_files,
@@ -1117,8 +1147,6 @@ def test_spec_dec_fast_logits_info():
     assert fast_logits_info.draft_participant_id == 5
 
 
-@pytest.mark.skipif(_tb.binding_type == "nanobind",
-                    reason="Test not supported for nanobind yet")
 def test_result():
     result = trtllm.Result()
     result.is_final = True
@@ -1156,8 +1184,6 @@ def test_result():
     assert (additional_output.output == torch.ones(1, 4, 100)).all()
 
 
-@pytest.mark.skipif(_tb.binding_type == "nanobind",
-                    reason="Test not supported for nanobind yet")
 def test_result_pickle():
     result = trtllm.Result()
     result.is_final = True
@@ -1171,6 +1197,9 @@ def test_result_pickle():
     result.sequence_index = 1
     result.is_sequence_final = True
     result.decoding_iter = 1
+    result.context_phase_params = trtllm.ContextPhaseParams([1, 2], 123,
+                                                            bytes([0, 1]),
+                                                            [10, 20, 30])
     result.request_perf_metrics = trtllm.RequestPerfMetrics()
     result.request_perf_metrics.last_iter = 33
     result_str = pickle.dumps(result)
@@ -1186,6 +1215,10 @@ def test_result_pickle():
     assert result.sequence_index == result_copy.sequence_index
     assert result.is_sequence_final == result_copy.is_sequence_final
     assert result.decoding_iter == result_copy.decoding_iter
+    assert result.context_phase_params.req_id == result_copy.context_phase_params.req_id
+    assert result.context_phase_params.first_gen_tokens == result_copy.context_phase_params.first_gen_tokens
+    assert result.context_phase_params.draft_tokens == result_copy.context_phase_params.draft_tokens
+    assert result.context_phase_params.opaque_state == result_copy.context_phase_params.opaque_state
     assert result.request_perf_metrics.last_iter == result_copy.request_perf_metrics.last_iter
 
 
@@ -1504,8 +1537,6 @@ def test_eagle_config():
         assert getattr(config, k) == v
 
 
-@pytest.mark.skipif(_tb.binding_type == "nanobind",
-                    reason="Test not supported for nanobind yet")
 def test_eagle_config_pickle():
     config = trtllm.EagleConfig([[0, 0], [0, 1]], False, 0.5)
     config_copy = pickle.loads(pickle.dumps(config))
@@ -1878,8 +1909,6 @@ def test_logits_post_processor(model_files, model_path):
     assert tokens[-max_tokens:] == [42] * max_tokens
 
 
-@pytest.mark.skipif(_tb.binding_type == "nanobind",
-                    reason="Test not supported for nanobind yet")
 def test_logits_post_processor_batched(model_files, model_path):
 
     # Define the logits post-processor callback
@@ -2154,8 +2183,6 @@ def test_request_perf_metrics_kv_cache(model_path):
     assert kv_cache_metrics.kv_cache_hit_rate == 1.0
 
 
-@pytest.mark.skipif(_tb.binding_type == "nanobind",
-                    reason="Test not supported for nanobind yet")
 @pytest.mark.parametrize("exclude_input_from_output", [False, True])
 def test_request_perf_metrics_draft(model_path_draft_tokens_external,
                                     exclude_input_from_output: bool):
