@@ -21,7 +21,8 @@ from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
 from tensorrt_llm._torch.speculative.mtp import SampleStateTensorsMTP
 from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
                                  torch_dtype_to_str, trace_func)
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import (MultimodalParams,
+                                            MultimodalRuntimeData)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import LoraConfig, LoraModelConfig
 from tensorrt_llm.mapping import Mapping
@@ -1145,8 +1146,16 @@ class PyTorchModelEngine(ModelEngine):
             num_cached_tokens_per_seq.append(past_seen_token_num)
 
             # Multimodal
+            # TODO: enable chunk prefill for multimodal (maybe need to pass prompt_tokens to MultimodalRuntimeData)
+            py_multimodal_runtime = MultimodalRuntimeData(
+                mm_token_lengths=request.multimodal_lengths,
+                mm_token_positions=request.multimodal_positions,
+                num_cached_tokens=past_seen_token_num
+            ) if request.multimodal_hashes is not None else None
+
             multimodal_params = MultimodalParams(
-                multimodal_data=request.py_multimodal_data)
+                multimodal_data=request.py_multimodal_data,
+                multimodal_runtime=py_multimodal_runtime)
             multimodal_params.to_device("multimodal_data",
                                         "cuda",
                                         pin_memory=True)
@@ -1207,7 +1216,8 @@ class PyTorchModelEngine(ModelEngine):
             if next_draft_tokens_device is None or request.is_dummy or request.py_batch_idx is None:
                 # get token ids, including input token ids and draft token ids. For these dummy requests,
                 # no need to copy the token ids.
-                if not request.is_dummy:
+                if not (request.is_attention_dp_dummy
+                        or request.is_cuda_graph_dummy):
                     input_ids.append(request.get_last_tokens(0))
                     input_ids.extend(request.py_draft_tokens)
                     draft_tokens.extend(request.py_draft_tokens)

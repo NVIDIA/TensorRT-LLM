@@ -52,58 +52,37 @@ struct dtype_traits<half>
 
 namespace
 {
-// todo: Properly support FP8 and BF16 and verify functionality
-tle::Tensor numpyToTensor(nb::ndarray<nb::numpy> const& array)
+tle::Tensor numpyToTensor(nb::object const& object)
 {
-    auto npDtype = array.dtype();
-    char kind = '\0';
-    switch (npDtype.code)
-    {
-    case static_cast<uint8_t>(nb::dlpack::dtype_code::Int):
-        kind = 'i'; // signed integer
-        break;
-    case static_cast<uint8_t>(nb::dlpack::dtype_code::UInt):
-        kind = 'u'; // unsigned integer
-        break;
-    case static_cast<uint8_t>(nb::dlpack::dtype_code::Float):
-        kind = 'f'; // floating point
-        break;
-    case static_cast<uint8_t>(nb::dlpack::dtype_code::Bfloat):
-        kind = 'f'; // brain floating point (treat as float kind)
-        break;
-    case static_cast<uint8_t>(nb::dlpack::dtype_code::Complex):
-        kind = 'c'; // complex
-        break;
-    default:
-        kind = 'V'; // void/other
-        break;
-    }
+    std::string dtype_name = nb::cast<std::string>(object.attr("dtype").attr("name"));
+    nb::object metadata = object.attr("dtype").attr("metadata");
+
     tle::DataType dtype;
-    if (npDtype == nb::dtype<half>())
+    if (dtype_name == "float16")
     {
         dtype = tle::DataType::kFP16;
     }
-    else if (npDtype == nb::dtype<float>())
+    else if (dtype_name == "float32")
     {
         dtype = tle::DataType::kFP32;
     }
-    else if (npDtype == nb::dtype<int8_t>())
+    else if (dtype_name == "int8")
     {
         dtype = tle::DataType::kINT8;
     }
-    else if (npDtype == nb::dtype<int32_t>())
+    else if (dtype_name == "int32")
     {
         dtype = tle::DataType::kINT32;
     }
-    else if (npDtype == nb::dtype<int64_t>())
+    else if (dtype_name == "int64")
     {
         dtype = tle::DataType::kINT64;
     }
-    else if (kind == 'V' && array.itemsize() == 1)
+    else if (dtype_name == "void8" && !metadata.is_none() && nb::cast<std::string>(metadata["dtype"]) == "float8")
     {
         dtype = tle::DataType::kFP8;
     }
-    else if (kind == 'V' && array.itemsize() == 2)
+    else if (dtype_name == "void16" && !metadata.is_none() && nb::cast<std::string>(metadata["dtype"]) == "bfloat16")
     {
         dtype = tle::DataType::kBF16;
     }
@@ -112,16 +91,21 @@ tle::Tensor numpyToTensor(nb::ndarray<nb::numpy> const& array)
         TLLM_THROW("Unsupported numpy dtype.");
     }
 
-    // todo: improve the following code
+    nb::object array_interface = object.attr("__array_interface__");
+    nb::object shape_obj = array_interface["shape"];
     std::vector<int64_t> dims;
-    dims.reserve(array.ndim());
-    for (size_t i = 0; i < array.ndim(); ++i)
-    {
-        dims.push_back(static_cast<int64_t>(array.shape(i)));
-    }
-    tle::Shape shape(dims.data(), dims.size());
+    dims.reserve(nb::len(shape_obj));
 
-    return tle::Tensor::of(dtype, const_cast<void*>(array.data()), shape);
+    for (size_t i = 0; i < nb::len(shape_obj); ++i)
+    {
+        dims.push_back(nb::cast<int64_t>(shape_obj[i]));
+    }
+
+    nb::object data_obj = array_interface["data"];
+    uintptr_t addr = nb::cast<uintptr_t>(data_obj[0]);
+    void* data_ptr = reinterpret_cast<void*>(addr);
+    tle::Shape shape(dims.data(), dims.size());
+    return tle::Tensor::of(dtype, data_ptr, shape);
 }
 
 } // namespace
@@ -153,8 +137,8 @@ Executor::Executor(nb::bytes const& engineBuffer, std::string const& jsonConfigS
         for (auto const& [rawName, rawArray] : managedWeights.value())
         {
             std::string name = nb::cast<std::string>(rawName);
-            nb::ndarray<nb::numpy> array = nb::cast<nb::ndarray<nb::numpy>>(rawArray);
-            managedWeightsMap->emplace(name, numpyToTensor(array));
+            nb::object array_obj = nb::cast<nb::object>(rawArray);
+            managedWeightsMap->emplace(name, numpyToTensor(array_obj));
         }
     }
     mExecutor = std::make_unique<tle::Executor>(

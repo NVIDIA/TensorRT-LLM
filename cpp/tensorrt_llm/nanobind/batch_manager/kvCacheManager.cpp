@@ -48,6 +48,9 @@ using SizeType32 = tensorrt_llm::runtime::SizeType32;
 using TokenIdType = tensorrt_llm::runtime::TokenIdType;
 using VecTokens = std::vector<TokenIdType>;
 using CudaStreamPtr = std::shared_ptr<tensorrt_llm::runtime::CudaStream>;
+using CacheBlockIds = std::vector<std::vector<SizeType32>>;
+
+NB_MAKE_OPAQUE(CacheBlockIds);
 
 namespace
 {
@@ -424,7 +427,15 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("get_newly_allocated_block_ids", &BaseKVCacheManager::getNewlyAllocatedBlockIds)
         .def("flush_iteration_events", &BaseKVCacheManager::flushIterationEvents);
 
-    nb::bind_vector<std::vector<std::vector<SizeType32>>>(m, "CacheBlockIds");
+    nb::bind_vector<CacheBlockIds>(m, "CacheBlockIds")
+        .def("__getstate__", [](CacheBlockIds const& v) { return nb::make_tuple(v); })
+        .def("__setstate__",
+            [](CacheBlockIds& self, nb::tuple const& t)
+            {
+                if (t.size() != 1)
+                    throw std::runtime_error("Invalid state!");
+                new (&self) CacheBlockIds(nb::cast<std::vector<std::vector<SizeType32>>>(t[0]));
+            });
 
     nb::enum_<tbk::CacheType>(m, "CacheType")
         .value("SELF", tbk::CacheType::kSELF)

@@ -12,4 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-__version__ = "1.0.0rc5"
+"""
+Utility modules for TensorRT-LLM integration tests.
+
+This package provides various utilities to simplify test development and reduce
+boilerplate code.
+"""
+
+from .timeout_manager import (TimeoutManager, create_timeout_manager,
+                              with_timeout_management)
+
+__all__ = [
+    'TimeoutManager', 'with_timeout_management', 'create_timeout_manager'
+]
