@@ -1095,7 +1095,6 @@ private:
     /// @brief The period in milliseconds to gather attention DP events across ranks
     SizeType32 mAttentionDpEventsGatherPeriodMs;
     /// @brief The maximum size in bytes of GPU memory that can be allocated for the KV cache.
-    /// This is only used for VSWA case for now as a alternative to mMaxTokens.
     /// If both mMaxGpuTotalBytes and mFreeGpuMemoryFraction are specified, memory corresponding to the minimum will
     /// be allocated.
     uint64_t mMaxGpuTotalBytes;
