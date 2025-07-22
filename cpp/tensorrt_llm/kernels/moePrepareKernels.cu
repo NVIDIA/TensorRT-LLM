@@ -319,19 +319,19 @@ __global__ void computeCumsumDevice(int* sendCountsCumsum, int* recvCountsCumsum
     }
 }
 
-template <typename STEP_COMMUNICATOR_TYPE>
+template <typename PipelineConfig>
 class PacketPipeline
 {
 public:
     __device__ __inline__ PacketPipeline(
-        void* bufferBase, STEP_COMMUNICATOR_TYPE* stepCommunicator, int* sharedNewStepPtr, bool isSender)
+        void* bufferBase, StepCommunicatorBase* stepCommunicator, int* sharedNewStepPtr, bool isSender)
         : bufferBase(bufferBase)
         , stepCommunicator(stepCommunicator)
         , shared_new_step(sharedNewStepPtr)
     {
         step = 0;
         needRelease = false;
-        packetId = isSender ? 0 : PACKET_PER_STEP - 1;
+        packetId = isSender ? 0 : PipelineConfig::PACKET_PER_STEP - 1;
     }
 
     __device__ __forceinline__ void* getFirstSendPacket()
@@ -343,9 +343,10 @@ public:
     {
 
         packetId++;
-        if (packetId < PACKET_PER_STEP)
+        if (packetId < PipelineConfig::PACKET_PER_STEP)
         {
-            return acquireNewStep ? bufferBase + step * PACKET_PER_STEP * PACKET_SIZE + packetId * PACKET_SIZE
+            return acquireNewStep ? bufferBase + step * PipelineConfig::PACKET_PER_STEP * PipelineConfig::PACKET_SIZE
+                    + packetId * PipelineConfig::PACKET_SIZE
                                   : nullptr;
         }
 
@@ -365,7 +366,7 @@ public:
         {
             step = *(shared_new_step);
             packetId = 0;
-            return bufferBase + step * PACKET_SIZE * PACKET_PER_STEP;
+            return bufferBase + step * PipelineConfig::PACKET_SIZE * PipelineConfig::PACKET_PER_STEP;
         }
 
         return nullptr;
@@ -382,9 +383,10 @@ public:
     __device__ __inline__ void* getNewRecvPacket()
     {
         packetId++;
-        if (packetId < PACKET_PER_STEP)
+        if (packetId < PipelineConfig::PACKET_PER_STEP)
         {
-            return bufferBase + step * PACKET_PER_STEP * PACKET_SIZE + packetId * PACKET_SIZE;
+            return bufferBase + step * PipelineConfig::PACKET_PER_STEP * PipelineConfig::PACKET_SIZE
+                + packetId * PipelineConfig::PACKET_SIZE;
         }
 
         __syncthreads();
@@ -401,7 +403,7 @@ public:
         __syncthreads();
         packetId = 0;
         step = *(shared_new_step);
-        void* packetPtr = bufferBase + step * PACKET_SIZE * PACKET_PER_STEP;
+        void* packetPtr = bufferBase + step * PipelineConfig::PACKET_SIZE * PipelineConfig::PACKET_PER_STEP;
 
         return packetPtr;
     }
@@ -415,14 +417,14 @@ public:
     }
 
     void* bufferBase;
-    STEP_COMMUNICATOR_TYPE* stepCommunicator;
+    StepCommunicatorBase* stepCommunicator;
     int step;
     int packetId;
     bool needRelease;
     int* shared_new_step;
 };
 
-template <typename STEP_COMMUNICATOR_TYPE>
+template <typename PipelineConfig, typename ExpertType, typename ScaleType>
 __global__ void allToAllMetadataDevice(int* sendExperts, int* recvExperts, float* sendScales, float* recvScales,
     int* localExpertStatics, int* gatheredExpertStatics, MoeCommWorkspace workspace, int* sendCountsCumsum,
     int* localSendIndice, int* recvCountsCumsum, int* localRecvIndice, int tokenCount, int maxTokenCountPerRank,
@@ -431,22 +433,21 @@ __global__ void allToAllMetadataDevice(int* sendExperts, int* recvExperts, float
     bool isSender = (blockIdx.y == 0);
     int targetRankId = blockIdx.x;
     int slotCountPerRank = slotCount / rankCount;
-    int groupSize = topK / UNIT_SIZE;
-    int groupId = threadIdx.x % groupSize;
+    int groupSize = topK / PipelineConfig::UNIT_SIZE;
 
     __shared__ int sharedNewStep;
-    __align__(16) int experts[UNIT_SIZE];
-    __align__(16) float scales[UNIT_SIZE];
+    __align__(16) int experts[PipelineConfig::UNIT_SIZE];
+    __align__(16) float scales[PipelineConfig::UNIT_SIZE];
 
     uint8_t* bufferBase = (uint8_t*) (workspace.getFifoBasePtr(isSender, rankId, targetRankId, 0, 1));
-    STEP_COMMUNICATOR_TYPE stepCommunicator(workspace.getFifoConnInfo(isSender, rankId, targetRankId, 0, rankCount, 1));
-    PacketPipeline<STEP_COMMUNICATOR_TYPE> pipeline(bufferBase, &stepCommunicator, &sharedNewStep, isSender);
+    StepCommunicatorBase stepCommunicator(workspace.getFifoConnInfo(isSender, rankId, targetRankId, 0, rankCount, 1));
+    PacketPipeline<PipelineConfig> pipeline(bufferBase, &stepCommunicator, &sharedNewStep, isSender);
 
     if (isSender)
     {
         int baseCumsum = targetRankId == 0 ? 0 : *(sendCountsCumsum + targetRankId - 1);
         int sendTokenCount = *(sendCountsCumsum + targetRankId) - baseCumsum;
-        int unitCount = sendTokenCount * topK / UNIT_SIZE;
+        int unitCount = sendTokenCount * topK / PipelineConfig::UNIT_SIZE;
 
         void* packPtr = pipeline.getFirstSendPacket();
         int indexBase = 0;
@@ -457,13 +458,15 @@ __global__ void allToAllMetadataDevice(int* sendExperts, int* recvExperts, float
             if (threadIdx.x < UNIT_PER_ITER)
             {
                 int index = indexBase + threadIdx.x;
+                int groupId = index % groupSize;
                 if (index < unitCount)
                 {
                     int tokenId = *(localSendIndice + maxTokenCountPerRank * targetRankId + (index / groupSize));
-                    *((int4*) (experts)) = *(int4*) (sendExperts + tokenId * topK + groupId * UNIT_SIZE);
+                    *((ExpertType*) (experts))
+                        = *(ExpertType*) (sendExperts + tokenId * topK + groupId * PipelineConfig::UNIT_SIZE);
 
 #pragma unroll
-                    for (int j = 0; j < UNIT_SIZE; j++)
+                    for (int j = 0; j < PipelineConfig::UNIT_SIZE; j++)
                     {
                         int expertId = experts[j];
                         if (expertId / slotCountPerRank != targetRankId)
@@ -472,14 +475,15 @@ __global__ void allToAllMetadataDevice(int* sendExperts, int* recvExperts, float
                         }
                     }
 
-                    int* expertsPtr = (int*) (packPtr) + threadIdx.x * UNIT_SIZE;
-                    *((int4*) (expertsPtr)) = *((int4*) (experts));
+                    int* expertsPtr = (int*) (packPtr) + threadIdx.x * PipelineConfig::UNIT_SIZE;
+                    *((ExpertType*) (expertsPtr)) = *((ExpertType*) (experts));
                     if (sendScales != nullptr)
                     {
-                        *((float4*) (scales)) = *(float4*) (sendScales + tokenId * topK + groupId * UNIT_SIZE);
-                        float* scaleBasePtr = (float*) (packPtr + SCALE_OFFSET);
-                        float* scalesPtr = (float*) (scaleBasePtr) + threadIdx.x * UNIT_SIZE;
-                        *((float4*) (scalesPtr)) = *((float4*) (scales));
+                        *((ScaleType*) (scales))
+                            = *(ScaleType*) (sendScales + tokenId * topK + groupId * PipelineConfig::UNIT_SIZE);
+                        float* scaleBasePtr = (float*) (packPtr + PipelineConfig::SCALE_OFFSET);
+                        float* scalesPtr = (float*) (scaleBasePtr) + threadIdx.x * PipelineConfig::UNIT_SIZE;
+                        *((ScaleType*) (scalesPtr)) = *((ScaleType*) (scales));
                     }
                 }
             }
@@ -488,7 +492,7 @@ __global__ void allToAllMetadataDevice(int* sendExperts, int* recvExperts, float
                 int staticCopyIdx = threadIdx.x - UNIT_PER_ITER;
                 if (staticCopyBase + staticCopyIdx * 4 < expertCount)
                 {
-                    int4* staticBasePtr = (int4*) (packPtr + STATIC_COPY_OFFSET);
+                    int4* staticBasePtr = (int4*) (packPtr + PipelineConfig::STATIC_COPY_OFFSET);
                     int4 staticData = *(int4*) (localExpertStatics + staticCopyBase + staticCopyIdx * 4);
                     *(staticBasePtr + staticCopyIdx) = staticData;
                 }
@@ -521,18 +525,21 @@ __global__ void allToAllMetadataDevice(int* sendExperts, int* recvExperts, float
                 if (threadIdx.x < packetUnitCount)
                 {
                     int tokenId = baseCumsum + (unitIdBase + threadIdx.x) / groupSize;
-                    int* expertsPtr = (int*) (packetPtr) + threadIdx.x * UNIT_SIZE;
-                    *((int4*) (experts)) = *((int4*) (expertsPtr));
-                    int4* dstExpertsPtr = (int4*) (recvExperts + tokenId * topK + groupId * UNIT_SIZE);
-                    *dstExpertsPtr = *((int4*) (experts));
+                    int groupId = (unitIdBase + threadIdx.x) % groupSize;
+                    int* expertsPtr = (int*) (packetPtr) + threadIdx.x * PipelineConfig::UNIT_SIZE;
+                    *((ExpertType*) (experts)) = *((ExpertType*) (expertsPtr));
+                    ExpertType* dstExpertsPtr
+                        = (ExpertType*) (recvExperts + tokenId * topK + groupId * PipelineConfig::UNIT_SIZE);
+                    *dstExpertsPtr = *((ExpertType*) (experts));
 
                     if (recvScales != nullptr)
                     {
-                        float* scaleBasePtr = (float*) (packetPtr + SCALE_OFFSET);
-                        float* scalesPtr = scaleBasePtr + threadIdx.x * UNIT_SIZE;
-                        *((float4*) (scales)) = *((float4*) (scalesPtr));
-                        float4* dstScalesPtr = (float4*) (recvScales + tokenId * topK + groupId * UNIT_SIZE);
-                        *dstScalesPtr = *((float4*) (scales));
+                        float* scaleBasePtr = (float*) (packetPtr + PipelineConfig::SCALE_OFFSET);
+                        float* scalesPtr = scaleBasePtr + threadIdx.x * PipelineConfig::UNIT_SIZE;
+                        *((ScaleType*) (scales)) = *((ScaleType*) (scalesPtr));
+                        ScaleType* dstScalesPtr
+                            = (ScaleType*) (recvScales + tokenId * topK + groupId * PipelineConfig::UNIT_SIZE);
+                        *dstScalesPtr = *((ScaleType*) (scales));
                     }
                 }
             }
@@ -541,7 +548,7 @@ __global__ void allToAllMetadataDevice(int* sendExperts, int* recvExperts, float
                 int staticCopyIdx = threadIdx.x - UNIT_PER_ITER;
                 if (staticCopyBase + staticCopyIdx * 4 < expertCount)
                 {
-                    int4* staticBasePtr = (int4*) (packetPtr + STATIC_COPY_OFFSET);
+                    int4* staticBasePtr = (int4*) (packetPtr + PipelineConfig::STATIC_COPY_OFFSET);
                     int4 staticData = *(staticBasePtr + staticCopyIdx);
                     *(int4*) (gatheredExpertStatics + targetRankId * expertCount + staticCopyBase + staticCopyIdx * 4)
                         = staticData;
@@ -630,10 +637,28 @@ void allToAllMetadata(int* sendExperts, int* recvExperts, float* sendScales, flo
     dim3 block(block_size);
     dim3 grid(rankCount, 2);
 
-    allToAllMetadataDevice<StepCommunicatorBase><<<grid, block, 0, stream>>>(sendExperts, recvExperts, sendScales,
-        recvScales, localExpertStatics, gatheredExpertStatics, workspace, sendCountsCumsum, localSendIndice,
-        recvCountsCumsum, localRecvIndice, tokenCount, maxTokenCountPerRank, topK, expertCount, slotCount, rankId,
-        rankCount);
+    if (topK % 4 == 0)
+    {
+        using PipelineConfig = PipelineConfig<4, 16>;
+        static_assert(
+            PipelineConfig::PACKET_SIZE_IN_U64 * PipelineConfig::PACKET_PER_STEP * STEP_DEPTH <= FIFO_SIZE_IN_U64,
+            "FIFO size is too small");
+        allToAllMetadataDevice<PipelineConfig, int4, float4><<<grid, block, 0, stream>>>(sendExperts, recvExperts,
+            sendScales, recvScales, localExpertStatics, gatheredExpertStatics, workspace, sendCountsCumsum,
+            localSendIndice, recvCountsCumsum, localRecvIndice, tokenCount, maxTokenCountPerRank, topK, expertCount,
+            slotCount, rankId, rankCount);
+    }
+    else
+    {
+        using PipelineConfig = PipelineConfig<1, 64>;
+        static_assert(
+            PipelineConfig::PACKET_SIZE_IN_U64 * PipelineConfig::PACKET_PER_STEP * STEP_DEPTH <= FIFO_SIZE_IN_U64,
+            "FIFO size is too small");
+        allToAllMetadataDevice<PipelineConfig, int, float><<<grid, block, 0, stream>>>(sendExperts, recvExperts,
+            sendScales, recvScales, localExpertStatics, gatheredExpertStatics, workspace, sendCountsCumsum,
+            localSendIndice, recvCountsCumsum, localRecvIndice, tokenCount, maxTokenCountPerRank, topK, expertCount,
+            slotCount, rankId, rankCount);
+    }
 
     int smCount = tensorrt_llm::common::getMultiProcessorCount();
     memsetExpertIdsDevice<<<smCount, 256, 0, stream>>>(
@@ -642,7 +667,7 @@ void allToAllMetadata(int* sendExperts, int* recvExperts, float* sendScales, flo
 
 size_t getMoePrepareWorkspaceSize(int epSize)
 {
-    return (STEP_DEPTH * PACKET_PER_STEP * PACKET_SIZE + StepCommunicatorBase::META_SIZE) * epSize;
+    return (FIFO_SIZE_IN_U64 * 8 + StepCommunicatorBase::META_SIZE) * epSize;
 }
 
 } // namespace moe_prepare
