@@ -303,7 +303,7 @@ class ModelConfig(Generic[TConfig]):
                                          'num_kv_heads_per_layer', None)
         if num_kv_heads_per_layer is not None:
             # For models with per-layer KV heads, like nemotron-nas
-            num_kv_heads_per_layer_raw = self.pretrained_config.num_kv_heads_per_layer
+            kv_heads_per_layer_raw = num_kv_heads_per_layer
             use_per_layer_kv_heads = True
         else:
             # Check if num_key_value_heads is a list (per-layer) or scalar (uniform)
@@ -313,7 +313,7 @@ class ModelConfig(Generic[TConfig]):
             if num_kv_heads_raw is not None and isinstance(
                     num_kv_heads_raw, list):
                 # num_key_value_heads is a list - treat as per-layer KV heads
-                num_kv_heads_per_layer_raw = num_kv_heads_raw
+                kv_heads_per_layer_raw = num_kv_heads_raw
                 use_per_layer_kv_heads = True
             else:
                 # num_key_value_heads is scalar or None - treat as uniform KV heads
@@ -329,17 +329,15 @@ class ModelConfig(Generic[TConfig]):
 
         if use_per_layer_kv_heads:
             # TRT-LLM LoRA requires uniform KV heads across layers
-            if self.lora_config is not None and not all(
-                    kv == num_kv_heads_per_layer_raw[0]
-                    for kv in num_kv_heads_per_layer_raw):
-                kv_heads_list = self.pretrained_config.num_kv_heads_per_layer
+            if self.lora_config is not None and len(
+                    set(kv_heads_per_layer_raw)) > 1:
                 raise ValueError(
                     f"TRT-LLM LoRA requires uniform KV heads across layers, "
-                    f"got: {kv_heads_list}")
+                    f"got: {kv_heads_per_layer_raw}")
             # Apply TP/CP scaling to each layer
             num_kv_heads_per_layer = [
                 kv_heads // (self.mapping.tp_size * self.mapping.cp_size)
-                for kv_heads in num_kv_heads_per_layer_raw
+                for kv_heads in kv_heads_per_layer_raw
             ]
 
         hidden_size = self.pretrained_config.hidden_size // self.mapping.tp_size
