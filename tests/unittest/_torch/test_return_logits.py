@@ -94,7 +94,7 @@ def test_generate_async_with_return_logits(disable_overlap_scheduler: bool,
             or return_log_probs):  # prune space
         pytest.skip("Nothing to test")
 
-    if not enable_torch_sampler and gather_context_logits:
+    if enable_torch_sampler and gather_context_logits:
         pytest.skip("TorchSampler does not support gather_context_logits")
 
     build_config = BuildConfig()
