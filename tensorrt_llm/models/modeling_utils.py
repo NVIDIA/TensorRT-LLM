@@ -125,6 +125,12 @@ class SpeculativeDecodingMode(IntFlag):
 
 
 @dataclasses.dataclass
+class KvCacheConnectorConfig:
+    connector_module: str
+    connector_class: str
+
+
+@dataclasses.dataclass
 class QuantConfig:
     """
     Serializable quantization configuration class, part of the PretrainedConfig.
