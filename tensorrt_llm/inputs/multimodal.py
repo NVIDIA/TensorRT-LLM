@@ -234,9 +234,7 @@ class MultimodalParams:
                 f"MultimodalParams: Unsupported element '{element}' to move to device. "
                 f"Supported elements: 'multimodal_data', 'multimodal_input'")
 
-    def to_handle(self,
-                  element: str,
-                  key: Optional[str] = None) -> None:
+    def to_handle(self, element: str, key: Optional[str] = None) -> None:
         """Convert multimodal data to tensor handle.
 
         Converts torch.Tensor objects to SharedTensorContainer handles (serializable dictionaries)
@@ -300,9 +298,7 @@ class MultimodalParams:
             raise ValueError(
                 f"Unsupported element '{element}' to convert to handle.")
 
-    def to_tensor(self,
-                  element: str,
-                  key: Optional[str] = None) -> None:
+    def to_tensor(self, element: str, key: Optional[str] = None) -> None:
         """Convert multimodal tensor handles back to tensors. This is the dual operation to to_handle.
 
         Converts SharedTensorContainer handles (serializable dictionaries) back to torch.Tensor objects
