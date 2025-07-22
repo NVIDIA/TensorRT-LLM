@@ -358,7 +358,10 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_device_not_contain(["H100", "H200", "B200"])
     def test_fp8_tp4(self):
         model_path = f"{llm_models_root()}/modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8"
-        with LLM(model_path, tensor_parallel_size=4) as llm:
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+        with LLM(model_path,
+                 tensor_parallel_size=4,
+                 kv_cache_config=kv_cache_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
