@@ -492,7 +492,18 @@ def test_nemo_lora_unsupported_modules_validation(tmp_path):
 
 @force_ampere
 def test_gqa_nemo_lora(tmp_path):
-    """Test NeMo LoRA with GQA using TinyLlama."""
+    """
+    Test NeMo-format LoRA checkpoint loading and GQA support in TinyLlama.
+
+    This test verifies two properties:
+    1. That a NeMo-format LoRA checkpoint with GQA (grouped query attention) can be loaded and applied to a TinyLlama model,
+       and that generation with this LoRA produces a deterministic, expected output for a fixed prompt and temperature=0.0.
+    2. That the LoRA weights have a significant effect: generating with LoRA produces a different output than generating
+       without LoRA, confirming that the LoRA adapter is actually being applied.
+
+    The test uses a deterministic dummy LoRA checkpoint (seed=42) and checks both the positive (LoRA applied) and negative
+    (no LoRA) cases for output text.
+    """
     # TinyLlama's exact GQA configuration
     hidden_size = 2048
     num_layers = 22
@@ -507,7 +518,11 @@ def test_gqa_nemo_lora(tmp_path):
         lora_rank=lora_rank,
         num_attention_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
+        seed=42,  # NOTE: the seed=42 is important for the test to pass.
     )
+    expected_lora_text_output = "Paris. The capital of France is Paris. The"
+    test_prompts = ["The capital of France is"]
+    sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
 
     lora_config = LoraConfig(
         lora_dir=[str(nemo_path)],
@@ -517,23 +532,6 @@ def test_gqa_nemo_lora(tmp_path):
 
     model_path = get_model_path("llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
 
-    # First, generate without LoRA
-    llm_no_lora = LLM(
-        model=model_path,
-        kv_cache_config=global_kvcache_config,
-    )
-
-    try:
-        test_prompts = ["The capital of France is"]
-        sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
-
-        # Generate without LoRA
-        outputs_no_lora = llm_no_lora.generate(test_prompts, sampling_params)
-        no_lora_text = outputs_no_lora[0].outputs[0].text
-    finally:
-        llm_no_lora.shutdown()
-
-    # Now generate with LoRA
     llm = LLM(
         model=model_path,
         lora_config=lora_config,
@@ -546,30 +544,24 @@ def test_gqa_nemo_lora(tmp_path):
                                str(nemo_path),
                                lora_ckpt_source="nemo")
 
-        outputs = llm.generate(test_prompts,
-                               sampling_params,
-                               lora_request=[lora_req])
+        lora_outputs = llm.generate(test_prompts,
+                                    sampling_params,
+                                    lora_request=[lora_req])
 
-        # Validate output
-        assert len(outputs) == 1
-        assert outputs[0].outputs[0] is not None
-        assert len(outputs[0].outputs[0].token_ids) > 0
+        # For the above deterministic dummy LoRA checkpoint,
+        # with temperature=0.0,
+        # the expected output text should always be the same.
+        assert lora_outputs[0].outputs[0].text == expected_lora_text_output, \
+            f"Expected output text: {expected_lora_text_output}, " \
+            f"got: {lora_outputs[0].outputs[0].text}"
+        assert len(lora_outputs) == 1
 
-        # Compare with and without LoRA
-        lora_text = outputs[0].outputs[0].text
-        assert lora_text, "Generated text with LoRA should not be empty"
-
-        # Check that both outputs start with the expected completion "Paris"
-        assert "Paris" in lora_text or "paris" in lora_text.lower(), \
-            f"LoRA output should contain 'Paris', got: {lora_text}"
-        assert "Paris" in no_lora_text or "paris" in no_lora_text.lower(), \
-            f"No-LoRA output should contain 'Paris', got: {no_lora_text}"
-
-        # Since dummy LoRA weights are initialized with small values,
-        # the outputs should be similar. 60% was trial and error.
-        assert similar(
-            lora_text, no_lora_text,
-            threshold=0.60), "LoRA and no LoRA outputs should be similar"
-
+        # Generate without LoRA.
+        # The LoRA weights are tuned/large enough that
+        # they differ from a no-LoRA run.
+        base_outputs = llm.generate(test_prompts, sampling_params)
+        assert base_outputs[0].outputs[0].text != expected_lora_text_output, \
+            f"No-LoRA output should differ from expected output text: {expected_lora_text_output}, " \
+            f"got: {base_outputs[0].outputs[0].text}"
     finally:
         llm.shutdown()

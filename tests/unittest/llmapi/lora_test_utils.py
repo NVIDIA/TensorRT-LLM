@@ -1,4 +1,3 @@
-# NeMo LoRA test utilities
 import json
 import tarfile
 import tempfile
@@ -123,14 +122,15 @@ def check_llama_7b_multi_lora_from_request_test_harness(
 
 
 def create_mock_nemo_lora_checkpoint(
-    lora_dir: Path,
-    hidden_size: int = 4096,
-    num_layers: int = 32,
-    lora_rank: int = 8,
-    tp_size: int = 1,
-    num_attention_heads: int = 32,
-    num_kv_heads: int = None,  # If None, defaults to num_attention_heads
-    dtype: torch.dtype = torch.float16,
+        lora_dir: Path,
+        hidden_size: int = 4096,
+        num_layers: int = 32,
+        lora_rank: int = 8,
+        tp_size: int = 1,
+        num_attention_heads: int = 32,
+        num_kv_heads: int = None,  # If None, defaults to num_attention_heads
+        dtype: torch.dtype = torch.float16,
+        seed: int = None,  # For deterministic weight initialization
 ) -> Path:
     """Create a minimal NeMo LoRA checkpoint for testing.
 
@@ -171,6 +171,10 @@ def create_mock_nemo_lora_checkpoint(
     with tempfile.TemporaryDirectory() as temp_dir_str:
         temp_dir = Path(temp_dir_str)
 
+        # Set random seed for deterministic weight initialization
+        if seed is not None:
+            torch.manual_seed(seed)
+
         weights_dict = {}
 
         head_dim = hidden_size // num_attention_heads
@@ -178,19 +182,24 @@ def create_mock_nemo_lora_checkpoint(
 
         qkv_output_dim = hidden_size + 2 * kv_hidden_size
 
+        # NOTE:
+        # for seed=42, and coefficient=0.02, the expected outputs are hardcoded
+        # in the test `test_llm_pytorch.py::test_gqa_nemo_lora`.
+        # Therefore changing "WEIGHTS_COEFFICIENT" or the seed will break the test.
+        WEIGHTS_COEFFICIENT = 0.02
         for layer_idx in range(num_layers):
             key_prefix = f"model.layers.{layer_idx}.self_attention.adapter_layer.lora_kqv_adapter"
 
             # Create linear_in weights [lora_rank, hidden_size] with small random values
             linear_in_key = f"{key_prefix}.linear_in.weight"
             weights_dict[linear_in_key] = torch.randn(
-                lora_rank, hidden_size, dtype=dtype) * 0.01
+                lora_rank, hidden_size, dtype=dtype) * WEIGHTS_COEFFICIENT
 
             # Create linear_out weights [qkv_output_dim, lora_rank] for fused QKV
             # This is the key difference for GQA - the output dimension changes
             linear_out_key = f"{key_prefix}.linear_out.weight"
             weights_dict[linear_out_key] = torch.randn(
-                qkv_output_dim, lora_rank, dtype=dtype) * 0.01
+                qkv_output_dim, lora_rank, dtype=dtype) * WEIGHTS_COEFFICIENT
 
         ckpt_path = temp_dir / "model_weights.ckpt"
         torch.save(weights_dict, ckpt_path)
