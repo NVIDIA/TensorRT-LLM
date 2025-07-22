@@ -541,7 +541,6 @@ Run 32-way expert parallelism inference on the prepared dataset. Please refer to
 ```bash
 cat > ./extra_llm_api_options.yaml <<EOF
 enable_attention_dp: true
-cuda_graph_config: {}
 EOF
 
 trtllm-llmapi-launch \
@@ -622,7 +621,6 @@ Run 36-way expert parallelism inference with the EPLB configuration incorporated
 ```bash
 cat > ./extra_llm_api_options_eplb.yaml <<EOF
 enable_attention_dp: true
-cuda_graph_config: {}
 moe_config:
   load_balancer: ./moe_load_balancer.yaml
 EOF

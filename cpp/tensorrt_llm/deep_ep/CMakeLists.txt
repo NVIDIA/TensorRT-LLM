@@ -1,4 +1,4 @@
-set(DEEP_EP_COMMIT eb3f072664251c05074c3ecc3c3f5dad179c29a9)
+set(DEEP_EP_COMMIT 7b15af835942675df041eca2dcb9930b880287e1)
 set(NVSHMEM_URL_HASH
     SHA256=eb2c8fb3b7084c2db86bd9fd905387909f1dfd483e7b45f7b3c3d5fcf5374b5a)
 
@@ -35,6 +35,9 @@ file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/cuda_architectures.txt
 if(NOT DEEP_EP_CUDA_ARCHITECTURES)
   return()
 endif()
+
+# Ensure that dependent libraries are installed
+find_library(MLX5_lib NAMES mlx5 REQUIRED)
 
 # Prepare files
 # =============

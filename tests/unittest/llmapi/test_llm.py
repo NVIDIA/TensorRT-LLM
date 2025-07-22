@@ -49,9 +49,9 @@ from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
 # isort: off
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
 from gc_utils import assert_resource_freed
-from utils.util import skip_single_gpu
+from llmapi.lora_test_utils import check_llama_7b_multi_unique_lora_adapters_from_request
 from utils.llm_data import llm_models_root
-from utils.util import force_ampere, similar, skip_gpu_memory_less_than_40gb, skip_pre_hopper
+from utils.util import force_ampere, similar, skip_gpu_memory_less_than_40gb, skip_pre_hopper, skip_single_gpu
 # isort: on
 
 # The unittests are based on the tiny-llama, which is fast to build and run.
@@ -661,15 +661,14 @@ def test_generate_with_SamplingConfig(llm_for_sampling_params: LLM,
 @force_ampere
 @pytest.mark.part0
 def test_generate_with_seed(llm_for_sampling_params: LLM):
-    pytest.skip("https://nvbugs/5368507")
     prompts = ["The capital of France is"] * 10
     # Use a high temperature and large max_tokens to increase the diversity
     sampling_params = [
         SamplingParams(temperature=100, top_k=100, max_tokens=100)
         for _ in range(10)
     ]
-    # Fix the seed for the first 5 prompts
-    for i in range(5):
+    # Fix the seed for the second 5 prompts
+    for i in range(5, 10):
         sampling_params[i].seed = 515
 
     llm = llm_for_sampling_params
@@ -1363,67 +1362,46 @@ def llama_v2_13b_lora_from_dir_test_harness(**llm_kwargs):
         assert similar(output.outputs[0].text, ref)
 
 
-def llama_7b_multi_lora_from_request_test_harness(**llm_kwargs):
-    hf_model_dir = get_model_path("llama-models/llama-7b-hf")
-    hf_lora_dir1 = get_model_path("llama-models/luotuo-lora-7b-0.1")
-    hf_lora_dir2 = get_model_path("llama-models/Japanese-Alpaca-LoRA-7b-v0")
-
+@pytest.mark.parametrize(
+    "lora_adapter_count_per_call, max_loras, max_cpu_loras, repeat_calls, repeats_per_call",
+    [
+        # Test eviction and re-loading a previously evicted adapter from the LoRA GPU cache, within a single
+        # llm.generate call, that's repeated twice.
+        ([
+            2,
+        ], 1, 2, 2, 3),
+        # Test eviction and loading of new adapters in the evicted space, over several llm.generate calls, with LoRA GPU
+        # cache size < LoRA CPU cache size
+        ([2, 2, 2], 1, 3, 1, 1),
+    ])
+@skip_gpu_memory_less_than_40gb
+def test_llama_7b_multi_lora_evict_load_new_adapters(
+        lora_adapter_count_per_call: list[int], max_loras: int,
+        max_cpu_loras: int, repeat_calls: int, repeats_per_call: int):
     # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
     # (1) specify lora_target_modules, or
     # (2) provide a lora_dir to infer the lora_target_modules.
     build_config = BuildConfig(lora_config=LoraConfig(
-        lora_target_modules=['attn_q', 'attn_k', 'attn_v']))
-    llm = LLM(hf_model_dir,
-              enable_lora=True,
-              max_lora_rank=8,
-              build_config=build_config,
-              fast_build=True,
-              **llm_kwargs)
-
-    prompts = [
-        "美国的首都在哪里? \n答案:",
-        "美国的首都在哪里? \n答案:",
-        "美国的首都在哪里? \n答案:",
-        "アメリカ合衆国の首都はどこですか? \n答え:",
-        "アメリカ合衆国の首都はどこですか? \n答え:",
-        "アメリカ合衆国の首都はどこですか? \n答え:",
-    ]
-    references = [
-        "沃尔玛\n\n## 新闻\n\n* ",
-        "美国的首都是华盛顿。\n\n美国的",
-        "纽约\n\n### カンファレンスの",
-        "Washington, D.C.\nWashington, D.C. is the capital of the United",
-        "华盛顿。\n\n英国の首都是什",
-        "ワシントン\nQ1. アメリカ合衆国",
-    ]
-    key_words = [
-        "沃尔玛",
-        "华盛顿",
-        "纽约",
-        "Washington",
-        "华盛顿",
-        "ワシントン",
-    ]
-    lora_req1 = LoRARequest("luotuo", 1, hf_lora_dir1)
-    lora_req2 = LoRARequest("Japanese", 2, hf_lora_dir2)
-    sampling_params = SamplingParams(max_tokens=20)
-    outputs = llm.generate(
-        prompts,
-        sampling_params,
-        lora_request=[None, lora_req1, lora_req2, None, lora_req1, lora_req2])
-    for output, ref, key_word in zip(outputs, references, key_words):
-        assert similar(output.outputs[0].text,
-                       ref) or key_word in output.outputs[0].txt
+        lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
+        max_lora_rank=8,
+        max_loras=max_loras,
+        max_cpu_loras=max_cpu_loras))
+    check_llama_7b_multi_unique_lora_adapters_from_request(
+        lora_adapter_count_per_call,
+        repeat_calls,
+        repeats_per_call,
+        LLM,
+        enable_lora=True,
+        build_config=build_config,
+        fast_build=True,
+        max_lora_rank=8,
+        max_loras=max_loras,
+        max_cpu_loras=max_cpu_loras)
 
 
 @skip_gpu_memory_less_than_40gb
 def test_llama_v2_13b_lora():
     llama_v2_13b_lora_from_dir_test_harness()
-
-
-@skip_gpu_memory_less_than_40gb
-def test_llama_7b_multi_lora():
-    llama_7b_multi_lora_from_request_test_harness(max_loras=1, max_cpu_loras=8)
 
 
 def llama_v2_7b_prompt_adapter_test_harness(**llm_kwargs):
@@ -2111,36 +2089,24 @@ def test_llm_chunked_prefill():
     success_path()
 
 
-def _test_llm_capture_request_error(pytorch_backend: bool, tp_size: int = 1):
-    llm_args_extra = {}
-    if pytorch_backend:
-        LLM_CLASS = LLM_torch
-        llm_args_extra["max_num_tokens"] = 64
-    else:
-        LLM_CLASS = LLM
-        build_config = BuildConfig()
-        build_config.max_num_tokens = 64
-        llm_args_extra["fast_build"] = True
-        llm_args_extra["build_config"] = build_config
+def _test_llm_capture_request_error(tp_size: int = 1):
+    build_config = BuildConfig()
+    build_config.max_num_tokens = 64
 
-    llm = LLM_CLASS(
+    llm = LLM(
         model=llama_model_path,
-        tensor_parallel_size=tp_size,
-        **llm_args_extra,
+        build_config=build_config,
+        fast_build=True,
     )
 
     prompt = 'A ' * 65  # the minimum max_num_tokens is 64
-    if pytorch_backend:
-        # pytorch backend will raise ValueError for max_num_tokens
-        with pytest.raises(ValueError):
-            llm.generate(prompt)
-    else:
-        with pytest.raises(RequestError):
-            llm.generate(prompt)
+
+    with pytest.raises(RequestError):
+        llm.generate(prompt)
 
 
 def test_llm_capture_request_error():
-    _test_llm_capture_request_error(pytorch_backend=False, tp_size=1)
+    _test_llm_capture_request_error(tp_size=1)
 
 
 def test_llm_shutdown_executor():
