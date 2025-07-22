@@ -901,12 +901,8 @@ class AwaitResponseHelper:
             assert response is not None
             queue = self.worker.return_queue(response.client_id)
 
-            logprobs_result = _get_logprobs(self.worker, response,
+            response = _maybe_wrap_response(self.worker, response,
                                             self.worker._is_pytorch_backend)
-            req_perf_metrics = _get_req_perf_metrics(response)
-            if logprobs_result or req_perf_metrics:
-                response = ResponseWrapper(response, logprobs_result,
-                                           req_perf_metrics)
 
             # For AsyncQueue.sync_q, we will batch the events to avoid too many
             # event notifications, thus put without wait here.
@@ -944,12 +940,8 @@ class AwaitResponseHelper:
                 response = ErrorResponse(response.client_id, response.error_msg,
                                          response.request_id)
             else:
-                logprobs_result = _get_logprobs(self.worker, response,
+                response = _maybe_wrap_response(self.worker, response,
                                                 self.worker._is_pytorch_backend)
-                req_perf_metrics = _get_req_perf_metrics(response)
-                if logprobs_result or req_perf_metrics:
-                    response = ResponseWrapper(response, logprobs_result,
-                                               req_perf_metrics)
 
             _send_rsp(self.worker,
                       response,
@@ -1059,11 +1051,16 @@ def _send_rsp(
         raise ValueError(f"Unknown response type: {response}")
 
 
-def _get_req_perf_metrics(
-        response: tllm.Response) -> Optional[dict[str, float]]:
+def _get_metrics_dict(
+        response: tllm.Response) -> dict[RequestEventTiming, float]:
     req_perf_metrics, metrics_dict = None, {}
-    if response.result:
-        req_perf_metrics = response.result.request_perf_metrics
+    res = response.result
+    if res:
+        if hasattr(res, '_result'):
+            if result := res.get_result():
+                req_perf_metrics = result.request_perf_metrics
+        else:
+            req_perf_metrics = res.request_perf_metrics
         if req_perf_metrics and req_perf_metrics.timing_metrics:
             metrics_dict = {
                 RequestEventTiming.ARRIVAL_TIME:
@@ -1078,3 +1075,20 @@ def _get_req_perf_metrics(
                 req_perf_metrics.timing_metrics.last_token_time.total_seconds()
             }
     return metrics_dict
+
+
+def _maybe_wrap_response(
+        worker,
+        response: tllm.Response,
+        is_pytorch_backend=False) -> Union[tllm.Response, ResponseWrapper]:
+
+    logprobs_result = _get_logprobs(worker, response, is_pytorch_backend)
+    req_perf_metrics = _get_metrics_dict(response)
+    if logprobs_result or req_perf_metrics:
+        if hasattr(response, 'result') and hasattr(response.result, "_result"):
+            response.result.deserialize()
+            response = tllm.Response(request_id=response.request_id,
+                                     result=response.result._result,
+                                     client_id=response.client_id)
+        response = ResponseWrapper(response, logprobs_result, req_perf_metrics)
+    return response
