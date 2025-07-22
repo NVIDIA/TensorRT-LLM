@@ -9,22 +9,16 @@ from click_option_group import (MutuallyExclusiveOptionGroup, OptionGroup,
                                 optgroup)
 from huggingface_hub import snapshot_download
 
-from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
-from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
-from tensorrt_llm.bench.build.build import get_model_config
-
-# isort: off
-from tensorrt_llm.bench.benchmark.utils.general import (
-    ALL_SUPPORTED_BACKENDS,
-    TuningConstraints,
-    get_settings_from_engine,
-    get_settings
-)
-# isort: on
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
+from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
+# isort: on
+from tensorrt_llm.bench.benchmark.utils.general import (
+    ALL_SUPPORTED_BACKENDS, TuningConstraints, generate_warmup_dataset,
+    get_settings, get_settings_from_engine)
+from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
+from tensorrt_llm.bench.build.build import get_model_config
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
