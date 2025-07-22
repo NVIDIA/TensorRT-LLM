@@ -1448,8 +1448,6 @@ class BaseLlmArgs(BaseModel):
                 assert self.speculative_config.speculative_model_dir is not None, "Path to EAGLE3 weights must be specified."
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.EAGLE
-                if self.speculative_config.eagle3_one_model:
-                    self.speculative_config.num_extra_kv_tokens = self.speculative_config.max_draft_len - 1
                 if self.backend not in ['pytorch', '_autodeploy']:
                     eagle_config = _EagleConfig(
                         self.speculative_config.eagle_choices,

@@ -129,7 +129,8 @@ class ModelDrafter(Drafter):
         """Create a draft request based on the original request state."""
         num_draft_tokens, num_accepted_tokens = self._initialize_draft_tokens(
             request)
-        input_tokens = get_draft_model_prompt(request.get_tokens()[0])
+        input_tokens = get_draft_model_prompt(self.spec_config.spec_dec_mode,
+                                              request.get_tokens()[0])
 
         # First time seeing this request - context request
         if request.max_beam_num_tokens - 1 == request.py_prompt_len:
