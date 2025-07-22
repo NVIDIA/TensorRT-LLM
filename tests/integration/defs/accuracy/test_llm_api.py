@@ -266,6 +266,26 @@ class TestMixtral8x7BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+class TestPhi4MiniInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "microsoft/Phi-4-mini-instruct"
+    MODEL_PATH = f"{llm_models_root()}/Phi-4-mini-instruct"
+
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    def test_fp8(self):
+        quant_config = QuantConfig(QuantAlgo.FP8)
+        with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
 class TestQwen2_7BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen2-7B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/Qwen2-7B-Instruct"
