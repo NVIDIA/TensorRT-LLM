@@ -236,7 +236,7 @@ class MultimodalParams:
 
     def to_handle(self,
                   element: str,
-                  key: Optional[str] = "multimodal_embedding") -> None:
+                  key: Optional[str] = None) -> None:
         """Convert multimodal data to tensor handle.
 
         Converts torch.Tensor objects to SharedTensorContainer handles (serializable dictionaries)
@@ -245,7 +245,7 @@ class MultimodalParams:
         Args:
             element: Element to convert ("multimodal_data" or "multimodal_input")
             key: Specific key to convert. If None, converts all tensor values in multimodal_data.
-                 Defaults to "multimodal_embedding".
+                 Defaults to None.
 
         Example:
             # Convert all tensors in multimodal_data to handles
@@ -302,7 +302,7 @@ class MultimodalParams:
 
     def to_tensor(self,
                   element: str,
-                  key: Optional[str] = "multimodal_embedding") -> None:
+                  key: Optional[str] = None) -> None:
         """Convert multimodal tensor handles back to tensors. This is the dual operation to to_handle.
 
         Converts SharedTensorContainer handles (serializable dictionaries) back to torch.Tensor objects
@@ -311,7 +311,7 @@ class MultimodalParams:
         Args:
             element: Element to convert ("multimodal_data" or "multimodal_input")
             key: Specific key to convert. If None, converts all tensor handles in multimodal_data.
-                 Defaults to "multimodal_embedding".
+                 Defaults to None.
 
         Example:
             # Convert all handles back to tensors
