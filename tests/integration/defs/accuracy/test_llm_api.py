@@ -79,6 +79,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     def test_gather_generation_logits_cuda_graph(self):
+        """RCCA: https://nvbugs/5365525"""
         extended_runtime_perf_knob_config = ExtendedRuntimePerfKnobConfig(
             cuda_graph_mode=True, cuda_graph_cache_size=1)
         llm = LLM(
@@ -199,17 +200,48 @@ class TestMistral7B_0_3(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-class TestMistral_Nemo_12B_Base(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "mistralai/Mistral-Nemo-Base-2407"
+class TestMistralNemo12B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "mistralai/Mistral-Nemo-12b-Base"
     MODEL_PATH = f"{llm_models_root()}/Mistral-Nemo-Base-2407"
 
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_auto_dtype(self):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
+
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_cache_config,
+                 max_batch_size=8) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    def test_auto_dtype_tp2(self):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
+
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_cache_config,
+                 tensor_parallel_size=2,
+                 max_batch_size=8) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device_memory(80000)
     @skip_pre_ada
     def test_fp8(self):
-        quant_config = QuantConfig(quant_algo=QuantAlgo.FP8,
+        quant_config = QuantConfig(QuantAlgo.FP8,
                                    kv_cache_quant_algo=QuantAlgo.FP8)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
 
-        with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
+        with LLM(self.MODEL_PATH,
+                 quant_config=quant_config,
+                 kv_cache_config=kv_cache_config,
+                 max_batch_size=8) as llm:
             task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
 
@@ -277,6 +309,7 @@ class TestPhi4MiniInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_ada
     def test_fp8(self):
         quant_config = QuantConfig(QuantAlgo.FP8)
         with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
@@ -420,7 +453,7 @@ class TestQwen2_5_7BInstruct(LlmapiAccuracyTestHarness):
     @skip_pre_ada
     def test_fp8_kvcache(self):
         "RCCA: https://nvbugs/5065080"
-        quant_config = QuantConfig(QuantAlgo.FP8,
+        quant_config = QuantConfig(quant_algo=QuantAlgo.FP8,
                                    kv_cache_quant_algo=QuantAlgo.FP8)
         with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
