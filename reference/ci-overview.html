@@ -58,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -70,7 +70,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc3" />
+  <meta name="docsearch:version" content="1.0.0rc4" />
 
 
   </head>
@@ -349,6 +349,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
@@ -384,6 +386,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-bench.html">trtllm-bench</a></li>
+
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
 </ul>
@@ -551,9 +555,24 @@
 <li><p>Search <code class="docutils literal notranslate"><span class="pre">jenkins/L0_Test.groovy</span></code> for a stage whose YAML file matches (for example <code class="docutils literal notranslate"><span class="pre">l0_a100</span></code>) and whose name contains <code class="docutils literal notranslate"><span class="pre">[Post-Merge]</span></code> if the YAML entry uses <code class="docutils literal notranslate"><span class="pre">stage:</span> <span class="pre">post_merge</span></code>.</p></li>
 <li><p>The resulting stage name(s) are what you pass to Jenkins via the <code class="docutils literal notranslate"><span class="pre">stage_list</span></code> parameter when triggering a job.</p></li>
 </ol>
-<section id="example">
-<h3>Example<a class="headerlink" href="#example" title="Link to this heading">#</a></h3>
-<p><code class="docutils literal notranslate"><span class="pre">triton_server/test_triton.py::test_gpt_ib_ptuning[gpt-ib-ptuning]</span></code> appears in <code class="docutils literal notranslate"><span class="pre">l0_a100.yml</span></code> under <code class="docutils literal notranslate"><span class="pre">stage:</span> <span class="pre">post_merge</span></code> and <code class="docutils literal notranslate"><span class="pre">backend:</span> <span class="pre">triton</span></code>.  The corresponding Jenkins stages are <code class="docutils literal notranslate"><span class="pre">A100X-Triton-[Post-Merge]-1</span></code> and <code class="docutils literal notranslate"><span class="pre">A100X-Triton-[Post-Merge]-2</span></code> (two shards).</p>
+<section id="using-test-to-stage-mapping-py">
+<h3>Using <code class="docutils literal notranslate"><span class="pre">test_to_stage_mapping.py</span></code><a class="headerlink" href="#using-test-to-stage-mapping-py" title="Link to this heading">#</a></h3>
+<p>Manually searching YAML and Groovy files can be tedious.  The helper script
+<code class="docutils literal notranslate"><span class="pre">scripts/test_to_stage_mapping.py</span></code> automates the lookup:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>scripts/test_to_stage_mapping.py<span class="w"> </span>--tests<span class="w"> </span><span class="s2">&quot;triton_server/test_triton.py::test_gpt_ib_ptuning[gpt-ib-ptuning]&quot;</span>
+python<span class="w"> </span>scripts/test_to_stage_mapping.py<span class="w"> </span>--tests<span class="w"> </span>gpt_ib_ptuning
+python<span class="w"> </span>scripts/test_to_stage_mapping.py<span class="w"> </span>--stages<span class="w"> </span>A100X-Triton-Post-Merge-1
+python<span class="w"> </span>scripts/test_to_stage_mapping.py<span class="w"> </span>--test-list<span class="w"> </span>my_tests.txt
+python<span class="w"> </span>scripts/test_to_stage_mapping.py<span class="w"> </span>--test-list<span class="w"> </span>my_tests.yml
+</pre></div>
+</div>
+<p>The first two commands print the Jenkins stages that run the specified tests or
+patterns. Patterns are matched by substring, so partial test names are
+supported out of the box. The third lists every test executed in the given stage. When
+providing tests on the command line, quote each test string so the shell does
+not interpret the <code class="docutils literal notranslate"><span class="pre">[</span></code> and <code class="docutils literal notranslate"><span class="pre">]</span></code> characters as globs. Alternatively, store the
+tests in a newline‑separated text file or a YAML list and supply it with
+<code class="docutils literal notranslate"><span class="pre">--test-list</span></code>.</p>
 <p>To run the same tests on your pull request, comment:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>/bot<span class="w"> </span>run<span class="w"> </span>--stage-list<span class="w"> </span><span class="s2">&quot;A100X-Triton-[Post-Merge]-1,A100X-Triton-[Post-Merge]-2&quot;</span>
 </pre></div>
@@ -656,7 +675,7 @@ selective keeps CI turnaround fast and conserves hardware resources.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#unit-tests">Unit tests</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#jenkins-stage-names">Jenkins stage names</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#finding-the-stage-for-a-test">Finding the stage for a test</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#example">Example</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#using-test-to-stage-mapping-py">Using <code class="docutils literal notranslate"><span class="pre">test_to_stage_mapping.py</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#waiving-tests">Waiving tests</a></li>
@@ -759,9 +778,9 @@ selective keeps CI turnaround fast and conserves hardware resources.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 14, 2025.</p>
+  <p>Last updated on July 19, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cfcb97a">cfcb97a</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/69e9f6d">69e9f6d</a>.</p>
   
 </div></div>
       

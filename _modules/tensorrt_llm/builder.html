@@ -57,7 +57,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -67,7 +67,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc3" />
+  <meta name="docsearch:version" content="1.0.0rc4" />
 
 
   </head>
@@ -342,6 +342,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
@@ -377,6 +379,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-bench.html">trtllm-bench</a></li>
+
 <li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-build.html">trtllm-build</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-serve.html">trtllm-serve</a></li>
 </ul>
@@ -507,12 +511,14 @@
 <span class="c1"># See the License for the specific language governing permissions and</span>
 <span class="c1"># limitations under the License.</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">copy</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">dataclasses</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">shutil</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">functools</span><span class="w"> </span><span class="kn">import</span> <span class="n">cache</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Dict</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Union</span>
 
@@ -1056,6 +1062,18 @@
             <span class="n">override_attri</span><span class="p">(</span><span class="s1">&#39;paged_state&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span></div>
 
 
+<div class="viewcode-block" id="BuildConfig.get_build_config_defaults">
+<a class="viewcode-back" href="../../llm-api/reference.html#tensorrt_llm.llmapi.BuildConfig.get_build_config_defaults">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="nd">@cache</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_build_config_defaults</span><span class="p">(</span><span class="bp">cls</span><span class="p">):</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="n">field</span><span class="o">.</span><span class="n">name</span><span class="p">:</span> <span class="n">field</span><span class="o">.</span><span class="n">default</span>
+            <span class="k">for</span> <span class="n">field</span> <span class="ow">in</span> <span class="n">dataclasses</span><span class="o">.</span><span class="n">fields</span><span class="p">(</span><span class="bp">cls</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">field</span><span class="o">.</span><span class="n">default</span> <span class="ow">is</span> <span class="ow">not</span> <span class="n">dataclasses</span><span class="o">.</span><span class="n">MISSING</span>
+        <span class="p">}</span></div>
+
+
 <div class="viewcode-block" id="BuildConfig.from_dict">
 <a class="viewcode-back" href="../../llm-api/reference.html#tensorrt_llm.llmapi.BuildConfig.from_dict">[docs]</a>
     <span class="nd">@classmethod</span>
@@ -1063,48 +1081,75 @@
         <span class="n">config</span> <span class="o">=</span> <span class="n">copy</span><span class="o">.</span><span class="n">deepcopy</span><span class="p">(</span>
             <span class="n">config</span>
         <span class="p">)</span>  <span class="c1"># it just does not make sense to change the input arg `config`</span>
-        <span class="n">max_input_len</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;max_input_len&#39;</span><span class="p">)</span>
-        <span class="n">max_seq_len</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;max_seq_len&#39;</span><span class="p">)</span>
-        <span class="n">max_batch_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;max_batch_size&#39;</span><span class="p">)</span>
-        <span class="n">max_beam_width</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;max_beam_width&#39;</span><span class="p">)</span>
-        <span class="n">max_num_tokens</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;max_num_tokens&#39;</span><span class="p">)</span>
-        <span class="n">opt_num_tokens</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;opt_num_tokens&#39;</span><span class="p">)</span>
-        <span class="n">opt_batch_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;opt_batch_size&#39;</span><span class="p">,</span> <span class="mi">8</span><span class="p">)</span>
-        <span class="n">max_prompt_embedding_table_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span>
-            <span class="s1">&#39;max_prompt_embedding_table_size&#39;</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
 
-        <span class="n">kv_cache_type</span> <span class="o">=</span> <span class="n">KVCacheType</span><span class="p">(</span>
-            <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;kv_cache_type&#39;</span><span class="p">))</span> <span class="k">if</span> <span class="s1">&#39;plugin_config&#39;</span> <span class="ow">in</span> <span class="n">config</span> <span class="k">else</span> <span class="kc">None</span>
-        <span class="n">gather_context_logits</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;gather_context_logits&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
-        <span class="n">gather_generation_logits</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;gather_generation_logits&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
-        <span class="n">strongly_typed</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;strongly_typed&#39;</span><span class="p">,</span> <span class="kc">True</span><span class="p">)</span>
-        <span class="n">force_num_profiles</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;force_num_profiles&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-        <span class="n">weight_sparsity</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;weight_sparsity&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
+        <span class="n">defaults</span> <span class="o">=</span> <span class="bp">cls</span><span class="o">.</span><span class="n">get_build_config_defaults</span><span class="p">()</span>
+        <span class="n">max_input_len</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;max_input_len&#39;</span><span class="p">,</span>
+                                   <span class="n">defaults</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;max_input_len&#39;</span><span class="p">))</span>
+        <span class="n">max_seq_len</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;max_seq_len&#39;</span><span class="p">,</span> <span class="n">defaults</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;max_seq_len&#39;</span><span class="p">))</span>
+        <span class="n">max_batch_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;max_batch_size&#39;</span><span class="p">,</span>
+                                    <span class="n">defaults</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;max_batch_size&#39;</span><span class="p">))</span>
+        <span class="n">max_beam_width</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;max_beam_width&#39;</span><span class="p">,</span>
+                                    <span class="n">defaults</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;max_beam_width&#39;</span><span class="p">))</span>
+        <span class="n">max_num_tokens</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;max_num_tokens&#39;</span><span class="p">,</span>
+                                    <span class="n">defaults</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;max_num_tokens&#39;</span><span class="p">))</span>
+        <span class="n">opt_num_tokens</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;opt_num_tokens&#39;</span><span class="p">,</span>
+                                    <span class="n">defaults</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;opt_num_tokens&#39;</span><span class="p">))</span>
+        <span class="n">opt_batch_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;opt_batch_size&#39;</span><span class="p">,</span>
+                                    <span class="n">defaults</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;opt_batch_size&#39;</span><span class="p">))</span>
+        <span class="n">max_prompt_embedding_table_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span>
+            <span class="s1">&#39;max_prompt_embedding_table_size&#39;</span><span class="p">,</span>
+            <span class="n">defaults</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;max_prompt_embedding_table_size&#39;</span><span class="p">))</span>
+
+        <span class="k">if</span> <span class="s2">&quot;kv_cache_type&quot;</span> <span class="ow">in</span> <span class="n">config</span> <span class="ow">and</span> <span class="n">config</span><span class="p">[</span><span class="s2">&quot;kv_cache_type&quot;</span><span class="p">]</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">kv_cache_type</span> <span class="o">=</span> <span class="n">KVCacheType</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;kv_cache_type&#39;</span><span class="p">))</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">kv_cache_type</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">gather_context_logits</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span>
+            <span class="s1">&#39;gather_context_logits&#39;</span><span class="p">,</span> <span class="n">defaults</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;gather_context_logits&#39;</span><span class="p">))</span>
+        <span class="n">gather_generation_logits</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span>
+            <span class="s1">&#39;gather_generation_logits&#39;</span><span class="p">,</span>
+            <span class="n">defaults</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;gather_generation_logits&#39;</span><span class="p">))</span>
+        <span class="n">strongly_typed</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;strongly_typed&#39;</span><span class="p">,</span>
+                                    <span class="n">defaults</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;strongly_typed&#39;</span><span class="p">))</span>
+        <span class="n">force_num_profiles</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;force_num_profiles&#39;</span><span class="p">,</span>
+                                        <span class="n">defaults</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;force_num_profiles&#39;</span><span class="p">))</span>
+        <span class="n">weight_sparsity</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;weight_sparsity&#39;</span><span class="p">,</span>
+                                     <span class="n">defaults</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;weight_sparsity&#39;</span><span class="p">))</span>
         <span class="n">profiling_verbosity</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;profiling_verbosity&#39;</span><span class="p">,</span>
-                                         <span class="s1">&#39;layer_names_only&#39;</span><span class="p">)</span>
-        <span class="n">enable_debug_output</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;enable_debug_output&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
-        <span class="n">max_draft_len</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;max_draft_len&#39;</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
-        <span class="n">speculative_decoding_mode</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;speculative_decoding_mode&#39;</span><span class="p">,</span>
-                                               <span class="n">SpeculativeDecodingMode</span><span class="o">.</span><span class="n">NONE</span><span class="p">)</span>
-        <span class="n">use_refit</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;use_refit&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
-        <span class="n">input_timing_cache</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;input_timing_cache&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-        <span class="n">output_timing_cache</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;output_timing_cache&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+                                         <span class="n">defaults</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;profiling_verbosity&#39;</span><span class="p">))</span>
+        <span class="n">enable_debug_output</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;enable_debug_output&#39;</span><span class="p">,</span>
+                                         <span class="n">defaults</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;enable_debug_output&#39;</span><span class="p">))</span>
+        <span class="n">max_draft_len</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;max_draft_len&#39;</span><span class="p">,</span>
+                                   <span class="n">defaults</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;max_draft_len&#39;</span><span class="p">))</span>
+        <span class="n">speculative_decoding_mode</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span>
+            <span class="s1">&#39;speculative_decoding_mode&#39;</span><span class="p">,</span>
+            <span class="n">defaults</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;speculative_decoding_mode&#39;</span><span class="p">))</span>
+        <span class="n">use_refit</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;use_refit&#39;</span><span class="p">,</span> <span class="n">defaults</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;use_refit&#39;</span><span class="p">))</span>
+        <span class="n">input_timing_cache</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;input_timing_cache&#39;</span><span class="p">,</span>
+                                        <span class="n">defaults</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;input_timing_cache&#39;</span><span class="p">))</span>
+        <span class="n">output_timing_cache</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;output_timing_cache&#39;</span><span class="p">,</span>
+                                         <span class="n">defaults</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;output_timing_cache&#39;</span><span class="p">))</span>
         <span class="n">lora_config</span> <span class="o">=</span> <span class="n">LoraConfig</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;lora_config&#39;</span><span class="p">,</span> <span class="p">{}))</span>
         <span class="n">auto_parallel_config</span> <span class="o">=</span> <span class="n">AutoParallelConfig</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span>
             <span class="n">config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;auto_parallel_config&#39;</span><span class="p">,</span> <span class="p">{}))</span>
-        <span class="n">max_encoder_input_len</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;max_encoder_input_len&#39;</span><span class="p">,</span> <span class="mi">1024</span><span class="p">)</span>
-        <span class="n">weight_streaming</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;weight_streaming&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
-        <span class="n">use_strip_plan</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;use_strip_plan&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
+        <span class="n">max_encoder_input_len</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span>
+            <span class="s1">&#39;max_encoder_input_len&#39;</span><span class="p">,</span> <span class="n">defaults</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;max_encoder_input_len&#39;</span><span class="p">))</span>
+        <span class="n">weight_streaming</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;weight_streaming&#39;</span><span class="p">,</span>
+                                      <span class="n">defaults</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;weight_streaming&#39;</span><span class="p">))</span>
+        <span class="n">use_strip_plan</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;use_strip_plan&#39;</span><span class="p">,</span>
+                                    <span class="n">defaults</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;use_strip_plan&#39;</span><span class="p">))</span>
 
         <span class="k">if</span> <span class="n">plugin_config</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">plugin_config</span> <span class="o">=</span> <span class="n">PluginConfig</span><span class="p">()</span>
         <span class="k">if</span> <span class="s2">&quot;plugin_config&quot;</span> <span class="ow">in</span> <span class="n">config</span><span class="o">.</span><span class="n">keys</span><span class="p">():</span>
             <span class="n">plugin_config</span><span class="o">.</span><span class="n">update_from_dict</span><span class="p">(</span><span class="n">config</span><span class="p">[</span><span class="s2">&quot;plugin_config&quot;</span><span class="p">])</span>
 
-        <span class="n">dry_run</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;dry_run&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
-        <span class="n">visualize_network</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;visualize_network&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-        <span class="n">monitor_memory</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;monitor_memory&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
-        <span class="n">use_mrope</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;use_mrope&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
+        <span class="n">dry_run</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;dry_run&#39;</span><span class="p">,</span> <span class="n">defaults</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;dry_run&#39;</span><span class="p">))</span>
+        <span class="n">visualize_network</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;visualize_network&#39;</span><span class="p">,</span>
+                                       <span class="n">defaults</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;visualize_network&#39;</span><span class="p">))</span>
+        <span class="n">monitor_memory</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;monitor_memory&#39;</span><span class="p">,</span>
+                                    <span class="n">defaults</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;monitor_memory&#39;</span><span class="p">))</span>
+        <span class="n">use_mrope</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;use_mrope&#39;</span><span class="p">,</span> <span class="n">defaults</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;use_mrope&#39;</span><span class="p">))</span>
 
         <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span>
             <span class="n">max_input_len</span><span class="o">=</span><span class="n">max_input_len</span><span class="p">,</span>
@@ -1981,9 +2026,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 14, 2025.</p>
+  <p>Last updated on July 19, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cfcb97a">cfcb97a</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/69e9f6d">69e9f6d</a>.</p>
   
 </div></div>
       

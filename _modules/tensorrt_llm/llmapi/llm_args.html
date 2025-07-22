@@ -57,7 +57,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -67,7 +67,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc3" />
+  <meta name="docsearch:version" content="1.0.0rc4" />
 
 
   </head>
@@ -342,6 +342,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
@@ -377,6 +379,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-bench.html">trtllm-bench</a></li>
+
 <li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-build.html">trtllm-build</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-serve.html">trtllm-serve</a></li>
 </ul>
@@ -568,7 +572,7 @@
     <span class="n">max_batch_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Maximum batch size for CUDA graphs.&quot;</span><span class="p">)</span>
 
-    <span class="n">padding_enabled</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+    <span class="n">enable_padding</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
         <span class="s2">&quot;If true, batches are rounded up to the nearest cuda_graph_batch_size. This is usually a net win for performance.&quot;</span>
@@ -584,6 +588,36 @@
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                 <span class="s2">&quot;cuda_graph_config.max_batch_size must be non-negative&quot;</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">v</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="MoeConfig">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">MoeConfig</span><span class="p">(</span><span class="n">BaseModel</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    Configuration for MoE.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">backend</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;CUTLASS&quot;</span><span class="p">,</span> <span class="s2">&quot;CUTEDSL&quot;</span><span class="p">,</span> <span class="s2">&quot;WIDEEP&quot;</span><span class="p">,</span> <span class="s2">&quot;TRTLLM&quot;</span><span class="p">,</span>
+                     <span class="s2">&quot;VANILLA&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s1">&#39;CUTLASS&#39;</span><span class="p">,</span>
+                                        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;MoE backend to use.&quot;</span><span class="p">)</span>
+
+    <span class="n">max_num_tokens</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;If set, at most max_num_tokens tokens will be sent to torch.ops.trtllm.fused_moe at the same time. If the number of tokens exceeds max_num_tokens, the input tensors will be split into chunks and a for loop will be used.&quot;</span>
+    <span class="p">)</span>
+
+    <span class="n">load_balancer</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">object</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Configuration for MoE load balancing.&quot;</span><span class="p">,</span>
+        <span class="n">json_schema_extra</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;Union[MoeLoadBalancerConfig, str]&quot;</span><span class="p">})</span>
+
+<div class="viewcode-block" id="MoeConfig.from_dict">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.from_dict">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">):</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="o">**</span><span class="n">data</span><span class="p">)</span></div>
 </div>
 
 
@@ -862,8 +896,9 @@
 <div class="viewcode-block" id="UserProvidedDecodingConfig">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">UserProvidedDecodingConfig</span><span class="p">(</span><span class="n">DecodingBaseConfig</span><span class="p">):</span>
-    <span class="c1"># Type should be Drafter, but it leads to circular import</span>
-    <span class="n">drafter</span><span class="p">:</span> <span class="nb">object</span>
+    <span class="c1"># Cannot use real type annotations due to circular imports</span>
+    <span class="n">drafter</span><span class="p">:</span> <span class="nb">object</span>  <span class="c1"># Type is Drafter</span>
+    <span class="n">resource_manager</span><span class="p">:</span> <span class="nb">object</span> <span class="o">=</span> <span class="kc">None</span>  <span class="c1"># Type is Optional[ResourceManager]</span>
 
 <div class="viewcode-block" id="UserProvidedDecodingConfig.from_dict">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.from_dict">[docs]</a>
@@ -1398,6 +1433,10 @@
     <span class="n">use_uvm</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                           <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Whether to use UVM for the KV cache.&quot;</span><span class="p">)</span>
 
+    <span class="c1"># This is a pure python field, not a pybind field. It is only for the Pytorch backend.</span>
+    <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span>
+                       <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The data type to use for the KV cache.&quot;</span><span class="p">)</span>
+
     <span class="k">def</span><span class="w"> </span><span class="nf">_to_pybind</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="n">_KvCacheConfig</span><span class="p">(</span>
             <span class="n">enable_block_reuse</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_block_reuse</span><span class="p">,</span>
@@ -1457,12 +1496,20 @@
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">    Configuration for the cache transceiver.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
-    <span class="n">max_num_tokens</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+
+    <span class="n">backend</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;default&quot;</span><span class="p">,</span> <span class="s2">&quot;ucx&quot;</span><span class="p">,</span> <span class="s2">&quot;nixl&quot;</span><span class="p">,</span> <span class="s2">&quot;mpi&quot;</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;The communication backend type to use for the cache transceiver.&quot;</span><span class="p">)</span>
+
+    <span class="n">max_tokens_in_buffer</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The max number of tokens the transfer buffer can fit.&quot;</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_to_pybind</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-        <span class="k">return</span> <span class="n">_CacheTransceiverConfig</span><span class="p">(</span><span class="n">max_num_tokens</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_num_tokens</span><span class="p">)</span></div>
+        <span class="k">return</span> <span class="n">_CacheTransceiverConfig</span><span class="p">(</span>
+            <span class="n">backend</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">backend</span><span class="p">,</span>
+            <span class="n">max_tokens_in_buffer</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_tokens_in_buffer</span><span class="p">)</span></div>
 
 
 
@@ -1607,10 +1654,6 @@
 
     <span class="n">lora_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">LoraConfig</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;LoRA configuration for the model.&quot;</span><span class="p">)</span>
-
-    <span class="c1"># Quantization and calibration configurations</span>
-    <span class="n">quant_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">QuantConfig</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
-        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Quantization config.&quot;</span><span class="p">,</span> <span class="n">validate_default</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 
     <span class="c1"># Several options from ExecutorConfig, expanded here for less hierarchy</span>
     <span class="n">kv_cache_config</span><span class="p">:</span> <span class="n">KvCacheConfig</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="n">KvCacheConfig</span><span class="p">,</span>
@@ -1792,13 +1835,6 @@
                 <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="s2">&quot;Pre SM 80 GPUs do not support bfloat16&quot;</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">v</span>
 
-    <span class="nd">@field_validator</span><span class="p">(</span><span class="s2">&quot;quant_config&quot;</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="s1">&#39;before&#39;</span><span class="p">)</span>
-    <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">validate_quant_config</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">info</span><span class="p">):</span>
-        <span class="k">if</span> <span class="n">v</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">v</span> <span class="o">=</span> <span class="n">QuantConfig</span><span class="p">()</span>
-        <span class="k">return</span> <span class="n">v</span>
-
     <span class="nd">@field_validator</span><span class="p">(</span><span class="s2">&quot;gpus_per_node&quot;</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="s1">&#39;before&#39;</span><span class="p">)</span>
     <span class="nd">@classmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">validate_gpus_per_node</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">info</span><span class="p">):</span>
@@ -1870,7 +1906,8 @@
                 <span class="s1">&#39;pytorch&#39;</span><span class="p">,</span> <span class="s1">&#39;_autodeploy&#39;</span>
         <span class="p">]:</span>
             <span class="c1"># Load parallel_config from the engine.</span>
-            <span class="n">model_format</span> <span class="o">=</span> <span class="n">get_model_format</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">)</span>
+            <span class="n">model_format</span> <span class="o">=</span> <span class="n">get_model_format</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">,</span> <span class="n">trust_remote_code</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">trust_remote_code</span><span class="p">)</span>
 
             <span class="k">if</span> <span class="n">model_format</span> <span class="ow">is</span> <span class="n">_ModelFormatKind</span><span class="o">.</span><span class="n">TLLM_ENGINE</span><span class="p">:</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">build_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
@@ -1936,6 +1973,15 @@
                                 <span class="sa">f</span><span class="s2">&quot;overriding </span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2"> from build_config&quot;</span><span class="p">)</span>
                         <span class="nb">setattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">build_config</span><span class="p">,</span> <span class="n">key</span><span class="p">))</span>
 
+        <span class="k">return</span> <span class="bp">self</span>
+
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_runtime_args</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_batch_size</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_num_tokens</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_batch_size</span> <span class="o">&gt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_num_tokens</span><span class="p">:</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">&quot;max_batch_size [</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">max_batch_size</span><span class="si">}</span><span class="s2">] should be less than or equal to max_num_tokens [</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">max_num_tokens</span><span class="si">}</span><span class="s2">]&quot;</span>
+                <span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span>
 
     <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
@@ -2242,6 +2288,10 @@
     <span class="n">calib_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">CalibConfig</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Calibration config.&quot;</span><span class="p">,</span> <span class="n">validate_default</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 
+    <span class="c1"># Quantization and calibration configurations</span>
+    <span class="n">quant_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">QuantConfig</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Quantization config.&quot;</span><span class="p">,</span> <span class="n">validate_default</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+
     <span class="n">embedding_parallel_mode</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="s1">&#39;SHARDING_ALONG_VOCAB&#39;</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The embedding parallel mode.&quot;</span><span class="p">)</span>
@@ -2279,6 +2329,16 @@
     <span class="k">def</span><span class="w"> </span><span class="nf">init_calib_config</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">v</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">v</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">CalibConfig</span><span class="p">()</span>
+        <span class="k">return</span> <span class="n">v</span></div>
+
+
+<div class="viewcode-block" id="TrtLlmArgs.validate_quant_config">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_quant_config">[docs]</a>
+    <span class="nd">@field_validator</span><span class="p">(</span><span class="s2">&quot;quant_config&quot;</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="s1">&#39;before&#39;</span><span class="p">)</span>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_quant_config</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">info</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">v</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">v</span> <span class="o">=</span> <span class="n">QuantConfig</span><span class="p">()</span>
         <span class="k">return</span> <span class="n">v</span></div>
 
 
@@ -2333,6 +2393,14 @@
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">&quot;Invalid build_cache_config: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_build_cache</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span></div>
+
+
+<div class="viewcode-block" id="TrtLlmArgs.validate_kv_cache_dtype">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_kv_cache_dtype">[docs]</a>
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_kv_cache_dtype</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">dtype</span> <span class="o">==</span> <span class="s2">&quot;auto&quot;</span><span class="p">,</span> <span class="s2">&quot;KvCacheConfig.dtype is not supported by the TensorRT backend.&quot;</span>
+        <span class="k">return</span> <span class="bp">self</span></div>
 </div>
 
 
@@ -2385,7 +2453,7 @@
         <span class="s2">&quot;Lower values trigger more frequent garbage collection.&quot;</span><span class="p">)</span>
 
     <span class="n">cuda_graph_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">CudaGraphConfig</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
-        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">default_factory</span><span class="o">=</span><span class="n">CudaGraphConfig</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;CUDA graph config.If true, use CUDA graphs for decoding. </span><span class="se">\</span>
 <span class="s2">        CUDA graphs are only created for the batch sizes in cuda_graph_config.batch_sizes, </span><span class="se">\</span>
 <span class="s2">        and are enabled for batches that consist of decoding requests *only* </span><span class="se">\</span>
@@ -2396,25 +2464,11 @@
     <span class="n">disable_overlap_scheduler</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Disable the overlap scheduler.&quot;</span><span class="p">)</span>
 
-    <span class="n">moe_max_num_tokens</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
-        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-        <span class="n">description</span><span class="o">=</span>
-        <span class="s2">&quot;If set, at most moe_max_num_tokens tokens will be sent to torch.ops.trtllm.fused_moe at the same time. If the number of tokens exceeds moe_max_num_tokens, the input tensors will be split into chunks and a for loop will be used.&quot;</span>
-    <span class="p">)</span>
-
-    <span class="n">moe_load_balancer</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">object</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
-        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Configuration for MoE load balancing.&quot;</span><span class="p">,</span>
-        <span class="n">json_schema_extra</span><span class="o">=</span><span class="p">{</span>
-            <span class="s2">&quot;type&quot;</span><span class="p">:</span>
-            <span class="s2">&quot;Union[tensorrt_llm._torch.model_config.MoeLoadBalancerConfig, str, None]&quot;</span>
-        <span class="p">})</span>
+    <span class="n">moe_config</span><span class="p">:</span> <span class="n">MoeConfig</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="n">MoeConfig</span><span class="p">,</span>
+                                  <span class="n">description</span><span class="o">=</span><span class="s2">&quot;MoE config.&quot;</span><span class="p">)</span>
 
     <span class="n">attn_backend</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s1">&#39;TRTLLM&#39;</span><span class="p">,</span>
                               <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Attention backend to use.&quot;</span><span class="p">)</span>
-
-    <span class="n">moe_backend</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s1">&#39;CUTLASS&#39;</span><span class="p">,</span>
-                             <span class="n">description</span><span class="o">=</span><span class="s2">&quot;MoE backend to use.&quot;</span><span class="p">)</span>
 
     <span class="n">enable_mixed_sampler</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
@@ -2427,9 +2481,6 @@
         <span class="n">description</span><span class="o">=</span>
         <span class="s2">&quot;If true, will use the TRTLLM sampler instead of the PyTorch sampler. The TRTLLM sampler has a wide coverage of sampling strategies.&quot;</span>
     <span class="p">)</span>
-
-    <span class="n">kv_cache_dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span>
-                                <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Data type for KV cache.&quot;</span><span class="p">)</span>
 
     <span class="n">enable_iter_perf_stats</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Enable iteration performance statistics.&quot;</span><span class="p">)</span>
@@ -2483,6 +2534,31 @@
                 <span class="s1">&#39;LOWPRECISION&#39;</span><span class="p">,</span>
                 <span class="s1">&#39;MNNVL&#39;</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s1">&#39;AUTO&#39;</span><span class="p">,</span>
                                   <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Allreduce strategy to use.&quot;</span><span class="p">)</span>
+    <span class="n">checkpoint_loader</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">object</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The checkpoint loader to use for this LLM instance.&quot;</span><span class="p">,</span>
+        <span class="n">json_schema_extra</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;Optional[tensorrt_llm._torch.BaseCheckpointLoader]&quot;</span>
+        <span class="p">},</span>
+    <span class="p">)</span>
+
+    <span class="n">checkpoint_format</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The format of the provided checkpoint.&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="c1"># PrivateVars</span>
+    <span class="n">_quant_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">QuantConfig</span><span class="p">]</span> <span class="o">=</span> <span class="n">PrivateAttr</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">quant_config</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">QuantConfig</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_quant_config</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_quant_config</span> <span class="o">=</span> <span class="n">QuantConfig</span><span class="p">()</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_quant_config</span>
+
+    <span class="nd">@quant_config</span><span class="o">.</span><span class="n">setter</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">quant_config</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">value</span><span class="p">:</span> <span class="n">QuantConfig</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_quant_config</span> <span class="o">=</span> <span class="n">value</span>
 
     <span class="c1"># TODO: remove backend later</span>
 <div class="viewcode-block" id="TorchLlmArgs.init_backend">
@@ -2523,28 +2599,6 @@
     <span class="k">def</span><span class="w"> </span><span class="nf">extra_resource_managers</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">value</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">object</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_extra_resource_managers</span> <span class="o">=</span> <span class="n">value</span>
 
-<div class="viewcode-block" id="TorchLlmArgs.validate_moe_load_balancer">
-<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_moe_load_balancer">[docs]</a>
-    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">validate_moe_load_balancer</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-        <span class="kn">from</span><span class="w"> </span><span class="nn">.._torch.model_config</span><span class="w"> </span><span class="kn">import</span> <span class="n">MoeLoadBalancerConfig</span>
-        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_load_balancer</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
-            <span class="k">if</span> <span class="ow">not</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_load_balancer</span><span class="p">):</span>
-                <span class="k">raise</span> <span class="ne">FileNotFoundError</span><span class="p">(</span>
-                    <span class="sa">f</span><span class="s2">&quot;MoE load balancer config file not found: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_load_balancer</span><span class="si">}</span><span class="s2">&quot;</span>
-                <span class="p">)</span>
-            <span class="k">try</span><span class="p">:</span>
-                <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_load_balancer</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
-                    <span class="n">moe_load_balancer_config</span> <span class="o">=</span> <span class="n">yaml</span><span class="o">.</span><span class="n">safe_load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">moe_load_balancer</span> <span class="o">=</span> <span class="n">MoeLoadBalancerConfig</span><span class="p">(</span>
-                    <span class="o">**</span><span class="n">moe_load_balancer_config</span><span class="p">)</span>
-            <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
-                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                    <span class="sa">f</span><span class="s2">&quot;Failed to load MoE load balancer config file: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_load_balancer</span><span class="si">}</span><span class="s2">&quot;</span>
-                <span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">e</span>
-        <span class="k">return</span> <span class="bp">self</span></div>
-
-
 <div class="viewcode-block" id="TorchLlmArgs.validate_stream_interval">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_stream_interval">[docs]</a>
     <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
@@ -2555,19 +2609,38 @@
         <span class="k">return</span> <span class="bp">self</span></div>
 
 
+<div class="viewcode-block" id="TorchLlmArgs.validate_checkpoint_format">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_checkpoint_format">[docs]</a>
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_checkpoint_format</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">checkpoint_format</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">checkpoint_loader</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                <span class="s2">&quot;checkpoint_format and checkpoint_loader are both provided, &quot;</span>
+                <span class="s2">&quot;checkpoint_loader will be ignored.&quot;</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">checkpoint_loader</span> <span class="o">=</span> <span class="kc">None</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">checkpoint_format</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">checkpoint_loader</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+                <span class="s2">&quot;neither checkpoint_format nor checkpoint_loader were provided, &quot;</span>
+                <span class="s2">&quot;checkpoint_format will be set to HF.&quot;</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">checkpoint_format</span> <span class="o">=</span> <span class="s2">&quot;HF&quot;</span>
+
+        <span class="k">return</span> <span class="bp">self</span></div>
+
+
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">_generate_cuda_graph_batch_sizes</span><span class="p">(</span><span class="n">max_batch_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-                                         <span class="n">padding_enabled</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+                                         <span class="n">enable_padding</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Generate a list of batch sizes for CUDA graphs.</span>
 
 <span class="sd">        Args:</span>
 <span class="sd">            max_batch_size: Maximum batch size to generate up to</span>
-<span class="sd">            padding_enabled: Whether padding is enabled, which affects the batch size distribution</span>
+<span class="sd">            enable_padding: Whether padding is enabled, which affects the batch size distribution</span>
 
 <span class="sd">        Returns:</span>
 <span class="sd">            List of batch sizes to create CUDA graphs for</span>
 <span class="sd">        &quot;&quot;&quot;</span>
-        <span class="k">if</span> <span class="n">padding_enabled</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">enable_padding</span><span class="p">:</span>
             <span class="n">batch_sizes</span> <span class="o">=</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">]</span> <span class="o">+</span> <span class="p">[</span><span class="n">i</span> <span class="o">*</span> <span class="mi">8</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">17</span><span class="p">)]</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">batch_sizes</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">32</span><span class="p">))</span> <span class="o">+</span> <span class="p">[</span><span class="mi">32</span><span class="p">,</span> <span class="mi">64</span><span class="p">,</span> <span class="mi">128</span><span class="p">]</span>
@@ -2586,6 +2659,28 @@
             <span class="n">batch_sizes</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">max_batch_size</span><span class="p">)</span>
 
         <span class="k">return</span> <span class="n">batch_sizes</span>
+
+<div class="viewcode-block" id="TorchLlmArgs.validate_load_balancer">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_load_balancer">[docs]</a>
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_load_balancer</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;TorchLlmArgs&#39;</span><span class="p">:</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">.._torch</span><span class="w"> </span><span class="kn">import</span> <span class="n">MoeLoadBalancerConfig</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_config</span><span class="o">.</span><span class="n">load_balancer</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_config</span><span class="o">.</span><span class="n">load_balancer</span><span class="p">):</span>
+                <span class="k">raise</span> <span class="ne">FileNotFoundError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">&quot;MoE load balancer config file not found: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_config</span><span class="o">.</span><span class="n">load_balancer</span><span class="si">}</span><span class="s2">&quot;</span>
+                <span class="p">)</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_config</span><span class="o">.</span><span class="n">load_balancer</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                    <span class="n">moe_load_balancer_config</span> <span class="o">=</span> <span class="n">yaml</span><span class="o">.</span><span class="n">safe_load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">moe_config</span><span class="o">.</span><span class="n">load_balancer</span> <span class="o">=</span> <span class="n">MoeLoadBalancerConfig</span><span class="p">(</span>
+                    <span class="o">**</span><span class="n">moe_load_balancer_config</span><span class="p">)</span>
+            <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">&quot;Failed to load MoE load balancer config file: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">load_balancer</span><span class="si">}</span><span class="s2">&quot;</span>
+                <span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">e</span>
+        <span class="k">return</span> <span class="bp">self</span></div>
+
 
 <div class="viewcode-block" id="TorchLlmArgs.validate_cuda_graph_config">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_cuda_graph_config">[docs]</a>
@@ -2607,7 +2702,7 @@
             <span class="n">config</span><span class="o">.</span><span class="n">batch_sizes</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">batch_sizes</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">max_batch_size</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
                 <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">batch_sizes</span> <span class="o">!=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_generate_cuda_graph_batch_sizes</span><span class="p">(</span>
-                        <span class="n">config</span><span class="o">.</span><span class="n">max_batch_size</span><span class="p">,</span> <span class="n">config</span><span class="o">.</span><span class="n">padding_enabled</span><span class="p">):</span>
+                        <span class="n">config</span><span class="o">.</span><span class="n">max_batch_size</span><span class="p">,</span> <span class="n">config</span><span class="o">.</span><span class="n">enable_padding</span><span class="p">):</span>
                     <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                         <span class="s2">&quot;Please don&#39;t set both cuda_graph_config.batch_sizes &quot;</span>
                         <span class="s2">&quot;and cuda_graph_config.max_batch_size.</span><span class="se">\n</span><span class="s2">&quot;</span>
@@ -2619,10 +2714,29 @@
         <span class="k">else</span><span class="p">:</span>
             <span class="n">max_batch_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">max_batch_size</span> <span class="ow">or</span> <span class="mi">128</span>
             <span class="n">generated_sizes</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_generate_cuda_graph_batch_sizes</span><span class="p">(</span>
-                <span class="n">max_batch_size</span><span class="p">,</span> <span class="n">config</span><span class="o">.</span><span class="n">padding_enabled</span><span class="p">)</span>
+                <span class="n">max_batch_size</span><span class="p">,</span> <span class="n">config</span><span class="o">.</span><span class="n">enable_padding</span><span class="p">)</span>
             <span class="n">config</span><span class="o">.</span><span class="n">batch_sizes</span> <span class="o">=</span> <span class="n">generated_sizes</span>
             <span class="n">config</span><span class="o">.</span><span class="n">max_batch_size</span> <span class="o">=</span> <span class="n">max_batch_size</span>
 
+        <span class="k">return</span> <span class="bp">self</span></div>
+
+
+<div class="viewcode-block" id="TorchLlmArgs.sync_quant_config_with_kv_cache_config_dtype">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.sync_quant_config_with_kv_cache_config_dtype">[docs]</a>
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s1">&#39;after&#39;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">sync_quant_config_with_kv_cache_config_dtype</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;TorchLlmArgs&#39;</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_config</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span>
+
+        <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">dtype</span> <span class="o">==</span> <span class="s2">&quot;auto&quot;</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span>
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">dtype</span> <span class="o">==</span> <span class="s1">&#39;fp8&#39;</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">quant_config</span><span class="o">.</span><span class="n">kv_cache_quant_algo</span> <span class="o">=</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;Cannot sync quant_config.kv_cache_quant_algo with kv_cache_config.dtype of </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">dtype</span><span class="si">}</span><span class="s2">, &quot;</span>
+                <span class="s2">&quot;please update the validator&quot;</span><span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span></div>
 
 
@@ -2641,17 +2755,17 @@
             <span class="n">cuda_graph_max_batch_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_config</span><span class="o">.</span><span class="n">max_batch_size</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_config</span> <span class="k">else</span>
             <span class="n">CudaGraphConfig</span><span class="o">.</span><span class="n">model_fields</span><span class="p">[</span><span class="s1">&#39;max_batch_size&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">default</span><span class="p">,</span>
-            <span class="n">cuda_graph_padding_enabled</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_config</span><span class="o">.</span><span class="n">padding_enabled</span>
+            <span class="n">cuda_graph_padding_enabled</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_config</span><span class="o">.</span><span class="n">enable_padding</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_config</span> <span class="k">else</span>
-            <span class="n">CudaGraphConfig</span><span class="o">.</span><span class="n">model_fields</span><span class="p">[</span><span class="s1">&#39;padding_enabled&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">default</span><span class="p">,</span>
+            <span class="n">CudaGraphConfig</span><span class="o">.</span><span class="n">model_fields</span><span class="p">[</span><span class="s1">&#39;enable_padding&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">default</span><span class="p">,</span>
             <span class="n">disable_overlap_scheduler</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">disable_overlap_scheduler</span><span class="p">,</span>
-            <span class="n">moe_max_num_tokens</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_max_num_tokens</span><span class="p">,</span>
-            <span class="n">moe_load_balancer</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_load_balancer</span><span class="p">,</span>
+            <span class="n">moe_max_num_tokens</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_config</span><span class="o">.</span><span class="n">max_num_tokens</span><span class="p">,</span>
+            <span class="n">moe_load_balancer</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_config</span><span class="o">.</span><span class="n">load_balancer</span><span class="p">,</span>
             <span class="n">attn_backend</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">attn_backend</span><span class="p">,</span>
-            <span class="n">moe_backend</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_backend</span><span class="p">,</span>
+            <span class="n">moe_backend</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_config</span><span class="o">.</span><span class="n">backend</span><span class="p">,</span>
             <span class="n">enable_mixed_sampler</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_mixed_sampler</span><span class="p">,</span>
             <span class="n">enable_trtllm_sampler</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_trtllm_sampler</span><span class="p">,</span>
-            <span class="n">kv_cache_dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_dtype</span><span class="p">,</span>
+            <span class="n">kv_cache_dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
             <span class="n">enable_iter_perf_stats</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_iter_perf_stats</span><span class="p">,</span>
             <span class="n">enable_iter_req_stats</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_iter_req_stats</span><span class="p">,</span>
             <span class="n">print_iter_log</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">print_iter_log</span><span class="p">,</span>
@@ -2693,10 +2807,12 @@
         <span class="s2">&quot;enable_build_cache&quot;</span><span class="p">:</span> <span class="n">BuildCacheConfig</span><span class="p">,</span>
         <span class="s2">&quot;speculative_config&quot;</span><span class="p">:</span> <span class="n">DecodingBaseConfig</span><span class="p">,</span>
         <span class="s2">&quot;lora_config&quot;</span><span class="p">:</span> <span class="n">LoraConfig</span><span class="p">,</span>
+        <span class="s2">&quot;moe_config&quot;</span><span class="p">:</span> <span class="n">MoeConfig</span><span class="p">,</span>
     <span class="p">}</span>
     <span class="k">for</span> <span class="n">field_name</span><span class="p">,</span> <span class="n">field_type</span> <span class="ow">in</span> <span class="n">field_mapping</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
         <span class="k">if</span> <span class="n">field_name</span> <span class="ow">in</span> <span class="n">llm_args_dict</span><span class="p">:</span>
-            <span class="k">if</span> <span class="n">field_name</span> <span class="o">==</span> <span class="s2">&quot;speculative_config&quot;</span><span class="p">:</span>
+            <span class="c1"># Some fields need to be converted manually.</span>
+            <span class="k">if</span> <span class="n">field_name</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;speculative_config&quot;</span><span class="p">,</span> <span class="s2">&quot;build_config&quot;</span><span class="p">]:</span>
                 <span class="n">llm_args_dict</span><span class="p">[</span><span class="n">field_name</span><span class="p">]</span> <span class="o">=</span> <span class="n">field_type</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span>
                     <span class="n">llm_args_dict</span><span class="p">[</span><span class="n">field_name</span><span class="p">])</span>
             <span class="k">else</span><span class="p">:</span>
@@ -2719,7 +2835,8 @@
     <span class="k">return</span> <span class="n">llm_args</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">get_model_format</span><span class="p">(</span><span class="n">model_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">_ModelFormatKind</span><span class="p">:</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">get_model_format</span><span class="p">(</span><span class="n">model_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+                     <span class="n">trust_remote_code</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">_ModelFormatKind</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&#39;&#39;&#39; Get the format of the model.  &#39;&#39;&#39;</span>
     <span class="k">if</span> <span class="ow">not</span> <span class="p">(</span><span class="n">Path</span><span class="p">(</span><span class="n">model_dir</span><span class="p">)</span> <span class="o">/</span> <span class="s1">&#39;config.json&#39;</span><span class="p">)</span><span class="o">.</span><span class="n">exists</span><span class="p">():</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
@@ -2738,7 +2855,8 @@
             <span class="n">PretrainedConfig</span><span class="o">.</span><span class="n">from_checkpoint</span><span class="p">(</span><span class="n">model_dir</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">model_format</span> <span class="o">=</span> <span class="n">_ModelFormatKind</span><span class="o">.</span><span class="n">HF</span>
-            <span class="n">AutoConfig</span><span class="o">.</span><span class="n">from_hugging_face</span><span class="p">(</span><span class="n">model_dir</span><span class="p">)</span>
+            <span class="n">AutoConfig</span><span class="o">.</span><span class="n">from_hugging_face</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span>
+                                         <span class="n">trust_remote_code</span><span class="o">=</span><span class="n">trust_remote_code</span><span class="p">)</span>
     <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
             <span class="sa">f</span><span class="s2">&quot;Inferred model format </span><span class="si">{</span><span class="n">model_format</span><span class="si">}</span><span class="s2">, but failed to load config.json: </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="s2">&quot;</span>
@@ -2865,9 +2983,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 14, 2025.</p>
+  <p>Last updated on July 19, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cfcb97a">cfcb97a</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/69e9f6d">69e9f6d</a>.</p>
   
 </div></div>
       

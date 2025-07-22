@@ -58,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -70,7 +70,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc3" />
+  <meta name="docsearch:version" content="1.0.0rc4" />
 
 
   </head>
@@ -349,6 +349,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
@@ -384,6 +386,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-bench.html">trtllm-bench</a></li>
+
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
 </ul>
@@ -1146,6 +1150,11 @@ self.max = [dim 0 max, dim 1 max]</p>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/functional.html#RopeEmbeddingUtils.create_sinusoidal_positions_long_rope"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.functional.RopeEmbeddingUtils.create_sinusoidal_positions_long_rope" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.functional.RopeEmbeddingUtils.create_sinusoidal_positions_long_rope_for_attention_plugin">
+<em class="property"><span class="pre">static</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">create_sinusoidal_positions_long_rope_for_attention_plugin</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="pre">num_pos:</span> <span class="pre">int,</span> <span class="pre">dim:</span> <span class="pre">int,</span> <span class="pre">theta:</span> <span class="pre">float,</span> <span class="pre">original_max_pos:</span> <span class="pre">int,</span> <span class="pre">short_factor:</span> <span class="pre">~typing.List[float],</span> <span class="pre">long_factor:</span> <span class="pre">~typing.List[float],</span> <span class="pre">dtype=&lt;class</span> <span class="pre">'numpy.float32'&gt;</span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/functional.html#RopeEmbeddingUtils.create_sinusoidal_positions_long_rope_for_attention_plugin"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.functional.RopeEmbeddingUtils.create_sinusoidal_positions_long_rope_for_attention_plugin" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py method">
@@ -6742,6 +6751,7 @@ function creates a constant tensor.</p></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin"><code class="docutils literal notranslate"><span class="pre">create_sinusoidal_positions_for_attention_plugin()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.RopeEmbeddingUtils.create_sinusoidal_positions_for_cogvlm_attention_plugin"><code class="docutils literal notranslate"><span class="pre">create_sinusoidal_positions_for_cogvlm_attention_plugin()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.RopeEmbeddingUtils.create_sinusoidal_positions_long_rope"><code class="docutils literal notranslate"><span class="pre">create_sinusoidal_positions_long_rope()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.RopeEmbeddingUtils.create_sinusoidal_positions_long_rope_for_attention_plugin"><code class="docutils literal notranslate"><span class="pre">create_sinusoidal_positions_long_rope_for_attention_plugin()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.RopeEmbeddingUtils.create_sinusoidal_positions_yarn"><code class="docutils literal notranslate"><span class="pre">create_sinusoidal_positions_yarn()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.RopeEmbeddingUtils.rotate_every_two"><code class="docutils literal notranslate"><span class="pre">rotate_every_two()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.RopeEmbeddingUtils.rotate_half"><code class="docutils literal notranslate"><span class="pre">rotate_half()</span></code></a></li>
@@ -7030,9 +7040,9 @@ function creates a constant tensor.</p></li>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 14, 2025.</p>
+  <p>Last updated on July 19, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cfcb97a">cfcb97a</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/69e9f6d">69e9f6d</a>.</p>
   
 </div></div>
       

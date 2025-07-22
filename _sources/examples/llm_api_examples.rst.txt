@@ -22,6 +22,8 @@ _____________
    llm_logits_processor
    llm_multilora
    llm_speculative_decoding
+   llm_runtime
+   llm_sampling
 
 Slurm
 _____
