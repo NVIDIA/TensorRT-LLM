@@ -1641,7 +1641,7 @@ def test_ptp_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
             [
                 str(example_root / "quickstart_advanced.py"),
                 "--use_cuda_graph",
-                "--spec_decode_nextn",
+                "--spec_decode_max_draft_len",
                 "1",  # test 1 MTP module
                 "--spec_decode_algo",
                 "MTP",
@@ -1720,13 +1720,13 @@ def test_ptp_quickstart_advanced_eagle3(llm_root, llm_venv, model_name,
                                      delete_on_close=True) as running_log:
         llm_venv.run_cmd([
             str(example_root / "quickstart_advanced.py"),
-            "--spec_decode_nextn",
+            "--spec_decode_max_draft_len",
             "4",
             "--spec_decode_algo",
             "eagle3",
             "--model_dir",
             f"{llm_models_root()}/{model_path}",
-            "--eagle_model_dir",
+            "--draft_model_dir",
             f"{llm_models_root()}/{eagle_model_path}",
             "--disable_kv_cache_reuse",
             "--disable_overlap_scheduler",
@@ -1753,7 +1753,7 @@ def test_ptp_quickstart_advanced_ngram(llm_root, llm_venv, model_name,
             f"{llm_models_root()}/{model_path}",
             "--spec_decode_algo",
             "NGRAM",
-            "--spec_decode_nextn",
+            "--spec_decode_max_draft_len",
             "4",
             "--max_matching_ngram_size",
             "2",
@@ -1829,7 +1829,7 @@ def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
             "--disable_kv_cache_reuse",
             "--spec_decode_algo",
             "MTP",
-            "--spec_decode_nextn",
+            "--spec_decode_max_draft_len",
             "5",
             "--use_relaxed_acceptance_for_thinking",
             "--relaxed_topk=10",
@@ -2033,8 +2033,8 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         "mistral-small-3.1-24b-instruct": {
             "image": [
                 [
-                    "dramatic", "seascape", "stormy", "turbulent", "waves",
-                    "rough"
+                    "dramatic", "seascape", "cloudy", "turbulent", "waves",
+                    "water"
                 ],
                 ["scenic", "rock", "landscape", "snow", "formation"],
                 ["highway", "traffic", "directions", "lanes", "Jurong"],

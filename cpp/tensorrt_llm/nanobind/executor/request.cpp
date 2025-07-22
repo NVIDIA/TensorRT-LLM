@@ -445,13 +445,18 @@ void initRequestBindings(nb::module_& m)
                 std::vector<char>(opaque_state_str_view.begin(), opaque_state_str_view.end()),
                 nb::cast<std::optional<VecTokens>>(state[3]));
         }
-        new (&contextPhaseParams) tle::ContextPhaseParams(nb::cast<VecTokens>(state[0]),
-            nb::cast<tle::ContextPhaseParams::RequestIdType>(state[1]), nb::cast<std::optional<VecTokens>>(state[3]));
+        else
+        {
+            new (&contextPhaseParams) tle::ContextPhaseParams(nb::cast<VecTokens>(state[0]),
+                nb::cast<tle::ContextPhaseParams::RequestIdType>(state[1]),
+                nb::cast<std::optional<VecTokens>>(state[3]));
+        }
     };
 
     nb::class_<tle::ContextPhaseParams>(m, "ContextPhaseParams")
-        .def("__init__",
-            [](tle::ContextPhaseParams const& self, VecTokens const& first_gen_tokens,
+        .def(
+            "__init__",
+            [](tle::ContextPhaseParams& self, VecTokens const& first_gen_tokens,
                 tle::ContextPhaseParams::RequestIdType req_id, std::optional<nb::bytes> const& opaque_state,
                 std::optional<VecTokens> const& draft_tokens)
             {
@@ -459,11 +464,16 @@ void initRequestBindings(nb::module_& m)
                 {
                     auto opaque_state_str_view
                         = std::string_view(opaque_state.value().c_str(), opaque_state.value().size());
-                    return std::make_unique<tle::ContextPhaseParams>(first_gen_tokens, req_id,
+                    new (&self) tle::ContextPhaseParams(first_gen_tokens, req_id,
                         std::vector<char>(opaque_state_str_view.begin(), opaque_state_str_view.end()), draft_tokens);
                 }
-                return std::make_unique<tle::ContextPhaseParams>(first_gen_tokens, req_id, draft_tokens);
-            })
+                else
+                {
+                    new (&self) tle::ContextPhaseParams(first_gen_tokens, req_id, draft_tokens);
+                }
+            },
+            nb::arg("first_gen_tokens"), nb::arg("req_id"), nb::arg("opaque_state").none(),
+            nb::arg("draft_tokens").none())
         .def_prop_ro("first_gen_tokens", [](tle::ContextPhaseParams const& self) { return self.getFirstGenTokens(); })
         .def_prop_ro("draft_tokens", [](tle::ContextPhaseParams const& self) { return self.getDraftTokens(); })
         .def_prop_ro("req_id", &tle::ContextPhaseParams::getReqId)
@@ -486,14 +496,14 @@ void initRequestBindings(nb::module_& m)
         return nb::make_tuple(self.getEagleChoices(), self.isGreedySampling(), self.getPosteriorThreshold(),
             self.useDynamicTree(), self.getDynamicTreeMaxTopK());
     };
-    auto EagleDecodingConfigSetstate = [](tle::EagleConfig& eagleConfig, nb::tuple const& state)
+    auto EagleDecodingConfigSetstate = [](tle::EagleConfig& self, nb::tuple const& state)
     {
         if (state.size() != 5)
         {
             throw std::runtime_error("Invalid EagleConfig state!");
         }
-        new (&eagleConfig) tle::EagleConfig(nb::cast<std::optional<tle::EagleChoices>>(state[0]),
-            nb::cast<bool>(state[1]), nb::cast<std::optional<float>>(state[2]), nb::cast<bool>(state[3]),
+        new (&self) tle::EagleConfig(nb::cast<std::optional<tle::EagleChoices>>(state[0]), nb::cast<bool>(state[1]),
+            nb::cast<std::optional<float>>(state[2]), nb::cast<bool>(state[3]),
             nb::cast<std::optional<SizeType32>>(state[4]));
     };
     nb::class_<tle::EagleConfig>(m, "EagleConfig")
@@ -522,13 +532,13 @@ void initRequestBindings(nb::module_& m)
     auto guidedDecodingParamsGetstate
         = [](tle::GuidedDecodingParams const& self) { return nb::make_tuple(self.getGuideType(), self.getGuide()); };
 
-    auto guidedDecodingParamsSetstate = [](tle::GuidedDecodingParams& guidedDecodingParams, nb::tuple const& state)
+    auto guidedDecodingParamsSetstate = [](tle::GuidedDecodingParams& self, nb::tuple const& state)
     {
         if (state.size() != 2)
         {
             throw std::runtime_error("Invalid GuidedDecodingParams state!");
         }
-        new (&guidedDecodingParams) tle::GuidedDecodingParams(
+        new (&self) tle::GuidedDecodingParams(
             nb::cast<tle::GuidedDecodingParams::GuideType>(state[0]), nb::cast<std::optional<std::string>>(state[1]));
     };
 
@@ -553,13 +563,13 @@ void initRequestBindings(nb::module_& m)
             self.getCrossAttentionMask(), self.getEagleConfig(), self.getSkipCrossAttnBlocks(),
             self.getGuidedDecodingParams());
     };
-    auto requestSetstate = [](tle::Request& request, nb::tuple const& state)
+    auto requestSetstate = [](tle::Request& self, nb::tuple const& state)
     {
         if (state.size() != 33)
         {
             throw std::runtime_error("Invalid Request state!");
         }
-        new (&request) tle::Request(nb::cast<VecTokens>(state[0]), nb::cast<SizeType32>(state[1]),
+        new (&self) tle::Request(nb::cast<VecTokens>(state[0]), nb::cast<SizeType32>(state[1]),
             nb::cast<bool>(state[2]), nb::cast<tle::SamplingConfig>(state[3]), nb::cast<tle::OutputConfig>(state[4]),
             nb::cast<std::optional<SizeType32>>(state[5]), nb::cast<std::optional<SizeType32>>(state[6]),
             nb::cast<std::optional<std::vector<SizeType32>>>(state[7]),
@@ -797,13 +807,13 @@ void initRequestBindings(nb::module_& m)
         return nb::make_tuple(self.timingMetrics, self.kvCacheMetrics, self.speculativeDecoding, self.firstIter,
             self.lastIter, self.iter);
     };
-    auto requestPerfMetricsSetstate = [](tle::RequestPerfMetrics& requestPerfMetrics, nb::tuple const& state)
+    auto requestPerfMetricsSetstate = [](tle::RequestPerfMetrics& self, nb::tuple const& state)
     {
         if (state.size() != 6)
         {
             throw std::runtime_error("Invalid RequestPerfMetrics state!");
         }
-        new (&requestPerfMetrics) tle::RequestPerfMetrics{nb::cast<tle::RequestPerfMetrics::TimingMetrics>(state[0]),
+        new (&self) tle::RequestPerfMetrics{nb::cast<tle::RequestPerfMetrics::TimingMetrics>(state[0]),
             nb::cast<tle::RequestPerfMetrics::KvCacheMetrics>(state[1]),
             nb::cast<tle::RequestPerfMetrics::SpeculativeDecodingMetrics>(state[2]),
             nb::cast<std::optional<tle::IterationType>>(state[3]),
@@ -824,19 +834,17 @@ void initRequestBindings(nb::module_& m)
         .def("__setstate__", requestPerfMetricsSetstate);
 
     nb::class_<tle::AdditionalOutput>(m, "AdditionalOutput")
-        .def("__init__ ",
-            [](tle::AdditionalOutput const& self, std::string const& name, tle::Tensor const& output)
-            { return std::make_unique<tle::AdditionalOutput>(name, output); })
+        .def(nb::init<std::string, tle::Tensor>(), nb::arg("name"), nb::arg("output"))
         .def_rw("name", &tle::AdditionalOutput::name)
         .def_rw("output", &tle::AdditionalOutput::output);
 
-    auto resultSetstate = [](tle::Result& result, nb::tuple const& state)
+    auto resultSetstate = [](tle::Result& self, nb::tuple const& state)
     {
         if (state.size() != 13)
         {
             throw std::runtime_error("Invalid Request state!");
         }
-        new (&result) tle::Result();
+        tle::Result result;
         result.isFinal = nb::cast<bool>(state[0]);
         result.outputTokenIds = nb::cast<std::vector<VecTokens>>(state[1]);
         result.cumLogProbs = nb::cast<std::optional<std::vector<float>>>(state[2]);
@@ -850,6 +858,7 @@ void initRequestBindings(nb::module_& m)
         result.decodingIter = nb::cast<SizeType32>(state[10]);
         result.contextPhaseParams = nb::cast<std::optional<tle::ContextPhaseParams>>(state[11]);
         result.requestPerfMetrics = nb::cast<std::optional<tle::RequestPerfMetrics>>(state[12]);
+        new (&self) tle::Result(result);
     };
 
     auto resultGetstate = [](tle::Result const& self)

@@ -97,7 +97,7 @@ Prompt: 'The future of AI is', Generated text: ' a topic of great interest and s
 To run with MTP, use [examples/llm-api/quickstart_advanced.py](../pytorch/quickstart_advanced.py) with additional options, see
 ```bash
 cd examples/llm-api
-python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_nextn N
+python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_max_draft_len N
 ```
 
 `N` is the number of MTP modules. When `N` is equal to `0`, which means that MTP is not used (default). When `N` is greater than `0`, which means that `N` MTP modules are enabled. In the current implementation, the weight of each MTP module is shared.
@@ -124,7 +124,7 @@ When verifying and receiving draft tokens, there are two ways:
 
   ```bash
   cd examples/llm-api
-  python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_nextn N --use_relaxed_acceptance_for_thinking --relaxed_topk 15 --relaxed_delta 0.5
+  python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_max_draft_len N --use_relaxed_acceptance_for_thinking --relaxed_topk 15 --relaxed_delta 0.5
   ```
 
 ### Long context support

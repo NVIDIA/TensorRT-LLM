@@ -38,6 +38,7 @@ from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
 
+from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.llmapi.utils import enable_llm_debug
@@ -602,6 +603,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.enable_attention_dp = mapping.enable_attention_dp
 
         self.mlp_tp_size = mapping.tp_size
+        self.is_p2p_supported = can_access_peer(mapping)
 
         self.fusion_config = EagerFusionConfig()
         self.enable_fusion = os.environ.get(
@@ -796,7 +798,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             not (hidden_states.shape[0] <= self.moe_allreduce.max_token
                  and self.fusion_config.POST_MOE_FUSION
                  and self.model_config.moe_backend == "TRTLLM"
-                 and self.mlp.experts.has_nvfp4))
+                 and self.mlp.experts.has_nvfp4 and self.is_p2p_supported))
 
         hidden_states = _run_MoE(hidden_states,
                                  hidden_states_fp4=None,
