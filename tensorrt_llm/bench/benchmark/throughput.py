@@ -13,7 +13,6 @@ from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
-# isort: on
 from tensorrt_llm.bench.benchmark.utils.general import (
     ALL_SUPPORTED_BACKENDS, TuningConstraints, generate_warmup_dataset,
     get_settings, get_settings_from_engine)
