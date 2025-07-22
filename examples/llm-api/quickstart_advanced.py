@@ -107,11 +107,7 @@ def add_llm_args(parser):
     parser.add_argument('--max_beam_width', type=int, default=1)
 
     # Speculative decoding
-    parser.add_argument(
-        '--spec_decode_algo',
-        type=str,
-        default=None,
-        choices=['MTP', 'EAGLE3', 'DRAFT_TARGET', 'NGRAM', 'AUTO'])
+    parser.add_argument('--spec_decode_algo', type=str, default=None)
     parser.add_argument('--spec_decode_max_draft_len', type=int, default=1)
     parser.add_argument('--draft_model_dir', type=str, default=None)
     parser.add_argument('--max_matching_ngram_size', type=int, default=5)
