@@ -2033,8 +2033,8 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         "mistral-small-3.1-24b-instruct": {
             "image": [
                 [
-                    "dramatic", "seascape", "stormy", "turbulent", "waves",
-                    "rough"
+                    "dramatic", "seascape", "cloudy", "turbulent", "waves",
+                    "water"
                 ],
                 ["scenic", "rock", "landscape", "snow", "formation"],
                 ["highway", "traffic", "directions", "lanes", "Jurong"],
