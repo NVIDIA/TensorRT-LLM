@@ -359,9 +359,12 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
             config.earlyStopping, config.noRepeatNgramSize, config.numReturnSequences, config.minP,
             config.beamWidthArray);
     };
-    auto SamplingConfigSetState = [](tr::SamplingConfig& self, nb::tuple t) -> tr::SamplingConfig
+    auto SamplingConfigSetState = [](tr::SamplingConfig& self, nb::tuple t)
     {
-        assert(t.size() == 19);
+        if (t.size() != 19)
+        {
+            throw std::runtime_error("Invalid SamplingConfig state!");
+        }
 
         tr::SamplingConfig config;
         config.beamWidth = nb::cast<SizeType32>(t[0]);
@@ -384,7 +387,7 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         config.minP = nb::cast<OptVec<float>>(t[17]);
         config.beamWidthArray = nb::cast<OptVec<std::vector<SizeType32>>>(t[18]);
 
-        return config;
+        new (&self) tr::SamplingConfig(config);
     };
 
     nb::class_<tr::SamplingConfig>(m, "SamplingConfig")
