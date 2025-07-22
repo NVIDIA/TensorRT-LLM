@@ -53,7 +53,7 @@ class LogProbsResult(NamedTuple):
 class ResponseWrapper:
     """
     1. Wrapper of runtime response with optional outputs computed post runtime.
-    2. a workaround to pass around RequestPerfMetrics.
+    2. A workaround to pass around RequestPerfMetrics.
     """
 
     def __init__(self,
@@ -730,8 +730,8 @@ def compute_logprobs(
 def _process_req_perf_metrics(
         req_perf_metrics_dict: Optional[dict[str, float]],
         output_length: int,
-        is_multiple_response: Optional[bool] = False
-) -> Optional[dict[str, float]]:
+        is_multiple_response: bool = False
+) -> dict[SupportedMetricNames, float]:
     stat = {}
     if not req_perf_metrics_dict:
         return stat

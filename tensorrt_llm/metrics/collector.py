@@ -6,6 +6,7 @@ from typing import Dict, Optional, Union
 from .enums import SupportedMetricNames
 
 
+# Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0rc1/vllm/engine/metrics.py#L30
 class MetricsCollector:
     labelname_finish_reason = "finished_reason"
 

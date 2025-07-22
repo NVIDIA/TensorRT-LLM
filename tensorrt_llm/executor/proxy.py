@@ -23,6 +23,7 @@ from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorker, PostprocWorkerConfig
+from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult, ResponseWrapper
 from .utils import (ErrorResponse, IntraProcessQueue, WorkerCommIpcAddrs,
                     create_mpi_comm_session, get_spawn_proxy_process_env,
