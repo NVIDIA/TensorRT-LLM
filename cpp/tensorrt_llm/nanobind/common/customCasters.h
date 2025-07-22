@@ -38,6 +38,7 @@
 #include <torch/csrc/autograd/variable.h>
 #include <torch/extension.h>
 #include <torch/torch.h>
+#include <vector>
 
 // Pybind requires to have a central include in order for type casters to work.
 // Opaque bindings add a type caster, so they have the same requirement.
@@ -48,7 +49,6 @@ NB_MAKE_OPAQUE(tensorrt_llm::batch_manager::ReqIdsSet)
 NB_MAKE_OPAQUE(std::vector<tensorrt_llm::batch_manager::SlotDecoderBuffers>)
 NB_MAKE_OPAQUE(std::vector<tensorrt_llm::runtime::decoder_batch::Request>)
 NB_MAKE_OPAQUE(std::vector<tensorrt_llm::runtime::SamplingConfig>)
-NB_MAKE_OPAQUE(std::vector<std::vector<tensorrt_llm::runtime::SizeType32>>)
 
 namespace nb = nanobind;
 
@@ -126,70 +126,6 @@ struct type_caster<tensorrt_llm::common::OptionalRef<T>>
 
         return value_conv::from_cpp(*src, policy, cleanup);
     }
-};
-
-template <typename T>
-struct PathCaster
-{
-
-private:
-    static PyObject* unicode_from_fs_native(std::string const& w)
-    {
-        return PyUnicode_DecodeFSDefaultAndSize(w.c_str(), ssize_t(w.size()));
-    }
-
-    static PyObject* unicode_from_fs_native(std::wstring const& w)
-    {
-        return PyUnicode_FromWideChar(w.c_str(), ssize_t(w.size()));
-    }
-
-public:
-    static handle from_cpp(T const& path, rv_policy, cleanup_list* cleanup)
-    {
-        if (auto py_str = unicode_from_fs_native(path.native()))
-        {
-            return module_::import_("pathlib").attr("Path")(steal<object>(py_str), cleanup).release();
-        }
-        return nullptr;
-    }
-
-    bool from_python(handle src, uint8_t flags, cleanup_list* cleanup)
-    {
-        PyObject* native = nullptr;
-        if constexpr (std::is_same_v<typename T::value_type, char>)
-        {
-            if (PyUnicode_FSConverter(src.ptr(), &native) != 0)
-            {
-                if (auto* c_str = PyBytes_AsString(native))
-                {
-                    // AsString returns a pointer to the internal buffer, which
-                    // must not be free'd.
-                    value = c_str;
-                }
-            }
-        }
-        else if constexpr (std::is_same_v<typename T::value_type, wchar_t>)
-        {
-            if (PyUnicode_FSDecoder(src.ptr(), &native) != 0)
-            {
-                if (auto* c_str = PyUnicode_AsWideCharString(native, nullptr))
-                {
-                    // AsWideCharString returns a new string that must be free'd.
-                    value = c_str; // Copies the string.
-                    PyMem_Free(c_str);
-                }
-            }
-        }
-        Py_XDECREF(native);
-        if (PyErr_Occurred())
-        {
-            PyErr_Clear();
-            return false;
-        }
-        return true;
-    }
-
-    NB_TYPE_CASTER(T, const_name("os.PathLike"));
 };
 
 template <>
@@ -311,34 +247,45 @@ struct type_caster<at::Tensor>
 
     bool from_python(nb::handle src, uint8_t, cleanup_list*) noexcept
     {
-        nb::object capsule = nb::getattr(src, "__dlpack__")();
-        DLManagedTensor* dl_managed = static_cast<DLManagedTensor*>(PyCapsule_GetPointer(capsule.ptr(), "dltensor"));
-        PyCapsule_SetDestructor(capsule.ptr(), nullptr);
-        value = at::fromDLPack(dl_managed).alias();
-        return true;
+        PyObject* obj = src.ptr();
+        if (THPVariable_Check(obj))
+        {
+            value = THPVariable_Unpack(obj);
+            return true;
+        }
+        return false;
     }
 
-    static handle from_cpp(at::Tensor tensor, rv_policy, cleanup_list*) noexcept
+    static handle from_cpp(at::Tensor src, rv_policy, cleanup_list*) noexcept
     {
-        DLManagedTensor* dl_managed = at::toDLPack(tensor);
-        if (!dl_managed)
-            return nullptr;
+        return THPVariable_Wrap(src);
+    }
+};
 
-        nanobind::object capsule = nb::steal(PyCapsule_New(dl_managed, "dltensor",
-            [](PyObject* obj)
-            {
-                DLManagedTensor* dl = static_cast<DLManagedTensor*>(PyCapsule_GetPointer(obj, "dltensor"));
-                dl->deleter(dl);
-            }));
-        if (!capsule.is_valid())
+template <typename T>
+struct type_caster<std::vector<std::reference_wrapper<T const>>>
+{
+    using VectorType = std::vector<std::reference_wrapper<T const>>;
+
+    NB_TYPE_CASTER(VectorType, const_name("List[") + make_caster<T>::Name + const_name("]"));
+
+    bool from_python(handle src, uint8_t flags, cleanup_list* cleanup) noexcept
+    {
+        // Not needed for our use case since we only convert C++ to Python
+        return false;
+    }
+
+    static handle from_cpp(VectorType const& src, rv_policy policy, cleanup_list* cleanup) noexcept
+    {
+
+        std::vector<T> result;
+        result.reserve(src.size());
+        for (auto const& ref : src)
         {
-            dl_managed->deleter(dl_managed);
-            return nullptr;
+            result.push_back(ref.get());
         }
-        nanobind::module_ torch = nanobind::module_::import_("torch");
-        nanobind::object result = torch.attr("from_dlpack")(capsule);
-        capsule.release();
-        return result.release();
+
+        return make_caster<std::vector<T>>::from_cpp(result, policy, cleanup);
     }
 };
 } // namespace detail
