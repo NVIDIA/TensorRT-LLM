@@ -34,6 +34,7 @@ from ..distributed import MPIDist
 from ..distributed.communicator import init_pp_comm
 from ..expert_statistic import ExpertStatistic
 from ..metadata import KVCacheParams
+from ..model_config import MoEPrefetchConfig
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_utils import filter_mm_token_from_input_ids
 from ..models.modeling_utils import DecoderModelForCausalLM
