@@ -2217,7 +2217,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             echo "Force disable ONLY_PYTORCH_FILE_CHANGED mode. Backend mode set by flag: ${testFilter[(TEST_BACKEND)]}."
         } else {
             echo "ONLY_PYTORCH_FILE_CHANGED mode is true."
-            parallelJobsFiltered = parallelJobsFiltered.findAll { !it.key.contains("-CPP-") && !it.key.contains("-TensorRT-") }
+            parallelJobsFiltered = parallelJobsFiltered.findAll { !it.key.contains("-CPP-") && !it.key.contains("-TensorRT-") && !it.key.contains("-Triton-") }
             println parallelJobsFiltered.keySet()
         }
     }
@@ -2233,7 +2233,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             echo "Force disable ONLY_TRITON_FILE_CHANGED mode. Backend mode set by flag: ${testFilter[(TEST_BACKEND)]}."
         } else {
             echo "ONLY_TRITON_FILE_CHANGED mode is true."
-            parallelJobsFiltered = parallelJobsFiltered.findAll { it.key.contains("-Triton-") }
+            parallelJobsFiltered = parallelJobsFiltered.findAll { !it.key.contains("-CPP-") && !it.key.contains("-TensorRT-") && !it.key.contains("-PyTorch-") }
             println parallelJobsFiltered.keySet()
         }
     }
