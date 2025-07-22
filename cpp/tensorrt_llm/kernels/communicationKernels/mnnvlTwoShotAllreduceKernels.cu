@@ -74,13 +74,6 @@ __device__ __inline__ float2 loadfloat2(void const* ptr)
     return *(float2*) return_value;
 }
 
-template <typename T>
-inline __device__ T max3(T in_a, T in_b, T in_c)
-{
-    T max_ab = in_a > in_b ? in_a : in_b;
-    return max_ab > in_c ? max_ab : in_c;
-}
-
 template <int WORLD_SIZE, typename T>
 __global__ void twoshot_allreduce_kernel(T* output_ptr, T* shard_ptr, T** input_ptrs, T* mcast_ptr, int num_tokens,
     int buffer_M, int token_dim, int rank, uint32_t* buffer_flags, bool wait_for_results)
