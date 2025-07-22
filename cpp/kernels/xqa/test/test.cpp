@@ -130,7 +130,7 @@ template <uint32_t nbKHeads>
 #endif
 #endif
 void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, bool verbose = false,
-    bool saveData = false, uint32_t ctxLen = ~0U, uint32_t slidingWinSize = std::numeric_limits<uint32_t>::max())
+    bool saveData = false, uint32_t ctxLen = ~0U, uint32_t slidingWinSize = 1U << 30)
 {
 #if IS_MLA
     if (nbKHeads != 1)
@@ -363,6 +363,8 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
         {
 #if IS_MLA || SPEC_Q_SEQ_LEN
             hostMask[tokenIdx * qSeqLen + kvPosIdx] = (tokenIdx >= kvPosIdx);
+#elif !IS_SPEC_DEC_TREE
+            hostMask[tokenIdx * qSeqLen + kvPosIdx] = tokenIdx >= kvPosIdx;
 #else
             hostMask[tokenIdx * qSeqLen + kvPosIdx] = maskDist(rng);
 #endif
@@ -1038,6 +1040,10 @@ TEST(RefCheck, llama_V2_70b_3)
     runTest<8, HEAD_GROUP_SIZE, Q_SEQ_LEN>(8, 1028, runPerfTest, runCheckTest);
     runTest<8, HEAD_GROUP_SIZE, Q_SEQ_LEN>(8, 2048, runPerfTest, runCheckTest);
     runTest<8, HEAD_GROUP_SIZE, Q_SEQ_LEN>(8, 4096, runPerfTest, runCheckTest);
+    runTest<8, HEAD_GROUP_SIZE, Q_SEQ_LEN>(8, 2048, runPerfTest, runCheckTest);
+
+    // runTest<1, HEAD_GROUP_SIZE, Q_SEQ_LEN>(1, 2, false, runCheckTest, true, false, ~0U, 1);
+    // runTest<1, HEAD_GROUP_SIZE, Q_SEQ_LEN>(1, 2039, false, runCheckTest, true, false, ~0U, 1024);
 }
 #endif
 
