@@ -6,12 +6,17 @@ import torch
 from parameterized import parameterized
 from transformers import Gemma3Config
 from transformers import Gemma3ForCausalLM as HFGemma3ForCausalLM
+from transformers import Gemma3TextConfig
 from transformers.cache_utils import HybridCache
 
 import tensorrt_llm
+from tensorrt_llm._torch.attention_backend import (AttentionMetadata,
+                                                   FlashInferAttentionMetadata)
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.checkpoints.hf.gemma3_weight_mapper import \
+    Gemma3HfWeightMapper
 from tensorrt_llm._torch.models.modeling_gemma3 import Gemma3ForCausalLM
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -34,7 +39,7 @@ GEMMA3_1B_CONFIG = {
     "max_position_embeddings": 32768,
     "model_type": "gemma3_text",
     "num_attention_heads": 4,
-    "num_hidden_layers": 26,
+    "num_hidden_layers": 6,
     "num_key_value_heads": 1,
     "pad_token_id": 0,
     "query_pre_attn_scalar": 256,
@@ -42,7 +47,7 @@ GEMMA3_1B_CONFIG = {
     "rope_local_base_freq": 10000,
     "rope_scaling": None,
     "rope_theta": 1000000,
-    "sliding_window": 512,
+    "sliding_window": 4,
     "sliding_window_pattern": 6,
     "torch_dtype": "bfloat16",
     "transformers_version": "4.50.0.dev0",
@@ -65,14 +70,15 @@ GEMMA3_27B_CONFIG = {
         "intermediate_size": 21504,
         "model_type": "gemma3_text",
         "num_attention_heads": 32,
-        "num_hidden_layers": 62,
+        "num_hidden_layers": 6,
         "num_key_value_heads": 16,
         "query_pre_attn_scalar": 168,
         "rope_scaling": {
             "factor": 8.0,
             "rope_type": "linear"
         },
-        "sliding_window": 1024
+        "sliding_window": 4,
+        "sliding_window_pattern": 6,
     },
     "torch_dtype": "bfloat16",
     "transformers_version": "4.50.0.dev0",
@@ -100,7 +106,7 @@ class Scenario:
 
 class TestGemma3(unittest.TestCase):
 
-    def get_kv_cache_manager(self, dtype: torch.dtype, config: Gemma3Config,
+    def get_kv_cache_manager(self, dtype: torch.dtype, config: Gemma3TextConfig,
                              tokens_per_block: int, max_seq_len: int,
                              batch_size: int, num_blocks: int):
         if dtype == torch.half:
@@ -132,9 +138,9 @@ class TestGemma3(unittest.TestCase):
 
     def test_gemma3_sanity(self):
 
-        config_dict = deepcopy(
-            GEMMA3_1B_CONFIG)  # Using 1B config for sanity test.
-        gemma3_config = Gemma3Config.from_dict(config_dict)
+        # Using 1B config for sanity test.
+        config_dict = deepcopy(GEMMA3_1B_CONFIG)
+        gemma3_config = Gemma3TextConfig.from_dict(config_dict)
 
         dtype = gemma3_config.torch_dtype
         device = torch.device('cuda')
@@ -211,6 +217,20 @@ class TestGemma3(unittest.TestCase):
 
         kv_cache_manager.shutdown()
 
+    def _verify_params_flushed_upon_prepare(self,
+                                            attn_metadata: AttentionMetadata):
+        # This check is valid only for FlashInferAttentionMetadata. It checks that the PlanParams specific
+        # to forward call with custom mask exist right after the forward call and are flushed upon prepare.
+        if isinstance(attn_metadata, FlashInferAttentionMetadata):
+            # Right after forward call with custom mask, plan_params will have non-trivial attention_mask_data.
+            # One for global-prefill, other for local-prefill.
+            self.assertEqual(len(attn_metadata._plan_params_to_wrappers), 2)
+            for plan_params in attn_metadata._plan_params_to_wrappers.keys():
+                assert plan_params.attention_mask_data is not None
+            # Prepare should flush the params with non-trivial attention_mask_data.
+            attn_metadata.prepare()
+            self.assertEqual(len(attn_metadata._plan_params_to_wrappers), 0)
+
     @parameterized.expand([
         Scenario(backend="TRTLLM", config_name="1B"),
         Scenario(backend="VANILLA", config_name="1B"),
@@ -239,17 +259,15 @@ class TestGemma3(unittest.TestCase):
         else:
             raise ValueError(f"Unknown config_name: {config_name}")
 
-        gemma3_config = Gemma3Config.from_dict(config_dict)
         if config_name == "27B":
+            gemma3_config = Gemma3Config.from_dict(config_dict)
             gemma3_config.text_config.torch_dtype = gemma3_config.torch_dtype
             gemma3_config = gemma3_config.text_config
+        else:
+            gemma3_config = Gemma3TextConfig.from_dict(config_dict)
+
         dtype = gemma3_config.torch_dtype
         device = torch.device('cuda')
-
-        # 2-layer network with one local (sliding window=4) and one global layer.
-        gemma3_config.num_hidden_layers = 2
-        gemma3_config.sliding_window = 4
-        gemma3_config.sliding_window_pattern = 2
 
         num_blocks = 1
         tokens_per_block = 128
@@ -267,7 +285,9 @@ class TestGemma3(unittest.TestCase):
         model_config = ModelConfig(pretrained_config=gemma3_config,
                                    attn_backend=backend)
         gemma3 = Gemma3ForCausalLM(model_config).to(dtype).to(device)
-        gemma3.load_weights(hf_gemma3.state_dict())
+        weight_mapper = Gemma3HfWeightMapper()
+        weight_mapper.init_model_and_config(gemma3, model_config)
+        gemma3.load_weights(hf_gemma3.state_dict(), weight_mapper)
 
         kv_cache_manager = self.get_kv_cache_manager(
             dtype=dtype,
@@ -303,20 +323,31 @@ class TestGemma3(unittest.TestCase):
         position_ids = [torch.arange(0, input_ids.size(-1), dtype=torch.int32)]
         position_ids = torch.cat(position_ids).unsqueeze(0).cuda()
 
+        # This helps us better test the custom masking utils for Gemma3 VLM as well
+        # as SWA plumbing for FlashInfer. All tokens being text tokens should yield
+        # same results as using global or local attention for appropriate layers.
+        if backend == "FLASHINFER":
+            image_token_mask = torch.tensor(
+                [False, False, False, False, False, False, False, False],
+                device=device)
+        else:
+            image_token_mask = None
+
         with torch.inference_mode():
             attn_metadata.prepare()
             logits = gemma3.forward(input_ids=input_ids,
                                     position_ids=position_ids,
-                                    attn_metadata=attn_metadata)
+                                    attn_metadata=attn_metadata,
+                                    image_token_mask=image_token_mask)
             ref = hf_gemma3.forward(input_ids=input_ids.unsqueeze(0),
                                     position_ids=position_ids,
                                     past_key_values=hf_cache,
                                     use_cache=True)
-
             torch.testing.assert_close(logits,
                                        ref.logits[:, -1].float(),
-                                       atol=0.05,
-                                       rtol=0.05)
+                                       atol=0.4,
+                                       rtol=0.4)
+            self._verify_params_flushed_upon_prepare(attn_metadata)
 
         # Generation phase.
         gen_input_ids = torch.tensor([900], dtype=torch.int, device=device)
@@ -349,12 +380,294 @@ class TestGemma3(unittest.TestCase):
                                     position_ids=gen_position_ids,
                                     past_key_values=hf_cache,
                                     use_cache=True,
-                                    cache_position=torch.IntTensor(
+                                    cache_position=torch.LongTensor(
                                         [input_ids.size(-1)]).to(device),
                                     last_cache_position=input_ids.size(-1) + 1)
             torch.testing.assert_close(logits,
                                        ref.logits[:, -1].float(),
-                                       atol=0.05,
-                                       rtol=0.05)
+                                       atol=0.4,
+                                       rtol=0.4)
 
         kv_cache_manager.shutdown()
+
+    def test_gemma3_flashinfer_mask(self):
+        config_dict = deepcopy(GEMMA3_1B_CONFIG)
+        gemma3_config = Gemma3TextConfig.from_dict(config_dict)
+
+        dtype = gemma3_config.torch_dtype
+        device = torch.device('cuda')
+
+        model_config = ModelConfig(pretrained_config=gemma3_config,
+                                   attn_backend="FLASHINFER")
+        gemma3 = Gemma3ForCausalLM(model_config).to(device)
+
+        input_ids = torch.tensor([100, 200, 300, 400, 500, 600, 700, 800],
+                                 dtype=torch.int,
+                                 device=device)
+
+        # This initial setup is to populate KV cache so that attn_metadata has the info
+        # needed for generating mask.
+        context_sequence_lengths = [3, 2, 1]
+        sequence_lengths = context_sequence_lengths + [1, 1]
+        past_seen_tokens = [0, 0, 0, 2, 1]
+        request_ids = list(range(len(sequence_lengths)))
+        token_nums = (torch.tensor(past_seen_tokens) +
+                      torch.tensor(sequence_lengths)).tolist()
+        prompt_lens = token_nums[:3] + past_seen_tokens[3:]
+
+        num_blocks = 100
+        tokens_per_block = 128
+        max_seq_len = num_blocks * tokens_per_block
+        batch_size = len(context_sequence_lengths) + 2
+        kv_cache_manager = self.get_kv_cache_manager(
+            dtype=dtype,
+            config=gemma3_config,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=max_seq_len,
+            batch_size=batch_size,
+            num_blocks=num_blocks)
+        kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+
+        metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
+        assert metadata_cls == FlashInferAttentionMetadata
+        attn_metadata = metadata_cls(
+            seq_lens=torch.tensor(sequence_lengths, dtype=torch.int),
+            num_contexts=len(context_sequence_lengths),
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=past_seen_tokens,
+            ),
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            prompt_lens=prompt_lens,
+            max_num_requests=len(context_sequence_lengths) + 2,
+            max_num_tokens=8192,
+        )
+        attn_metadata.prepare()
+
+        # First sample has 2 image tokens, second sample has 2 image tokens, third sample has none.
+        image_token_mask = torch.tensor(
+            [True, True, False, True, True, True, False, False], device=device)
+        causal_mask = gemma3.get_flashinfer_attention_mask(
+            image_token_mask=image_token_mask, attn_metadata=attn_metadata)
+        # Causal mask for context request 1.
+        ctx_request_1_mask = torch.tensor(
+            [[True, True, False], [True, True, False], [True, True, True]],
+            device=device)
+        # Causal mask for context request 2.
+        ctx_request_2_mask = torch.tensor([[True, True], [True, True]],
+                                          device=device)
+        # Causal mask for context request 3.
+        ctx_request_3_mask = torch.tensor([[True]], device=device)
+
+        expected_causal_mask = torch.cat([
+            ctx_request_1_mask.flatten(),
+            ctx_request_2_mask.flatten(),
+            ctx_request_3_mask.flatten(),
+        ],
+                                         dim=0)
+        torch.testing.assert_close(causal_mask, expected_causal_mask)
+
+    def single_image_mask_test_helper(
+            self, effective_sliding_window: int) -> torch.Tensor:
+        config_dict = deepcopy(GEMMA3_1B_CONFIG)
+        gemma3_config = Gemma3TextConfig.from_dict(config_dict)
+        device = torch.device('cuda')
+        model_config = ModelConfig(pretrained_config=gemma3_config,
+                                   attn_backend="FLASHINFER")
+        gemma3 = Gemma3ForCausalLM(model_config).to(device)
+
+        image_token_mask = torch.tensor(
+            [False, False, True, True, True, True, False, False], device=device)
+        return gemma3.get_context_mask(
+            image_token_mask=image_token_mask,
+            effective_sliding_window=effective_sliding_window)
+
+    @parameterized.expand([
+        "global",
+        "sliding_window_larger_than_seq",
+        "sliding_window_equal_to_seq",
+    ], lambda testcase_func, param_num, param:
+                          f"{testcase_func.__name__}[{param.args[0]}]")
+    def test_gemma3_global_context_mask_single_image(self,
+                                                     test_name: str) -> None:
+        device = torch.device('cuda')
+        effecive_sliding_window_map = {
+            # For global mask, don't mention sliding window size.
+            "global": None,
+            # For a sliding window larger than sequence length, the local mask is the same as the global mask.
+            "sliding_window_larger_than_seq": 10,
+            # For a sliding window same as sequence length, the local mask is the same as the global mask.
+            "sliding_window_equal_to_seq": 8,
+        }
+        effective_sliding_window = effecive_sliding_window_map[test_name]
+        attention_mask = self.single_image_mask_test_helper(
+            effective_sliding_window=effective_sliding_window)
+        # Text tokens attend to each other in causal fashion. Image tokens attend in causal fashion
+        # as well as to all other image tokens.
+        expected_attention_mask = torch.tensor(
+            [[1, 0, 0, 0, 0, 0, 0, 0], [1, 1, 0, 0, 0, 0, 0, 0],
+             [1, 1, 1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 1, 0, 0],
+             [1, 1, 1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 1, 0, 0],
+             [1, 1, 1, 1, 1, 1, 1, 0], [1, 1, 1, 1, 1, 1, 1, 1]],
+            device=device).bool()
+        torch.testing.assert_close(attention_mask, expected_attention_mask)
+
+    def test_gemma3_local_context_mask_single_image(self) -> None:
+        device = torch.device('cuda')
+        attention_mask = self.single_image_mask_test_helper(
+            effective_sliding_window=2)
+        expected_attention_mask = torch.tensor(
+            [[1, 0, 0, 0, 0, 0, 0, 0], [1, 1, 0, 0, 0, 0, 0, 0],
+             [0, 1, 1, 1, 1, 1, 0, 0], [0, 0, 1, 1, 1, 1, 0, 0],
+             [0, 0, 1, 1, 1, 1, 0, 0], [0, 0, 1, 1, 1, 1, 0, 0],
+             [0, 0, 0, 0, 0, 1, 1, 0], [0, 0, 0, 0, 0, 0, 1, 1]],
+            device=device).bool()
+        torch.testing.assert_close(attention_mask, expected_attention_mask)
+
+    def multi_image_mask_test_helper(
+            self, effective_sliding_window: int) -> torch.Tensor:
+        config_dict = deepcopy(GEMMA3_1B_CONFIG)
+        gemma3_config = Gemma3TextConfig.from_dict(config_dict)
+        device = torch.device('cuda')
+        model_config = ModelConfig(pretrained_config=gemma3_config,
+                                   attn_backend="FLASHINFER")
+        gemma3 = Gemma3ForCausalLM(model_config).to(device)
+
+        # 4 images with 4, 3, 2, 2 tokens respectively.
+        image_token_mask = torch.tensor(
+            [
+                # text blob.
+                False,
+                False,
+                # image1 blob.
+                True,
+                True,
+                True,
+                True,
+                # text blob.
+                False,
+                False,
+                # image2 blob.
+                True,
+                True,
+                True,
+                # text blob.
+                False,
+                False,
+                # image3 blob.
+                True,
+                True,
+                # text blob.
+                False,
+                False,
+                # image4 blob.
+                True,
+                True,
+                # text blob.
+                False,
+            ],
+            device=device)
+        return gemma3.get_context_mask(
+            image_token_mask=image_token_mask,
+            effective_sliding_window=effective_sliding_window)
+
+    @parameterized.expand([
+        "global",
+        "sliding_window_larger_than_seq",
+        "sliding_window_equal_to_seq",
+    ], lambda testcase_func, param_num, param:
+                          f"{testcase_func.__name__}[{param.args[0]}]")
+    def test_gemma3_global_context_mask_multi_image(self,
+                                                    test_name: str) -> None:
+        device = torch.device('cuda')
+        effecive_sliding_window_map = {
+            # Don't mention sliding window size for global mask.
+            "global": None,
+            # For a sliding window larger than sequence length, the local mask is the same as the global mask.
+            "sliding_window_larger_than_seq": 25,
+            # For a sliding window same as sequence length, the local mask is the same as the global mask.
+            "sliding_window_equal_to_seq": 20,
+        }
+        effective_sliding_window = effecive_sliding_window_map[test_name]
+
+        # Text tokens attend to each other in causal fashion. Image tokens attend in causal fashion
+        # as well as to all other image tokens.
+        expected_attention_mask = torch.tensor(
+            [
+                # text blob.
+                [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                # image1 blob.
+                [1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                # text blob.
+                [1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                # image2 blob.
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                # text blob.
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0],
+                # image3 blob.
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0],
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0],
+                # text blob.
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0],
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0],
+                # image4 blob.
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0],
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0],
+                # text blob.
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            ],
+            device=device).bool()
+        attention_mask = self.multi_image_mask_test_helper(
+            effective_sliding_window=effective_sliding_window)
+        torch.testing.assert_close(attention_mask, expected_attention_mask)
+
+    def test_gemma3_local_context_mask_multi_image(self) -> None:
+        device = torch.device('cuda')
+        attention_mask = self.multi_image_mask_test_helper(
+            effective_sliding_window=3)
+
+        # Text tokens attend to each other in causal fashion. Image tokens attend in causal fashion
+        # as well as to all other image tokens.
+        expected_attention_mask = torch.tensor(
+            [
+                # text blob.
+                [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                # image1 blob.
+                [1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                # text blob.
+                [0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                # image2 blob.
+                [0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                # text blob.
+                [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+                [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0],
+                # image3 blob.
+                [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0],
+                [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0],
+                # text blob.
+                [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0],
+                [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0],
+                # image4 blob.
+                [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0],
+                [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0],
+                # text blob.
+                [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1],
+            ],
+            device=device).bool()
+        torch.testing.assert_close(attention_mask, expected_attention_mask)

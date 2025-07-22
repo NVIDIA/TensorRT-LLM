@@ -73,12 +73,14 @@ class BindCapacityScheduler(CapacityScheduler):
         self,
         max_num_requests: int,
         kv_cache_manager,
+        peft_cache_manager: tb_internal.batch_manager.PeftCacheManager | None,
         scheduler_policy: tb_executor.CapacitySchedulerPolicy = tb_executor.
         CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         two_step_lookahead: bool = False,
     ):
         super(BindCapacityScheduler, self).__init__()
         self.kv_cache_manager = kv_cache_manager
+        self.peft_cache_manager = peft_cache_manager
 
         self.impl = tb_internal.algorithms.CapacityScheduler(
             max_num_requests=max_num_requests,
@@ -91,7 +93,8 @@ class BindCapacityScheduler(CapacityScheduler):
     def schedule_request(
         self, active_requests: RequestList
     ) -> tuple[list[LlmRequest], list[LlmRequest], list[LlmRequest]]:
-        return self.impl(active_requests, self.kv_cache_manager)
+        return self.impl(active_requests, self.kv_cache_manager,
+                         self.peft_cache_manager)
 
 
 class GuaranteedNoEvictScheduler(CapacityScheduler):

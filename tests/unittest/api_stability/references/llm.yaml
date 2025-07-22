@@ -66,21 +66,21 @@ methods:
       cuda_graph_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.CudaGraphConfig]
         default: null
+      checkpoint_loader:
+        annotation: Optional[tensorrt_llm._torch.BaseCheckpointLoader]
+        default: null
+      checkpoint_format:
+        annotation: Optional[str]
+        default: null
       disable_overlap_scheduler:
         annotation: bool
         default: False
-      moe_max_num_tokens:
-        annotation: Optional[int]
-        default: null
-      moe_load_balancer:
-        annotation: Union[tensorrt_llm._torch.MoeLoadBalancerConfig, str, None]
+      moe_config:
+        annotation: tensorrt_llm.llmapi.llm_args.MoeConfig
         default: null
       attn_backend:
         annotation: str
         default: TRTLLM
-      moe_backend:
-        annotation: str
-        default: CUTLASS
       enable_mixed_sampler:
         annotation: bool
         default: False
@@ -102,7 +102,7 @@ methods:
       torch_compile_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.TorchCompileConfig]
         default: null
-      autotuner_enabled:
+      enable_autotuner:
         annotation: bool
         default: True
       enable_layerwise_nvtx_marker:

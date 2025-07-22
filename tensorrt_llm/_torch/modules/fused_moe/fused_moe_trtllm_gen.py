@@ -2,6 +2,7 @@ from typing import Dict, List, Optional, Union
 
 import torch
 
+from ...distributed.ops import reducescatter
 from ...model_config import ModelConfig
 from ...utils import Fp4QuantizedTensor
 from .interface import MoE, MoEWeightLoadingMode
@@ -104,6 +105,24 @@ class TRTLLMGenFusedMoE(MoE):
             raise NotImplementedError(
                 "TRTLLMGenFusedMoE doesn't support fp16/bf16/fp32 MoE.")
 
+    def reducescatter_or_allreduce(
+        self,
+        inputs,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        use_dp_padding: Optional[bool] = None,
+    ):
+        outputs = inputs
+        if self.parallel_size > 1:
+            if self.use_dp:
+                outputs = reducescatter(
+                    inputs,
+                    self.mapping,
+                    dim=0,
+                    sizes=None if use_dp_padding else all_rank_num_tokens)
+            elif self.reduce_results:
+                outputs = self.all_reduce(inputs)
+        return outputs
+
     def create_weights(self):
         if self._weights_created:
             return
@@ -154,13 +173,6 @@ class TRTLLMGenFusedMoE(MoE):
             assert do_finalize, "fp8_block_scale_moe_runner does not support do_finalize=False"
             x_val, x_scale = torch.ops.trtllm.fp8_quantize_1x128(x)
 
-            # FIXME: tile_tokens_dim is hardcoded for now
-            tile_tokens_dim = 8
-            if 8 < x.shape[0] and x.shape[0] < 1024:
-                tile_tokens_dim = 16
-            elif x.shape[0] >= 1024:
-                tile_tokens_dim = 32
-
             final_hidden_states = torch.ops.trtllm.fp8_block_scale_moe_runner(
                 router_logits,
                 routing_bias,
@@ -179,18 +191,19 @@ class TRTLLMGenFusedMoE(MoE):
                 slot_start,  # local_expert_start;  use ep_rank if stride!=1
                 self.expert_size_per_partition,  # local_expert_size
                 routed_scaling_factor,
-                tile_tokens_dim,
                 self.routing_method.routing_method_type,
             )
         elif self.has_nvfp4:
             scale_factor_use_ue8m0 = False
             is_scale_factor_swizzled = False  # use linear layout here
-            hidden_states_fp4, hidden_states_scale_linear_fp4 = torch.ops.trtllm.fp4_quantize(
-                x, self.fc31_input_scale, 16, scale_factor_use_ue8m0,
-                is_scale_factor_swizzled)
-
-            # FIXME: tile_tokens_dim is hardcoded for now
-            tile_tokens_dim = 8
+            hidden_states_fp4, hidden_states_scale_linear_fp4 = (
+                torch.ops.trtllm.fp4_quantize(
+                    x,
+                    self.fc31_input_scale,
+                    self.scaling_vector_size,
+                    scale_factor_use_ue8m0,
+                    is_scale_factor_swizzled,
+                ))
 
             outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
                 router_logits,
@@ -213,7 +226,6 @@ class TRTLLMGenFusedMoE(MoE):
                 slot_start,  # local_expert_start;  use ep_rank if stride!=1
                 self.expert_size_per_partition,  # local_expert_size
                 routed_scaling_factor,
-                tile_tokens_dim,
                 self.routing_method.routing_method_type,
                 do_finalize=do_finalize,
             )
@@ -228,8 +240,11 @@ class TRTLLMGenFusedMoE(MoE):
                 "TRTLLMGenFusedMoE only supports fp8_block_scaling and nvfp4 dtypes."
             )
 
-        if self.reduce_results and self.parallel_size > 1:
-            final_hidden_states = self.all_reduce(final_hidden_states)
+        final_hidden_states = self.reducescatter_or_allreduce(
+            final_hidden_states,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=use_dp_padding,
+        )
 
         if use_dp_padding:
             rank = self.mapping.tp_rank

@@ -67,9 +67,14 @@ Another example uses ``curl``:
     :linenos:
 
 Multimodal Serving
-~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~
 
-For multimodal models (e.g., Qwen2-VL), you'll need to create a configuration file and start the server with additional options:
+For multimodal models, you need to create a configuration file and start the server with additional options due to the following limitations:
+
+* TRT-LLM multimodal is currently not compatible with ``kv_cache_reuse``
+* Multimodal models require ``chat_template``, so only the Chat API is supported
+
+To set up multimodal models:
 
 First, create a configuration file:
 
@@ -78,7 +83,6 @@ First, create a configuration file:
    cat >./extra-llm-api-config.yml<<EOF
    kv_cache_config:
        enable_block_reuse: false
-       free_gpu_memory_fraction: 0.6
    EOF
 
 Then, start the server with the configuration file:
@@ -89,8 +93,8 @@ Then, start the server with the configuration file:
        --extra_llm_api_options ./extra-llm-api-config.yml \
        --backend pytorch
 
-Completions API
-~~~~~~~~~~~~~~~
+Multimodal Chat API
+~~~~~~~~~~~~~~~~~~~
 
 You can query Completions API with any http clients, a typical example is OpenAI Python client:
 
@@ -103,6 +107,74 @@ Another example uses ``curl``:
 .. literalinclude:: ../../../examples/serve/curl_chat_client_for_multimodal.sh
     :language: bash
     :linenos:
+
+Multimodal Modality Coverage
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+TRT-LLM multimodal supports the following modalities and data types (depending on the model):
+
+**Text**
+
+* No type specified:
+
+  .. code-block:: json
+
+     {"role": "user", "content": "What's the capital of South Korea?"}
+
+* Explicit "text" type:
+
+  .. code-block:: json
+
+     {"role": "user", "content": [{"type": "text", "text": "What's the capital of South Korea?"}]}
+
+**Image**
+
+* Using "image_url" with URL:
+
+  .. code-block:: json
+
+     {"role": "user", "content": [
+         {"type": "text", "text": "What's in this image?"},
+         {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}
+     ]}
+
+* Using "image_url" with base64-encoded data:
+
+  .. code-block:: json
+
+     {"role": "user", "content": [
+         {"type": "text", "text": "What's in this image?"},
+         {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,{image_base64}"}}
+     ]}
+
+.. note::
+   To convert images to base64-encoded format, use the utility function
+   :func:`tensorrt_llm.utils.load_base64_image`. Refer to the
+   `load_base64_image utility <https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/utils/load_base64_image.py>`__
+   for implementation details.
+
+**Video**
+
+* Using "video_url":
+
+  .. code-block:: json
+
+     {"role": "user", "content": [
+         {"type": "text", "text": "What's in this video?"},
+         {"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}
+     ]}
+
+**Audio**
+
+* Using "audio_url":
+
+  .. code-block:: json
+
+     {"role": "user", "content": [
+         {"type": "text", "text": "What's in this audio?"},
+         {"type": "audio_url", "audio_url": {"url": "https://example.com/audio.mp3"}}
+     ]}
+
 
 Benchmark
 ---------

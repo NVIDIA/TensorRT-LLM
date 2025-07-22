@@ -14,7 +14,7 @@ def model_name():
     return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 
-@pytest.fixture(scope="module", params=[None, 'pytorch'])
+@pytest.fixture(scope="module", params=["trt", "pytorch"])
 def backend(request):
     return request.param
 
@@ -29,10 +29,9 @@ def num_postprocess_workers(request):
 @pytest.fixture(scope="module")
 def server(model_name: str, backend: str, num_postprocess_workers: int):
     model_path = get_model_path(model_name)
-    if backend == "pytorch":
-        args = ["--backend", f"{backend}"]
-    else:
-        args = ["--max_beam_width", "4"]
+    args = ["--backend", f"{backend}"]
+    if backend == "trt":
+        args.extend(["--max_beam_width", "4"])
     args.extend(["--num_postprocess_workers", f"{num_postprocess_workers}"])
     with RemoteOpenAIServer(model_path, args) as remote_server:
         yield remote_server

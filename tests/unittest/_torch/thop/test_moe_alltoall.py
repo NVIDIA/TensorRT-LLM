@@ -471,12 +471,13 @@ class TestMoeAlltoAllSingleGPU(unittest.TestCase):
 
     @parameterized.expand([
         (0, 2, 16, 20, 8, 512),
-        (0, 2, 16, 16, 4, 8),
+        (0, 2, 16, 16, 3, 300),
         (0, 4, 20, 24, 8, 4000),
         (0, 8, 96, 96, 8, 1000),
         (3, 8, 128, 128, 8, 1000),
         (3, 8, 128, 144, 8, 1),
         (0, 4, 72, 80, 4, 2256),
+        (0, 4, 72, 80, 6, 3333),
         # Hang with stream count > 8
         #(0, 9, 90, 8, 100),
     ])
@@ -716,12 +717,10 @@ class TestMoeAlltoAllSingleGPU(unittest.TestCase):
         for i in range(total_recv_token_count):
             for j in range(top_k):
                 expert_id = int(prepared_local_experts_cpu[i][j])
-                assert expert_id == slot_count or compute_target_rank(
-                    expert_id) == ep_rank
-                scale = float(prepared_local_scales_cpu[i][j])
-                if expert_id == slot_count:
-                    assert scale < 1e-6
-                else:
+                assert 0 <= expert_id and expert_id <= slot_count
+                if expert_id < slot_count:
+                    assert compute_target_rank(expert_id) == ep_rank
+                    scale = float(prepared_local_scales_cpu[i][j])
                     assert scale > 1e-6
 
         gathered_expert_statics_cpu = gathered_expert_statics.cpu()

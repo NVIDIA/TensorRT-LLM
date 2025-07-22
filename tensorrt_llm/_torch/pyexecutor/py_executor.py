@@ -2,16 +2,13 @@ import dataclasses
 import datetime
 import functools
 import gc
-import heapq
 import os
-import queue
 import threading
 import time
 import traceback
 import weakref
-from collections import namedtuple
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Union
 
 import torch
 
@@ -23,7 +20,7 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
                                             RequestStage, RequestStats,
-                                            RequestType, SpecDecodingStats,
+                                            SpecDecodingStats,
                                             StaticBatchingStats)
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
@@ -31,11 +28,13 @@ from tensorrt_llm.logger import logger
 
 from ..distributed import Distributed
 from ..speculative.drafter import Drafter
+from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
+from .guided_decoder import GuidedDecoder
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
-                          LlmResponse, executor_request_to_llm_request)
+                          LlmResponse)
 from .model_engine import ModelEngine
-from .sampler import Sampler, SampleState, SampleStateTensors, TorchSampler
+from .sampler import Sampler, SampleState, SampleStateTensors
 from .scheduler import RequestScheduler, ScheduledRequests
 
 # Environment variable to specify iteration ranges for profiling start/stop.
@@ -49,40 +48,6 @@ PROFILE_RECORD_GC_ENV_VAR_NAME = "TLLM_PROFILE_RECORD_GC"
 # Environment variable to enable PyTorch profiler tracing.
 # Set to a path to save detailed tracing of PyTorch operations.
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
-
-SHUTDOWN_REQUEST_ID = -1
-
-
-@dataclasses.dataclass
-class RequestQueueItem:
-    id: int
-    request: Optional[ExecutorRequest] = None
-    query: Optional[list] = None  # only used in `StarAttention`
-
-    def is_shutdown_request(self):
-        return self.id == SHUTDOWN_REQUEST_ID
-
-
-def _get_from_request_queue(request_queue,
-                            timeout: Optional[datetime.timedelta],
-                            max_req_count: int) -> List[RequestQueueItem]:
-    items = []
-    timeout_secs = timeout.total_seconds() if timeout is not None else None
-    req_count = 0
-    try:
-        if request_queue.empty() and (timeout_secs is None or timeout_secs > 0):
-            # if queue is empty and want to wait, wait
-            items.append(request_queue.get(timeout=timeout_secs))
-        else:
-            # if not empty or don't want to wait, just return all items in queue
-            while req_count < max_req_count:
-                queue_item = request_queue.get_nowait()
-                items.append(queue_item)
-                if not queue_item.is_shutdown_request():
-                    req_count += 1
-    except queue.Empty:
-        pass
-    return items
 
 
 @functools.cache
@@ -173,15 +138,15 @@ class PyExecutor:
                  max_input_len: int = 2048,
                  max_batch_size: int = 8,
                  max_beam_width: int = 1,
-                 max_draft_tokens: int = 0,
+                 max_draft_len: int = 0,
                  kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
                  draft_model_engine: Optional[ModelEngine] = None,
+                 guided_decoder: Optional[GuidedDecoder] = None,
                  garbage_collection_gen0_threshold: Optional[int] = None,
                  start_worker: bool = True):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = global_mpi_rank()
-        self.request_queue: queue.Queue[RequestQueueItem] = queue.Queue()
 
         # profile config
         self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
@@ -196,6 +161,7 @@ class PyExecutor:
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.sampler = sampler
         self.drafter = drafter
+        self.guided_decoder = guided_decoder
         self.dist = dist
         self.disable_overlap_scheduler = disable_overlap_scheduler
 
@@ -203,11 +169,10 @@ class PyExecutor:
         self.draft_model_engine = draft_model_engine
 
         # enqueue and _fetch_new_requests used data
-        self.enqueue_lock = threading.Lock()
         self.active = True
         self.next_req_id = max_batch_size  # The first max_batch_size request IDs are reserved for dummy requests
         self.max_beam_width = max_beam_width
-        self.max_draft_tokens = max_draft_tokens
+        self.max_draft_len = max_draft_len
         self.print_log = model_engine.pytorch_backend_config.print_iter_log
         self.enable_iter_perf_stats = model_engine.pytorch_backend_config.enable_iter_perf_stats
         self.enable_iter_req_stats = model_engine.pytorch_backend_config.enable_iter_req_stats
@@ -225,12 +190,6 @@ class PyExecutor:
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
-
-        if self.draft_model_engine is not None and self.kv_cache_manager is not None:
-            if self.kv_cache_manager.enable_block_reuse:
-                raise NotImplementedError(
-                    "Draft model engine + KV cache reuse is not supported yet. "
-                    "This will be fixed in the near future!")
 
         self.max_input_len = max_input_len
         # _executor_loop private data
@@ -251,7 +210,6 @@ class PyExecutor:
         self.send_handles = [None] * self.num_micro_batches
 
         self.inflight_req_ids = ReqIdsSet()
-        self.canceled_req_ids = ReqIdsSet()
 
         self.model_engine.warmup(self.resource_manager)
         if self.draft_model_engine is not None:
@@ -259,10 +217,21 @@ class PyExecutor:
 
         self.is_shutdown = False
 
+        # request fetcher initialization
+        self.executor_request_queue = ExecutorRequestQueue(
+            dist=self.dist,
+            enable_attention_dp=self.enable_attention_dp,
+            max_batch_size=max_batch_size,
+            max_beam_width=self.max_beam_width,
+            max_num_active_requests=self.max_num_active_requests,
+            enable_iter_perf_stats=self.enable_iter_perf_stats,
+            is_disaggregated=kv_cache_transceiver is not None,
+        )
+        self.executor_request_queue.set_exclude_last_generation_logits(
+            self.disable_overlap_scheduler, self.sampler)
+
         self.stats_lock = threading.Lock()
         self.stats = []
-        self.start_times = {}
-        self.new_active_requests_queue_latency_ms = 0
         self.gather_all_responses = False
 
         self.kv_cache_transceiver = kv_cache_transceiver
@@ -276,7 +245,7 @@ class PyExecutor:
         if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
             self.event_loop = trace_func(self.event_loop)
 
-        if self.draft_model_engine is not None:
+        if self.drafter is not None:
             if self.event_loop.__name__ != self._executor_loop.__name__:
                 raise NotImplementedError(
                     "Drafting is not supported for selected executor loop. "
@@ -323,19 +292,7 @@ class PyExecutor:
         """
         Enqueue new requests
         """
-        req_ids = []
-        try:
-            self.enqueue_lock.acquire()
-            assert self.active, "PyExecutor has already been shutdown."
-            start_time = time.time()
-            for request in requests:
-                self.start_times[self.next_req_id] = start_time
-                self.request_queue.put(
-                    RequestQueueItem(self.next_req_id, request))
-                req_ids.append(self.next_req_id)
-                self.next_req_id += 1
-        finally:
-            self.enqueue_lock.release()
+        req_ids = self.executor_request_queue.enqueue_requests(requests)
         return req_ids
 
     def await_responses(
@@ -368,18 +325,13 @@ class PyExecutor:
         Args:
             id (int): The request id for which to cancel the response
         """
-        self.canceled_req_ids.insert(id)
+        self.executor_request_queue.enqueue_cancel_request(id)
 
     def shutdown(self):
         """
         Signals the server to shutdown.
         """
-        try:
-            self.enqueue_lock.acquire()
-            self.request_queue.put(RequestQueueItem(SHUTDOWN_REQUEST_ID))
-            self.active = False
-        finally:
-            self.enqueue_lock.release()
+        self.executor_request_queue.enqueue_shutdown_request()
         self.shutdown_event.wait()
         self.worker_thread.join()
         self.worker_started = False
@@ -394,10 +346,7 @@ class PyExecutor:
         """
         Indicates if the current process is allowed to enqueue requests
         """
-        self.enqueue_lock.acquire()
-        can_enqueue = self.active
-        self.enqueue_lock.release()
-        return can_enqueue and self.dist.rank == 0
+        return self.executor_request_queue.can_enqueue_request()
 
     def get_latest_iteration_stats(self):
         """
@@ -435,24 +384,17 @@ class PyExecutor:
         """
         Enqueue a new request, query is only used in `StarAttention`.
         """
-        try:
-            self.enqueue_lock.acquire()
-            assert self.active, "PyExecutor has already been shutdown."
-            req_id = self.next_req_id
-            if self.enable_iter_perf_stats:
-                self.start_times[req_id] = time.time()
+        req_id = self.executor_request_queue.enqueue_request(request, query)
 
-            if query is not None:
-                self.request_queue.put(RequestQueueItem(req_id, request, query))
-            else:
-                self.request_queue.put(RequestQueueItem(req_id, request))
-            self.next_req_id += 1
-        finally:
-            self.enqueue_lock.release()
         return req_id
 
     def set_gather_responses(self, gather_all_responses):
         self.gather_all_responses = gather_all_responses
+
+    @property
+    def should_stop_processing(self):
+        return self.is_shutdown and len(self.active_requests) == 0 and \
+            self.executor_request_queue.get_waiting_queue_size() == 0
 
     @contextmanager
     def _profiler(self):
@@ -591,7 +533,7 @@ class PyExecutor:
             req_stat.stage = req.stage
             req_stats.append(req_stat)
 
-        for req in list(self.request_queue.queue):
+        for req in list(self.executor_request_queue.get_request_queue().queue):
             if isinstance(req, RequestQueueItem):
                 req_stat = get_queued_req_stats(req.id)
                 req_stat.stage = RequestStage.QUEUED
@@ -608,7 +550,8 @@ class PyExecutor:
                            scheduled_batch) -> IterationStats:
         stats.iter_latency_ms = iter_latency_ms
 
-        stats.num_queued_requests = self.request_queue.qsize()
+        stats.num_queued_requests = self.executor_request_queue.get_request_queue_size(
+        )
         stats.num_completed_requests = num_completed_requests
         stats.max_num_active_requests = self.max_num_active_requests
 
@@ -710,18 +653,19 @@ class PyExecutor:
         with self._profiler() as profile_step:
             iter_start_time = time.time()
             iter_stats = None
-            while not self.is_shutdown or len(self.active_requests) > 0:
+            while not self.should_stop_processing:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
                 new_requests = self._fetch_new_requests()
-                if self.is_shutdown and len(self.active_requests) == 0:
+                if self.should_stop_processing:
                     break
 
                 if self.enable_iter_perf_stats:
                     iter_stats = self._get_init_iter_stats(
                         len(new_requests),
-                        self.new_active_requests_queue_latency_ms)
+                        self.executor_request_queue.
+                        get_new_active_requests_queue_latency())
 
                 self._pad_attention_dp_dummy_request()
 
@@ -762,6 +706,12 @@ class PyExecutor:
                             if self._need_return_logits(scheduled_batch):
                                 logits_host = batch_outputs["logits"].to(
                                     "cpu", non_blocking=True)
+
+                            if self.guided_decoder is not None:
+                                self.guided_decoder.build(scheduled_batch)
+                                self.guided_decoder.execute(
+                                    scheduled_batch, batch_outputs['logits'])
+
                             sample_state = self._sample_async(
                                 scheduled_batch, batch_outputs)
                             sample_state.host.logits = logits_host
@@ -839,7 +789,7 @@ class PyExecutor:
                 if previous_batch is not None:
                     with torch.cuda.nvtx.range("_handle_previous_batch_pp"):
                         self._update_requests(previous_batch.sample_state)
-                        self._handle_cancelled_requests()
+                        self._handle_canceled_requests()
                         finished_requests = self._handle_responses()
                         previous_scheduled_batch = previous_batch.sample_state.scheduled_requests
                         self.resource_manager.update_resources(
@@ -861,12 +811,12 @@ class PyExecutor:
             sample_state = None
             iter_start_time = time.time()
             iter_stats = None
-            while not self.is_shutdown or len(self.active_requests) > 0:
+            while not self.should_stop_processing:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
                 new_requests = self._fetch_new_requests()
-                if self.is_shutdown and len(self.active_requests) == 0:
+                if self.should_stop_processing:
                     break
 
                 if self.kv_cache_transceiver:
@@ -875,12 +825,13 @@ class PyExecutor:
                 if self.enable_iter_perf_stats:
                     iter_stats = self._get_init_iter_stats(
                         len(new_requests),
-                        self.new_active_requests_queue_latency_ms)
+                        self.executor_request_queue.
+                        get_new_active_requests_queue_latency())
 
                 self._pad_attention_dp_dummy_request()
 
-                if self.draft_model_engine is not None or self.drafter is not None:
-                    self._prepare_draft_requests()
+                if self.drafter is not None:
+                    self._prepare_draft_requests(self.active_requests)
 
                 scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
                 )
@@ -918,22 +869,20 @@ class PyExecutor:
                         self._prepare_disagg_gen_transmission_complete(
                             scheduled_batch)
 
-                    self.resource_manager.prepare_resources(scheduled_batch)
-                    if self.draft_model_engine is not None:
-                        self._prepare_draft_tokens(scheduled_batch)
-
-                    if self.drafter is not None:
-                        self.drafter.prepare_draft_tokens(scheduled_batch)
-
-                    if self.kv_cache_transceiver:
-                        # For generation requests which have completed KV cache transfer
-                        self._prepare_disagg_gen_transmission_complete(
-                            scheduled_batch)
-
                         # Return the first token to the client
                         self._handle_first_token_response(scheduled_batch)
 
+                    self.resource_manager.prepare_resources(scheduled_batch)
+                    if self.drafter is not None:
+                        self.drafter.prepare_draft_tokens(
+                            scheduled_batch, self.resource_manager)
+
                     batch_outputs = self._forward_step(scheduled_batch)
+
+                    if self.guided_decoder is not None:
+                        self.guided_decoder.build(scheduled_batch)
+                        self.guided_decoder.execute(scheduled_batch,
+                                                    batch_outputs['logits'])
 
                     sample_state = self._sample_async(scheduled_batch,
                                                       batch_outputs)
@@ -950,7 +899,7 @@ class PyExecutor:
                         for req in ctx_transmission_reqs:
                             req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
 
-                    self._handle_cancelled_requests()
+                    self._handle_canceled_requests()
                     finished_requests = self._handle_responses()
                     self.resource_manager.update_resources(scheduled_batch)
                     if self.enable_kv_cache_events:
@@ -969,17 +918,16 @@ class PyExecutor:
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
 
-    def _prepare_draft_requests(self):
+    def _prepare_draft_requests(self, requests):
         try:
             # Set draft tokens here to make the KV cache manager
             # and scheduler aware of them.
-            for req in self.active_requests:
-                # TODO: enable draft tokens in context phase
+            for req in requests:
                 if req.state not in (LlmRequestState.GENERATION_IN_PROGRESS,
                                      LlmRequestState.DISAGG_GENERATION_INIT):
                     continue
                 req.py_last_draft_tokens = req.py_draft_tokens
-                max_draft_len = self.model_engine.spec_config.max_draft_tokens
+                max_draft_len = self.model_engine.spec_config.max_draft_len
 
                 if max_draft_len > 0:
                     req.py_draft_tokens = [0] * max_draft_len
@@ -997,21 +945,22 @@ class PyExecutor:
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)
         if self.dist.rank == 0 and not self.is_warmup and self.benchmark_req_queues_size > 0 and self.kv_cache_transceiver:
-            while self.request_queue.qsize() < self.benchmark_req_queues_size:
+            while self.executor_request_queue.get_request_queue_size(
+            ) < self.benchmark_req_queues_size:
                 logger.info(
-                    f"sleep 5 seconds, num_request_queue: {self.request_queue.qsize()}"
+                    f"sleep 5 seconds, num_request_queue: {self.executor_request_queue.get_request_queue_size()}"
                 )
                 time.sleep(5)
 
         with self._profiler() as profile_step:
             iter_start_time = time.time()
             iter_stats = None
-            while not self.is_shutdown or len(self.active_requests) > 0:
+            while not self.should_stop_processing:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
                 new_requests = self._fetch_new_requests()
-                if self.is_shutdown and len(self.active_requests) == 0:
+                if self.should_stop_processing:
                     break
 
                 if self.kv_cache_transceiver:
@@ -1020,7 +969,8 @@ class PyExecutor:
                 if self.enable_iter_perf_stats:
                     iter_stats = self._get_init_iter_stats(
                         len(new_requests),
-                        self.new_active_requests_queue_latency_ms)
+                        self.executor_request_queue.
+                        get_new_active_requests_queue_latency())
 
                 self._pad_attention_dp_dummy_request()
 
@@ -1084,6 +1034,14 @@ class PyExecutor:
                     batch_outputs = self._forward_step(scheduled_batch,
                                                        previous_tensors_device)
 
+                    if self.previous_batch is not None:
+                        self._update_requests(self.previous_batch.sample_state)
+
+                    if self.guided_decoder is not None:
+                        self.guided_decoder.build(scheduled_batch)
+                        self.guided_decoder.execute(scheduled_batch,
+                                                    batch_outputs['logits'])
+
                     sample_state = self._sample_async(scheduled_batch,
                                                       batch_outputs)
                     assert sample_state is not None, "Sampling failed"
@@ -1095,9 +1053,7 @@ class PyExecutor:
                     ) if self.kv_cache_transceiver else []
 
                     if self.previous_batch is not None:
-                        previous_batch_size = self.previous_batch.sample_state.scheduled_requests.batch_size
-                        if previous_batch_size > 0:  # first previous batch size is 0
-                            self._process_previous_batch()
+                        self._process_previous_batch()
                         self.previous_batch: Optional[BatchState] = None
 
                     scheduled_batch.context_requests = [
@@ -1119,13 +1075,11 @@ class PyExecutor:
                     self._terminate_ctx_finished_requests()
 
     def _process_previous_batch(self):
-        self._update_requests(self.previous_batch.sample_state)
-
         if self.kv_cache_transceiver and self.previous_batch.ctx_transmission_reqs:
             for req in self.previous_batch.ctx_transmission_reqs:
                 req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
 
-        self._handle_cancelled_requests()
+        self._handle_canceled_requests()
         finished_requests = self._handle_responses()
         scheduled_requests = self.previous_batch.sample_state.scheduled_requests
         self.resource_manager.update_resources(scheduled_requests)
@@ -1148,176 +1102,17 @@ class PyExecutor:
             sampler_event=sampler_event,
         )
 
-    def _update_new_active_requests_queue_latency(
-            self, new_requests: List[RequestQueueItem]):
-        if self.enable_iter_perf_stats and self.dist.rank == 0:
-            now = time.time()
-            for req_item in new_requests:
-                if req_item.id in self.start_times:
-                    self.new_active_requests_queue_latency_ms += now - self.start_times.pop(
-                        req_item.id)
-
-    @nvtx_range("_broadcast_new_requests")
-    def _broadcast_new_requests(
-        self,
-        new_requests: List[RequestQueueItem],
-        py_request_objects: Optional[dict[str, tuple[str, dict]]] = None,
-    ) -> tuple[List[RequestQueueItem], Optional[dict[str, tuple[str, dict]]]]:
-        """Broadcasts new_requests and optional Python-only metadata (`py_request_objects`) across pipeline stages.
-           `py_request_objects` is a tuple of (attribute_name, {request_id: object}).
-        """
-        payloads = (new_requests, py_request_objects)
-
-        if not self.dist.has_pp:
-            return self.dist.broadcast(payloads, root=0)
-
-        # broadcast within first tp group before send/recv chain to other tp groups
-        if self.dist.tp_size > 1 and self.dist.is_first_pp_rank:
-            payloads = self.dist.tp_broadcast(payloads, root=0)
-
-        # tag = [0, num_micro_batches - 1] used for new_tokens send/recv
-        tag = self.num_micro_batches
-
-        # send payloads
-        if not self.dist.is_first_pp_rank:
-            payloads = self.dist.recv_object(self.dist.prev_pp_rank, tag)
-
-        if not self.dist.is_last_pp_rank:
-            self.dist.send_object(payloads, self.dist.next_pp_rank, tag)
-
-        return payloads
-
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(self) -> List[RequestQueueItem]:
-        if self.enable_attention_dp:
-            all_ranks_num_active_requests = []
-            responses_list = self.dist.tp_allgather(len(self.active_requests))
-            for num_active_requests in responses_list:
-                all_ranks_num_active_requests.append(num_active_requests)
-            total_num_active_requests = sum(all_ranks_num_active_requests)
-            total_max_num_active_requests = self.dist.tp_size * self.max_num_active_requests
-        else:
-            total_num_active_requests = len(self.active_requests)
-            total_max_num_active_requests = self.max_num_active_requests
+        new_requests = self.executor_request_queue.fetch_new_requests(
+            len(self.active_requests))
+        self.active_requests.extend(new_requests)
 
-        timeout = None if total_num_active_requests == 0 else datetime.timedelta(
-            0)
-        new_requests = []
-        if self.dist.rank == 0:
-            new_requests = _get_from_request_queue(
-                self.request_queue, timeout,
-                total_max_num_active_requests - total_num_active_requests)
-
-        if self.dist.rank == 0:
-            py_logits_post_processors = self._collect_py_objects_from_requests(
-                new_requests, "py_logits_post_processors")
-            py_multimodal_data = self._collect_py_objects_from_requests(
-                new_requests, "py_multimodal_data")
-            py_request_objects = tuple(
-                filter(None, [py_logits_post_processors, py_multimodal_data]))
-        else:
-            py_request_objects = None
-
-        if self.dist.rank == 0:
-            # Preserve original `new_requests` on rank 0 since it may contain
-            # Python-only objects (e.g., custom logits processors) not serializable by pybind.
-            _ = self._broadcast_new_requests(new_requests, py_request_objects)
-        else:
-            new_requests, py_request_objects = self._broadcast_new_requests(
-                new_requests, py_request_objects)
-
-        # drop requests arriving after shutdown
-        valid_new_requests = []
-        for req_item in new_requests:
-            if req_item.is_shutdown_request():
-                self.is_shutdown = True
-                break
-            else:
-                valid_new_requests.append(req_item)
-        # Check if the beam width of the requests is equal to the max_beam_width
-        for req_item in valid_new_requests:
-            assert req_item.request.sampling_config.beam_width == self.max_beam_width, f"Request beam width {req_item.request.sampling_config.beam_width} is not equal to max_beam_width {self.max_beam_width}. This is not supported!"
-        new_requests = valid_new_requests
-
-        if py_request_objects and (self.dist.tp_size > 1
-                                   or self.dist.has_pp) and self.dist.rank > 0:
-            for attr_name, req_obj_dict in py_request_objects:
-                self._attach_py_objects_to_requests(new_requests, attr_name,
-                                                    req_obj_dict)
-
-        if not self.enable_attention_dp:
-            self._update_new_active_requests_queue_latency(new_requests)
-            new_requests = self._merge_requests(new_requests)
-            self.active_requests.extend(new_requests)
-            return new_requests
-
-        num_new_requests_all_ranks = len(new_requests)
-        self.expected_num_active_requests = max(
-            (total_num_active_requests + num_new_requests_all_ranks +
-             self.dist.tp_size - 1) // self.dist.tp_size,
-            max(all_ranks_num_active_requests),
+        self.is_shutdown = self.executor_request_queue.is_shutdown
+        self.expected_num_active_requests = self.executor_request_queue.get_expected_num_active_requests(
         )
 
-        self.has_context_request = False
-        new_requests_cur_rank = []
-        if new_requests != [] and self.expected_num_active_requests > all_ranks_num_active_requests[
-                self.dist.tp_rank]:
-            # Balance context tokens across ranks
-            HeapVal = namedtuple(
-                'HeapVal',
-                [
-                    'num_tokens',  # number of context tokens that have been added
-                    'num_requests',  # number of requests to be added
-                    'rank',  # rank
-                    'request_list',  # new requests that have been added
-                ],
-            )
-            all_ranks_new_requests_heap = [
-                HeapVal(0, self.expected_num_active_requests - val, tp_rank, [])
-                for tp_rank, val in enumerate(all_ranks_num_active_requests)
-            ]
-            new_requests_cur_rank = all_ranks_new_requests_heap[
-                self.dist.tp_rank].request_list
-            all_ranks_new_requests_heap = [
-                val for val in all_ranks_new_requests_heap
-                if val.num_requests > 0
-            ]
-            heapq.heapify(all_ranks_new_requests_heap)
-            new_requests = sorted(new_requests,
-                                  key=lambda x: len(x.request.input_token_ids),
-                                  reverse=True)
-            for req_item in new_requests:
-                val = heapq.heappop(all_ranks_new_requests_heap)
-                val = val._replace(
-                    num_tokens=val.num_tokens +
-                    len(req_item.request.input_token_ids),
-                    num_requests=val.num_requests - 1,
-                )
-                val.request_list.append(req_item)
-                if val.num_requests > 0:
-                    heapq.heappush(all_ranks_new_requests_heap, val)
-                elif val.rank == self.dist.tp_rank:
-                    break
-
-            # In disaggregated serving, we might get either context request or
-            # generation request. In IFB, we only get context request from request queue
-            if self.kv_cache_transceiver:
-                for req_item in new_requests_cur_rank:
-                    if req_item.request.request_type == RequestType.REQUEST_TYPE_CONTEXT_ONLY:
-                        self.has_context_request = True
-                        break
-            else:
-                self.has_context_request = len(new_requests_cur_rank) > 0
-            self._update_new_active_requests_queue_latency(
-                new_requests_cur_rank)
-
-        self.num_fetch_requests = self.num_fetch_requests + num_new_requests_all_ranks
-        self.num_fetch_requests_cur_rank = self.num_fetch_requests_cur_rank + len(
-            new_requests_cur_rank)
-
-        new_requests_cur_rank = self._merge_requests(new_requests_cur_rank)
-        self.active_requests.extend(new_requests_cur_rank)
-        return new_requests_cur_rank
+        return new_requests
 
     def _add_kv_cache_events(self):
         kv_cache_manager = self.resource_manager.resource_managers.get(
@@ -1327,149 +1122,6 @@ class PyExecutor:
         # Flush iteration events at each iteration to ensure that events have enough time
         # to be transferred to main thread when user needs them.
         kv_cache_manager.flush_iteration_events()
-
-    def _collect_py_objects_from_requests(
-            self, requests: list[RequestQueueItem],
-            attribute_name: str) -> Optional[tuple[str, dict]]:
-        """WAR to gather dynamic Python-only attributes (e.g., custom logits processors)
-        that cannot be handled by pybind serialization during MP communication.
-
-        Returns:
-            A tuple of (attribute_name, {request_id: object}) or None.
-        """
-        req_id_to_obj = {}
-        for item in requests:
-            if item.is_shutdown_request():
-                continue
-            obj = getattr(item.request, attribute_name, None)
-            if obj is not None:
-                req_id_to_obj[item.id] = obj
-        return None if not req_id_to_obj else (attribute_name, req_id_to_obj)
-
-    def _attach_py_objects_to_requests(self, requests: list[RequestQueueItem],
-                                       attribute_name: str,
-                                       py_request_objects: dict):
-        """Attaches Python-only objects (e.g., dynamic attributes not handled by pybind)
-        to each request.
-        """
-        for item in requests:
-            py_obj = py_request_objects.get(item.id)
-            if py_obj is not None:
-                setattr(item.request, attribute_name, py_obj)
-
-    def _partition_context(self, ctx_ids_list):
-        ctx_ids = torch.tensor(ctx_ids_list).unsqueeze(0)
-        ctx_len = ctx_ids.shape[-1]
-        block_size = self.dist.cp_config['block_size']
-        if block_size is None:
-            block_size = ctx_len // self.dist.cp_size
-        anchor_block_size = self.dist.cp_config['cp_anchor_size']
-        if anchor_block_size is None:
-            anchor_block_size = block_size
-
-        assert anchor_block_size <= block_size, f'cp_anchor_size {anchor_block_size} should be smaller than block_size {block_size}'
-        padding = 0
-        if ctx_len % block_size != 0:
-            padding = block_size - (ctx_len % block_size)
-            assert padding <= ctx_len, f'block size is too large for context, please set it smaller'
-            ctx_ids = torch.cat(
-                (ctx_ids, torch.zeros_like(ctx_ids)[:, :padding]), dim=-1)
-        position_ids = torch.arange(0, ctx_ids.shape[-1]).unsqueeze(0)
-
-        ctx_ids_blocks = torch.tensor_split(
-            torch.stack(ctx_ids.split(block_size, dim=-1)), self.dist.cp_size)
-        position_ids_blocks = torch.tensor_split(
-            torch.stack(position_ids.split(block_size, dim=-1)),
-            self.dist.cp_size)
-        if self.dist.cp_rank != 0:
-            ctx_blocks, position_blocks = [
-                ctx_ids_blocks[0][0].tolist()[0][:anchor_block_size]
-            ], [position_ids_blocks[0][0].tolist()[0][:anchor_block_size]]
-        else:
-            ctx_blocks, position_blocks = [], []
-
-        for idx in range(len(ctx_ids_blocks[self.dist.cp_rank])):
-            ctx_block = ctx_ids_blocks[self.dist.cp_rank][idx]
-            position_block = position_ids_blocks[self.dist.cp_rank][idx]
-            ctx_blocks.append(ctx_block.tolist()[0])
-            position_blocks.append(position_block.tolist()[0])
-        return ctx_blocks, position_blocks, padding
-
-    def _merge_star_attention_requests(self,
-                                       new_requests: list[RequestQueueItem]):
-        result = []
-        for req_item in new_requests:
-            req_id, exe_req, query_token_ids = req_item.id, req_item.request, req_item.query
-            ctx_len0 = len(exe_req.input_token_ids)
-            ctx_blocks, position_blocks, last_block_padding_num = [
-                exe_req.input_token_ids
-            ], [[i for i in range(ctx_len0)]], 0
-            ctx_blocks, position_blocks, last_block_padding_num = self._partition_context(
-                exe_req.input_token_ids)
-            if self.dist.cp_rank == self.dist.cp_size - 1 and last_block_padding_num > 0:
-                ctx_blocks[-1] = ctx_blocks[-1][:-last_block_padding_num]
-                position_blocks[-1] = position_blocks[
-                    -1][:-last_block_padding_num]
-            #if has query
-            if query_token_ids:
-                ctx_blocks.append(query_token_ids)
-                position_blocks.append([
-                    i for i in range(ctx_len0, ctx_len0 + len(query_token_ids))
-                ])
-
-            # insert the dummy block to align the number of ctx iterations of each rank
-            block_size = self.dist.cp_config['block_size']
-            total_blocks = (ctx_len0 + block_size - 1) // block_size
-            num_blocks_per_rank = (
-                total_blocks + self.dist.cp_size -
-                1) // self.dist.cp_size + 1  # 1 for query block
-            if len(ctx_blocks) == num_blocks_per_rank:
-                ctx_blocks.insert(1, [])
-                position_blocks.insert(1, [])
-            elif len(ctx_blocks) == num_blocks_per_rank + 1:
-                # anchor + ctx_blocks + qry_block
-                pass
-            else:
-                print(
-                    f'rank = {self.dist.cp_rank}, len(ctx_blocks)  = {len(ctx_blocks) }, num_blocks_per_rank = {num_blocks_per_rank}'
-                )
-                assert False, f'invalid context partition'
-
-            # fake data for scheduler
-            ctx_blocks_list = [0] * (block_size +
-                                     self.dist.cp_config['cp_anchor_size'])
-
-            req = executor_request_to_llm_request(
-                req_id, exe_req, self._should_exclude_last_generation_logits(),
-                ctx_blocks_list)
-            req.gen_iters = 0
-            req.ctx_iters = 0
-            req.ctx_blocks = ctx_blocks
-            req.ctx_position_blocks = position_blocks
-            req.query_id = query_token_ids
-
-            result.append(req)
-
-        return result
-
-    @nvtx_range("_merge_requests")
-    def _merge_requests(self, new_requests: list[RequestQueueItem]):
-        cp_config = self.dist.cp_config
-        if 'cp_type' in cp_config:
-            cp_type = cp_config['cp_type']
-            if cp_type == 'star_attention':
-                return self._merge_star_attention_requests(new_requests)
-            elif cp_type == 'ring_attention':
-                raise NotImplementedError("ring attention not implemented yet")
-            else:
-                raise NotImplementedError(f'unsupport cp type {cp_type}')
-        else:
-            return [
-                executor_request_to_llm_request(
-                    req_item.id, req_item.request,
-                    self._should_exclude_last_generation_logits())
-                for req_item in new_requests
-            ]
 
     @nvtx_range("_schedule")
     def _schedule(self):
@@ -1523,7 +1175,7 @@ class PyExecutor:
                 request_ids=[0],
                 is_gen=not self.has_context_request,
                 prepare_resource=not self.has_context_request,
-                max_num_draft_tokens=self.max_draft_tokens,
+                max_num_draft_tokens=self.max_draft_len,
             )[0]
             llm_request.is_attention_dp_dummy = True
             spec_resource_manager = self.resource_manager.get_resource_manager(
@@ -1610,8 +1262,13 @@ class PyExecutor:
             if req.is_context_only_request and (req.is_context_finished or
                                                 req.is_finished_due_to_length):
                 self.kv_cache_transceiver.respond_and_send_async(req)
-                self.resource_manager.resource_managers[
-                    ResourceManagerType.SEQ_SLOT_MANAGER].free_resources(req)
+                for resource_mgr_type in (
+                        ResourceManagerType.SEQ_SLOT_MANAGER,
+                        ResourceManagerType.SPEC_RESOURCE_MANAGER):
+                    if resource_mgr_type in self.resource_manager.resource_managers and self.resource_manager.resource_managers[
+                            resource_mgr_type] is not None:
+                        self.resource_manager.resource_managers[
+                            resource_mgr_type].free_resources(req)
 
         self.kv_cache_transceiver.check_context_transfer_status(0)
 
@@ -1726,189 +1383,6 @@ class PyExecutor:
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
 
-    @nvtx_range("_prepare_draft_batch")
-    def _prepare_draft_batch(
-        self, scheduled_requests: ScheduledRequests
-    ) -> Tuple[ScheduledRequests, Dict[int, LlmRequest]]:
-        """
-        Prepares a batch for the draft model engine. Draft tokens are only produced
-        for generation requests.
-
-        The requests are prepared as follows:
-        1. The first time the draft engine sees a request, it's a context request.
-        2. Otherwise, if draft tokens were accepted on the last target model decoding
-        step, it's a chunked context request (we process all the accepted tokens together).
-        3. Otherwise, it's a generation request.
-        """
-        try:
-            draft_batch = ScheduledRequests()
-
-            for request in scheduled_requests.generation_requests:
-                if request.py_draft_pages_allocated == 0:
-                    # No space for draft tokens.
-                    continue
-
-                # Stop drafting when we hit the max seqlen. We still need dummy draft
-                # tokens attached to the requests to make sure everything works properly
-                # with CUDA graph. These dummy tokens are already added by
-                # _prepare_draft_requests to make the KV cache/scheduler aware of the fact
-                # that we want to do spec decoding, so no need to do anything else here.
-                # This makes the perf for this case suboptimal, but that's OK - this is
-                # a corner case for weird models like the llama 3.1 8b EAGLE3 implementation.
-                if request.max_beam_num_tokens - 1 >= self.draft_model_engine.max_seq_len:
-                    continue
-
-                num_draft_tokens = len(
-                    request.py_last_draft_tokens
-                ) if request.py_last_draft_tokens is not None else 0
-                request.py_draft_tokens = []
-
-                num_accepted_tokens = request.py_num_accepted_draft_tokens
-                num_rejected_tokens = num_draft_tokens - num_accepted_tokens
-                assert num_rejected_tokens >= 0
-
-                spec_config = self.model_engine.spec_config
-                beam_idx = 0
-                input_tokens = spec_config.get_draft_model_prompt(
-                    request.get_tokens()[beam_idx])
-
-                def create_new_request(input_tokens):
-                    return LlmRequest(
-                        request_id=request.py_request_id,
-                        max_new_tokens=request.py_max_new_tokens,
-                        input_tokens=input_tokens,
-                        sampling_config=request.sampling_config,
-                        return_perf_metrics=request.return_perf_metrics,
-                        is_streaming=False,
-                        is_draft=True)
-
-                if request.max_beam_num_tokens - 1 == request.py_prompt_len:
-                    # This is the first time the draft model is seeing this request.
-                    # Prepare a context request. We discard the first token and take
-                    # the newly decoded one - this is the convention for EAGLE 2 and 3.
-                    assert num_draft_tokens == 0
-                    new_request = create_new_request(input_tokens)
-                    draft_batch.context_requests.append(new_request)
-                elif num_accepted_tokens == 0:
-                    new_request = create_new_request(input_tokens[:-1])
-                    # Explicitly add the last token so get_last_tokens() returns
-                    # the right value
-                    new_request.add_new_token(input_tokens[-1], beam_idx)
-                    new_request.state = LlmRequestState.GENERATION_IN_PROGRESS
-                    draft_batch.generation_requests.append(new_request)
-                else:
-                    new_request = create_new_request(input_tokens)
-                    new_request.context_chunk_size = num_accepted_tokens + 1
-                    new_request.context_current_position = len(
-                        input_tokens) - num_accepted_tokens - 1
-                    new_request.context_chunk_size = num_accepted_tokens + 1
-                    new_request.context_current_position = len(
-                        input_tokens) - num_accepted_tokens - 1
-
-                    draft_batch.context_requests.append(new_request)
-
-                new_request.py_stop_words_list = request.py_stop_words_list
-
-            return draft_batch
-
-        except Exception as e:
-            traceback.print_exc()
-            error_msg = str(e)
-            logger.error(f"Encountered an error in decode: {error_msg}")
-            self._handle_errors(error_msg)
-
-    @nvtx_range("_prepare_draft_tokens")
-    def _prepare_draft_tokens(self, scheduled_requests: ScheduledRequests):
-        if not self.draft_model_engine:
-            raise ValueError("Draft model engine is not set")
-
-        try:
-            draft_batch = self._prepare_draft_batch(scheduled_requests)
-
-            if draft_batch.batch_size == 0:
-                return
-            self.draft_seq_slot_manager.prepare_resources(draft_batch)
-
-            req_id_to_old_request = {
-                req.py_request_id: req
-                for req in scheduled_requests.all_requests()
-            }
-
-            # Disable cuda graph for the 1st draft model forward
-            if self.model_engine.spec_config.spec_dec_mode.needs_kv_cache_recompute(
-            ):
-                with self.draft_model_engine.no_cuda_graph():
-                    outputs = self.draft_model_engine.forward(
-                        draft_batch, self.resource_manager)
-            else:
-                outputs = self.draft_model_engine.forward(
-                    draft_batch, self.resource_manager)
-            if hasattr(self.draft_model_engine.model.model, 'd2t'):
-                outputs['d2t'] = self.draft_model_engine.model.model.d2t.data
-
-            sample_state = self._sample_async(draft_batch, outputs)
-            previous_batch = sample_state
-
-            self._update_request_states(draft_batch)
-
-            def _process_decoded_tokens(draft_batch):
-                new_requests = []
-                for req in draft_batch.all_requests():
-                    target_model_req = req_id_to_old_request[req.py_request_id]
-                    target_model_req.py_draft_tokens.append(
-                        req.get_last_tokens(0))
-                    if req.state != LlmRequestState.GENERATION_COMPLETE and len(
-                            target_model_req.py_draft_tokens
-                    ) < target_model_req.py_draft_pages_allocated:
-                        new_requests.append(req)
-                    else:
-                        self.draft_seq_slot_manager.free_resources(req)
-
-                return new_requests
-
-            # The TRTLLM attention kernels cannot handle generation requests with
-            # different seqlens. No issues with flashinfer, should we look into removing
-            # this? Just needs proper kernel support.
-            def _pad_to_max_draft_tokens():
-                for req in scheduled_requests.generation_requests:
-                    max_draft_tokens = self.max_draft_tokens
-                    num_draft_tokens = len(req.py_draft_tokens)
-                    req.py_draft_tokens.extend(
-                        0 for _ in range(max_draft_tokens - num_draft_tokens))
-
-            draft_batch.generation_requests = draft_batch.context_requests + draft_batch.generation_requests
-            draft_batch.context_requests = []
-
-            for i in range(self.max_draft_tokens - 1):
-                if len(draft_batch.generation_requests) == 0:
-                    break
-
-                outputs = self.draft_model_engine.forward(
-                    draft_batch,
-                    self.resource_manager,
-                    new_tensors_device=previous_batch.device)
-
-                if hasattr(self.draft_model_engine.model.model, 'd2t'):
-                    outputs[
-                        'd2t'] = self.draft_model_engine.model.model.d2t.data
-                sample_state = self._sample_async(draft_batch, outputs)
-                self._update_request_states(draft_batch)
-                self._update_requests(previous_batch)
-                new_requests = _process_decoded_tokens(
-                    previous_batch.scheduled_requests)
-                draft_batch.generation_requests = new_requests
-                previous_batch = sample_state
-            self._update_requests(previous_batch)
-            new_requests = _process_decoded_tokens(
-                previous_batch.scheduled_requests)
-            _pad_to_max_draft_tokens()
-
-        except Exception as e:
-            traceback.print_exc()
-            error_msg = str(e)
-            logger.error(f"Encountered an error in decode: {error_msg}")
-            self._handle_errors(error_msg)
-
     def _handle_errors(self, error_msg: Optional[str] = None):
         error_responses = {}
         error_msg = error_msg or "error"
@@ -1926,41 +1400,27 @@ class PyExecutor:
     def _terminate_request(self, request: LlmRequest):
         self.resource_manager.free_resources(request)
 
-    @nvtx_range("_handle_cancelled_requests")
-    def _handle_cancelled_requests(self):
-        #TODO: properly handle canceled ids in pp case
-        if self.dist.has_tp:
-            self.canceled_req_ids = self.dist.broadcast(self.canceled_req_ids,
-                                                        root=0)
-
-        if len(self.canceled_req_ids) == 0:
+    @nvtx_range("_handle_canceled_requests")
+    def _handle_canceled_requests(self):
+        if self.executor_request_queue.get_canceled_req_ids_size() == 0:
             return
 
-        cancelled_responses = {}
-        left_requests = []
-        # Tracks canceled requests for proper handling in overlap mode during `sampler.update_requests`.
-        self.canceled_requests = []
+        # Remove cancel request in the waiting queue
+        self.executor_request_queue.update_waiting_queue()
+
         for request in self.active_requests:
             req_id = request.py_request_id
-            if req_id in self.canceled_req_ids:
-                self._terminate_request(request)
+            if req_id in self.executor_request_queue.get_canceled_req_ids():
+                # Mark requests as finished, then, we reuse all existing code
+                # to clean up the KV cache resources.
                 request.finish_by_reason(FinishReason.CANCELLED)
                 request.decoding_iter = request.py_decoding_iter
-                cancelled_responses[req_id] = request.create_response(
-                    False, self.dist.rank)
-                self.canceled_requests.append(request)
-                self.canceled_req_ids.erase(req_id)
-            else:
-                left_requests.append(request)
-        self.active_requests = left_requests
 
-        # When enable attention dp, each rank does not have full copy of requests
-        # so we need to remove the cancel requests not in the local rank
-        self.canceled_req_ids.clear()
-
-        # enqueue the cancelled requests' responses as they are not
-        # active_requests and be discarded in the sampler loop.
-        self._enqueue_responses(cancelled_responses)
+        if self.enable_attention_dp:
+            # TODO: revisit the cancel logic of attention dp
+            # When enable attention dp, each rank does not have full copy of requests
+            # so we need to remove the cancel requests not in the local rank
+            self.executor_request_queue.clear_canceled_req_ids()
 
     @nvtx_range("_enqueue_responses")
     def _enqueue_responses(self, responses: Dict[int, LlmResponse]):
@@ -2052,7 +1512,8 @@ class PyExecutor:
                     requests_to_terminate.append(request)
             else:
                 new_active_requests.append(request)
-        self.active_requests = new_active_requests
+        self.active_requests.clear()
+        self.active_requests.extend(new_active_requests)
         self._enqueue_responses(new_responses)
         for request in requests_to_terminate:
             self._terminate_request(request)
@@ -2112,19 +1573,3 @@ class PyExecutor:
         """Remove reqids of current requests from self.inflight_req_ids."""
         for req in scheduled_requests.all_requests():
             self.inflight_req_ids.erase(req.request_id)
-
-    def _should_exclude_last_generation_logits(self) -> bool:
-        # When overlap scheduler is enabled then when starting to handle a new prompt,
-        # sample_async is called twice before the first call to update_requests:
-        # - 1st time as a context request that handles on the 1st generated token
-        # - 2nd time as a generation request that handles on the 2nd generated token.
-        # and only after these two calls the sampler's update_request method is called.
-        # So in a sampler that works by the expected flow of handling the logits in
-        # sample_async (TorchSampler is an anomaly that instead does that on
-        # update_requests), every update_request doesn't handle the newest token, but one
-        # before it. Since all these calls work on the same request object, then its
-        # logits storage contains the logits of both the token update_requests should work
-        # on, and also its next token. Thus, excluding the last generation logits from any
-        # getter is required, when not using TorchSampler.
-        return not self.disable_overlap_scheduler and not isinstance(
-            self.sampler, TorchSampler)

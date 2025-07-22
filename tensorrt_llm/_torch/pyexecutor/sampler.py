@@ -124,7 +124,7 @@ def top_p_sampling_batch(logits: torch.Tensor, top_p: float = 0.9):
     logits_dim = logits.dim()
     if logits_dim == 1:
         logits = logits.unsqueeze(0)
-    assert logits_dim == 2, "logits should be 2D： [batch_size, vocab_size]"
+    assert logits_dim == 2, "logits should be 2D: [batch_size, vocab_size]"
 
     # sort the logits of each sample in descending order
     sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
@@ -194,7 +194,7 @@ def add_token(request: LlmRequest,
               *,
               beam: int,
               step: int = 0) -> int:
-    seq_slot = request.seq_slot
+    seq_slot = request.py_seq_slot
     assert seq_slot is not None
     new_token = int(new_tokens[step, seq_slot, beam])
     request.add_new_token(new_token, beam)
@@ -220,7 +220,7 @@ class TorchSampler(Sampler):
     @dataclass(frozen=True, kw_only=True)
     class Args:
         max_seq_len: int
-        max_draft_tokens: int
+        max_draft_len: int
         max_num_sequences: int
         max_beam_width: int
         enable_mixed_sampler: bool
@@ -228,7 +228,7 @@ class TorchSampler(Sampler):
     def __init__(self, args: Args):
         self.max_seq_len = args.max_seq_len
         self.enable_mixed_sampler = args.enable_mixed_sampler
-        self.max_tokens = args.max_draft_tokens + 1
+        self.max_tokens = args.max_draft_len + 1
         assert args.max_beam_width == self.MAX_BEAM_WIDTH, "TorchSampler only supports beam_width = 1"
         self.num_seq_slots = args.max_num_sequences
 
@@ -285,14 +285,14 @@ class TorchSampler(Sampler):
 
     def handle_logits(self, request: LlmRequest, state: SampleState, *,
                       beam: int, count: int):
-        current_slice = slice(0, count), request.seq_slot, beam
+        current_slice = slice(0, count), request.py_seq_slot, beam
         if request.py_return_generation_logits:
             assert state.host.logits is not None
             current_logits = state.host.logits[current_slice]
             request.py_result.append_generation_logits(current_logits)
         if request.py_return_log_probs:
             assert state.host.log_probs is not None
-            log_probs = state.host.log_probs[request.seq_slot][beam][:count]
+            log_probs = state.host.log_probs[request.py_seq_slot][beam][:count]
             current_tokens = state.host.new_tokens[current_slice]
 
             token_log_probs = [{
@@ -406,7 +406,7 @@ class TorchSampler(Sampler):
         no_draft_tokens = len(requests) == sum_steps
         fast_path = not self.enable_mixed_sampler and no_draft_tokens and gen_logits_host is None and log_probs_host is None
 
-        seq_slots = torch.as_tensor([r.seq_slot for r in requests])
+        seq_slots = torch.as_tensor([r.py_seq_slot for r in requests])
         seq_slots = seq_slots.to(device="cuda", non_blocking=True)
 
         if fast_path:
@@ -536,8 +536,7 @@ class TRTLLMSampler(Sampler):
             "buffer_manager":
             buffer_manager,
             "decoder_input_buffers": [
-                DecoderInputBuffers(self.max_num_sequences,
-                                    self.executor_config.max_batch_size,
+                DecoderInputBuffers(self.executor_config.max_batch_size,
                                     self.MAX_DECODING_TOKENS, buffer_manager)
                 for _ in range(self.num_micro_batches)
             ],
@@ -617,9 +616,9 @@ class TRTLLMSampler(Sampler):
         # Copy cache indirection output to input
         for request in scheduled_requests.generation_requests:
             self.store["decoder_state"].cache_indirection_input[
-                request.seq_slot].copy_(
+                request.py_seq_slot].copy_(
                     self.store["decoder_state"].cache_indirection_output[
-                        request.seq_slot],
+                        request.py_seq_slot],
                     non_blocking=True)
 
     @torch.inference_mode()
@@ -715,7 +714,8 @@ class TRTLLMSampler(Sampler):
     @torch.inference_mode()
     def update_requests(self, state: SampleStateTRTLLM):
         assert isinstance(state, SampleStateTRTLLM)
-        assert state.scheduled_requests.batch_size > 0
+        if state.scheduled_requests.batch_size == 0:
+            return
 
         if state.sampler_event:
             state.sampler_event.synchronize()
@@ -750,8 +750,7 @@ class TRTLLMSampler(Sampler):
 
         reqs_with_new_tokens = [
             r for r in reqs
-            if (sequence_lengths_host_data[r.py_seq_slot] > r.get_num_tokens(0)
-                or self.is_trt_overlap)
+            if (sequence_lengths_host_data[r.py_seq_slot] > r.get_num_tokens(0))
         ]
 
         # Add new tokens
@@ -820,7 +819,6 @@ class TRTLLMSampler(Sampler):
             for beam in range(beam_width):
                 seq_len = sequence_lengths_host_data[seq_slot * beam_width +
                                                      beam]
-                seq_len = seq_len + 1 if self.is_trt_overlap else seq_len
                 num_new_tokens[beam] = min(
                     num_generated_tokens,
                     seq_len - request.get_num_tokens(beam))
@@ -845,8 +843,7 @@ class TRTLLMSampler(Sampler):
                         })
 
                 if request.py_return_log_probs:
-                    cum_log_probs.append(
-                        cum_log_probs_host[seq_slot * beam_width + beam])
+                    cum_log_probs.append(cum_log_probs_host[seq_slot][beam])
 
                 finished_state = FinishedState(
                     finish_reasons[seq_slot * beam_width + beam])
@@ -884,7 +881,7 @@ class TRTLLMSampler(Sampler):
 
     def _finalize_request(self, request: LlmRequest, streaming: bool):
         """ Finalizes the request. This is necessary for beam search. """
-        seq_slot = request.seq_slot
+        seq_slot = request.py_seq_slot
         event = self.algs.decoder.finalize(self.store["decoder_state"],
                                            seq_slot, request.sampling_config,
                                            streaming)
@@ -896,7 +893,7 @@ class TRTLLMSampler(Sampler):
         request: LlmRequest which shall be post processed
         finalize_event: CudaEvent to wait for the finalize step to finish
         """
-        seq_slot = request.seq_slot
+        seq_slot = request.py_seq_slot
         beam_width = request.sampling_config.beam_width
         # synchronize on the finalize event before continuing the post processing.
         finalize_event.synchronize()

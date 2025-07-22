@@ -18,7 +18,8 @@ from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_utils import fuse_input_embeds
+from .modeling_multimodal_utils import (find_uncached_mm_embeds,
+                                        fuse_input_embeds)
 from .modeling_utils import register_auto_model
 
 DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
@@ -179,6 +180,8 @@ class Qwen2VLInputProcessorBase(InputProcessor):
                 # Calculate temporal position IDs based on model type
                 if hasattr(model_config.vision_config, 'tokens_per_second'):
                     # Qwen2_5_VL style temporal position calculation
+                    if isinstance(second_per_grid_t, torch.Tensor):
+                        second_per_grid_t = second_per_grid_t.item()
                     range_tensor = torch.arange(llm_grid_t).view(-1, 1)
                     expanded_range = range_tensor.expand(
                         -1, llm_grid_h * llm_grid_w)
@@ -273,6 +276,8 @@ class Qwen2VLInputProcessorBase(InputProcessor):
             do_rescale = False
         if videos and isinstance(videos[0][0], torch.Tensor):
             do_rescale = False
+            # transformers=4.53.1 does not support GPU video tensors in Qwen2VL processor.
+            videos = [[frame.to("cpu") for frame in video] for video in videos]
         return self.processor(text=[text],
                               images=images,
                               videos=videos,
@@ -597,6 +602,12 @@ class Qwen2VLModelBase(PreTrainedModel):
             mrope_config = self._parse_and_concat_mrope_config(
                 multimodal_params, num_context_requests,
                 num_generation_requests)
+            mm_embeds = find_uncached_mm_embeds(
+                mm_embeds, multimodal_params[:num_context_requests])
+
+        if 'mrope_position_deltas' in kwargs:
+            mrope_config['mrope_position_deltas'] = kwargs[
+                'mrope_position_deltas']
 
         input_ids, input_embeds = fuse_input_embeds(self.llm.model.embed_tokens,
                                                     input_ids, mm_embeds)

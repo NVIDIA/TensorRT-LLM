@@ -20,6 +20,8 @@
 #include <cooperative_groups/reduce.h>
 #include <cub/cub.cuh>
 
+#include "tensorrt_llm/kernels/archCondition.h"
+
 namespace moe::dev::routing
 {
 
@@ -86,12 +88,8 @@ struct TopKRedType
 
     __device__ inline TypeCmp reduce(cg::thread_block_tile<WarpSize> const& warp)
     {
-#if defined(TLLM_GEN_HAS_FAST_REDUX)
-        static constexpr bool UseCg = false;
-#else
-        static constexpr bool UseCg = true;
-#endif
-        if constexpr (UseCg || sizeof(TypeCmp) == 8)
+        static constexpr bool hasFastRedux = tensorrt_llm::kernels::arch::is_major_v<10>;
+        if constexpr (!hasFastRedux || sizeof(TypeCmp) == 8)
         {
             return cg::reduce(warp, compVal, cg::greater<TypeCmp>{});
         }
@@ -162,7 +160,7 @@ struct Sort<4, RedType>
 
 template <int K, typename Type>
 __forceinline__ __device__ void reduceTopK(cg::thread_block_tile<WarpSize> const& warp, Type (&out)[K],
-    int32_t (&outIdx)[K], Type value, int32_t idx, Type const minValue)
+    int32_t (&outIdx)[K], Type value, int32_t idx, Type const minValue, int actualK = K)
 {
     static_assert(K > 0, "Top K must have K > 0");
     static_assert(K < WarpSize, "Top K must have K < WarpSize");
@@ -170,7 +168,7 @@ __forceinline__ __device__ void reduceTopK(cg::thread_block_tile<WarpSize> const
     RedType topK{value, idx};
     typename RedType::TypeCmp packedMax{};
 #pragma unroll
-    for (int kk = 0; kk < K; ++kk)
+    for (int kk = 0; kk < actualK; ++kk) //@todo: check if actualK is correct
     {
         topK = kk > 0 && packedMax == topK.compVal ? RedType{minValue, idx} : topK;
         // get the next largest value
@@ -181,7 +179,7 @@ __forceinline__ __device__ void reduceTopK(cg::thread_block_tile<WarpSize> const
 
 template <int K, typename Type, int N>
 __forceinline__ __device__ void reduceTopK(cg::thread_block_tile<WarpSize> const& warp, Type (&out)[K],
-    int32_t (&outIdx)[K], Type (&value)[N], int32_t (&idx)[N], Type const minValue)
+    int32_t (&outIdx)[K], Type (&value)[N], int32_t (&idx)[N], Type const minValue, int actualK = K)
 {
     static_assert(K > 0, "Top K must have K > 0");
     static_assert(K < WarpSize, "Top K must have K < WarpSize");
@@ -199,7 +197,7 @@ __forceinline__ __device__ void reduceTopK(cg::thread_block_tile<WarpSize> const
 
     typename RedType::TypeCmp packedMax{};
 #pragma unroll
-    for (int kk = 0; kk < K; ++kk)
+    for (int kk = 0; kk < actualK; ++kk) //@todo: check if actualK is correct
     {
         bool update = kk > 0 && packedMax == topK[0].compVal;
 #pragma unroll

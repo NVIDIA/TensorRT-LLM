@@ -11,6 +11,7 @@ from tensorrt_llm.bench.dataclasses.general import DatasetMetadata
 from tensorrt_llm.bench.dataclasses.statistics import (BenchmarkStatistics,
                                                        PercentileStats,
                                                        RequestRecord)
+from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.logger import Logger
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
@@ -59,6 +60,7 @@ class StatsKeeper:
         Register request perf items, used exclusively with LLM API.
         """
         record = self.requests[request_perf_item.request_id]
+        record.id = request_perf_item.request_id
         record.num_input_tokens = request_perf_item.num_input_tokens
         record.start_timestamp = request_perf_item.start_timestamp
         record.register_event(request_perf_item.error,
@@ -220,6 +222,16 @@ class ReportUtility:
             retval[req_id] = output_str
         return dict(sorted(retval.items()))
 
+    def get_request_info(self, tokenizer) -> Dict[int, List[str]]:
+        requests = []
+        for request in self.raw_statistics.requests.values():
+            entry = request.model_dump()
+            entry["output"] = tokenizer.decode(entry["tokens"])
+            entry["output_tokens"] = len(entry["tokens"])
+            entry.pop("tokens")
+            requests.append(entry)
+        return requests
+
     def get_statistics_dict(self) -> Dict[str, Any]:
         """Get statistics as a dictionary.
 
@@ -264,8 +276,17 @@ class ReportUtility:
             model = self.rt_cfg.model_path or self.rt_cfg.model
             model_config = ModelConfig.from_pretrained(model,
                                                        trust_remote_code=True)
-            validate_and_set_kv_cache_quant(model_config,
-                                            self.kwargs["kv_cache_dtype"])
+            kv_cache_config = self.kwargs.get("kv_cache_config",
+                                              KvCacheConfig())
+            if isinstance(kv_cache_config, KvCacheConfig):
+                kv_cache_dtype = kv_cache_config.dtype
+            elif isinstance(kv_cache_config, dict):
+                kv_cache_dtype = kv_cache_config.get("dtype", "auto")
+            else:
+                raise ValueError(
+                    f"Invalid kv_cache_config type: {type(kv_cache_config)}.")
+
+            validate_and_set_kv_cache_quant(model_config, kv_cache_dtype)
 
             stats_dict["engine"] |= {
                 "backend":

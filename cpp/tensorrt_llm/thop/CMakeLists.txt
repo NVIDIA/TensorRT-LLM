@@ -45,6 +45,7 @@ add_library(
   convertSpecDecodingMaskToPackedMaskOp.cpp
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
+  cudaScaledMM.cpp
   dynamicDecodeOp.cpp
   fmhaPackMaskOp.cpp
   fp8Op.cpp
@@ -84,6 +85,7 @@ add_library(
   selectiveScanOp.cpp
   userbuffersFinalizeOp.cpp
   userbuffersTensor.cpp
+  weightOnlyQuantGemm.cpp
   weightOnlyQuantOp.cpp
   mtpOp.cpp
   loraOp.cpp

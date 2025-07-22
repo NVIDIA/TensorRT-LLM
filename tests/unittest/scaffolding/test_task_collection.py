@@ -3,9 +3,8 @@ from enum import Enum
 from typing import List
 
 from tensorrt_llm.scaffolding import (Controller, ParallelProcess,
-                                      ScaffoldingLlm, ScaffoldingOutput, Task,
-                                      TaskCollection, TaskStatus, Worker,
-                                      with_task_collection)
+                                      ScaffoldingLlm, Task, TaskCollection,
+                                      TaskStatus, Worker, with_task_collection)
 
 
 class DummyTask(Task):
@@ -19,8 +18,8 @@ class DummyTask(Task):
         task = DummyTask()
         return task
 
-    def create_scaffolding_output(self) -> "ScaffoldingOutput":
-        return ScaffoldingOutput()
+    def create_scaffolding_output(self):
+        return None
 
     def verify(self):
         assert self.before_flag, "task.before_flag has not been set to True"
@@ -52,14 +51,15 @@ class DummyControllerBase(Controller):
         super().__init__()
         self.expected_task_count = expected_task_count
 
-    def generate(self, prompt: str, **kwargs) -> ScaffoldingOutput:
+    def generate(self, prompt: str, **kwargs):
         task = DummyTask.create_from_prompt(prompt)
         yield from self.process([task], **kwargs)
         return task.create_scaffolding_output()
 
     def verify(self):
         assert self.task_collections[
-            "dummy"].task_count == self.expected_task_count, "task count is not as expected"
+            "dummy"].task_count == self.expected_task_count, (
+                "task count is not as expected")
 
 
 @with_task_collection("dummy", DummyTaskCollection)

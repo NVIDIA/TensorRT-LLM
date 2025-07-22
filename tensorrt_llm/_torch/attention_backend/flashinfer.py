@@ -14,7 +14,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..utils import get_global_attrs, get_model_extra_attrs
 from .interface import (AttentionBackend, AttentionMask, AttentionMetadata,
-                        PredefinedAttentionMask)
+                        CustomAttentionMask, PredefinedAttentionMask)
 
 try:
     check_cuda_arch()
@@ -297,10 +297,16 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self._positions[:positions.size(0)].copy_(positions,
                                                       non_blocking=True)
 
-        for plan_params in self._plan_params_to_wrappers:
-            # Re-plan the cached wrappers for a new set of requests.
-            self._plan_params_to_wrappers[plan_params].is_planned = False
-            self._plan_with_params(plan_params)
+        # Generally, plan_params with non-trivial attention_mask_data are relevant only the
+        # corresponding forward pass. So, flush them out here as they won't be relevant for
+        # subsequent forward calls.
+        for plan_params in list(self._plan_params_to_wrappers.keys()):
+            if plan_params.attention_mask_data is None:
+                # Re-plan the cached wrappers for a new set of requests.
+                self._plan_params_to_wrappers[plan_params].is_planned = False
+                self._plan_with_params(plan_params)
+            else:
+                del self._plan_params_to_wrappers[plan_params]
 
         if self.cross is not None and self.cross is not self:
             self.cross.prepare()
@@ -366,6 +372,12 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         is_causal = plan_params.attention_mask_type == AttentionMaskType.causal
 
         def prefill_plan():
+            # Setting `window_left` to -1 for custom attention mask is important.
+            # Else, FlashInfer proceeds to use SWA regardless of attention_mask_data.
+            if plan_params.attention_mask_data is not None:
+                window_left = -1
+            else:
+                window_left = plan_params.window_left
             prefill_wrapper.plan(
                 self.qo_indptr[:self.num_contexts + 1],
                 self.paged_kv_indptr_prefill[:self.num_contexts + 1],
@@ -377,9 +389,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 self.page_size,
                 causal=is_causal,
                 sm_scale=plan_params.sm_scale,
-                window_left=plan_params.window_left,
+                window_left=window_left,
                 q_data_type=plan_params.q_dtype,
                 kv_data_type=plan_params.kv_dtype,
+                custom_mask=plan_params.attention_mask_data,
             )
 
         if plan_params in self._plan_params_to_wrappers:
@@ -419,7 +432,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 kv_data_type=plan_params.kv_dtype,
             )
 
-        # Must sync after append_paged_kv_cache and before plan
+        # Must sync after append_paged_kv_cache and before plan.
         torch.cuda.current_stream().synchronize()
 
         if self.num_contexts > 0:
@@ -473,8 +486,14 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 *,
                 attention_window_size: Optional[int] = None,
                 attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
+                attention_mask_data: Optional[torch.Tensor] = None,
                 **kwargs) -> torch.Tensor:
-        if attention_mask == PredefinedAttentionMask.CAUSAL:
+        if attention_mask == CustomAttentionMask.CUSTOM:
+            assert attention_mask_data is not None, "attention_mask_data is required for custom attention mask."
+            attention_mask_type = int(AttentionMaskType.custom_mask)
+            attention_mask_data = attention_mask_data if attention_mask_data.ndim == 1 else attention_mask_data.flatten(
+            )
+        elif attention_mask == PredefinedAttentionMask.CAUSAL:
             attention_mask_type = int(AttentionMaskType.causal)
             attention_mask_data = None
         elif attention_mask == PredefinedAttentionMask.FULL:

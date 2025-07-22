@@ -47,7 +47,9 @@ class LlmManager:
     def _task_done_callback(self, task: asyncio.Task) -> None:
         self._tasks.discard(task)
         if task.exception() is not None and not self._stop.is_set():
-            logger.error("Exception raised during inference - stopping")
+            logger.error(
+                f"Stopping benchmarking due to following exception raised during inference: {task.exception()}"
+            )
             self.stop()
 
     async def process_request(self, request: InferenceRequest,
@@ -86,7 +88,7 @@ class LlmManager:
             request_perf_item = PerfItemTuple(
                 start_timestamp=request_start_timestamp,
                 end_timestamp=response_end_timestamp,
-                request_id=response.request_id,
+                request_id=response.id,
                 num_input_tokens=len(output.prompt_token_ids),
                 response_is_final=response.finished,
                 error=False,

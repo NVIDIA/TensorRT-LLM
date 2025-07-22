@@ -295,6 +295,7 @@ public:
         // Clean up
         MPI_Group_free(&new_group);
         MPI_Group_free(&world_group);
+        MPI_Comm_free(&new_comm);
 
         return nvls_handle;
     }
@@ -401,14 +402,14 @@ void MPI_group_barrier(std::set<int> group)
     MPI_Comm new_comm;
 
     // Get the group of the world communicator
-    MPI_Comm_group(MPI_COMM_WORLD, &world_group);
+    MPI_Comm_group(COMM_SESSION, &world_group);
 
     // Create a new group containing only the ranks we want
     std::vector<int> ranks(group.begin(), group.end());
     MPI_Group_incl(world_group, ranks.size(), ranks.data(), &new_group);
 
     // Create a new communicator from the group
-    MPI_Comm_create_group(MPI_COMM_WORLD, new_group, 0, &new_comm);
+    MPI_Comm_create_group(COMM_SESSION, new_group, 0, &new_comm);
 
     // Use the new communicator for the barrier
     MPI_Barrier(new_comm);
@@ -509,6 +510,8 @@ IpcNvlsHandle* ipcNvlsAllocate(size_t size, std::set<int> group)
     MPI_Group_free(&world_group);
 
     MPI_Barrier(new_comm);
+
+    MPI_Comm_free(&new_comm);
 
     return handle;
 #else

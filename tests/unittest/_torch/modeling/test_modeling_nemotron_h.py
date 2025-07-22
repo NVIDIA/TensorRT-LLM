@@ -1,3 +1,4 @@
+import pytest
 import torch
 from utils.llm_data import llm_models_root
 from utils.util import skip_gpu_memory_less_than
@@ -269,6 +270,7 @@ def test_nemotron_h_correctness():
         nemotron_h.shutdown()
 
 
+@pytest.mark.skip(reason="https://nvbugs/5404046")
 def test_nemotron_h_cuda_graph_overlap_scheduler():
     prompts = [
         "Tell me something I don't know about the future of AI",

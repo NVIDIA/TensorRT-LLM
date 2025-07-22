@@ -4,11 +4,26 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.utils import (get_last_power_of_2_num_tokens_buckets,
-                                       last_positive_power_of_2)
+from tensorrt_llm._torch.utils import (fp4_utils,
+                                       get_last_power_of_2_num_tokens_buckets,
+                                       last_positive_power_of_2,
+                                       next_positive_power_of_2)
 
 from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                          OptimizationProfile, TunableRunner, TuningConfig)
+
+
+def calculate_tile_tokens_dim(num_tokens: int, num_experts: int,
+                              top_k: int) -> int:
+    # Guess tokens per expert assuming perfect expert distribution first.
+    num_tokens_per_expert = num_tokens * top_k // num_experts
+
+    # And pad the number to the next power of 2.
+    tile_tokens_dim = next_positive_power_of_2(num_tokens_per_expert)
+    # Cap to 8-64 tokens per CTA tile as it's the range supported by the kernel.
+    tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
+
+    return tile_tokens_dim
 
 
 @dataclass(frozen=True)
@@ -220,10 +235,13 @@ def fp4_block_scale_moe_runner(routing_logits: torch.Tensor,
                                intermediate_size: int, local_expert_offset: int,
                                local_num_experts: int,
                                routed_scaling_factor: Optional[float],
-                               tile_tokens_dim: int, routing_method_type: int,
+                               routing_method_type: int,
                                do_finalize: bool) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
+
+    num_tokens = hidden_states.shape[0]
+    tile_tokens_dim = calculate_tile_tokens_dim(num_tokens, num_experts, top_k)
 
     kernel_runner = FP4BlockScaleMoERunner(
         num_experts, top_k, n_group, topk_group, intermediate_size,
@@ -252,6 +270,53 @@ def fp4_block_scale_moe_runner(routing_logits: torch.Tensor,
     )
 
     return kernel_runner(inputs, tactic=best_tactic)
+
+
+@fp4_block_scale_moe_runner.register_fake
+def _(
+    routing_logits,
+    routing_bias,
+    hidden_states,
+    hidden_states_scale,
+    gemm1_weights,
+    gemm1_weights_scale,
+    gemm2_weights,
+    gemm2_weights_scale,
+    output1_scale_scalar,
+    output1_scale_gate_scalar,
+    output2_scale_scalar,
+    num_experts,
+    top_k,
+    n_group,
+    topk_group,
+    intermediate_size,
+    local_expert_offset,
+    local_num_experts,
+    routed_scaling_factor,
+    routing_method_type,
+    do_finalize,
+) -> List[torch.Tensor]:
+    num_tokens = hidden_states.shape[0]
+    hidden_size = hidden_states.shape[1] * 2
+    if do_finalize:
+        return [
+            hidden_states.new_empty((num_tokens, hidden_size),
+                                    dtype=torch.bfloat16)
+        ]
+
+    tile_tokens_dim = calculate_tile_tokens_dim(num_tokens, num_experts, top_k)
+
+    expanded_row_count = num_tokens * top_k
+    max_padding_required = (tile_tokens_dim - 1) * num_experts
+    max_num_padded_tokens = fp4_utils.pad_up(
+        expanded_row_count + max_padding_required, tile_tokens_dim)
+    wt_dtype = routing_bias.dtype if routing_bias is not None else torch.bfloat16
+    return [
+        hidden_states.new_empty((max_num_padded_tokens, hidden_size),
+                                dtype=torch.bfloat16),
+        hidden_states.new_empty((num_tokens, top_k), dtype=wt_dtype),
+        hidden_states.new_empty((num_tokens, top_k), dtype=torch.int32)
+    ]
 
 
 @dataclass(frozen=True)
@@ -367,8 +432,11 @@ class FP8BlockScaleMoERunner(TunableRunner):
         HIDDEN_STATES_IDX = 2
         TUNED_DIM = 0
 
-        m_values = get_last_power_of_2_num_tokens_buckets(2048)
-        round_rule = lambda x: min(last_positive_power_of_2(x), 2048)
+        MAX_PROFILE_BUCKET = 4096
+
+        m_values = get_last_power_of_2_num_tokens_buckets(MAX_PROFILE_BUCKET)
+        round_rule = lambda x: min(last_positive_power_of_2(x),
+                                   MAX_PROFILE_BUCKET)
 
         specs = (DynamicTensorSpec(HIDDEN_STATES_IDX, TUNED_DIM, m_values,
                                    round_rule), )
@@ -377,7 +445,31 @@ class FP8BlockScaleMoERunner(TunableRunner):
 
     @classmethod
     def get_constraint_specs(cls) -> Tuple[ConstraintSpec, ...]:
-        return ()
+
+        def _constrain_to_num_tokens(shapes: Tuple[torch.Size]) -> int:
+            num_tokens = shapes[2][0]
+
+            return num_tokens
+
+        HS_SCALE_IDX = 3
+        CONSTRAINED_HS_SCALE_DIM = 1
+
+        constraint_hidden_states_scale = ConstraintSpec(
+            HS_SCALE_IDX, CONSTRAINED_HS_SCALE_DIM, _constrain_to_num_tokens)
+
+        ROUTER_LOGITS_IDX = 0
+        CONSTRAINED_RL_DIM = 0
+
+        constraint_routing_logits = ConstraintSpec(ROUTER_LOGITS_IDX,
+                                                   CONSTRAINED_RL_DIM,
+                                                   _constrain_to_num_tokens)
+
+        constraint_specs_tuple = (
+            constraint_hidden_states_scale,
+            constraint_routing_logits,
+        )
+
+        return constraint_specs_tuple
 
     @classmethod
     @lru_cache(maxsize=None)
@@ -393,22 +485,30 @@ class FP8BlockScaleMoERunner(TunableRunner):
 
 
 @torch.library.custom_op("trtllm::fp8_block_scale_moe_runner", mutates_args=())
-def fp8_block_scale_moe_runner(routing_logits: torch.Tensor,
-                               routing_bias: torch.Tensor,
-                               hidden_states: torch.Tensor,
-                               hidden_states_scale: torch.Tensor,
-                               gemm1_weights: torch.Tensor,
-                               gemm1_weights_scale: torch.Tensor,
-                               gemm2_weights: torch.Tensor,
-                               gemm2_weights_scale: torch.Tensor,
-                               num_experts: int, top_k: int, n_group: int,
-                               topk_group: int, intermediate_size: int,
-                               local_expert_offset: int, local_num_experts: int,
-                               routed_scaling_factor: float,
-                               tile_tokens_dim: int,
-                               routing_method_type: int) -> torch.Tensor:
+def fp8_block_scale_moe_runner(
+    routing_logits: torch.Tensor,
+    routing_bias: torch.Tensor,
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    n_group: int,
+    topk_group: int,
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routed_scaling_factor: float,
+    routing_method_type: int,
+) -> torch.Tensor:
 
     tuner = AutoTuner.get()
+
+    num_tokens = hidden_states.shape[0]
+    tile_tokens_dim = calculate_tile_tokens_dim(num_tokens, num_experts, top_k)
 
     kernel_runner = FP8BlockScaleMoERunner(num_experts, top_k, n_group,
                                            topk_group, intermediate_size,
@@ -436,3 +536,30 @@ def fp8_block_scale_moe_runner(routing_logits: torch.Tensor,
     )
 
     return kernel_runner(inputs, tactic=best_tactic)
+
+
+@fp8_block_scale_moe_runner.register_fake
+def _(
+    routing_logits: torch.Tensor,
+    routing_bias: torch.Tensor,
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    n_group: int,
+    topk_group: int,
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routed_scaling_factor: float,
+    routing_method_type: int,
+) -> torch.Tensor:
+    num_tokens = hidden_states.shape[0]
+    hidden_size = hidden_states.shape[1] * 2
+
+    return hidden_states.new_empty((num_tokens, hidden_size),
+                                   dtype=torch.bfloat16)
