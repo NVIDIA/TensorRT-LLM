@@ -10,7 +10,8 @@ import sys
 def get_remove_lines_from_diff(diff):
     lines = diff.split('\n')
     remove_lines = [
-        line[1:] + '\n' for line in lines if len(line) > 1 and line.startswith('-')
+        line[1:] + '\n' for line in lines
+        if len(line) > 1 and line.startswith('-')
     ]
     return remove_lines
 
