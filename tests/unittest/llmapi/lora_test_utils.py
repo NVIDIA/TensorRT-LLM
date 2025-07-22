@@ -151,9 +151,20 @@ def create_mock_nemo_lora_checkpoint(
     Returns:
         Path to the created .nemo file
     """
+
+    # Validate parameters
+    if hidden_size % num_attention_heads != 0:
+        raise ValueError(f"hidden_size ({hidden_size}) must be divisible by "
+                         f"num_attention_heads ({num_attention_heads})")
+
     # Default to standard MHA if not specified
     if num_kv_heads is None:
         num_kv_heads = num_attention_heads
+
+    if num_attention_heads % num_kv_heads != 0:
+        raise ValueError(
+            f"num_attention_heads ({num_attention_heads}) must be divisible by "
+            f"num_kv_heads ({num_kv_heads}) for GQA")
 
     nemo_path = lora_dir / "test_lora.nemo"
 

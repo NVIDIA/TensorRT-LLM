@@ -31,14 +31,6 @@ from transformers import AutoModelForCausalLM
 
 # isort: on
 
-# NeMo LoRA test data
-LORA_RANK_CONFIGS = [
-    # (lora_rank, max_lora_rank, description)
-    (8, 8, "rank_8"),
-    (16, 16, "rank_16"),
-    (4, 8, "rank_4_max_8"),
-]
-
 
 @force_ampere
 def test_tinyllama_logits_processor():
@@ -567,23 +559,17 @@ def test_gqa_nemo_lora(tmp_path):
         lora_text = outputs[0].outputs[0].text
         assert lora_text, "Generated text with LoRA should not be empty"
 
-        # Since LoRA weights are initialized with small values (* 0.01),
-        # the outputs should start similarly but may diverge
         # Check that both outputs start with the expected completion "Paris"
         assert "Paris" in lora_text or "paris" in lora_text.lower(), \
             f"LoRA output should contain 'Paris', got: {lora_text}"
         assert "Paris" in no_lora_text or "paris" in no_lora_text.lower(), \
             f"No-LoRA output should contain 'Paris', got: {no_lora_text}"
 
-        # For very small LoRA weights, at least the first few tokens should be similar
-        # Check if the outputs are at least 60% similar or start with the same word
-        if not similar(lora_text, no_lora_text, threshold=0.6):
-            # If not similar enough, at least check they start with the same word
-            first_word_lora = lora_text.split()[0] if lora_text.split() else ""
-            first_word_no_lora = no_lora_text.split()[0] if no_lora_text.split(
-            ) else ""
-            assert first_word_lora.lower() == first_word_no_lora.lower(), \
-                f"First words should match: LoRA='{first_word_lora}' vs No-LoRA='{first_word_no_lora}'"
+        # Since dummy LoRA weights are initialized with small values,
+        # the outputs should be similar. 60% was trial and error.
+        assert similar(
+            lora_text, no_lora_text,
+            threshold=0.60), "LoRA and no LoRA outputs should be similar"
 
     finally:
         llm.shutdown()
