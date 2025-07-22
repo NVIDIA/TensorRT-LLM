@@ -5,7 +5,7 @@ from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
-from .lora_test_utils import check_llama_7b_multi_unique_lora_adapters_from_request
+from .lora_test_utils import check_llama_7b_multi_unique_lora_adapters_from_request, create_mock_nemo_lora_checkpoint
 from .test_llm import (get_model_path, global_kvcache_config, llama_model_path,
                        llm_get_stats_async_test_harness,
                        llm_get_stats_test_harness, prompts,
@@ -29,10 +29,6 @@ from peft import LoraConfig as PeftLoraConfig
 from peft import get_peft_model
 from transformers import AutoModelForCausalLM
 
-import json
-import tarfile
-from pathlib import Path
-
 # isort: on
 
 # NeMo LoRA test data
@@ -42,96 +38,6 @@ LORA_RANK_CONFIGS = [
     (16, 16, "rank_16"),
     (4, 8, "rank_4_max_8"),
 ]
-
-
-def create_mock_nemo_lora_checkpoint(
-        lora_dir: Path,
-        hidden_size: int = 4096,
-        num_layers: int = 32,
-        lora_rank: int = 8,
-        tp_size: int = 1,
-        num_attention_heads: int = 32,
-        num_kv_heads: int = None,  # If None, defaults to num_attention_heads
-) -> Path:
-    """Create a minimal NeMo LoRA checkpoint for testing.
-
-    This creates a .nemo tarfile with the expected structure:
-    - model_weights.ckpt containing attn_qkv adapter weights
-    - model_config.yaml with basic configuration
-
-    Args:
-        lora_dir: Directory to create the checkpoint in
-        hidden_size: Model hidden size
-        num_layers: Number of transformer layers
-        lora_rank: LoRA rank
-        tp_size: Tensor parallelism size
-        num_attention_heads: Number of query attention heads
-        num_kv_heads: Number of key/value heads (for GQA). If None, equals num_attention_heads
-
-    Returns:
-        Path to the created .nemo file
-    """
-    # Default to standard MHA if not specified
-    if num_kv_heads is None:
-        num_kv_heads = num_attention_heads
-
-    nemo_path = lora_dir / "test_lora.nemo"
-
-    with tempfile.TemporaryDirectory() as temp_dir_str:
-        temp_dir = Path(temp_dir_str)
-
-        weights_dict = {}
-
-        head_dim = hidden_size // num_attention_heads
-        kv_hidden_size = head_dim * num_kv_heads
-
-        qkv_output_dim = hidden_size + 2 * kv_hidden_size
-
-        for layer_idx in range(num_layers):
-            key_prefix = f"model.layers.{layer_idx}.self_attention.adapter_layer.lora_kqv_adapter"
-
-            # Create linear_in weights [lora_rank, hidden_size] with small random values
-            linear_in_key = f"{key_prefix}.linear_in.weight"
-            weights_dict[linear_in_key] = torch.randn(
-                lora_rank, hidden_size, dtype=torch.float16) * 0.01
-
-            # Create linear_out weights [qkv_output_dim, lora_rank] for fused QKV
-            # This is the key difference for GQA - the output dimension changes
-            linear_out_key = f"{key_prefix}.linear_out.weight"
-            weights_dict[linear_out_key] = torch.randn(
-                qkv_output_dim, lora_rank, dtype=torch.float16) * 0.01
-
-        ckpt_path = temp_dir / "model_weights.ckpt"
-        torch.save(weights_dict, ckpt_path)
-
-        config = {
-            "precision": "fp16",
-            "trainer": {
-                "num_nodes": 1,
-                "devices": tp_size,
-            },
-            "model": {
-                "hidden_size": hidden_size,
-                "num_layers": num_layers,
-                "num_attention_heads": num_attention_heads,
-                "num_query_groups": num_kv_heads,  # This is the key for GQA
-            },
-            "lora": {
-                "rank": lora_rank,
-                "target_modules": ["attn_qkv"],
-            }
-        }
-
-        config_path = temp_dir / "model_config.yaml"
-        # Using JSON for simplicity since YAML parsing isn't critical for the test
-        with open(config_path, 'w') as f:
-            json.dump(config, f)
-
-        with tarfile.open(nemo_path, 'w') as tar:
-            tar.add(ckpt_path, arcname="model_weights.ckpt")
-            tar.add(config_path, arcname="model_config.yaml")
-
-    return nemo_path
 
 
 @force_ampere
@@ -594,9 +500,7 @@ def test_nemo_lora_unsupported_modules_validation(tmp_path):
 
 @force_ampere
 def test_gqa_nemo_lora(tmp_path):
-    """Test NeMo LoRA with GQA using TinyLlama.
-
-    """
+    """Test NeMo LoRA with GQA using TinyLlama."""
     # TinyLlama's exact GQA configuration
     hidden_size = 2048
     num_layers = 22
@@ -621,35 +525,65 @@ def test_gqa_nemo_lora(tmp_path):
 
     model_path = get_model_path("llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
 
+    # First, generate without LoRA
+    llm_no_lora = LLM(
+        model=model_path,
+        kv_cache_config=global_kvcache_config,
+    )
+
     try:
-        llm = LLM(
-            model=model_path,
-            lora_config=lora_config,
-            kv_cache_config=global_kvcache_config,
-        )
+        test_prompts = ["The capital of France is"]
+        sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
 
-        test_prompts = ["Test TinyLlama GQA with NeMo LoRA"]
+        # Generate without LoRA
+        outputs_no_lora = llm_no_lora.generate(test_prompts, sampling_params)
+        no_lora_text = outputs_no_lora[0].outputs[0].text
+    finally:
+        llm_no_lora.shutdown()
 
+    # Now generate with LoRA
+    llm = LLM(
+        model=model_path,
+        lora_config=lora_config,
+        kv_cache_config=global_kvcache_config,
+    )
+
+    try:
         lora_req = LoRARequest("tinyllama-gqa-test",
                                0,
                                str(nemo_path),
                                lora_ckpt_source="nemo")
 
-        sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
         outputs = llm.generate(test_prompts,
                                sampling_params,
                                lora_request=[lora_req])
 
-        # Basic validation
+        # Validate output
         assert len(outputs) == 1
         assert outputs[0].outputs[0] is not None
         assert len(outputs[0].outputs[0].token_ids) > 0
 
-        print(f"  ✓ TinyLlama GQA with NeMo LoRA passed successfully!")
+        # Compare with and without LoRA
+        lora_text = outputs[0].outputs[0].text
+        assert lora_text, "Generated text with LoRA should not be empty"
 
-    except Exception as e:
-        # Any error now indicates a real problem since dimensions match
-        pytest.fail(f"TinyLlama GQA test failed: {e}")
+        # Since LoRA weights are initialized with small values (* 0.01),
+        # the outputs should start similarly but may diverge
+        # Check that both outputs start with the expected completion "Paris"
+        assert "Paris" in lora_text or "paris" in lora_text.lower(), \
+            f"LoRA output should contain 'Paris', got: {lora_text}"
+        assert "Paris" in no_lora_text or "paris" in no_lora_text.lower(), \
+            f"No-LoRA output should contain 'Paris', got: {no_lora_text}"
+
+        # For very small LoRA weights, at least the first few tokens should be similar
+        # Check if the outputs are at least 60% similar or start with the same word
+        if not similar(lora_text, no_lora_text, threshold=0.6):
+            # If not similar enough, at least check they start with the same word
+            first_word_lora = lora_text.split()[0] if lora_text.split() else ""
+            first_word_no_lora = no_lora_text.split()[0] if no_lora_text.split(
+            ) else ""
+            assert first_word_lora.lower() == first_word_no_lora.lower(), \
+                f"First words should match: LoRA='{first_word_lora}' vs No-LoRA='{first_word_no_lora}'"
+
     finally:
-        if 'llm' in locals():
-            llm.shutdown()
+        llm.shutdown()

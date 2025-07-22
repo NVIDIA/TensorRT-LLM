@@ -6,7 +6,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -67,7 +67,10 @@ HF_LORA_PATTERN = re.compile(
 
 
 def iterate_hf_lora(
-    iter_fn, lora_weights: Dict[str, torch.Tensor], hf_modules: set, component: Optional[str] = None
+    iter_fn,
+    lora_weights: Dict[str, torch.Tensor],
+    hf_modules: Set[str],
+    component: Optional[str] = None,
 ):
     """Iterate over HuggingFace LoRA weights and call iterator function for each weight.
 
@@ -129,7 +132,7 @@ def iterate_hf_lora(
 
 
 def get_all_hf_lora_weights(
-    lora_weights: Dict[str, torch.Tensor], hf_modules: set, component: Optional[str] = None
+    lora_weights: Dict[str, torch.Tensor], hf_modules: Set[str], component: Optional[str] = None
 ):
     """Extract and organize all HuggingFace LoRA weights by layer and module.
 
