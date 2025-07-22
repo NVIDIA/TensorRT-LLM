@@ -305,7 +305,7 @@ class MNNVLAllReduce(nn.Module):
 
     @staticmethod
     def get_supported_dtypes():
-        return (torch.bfloat16, torch.float32)
+        return (torch.float16, torch.bfloat16, torch.float32)
 
     def forward(
         self,
