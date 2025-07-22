@@ -13,6 +13,7 @@ from .fused_moe_vanilla import VanillaMoE
 from .fused_moe_wide_ep import WideEPMoE
 from .interface import MoE, MoEWeightLoadingMode
 from .moe_load_balancer import get_moe_load_balancer
+from .moe_prefetch_manager import MoEPrefetchProxy
 from .routing import BaseMoeRoutingMethod
 
 
@@ -61,6 +62,7 @@ def create_moe(
     weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
     apply_router_weight_on_input: bool = False,
     layer_idx: Optional[int] = None,
+    moe_prefetch_proxy: Optional[MoEPrefetchProxy] = None,
 ) -> MoE:
     moe_cls = get_moe_cls(model_config, routing_method, dtype,
                           override_quant_config)
@@ -96,6 +98,7 @@ def create_moe(
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
+            moe_prefetch_proxy=moe_prefetch_proxy,
         )
     elif moe_cls == WideEPMoE:
         return moe_cls(
