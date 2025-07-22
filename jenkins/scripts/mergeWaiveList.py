@@ -1,11 +1,16 @@
 import argparse
 import sys
 
+# Generate the merged waive list:
+# 1. Parse the current MR waive list, and get the removed lines from the diff
+# 2. Parse the TOT waive list
+# 3. Merge the current MR waive list and TOT waive list, and remove the removed lines from the step 1
+
 
 def get_remove_lines_from_diff(diff):
     lines = diff.split('\n')
     remove_lines = [
-        line[1:] + '\n' for line in lines if len(line) > 1 and line[0] == '-'
+        line[1:] + '\n' for line in lines if len(line) > 1 and line.startswith('-')
     ]
     return remove_lines
 
@@ -13,7 +18,7 @@ def get_remove_lines_from_diff(diff):
 def parse_waive_txt(waive_txt):
     with open(waive_txt, 'r') as f:
         lines = f.readlines()
-    waive_list = [line for line in lines if len(line) != 0]
+    waive_list = [line for line in lines if line.strip()]
     return waive_list
 
 

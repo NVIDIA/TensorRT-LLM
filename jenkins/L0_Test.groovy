@@ -1290,14 +1290,15 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv ${llmTarfile}")
         sh "cd ${llmPath} && tar -zxf ${tarName}"
 
-        // download waives.txt
+        // Download the new merged waives.txt
         def waivesTxt = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/waive_list/waives.txt"
         try {
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${waivesTxt}")
-            if (fileExists("waives.txt")) {
-                sh "rm ${llmSrc}/tests/integration/test_lists/waives.txt"
-                sh "mv waives.txt ${llmSrc}/tests/integration/test_lists/waives.txt"
+            if (!fileExists("waives.txt")) {
+                error "There is no merged waives.txt file, use the default waives.txt."
             }
+            sh "rm ${llmSrc}/tests/integration/test_lists/waives.txt"
+            sh "mv waives.txt ${llmSrc}/tests/integration/test_lists/waives.txt"
             echo "Download merged waives.txt successfully"
         } catch (InterruptedException e) {
             throw e
