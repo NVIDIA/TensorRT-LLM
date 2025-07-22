@@ -807,12 +807,10 @@ class Llama4InputProcessor(InputProcessor):
         self.tokenizer = tokenizer
         self.vocab_size = model_config.text_config.vocab_size
         self.image_token_index = model_config.image_token_index
-        # TODO: use tokenizer to get these special tokens/values
-        self.fake_image_token = "<|image|>"  # this must be the same as placeholder prompt
-        self.image_token = "<|patch|>"
-        self.image_token_start_index = 200080
-        self.image_token_end_index = 200081
-
+        self.fake_image_token = self.processor.fake_image_token
+        self.image_token = self.processor.img_patch_token
+        self.image_token_start_index = self.model_config.boi_token_index
+        self.image_token_end_index = self.model_config.eoi_token_index
         self.encoder = nn.ModuleDict({
             "vision_model":
             Llama4VisionModel(model_config.vision_config),
