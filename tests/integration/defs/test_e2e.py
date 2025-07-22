@@ -1911,9 +1911,6 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
 ])
 def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                                    modality):
-    llm_venv.run_cmd(
-        ['-m', 'pip', 'install', 'flash-attn==2.7.3', '--no-build-isolation'])
-
     example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
     test_data_root = Path(
         os.path.join(llm_models_root(), "multimodals", "test_data"))
