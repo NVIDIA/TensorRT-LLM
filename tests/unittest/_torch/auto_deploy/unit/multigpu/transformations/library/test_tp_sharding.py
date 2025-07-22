@@ -8,11 +8,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from _dist_test_utils import get_device_counts
-from _graph_test_helpers import run_test
+from _graph_test_helpers import run_sharding_pattern_detection_test, run_test
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
-from tensorrt_llm._torch.auto_deploy.transformations.library import column_row_shard
-from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
+from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.transformations.library import (
+    ShardingConfig,
+    SplitDimension,
+    TPShardingInfo,
+    detect_column_row_shard,
+    sharding_transform_executor,
+)
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op
 
 
 class GQA_Block(nn.Module):
@@ -139,7 +146,10 @@ def _run_job(
     # now run the test
     op_expected = getattr(torch.ops.auto_deploy, dist_op_expected)
 
-    transform_func = partial(column_row_shard, rank=rank, world_size=world_size)
+    def transform_func(gm) -> None:
+        sharding_config = ShardingConfig()
+        detect_column_row_shard(gm, rank, world_size, sharding_config)
+        sharding_transform_executor(gm, sharding_config)
 
     def combined_graph_check(gm) -> bool:
         # Check for expected distributed operations
@@ -159,6 +169,107 @@ def _run_job(
     )
 
 
+def _run_pattern_detection_job(
+    model_cls: nn.Module,
+    bias: bool,
+    rank: int,
+    world_size: int,
+) -> None:
+    # init model and input
+    batch_size = 4
+    sequence_len = 8
+    num_features = 32
+
+    # GQA specific parameters
+    num_heads = 4
+    num_key_value_heads = 1
+
+    if model_cls == GQA_Block:
+        model = model_cls(
+            num_attention_heads=num_heads,
+            hidden_size=num_features,
+            num_key_value_heads=num_key_value_heads,
+        ).to(device="cuda", dtype=torch.float16)
+    else:
+        model = model_cls(num_features, num_features, bias=bias).to(
+            device="cuda", dtype=torch.float16
+        )
+    x = torch.randn(batch_size, sequence_len, num_features, device="cuda", dtype=torch.float16)
+
+    # Test pattern detection - create expected transformations for validation
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+    expected_transformations = []
+    # if world_size == 1, no sharding transformations should be detected
+    if world_size > 1:
+        if model_cls == GQA_Block:
+            min_local_shape = num_features // num_heads
+            for node in gm.graph.nodes:
+                if is_linear_op(node, include_quantization=True):
+                    # for Q, K, V layers, we expect:
+                    # dim = 0, add_dist = False
+                    # for O layer, we expect:
+                    # dim = 1, add_dist = True
+                    if "o_proj" in node.args[1].name:
+                        dim = SplitDimension.COLUMN
+                        dist_op = "all_reduce"
+                    else:
+                        dim = SplitDimension.ROW
+                        dist_op = None
+                    expected_transformations.append(
+                        TPShardingInfo(
+                            target_node=node.name,
+                            split_dim=dim,
+                            rank=rank,
+                            world_size=world_size,
+                            dist_op=dist_op,
+                            min_local_shape=min_local_shape,
+                        )
+                    )
+        elif model_cls == MLP:
+            for node in gm.graph.nodes:
+                if is_linear_op(node, include_quantization=True):
+                    # linear1 should be sharded on dim=0, add_dist=False, min_local_shape=1
+                    # linear2 should be sharded on dim=1, add_dist=True, min_local_shape=1
+                    if "linear1" in node.args[1].name:
+                        dim = SplitDimension.ROW
+                        dist_op = None
+                    else:
+                        dim = SplitDimension.COLUMN
+                        dist_op = "all_reduce"
+                    expected_transformations.append(
+                        TPShardingInfo(
+                            target_node=node.name,
+                            split_dim=dim,
+                            rank=rank,
+                            world_size=world_size,
+                            dist_op=dist_op,
+                            min_local_shape=1,
+                        )
+                    )
+        elif model_cls == nn.Linear:
+            # expect simple shard only (dim=0, add_dist=True, min_local_shape=1)
+            for node in gm.graph.nodes:
+                if is_linear_op(node, include_quantization=True):
+                    expected_transformations.append(
+                        TPShardingInfo(
+                            target_node=node.name,
+                            split_dim=SplitDimension.ROW,  # Simple shard uses dim=0
+                            rank=rank,
+                            world_size=world_size,
+                            dist_op="all_gather",
+                            min_local_shape=1,
+                        )
+                    )
+
+    # get detected transformations
+    sharding_config = ShardingConfig()
+    detect_column_row_shard(gm, rank, world_size, sharding_config)
+    detected_transformations = sharding_config.tp_transforms
+
+    # Run pattern detection test
+    run_sharding_pattern_detection_test(detected_transformations, expected_transformations)
+
+
 @pytest.mark.parametrize("device_count", get_device_counts())
 @pytest.mark.parametrize("bias", [False, True])
 @pytest.mark.parametrize(
@@ -174,3 +285,24 @@ def test_sharding(model_cls: Type[nn.Module], dist_op_expected: str, bias: bool,
         job=partial(_run_job, model_cls, dist_op_expected, bias),
         size=device_count,
     )
+
+
+@pytest.mark.parametrize("world_size", [1, 8])
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize(
+    "model_cls, dist_op_expected",
+    (
+        (MLP, "torch_dist_all_reduce"),
+        (nn.Linear, "torch_dist_all_gather"),
+        (GQA_Block, "torch_dist_all_reduce"),
+    ),
+)
+def test_sharding_pattern_detection(
+    model_cls: Type[nn.Module], dist_op_expected: str, bias: bool, world_size: int
+):
+    """Test pattern detection logic without distributed execution.
+
+    This test verifies only the pattern detection logic with provided world_size.
+    No need to run distributed job, can be run on single process.
+    """
+    _run_pattern_detection_job(model_cls, bias, 0, world_size)

@@ -12,4 +12,5 @@ def _from_pretrained_patched(pretrained_model_name_or_path, **kwargs):
     return _orig_from_pretrained(pretrained_model_name_or_path, **kwargs)
 
 
+# TODO: figure out how this can be incorporated into the export patch system
 AutoConfig.from_pretrained = _from_pretrained_patched
