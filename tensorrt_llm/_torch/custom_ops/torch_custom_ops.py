@@ -1101,22 +1101,10 @@ def set_stream(stream_id: int) -> None:
     torch.cuda.set_stream(stream)
 
 
-@set_stream.register_fake
-def _(stream_id: int) -> None:
-    # Fake implementation does nothing
-    pass
-
-
 @torch.library.custom_op("trtllm::record_event", mutates_args=())
 def record_event(event_idx: int) -> None:
     event = get_event(event_idx)
     event.record()
-
-
-@record_event.register_fake
-def _(event_idx: int) -> None:
-    # Fake implementation does nothing
-    pass
 
 
 @torch.library.custom_op("trtllm::wait_event", mutates_args=())
@@ -1125,20 +1113,8 @@ def wait_event(event_idx: int) -> None:
     event.wait()
 
 
-@wait_event.register_fake
-def _(event_idx: int) -> None:
-    # Fake implementation does nothing
-    pass
-
-
 @torch.library.custom_op("trtllm::record_stream", mutates_args=())
 def record_stream(tensor: torch.Tensor, stream_id: int) -> None:
     stream = get_stream(stream_id)
     assert stream is not None
     tensor.record_stream(stream)
-
-
-@record_stream.register_fake
-def _(tensor: torch.Tensor, stream_id: int) -> None:
-    # Fake implementation does nothing
-    pass
