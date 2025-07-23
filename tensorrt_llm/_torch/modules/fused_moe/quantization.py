@@ -1,3 +1,4 @@
+import math
 from abc import ABC, abstractmethod
 from typing import Dict, List, NamedTuple, Optional, Union
 
@@ -84,10 +85,12 @@ class FusedMoEQuantScalesW4A8MXFP4MXFP8(NamedTuple):
 
 def trtllmgen_maybe_get_cached_w3_w1_permute_indices(
         dst_w3_w1_weight: torch.Tensor,
-        cache_permute_indices: Dict[tuple[int, int, int], torch.Tensor],
+        cache_permute_indices: Dict[tuple[tuple[int, int, int], str],
+                                    torch.Tensor],
         epilogue_tile_m: int,
         num_elts_per_sf: Union[None, int] = None) -> torch.Tensor:
-    if dst_w3_w1_weight.shape not in cache_permute_indices:
+    key = (dst_w3_w1_weight.shape, "w31")
+    if key not in cache_permute_indices:
         # Get permute indices and chain them together
         permute0 = get_reorder_rows_for_gated_act_gemm_row_indices(
             dst_w3_w1_weight)
@@ -100,18 +103,20 @@ def trtllmgen_maybe_get_cached_w3_w1_permute_indices(
                 epilogue_tile_m=epilogue_tile_m,
                 num_elts_per_sf=num_elts_per_sf)
         # Memoize permute indices as recompute is **very** costly
-        cache_permute_indices[dst_w3_w1_weight.shape] = permute0[permute1].to(
+        cache_permute_indices[key] = permute0[permute1].to(
             dst_w3_w1_weight.device)
-    permute_indices = cache_permute_indices[dst_w3_w1_weight.shape]
+    permute_indices = cache_permute_indices[key]
     return permute_indices
 
 
 def trtllmgen_maybe_get_cached_w2_permute_indices(
         dst_w2_weight: torch.Tensor,
-        cache_permute_indices: Dict[tuple[int, int, int], torch.Tensor],
+        cache_permute_indices: Dict[tuple[tuple[int, int, int], str],
+                                    torch.Tensor],
         epilogue_tile_m: int,
         num_elts_per_sf: Union[None, int] = None) -> torch.Tensor:
-    if dst_w2_weight.shape not in cache_permute_indices:
+    key = (dst_w2_weight.shape, "w2")
+    if key not in cache_permute_indices:
         if num_elts_per_sf is None:
             permute_indices = (get_shuffle_matrix_a_row_indices(
                 dst_w2_weight, epilogue_tile_m).to(dst_w2_weight.device))
@@ -121,8 +126,8 @@ def trtllmgen_maybe_get_cached_w2_permute_indices(
                 epilogue_tile_m=epilogue_tile_m,
                 num_elts_per_sf=num_elts_per_sf).to(dst_w2_weight.device))
         # Memoize permute indices as recompute is **very** costly
-        cache_permute_indices[dst_w2_weight.shape] = permute_indices
-    permute_indices = cache_permute_indices[dst_w2_weight.shape]
+        cache_permute_indices[key] = permute_indices
+    permute_indices = cache_permute_indices[key]
     return permute_indices
 
 
@@ -2313,9 +2318,11 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
                                                   self.weight_alignment)
         else:
             # Pad bias, TRTLLM backend expects float32 bias.
+            # Divide bias by tp_size as we shard along the hidden dimension.
+            # The bias is applied at each TP rank before the final accumulation.
             assert len(w2_weight_shard.shape) == 1
             w2_weight_shard = maybe_pad_for_mxfp4(
-                w2_weight_shard, self.weight_alignment).float()
+                w2_weight_shard, self.weight_alignment).float() / module.tp_size
 
         # FIXME: this depends on the kernel internals
         epilogue_tile_m = 128
@@ -2399,15 +2406,20 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
                                           dst_w2_weight_scale: torch.Tensor):
         device = dst_w2_weight_scale.device
         assert device.type == "cuda"
+        # The last rank might get not full tensor, but its remainder.
+        # E.g. TP=8 and w2_weight_scale.shape[1] = 90, the last rank will get 6 elements.
+        # Take the original width, pad it to the self.weight_alignment // module.scaling_vector_size,
+        # Use this value as padding for the weight scales.
+        original_width = math.ceil(w2_weight_scale.shape[1] / module.tp_size)
+        sfs_alignment = self.weight_alignment // module.scaling_vector_size
+        padded_width = math.ceil(original_width / sfs_alignment) * sfs_alignment
         w2_weight_scale = load_weight_shard(w2_weight_scale,
                                             module.tp_size,
                                             module.tp_rank,
                                             TensorParallelMode.ROW,
                                             device=device)
-        w2_weight_scale = maybe_pad_for_mxfp4(
-            w2_weight_scale,
-            self.weight_alignment // module.scaling_vector_size,
-            self.weight_alignment)
+        w2_weight_scale = maybe_pad_for_mxfp4(w2_weight_scale, padded_width,
+                                              self.weight_alignment)
 
         # Keep weights in device buffer
         dst_w2_weight_scale.copy_(

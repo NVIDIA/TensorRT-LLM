@@ -109,6 +109,12 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
             && options.mFusedAct == mOptions.fusedAct && options.mIsStaticBatch == mOptions.staticBatch
             && tileSize == mOptions.tileSize)
         {
+            // FIXME: Disable split-k for now.
+            if (options.mClusterDimZ != 1)
+            {
+                continue;
+            }
+
             if (options.mFusedAct)
             {
                 if (options.mActType != static_cast<batchedGemm::gemmGatedAct::ActType>(mOptions.actType))
