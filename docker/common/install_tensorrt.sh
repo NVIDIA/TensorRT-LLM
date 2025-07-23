@@ -12,7 +12,8 @@ CUDNN_VER="9.10.2.21-1"
 # PyTorch 25.06 uses NCCL 2.27.3. NCCL 2.27.5 resolves a perf regression issue.
 # Use NCCL version 2.27.5 instead.
 NCCL_VER="2.27.5-1+cuda12.9"
-CUBLAS_VER="12.9.1.4-1"
+# Note: ideally we should use 12.9.1.4-1 to align with other SW versions, but it will cause nvbug https://nvbugs/5376270, so we don't upgrade it.
+CUBLAS_VER="12.9.0.13-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
 # https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
 NVRTC_VER="12.9.86-1"
