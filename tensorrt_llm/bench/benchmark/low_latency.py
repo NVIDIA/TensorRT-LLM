@@ -14,7 +14,8 @@ from huggingface_hub import snapshot_download
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
-from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
+from tensorrt_llm.bench.benchmark.utils.general import (TuningConstraints,
+                                                        generate_warmup_dataset)
 from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
 from tensorrt_llm.bench.build.build import get_model_config
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
@@ -232,8 +233,16 @@ def latency_command(
         if bench_env.checkpoint_path is None:
             snapshot_download(model)
 
-        exec_settings = get_settings(params, metadata, bench_env.model,
-                                     bench_env.checkpoint_path)
+        tuning_constraints = TuningConstraints(
+            average_isl=metadata.avg_isl,
+            average_osl=metadata.avg_osl,
+            maximum_isl=metadata.max_isl,
+            maximum_osl=metadata.max_osl,
+            max_sequence_length=max_seq_len or metadata.max_sequence_length,
+        )
+
+        exec_settings = get_settings(params, tuning_constraints,
+                                     bench_env.model, bench_env.checkpoint_path)
         kwargs_max_sql = max_seq_len or metadata.max_sequence_length
         logger.info(f"Setting PyTorch max sequence length to {kwargs_max_sql}")
         kwargs["max_seq_len"] = kwargs_max_sql
