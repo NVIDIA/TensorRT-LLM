@@ -66,10 +66,10 @@ def test_create_child_request(n: int):
             parent.request_id + parent.sampling_config.num_return_sequences):
         parent.create_child_request(child_id)
 
-    assert len(
-        parent.children) == parent.sampling_config.num_return_sequences - 1
+    assert len(parent.child_requests
+               ) == parent.sampling_config.num_return_sequences - 1
 
-    for ind, child in enumerate(parent.children):
+    for ind, child in enumerate(parent.child_requests):
         assert child.request_id == ind + parent.request_id + 1
         assert child.py_request_id == child.request_id
         assert child.parent_request_id == parent.request_id
@@ -88,7 +88,7 @@ def test_create_child_request(n: int):
         assert child.get_tokens() == parent.get_tokens()
         assert child.get_tokens() is not parent.get_tokens()
 
-        assert child.children == []
+        assert child.child_requests == []
 
 
 @force_ampere  # Save H100 resource

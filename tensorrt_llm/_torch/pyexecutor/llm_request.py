@@ -334,7 +334,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                                   return_log_probs, return_context_logits,
                                   return_generation_logits,
                                   exclude_last_generation_logits)
-        self.children = []
+        self.child_requests = []
 
     def is_generation_only_request(self):
         return self.py_llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
@@ -377,14 +377,14 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         py_request.py_batch_idx = None
         py_request.py_seq_slot = None
 
-        py_request.children = []
+        py_request.child_requests = []
 
         assert py_request.is_child
         assert py_request.request_id == child.request_id
         assert py_request.parent_request_id == self.request_id
         assert py_request.sampling_config.random_seed != self.sampling_config.random_seed
 
-        self.children.append(py_request)
+        self.child_requests.append(py_request)
 
 
 def convert_wordlist(word_list) -> List[List[int]]:
