@@ -227,7 +227,6 @@ class Mistral3InputProcessor(InputProcessor):
         self.model_config = model_config
         self.tokenizer = tokenizer
 
-        self._device = "cuda"
         self._processor = AutoProcessor.from_pretrained(model_path,
                                                         use_fast=False)
 
@@ -257,7 +256,6 @@ class Mistral3InputProcessor(InputProcessor):
         if pixel_values is not None:
             # We have no use for the `attention_mask`.
             processed.pop("attention_mask")
-            processed = processed.to(self._device)
             # NOTE: `processed` is a dict-like object, but not actually a dict.
             extra_processed_inputs = {
                 "multimodal_data": {
