@@ -10,9 +10,9 @@ from tensorrt_llm.llmapi.llm_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 
-def create_vanila_model_config() -> ModelConfig:
+def create_vanilla_model_config() -> ModelConfig:
     return ModelConfig(
-        name='vanila-model',
+        name='vanilla-model',
         model_type='mock',
         param_count=1_000_000_000,
         num_hidden_layers=12,
@@ -162,7 +162,7 @@ def legacy_calc_engine_setting(
 @pytest.mark.parametrize("seq_len", [5, 200, 2000, 8000, 130000])
 def test_tuning_max_batch_size_calculation(seq_len):
     model_configs = {
-        'vanila': create_vanila_model_config(),
+        'vanilla': create_vanilla_model_config(),
         'swa': create_swa_model_config(),
         'vswa': create_vswa_model_config(),
     }
@@ -172,8 +172,8 @@ def test_tuning_max_batch_size_calculation(seq_len):
     input_len = seq_len // 2
     output_len = seq_len - input_len
 
-    legacy_vanila_mbs, legacy_vanila_mnt = legacy_calc_engine_setting(
-        model_config=model_configs['vanila'],
+    legacy_vanilla_mbs, legacy_vanilla_mnt = legacy_calc_engine_setting(
+        model_config=model_configs['vanilla'],
         quant_config=quant_config,
         tp_size=1,
         pp_size=1,
@@ -181,10 +181,9 @@ def test_tuning_max_batch_size_calculation(seq_len):
         target_output_len=output_len,
         kv_cache_gpu_mem_fraction=cache_mem_fraction,
     )
-    print(f'Vanila: mbs {legacy_vanila_mbs} mnt {legacy_vanila_mnt}')
 
-    vanila_mbs, vanila_mnt = calc_engine_setting(
-        model_config=model_configs['vanila'],
+    vanilla_mbs, vanilla_mnt = calc_engine_setting(
+        model_config=model_configs['vanilla'],
         quant_config=quant_config,
         tp_size=1,
         pp_size=1,
@@ -192,11 +191,11 @@ def test_tuning_max_batch_size_calculation(seq_len):
         target_output_len=output_len,
         kv_cache_gpu_mem_fraction=cache_mem_fraction,
     )
-    print(f'Vanila: mbs {vanila_mbs} mnt {vanila_mnt}')
+    print(f'vanilla: mbs {vanilla_mbs} mnt {vanilla_mnt}')
 
-    # Computation for a vanila model should be identical to the legcay.
-    assert legacy_vanila_mbs == vanila_mbs
-    assert legacy_vanila_mnt == vanila_mnt
+    # Computation for a vanilla model should be identical to the legcay.
+    assert legacy_vanilla_mbs == vanilla_mbs
+    assert legacy_vanilla_mnt == vanilla_mnt
 
     swa_mbs, swa_mnt = calc_engine_setting(
         model_config=model_configs['swa'],
@@ -207,15 +206,14 @@ def test_tuning_max_batch_size_calculation(seq_len):
         target_output_len=output_len,
         kv_cache_gpu_mem_fraction=cache_mem_fraction,
     )
-    print(f'SWA: mbs {swa_mbs} mnt {swa_mnt}')
 
     if seq_len <= model_configs['swa'].sliding_window:
-        assert vanila_mbs == swa_mbs
-        assert vanila_mnt == swa_mnt
+        assert vanilla_mbs == swa_mbs
+        assert vanilla_mnt == swa_mnt
     else:
-        # SWA is more memory efficient than Vanila
-        assert swa_mbs > vanila_mbs
-        assert swa_mnt >= vanila_mnt
+        # SWA is more memory efficient than vanilla
+        assert swa_mbs > vanilla_mbs
+        assert swa_mnt >= vanilla_mnt
 
     vswa_mbs, vswa_mnt = calc_engine_setting(
         model_config=model_configs['vswa'],
@@ -226,14 +224,13 @@ def test_tuning_max_batch_size_calculation(seq_len):
         target_output_len=output_len,
         kv_cache_gpu_mem_fraction=cache_mem_fraction,
     )
-    print(f'VSWA: mbs {vswa_mbs} mnt {vswa_mnt}')
 
     if seq_len <= model_configs['vswa'].sliding_window:
-        assert vanila_mbs == vswa_mbs
+        assert vanilla_mbs == vswa_mbs
     else:
-        # VSWA is more memory efficient than Vanila
-        assert vswa_mbs > vanila_mbs
-        assert vswa_mnt >= vanila_mnt
+        # VSWA is more memory efficient than vanilla
+        assert vswa_mbs > vanilla_mbs
+        assert vswa_mnt >= vanilla_mnt
         # VSWA is less memory efficient than SWA
         assert vswa_mbs < swa_mbs
         assert vswa_mnt <= swa_mnt
