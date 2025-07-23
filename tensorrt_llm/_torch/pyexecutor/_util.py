@@ -14,7 +14,7 @@ from tensorrt_llm.bindings.executor import DecodingMode, ExecutorConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import (LoraConfig,
                                        get_default_trtllm_modules_to_hf_modules,
-                                       load_torch_hf_lora)
+                                       load_torch_lora)
 from tensorrt_llm.mapping import Mapping
 
 from ..model_config import ModelConfig
@@ -437,7 +437,8 @@ def create_py_executor_instance(
         from tensorrt_llm.bindings import LoraModule
 
         if len(lora_config.lora_dir) == 1:
-            load_torch_hf_lora(lora_config)
+            # Route to appropriate loader based on checkpoint source
+            load_torch_lora(lora_config)
         else:
             assert len(lora_config.lora_target_modules
                        ) >= 1, "Expecting at least one lora target module"
@@ -450,12 +451,25 @@ def create_py_executor_instance(
 
         num_experts = _try_infer_num_experts(model_engine.model.model_config)
 
+        num_attn_layers = model_binding_config.num_attention_layers()
+        per_layer_kv_heads = [
+            model_binding_config.num_kv_heads(i) for i in range(num_attn_layers)
+        ]
+        num_kv_attention_heads = max(per_layer_kv_heads)
+        if len(set(per_layer_kv_heads)) > 1:
+            # NOTE: This code-path is currently untested and not validated. Can fail!
+            # This support is tracked in TRTLLM-6561
+            logger.warning(
+                f"Non-uniform KV heads per layer detected, using max ({num_kv_attention_heads}) for LoRA. "
+                "This code-path is currently untested and not validated. May fail!"
+            )
+
         lora_modules = LoraModule.create_lora_modules(
             lora_module_names=lora_config.lora_target_modules,
             hidden_size=model_binding_config.hidden_size,
             mlp_hidden_size=model_binding_config.mlp_hidden_size,
             num_attention_heads=model_binding_config.num_heads,
-            num_kv_attention_heads=model_binding_config.num_heads,
+            num_kv_attention_heads=num_kv_attention_heads,
             attention_head_size=model_binding_config.head_size,
             tp_size=mapping.tp_size,
             num_experts=num_experts)

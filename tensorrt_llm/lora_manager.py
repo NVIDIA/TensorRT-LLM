@@ -4,8 +4,9 @@ import re
 import tarfile
 from collections import defaultdict
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -22,8 +23,21 @@ if TYPE_CHECKING:
     from .runtime import ModelConfig
 
 
-def get_all_nemo_lora_weights(lora_weights):
-    layer_weights = defaultdict(dict)
+def get_all_nemo_lora_weights(
+    lora_weights: Dict[str, torch.Tensor],
+) -> Dict[int, Dict[str, torch.Tensor]]:
+    """Extract and organize NeMo LoRA weights by layer and direction.
+
+    Args:
+        lora_weights: Dictionary mapping weight keys to tensors from NeMo checkpoint
+
+    Returns:
+        Dictionary mapping layer_idx -> {direction -> tensor} where direction is 'in' or 'out'
+
+    Raises:
+        KeyError: If unsupported keys are found or layer extraction fails
+    """
+    layer_weights: Dict[int, Dict[str, torch.Tensor]] = defaultdict(dict)
     adapter_key = "self_attention.adapter_layer.lora_kqv_adapter"
     layer_pattern = re.compile(r".*\.layers\.(\d+)\..*")
     for key, weights in lora_weights.items():
@@ -52,7 +66,28 @@ HF_LORA_PATTERN = re.compile(
 )
 
 
-def iterate_hf_lora(iter_fn, lora_weights, hf_modules, component=None):
+def iterate_hf_lora(
+    iter_fn,
+    lora_weights: Dict[str, torch.Tensor],
+    hf_modules: Set[str],
+    component: Optional[str] = None,
+):
+    """Iterate over HuggingFace LoRA weights and call iterator function for each weight.
+
+    Args:
+        iter_fn: Function to call for each weight with signature
+        (layer_idx, hf_module, expert_idx, inout_or_mag, weights)
+        lora_weights: Dictionary mapping weight keys to tensors from HF checkpoint
+        hf_modules: Set of supported HF module names
+        component: Optional component name to filter by (e.g., 'decoder')
+
+    Returns:
+        Nested dictionary structure organizing the weights
+
+    Raises:
+        KeyError: If unsupported keys are found
+        AssertionError: If HF module is not in supported list
+    """
     all_weights = defaultdict(lambda: defaultdict(dict))
     pattern = HF_LORA_PATTERN
     for key, weights in lora_weights.items():
@@ -96,7 +131,20 @@ def iterate_hf_lora(iter_fn, lora_weights, hf_modules, component=None):
     return all_weights
 
 
-def get_all_hf_lora_weights(lora_weights, hf_modules, component=None):
+def get_all_hf_lora_weights(
+    lora_weights: Dict[str, torch.Tensor], hf_modules: Set[str], component: Optional[str] = None
+):
+    """Extract and organize all HuggingFace LoRA weights by layer and module.
+
+    Args:
+        lora_weights: Dictionary mapping weight keys to tensors from HF checkpoint
+        hf_modules: Set of supported HF module names
+        component: Optional component name to filter by (e.g., 'decoder')
+
+    Returns:
+        Nested dictionary organizing weights by layer, module, and potentially expert
+    """
+
     def iter_fn(layer_idx, hf_module, expert_idx, inout, weights):
         if expert_idx is None:
             all_weights[layer_idx][hf_module][inout] = weights
@@ -118,8 +166,19 @@ def get_hf_target_modules(lora_weights, hf_modules):
     return hf_target_modules
 
 
-def invert_module_mapping(trtllm_modules_to_hf_modules):
-    hf_modules_to_trtllm_modules = {}
+def invert_module_mapping(
+    trtllm_modules_to_hf_modules: Dict[str, Union[str, List[str]]],
+) -> Dict[str, str]:
+    """Invert module mapping from TensorRT-LLM -> HF to HF -> TensorRT-LLM.
+
+    Args:
+        trtllm_modules_to_hf_modules: Mapping from TensorRT-LLM module names to HF module names
+                                     (values can be strings or lists of strings)
+
+    Returns:
+        Dictionary mapping HF module names to TensorRT-LLM module names
+    """
+    hf_modules_to_trtllm_modules: Dict[str, str] = {}
     for k, hf_modules in trtllm_modules_to_hf_modules.items():
         if isinstance(hf_modules, list):
             for hf_module in hf_modules:
@@ -218,8 +277,88 @@ class HfLoraLoader:
         return list(lora_target_modules)
 
 
+@lru_cache(maxsize=128)
+def _find_nemo_files_single_path(lora_path: str) -> List[str]:
+    """Find .nemo files from a single path (file or directory).
+
+    This function is cached per individual path to maximize cache efficiency
+    when the same paths appear in different collections.
+
+    Args:
+        lora_path: A single path that can be either:
+                  - Direct path to a .nemo file
+                  - Directory containing .nemo files (will auto-detect *.nemo)
+
+    Returns:
+        List[str]: List of paths to .nemo files found in this single path
+
+    Raises:
+        ValueError: If path doesn't exist, no .nemo files found, or invalid file type
+    """
+    path = Path(lora_path)
+    if not path.exists():
+        raise ValueError(f"{path} does not exist")
+
+    if path.is_file():
+        if path.suffix == ".nemo":
+            return [str(path)]
+        else:
+            raise ValueError(f"{path} is not a .nemo file")
+    elif path.is_dir():
+        nemo_files_in_dir = list(path.glob("*.nemo"))
+        if not nemo_files_in_dir:
+            raise ValueError(f"No .nemo files found in directory {path}")
+        return [str(f) for f in nemo_files_in_dir]
+    else:
+        raise ValueError(f"{path} is neither a file nor a directory")
+
+
+def find_nemo_files(lora_dirs: List[str]) -> List[str]:
+    """Find all .nemo files from a list of directories or file paths.
+
+    This function is optimized for repeated calls at generation time by using an internal LRU cache
+    on individual paths, which maximizes cache efficiency when the same paths
+    appear in different collections.
+
+    Args:
+        lora_dirs: List of paths that can be either:
+                  - Direct paths to .nemo files
+                  - Directories containing .nemo files (will auto-detect *.nemo)
+
+    Returns:
+        List[str]: List of paths to .nemo files
+
+    Raises:
+        ValueError: If a path doesn't exist, no .nemo files are found in a directory
+        path, or a file path is of invalid file type
+    """
+    if len(lora_dirs) == 0:
+        return []
+
+    all_nemo_files: List[str] = []
+    for lora_path in lora_dirs:
+        nemo_files_for_path = _find_nemo_files_single_path(lora_path)
+        all_nemo_files.extend(nemo_files_for_path)
+
+    if not all_nemo_files:
+        raise ValueError("No .nemo files found in the provided paths")
+
+    return all_nemo_files
+
+
 class NemoLoraLoader:
     def __init__(self, lora_dirs: List[str]):
+        """Initialize NemoLoraLoader with paths to .nemo files or directories.
+
+        Args:
+            lora_dirs: List of paths that can be either:
+                      - Direct paths to .nemo files
+                      - Directories containing .nemo files (will auto-detect *.nemo)
+
+        Note: The parameter name 'lora_dirs' is misleading - it can accept both
+              directories and files. This is a design flaw that should be fixed
+              in a future version (e.g., rename to 'lora_paths').
+        """
         self.lora_target_modules = []
         self.is_valid = False
 
@@ -230,15 +369,28 @@ class NemoLoraLoader:
             path = Path(lora_file)
             if not path.exists():
                 raise ValueError(f"{path} does not exist")
-            if not path.is_file():
-                raise ValueError(f"{path} is not a file")
         self.is_valid = True
         # Hardcoded since LoraManager only supports this case now
         self.lora_target_modules = ["attn_qkv"]
 
+    def get_target_modules(self):
+        """Get target modules for NeMo LoRA.
+
+        Unlike the HF loader, this method does not accept trtllm_modules_to_hf_modules
+        as an argument since the module mapping is hardcoded for NeMo LoRA support.
+
+        Returns:
+            List[str]: List of target module names supported by NeMo LoRA
+        """
+        return self.lora_target_modules
+
 
 def load_nemo_lora(model, lora_config: LoraConfig):
     lora_loader = NemoLoraLoader(lora_config.lora_dir)
+
+    if not lora_loader.is_valid:
+        raise ValueError(f"Failed to load NeMo LoRA from {lora_config.lora_dir}")
+
     if len(lora_config.lora_target_modules) == 0:
         lora_config.lora_target_modules = lora_loader.lora_target_modules
 
@@ -285,6 +437,73 @@ def load_torch_hf_lora(lora_config: LoraConfig):
 
     missing_qkv_modules = LoraManager.get_missing_qkv_modules(lora_config.lora_target_modules)
     lora_config.lora_target_modules.extend(missing_qkv_modules)
+
+
+def load_torch_nemo_lora(lora_config: LoraConfig):
+    """Load NeMo LoRA checkpoint for PyTorch workflow.
+
+    This is a PyTorch-specific loader for NeMo LoRA checkpoints, similar to
+    load_torch_hf_lora but handling NeMo checkpoint format. NeMo uses a combined
+    "attn_qkv" module rather than separate Q, K, V modules, so no missing QKV
+    module handling is needed.
+
+    Note: This function only sets up the configuration. For PyTorch workflow,
+    the actual weight loading happens later via LoraManager when requests are
+    made with LoRA UIDs.
+
+    Args:
+        lora_config: LoRA configuration with lora_ckpt_source="nemo"
+
+    Raises:
+        ValueError: If NeMo LoRA directory is invalid or unsupported modules are specified
+    """
+    lora_config.trtllm_modules_to_hf_modules = {"attn_qkv": "attn_qkv"}
+
+    assert len(lora_config.lora_dir) == 1, "Expecting only a single lora dir"
+    lora_loader = NemoLoraLoader(lora_config.lora_dir)
+
+    if not lora_loader.is_valid:
+        raise ValueError(f"Failed to load NeMo LoRA from {lora_config.lora_dir}")
+
+    if len(lora_config.lora_target_modules) == 0:
+        lora_config.lora_target_modules = lora_loader.get_target_modules()
+
+    if len(lora_config.lora_target_modules) == 0:
+        raise ValueError(
+            "lora_target_modules is empty. "
+            "Please specify lora_target_modules or provide lora_dir to infer lora_target_modules."
+        )
+
+    supported_modules = {"attn_qkv"}
+    unsupported_modules = set(lora_config.lora_target_modules) - supported_modules
+    if unsupported_modules:
+        raise ValueError(
+            f"NeMo LoRA only supports {supported_modules} modules, "
+            f"but got unsupported modules: {unsupported_modules}. "
+            f"NeMo LoRA does not support embedding, lm_head, or MLP adapters."
+        )
+
+
+def load_torch_lora(lora_config: LoraConfig):
+    """Load LoRA checkpoint for PyTorch workflow.
+
+    This function routes to the appropriate loader based on lora_ckpt_source.
+
+    Args:
+        lora_config: LoRA configuration with lora_ckpt_source set to "hf" or "nemo"
+
+    Raises:
+        ValueError: If lora_ckpt_source is not supported
+    """
+    if lora_config.lora_ckpt_source == "nemo":
+        load_torch_nemo_lora(lora_config)
+    elif lora_config.lora_ckpt_source == "hf":
+        load_torch_hf_lora(lora_config)
+    else:
+        raise ValueError(
+            f"Unsupported lora_ckpt_source: {lora_config.lora_ckpt_source}. "
+            f"Supported sources: 'hf', 'nemo'"
+        )
 
 
 def load_hf_lora(
@@ -388,7 +607,18 @@ def use_lora(
         raise ValueError(f"Unsupported lora_ckpt_source: {lora_config.lora_ckpt_source}")
 
 
-def unpack_nemo_weights(nemo_archive_path):
+def unpack_nemo_weights(nemo_archive_path: str) -> Tuple[Dict, Dict[str, torch.Tensor]]:
+    """Unpack model config and weights from a NeMo .nemo archive file.
+
+    Args:
+        nemo_archive_path: Path to the .nemo archive file
+
+    Returns:
+        Tuple of (model_config_dict, model_weights_dict)
+
+    Raises:
+        Exception: If required files cannot be extracted from the archive
+    """
     with tarfile.open(nemo_archive_path) as tar:
         try:
             model_weights_file = tar.extractfile("model_weights.ckpt")
@@ -539,8 +769,12 @@ class LoraManager(object):
                 uids=uids,
             )
         elif ckpt_source == "nemo":
+            # Find all .nemo files from directories or files
+            nemo_files = find_nemo_files(model_dirs_or_files)
+
+            # Pass the actual .nemo files to the loader
             return self.load_from_nemo(
-                model_files=model_dirs_or_files,
+                model_files=nemo_files,
                 model_config=model_config,
                 runtime_mapping=runtime_mapping,
                 uids=uids,
