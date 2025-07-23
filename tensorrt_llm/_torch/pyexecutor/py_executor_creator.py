@@ -332,14 +332,15 @@ def create_py_executor(
 
     guided_decoder: Optional[GuidedDecoder] = None
     if executor_config.guided_decoding_config is not None:
-        if spec_config is not None:
-            raise ValueError(
-                "Guided decoding is not supported with speculative decoding.")
         if mapping.is_last_pp_rank():
+            max_num_draft_tokens = 0
+            if spec_config is not None:
+                max_num_draft_tokens = spec_config.max_draft_len
             guided_decoder = GuidedDecoder(
                 executor_config.guided_decoding_config,
                 executor_config.max_batch_size,
-                model_engine.model.vocab_size_padded)
+                model_engine.model.vocab_size_padded,
+                max_num_draft_tokens=max_num_draft_tokens)
 
     resources = {}
     estimating_kv_cache = False
