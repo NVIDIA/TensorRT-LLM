@@ -186,6 +186,20 @@ int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t
         }
     }
 
+    // Set useUnifiedGemm as false when upgrading cublas from "12.9.0.13-1" (DLFW 25.05) to "12.9.1.4-1" (DLFW 25.06).
+    // Reason:
+    //   `tests/unittest/trt/functional/test_moe.py::TestMoE::test_mlp_lora_comparison` will be failed if useUnifiedGemm
+    //   is true. Detailed failed cases:
+    //     - For A10, `dtype_str: int8/float16/bfloat16` will fail, while `dtype_str: int4` will pass.
+    //     - For L40S, `dtype_str: int8/float16/bfloat16` will fail, while `dtype_str: int4` will pass.
+    //     - For H100, `dtype_str: int4/int8` will fail, while `dtype_str: float16/bfloat16` will pass.
+    // Related nvbugs:
+    //   - For A10, https://nvbugs/5376025
+    //   - For L40S, https://nvbugs/5376290
+    //   - For H100, https://nvbugs/5376270
+    // Note: such above failed cases will pass with cublas 12.9.0.13-1.
+    useUnifiedGemm = false;
+
     // TODO can add batch_size == 1 case
     if (useUnifiedGemm)
     {
