@@ -18,7 +18,7 @@ from tensorrt_llm.lora_manager import (LoraConfig,
 from tensorrt_llm.mapping import Mapping
 
 from ..model_config import ModelConfig
-from ..speculative import get_spec_decoder
+from ..speculative import get_num_extra_kv_tokens, get_spec_decoder
 from .config import PyTorchConfig
 from .config_utils import is_mla, is_nemotron_hybrid
 from .guided_decoder import GuidedDecoder
@@ -164,7 +164,7 @@ class KvCacheCreator:
 
         if spec_cfg is not None:
             num_extra_tokens_per_seq += spec_cfg.max_draft_len
-            num_extra_tokens_per_seq += spec_cfg.num_extra_kv_tokens
+            num_extra_tokens_per_seq += get_num_extra_kv_tokens(spec_cfg)
         for req in self._dummy_reqs:
             num_req_tokens = len(req.input_token_ids) + num_extra_tokens_per_seq
             # Requests cannot share KV cache blocks. Round up to nearest integer multiple of block size.
