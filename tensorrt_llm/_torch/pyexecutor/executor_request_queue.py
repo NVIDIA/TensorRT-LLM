@@ -163,23 +163,18 @@ class ExecutorRequestQueue:
 
     def _get_request_id(self):
         # (next_request_id + 1) % UINT64_MAX
+        current_id = self.next_request_id
         self.next_request_id = (self.next_request_id + 1) & ((1 << 64) - 1)
-        return self.next_request_id
+        return current_id
 
     def _generate_child_request_ids(
             self, request: ExecutorRequest) -> List[int] | None:
         """ Generate child request IDs if needed. """
         child_req_ids = None
-        sampling_config = request.sampling_config
-        beam_width = (sampling_config.beam_width
-                      if sampling_config.beam_width else 1)
-        num_return_sequences = (sampling_config.num_return_sequences
-                                if sampling_config.num_return_sequences else 1)
-
-        # Create child requests if beam_width == 1 and num_return_sequences > 1.
-        if beam_width == 1 and num_return_sequences > 1:
+        num_children = self._get_num_child_requests(request)
+        if num_children > 0:
             child_req_ids = []
-            for _ in range(num_return_sequences - 1):
+            for _ in range(num_children):
                 child_req_id = self._get_request_id()
                 if self.enable_iter_perf_stats:
                     self.start_times[child_req_id] = time.time()
@@ -599,8 +594,8 @@ class ExecutorRequestQueue:
                     req_item.id, req_item.request, req_item.child_req_ids,
                     self._should_exclude_last_generation_logits())
                 req_with_children.append(req)
-                if req.children:
-                    req_with_children.extend(req.children)
+                if req.child_requests:
+                    req_with_children.extend(req.child_requests)
             return req_with_children
 
     def _merge_star_attention_requests(self,
