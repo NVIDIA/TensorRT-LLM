@@ -1410,7 +1410,7 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
     reason="The kernel only supports Blackwell. Current SM is %d." %
     getSMVersion(),
 )
-@pytest.mark.parametrize("num_tokens", [1, 256])
+@pytest.mark.parametrize("num_tokens", [1, 256, 1024])
 @pytest.mark.parametrize("hidden_size", [512])
 @pytest.mark.parametrize("intermediate_size", [512])
 @pytest.mark.parametrize(
@@ -1480,6 +1480,11 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
     if top_k != 8:
         if dtype_activation != "mxfp8":
             pytest.skip("TopK = 4 is tested only with mxfp8")
+    if num_tokens == 1024:
+        if top_k != 4 or dtype_activation != "mxfp8" or act_type_str != "SwiGlu" or not use_autotune:
+            pytest.skip(
+                "1024 tokens is tested only with topk=4, mxfp8, SwiGlu, and autotune"
+            )
 
     assert top_k <= num_experts
     assert top_k <= 8
@@ -1712,8 +1717,11 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
     #
     # Run the TRT-LLM kernel
     #
+    unpadded_hidden_size = hidden_size
     with autotune(use_autotune):
         if dtype_activation == "mxfp8":
+            # Test fused unpadding by checking only half of the output.
+            unpadded_hidden_size = hidden_size // 2
             output = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
                 expert_logits, routing_bias,
                 hidden_states_mxe4m3.cuda().view(torch.float8_e4m3fn),
@@ -1723,8 +1731,8 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                 gemm1_alpha, gemm1_beta, gemm2_weights_mxe2m1_shuffled.cuda(),
                 gemm2_scales_mxe2m1_shuffled.cuda(), gemm2_bias_shuffled.cuda(),
                 num_experts, top_k, n_groups, top_k_groups, intermediate_size,
-                0, num_experts, routed_scaling, tile_tokens_dim,
-                routing_method_type, act_type.value)
+                unpadded_hidden_size, 0, num_experts, routed_scaling,
+                tile_tokens_dim, routing_method_type, act_type.value)
         elif dtype_activation == "bf16":
             output = torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
                 expert_logits, routing_bias,
@@ -1751,9 +1759,10 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
         else:
             raise ValueError("Invalid dtype_activation")
 
-    # print(output_dequant_reference)
-    # print(output)
     output_dequant_actual = output.to(torch.float)
+    output_dequant_reference = output_dequant_reference[:, :
+                                                        unpadded_hidden_size].contiguous(
+                                                        )
     percent = 0.8 if dtype_activation == "mxfp8" else 0.85
     check_accuracy(output_dequant_reference,
                    output_dequant_actual,

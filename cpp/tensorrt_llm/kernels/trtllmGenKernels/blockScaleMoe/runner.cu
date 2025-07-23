@@ -439,7 +439,9 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
         finalizeData.numTokens = args.num_tokens;
         finalizeData.numExperts = args.num_experts;
         finalizeData.topK = args.top_k;
-        finalizeData.hiddenDim = args.hidden_size;
+        // We want to fuse unpadding into the finalize kernel, so we need to use the output hidden size.
+        finalizeData.hiddenDim = args.hidden_size_output.value_or(args.hidden_size);
+        finalizeData.hiddenDimPadded = args.hidden_size;
         finalizeData.totalNumPaddedTokens = workspace.total_num_padded_tokens;
     }
 }

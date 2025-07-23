@@ -588,15 +588,16 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
 
     def __init__(self, num_experts: int, top_k: int, n_group: Optional[int],
                  topk_group: Optional[int], intermediate_size: int,
-                 local_expert_offset: int, local_num_experts: int,
-                 routed_scaling_factor: Optional[float], tile_tokens_dim: int,
-                 routing_method_type: int, act_type: int):
+                 hidden_size_output: int, local_expert_offset: int,
+                 local_num_experts: int, routed_scaling_factor: Optional[float],
+                 tile_tokens_dim: int, routing_method_type: int, act_type: int):
 
         self.num_experts = num_experts
         self.top_k = top_k
         self.n_group = n_group
         self.topk_group = topk_group
         self.intermediate_size = intermediate_size
+        self.hidden_size_output = hidden_size_output
         self.local_expert_offset = local_expert_offset
         self.local_num_experts = local_num_experts
         self.routed_scaling_factor = routed_scaling_factor
@@ -610,6 +611,7 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
         instance_key = (
             self.top_k,
             self.intermediate_size,
+            self.hidden_size_output,
             self.local_num_experts,
             self.tile_tokens_dim,
             self.act_type,
@@ -630,6 +632,7 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
         return hash((
             self.top_k,
             self.intermediate_size,
+            self.hidden_size_output,
             self.local_num_experts,
             self.tile_tokens_dim,
             self.act_type,
@@ -642,6 +645,7 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
 
         return (self.top_k == other.top_k
                 and self.intermediate_size == other.intermediate_size
+                and self.hidden_size_output == other.hidden_size_output
                 and self.local_num_experts == other.local_num_experts
                 and self.tile_tokens_dim == other.tile_tokens_dim
                 and self.act_type == other.act_type)
@@ -661,8 +665,9 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             args.gemm1_beta, args.gemm2_weights, args.gemm2_weights_scale,
             args.gemm2_bias, None, None, None, self.num_experts, self.top_k,
             self.n_group, self.topk_group, self.intermediate_size,
-            self.local_expert_offset, self.local_num_experts,
-            self.routed_scaling_factor, self.routing_method_type, tactic)
+            self.hidden_size_output, self.local_expert_offset,
+            self.local_num_experts, self.routed_scaling_factor,
+            self.routing_method_type, tactic)
 
     def get_valid_tactics(
         self,
@@ -759,16 +764,17 @@ def mxe4m3_mxe2m1_block_scale_moe_runner(
         gemm2_weights_scale: torch.Tensor, gemm2_bias: Optional[torch.Tensor],
         num_experts: int, top_k: int, n_group: Optional[int],
         topk_group: Optional[int], intermediate_size: int,
-        local_expert_offset: int, local_num_experts: int,
-        routed_scaling_factor: Optional[float], tile_tokens_dim: int,
-        routing_method_type: int, act_type: int) -> torch.Tensor:
+        hidden_size_output: int, local_expert_offset: int,
+        local_num_experts: int, routed_scaling_factor: Optional[float],
+        tile_tokens_dim: int, routing_method_type: int,
+        act_type: int) -> torch.Tensor:
 
     tuner = AutoTuner.get()
 
     kernel_runner = MxE4m3MxE2m1BlockScaleMoERunner(
         num_experts, top_k, n_group, topk_group, intermediate_size,
-        local_expert_offset, local_num_experts, routed_scaling_factor,
-        tile_tokens_dim, routing_method_type, act_type)
+        hidden_size_output, local_expert_offset, local_num_experts,
+        routed_scaling_factor, tile_tokens_dim, routing_method_type, act_type)
 
     input_tensors = [
         routing_logits,
@@ -893,7 +899,7 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             args.gemm2_weights_scale, args.gemm2_bias,
             args.output1_scale_scalar, args.output1_scale_gate_scalar,
             args.output2_scale_scalar, self.num_experts, self.top_k,
-            self.n_group, self.topk_group, self.intermediate_size,
+            self.n_group, self.topk_group, self.intermediate_size, None,
             self.local_expert_offset, self.local_num_experts,
             self.routed_scaling_factor, self.routing_method_type, tactic)
 
