@@ -40,7 +40,7 @@ def _masked_index_copy_group_quant_fp8(
 ):
     group_block = tl.program_id(0)
     token_block = tl.program_id(1)
-    block_num_per_token = tl.num_programs(1)
+    token_block_num = tl.num_programs(1)
 
     # calculate group and element offsets
     num_tokens = tl.load(start_offsets_ptr + row_size)
@@ -48,25 +48,20 @@ def _masked_index_copy_group_quant_fp8(
     elem_offsets = group_start + tl.arange(0, BLOCK)
     valid_elem = elem_offsets < (group_start + group_size)
     input_ptr_offs = input_ptr + elem_offsets
-    row_indices_ptr_offs = row_indices_ptr + elem_offsets // dim_size
     output_ptr_offs = out_q_ptr + elem_offsets
     output_s_offs = out_s_ptr + group_block
 
     # process tokens
     for token_index in tl.range(token_block,
                                 num_tokens,
-                                block_num_per_token,
+                                token_block_num,
                                 num_stages=NUM_STAGE):
         # load input and indices
         input_data = tl.load(input_ptr_offs + token_index * dim_size,
                              mask=valid_elem,
                              other=0.0)
-        row_idx = tl.load(row_indices_ptr_offs + token_index,
-                          mask=valid_elem,
-                          other=0)
-        start_offset = tl.load(start_offsets_ptr + row_idx,
-                               mask=valid_elem,
-                               other=0)
+        row_idx = tl.load(row_indices_ptr + token_index)
+        start_offset = tl.load(start_offsets_ptr + row_idx)
         idx = row_idx * col_size + token_index - start_offset
 
         # quantization
@@ -78,7 +73,7 @@ def _masked_index_copy_group_quant_fp8(
 
         # store quantized values and scaling factor
         tl.store(output_ptr_offs + idx * dim_size, output_q, mask=valid_elem)
-        tl.store(output_s_offs + idx * num_groups, output_s, mask=valid_elem)
+        tl.store(output_s_offs + idx * num_groups, output_s)
 
 
 def masked_index_copy_group_quant_fp8(
@@ -99,6 +94,7 @@ def masked_index_copy_group_quant_fp8(
     assert start_offsets.shape[
         0] == output.shape[0] + 1, "Start offsets must be (num_experts + 1)"
 
+    num_tokens = input.shape[0]
     row_size = output.shape[0]
     col_size = output.shape[1]
     dim_size = output.shape[2]
@@ -106,12 +102,17 @@ def masked_index_copy_group_quant_fp8(
 
     # get block/grid/stage/warp
     BLOCK = group_size
-    BLOCK_NUM_PER_TOKEN = 128
-    NUM_STAGES = 2
-    num_warps = 4
+    if num_tokens <= 4096:
+        TOKEN_BLOCK_NUM = 128
+        NUM_STAGES = 4
+        num_warps = 2
+    else:
+        TOKEN_BLOCK_NUM = 64
+        NUM_STAGES = 6
+        num_warps = 1
     grid = (
         num_groups,
-        BLOCK_NUM_PER_TOKEN,
+        TOKEN_BLOCK_NUM,
     )
 
     # FP8 quantization parameters
