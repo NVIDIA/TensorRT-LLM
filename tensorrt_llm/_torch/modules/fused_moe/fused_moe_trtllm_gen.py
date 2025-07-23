@@ -336,9 +336,8 @@ class TRTLLMGenFusedMoE(MoE):
             )
         elif self.has_w4a8_mxfp4_mxfp8:
             # TRTLLM-Gen uses linear SF layout for the mxfp8 input.
-            pad_size = self.w3_w1_weight.shape[-1] * 2 - x.shape[-1]
-            x = torch.nn.functional.pad(x, (0, pad_size))
-            mxfp8_x, sf = torch.ops.trtllm.mxfp8_quantize(x, False)
+            mxfp8_x, sf = torch.ops.trtllm.mxfp8_quantize(
+                x, False, alignment=self.quant_method.weight_alignment)
             intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
                 -2] // 2
 
