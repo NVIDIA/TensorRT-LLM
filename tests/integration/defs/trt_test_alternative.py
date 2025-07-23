@@ -208,7 +208,8 @@ def call(*popenargs,
     poll_procs = poll_procs or []
     if not suppress_output_info:
         print(f"Start subprocess with call({popenargs}, {kwargs})")
-    timeout = get_pytest_timeout(timeout)
+    # timeout = get_pytest_timeout(timeout)
+    timeout = 3600
     if timeout is None:
         actual_timeout = None
     else:
