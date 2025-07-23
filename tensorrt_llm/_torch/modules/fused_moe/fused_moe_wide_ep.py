@@ -588,43 +588,26 @@ class WideEPMoE(MoE):
                         x_sf = swizzle_sf(x_sf, x.shape[0], x.shape[1] * 2,
                                           self.scaling_vector_size)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
-                assert x_sf is not None and self.has_nvfp4
                 token_num = x_row
                 hidden_size = x_col
+                assert x_sf is not None and self.has_nvfp4
                 assert hidden_size % 32 == 0
-                x_sf_dtype = x_sf.dtype
-                x_dtype = x.dtype
-                assert x_sf_dtype == torch.uint8 and x_dtype == torch.uint8
-                x_sf = x_sf.view(torch.bfloat16)
+                assert x.dtype == torch.uint8 and x_sf.dtype == torch.uint8
                 assert x_sf.shape[0] == token_num and x_sf.shape[
-                    1] == hidden_size // 16 // 2
-                x = x.view(torch.bfloat16)
-                assert x.shape[0] == token_num and x.shape[1] == hidden_size // 4
-                # DeepEP LL dispatch only supports bf16 tensors with a hidden size of 2560, 4096, 5120, or 7168 as input. A hidden size of 2560 is sufficient to accommodate packed FP4 data.
-                packed_hidden_size = 2560
-                assert x.shape[1] + x_sf.shape[1] <= packed_hidden_size
-                fp4_packed_tensor = torch.empty((token_num, packed_hidden_size),
-                                                dtype=torch.bfloat16,
-                                                device=x.device)
-                fp4_packed_tensor[:, :x.shape[1]] = x
-                fp4_packed_tensor[:,
-                                  x.shape[1]:x.shape[1] + x_sf.shape[1]] = x_sf
+                    1] == hidden_size // 16
+                assert x.shape[0] == token_num and x.shape[1] == hidden_size // 2
 
                 deep_ep_topk_idx = token_selected_slots
                 deep_ep_topk_weights = token_final_scales
 
                 assert all_rank_max_num_tokens <= self.deep_ep_max_num_tokens
-                fp4_packed_tensor, recv_expert_count, deep_ep_handle = \
-                    self.deep_ep_buffer.low_latency_dispatch(fp4_packed_tensor, deep_ep_topk_idx, all_rank_max_num_tokens, self.num_slots)
-                deep_ep_handle = list(deep_ep_handle)
-                deep_ep_handle[3] = hidden_size
-                deep_ep_handle = tuple(deep_ep_handle)
+                x, x_sf, recv_expert_count, deep_ep_handle = \
+                    self.deep_ep_buffer.low_latency_dispatch_fp4(x, x_sf, deep_ep_topk_idx, all_rank_max_num_tokens, self.num_slots)
+                assert x.dtype == torch.uint8 and x_sf.dtype == torch.uint8
+                assert x.dim() == 3 and x_sf.dim() == 3
+                assert x.shape[2] == hidden_size // 2 and x_sf.shape[
+                    2] == hidden_size // 16
 
-                assert fp4_packed_tensor.ndim == 3 and fp4_packed_tensor.shape[
-                    2] == packed_hidden_size
-                x_sf = fp4_packed_tensor[:, :, x.shape[1]:x.shape[1] +
-                                         x_sf.shape[1]].contiguous()
-                x = fp4_packed_tensor[:, :, :x.shape[1]].contiguous()
                 mask = torch.arange(
                     x.shape[1], dtype=torch.int32, device=x.device).expand(
                         x.shape[0], x.shape[1]) < recv_expert_count.unsqueeze(1)
@@ -634,9 +617,9 @@ class WideEPMoE(MoE):
                                  x.shape[0] * (self.mapping.moe_ep_rank + 1),
                                  dtype=torch.int32,
                                  device=x.device).unsqueeze(1), self.num_slots)
-                x = x.reshape(x.shape[0] * x.shape[1], x.shape[2]).view(x_dtype)
+                x = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
                 x_sf = x_sf.reshape(x_sf.shape[0] * x_sf.shape[1],
-                                    x_sf.shape[2]).view(x_sf_dtype)
+                                    x_sf.shape[2])
                 x_sf = swizzle_sf(x_sf, x.shape[0], x.shape[1] * 2,
                                   self.scaling_vector_size)
                 token_selected_slots = token_selected_slots.view(x.shape[0], 1)
