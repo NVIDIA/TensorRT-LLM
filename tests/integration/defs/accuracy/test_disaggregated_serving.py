@@ -512,12 +512,12 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             }
         }
         ctx_server_config["kv_cache_config"] = {
-            "max_attention_window": [512, 512, 512, 512, 512, 32768],
-            "enable_block_reuse": False
+            # "max_attention_window": [512, 512, 512, 512, 512, 32768],
+            "enable_block_reuse": True
         }
         gen_server_config["kv_cache_config"] = {
-            "max_attention_window": [512, 512, 512, 512, 512, 32768],
-            "enable_block_reuse": False
+            # "max_attention_window": [512, 512, 512, 512, 512, 32768],
+            "enable_block_reuse": True
         }
         disaggregated_server_config = {
             "hostname": "localhost",
@@ -536,4 +536,6 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
             task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
