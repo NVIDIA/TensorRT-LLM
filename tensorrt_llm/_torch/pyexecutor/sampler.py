@@ -666,7 +666,9 @@ class TRTLLMSampler(Sampler):
         self.decoding_config = self.executor_config.decoding_config if self.executor_config.decoding_config else DecodingConfig(
             decoding_mode)
         max_attn_window = self.executor_config.kv_cache_config.max_attention_window
-        self.max_attention_window = max(max_attn_window) if max_attn_window is not None else executor_config.max_seq_len
+        self.max_attention_window = max(
+            max_attn_window
+        ) if max_attn_window is not None else executor_config.max_seq_len
         self.max_num_sequences = mapping.pp_size * self.executor_config.max_batch_size
         self.max_seq_idle_microseconds = 180 * 1000 * 1000
         self.is_trt_overlap = not disable_overlap_scheduler
