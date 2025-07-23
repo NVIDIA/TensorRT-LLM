@@ -293,15 +293,14 @@ class CutlassFusedMoE(MoE):
                             False, True)
             elif self.has_w4a8_mxfp4_mxfp8:
                 use_mxfp8_act_scaling = True
-                # TODO: Fuse padding.
-                pad_size = self.w3_w1_weight.shape[-1] * 16 - x.shape[-1]
-                x = torch.nn.functional.pad(x, (0, pad_size))
+                if run_post_quant_allgather or self.enable_alltoall:
+                    x, x_sf = torch.ops.trtllm.mxfp8_quantize(
+                        x, False, alignment=self.quant_method.weight_alignment)
+                else:
+                    x, x_sf = torch.ops.trtllm.mxfp8_quantize(
+                        x, True, alignment=self.quant_method.weight_alignment)
                 # Update x_row and x_col to the padded shape
                 x_row, x_col = x.shape[0], x.shape[1]
-                if run_post_quant_allgather or self.enable_alltoall:
-                    x, x_sf = torch.ops.trtllm.mxfp8_quantize(x, False)
-                else:
-                    x, x_sf = torch.ops.trtllm.mxfp8_quantize(x, True)
             else:
                 raise ValueError(
                     f"unsupported quantization mode: {self.quant_config.quant_mode}"

@@ -147,6 +147,7 @@ class FusedMoEMethodBase(ABC):
     """
     Base class for all fused MoE methods.
     """
+    weight_alignment: int = 1
 
     def need_load_shared_weights(self, module):
         if hasattr(
