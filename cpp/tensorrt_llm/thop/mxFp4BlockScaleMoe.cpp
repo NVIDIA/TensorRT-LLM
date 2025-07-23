@@ -41,7 +41,7 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::Tensor const& routing_l
     std::optional<torch::Tensor> const& output1_scale_gate_scalar,
     std::optional<torch::Tensor> const& output2_scale_scalar, int64_t const num_experts, int64_t const top_k,
     std::optional<int64_t> const n_group, std::optional<int64_t> const topk_group, int64_t const intermediate_size,
-    int64_t const local_expert_offset, int64_t const local_num_experts,
+    std::optional<int64_t> const hidden_size_output, int64_t const local_expert_offset, int64_t const local_num_experts,
     std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim, int64_t const routing_method_type,
     btg::Dtype const dtype, MoeRunnerType& moe_runner, int64_t moeConfigIndex)
 {
@@ -113,6 +113,7 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::Tensor const& routing_l
     args.num_tokens = hidden_states.sizes()[0];
     args.num_experts = num_experts;
     args.hidden_size = hidden_states.sizes()[1];
+    args.hidden_size_output = hidden_size_output.value_or(args.hidden_size);
     args.top_k = top_k;
     args.n_group = n_group.value_or(0);
     args.topk_group = topk_group.value_or(0);
@@ -319,8 +320,8 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::Tensor const& routing_l
     }
 
     // allocate output
-    at::Tensor output = at::detail::empty_cuda(
-        {args.num_tokens, args.hidden_size}, at::ScalarType::BFloat16, hidden_states.device(), std::nullopt);
+    at::Tensor output = at::detail::empty_cuda({args.num_tokens, args.hidden_size_output.value()},
+        at::ScalarType::BFloat16, hidden_states.device(), std::nullopt);
 
     // setup workspace
     workspace.total_num_padded_tokens = total_num_padded_tokens.data_ptr<int>();
@@ -403,8 +404,8 @@ public:
         return dtype_mxe2m1_block_scale_moe_runner(routing_logits, routing_bias, hidden_states, std::nullopt,
             gemm1_weights, gemm1_weights_scale, gemm1_bias, gemm1_alpha, gemm1_beta, gemm2_weights, gemm2_weights_scale,
             gemm2_bias, std::nullopt, std::nullopt, std::nullopt, num_experts, top_k, n_group, topk_group,
-            intermediate_size, local_expert_offset, local_num_experts, routed_scaling_factor, mTileTokensDim,
-            routing_method_type, mDtypeAct, *mRunner, moeConfigIndex);
+            intermediate_size, std::nullopt, local_expert_offset, local_num_experts, routed_scaling_factor,
+            mTileTokensDim, routing_method_type, mDtypeAct, *mRunner, moeConfigIndex);
     }
 
 private:
@@ -446,8 +447,8 @@ public:
         std::optional<torch::Tensor> const& output1_scale_gate_scalar,
         std::optional<torch::Tensor> const& output2_scale_scalar, int64_t num_experts, int64_t top_k,
         std::optional<int64_t> const n_group, std::optional<int64_t> const topk_group, int64_t intermediate_size,
-        int64_t local_expert_offset, int64_t local_num_experts, std::optional<double> routed_scaling_factor,
-        int64_t routing_method_type, int64_t moeConfigIndex)
+        std::optional<int64_t> const hidden_size_output, int64_t local_expert_offset, int64_t local_num_experts,
+        std::optional<double> routed_scaling_factor, int64_t routing_method_type, int64_t moeConfigIndex)
     {
         // Autotuner has requested a default or 'fallback' config index
         if (moeConfigIndex == -1)
@@ -462,8 +463,8 @@ public:
         return dtype_mxe2m1_block_scale_moe_runner(routing_logits, routing_bias, hidden_states, hidden_states_scale,
             gemm1_weights, gemm1_weights_scale, gemm1_bias, gemm1_alpha, gemm1_beta, gemm2_weights, gemm2_weights_scale,
             gemm2_bias, output1_scale_scalar, output1_scale_gate_scalar, output2_scale_scalar, num_experts, top_k,
-            n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts, routed_scaling_factor,
-            mTileTokensDim, routing_method_type, mDtypeAct, *mRunner, moeConfigIndex);
+            n_group, topk_group, intermediate_size, hidden_size_output, local_expert_offset, local_num_experts,
+            routed_scaling_factor, mTileTokensDim, routing_method_type, mDtypeAct, *mRunner, moeConfigIndex);
     }
 
 private:

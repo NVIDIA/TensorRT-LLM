@@ -211,7 +211,11 @@ struct MoERunnerArgs
 
     int32_t num_tokens{0};
     int32_t num_experts{0};
+    // Hidden dimension input of MoE block. It might be padded.
     int32_t hidden_size{0};
+    // Hidden dimension output of MoE block. It is not padded.
+    // If not provided it is the same as hidden_size.
+    std::optional<int32_t> hidden_size_output;
     // TODO: only compiled routing kernel supports top_k = 8
     int32_t top_k{0};
     int32_t n_group{0};

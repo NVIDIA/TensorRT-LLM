@@ -361,6 +361,7 @@ class TRTLLMGenFusedMoE(MoE):
                 n_group,
                 topk_group,
                 intermediate_size_per_partition_padded,
+                self.hidden_size,
                 self.
                 slot_start,  # local_expert_start;  use ep_rank if stride!=1
                 self.expert_size_per_partition,  # local_expert_size
@@ -369,9 +370,6 @@ class TRTLLMGenFusedMoE(MoE):
                 self.routing_method.routing_method_type,
                 0,  # act_type
             )
-            # TODO: Fuse this for padded MXFP4.
-            final_hidden_states = final_hidden_states[:, :self.
-                                                      hidden_size].contiguous()
         else:
             raise NotImplementedError(
                 "TRTLLMGenFusedMoE only supports fp8_block_scaling, nvfp4, w4a16_mxfp4 and w4a8_mxfp4_fp8 dtypes."
