@@ -333,6 +333,26 @@ def get_pytest_timeout(timeout=None):
     if timeout:
         return timeout
 
+    # Check pytest markers first (ensures "TIMEOUT" in l0_*.yml etc. is respected)
+    try:
+        import pytest
+        marks = None
+        try:
+            current_item = pytest.current_test
+            if hasattr(current_item, 'iter_markers'):
+                marks = list(current_item.iter_markers('timeout'))
+        except (AttributeError, NameError):
+            pass
+
+        if marks and len(marks) > 0:
+            timeout_mark = marks[0]
+            timeout_pytest = timeout_mark.args[0] if timeout_mark.args else None
+            if timeout_pytest and isinstance(timeout_pytest, (int, float)):
+                return timeout_pytest
+
+    except (ImportError, Exception):
+        pass
+
     try:
         import sys
         for i, arg in enumerate(sys.argv):
