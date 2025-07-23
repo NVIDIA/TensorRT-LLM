@@ -2,6 +2,7 @@ import io
 import json
 import re
 import tarfile
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -821,30 +822,102 @@ class LoraManager(object):
             if uid not in self._cpp_lora_config:
                 self._cpp_lora_config[uid] = []  # Will be converted to tensor later
 
-            _, nemo_weights = unpack_nemo_weights(model_file)
+            nemo_model_config, nemo_weights = unpack_nemo_weights(model_file)
             all_lora_weights = get_all_nemo_lora_weights(nemo_weights)
+
+            # Extract rank from NeMo model config (more reliable than deriving from tensors)
+            config_rank = None
+            if (
+                "lora_tuning" in nemo_model_config
+                and "adapter_dim" in nemo_model_config["lora_tuning"]
+            ):
+                config_rank = nemo_model_config["lora_tuning"]["adapter_dim"]
+
+            # If rank not found in config, fall back to tensor-based derivation
+            if config_rank is None:
+                warnings.warn(
+                    "Could not find lora_tuning.adapter_dim in NeMo model config, "
+                    "will derive from tensor shapes"
+                )
 
             self._lora_uid_to_low_ranks[uid] = {}
             self._lora_weights_pointers_list[uid] = {}
-            for layer_idx in sorted(all_lora_weights.keys()):
+
+            # Determine expected number of layers from model config or infer from available weights
+            num_layers = nemo_model_config.get("num_layers")
+            if num_layers is None:
+                # Fallback: infer from available weights
+                num_layers = max(all_lora_weights.keys()) + 1 if all_lora_weights else 1
+                warnings.warn(
+                    f"Could not find num_layers in NeMo model config, "
+                    f"inferring {num_layers} layers from weights"
+                )
+
+            # Process all expected layers (not just existing ones)
+            for layer_idx in range(num_layers):
                 self._lora_uid_to_low_ranks[uid][layer_idx] = {}
                 self._lora_weights_pointers_list[uid][layer_idx] = {}
 
                 for lora_module in self.lora_target_modules:
                     if lora_module != "attn_qkv":
+                        warnings.warn(
+                            f"LoRA module '{lora_module}' not supported in NeMo loading, skipping."
+                        )
                         self._lora_uid_to_low_ranks[uid][layer_idx][lora_module] = 0
                         continue
 
-                    if lora_module == "attn_qkv":
-                        t_in = all_lora_weights[layer_idx]["in"]
-                        t_out = all_lora_weights[layer_idx]["out"]
-                        assert t_out.shape[0] % tp_size == 0
-                        t_out = torch.split(t_out, t_out.shape[0] // tp_size, dim=0)[
-                            tp_rank
-                        ].contiguous()
-                    else:
-                        t_in = None
-                        t_out = None
+                    # At this point, lora_module must be "attn_qkv"
+                    # Graceful handling of missing matrices with warnings and zero tensor fallbacks
+                    layer_weights = all_lora_weights.get(
+                        layer_idx, {}
+                    )  # Use get() to handle missing layers
+
+                    # Determine rank: prefer config rank, fall back to tensor-based derivation
+                    rank = config_rank
+                    if rank is None:
+                        if "in" in layer_weights:
+                            rank = layer_weights["in"].shape[0]
+                        elif "out" in layer_weights:
+                            rank = layer_weights["out"].shape[1]
+                        else:
+                            # Both matrices missing - look for rank from other layers or use default
+                            for other_layer_idx in sorted(all_lora_weights.keys()):
+                                if (
+                                    other_layer_idx != layer_idx
+                                    and "in" in all_lora_weights[other_layer_idx]
+                                ):
+                                    rank = all_lora_weights[other_layer_idx]["in"].shape[0]
+                                    break
+                            if rank is None:
+                                # Final fallback to a reasonable default rank
+                                rank = 64
+                                warnings.warn(
+                                    f"Layer {layer_idx}: No reference rank found for attn_qkv, "
+                                    f"using default rank {rank}"
+                                )
+
+                    # Handle missing "in" matrix (lora_A equivalent)
+                    if "in" not in layer_weights:
+                        warnings.warn(
+                            f"Layer {layer_idx} is missing 'in' matrix for attn_qkv in NeMo LoRA weights, "
+                            f"creating zero tensor"
+                        )
+                        layer_weights["in"] = torch.zeros(rank, model_config.hidden_size)
+
+                    # Handle missing "out" matrix (lora_B equivalent) - 3x larger for fused QKV
+                    if "out" not in layer_weights:
+                        warnings.warn(
+                            f"Layer {layer_idx} is missing 'out' matrix for attn_qkv in NeMo LoRA weights, "
+                            f"creating zero tensor"
+                        )
+                        layer_weights["out"] = torch.zeros(3 * model_config.hidden_size, rank)
+
+                    t_in = layer_weights["in"]
+                    t_out = layer_weights["out"]
+                    assert t_out.shape[0] % tp_size == 0
+                    t_out = torch.split(t_out, t_out.shape[0] // tp_size, dim=0)[
+                        tp_rank
+                    ].contiguous()
 
                     if t_in is not None and t_out is not None:
                         t_in = t_in.cuda().to(str_dtype_to_torch(model_config.dtype)).contiguous()
@@ -883,6 +956,8 @@ class LoraManager(object):
             load_from_model_file(uid, model_file)
             release_gc()
 
+        if new_uids:
+            print(f"Successfully loaded NeMo LoRA adapters with UIDs: {new_uids}")
         return new_uids
 
     def load_from_hf(
@@ -1022,10 +1097,15 @@ class LoraManager(object):
                 for hf_module, module_weights in layer_weights.items():
                     lora_module = hf_modules_to_trtllm_modules[hf_module]
                     if lora_module not in self.lora_target_modules:
+                        warnings.warn(
+                            f"LoRA module '{lora_module}' not in target modules {self.lora_target_modules}, skipping."
+                        )
                         self._lora_uid_to_low_ranks[uid][layer_idx][lora_module] = 0
                         continue
-                    if "in" not in module_weights:
-                        is_moe = True
+
+                    is_moe = "in" not in module_weights and "out" not in module_weights
+
+                    if is_moe:
                         t_in = torch.stack(
                             [
                                 module_weights[expert_idx]["in"]
@@ -1044,7 +1124,17 @@ class LoraManager(object):
                                 raise ValueError("DoRA with MoE is not supported")
                         t_mag = None
                     else:
-                        is_moe = False
+                        if "in" not in module_weights:
+                            warnings.warn(
+                                f"Module {hf_module} is missing 'in' matrix, creating zero tensor"
+                            )
+                            module_weights["in"] = torch.zeros(rank, model_config.hidden_size)
+                        if "out" not in module_weights:
+                            warnings.warn(
+                                f"Module {hf_module} is missing 'out' matrix, creating zero tensor"
+                            )
+                            module_weights["out"] = torch.zeros(model_config.hidden_size, rank)
+
                         t_in = module_weights["in"]
                         t_out = module_weights["out"]
                         t_mag = module_weights.get("magnitude", None)
@@ -1139,6 +1229,8 @@ class LoraManager(object):
             load_from_model_dir(uid, model_dir, hf_config)
             release_gc()
 
+        if new_uids:
+            print(f"Successfully loaded HF LoRA adapters with UIDs: {new_uids}")
         return new_uids
 
     @property
