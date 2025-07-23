@@ -26,7 +26,7 @@ def create_vanila_model_config() -> ModelConfig:
 
 def create_swa_model_config() -> ModelConfig:
     return ModelConfig(
-        name='vswa-model',
+        name='swa-model',
         model_type='mock',
         param_count=1_000_000_000,
         num_hidden_layers=12,
@@ -233,7 +233,7 @@ def test_tuning_max_batch_size_calculation(seq_len):
     else:
         # VSWA is more memory efficient than Vanila
         assert vswa_mbs > vanila_mbs
-        assert vswa_mnt >= vanila_mbs
+        assert vswa_mnt >= vanila_mnt
         # VSWA is less memory efficient than SWA
         assert vswa_mbs < swa_mbs
         assert vswa_mnt <= swa_mnt
