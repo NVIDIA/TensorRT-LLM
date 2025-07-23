@@ -426,7 +426,8 @@ class PyTorchModelEngine(ModelEngine):
         # This way it can also be used for CUDA graphs.
         if self.use_beam_search:
             self.cache_indirection_attention = torch.zeros(
-                (self.batch_size, self.max_beam_width, self.max_seq_len),
+                (self.batch_size, self.max_beam_width, self.max_seq_len +
+                 (0 if self._disable_overlap_scheduler else 1)),
                 device="cuda",
                 dtype=torch.int32)
         else:
@@ -753,11 +754,7 @@ class PyTorchModelEngine(ModelEngine):
             self.model.model_config.pretrained_config) and (
                 self.attn_runtime_features.cache_reuse
                 or self.attn_runtime_features.chunked_prefill)
-        # Cache indirection is only used for beam search on generation requests with TRTLLM backend.
-        if self.attn_backend.Metadata is TrtllmAttentionMetadata:
-            kwargs = {"cache_indirection": self.cache_indirection_attention}
-        else:
-            kwargs = {}
+        cache_indirection = self.cache_indirection_attention if self.attn_backend.Metadata is TrtllmAttentionMetadata else None
         if kv_cache_manager is None:
             return self.attn_backend.Metadata(
                 max_num_requests=self.batch_size,
@@ -768,7 +765,7 @@ class PyTorchModelEngine(ModelEngine):
                 runtime_features=self.attn_runtime_features,
                 enable_flash_mla=self.model.model_config.enable_flash_mla,
                 enable_paged_context_mla=enable_paged_context_mla,
-                **kwargs)
+                cache_indirection=cache_indirection)
 
         if self.attn_metadata is not None:
             # This assertion can be relaxed if needed: just create a new metadata
@@ -785,7 +782,7 @@ class PyTorchModelEngine(ModelEngine):
             runtime_features=self.attn_runtime_features,
             enable_flash_mla=self.model.model_config.enable_flash_mla,
             enable_paged_context_mla=enable_paged_context_mla,
-            **kwargs)
+            cache_indirection=cache_indirection)
 
         return self.attn_metadata
 
