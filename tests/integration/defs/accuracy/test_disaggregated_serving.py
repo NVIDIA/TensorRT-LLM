@@ -588,3 +588,5 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                                       self.MODEL_PATH) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
