@@ -463,6 +463,33 @@ trt_llm_release_perf_test:
   - perf/test_perf.py::test_perf[llama_v3.1_nemotron_ultra_253b_fp8-bench-pytorch-float8-maxbs:1-input_output_len:500,2000-reqs:8-con:1-tp:8-gpus:8]
   - perf/test_perf.py::test_perf[llama_v3.1_nemotron_ultra_253b_fp8-bench-pytorch-float8-maxbs:256-maxnt:5000-input_output_len:5000,500-reqs:250-con:250-tp:8-gpus:8]
   - perf/test_perf.py::test_perf[llama_v3.1_nemotron_ultra_253b_fp8-bench-pytorch-float8-maxbs:256-input_output_len:500,2000-reqs:250-con:250-tp:8-gpus:8]
+  # llama_v3.1_405b_fp8
+  #pytorch backend
+  - perf/test_perf.py::test_perf[llama_v3.1_405b_fp8-bench-pytorch-float8-maxbs:1-input_output_len:2000,500-reqs:8-con:1-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.1_405b_fp8-bench-pytorch-float8-maxbs:1024-maxnt:4096-input_output_len:500,2000-reqs:3000-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.1_405b_fp8-bench-pytorch-float8-maxbs:1024-maxnt:4096-input_output_len:1000,1000-reqs:3000-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.1_405b_fp8-bench-pytorch-float8-input_output_len:128,128-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.1_405b_fp8-bench-pytorch-float8-input_output_len:512,32-tp:8-gpus:8]
+
+  #llama_v4_maverick_17b_128e_instruct_fp8
+  #pytorch backend
+  - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-float8-maxbs:1024-maxnt:4096-input_output_len:2000,500-reqs:3000-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-float8-maxbs:1024-maxnt:4096-input_output_len:500,2000-reqs:3000-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-float8-maxbs:1024-maxnt:4096-input_output_len:1000,1000-reqs:3000-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-float8-input_output_len:128,128-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-float8-input_output_len:512,32-gpus:8]
+
+  #llama_v4_scout_17b_16e_instruct_fp8
+  #pytorch backend
+  - perf/test_perf.py::test_perf[llama_v4_scout_17b_16e_instruct_fp8-bench-pytorch-float8-maxbs:1024-maxnt:4096-input_output_len:2000,500-reqs:3000-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v4_scout_17b_16e_instruct_fp8-bench-pytorch-float8-maxbs:1024-maxnt:4096-input_output_len:500,2000-reqs:3000-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v4_scout_17b_16e_instruct_fp8-bench-pytorch-float8-maxbs:1024-maxnt:4096-input_output_len:1000,1000-reqs:3000-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v4_scout_17b_16e_instruct_fp8-bench-pytorch-float8-input_output_len:128,128-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v4_scout_17b_16e_instruct_fp8-bench-pytorch-float8-input_output_len:512,32-tp:8-gpus:8]
+
+  #deepseek_r1_fp8
+  #pytorch backend
+  - perf/test_perf.py::test_perf[deepseek_r1_fp8-bench-pytorch-float8-maxbs:1024-maxnt:4096-input_output_len:1000,1000-reqs:3000-ep:8-tp:8-gpus:8]
 
 
 - condition:
@@ -516,6 +543,7 @@ trt_llm_release_perf_test:
   - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp8-bench-pytorch-streaming-float8-input_output_len:2000,200-gpus:8]
   - perf/test_perf.py::test_perf[llama_v3.1_70b_instruct_fp8-bench-pytorch-float8-input_output_len:128,128-gpus:8]
   - perf/test_perf.py::test_perf[llama_v3.1_70b_instruct_fp8-bench-pytorch-float8-input_output_len:2000,200-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.1_70b_instruct_fp8-bench-pytorch-float8-input_output_len:1000,1000-gpus:8]
   - perf/test_perf.py::test_perf[llama_v3.3_nemotron_super_49b-bench-pytorch-bfloat16-input_output_len:128,128-gpus:8]
 
 
@@ -529,18 +557,27 @@ trt_llm_release_perf_test:
       - '*6000*'
       linux_distribution_name: '*'
   tests:
+  #llama_v3.1_8b
   - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-bfloat16-input_output_len:128,128-quant:nvfp4]
   - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct_fp8-bench-pytorch-float8-input_output_len:128,128]
   - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct_fp8-bench-pytorch-float8-input_output_len:512,32-kv_cache_dtype:fp8]
   - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct_fp4-bench-pytorch-float4-input_output_len:128,128]
   - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct_fp4-bench-pytorch-float4-input_output_len:512,32-kv_cache_dtype:fp8]
+  #llama_v3.1_70b
   - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-pytorch-bfloat16-input_output_len:128,128-tp:2-gpus:2]
   - perf/test_perf.py::test_perf[llama_v3.1_70b_instruct_fp8-bench-pytorch-float8-input_output_len:128,128]
   - perf/test_perf.py::test_perf[llama_v3.1_70b_instruct_fp8-bench-pytorch-float8-input_output_len:512,32-kv_cache_dtype:fp8]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp4-bench-pytorch-float4-input_output_len:128,128-tp:2-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp4-bench-pytorch-float4-input_output_len:512,32-kv_cache_dtype:fp8-tp:2-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp4-bench-pytorch-float4-input_output_len:500,2000-tp:2-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp4-bench-pytorch-float4-input_output_len:1000,1000-tp:2-gpus:2]
+  #llama_v3.3_nemotron_super_49b
   - perf/test_perf.py::test_perf[llama_v3.3_nemotron_super_49b-bench-pytorch-bfloat16-input_output_len:128,128-tp:2-gpus:2]
+  #deepseek_v3_lite
   - perf/test_perf.py::test_perf[deepseek_v3_lite_nvfp4-bench-pytorch-float4-input_output_len:128,128]
   - perf/test_perf.py::test_perf[deepseek_v3_lite_nvfp4-bench-pytorch-streaming-float4-input_output_len:128,128]
   - perf/test_perf.py::test_perf[deepseek_v3_lite_fp8-bench-pytorch-float8-input_output_len:128,128]
+  #mixtral_8x7b_v0.1
   - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1-bench-pytorch-float16-input_output_len:128,128-tp:2-gpus:2]
   - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct_fp8-bench-pytorch-float8-input_output_len:128,128-tp:2-gpus:2]
   - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct_fp4-bench-pytorch-float4-input_output_len:128,128-tp:2-gpus:2]
