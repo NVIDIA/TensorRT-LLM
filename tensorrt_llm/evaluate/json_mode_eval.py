@@ -79,10 +79,9 @@ class JsonModeEval(Evaluator):
             except (json.JSONDecodeError, jsonschema.ValidationError):
                 all_corrections.append(False)
                 all_grammar_corrections.append(False)
-            else:
-                all_grammar_corrections.append(True)
-            ref_json = json.loads(ref)
-            all_corrections.append(output_json == ref_json)
+                continue
+            all_corrections.append(output_json == json.loads(ref))
+            all_grammar_corrections.append(True)
 
         acc = np.mean(all_corrections) * 100
         logger.info(
