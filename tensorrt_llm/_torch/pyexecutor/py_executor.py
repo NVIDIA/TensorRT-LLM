@@ -643,7 +643,7 @@ class PyExecutor:
         with self._profiler() as profile_step:
             iter_start_time = time.time()
             iter_stats = None
-            while not self.should_stop_processing:
+            while True:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
@@ -801,7 +801,7 @@ class PyExecutor:
             sample_state = None
             iter_start_time = time.time()
             iter_stats = None
-            while not self.should_stop_processing:
+            while True:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
@@ -945,7 +945,7 @@ class PyExecutor:
         with self._profiler() as profile_step:
             iter_start_time = time.time()
             iter_stats = None
-            while not self.should_stop_processing:
+            while True:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
