@@ -176,7 +176,9 @@ class KVCacheManager(BaseResourceManager):
         self.kv_factor = 1 if kv_cache_type == CacheTypeCpp.SELFKONLY else 2
         # Some speculative decoding methods need to use different kv lengths for the
         # draft/target layers. Add extra tokens to handle this issue.
-        self.num_extra_kv_tokens = 0 if spec_config is None else spec_config.num_extra_kv_tokens
+        # Import here to avoid circular imports
+        from ..speculative import get_num_extra_kv_tokens
+        self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
         self.max_num_tokens = max_num_tokens
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 import traceback
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
+import torch
+
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
@@ -15,6 +17,20 @@ from .drafter import Drafter
 
 if TYPE_CHECKING:
     from ..pyexecutor.model_engine import ModelEngine
+    from .interface import SpeculativeDecodingMode
+
+
+# Place the tool function here to avoid circular import
+def get_draft_model_prompt(spec_dec_mode: SpeculativeDecodingMode,
+                           input_tokens: torch.Tensor) -> torch.Tensor:
+    """
+    Can be used to modify prompts for speculative algorithms that need to update tokens
+    before drafting.
+    """
+    if spec_dec_mode.is_eagle3():
+        # EAGLE3 always throws away the first token when processing draft inputs
+        return input_tokens[1:]
+    return input_tokens
 
 
 class ModelDrafter(Drafter):
@@ -113,8 +129,8 @@ class ModelDrafter(Drafter):
         """Create a draft request based on the original request state."""
         num_draft_tokens, num_accepted_tokens = self._initialize_draft_tokens(
             request)
-        input_tokens = self.spec_config.get_draft_model_prompt(
-            request.get_tokens()[0])
+        input_tokens = get_draft_model_prompt(self.spec_config.spec_dec_mode,
+                                              request.get_tokens()[0])
 
         # First time seeing this request - context request
         if request.max_beam_num_tokens - 1 == request.py_prompt_len:

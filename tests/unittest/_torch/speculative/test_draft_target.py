@@ -49,8 +49,7 @@ def test_llama_draft_target(use_cuda_graph: bool, attn_backend: str):
     )
 
     prompts = [
-        #"The capital of France is",  # Waive this prompt to avoid a flaky error, https://nvbugspro.nvidia.com/bug/5374319
-        "The capital of Germany is",
+        "The capital of France is",
         "The president of the United States is",
     ]
     sampling_params = SamplingParams(max_tokens=32)
