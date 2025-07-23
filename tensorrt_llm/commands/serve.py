@@ -109,7 +109,12 @@ def get_llm_args(model: str,
         dynamic_batch_config=dynamic_batch_config,
     )
     if cp_config is not None and "cp_type" in cp_config:
-        cp_config["cp_type"] = CpType[cp_config["cp_type"].upper()]
+        cp_config = cp_config.copy()
+        try:
+            cp_config["cp_type"] = CpType[cp_config["cp_type"].upper()]
+        except KeyError:
+            raise ValueError(f"Invalid cp_type: {cp_config['cp_type']}. " \
+                             f"Must be one of: {', '.join([t.name for t in CpType])}")
 
     llm_args = {
         "model": model,

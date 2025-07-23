@@ -461,7 +461,7 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
     isclose = err < atol + rtol * ref_abs
     ratio_mismatch = 0.0
     if not isclose.all().item():
-        n_mismatch = (isclose == False).sum().item()
+        n_mismatch = (~isclose).sum().item()
         ratio_mismatch = n_mismatch / output.numel()
         print(
             f"Rank {rank} {world_size}-GPU: {n_mismatch}/{output.numel()} mismatches: {ratio_mismatch}"
