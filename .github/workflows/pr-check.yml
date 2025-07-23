@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: PR Checks
+on:
+  pull_request:
+    types: [opened, edited, synchronize]
+jobs:
+  check-pr-title:
+    name: Check PR Title
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PR title
+        id: check-pr-title
+        continue-on-error: true
+        uses: agenthunt/conventional-commit-checker-action@v2.0.0
+        with:
+          pr-title-regex: "^(\\[(None|[A-Z0-9]+-[0-9]+|#[0-9]+|https:\\/\\/nvbugs\\/[0-9]+)\\])(\\[[a-z0-9]+\\]) (([^ ].*)?[^ ])$"
+          pr-body-regex: ""
+      - name: PR title format
+        if: steps.check-pr-title.outcome == 'failure'
+        run: |
+          echo "PR title format check failed"
+          echo "PR title format:"
+          echo "[JIRA ticket/NVBugs ID/GitHub issue/None][type] summary"
+          echo ""
+          echo "Valid ticket formats:"
+          echo "  - JIRA ticket: [TRTLLM-1234] or [ABC-123]"
+          echo "  - NVBugs ID: [https://nvbugs/1234567]"
+          echo "  - GitHub issue: [#1234]"
+          echo "  - No ticket: [None]"
+          echo ""
+          echo "Valid types: [fix], [feat], [doc], [infra], etc. (lowercase)"
+          echo ""
+          echo "Examples:"          echo "e.g. [JIRA-1234][fix] some summary"
+          echo "e.g. [https://nvbugs/1234][feat] some summary"
+          echo "e.g. [#1234][doc] some summary"
+          echo "e.g. [None][fix] some summary"
+          exit 1
