@@ -116,7 +116,7 @@ def _insert_fused_gemm(gm: GraphModule, idx: int, parent_node: Node, linear_node
     gm.delete_all_unused_submodules()
 
 
-def fuse_gemms(gm: GraphModule) -> GraphModule:
+def fuse_gemms(gm: GraphModule) -> None:
     ad_logger.info("GEMM fusion")
     ad_logger.debug("Before GEMM fusion: " + str(gm))
     # sort linear nodes by parent node
@@ -139,8 +139,7 @@ def fuse_gemms(gm: GraphModule) -> GraphModule:
             _insert_fused_gemm(gm, idx := idx + 1, parent_node, lin_children)
 
         # clean up and return
-        gm = canonicalize_graph(gm)
+        canonicalize_graph(gm)
 
     ad_logger.debug("After GEMM fusion: " + str(gm))
     torch.cuda.empty_cache()
-    return gm
