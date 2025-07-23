@@ -10,6 +10,7 @@ import zmq
 import zmq.asyncio
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.models.modeling_utils import KvCacheConnectorConfig
 
 from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
@@ -46,6 +47,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         garbage_collection_gen0_threshold: Optional[int] = None,
+        kv_connector_config: Optional[KvCacheConnectorConfig] = None,
     ) -> None:
         postproc_worker_config = postproc_worker_config or PostprocWorkerConfig(
         )
@@ -94,7 +96,8 @@ class GenerationExecutorProxy(GenerationExecutor):
                              postproc_worker_config=postproc_worker_config,
                              is_llm_executor=False,
                              garbage_collection_gen0_threshold=self.
-                             garbage_collection_gen0_threshold)
+                             garbage_collection_gen0_threshold,
+                             kv_connector_config=kv_connector_config)
 
         if "log_level" not in worker_kwargs:
             worker_kwargs["log_level"] = logger.level

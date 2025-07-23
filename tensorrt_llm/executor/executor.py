@@ -27,6 +27,7 @@ from ..llmapi.mpi_session import (MpiSession, external_mpi_comm_available,
 from ..llmapi.utils import (AsyncQueue, enable_llm_debug,
                             enable_worker_single_process_for_tp1, print_colored,
                             print_colored_debug)
+from ..models.modeling_utils import KvCacheConnectorConfig
 from ..sampling_params import (BatchedLogitsProcessor, LogprobParams,
                                SamplingParams)
 from ..scheduling_params import SchedulingParams
@@ -355,6 +356,7 @@ class GenerationExecutor(ABC):
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
         garbage_collection_gen0_threshold: Optional[int] = None,
+        kv_connector_config: Optional[KvCacheConnectorConfig] = None,
     ) -> Union["GenerationExecutorProxy", "GenerationExecutorWorker"]:
         # local imports to avoid cyclic importing
         from .proxy import GenerationExecutorProxy
@@ -400,7 +402,8 @@ class GenerationExecutor(ABC):
                 postproc_worker_config=postproc_worker_config,
                 is_llm_executor=is_llm_executor,
                 garbage_collection_gen0_threshold=
-                garbage_collection_gen0_threshold)
+                garbage_collection_gen0_threshold,
+                kv_connector_config=kv_connector_config)
 
         # WAR: For the performance of gathering logits, we use single process worker
         # for TP1 to avoid the large overhead of IPC.
@@ -410,10 +413,12 @@ class GenerationExecutor(ABC):
             logger.warning(
                 "Using single process worker for TP1, this may hurt streaming generation performance."
             )
-            return GenerationExecutorWorker(**worker_kwargs,
-                                            is_llm_executor=is_llm_executor,
-                                            garbage_collection_gen0_threshold=
-                                            garbage_collection_gen0_threshold)
+            return GenerationExecutorWorker(
+                **worker_kwargs,
+                is_llm_executor=is_llm_executor,
+                garbage_collection_gen0_threshold=
+                garbage_collection_gen0_threshold,
+                kv_connector_config=kv_connector_config)
 
         # For single-gpu case:
         # Partition the workload to multiple process for streaming performance.
@@ -427,7 +432,8 @@ class GenerationExecutor(ABC):
                 postproc_worker_config=postproc_worker_config,
                 is_llm_executor=is_llm_executor,
                 garbage_collection_gen0_threshold=
-                garbage_collection_gen0_threshold)
+                garbage_collection_gen0_threshold,
+                kv_connector_config=kv_connector_config)
         else:
             ctx = multiprocessing.get_context("spawn")
             # The ProcessPoolExecutorSession is used to support Windows, as mpi4py cannot.
@@ -440,7 +446,8 @@ class GenerationExecutor(ABC):
                 postproc_worker_config=postproc_worker_config,
                 is_llm_executor=is_llm_executor,
                 garbage_collection_gen0_threshold=
-                garbage_collection_gen0_threshold)
+                garbage_collection_gen0_threshold,
+                kv_connector_config=kv_connector_config)
 
     def wait_first_completed(
         self, futures: List[GenerationResult]

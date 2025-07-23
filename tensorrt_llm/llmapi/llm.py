@@ -1054,7 +1054,9 @@ class _TorchLLM(BaseLLM):
             is_llm_executor=True,
             lora_config=self.args.lora_config,
             garbage_collection_gen0_threshold=self.args.
-            garbage_collection_gen0_threshold)
+            garbage_collection_gen0_threshold,
+            kv_connector_config=self.args.connector_config,
+        )
 
     def _validate_args_for_torch_backend(self, kwargs: dict) -> None:
         """Validate that users don't pass TrtLlmArgs-specific arguments when using PyTorch backend.
