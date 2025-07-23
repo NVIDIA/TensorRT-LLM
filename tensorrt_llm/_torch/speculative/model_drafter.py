@@ -203,8 +203,8 @@ class ModelDrafter(Drafter):
                 # a prefill chunk on the last iteration. Now, we need to fill in the KV cache
                 # for the draft model too.
                 all_tokens = request.get_tokens()[0]
-                input_tokens = self.spec_config.get_draft_model_prompt(
-                    all_tokens)
+                input_tokens = get_draft_model_prompt(
+                    self.spec_config.spec_dec_mode, all_tokens)
 
                 new_request = self._create_context_request(
                     request, input_tokens)
