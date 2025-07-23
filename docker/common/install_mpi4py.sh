@@ -17,9 +17,6 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 # Download and extract in one step
 curl -L ${RELEASE_URL} | tar -zx -C "$TMP_DIR"
 
-# Bypassing compatibility issues with higher versions (>= 69) of setuptools.
-# sed -i 's/>= 40\.9\.0/>= 40.9.0, < 69/g' "$TMP_DIR/mpi4py-${MPI4PY_VERSION}/pyproject.toml"
-
 # Apply the patch
 cd "$TMP_DIR/mpi4py-${MPI4PY_VERSION}"
 git apply <<EOF
