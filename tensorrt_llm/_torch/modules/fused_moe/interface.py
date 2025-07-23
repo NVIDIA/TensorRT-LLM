@@ -130,12 +130,6 @@ class MoE(nn.Module):
         )
 
     @property
-    def enable_alltoall(self):
-        """ enable_alltoall (bool): whether to enable alltoall instead of allgather/reducescatter
-        """
-        return False
-
-    @property
     def has_w4a8_mxfp4_fp8(self):
         assert self._weights_created
         return self.quant_config is not None and self.quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8(
@@ -153,6 +147,12 @@ class MoE(nn.Module):
         return self.quant_config is not None and self.quant_config.layer_quant_mode.has_w4a16_mxfp4(
         )
 
+    @property
+    def enable_alltoall(self):
+        """ enable_alltoall (bool): whether to enable alltoall instead of allgather/reducescatter
+        """
+        return False
+
     def reducescatter_or_allreduce(
         self,
         inputs,
@@ -163,7 +163,7 @@ class MoE(nn.Module):
         Common helper for TP and EP in subclasses of the MoE module.
         """
         outputs = inputs
-        if self.parallel_size > 1:
+        if self.parallel_size > 1 and not self.enable_alltoall:
             if self.use_dp:
                 outputs = reducescatter(
                     inputs,
