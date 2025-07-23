@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 from torch import nn
@@ -13,6 +13,9 @@ from ..pyexecutor.sampler import (SampleState, SampleStateTensors, TorchSampler,
                                   add_token, int_tensor)
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 
 
 @dataclass(kw_only=True)
@@ -1100,8 +1103,9 @@ class MTPWorker(nn.Module):
 
 class MTPEagleWorker(MTPWorker):
 
-    def __init__(self, spec_config: "MTPDecodingConfig",
-                 model_config: ModelConfig):
+    def __init__(self,
+                 spec_config: "MTPDecodingConfig",
+                 model_config: Optional[ModelConfig] = None):
         super().__init__(spec_config, model_config)
         self.model_config = model_config
         self.mtp_num_modules = spec_config.num_nextn_predict_layers
