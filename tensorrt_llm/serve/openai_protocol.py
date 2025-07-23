@@ -644,7 +644,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
         )
         if self.logprobs:
             logprobs = 1 if not self.top_logprobs else self.top_logprobs
-            print(f"Using logprobs: {logprobs}")
             if backend == "pytorch":
                 sampling_params.logprobs = logprobs
             else:
