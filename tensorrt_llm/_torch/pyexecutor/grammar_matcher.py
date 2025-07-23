@@ -130,16 +130,35 @@ class XGrammarMatcherFactory(GrammarMatcherFactory):
 
 class LLGuidanceMatcher(GrammarMatcher):
 
-    def __init__(self, matcher: llguidance.LLMatcher):
+    def __init__(self, matcher: llguidance.LLMatcher, eos_token: int):
         super().__init__()
         self._matcher = matcher
+        self._eos_token = eos_token
+        self._is_terminated = False
 
     def accept_token(self, token_id: int) -> bool:
-        result = self._matcher.consume_token(token_id)
-        self._check_err()
-        return result
+        if self._matcher.is_stopped():
+            # Accept EOS token only if the matcher is stopped.
+            if token_id == self._eos_token:
+                self._is_terminated = True
+                return True
+            else:
+                return False
+
+        # Currently, there is no reliable way to try accepting a token without getting the matcher into an error state.
+        # Also, there is no way to restore the matcher once it's in an error state.
+        # TODO: Fix this upon https://github.com/guidance-ai/llguidance/issues/211
+        _backup_matcher = self._matcher.deep_copy()
+        accepted = self._matcher.consume_token(token_id)
+        accepted = accepted and not self._matcher.is_error()
+        if not accepted:
+            self._matcher = _backup_matcher
+        return accepted
 
     def rollback(self, num_tokens: int) -> None:
+        if self._is_terminated:
+            self._is_terminated = False
+            num_tokens -= 1
         self._matcher.rollback(num_tokens)
         self._check_err()
 
@@ -150,7 +169,7 @@ class LLGuidanceMatcher(GrammarMatcher):
         self._check_err()
 
     def is_terminated(self) -> bool:
-        return self._matcher.is_stopped()
+        return self._is_terminated
 
     def _check_err(self) -> None:
         if self._matcher.is_error():
@@ -206,4 +225,4 @@ class LLGuidanceMatcherFactory(GrammarMatcherFactory):
         if matcher.is_error():
             raise ValueError(f"LLGuidance matcher error: {matcher.get_error()}")
 
-        return LLGuidanceMatcher(matcher)
+        return LLGuidanceMatcher(matcher, self._tokenizer.eos_token)
