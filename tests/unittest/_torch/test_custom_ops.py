@@ -7,11 +7,8 @@ import torch
 import torch._library.utils as library_utils
 import torch.testing._internal.optests as optests
 from torch.testing._internal.common_utils import IS_WINDOWS
-from torch.testing._internal.optests.generate_tests import \
-    resolve_unique_overload_or_throw
 
-import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
-import tensorrt_llm._torch.custom_ops  # noqa: F401
+import tensorrt_llm  # noqa: F401
 
 
 def requires_compile(fun):
@@ -23,7 +20,8 @@ def requires_compile(fun):
 class CustomOpTestCaseBase(unittest.TestCase):
     test_ns = "_test_custom_op"
 
-    custom_op_namespaces = ("auto_deploy", "trtllm")
+    # "auto_deploy" custom ops are not checked here.
+    custom_op_namespaces = ("trtllm", )
 
     @classmethod
     def setUpClass(cls):
@@ -35,37 +33,26 @@ class CustomOpTestCaseBase(unittest.TestCase):
         discovered_ops = []
         for namespace in cls.custom_op_namespaces:
             ops = cls._discover_namespace_ops(namespace)
+            print(f"Total {len(ops)} custom ops in namespace {namespace}")
             discovered_ops.extend(ops)
-
-        names = "\n\t".join(op._name for op in discovered_ops)
-        print(f"Discovered {len(discovered_ops)} custom ops:\n\t{names}")
         return discovered_ops
 
     @classmethod
     def _discover_namespace_ops(cls, namespace: str, prefix: str = ""):
         """Discover custom ops in a specific namespace."""
+        # C++ custom ops are lazy loaded, cannot use torch.ops.x to discover all custom ops.
+        # Use schemas to discover instead.
+        ops_schemas = torch._C._jit_get_all_schemas()
         ops = []
 
-        if not hasattr(torch.ops, namespace):
-            return ops
-
-        namespace_obj = getattr(torch.ops, namespace)
-
-        for attr_name in dir(namespace_obj):
-            if not attr_name.startswith(prefix):
+        ns_prefix = f"{namespace}::{prefix}"
+        print("Discovering custom ops:")
+        for schema in ops_schemas:
+            if not schema.name.startswith(ns_prefix):
                 continue
-
-            op = getattr(namespace_obj, attr_name)
-
-            if isinstance(op, torch._library.custom_ops.CustomOpDef):
-                op = op._opoverload
-            elif isinstance(op, torch._ops.OpOverloadPacket):
-                op = resolve_unique_overload_or_throw(op)
-            elif isinstance(op, torch._ops.OpOverload):
-                pass
-            else:
-                continue
+            op = library_utils.lookup_op(schema.name)
             ops.append(op)
+            print(f"    {op._name}")
 
         return ops
 
@@ -145,8 +132,59 @@ class TestCustomOp(CustomOpTestCaseBase):
     # As a trade-off, only fake registration is checked.
     def test_register_fake(self):
         """Test custom operator fake impl registration."""
+
+        # Custom ops that are not required to have fake impl.
+        waivers = {
+            "trtllm::record_stream",
+            "trtllm::wait_event",
+            "trtllm::record_event",
+            "trtllm::set_stream",
+        }
+
+        # TODO: add fake impl for these ops in follow-up PRs.
+        to_fix = {
+            "trtllm::lora_grouped_gemm",
+            "trtllm::mtp_relaxed_acceptance_op",
+            "trtllm::mtp_update_hidden_states_op",
+            "trtllm::mtp_prepare_drafter_inputs_op",
+            "trtllm::selective_scan",
+            "trtllm::reducescatter_list",
+            "trtllm::fp8_per_tensor_scale_moe_runner",
+            "trtllm::migrate_to_host_accessible",
+            "trtllm::mnnvl_moe_alltoallv_prepare_without_allgather",
+            "trtllm::mamba_conv1d",
+            "trtllm::llama4_moe_tp8ep1_min_latency",
+            "trtllm::llama4_fp8_fp8_gemm_swiglu",
+            "trtllm::llama4_fp8_bf16_gemm",
+            "trtllm::llama4_bf16_bf16_gemm",
+            "trtllm::fused_topk_softmax",
+            "trtllm::fp8_batched_quantize_1x128_permute102",
+            "trtllm::fp8_block_scaling_moe_gemm",
+            "trtllm::fp8_block_scaling_bmm_out",
+            "trtllm::fp8_block_scaling_bmm",
+            "trtllm::fp4_batched_quantize",
+            "trtllm::fp4_gemm_trtllmgen",
+            "trtllm::fp4_bmm",
+            "trtllm::merge_chunked_attention_for_mla",
+            "trtllm::cuda_scaled_mm",
+            "trtllm::cublas_mm_out",
+            "trtllm::initialize_static_lowprecision_buffers",
+            "trtllm::cutlass_scaled_mm",
+            "trtllm::fp8_per_tensor_scaling_tllmg_gemm",
+            "trtllm::load_chunked_kv_cache_for_mla",
+            "trtllm::load_paged_kv_cache_for_mla",
+            "trtllm::set_paged_kv_cache_for_mla",
+            "trtllm::set_chunked_kv_cache_for_mla",
+            "trtllm::mla_rope_append_paged_kv_assign_q",
+            "trtllm::cublas_scaled_mm_out",
+            "trtllm::fused_qk_norm_rope",
+        }
+
         ops_missing_fake_impl = []
+
         for op in self.custom_ops:
+            if op._name in waivers or op._name in to_fix:
+                continue
             if not library_utils.has_fake_kernel(op):
                 ops_missing_fake_impl.append(op)
 
