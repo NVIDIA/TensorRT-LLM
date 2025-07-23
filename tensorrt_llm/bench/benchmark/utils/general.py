@@ -88,12 +88,14 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
     enable_chunked_prefill = params.get("enable_chunked_prefill", False)
 
     kv_cache_dtype = "auto"
+    kv_cache_config = {}
     if extra_llm_api_options:
         with open(extra_llm_api_options, 'r') as f:
             llm_args_dict = yaml.safe_load(f)
-
-        if "kv_cache_dtype" in llm_args_dict:
-            kv_cache_dtype = llm_args_dict["kv_cache_dtype"]
+            kv_cache_config = llm_args_dict.get("kv_cache_config", {
+                "dtype": "auto",
+            })
+            kv_cache_dtype = kv_cache_config.get("dtype", "auto")
 
         enable_chunked_prefill = llm_args_dict.get("enable_chunked_prefill",
                                                    enable_chunked_prefill)
@@ -158,9 +160,11 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
         "max_batch_size": max_batch_size
     }
 
+    kv_cache_config["dtype"] = kv_cache_dtype
+
     pyt_options = {
         "cuda_graph_config": cuda_graph_config,
-        "kv_cache_dtype": kv_cache_dtype,
+        "kv_cache_config": kv_cache_config,
     }
 
     backend = params.get("backend", "pytorch")

@@ -193,10 +193,10 @@ class KVCacheManager(BaseResourceManager):
                              else 0)
 
         # Determine if this is VSWA (Variable Sliding Window Attention)
-        is_vswa = len(self.max_attention_window_vec) > 1
+        self.is_vswa = len(self.max_attention_window_vec) > 1
 
         # Calculate blocks per window using appropriate method
-        if is_vswa:
+        if self.is_vswa:
             # VSWA case: use C++ implementation for variable window sizes
             # model config check
             if model_config is None:
@@ -523,7 +523,14 @@ class KVCacheManager(BaseResourceManager):
         return result
 
     def get_num_free_blocks(self) -> int:
-        return self.impl.get_kv_cache_stats().free_num_blocks
+        if self.is_vswa:
+            logger.info(
+                f"For VSWA case, we return the minimum of the number of free blocks for each window size: {self.impl.get_kv_cache_stats().num_free_blocks_per_window_size}"
+            )
+            return min(self.impl.get_kv_cache_stats().
+                       num_free_blocks_per_window_size.values())
+        else:
+            return self.impl.get_kv_cache_stats().free_num_blocks
 
     def get_num_kv_blocks(self, num_tokens: int) -> int:
         return (num_tokens + self.tokens_per_block - 1) // self.tokens_per_block
@@ -717,6 +724,8 @@ class KVCacheManager(BaseResourceManager):
 
         # VSWA on Torch backend has not supported the cross attention.
         is_cross_attention = False
+        # check model config
+        assert model_config.layer_types is not None, "layer_types have to be set correctly for VSWA"
 
         # Construct WorldConfig from self.mapping
         world_config_cpp = WorldConfig(

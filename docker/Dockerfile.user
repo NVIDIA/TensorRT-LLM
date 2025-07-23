@@ -21,3 +21,5 @@ RUN (getent group ${GROUP_ID} || groupadd --gid ${GROUP_ID} ${GROUP_NAME}) && \
     rm -rf /var/lib/apt/lists/*
 
 USER ${USER_NAME}
+
+ENV PATH="/home/${USER_NAME}/.local/bin:$PATH"
