@@ -76,6 +76,12 @@ class AutoModelForCausalLMFactory(ModelFactory):
         "max_position_embeddings": 1024,
     }
 
+    def _get_max_position_embeddings_config(self) -> Dict[str, Any]:
+        """Get the max position embeddings config for the model."""
+        return {
+            "max_position_embeddings": self.max_seq_len,
+        }
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -83,7 +89,11 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
         # Ingest defaults for tokenizer and model kwargs
         self.tokenizer_kwargs = deep_merge_dicts(self._tokenizer_defaults, self.tokenizer_kwargs)
-        self.model_kwargs = deep_merge_dicts(self._model_defaults, self.model_kwargs)
+        self.model_kwargs = deep_merge_dicts(
+            self._model_defaults,
+            self.model_kwargs,
+            self._get_max_position_embeddings_config(),
+        )
 
         # special handling for torch_dtype in model_kwargs since HF does not correctly update
         # torch_dtype string to an actual torch.dtype object (only with default)
@@ -343,6 +353,15 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             "use_cache": False,
         },
     }
+
+    def _get_max_position_embeddings_config(self) -> Dict[str, Any]:
+        """Get the max position embeddings config for the model."""
+        return {
+            "max_position_embeddings": self.max_seq_len,
+            "text_config": {
+                "max_position_embeddings": self.max_seq_len,
+            },
+        }
 
     @property
     def automodel_from_config(self):
