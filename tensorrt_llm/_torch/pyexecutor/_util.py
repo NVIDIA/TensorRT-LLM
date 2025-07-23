@@ -163,20 +163,21 @@ class KvCacheCreator:
         return kv_size_per_token
 
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
-                        alloc_kv_tokens: int) -> int:
+                        allocated_bytes: int) -> int:
         """
         Calculate the max KV cache capacity.
+
+        NOTE: `allocated_bytes` is the total KV-cache memory that must be pre-allocated during the estimation phase (for both the main and draft models) so the estimation run can complete successfully. When computing `available_kv_mem`, add this amount back in.
         """
         kv_size_per_token = self._get_kv_size_per_token()
 
         available_kv_mem = (total_gpu_memory - peak_memory +
-                            alloc_kv_tokens * kv_size_per_token) * fraction
+                            allocated_bytes) * fraction
         logger.info(
             f"Peak memory during memory usage profiling (torch + non-torch): {peak_memory / (GB):.2f} GiB, "
             f"available KV cache memory when calculating max tokens: {available_kv_mem / (GB):.2f} GiB, "
             f"fraction is set {fraction}, kv size is {kv_size_per_token}. device total memory {total_gpu_memory / (GB):.2f} GiB, "
-            f", tmp kv_mem { (alloc_kv_tokens * kv_size_per_token) / (GB):.2f} GiB"
-        )
+            f", tmp kv_mem { (allocated_bytes) / (GB):.2f} GiB")
         return int(available_kv_mem)
 
     def _create_dummy_context_requests(
@@ -324,13 +325,21 @@ class KvCacheCreator:
                 ResourceManagerType.KV_CACHE_MANAGER))
         peak_memory += extra_memory_for_attention_metadata
 
+        # get kv cache stats for both model and draft model
         kv_stats = py_executor.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER).get_kv_cache_stats()
+        kv_stats_draft = py_executor.resource_manager.resource_managers.get(
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER).get_kv_cache_stats(
+            ) if self._draft_model_engine is not None else None
+
+        # get total allocated bytes
+        allocated_bytes = kv_stats.allocated_bytes + (
+            kv_stats_draft.allocated_bytes if kv_stats_draft is not None else 0)
 
         # calculate max memory from peak memory and free gpu memory fraction
-        kv_cache_max_memory = self._cal_max_memory(
-            peak_memory, total_gpu_memory, fraction,
-            kv_stats.max_num_blocks * kv_stats.tokens_per_block)
+        kv_cache_max_memory = self._cal_max_memory(peak_memory,
+                                                   total_gpu_memory, fraction,
+                                                   allocated_bytes)
 
         max_attention_window = executor_config.kv_cache_config.max_attention_window
         is_vswa = max_attention_window and len(max_attention_window) > 1
