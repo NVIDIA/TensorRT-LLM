@@ -1388,9 +1388,12 @@ class MLA(nn.Module):
                               attn_metadata,
                               output=attn_output,
                               latent_cache_gen=latent_cache_gen)
-        # note: for testing Helix parallelism, we ensure that the output is
-        # compatible with o_proj, thus we cut it to num_heads_tp_cp * v_head_dim
-        attn_output = attn_output[:, :self.num_heads_tp_cp * self.v_head_dim]
+        if self.mapping.has_cp_helix():
+            # note: for testing Helix parallelism, we ensure that the output is
+            # compatible with o_proj even in the context phase,
+            # thus we cut it to num_heads_tp_cp * v_head_dim
+            attn_output = attn_output[:, :self.num_heads_tp_cp *
+                                      self.v_head_dim]
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
         return attn_output

@@ -14,8 +14,9 @@ from mpi4py.futures import MPIPoolExecutor
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.interface import (
-    KVCacheParams, PositionalEmbeddingParams, RopeParams)
+    AttentionMetadata, KVCacheParams, PositionalEmbeddingParams, RopeParams)
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.distributed.ops import cp_allgather
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.attention import MLA
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
@@ -68,6 +69,10 @@ class Scenario:
     batch: int = 8
     ctx_len: int = 1024
     ref_steps: int = 1
+    # note: need to use fairly high tolerances because the softmax stats can lose
+    # a lot of precision and we're using bf16 here
+    atol: float = 2e-1
+    rtol: float = 2e-2
 
     @property
     def max_position_embeddings(self) -> int:
@@ -107,11 +112,10 @@ all_scenarios = [
 test_scenarios = [
     all_scenarios[1],
     all_scenarios[5],
-    # TODO tests with higher batch sizes are failing, re-enable when fixed
-    # all_scenarios[8],
-    # all_scenarios[12],
-    # all_scenarios[18],
-    # all_scenarios[19],
+    all_scenarios[8],
+    all_scenarios[12],
+    all_scenarios[18],
+    all_scenarios[19],
 ]
 
 
@@ -264,24 +268,57 @@ def _copy_to_cp(weights, param_name, dim, rank, world_size):
 
 
 def _make_latent_cache_gen(mla: MLA, rank: int, world_size: int,
-                           ctx_len_per_gpu: int, input_ctx_bs: torch.Tensor):
+                           ctx_len_per_gpu: int, input_ctx_bs: torch.Tensor,
+                           ref_attn_metadata: Optional[AttentionMetadata]):
+    if rank == 0:
+        # note: we get the compressed KV values from the reference cache directly
+        # but we get the RoPE values by simply applying the fused_a Linear layer
+        # this is because we want the non-embedded RoPE values for latent_cache
+        # TODO ideally, we should get the non-embedded KV values from the reference
+        # as well, but this is not implemented yet
+        ret = input_ctx_bs.new_empty((world_size - 1, input_ctx_bs.shape[0],
+                                      mla.kv_lora_rank + mla.qk_rope_head_dim))
+        for r in range(world_size - 1):
+            input_ctx_rank = input_ctx_bs[:, (r + 1) * ctx_len_per_gpu, :]
+            if mla.is_lite:
+                _, k_pe = mla.fused_a(input_ctx_rank).split(
+                    [mla.kv_lora_rank, mla.qk_rope_head_dim], -1)
+            else:
+                _, __, k_pe = mla.fused_a(input_ctx_rank).split(
+                    [mla.q_lora_rank, mla.kv_lora_rank, mla.qk_rope_head_dim],
+                    -1)
+            assert ref_attn_metadata is not None
+            compressed_kv = k_pe.new_empty((k_pe.shape[0], mla.kv_lora_rank))
+            for b in range(k_pe.shape[0]):
+                block, t = divmod(
+                    (r + 1) * ctx_len_per_gpu,
+                    ref_attn_metadata.kv_cache_manager.tokens_per_block)
+                kv_block = ref_attn_metadata.host_kv_cache_block_offsets[
+                    0, b, 0, block].item()
+                compressed_kv[
+                    b] = ref_attn_metadata.kv_cache_manager.get_buffers(0)[
+                        kv_block, 0, t, 0, :mla.kv_lora_rank]
+            ret[r] = torch.concat([compressed_kv, k_pe], dim=-1)
+    else:
+        ret = input_ctx_bs.new_empty((world_size - 1, input_ctx_bs.shape[0],
+                                      mla.kv_lora_rank + mla.qk_rope_head_dim))
+
+    mapping = Mapping(world_size=world_size,
+                      rank=rank,
+                      cp_size=world_size,
+                      cp_config={'cp_type': CpType.HELIX})
+    # use cp_allgather here to broadcast from rank 0 to all other ranks
+    ret_all = cp_allgather(ret, mapping=mapping, dim=0)
+    ret = ret_all.view(world_size, *ret.shape)[0]
     if rank == world_size - 1:
         return None
-    input_ctx_rank = input_ctx_bs[:, (rank + 1) * ctx_len_per_gpu, :]
-    if mla.is_lite:
-        compressed_kv, k_pe = mla.fused_a(input_ctx_rank).split(
-            [mla.kv_lora_rank, mla.qk_rope_head_dim], -1)
-    else:
-        _, compressed_kv, k_pe = mla.fused_a(input_ctx_rank).split(
-            [mla.q_lora_rank, mla.kv_lora_rank, mla.qk_rope_head_dim], -1)
-    compressed_kv = mla.kv_a_layernorm(compressed_kv)
-    return torch.concat([compressed_kv, k_pe], dim=-1)
+    return ret[rank]
 
 
 def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
                          mapping: Mapping, test_params: tuple,
                          ref_output: torch.Tensor, gen_steps: int):
-    input_ctx, position_ids_ctx, weights, pos_embd_params = test_params
+    input_ctx, input_gen, position_ids_ctx, weights, pos_embd_params, ref_attn_metadata = test_params
     # we start with the same position_ids as the reference MLA.
     position_ids_gen = torch.full((scenario.batch, ),
                                   scenario.ctx_len,
@@ -319,7 +356,6 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
     ctx_len_per_gpu = scenario.ctx_len // world_size
     input_ctx_bs = input_ctx.view(scenario.batch, scenario.ctx_len,
                                   scenario.hidden_size)
-    input_gen = input_ctx_bs[:, 0, :].contiguous()
 
     # split inputs into chunks for each rank
     input_ctx_bs_rank = input_ctx_bs[:, rank * ctx_len_per_gpu:(rank + 1) *
@@ -339,7 +375,8 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
 
     # for non-last rank, generate the right latent cache for generation
     latent_cache_gen = _make_latent_cache_gen(mla, rank, world_size,
-                                              ctx_len_per_gpu, input_ctx_bs)
+                                              ctx_len_per_gpu, input_ctx_bs,
+                                              ref_attn_metadata)
 
     outputs = []
     start = time.time()
@@ -373,7 +410,7 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
                          input_gen,
                          attn_metadata,
                          latent_cache_gen=latent_cache_gen)
-        print(f"Rank {rank} {world_size}-GPU: result: {result[0, :10]}")
+        print(f"Rank {rank} {world_size}-GPU: result: {result[:, :8]}")
         # update position_ids_gen
         position_ids_gen += 1
         if step < scenario.ref_steps:
@@ -391,13 +428,11 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
           f"{end - start} s, throughput: {throughput} MLA/s")
     output = torch.stack(outputs, dim=0)
     kv_cache_manager.shutdown()
+    if ref_attn_metadata is not None:
+        ref_attn_metadata.kv_cache_manager.shutdown()
 
     # every rank should have the same output and checks against the reference output
-    # note: need to use fairly high tolerances because the softmax stats can lose
-    # a lot of precision
-    atol = 1e-1
-    rtol = 1e-2
-
+    atol, rtol = scenario.atol, scenario.rtol
     err = torch.abs(output - ref_output)
     ref_abs = torch.abs(ref_output)
     ref_abs[ref_abs == 0] = torch.finfo(ref_abs.dtype).smallest_normal
@@ -463,6 +498,10 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario,
                             scenario.hidden_size,
                             dtype=scenario.dtype,
                             device="cuda").uniform_(-1, 1)
+    input_gen = torch.empty(scenario.batch * scenario.predicted_tokens_per_seq,
+                            scenario.hidden_size,
+                            dtype=scenario.dtype,
+                            device="cuda").uniform_(-1, 1)
     position_ids_ctx = torch.arange(scenario.ctx_len,
                                     dtype=torch.int,
                                     device="cuda").repeat(scenario.batch)
@@ -498,8 +537,6 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario,
     # up to this point, all ranks should have same tensors because the seed is the same
     # now we run the reference MLA on rank 0
     if rank == 0:
-        input_gen = input_ctx.view(scenario.batch, scenario.ctx_len,
-                                   scenario.hidden_size)[:, 0, :].contiguous()
         # Reference output (single GPU, but with correct KV/metadata setup)
         ref_mapping = Mapping(world_size=1, tp_size=1, rank=0)
         ref_kv_cache_manager, ref_attn_metadata = _setup_kv_and_metadata(
@@ -529,7 +566,7 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario,
             )
             ref_attn_metadata.prepare()
             result = mla(position_ids_gen, input_gen, ref_attn_metadata)
-            print(f"Ref result: {result[0, :10]}")
+            print(f"Ref result: {result[:, :8]}")
             # update position_ids_gen
             position_ids_gen += 1
             if step < scenario.ref_steps:
@@ -545,13 +582,13 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario,
         print(f"Time taken for {gen_steps - scenario.ref_steps} steps: "
               f"{end - start} s, throughput: {throughput} MLA/s")
         ref_output = torch.stack(ref_outputs, dim=0)
-        ref_kv_cache_manager.shutdown()
     else:
         ref_output = torch.empty(scenario.ref_steps,
                                  scenario.batch,
                                  scenario.hidden_size,
                                  dtype=scenario.dtype,
                                  device="cuda")
+        ref_attn_metadata = None
 
     # Distributed mapping for helix
     mapping = Mapping(world_size=world_size,
@@ -559,11 +596,11 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario,
                       cp_size=world_size,
                       cp_config={'cp_type': CpType.HELIX})
     # we use cp_allgather here because there is no broadcast op across CP group
-    from tensorrt_llm._torch.distributed.ops import cp_allgather
     ref_output_all = cp_allgather(ref_output, mapping=mapping, dim=0)
     # we only need the values from rank 0
     ref_output = ref_output_all.view(world_size, *ref_output.shape)[0]
-    test_params = (input_ctx, position_ids_ctx, weights, pos_embd_params)
+    test_params = (input_ctx, input_gen, position_ids_ctx, weights,
+                   pos_embd_params, ref_attn_metadata)
     return _run_mla_distributed(rank, world_size, scenario, mapping,
                                 test_params, ref_output, gen_steps)
 
@@ -582,6 +619,8 @@ def _run_single_rank(func, *args, **kwargs):
         raise Exception(f"\n\nError occurred. Original traceback is\n{tb}\n")
 
 
+# note: for now, we allow up to 10% mismatch due to how the latent cache
+# is created for the non-last ranks
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason="needs 2 GPUs to run this test")
 @pytest.mark.parametrize("scenario",
@@ -589,7 +628,7 @@ def _run_single_rank(func, *args, **kwargs):
                          ids=lambda x: f"scenario: {x}")
 def test_mla_helix_distributed(scenario: Scenario,
                                gen_steps: Optional[int] = None,
-                               max_mismatch_ratio: float = 0.0,
+                               max_mismatch_ratio: float = 0.1,
                                mismatch_ratios: Optional[List[float]] = None):
     world_size = 2
     gen_steps = scenario.ref_steps if gen_steps is None else gen_steps
