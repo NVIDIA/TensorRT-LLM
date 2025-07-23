@@ -108,11 +108,8 @@ def add_llm_args(parser):
 
     # Speculative decoding
     parser.add_argument('--spec_decode_algo', type=str, default=None)
-    parser.add_argument('--spec_decode_nextn', type=int, default=1)
-    parser.add_argument('--draft_model_dir',
-                        '--eagle_model_dir',
-                        type=str,
-                        default=None)
+    parser.add_argument('--spec_decode_max_draft_len', type=int, default=1)
+    parser.add_argument('--draft_model_dir', type=str, default=None)
     parser.add_argument('--max_matching_ngram_size', type=int, default=5)
     parser.add_argument('--use_one_model', default=False, action='store_true')
 
@@ -145,7 +142,7 @@ def parse_arguments():
     return args
 
 
-def setup_llm(args):
+def setup_llm(args, **kwargs):
     kv_cache_config = KvCacheConfig(
         enable_block_reuse=not args.disable_kv_cache_reuse,
         free_gpu_memory_fraction=args.kv_cache_fraction,
@@ -162,23 +159,23 @@ def setup_llm(args):
             )
 
         spec_config = MTPDecodingConfig(
-            num_nextn_predict_layers=args.spec_decode_nextn,
+            num_nextn_predict_layers=args.spec_decode_max_draft_len,
             use_relaxed_acceptance_for_thinking=args.
             use_relaxed_acceptance_for_thinking,
             relaxed_topk=args.relaxed_topk,
             relaxed_delta=args.relaxed_delta)
     elif spec_decode_algo == "EAGLE3":
         spec_config = EagleDecodingConfig(
-            max_draft_len=args.spec_decode_nextn,
+            max_draft_len=args.spec_decode_max_draft_len,
             speculative_model_dir=args.draft_model_dir,
             eagle3_one_model=args.use_one_model)
     elif spec_decode_algo == "DRAFT_TARGET":
         spec_config = DraftTargetDecodingConfig(
-            max_draft_len=args.spec_decode_nextn,
+            max_draft_len=args.spec_decode_max_draft_len,
             speculative_model_dir=args.draft_model_dir)
     elif spec_decode_algo == "NGRAM":
         spec_config = NGramDecodingConfig(
-            max_draft_len=args.spec_decode_nextn,
+            max_draft_len=args.spec_decode_max_draft_len,
             max_matching_ngram_size=args.max_matching_ngram_size,
             is_keep_all=True,
             is_use_oldest=True,
@@ -222,7 +219,9 @@ def setup_llm(args):
         speculative_config=spec_config,
         trust_remote_code=args.trust_remote_code,
         gather_generation_logits=args.return_generation_logits,
-        max_beam_width=args.max_beam_width)
+        max_beam_width=args.max_beam_width,
+        **kwargs,
+    )
 
     sampling_params = SamplingParams(
         max_tokens=args.max_tokens,

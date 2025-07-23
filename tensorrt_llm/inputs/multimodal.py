@@ -83,6 +83,72 @@ class MultimodalInput:
 
 
 @dataclass
+class MultimodalRuntimeData:
+    """Runtime data for tracking multimodal token caching and reuse per request sequence.
+
+    This class tracks which multimodal tokens are cached vs. need to be processed
+    for each request sequence during KV cache reuse scenarios.
+
+    Attributes:
+        num_cached_tokens: Total number of cached tokens for this sequence
+        mm_token_lengths: Length of each multimodal token chunk
+        mm_token_positions: Starting positions of each multimodal token chunk
+        prompt_tokens: Current iteration of prompt tokens for this sequence (optional). Need it for chunk prefill if enabled (#TODO)
+        num_cached_mm_tokens: Number of multimodal tokens that are cached in this iteration (computed)
+        total_mm_tokens: Total number of multimodal tokens in this sequence (computed)
+    """
+    num_cached_tokens: int
+    mm_token_lengths: List[int]
+    mm_token_positions: List[int]
+
+    # TODO: support chunk prefill for multimodal
+    # When chunk prefill is enabled, we need to pass the prompt tokens for current chunk and mask to find the included mm tokens
+    prompt_tokens: Optional[List[int]] = None
+
+    num_cached_mm_tokens: Optional[int] = None
+    total_mm_tokens: Optional[int] = None
+
+    def __post_init__(self):
+        # Validate input data
+        if len(self.mm_token_positions) != len(self.mm_token_lengths):
+            raise ValueError(
+                f"mm_token_positions ({len(self.mm_token_positions)}) and mm_token_lengths ({len(self.mm_token_lengths)}) must have the same length"
+            )
+
+        if self.num_cached_tokens < 0:
+            raise ValueError(
+                f"num_cached_tokens must be non-negative, got {self.num_cached_tokens}"
+            )
+
+        if any(length <= 0 for length in self.mm_token_lengths):
+            raise ValueError(
+                f"All mm_token_lengths must be positive, got {self.mm_token_lengths}"
+            )
+
+        if any(pos < 0 for pos in self.mm_token_positions):
+            raise ValueError(
+                f"All mm_token_positions must be non-negative, got {self.mm_token_positions}"
+            )
+
+        if self.num_cached_mm_tokens is None:
+            # Compute cached multimodal tokens based on positions and cached tokens
+            self.num_cached_mm_tokens = 0
+            for pos, length in zip(self.mm_token_positions,
+                                   self.mm_token_lengths):
+                if pos + length <= self.num_cached_tokens:
+                    self.num_cached_mm_tokens += length
+                elif pos < self.num_cached_tokens:
+                    # Partial overlap - only count the cached portion
+                    self.num_cached_mm_tokens += self.num_cached_tokens - pos
+
+        if self.num_cached_mm_tokens > self.num_cached_tokens:
+            raise ValueError(
+                f"num_cached_mm_tokens ({self.num_cached_mm_tokens}) must be less than or equal to "
+                f"num_cached_tokens ({self.num_cached_tokens})")
+        self.total_mm_tokens = sum(self.mm_token_lengths)
+
+
+@dataclass
 class MultimodalParams:
     """Unified container for multimodal parameters.
 
@@ -117,6 +183,7 @@ class MultimodalParams:
 
     multimodal_input: Optional[MultimodalInput] = None
     multimodal_data: Optional[Dict[str, Any]] = field(default_factory=dict)
+    multimodal_runtime: Optional[MultimodalRuntimeData] = None
 
     def __post_init__(self):
         """Ensure default values are properly set."""

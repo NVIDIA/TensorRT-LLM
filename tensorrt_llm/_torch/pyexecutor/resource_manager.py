@@ -176,7 +176,9 @@ class KVCacheManager(BaseResourceManager):
         self.kv_factor = 1 if kv_cache_type == CacheTypeCpp.SELFKONLY else 2
         # Some speculative decoding methods need to use different kv lengths for the
         # draft/target layers. Add extra tokens to handle this issue.
-        self.num_extra_kv_tokens = 0 if spec_config is None else spec_config.num_extra_kv_tokens
+        # Import here to avoid circular imports
+        from ..speculative import get_num_extra_kv_tokens
+        self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
         self.max_num_tokens = max_num_tokens
 
@@ -193,10 +195,10 @@ class KVCacheManager(BaseResourceManager):
                              else 0)
 
         # Determine if this is VSWA (Variable Sliding Window Attention)
-        is_vswa = len(self.max_attention_window_vec) > 1
+        self.is_vswa = len(self.max_attention_window_vec) > 1
 
         # Calculate blocks per window using appropriate method
-        if is_vswa:
+        if self.is_vswa:
             # VSWA case: use C++ implementation for variable window sizes
             # model config check
             if model_config is None:
@@ -522,7 +524,14 @@ class KVCacheManager(BaseResourceManager):
         return result
 
     def get_num_free_blocks(self) -> int:
-        return self.impl.get_kv_cache_stats().free_num_blocks
+        if self.is_vswa:
+            logger.info(
+                f"For VSWA case, we return the minimum of the number of free blocks for each window size: {self.impl.get_kv_cache_stats().num_free_blocks_per_window_size}"
+            )
+            return min(self.impl.get_kv_cache_stats().
+                       num_free_blocks_per_window_size.values())
+        else:
+            return self.impl.get_kv_cache_stats().free_num_blocks
 
     def get_num_kv_blocks(self, num_tokens: int) -> int:
         return (num_tokens + self.tokens_per_block - 1) // self.tokens_per_block
@@ -716,6 +725,8 @@ class KVCacheManager(BaseResourceManager):
 
         # VSWA on Torch backend has not supported the cross attention.
         is_cross_attention = False
+        # check model config
+        assert model_config.layer_types is not None, "layer_types have to be set correctly for VSWA"
 
         # Construct WorldConfig from self.mapping
         world_config_cpp = WorldConfig(
@@ -1208,7 +1219,7 @@ class PeftCacheManager(BaseResourceManager):
         pass
 
     def free_resources(self, request: LlmRequest):
-        pass
+        self.impl.mark_request_done(request)
 
     def shutdown(self):
         pass

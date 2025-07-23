@@ -48,12 +48,17 @@ def server(model_name: str, backend: str, tp_pp_size: tuple):
     tp_size, pp_size = tp_pp_size
     device_count = torch.cuda.device_count()
     args = [
-        "--tp_size", f"{tp_size}", "--pp_size", f"{pp_size}", "--gpus_per_node",
-        f"{device_count}", "--kv_cache_free_gpu_memory_fraction", "0.95"
+        "--tp_size",
+        f"{tp_size}",
+        "--pp_size",
+        f"{pp_size}",
+        "--gpus_per_node",
+        f"{device_count}",
+        "--kv_cache_free_gpu_memory_fraction",
+        "0.95",
+        "--backend",
+        backend,
     ]
-    if backend is not None:
-        args.append("--backend")
-        args.append(backend)
     with RemoteOpenAIServer(model_path, args, llmapi_launch=True,
                             port=8001) as remote_server:
         yield remote_server

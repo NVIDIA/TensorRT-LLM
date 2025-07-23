@@ -675,24 +675,114 @@ def _(
                              dtype=output_dtype)
 
 
-class W4A16GemmRunner(TunableRunner):
-    _runner_dict = dict()
-    MAX_SUPPORTED_SM_VERSION = 90
+class WeightOnlyQuantGemmRunner(TunableRunner):
+    runner_dict = dict()
+    tuning_config = TuningConfig(dynamic_tensor_specs=(
+        DynamicTensorSpec(0, 0, get_last_power_of_2_num_tokens_buckets,
+                          last_positive_power_of_2), ))
 
-    def __init__(self, activation_dtype: torch.dtype, quant_mode: int):
-        instance_key = (activation_dtype, quant_mode)
-        if instance_key not in W4A16GemmRunner._runner_dict:
-            W4A16GemmRunner._runner_dict[
-                instance_key] = torch.classes.trtllm.W4A16GemmRunner(
-                    activation_dtype, quant_mode)
-        self._w4a16_gemm_runner = W4A16GemmRunner._runner_dict[instance_key]
+    def __init__(
+        self,
+        activation_dtype: torch.dtype,
+        weight_dtype: torch.dtype,
+        output_dtype: torch.dtype,
+        to_userbuffers: bool,
+    ):
+        self.output_dtype = output_dtype
+        self.to_userbuffers = to_userbuffers
+        instance_key = (activation_dtype, weight_dtype)
+        if instance_key not in WeightOnlyQuantGemmRunner.runner_dict:
+            WeightOnlyQuantGemmRunner.runner_dict[
+                instance_key] = torch.classes.trtllm.WeightOnlyQuantGemmRunner(
+                    activation_dtype, weight_dtype)
+        self.weight_only_quant_gemm_runner = WeightOnlyQuantGemmRunner.runner_dict[
+            instance_key]
 
     def get_valid_tactics(
         self,
         inputs: List[torch.Tensor],
         profile: OptimizationProfile,
     ) -> List[int]:
-        return list(range(self._w4a16_gemm_runner.get_num_configs()))
+        return list(range(self.weight_only_quant_gemm_runner.get_num_configs()))
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = -1,
+    ) -> torch.Tensor:
+        activation, weight, weight_scale = inputs
+        return self.weight_only_quant_gemm_runner.run_gemm(
+            activation,
+            weight,
+            weight_scale,
+            tactic,
+            self.to_userbuffers,
+            self.output_dtype,
+        )
+
+
+@torch.library.custom_op("trtllm::weight_only_quant_gemm", mutates_args=())
+def weight_only_quant_gemm(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    weight_dtype: torch.dtype,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    to_userbuffers: bool = False,
+) -> torch.Tensor:
+
+    tuner = AutoTuner.get()
+
+    # allocate workspace for profiling
+    weight_only_quant_gemm_runner = WeightOnlyQuantGemmRunner(
+        activation.dtype, weight_dtype, output_dtype, to_userbuffers)
+
+    _, best_tactic = tuner.choose_one(
+        "trtllm::weight_only_quant_gemm::gemm",
+        [weight_only_quant_gemm_runner],
+        WeightOnlyQuantGemmRunner.tuning_config,
+        [activation, weight, weight_scale],
+    )
+
+    return weight_only_quant_gemm_runner(
+        inputs=[activation, weight, weight_scale], tactic=best_tactic)
+
+
+@weight_only_quant_gemm.register_fake
+def _(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    weight_type: torch.dtype,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype = None,
+    to_userbuffers: bool = False,
+) -> torch.Tensor:
+    dtype = output_dtype if output_dtype is not None else activation.dtype
+    return activation.new_empty((activation.size(0), weight.size(1)),
+                                dtype=dtype)
+
+
+class FinegrainedMixedDtypeGemm(TunableRunner):
+    _runner_dict = dict()
+    MAX_SUPPORTED_SM_VERSION = 90
+
+    def __init__(self, activation_dtype: torch.dtype, output_dtype: torch.dtype,
+                 quant_mode: int):
+        instance_key = (activation_dtype, output_dtype, quant_mode)
+        if instance_key not in FinegrainedMixedDtypeGemm._runner_dict:
+            FinegrainedMixedDtypeGemm._runner_dict[
+                instance_key] = torch.classes.trtllm.finegrainedMixedDtypeGemmRunner(
+                    activation_dtype, output_dtype, quant_mode)
+        self._finegrained_mixed_dtype_gemm_runner = FinegrainedMixedDtypeGemm._runner_dict[
+            instance_key]
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+    ) -> List[int]:
+        return list(
+            range(self._finegrained_mixed_dtype_gemm_runner.get_num_configs()))
 
     def forward(self,
                 inputs: List[torch.Tensor],
@@ -707,25 +797,25 @@ class W4A16GemmRunner(TunableRunner):
 
         activation, weights_packed, scales = inputs
 
-        return self._w4a16_gemm_runner.run_gemm(
-            activation,
-            weights_packed,
-            scales,
-            kwargs["group_size"],
-            tactic,
-            kwargs["bias"],
-            kwargs["zeros"],
-        )
+        alpha = 1.0 if kwargs.get("alpha") is None else kwargs["alpha"]
+
+        return self._finegrained_mixed_dtype_gemm_runner.run_gemm(
+            activation, weights_packed, scales, kwargs["group_size"], tactic,
+            kwargs["bias"], kwargs["zeros"], alpha)
 
 
-@torch.library.custom_op("trtllm::w4a16_gemm", mutates_args=())
-def w4a16_gemm(input: torch.Tensor,
-               weight: torch.Tensor,
-               scales: torch.Tensor,
-               group_size: int,
-               has_zero_point: bool,
-               bias: Optional[torch.Tensor] = None,
-               zeros: Optional[torch.Tensor] = None) -> torch.Tensor:
+@torch.library.custom_op("trtllm::finegrained_mixed_dtype_gemm",
+                         mutates_args=())
+def finegrained_mixed_dtype_gemm(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        scales: torch.Tensor,
+        group_size: int,
+        has_zero_point: bool,
+        output_dtype: torch.dtype,
+        alpha: Optional[float] = None,
+        bias: Optional[torch.Tensor] = None,
+        zeros: Optional[torch.Tensor] = None) -> torch.Tensor:
 
     assert not has_zero_point or zeros is not None, "Expected 'zeros' tensor when has_zero_point is True"
 
@@ -741,16 +831,44 @@ def w4a16_gemm(input: torch.Tensor,
     if quant_mode == 0:
         assert zeros is None, "When quant_mode is 0 (FINEGRAINED_SCALE_ONLY), zeros must be None"
 
-    w4a16_gemm_runner = W4A16GemmRunner(input.dtype, quant_mode)
+    finegrained_mixed_dtype_gemm_runner = FinegrainedMixedDtypeGemm(
+        input.dtype, output_dtype, quant_mode)
 
-    kwargs = {"group_size": group_size, "zeros": zeros, "bias": bias}
-    _, best_tactic = tuner.choose_one("trtllm::w4a16_gemm::gemm",
-                                      [w4a16_gemm_runner], tuning_config,
-                                      [input, weight, scales], **kwargs)
+    kwargs = {
+        "group_size": group_size,
+        "zeros": zeros,
+        "bias": bias,
+        "alpha": alpha
+    }
 
-    return w4a16_gemm_runner(inputs=[input, weight, scales],
-                             tactic=best_tactic,
-                             **kwargs)
+    _, best_tactic = tuner.choose_one(
+        "trtllm::finegrained_mixed_dtype_gemm::gemm",
+        [finegrained_mixed_dtype_gemm_runner], tuning_config,
+        [input, weight, scales], **kwargs)
+
+    return finegrained_mixed_dtype_gemm_runner(inputs=[input, weight, scales],
+                                               tactic=best_tactic,
+                                               **kwargs)
+
+
+@finegrained_mixed_dtype_gemm.register_fake
+def _(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    has_zero_point: bool,
+    output_dtype: torch.dtype,
+    alpha: Optional[float] = None,
+    bias: Optional[torch.Tensor] = None,
+    zeros: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    # For a typical GEMM: input [M, K] @ weight [K, N] -> output [M, N]
+    # Weight is typically packed, so we need to infer the output dimension
+    M = input.size(0)
+    # Assuming weight is packed and the output dimension can be inferred from weight.size(1)
+    N = weight.size(1) if weight.dim() > 1 else weight.size(0)
+    return input.new_empty((M, N), dtype=output_dtype)
 
 
 @torch.library.custom_op("trtllm::attention", mutates_args=())
@@ -961,3 +1079,45 @@ def _(
         output_sf = torch.empty(())  # Create a placeholder, which is not used.
 
     return output_act, output_sf
+
+
+def get_event(event_idx: int):
+    from ..utils import get_model_extra_attrs
+    extra_attrs = get_model_extra_attrs()
+    assert "events" in extra_attrs, "Missing Event Book"
+    return extra_attrs["events"]()[event_idx]
+
+
+def get_stream(stream_id: int):
+    from ..utils import get_model_extra_attrs
+    extra_attrs = get_model_extra_attrs()
+    if stream_id == 0:
+        return extra_attrs["global_stream"]
+    assert "aux_streams" in extra_attrs, "Missing Aux Streams"
+    return extra_attrs["aux_streams"]()[stream_id - 1]
+
+
+@torch.library.custom_op("trtllm::set_stream", mutates_args=())
+def set_stream(stream_id: int) -> None:
+    stream = get_stream(stream_id)
+    assert stream is not None
+    torch.cuda.set_stream(stream)
+
+
+@torch.library.custom_op("trtllm::record_event", mutates_args=())
+def record_event(event_idx: int) -> None:
+    event = get_event(event_idx)
+    event.record()
+
+
+@torch.library.custom_op("trtllm::wait_event", mutates_args=())
+def wait_event(event_idx: int) -> None:
+    event = get_event(event_idx)
+    event.wait()
+
+
+@torch.library.custom_op("trtllm::record_stream", mutates_args=())
+def record_stream(tensor: torch.Tensor, stream_id: int) -> None:
+    stream = get_stream(stream_id)
+    assert stream is not None
+    tensor.record_stream(stream)

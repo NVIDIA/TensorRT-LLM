@@ -12,7 +12,6 @@ from .worker import OpenaiWorker, TRTLLMWorker, TRTOpenaiWorker, Worker
 
 __all__ = [
     "ScaffoldingLlm",
-    "ScaffoldingOutput",
     "ParallelProcess",
     "Controller",
     "NativeGenerationController",

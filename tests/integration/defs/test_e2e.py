@@ -1407,13 +1407,7 @@ def test_openai_completions_example(llm_root, llm_venv, backend: str):
 
 @pytest.mark.parametrize("backend", ["pytorch", "trt"])
 def test_openai_chat_example(llm_root, llm_venv, backend: str):
-    example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
     llm_venv.run_cmd([
         "-m", "pytest",
         str(test_root / "_test_openai_chat.py"), "-k", backend
@@ -1435,13 +1429,7 @@ def test_openai_lora(llm_root, llm_venv):
 
 
 def test_openai_chat_multimodal_example(llm_root, llm_venv):
-    example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
     llm_venv.run_cmd(
         ["-m", "pytest",
          str(test_root / "_test_openai_chat_multimodal.py")])
@@ -1449,7 +1437,6 @@ def test_openai_chat_multimodal_example(llm_root, llm_venv):
 
 def test_openai_chat_structural_tag_example(llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
-
     llm_venv.run_cmd([
         "-m", "pytest",
         str(test_root / "_test_openai_chat_structural_tag.py")
@@ -1459,13 +1446,7 @@ def test_openai_chat_structural_tag_example(llm_venv):
 @pytest.mark.skip_less_device(2)
 @pytest.mark.skip_less_device_memory(40000)
 def test_openai_multi_chat_example(llm_root, llm_venv):
-    example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
     llm_venv.run_cmd(
         ["-m", "pytest",
          str(test_root / "_test_openai_multi_chat.py")])
@@ -1475,13 +1456,7 @@ def test_openai_multi_chat_example(llm_root, llm_venv):
 @pytest.mark.skip_less_device(4)
 @pytest.mark.skip_less_device_memory(80000)
 def test_openai_consistent_chat(llm_root, llm_venv):
-    example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
     llm_venv.run_cmd(
         ["-m", "pytest",
          str(test_root / "_test_openai_consistent_chat.py")])
@@ -1491,13 +1466,7 @@ def test_openai_consistent_chat(llm_root, llm_venv):
 @pytest.mark.skip_less_device(4)
 @pytest.mark.skip_less_device_memory(80000)
 def test_openai_multinodes_chat_tp16pp1(llm_root, llm_venv):
-    example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
     llm_venv.run_cmd([
         "-m", "pytest", "-k", "tp16pp1",
         str(test_root / "_test_openai_multi_nodes.py")
@@ -1508,13 +1477,7 @@ def test_openai_multinodes_chat_tp16pp1(llm_root, llm_venv):
 @pytest.mark.skip_less_device(4)
 @pytest.mark.skip_less_device_memory(80000)
 def test_openai_multinodes_chat_tp8pp2(llm_root, llm_venv):
-    example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
     llm_venv.run_cmd([
         "-m", "pytest", "-k", "tp8pp2",
         str(test_root / "_test_openai_multi_nodes.py")
@@ -1523,13 +1486,7 @@ def test_openai_multinodes_chat_tp8pp2(llm_root, llm_venv):
 
 @pytest.mark.skip_less_device_memory(80000)
 def test_trtllm_benchmark_serving(llm_root, llm_venv):
-    example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
     llm_venv.run_cmd(
         ["-m", "pytest",
          str(test_root / "_test_trtllm_serve_benchmark.py")])
@@ -1544,7 +1501,25 @@ def test_build_time_benchmark_sanity(llm_root, llm_venv):
     ])
 
 
-### Pivot-To-Python examples
+### PyTorch examples
+
+
+def parse_output(text):
+    results = []
+    text_lists = re.split(r"\[\d+\] Prompt:", text)
+    for item in text_lists:
+        item = item.replace(os.linesep, "")
+        while True:
+            match = re.search(r"(Generated text: \'(.*?)\')", item,
+                              re.MULTILINE)
+            if match is None:
+                break
+            _, end = match.span(1)
+            results.append(match.group(2))
+            item = item[end:]
+    return results
+
+
 def test_ptp_quickstart(llm_root, llm_venv):
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
 
@@ -1666,7 +1641,7 @@ def test_ptp_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
             [
                 str(example_root / "quickstart_advanced.py"),
                 "--use_cuda_graph",
-                "--spec_decode_nextn",
+                "--spec_decode_max_draft_len",
                 "1",  # test 1 MTP module
                 "--spec_decode_algo",
                 "MTP",
@@ -1745,13 +1720,13 @@ def test_ptp_quickstart_advanced_eagle3(llm_root, llm_venv, model_name,
                                      delete_on_close=True) as running_log:
         llm_venv.run_cmd([
             str(example_root / "quickstart_advanced.py"),
-            "--spec_decode_nextn",
+            "--spec_decode_max_draft_len",
             "4",
             "--spec_decode_algo",
             "eagle3",
             "--model_dir",
             f"{llm_models_root()}/{model_path}",
-            "--eagle_model_dir",
+            "--draft_model_dir",
             f"{llm_models_root()}/{eagle_model_path}",
             "--disable_kv_cache_reuse",
             "--disable_overlap_scheduler",
@@ -1778,7 +1753,7 @@ def test_ptp_quickstart_advanced_ngram(llm_root, llm_venv, model_name,
             f"{llm_models_root()}/{model_path}",
             "--spec_decode_algo",
             "NGRAM",
-            "--spec_decode_nextn",
+            "--spec_decode_max_draft_len",
             "4",
             "--max_matching_ngram_size",
             "2",
@@ -1854,7 +1829,7 @@ def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
             "--disable_kv_cache_reuse",
             "--spec_decode_algo",
             "MTP",
-            "--spec_decode_nextn",
+            "--spec_decode_max_draft_len",
             "5",
             "--use_relaxed_acceptance_for_thinking",
             "--relaxed_topk=10",
@@ -2019,22 +1994,19 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         },
         "llava-v1.6-mistral-7b": {
             "image": [
+                ["ocean", "sky", "large", "waves", "shore", "blue"],
                 [
-                    "ocean", "cloud", "waves", "white", "shore", "large",
-                    "dramatic", "breaking"
+                    "landscape", "rock", "landmark", "formation", "smooth",
+                    "mountain"
                 ],
-                ["mountain", "butte", "flat", "top", "sky"],
-                ["highway", "vehicles", "traffic", "divider", "suburban"],
+                ["highway", "vehicles", "traffic", "bus", "suburban"],
             ],
         },
         "qwen2-vl-7b-instruct": {
             "image": [
-                ["ocean", "waves", "shore", "natural", "clouds", "turbulent"],
-                [
-                    "mountainous", "landscape", "rock", "peak", "weather",
-                    "steep"
-                ],
-                ["traffic", "vehicles", "moderate", "lanes", "road"],
+                ["ocean", "waves", "atmosphere", "stormy", "clouds", "intense"],
+                ["trees", "rocks", "road", "sunny", "natural", "greenery"],
+                ["traffic", "vehicles", "moderate", "lanes", "road", "cars"],
             ],
             "video": [
                 ["city", "night", "lights", "jacket", "wet"],
@@ -2043,25 +2015,19 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         },
         "qwen2.5-vl-7b-instruct": {
             "image": [
-                ["dramatic", "moody", "stormy", "turbulent", "wave"],
-                [
-                    "large", "dome", "yosemite", "landmark", "rock", "road",
-                    "formation"
-                ],
-                ["highway", "traffic", "vehicles", "bus", "police"],
+                ["dramatic", "moody", "ocean", "stormy", "sky", "clouds"],
+                ["large", "dome", "yosemite", "landmark", "rock", "road"],
+                ["highway", "traffic", "vehicles", "bus", "police", "traffic"],
             ],
             "video": [
                 ["woman", "neon", "night", "jacket", "wet"],
-                ["earth", "rotating", "night", "lights", "cities"],
+                ["earth", "world", "night", "lights", "cities"],
             ],
         },
         "mistral-small-3.1-24b-instruct": {
             "image": [
-                [
-                    "dramatic", "seascape", "stormy", "turbulent", "waves",
-                    "rough"
-                ],
-                ["scenic", "rock", "landscape", "snow", "formation"],
+                ["dramatic", "seascape", "ocean", "turbulent", "waves", "dark"],
+                ["scenic", "rock", "landscape", "snow", "altitude"],
                 ["highway", "traffic", "directions", "lanes", "Jurong"],
             ],
         },
@@ -2069,7 +2035,7 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
             "image": [
                 ["dramatic", "turbulent", "waves", "ocean", "overcast"],
                 ["half", "dome", "yosemite", "landmark", "rounded"],
-                ["flowing", "standstill", "vehicles", "road", "Changi"],
+                ["flowing", "traffic", "vehicles", "road", "Changi"],
             ],
         },
     }
@@ -2100,21 +2066,6 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         cmd.append("--disable_kv_cache_reuse")
 
     output = llm_venv.run_cmd(cmd, caller=check_output)
-
-    def parse_output(text):
-        results = []
-        text_lists = re.split(r"\[\d+\] Prompt:", text)
-        for item in text_lists:
-            item = item.replace(os.linesep, "")
-            while True:
-                match = re.search(r"(Generated text: \'(.*?)\')", item,
-                                  re.MULTILINE)
-                if match is None:
-                    break
-                _, end = match.span(1)
-                results.append(match.group(2))
-                item = item[end:]
-        return results
 
     match_ratio = 4.0 / 5
     if model_name == "qwen2-vl-7b-instruct" and modality == "image":
@@ -2180,6 +2131,92 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         if model_name in mapping:
             peak, fraction = mapping[model_name]
             _check_mem_usage(running_log, [peak, 0, 0, 0])
+
+
+@pytest.mark.parametrize("modality", ["image", "audio", "image_audio"])
+def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, modality):
+    model_name = "Phi-4-multimodal-instruct"
+    model_path = "multimodals/Phi-4-multimodal-instruct"
+
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    test_data_root = Path(
+        os.path.join(llm_models_root(), "multimodals", "test_data"))
+    audio_data_root = Path(
+        os.path.join(llm_models_root(), "multimodals",
+                     "Phi-4-multimodal-instruct", "examples"))
+    print(f"Accuracy test {model_name} {modality} mode with example inputs.")
+    accuracy_inputs = {
+        "image": {
+            "prompt": [
+                "Describe the object and the weather condition in the image.",
+                "Describe the traffic condition on the road in the image.",
+            ],
+            "media": [
+                str(test_data_root / "inpaint.png"),
+                str(test_data_root / "61.jpg"),
+            ],
+        },
+        "audio": {
+            "prompt": [
+                "Transcribe the audio clip into text, please don't add other text.",
+                "Transcribe the audio clip into text, please don't add other text.",
+            ],
+            "media": [
+                str(audio_data_root /
+                    "what_is_the_traffic_sign_in_the_image.wav"),
+                str(audio_data_root / "what_is_shown_in_this_image.wav"),
+            ],
+        },
+        "image_audio": {
+            "prompt": [
+                "",
+            ],
+            "media": [
+                str(test_data_root / "inpaint.png"),
+                str(audio_data_root / "what_is_shown_in_this_image.wav"),
+            ],
+        }
+    }
+    expected_keywords = {
+        "image": [
+            ["clear", "sunny", "sky", "image", "object"],
+            ["road", "car", "lane", "strip", "bus"],
+        ],
+        "audio": [
+            ["what", "is", "the", "traffic", "sign", "in", "image"],
+            ["what", "is", "shown", "in", "this", "image"],
+        ],
+        "image_audio": [
+            ["Half", "Dome", "Park", "natural", "image"],
+        ],
+    }
+
+    cmd = [
+        str(example_root / "quickstart_multimodal.py"),
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--modality",
+        modality,
+        "--prompt",
+        *accuracy_inputs[modality]["prompt"],
+        "--media",
+        *accuracy_inputs[modality]["media"],
+        "--load_lora",
+        "--auto_model_name",
+        "Phi4MMForCausalLM",
+    ]
+    output = llm_venv.run_cmd(cmd, caller=check_output)
+
+    match_ratio = 0.6
+    for prompt_output, prompt_keywords in zip(parse_output(output),
+                                              expected_keywords[modality]):
+        matches = [
+            keyword in prompt_output.lower() for keyword in prompt_keywords
+        ]
+        obs_match_ratio = 1. * sum(matches) / len(matches)
+        assert obs_match_ratio >= match_ratio, f"Incorrect output!\nGenerated \"{prompt_output}\"\nExpected keywords \"{prompt_keywords}\"\n Matched keywords: {matches}\n Observed match ratio {obs_match_ratio} below threshold {match_ratio}"
+
+    print("All answers are correct!")
 
 
 @pytest.mark.parametrize("model_name,model_path", [

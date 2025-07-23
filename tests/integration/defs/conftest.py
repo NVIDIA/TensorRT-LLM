@@ -487,9 +487,9 @@ def draft_target_model_example_root(llm_root, llm_venv):
 
 
 @pytest.fixture(scope="module")
-def prompt_lookup_example_root(llm_root, llm_venv):
-    "Get Prompt-Lookup example root"
-    example_root = os.path.join(llm_root, "examples", "prompt_lookup")
+def ngram_example_root(llm_root, llm_venv):
+    "Get NGram example root"
+    example_root = os.path.join(llm_root, "examples", "ngram")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -1084,7 +1084,7 @@ def draft_target_model_roots(request):
 
 
 @pytest.fixture(scope="function")
-def prompt_lookup_root(request):
+def ngram_root(request):
     models_root = llm_models_root()
     assert models_root, "Did you set LLM_MODELS_ROOT?"
     if request.param == "gpt2":
@@ -1094,7 +1094,7 @@ def prompt_lookup_root(request):
                                    "llama-models-v2/llama-v2-13b-hf")
     assert os.path.exists(
         models_root
-    ), f"Prompt-Lookup model path {models_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    ), f"NGram model path {models_root} does not exist under NFS LLM_MODELS_ROOT dir"
     return models_root
 
 
@@ -2347,3 +2347,38 @@ def tritonserver_test_root(llm_root):
                                      "tests/integration/defs/triton_server")
 
     return tritonserver_root
+
+
+@pytest.fixture
+def timeout_from_marker(request):
+    """Get timeout value from pytest timeout marker."""
+    timeout_marker = request.node.get_closest_marker('timeout')
+    if timeout_marker:
+        return timeout_marker.args[0] if timeout_marker.args else None
+    return None
+
+
+@pytest.fixture
+def timeout_from_command_line(request):
+    """Get timeout value from command line --timeout parameter."""
+    # Get timeout from command line argument
+    timeout_arg = request.config.getoption("--timeout", default=None)
+    if timeout_arg is not None:
+        return float(timeout_arg)
+    return None
+
+
+@pytest.fixture
+def timeout_manager(timeout_from_command_line, timeout_from_marker):
+    """Create a TimeoutManager instance with priority: command line > marker > config."""
+    from defs.utils.timeout_manager import TimeoutManager
+
+    # Priority: marker > command line
+    timeout_value = None
+
+    if timeout_from_marker is not None:
+        timeout_value = timeout_from_marker
+    elif timeout_from_command_line is not None:
+        timeout_value = timeout_from_command_line
+
+    return TimeoutManager(timeout_value)

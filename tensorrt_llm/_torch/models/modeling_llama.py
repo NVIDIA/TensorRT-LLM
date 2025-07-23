@@ -11,6 +11,8 @@ from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
 
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, MoEAllReduce)
+from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
+    BaseWeightMapper
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import HfLoraLoader
@@ -303,13 +305,6 @@ class Llama4MoE(nn.Module):
     def compute_routed_output(self, hidden_states, all_rank_num_tokens,
                               all_rank_max_num_tokens,
                               cutlass_min_latency_mode):
-        use_dp_padding = False
-        if self.enable_attention_dp and self.mapping.tp_size > 1:
-            # Use padding here to keep the behavior unchanged
-            use_dp_padding = True
-            hidden_states = torch.nn.functional.pad(
-                hidden_states,
-                (0, 0, 0, all_rank_max_num_tokens - hidden_states.shape[0]))
         router_logits = self.router(hidden_states)
         routed_output = self.experts(
             hidden_states,
@@ -317,8 +312,7 @@ class Llama4MoE(nn.Module):
             do_finalize=not cutlass_min_latency_mode,
             all_rank_num_tokens=all_rank_num_tokens,
             all_rank_max_num_tokens=all_rank_max_num_tokens,
-            use_dp_padding=use_dp_padding,
-        )
+            use_dp_padding=False)
         return routed_output
 
     def forward(
@@ -709,11 +703,13 @@ class LlamaModel(DecoderModel):
                 model_config,
                 'lora_config') and model_config.lora_config is not None and len(
                     model_config.lora_config.lora_dir) == 1:
-            lora_loader = HfLoraLoader(model_config.lora_config.lora_dir)
-            if lora_loader.vocab_size != 0 and lora_loader.embed_tokens is not None:
-                vocab_size = lora_loader.vocab_size
-                weight = lora_loader.embed_tokens
-                self.has_custom_embed_tokens = True
+            # Only check for custom vocab in HF LoRA, not NeMo
+            if model_config.lora_config.lora_ckpt_source == "hf":
+                lora_loader = HfLoraLoader(model_config.lora_config.lora_dir)
+                if lora_loader.vocab_size != 0 and lora_loader.embed_tokens is not None:
+                    vocab_size = lora_loader.vocab_size
+                    weight = lora_loader.embed_tokens
+                    self.has_custom_embed_tokens = True
 
         if self.model_config.mapping.enable_attention_dp:
             self.embed_tokens = Embedding(
@@ -917,16 +913,8 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
 
         return super().infer_max_seq_len()
 
-    def load_weights(self, weights: Dict):
-        new_weights = {}
-        for key, tensor in weights.items():
-            if key.startswith("language_model."):
-                new_key = key[len("language_model."):]
-                new_weights[new_key] = tensor
-            else:
-                new_weights[key] = tensor
-
-        super().load_weights(new_weights)
+    def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper):
+        super().load_weights(weights, weight_mapper)
 
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):

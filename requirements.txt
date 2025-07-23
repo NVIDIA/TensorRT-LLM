@@ -30,7 +30,8 @@ nvidia-nccl-cu12
 nvidia-cuda-nvrtc-cu12
 transformers==4.53.1
 pydantic>=2.9.1
-pydantic-settings
+pydantic-settings[yaml]
+omegaconf
 pillow==10.3.0
 wheel<=0.45.1
 optimum
@@ -59,3 +60,4 @@ ninja
 etcd3
 blake3
 llguidance==0.7.29
+soundfile

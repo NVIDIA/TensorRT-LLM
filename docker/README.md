@@ -89,13 +89,10 @@ equivalent containers as [described above](#building-docker-images-with-gnu-make
 ### Jenkins Integration
 
 [`Makefile`](Makefile) has special targets for building, pushing and running the Docker build image used on Jenkins.
-The full image name and tag is defined in [`L0_MergeRequest.groovy`](../jenkins/L0_MergeRequest.groovy). The `make`
-system will parse this name as the value of `LLM_DOCKER_IMAGE`. To build and push a new Docker image for Jenkins,
-define a new image name and tag in [`L0_MergeRequest.groovy`](../jenkins/L0_MergeRequest.groovy) and run
+The full image names and tags are defined in [`current_image_tags.properties`](../jenkins/current_image_tags.properties). The `make`
+system will parse the names/tags from this file.
 
-```bash
-make -C docker jenkins_push
-```
+#### Running
 
 Start a new container using the same image as Jenkins using your local user account with
 
@@ -133,6 +130,38 @@ make -C docker trtllm_run LOCAL_USER=1 DOCKER_PULL=1
 
 The argument `DOCKER_PULL=1` instructs `make` to pull the latest version of the image before deploying it in the container.
 By default, the release images built in the above manner are tagged by their `git` branch name and may be frequently updated.
+
+#### Building CI images
+
+To build and push a new Docker image for Jenkins, define new image names and tags in [`current_image_tags.properties`](../jenkins/current_image_tags.properties) and run
+
+```bash
+# Commands assume an amd64 host
+make -C docker jenkins_build
+#
+docker buildx create --name multi-builder
+make -C docker jenkins-aarch64_build \
+    DOCKER_BUILD_ARGS="--platform arm64 --builder=multi-builder"
+#
+# check jenkins/BuildDockerImage.groovy for current Python versions
+make -C docker jenkins-rockylinux8_build PYTHON_VERSION=3.12.3
+make -C docker jenkins-rockylinux8_build PYTHON_VERSION=3.10.12
+```
+
+The resulting images then need to be pushed:
+
+```bash
+sh -c '. jenkins/current_image_tags.properties && echo $LLM_DOCKER_IMAGE $LLM_SBSA_DOCKER_IMAGE $LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE $LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE' | tr ' ' '\n' | xargs -I{} docker push {}
+```
+
+Alternatively, it is possible to trigger the image build by opening a new pull request and commenting
+
+```text
+/bot run --stage-list "Build-Docker-Images"
+```
+
+The resulting images can then be re-tagged using `scripts/rename_docker_images.py`
+and the new tags included in [`current_image_tags.properties`](../jenkins/current_image_tags.properties).
 
 ### Docker rootless
 

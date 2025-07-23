@@ -248,7 +248,6 @@ class _ModelFormatKind(Enum):
 class DecodingBaseConfig(BaseModel):
     max_draft_len: Optional[int] = None
     speculative_model_dir: Optional[Union[str, Path]] = None
-    num_extra_kv_tokens: int = 0
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -295,13 +294,6 @@ class DecodingBaseConfig(BaseModel):
         return TorchSpeculativeDecodingMode.from_string(
             self.decoding_type.upper())
 
-    def update_from_model_config(self, model_config):
-        pass
-
-    def get_draft_model_prompt(self,
-                               input_tokens: torch.Tensor) -> torch.Tensor:
-        return input_tokens
-
 
 class MedusaDecodingConfig(DecodingBaseConfig):
     medusa_choices: Optional[List[List[int]]] = None
@@ -345,17 +337,11 @@ class EagleDecodingConfig(DecodingBaseConfig):
             return TorchSpeculativeDecodingMode.EAGLE3_ONE_MODEL
         return TorchSpeculativeDecodingMode.EAGLE3
 
-    def get_draft_model_prompt(self,
-                               input_tokens: torch.Tensor) -> torch.Tensor:
-        """
-        Eagle3 always throws away the first token when processing draft inputs
-        """
-        return input_tokens[1:]
-
 
 class UserProvidedDecodingConfig(DecodingBaseConfig):
-    # Type should be Drafter, but it leads to circular import
-    drafter: object
+    # Cannot use real type annotations due to circular imports
+    drafter: object  # Type is Drafter
+    resource_manager: object = None  # Type is Optional[ResourceManager]
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -446,11 +432,6 @@ class MTPDecodingConfig(DecodingBaseConfig):
         if self.num_nextn_predict_layers_from_model_config == 1 and not self.use_mtp_vanilla:
             return TorchSpeculativeDecodingMode.MTP_EAGLE
         return TorchSpeculativeDecodingMode.MTP
-
-    def update_from_model_config(self, model_config):
-        assert self.num_nextn_predict_layers > 0
-        if model_config.num_nextn_predict_layers == 1 and not self.use_mtp_vanilla:
-            self.num_extra_kv_tokens = self.num_nextn_predict_layers - 1
 
 
 class PybindMirror(ABC):
@@ -878,12 +859,20 @@ class CacheTransceiverConfig(BaseModel, PybindMirror):
     """
     Configuration for the cache transceiver.
     """
-    max_num_tokens: Optional[int] = Field(
+
+    backend: Optional[Literal["default", "ucx", "nixl", "mpi"]] = Field(
+        default=None,
+        description=
+        "The communication backend type to use for the cache transceiver.")
+
+    max_tokens_in_buffer: Optional[int] = Field(
         default=None,
         description="The max number of tokens the transfer buffer can fit.")
 
     def _to_pybind(self):
-        return _CacheTransceiverConfig(max_num_tokens=self.max_num_tokens)
+        return _CacheTransceiverConfig(
+            backend=self.backend,
+            max_tokens_in_buffer=self.max_tokens_in_buffer)
 
 
 @dataclass
@@ -1349,6 +1338,15 @@ class BaseLlmArgs(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def validate_runtime_args(self):
+        if self.max_batch_size is not None and self.max_num_tokens is not None:
+            if self.max_batch_size > self.max_num_tokens:
+                logger.warning(
+                    f"max_batch_size [{self.max_batch_size}] should be less than or equal to max_num_tokens [{self.max_num_tokens}]"
+                )
+        return self
+
+    @model_validator(mode="after")
     def validate_build_config_with_runtime_params(self):
         # Note: max_batch_size and max_num_tokens in LlmArgs are for runtime,
         # which will be passed to the C++ Executor API, overwriting the values
@@ -1450,8 +1448,6 @@ class BaseLlmArgs(BaseModel):
                 assert self.speculative_config.speculative_model_dir is not None, "Path to EAGLE3 weights must be specified."
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.EAGLE
-                if self.speculative_config.eagle3_one_model:
-                    self.speculative_config.num_extra_kv_tokens = self.speculative_config.max_draft_len - 1
                 if self.backend not in ['pytorch', '_autodeploy']:
                     eagle_config = _EagleConfig(
                         self.speculative_config.eagle_choices,
@@ -1472,6 +1468,7 @@ class BaseLlmArgs(BaseModel):
             elif isinstance(self.speculative_config, DraftTargetDecodingConfig):
                 assert self.backend in ['pytorch']
                 assert self.speculative_config.max_draft_len > 0
+                assert self.speculative_config.speculative_model_dir is not None, "Path to draft model must be specified."
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.DRAFT_TOKENS_EXTERNAL
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
 
@@ -1774,6 +1771,20 @@ class TorchCompileConfig(BaseModel):
         description=
         "When torch compile is enabled, userbuffers is enabled by default.")
 
+    max_num_streams: int = Field(
+        default=1,
+        description=
+        "The maximum number of CUDA streams to use for torch.compile.")
+
+    @field_validator('max_num_streams')
+    @classmethod
+    def validate_torch_compile_max_num_streams(cls, v):
+        """Validate torch_compile_config.max_num_streams >= 1."""
+        if v < 1:
+            raise ValueError(
+                "torch_compile_config.max_num_streams must be >= 1")
+        return v
+
 
 class TorchLlmArgs(BaseLlmArgs):
     # Just a dummy BuildConfig to allow code reuse with the TrtLlmArgs
@@ -1872,6 +1883,18 @@ class TorchLlmArgs(BaseLlmArgs):
                 'LOWPRECISION',
                 'MNNVL']] = Field(default='AUTO',
                                   description="Allreduce strategy to use.")
+    checkpoint_loader: Optional[object] = Field(
+        default=None,
+        description="The checkpoint loader to use for this LLM instance.",
+        json_schema_extra={
+            "type": "Optional[tensorrt_llm._torch.BaseCheckpointLoader]"
+        },
+    )
+
+    checkpoint_format: Optional[str] = Field(
+        default=None,
+        description="The format of the provided checkpoint.",
+    )
 
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
@@ -1924,6 +1947,22 @@ class TorchLlmArgs(BaseLlmArgs):
         if self.stream_interval <= 0:
             raise ValueError(
                 f"stream_interval must be positive, got {self.stream_interval}")
+        return self
+
+    @model_validator(mode="after")
+    def validate_checkpoint_format(self):
+        if self.checkpoint_format is not None and self.checkpoint_loader is not None:
+            logger.warning(
+                "checkpoint_format and checkpoint_loader are both provided, "
+                "checkpoint_loader will be ignored.")
+            self.checkpoint_loader = None
+
+        if self.checkpoint_format is None and self.checkpoint_loader is None:
+            logger.info(
+                "neither checkpoint_format nor checkpoint_loader were provided, "
+                "checkpoint_format will be set to HF.")
+            self.checkpoint_format = "HF"
+
         return self
 
     @staticmethod
@@ -2070,6 +2109,9 @@ class TorchLlmArgs(BaseLlmArgs):
             torch_compile_enable_userbuffers=self.torch_compile_config.
             enable_userbuffers if self.torch_compile_config is not None else
             TorchCompileConfig.model_fields['enable_userbuffers'].default,
+            torch_compile_max_num_streams=self.torch_compile_config.
+            max_num_streams if self.torch_compile_config is not None else
+            TorchCompileConfig.model_fields['max_num_streams'].default,
             enable_autotuner=self.enable_autotuner,
             enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
             load_format=self.load_format,
@@ -2096,7 +2138,8 @@ def update_llm_args_with_extra_dict(
     }
     for field_name, field_type in field_mapping.items():
         if field_name in llm_args_dict:
-            if field_name == "speculative_config":
+            # Some fields need to be converted manually.
+            if field_name in ["speculative_config", "build_config"]:
                 llm_args_dict[field_name] = field_type.from_dict(
                     llm_args_dict[field_name])
             else:

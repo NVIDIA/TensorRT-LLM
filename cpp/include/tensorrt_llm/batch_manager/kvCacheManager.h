@@ -31,6 +31,7 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 #include <NvInferRuntime.h>
 
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <list>
@@ -67,6 +68,9 @@ using UniqueToken = tensorrt_llm::runtime::UniqueToken;
 using VecUniqueTokens = tensorrt_llm::runtime::VecUniqueTokens;
 using LoraTaskIdType = tensorrt_llm::runtime::LoraTaskIdType;
 using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
+
+// Type alias for multimodal hash key (hash array + start offset)
+using MmKey = std::pair<std::array<uint8_t, 32>, SizeType32>;
 
 template <typename T>
 using OptionalRef = tensorrt_llm::common::OptionalRef<T>;
@@ -107,6 +111,10 @@ struct BlockKey
     std::optional<LoraTaskIdType> loraTaskId = std::nullopt;
     VecUniqueTokens uniqueTokens;
 
+    // Extra keys for multimodal data (similar to VLLM's approach)
+    // Each extra key is a pair of (mm_hash, start_offset_in_block)
+    std::vector<MmKey> extraKeys;
+
     BlockKey() = default;
 
     explicit BlockKey(VecTokens const& tokens, std::optional<LoraTaskIdType> loraTaskId = std::nullopt)
@@ -119,23 +127,25 @@ struct BlockKey
         }
     }
 
-    BlockKey(bool usesExtraIds, std::optional<LoraTaskIdType> loraTaskId, VecUniqueTokens uniqueTokens)
-        : usesExtraIds(usesExtraIds)
+    explicit BlockKey(bool usesExtraIds, std::optional<LoraTaskIdType> loraTaskId, VecUniqueTokens uniqueTokens,
+        std::vector<MmKey> extraKeys = {})
+        : usesExtraIds{usesExtraIds}
         , loraTaskId{loraTaskId}
         , uniqueTokens{std::move(uniqueTokens)}
+        , extraKeys{std::move(extraKeys)}
     {
     }
 
     bool operator==(BlockKey const& other) const noexcept
     {
-        return (
-            usesExtraIds == other.usesExtraIds && loraTaskId == other.loraTaskId && uniqueTokens == other.uniqueTokens);
+        return (usesExtraIds == other.usesExtraIds && loraTaskId == other.loraTaskId
+            && uniqueTokens == other.uniqueTokens && extraKeys == other.extraKeys);
     }
 
     int partialMatch(BlockKey const& other) const noexcept
     {
         SizeType32 numMatched{0};
-        if (loraTaskId == other.loraTaskId)
+        if (loraTaskId == other.loraTaskId && extraKeys == other.extraKeys)
         {
             auto [matchEnd, otherMatchEnd] = std::mismatch(
                 uniqueTokens.begin(), uniqueTokens.end(), other.uniqueTokens.begin(), other.uniqueTokens.end());
@@ -180,6 +190,8 @@ struct KvCacheStats
     SizeType32 missedBlocks;
     // Measuring the KV Cache reuse rate. cacheHitRate = reusedBlocks / (reusedBlocks + missedBlocks).
     float cacheHitRate;
+    // Number of free blocks for every configured attention-window size.
+    std::map<SizeType32, SizeType32> numFreeBlocksPerWindowSize;
 };
 
 // Basic building block of a paged KV cache - a single
@@ -1457,6 +1469,11 @@ public:
         return mBlockManager.getNumMissedBlocks();
     }
 
+    [[nodiscard]] std::map<SizeType32, SizeType32> getNumFreeBlocksPerWindowSize() const
+    {
+        return mBlockManager.getNumFreeBlocksPerWindowSize();
+    }
+
     [[nodiscard]] KvCacheStats getKvCacheStats() const override
     {
         KvCacheStats kvCacheStats;
@@ -1471,6 +1488,7 @@ public:
         kvCacheStats.cacheHitRate = kvCacheStats.reusedBlocks == 0 ? 0
                                                                    : static_cast<float>(kvCacheStats.reusedBlocks)
                 / static_cast<float>(kvCacheStats.reusedBlocks + kvCacheStats.missedBlocks);
+        kvCacheStats.numFreeBlocksPerWindowSize = getNumFreeBlocksPerWindowSize();
         return kvCacheStats;
     }
 

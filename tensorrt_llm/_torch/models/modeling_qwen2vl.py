@@ -18,7 +18,8 @@ from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_utils import fuse_input_embeds
+from .modeling_multimodal_utils import (find_uncached_mm_embeds,
+                                        fuse_input_embeds)
 from .modeling_utils import register_auto_model
 
 DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
@@ -33,9 +34,7 @@ class Qwen2VLInputProcessorBase(InputProcessor):
                  trust_remote_code: bool = True):
         self.model_config = model_config
         self.tokenizer = tokenizer
-        # TODO: change to True and also change the according test result
-        self.use_fast = False
-        self.device = 'cuda'
+        self.use_fast = True
         self.processor = AutoProcessor.from_pretrained(
             model_path,
             use_fast=self.use_fast,
@@ -225,7 +224,7 @@ class Qwen2VLInputProcessorBase(InputProcessor):
                     self.model_config.num_attention_heads),
             theta=float(self.model_config.rope_theta),
             scale_type=RotaryScalingType.mrope)
-        self.rotary_cos_sin = torch.from_numpy(rotary_cos_sin).to(self.device)
+        self.rotary_cos_sin = torch.from_numpy(rotary_cos_sin)
         self.rotary_cos_sin = self.rotary_cos_sin.reshape(
             self.model_config.max_position_embeddings,
             int(self.model_config.hidden_size /
@@ -343,7 +342,7 @@ class Qwen2VLInputProcessorBase(InputProcessor):
                         inputs.get("multi_modal_data", {}), inputs.get("mm_processor_kwargs", {})
 
         processed_inputs = self._preprocess(text_prompt, mm_data,
-                                            mm_processor_kwargs).to(self.device)
+                                            mm_processor_kwargs)
 
         if not mm_data:
             fused_input_ids = processed_inputs['input_ids']
@@ -601,6 +600,8 @@ class Qwen2VLModelBase(PreTrainedModel):
             mrope_config = self._parse_and_concat_mrope_config(
                 multimodal_params, num_context_requests,
                 num_generation_requests)
+            mm_embeds = find_uncached_mm_embeds(
+                mm_embeds, multimodal_params[:num_context_requests])
 
         if 'mrope_position_deltas' in kwargs:
             mrope_config['mrope_position_deltas'] = kwargs[
