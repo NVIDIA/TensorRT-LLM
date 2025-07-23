@@ -18,10 +18,13 @@ import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
     BaseCheckpointLoader
 from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
+from tensorrt_llm._torch.speculative import (
+    get_num_extra_kv_tokens, update_spec_config_from_model_config)
 from tensorrt_llm._torch.speculative.mtp import SampleStateTensorsMTP
 from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
                                  torch_dtype_to_str, trace_func)
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import (MultimodalParams,
+                                            MultimodalRuntimeData)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import LoraConfig, LoraModelConfig
 from tensorrt_llm.mapping import Mapping
@@ -323,7 +326,9 @@ class PyTorchModelEngine(ModelEngine):
                     enable_piecewise_cuda_graph=pytorch_backend_config.
                     torch_compile_piecewise_cuda_graph,
                     cuda_graph_batch_sizes=pytorch_backend_config.
-                    cuda_graph_batch_sizes)
+                    cuda_graph_batch_sizes,
+                    max_num_streams=pytorch_backend_config.
+                    torch_compile_max_num_streams)
                 if isinstance(self.model, DecoderModelForCausalLM):
                     self.model.model = torch.compile(
                         self.model.model,
@@ -350,7 +355,8 @@ class PyTorchModelEngine(ModelEngine):
 
         if self.is_spec_decode:
             self.spec_metadata = None
-            self.spec_config.update_from_model_config(self.model.config)
+            update_spec_config_from_model_config(self.spec_config,
+                                                 self.model.config)
             max_num_draft_tokens = self.spec_config.max_draft_len * batch_size
             self.draft_tokens_cuda = torch.empty((max_num_draft_tokens, ),
                                                  dtype=torch.int,
@@ -1143,8 +1149,16 @@ class PyTorchModelEngine(ModelEngine):
             num_cached_tokens_per_seq.append(past_seen_token_num)
 
             # Multimodal
+            # TODO: enable chunk prefill for multimodal (maybe need to pass prompt_tokens to MultimodalRuntimeData)
+            py_multimodal_runtime = MultimodalRuntimeData(
+                mm_token_lengths=request.multimodal_lengths,
+                mm_token_positions=request.multimodal_positions,
+                num_cached_tokens=past_seen_token_num
+            ) if request.multimodal_hashes is not None else None
+
             multimodal_params = MultimodalParams(
-                multimodal_data=request.py_multimodal_data)
+                multimodal_data=request.py_multimodal_data,
+                multimodal_runtime=py_multimodal_runtime)
             multimodal_params.to_device("multimodal_data",
                                         "cuda",
                                         pin_memory=True)
@@ -1152,7 +1166,7 @@ class PyTorchModelEngine(ModelEngine):
             if multimodal_params.has_content():
                 multimodal_params_list.append(multimodal_params)
 
-            request.py_batch_idx = request.seq_slot
+            request.py_batch_idx = request.py_seq_slot
 
         num_ctx_requests = len(scheduled_requests.context_requests)
         num_ctx_tokens = len(input_ids)
@@ -1205,7 +1219,8 @@ class PyTorchModelEngine(ModelEngine):
             if next_draft_tokens_device is None or request.is_dummy or request.py_batch_idx is None:
                 # get token ids, including input token ids and draft token ids. For these dummy requests,
                 # no need to copy the token ids.
-                if not request.is_dummy:
+                if not (request.is_attention_dp_dummy
+                        or request.is_cuda_graph_dummy):
                     input_ids.append(request.get_last_tokens(0))
                     input_ids.extend(request.py_draft_tokens)
                     draft_tokens.extend(request.py_draft_tokens)
@@ -1234,11 +1249,11 @@ class PyTorchModelEngine(ModelEngine):
                 num_cached_tokens_per_seq.append(past_seen_token_num)
                 request_ids.append(request.py_request_id)
                 # update batch index
-                request.py_batch_idx = request.seq_slot
+                request.py_batch_idx = request.py_seq_slot
             else:
                 # update batch index
                 previous_batch_idx = request.py_batch_idx
-                request.py_batch_idx = request.seq_slot
+                request.py_batch_idx = request.py_seq_slot
                 # inputs
                 # overlap scheduler can only support the speculative decoding
                 # methods with a fixed number of draft tokens
@@ -1292,8 +1307,8 @@ class PyTorchModelEngine(ModelEngine):
                 gather_ids.append(len(position_ids) - 1)
 
             request_ids.append(request.py_request_id)
-            gen_request_seq_slots.append(request.seq_slot)
-            request.py_batch_idx = request.seq_slot
+            gen_request_seq_slots.append(request.py_seq_slot)
+            request.py_batch_idx = request.py_seq_slot
 
         previous_batch_len = len(previous_batch_indices)
 
@@ -1430,8 +1445,7 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.kv_cache_params = KVCacheParams(
             use_cache=True,
             num_cached_tokens_per_seq=num_cached_tokens_per_seq,
-            num_extra_kv_tokens=0 if self.spec_config is None else
-            self.spec_config.num_extra_kv_tokens)
+            num_extra_kv_tokens=get_num_extra_kv_tokens(self.spec_config))
         attn_metadata.kv_cache_manager = kv_cache_manager
 
         attn_metadata.prepare()
@@ -2092,6 +2106,14 @@ class PyTorchModelEngine(ModelEngine):
         assert attrs is not None, "Model extra attrs is not set"
         attrs["attention_metadata"] = weakref.ref(kwargs['attn_metadata'])
         attrs.update(self.model.model_config.extra_attrs)
+
+        if self._torch_compile_backend is not None:
+            # Register aux streams and events to model extra attrs.
+            # The streams and events are list which could be updated during compilation.
+            attrs["aux_streams"] = weakref.ref(
+                self._torch_compile_backend.aux_streams)
+            attrs["events"] = weakref.ref(self._torch_compile_backend.events)
+            attrs["global_stream"] = torch.cuda.current_stream()
 
         if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
             return trace_func(self.model.forward)(**kwargs)

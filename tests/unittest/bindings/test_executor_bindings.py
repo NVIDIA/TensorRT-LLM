@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 import tensorrt_llm.bindings.executor as trtllm
 import tensorrt_llm.version as trtllm_version
+from tensorrt_llm._utils import torch_to_numpy
 from tensorrt_llm.models.modeling_utils import PretrainedConfig
 
 _sys.path.append(_os.path.join(_os.path.dirname(__file__), '..'))
@@ -64,6 +65,40 @@ def test_executor_from_memory(model_files, model_path):
     json_config_str = open(model_path / "config.json", 'r').read()
     executor = trtllm.Executor(engine_buffer, json_config_str,
                                trtllm.ModelType.DECODER_ONLY, executor_config)
+
+
+def test_executor_with_managed_weights(model_files, model_path):
+    """Test executor constructor with standard dtypes in managed weights."""
+
+    executor_config = trtllm.ExecutorConfig(
+        1, kv_cache_config=trtllm.KvCacheConfig(free_gpu_memory_fraction=0.5))
+    engine_buffer = open(model_path / "rank0.engine", mode="rb").read()
+    json_config_str = open(model_path / "config.json", 'r').read()
+
+    managed_weights = {
+        "weight_float32":
+        np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
+        "weight_int32":
+        np.array([[1, 2], [3, 4]], dtype=np.int32),
+        "weight_int64":
+        np.array([[1, 2], [3, 4]], dtype=np.int64),
+        "weight_int8":
+        np.array([[1, 2], [3, 4]], dtype=np.int8),
+        "weight_fp16":
+        np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float16),
+        "weight_bf16":
+        torch_to_numpy(
+            torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.bfloat16)),
+        "weight_fp8":
+        torch_to_numpy(
+            torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float8_e4m3fn)),
+    }
+
+    executor = trtllm.Executor(engine_buffer, json_config_str,
+                               trtllm.ModelType.DECODER_ONLY, executor_config,
+                               managed_weights)
+
+    assert executor.can_enqueue_requests() == True
 
 
 def test_executor_invalid_ctor():
@@ -1162,6 +1197,9 @@ def test_result_pickle():
     result.sequence_index = 1
     result.is_sequence_final = True
     result.decoding_iter = 1
+    result.context_phase_params = trtllm.ContextPhaseParams([1, 2], 123,
+                                                            bytes([0, 1]),
+                                                            [10, 20, 30])
     result.request_perf_metrics = trtllm.RequestPerfMetrics()
     result.request_perf_metrics.last_iter = 33
     result_str = pickle.dumps(result)
@@ -1177,6 +1215,10 @@ def test_result_pickle():
     assert result.sequence_index == result_copy.sequence_index
     assert result.is_sequence_final == result_copy.is_sequence_final
     assert result.decoding_iter == result_copy.decoding_iter
+    assert result.context_phase_params.req_id == result_copy.context_phase_params.req_id
+    assert result.context_phase_params.first_gen_tokens == result_copy.context_phase_params.first_gen_tokens
+    assert result.context_phase_params.draft_tokens == result_copy.context_phase_params.draft_tokens
+    assert result.context_phase_params.opaque_state == result_copy.context_phase_params.opaque_state
     assert result.request_perf_metrics.last_iter == result_copy.request_perf_metrics.last_iter
 
 
@@ -2221,7 +2263,7 @@ def test_kv_event_stream_timeout(model_path):
     assert len(events) == 1
 
     start = datetime.datetime.now()
-    events = cache_manager.get_latest_events(datetime.timedelta(seconds=1))
+    events = cache_manager.get_latest_events(1000)
     end = datetime.datetime.now()
     # Make sure that it actually waited
     assert abs(end - start) > datetime.timedelta(milliseconds=900)
@@ -2463,8 +2505,9 @@ def test_guided_decoding_config_pickle():
 
 
 def test_cache_transceiver_config_pickle():
-    config = trtllm.CacheTransceiverConfig(backend="UCX",
-                                           max_tokens_in_buffer=1024)
+    config = trtllm.CacheTransceiverConfig(
+        backend=trtllm.CacheTransceiverBackendType.UCX,
+        max_tokens_in_buffer=1024)
     config_copy = pickle.loads(pickle.dumps(config))
     assert config_copy.backend == config.backend
     assert config_copy.max_tokens_in_buffer == config.max_tokens_in_buffer

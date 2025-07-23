@@ -14,11 +14,11 @@ from tensorrt_llm.bindings.executor import DecodingMode, ExecutorConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import (LoraConfig,
                                        get_default_trtllm_modules_to_hf_modules,
-                                       load_torch_hf_lora)
+                                       load_torch_lora)
 from tensorrt_llm.mapping import Mapping
 
 from ..model_config import ModelConfig
-from ..speculative import get_spec_decoder
+from ..speculative import get_num_extra_kv_tokens, get_spec_decoder
 from .config import PyTorchConfig
 from .config_utils import is_mla, is_nemotron_hybrid
 from .guided_decoder import GuidedDecoder
@@ -164,7 +164,7 @@ class KvCacheCreator:
 
         if spec_cfg is not None:
             num_extra_tokens_per_seq += spec_cfg.max_draft_len
-            num_extra_tokens_per_seq += spec_cfg.num_extra_kv_tokens
+            num_extra_tokens_per_seq += get_num_extra_kv_tokens(spec_cfg)
         for req in self._dummy_reqs:
             num_req_tokens = len(req.input_token_ids) + num_extra_tokens_per_seq
             # Requests cannot share KV cache blocks. Round up to nearest integer multiple of block size.
@@ -432,11 +432,13 @@ def create_py_executor_instance(
                 f"Cannot overwrite existing resource manager {key}.")
         resources[key] = value
 
+    peft_cache_manager = None
     if lora_config is not None:
         from tensorrt_llm.bindings import LoraModule
 
         if len(lora_config.lora_dir) == 1:
-            load_torch_hf_lora(lora_config)
+            # Route to appropriate loader based on checkpoint source
+            load_torch_lora(lora_config)
         else:
             assert len(lora_config.lora_target_modules
                        ) >= 1, "Expecting at least one lora target module"
@@ -449,12 +451,25 @@ def create_py_executor_instance(
 
         num_experts = _try_infer_num_experts(model_engine.model.model_config)
 
+        num_attn_layers = model_binding_config.num_attention_layers()
+        per_layer_kv_heads = [
+            model_binding_config.num_kv_heads(i) for i in range(num_attn_layers)
+        ]
+        num_kv_attention_heads = max(per_layer_kv_heads)
+        if len(set(per_layer_kv_heads)) > 1:
+            # NOTE: This code-path is currently untested and not validated. Can fail!
+            # This support is tracked in TRTLLM-6561
+            logger.warning(
+                f"Non-uniform KV heads per layer detected, using max ({num_kv_attention_heads}) for LoRA. "
+                "This code-path is currently untested and not validated. May fail!"
+            )
+
         lora_modules = LoraModule.create_lora_modules(
             lora_module_names=lora_config.lora_target_modules,
             hidden_size=model_binding_config.hidden_size,
             mlp_hidden_size=model_binding_config.mlp_hidden_size,
             num_attention_heads=model_binding_config.num_heads,
-            num_kv_attention_heads=model_binding_config.num_heads,
+            num_kv_attention_heads=num_kv_attention_heads,
             attention_head_size=model_binding_config.head_size,
             tp_size=mapping.tp_size,
             num_experts=num_experts)
@@ -507,6 +522,7 @@ def create_py_executor_instance(
     capacity_scheduler = BindCapacityScheduler(
         max_num_sequences,
         kv_cache_manager.impl if kv_cache_manager is not None else None,
+        peft_cache_manager.impl if peft_cache_manager is not None else None,
         executor_config.scheduler_config.capacity_scheduler_policy,
         two_step_lookahead=mapping.has_pp())
     mb_scheduler = BindMicroBatchScheduler(executor_config.max_batch_size,
@@ -520,7 +536,6 @@ def create_py_executor_instance(
     cache_transceiver_config = executor_config.cache_transceiver_config
     kv_cache_transceiver = create_kv_cache_transceiver(
         mapping, kv_cache_manager, attention_type, cache_transceiver_config)
-
     return PyExecutor(
         resource_manager,
         scheduler,

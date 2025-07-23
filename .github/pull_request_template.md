@@ -70,7 +70,8 @@ Launch build/test pipelines. All previously running jobs will be killed.
 
 `--debug ` *(OPTIONAL)* : **Experimental feature**. Enable access to the CI container for debugging purpose. Note: Specify exactly one stage in the `stage-list` parameter to access the appropriate container environment. Note: Does **NOT** update GitHub check status.
 
-For guidance on mapping tests to stage names, see `docs/source/reference/ci-overview.md`.
+For guidance on mapping tests to stage names, see `docs/source/reference/ci-overview.md`
+and the `scripts/test_to_stage_mapping.py` helper.
 
 ### kill
 

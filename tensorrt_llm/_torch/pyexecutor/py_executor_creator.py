@@ -19,7 +19,8 @@ from tensorrt_llm.quantization import QuantAlgo
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..distributed import MPIDist
-from ..speculative import get_spec_drafter, get_spec_resource_manager
+from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
+                           get_spec_resource_manager)
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla)
 from .config import PyTorchConfig
@@ -162,21 +163,6 @@ def _mangle_executor_config(executor_config: ExecutorConfig):
             )
             executor_config.kv_cache_config.enable_block_reuse = False
 
-    spec_config = executor_config.speculative_config
-    if spec_config is not None and spec_config.spec_dec_mode.has_draft_model():
-        # The draft and target models have different KV cache managers to support
-        # different head sizes, dtypes, etc in the generic case.
-        # However, this line will set context_current_position > 0 if there are
-        # cached blocks: https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/pyexecutor/resource_manager.py#L310.
-        # It actually mutates the LLM request! As a result, when we try to allocate KV cache
-        # pages for the draft model, is_first_context_chunk returns False and
-        # no pages are allocated.
-        # We need to refactor LLMRequest to fix this. Disable block reuse for now.
-        logger.warning(
-            f"Disabling block reuse for speculation algorithm {spec_config.spec_dec_mode}"
-        )
-        executor_config.kv_cache_config.enable_block_reuse = False
-
     if pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION" and executor_config.enable_chunked_context:
         logger.warning(
             f"Disabling chunked context for {pytorch_backend_config.attn_backend} backend"
@@ -281,7 +267,7 @@ def create_py_executor(
             max_seq_len += spec_config.max_draft_len
 
     if spec_config is not None:
-        max_seq_len += spec_config.num_extra_kv_tokens
+        max_seq_len += get_num_extra_kv_tokens(spec_config)
         max_seq_len += spec_config.max_draft_len
 
     executor_config.max_seq_len = max_seq_len

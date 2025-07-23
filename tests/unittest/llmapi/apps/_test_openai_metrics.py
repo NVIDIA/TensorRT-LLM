@@ -21,7 +21,6 @@ def client():
     llm = PyTorchLLM(model=llama_model_path,
                      build_config=build_config,
                      kv_cache_config=KvCacheConfig(),
-                     backend="pytorch",
                      enable_iter_perf_stats=True)
     hf_tokenizer = AutoTokenizer.from_pretrained(llama_model_path)
 

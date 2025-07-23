@@ -248,7 +248,6 @@ class _ModelFormatKind(Enum):
 class DecodingBaseConfig(BaseModel):
     max_draft_len: Optional[int] = None
     speculative_model_dir: Optional[Union[str, Path]] = None
-    num_extra_kv_tokens: int = 0
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -295,13 +294,6 @@ class DecodingBaseConfig(BaseModel):
         return TorchSpeculativeDecodingMode.from_string(
             self.decoding_type.upper())
 
-    def update_from_model_config(self, model_config):
-        pass
-
-    def get_draft_model_prompt(self,
-                               input_tokens: torch.Tensor) -> torch.Tensor:
-        return input_tokens
-
 
 class MedusaDecodingConfig(DecodingBaseConfig):
     medusa_choices: Optional[List[List[int]]] = None
@@ -344,13 +336,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
         if self.eagle3_one_model:
             return TorchSpeculativeDecodingMode.EAGLE3_ONE_MODEL
         return TorchSpeculativeDecodingMode.EAGLE3
-
-    def get_draft_model_prompt(self,
-                               input_tokens: torch.Tensor) -> torch.Tensor:
-        """
-        Eagle3 always throws away the first token when processing draft inputs
-        """
-        return input_tokens[1:]
 
 
 class UserProvidedDecodingConfig(DecodingBaseConfig):
@@ -447,11 +432,6 @@ class MTPDecodingConfig(DecodingBaseConfig):
         if self.num_nextn_predict_layers_from_model_config == 1 and not self.use_mtp_vanilla:
             return TorchSpeculativeDecodingMode.MTP_EAGLE
         return TorchSpeculativeDecodingMode.MTP
-
-    def update_from_model_config(self, model_config):
-        assert self.num_nextn_predict_layers > 0
-        if model_config.num_nextn_predict_layers == 1 and not self.use_mtp_vanilla:
-            self.num_extra_kv_tokens = self.num_nextn_predict_layers - 1
 
 
 class PybindMirror(ABC):
@@ -1358,6 +1338,15 @@ class BaseLlmArgs(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def validate_runtime_args(self):
+        if self.max_batch_size is not None and self.max_num_tokens is not None:
+            if self.max_batch_size > self.max_num_tokens:
+                logger.warning(
+                    f"max_batch_size [{self.max_batch_size}] should be less than or equal to max_num_tokens [{self.max_num_tokens}]"
+                )
+        return self
+
+    @model_validator(mode="after")
     def validate_build_config_with_runtime_params(self):
         # Note: max_batch_size and max_num_tokens in LlmArgs are for runtime,
         # which will be passed to the C++ Executor API, overwriting the values
@@ -1459,8 +1448,6 @@ class BaseLlmArgs(BaseModel):
                 assert self.speculative_config.speculative_model_dir is not None, "Path to EAGLE3 weights must be specified."
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.EAGLE
-                if self.speculative_config.eagle3_one_model:
-                    self.speculative_config.num_extra_kv_tokens = self.speculative_config.max_draft_len - 1
                 if self.backend not in ['pytorch', '_autodeploy']:
                     eagle_config = _EagleConfig(
                         self.speculative_config.eagle_choices,
@@ -1481,6 +1468,7 @@ class BaseLlmArgs(BaseModel):
             elif isinstance(self.speculative_config, DraftTargetDecodingConfig):
                 assert self.backend in ['pytorch']
                 assert self.speculative_config.max_draft_len > 0
+                assert self.speculative_config.speculative_model_dir is not None, "Path to draft model must be specified."
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.DRAFT_TOKENS_EXTERNAL
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
 
@@ -1782,6 +1770,20 @@ class TorchCompileConfig(BaseModel):
         default=True,
         description=
         "When torch compile is enabled, userbuffers is enabled by default.")
+
+    max_num_streams: int = Field(
+        default=1,
+        description=
+        "The maximum number of CUDA streams to use for torch.compile.")
+
+    @field_validator('max_num_streams')
+    @classmethod
+    def validate_torch_compile_max_num_streams(cls, v):
+        """Validate torch_compile_config.max_num_streams >= 1."""
+        if v < 1:
+            raise ValueError(
+                "torch_compile_config.max_num_streams must be >= 1")
+        return v
 
 
 class TorchLlmArgs(BaseLlmArgs):
@@ -2107,6 +2109,9 @@ class TorchLlmArgs(BaseLlmArgs):
             torch_compile_enable_userbuffers=self.torch_compile_config.
             enable_userbuffers if self.torch_compile_config is not None else
             TorchCompileConfig.model_fields['enable_userbuffers'].default,
+            torch_compile_max_num_streams=self.torch_compile_config.
+            max_num_streams if self.torch_compile_config is not None else
+            TorchCompileConfig.model_fields['max_num_streams'].default,
             enable_autotuner=self.enable_autotuner,
             enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
             load_format=self.load_format,

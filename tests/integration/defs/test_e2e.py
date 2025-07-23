@@ -1407,13 +1407,7 @@ def test_openai_completions_example(llm_root, llm_venv, backend: str):
 
 @pytest.mark.parametrize("backend", ["pytorch", "trt"])
 def test_openai_chat_example(llm_root, llm_venv, backend: str):
-    example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
     llm_venv.run_cmd([
         "-m", "pytest",
         str(test_root / "_test_openai_chat.py"), "-k", backend
@@ -1435,13 +1429,7 @@ def test_openai_lora(llm_root, llm_venv):
 
 
 def test_openai_chat_multimodal_example(llm_root, llm_venv):
-    example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
     llm_venv.run_cmd(
         ["-m", "pytest",
          str(test_root / "_test_openai_chat_multimodal.py")])
@@ -1449,7 +1437,6 @@ def test_openai_chat_multimodal_example(llm_root, llm_venv):
 
 def test_openai_chat_structural_tag_example(llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
-
     llm_venv.run_cmd([
         "-m", "pytest",
         str(test_root / "_test_openai_chat_structural_tag.py")
@@ -1459,13 +1446,7 @@ def test_openai_chat_structural_tag_example(llm_venv):
 @pytest.mark.skip_less_device(2)
 @pytest.mark.skip_less_device_memory(40000)
 def test_openai_multi_chat_example(llm_root, llm_venv):
-    example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
     llm_venv.run_cmd(
         ["-m", "pytest",
          str(test_root / "_test_openai_multi_chat.py")])
@@ -1475,13 +1456,7 @@ def test_openai_multi_chat_example(llm_root, llm_venv):
 @pytest.mark.skip_less_device(4)
 @pytest.mark.skip_less_device_memory(80000)
 def test_openai_consistent_chat(llm_root, llm_venv):
-    example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
     llm_venv.run_cmd(
         ["-m", "pytest",
          str(test_root / "_test_openai_consistent_chat.py")])
@@ -1491,13 +1466,7 @@ def test_openai_consistent_chat(llm_root, llm_venv):
 @pytest.mark.skip_less_device(4)
 @pytest.mark.skip_less_device_memory(80000)
 def test_openai_multinodes_chat_tp16pp1(llm_root, llm_venv):
-    example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
     llm_venv.run_cmd([
         "-m", "pytest", "-k", "tp16pp1",
         str(test_root / "_test_openai_multi_nodes.py")
@@ -1508,13 +1477,7 @@ def test_openai_multinodes_chat_tp16pp1(llm_root, llm_venv):
 @pytest.mark.skip_less_device(4)
 @pytest.mark.skip_less_device_memory(80000)
 def test_openai_multinodes_chat_tp8pp2(llm_root, llm_venv):
-    example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
     llm_venv.run_cmd([
         "-m", "pytest", "-k", "tp8pp2",
         str(test_root / "_test_openai_multi_nodes.py")
@@ -1523,13 +1486,7 @@ def test_openai_multinodes_chat_tp8pp2(llm_root, llm_venv):
 
 @pytest.mark.skip_less_device_memory(80000)
 def test_trtllm_benchmark_serving(llm_root, llm_venv):
-    example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
     llm_venv.run_cmd(
         ["-m", "pytest",
          str(test_root / "_test_trtllm_serve_benchmark.py")])
@@ -1684,7 +1641,7 @@ def test_ptp_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
             [
                 str(example_root / "quickstart_advanced.py"),
                 "--use_cuda_graph",
-                "--spec_decode_nextn",
+                "--spec_decode_max_draft_len",
                 "1",  # test 1 MTP module
                 "--spec_decode_algo",
                 "MTP",
@@ -1763,13 +1720,13 @@ def test_ptp_quickstart_advanced_eagle3(llm_root, llm_venv, model_name,
                                      delete_on_close=True) as running_log:
         llm_venv.run_cmd([
             str(example_root / "quickstart_advanced.py"),
-            "--spec_decode_nextn",
+            "--spec_decode_max_draft_len",
             "4",
             "--spec_decode_algo",
             "eagle3",
             "--model_dir",
             f"{llm_models_root()}/{model_path}",
-            "--eagle_model_dir",
+            "--draft_model_dir",
             f"{llm_models_root()}/{eagle_model_path}",
             "--disable_kv_cache_reuse",
             "--disable_overlap_scheduler",
@@ -1796,7 +1753,7 @@ def test_ptp_quickstart_advanced_ngram(llm_root, llm_venv, model_name,
             f"{llm_models_root()}/{model_path}",
             "--spec_decode_algo",
             "NGRAM",
-            "--spec_decode_nextn",
+            "--spec_decode_max_draft_len",
             "4",
             "--max_matching_ngram_size",
             "2",
@@ -1872,7 +1829,7 @@ def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
             "--disable_kv_cache_reuse",
             "--spec_decode_algo",
             "MTP",
-            "--spec_decode_nextn",
+            "--spec_decode_max_draft_len",
             "5",
             "--use_relaxed_acceptance_for_thinking",
             "--relaxed_topk=10",
@@ -2076,8 +2033,8 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         "mistral-small-3.1-24b-instruct": {
             "image": [
                 [
-                    "dramatic", "seascape", "stormy", "turbulent", "waves",
-                    "rough"
+                    "dramatic", "seascape", "cloudy", "turbulent", "waves",
+                    "water"
                 ],
                 ["scenic", "rock", "landscape", "snow", "formation"],
                 ["highway", "traffic", "directions", "lanes", "Jurong"],
