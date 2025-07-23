@@ -15,6 +15,7 @@ l0_a100:
   tests:
     - unittest/llmapi/test_llm_pytorch.py
     - unittest/llmapi/test_mpi_session.py # generic tests
+    - unittest/test_lora_manager.py
 - condition:
     ranges:
       system_gpu_count:
