@@ -25,53 +25,60 @@ def _masked_index_copy_group_quant_fp8(
     # mask indices
     start_offsets_ptr,
     row_indices_ptr,
-    # group size
-    group_size,
-    # output size
+    # dimensions
+    num_groups,
     row_size,
     col_size,
     dim_size,
-    # avoid to divide zero
+    group_size,
+    # quantization parameters
     eps,
+    fp8_max,
     # block size
     BLOCK: tl.constexpr,
+    NUM_STAGE: tl.constexpr,
 ):
-    # get program id and block offset
-    pid = tl.program_id(0)
-    block_start = pid * group_size
+    group_block = tl.program_id(0)
+    token_block = tl.program_id(1)
+    block_num_per_token = tl.num_programs(1)
 
-    # compute mask and pointers
-    offsets = block_start + tl.arange(0, BLOCK)
-    mask = offsets < (block_start + group_size)
+    # calculate group and element offsets
     num_tokens = tl.load(start_offsets_ptr + row_size)
-    token_idx = offsets // dim_size
-    valid = (token_idx < num_tokens) & mask
-    row_idx = tl.load(row_indices_ptr + token_idx, mask=valid)
-    start_offset = tl.load(start_offsets_ptr + row_idx, mask=valid)
-    col_idx = token_idx - start_offset
-    elem_idx = offsets % dim_size
+    group_start = group_block * group_size
+    elem_offsets = group_start + tl.arange(0, BLOCK)
+    valid_elem = elem_offsets < (group_start + group_size)
+    input_ptr_offs = input_ptr + elem_offsets
+    row_indices_ptr_offs = row_indices_ptr + elem_offsets // dim_size
+    output_ptr_offs = out_q_ptr + elem_offsets
+    output_s_offs = out_s_ptr + group_block
 
-    # load input data
-    input = tl.load(input_ptr + offsets, mask=valid, other=0.0).to(tl.float32)
+    # process tokens
+    for token_index in tl.range(token_block,
+                                num_tokens,
+                                block_num_per_token,
+                                num_stages=NUM_STAGE):
+        # load input and indices
+        input_data = tl.load(input_ptr_offs + token_index * dim_size,
+                             mask=valid_elem,
+                             other=0.0)
+        row_idx = tl.load(row_indices_ptr_offs + token_index,
+                          mask=valid_elem,
+                          other=0)
+        start_offset = tl.load(start_offsets_ptr + row_idx,
+                               mask=valid_elem,
+                               other=0)
+        idx = row_idx * col_size + token_index - start_offset
 
-    # quant
-    _absmax = tl.maximum(tl.max(tl.abs(input)), eps)
-    output_s = _absmax / 448.0
-    output_s = tl.exp2(tl.ceil(tl.log2(tl.abs(output_s))))
-    output_s_inv = 1.0 / output_s
-    output_q = tl.clamp(input * output_s_inv, -448.0,
-                        448.0).to(out_q_ptr.dtype.element_ty)
+        # quantization
+        _absmax = tl.maximum(tl.max(tl.abs(input_data)), eps)
+        output_s = _absmax / fp8_max
+        output_s = tl.exp2(tl.ceil(tl.log2(tl.abs(output_s))))
+        output_q = tl.clamp(input_data / output_s, -fp8_max,
+                            fp8_max).to(out_q_ptr.dtype.element_ty)
 
-    # write output
-    s_dim_size = dim_size // group_size
-    out_offsets = row_idx * col_size * dim_size + col_idx * dim_size + elem_idx
-    group_in_token = elem_idx // group_size
-    out_s_offset = row_idx * col_size * s_dim_size + col_idx * s_dim_size + group_in_token
-
-    # Only store scaling factor for the first element in each group to avoid race conditions
-    is_first_in_group = elem_idx % group_size == 0
-    tl.store(out_q_ptr + out_offsets, output_q, mask=valid)
-    tl.store(out_s_ptr + out_s_offset, output_s, mask=valid & is_first_in_group)
+        # store quantized values and scaling factor
+        tl.store(output_ptr_offs + idx * dim_size, output_q, mask=valid_elem)
+        tl.store(output_s_offs + idx * num_groups, output_s, mask=valid_elem)
 
 
 def masked_index_copy_group_quant_fp8(
@@ -88,32 +95,44 @@ def masked_index_copy_group_quant_fp8(
     ), "the last dimension of `input` cannot be divisible by `group_size`"
     assert input.is_contiguous(), "`input` is not contiguous"
     assert input.ndim == 2, "Input must be a 2D tensor"
-    assert output.ndim == 3, "Input must be a 3D tensor, [row, col, dim]"
+    assert output.ndim == 3, "Output must be a 3D tensor, [row, col, dim]"
     assert start_offsets.shape[
         0] == output.shape[0] + 1, "Start offsets must be (num_experts + 1)"
 
-    num_tokens = input.shape[0]
     row_size = output.shape[0]
     col_size = output.shape[1]
     dim_size = output.shape[2]
-    total_elems = num_tokens * dim_size
+    num_groups = (dim_size + group_size - 1) // group_size
 
-    M = total_elems // group_size
-    BLOCK = triton.next_power_of_2(group_size)
-    # heuristics for number of warps
-    num_warps = min(max(BLOCK // 256, 1), 8)
-    _masked_index_copy_group_quant_fp8[(M, )](
+    # get block/grid/stage/warp
+    BLOCK = group_size
+    BLOCK_NUM_PER_TOKEN = 128
+    NUM_STAGES = 2
+    num_warps = 4
+    grid = (
+        num_groups,
+        BLOCK_NUM_PER_TOKEN,
+    )
+
+    # FP8 quantization parameters
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    fp8_max = finfo.max
+
+    _masked_index_copy_group_quant_fp8[grid](
         input,
         output,
         output_s,
         start_offsets,
         row_indices,
-        group_size,
+        num_groups,
         row_size,
         col_size,
         dim_size,
+        group_size,
         eps,
+        fp8_max,
         BLOCK=BLOCK,
+        NUM_STAGE=NUM_STAGES,
         num_warps=num_warps,
     )
     return
