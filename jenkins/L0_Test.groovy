@@ -1159,6 +1159,10 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
         // If stageName contains "-Triton-", add "backend=triton" to makoArgs
         // At this point, only tests with backend=triton or unspecified backend will be run
         makoArgs += ["backend=triton"]
+    } else if (stageName.contains("-Fmha-")) {
+        // If stageName contains "-Fmha-", add "backend=fmha" to makoArgs
+        // At this point, only tests with backend=fmha or unspecified backend will be run
+        makoArgs += ["backend=fmha"]
     } else {
         // If stageName does not contain "-PyTorch-", "-TensorRT-", "-CPP-", or "-Triton-", do not add any backend
         // At this point, all tests will be run
@@ -1971,6 +1975,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "A100X-TensorRT-Post-Merge-6": ["a100x", "l0_a100", 6, 6],
         "A100X-Triton-Post-Merge-1": ["a100x", "l0_a100", 1, 2],
         "A100X-Triton-Post-Merge-2": ["a100x", "l0_a100", 2, 2],
+        "A100X-Fmha-Post-Merge-1": ["a100x", "l0_a100", 1, 1],
         "L40S-TensorRT-Post-Merge-1": ["l40s", "l0_l40s", 1, 5],
         "L40S-TensorRT-Post-Merge-2": ["l40s", "l0_l40s", 2, 5],
         "L40S-TensorRT-Post-Merge-3": ["l40s", "l0_l40s", 3, 5],
