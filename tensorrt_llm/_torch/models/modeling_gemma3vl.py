@@ -1,3 +1,4 @@
+import copy
 import dataclasses
 import os
 from typing import List, Optional, Tuple
@@ -6,6 +7,9 @@ import torch
 from transformers import AutoProcessor, Gemma3Config, PreTrainedModel
 from transformers.modeling_utils import no_init_weights
 from transformers.models.gemma3.modeling_gemma3 import Gemma3MultiModalProjector
+
+from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
+    BaseWeightMapper
 
 from ..._utils import nvtx_range
 from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
@@ -98,13 +102,14 @@ class Gemma3VLM(PreTrainedModel):
                                             dtype=torch.int32,
                                             device=self._device)
 
-        self.model_config = model_config
+        model_config_cp = copy.deepcopy(model_config)
+        self.model_config = model_config_cp
 
-        llm_model_config = self.get_sub_model_config(model_config,
+        llm_model_config = self.get_sub_model_config(model_config_cp,
                                                      "text_config")
         self.llm = Gemma3ForCausalLM(llm_model_config)
 
-        vision_model_config = self.get_sub_model_config(model_config,
+        vision_model_config = self.get_sub_model_config(model_config_cp,
                                                         "vision_config")
         self.siglip_tower = SiglipVisionModel(vision_model_config,
                                               use_post_layernorm=True)
@@ -141,9 +146,9 @@ class Gemma3VLM(PreTrainedModel):
             sub_model_config.pretrained_config.torch_dtype = model_config.pretrained_config.torch_dtype
         return sub_model_config
 
-    def load_weights(self, weights):
+    def load_weights(self, weights, weight_mapper: BaseWeightMapper):
         llm_weights = filter_weights("language_model", weights)
-        self.llm.load_weights(llm_weights)
+        self.llm.load_weights(llm_weights, weight_mapper)
 
         vit_weights = filter_weights("vision_tower", weights)
         self.siglip_tower.load_weights(vit_weights)
