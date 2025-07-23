@@ -787,6 +787,9 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skip(
+        reason=
+        "Skipped because cyclic kv cache is disabled on the feature branch")
     def test_auto_dtype_vswa(self):
         # # NOTE: Test with VSWA kv cache config.
         # self.kv_cache_config.max_attention_window = [

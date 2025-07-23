@@ -419,4 +419,9 @@ class TritonLinear(Linear):
             return TritonUnquantizedLinearMethod()
         if quant_config.layer_quant_mode.has_fp8_qdq():
             return TritonFP8QDQLinearMethod()
+        if quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8():
+            return TritonMXFP4LinearMethod(activation_dtype=torch.float8_e4m3fn)
+        if quant_config.layer_quant_mode.has_w4a16_mxfp4():
+            assert self.dtype == torch.bfloat16, "Only bfloat16 is supported for W4A16 MXFP4"
+            return TritonMXFP4LinearMethod(activation_dtype=self.dtype)
         raise ValueError(f'unsupported quant mode: {quant_config.quant_mode}')
