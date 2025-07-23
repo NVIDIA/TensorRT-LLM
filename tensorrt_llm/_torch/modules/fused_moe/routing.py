@@ -37,15 +37,15 @@ class BaseMoeRoutingMethod(nn.Module):
         """
         raise NotImplementedError("Subclasses must implement this method")
 
-    def get_experts_per_token(self):
+    def get_experts_per_token(self) -> int:
         return self.top_k
 
     @property
-    def experts_per_token(self):
+    def experts_per_token(self) -> int:
         return self.get_experts_per_token()
 
     @property
-    def routing_method_type(self):
+    def routing_method_type(self) -> RoutingMethodType:
         return RoutingMethodType.Unspecified
 
 

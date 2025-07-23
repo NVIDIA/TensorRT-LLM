@@ -1,6 +1,11 @@
+import os
+from functools import cached_property
 from typing import Dict, List, Optional, Union
 
 import torch
+
+from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
+from tensorrt_llm.math_utils import pad_up
 
 from ...distributed import allgather
 from ...model_config import ModelConfig
@@ -126,6 +131,16 @@ class CutlassFusedMoE(MoE):
         self.has_been_profiled = False
         self.has_been_profiled_min_latency = False
 
+        # TODO: AlltoAll code is largely duplicated with WideEPMoE. Consider refactor and reuse in the future.
+        self.alltoall_workspace = None
+        self.alltoall_prepare_workspace = None
+        if self.enable_alltoall:
+            MnnvlMemory.initialize()
+            self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
+                model_config.mapping)
+            self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
+                model_config.mapping)
+
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
 
@@ -158,6 +173,14 @@ class CutlassFusedMoE(MoE):
         assert self._weights_created
         return self.quant_config and self.quant_config.quant_mode.is_int4_weight_only_per_group(
         )
+
+    @cached_property
+    def enable_alltoall(self):
+        return (self.mapping.moe_ep_size > self.routing_method.experts_per_token
+                and self.mapping.enable_attention_dp
+                and self.mapping.tp_size > 1
+                and os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") != "1"
+                and MnnvlMemory.supports_mnnvl())
 
     def _get_quant_method(self):
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
@@ -231,6 +254,8 @@ class CutlassFusedMoE(MoE):
         use_mxfp8_act_scaling = False
         weight_dtype = self.w3_w1_weight.dtype
         x_sf = None
+        x_row = x.shape[0]
+        x_col = x.shape[1]
         if self.has_any_quant:
             if self.has_fp8_qdq or self.has_w4a8_mxfp4_fp8:
                 x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
@@ -248,7 +273,7 @@ class CutlassFusedMoE(MoE):
                 use_w4_group_scaling = True
                 weight_dtype = torch.uint8
             elif self.has_nvfp4:
-                if run_post_quant_allgather:
+                if run_post_quant_allgather or self.enable_alltoall:
                     if isinstance(x, Fp4QuantizedTensor):
                         assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before communication"
                         x_row = x.shape[0]
@@ -273,7 +298,7 @@ class CutlassFusedMoE(MoE):
                 x = torch.nn.functional.pad(x, (0, pad_size))
                 # Update x_row and x_col to the padded shape
                 x_row, x_col = x.shape[0], x.shape[1]
-                if run_post_quant_allgather:
+                if run_post_quant_allgather or self.enable_alltoall:
                     x, x_sf = torch.ops.trtllm.mxfp8_quantize(x, False)
                 else:
                     x, x_sf = torch.ops.trtllm.mxfp8_quantize(x, True)
@@ -282,8 +307,58 @@ class CutlassFusedMoE(MoE):
                     f"unsupported quantization mode: {self.quant_config.quant_mode}"
                 )
 
-        # gather inputs for attention dp
-        if run_post_quant_allgather:
+        # Alltoall or allgather for attention DP
+        token_count = x.shape[0]
+        alltoall_info = None  # Store for later combine
+        if self.enable_alltoall:
+            assert all_rank_num_tokens is not None, "all_rank_num_tokens required for alltoall"
+            # Prepare alltoall indices
+            top_k = self.routing_method.experts_per_token
+            max_num_token = max(
+                all_rank_num_tokens) if all_rank_num_tokens else token_count
+
+            # Handle case where token_final_scales might be None (when apply_router_weight_on_input=True)
+            if token_final_scales is None:
+                token_final_scales = torch.ones_like(token_selected_experts,
+                                                     dtype=torch.float32)
+
+            # TODO: support alltoall without allgather for top_k % 4 != 0
+            assert top_k % 4 == 0, "alltoall without allgather only supports top_k % 4 == 0"
+            assert self.alltoall_prepare_workspace is not None, "alltoall_prepare_workspace should be initialized"
+            alltoall_info, token_selected_experts, token_final_scales, _ = MnnvlMoe.mnnvl_moe_alltoallv_prepare_without_allgather(
+                token_selected_experts, token_final_scales, None,
+                self.alltoall_prepare_workspace, max_num_token, self.ep_rank,
+                self.ep_size, self.num_experts, self.num_experts, top_k)
+
+            # Dispatch alltoall (common for both paths)
+            x = MnnvlMoe.mnnvl_moe_alltoallv(x, alltoall_info,
+                                             self.alltoall_workspace,
+                                             self.ep_rank, self.ep_size)
+            if x_sf is not None:
+                x_sf = x_sf.view(x_row, ceil_div(x_col,
+                                                 self.scaling_vector_size))
+
+                # Pad dim[1] to 16 bytes alignment for alltoall
+                # TODO: Remove this padding if possible
+                sf_per_16bytes = 16 // x_sf.element_size()
+                x_sf_col_orig = x_sf.shape[1]
+                x_sf_col = pad_up(x_sf_col_orig, sf_per_16bytes)
+                if x_sf_col > x_sf_col_orig:
+                    x_sf = torch.nn.functional.pad(
+                        x_sf, (0, x_sf_col - x_sf_col_orig))
+
+                x_sf = MnnvlMoe.mnnvl_moe_alltoallv(x_sf, alltoall_info,
+                                                    self.alltoall_workspace,
+                                                    self.ep_rank, self.ep_size)
+                x_row = x_sf.shape[0]
+
+                # TODO: Remove this slicing required by padding if possible
+                x_sf = x_sf[:, :x_sf_col_orig].contiguous()
+
+                x_sf = swizzle_sf(x_sf, x_row, x_col, self.scaling_vector_size)
+
+        elif run_post_quant_allgather:
+            # Original allgather logic
             if x_sf is not None:
                 x_sf = x_sf.view(x_row, ceil_div(x_col,
                                                  self.scaling_vector_size))
@@ -338,6 +413,18 @@ class CutlassFusedMoE(MoE):
             final_hidden_states = final_hidden_states[:, :
                                                       original_hidden_size].contiguous(
                                                       )
+
+        # Combine results if using alltoall
+        if self.enable_alltoall and alltoall_info is not None:
+            top_k = self.routing_method.experts_per_token
+            final_hidden_states = MnnvlMoe.mnnvl_moe_alltoallv_combine(
+                final_hidden_states,
+                alltoall_info,
+                self.alltoall_workspace,
+                ep_rank=self.ep_rank,
+                ep_size=self.ep_size,
+                top_k=top_k,
+                token_count=token_count)
 
         return final_hidden_states
 
