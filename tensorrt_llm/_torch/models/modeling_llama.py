@@ -69,6 +69,11 @@ class Llama4Attention(Attention):
             # This is safe to do because we limit seqlen to 8k for
             # non TRTLLM backends.
             attention_chunk_size = None
+        else:
+            # Disable chunked attention when max_num_tokens is smaller than attention_chunk_size
+            # TODO: Remove this after all attention kernels in TRTLLM backend support chunked attention
+            if attention_chunk_size and model_config.max_num_tokens < attention_chunk_size:
+                attention_chunk_size = None
 
         super().__init__(
             hidden_size=config.hidden_size,
