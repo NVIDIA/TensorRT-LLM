@@ -124,3 +124,5 @@ mistralai/Ministral-8B-Instruct-2410:
     accuracy: 78.35
 microsoft/Phi-4-multimodal-instruct:
   - accuracy: 81.19
+microsoft/Phi-4-mini-instruct:
+  - accuracy: 82.30
