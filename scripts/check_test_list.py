@@ -24,6 +24,10 @@ def install_python_dependencies(llm_src):
         shell=True,
         check=True)
     subprocess.run(
+        f"pip3 install -i https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple triton==3.4.1",
+        shell=True,
+        check=True)
+    subprocess.run(
         f"pip3 install --force-reinstall --no-deps {llm_src}/../tensorrt_llm-*.whl",
         shell=True,
         check=True)

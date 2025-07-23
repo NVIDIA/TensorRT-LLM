@@ -289,13 +289,13 @@ class ModelConfig(Generic[TConfig]):
             quant_algo = ModelConfig.override_quant_algo()
             if quant_algo is None and not is_dynamic_quant:
                 # Get default quant_algo for mxfp4 checkpoints
-                if moe_backend == 'TRITON':
-                    quant_algo = QuantAlgo.W4A16_MXFP4
-                else:
-                    if get_sm_version() >= 100:
-                        quant_algo = QuantAlgo.W4A8_MXFP4_MXFP8
+                if get_sm_version() >= 100:
+                    if moe_backend == 'TRITON':
+                        quant_algo = QuantAlgo.W4A8_MXFP4_FP8
                     else:
-                        quant_algo = QuantAlgo.W4A16_MXFP4
+                        quant_algo = QuantAlgo.W4A8_MXFP4_MXFP8
+                else:
+                    quant_algo = QuantAlgo.W4A16_MXFP4
             quant_config.quant_algo = quant_algo
             quant_config.group_size = 32
             quant_config.exclude_modules = list(exclude_modules)

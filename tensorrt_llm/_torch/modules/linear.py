@@ -1544,23 +1544,7 @@ class Linear(nn.Module):
             self.create_weights()
 
     def get_quant_method(self, quant_config: Optional[QuantConfig] = None):
-        if quant_config is None or not quant_config.layer_quant_mode.has_any_quant(
-                exclude_kv_cache=True):
-            return UnquantizedLinearMethod()
-        if quant_config.layer_quant_mode.has_fp8_qdq():
-            return FP8QDQLinearMethod()
-        if quant_config.layer_quant_mode.has_fp8_block_scales():
-            return FP8BlockScalesLinearMethod()
-        if quant_config.layer_quant_mode.has_nvfp4():
-            return NVFP4LinearMethod()
-        if quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8():
-            return W4A8MXFP4FP8LinearMethod()
-        if quant_config.layer_quant_mode.is_int4_weight_only_per_group(
-        ) and quant_config.quant_algo == QuantAlgo.W4A16_AWQ:
-            return W4A16_AWQ_LinearMethod()
-        if quant_config.layer_quant_mode.has_w4a8_mxfp4_mxfp8():
-            return W4A8MXFP4MXFP8LinearMethod()
-        raise ValueError(f'unsupported quant mode: {quant_config.quant_mode}')
+        return get_quant_method(quant_config)
 
     def create_weights(self):
         if self._weights_created:

@@ -158,19 +158,13 @@ def test_linear_mxfp4(activation_dtype):
         _, input_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(x)
         weights["input_scale"] = input_scale
 
-    # Override the quantization method for test purpose
-    from tensorrt_llm._torch.modules.triton_linear import \
-        TritonMXFP4LinearMethod
-    quant_method = lambda: TritonMXFP4LinearMethod(activation_dtype=
-                                                   activation_dtype)
+    quant_algo = QuantAlgo.W4A8_MXFP4_FP8 if activation_dtype == torch.float8_e4m3fn else QuantAlgo.W4A16_MXFP4
 
-    linear = TritonLinear(
-        in_features=hidden_size,
-        out_features=out_size,
-        bias=True,
-        dtype=dtype,
-        override_quant_method=quant_method,
-    )
+    linear = TritonLinear(in_features=hidden_size,
+                          out_features=out_size,
+                          bias=True,
+                          dtype=dtype,
+                          quant_config=QuantConfig(quant_algo=quant_algo))
     linear.load_weights([weights])
     linear.cuda()
 
