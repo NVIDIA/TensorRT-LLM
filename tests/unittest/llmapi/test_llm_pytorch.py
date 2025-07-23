@@ -10,13 +10,13 @@ from .lora_test_utils import (
     check_llama_7b_multi_lora_from_request_test_harness,
     check_llama_7b_multi_unique_lora_adapters_from_request,
     create_mock_nemo_lora_checkpoint)
-from .test_llm import (get_model_path, global_kvcache_config, llama_model_path,
+from .test_llm import (_test_llm_capture_request_error, get_model_path,
+                       global_kvcache_config, llama_model_path,
                        llm_get_stats_async_test_harness,
                        llm_get_stats_test_harness, prompts,
                        run_llm_abort_request,
                        run_llm_with_postprocess_parallel_and_result_handler,
-                       tinyllama_logits_processor_test_harness,
-                       _test_llm_capture_request_error)
+                       tinyllama_logits_processor_test_harness)
 from utils.util import (EnvVarsContextManager, force_ampere,
                         run_function_in_sub_process, similar,
                         skip_gpu_memory_less_than_40gb,
