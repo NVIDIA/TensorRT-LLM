@@ -2,6 +2,7 @@ import dataclasses
 import datetime
 import functools
 import gc
+import importlib
 import os
 import threading
 import time
@@ -27,9 +28,11 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             RequestStage, RequestStats,
                                             SpecDecodingStats,
                                             StaticBatchingStats)
-from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
+from tensorrt_llm.bindings.internal.batch_manager import (KvCacheConnectorRole,
+                                                          LlmRequestType,
                                                           ReqIdsSet)
 from tensorrt_llm.logger import logger
+from tensorrt_llm.models.modeling_utils import KvCacheConnectorConfig
 from tensorrt_llm.runtime.generation import CUASSERT
 
 from ..distributed import Distributed
@@ -132,6 +135,13 @@ class BatchStatePP(BatchState):
     scheduled_ctx_reqs: list[LlmRequest] = None
 
 
+def load_connector_module(kv_connector_config: KvCacheConnectorConfig):
+    module_name = kv_connector_config.connector_module
+    class_name = kv_connector_config.connector_class
+    module = importlib.import_module(module_name)
+    return getattr(module, class_name)
+
+
 class PyExecutor:
 
     def __init__(self,
@@ -150,7 +160,8 @@ class PyExecutor:
                  kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
                  guided_decoder: Optional[GuidedDecoder] = None,
                  garbage_collection_gen0_threshold: Optional[int] = None,
-                 start_worker: bool = True):
+                 start_worker: bool = True,
+                 kv_connector_config: Optional[KvCacheConnectorConfig] = None):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = global_mpi_rank()
@@ -263,6 +274,17 @@ class PyExecutor:
 
         self.worker_started = False
         self.worker_lock = threading.Lock()
+
+        print("LOADING WITH KV CONNECTOR CONFIG", kv_connector_config)
+        if kv_connector_config is not None:
+            connector_cls = load_connector_module(kv_connector_config)
+
+            self.connector_worker = connector_cls(KvCacheConnectorRole.Worker)
+
+            if global_mpi_rank() == 0:
+                self.connector_scheduler = connector_cls(
+                    KvCacheConnectorRole.Scheduler)
+
         if start_worker:
             self.start_worker()
 

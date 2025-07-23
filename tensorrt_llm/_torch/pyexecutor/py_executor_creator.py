@@ -15,6 +15,7 @@ from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import KvCacheConnectorConfig
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
@@ -195,7 +196,9 @@ def create_py_executor(
         executor_config: ExecutorConfig,
         checkpoint_dir: str = None,
         lora_config: Optional[LoraConfig] = None,
-        garbage_collection_gen0_threshold: Optional[int] = None) -> PyExecutor:
+        garbage_collection_gen0_threshold: Optional[int] = None,
+        kv_connector_config: Optional[KvCacheConnectorConfig] = None
+) -> PyExecutor:
     _mangle_executor_config(executor_config)
     pytorch_backend_config = executor_config.pytorch_backend_config
 
@@ -408,6 +411,7 @@ def create_py_executor(
             guided_decoder=guided_decoder,
             lora_config=lora_config,
             garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
+            kv_connector_config=kv_connector_config,
         )
 
     if estimating_kv_cache:
@@ -451,6 +455,7 @@ def create_py_executor(
                 lora_config=lora_config,
                 garbage_collection_gen0_threshold=
                 garbage_collection_gen0_threshold,
+                kv_connector_config=kv_connector_config,
             )
 
     _adjust_torch_mem_fraction(executor_config.pytorch_backend_config)

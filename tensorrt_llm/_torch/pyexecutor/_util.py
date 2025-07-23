@@ -17,6 +17,7 @@ from tensorrt_llm.lora_manager import (LoraConfig,
                                        get_default_trtllm_modules_to_hf_modules,
                                        load_torch_lora)
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import KvCacheConnectorConfig
 
 from ..model_config import ModelConfig
 from ..speculative import get_num_extra_kv_tokens, get_spec_decoder
@@ -418,7 +419,9 @@ def create_py_executor_instance(
         drafter,
         guided_decoder: Optional[GuidedDecoder] = None,
         lora_config: Optional[LoraConfig] = None,
-        garbage_collection_gen0_threshold: Optional[int] = None) -> PyExecutor:
+        garbage_collection_gen0_threshold: Optional[int] = None,
+        kv_connector_config: Optional[KvCacheConnectorConfig] = None
+) -> PyExecutor:
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
 
     spec_config = model_engine.spec_config
@@ -558,7 +561,8 @@ def create_py_executor_instance(
         kv_cache_transceiver=kv_cache_transceiver,
         guided_decoder=guided_decoder,
         start_worker=start_worker,
-        garbage_collection_gen0_threshold=garbage_collection_gen0_threshold)
+        garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
+        kv_connector_config=kv_connector_config)
 
 
 def create_torch_sampler_args(executor_config: ExecutorConfig, mapping: Mapping,
