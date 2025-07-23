@@ -77,7 +77,10 @@ class GuidedDecoder:
                     # Rollback the grammar matcher to the last accepted token.
                     num_rollback_tokens = self.num_guided_tokens[slot] - (
                         1 + llm_req.py_num_accepted_draft_tokens)
-                    assert num_rollback_tokens >= 0
+                    if num_rollback_tokens < 0:
+                        raise ValueError(
+                            f"Failed to rollback: num_guided_tokens={self.num_guided_tokens[slot]}, num_accepted_draft_tokens={llm_req.py_num_accepted_draft_tokens}, num_rollback_tokens={num_rollback_tokens}"
+                        )
                     matcher.rollback(num_rollback_tokens)
 
                     # Currently, guided decoding does not support with beam search.
