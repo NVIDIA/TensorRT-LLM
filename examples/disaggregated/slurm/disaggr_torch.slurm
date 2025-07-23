@@ -4,19 +4,21 @@
 #SBATCH --ntasks-per-node=4
 #SBATCH --partition=${partition} # add your partition here
 #SBATCH --account=${account} # add your account here
-#SBATCH --time=01:00:00
+#SBATCH --time=02:00:00
 #SBATCH --job-name=${job_name} # add your job name here
 
 isl=1024
 osl=1024
-multi_round=1
+multi_round=10
 gen_yaml_file=gen_yaml.py
+streaming=true
 container_image=${container_image} # add your container image here
 mount_dir=${mount_dir} # add your mount directory here
-workdir=${mount_dir}/bench-large-ep/slurm_scripts/
+workdir=${workdir} # add your path to the slurm scripts here
 model_dir=${model_dir} # add your model directory here
-logdir=${workdir}/bm_20250703_deepseek-r1-${isl}-${osl}/
-streaming=false
+
+mounts=${mount_dir}:${mount_dir}
+logdir=${workdir}/benchmark-${isl}-${osl}/
 mkdir -p ${logdir}
 
 container_name=disaggr-test
@@ -36,7 +38,7 @@ eplb_num_slots=${12}
 mtp_size=${13}
 concurrency=${14}
 
-sub_dir=${logdir}/dep${gen_tp_size}_concurrency${concurrency}_eplb${eplb_num_slots}_mtp${mtp_size}
+full_logdir=${logdir}/dep${gen_tp_size}_concurrency${concurrency}_eplb${eplb_num_slots}_mtp${mtp_size}
 
 ctx_gpus=$((num_ctx_servers * ctx_tp_size))
 gen_gpus=$((num_gen_servers * gen_tp_size))
@@ -47,22 +49,23 @@ enable_pdl=false
 if [ "${gen_enable_attention_dp}" = "false" ]; then
     enable_pdl=true
     echo "enable_pdl: ${enable_pdl}"
-    sub_dir=${logdir}/tep${gen_tp_size}_concurrency${concurrency}_eplb${eplb_num_slots}_mtp${mtp_size}
+    full_logdir=${logdir}/tep${gen_tp_size}_concurrency${concurrency}_eplb${eplb_num_slots}_mtp${mtp_size}
 fi
-
-full_logdir=${sub_dir}
 mkdir -p ${full_logdir}
+
+nsys_on=""
+# nsys_on=${full_logdir} # Uncomment this line to enable Nsys profiling
 
 # start the container
 srun -l --container-image=${container_image} \
         --container-name=${container_name} \
-        --container-mounts=${mount_dir}:${mount_dir} \
+        --container-mounts=${mounts} \
         --mpi=pmix \
         echo "Container up."
 
 # generate the yaml file
 srun -l --container-name=${container_name} \
-        --container-mounts=${mount_dir}:${mount_dir} \
+        --container-mounts=${mounts} \
         --mpi=pmix --overlap \
         python3 ${workdir}/${gen_yaml_file} --config ${full_logdir}/config.yaml \
             --model ${model_dir} \
@@ -87,33 +90,32 @@ echo "server host name: $hostname_value"
 
 # try to kill the server and workers
 srun -l --container-name=${container_name} \
-        --container-mounts=${mount_dir}:${mount_dir} \
+        --container-mounts=${mounts} \
         --mpi=pmix --overlap \
         pkill -f "trtllm-serve" || true
 
-nsys_on=""
-# nsys_on=${full_logdir}
-
 # start the workers
 srun -l --container-name=${container_name} \
-        --container-mounts=${mount_dir}:${mount_dir} \
+        --container-mounts=${mounts} \
     --mpi=pmix --overlap \
     bash ${workdir}/start_worker.sh ${full_logdir}/config.yaml "${concurrency}" "${enable_pdl}" ${ctx_gpus} ${nsys_on} &> ${full_logdir}/output_workers.log &
+
 # start the server
 srun -l --container-name=${container_name} \
-        --container-mounts=${mount_dir}:${mount_dir} \
+        --container-mounts=${mounts} \
         --mpi=pmix --overlap -N 1 -n 1 \
         -w ${hostname_value} \
         bash ${workdir}/start_server.sh ${full_logdir}/config.yaml &> ${full_logdir}/output_server.log &
+
 # start benchmarking
 srun -l --container-name=${container_name} \
-        --container-mounts=${mount_dir}:${mount_dir} \
+        --container-mounts=${mounts} \
         --mpi=pmix --overlap -N 1 -n 1 \
         bash ${workdir}/run_benchmark.sh ${isl} ${osl} ${multi_round} ${model_dir} "${concurrency}" ${streaming} ${full_logdir}/ > ${full_logdir}/benchmark.log 2>&1
 
 # try to kill the server and workers
 srun -l --container-name=${container_name} \
-        --container-mounts=${mount_dir}:${mount_dir} \
+        --container-mounts=${mounts} \
         --mpi=pmix --overlap \
         kill -9 $(ps aux | grep '[t]rtllm-serve' | awk '{print $2}') >/dev/null 2>&1 || true
 wait
