@@ -127,7 +127,7 @@ class TestCustomOp(CustomOpTestCaseBase):
 
         self.assertFalse(library_utils.has_fake_kernel(op))
 
-    # Better to add OpInfo for each custiom op, and use opcheck to test the custom ops.
+    # Better to add OpInfo for each custom op, and use opcheck to test the custom ops.
     # Currently OpInfo for custom ops are not available in the codebase.
     # As a trade-off, only fake registration is checked.
     def test_register_fake(self):
