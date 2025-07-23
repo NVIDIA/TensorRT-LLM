@@ -32,6 +32,10 @@ TRT-LLM uses some environment variables to control the behavior of disaggregated
 
 * `TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM`: The maximum number of concurrent KV cache sends. The default value is `4`. This environment variable only takes effect when `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE` is greater than 0.
 
+There are some other useful environment variables that may help when encountering failures or performance issues.
+
+* `NCCL_GRAPH_MIXING_SUPPORT`: With the default value `1`, the CUDA driver may create too many CUDA streams while working with one CUDA graph, leading to performance drop. Setting it to `0` will reduce the number of CUDA streams, but please make sure there are no other NCCL ops outside the one CUDA graph, otherwise it's unsafe.
+
 ## Troubleshooting and FAQ
 
 ### General FAQs
