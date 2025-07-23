@@ -156,9 +156,6 @@ class LogitBiasLogitsProcessor(LogitsProcessor):
         with torch.cuda.stream(stream):
             logits[:, :, token_ids_list] += bias_values
 
-        if stream is not None:
-            stream.synchronize()
-
 
 @dataclass(slots=True, kw_only=True)
 class AdditionalModelOutput:
