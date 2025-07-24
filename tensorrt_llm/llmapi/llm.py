@@ -920,17 +920,21 @@ class _TorchLLM(BaseLLM):
         max_num_tokens = self.args.max_num_tokens
         max_seq_len = self.args.max_seq_len
 
+        kwargs = {}
+        if self._on_trt_backend:
+            kwargs[
+                "batching_type"] = self.args.batching_type or tllm.BatchingType.INFLIGHT
+
         self._executor_config = tllm.ExecutorConfig(
             max_beam_width=self.args.max_beam_width,
             scheduler_config=PybindMirror.maybe_to_pybind(
                 self.args.scheduler_config),
-            batching_type=PybindMirror.maybe_to_pybind(self.args.batching_type)
-            or tllm.BatchingType.INFLIGHT,
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
             gather_generation_logits=self.args.gather_generation_logits,
             fail_fast_on_attention_window_too_large=getattr(
-                self.args, 'fail_fast_on_attention_window_too_large', False))
+                self.args, 'fail_fast_on_attention_window_too_large', False),
+            **kwargs)
 
         if self.args.kv_cache_config is not None:
             self._executor_config.kv_cache_config = PybindMirror.maybe_to_pybind(
@@ -959,7 +963,8 @@ class _TorchLLM(BaseLLM):
                 f"Unsupported guided decoding backend {self.args.guided_decoding_backend}"
             )
 
-        self._executor_config.normalize_log_probs = self.args.normalize_log_probs
+        if self._on_trt_backend:
+            self._executor_config.normalize_log_probs = self.args.normalize_log_probs
         self._executor_config.enable_chunked_context = self.args.enable_chunked_prefill
         self._executor_config.max_beam_width = self.args.max_beam_width
         if self.args.cache_transceiver_config is not None:

@@ -71,9 +71,9 @@ def Field(default: Any = ...,
     Args:
         default: The default value for the field
         status: Optional status indicator that gets added to json_schema_extra.
-           - None: stable
-           - "beta": beta, recommended to use according to the latest documentation
-           - "prototype": prototype, not recommended to use
+            - None: Stable.
+            - "beta": Recommended for use per the latest documentation.
+            - "prototype": Not yet stable and subject to breaking changes; intended for experimentation only.
         **kwargs: All other arguments passed to the original Pydantic Field
 
     Returns:
@@ -1155,7 +1155,10 @@ class BaseLlmArgs(BaseModel):
     decoding_config: Optional[object] = Field(
         default=None,
         description="The decoding config.",
-        json_schema_extra={"type": "Optional[DecodingConfig]"},
+        json_schema_extra={
+            "type": "Optional[tensorrt_llm.llmapi.llm_args.DecodingConfig]"
+        },
+        status="deprecated",
         deprecated="Use speculative_config instead.",
     )
 

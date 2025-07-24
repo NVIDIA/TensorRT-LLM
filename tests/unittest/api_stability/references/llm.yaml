@@ -147,6 +147,10 @@ methods:
         annotation: Optional[Literal['AUTO', 'NCCL', 'UB', 'MINLATENCY', 'ONESHOT', 'TWOSHOT', 'LOWPRECISION', 'MNNVL']]
         default: AUTO
         status: beta
+      decoding_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.DecodingConfig]
+        default: null
+        status: deprecated
     return_annotation: None
   generate:
     parameters:

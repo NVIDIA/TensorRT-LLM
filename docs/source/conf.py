@@ -155,8 +155,10 @@ html_css_files = [
 ]
 
 
-def tag_role(name, rawtext, text, lineno, inliner, options={}, content=[]):
+def tag_role(name, rawtext, text, lineno, inliner, options=None, content=None):
     """A custom role for displaying tags."""
+    options = options or {}
+    content = content or []
     tag_name = text.lower()
     node = nodes.literal(text, text, classes=['tag', tag_name])
     return [node], []
