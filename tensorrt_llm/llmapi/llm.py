@@ -379,7 +379,7 @@ class BaseLLM:
                         inputs, sampling_params)
             elif 'multi_modal_embeddings' in inputs:
                 mm_embedding_info = inputs['multi_modal_embeddings']
-                prompt_token_ids, extra_processed_inputs = self.input_processor.attch_multimodal_embeddings(
+                prompt_token_ids, extra_processed_inputs = self.input_processor.attach_multimodal_embeddings(
                     inputs, mm_embedding_info, sampling_params)
             else:
                 with nvtx_range_debug("input_processor"):

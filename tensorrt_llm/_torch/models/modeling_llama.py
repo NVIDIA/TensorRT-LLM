@@ -819,7 +819,7 @@ class Llama4InputProcessor(InputProcessor):
         }).cuda()
         load_sharded_checkpoint(self.encoder, model_path, strict=False)
 
-    def attch_multimodal_embeddings(
+    def attach_multimodal_embeddings(
         self, inputs: TextPrompt, multimodal_embedding: Dict[str,
                                                              List[Dict[str,
                                                                        Any]]],

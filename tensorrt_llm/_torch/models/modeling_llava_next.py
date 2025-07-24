@@ -195,7 +195,7 @@ class LlavaNextInputProcessor(InputProcessor):
         mm_features = mm_features.view(-1, mm_features.shape[-1])
         return fused_input_ids, mm_features
 
-    def attch_multimodal_embeddings(
+    def attach_multimodal_embeddings(
         self, inputs: TextPrompt,
         multimodal_embedding: Dict[str, List[torch.Tensor]],
         sampling_params: SamplingParams
