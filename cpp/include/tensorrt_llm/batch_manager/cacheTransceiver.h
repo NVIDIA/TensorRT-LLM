@@ -110,9 +110,9 @@ private:
 
     void setContextState(LlmRequest* llmRequest);
 
-    std::unique_ptr<DataResponder> mDataResponder;
+    std::unique_ptr<DataResponder> mCacheSender;
     std::unique_ptr<DataRequester> mDataRequester;
-    std::vector<std::pair<LlmRequest*, std::future<void>>> mResponderFutures;
+    std::vector<std::pair<LlmRequest*, std::future<void>>> mSenderFutures;
     std::vector<std::pair<LlmRequest*, std::future<void>>> mRequesterFutures;
     mpi::MpiComm const *mMpiGroupComm{nullptr}, *mMpiWorldComm{nullptr};
     std::shared_ptr<mpi::MpiComm> mMpiGroupTensorParaComm, mMpiGroupPipeParaComm, mMpiGroupDataComm,

@@ -394,14 +394,14 @@ protected:
         mCacheTransBufferManager = std::make_unique<CacheTransBufferManager>(mManager.get(), maxNumTokens);
         if (isSender)
         {
-            mResponder = std::make_unique<DataResponder>(
-                std::make_unique<DataSenderImpl>(mConnectionManager.get(), *mCacheState, mlocalRank,
+            mSender = std::make_unique<DataResponder>(
+                std::make_unique<CacheSenderImpl>(mConnectionManager.get(), *mCacheState, mlocalRank,
                     std::make_unique<CacheFormatter>(mManager.get(), mCacheTransBufferManager.get())));
         }
         else
         {
             mRequester = std::make_unique<DataRequester>(
-                std::make_unique<DataReceiverImpl>(mConnectionManager.get(), *mCacheState, mlocalRank,
+                std::make_unique<CacheReceiverImpl>(mConnectionManager.get(), *mCacheState, mlocalRank,
                     std::make_unique<CacheFormatter>(mManager.get(), mCacheTransBufferManager.get())));
         }
     }
@@ -432,7 +432,7 @@ protected:
                 // fill cache with tokens (= request length), for reuse test
                 TLLM_CUDA_CHECK(cudaMemset(block.data(), llmRequest->getPromptLen(), block.getSizeInBytes()));
             }
-            mFutures.emplace_back(mResponder->respondAndSendAsync(*llmRequest));
+            mFutures.emplace_back(mSender->respondAndSendAsync(*llmRequest));
         }
         else
         {
@@ -457,7 +457,7 @@ protected:
     SizeType32 mMaxNumSequences{};
     std::unique_ptr<KVCacheManager> mManager;
     std::unique_ptr<CacheTransBufferManager> mCacheTransBufferManager;
-    std::unique_ptr<DataResponder> mResponder;
+    std::unique_ptr<DataResponder> mSender;
     std::unique_ptr<DataRequester> mRequester;
     std::unique_ptr<texec::kv_cache::CacheState> mCacheState;
     std::unique_ptr<texec::kv_cache::CommState> mContextCommState;
@@ -764,12 +764,12 @@ protected:
 
             if (mIsContext)
             {
-                mResponder = std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(
+                mSender = std::make_unique<DataResponder>(std::make_unique<CacheSenderImpl>(
                     mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter()));
             }
             else
             {
-                mRequester = std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(
+                mRequester = std::make_unique<DataRequester>(std::make_unique<CacheReceiverImpl>(
                     mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter()));
             }
 
@@ -904,7 +904,7 @@ protected:
         auto const onlyWindowSize = blockManager.getPoolWindowSize(0);
 
         blockManager.getBufferManager(onlyWindowSize).getStream().synchronize();
-        auto future = mResponder->respondAndSendAsync(*llmRequest);
+        auto future = mSender->respondAndSendAsync(*llmRequest);
         return future;
     }
 
@@ -1112,7 +1112,7 @@ protected:
     SizeType32 mMaxNumSequences{};
     std::unique_ptr<KVCacheManager> mManager;
     std::unique_ptr<CacheTransBufferManager> mCacheTransBufferManager;
-    std::unique_ptr<DataResponder> mResponder;
+    std::unique_ptr<DataResponder> mSender;
     std::unique_ptr<DataRequester> mRequester;
     std::unique_ptr<texec::kv_cache::CacheState> mCacheState;
     std::unique_ptr<texec::kv_cache::CacheState> mContextCacheState;
