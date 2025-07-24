@@ -1229,7 +1229,6 @@ class PyTorchModelEngine(ModelEngine):
                 multimodal_runtime=py_multimodal_runtime)
 
             if multimodal_params.has_content():
-                multimodal_params.from_shared_tensor("multimodal_data")
                 multimodal_params.to_device("multimodal_data",
                                             "cuda",
                                             pin_memory=True)

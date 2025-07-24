@@ -159,6 +159,10 @@ class MultimodalParams:
         multimodal_input: Multimodal input data with hashing information.
         multimodal_data: Processed multimodal data containing embeddings, configurations,
                         and modality-specific data organized by type.
+        multimodal_runtime: Runtime data for tracking multimodal token caching and reuse
+                           during KV cache scenarios. Contains information about cached
+                           tokens, multimodal token positions, and lengths for efficient
+                           processing during inference.
 
     Structure of multimodal_data:
         {
@@ -209,10 +213,15 @@ class MultimodalParams:
 
         # Additional validation based on method_key
         method_key = obj.get('method_key')
-        if method_key == 1:  # CUDA tensor
+
+        # Import here to avoid circular imports
+        from tensorrt_llm._torch.shared_tensor import \
+            _SharedTensorRebuildMethodRegistry
+
+        if method_key == _SharedTensorRebuildMethodRegistry.REBUILD_CUDA:
             cuda_keys = {'tensor_size', 'storage_handle', 'storage_device'}
             return cuda_keys.issubset(obj.keys())
-        elif method_key == 2:  # CPU tensor
+        elif method_key == _SharedTensorRebuildMethodRegistry.REBUILD_CPU:
             cpu_keys = {'tensor_size', 'storage_handle', 'manager_handle'}
             return cpu_keys.issubset(obj.keys())
 
@@ -253,6 +262,7 @@ class MultimodalParams:
                     input_data):
                 # Convert shared tensor dict back to tensor
                 try:
+                    # Import here to avoid circular imports
                     from tensorrt_llm._torch.shared_tensor import \
                         SharedTensorContainer
 
@@ -275,6 +285,7 @@ class MultimodalParams:
         if isinstance(input_data, torch.Tensor):
             if operation == "to_shared_tensor":
                 try:
+                    # Import here to avoid circular imports
                     from tensorrt_llm._torch.shared_tensor import \
                         SharedTensorContainer
                     return SharedTensorContainer.from_tensor(
@@ -340,14 +351,11 @@ class MultimodalParams:
                                                         "to_shared_tensor")
         setattr(self, element, transformed_data)
 
-    def from_shared_tensor(self, element: str, mode: str = "context") -> None:
+    def from_shared_tensor(self, element: str) -> None:
         """Move specified multimodal data element from shared tensor.
 
         Args:
             element: Element to restore ("multimodal_data" or "multimodal_input")
-            mode: Recovery mode - "context" or "generation"
-                - "context": Recover all shared tensors except mrope_position_deltas
-                - "generation": Recover only mrope_position_deltas
 
         Raises:
             ValueError: If element or mode is not supported
@@ -363,7 +371,6 @@ class MultimodalParams:
 
         restored_data = self._apply_tensor_operation(data, "from_shared_tensor")
         setattr(self, element, restored_data)
-        # print(f"Restored {element} from shared tensor, restored_data: {restored_data}")
 
     def to_device(self,
                   element: str,
