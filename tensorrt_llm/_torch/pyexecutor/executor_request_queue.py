@@ -162,10 +162,8 @@ class ExecutorRequestQueue:
         return req_id
 
     def can_enqueue_request(self) -> bool:
-        self.enqueue_lock.acquire()
-        can_enqueue = self.active
-        self.enqueue_lock.release()
-        return can_enqueue and self.dist.rank == 0
+        with self.enqueue_lock:
+            return self.active and self.dist.rank == 0
 
     def _fetch_and_process_requests(
             self, total_num_active_requests: int,

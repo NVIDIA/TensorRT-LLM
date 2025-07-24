@@ -357,14 +357,10 @@ class PyExecutor:
             return []
 
         latest_stats = (IterationStats(), None)
-        try:
-            self.stats_lock.acquire()
+        with self.stats_lock:
             latest_stats = self.stats
             self.stats = []
-        finally:
-            self.stats_lock.release()
-
-        return latest_stats
+            return latest_stats
 
     def get_latest_kv_cache_events(self):
         kv_cache_manager = self.resource_manager.resource_managers.get(
@@ -598,11 +594,8 @@ class PyExecutor:
                            stats: IterationStats,
                            req_stats: Optional[List[RequestStats]] = None):
 
-        try:
-            self.stats_lock.acquire()
+        with self.stats_lock:
             self.stats.append((stats, req_stats))
-        finally:
-            self.stats_lock.release()
 
     def _process_iter_stats(self, finished_requests: list[LlmRequest],
                             active_requests: List[LlmRequest],
