@@ -663,7 +663,7 @@ def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
             "examples/disaggregated",
             "examples/pytorch/",
             "examples/scaffolding/",
-            "docs/"
+            "docs/",
         ],
         "Triton": [
             "tests/integration/defs/triton_server/",
@@ -1012,7 +1012,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     testStageName = "[Test-SBSA] Remote Run"
                 }
 
-                if (testFilter[(ONLY_DOCS_FILE_CHANGED)]) {
+                if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
                     echo "SBSA build job is skipped due to Jenkins configuration or conditional pipeline run"
                     return
                 }

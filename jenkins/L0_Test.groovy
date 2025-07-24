@@ -2210,19 +2210,18 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         echo "Only docs files are changed, run doc build stage only."
         parallelJobsFiltered = docBuildJobs
         println parallelJobsFiltered.keySet()
-    } else {
+    } else if (testFilter[(ONLY_ONE_GROUP_CHANGED)] != "") {
         if (testFilter[(TEST_BACKEND)] != null) {
             echo "Force disable ONLY_ONE_GROUP_CHANGED mode. Backend mode set by flag: ${testFilter[(TEST_BACKEND)]}."
         } else {
             echo "ONLY_ONE_GROUP_CHANGED mode is true. The group is: ${testFilter[(ONLY_ONE_GROUP_CHANGED)]}."
-            def excludedBackends = [
-                "PyTorch": ["-CPP-", "-TensorRT-", "-Triton-"],
-                "Triton": ["-PyTorch-", "-CPP-", "-TensorRT-"]
-            ]
+            def excludedBackends = new HashMap()
+            excludedBackends["PyTorch"] = ["-CPP-", "-TensorRT-", "-Triton-"]
+            excludedBackends["Triton"] = ["-PyTorch-", "-CPP-", "-TensorRT-"]
             def group = testFilter[(ONLY_ONE_GROUP_CHANGED)]
             if (excludedBackends.containsKey(group)) {
-                parallelJobsFiltered = parallelJobsFiltered.findAll { jobName ->
-                    !excludedBackends[group].any { backend -> jobName.contains(backend) }
+                parallelJobsFiltered = parallelJobsFiltered.findAll { key, value ->
+                    !excludedBackends[group].any { backend -> key.contains(backend) }
                 }
             }
             println parallelJobsFiltered.keySet()
@@ -2409,7 +2408,7 @@ pipeline {
                 expression {
                     // Only run the test list validation when necessary
                     env.targetArch == X86_64_TRIPLE &&
-                    testFilter[ONLY_DOCS_FILE_CHANGED] == false &&
+                    testFilter[ONLY_ONE_GROUP_CHANGED] != "Docs" &&
                     !(env.JOB_NAME ==~ /.*Multi-GPU.*/) &&
                     !(env.JOB_NAME ==~ /.*BuildDockerImageSanityTest.*/)
                 }
