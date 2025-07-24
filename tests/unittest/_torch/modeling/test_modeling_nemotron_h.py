@@ -177,10 +177,6 @@ def test_nemotron_h_correctness():
                                    prefill_logprobs_ref_mcore,
                                    atol=mcore_atol,
                                    rtol=0.0)
-        print(
-            f"max mcore prefill diff: {torch.max(torch.abs(prefill_logprobs_no_batching[0]- prefill_logprobs_ref_mcore))}"
-        )
-        print()
 
         for i in range(num_prompts):
             # compare prompt logprobs with initial implementation
@@ -189,17 +185,11 @@ def test_nemotron_h_correctness():
                 prefill_logprobs_ref_initial_no_batching[i],
                 atol=initial_impl_atol,
                 rtol=0.0)
-            print(
-                f"max prefill without batching diff: {torch.max(torch.abs(prefill_logprobs_no_batching[i] - prefill_logprobs_ref_initial_no_batching[i]))}"
-            )
             torch.testing.assert_close(
                 prefill_logprobs_batching[i],
                 prefill_logprobs_ref_initial_with_batching[i],
                 atol=initial_impl_atol,
                 rtol=0.0)
-            print(
-                f"max prefill with batching diff: {torch.max(torch.abs(prefill_logprobs_batching[i] - prefill_logprobs_ref_initial_with_batching[i]))}"
-            )
 
             # compare expected completion
             assert completions_batching[i] == expected_completions[i]
@@ -211,34 +201,21 @@ def test_nemotron_h_correctness():
                 decode_logprobs_ref_initial_no_batching[i],
                 atol=initial_impl_atol,
                 rtol=0.0)
-            print(
-                f"max decode without batching diff: {torch.max(torch.abs(decode_logprobs_no_batching[i] - decode_logprobs_ref_initial_no_batching[i]))}"
-            )
             torch.testing.assert_close(
                 decode_logprobs_batching[i],
                 decode_logprobs_ref_initial_with_batching[i],
                 atol=initial_impl_atol,
                 rtol=0.0)
-            print(
-                f"max decode with batching diff: {torch.max(torch.abs(decode_logprobs_batching[i] - decode_logprobs_ref_initial_with_batching[i]))}"
-            )
 
             # compare logprobs with and without batching, tolerace by diff in initial implementation
             torch.testing.assert_close(prefill_logprobs_batching[i],
                                        prefill_logprobs_no_batching[i],
                                        atol=batching_atol,
                                        rtol=0.0)
-            print(
-                f"max batching diff (prefill): {torch.max(torch.abs(prefill_logprobs_batching[i] - prefill_logprobs_no_batching[i]))}"
-            )
             torch.testing.assert_close(decode_logprobs_batching[i],
                                        decode_logprobs_no_batching[i],
                                        atol=batching_atol,
                                        rtol=0.0)
-            print(
-                f"max batching diff (decode): {torch.max(torch.abs(decode_logprobs_batching[i] - decode_logprobs_no_batching[i]))}"
-            )
-            print()
 
         # now let's test that decodes match prefill logprobs
         text_prompts_with_completions = [
@@ -262,9 +239,6 @@ def test_nemotron_h_correctness():
                                        prefill_decode_logprobs,
                                        atol=mcore_atol,
                                        rtol=0.0)
-            print(
-                f"max full sequence diff: {torch.max(torch.abs(full_sequence_logprobs[i] - prefill_decode_logprobs))}"
-            )
 
     finally:
         nemotron_h.shutdown()
@@ -370,10 +344,6 @@ def test_nemotron_h_chunked_prefill():
 
     for i, (output, chunked_prefill_output) in enumerate(
             zip(outputs, chunked_prefill_outputs)):
-        # assert same output
-        print('---------------')
-        print(output.outputs[0].text)
-        print(chunked_prefill_output.outputs[0].text)
         assert output.outputs[0].text == chunked_prefill_output.outputs[0].text
 
         # assert same prefill logprobs. Same atol as diff between mcore and initial impl
@@ -395,11 +365,3 @@ def test_nemotron_h_chunked_prefill():
                                    atol=0.2,
                                    rtol=0.05,
                                    msg=f"Prompt {i} decode logprobs ")
-        print(
-            f"Prompt {i} prefill logprobs max diff: {torch.abs(prefill_logprobs - chunked_prefill_logprobs).max()}"
-        )
-        print(
-            f"Prompt {i} decode logprobs max diff: {torch.abs(decode_logprobs - chunked_decode_logprobs).max()}"
-        )
-        print('---------------')
-        print()
