@@ -18,6 +18,8 @@ import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
     BaseCheckpointLoader
 from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
+from tensorrt_llm._torch.speculative import (
+    get_num_extra_kv_tokens, update_spec_config_from_model_config)
 from tensorrt_llm._torch.speculative.mtp import SampleStateTensorsMTP
 from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
                                  torch_dtype_to_str, trace_func)
@@ -353,7 +355,8 @@ class PyTorchModelEngine(ModelEngine):
 
         if self.is_spec_decode:
             self.spec_metadata = None
-            self.spec_config.update_from_model_config(self.model.config)
+            update_spec_config_from_model_config(self.spec_config,
+                                                 self.model.config)
             max_num_draft_tokens = self.spec_config.max_draft_len * batch_size
             self.draft_tokens_cuda = torch.empty((max_num_draft_tokens, ),
                                                  dtype=torch.int,
@@ -1320,7 +1323,6 @@ class PyTorchModelEngine(ModelEngine):
 
         num_tokens = len(input_ids)
         num_draft_tokens = len(draft_tokens)
-        num_requests = len(request_ids)
         total_num_tokens = len(position_ids)
         assert total_num_tokens <= self.max_num_tokens, (
             "total_num_tokens should be less than or equal to max_num_tokens")
@@ -1337,6 +1339,10 @@ class PyTorchModelEngine(ModelEngine):
             self.draft_tokens_cuda[:len(draft_tokens)].copy_(draft_tokens,
                                                              non_blocking=True)
         if next_draft_tokens_device is not None:
+            # Initialize these two values to zeros
+            self.previous_pos_id_offsets_cuda *= 0
+            self.previous_kv_lens_offsets_cuda *= 0
+
             if previous_batch_len > 0:
                 previous_slots = previous_seq_slots_device()
                 # previous input ids
@@ -1361,24 +1367,37 @@ class PyTorchModelEngine(ModelEngine):
                                                          pin_memory=True)
                 self.previous_pos_indices_cuda[0:previous_batch_tokens].copy_(
                     previous_pos_indices_host, non_blocking=True)
+
+                # The order of requests in a batch: [context requests, generation requests]
+                # generation requests: ['requests that do not have previous batch', 'requests that already have previous batch', 'dummy requests']
+                #   1) 'requests that do not have previous batch': disable overlap scheduler or the first step in the generation server of disaggregated serving.
+                #   2) 'requests that already have previous batch': previous iteration's requests.
+                #   3) 'dummy requests': pad dummy requests for CUDA graph or attention dp.
+                # Therefore, both of self.previous_pos_id_offsets_cuda and self.previous_kv_lens_offsets_cuda are also 3 segments.
+                #   For 1) 'requests that do not have previous batch': disable overlap scheduler or the first step in the generation server of disaggregated serving.
+                #       Set these requests' previous_pos_id_offsets and previous_kv_lens_offsets to '0' to skip the value changes in _preprocess_inputs.
+                #       Already set to '0' during initialization.
+                #   For 2) 'requests that already have previous batch': enable overlap scheduler.
+                #       Set their previous_pos_id_offsets and previous_kv_lens_offsets according to new_tokens_lens_device and kv_len_offsets_device.
+                #   For 3) 'dummy requests': pad dummy requests for CUDA graph or attention dp.
+                #       Already set to '0' during initialization.
+
+                num_extend_reqeust_wo_dummy = len(extend_requests) - len(
+                    extend_dummy_requests)
                 self.previous_pos_id_offsets_cuda[
-                    0:previous_batch_tokens].copy_(
+                    (num_extend_reqeust_wo_dummy - previous_batch_len) *
+                    (1 + self.max_draft_len):num_extend_reqeust_wo_dummy *
+                    (1 + self.max_draft_len)].copy_(
                         new_tokens_lens_device[self.previous_pos_indices_cuda[
                             0:previous_batch_tokens]],
                         non_blocking=True)
-                self.previous_kv_lens_offsets_cuda[0:previous_batch_len].copy_(
-                    kv_len_offsets_device[previous_slots], non_blocking=True)
-                # for the requests that do not have previous batch, set the previous_pos_id_offsets and
-                # previous_kv_lens_offsets to zeros to skip the value changes in _preprocess_inputs
-                self.previous_pos_id_offsets_cuda[
-                    previous_batch_tokens:num_requests *
-                    (1 + self.max_draft_len)] *= 0
+
                 self.previous_kv_lens_offsets_cuda[
-                    previous_batch_len:num_requests] *= 0
-            else:
-                # change the data to zeros to skip the value changes in _preprocess_inputs
-                self.previous_pos_id_offsets_cuda *= 0
-                self.previous_kv_lens_offsets_cuda *= 0
+                    num_extend_reqeust_wo_dummy -
+                    previous_batch_len:num_extend_reqeust_wo_dummy].copy_(
+                        kv_len_offsets_device[previous_slots],
+                        non_blocking=True)
+
         elif new_tokens_device is not None:
             seq_slots_device = previous_seq_slots_device()
             max_draft_len = max(draft_lens)
@@ -1442,8 +1461,7 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.kv_cache_params = KVCacheParams(
             use_cache=True,
             num_cached_tokens_per_seq=num_cached_tokens_per_seq,
-            num_extra_kv_tokens=0 if self.spec_config is None else
-            self.spec_config.num_extra_kv_tokens)
+            num_extra_kv_tokens=get_num_extra_kv_tokens(self.spec_config))
         attn_metadata.kv_cache_manager = kv_cache_manager
 
         attn_metadata.prepare()

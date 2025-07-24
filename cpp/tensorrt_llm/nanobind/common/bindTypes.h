@@ -21,43 +21,10 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
 
-namespace PybindUtils
+namespace NanobindUtils
 {
 
 namespace nb = nanobind;
-
-template <typename T>
-void bindList(nb::module_& m, std::string const& name)
-{
-    nb::class_<T>(m, name.c_str())
-        .def(nb::init<>())
-        .def("push_back", [](T& lst, const typename T::value_type& value) { lst.push_back(value); })
-        .def("pop_back", [](T& lst) { lst.pop_back(); })
-        .def("push_front", [](T& lst, const typename T::value_type& value) { lst.push_front(value); })
-        .def("pop_front", [](T& lst) { lst.pop_front(); })
-        .def("__len__", [](T const& lst) { return lst.size(); })
-        .def(
-            "__iter__", [](T& lst) { return nb::make_iterator(nb::type<T>(), "iterator", lst.begin(), lst.end()); },
-            nb::keep_alive<0, 1>())
-        .def("__getitem__",
-            [](T const& lst, size_t index)
-            {
-                if (index >= lst.size())
-                    throw nb::index_error();
-                auto it = lst.begin();
-                std::advance(it, index);
-                return *it;
-            })
-        .def("__setitem__",
-            [](T& lst, size_t index, const typename T::value_type& value)
-            {
-                if (index >= lst.size())
-                    throw nb::index_error();
-                auto it = lst.begin();
-                std::advance(it, index);
-                *it = value;
-            });
-}
 
 template <typename T>
 void bindSet(nb::module_& m, std::string const& name)
@@ -93,8 +60,8 @@ void bindSet(nb::module_& m, std::string const& name)
                 {
                     s.insert(item);
                 }
-                return s;
+                new (&v) T(s);
             });
 }
 
-} // namespace PybindUtils
+} // namespace NanobindUtils

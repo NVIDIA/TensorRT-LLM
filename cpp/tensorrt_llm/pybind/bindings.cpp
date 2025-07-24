@@ -355,7 +355,10 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     };
     auto SamplingConfigSetState = [](py::tuple t) -> tr::SamplingConfig
     {
-        assert(t.size() == 19);
+        if (t.size() != 19)
+        {
+            throw std::runtime_error("Invalid SamplingConfig state!");
+        }
 
         tr::SamplingConfig config;
         config.beamWidth = t[0].cast<SizeType32>();

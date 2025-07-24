@@ -112,6 +112,7 @@ def gqa_attention_kv_stage1(
     V_D_HEAD: tl.constexpr,  # Dimension of each key/value head
     SEQ_BLOCK_SIZE: tl.constexpr,  # Block size used for tiling the sequence dim.
     HEAD_BLOCK_SIZE: tl.constexpr,  # pad to 16 if HEAD_RATIO is < 16 to invoke tensor cores.
+    SLIDING_WINDOW: tl.constexpr,
 ):
     """Attention kernel to be used for generate-only batches.
 
@@ -122,7 +123,7 @@ def gqa_attention_kv_stage1(
     Supports non-power-of-2 D_HEAD
 
     Uses flash decoding.
-    KV-cache layout is assumed to be [Batch,Seq, Head, Dim]
+    KV-cache layout is assumed to be [Batch, Seq, Head, Dim]
     1. Fetch the K-cache from 0 to input_pos
     2. Fetch the V-cache from 0 to input_pos
     3. A = Q*K^T [1,D_HEAD] * [1,seq_len,D_HEAD] -> [1, seq_len]
@@ -145,10 +146,20 @@ def gqa_attention_kv_stage1(
 
     # The number of Q heads that map to each KV head.
     HEAD_RATIO: tl.constexpr = N_HEADS // N_KV_HEADS  # This needs to be a power-of-2
-    if seq_start_pos > kv_position:
-        return
-    seq_offsets = seq_start_pos + tl.arange(0, SEQ_BLOCK_SIZE)
-    seq_mask = seq_offsets <= kv_position
+
+    # Apply sliding window constraints
+    if SLIDING_WINDOW > 0:
+        # For sliding window, limit the sequence range
+        sliding_start = tl.maximum(0, kv_position - SLIDING_WINDOW + 1)
+        if seq_start_pos + SEQ_BLOCK_SIZE <= sliding_start or seq_start_pos > kv_position:
+            return
+        seq_offsets = seq_start_pos + tl.arange(0, SEQ_BLOCK_SIZE)
+        seq_mask = (seq_offsets <= kv_position) & (seq_offsets >= sliding_start)
+    else:
+        if seq_start_pos > kv_position:
+            return
+        seq_offsets = seq_start_pos + tl.arange(0, SEQ_BLOCK_SIZE)
+        seq_mask = seq_offsets <= kv_position
 
     # Need to pad the head dim to 16 if HEAD_RATIO is < 16 so that tensor cores can be invoked
     #
@@ -358,6 +369,8 @@ def attention_kv_stage2(
     N_HEADS: tl.constexpr,
     D_HEAD: tl.constexpr,
     SEQ_BLOCK_SIZE: tl.constexpr,  # Nearest power of 2 for num_blocks
+    HAS_SINKS: tl.constexpr,
+    sinks_ptr,
 ):
     # There are batch * N_HEADS programs
     batch_id = tl.program_id(axis=0)
@@ -382,6 +395,11 @@ def attention_kv_stage2(
     sumexp = tl.exp(logsumexp - max_logsumexp)  # [NUM_BLOCKS_POW2]
 
     aggregate_sumexp = tl.sum(sumexp, axis=0)
+    # Add sinks contribution to the softmax denominator
+    if HAS_SINKS:
+        sinks_val = tl.load(sinks_ptr + batch_id * N_HEADS + head_id)
+        sinks_exp = tl.exp(sinks_val - max_logsumexp)
+        aggregate_sumexp += sinks_exp
 
     values_offsets = block_offsets[:, None] * D_HEAD + dhead_offsets[None, :]
     values_mask = block_mask[:, None] * dhead_mask[None, :]
@@ -573,6 +591,9 @@ def context_attention_kv_flattened(
     V_D_HEAD: tl.constexpr,  # Dimension of each value head.
     SEQ_BLOCK: tl.constexpr,
     MAX_SEQ_LENGTH: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,  # Sliding window size, -1 means no sliding window
+    HAS_SINKS: tl.constexpr,
+    sinks_ptr,
 ):
     """Kernel for context phase.
 
@@ -623,7 +644,15 @@ def context_attention_kv_flattened(
     # input_pos_ptr stores the location at which kv must be written back for the given batch.
     kv_position = tl.load(input_pos_ptr + batch_id)
     num_blocks = (kv_position + seq_len + SEQ_BLOCK - 1) // SEQ_BLOCK
-    for s in range(0, num_blocks + 1, 1):
+    start = 0
+    if SLIDING_WINDOW > 0:
+        # Use the LAST query in this block for more conservative start calculation
+        last_q_pos = (
+            (seq_block_id + 1) * SEQ_BLOCK - 1 + kv_position
+        )  # Last query's absolute position
+        earliest_kv_pos = max(0, last_q_pos - SLIDING_WINDOW + 1)
+        start = max(0, earliest_kv_pos // SEQ_BLOCK)
+    for s in range(start, num_blocks + 1):
         kv_seq_offsets = s * SEQ_BLOCK + tl.arange(0, SEQ_BLOCK)
         kv_seq_mask = kv_seq_offsets < (kv_position + seq_len)
 
@@ -637,9 +666,17 @@ def context_attention_kv_flattened(
         )
         qk = tl.zeros([SEQ_BLOCK, SEQ_BLOCK], dtype=tl.float32)
         qk += tl.dot(q, k.trans())
-        qk = tl.where(
-            (seq_offsets[:, None] + kv_position) >= kv_seq_offsets[None, :], qk, float("-inf")
-        )
+        # Apply causal mask
+        causal_mask = (seq_offsets[:, None] + kv_position) >= kv_seq_offsets[None, :]
+        # Apply sliding window mask if enabled
+        if SLIDING_WINDOW > 0:
+            sliding_window_mask = kv_seq_offsets[None, :] >= (
+                seq_offsets[:, None] + kv_position - SLIDING_WINDOW + 1
+            )
+            combined_mask = sliding_window_mask & causal_mask
+        else:
+            combined_mask = causal_mask
+        qk = tl.where(combined_mask, qk, float("-inf"))
         qk *= SCALE
         # rowmax
         m_ij = tl.maximum(tl.max(qk, 1), lse_i)
@@ -661,6 +698,16 @@ def context_attention_kv_flattened(
         m_i = m_ij
         l_i_new = tl.exp(lse_i - m_ij) + l_ij
         lse_i = m_ij + tl.log(l_i_new)
+
+    # Add sinks contribution to the final softmax calculation
+    if HAS_SINKS:
+        sinks_val = tl.load(sinks_ptr + batch_id * N_HEADS + head_id)
+        m_sinks = tl.maximum(m_i, sinks_val)
+        acc_scale = tl.exp(m_i - m_sinks)
+        acc = acc * acc_scale[:, None]
+        l_sinks = tl.exp(lse_i - m_sinks) + tl.exp(sinks_val - m_sinks)
+        lse_i = m_sinks + tl.log(l_sinks)
+        m_i = m_sinks
 
     o_scale = tl.exp(m_i - lse_i)
 

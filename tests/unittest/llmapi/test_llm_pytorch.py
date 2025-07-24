@@ -5,7 +5,7 @@ from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
-from .lora_test_utils import check_llama_7b_multi_unique_lora_adapters_from_request
+from .lora_test_utils import check_llama_7b_multi_unique_lora_adapters_from_request, create_mock_nemo_lora_checkpoint
 from .test_llm import (get_model_path, global_kvcache_config, llama_model_path,
                        llm_get_stats_async_test_harness,
                        llm_get_stats_test_harness, prompts,
@@ -427,3 +427,141 @@ def test_bielik_11b_v2_2_instruct_multi_lora() -> None:
                                lora_request=lora_requests)
 
         assert len(outputs) == 2
+
+
+@pytest.mark.parametrize(
+    "lora_rank,max_lora_rank,description",
+    [
+        # (lora_rank, max_lora_rank, description)
+        (8, 8, "rank_8"),
+        (16, 16, "rank_16"),
+        (4, 8, "rank_4_max_8"),
+    ])
+def test_load_torch_nemo_lora_function(tmp_path, lora_rank, max_lora_rank,
+                                       description):
+    """Test load_torch_nemo_lora function with different LoRA rank configurations."""
+    from tensorrt_llm.lora_manager import load_torch_nemo_lora
+
+    nemo_path = create_mock_nemo_lora_checkpoint(
+        tmp_path,
+        hidden_size=2048,
+        num_layers=16,
+        lora_rank=lora_rank,
+    )
+
+    lora_config = LoraConfig(
+        lora_dir=[str(nemo_path)],
+        lora_ckpt_source="nemo",
+        max_lora_rank=max_lora_rank,
+    )
+
+    # This should not raise an error
+    load_torch_nemo_lora(lora_config)
+
+    assert lora_config.lora_target_modules == [
+        "attn_qkv"
+    ], f"Expected attn_qkv modules for {description}"
+    assert lora_config.trtllm_modules_to_hf_modules == {
+        "attn_qkv": "attn_qkv"
+    }, f"Expected correct module mapping for {description}"
+
+
+def test_nemo_lora_unsupported_modules_validation(tmp_path):
+    """Test validation of unsupported modules in NeMo LoRA."""
+    from tensorrt_llm.lora_manager import load_torch_nemo_lora
+
+    nemo_path = create_mock_nemo_lora_checkpoint(
+        tmp_path,
+        hidden_size=2048,
+        num_layers=16,
+        lora_rank=8,
+    )
+
+    # Test validation: should fail with unsupported modules
+    invalid_config = LoraConfig(
+        lora_dir=[str(nemo_path)],
+        lora_ckpt_source="nemo",
+        lora_target_modules=["attn_qkv",
+                             "mlp_h_to_4h"],  # mlp_h_to_4h not supported
+        max_lora_rank=8,
+    )
+
+    with pytest.raises(ValueError, match="NeMo LoRA only supports"):
+        load_torch_nemo_lora(invalid_config)
+
+
+@force_ampere
+def test_gqa_nemo_lora(tmp_path):
+    """
+    Test NeMo-format LoRA checkpoint loading and GQA support in TinyLlama.
+
+    This test verifies two properties:
+    1. That a NeMo-format LoRA checkpoint with GQA (grouped query attention) can be loaded and applied to a TinyLlama model,
+       and that generation with this LoRA produces a deterministic, expected output for a fixed prompt and temperature=0.0.
+    2. That the LoRA weights have a significant effect: generating with LoRA produces a different output than generating
+       without LoRA, confirming that the LoRA adapter is actually being applied.
+
+    The test uses a deterministic dummy LoRA checkpoint (seed=42) and checks both the positive (LoRA applied) and negative
+    (no LoRA) cases for output text.
+    """
+    # TinyLlama's exact GQA configuration
+    hidden_size = 2048
+    num_layers = 22
+    num_q_heads = 32  # Query attention heads
+    num_kv_heads = 4  # Key/Value heads (GQA)
+    lora_rank = 8
+
+    nemo_path = create_mock_nemo_lora_checkpoint(
+        tmp_path,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        lora_rank=lora_rank,
+        num_attention_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        seed=42,  # NOTE: the seed=42 is important for the test to pass.
+    )
+    expected_lora_text_output = "Paris. The capital of France is Paris. The"
+    test_prompts = ["The capital of France is"]
+    sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
+
+    lora_config = LoraConfig(
+        lora_dir=[str(nemo_path)],
+        lora_ckpt_source="nemo",
+        max_lora_rank=lora_rank,
+    )
+
+    model_path = get_model_path("llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+
+    llm = LLM(
+        model=model_path,
+        lora_config=lora_config,
+        kv_cache_config=global_kvcache_config,
+    )
+
+    try:
+        lora_req = LoRARequest("tinyllama-gqa-test",
+                               0,
+                               str(nemo_path),
+                               lora_ckpt_source="nemo")
+
+        lora_outputs = llm.generate(test_prompts,
+                                    sampling_params,
+                                    lora_request=[lora_req])
+
+        # For the above deterministic dummy LoRA checkpoint,
+        # with temperature=0.0,
+        # the expected output text should always be the same.
+        assert lora_outputs[0].outputs[0].text == expected_lora_text_output, \
+            f"Expected output text: {expected_lora_text_output}, " \
+            f"got: {lora_outputs[0].outputs[0].text}"
+        assert len(lora_outputs) == 1
+
+        # Generate without LoRA.
+        # The LoRA weights are tuned/large enough that
+        # they differ from a no-LoRA run.
+        base_outputs = llm.generate(test_prompts, sampling_params)
+        assert base_outputs[0].outputs[0].text != expected_lora_text_output, \
+            f"No-LoRA output should differ from expected output text: {expected_lora_text_output}, " \
+            f"got: {base_outputs[0].outputs[0].text}"
+    finally:
+        llm.shutdown()
