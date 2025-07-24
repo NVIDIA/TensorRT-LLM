@@ -18,7 +18,7 @@
 #include "ucxCacheCommunicator.h"
 #if ENABLE_UCX
 
-#include "tensorrt_llm/batch_manager/dataTransceiverImpl.h"
+#include "tensorrt_llm/batch_manager/dataTransceiver.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/executor/cache_transmission/ucx_utils/connection.h"

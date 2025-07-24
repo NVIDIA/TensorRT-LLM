@@ -26,7 +26,6 @@
 
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
-#include "tensorrt_llm/batch_manager/dataTransceiverImpl.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -158,10 +157,10 @@ TEST_F(CacheConfigTest, EqualTo)
 //          MockTransceiverTest
 // ---------------------------------------
 
-class MockDataSender : public DataSender
+class MockCacheSender : public CacheSender
 {
 public:
-    MockDataSender()
+    MockCacheSender()
     {
         ON_CALL(*this, getCommState).WillByDefault(ReturnRef(mState));
         ON_CALL(*this, recvRequestInfo)
@@ -183,9 +182,9 @@ private:
     static texec::kv_cache::CommState mState;
 };
 
-texec::kv_cache::CommState MockDataSender::mState;
+texec::kv_cache::CommState MockCacheSender::mState;
 
-class MockDataReceiver : public DataReceiver
+class MockCacheReceiver : public CacheReceiver
 {
 public:
     MOCK_METHOD(TransferSession, sendRequestInfo, (LlmRequest const&), (override));
@@ -216,7 +215,7 @@ TEST_F(MockTransceiverTest, MpiResponderBasic)
     {
         GTEST_SKIP() << "mpirun with procs<=2 is required to run this test.";
     }
-    auto sender = std::make_unique<MockDataSender>();
+    auto sender = std::make_unique<MockCacheSender>();
     EXPECT_CALL(*sender, recvRequestInfo)
         .WillOnce(Return(RequestInfo{0,
             texec::DataTransceiverState{
@@ -226,7 +225,7 @@ TEST_F(MockTransceiverTest, MpiResponderBasic)
     EXPECT_CALL(*sender, getCounterpartsCount).WillOnce(Return(1));
     EXPECT_CALL(*sender, release).WillOnce(Return());
 
-    DataResponder responder{std::move(sender)};
+    CacheSender responder{std::move(sender)};
     auto request = makeLlmRequest(0);
     auto future = responder.respondAndSendAsync(*request);
     future.get();
@@ -239,14 +238,14 @@ TEST_F(MockTransceiverTest, MpiRequesterBasic)
     {
         GTEST_SKIP() << "mpirun with procs<=2 is required to run this test.";
     }
-    auto receiver = std::make_unique<MockDataReceiver>();
+    auto receiver = std::make_unique<MockCacheReceiver>();
     auto state = std::make_unique<texec::DataTransceiverState>();
     state->setCommState(texec::kv_cache::CommState{std::vector<int>{0}});
     EXPECT_CALL(*receiver, sendRequestInfo)
         .WillOnce(Return(TransferSession({nullptr}, DataContext{0}, *state, *state,
             tensorrt_llm::runtime::BufferManager{std::make_shared<tr::CudaStream>()}, nullptr)));
     EXPECT_CALL(*receiver, receiveSync).WillOnce(Return());
-    DataRequester requester{std::move(receiver)};
+    CacheReceiver requester{std::move(receiver)};
     auto request = makeLlmRequest(0);
     auto stats = texec::ContextPhaseParams({}, 0, state.release(), std::nullopt);
     request->setContextPhaseParams(std::move(stats));
@@ -397,14 +396,14 @@ protected:
         mCacheTransBufferManager = std::make_unique<CacheTransBufferManager>(mManager.get(), maxNumTokens);
         if (isSender)
         {
-            mResponder = std::make_unique<DataResponder>(
-                std::make_unique<DataSenderImpl>(mConnectionManager.get(), *mCacheState, mlocalRank,
+            mSender = std::make_unique<CacheSender>(
+                std::make_unique<CacheSenderImpl>(mConnectionManager.get(), *mCacheState, mlocalRank,
                     std::make_unique<CacheFormatter>(mManager.get(), mCacheTransBufferManager.get())));
         }
         else
         {
-            mRequester = std::make_unique<DataRequester>(
-                std::make_unique<DataReceiverImpl>(mConnectionManager.get(), *mCacheState, mlocalRank,
+            mRequester = std::make_unique<CacheReceiver>(
+                std::make_unique<CacheReceiverImpl>(mConnectionManager.get(), *mCacheState, mlocalRank,
                     std::make_unique<CacheFormatter>(mManager.get(), mCacheTransBufferManager.get())));
         }
     }
@@ -435,7 +434,7 @@ protected:
                 // fill cache with tokens (= request length), for reuse test
                 TLLM_CUDA_CHECK(cudaMemset(block.data(), llmRequest->getPromptLen(), block.getSizeInBytes()));
             }
-            mFutures.emplace_back(mResponder->respondAndSendAsync(*llmRequest));
+            mFutures.emplace_back(mSender->respondAndSendAsync(*llmRequest));
         }
         else
         {
@@ -460,8 +459,8 @@ protected:
     SizeType32 mMaxNumSequences{};
     std::unique_ptr<KVCacheManager> mManager;
     std::unique_ptr<CacheTransBufferManager> mCacheTransBufferManager;
-    std::unique_ptr<DataResponder> mResponder;
-    std::unique_ptr<DataRequester> mRequester;
+    std::unique_ptr<CacheSender> mSender;
+    std::unique_ptr<CacheReceiver> mRequester;
     std::unique_ptr<texec::kv_cache::CacheState> mCacheState;
     std::unique_ptr<texec::kv_cache::CommState> mContextCommState;
     std::vector<std::future<void>> mFutures;
@@ -789,12 +788,12 @@ protected:
 
             if (mIsContext)
             {
-                mResponder = std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(
+                mSender = std::make_unique<CacheSender>(std::make_unique<CacheSenderImpl>(
                     mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter()));
             }
             else
             {
-                mRequester = std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(
+                mRequester = std::make_unique<CacheReceiver>(std::make_unique<CacheReceiverImpl>(
                     mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter()));
             }
 
@@ -930,7 +929,7 @@ protected:
         auto const onlyWindowSize = blockManager.getPoolWindowSize(0);
 
         blockManager.getBufferManager(onlyWindowSize).getStream().synchronize();
-        auto future = mResponder->respondAndSendAsync(*llmRequest);
+        auto future = mSender->respondAndSendAsync(*llmRequest);
         return future;
     }
 
@@ -1162,8 +1161,8 @@ protected:
     SizeType32 mMaxNumSequences{};
     std::unique_ptr<KVCacheManager> mManager;
     std::unique_ptr<CacheTransBufferManager> mCacheTransBufferManager;
-    std::unique_ptr<DataResponder> mResponder;
-    std::unique_ptr<DataRequester> mRequester;
+    std::unique_ptr<CacheSender> mSender;
+    std::unique_ptr<CacheReceiver> mRequester;
     std::unique_ptr<texec::kv_cache::CacheState> mCacheState;
     std::unique_ptr<texec::kv_cache::CacheState> mContextCacheState;
     std::unique_ptr<texec::kv_cache::CommState> mContextCommState;
