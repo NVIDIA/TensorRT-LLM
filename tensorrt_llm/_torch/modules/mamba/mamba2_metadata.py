@@ -21,8 +21,10 @@ from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 
 
 def cu_seqlens_to_chunk_indices_offsets(cu_seqlens: torch.Tensor,
-                                        chunk_size: int, total_seqlens: int):
+                                        chunk_size: int):
+    # TODO: add comment what this function does
 
+    total_seqlens = cu_seqlens[-1]
     cu_seqlens = cu_seqlens[1:]  # remove prepended 0
 
     # outputs will have length expansion of chunks that do not divide
@@ -98,8 +100,7 @@ class Mamba2Metadata:
                 self.has_initial_states[:num_contexts]).item()
             if self.use_initial_states:
                 self.chunk_indices, self.chunk_offsets = cu_seqlens_to_chunk_indices_offsets(
-                    self.cu_seqlens[:num_contexts + 1], self.chunk_size,
-                    num_ctx_tokens)
+                    self.cu_seqlens[:num_contexts + 1], self.chunk_size)
             else:
                 self.chunk_indices = None
                 self.chunk_offsets = None

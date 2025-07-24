@@ -212,7 +212,7 @@ def test_mamba2_chunk_scan_selective_state_update(dim, headdim, ngroups, dstate,
         if use_initial_states:
             assert remove_padding
             chunk_indices, chunk_offsets = cu_seqlens_to_chunk_indices_offsets(
-                cu_seqlens, chunk_size, input_seq_len)
+                cu_seqlens, chunk_size)
         out, ssm_state = mamba_chunk_scan_combined(
             x,
             dt,
@@ -546,8 +546,7 @@ def test_mamba2_chunk_scan_combined_prefix_chunking(max_seq_len,
     # yapf: enable
 
     chunk_indices, chunk_offsets = cu_seqlens_to_chunk_indices_offsets(
-        remaining_chunked_cu_seqlens, mamba_chunk_size,
-        remaining_chunked_input_seq_len)
+        remaining_chunked_cu_seqlens, mamba_chunk_size)
 
     out_chunked, state_chunked = mamba_chunk_scan_combined(
         remaining_x_chunked,
