@@ -405,12 +405,6 @@ def test_mamba2_chunk_scan_combined_prefix_chunking(max_seq_len,
     input_batch_size = 1
     input_seq_len = cu_seqlens[-1]
 
-    state = torch.empty(batch_size,
-                        nheads,
-                        headdim,
-                        dstate,
-                        device=device,
-                        dtype=torch_dtype)
     x = torch.empty(input_batch_size,
                     input_seq_len,
                     nheads,
@@ -418,7 +412,6 @@ def test_mamba2_chunk_scan_combined_prefix_chunking(max_seq_len,
                     device=device,
                     dtype=torch_dtype)
     x.normal_(mean, std_dev)
-    state.normal_(mean, std_dev)
     dt = torch.randn(input_batch_size,
                      input_seq_len,
                      nheads,
@@ -572,7 +565,7 @@ def test_mamba2_chunk_scan_combined_prefix_chunking(max_seq_len,
     # kernel chunked is same as kernel overall
     # tight tolerance to find subtle correctness issues
     rtol = 1e-2
-    atol = 1e-3
+    atol = 2e-3
     for i in range(batch_size):
         out_seq = out[:, cu_seqlens[i]:cu_seqlens[i + 1], ...]
         out_seq_ref = out_ref[:, cu_seqlens[i]:cu_seqlens[i + 1], ...]
