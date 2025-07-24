@@ -77,7 +77,7 @@ nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8
 
 #### Llama 3.1 8B FP8
 
-|                          | GPU:   | GH200   | H100 80GB HBM3   | H200 141GB HBM3   |
+|                          | GPU:   | GH200 96GB  | H100 80GB HBM3   | H200 141GB HBM3   |
 |:-----------------------------|:---|:--------------|:-----------------|:------------------|
 |    | TP Size   | 1          | 1             | 1              |
 | ISL, OSL |    |               |                  |                   |
