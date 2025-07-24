@@ -28,8 +28,7 @@ class RemoteOpenAIServer:
         args = ["--host", f"{self.host}", "--port", f"{self.port}"]
         if cli_args:
             args += cli_args
-        launch_cmd = ["python3"] + ["-m"] + ["tensorrt_llm.commands.serve"
-                                             ] + [model] + args
+        launch_cmd = ["trtllm-serve"] + [model] + args
         if llmapi_launch:
             # start server with llmapi-launch on multi nodes
             launch_cmd = ["trtllm-llmapi-launch"] + launch_cmd
