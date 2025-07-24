@@ -79,7 +79,7 @@ spec_config = NGramDecodingConfig(
 
     If `is_public_pool= True`, a global pool is shared by all the requests. If `is_public_pool= False`, each request will have its own cache pool.
 
-    The lookup time is logarithmic in the number of keys in the cache pool.
+    The lookup time is amortized constant time, but extra latency can be observed once the dictionary outgrows the CPU’s fastest cache.
 
 * **Verification** ‑ Verify proposed draft tokens.
 
