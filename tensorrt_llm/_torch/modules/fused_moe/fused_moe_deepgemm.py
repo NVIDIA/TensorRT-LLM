@@ -83,7 +83,6 @@ def _masked_index_copy_group_quant_fp8(
 
 def masked_index_copy_group_quant_fp8(
     output: torch.Tensor,
-    # output_s: torch.Tensor,
     input: torch.Tensor,
     start_offsets: torch.Tensor,
     row_indices: torch.Tensor,
