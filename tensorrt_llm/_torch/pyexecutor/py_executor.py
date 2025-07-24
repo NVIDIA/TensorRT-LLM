@@ -140,7 +140,6 @@ class PyExecutor:
                  max_beam_width: int = 1,
                  max_draft_len: int = 0,
                  kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
-                 draft_model_engine: Optional[ModelEngine] = None,
                  guided_decoder: Optional[GuidedDecoder] = None,
                  garbage_collection_gen0_threshold: Optional[int] = None,
                  start_worker: bool = True):
@@ -164,9 +163,6 @@ class PyExecutor:
         self.guided_decoder = guided_decoder
         self.dist = dist
         self.disable_overlap_scheduler = disable_overlap_scheduler
-
-        # Draft model for certain spec decode algorithms, e.g. EAGLE3
-        self.draft_model_engine = draft_model_engine
 
         # enqueue and _fetch_new_requests used data
         self.next_req_id = max_batch_size  # The first max_batch_size request IDs are reserved for dummy requests
@@ -210,8 +206,8 @@ class PyExecutor:
         self.inflight_req_ids = ReqIdsSet()
 
         self.model_engine.warmup(self.resource_manager)
-        if self.draft_model_engine is not None:
-            self.draft_model_engine.warmup(self.resource_manager)
+        if self.drafter is not None:
+            self.drafter.draft_model_engine.warmup(self.resource_manager)
 
         self.is_shutdown = False
 
@@ -334,8 +330,8 @@ class PyExecutor:
             if manager:
                 manager.shutdown()
         del self.model_engine
-        if self.draft_model_engine is not None:
-            del self.draft_model_engine
+        if self.drafter is not None:
+            del self.drafter.draft_model_engine
 
     def can_enqueue_requests(self) -> bool:
         """
