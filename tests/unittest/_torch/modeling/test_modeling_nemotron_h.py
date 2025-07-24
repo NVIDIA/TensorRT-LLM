@@ -39,7 +39,6 @@ def create_nemotron_h_llm(use_cuda_graph,
     model_dir = f"{llm_models_root(check=True)}/Nemotron-H-8B-Base-8K"
     return LLM(
         model=model_dir,
-        model=model_dir,
         tensor_parallel_size=1,
         max_batch_size=max_batch_size,
         cuda_graph_config=CudaGraphConfig() if use_cuda_graph else None,
