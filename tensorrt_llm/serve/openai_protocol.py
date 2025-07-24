@@ -57,7 +57,6 @@ class ResponseFormat(OpenAIBaseModel):
     schema: Optional[dict] = None
     structures: Optional[List[StructuralTag]] = None
     triggers: Optional[List[str]] = None
-    json_schema: Optional[Dict[str, Any]] = None
 
 
 class DisaggregatedParams(OpenAIBaseModel):
@@ -213,7 +212,7 @@ class CompletionRequest(OpenAIBaseModel):
         default=None,
         description=
         ("Similar to chat completion, this parameter specifies the format of "
-         "output. {'type': 'json_object'}, {'type': 'text' }, {'type': 'structural_tag'}, {'type': 'json_schema'} are "
+         "output. {'type': 'json_object'}, {'type': 'text' }, {'type': 'structural_tag'}, {'type': 'json'} are "
          "supported."),
     )
 
