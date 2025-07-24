@@ -1756,6 +1756,31 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    def test_eagle3(self):
+        pytorch_config = dict(
+            disable_overlap_scheduler=True,
+            cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 3, 4, 8]),
+        )
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+
+        eagle_model_dir = f"{llm_models_root()}/Qwen3/Qwen3-30B-eagle3"
+        target_model_dir = f"{llm_models_root()}/Qwen3/Qwen3-30B-A3B"
+
+        draft_len = 1
+        spec_config = EagleDecodingConfig(max_draft_len=draft_len,
+                                          speculative_model_dir=eagle_model_dir,
+                                          eagle3_one_model=True)
+
+        llm = LLM(model=target_model_dir,
+                  **pytorch_config,
+                  kv_cache_config=kv_cache_config,
+                  speculative_config=spec_config,
+                  max_seq_len=8192)
+
+        with llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
 
 class TestQwen3_32B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-32B"
@@ -1822,10 +1847,6 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
     )
     def test_nvfp4(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
                    overlap_scheduler, moe_backend):
-        if moe_backend == "TRTLLM":
-            pytest.skip(
-                "TRTLLM moe backend has accuracy issues: https://nvbugspro.nvidia.com/bug/5404726"
-            )
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
