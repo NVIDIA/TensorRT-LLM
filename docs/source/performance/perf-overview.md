@@ -77,7 +77,7 @@ nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8
 
 #### Llama 3.1 8B FP8
 
-|                          | GPU:   | GH200 480GB   | H100 80GB HBM3   | H200 141GB HBM3   |
+|                          | GPU:   | GH200   | H100 80GB HBM3   | H200 141GB HBM3   |
 |:-----------------------------|:---|:--------------|:-----------------|:------------------|
 |    | TP Size   | 1          | 1             | 1              |
 | ISL, OSL |    |               |                  |                   |
@@ -133,7 +133,7 @@ nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8
 
 #### Llama 4 Maverick FP8
 
-*Performance for Llama 4 on sequence lengths less than 8,192 tokens is affected by an issue introduced in v0.21. To reproduce the Llama 4 performance noted here, please use v0.20
+Note: Performance for Llama 4 on sequence lengths less than 8,192 tokens is affected by an issue introduced in v0.21. To reproduce the Llama 4 performance noted here, please use v0.20
 
 |                          | GPU    | H200 141GB HBM3   | H100 80GB HBM3   |
 |:-----------------------------|:---|:------------------|:-----------------|
