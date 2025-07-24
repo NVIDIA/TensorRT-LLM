@@ -357,7 +357,7 @@ class MultimodalParams:
             element: Element to restore ("multimodal_data" or "multimodal_input")
 
         Raises:
-            ValueError: If element or mode is not supported
+            ValueError: If element is not supported
             RuntimeError: If tensor restoration fails
         """
         supported_elements = ["multimodal_data", "multimodal_input"]
