@@ -1548,7 +1548,7 @@ void BlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmReq
 
 [[nodiscard]] kv_connector::KvCacheConnectorPoolData WindowBlockManager::getKvCacheConnectorPoolData() const
 {
-    return kv_connector::KvCacheConnectorPoolData(mPools.at(mWindowSize).primaryPtr, mNumPrimaryBlocks);
+    return kv_connector::KvCacheConnectorPoolData(mPools.at(0).primaryPtr, mNumPrimaryBlocks);
 }
 
 void WindowBlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest)
@@ -2596,7 +2596,19 @@ SizeType32 KVCacheManager::calculateMaxBlockRequirements(SizeType32 inputLength,
 [[nodiscard]] kv_connector::KvCacheConnectorPoolsData KVCacheManager::getKvCacheConnectorPoolsData() const
 {
     auto poolsData = mBlockManager.getKvCacheConnectorPoolsData();
-    return kv_connector::KvCacheConnectorPoolsData(poolsData, mLayerToPoolMapping);
+
+    auto layerToPoolView = BufferRange<SizeType32>(*mLayerToPoolMapping);
+
+    auto numLayers = mBlockManager.getNumLayers();
+
+    auto layerToPool = std::vector<SizeType32>(numLayers);
+
+    for (size_t layer = 0; layer < static_cast<size_t>(numLayers); layer++)
+    {
+        layerToPool[layer] = layerToPoolView[layer * 2];
+    }
+
+    return kv_connector::KvCacheConnectorPoolsData(poolsData, layerToPool);
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager
