@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import torch
 
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.bindings.executor import IterationStats
 from tensorrt_llm.logger import logger
 
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
@@ -297,6 +298,7 @@ class ModelDrafter(Drafter):
         self,
         scheduled_requests: ScheduledRequests,
         resource_manager: Optional[ResourceManager] = None,
+        iter_stats: IterationStats = None,
     ) -> None:
         """
         Prepare draft tokens for the scheduled requests.
