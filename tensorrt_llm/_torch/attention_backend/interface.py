@@ -135,6 +135,9 @@ class AttentionMetadata:
     _num_ctx_tokens: int = field(init=False, default=0, repr=False)
     _num_tokens: int = field(init=False, default=0, repr=False)
 
+    # This buffer is currently only used for TrtllmAttentionMetadata.
+    cache_indirection: Optional[torch.Tensor] = None
+
     def __post_init__(self) -> None:
         if self.is_cross:
             assert self.cross is None or self.cross is self, "Cross attention metadata should not have sub metadata"

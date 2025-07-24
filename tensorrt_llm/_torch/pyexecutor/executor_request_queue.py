@@ -10,7 +10,6 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.bindings.executor import RequestType
 
 from ..distributed import Distributed
 from .llm_request import ExecutorRequest, executor_request_to_llm_request
@@ -61,7 +60,6 @@ class ExecutorRequestQueue:
         self.num_fetch_requests_cur_rank = 0
         self.expected_num_active_requests = 0
         self.new_active_requests_queue_latency_ms = 0
-        self.has_context_request = False
         self.is_shutdown = False
         self.should_exclude_last_generation_logits = False
 
@@ -318,7 +316,6 @@ class ExecutorRequestQueue:
             self, new_requests: List[RequestQueueItem],
             all_ranks_num_active_requests: List[int]) -> List[RequestQueueItem]:
         """Balance requests across ranks for attention DP."""
-        self.has_context_request = False
         new_requests_cur_rank = []
 
         if new_requests and self.expected_num_active_requests > all_ranks_num_active_requests[
@@ -363,15 +360,6 @@ class ExecutorRequestQueue:
                     heapq.heappush(all_ranks_new_requests_heap, val)
                 elif val.rank == self.dist.tp_rank:
                     break
-
-            # Check for context requests
-            if self.is_disaggregated:
-                for req_item in new_requests_cur_rank:
-                    if req_item.request.request_type == RequestType.REQUEST_TYPE_CONTEXT_ONLY:
-                        self.has_context_request = True
-                        break
-            else:
-                self.has_context_request = len(new_requests_cur_rank) > 0
 
         return new_requests_cur_rank
 

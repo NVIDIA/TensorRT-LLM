@@ -228,7 +228,7 @@ TEST_F(TransferAgentTest, Connect)
 
 TEST_F(TransferAgentTest, SyncMessage)
 {
-
+    constexpr std::size_t MAX_QUERY_TIMES = std::numeric_limits<size_t>::max();
     std::string const agent0{"agent0"}, agent1{"agent1"};
     BaseAgentConfig config0{agent0, true}, config1{agent1, true};
     auto nixlAgent0 = makeTransferAgent(config0);
@@ -255,17 +255,15 @@ TEST_F(TransferAgentTest, SyncMessage)
         checked = nixlAgent0->checkRemoteDescs(agent1, regMem3.getDescs());
     } while (!checked);
     auto syncMessage = std::string("agent_sync_message");
-    nixlAgent0->notifySyncMessage(agent1, syncMessage);
-    TransferRequest writeReq{TransferOp::kWRITE, regMem0.getDescs(), regMem3.getDescs(), agent1};
+    TransferRequest writeReq{TransferOp::kWRITE, regMem0.getDescs(), regMem3.getDescs(), agent1, syncMessage};
     auto status = nixlAgent0->submitTransferRequests(writeReq);
-    status->wait();
 
-    const size_t MAX_QUERY_TIMES = std::numeric_limits<size_t>::max();
     auto notif = nixlAgent1->getNotifiedSyncMessages();
-    for (size_t i = 0; i < MAX_QUERY_TIMES && notif.size() == 0; i++)
+    for (std::size_t i = 0; i < MAX_QUERY_TIMES && notif.size() == 0; i++)
     {
         notif = nixlAgent1->getNotifiedSyncMessages();
     }
+    TLLM_CHECK(status->isCompleted());
     TLLM_CHECK(notif.size() == 1);
     TLLM_CHECK(notif[agent0].size() == 1);
     TLLM_CHECK(notif[agent0][0] == syncMessage);
@@ -275,7 +273,7 @@ TEST_F(TransferAgentTest, SyncMessage)
     std::string syncMessage2 = "two_agent_sync_message";
     nixlAgent0->notifySyncMessage(agent1, syncMessage2);
     auto notif2 = nixlAgent1->getNotifiedSyncMessages();
-    for (size_t i = 0; i < MAX_QUERY_TIMES && notif2.size() == 0; i++)
+    for (std::size_t i = 0; i < MAX_QUERY_TIMES && notif2.size() == 0; i++)
     {
         notif2 = nixlAgent1->getNotifiedSyncMessages();
     }
@@ -289,7 +287,7 @@ TEST_F(TransferAgentTest, SyncMessage)
     std::string syncMessage3 = "three_agent_sync_message";
     nixlAgent1->notifySyncMessage(agent0, syncMessage3);
     auto notif3 = nixlAgent0->getNotifiedSyncMessages();
-    for (size_t i = 0; i < MAX_QUERY_TIMES && notif3.size() == 0; i++)
+    for (std::size_t i = 0; i < MAX_QUERY_TIMES && notif3.size() == 0; i++)
     {
         notif3 = nixlAgent0->getNotifiedSyncMessages();
     }
@@ -304,15 +302,14 @@ TEST_F(TransferAgentTest, SyncMessage)
     } while (!checked2);
 
     std::string syncMessage4 = "four_agent_sync_message";
-    nixlAgent1->notifySyncMessage(agent0, syncMessage4);
-    TransferRequest writeReq1{TransferOp::kWRITE, regMem2.getDescs(), regMem1.getDescs(), agent0};
+    TransferRequest writeReq1{TransferOp::kWRITE, regMem2.getDescs(), regMem1.getDescs(), agent0, syncMessage4};
     auto status1 = nixlAgent1->submitTransferRequests(writeReq1);
-    status1->wait();
     auto notif4 = nixlAgent0->getNotifiedSyncMessages();
-    for (size_t i = 0; i < MAX_QUERY_TIMES && notif4.size() == 0; i++)
+    for (std::size_t i = 0; i < MAX_QUERY_TIMES && notif4.size() == 0; i++)
     {
         notif4 = nixlAgent0->getNotifiedSyncMessages();
     }
+    TLLM_CHECK(status1->isCompleted());
     TLLM_CHECK(notif4.size() == 1);
     TLLM_CHECK(notif4[agent1].size() == 1);
     TLLM_CHECK(notif4[agent1][0] == syncMessage4);

@@ -1155,15 +1155,14 @@ class TestMixtral8x22B(CliFlowAccuracyTestHarness):
     @skip_pre_ada
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(80000)
-    def test_fp8_tp2pp2(self, timeout_manager):
+    def test_fp8_tp2pp2(self):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
                         MMLU(self.MODEL_NAME)],
                  quant_algo=QuantAlgo.FP8,
                  tp_size=2,
                  pp_size=2,
                  extra_convert_args=["--calib_size=32"],
-                 extra_build_args=["--gemm_plugin=auto"],
-                 timeout_manager=timeout_manager)
+                 extra_build_args=["--gemm_plugin=auto"])
 
     @skip_post_blackwell
     @pytest.mark.skip_less_device(8)
@@ -1173,8 +1172,7 @@ class TestMixtral8x22B(CliFlowAccuracyTestHarness):
         ids=['expert_parallel', 'mixed_parallel', 'tensor_parallel'])
     @pytest.mark.parametrize("moe_renorm_mode", [0, 1],
                              ids=['no_renormalize', 'renormalize'])
-    def test_int8_plugin_tp8(self, moe_tp_size, moe_renorm_mode,
-                             timeout_manager):
+    def test_int8_plugin_tp8(self, moe_tp_size, moe_renorm_mode):
         self.run(quant_algo=QuantAlgo.W8A16,
                  tp_size=8,
                  extra_convert_args=[
@@ -1185,8 +1183,7 @@ class TestMixtral8x22B(CliFlowAccuracyTestHarness):
                  extra_build_args=[
                      "--max_beam_width=4", "--gemm_plugin=auto",
                      "--moe_plugin=auto", f"--max_seq_len={8192}"
-                 ],
-                 timeout_manager=timeout_manager)
+                 ])
 
 
 class TestGemma2B(CliFlowAccuracyTestHarness):
