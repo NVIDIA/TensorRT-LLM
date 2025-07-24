@@ -148,14 +148,14 @@ public:
         auto future = promise.get_future();
         {
             {
-                std::unique_lock lkResp(mResponderMutex);
+                std::unique_lock lkResp(mSenderMutex);
                 mReadyResponses.emplace(
                     llmRequest.mRequestId, Response{std::addressof(llmRequest), std::move(promise)});
             }
             std::unique_lock lkCond(mCondMutex);
             mAnyReady = true;
         }
-        mResponderCv.notify_all();
+        mSenderCv.notify_all();
         return future;
     }
 
@@ -208,7 +208,7 @@ private:
                 if (!mAnyReady)
                 {
                     std::unique_lock lk(mCondMutex);
-                    mResponderCv.wait(lk, [this]() { return (mAnyReady || mTerminate); });
+                    mSenderCv.wait(lk, [this]() { return (mAnyReady || mTerminate); });
                 }
                 if (mTerminate)
                 {
@@ -263,7 +263,7 @@ private:
                         "mReadyResponses size is: %zu. mpi rank :%d     ",
                         mCurrentRequest.value(), mReadyResponses.size(), mpi::MpiComm::world().getRank());
                     std::unique_lock lk(mCondMutex);
-                    mResponderCv.wait(lk, [this]() { return (mAnyReady || mTerminate); });
+                    mSenderCv.wait(lk, [this]() { return (mAnyReady || mTerminate); });
                 }
             }
         }
@@ -285,13 +285,13 @@ private:
         }
         // We don't have to wait for the future. If another thread is sending data, it won't pay attention
         // to the terminate flag.
-        mResponderCv.notify_all();
+        mSenderCv.notify_all();
     }
 
     void removeResponse(std::map<RequestIdType, Response>::iterator it)
     {
         {
-            std::unique_lock lkResp(mResponderMutex);
+            std::unique_lock lkResp(mSenderMutex);
             mReadyResponses.erase(it);
         }
         if (mReadyResponses.empty())
@@ -313,16 +313,16 @@ private:
 
     [[nodiscard]] std::map<RequestIdType, Response>::iterator getCurrentResponse()
     {
-        std::unique_lock lk(mResponderMutex);
+        std::unique_lock lk(mSenderMutex);
         return mReadyResponses.find(getCurrentRequestId());
     }
 
 private:
     std::optional<RequestIdType> mCurrentRequest;
     std::map<RequestIdType, Response> mReadyResponses;
-    std::mutex mResponderMutex, mCondMutex;
+    std::mutex mSenderMutex, mCondMutex;
     std::atomic<bool> mAnyReady{false}, mTerminate{false};
-    std::condition_variable mResponderCv;
+    std::condition_variable mSenderCv;
     std::future<void> mResponseFuture;
     std::unique_ptr<DataSender> mSender;
     std::unordered_map<LlmRequest::RequestIdType, int> mRemainSendCount;
@@ -333,9 +333,9 @@ class DataRequester::Impl
 {
 public:
     Impl(std::unique_ptr<DataReceiver> receiver)
-        : mReceiver{std::move(receiver)}
+        : mCacheReceiver{std::move(receiver)}
     {
-        TLLM_CHECK(mReceiver);
+        TLLM_CHECK(mCacheReceiver);
         TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
     }
 
@@ -400,8 +400,8 @@ private:
             llmRequest.getContextPhaseParams().value().getReqId());
         llmRequest.setKvCacheTransferStart(std::chrono::steady_clock::now());
         TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
-        auto session = mReceiver->sendRequestInfo(llmRequest);
-        mReceiver->receiveSync(session);
+        auto session = mCacheReceiver->sendRequestInfo(llmRequest);
+        mCacheReceiver->receiveSync(session);
         llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
 
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
@@ -507,7 +507,7 @@ private:
         }
     }
 
-    std::unique_ptr<DataReceiver> mReceiver;
+    std::unique_ptr<DataReceiver> mCacheReceiver;
     int mDeviceId{-1};
 
     std::vector<std::future<void>> mRequestFutures;
