@@ -11,7 +11,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import (AttentionInputType, AttentionMetadata,
                                  TrtllmAttention, TrtllmAttentionMetadata)
-from ..attention_backend.interface import (AttentionBackend,
+from ..attention_backend.interface import (AttentionBackend, AttentionMask,
                                            PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
 from ..attention_backend.utils import create_attention, get_attention_backend
@@ -68,8 +68,9 @@ class Attention(nn.Module):
         config = config or ModelConfig()
         self.hidden_size = hidden_size
         self.num_heads = num_attention_heads
-        self.head_dim = getattr(config.pretrained_config, "head_dim",
-                                self.hidden_size // self.num_heads)
+        self.head_dim = getattr(config.pretrained_config, 'head_dim', None)
+        if not isinstance(self.head_dim, int):
+            self.head_dim = self.hidden_size // self.num_heads
         self.num_key_value_heads = num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = max_position_embeddings
@@ -130,7 +131,8 @@ class Attention(nn.Module):
                 weight_mode=WeightMode.FUSED_QKV_LINEAR),
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-            allreduce_strategy=config.allreduce_strategy)
+            allreduce_strategy=config.allreduce_strategy,
+            force_dynamic_quantization=config.force_dynamic_quantization)
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])
 
@@ -144,7 +146,8 @@ class Attention(nn.Module):
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             lora=self.o_lora,
-            allreduce_strategy=config.allreduce_strategy)
+            allreduce_strategy=config.allreduce_strategy,
+            force_dynamic_quantization=config.force_dynamic_quantization)
 
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
@@ -226,12 +229,12 @@ class Attention(nn.Module):
         position_ids: Optional[torch.IntTensor],
         hidden_states: Union[torch.Tensor, Fp4QuantizedTensor],
         attn_metadata: AttentionMetadata,
-        attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
-        CAUSAL,
+        attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
         mrope_config: Optional[dict] = None,
         all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,
         attention_window_size: Optional[int] = None,
+        attention_mask_data: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -241,11 +244,12 @@ class Attention(nn.Module):
             position_ids (Optional[torch.IntTensor]): The position IDs.
             hidden_states (torch.Tensor): The hidden states.
             attn_metadata (AttentionMetadata): The attention metadata.
-            attention_mask (PredefinedAttentionMask): The attention mask type.
+            attention_mask (AttentionMask): The attention mask type.
             mrope_config (Optional[dict]): The MROPE configuration.
             all_reduce_params (Optional[AllReduceParams]): The all reduce parameters.
             lora_params (Optional[dict]): The LoRA parameters.
             attention_window_size (Optional[int]): The attention window size.
+            attention_mask_data (Optional[torch.Tensor]): The attention mask data.
 
         Returns:
             torch.Tensor: The output tensor.
@@ -269,7 +273,7 @@ class Attention(nn.Module):
 
         out_scale = None
         out_scale_sf = None
-        if self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4 or self.o_proj.has_fp8_block_scales:
+        if self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4 or self.o_proj.has_fp8_block_scales or self.o_proj.has_fp8_rowwise:
             out_scale = self.o_proj.inv_input_scale
         if self.o_proj.has_nvfp4 and self.support_nvfp4_output:
             out_scale_sf = self.o_proj.input_scale
@@ -284,7 +288,8 @@ class Attention(nn.Module):
             out_scale_sf=out_scale_sf,
             attention_mask=attention_mask,
             mrope_config=mrope_config,
-            attention_window_size=attention_window_size)
+            attention_window_size=attention_window_size,
+            attention_mask_data=attention_mask_data)
         hidden_states = attn_output
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params,
@@ -362,7 +367,7 @@ def fp8_block_scaling_bmm_out(
     out: torch.Tensor,
 ) -> torch.Tensor:
     sm_version = get_sm_version()
-    if sm_version == 90:
+    if sm_version == 90 or sm_version == 89:
         mat1_fp8, mat1_scale = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
             mat1)
         torch.ops.trtllm.fp8_block_scaling_bmm_out(mat1_fp8, mat2_fp8,
@@ -505,7 +510,7 @@ class MLA(nn.Module):
         self.num_heads_tp = self.num_heads // tp_size
         self.num_heads_tp_cp = self.num_heads_tp // cp_size
 
-        rms_norm_eps = getattr(config.pretrained_config, "rms_norm_eps", 1e-6)
+        rms_norm_eps = config.pretrained_config.rms_norm_eps
         quant_config = config.get_quant_config()
         self.quant_config = quant_config
 
@@ -517,7 +522,8 @@ class MLA(nn.Module):
                 dtype=dtype,
                 quant_config=quant_config,
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
-                use_custom_cublas_mm=True)
+                use_custom_cublas_mm=True,
+                force_dynamic_quantization=config.force_dynamic_quantization)
 
             self.q_a_layernorm = RMSNorm(hidden_size=self.q_lora_rank,
                                          eps=rms_norm_eps,
@@ -532,7 +538,8 @@ class MLA(nn.Module):
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 quant_config=quant_config,
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
-                allreduce_strategy=config.allreduce_strategy)
+                allreduce_strategy=config.allreduce_strategy,
+                force_dynamic_quantization=config.force_dynamic_quantization)
         else:
             self.fused_a = Linear(
                 hidden_size,
@@ -541,7 +548,8 @@ class MLA(nn.Module):
                 dtype=dtype,
                 quant_config=quant_config,
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
-                use_custom_cublas_mm=True)
+                use_custom_cublas_mm=True,
+                force_dynamic_quantization=config.force_dynamic_quantization)
 
             self.q_proj = Linear(
                 self.q_lora_rank,
@@ -552,7 +560,8 @@ class MLA(nn.Module):
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 quant_config=quant_config,
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
-                allreduce_strategy=config.allreduce_strategy)
+                allreduce_strategy=config.allreduce_strategy,
+                force_dynamic_quantization=config.force_dynamic_quantization)
             self.q_b_proj = self.q_proj
 
         self.kv_a_layernorm = RMSNorm(hidden_size=kv_lora_rank,
@@ -569,7 +578,8 @@ class MLA(nn.Module):
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             quant_config=quant_config,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-            allreduce_strategy=config.allreduce_strategy)
+            allreduce_strategy=config.allreduce_strategy,
+            force_dynamic_quantization=config.force_dynamic_quantization)
         # This parameter will view into self.kv_b_proj.weight after loading weights.
         # For dummy weight initialization, this parameter is initialized with empty tensor.
         # Used in forward_generation only
@@ -600,7 +610,8 @@ class MLA(nn.Module):
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=quant_config,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-            allreduce_strategy=config.allreduce_strategy)
+            allreduce_strategy=config.allreduce_strategy,
+            force_dynamic_quantization=config.force_dynamic_quantization)
 
         def yarn_get_mscale(scale=1, mscale=1):
             if scale <= 1:
