@@ -14,15 +14,37 @@
 # limitations under the License.
 
 import math
+from typing import Tuple
 
 import torch
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 
 
-def cu_seqlens_to_chunk_indices_offsets(cu_seqlens: torch.Tensor,
-                                        chunk_size: int):
-    # TODO: add comment what this function does
+def cu_seqlens_to_chunk_indices_offsets(
+        cu_seqlens: torch.Tensor,
+        chunk_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    This function computes the chunk indices and offsets for the given cu_seqlens and chunk_size.
+    Both are tensors of integers with length N, where N is the number of logical (pseudo) chunks.
+    A logical chunk is a sequence of tokens that are all part of the same sequence and are all in the same pyshical chunk.
+    In other words, a logical chunk changes every time we cross a sequence boundary or a pyshical chunk boundary.
+    Logical chunks are needed to handle batched requests with initial states (see _state_passing_fwd and _chunk_scan_fwd).
+    The chunk_indices tensor contains the index of the physical chunk for each logical chunk.
+    The chunk_offsets tensor contains the offset (AKA starting index) of the logical chunk in the physical chunk.
+
+    Example:
+    cu_seqlens = [0, 5, 10]
+    chunk_size = 8
+    -> chunk_indices = [0, 1, 0]
+    -> chunk_offsets = [0, 5, 0]
+
+    In this example, we have 2 sequences, each with 5 tokens. The physical chunk size is 8 tokens.
+    We have three logical chunks:
+    - the first logical chunk starts at token 0 in the first physical chunk and contains all 5 tokens from the first sequence
+    - the second logical chunk starts at token 5 in the first physical chunk and contains first 3 tokens from the second sequence
+    - the third logical chunk starts at token 0 in the second physical chunk and contains the remaining 2 tokens from the second sequence
+    """
 
     total_seqlens = cu_seqlens[-1]
     cu_seqlens = cu_seqlens[1:]  # remove prepended 0
