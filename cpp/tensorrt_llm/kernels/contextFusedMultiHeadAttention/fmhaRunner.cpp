@@ -538,7 +538,7 @@ void FusedMHARunnerV2::setTmaDescriptors(MHARunnerParams runnerParams)
         // Box size of TMA
         const uint32_t box_size_o[3] = {d_per_group, 1, 16};
 
-        // Yuxin: dataTypeOut may be different with dataType, so desc_format and swizzle_mode
+        // dataTypeOut may be different with dataType, so desc_format and swizzle_mode
         // may be incorrect. For example, QKV are in bf16 while O is in fp8.
         // Luckily, this case doesn't exist so far. But we should keep one eye on it.
         qo_tma_descriptor.set_tma_desctriptor(o_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED,
