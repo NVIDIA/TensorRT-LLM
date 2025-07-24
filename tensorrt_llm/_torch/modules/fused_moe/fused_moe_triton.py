@@ -192,6 +192,38 @@ class TritonEPRouter():
                            expt_data), gather_indx, scatter_indx
 
 
+def require_contiguous_weight(act_dtype, weights):
+    weights_dtype = weights.dtype
+    if weights_dtype == torch.bfloat16:
+        assert act_dtype == torch.bfloat16
+        return True
+    assert torch.cuda.get_device_capability()[0] >= 9
+    if torch.cuda.get_device_capability()[0] < 10:
+        if weights_dtype == torch.float8_e4m3fn:
+            assert act_dtype == torch.float8_e4m3fn
+            return False
+        if weights_dtype == torch.uint8:
+            assert act_dtype in [torch.float8_e4m3fn, torch.bfloat16]
+            return False
+    else:
+        if weights_dtype == torch.float8_e4m3fn:
+            assert act_dtype == torch.float8_e4m3fn
+            return True
+        if weights_dtype == torch.uint8:
+            assert act_dtype in [torch.float8_e4m3fn, torch.bfloat16]
+            return weights.shape[1] % 64 != 0
+    raise ValueError("Unknown dtype combination for contiguous weight check: "
+                     f"act_dtype={act_dtype}, weights_dtype={weights_dtype}")
+
+
+def maybe_transpose_weight(act_dtype, weight):
+    # Make sure the weight has the exact layout the kernels wants to avoid any perf impact
+    assert weight.dim() == 3
+    if require_contiguous_weight(act_dtype, weight):
+        return weight.contiguous()
+    return weight.transpose(1, 2).contiguous().transpose(1, 2)
+
+
 class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, shuffle_weight=True):
@@ -295,6 +327,22 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
             w2_weight_shard /= module.tp_size
 
         dst_w2_weight.copy_(w2_weight_shard, non_blocking=True)
+
+    def load_expert_weights_to_dst(
+            self, module: torch.nn.Module, weights: List[Dict],
+            weight_loading_mode: MoEWeightLoadingMode,
+            load_expert_ids: List[int], dst_w3_w1_weights_tensor: torch.Tensor,
+            dst_w2_weights_tensor: torch.Tensor,
+            dst_w3_w1_bias_tensor: Optional[torch.Tensor],
+            dst_w2_bias_tensor: Optional[torch.Tensor]):
+        FusedMoEMethodBase.load_expert_weights_to_dst(
+            self, module, weights, weight_loading_mode, load_expert_ids,
+            dst_w3_w1_weights_tensor, dst_w2_weights_tensor,
+            dst_w3_w1_bias_tensor, dst_w2_bias_tensor)
+        module.w3_w1_weight.data = maybe_transpose_weight(
+            module.dtype, module.w3_w1_weight.data)
+        module.w2_weight.data = maybe_transpose_weight(module.dtype,
+                                                       module.w2_weight.data)
 
     def apply(self, module: torch.nn.Module, x: torch.Tensor,
               router_logits: torch.Tensor) -> torch.Tensor:
@@ -492,6 +540,22 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         module.fc2_input_dequant.data.copy_(max_fc2_input_scale,
                                             non_blocking=True)
 
+    def load_expert_weights_to_dst(
+            self, module: torch.nn.Module, weights: List[Dict],
+            weight_loading_mode: MoEWeightLoadingMode,
+            load_expert_ids: List[int], dst_w3_w1_weights_tensor: torch.Tensor,
+            dst_w2_weights_tensor: torch.Tensor,
+            dst_w3_w1_bias_tensor: Optional[torch.Tensor],
+            dst_w2_bias_tensor: Optional[torch.Tensor]):
+        FusedMoEMethodBase.load_expert_weights_to_dst(
+            self, module, weights, weight_loading_mode, load_expert_ids,
+            dst_w3_w1_weights_tensor, dst_w2_weights_tensor,
+            dst_w3_w1_bias_tensor, dst_w2_bias_tensor)
+        module.w3_w1_weight.data = maybe_transpose_weight(
+            torch.float8_e4m3fn, module.w3_w1_weight.data)
+        module.w2_weight.data = maybe_transpose_weight(torch.float8_e4m3fn,
+                                                       module.w2_weight.data)
+
     def apply(self, module: torch.nn.Module, x: torch.Tensor,
               router_logits: torch.Tensor) -> torch.Tensor:
         # Fetch all the data needed for the Triton kernel
@@ -621,8 +685,7 @@ def swizzle_weight_and_scale(weight_tensor: torch.Tensor,
     scale = perm_tensor_from_contig(scale, axis, swizzle_axis)
     actual_scale_shape = perm_tuple_from_contig(orig_scale_shape, axis,
                                                 swizzle_axis)
-    # If weights are not contiguous, Triton matmul will secretly transpose instead of throwing an error.
-    return quant_tensor.contiguous(), scale, actual_scale_shape
+    return quant_tensor, scale, actual_scale_shape
 
 
 # We inherit from TritonUnquantizedFusedMoEMethod to reuse the weight preprocessing logic
@@ -1039,6 +1102,11 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                 module.fc2_input_dequant.data.copy_(max_fc2_input_scale,
                                                     non_blocking=True)
 
+        module.w3_w1_weight.data = maybe_transpose_weight(
+            self.activation_dtype, module.w3_w1_weight.data)
+        module.w2_weight.data = maybe_transpose_weight(self.activation_dtype,
+                                                       module.w2_weight.data)
+
     def apply(self, module: torch.nn.Module, x: torch.Tensor,
               router_logits: torch.Tensor) -> torch.Tensor:
         # Fetch all the data needed for the Triton kernel
@@ -1235,6 +1303,16 @@ class TritonFusedMoE(MoE):
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
+
+        if torch.cuda.get_device_capability()[0] >= 10:
+            from triton_kernels.matmul_ogs_details import opt_flags as optf
+            constraints = {
+                "block_m": 128,
+            }
+            # We need to unfortunately fix the block_m to 128 on Blackwell, otherwise it's computed based on x.
+            # And then triton would transpose weights based on heuristics related to block_m. This essentially means
+            # Triton will oaccasionally transpose weights for different input shapes and performance will suffer.
+            optf.update_opt_flags_constraints(constraints)
 
     def _get_quant_method(self):
         if hasattr(self, 'override_quant_method'):

@@ -12,6 +12,7 @@ from ...models.modeling_utils import QuantConfig
 # Reuse the common Triton import setup
 from .fused_moe.fused_moe_triton import (IS_TRITON_KERNELS_AVAILABLE,
                                          get_swizzle_type,
+                                         maybe_transpose_weight,
                                          swizzle_weight_and_scale)
 
 if IS_TRITON_KERNELS_AVAILABLE:
@@ -61,6 +62,8 @@ class TritonUnquantizedLinearMethod(LinearMethodBase):
 
     def load_weights_vanilla(self, module: Linear, weights: List[Dict]):
         load_weights_vanilla_helper(module, weights, **self.param_transform)
+        module.weight.data = maybe_transpose_weight(module.dtype,
+                                                    module.weight.data)
 
     def load_weights_fused_qkv_linear(self, module: Linear,
                                       weights: List[Dict]):
@@ -70,6 +73,8 @@ class TritonUnquantizedLinearMethod(LinearMethodBase):
             (q_weight, k_weight, v_weight), axis=-1
         )  #Each of them has shape (1, in_features, out_features_part)
         copy_weight(module.weight, fused_weight)
+        module.weight.data = maybe_transpose_weight(module.dtype,
+                                                    module.weight.data)
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
                                           weights: List[Dict]):
@@ -79,6 +84,8 @@ class TritonUnquantizedLinearMethod(LinearMethodBase):
             (gate_weight, up_weight), axis=-1
         )  #Each of them has shape (1, in_features, out_features_part)
         copy_weight(module.weight, fused_weight)
+        module.weight.data = maybe_transpose_weight(module.dtype,
+                                                    module.weight.data)
 
 
 class TritonFP8QDQLinearMethod(LinearMethodBase):
@@ -161,6 +168,8 @@ class TritonFP8QDQLinearMethod(LinearMethodBase):
             # Dynamic quantization
             module.input_scale = None
         copy_weight(module.weight_scale, weight_scale[0])
+        module.weight.data = maybe_transpose_weight(torch.float8_e4m3fn,
+                                                    module.weight.data)
 
     def load_weights_fused_qkv_linear(self, module: Linear,
                                       weights: List[Dict]):
@@ -185,6 +194,8 @@ class TritonFP8QDQLinearMethod(LinearMethodBase):
             torch.float8_e4m3fn)
         copy_weight(module.weight,
                     self.param_transform["weight_transform"](fused_weight))
+        module.weight.data = maybe_transpose_weight(torch.float8_e4m3fn,
+                                                    module.weight.data)
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
                                           weights: List[Dict]):
@@ -207,6 +218,8 @@ class TritonFP8QDQLinearMethod(LinearMethodBase):
             torch.float8_e4m3fn)
         copy_weight(module.weight,
                     self.param_transform["weight_transform"](fused_weight))
+        module.weight.data = maybe_transpose_weight(torch.float8_e4m3fn,
+                                                    module.weight.data)
 
 
 class TritonMXFP4LinearMethod(LinearMethodBase):
@@ -346,6 +359,9 @@ class TritonMXFP4LinearMethod(LinearMethodBase):
         else:
             # Dynamic quantization
             module.input_scale = None
+
+        module.weight.data = maybe_transpose_weight(self.activation_dtype,
+                                                    module.weight.data)
 
     def load_weights_vanilla(self, module: Linear, weights: List[Dict]):
         assert len(weights) == 1
