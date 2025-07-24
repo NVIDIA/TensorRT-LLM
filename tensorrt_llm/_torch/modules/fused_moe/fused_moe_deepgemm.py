@@ -46,39 +46,43 @@ def _masked_index_copy_group_quant_fp8(
 
     # calculate group and element offsets
     num_tokens = tl.load(start_offsets_ptr + row_size)
-    group_start = group_block * group_size
-    elem_offsets = group_start + tl.arange(0, BLOCK)
-    valid_elem = elem_offsets < (group_start + group_size)
-    input_ptr_offs = input_ptr + elem_offsets
-    output_ptr_offs = out_q_ptr + elem_offsets
-    output_s_offs = out_s_ptr + (group_block // 4) * aligned_col
-    shift = (group_block % 4) * 8
+    elem_offsets = group_block * group_size * 4 + tl.arange(0, BLOCK)
+    output_s_offs = out_s_ptr + group_block * aligned_col
 
     # process tokens
     for token_index in tl.range(token_block,
                                 num_tokens,
                                 token_block_num,
                                 num_stages=NUM_STAGE):
-        # load input and indices
-        input_data = tl.load(input_ptr_offs + token_index * dim_size,
-                             mask=valid_elem,
-                             other=0.0)
+        # load indices
         row_idx = tl.load(row_indices_ptr + token_index)
         start_offset = tl.load(start_offsets_ptr + row_idx)
         idx = row_idx * col_size + token_index - start_offset
         idx_s = row_idx * aligned_dim * aligned_col + token_index - start_offset
 
-        # quantization
-        _absmax = tl.maximum(tl.max(tl.abs(input_data)), eps)
-        output_s = _absmax / fp8_max
-        output_s = tl.exp2(tl.ceil(tl.log2(tl.abs(output_s))))
-        output_q = tl.clamp(input_data / output_s, -fp8_max,
-                            fp8_max).to(out_q_ptr.dtype.element_ty)
-        output_s = (output_s.to(tl.int32, bitcast=True) >> 23).to(tl.uint8)
+        output_s_int32 = 0
+        for group_index in tl.range(4):
+            # load input data
+            dim_offset = elem_offsets + group_index * group_size
+            valid = dim_offset < dim_size
+            input_data = tl.load(input_ptr + token_index * dim_size +
+                                 dim_offset,
+                                 mask=valid,
+                                 other=0.0)
+            # quantization
+            _absmax = tl.maximum(tl.max(tl.abs(input_data)), eps)
+            output_s = _absmax / fp8_max
+            output_s = tl.exp2(tl.ceil(tl.log2(tl.abs(output_s))))
+            output_q = tl.clamp(input_data / output_s, -fp8_max,
+                                fp8_max).to(out_q_ptr.dtype.element_ty)
+            output_s = output_s.to(tl.int32, bitcast=True) >> 23
+            output_s_int32 += output_s << (group_index * 8)
 
-        # store quantized values and scaling factor
-        tl.store(output_ptr_offs + idx * dim_size, output_q, mask=valid_elem)
-        tl.atomic_or(output_s_offs + idx_s, output_s << shift)
+            # store quantized values and scaling factor
+            tl.store(out_q_ptr + idx * dim_size + dim_offset,
+                     output_q,
+                     mask=valid)
+        tl.store(output_s_offs + idx_s, output_s_int32)
 
 
 def masked_index_copy_group_quant_fp8(
@@ -102,7 +106,6 @@ def masked_index_copy_group_quant_fp8(
     row_size = output.shape[0]
     col_size = output.shape[1]
     dim_size = output.shape[2]
-    num_groups = (dim_size + group_size - 1) // group_size
 
     # create padded output_s
     alignment = 4
@@ -114,17 +117,22 @@ def masked_index_copy_group_quant_fp8(
                            device='cuda')
 
     # get block/grid/stage/warp
+    num_groups = (dim_size + group_size - 1) // group_size
     BLOCK = group_size
-    if num_tokens <= 4096:
-        TOKEN_BLOCK_NUM = 128
+    if num_tokens <= 1000 or col_size <= 256:  # Small workload
+        TOKEN_BLOCK_NUM = 256
         NUM_STAGES = 4
         num_warps = 2
-    else:
-        TOKEN_BLOCK_NUM = 64
-        NUM_STAGES = 6
+    elif num_tokens <= 10000 or col_size <= 2048:  # Medium workload
+        TOKEN_BLOCK_NUM = 1024
+        NUM_STAGES = 2
+        num_warps = 1
+    else:  # Large workload
+        TOKEN_BLOCK_NUM = 2048
+        NUM_STAGES = 2
         num_warps = 1
     grid = (
-        num_groups,
+        (num_groups + 3) // 4,
         TOKEN_BLOCK_NUM,
     )
 
