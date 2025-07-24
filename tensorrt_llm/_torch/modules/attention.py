@@ -250,7 +250,6 @@ class Attention(nn.Module):
             lora_params (Optional[dict]): The LoRA parameters.
             attention_window_size (Optional[int]): The attention window size.
             attention_mask_data (Optional[torch.Tensor]): The attention mask data.
-
         Returns:
             torch.Tensor: The output tensor.
         """
