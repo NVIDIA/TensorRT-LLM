@@ -526,25 +526,6 @@ void initBindings(pybind11::module_& m)
         py::arg("context_requests"), py::arg("generation_requests"), py::arg("logits"), py::arg("beam_width"),
         py::arg("num_context_logits_prefix_sum"), py::arg("decoder_input_buffers"), py::arg("decoder_state"),
         py::arg("buffer_manager"), "Make decoding batch input.");
-
-    py::enum_<tb::kv_connector::KvCacheConnectorRole>(m, "KvCacheConnectorRole")
-        .value("Scheduler", tb::kv_connector::KvCacheConnectorRole::Scheduler)
-        .value("Worker", tb::kv_connector::KvCacheConnectorRole::Worker);
-
-    py::class_<tb::kv_connector::KvCacheConnector, kv_connector::PyKvCacheConnector, py::smart_holder>(
-        m, "KvCacheConnector")
-        .def(py::init<tb::kv_connector::KvCacheConnectorRole>(), py::arg("role"))
-        .def("register_kv_caches", &tb::kv_connector::KvCacheConnector::registerKvCaches)
-        .def("start_load_kv", &tb::kv_connector::KvCacheConnector::startLoadKv)
-        .def("wait_for_layer_load", &tb::kv_connector::KvCacheConnector::waitForLayerLoad, py::arg("layer_idx"))
-        .def("save_kv_layer", &tb::kv_connector::KvCacheConnector::saveKvLayer, py::arg("layer_idx"))
-        .def("wait_for_save", &tb::kv_connector::KvCacheConnector::waitForSave)
-        .def("get_finished", &tb::kv_connector::KvCacheConnector::getFinished, py::arg("finished_req_ids"))
-        .def("get_num_new_matched_tokens", &tb::kv_connector::KvCacheConnector::getNumNewMatchedTokens,
-            py::arg("request"), py::arg("num_computed_tokens"))
-        .def("update_state_after_alloc", &tb::kv_connector::KvCacheConnector::updateStateAfterAlloc)
-        .def("request_finished", &tb::kv_connector::KvCacheConnector::requestFinished, py::arg("request"))
-        .def_property_readonly("role", &tb::kv_connector::KvCacheConnector::role);
 }
 
 } // namespace tensorrt_llm::pybind::batch_manager
