@@ -125,24 +125,29 @@ def masked_index_gather_kernel(output_ptr, input_ptr, start_offsets_ptr,
                                BLOCK_SIZE: tl.constexpr):
     # get program id and block offset
     pid = tl.program_id(0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-
-    # compute mask and pointers
     num_tokens = tl.load(start_offsets_ptr + row_size)
-    token_idx = offsets // dim_size
-    valid = token_idx < num_tokens
+
+    token_idx = pid
+    valid_token = token_idx < num_tokens
+    if not valid_token:
+        return
+
     row_idx = tl.load(row_indices_ptr + token_idx)
-    start_offset = tl.load(start_offsets_ptr + row_idx, mask=valid)
+    start_offset = tl.load(start_offsets_ptr + row_idx)
     col_idx = token_idx - start_offset
-    elem_idx = offsets % dim_size
 
-    # input data
-    input_offsets = row_idx * col_size * dim_size + col_idx * dim_size + elem_idx
-    input_vals = tl.load(input_ptr + input_offsets, mask=valid)
+    # Process elements in blocks
+    for hidden_start in tl.range(0, dim_size, BLOCK_SIZE):
+        hidden_indices = hidden_start + tl.arange(0, BLOCK_SIZE)
+        valid_hidden = hidden_indices < dim_size
 
-    # get gather indices and store to output
-    tl.store(output_ptr + offsets, input_vals, mask=valid)
+        input_offset = row_idx * col_size * dim_size + col_idx * dim_size + hidden_indices
+        input_val = tl.load(input_ptr + input_offset,
+                            mask=valid_hidden,
+                            other=0.0)
+
+        output_offset = pid * dim_size + hidden_indices
+        tl.store(output_ptr + output_offset, input_val, mask=valid_hidden)
 
 
 @torch.no_grad()
@@ -156,10 +161,9 @@ def triton_masked_index_gather(output, input, start_offsets, row_indices):
     col_size = input.shape[1]
     dim_size = input.shape[2]
     num_tokens = output.shape[0]
-    total_elems = num_tokens * dim_size
 
+    grid = (num_tokens, )
     # launch kernel
-    grid = lambda meta: (triton.cdiv(total_elems, meta['BLOCK_SIZE']), )
     masked_index_gather_kernel[grid](output,
                                      input,
                                      start_offsets,
