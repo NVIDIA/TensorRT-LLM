@@ -266,7 +266,6 @@ class MultimodalParams:
                     from tensorrt_llm._torch.shared_tensor import \
                         SharedTensorContainer
 
-                    # print(f"input_data: {input_data}")
                     return SharedTensorContainer.from_dict(
                         input_data).get_local_view()
                 except Exception as e:
