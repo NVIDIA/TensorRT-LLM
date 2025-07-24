@@ -998,6 +998,12 @@ class BaseLlmArgs(BaseModel):
         description="The format to load the model.",
         json_schema_extra={"type": "Literal['auto', 'dummy']"})
 
+    fail_fast_on_attention_window_too_large: bool = Field(
+        default=False,
+        description=
+        "Fail fast when attention window is too large to fit even a single sequence in the KV cache."
+    )
+
     # LoRA arguments
     enable_lora: bool = Field(default=False, description="Enable LoRA.")
 
@@ -1658,12 +1664,6 @@ class TrtLlmArgs(BaseLlmArgs):
 
     fast_build: bool = Field(default=False, description="Enable fast build.")
 
-    fail_fast_on_attention_window_too_large: bool = Field(
-        default=False,
-        description=
-        "Fail fast when attention window is too large to fit even a single sequence in the KV cache."
-    )
-
     # BuildConfig is introduced to give users a familiar interface to configure the model building.
     build_config: Optional[object] = Field(
         default=None,
@@ -1883,12 +1883,6 @@ class TorchLlmArgs(BaseLlmArgs):
     force_dynamic_quantization: bool = Field(
         default=False,
         description="If true, force dynamic quantization. Defaults to False.",
-    )
-
-    fail_fast_on_attention_window_too_large: bool = Field(
-        default=False,
-        description=
-        "Fail fast when attention window is too large to fit even a single sequence in the KV cache."
     )
 
     allreduce_strategy: Optional[
