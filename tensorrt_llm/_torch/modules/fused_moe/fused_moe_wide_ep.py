@@ -143,18 +143,16 @@ class WideEPMoE(MoE):
         if self.use_dp:
             max_num_tokens *= model_config.mapping.world_size
         self.moe_max_num_tokens = model_config.moe_max_num_tokens if model_config.moe_max_num_tokens is not None else max_num_tokens
+        self.aux_stream = aux_stream if aux_stream is not None else torch.cuda.Stream(
+        )
+        self.event_dict = {
+            key: torch.cuda.Event()
+            for key in [EventType.Main, EventType.MoeAlltoall]
+        }
+
         # The auxiliary CUDA stream and CUDA events are only used when MoE chunking is applied
         if self.moe_max_num_tokens < max_num_tokens:
-            self.aux_stream = aux_stream if aux_stream is not None else torch.cuda.Stream(
-            )
-            self.event_dict = {
-                key: torch.cuda.Event()
-                for key in [EventType.Main, EventType.MoeChunkingOverlap]
-            }
-        else:
-            self.aux_stream = None
-            self.event_dict = None
-
+            self.event_dict[EventType.MoeChunkingOverlap] = torch.cuda.Event()
         # The profiler converges on the same best tactic when the number of tokens is large enough.
         # To avoid long profiling time, the max number of tokens used in the profiling is capped to
         # around 16k tokens per expert, which is well into the compute bound domain.
@@ -184,6 +182,8 @@ class WideEPMoE(MoE):
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
                 MnnvlMemory.initialize()
                 self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
+                    model_config.mapping)
+                self.alltoall_workspace_aux = MnnvlMoe.get_moe_workspace_aux(
                     model_config.mapping)
                 if self.enable_alltoall_without_allgather:
                     self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
@@ -866,23 +866,25 @@ class WideEPMoE(MoE):
                                     x_col: int,
                                     alltoall_info: MoEAlltoallInfo,
                                     is_sf_swizzle: bool = True):
+        self.event_dict[EventType.Main].record()
         x = MnnvlMoe.mnnvl_moe_alltoallv(x, alltoall_info,
                                          self.alltoall_workspace, self.ep_rank,
                                          self.ep_size)
-
         if x_sf is not None:
-            if self.has_nvfp4 and is_sf_swizzle:
-                x_sf = unswizzle_sf(x_sf, x_row, x_col,
-                                    self.scaling_vector_size)
+            with torch.cuda.stream(self.aux_stream):
+                self.event_dict[EventType.Main].wait()
+                if self.has_nvfp4 and is_sf_swizzle:
+                    x_sf = unswizzle_sf(x_sf, x_row, x_col,
+                                        self.scaling_vector_size)
 
-            x_sf = MnnvlMoe.mnnvl_moe_alltoallv(x_sf, alltoall_info,
-                                                self.alltoall_workspace,
-                                                self.ep_rank, self.ep_size)
-
-            if self.has_nvfp4:
-                x_sf = swizzle_sf(x_sf, x.shape[0], x.shape[1] * 2,
-                                  self.scaling_vector_size)
-
+                x_sf = MnnvlMoe.mnnvl_moe_alltoallv(x_sf, alltoall_info,
+                                                    self.alltoall_workspace_aux,
+                                                    self.ep_rank, self.ep_size)
+                if self.has_nvfp4:
+                    x_sf = swizzle_sf(x_sf, x.shape[0], x.shape[1] * 2,
+                                      self.scaling_vector_size)
+                self.event_dict[EventType.MoeAlltoall].record()
+            self.event_dict[EventType.MoeAlltoall].wait()
         return x, x_sf
 
     def alltoall_combine(self, final_hidden_states: torch.Tensor,
