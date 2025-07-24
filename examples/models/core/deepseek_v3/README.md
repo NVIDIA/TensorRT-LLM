@@ -77,7 +77,7 @@ git clone https://huggingface.co/deepseek-ai/DeepSeek-V3 <YOUR_MODEL_DIR>
 ## Quick Start
 
 ### Run a single inference
-To quickly run DeepSeek-V3, [examples/llm-api/quickstart_advanced.py](../pytorch/quickstart_advanced.py):
+To quickly run DeepSeek-V3, [examples/llm-api/quickstart_advanced.py](../llm-api/quickstart_advanced.py):
 
 ```bash
 cd examples/llm-api
@@ -94,7 +94,7 @@ Prompt: 'The future of AI is', Generated text: ' a topic of great interest and s
 ```
 
 ### Multi-Token Prediction (MTP)
-To run with MTP, use [examples/llm-api/quickstart_advanced.py](../pytorch/quickstart_advanced.py) with additional options, see
+To run with MTP, use [examples/llm-api/quickstart_advanced.py](../../../llm-api/quickstart_advanced.py) with additional options, see
 ```bash
 cd examples/llm-api
 python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_max_draft_len N
