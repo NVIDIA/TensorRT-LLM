@@ -169,7 +169,6 @@ class PyExecutor:
         self.draft_model_engine = draft_model_engine
 
         # enqueue and _fetch_new_requests used data
-        self.active = True
         self.next_req_id = max_batch_size  # The first max_batch_size request IDs are reserved for dummy requests
         self.max_beam_width = max_beam_width
         self.max_draft_len = max_draft_len
@@ -196,7 +195,6 @@ class PyExecutor:
         self.max_num_active_requests = model_engine.get_max_num_sequences()
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
-        self.has_context_request = False
         self.ctx_in_transmission_requests = []
         self.previous_batch: Optional[BatchState] = None
         self.num_scheduled_requests: int = 0
@@ -1138,7 +1136,7 @@ class PyExecutor:
     @nvtx_range("_pad_attention_dp_dummy_request")
     def _pad_attention_dp_dummy_request(self):
         """
-        Pad with a dummy request, if required, to ensure every attention_dp rank has at least one active request.
+        Pad with a generation dummy request, if required, to ensure every attention_dp rank has at least one active request.
         """
         if not self.enable_attention_dp:
             return
@@ -1156,8 +1154,8 @@ class PyExecutor:
         if self.expected_num_active_requests - num_active_request > 0 and num_active_request == 0:
             llm_request = self.kv_cache_manager.add_dummy_requests(
                 request_ids=[0],
-                is_gen=not self.has_context_request,
-                prepare_resource=not self.has_context_request,
+                is_gen=True,
+                prepare_resource=True,
                 max_num_draft_tokens=self.max_draft_len,
             )[0]
             llm_request.is_attention_dp_dummy = True
