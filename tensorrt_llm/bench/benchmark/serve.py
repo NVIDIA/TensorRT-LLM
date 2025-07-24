@@ -163,21 +163,21 @@ def serve_command(
     logger.info("Preparing to run serve...")
 
     # Server configuration
-    host: str = params.pop("host")
-    port: int = params.pop("port")
+    host: str = params.get("host")
+    port: int = params.get("port")
 
     # Constraints
-    max_seq_len: int = params.pop("max_seq_len")
-    target_input_len: int = params.pop("target_input_len")
-    target_output_len: int = params.pop("target_output_len")
-    max_isl: int = params.pop("max_isl")
-    max_osl: int = params.pop("max_osl")
+    max_seq_len: int = params.get("max_seq_len")
+    target_input_len: int = params.get("target_input_len")
+    target_output_len: int = params.get("target_output_len")
+    max_isl: int = params.get("max_isl")
+    max_osl: int = params.get("max_osl")
 
     model: str = bench_env.model
     checkpoint_path: Path = bench_env.checkpoint_path or bench_env.model
-    engine_dir: Path = params.pop("engine_dir")
+    engine_dir: Path = params.get("engine_dir")
     backend: str = params.get("backend")
-    post_workers: int = params.pop("post_workers")
+    post_workers: int = params.get("post_workers")
     tuning_constraints = TuningConstraints(
         average_isl=target_input_len,
         average_osl=target_output_len,
@@ -216,14 +216,14 @@ def serve_command(
     engine_tokens = exec_settings["settings_config"]["max_num_tokens"]
 
     # Runtime Options
-    runtime_max_bs = params.pop("max_batch_size")
-    runtime_max_tokens = params.pop("max_num_tokens")
+    runtime_max_bs = params.get("max_batch_size")
+    runtime_max_tokens = params.get("max_num_tokens")
     runtime_max_bs = runtime_max_bs or engine_bs
     runtime_max_tokens = runtime_max_tokens or engine_tokens
-    kv_cache_percent = params.pop("kv_cache_free_gpu_mem_fraction")
-    beam_width = params.pop("max_beam_width")
-    enable_chunked_context: bool = params.pop("enable_chunked_context")
-    scheduler_policy: str = params.pop("scheduler_policy")
+    kv_cache_percent = params.get("kv_cache_free_gpu_mem_fraction")
+    beam_width = params.get("max_beam_width")
+    enable_chunked_context: bool = params.get("enable_chunked_context")
+    scheduler_policy: str = params.get("scheduler_policy")
 
     # Update configuration with runtime options
     exec_settings["settings_config"]["kv_cache_percent"] = kv_cache_percent
@@ -238,7 +238,7 @@ def serve_command(
     exec_settings["settings_config"]["dynamic_max_batch_size"] = True
 
     # LlmArgs
-    exec_settings["extra_llm_api_options"] = params.pop("extra_llm_api_options")
+    exec_settings["extra_llm_api_options"] = params.get("extra_llm_api_options")
 
     # Construct the runtime configuration dataclass.
     runtime_config = RuntimeConfig(**exec_settings)
