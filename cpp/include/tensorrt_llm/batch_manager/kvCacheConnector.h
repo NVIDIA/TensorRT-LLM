@@ -63,7 +63,7 @@ class KvCacheConnectorPoolsData
 {
 public:
     explicit KvCacheConnectorPoolsData(
-        std::vector<KvCacheConnectorPoolData>& poolsData, runtime::ITensor::SharedPtr const& layerToPoolMapping)
+        std::vector<KvCacheConnectorPoolData>& poolsData, std::vector<SizeType32>& layerToPoolMapping)
         : mPoolsData(poolsData)
         , mLayerToPoolMapping(layerToPoolMapping)
     {
@@ -74,14 +74,14 @@ public:
         return mPoolsData;
     }
 
-    runtime::ITensor::SharedPtr& getLayerToPoolMapping()
+    std::vector<SizeType32>& getLayerToPoolMapping()
     {
         return mLayerToPoolMapping;
     }
 
 private:
     std::vector<KvCacheConnectorPoolData> mPoolsData;
-    runtime::ITensor::SharedPtr mLayerToPoolMapping;
+    std::vector<SizeType32> mLayerToPoolMapping;
 };
 
 class KvCacheConnector

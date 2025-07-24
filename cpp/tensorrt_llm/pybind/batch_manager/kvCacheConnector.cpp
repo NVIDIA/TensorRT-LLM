@@ -110,13 +110,8 @@ void tensorrt_llm::batch_manager::kv_cache_manager::KVCacheManagerConnectorBindi
 
     py::class_<tb::kv_connector::KvCacheConnectorPoolsData>(m, "KvCacheConnectorPoolsData")
         .def_property_readonly("pools", &tb::kv_connector::KvCacheConnectorPoolsData::getPoolsData)
-        .def_property_readonly("layer_to_pool_mapping",
-            [](tb::kv_connector::KvCacheConnectorPoolsData& self)
-            {
-                auto const& layerToPoolMapping = self.getLayerToPoolMapping();
-
-                return tensorrt_llm::runtime::Torch::tensor(layerToPoolMapping);
-            });
+        .def_property_readonly(
+            "layer_to_pool_mapping", &tb::kv_connector::KvCacheConnectorPoolsData::getLayerToPoolMapping);
 
     py::class_<tb::kv_connector::KvCacheConnector, PyKvCacheConnector, py::smart_holder>(m, "KvCacheConnector")
         .def(py::init<tb::kv_connector::KvCacheConnectorRole>(), py::arg("role"))
