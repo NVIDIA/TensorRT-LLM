@@ -55,8 +55,10 @@ public:
 
         // Note: create() shall not leak resources when throwing exceptions.
         // release() will only, and will always be called if create() success.
+        // release() will be called with destructing=true when the CUDAVirtualMemoryChunk
+        // is being destructed.
         virtual CUmemGenericAllocationHandle create() = 0;
-        virtual void release(CUmemGenericAllocationHandle) = 0;
+        virtual void release(CUmemGenericAllocationHandle handle, bool destructing) = 0;
     };
 
     using CreatorPtr = std::unique_ptr<Creator>;
@@ -78,8 +80,10 @@ public:
 
         // Note: setup() shall not leak resources when throwing exceptions.
         // teardown() will only, and will always be called if setup() success.
-        virtual void setup(CUmemGenericAllocationHandle) = 0;
-        virtual void teardown(CUmemGenericAllocationHandle) = 0;
+        // teardown() will be called with destructing=true when the CUDAVirtualMemoryChunk
+        // is being destructed.
+        virtual void setup(CUmemGenericAllocationHandle handle) = 0;
+        virtual void teardown(CUmemGenericAllocationHandle handle, bool destructing) = 0;
     };
 
     using ConfiguratorPtr = std::unique_ptr<Configurator>;
@@ -134,7 +138,10 @@ public:
      *
      * Never stops early upon exception. The last thrown exception will be propagated, and others logged.
      */
-    void release();
+    void release()
+    {
+        _release(false);
+    }
 
     CUDAVirtualMemoryChunk(CUDAVirtualMemoryChunk const&) = delete;
     CUDAVirtualMemoryChunk& operator=(CUDAVirtualMemoryChunk const&) = delete;
@@ -170,7 +177,7 @@ public:
         // we shouldn't call release() again.
         if (mHandle != 0 && mState != INVALID_STATE)
         {
-            release();
+            _release(true);
         }
     }
 
@@ -183,6 +190,8 @@ public:
     }
 
 private:
+    void _release(bool destructing);
+
     constexpr static size_t INVALID_STATE = static_cast<size_t>(-1);
     size_t mState = 0;
     CUmemGenericAllocationHandle mHandle{};
@@ -214,7 +223,7 @@ struct LocalCreator : CUDAVirtualMemoryChunk::Creator
         return handle;
     }
 
-    void release(CUmemGenericAllocationHandle handle) override
+    void release(CUmemGenericAllocationHandle handle, bool destructing) override
     {
         TLLM_CU_CHECK_FREE_RESOURCE(cuMemRelease(handle));
         if constexpr (count)
@@ -246,7 +255,7 @@ struct UnicastConfigurator : CUDAVirtualMemoryChunk::Configurator
         TLLM_CU_CHECK(cuMemSetAccess(mAddress, mSize, &mDesc, 1));
     }
 
-    void teardown(CUmemGenericAllocationHandle) override
+    void teardown(CUmemGenericAllocationHandle, bool) override
     {
         TLLM_CU_CHECK_FREE_RESOURCE(cuMemUnmap(mAddress, mSize));
     }
@@ -266,7 +275,7 @@ struct MulticastConfigurator : CUDAVirtualMemoryChunk::Configurator
         TLLM_CU_CHECK(cuMulticastBindMem(mMulticast, 0, handle, mBindOffset, mSize, 0));
     }
 
-    void teardown(CUmemGenericAllocationHandle) override
+    void teardown(CUmemGenericAllocationHandle, bool) override
     {
         TLLM_CU_CHECK_FREE_RESOURCE(cuMulticastUnbind(mMulticast, mDevice, 0, mSize));
     }
@@ -302,7 +311,7 @@ struct MemsetConfigurator : CUDAVirtualMemoryChunk::Configurator
         }
     }
 
-    void teardown(CUmemGenericAllocationHandle) noexcept override {}
+    void teardown(CUmemGenericAllocationHandle, bool) noexcept override {}
 
     CUdeviceptr mAddress;
     size_t mSize;
@@ -326,8 +335,8 @@ struct OffloadConfigurator : CUDAVirtualMemoryChunk::Configurator
     {
     }
 
-    void setup(CUmemGenericAllocationHandle) override;
-    void teardown(CUmemGenericAllocationHandle) override;
+    void setup(CUmemGenericAllocationHandle handle) override;
+    void teardown(CUmemGenericAllocationHandle handle, bool destructing) override;
 
     CUdeviceptr mAddress;
     size_t mSize;

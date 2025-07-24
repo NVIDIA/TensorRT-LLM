@@ -84,7 +84,7 @@ static bool safe_invoke_helper(std::exception_ptr& ep, char const* msg, Callable
     }
 }
 
-void CUDAVirtualMemoryChunk::release()
+void CUDAVirtualMemoryChunk::_release(bool destructing)
 {
     TLLM_CHECK_WITH_INFO(status() == MATERIALIZED || (status() == ERRORED && mState != INVALID_STATE),
         "virtual memory is in status %d which cannot be released", status());
@@ -99,9 +99,10 @@ void CUDAVirtualMemoryChunk::release()
     auto const* msg = "Multiple exceptions thrown during release. The previous exception is: %s";
     for (size_t i = start; i < count; ++i)
     {
-        safe_invoke_helper(ePtr, msg, &Configurator::teardown, mConfigurators[count - i - 1].get(), mHandle);
+        safe_invoke_helper(
+            ePtr, msg, &Configurator::teardown, mConfigurators[count - i - 1].get(), mHandle, destructing);
     }
-    safe_invoke_helper(ePtr, msg, &Creator::release, mCreator.get(), mHandle);
+    safe_invoke_helper(ePtr, msg, &Creator::release, mCreator.get(), mHandle, destructing);
     mHandle = {};
     mState = 0;
 
@@ -128,8 +129,13 @@ void OffloadConfigurator::setup(CUmemGenericAllocationHandle)
     }
 }
 
-void OffloadConfigurator::teardown(CUmemGenericAllocationHandle)
+void OffloadConfigurator::teardown(CUmemGenericAllocationHandle, bool destructing)
 {
+    if (destructing)
+    {
+        return;
+    }
+
     if (mBackedStorage == nullptr)
     {
         switch (mBackType)
@@ -140,7 +146,7 @@ void OffloadConfigurator::teardown(CUmemGenericAllocationHandle)
         }
     }
     // We have to synchronize here, or the memory may be unmapped before the copy operation.
-    TLLM_CU_CHECK(cuMemcpyDtoH_v2(mBackedStorage->data(), mAddress, mSize));
+    TLLM_CU_CHECK_FREE_RESOURCE(cuMemcpyDtoH_v2(mBackedStorage->data(), mAddress, mSize));
 }
 
 void CudaVirtualMemoryManager::add(uintptr_t handle, std::string mark, CUDAVirtualMemoryChunk&& memory)

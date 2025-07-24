@@ -158,7 +158,7 @@ void checkDriver(
 template <typename T>
 void checkDriverExitSafe(T result, char const* const func, char const* const file, int const line)
 {
-    if (result)
+    if (result != CUDA_SUCCESS && result != CUDA_ERROR_DEINITIALIZED)
     {
         throw TllmException(
             file, line, fmtstr("[TensorRT-LLM][ERROR] CUDA driver error in %s: %d.", func, result).c_str());
