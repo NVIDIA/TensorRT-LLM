@@ -341,6 +341,11 @@ public:
 
     void debugCheckSemaphores(cudaStream_t stream);
 
+    [[nodiscard]] int getMultiProcessorCount() const
+    {
+        return mMultiProcessorCount;
+    }
+
     [[nodiscard]] std::string toString() const;
 
     int mLayerIdx = -1;

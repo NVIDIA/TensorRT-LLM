@@ -74,6 +74,10 @@ enum class Attention_input_layout
     // of [B, 2, Blocks_per_Seq], and the indice indicates the block distance to the pool ptr in
     // global memory.
     Q_PAGED_KV,
+    // Q has [B, S, H, D] layout,
+    // K has [B, S, H_kv, D] layout,
+    // V has [B, S, H_kv, Dv] layout,
+    SEPARATE_Q_K_V,
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -85,6 +89,7 @@ static inline std::string attention_input_layout_to_string(Attention_input_layou
     case Attention_input_layout::PACKED_QKV: return "packed_qkv";
     case Attention_input_layout::CONTIGUOUS_Q_KV: return "contiguous_q_kv";
     case Attention_input_layout::Q_PAGED_KV: return "contiguous_q_paged_kv";
+    case Attention_input_layout::SEPARATE_Q_K_V: return "separate_q_k_v";
     default: assert(false); return "";
     }
 }
@@ -114,8 +119,6 @@ struct Fused_multihead_attention_params_base
     // The O matrix (output).
     void* o_ptr;
 
-    // The stride between rows of the Q, K and V matrices.
-    int64_t qkv_stride_in_bytes;
     // The stride between rows of O.
     int64_t o_stride_in_bytes;
 
@@ -169,6 +172,8 @@ struct Fused_multihead_attention_params_base
 
 struct Fused_multihead_attention_params_v1 : Fused_multihead_attention_params_base
 {
+    // The stride between rows of the Q, K and V matrices.
+    int64_t qkv_stride_in_bytes;
     // The mask to implement drop-out.
     void* packed_mask_ptr;
 
@@ -207,20 +212,25 @@ struct Fused_multihead_attention_params_v2 : Fused_multihead_attention_params_ba
     // Kv in packed qkv layout: [B, S, 3, H, D]
     // Contiguous kv layout: [B, 2, H, S, D].
     // Paged kv layout: [UINT32_MAX, H, Tokens_per_block, D].
-    fmha::cudaTmaDesc tma_desc_kv;
+    fmha::cudaTmaDesc tma_desc_k;
+    fmha::cudaTmaDesc tma_desc_v;
     // Tma descriptor for o
     fmha::cudaTmaDesc tma_desc_o;
 
     // Contiguous Q buffer pointer [B, S, H, D].
     void* q_ptr;
+    // The separate K matrice.
+    void* k_ptr;
+    // The separate V matrice.
+    void* v_ptr;
     // Contiguous KV buffer pointer [B, 2, H, S, D].
     void* kv_ptr;
     // Paged KV Cache buffer.
     fmha::Kv_block_array paged_kv_cache;
     // Q and KV stride (used by LDGSTS).
     int64_t q_stride_in_bytes;
-    int64_t kv_stride_in_bytes;
-    int64_t v_stride_in_bytes = 0;
+    int64_t k_stride_in_bytes;
+    int64_t v_stride_in_bytes;
 
     // Paged KV load.
     int blocks_per_tma_load;
