@@ -173,7 +173,7 @@ struct Compute
 
     enum
     {
-        TILE_SIZE_V = STEP_KV * Kernel_traits::D
+        TILE_SIZE_V = STEP_KV * Kernel_traits::DV
     };
 
     enum
