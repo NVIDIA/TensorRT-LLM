@@ -135,13 +135,6 @@ class BatchStatePP(BatchState):
     scheduled_ctx_reqs: list[LlmRequest] = None
 
 
-def load_connector_module(kv_connector_config: KvCacheConnectorConfig):
-    module_name = kv_connector_config.connector_module
-    class_name = kv_connector_config.connector_class
-    module = importlib.import_module(module_name)
-    return getattr(module, class_name)
-
-
 class PyExecutor:
 
     def __init__(self,
@@ -276,13 +269,27 @@ class PyExecutor:
         self.worker_lock = threading.Lock()
 
         if kv_connector_config is not None:
-            connector_cls = load_connector_module(kv_connector_config)
+            logger.info(
+                f"Initializing kv connector with config: {kv_connector_config}")
+            module_name = kv_connector_config.connector_module
+            class_name = kv_connector_config.connector_class
 
-            self.connector_worker = connector_cls(KvCacheConnectorRole.Worker)
+            try:
+                module = importlib.import_module(module_name)
+                connector_cls = getattr(module, class_name)
+                self.connector_worker = connector_cls(
+                    KvCacheConnectorRole.Worker)
 
-            if global_mpi_rank() == 0:
-                self.connector_scheduler = connector_cls(
-                    KvCacheConnectorRole.Scheduler)
+                # Only initialize the scheduler on rank 0.
+                if global_mpi_rank() == 0:
+                    self.connector_scheduler = connector_cls(
+                        KvCacheConnectorRole.Scheduler)
+            except Exception as e:
+                logger.error(f"Error instantiating connector: {e}")
+                raise e
+            kv_cache_data = self.kv_cache_manager.get_kv_cache_connector_pools_data(
+            )
+            self.connector_worker.register_kv_caches(kv_cache_data)
 
         if start_worker:
             self.start_worker()
