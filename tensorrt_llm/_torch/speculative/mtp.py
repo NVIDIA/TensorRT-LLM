@@ -1067,10 +1067,27 @@ class MTPWorker(nn.Module):
         combined = torch.stack(
             [max_index_per_rank_float, local_max_values_float32],
             dim=-1).flatten(-2)
-        return combined
+
+        original_last_dim = combined.shape[-1]
+        
+        # Ensure the combined tensor has at least 8 elements by padding with zeros
+        if combined.numel() < 4:
+            padding_size = 4 - combined.numel()
+            # Create padding tensor with same shape as combined except for the last dimension
+            padding_shape = list(combined.shape)
+            padding_shape[-1] = padding_size
+            padding = torch.zeros(padding_shape, dtype=combined.dtype, device=combined.device)
+            combined = torch.cat([combined, padding], dim=-1)
+        
+        
+        return original_last_dim, combined
 
     @torch.compile(options={"max-autotune": True})
-    def get_draft_tokens_from_gathered(self, gathered):
+    def get_draft_tokens_from_gathered(self, gathered, original_last_dim):
+        
+        gathered = gathered[..., :original_last_dim]
+        num_ranks, features_per_rank = gathered.shape
+        gathered = gathered.reshape(1, num_ranks * features_per_rank)
         gathered_indices_float = gathered[..., 0::2]  # Even positions: indices
         gathered_values_float = gathered[..., 1::2]  # Odd positions: values
 
@@ -1103,22 +1120,13 @@ class MTPWorker(nn.Module):
                 and hasattr(self.model_config, 'mapping')
                 and self.model_config.mapping.tp_size
                 > 1) and not (self.model_config.mapping.enable_attention_dp):
-            combined = self.get_local_max_and_combined(logits)
+            original_last_dim, combined = self.get_local_max_and_combined(logits)
 
-            if 1:
+            # if 1:
                 #print(f"DBG AMEY: rank: {self.model_config.mapping.tp_rank} combined.shape: {combined.shape}")
                 
                 # Store original size before padding
-                original_last_dim = combined.shape[-1]
                 
-                # Ensure the combined tensor has at least 8 elements by padding with zeros
-                if combined.numel() < 8:
-                    padding_size = 8 - combined.numel()
-                    # Create padding tensor with same shape as combined except for the last dimension
-                    padding_shape = list(combined.shape)
-                    padding_shape[-1] = padding_size
-                    padding = torch.zeros(padding_shape, dtype=combined.dtype, device=combined.device)
-                    combined = torch.cat([combined, padding], dim=-1)
                 
                 # if self.model_config.mapping.tp_rank == 0:
                 #     print(f"DBG AMEY: after padding rank: {self.model_config.mapping.tp_rank} combined.shape: {combined.shape} dtype: {combined.dtype} device: {combined.device}")
@@ -1137,26 +1145,19 @@ class MTPWorker(nn.Module):
                 #     print("DBG AMEY: gathered: ", gathered)
                 
                 # Remove the padded zeros by slicing to original size
-                gathered = gathered[..., :original_last_dim]
-                #print(f"DBG AMEY: after removing padding rank: {self.model_config.mapping.tp_rank} gathered.shape: {gathered.shape}")
-                #print("DBG AMEY: unpaddedgathered: ", gathered)
                 
-                # Reshape to match original allgather format: [num_ranks, features] -> [1, num_ranks * features]
-                # Original allgather concatenates along dim=-1, so we need to flatten all ranks' data
-                num_ranks, features_per_rank = gathered.shape
-                gathered = gathered.reshape(1, num_ranks * features_per_rank)
                 #print(f"DBG AMEY: after reshaping to allgather format rank: {self.model_config.mapping.tp_rank} gathered.shape: {gathered.shape}")
                 
-                draft_tokens = self.get_draft_tokens_from_gathered(gathered)
-            else:
-                # Fallback to original allgather approach
-                gathered = allgather(combined, self.model_config.mapping, dim=-1)
+                draft_tokens = self.get_draft_tokens_from_gathered(gathered, original_last_dim)
+            # else:
+            #     # Fallback to original allgather approach
+            #     gathered = allgather(combined, self.model_config.mapping, dim=-1)
                 
-                # Remove the padded zeros by slicing to original size
-                # gathered = gathered[..., :original_last_dim]
-                #print(f"DBG AMEY: fallback after removing padding rank: {self.model_config.mapping.tp_rank} gathered.shape: {gathered.shape}")
+            #     # Remove the padded zeros by slicing to original size
+            #     # gathered = gathered[..., :original_last_dim]
+            #     #print(f"DBG AMEY: fallback after removing padding rank: {self.model_config.mapping.tp_rank} gathered.shape: {gathered.shape}")
                 
-                draft_tokens = self.get_draft_tokens_from_gathered(gathered)
+            #     draft_tokens = self.get_draft_tokens_from_gathered(gathered)
         else:
             # Simple argmax if no TP or no model config
             draft_tokens = torch.argmax(logits, dim=-1).type(torch.int32)

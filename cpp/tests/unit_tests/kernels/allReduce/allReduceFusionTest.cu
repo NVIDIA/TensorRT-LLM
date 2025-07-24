@@ -461,6 +461,12 @@ public:
             token_num * hidden_dim, kNCCLDataType, ncclSum, m_nccl_comm, m_stream->get()));
     }
 
+    void run_nccl_allgather(int token_num, int hidden_dim)
+    {
+        TLLM_NCCL_CHECK(ncclAllGather(m_allreduce_in.device_data(), m_allgather_out.device_data(),
+            token_num * hidden_dim, kNCCLDataType, m_nccl_comm, m_stream->get()));
+    }
+
     void run_residual_add(int token_num, int hidden_dim)
     {
         residual_add(m_residual_out.device_data<DType>(), m_residual_in.device_data<DType>(), token_num * hidden_dim,
@@ -682,8 +688,10 @@ TEST(Kernel_AllReduceFusion, AllGatherAccuracyAndOutput)
     }
 
     int iter = 100;
+    int warmup = 50;
     int token_num = 1;
-    int hidden_dim = 16; // Small size for easy output verification
+    bool run_benchmark = true;
+    int hidden_dim = 4; // Small size for easy output verification
 
     Runner runner(token_num, hidden_dim);
 
@@ -720,12 +728,24 @@ TEST(Kernel_AllReduceFusion, AllGatherAccuracyAndOutput)
         printf("[Verify] token_num %-4d, hidden_dim %-4d ...", token_num, hidden_dim);
     }
 
-    // Run iterations
-    for (int i = 0; i < iter; ++i)
+    // Run accuracy verification
+    for (int i = 0; i < 10; ++i)
     {
         // runner.reset_io();
         runner.run_once(&Runner::run_kernel, token_num, hidden_dim);
         runner.verify(token_num, hidden_dim);
+    }
+
+    // Measure latency
+    if (run_benchmark)
+    {
+        auto latency = runner.benchmark(&Runner::run_kernel, warmup, iter, token_num, hidden_dim);
+        if (rank == 0)
+        {
+            printf("======================BENCHMARK=========================\n");
+            printf("token_num %-4d, hidden_dim %-4d, AllGather fusion kernel latency %4.4fus \n", token_num, hidden_dim, latency);
+            printf("======================BENCHMARK=========================\n");
+        }
     }
 
     // Print the AllGather output (only once, after iterations)
@@ -749,60 +769,94 @@ TEST(Kernel_AllReduceFusion, AllGatherAccuracyAndOutputFloat)
         return;
     }
 
-    int iter = 100;
-    int token_num = 1;
-    int hidden_dim = 16; // Small size for easy output verification
-
-    Runner runner(token_num, hidden_dim);
-
-    if (rank == 0)
+    int iter = 500;
+    int warmup = 50;
+    bool run_benchmark = true;
+    bool enable_print = false;
+    
+    // Define test configurations
+    std::vector<int> token_nums{1, 2, 4, 8, 16, 32, 64}; // Removed 128 to avoid hanging
+    std::vector<int> hidden_dims{4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192};
+    
+    for (auto token_num : token_nums)
     {
-        printf("[AllGather Float Test] token_num %d, hidden_dim %d, world_size %d, iter %d\n", token_num, hidden_dim, world_size, iter);
-    }
-
-    // Set up deterministic input data for each rank using float values
-    int message_size = token_num * hidden_dim;
-    runner.set_input_data_typed<float>(message_size, [rank](int i) { return static_cast<float>(rank * 100.0f + i); });
-
-    // Print input data from each rank (only once, before iterations)
-    comm.barrier(); // Synchronize before printing
-    if (rank == 0)
-    {
-        printf("\n=== Float Input Data ===\n");
-    }
-    comm.barrier();
-
-    // Print input data in rank order
-    for (int r = 0; r < world_size; ++r)
-    {
-        if (rank == r)
+        for (auto hidden_dim : hidden_dims)
         {
-            runner.print_input_data(token_num, hidden_dim);
+            Runner runner(std::max(token_num, 128), hidden_dim); // Use max token_num for allocation
+
+        if (rank == 0)
+        {
+            printf("[AllGather Float Test] token_num %d, hidden_dim %d, world_size %d, iter %d\n", token_num, hidden_dim, world_size, iter);
         }
-        comm.barrier();
-    }
 
-    if (rank == 0)
-    {
-        printf("========================\n");
-        printf("[Verify] token_num %-4d, hidden_dim %-4d ...", token_num, hidden_dim);
-    }
+        // Set up deterministic input data for each rank using float values
+        int message_size = token_num * hidden_dim;
+        runner.set_input_data_typed<float>(message_size, [rank](int i) { return static_cast<float>(rank * 100.0f + i); });
 
-    // Run iterations
-    for (int i = 0; i < iter; ++i)
-    {
-        // runner.reset_io();
-        runner.run_once(&Runner::run_kernel, token_num, hidden_dim);
-        runner.verify(token_num, hidden_dim);
-    }
+        // Print input data from each rank (only once, before iterations)
+        if (enable_print)
+        {
+            comm.barrier(); // Synchronize before printing
+            if (rank == 0)
+            {
+                printf("\n=== Float Input Data ===\n");
+            }
+            comm.barrier();
 
-    // Print the AllGather output (only once, after iterations)
-    runner.print_allgather_output(token_num, hidden_dim);
+            // Print input data in rank order
+            for (int r = 0; r < world_size; ++r)
+            {
+                if (rank == r)
+                {
+                    runner.print_input_data(token_num, hidden_dim);
+                }
+                comm.barrier();
+            }
+        }
 
-    if (rank == 0)
-    {
-        printf("\033[32mAllGather Float Test PASSED!\033[0m\n");
-    }
+        if (rank == 0)
+        {
+            printf("========================\n");
+            printf("[Verify] token_num %-4d, hidden_dim %-4d ...", token_num, hidden_dim);
+        }
+
+        // Run accuracy verification
+        for (int i = 0; i < 10; ++i)
+        {
+            // runner.reset_io();
+            runner.run_once(&Runner::run_kernel, token_num, hidden_dim);
+            runner.verify(token_num, hidden_dim);
+        }
+
+        // Measure latency - Compare Fusion Kernel vs NCCL AllGather
+        if (run_benchmark)
+        {
+            // Benchmark Fusion Kernel
+            auto fusion_latency = runner.benchmark(&Runner::run_kernel, warmup, iter, token_num, hidden_dim);
+            
+            // Benchmark NCCL AllGather
+            auto nccl_latency = runner.benchmark(&Runner::run_nccl_allgather, warmup, iter, token_num, hidden_dim);
+            
+            if (rank == 0)
+            {
+                printf("======================PERFORMANCE COMPARISON=========================\n");
+                printf("RES: token_num %-4d, hidden_dim %-4d , AllGather Fusion Kernel latency: %4.4fus , NCCL AllGather latency: %4.4fus , Speedup (NCCL/Fusion): %4.4fx\n", token_num, hidden_dim, fusion_latency, nccl_latency, nccl_latency / fusion_latency);
+                printf("==================================================================\n");
+            }
+        }
+
+        if (enable_print)
+        {
+            // Print the AllGather output (only once, after iterations)
+            runner.print_allgather_output(token_num, hidden_dim);
+        }
+
+            if (rank == 0)
+            {
+                printf("\033[32mAllGather Float Test PASSED for token_num %d, hidden_dim %d!\033[0m\n", token_num, hidden_dim);
+            }
+        } // End hidden_dim loop
+    } // End token_num loop
 }
 
 TEST(Kernel_AllReduceFusion, AllReduceAccuracyFloat)
