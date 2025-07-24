@@ -110,9 +110,9 @@ class CompletionOutput:
     token_ids: Optional[List[int]] = field(default_factory=list)
     cumulative_logprob: Optional[float] = None
     logprobs: Optional[TokenLogprobs
-                       | list[float]] = field(default_factory=list)
+                       | List[float]] = field(default_factory=list)
     prompt_logprobs: Optional[TokenLogprobs
-                              | list[float]] = field(default_factory=list)
+                              | List[float]] = field(default_factory=list)
     finish_reason: Optional[Literal['stop', 'length', 'timeout',
                                     'cancelled']] = None
     stop_reason: Optional[Union[int, str]] = None
