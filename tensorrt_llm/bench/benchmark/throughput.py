@@ -183,7 +183,8 @@ from tensorrt_llm.sampling_params import SamplingParams
     help=
     "Desired concurrency rate (number of requests processing at the same time), <=0 for no concurrency limit.",
 )
-@click.option(
+@optgroup.group("Streaming Options", help="Options for streaming mode.")
+@optgroup.option(
     "--streaming",
     is_flag=True,
     default=False,
