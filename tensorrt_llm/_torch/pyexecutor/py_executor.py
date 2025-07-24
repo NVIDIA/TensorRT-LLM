@@ -1149,7 +1149,7 @@ class PyExecutor:
     @nvtx_range("_pad_attention_dp_dummy_request")
     def _pad_attention_dp_dummy_request(self):
         """
-        Pad with a dummy request, if required, to ensure every attention_dp rank has at least one active request.
+        Pad with a generation dummy request, if required, to ensure every attention_dp rank has at least one active request.
         """
         if not self.enable_attention_dp:
             return
