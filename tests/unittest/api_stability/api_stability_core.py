@@ -18,6 +18,9 @@ from pydantic import BaseModel
 
 import tensorrt_llm
 from tensorrt_llm import LLM
+# Import BaseCheckpointLoader for YAML processing
+from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
+    BaseCheckpointLoader
 from tensorrt_llm.executor import GenerationResult
 from tensorrt_llm.executor.result import TokenLogprobs
 from tensorrt_llm.llmapi import (CalibConfig, CompletionOutput,
