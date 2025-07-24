@@ -1,6 +1,5 @@
 # FMHA_v2
 
-
 ## Introduction
 
 FMHA_v2 is just a bunch of Multi-head Attention kernels that we've enabled for known cases. It's not built as a library (cuBLAS, cuDNN, HazyResearch's MHA, etc) that is supposed to deliver good perf for all cases. End users will get access to FMHA through products or libraries, not directly through FMHA_v2.
