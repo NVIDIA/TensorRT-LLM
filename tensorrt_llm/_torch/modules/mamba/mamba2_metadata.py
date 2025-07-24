@@ -98,7 +98,7 @@ class Mamba2Metadata:
                 self.has_initial_states[:num_contexts]).item()
             if self.use_initial_states:
                 self.chunk_indices, self.chunk_offsets = cu_seqlens_to_chunk_indices_offsets(
-                    self.cu_seqlens[:num_contexts], self.chunk_size,
+                    self.cu_seqlens[:num_contexts + 1], self.chunk_size,
                     num_ctx_tokens)
             else:
                 self.chunk_indices = None
