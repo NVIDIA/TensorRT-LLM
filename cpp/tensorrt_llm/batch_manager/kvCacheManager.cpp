@@ -1535,6 +1535,22 @@ void BlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmReq
     }
 }
 
+[[nodiscard]] std::vector<kv_connector::KvCacheConnectorPoolData> BlockManager::getKvCacheConnectorPoolsData() const
+{
+    std::vector<kv_connector::KvCacheConnectorPoolData> poolsData;
+    poolsData.reserve(mWindowBlockManagers.size());
+    for (auto const& [_, manager] : mWindowBlockManagers)
+    {
+        poolsData.emplace_back(manager.getKvCacheConnectorPoolData());
+    }
+    return poolsData;
+}
+
+[[nodiscard]] kv_connector::KvCacheConnectorPoolData WindowBlockManager::getKvCacheConnectorPoolData() const
+{
+    return kv_connector::KvCacheConnectorPoolData(mPools.at(mWindowSize).primaryPtr, mNumPrimaryBlocks);
+}
+
 void WindowBlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest)
 {
     auto constexpr beamIdx = 0;
@@ -2576,4 +2592,11 @@ SizeType32 KVCacheManager::calculateMaxBlockRequirements(SizeType32 inputLength,
     auto const leftoverBlockCapacity = blockCapacity - outputBlockRequirements;
     return std::min(outputLength + leftoverBlockCapacity * tokensPerBlock, inputLength + outputLength);
 }
+
+[[nodiscard]] kv_connector::KvCacheConnectorPoolsData KVCacheManager::getKvCacheConnectorPoolsData() const
+{
+    auto poolsData = mBlockManager.getKvCacheConnectorPoolsData();
+    return kv_connector::KvCacheConnectorPoolsData(poolsData, mLayerToPoolMapping);
+}
+
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager
