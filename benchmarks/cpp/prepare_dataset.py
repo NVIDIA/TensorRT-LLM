@@ -88,6 +88,7 @@ class RootArgs(BaseModel):
 @click.option("--trust-remote-code",
               is_flag=True,
               default=False,
+              envvar="TRUST_REMOTE_CODE",
               help="Trust remote code.")
 @click.pass_context
 def cli(ctx, **kwargs):
