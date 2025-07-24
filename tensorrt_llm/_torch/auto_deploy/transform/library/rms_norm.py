@@ -9,7 +9,6 @@ from torch.fx import GraphModule
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ...transformations._graph import canonicalize_graph
 
 # It is important to import ADPatternMatcherPass from pattern_matcher.py, not from torch._inductor.pattern_matcher
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
@@ -133,9 +132,7 @@ class FuseRMSNorm(BaseTransform):
             )
 
         cnt = patterns.apply(graph)
-        canonicalize_graph(gm)
 
-        # TODO:(hg) confirm this
         info = TransformInfo(skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=True)
 
         return gm, info
