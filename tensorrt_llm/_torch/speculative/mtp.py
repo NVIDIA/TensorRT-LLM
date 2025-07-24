@@ -54,10 +54,11 @@ class MTPHiddenStatesManager(BaseResourceManager):
         )
         if self.use_relaxed_acceptance_for_thinking:
             # The relaxed_delta for relaxed acceptance
-            self.mtp_relaxed_delta_pool = torch.zeros(
+            self.mtp_relaxed_delta_pool_host = torch.zeros(
                 (self.max_num_requests),
                 dtype=torch.float,
-                device='cuda',
+                device='cpu',
+                pin_memory=True,
             )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
@@ -67,7 +68,7 @@ class MTPHiddenStatesManager(BaseResourceManager):
             if req.is_first_context_chunk:
                 slot_id = self.slot_manager.add_slot(req.request_id)
                 if self.use_relaxed_acceptance_for_thinking:
-                    self.mtp_relaxed_delta_pool[slot_id] = 0.
+                    self.mtp_relaxed_delta_pool_host[slot_id] = 0.
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
         pass
@@ -75,7 +76,7 @@ class MTPHiddenStatesManager(BaseResourceManager):
     def free_resources(self, request: LlmRequest):
         free_slot_id = self.slot_manager.get_slot(request.request_id)
         if self.use_relaxed_acceptance_for_thinking:
-            self.mtp_relaxed_delta_pool[free_slot_id] = 0.
+            self.mtp_relaxed_delta_pool_host[free_slot_id] = 0.
         self.slot_manager.remove_slot(request.request_id)
 
     def add_dummy_requests(self, request_ids: List[int]):
@@ -105,6 +106,8 @@ class MTPSpecMetadata(SpecMetadata):
     slot_ids: Optional[torch.Tensor] = None
     # The index of the batche inputs
     batch_indices_cuda: Optional[torch.Tensor] = None
+    # The relaxed delta for relaxed acceptance
+    relaxed_delta_cuda: Optional[torch.Tensor] = None
     # The number of sequences for speculative model/layer of different rank
     _all_rank_num_seqs: Optional[List[int]] = None
     # This is used for attention dp in the MTP Eagle worker. The numbers of input
@@ -132,6 +135,12 @@ class MTPSpecMetadata(SpecMetadata):
                 dtype=torch.long,
                 device='cuda',
             )
+            if self.mtp_hidden_states_manager.use_relaxed_acceptance_for_thinking:
+                self.relaxed_delta_cuda = torch.empty(
+                    [self.max_num_requests],
+                    dtype=torch.float,
+                    device='cuda',
+                )
         self.batch_indices_cuda = torch.empty(
             [self.max_num_requests],
             dtype=torch.int,
@@ -201,6 +210,11 @@ class MTPSpecMetadata(SpecMetadata):
                                         dtype=torch.int,
                                         pin_memory=True)
             self.slot_ids[:num_seqs].copy_(mtp_slot_ids, non_blocking=True)
+            if self.mtp_hidden_states_manager.use_relaxed_acceptance_for_thinking:
+                self.relaxed_delta_cuda[:num_seqs].copy_(
+                    self.mtp_hidden_states_manager.
+                    mtp_relaxed_delta_pool_host[mtp_slot_ids],
+                    non_blocking=True)
 
 
 class MTPSampler(TorchSampler):
@@ -786,7 +800,7 @@ class MTPWorker(nn.Module):
                                              dtype=torch.int,
                                              device=logits.device)
         if self.spec_config.use_relaxed_acceptance_for_thinking:
-            mtp_relaxed_delta_pool = spec_metadata.mtp_hidden_states_manager.mtp_relaxed_delta_pool
+            relaxed_delta_cuda = spec_metadata.relaxed_delta_cuda
 
             # context
             con_logits = logits[:num_contexts]
@@ -810,7 +824,7 @@ class MTPWorker(nn.Module):
             ctx_delta = (ctx_think_tokens_num
                          >= 1).int() * self.spec_config.relaxed_delta
             ctx_slot_ids = spec_metadata.slot_ids[:num_contexts]
-            mtp_relaxed_delta_pool.index_copy_(0, ctx_slot_ids, ctx_delta)
+            relaxed_delta_cuda.index_copy_(0, ctx_slot_ids, ctx_delta)
 
             # generation
             gen_logprobs = self.process_generation_logits(logits, num_contexts)
@@ -819,7 +833,7 @@ class MTPWorker(nn.Module):
 
             accepted_tokens, num_accepted_tokens = torch.ops.trtllm.mtp_relaxed_acceptance_op(
                 spec_metadata.slot_ids, topk_value, topk_indices, draft_tokens,
-                mtp_relaxed_delta_pool, num_accepted_tokens, accepted_tokens,
+                relaxed_delta_cuda, num_accepted_tokens, accepted_tokens,
                 mtp_num_modules, batch_size, num_contexts,
                 self.spec_config.relaxed_topk, self.spec_config.relaxed_delta,
                 self.spec_config.BEGIN_THINKING_PHASE_TOKEN,
