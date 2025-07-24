@@ -2206,9 +2206,9 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         },
         "qwen2.5-vl-7b-instruct": {
             "image": [
-                ["dramatic", "moody", "ocean", "stormy", "sky", "clouds"],
+                ["dramatic", "moody", "ocean", "stormy", "sky", "waves"],
                 ["large", "dome", "yosemite", "landmark", "rock", "road"],
-                ["highway", "traffic", "vehicles", "bus", "police", "traffic"],
+                ["highway", "traffic", "vehicles", "lanes", "congestion", "road"],
             ],
             "video": [
                 ["woman", "neon", "night", "jacket", "wet"],
