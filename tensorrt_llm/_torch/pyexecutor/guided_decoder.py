@@ -5,6 +5,7 @@ import torch
 
 from ..._utils import nvtx_range
 from ...bindings.executor import GuidedDecodingConfig
+from ...logger import logger
 from .grammar_matcher import (GrammarMatcher, GrammarMatcherFactory,
                               LLGuidanceMatcherFactory, XGrammarMatcherFactory)
 from .scheduler import ScheduledRequests
@@ -37,8 +38,11 @@ class GuidedDecoder:
                 guided_decoding_config, vocab_size_padded)
         else:
             raise ValueError(
-                f"invalid guided_decoding_backend: {self.guided_decoding_backend}"
+                f"invalid guided decoding backend: {self.guided_decoding_backend}"
             )
+        logger.info(
+            f"Guided decoder initialized with backend: {self.guided_decoding_backend}"
+        )
 
         self.bitmask = torch.empty(self.max_num_sequences,
                                    self.max_num_draft_tokens + 1,

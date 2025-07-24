@@ -145,15 +145,9 @@ class LLGuidanceMatcher(GrammarMatcher):
             else:
                 return False
 
-        # Currently, there is no reliable way to try accepting a token without getting the matcher into an error state.
-        # Also, there is no way to restore the matcher once it's in an error state.
-        # TODO: Fix this upon https://github.com/guidance-ai/llguidance/issues/211
-        _backup_matcher = self._matcher.deep_copy()
-        accepted = self._matcher.consume_token(token_id)
-        accepted = accepted and not self._matcher.is_error()
-        if not accepted:
-            self._matcher = _backup_matcher
-        return accepted
+        num_accepted = self._matcher.try_consume_tokens([token_id])
+        self._check_err()
+        return num_accepted > 0
 
     def rollback(self, num_tokens: int) -> None:
         if self._is_terminated:
