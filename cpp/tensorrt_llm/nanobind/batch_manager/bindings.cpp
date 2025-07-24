@@ -79,7 +79,7 @@ void initBindings(nb::module_& m)
             }
         });
 
-    PybindUtils::bindSet<tb::ReqIdsSet>(m, "ReqIdsSet");
+    NanobindUtils::bindSet<tb::ReqIdsSet>(m, "ReqIdsSet");
 
     nb::enum_<tb::LlmRequestType>(m, "LlmRequestType")
         .value("LLMREQUEST_TYPE_CONTEXT_AND_GENERATION", tb::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION)

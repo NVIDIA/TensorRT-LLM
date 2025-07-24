@@ -34,9 +34,7 @@ class Qwen2VLInputProcessorBase(InputProcessor):
                  trust_remote_code: bool = True):
         self.model_config = model_config
         self.tokenizer = tokenizer
-        # TODO: change to True and also change the according test result
-        self.use_fast = False
-        self.device = 'cuda'
+        self.use_fast = True
         self.processor = AutoProcessor.from_pretrained(
             model_path,
             use_fast=self.use_fast,
@@ -226,7 +224,7 @@ class Qwen2VLInputProcessorBase(InputProcessor):
                     self.model_config.num_attention_heads),
             theta=float(self.model_config.rope_theta),
             scale_type=RotaryScalingType.mrope)
-        self.rotary_cos_sin = torch.from_numpy(rotary_cos_sin).to(self.device)
+        self.rotary_cos_sin = torch.from_numpy(rotary_cos_sin)
         self.rotary_cos_sin = self.rotary_cos_sin.reshape(
             self.model_config.max_position_embeddings,
             int(self.model_config.hidden_size /
@@ -344,7 +342,7 @@ class Qwen2VLInputProcessorBase(InputProcessor):
                         inputs.get("multi_modal_data", {}), inputs.get("mm_processor_kwargs", {})
 
         processed_inputs = self._preprocess(text_prompt, mm_data,
-                                            mm_processor_kwargs).to(self.device)
+                                            mm_processor_kwargs)
 
         if not mm_data:
             fused_input_ids = processed_inputs['input_ids']

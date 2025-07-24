@@ -2002,22 +2002,19 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         },
         "llava-v1.6-mistral-7b": {
             "image": [
+                ["ocean", "sky", "large", "waves", "shore", "blue"],
                 [
-                    "ocean", "cloud", "waves", "white", "shore", "large",
-                    "dramatic", "breaking"
+                    "landscape", "rock", "landmark", "formation", "smooth",
+                    "mountain"
                 ],
-                ["mountain", "butte", "flat", "top", "sky"],
-                ["highway", "vehicles", "traffic", "divider", "suburban"],
+                ["highway", "vehicles", "traffic", "bus", "suburban"],
             ],
         },
         "qwen2-vl-7b-instruct": {
             "image": [
-                ["ocean", "waves", "shore", "natural", "clouds", "turbulent"],
-                [
-                    "mountainous", "landscape", "rock", "peak", "weather",
-                    "steep"
-                ],
-                ["traffic", "vehicles", "moderate", "lanes", "road"],
+                ["ocean", "waves", "atmosphere", "stormy", "clouds", "intense"],
+                ["trees", "rocks", "road", "sunny", "natural", "greenery"],
+                ["traffic", "vehicles", "moderate", "lanes", "road", "cars"],
             ],
             "video": [
                 ["city", "night", "lights", "jacket", "wet"],
@@ -2026,25 +2023,19 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         },
         "qwen2.5-vl-7b-instruct": {
             "image": [
-                ["dramatic", "moody", "stormy", "turbulent", "wave"],
-                [
-                    "large", "dome", "yosemite", "landmark", "rock", "road",
-                    "formation"
-                ],
-                ["highway", "traffic", "vehicles", "bus", "police"],
+                ["dramatic", "moody", "ocean", "stormy", "sky", "clouds"],
+                ["large", "dome", "yosemite", "landmark", "rock", "road"],
+                ["highway", "traffic", "vehicles", "bus", "police", "traffic"],
             ],
             "video": [
                 ["woman", "neon", "night", "jacket", "wet"],
-                ["earth", "rotating", "night", "lights", "cities"],
+                ["earth", "world", "night", "lights", "cities"],
             ],
         },
         "mistral-small-3.1-24b-instruct": {
             "image": [
-                [
-                    "dramatic", "seascape", "cloudy", "turbulent", "waves",
-                    "water"
-                ],
-                ["scenic", "rock", "landscape", "snow", "formation"],
+                ["dramatic", "seascape", "ocean", "turbulent", "waves", "dark"],
+                ["scenic", "rock", "landscape", "snow", "altitude"],
                 ["highway", "traffic", "directions", "lanes", "Jurong"],
             ],
         },
@@ -2052,7 +2043,7 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
             "image": [
                 ["dramatic", "turbulent", "waves", "ocean", "overcast"],
                 ["half", "dome", "yosemite", "landmark", "rounded"],
-                ["flowing", "standstill", "vehicles", "road", "Changi"],
+                ["flowing", "traffic", "vehicles", "road", "Changi"],
             ],
         },
     }

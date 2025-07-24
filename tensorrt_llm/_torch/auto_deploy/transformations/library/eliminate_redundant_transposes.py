@@ -40,7 +40,7 @@ def _are_transpose_args_same(node1: Node, node2: Node) -> bool:
     return dim1_node1 == dim1_node2 and dim2_node1 == dim2_node2
 
 
-def eliminate_redundant_transposes(gm: GraphModule) -> GraphModule:
+def eliminate_redundant_transposes(gm: GraphModule) -> None:
     """Eliminate redundant transpose operations in the graph.
 
     This transformation identifies pairs of consecutive transpose operations with
@@ -107,7 +107,6 @@ def eliminate_redundant_transposes(gm: GraphModule) -> GraphModule:
     # Clean up the graph
     if nodes_to_eliminate:
         gm.graph.eliminate_dead_code()
-        gm = canonicalize_graph(gm)
+        canonicalize_graph(gm)
     ad_logger.info(f"Found and eliminated {len(nodes_to_eliminate)} redundant transpose pairs")
     ad_logger.debug("After eliminating redundant transposes: " + str(gm))
-    return gm

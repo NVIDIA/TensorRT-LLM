@@ -388,6 +388,9 @@ def throughput_command(
                 logger.warning(
                     "Ignore extended_runtime_perf_knob_config for _autodeploy backend."
                 )
+            kwargs["world_size"] = kwargs.pop("tensor_parallel_size", None)
+            kwargs.pop("pipeline_parallel_size", None)
+
             llm = AutoDeployLLM(**kwargs)
         else:
             llm = LLM(**kwargs)
