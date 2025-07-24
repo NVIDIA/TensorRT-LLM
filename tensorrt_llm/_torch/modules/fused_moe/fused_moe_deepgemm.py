@@ -26,11 +26,13 @@ def _masked_index_copy_group_quant_fp8(
     start_offsets_ptr,
     row_indices_ptr,
     # dimensions
-    num_groups,
     row_size,
     col_size,
     dim_size,
     group_size,
+    # output scale factor size
+    aligned_col,
+    aligned_dim,
     # quantization parameters
     eps,
     fp8_max,
@@ -49,7 +51,8 @@ def _masked_index_copy_group_quant_fp8(
     valid_elem = elem_offsets < (group_start + group_size)
     input_ptr_offs = input_ptr + elem_offsets
     output_ptr_offs = out_q_ptr + elem_offsets
-    output_s_offs = out_s_ptr + group_block
+    output_s_offs = out_s_ptr + (group_block // 4) * aligned_col
+    shift = (group_block % 4) * 8
 
     # process tokens
     for token_index in tl.range(token_block,
@@ -63,6 +66,7 @@ def _masked_index_copy_group_quant_fp8(
         row_idx = tl.load(row_indices_ptr + token_index)
         start_offset = tl.load(start_offsets_ptr + row_idx)
         idx = row_idx * col_size + token_index - start_offset
+        idx_s = row_idx * aligned_dim * aligned_col + token_index - start_offset
 
         # quantization
         _absmax = tl.maximum(tl.max(tl.abs(input_data)), eps)
@@ -70,15 +74,16 @@ def _masked_index_copy_group_quant_fp8(
         output_s = tl.exp2(tl.ceil(tl.log2(tl.abs(output_s))))
         output_q = tl.clamp(input_data / output_s, -fp8_max,
                             fp8_max).to(out_q_ptr.dtype.element_ty)
+        output_s = (output_s.to(tl.int32, bitcast=True) >> 23).to(tl.uint8)
 
         # store quantized values and scaling factor
         tl.store(output_ptr_offs + idx * dim_size, output_q, mask=valid_elem)
-        tl.store(output_s_offs + idx * num_groups, output_s)
+        tl.atomic_or(output_s_offs + idx_s, output_s << shift)
 
 
 def masked_index_copy_group_quant_fp8(
     output: torch.Tensor,
-    output_s: torch.Tensor,
+    # output_s: torch.Tensor,
     input: torch.Tensor,
     start_offsets: torch.Tensor,
     row_indices: torch.Tensor,
@@ -99,6 +104,15 @@ def masked_index_copy_group_quant_fp8(
     col_size = output.shape[1]
     dim_size = output.shape[2]
     num_groups = (dim_size + group_size - 1) // group_size
+
+    # create padded output_s
+    alignment = 4
+    scale_dim = (dim_size + group_size - 1) // group_size
+    padded_dim_size = (scale_dim + alignment - 1) // alignment * alignment
+    padded_col_size = (col_size + alignment - 1) // alignment * alignment
+    output_s = torch.zeros((row_size, padded_dim_size // 4, padded_col_size),
+                           dtype=torch.int32,
+                           device='cuda')
 
     # get block/grid/stage/warp
     BLOCK = group_size
@@ -125,18 +139,20 @@ def masked_index_copy_group_quant_fp8(
         output_s,
         start_offsets,
         row_indices,
-        num_groups,
         row_size,
         col_size,
         dim_size,
         group_size,
+        padded_col_size,
+        padded_dim_size // 4,
         eps,
         fp8_max,
         BLOCK=BLOCK,
         NUM_STAGE=NUM_STAGES,
         num_warps=num_warps,
     )
-    return
+    output_s = output_s.transpose(1, 2)[:, :col_size, :]
+    return output_s
 
 
 @triton.jit
@@ -421,16 +437,12 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             (self.expert_size_per_partition, m_max, self.hidden_size),
             dtype=torch.float8_e4m3fn,
             device='cuda')
-        act_input_sf = torch.empty(
-            (self.expert_size_per_partition, m_max, self.hidden_size // 128),
-            dtype=torch.float32,
-            device='cuda')
-        masked_index_copy_group_quant_fp8(act_input_fp8,
-                                          act_input_sf,
-                                          permuted_data_tensor,
-                                          expert_first_token_offset_tensor,
-                                          token_to_expert_map,
-                                          group_size=128)
+        act_input_sf = masked_index_copy_group_quant_fp8(
+            act_input_fp8,
+            permuted_data_tensor,
+            expert_first_token_offset_tensor,
+            token_to_expert_map,
+            group_size=128)
 
         h1 = deepgemm_fp8_group_blockwise_gemm(
             a=act_input_fp8,
