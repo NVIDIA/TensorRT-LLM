@@ -35,6 +35,55 @@ enum KvCacheConnectorRole : std::int8_t
     Worker
 };
 
+class KvCacheConnectorPoolData
+{
+public:
+    KvCacheConnectorPoolData(runtime::ITensor::SharedPtr const& poolTensor, SizeType32 numBlocks)
+        : mPoolTensor(poolTensor)
+        , mNumBlocks(numBlocks)
+    {
+    }
+
+    runtime::ITensor::SharedPtr const& getPoolTensor() const
+    {
+        return mPoolTensor;
+    }
+
+    SizeType32 getNumBlocks() const
+    {
+        return mNumBlocks;
+    }
+
+private:
+    runtime::ITensor::SharedPtr mPoolTensor;
+    SizeType32 mNumBlocks;
+};
+
+class KvCacheConnectorPoolsData
+{
+public:
+    explicit KvCacheConnectorPoolsData(
+        std::vector<KvCacheConnectorPoolData>& poolsData, runtime::ITensor::SharedPtr const& layerToPoolMapping)
+        : mPoolsData(poolsData)
+        , mLayerToPoolMapping(layerToPoolMapping)
+    {
+    }
+
+    std::vector<KvCacheConnectorPoolData>& getPoolsData()
+    {
+        return mPoolsData;
+    }
+
+    runtime::ITensor::SharedPtr& getLayerToPoolMapping()
+    {
+        return mLayerToPoolMapping;
+    }
+
+private:
+    std::vector<KvCacheConnectorPoolData> mPoolsData;
+    runtime::ITensor::SharedPtr mLayerToPoolMapping;
+};
+
 class KvCacheConnector
 {
 public:

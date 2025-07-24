@@ -275,7 +275,6 @@ class PyExecutor:
         self.worker_started = False
         self.worker_lock = threading.Lock()
 
-        print("LOADING WITH KV CONNECTOR CONFIG", kv_connector_config)
         if kv_connector_config is not None:
             connector_cls = load_connector_module(kv_connector_config)
 
