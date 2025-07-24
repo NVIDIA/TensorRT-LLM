@@ -175,7 +175,7 @@ public:
     void recv(DataContext const& ctx, void* data, size_t size) const override;
     void sendRequestAndBufferInfo(
         batch_manager::RequestInfo& requestInfo, std::optional<size_t> cacheBufferId, int validConnectionIdx);
-    void setSenderState(MemoryDesc mReceiverBufferDesc, int valideSegmentIdx);
+    void setSenderState(MemoryDesc mCacheReceiverBufferDesc, int valideSegmentIdx);
     [[nodiscard]] std::optional<size_t> getCacheBufferId() const;
     void setHasLoadRemoteAgent(bool hasLoadRemoteAgent);
     [[nodiscard]] bool hasLoadRemoteAgent() const;
@@ -186,7 +186,7 @@ private:
 
     struct SenderState
     {
-        MemoryDesc mReceiverBufferDesc{nullptr, 0, 0};
+        MemoryDesc mCacheReceiverBufferDesc{nullptr, 0, 0};
         int validSegmentIdx{0};
         SenderState() = default;
     };

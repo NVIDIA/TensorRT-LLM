@@ -30,7 +30,7 @@ static int32_t tagFromRequestId(LlmRequest::RequestIdType requestId)
     return ((requestId & 0xFFF) << 8) | (kDATA_TAG & 0xFF);
 }
 
-DataSenderImpl::DataSenderImpl(executor::kv_cache::ConnectionManager* manager,
+CacheSenderImpl::CacheSenderImpl(executor::kv_cache::ConnectionManager* manager,
     executor::kv_cache::CacheState selfCacheState, SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter)
     : mManager{manager}
     , mSelfState{std::move(selfCacheState), executor::kv_cache::CommState{manager->getCommState()}}
@@ -41,7 +41,7 @@ DataSenderImpl::DataSenderImpl(executor::kv_cache::ConnectionManager* manager,
     TLLM_CHECK(mManager->getCommState().getSelfIdx() == selfIndex);
 }
 
-[[nodiscard]] RequestInfo DataSenderImpl::recvRequestInfo()
+[[nodiscard]] RequestInfo CacheSenderImpl::recvRequestInfo()
 {
     using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
     auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
@@ -93,7 +93,7 @@ DataSenderImpl::DataSenderImpl(executor::kv_cache::ConnectionManager* manager,
     return info;
 }
 
-void DataSenderImpl::sendSync(LlmRequest const& llmRequest)
+void CacheSenderImpl::sendSync(LlmRequest const& llmRequest)
 {
     auto it = mRequestToSession.find(llmRequest.mRequestId);
     TLLM_CHECK(it != mRequestToSession.end());
@@ -102,24 +102,24 @@ void DataSenderImpl::sendSync(LlmRequest const& llmRequest)
     mFormatter->format(session);
 }
 
-[[nodiscard]] executor::kv_cache::CommState const& DataSenderImpl::getCommState() const
+[[nodiscard]] executor::kv_cache::CommState const& CacheSenderImpl::getCommState() const
 {
     return mSelfState.getCommState().value();
 }
 
-void DataSenderImpl::setCommState(executor::kv_cache::CommState commState)
+void CacheSenderImpl::setCommState(executor::kv_cache::CommState commState)
 {
     mSelfState.setCommState(std::move(commState));
 }
 
-[[nodiscard]] size_t DataSenderImpl::getCounterpartsCount(LlmRequest::RequestIdType requestId) const
+[[nodiscard]] size_t CacheSenderImpl::getCounterpartsCount(LlmRequest::RequestIdType requestId) const
 {
     auto it = mRequestToSession.find(requestId);
     TLLM_CHECK(it != mRequestToSession.end());
     return it->second.getConnections().size();
 }
 
-void DataSenderImpl::release(LlmRequest::RequestIdType requestId)
+void CacheSenderImpl::release(LlmRequest::RequestIdType requestId)
 {
     auto it = mRequestToSession.find(requestId);
     TLLM_CHECK(it != mRequestToSession.end());
@@ -127,7 +127,7 @@ void DataSenderImpl::release(LlmRequest::RequestIdType requestId)
     mRequestToSession.erase(it);
 }
 
-DataReceiverImpl::DataReceiverImpl(executor::kv_cache::ConnectionManager* manager,
+CacheReceiverImpl::CacheReceiverImpl(executor::kv_cache::ConnectionManager* manager,
     executor::kv_cache::CacheState selfCacheState, SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter)
     : mManager{manager}
     , mSelfState{std::move(selfCacheState), executor::kv_cache::CommState{manager->getCommState()}}
@@ -138,7 +138,7 @@ DataReceiverImpl::DataReceiverImpl(executor::kv_cache::ConnectionManager* manage
     TLLM_CHECK(mFormatter);
 }
 
-TransferSession DataReceiverImpl::sendRequestInfo(LlmRequest const& llmRequest)
+TransferSession CacheReceiverImpl::sendRequestInfo(LlmRequest const& llmRequest)
 {
     uint64_t requestId = llmRequest.getContextPhaseParams().value().getReqId();
     auto const& contextState = llmRequest.getDataTransceiverState();
@@ -204,12 +204,12 @@ TransferSession DataReceiverImpl::sendRequestInfo(LlmRequest const& llmRequest)
         contextState, resource->mBufferManager, &llmRequest);
 }
 
-void DataReceiverImpl::receiveSync(TransferSession& session)
+void CacheReceiverImpl::receiveSync(TransferSession& session)
 {
     mFormatter->unformat(session);
 }
 
-void DataReceiverImpl::sendRequestInfo(executor::kv_cache::Connection const* connection, RequestInfo const& info)
+void CacheReceiverImpl::sendRequestInfo(executor::kv_cache::Connection const* connection, RequestInfo const& info)
 {
     std::ostringstream oss;
     RequestInfo::serialize(info, oss);
@@ -221,7 +221,7 @@ void DataReceiverImpl::sendRequestInfo(executor::kv_cache::Connection const* con
     connection->send(executor::kv_cache::DataContext{kINFO_TAG}, serializedInfo.data(), infoSize);
 }
 
-std::unique_ptr<DataReceiverImpl::ReceiveCacheResource> const& DataReceiverImpl::getReceiveCacheResource(
+std::unique_ptr<CacheReceiverImpl::ReceiveCacheResource> const& CacheReceiverImpl::getReceiveCacheResource(
     LlmRequest const& llmRequest)
 {
     std::scoped_lock<std::mutex> lock(mProcessIoResouceMutex);

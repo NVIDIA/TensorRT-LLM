@@ -194,10 +194,10 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     auto makeFormatter = [cacheManager, isMLA, this]()
     { return createCacheFormatter(cacheManager, mCacheTransBufferManager.get(), isMLA); };
 
-    mDataResponder = std::make_unique<DataResponder>(
-        std::make_unique<DataSenderImpl>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter()));
+    mCacheSender = std::make_unique<DataResponder>(
+        std::make_unique<CacheSenderImpl>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter()));
     mDataRequester = std::make_unique<DataRequester>(
-        std::make_unique<DataReceiverImpl>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter()));
+        std::make_unique<CacheReceiverImpl>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter()));
 
     initializeCommState();
 }
@@ -213,7 +213,7 @@ CacheTransceiver::~CacheTransceiver()
 
 void CacheTransceiver::initializeCommState()
 {
-    mCommState = std::addressof(mDataResponder->getCommState());
+    mCommState = std::addressof(mCacheSender->getCommState());
 }
 
 void CacheTransceiver::setContextState(LlmRequest* llmRequest)
@@ -249,8 +249,8 @@ void CacheTransceiver::respondAndSendAsync(LlmRequest* llmRequest)
         return;
     }
     setContextState(llmRequest);
-    auto future = mDataResponder->respondAndSendAsync(*llmRequest);
-    mResponderFutures.emplace_back(llmRequest, std::move(future));
+    auto future = mCacheSender->respondAndSendAsync(*llmRequest);
+    mSenderFutures.emplace_back(llmRequest, std::move(future));
 }
 
 void CacheTransceiver::respondAndSendLayerWise(
@@ -265,8 +265,8 @@ void CacheTransceiver::respondAndSendLayerWise(
 
         llmRequest->setState(LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS);
         setContextState(llmRequest.get());
-        auto future = mDataResponder->respondAndSendAsync(*llmRequest);
-        mResponderFutures.emplace_back(llmRequest.get(), std::move(future));
+        auto future = mCacheSender->respondAndSendAsync(*llmRequest);
+        mSenderFutures.emplace_back(llmRequest.get(), std::move(future));
     }
 }
 
@@ -372,7 +372,7 @@ void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLe
     bool blockAll = !atLeastRequestNum.has_value();
     auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mMpiGroupTPInDPComm : mMpiGroupTensorParaComm;
     std::vector<LlmRequest::RequestIdType> contextCompleteRequestIds;
-    for (auto&& [request, future] : mResponderFutures)
+    for (auto&& [request, future] : mSenderFutures)
     {
         if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
         {
@@ -412,23 +412,22 @@ void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLe
 
     // Make sure there are at least atLeastRequestNum requests in toCompleteIdSet.
     // This will preserve the order of insertion for KVCache transfer requests.
-    for (auto it = mResponderFutures.begin();
-         atLeastRequestNum.value_or(0) > static_cast<int>(toCompleteIdSet.size()) && it != mResponderFutures.end();
-         ++it)
+    for (auto it = mSenderFutures.begin();
+         atLeastRequestNum.value_or(0) > static_cast<int>(toCompleteIdSet.size()) && it != mSenderFutures.end(); ++it)
     {
         auto& [request, future] = *it;
         toCompleteIdSet.insert(request->mRequestId);
     }
 
     // Complete all the requests in toCompleteIdSet
-    for (auto it = mResponderFutures.begin(); it != mResponderFutures.end();)
+    for (auto it = mSenderFutures.begin(); it != mSenderFutures.end();)
     {
         auto& [request, future] = *it;
         if (blockAll || (toCompleteIdSet.find(request->mRequestId) != toCompleteIdSet.end()))
         {
             future.get();
             request->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
-            it = mResponderFutures.erase(it);
+            it = mSenderFutures.erase(it);
         }
         else
         {

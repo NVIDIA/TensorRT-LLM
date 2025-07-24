@@ -40,12 +40,12 @@ struct TransceiverTag
 
 using BaseCacheFormatter = kv_cache_manager::BaseCacheFormatter;
 
-class DataSenderImpl : public DataSender, public TransceiverTag
+class CacheSenderImpl : public DataSender, public TransceiverTag
 {
 public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
-    DataSenderImpl(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
+    CacheSenderImpl(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
         SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter);
 
     [[nodiscard]] RequestInfo recvRequestInfo() override;
@@ -69,12 +69,12 @@ private:
     runtime::BufferManager mBufferManager;
 };
 
-class DataReceiverImpl : public DataReceiver, public TransceiverTag
+class CacheReceiverImpl : public DataReceiver, public TransceiverTag
 {
 public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
-    DataReceiverImpl(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
+    CacheReceiverImpl(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
         SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter);
 
     TransferSession sendRequestInfo(LlmRequest const& llmRequest) override;
