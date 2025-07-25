@@ -819,6 +819,11 @@ def runLLMDocBuild(pipeline, config)
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
 
     // Step 3: build doc
+
+    // WAR: Remove CUDA sources and keys to avoid conflicts
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "rm -f /etc/apt/sources.list.d/cuda-ubuntu2404-x86_64.list")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-key del 7fa2af80 || true")
+
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get install doxygen python3-pip graphviz -y")
 
