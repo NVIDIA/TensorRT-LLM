@@ -307,6 +307,7 @@ class TestLlama3_2_1B(LlmapiAccuracyTestHarness):
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_hopper
     def test_fp8_prequantized(self):
         model_path = f"{llm_models_root()}/llama-3.2-models/Llama-3.2-1B-FP8"
         with LLM(model_path) as llm:
@@ -1478,6 +1479,7 @@ class TestLlama3_3NemotronSuper49Bv1(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
 
+    @skip_pre_hopper
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_device_not_contain(["H100", "B200"])
     def test_fp8_prequantized_tp2(self):
@@ -1507,6 +1509,7 @@ class TestLlama3_1NemotronNano8Bv1(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
 
+    @skip_pre_hopper
     @pytest.mark.skip_device_not_contain(["H100", "B200"])
     def test_fp8_prequantized(self):
         model_path = f"{llm_models_root()}/Llama-3.1-Nemotron-Nano-8B-v1-FP8"
@@ -1547,6 +1550,7 @@ class TestNemotronUltra(LlmapiAccuracyTestHarness):
             # task.evaluate(llm,
             #                 extra_evaluator_kwargs=dict(apply_chat_template=True))
 
+    @skip_pre_hopper
     @pytest.mark.skip_less_device(8)
     @pytest.mark.skip_device_not_contain(["H100", "B200"])
     @parametrize_with_ids("cuda_graph", [False, True])
