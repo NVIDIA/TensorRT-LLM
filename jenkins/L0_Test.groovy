@@ -859,6 +859,10 @@ def launchTestListCheck(pipeline)
     trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10"), "trt-llm", {
         try {
             echoNodeAndGpuInfo(pipeline, stageName)
+            // WAR: Remove CUDA sources and keys to avoid conflicts
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "rm -f /etc/apt/sources.list.d/cuda-ubuntu2404-x86_64.list")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-key del 7fa2af80 || true")
+
             trtllm_utils.llmExecStepWithRetry(pipeline, script: """apt-get update && apt-get install \
             libffi-dev \
             -y""")
@@ -1273,6 +1277,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // setup HF_HOME to cache model and datasets
         // init the huggingface cache from nfs, since the nfs is read-only, and HF_HOME needs to be writable, otherwise it will fail at creating file lock
         sh "mkdir -p ${HF_HOME} && ls -alh ${HF_HOME}"
+
+        // WAR: Remove CUDA sources and keys to avoid conflicts
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "rm -f /etc/apt/sources.list.d/cuda-ubuntu2404-x86_64.list")
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-key del 7fa2af80 || true")
+
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get install -y rsync")
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "rsync -r ${MODEL_CACHE_DIR}/hugging-face-cache/ ${HF_HOME}/ && ls -lh ${HF_HOME}")
