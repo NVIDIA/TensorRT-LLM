@@ -210,3 +210,5 @@ mistralai/Ministral-8B-Instruct-2410:
     accuracy: 65.96
 microsoft/Phi-4-multimodal-instruct:
   - accuracy: 69.69
+microsoft/Phi-4-multimodal-instruct-long-rope:
+  - accuracy: 65.98

@@ -1972,8 +1972,19 @@ class TestPhi4MM(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/multimodals/Phi-4-multimodal-instruct"
 
     def test_auto_dtype(self):
-        with LLM(self.MODEL_PATH) as llm:
-            task = MMLU(self.MODEL_NAME)
+        # Set max_seq_len to 4096 to use short rope factor.
+        model_name = "microsoft/Phi-4-multimodal-instruct"
+        with LLM(self.MODEL_PATH, max_seq_len=4096) as llm:
+            task = MMLU(model_name)
             task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
+            task = GSM8K(model_name)
+            task.evaluate(llm)
+
+    def test_auto_dtype_long_rope(self):
+        # Set max_seq_len larger than 4096 to use long rope factor.
+        model_name = "microsoft/Phi-4-multimodal-instruct-long-rope"
+        with LLM(self.MODEL_PATH, max_seq_len=8192) as llm:
+            task = MMLU(model_name)
+            task.evaluate(llm)
+            task = GSM8K(model_name)
             task.evaluate(llm)

@@ -2204,15 +2204,15 @@ def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, modality):
     }
     expected_keywords = {
         "image": [
-            ["clear", "sunny", "sky", "image", "object"],
-            ["road", "car", "lane", "strip", "bus"],
+            ["image", "depicts", "mountain", "half", "rock"],
+            ["road", "car", "lane", "traffic", "bus"],
         ],
         "audio": [
             ["what", "is", "the", "traffic", "sign", "in", "image"],
             ["what", "is", "shown", "in", "this", "image"],
         ],
         "image_audio": [
-            ["Half", "Dome", "Park", "natural", "image"],
+            ["image", "depicts", "Grand", "rock", "scene"],
         ],
     }
 
@@ -2226,6 +2226,8 @@ def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, modality):
         *accuracy_inputs[modality]["prompt"],
         "--media",
         *accuracy_inputs[modality]["media"],
+        # Set max_seq_len to 4096 to use short rope factor.
+        "--max_seq_len=4096",
         "--load_lora",
         "--auto_model_name",
         "Phi4MMForCausalLM",
