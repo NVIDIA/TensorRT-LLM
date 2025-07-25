@@ -201,7 +201,7 @@ class LlavaNextInputProcessor(InputProcessor):
         sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         """
-        Attach pre-processed multimodal embeddings into text token stream for Llama4 model.
+        Attach pre-processed multimodal embeddings into text token stream for LlavaNext model.
 
         This method skips vision processing and works with externally provided embeddings.
         It replaces/expands image placeholders in the text with appropriate tokens and prepares

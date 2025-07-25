@@ -277,8 +277,7 @@ class MultimodalParams:
                 _to_tensor_handle(self.multimodal_data)
             else:
                 if key not in self.multimodal_data:
-                    raise ValueError(
-                        f"Key '{key}' not found in multimodal_data")
+                    return  # no-op if key not found
 
                 value = self.multimodal_data[key]
                 if isinstance(value, torch.Tensor):
@@ -353,8 +352,7 @@ class MultimodalParams:
                 _to_tensor(self.multimodal_data)
             else:
                 if key not in self.multimodal_data:
-                    raise ValueError(
-                        f"Key '{key}' not found in multimodal_data")
+                    return  # no-op if key not found
 
                 value = self.multimodal_data[key]
                 if isinstance(

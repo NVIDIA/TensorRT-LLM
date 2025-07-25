@@ -395,6 +395,7 @@ class BaseLLM:
                     multimodal_data=extra_processed_inputs.get(
                         'multimodal_data'))
                 # Convert to shared tensor handle to reduce IPC overhead
+                # for values with non-selected keys, it's no-op
                 multimodal_params.to_handle("multimodal_data",
                                             key="multimodal_embedding")
                 # Only pass it if it has content

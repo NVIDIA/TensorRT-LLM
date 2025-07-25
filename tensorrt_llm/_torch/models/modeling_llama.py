@@ -913,6 +913,10 @@ class Llama4InputProcessor(InputProcessor):
                 for offset, token_id in zip(
                         mm_embedding_special_offsets[local_image_index],
                         mm_embedding_special_tokens[local_image_index]):
+                    if offset < 0 or offset >= len(image_tokens):
+                        raise ValueError(
+                            f"Image special token offset {offset} is out of range with the total image tokens length {len(image_tokens)}"
+                        )
                     if offset < len(image_tokens):
                         image_tokens[offset] = self.tokenizer.decode([token_id])
 
