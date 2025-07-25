@@ -16,6 +16,8 @@ from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import GuidedDecodingParams, SamplingParams
 
+from ..sampling_params import LogitBiasLogitsProcessor
+
 
 class OpenAIBaseModel(BaseModel):
     # OpenAI API does not allow extra fields & allow to initialize by both alias and field name
@@ -248,11 +250,15 @@ class CompletionRequest(OpenAIBaseModel):
                 self.response_format),
             detokenize=self.detokenize,
 
+            # logits_bias
+            logits_processor=None if not self.logit_bias else
+            LogitBiasLogitsProcessor(self.logit_bias),
+
             # completion-extra-params
             add_special_tokens=self.add_special_tokens,
 
             # TODO: migrate to use logprobs and prompt_logprobs
-            _return_log_probs=self.logprobs,
+            _return_log_probs=bool(self.logprobs),
         )
         return sampling_params
 
@@ -539,11 +545,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
             guided_decoding=_response_format_to_guided_decoding_params(
                 self.response_format),
 
+            # logits_bias
+            logits_processor=None if not self.logit_bias else
+            LogitBiasLogitsProcessor(self.logit_bias),
+
             # chat-completion-extra-params
             add_special_tokens=self.add_special_tokens,
 
             # TODO: migrate to use logprobs and prompt_logprobs
-            _return_log_probs=self.logprobs,
+            _return_log_probs=bool(self.logprobs),
         )
         return sampling_params
 
@@ -572,13 +582,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
         top_logprobs = data.get("top_logprobs")
         if top_logprobs is not None and top_logprobs > 0:
             raise ValueError("top_logprobs is not supported")
-        return data
-
-    @model_validator(mode="before")
-    @classmethod
-    def verify_logit_processor(cls, data):
-        if data.get("logit_bias"):
-            raise ValueError("logit bias is not supported")
         return data
 
     @model_validator(mode="before")
