@@ -197,9 +197,9 @@ class GenerationExecutorProxy(GenerationExecutor):
 
     def _iteration_result_task(self, queue: Union[FusedIpcQueue,
                                                   IntraProcessQueue],
-                               result_singleton: IterationResult) -> bool:
-        # iteration result is not urgent, so we can sleep a bit
-        time.sleep(0.2)
+                               result_singleton: IterationResult, urgent: bool = False) -> bool:
+        if not urgent:
+            time.sleep(0.2)
 
         try:
             data = queue.get()
@@ -251,7 +251,7 @@ class GenerationExecutorProxy(GenerationExecutor):
 
     def dispatch_kv_cache_events_task(self) -> bool:
         return self._iteration_result_task(self.kv_cache_events_queue,
-                                           self._iter_kv_events_result)
+                                           self._iter_kv_events_result, urgent=True)
 
     def _start_dispatch_threads(self):
         if self.dispatch_result_thread is None:
