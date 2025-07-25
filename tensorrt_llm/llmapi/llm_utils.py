@@ -568,12 +568,12 @@ class ModelLoader:
         self._engine = Engine.from_dir(self._model_dir)
 
     @staticmethod
-    def load_hf_tokenizer(
-            model_dir,
-            trust_remote_code: bool = True,
-            use_fast: bool = True) -> Optional[TransformersTokenizer]:
+    def load_hf_tokenizer(model_dir,
+                          trust_remote_code: bool = True,
+                          use_fast: bool = True,
+                          **kwargs) -> Optional[TransformersTokenizer]:
         if (tokenizer := load_hf_tokenizer(model_dir, trust_remote_code,
-                                           use_fast)) is not None:
+                                           use_fast, **kwargs)) is not None:
             return tokenizer
         else:
             logger.warning(f"Failed to load tokenizer from {model_dir}")
