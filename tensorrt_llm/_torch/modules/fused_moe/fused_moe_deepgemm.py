@@ -287,12 +287,6 @@ def deepgemm_fp8_group_blockwise_gemm(
                                                       recipe=recipe,
                                                       num_groups=num_groups,
                                                       is_sfa=True)
-    sfb = fp8_utils.transform_sf_into_required_layout(sfb,
-                                                      mn=n,
-                                                      k=k,
-                                                      recipe=recipe,
-                                                      num_groups=num_groups,
-                                                      is_sfa=False)
 
     deep_gemm.fp8_m_grouped_gemm_nt_masked((a, sfa), (b, sfb),
                                            d,

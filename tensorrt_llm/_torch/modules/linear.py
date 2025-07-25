@@ -12,6 +12,7 @@ from torch import nn
 from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy)
@@ -19,7 +20,6 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
 from tensorrt_llm.quantization.mode import QuantAlgo
-from tensorrt_llm.quantization.utils.fp8_utils import per_token_cast_to_fp8_e8m0
 
 from ..._utils import get_sm_version
 from ...models.modeling_utils import QuantConfig
@@ -574,12 +574,20 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
 
         if get_sm_version() == 100:
             import deep_gemm
-            a_tuple = per_token_cast_to_fp8_e8m0(input)
+            a, a_sf = fp8_utils.per_token_cast_to_fp8_e8m0(input)
+            a_sf = fp8_utils.transform_sf_into_required_layout(a_sf,
+                                                               mn=a.shape[0],
+                                                               k=a.shape[1],
+                                                               recipe=(1, 128,
+                                                                       128),
+                                                               is_sfa=True)
             output = torch.empty((input.shape[0], module.weight.shape[0]),
                                  device=input.device,
                                  dtype=torch.bfloat16)
-            deep_gemm.fp8_gemm_nt(a_tuple, (module.weight, module.weight_scale),
-                                  output)
+            deep_gemm.fp8_gemm_nt((a, a_sf),
+                                  (module.weight, module.weight_scale),
+                                  output,
+                                  disable_ue8m0_cast=True)
         else:
             act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                 input)
