@@ -1537,6 +1537,11 @@ void BlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmReq
 
 [[nodiscard]] std::vector<kv_connector::KvCacheConnectorPoolData> BlockManager::getKvCacheConnectorPoolsData() const
 {
+    if (mWindowBlockManagers.size() > 1)
+    {
+        throw std::runtime_error("KV Cache connector is not supported with multiple window sizes");
+    }
+
     std::vector<kv_connector::KvCacheConnectorPoolData> poolsData;
     poolsData.reserve(mWindowBlockManagers.size());
     for (auto const& [_, manager] : mWindowBlockManagers)
