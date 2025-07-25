@@ -449,15 +449,13 @@ def EXTRA_STAGE_LIST = "extra_stage"
 @Field
 def MULTI_GPU_FILE_CHANGED = "multi_gpu_file_changed"
 @Field
-def ONLY_PYTORCH_FILE_CHANGED = "only_pytorch_file_changed"
+def ONLY_ONE_GROUP_CHANGED = "only_one_group_changed"
 @Field
 def AUTO_TRIGGER_TAG_LIST = "auto_trigger_tag_list"
 @Field
 def DEBUG_MODE = "debug"
 @Field
 def DETAILED_LOG = "detailed_log"
-@Field
-def ONLY_DOCS_FILE_CHANGED = "only_docs_file_changed"
 @Field
 def testFilter = [
     (REUSE_STAGE_LIST): null,
@@ -471,11 +469,10 @@ def testFilter = [
     (DISABLE_MULTI_GPU_TEST): false,
     (EXTRA_STAGE_LIST): null,
     (MULTI_GPU_FILE_CHANGED): false,
-    (ONLY_PYTORCH_FILE_CHANGED): false,
+    (ONLY_ONE_GROUP_CHANGED): "",
     (DEBUG_MODE): false,
     (AUTO_TRIGGER_TAG_LIST): [],
     (DETAILED_LOG): false,
-    (ONLY_DOCS_FILE_CHANGED): false,
 ]
 
 @Field
@@ -2209,20 +2206,26 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         println parallelJobsFiltered.keySet()
     }
 
-    if (testFilter[(ONLY_PYTORCH_FILE_CHANGED)]) {
-        if (testFilter[(TEST_BACKEND)] != null) {
-            echo "Force disable ONLY_PYTORCH_FILE_CHANGED mode. Backend mode set by flag: ${testFilter[(TEST_BACKEND)]}."
-        } else {
-            echo "ONLY_PYTORCH_FILE_CHANGED mode is true."
-            parallelJobsFiltered = parallelJobsFiltered.findAll { !it.key.contains("-CPP-") && !it.key.contains("-TensorRT-") }
-            println parallelJobsFiltered.keySet()
-        }
-    }
-
-    if (testFilter[(ONLY_DOCS_FILE_CHANGED)]) {
+    if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
         echo "Only docs files are changed, run doc build stage only."
         parallelJobsFiltered = docBuildJobs
         println parallelJobsFiltered.keySet()
+    } else if (testFilter[(ONLY_ONE_GROUP_CHANGED)] != "") {
+        if (testFilter[(TEST_BACKEND)] != null) {
+            echo "Force disable ONLY_ONE_GROUP_CHANGED mode. Backend mode set by flag: ${testFilter[(TEST_BACKEND)]}."
+        } else {
+            echo "ONLY_ONE_GROUP_CHANGED mode is true. The group is: ${testFilter[(ONLY_ONE_GROUP_CHANGED)]}."
+            def excludedBackends = new HashMap()
+            excludedBackends["PyTorch"] = ["-CPP-", "-TensorRT-", "-Triton-"]
+            excludedBackends["Triton"] = ["-PyTorch-", "-CPP-", "-TensorRT-"]
+            def group = testFilter[(ONLY_ONE_GROUP_CHANGED)]
+            if (excludedBackends.containsKey(group)) {
+                parallelJobsFiltered = parallelJobsFiltered.findAll { key, value ->
+                    !excludedBackends[group].any { backend -> key.contains(backend) }
+                }
+            }
+            println parallelJobsFiltered.keySet()
+        }
     }
 
     // Check --stage-list, only run the stages in stage-list.
@@ -2405,7 +2408,7 @@ pipeline {
                 expression {
                     // Only run the test list validation when necessary
                     env.targetArch == X86_64_TRIPLE &&
-                    testFilter[ONLY_DOCS_FILE_CHANGED] == false &&
+                    testFilter[ONLY_ONE_GROUP_CHANGED] != "Docs" &&
                     !(env.JOB_NAME ==~ /.*Multi-GPU.*/) &&
                     !(env.JOB_NAME ==~ /.*BuildDockerImageSanityTest.*/)
                 }

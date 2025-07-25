@@ -1311,6 +1311,10 @@ class PyExecutor:
 
         for request in scheduled_requests.context_requests:
             if request.state != LlmRequestState.GENERATION_COMPLETE:  # skip failed requests
+                request.py_last_context_chunk = (
+                    request.context_current_position,
+                    request.context_current_position +
+                    request.context_chunk_size)
                 request.move_to_next_context_chunk()
             if request.context_remaining_length == 0:
                 request.state = LlmRequestState.GENERATION_IN_PROGRESS
