@@ -309,6 +309,13 @@ class Qwen3MoEModel(DecoderModel):
         super().__init__(model_config)
         config = self.model_config
         self.aux_stream = torch.cuda.Stream()
+        self.preload_weight_modules = []
+        if config.moe_backend == "TRTLLM":
+            self.preload_weight_modules = [
+                "experts",
+                "routing_method",
+                "all_reduce",
+            ]
 
         if model_config.mapping.enable_attention_dp:
             # When attention_dp is enabled, we cannot do all_reduce since
@@ -381,6 +388,7 @@ class Qwen3MoeForCausalLM(SpecDecOneEngineForCausalLM[Qwen3MoEModel,
             Qwen3MoEModel(model_config),
             model_config,
         )
+        self.preload_weight_modules = self.model.preload_weight_modules
 
     def load_weights(self, weights: dict, weight_mapper: BaseWeightMapper):
         super().load_weights(weights, weight_mapper)

@@ -303,6 +303,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_batch_idx = None
         self.py_rewind_len = 0
         self.py_draft_tokens = [] if self.draft_tokens is None else self.draft_tokens
+        self.py_last_context_chunk = (None, None)
         self.py_last_draft_tokens = None
         self.py_num_accepted_draft_tokens = 0
         self.py_decoding_iter = 0
