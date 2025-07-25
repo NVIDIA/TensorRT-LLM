@@ -702,7 +702,7 @@ class PyExecutor:
                     can_queue = 0 not in tp_batch_sizes
                 else:
                     can_queue = scheduled_batch.batch_size > 0
-                    if not can_queue:
+                    if not can_queue and not self.kv_cache_transceiver:
                         assert len(self.inflight_req_ids) > 0, (
                             "fail to schedule any pending request, probably run out of resource"
                         )
