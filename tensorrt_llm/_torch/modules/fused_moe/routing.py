@@ -5,6 +5,134 @@ from typing import Optional
 import torch
 from torch import nn
 
+# Global cache for perfect router logits to share across all MLP blocks
+_PERFECT_ROUTER_LOGITS_CACHE = {}
+
+
+def get_perfect_router_cache_stats():
+    """Get statistics about the perfect router cache."""
+    global _PERFECT_ROUTER_LOGITS_CACHE
+
+    if not _PERFECT_ROUTER_LOGITS_CACHE:
+        return {
+            "cache_size": 0,
+            "memory_usage_mb": 0.0,
+            "cached_batch_sizes": []
+        }
+
+    total_memory = 0
+    cached_batch_sizes = []
+
+    for (num_tokens, num_experts, experts_per_token,
+         moe_ep_size), logits in _PERFECT_ROUTER_LOGITS_CACHE.items():
+        total_memory += logits.numel() * logits.element_size()
+        cached_batch_sizes.append(num_tokens)
+
+    return {
+        "cache_size": len(_PERFECT_ROUTER_LOGITS_CACHE),
+        "memory_usage_mb": total_memory / (1024 * 1024),
+        "cached_batch_sizes": sorted(list(set(cached_batch_sizes)))
+    }
+
+
+def precompute_common_perfect_router_logits(num_experts: int,
+                                            experts_per_token: int,
+                                            moe_ep_size: int,
+                                            dtype: torch.dtype):
+    """
+    Pre-compute logits for common batch sizes to avoid first-time computation overhead.
+    Only precomputes if cache is empty (avoids redundant work across multiple MLPBlock instances).
+    """
+    # Check if cache is already populated (avoid redundant work)
+    cache_stats = get_perfect_router_cache_stats()
+    if cache_stats["cache_size"] > 0:
+        return
+
+    # Common batch sizes for different scenarios
+    common_batch_sizes = [
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048,
+        3072,
+        4096,
+        5120,
+        6144,
+        7168,
+        8192  # Powers of 2 and common sizes
+    ]
+
+    print(
+        f"Precomputing perfect router logits for {len(common_batch_sizes)} common batch sizes..."
+    )
+
+    # Precompute logits for common batch sizes using global cache
+    for num_tokens in common_batch_sizes:
+        try:
+            # Use the global cache function which will handle CPU computation and caching
+            get_cached_perfect_router_logits(
+                num_tokens=num_tokens,
+                num_experts=num_experts,
+                experts_per_token=experts_per_token,
+                moe_ep_size=moe_ep_size,
+                device=torch.device('cpu'),  # Precompute on CPU
+                dtype=dtype)
+
+        except Exception as e:
+            # Skip this batch size if computation fails
+            print(
+                f"Warning: Failed to precompute logits for batch size {num_tokens}: {e}"
+            )
+            continue
+
+    # Print cache statistics
+    final_stats = get_perfect_router_cache_stats()
+    print(
+        f"Perfect router cache initialized: {final_stats['cache_size']} entries, "
+        f"{final_stats['memory_usage_mb']:.2f} MB memory usage")
+
+
+def get_cached_perfect_router_logits(num_tokens: int, num_experts: int,
+                                     experts_per_token: int, moe_ep_size: int,
+                                     device: torch.device,
+                                     dtype: torch.dtype) -> torch.Tensor:
+    """
+    Get cached perfect router logits, computing and caching if not found.
+    Uses global cache to share across all MLP blocks.
+    """
+    global _PERFECT_ROUTER_LOGITS_CACHE
+
+    cache_key = (num_tokens, num_experts, experts_per_token, moe_ep_size)
+
+    if cache_key in _PERFECT_ROUTER_LOGITS_CACHE:
+        # Return cached logits moved to the correct device
+        cached_logits = _PERFECT_ROUTER_LOGITS_CACHE[cache_key]
+        if cached_logits.device != device:
+            cached_logits = cached_logits.to(device)
+            # Update cache with device-specific version for future use
+            _PERFECT_ROUTER_LOGITS_CACHE[cache_key] = cached_logits
+        return cached_logits
+    else:
+        # Compute and cache new logits
+        logits = create_renormalize_expert_load_balanced_logits(
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            experts_per_token=experts_per_token,
+            moe_ep_size=moe_ep_size,
+            device=device,
+            dtype=dtype)
+
+        _PERFECT_ROUTER_LOGITS_CACHE[cache_key] = logits
+        return logits
+
 
 # The type of method in top-K routing, for use in torch custom op
 # Please keep this in sync with the counterpart defined in cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h
@@ -362,6 +490,7 @@ def create_renormalize_expert_load_balanced_logits(
     """
     k = experts_per_token
     experts_per_gpu = num_experts // moe_ep_size
+    # For expert load balance, only moe_ep_size is relevant. System could have multiple TP/gpus sharding each group of experts
     num_gpus = moe_ep_size
 
     # Validation checks

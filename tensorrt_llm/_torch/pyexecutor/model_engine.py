@@ -1001,8 +1001,6 @@ class PyTorchModelEngine(ModelEngine):
             checkpoint_dir,
             trust_remote_code=True,
             enable_min_latency=self.pytorch_backend_config.enable_min_latency,
-            enable_perfect_router=self.pytorch_backend_config.
-            enable_perfect_router,
             use_cuda_graph=self.pytorch_backend_config.use_cuda_graph,
             force_dynamic_quantization=self.pytorch_backend_config.
             force_dynamic_quantization,

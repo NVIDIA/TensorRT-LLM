@@ -91,8 +91,6 @@ class PyTorchConfig:
 
     # If true, enable min-latency mode. Currently only used for Llama4.
     enable_min_latency: bool = False
-    # Enable perfect router for Orangina.
-    enable_perfect_router: bool = False
     allreduce_strategy: str = "AUTO"
 
     # The iteration interval to create responses under the streaming mode.

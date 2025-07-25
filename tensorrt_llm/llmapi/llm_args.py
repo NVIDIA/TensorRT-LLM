@@ -167,7 +167,8 @@ class MoeConfig(StrictBaseModel):
     """
     Configuration for MoE.
     """
-    backend: Literal["CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM", "VANILLA",
+    backend: Literal["CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
+                     "VANILLA",
                      "TRITON"] = Field(default='CUTLASS',
                                        description="MoE backend to use.")
 
@@ -2074,11 +2075,6 @@ class TorchLlmArgs(BaseLlmArgs):
         description=
         "If true, enable min-latency mode. Currently only used for Llama4.",
         status="beta",
-    )
-
-    enable_perfect_router: bool = Field(
-        default=False,
-        description="Enable perfect router.",
     )
 
     # TODO: make this a per-request parameter
