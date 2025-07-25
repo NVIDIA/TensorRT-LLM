@@ -55,7 +55,6 @@ class Exaone4Attention(Attention):
 
     def __init__(self,
                  model_config: ModelConfig[Exaone4Config],
-                 is_sliding: bool,
                  layer_idx: Optional[int] = None,
                  aux_stream: Optional[torch.cuda.Stream] = None,
                  fuse_qk_norm_rope: bool = False):
@@ -64,9 +63,10 @@ class Exaone4Attention(Attention):
         self.attention_window_size = None
 
         # NOTE: In EXAONE4, only sliding layers apply rope.
-        self.is_sliding = is_sliding
+        self.sliding_window = config.sliding_window
+        self.is_sliding = check_is_sliding(config, layer_idx)
         pos_embd_params = None
-        if self.is_sliding:
+        if self.sliding_window is None or self.is_sliding:
             self.attention_window_size = config.sliding_window
 
             pos_embd_params = PositionalEmbeddingParams(
@@ -140,7 +140,7 @@ class Exaone4Attention(Attention):
 
         q, k, v = self.split_qkv(q, k, v)
         q, k = self.apply_qk_norm(q, k)
-        if self.is_sliding:
+        if self.sliding_window is None or self.is_sliding:
             return super().apply_rope(q, k, v, position_ids)
         else:
             return q, k, v
@@ -185,11 +185,9 @@ class Exaone4DecoderLayer(DecoderLayer):
         self.layer_idx = layer_idx
         self.is_quanted = model_config.quant_config and model_config.quant_config.quant_mode.has_any_quant(
         )
-        is_sliding = check_is_sliding(config, layer_idx)
 
         self.self_attn = Exaone4Attention(
             model_config,
-            is_sliding=is_sliding,
             layer_idx=layer_idx,
             aux_stream=aux_stream,
         )
