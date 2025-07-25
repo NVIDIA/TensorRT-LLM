@@ -391,7 +391,8 @@ def create_py_executor(
             guided_decoder=guided_decoder,
             lora_config=lora_config,
             garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
-            kv_connector_config=kv_connector_config,
+            kv_connector_config=kv_connector_config
+            if not estimating_kv_cache else None,
         )
 
     if estimating_kv_cache:
