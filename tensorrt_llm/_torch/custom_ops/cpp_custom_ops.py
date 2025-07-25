@@ -524,9 +524,16 @@ def _register_fake():
             torch.empty_like(residual),
         ]
 
+    @torch.library.register_fake("trtllm::renorm_moe_routing_op")
+    def _(router_logits, topk):
+        num_tokens = router_logits.shape[0]
+        sz = (num_tokens, topk)
+        return router_logits.new_empty(
+            sz, dtype=torch.int32), router_logits.new_empty(sz,
+                                                            dtype=torch.float32)
+
     @torch.library.register_fake("trtllm::alltoall")
     def _(input_list, group, num_lists):
         assert len(input_list) > 0
         assert len(input_list) == len(group)
-
         return [i.new_empty(i.shape) for i in input_list]

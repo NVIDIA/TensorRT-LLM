@@ -521,10 +521,9 @@ class TrtllmAttentionWrapper:
 class TrtllmAttentionMetadata(AttentionMetadata):
     workspace: Optional[torch.Tensor] = None
 
-    # TrtllmAttention needs to know the beam width and access to the cache indirection buffer,
+    # TrtllmAttention needs to know the beam width to access to the cache indirection buffer,
     # when beam search is enabled.
     beam_width: int = 1
-    cache_indirection: Optional[torch.Tensor] = None
 
     # TrtllmAttention needs to know the max sequence length.
     # Implemented as a property to support no cache mode.

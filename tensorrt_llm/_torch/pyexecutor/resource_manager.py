@@ -374,11 +374,15 @@ class KVCacheManager(BaseResourceManager):
         prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
         use_mrope: bool = False,
+        max_beam_width: int = 1,
     ):
-        beam_width = 1  # TODO: more than 1 beam?
+        beam_width = max_beam_width
         requests = []
         for i, req_id in enumerate(request_ids):
-            sampling_params = SamplingParams()
+            # exact choice of n can be ignored for dummy requests
+            sampling_params = SamplingParams(n=beam_width,
+                                             best_of=beam_width,
+                                             use_beam_search=beam_width > 1)
             # Here 1+max_num_draft_tokens is used to extend the prompt length to
             # a non-zero number to skip illegal memory access issue in MLA kernel
             # during warmup.
