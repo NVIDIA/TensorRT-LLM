@@ -29,6 +29,7 @@ from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy
+from tensorrt_llm.llmapi.utils import get_backend_repr
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -254,6 +255,12 @@ def throughput_command(
     """Run a throughput test on a TRT-LLM engine."""
 
     logger.info("Preparing to run throughput benchmark...")
+
+    backend_repr = get_backend_repr(params.get("backend"))
+    logger.warning(
+        f"Starting throughput benchmark with {backend_repr} backend, use `--backend` to switch to the other backend."
+    )
+
     # Parameters from CLI
     # Model, experiment, and engine params
     dataset_path: Path = params.get("dataset")

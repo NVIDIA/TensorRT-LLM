@@ -179,6 +179,13 @@ def latency_command(
     """Run a latency test on a TRT-LLM engine."""
 
     logger.info("Preparing to run latency benchmark...")
+
+    backend_repr = "PyTorch" if params.get(
+        "backend") == "pytorch" else "TensorRT"
+    logger.warning(
+        f"Starting latency benchmark with {backend_repr} backend, use `--backend` to switch to the other backend."
+    )
+
     # Parameters from CLI
     # Model, experiment, and engine params
     dataset_path: Path = params.get("dataset")

@@ -634,3 +634,12 @@ class ApiStatusRegistry:
 
 set_api_status = ApiStatusRegistry().set_api_status
 get_api_status = ApiStatusRegistry().get_api_status
+
+
+def get_backend_repr(backend):
+    _reprs = {
+        "pytorch": "PyTorch",
+        "tensorrt": "TensorRT",
+        "_autodeploy": "AutoDeploy",
+    }
+    return _reprs.get(backend, backend)
