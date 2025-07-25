@@ -8,33 +8,22 @@ import click
 from click_option_group import (MutuallyExclusiveOptionGroup, OptionGroup,
                                 optgroup)
 
-from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
-from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
-
 # isort: off
-from tensorrt_llm.bench.benchmark.utils.general import (
-<<<<<<< HEAD
-    get_settings_from_engine, get_settings, ALL_SUPPORTED_BACKENDS)
-# isort: on
-=======
-    get_settings_from_engine, get_settings)
->>>>>>> c1880441d (Move snapshot download.)
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm._tensorrt_engine import LLM
-from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
-from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
+from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
+from tensorrt_llm.bench.benchmark.utils.general import (ALL_SUPPORTED_BACKENDS,
+                                                        generate_warmup_dataset)
+from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
 from tensorrt_llm.bench.dataclasses.scenario import (
     BatchingConfiguration, BenchmarkEnvironment, LlmRuntimeSpecification,
     ReportingConfiguration, ScenarioSpecification, TuningConstraints,
     WorldConfig)
 from tensorrt_llm.bench.tuning.factory import HeuristicFactory
-# isort: on
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
-from tensorrt_llm.llmapi import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -310,7 +299,8 @@ def throughput_command(
 
     print(benchmark_specification)
 
-    heuristic_cls = HeuristicFactory.get_heuristic(benchmark_specification.llm_config.backend, "throughput")
+    heuristic_cls = HeuristicFactory.get_heuristic(
+        benchmark_specification.llm_config.backend, "throughput")
     kwargs = heuristic_cls.get_settings(benchmark_specification)
     kwargs['backend'] = benchmark_specification.llm_config.backend
     backend = kwargs['backend']
@@ -320,7 +310,7 @@ def throughput_command(
         kwargs["enable_iter_perf_stats"] = True
 
     # NOTE: We need to separate what is considered a benchmark setting and
-    # what is considered a tuning setting (for potential future re-use).
+    # what is considered a tuning setting (for potential future reuse).
     # Update to disable block reuse and partial reuse
     kwargs["kv_cache_config"] |= {
         "enable_block_reuse": False,
@@ -334,7 +324,6 @@ def throughput_command(
             n=benchmark_specification.llm_config.beam_width,
             use_beam_search=benchmark_specification.llm_config.beam_width > 1
         )
-
 
     try:
         logger.info("Setting up throughput benchmark.")
