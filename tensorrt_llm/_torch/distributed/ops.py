@@ -88,8 +88,8 @@ def get_allreduce_mnnvl_workspace(
 
         # This is a buffer to maintain the state of this allreduce Op
         # Should have the same lifetime with self._buffer
-        # [Buffer_ptr, Clear_ptr, Buffer_size, atomic access counter]
-        buffer_flags = torch.tensor([0, 2, max_num_elements, 0],
+        # [Buffer_ptr, Clear_ptr, Buffer_size, num_tokens_to_clear,atomic access counter]
+        buffer_flags = torch.tensor([0, 2, max_num_elements, 0, 0],
                                     dtype=torch.uint32,
                                     device=torch.device("cuda",
                                                         mapping.local_rank))
@@ -305,7 +305,7 @@ class MNNVLAllReduce(nn.Module):
 
     @staticmethod
     def get_supported_dtypes():
-        return (torch.bfloat16, torch.float32)
+        return (torch.float16, torch.bfloat16, torch.float32)
 
     def forward(
         self,
@@ -458,6 +458,7 @@ class AllReduce(nn.Module):
                                          == False):
             return input
 
+        allreduce_strategy = self.strategy
         if all_reduce_params is None:
             all_reduce_params = AllReduceParams()
 
@@ -469,6 +470,9 @@ class AllReduce(nn.Module):
                 return mnnvl_output
 
         # Fall back to regular AllReduce if MNNVL is not available or not applicable
+        # Make sure the strategy is AUTO since allreduceOp does not have the branch for MNNVL
+        if allreduce_strategy == AllReduceStrategy.MNNVL:
+            allreduce_strategy = AllReduceStrategy.AUTO
         output = torch.ops.trtllm.allreduce(
             input=input,
             residual=all_reduce_params.residual,
@@ -477,7 +481,7 @@ class AllReduce(nn.Module):
             bias=all_reduce_params.bias,
             workspace=self.workspace,
             group=self.mapping.tp_group,
-            strategy=self.strategy,
+            strategy=allreduce_strategy,
             op=all_reduce_params.fusion_op,
             eps=all_reduce_params.eps,
             trigger_completion_at_end=all_reduce_params.
