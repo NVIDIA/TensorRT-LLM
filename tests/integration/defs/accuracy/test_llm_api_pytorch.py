@@ -339,6 +339,8 @@ class TestLlama3_2_3B(LlmapiAccuracyTestHarness):
 
 
 @pytest.mark.timeout(7200)
+@pytest.mark.skip_less_host_memory(1000000)
+# 1TB is basic requirement for large model tests. CG4 120G only has 800G host memory, and 480G is shared with GPUs. the test will cause the system crash.
 class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.3-70B-Instruct"
 
@@ -355,10 +357,13 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.skip_device_not_contain(["H100", "H200", "B200"])
+    @skip_pre_hopper
     def test_fp8_tp4(self):
         model_path = f"{llm_models_root()}/modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8"
-        with LLM(model_path, tensor_parallel_size=4) as llm:
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+        with LLM(model_path,
+                 tensor_parallel_size=4,
+                 kv_cache_config=kv_cache_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
@@ -369,7 +374,7 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.skip_device_not_contain(["B200"])
+    @skip_pre_blackwell
     def test_nvfp4_tp4(self):
         model_path = f"{llm_models_root()}/modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4"
         with LLM(model_path, tensor_parallel_size=4) as llm:
