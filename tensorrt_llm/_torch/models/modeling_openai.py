@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -17,10 +18,16 @@ from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
+
+# isort and yapf will fight against each other here, so we disable isort
+# isort: off
 from ..modules.fused_moe import (MoE, MoEWeightLoadingMode,
                                  RenormalizeMoeRoutingMethod, TritonFusedMoE,
-                                 TRTLLMGenFusedMoE, create_moe,
-                                 create_renormalize_expert_load_balanced_logits)
+                                 TRTLLMGenFusedMoE, create_moe)
+from ..modules.fused_moe.routing import (get_cached_perfect_router_logits,
+                                         precompute_common_perfect_router_logits
+                                         )
+# isort: on
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
@@ -192,6 +199,14 @@ class MLPBlock(torch.nn.Module):
             swiglu_beta=self.swiglu_beta,
         )
 
+        # Perfect router caching - precompute common logits if enabled
+        if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
+            precompute_common_perfect_router_logits(
+                num_experts=pretrained_config.num_experts,
+                experts_per_token=pretrained_config.experts_per_token,
+                moe_ep_size=config.mapping.moe_ep_size,
+                dtype=pretrained_config.torch_dtype)
+
     @staticmethod
     def swiglu(x, alpha: float = 1.702):
         """
@@ -208,12 +223,12 @@ class MLPBlock(torch.nn.Module):
             device: torch.device) -> torch.Tensor:
         """
         Create ideal logits that produce GPU-aware load balanced expert assignment.
-        This method now delegates to the generic utility function in fused_moe.routing.
+         This method now uses the global cache to access precomputed logits to optimize performance.
         """
         pretrained_config = self.config.pretrained_config
-        assert self.config.mapping.moe_tp_size == 1, "this load balance scheme is tested with only MOE EP"
 
-        return create_renormalize_expert_load_balanced_logits(
+        # Use global cached logits
+        return get_cached_perfect_router_logits(
             num_tokens=num_tokens,
             num_experts=num_experts,
             experts_per_token=pretrained_config.experts_per_token,
@@ -235,10 +250,9 @@ class MLPBlock(torch.nn.Module):
 
         g = self.gate(t)
         # Use ideal load balanced logits if enabled, otherwise use gate output
-        if getattr(self.config, 'enable_perfect_router', False):
+        if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
             # WARNING: This discards the learned gate output and uses ideal logits for perfect load balancing
             # Only use this for testing load balancing strategies, not for actual inference
-            # The gate is still computed to maintain realistic performance measurement
             num_tokens, num_experts = g.shape
             g = self._create_ideal_expert_load_balanced_logits(
                 num_tokens=num_tokens, num_experts=num_experts, device=x.device)
@@ -272,7 +286,7 @@ class MLPBlock(torch.nn.Module):
 
         g = self.gate(t)
         # Use ideal load balanced logits if enabled, otherwise use gate output
-        if getattr(self.config, 'enable_perfect_router', False):
+        if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
             # WARNING: This discards the learned gate output and uses ideal logits for perfect load balancing
             # Only use this for testing load balancing strategies, not for actual inference
             # The gate is still computed to maintain realistic performance measurement

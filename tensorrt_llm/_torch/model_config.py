@@ -99,7 +99,6 @@ class ModelConfig(Generic[TConfig]):
     extra_attrs: Dict = field(default_factory=dict, repr=False, init=False)
 
     _frozen: bool = field(default=False, init=False, repr=False)
-    enable_perfect_router: bool = False  # Currently only used for Orangina
 
     def __setattr__(self, key, value):
         """
