@@ -830,7 +830,7 @@ class PyExecutor:
                         self._update_requests(previous_batch.sample_state)
 
                         if self.kv_cache_transceiver and previous_batch.scheduled_ctx_reqs:
-                            ctx_transmission_reqs = self._send_disagg_ctx_cache(
+                            self._send_disagg_ctx_cache(
                                 previous_batch.scheduled_ctx_reqs
                             ) if self.kv_cache_transceiver else []
 
