@@ -211,6 +211,7 @@ class TestLlama3_3NemotronSuper49Bv1(CliFlowAccuracyTestHarness):
     def test_auto_dtype_tp2(self):
         self.run(tasks=[MMLU(self.MODEL_NAME)], tp_size=2, dtype='auto')
 
+    @skip_pre_hopper
     @pytest.mark.skip(
         reason="nemotron-nas scripts have to accommodate fp8 flags")
     @pytest.mark.skip_less_device(2)
@@ -811,14 +812,14 @@ class TestLlama3_1_8BInstruct(CliFlowAccuracyTestHarness):
     def test_auto_dtype(self):
         self.run(dtype='auto')
 
-    @skip_pre_ada
+    @skip_pre_hopper
     def test_fp8_prequantized(self, mocker):
         mocker.patch.object(
             self.__class__, "MODEL_PATH",
             f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8")
         self.run(quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=QuantAlgo.FP8)
 
-    @skip_pre_ada
+    @skip_pre_hopper
     @skip_post_blackwell
     def test_medusa_fp8_prequantized(self, mocker):
         # nvidia/Llama-3.1-8B-Medusa-FP8
@@ -958,6 +959,7 @@ class TestLlama3_3_70BInstruct(CliFlowAccuracyTestHarness):
     def test_auto_dtype_tp8(self):
         self.run(tasks=[MMLU(self.MODEL_NAME)], tp_size=8, dtype='auto')
 
+    @skip_pre_hopper
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_device_not_contain(["H100", "H200", "B200"])
     def test_fp8_prequantized_tp4(self, mocker):
@@ -1155,15 +1157,14 @@ class TestMixtral8x22B(CliFlowAccuracyTestHarness):
     @skip_pre_ada
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(80000)
-    def test_fp8_tp2pp2(self, timeout_manager):
+    def test_fp8_tp2pp2(self):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
                         MMLU(self.MODEL_NAME)],
                  quant_algo=QuantAlgo.FP8,
                  tp_size=2,
                  pp_size=2,
                  extra_convert_args=["--calib_size=32"],
-                 extra_build_args=["--gemm_plugin=auto"],
-                 timeout_manager=timeout_manager)
+                 extra_build_args=["--gemm_plugin=auto"])
 
     @skip_post_blackwell
     @pytest.mark.skip_less_device(8)
@@ -1173,8 +1174,7 @@ class TestMixtral8x22B(CliFlowAccuracyTestHarness):
         ids=['expert_parallel', 'mixed_parallel', 'tensor_parallel'])
     @pytest.mark.parametrize("moe_renorm_mode", [0, 1],
                              ids=['no_renormalize', 'renormalize'])
-    def test_int8_plugin_tp8(self, moe_tp_size, moe_renorm_mode,
-                             timeout_manager):
+    def test_int8_plugin_tp8(self, moe_tp_size, moe_renorm_mode):
         self.run(quant_algo=QuantAlgo.W8A16,
                  tp_size=8,
                  extra_convert_args=[
@@ -1185,8 +1185,7 @@ class TestMixtral8x22B(CliFlowAccuracyTestHarness):
                  extra_build_args=[
                      "--max_beam_width=4", "--gemm_plugin=auto",
                      "--moe_plugin=auto", f"--max_seq_len={8192}"
-                 ],
-                 timeout_manager=timeout_manager)
+                 ])
 
 
 class TestGemma2B(CliFlowAccuracyTestHarness):

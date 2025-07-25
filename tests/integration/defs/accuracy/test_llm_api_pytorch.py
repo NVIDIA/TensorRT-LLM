@@ -307,6 +307,7 @@ class TestLlama3_2_1B(LlmapiAccuracyTestHarness):
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_hopper
     def test_fp8_prequantized(self):
         model_path = f"{llm_models_root()}/llama-3.2-models/Llama-3.2-1B-FP8"
         with LLM(model_path) as llm:
@@ -339,6 +340,8 @@ class TestLlama3_2_3B(LlmapiAccuracyTestHarness):
 
 
 @pytest.mark.timeout(7200)
+@pytest.mark.skip_less_host_memory(1000000)
+# 1TB is basic requirement for large model tests. CG4 120G only has 800G host memory, and 480G is shared with GPUs. the test will cause the system crash.
 class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.3-70B-Instruct"
 
@@ -355,10 +358,13 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.skip_device_not_contain(["H100", "H200", "B200"])
+    @skip_pre_hopper
     def test_fp8_tp4(self):
         model_path = f"{llm_models_root()}/modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8"
-        with LLM(model_path, tensor_parallel_size=4) as llm:
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+        with LLM(model_path,
+                 tensor_parallel_size=4,
+                 kv_cache_config=kv_cache_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
@@ -369,7 +375,7 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.skip_device_not_contain(["B200"])
+    @skip_pre_blackwell
     def test_nvfp4_tp4(self):
         model_path = f"{llm_models_root()}/modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4"
         with LLM(model_path, tensor_parallel_size=4) as llm:
@@ -406,6 +412,23 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(8)
+    @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
+    def test_chunked_prefill(self, attn_backend):
+        pytorch_config = dict(attn_backend=attn_backend,
+                              disable_overlap_scheduler=True)
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=8,
+                 pipeline_parallel_size=1,
+                 moe_expert_parallel_size=1,
+                 max_seq_len=8192,
+                 enable_chunked_prefill=True,
+                 max_num_tokens=256,
+                 **pytorch_config) as llm:
+            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
 
@@ -1456,6 +1479,7 @@ class TestLlama3_3NemotronSuper49Bv1(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
 
+    @skip_pre_hopper
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_device_not_contain(["H100", "B200"])
     def test_fp8_prequantized_tp2(self):
@@ -1485,6 +1509,7 @@ class TestLlama3_1NemotronNano8Bv1(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
 
+    @skip_pre_hopper
     @pytest.mark.skip_device_not_contain(["H100", "B200"])
     def test_fp8_prequantized(self):
         model_path = f"{llm_models_root()}/Llama-3.1-Nemotron-Nano-8B-v1-FP8"
@@ -1525,6 +1550,7 @@ class TestNemotronUltra(LlmapiAccuracyTestHarness):
             # task.evaluate(llm,
             #                 extra_evaluator_kwargs=dict(apply_chat_template=True))
 
+    @skip_pre_hopper
     @pytest.mark.skip_less_device(8)
     @pytest.mark.skip_device_not_contain(["H100", "B200"])
     @parametrize_with_ids("cuda_graph", [False, True])
@@ -1756,6 +1782,31 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    def test_eagle3(self):
+        pytorch_config = dict(
+            disable_overlap_scheduler=True,
+            cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 3, 4, 8]),
+        )
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+
+        eagle_model_dir = f"{llm_models_root()}/Qwen3/Qwen3-30B-eagle3"
+        target_model_dir = f"{llm_models_root()}/Qwen3/Qwen3-30B-A3B"
+
+        draft_len = 1
+        spec_config = EagleDecodingConfig(max_draft_len=draft_len,
+                                          speculative_model_dir=eagle_model_dir,
+                                          eagle3_one_model=True)
+
+        llm = LLM(model=target_model_dir,
+                  **pytorch_config,
+                  kv_cache_config=kv_cache_config,
+                  speculative_config=spec_config,
+                  max_seq_len=8192)
+
+        with llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
 
 class TestQwen3_32B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-32B"
@@ -1822,10 +1873,6 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
     )
     def test_nvfp4(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
                    overlap_scheduler, moe_backend):
-        if moe_backend == "TRTLLM":
-            pytest.skip(
-                "TRTLLM moe backend has accuracy issues: https://nvbugspro.nvidia.com/bug/5404726"
-            )
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
