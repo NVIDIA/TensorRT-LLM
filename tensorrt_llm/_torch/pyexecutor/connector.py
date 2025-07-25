@@ -2,7 +2,8 @@ from typing import Optional
 
 from tensorrt_llm.bindings.internal.batch_manager import \
     KvCacheConnector as KvCacheConnectorCpp
-from tensorrt_llm.bindings.internal.batch_manager import KvCacheConnectorRole
+from tensorrt_llm.bindings.internal.batch_manager import (KvCacheConnectorRole,
+                                                          SchedulerOutput)
 
 
 class KvCacheConnector(KvCacheConnectorCpp):
@@ -17,5 +18,6 @@ class KvCacheConnector(KvCacheConnectorCpp):
     def _get_connector_metadata(self) -> object:
         return self.connector_metadata
 
-    def build_connector_metadata(self) -> Optional[object]:
+    def build_connector_metadata(
+            self, scheduler_output: SchedulerOutput) -> Optional[object]:
         return None
