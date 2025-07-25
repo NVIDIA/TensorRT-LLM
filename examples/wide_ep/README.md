@@ -26,14 +26,14 @@ Wide-EP solves these challenges through:
 An example yaml file to enable wide EP:
 ```yaml
 moe_config:
-    backend: WideEP
+    backend: WIDEEP
     max_num_tokens: 9216
     load_balancer: ./moe_load_balancer.yaml # (optional) enable load balancer
 ```
 
 | Parameter | Description | Default | Notes |
 |-----------|-------------|---------|-------|
-| `backend` | MoE backend type | `CUTLASS` | Set to `WideEP` to enable wide EP |
+| `backend` | MoE backend type | `CUTLASS` | Set to `WIDEEP` to enable wide EP |
 | `max_num_tokens` | If set, at most max_num_tokens tokens will be sent to torch.ops.trtllm.fused_moe at the same time.  | `None` | If the number of tokens exceeds max_num_tokens, the input tensors will be split into chunks and a for loop will be used. |
 | `load_balancer` | Configuration for MoE load balancing | `None` | Set path to the yaml file |
 
@@ -58,7 +58,7 @@ Refer to the [slurm_scripts](./slurm_scripts/) directory, which reuses [disaggre
 
 ## References
 
-- [Technical Blog: Scaling Expert Parallelism in TensorRT-LLM](docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md)
+- [Technical Blog: Scaling Expert Parallelism in TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md)
 
 For detailed implementation examples and advanced usage, see the subdirectories:
 - [`ep_load_balancer/`](ep_load_balancer/): Load balancing tools and examples
