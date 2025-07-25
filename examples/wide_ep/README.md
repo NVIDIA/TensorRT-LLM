@@ -28,7 +28,7 @@ An example yaml file to enable wide EP:
 moe_config:
     backend: WIDEEP
     max_num_tokens: 9216
-    load_balancer: ./moe_load_balancer.yaml # (optional) enable load balancer
+    load_balancer: moe_load_balancer.yaml # (optional) enable load balancer
 ```
 
 | Parameter | Description | Default | Notes |
@@ -39,7 +39,7 @@ moe_config:
 
 #### Load Balancer Configuration
 
-An example yaml file to configure online EP balancer:
+An example `moe_load_balancer.yaml` file to configure online EP balancer:
 ```yaml
 num_slots: 288
 layer_updates_per_iter: 1

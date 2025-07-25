@@ -1,9 +1,7 @@
 #!/bin/bash
 
-# !!!
-# Please find the `disaggr_torch.slurm` script in the `examples/disaggregated/slurm/` directory.
-# Make sure that SLURM parameters are correctly set in `disaggr_torch.slurm` before executing this script.
-# !!!
+echo "Please find the \`disaggr_torch.slurm\` script in the \`examples/disaggregated/slurm/\` directory."
+echo "Make sure that SLURM parameters are correctly set in \`disaggr_torch.slurm\` before executing this script."
 
 mtp_size=0
 ntasks_per_node=4 # 4 GPUs per GB200 node
