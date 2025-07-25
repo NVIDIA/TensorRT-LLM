@@ -160,6 +160,8 @@ class PyExecutor:
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.sampler = sampler
         self.drafter = drafter
+        self.draft_model_engine = getattr(self.drafter, "draft_model_engine",
+                                          None)
         self.guided_decoder = guided_decoder
         self.dist = dist
         self.disable_overlap_scheduler = disable_overlap_scheduler
@@ -206,8 +208,8 @@ class PyExecutor:
         self.inflight_req_ids = ReqIdsSet()
 
         self.model_engine.warmup(self.resource_manager)
-        if self.drafter is not None:
-            self.drafter.draft_model_engine.warmup(self.resource_manager)
+        if self.draft_model_engine is not None:
+            self.draft_model_engine.warmup(self.resource_manager)
 
         self.is_shutdown = False
 
@@ -330,8 +332,8 @@ class PyExecutor:
             if manager:
                 manager.shutdown()
         del self.model_engine
-        if self.drafter is not None:
-            del self.drafter.draft_model_engine
+        if self.draft_model_engine is not None:
+            del self.draft_model_engine
 
     def can_enqueue_requests(self) -> bool:
         """
