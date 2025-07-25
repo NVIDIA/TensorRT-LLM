@@ -21,7 +21,7 @@ def example_cuda_graph_config():
 
     cuda_graph_config = CudaGraphConfig(
         batch_sizes=[1, 2, 4],
-        padding_enabled=True,
+        enable_padding=True,
     )
 
     llm = LLM(
