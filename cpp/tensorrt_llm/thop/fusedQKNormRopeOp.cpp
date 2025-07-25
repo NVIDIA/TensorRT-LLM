@@ -75,9 +75,8 @@ void fused_qk_norm_rope(
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "fused_qk_norm_rope(Tensor qkv, int num_heads_q, int num_heads_k, int num_heads_v, int head_dim, float eps, "
-        "Tensor q_weight, Tensor k_weight, float base, bool is_neox, Tensor position_ids) -> ()",
-        &fused_qk_norm_rope);
+        "fused_qk_norm_rope(Tensor(a!) qkv, int num_heads_q, int num_heads_k, int num_heads_v, int head_dim, float "
+        "eps, Tensor q_weight, Tensor k_weight, float base, bool is_neox, Tensor position_ids) -> ()");
 }
 
 // Register the CUDA implementation
