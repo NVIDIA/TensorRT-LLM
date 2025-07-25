@@ -126,4 +126,20 @@ void tensorrt_llm::batch_manager::kv_cache_manager::KVCacheManagerConnectorBindi
         .def("update_state_after_alloc", &tb::kv_connector::KvCacheConnector::updateStateAfterAlloc)
         .def("request_finished", &tb::kv_connector::KvCacheConnector::requestFinished, py::arg("request"))
         .def_property_readonly("role", &tb::kv_connector::KvCacheConnector::role);
+
+    py::class_<tb::kv_connector::NewRequestData>(m, "NewRequestData")
+        .def_readonly("request_id", &tb::kv_connector::NewRequestData::requestId)
+        .def_readonly("new_tokens", &tb::kv_connector::NewRequestData::newTokens)
+        .def_readonly("block_ids", &tb::kv_connector::NewRequestData::blockIds)
+        .def_readonly("num_computed_tokens", &tb::kv_connector::NewRequestData::numComputedTokens);
+
+    py::class_<tb::kv_connector::CachedRequestData>(m, "CachedRequestData")
+        .def_readonly("request_id", &tb::kv_connector::CachedRequestData::requestId)
+        .def_readonly("new_tokens", &tb::kv_connector::CachedRequestData::newTokens)
+        .def_readonly("new_block_ids", &tb::kv_connector::CachedRequestData::newBlockIds)
+        .def_readonly("num_computed_tokens", &tb::kv_connector::CachedRequestData::numComputedTokens);
+
+    py::class_<tb::kv_connector::SchedulerOutput>(m, "SchedulerOutput")
+        .def_readonly("new_requests", &tb::kv_connector::SchedulerOutput::newRequests)
+        .def_readonly("cached_requests", &tb::kv_connector::SchedulerOutput::cachedRequests);
 }
