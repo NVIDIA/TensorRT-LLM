@@ -2,15 +2,18 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import List, Optional
 
 from PIL import Image
 
-# Import VoRA support
-from tensorrt_llm.models.vora.llm_integration import VoRALLM
-from tensorrt_llm.llmapi import SamplingParams
+# Disable flashinfer for float32 compatibility
+
+# Import TensorRT-LLM components
 from tensorrt_llm.logger import logger
+from tensorrt_llm.llmapi import LLM
+from tensorrt_llm.sampling_params import SamplingParams
 
 
 def parse_arguments():
@@ -21,10 +24,11 @@ def parse_arguments():
                         help='Path to VoRA model or HuggingFace model ID')
     parser.add_argument('--prompt',
                         type=str,
-                        default="<image> Describe this image.",
-                        help='Text prompt for generation')
+                        default="Describe this image.",
+                        help='Text prompt for generation (no need to include <image> token)')
     parser.add_argument('--image_path',
                         type=str,
+                        default="/workspace/TensorRT-LLM/test.jpg",
                         help='Path to input image')
     parser.add_argument('--max_new_tokens',
                         type=int,
@@ -36,7 +40,7 @@ def parse_arguments():
                         help='Sampling temperature')
     parser.add_argument('--top_p',
                         type=float,
-                        default=0.9,
+                        default=0.8,
                         help='Top-p sampling parameter')
     parser.add_argument('--batch_prompts',
                         type=str,
@@ -77,42 +81,84 @@ def main():
     # Set logging level
     logger.set_level(args.log_level)
     
-    # Initialize VoRA model
+    # Initialize VoRA model using TensorRT-LLM LLM API
     logger.info(f"Loading VoRA model from {args.model_path}")
-    llm = VoRALLM(
-        model=args.model_path,
-        dtype="float32",
-        trust_remote_code=True
-    )
     
-    # Set up sampling parameters
+    # Initialize LLM with VoRA model using PyTorch backend
+    logger.info("Initializing VoRA model through LLM API...")
+    
+    # Initialize LLM API for VoRA model
+    llm = LLM(
+        model=args.model_path,
+        trust_remote_code=True,
+        dtype="bfloat16",  # Use bfloat16
+    )
+    logger.info("✓ Model loaded successfully")
+    
+    # Get EOS token from tokenizer
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    eos_token_id = tokenizer.eos_token_id
+    logger.info(f"Using EOS token ID: {eos_token_id}")
+    
+    # Sampling parameters
     sampling_params = SamplingParams(
         max_tokens=args.max_new_tokens,
         temperature=args.temperature,
-        top_p=args.top_p
+        top_p=args.top_p,
+        repetition_penalty=1.05,
+        end_id=eos_token_id,  # Use actual EOS token from tokenizer
+        stop_token_ids=[eos_token_id] if eos_token_id is not None else None,
     )
     
     # Prepare inputs
     if args.batch_prompts:
         # Batch processing
         prompts, image_paths = load_batch_inputs(args.batch_prompts)
-        images = None
+        images = []
         if image_paths:
             images = [Image.open(path) for path in image_paths]
     else:
         # Single prompt processing
-        prompts = args.prompt
-        images = None
-        if args.image_path:
-            images = Image.open(args.image_path)
+        prompts = [args.prompt]
+        images = []
+        if args.image_path and Path(args.image_path).exists():
+            images = [Image.open(args.image_path)]
+            logger.info(f"Loaded image: {args.image_path}")
+        elif args.image_path:
+            logger.warning(f"Image not found: {args.image_path}")
     
     # Generate
     logger.info("Starting generation...")
-    results = llm.generate(
-        prompts=prompts,
-        images=images,
+    
+    # Prepare prompts and images for LLM API
+    if images:
+        # Multimodal inputs
+        prompt_inputs = []
+        for i, (prompt, image) in enumerate(zip(prompts, images)):
+            prompt_inputs.append({
+                "prompt": prompt,
+                "multi_modal_data": {
+                    "image": image
+                }
+            })
+    else:
+        # Text-only inputs
+        prompt_inputs = prompts
+    
+    # Generate with the LLM API
+    outputs = llm.generate(
+        prompt_inputs,
         sampling_params=sampling_params
     )
+    
+    # Format results
+    results = []
+    for i, output in enumerate(outputs):
+        results.append({
+            'prompt': prompts[i],
+            'generated_text': output.outputs[0].text
+        })
     
     # Process results
     outputs = []
@@ -138,75 +184,7 @@ def main():
     logger.info("Generation completed!")
 
 
-def example_chat_interface():
-    """Example of using VoRA with chat interface."""
-    from tensorrt_llm.models.vora.llm_integration import VoRALLM
-    
-    # Initialize model
-    llm = VoRALLM(
-        model="Hon-Wong/VoRA-7B-Instruct",
-        dtype="float16"
-    )
-    
-    # Example 1: Text-only chat
-    messages = [
-        {"role": "user", "content": "What is machine learning?"}
-    ]
-    response = llm.chat(messages)
-    print(f"Response: {response}")
-    
-    # Example 2: Multimodal chat
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "url": "path/to/image.jpg"},
-                {"type": "text", "text": "What's in this image?"}
-            ]
-        }
-    ]
-    response = llm.chat(messages)
-    print(f"Response: {response}")
-
-
-def example_batch_processing():
-    """Example of batch processing with VoRA."""
-    from tensorrt_llm.models.vora.model_runner import create_vora_runner
-    
-    # Create runner
-    runner = create_vora_runner(
-        model_path="Hon-Wong/VoRA-7B-Instruct",
-        device="cuda",
-        dtype="float16",
-        max_batch_size=4
-    )
-    
-    # Prepare batch
-    batch = {
-        'prompts': [
-            "Describe this image.",
-            "What objects are visible?",
-            "What is the main subject?",
-            "Describe the colors in the image."
-        ],
-        'images': [
-            "image1.jpg",
-            "image2.jpg", 
-            "image3.jpg",
-            "image4.jpg"
-        ]
-    }
-    
-    # Process batch
-    results = runner.process_batch(
-        batch,
-        max_new_tokens=256,
-        temperature=0.7
-    )
-    
-    for prompt, result in zip(batch['prompts'], results):
-        print(f"Prompt: {prompt}")
-        print(f"Result: {result}\n")
+# Example functions removed - see documentation for usage examples
 
 
 if __name__ == '__main__':

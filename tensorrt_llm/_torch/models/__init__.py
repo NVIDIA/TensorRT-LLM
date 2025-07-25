@@ -24,6 +24,7 @@ from .modeling_qwen_moe import Qwen2MoeForCausalLM
 from .modeling_siglip import SiglipVisionModel
 from .modeling_utils import get_model_architecture
 from .modeling_vila import VilaModel
+from .modeling_vora import VoRAForCausalLM
 
 # Note: for better readiblity, this should have same order as imports above
 __all__ = [
@@ -49,6 +50,7 @@ __all__ = [
     "SiglipVisionModel",
     "get_model_architecture",
     "VilaModel",
+    "VoRAForCausalLM",
     "Qwen2VLModel",
     "Qwen2_5_VLModel",
     "Qwen3ForCausalLM",

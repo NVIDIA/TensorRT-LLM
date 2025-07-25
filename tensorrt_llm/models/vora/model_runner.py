@@ -3,6 +3,7 @@
 
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -12,6 +13,7 @@ from PIL import Image
 from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.profiler import Timer
 from tensorrt_llm.runtime.multimodal_model_runner import MultimodalModelRunner
 
 
@@ -29,11 +31,25 @@ class VoRAModelRunner:
         dtype: torch.dtype = torch.float16,
         trust_remote_code: bool = True,
         max_batch_size: int = 1,
+        enable_profiling: bool = False,
     ):
         self.model_path = model_path
         self.device = device
         self.dtype = dtype
         self.max_batch_size = max_batch_size
+        self.enable_profiling = enable_profiling
+        
+        # Initialize profiler
+        self.timer = Timer()
+        
+        # Performance metrics
+        self.metrics = {
+            'ttft': [],  # Time to first token
+            'tpot': [],  # Time per output token
+            'total_time': [],  # Total generation time
+            'tokens_generated': [],  # Number of tokens generated
+            'throughput': []  # Tokens per second
+        }
         
         logger.info(f"Loading VoRA model from {model_path}")
         
@@ -226,6 +242,12 @@ class VoRAModelRunner:
             **kwargs
         }
         
+        # Start timing if profiling is enabled
+        if self.enable_profiling:
+            self.timer.start("total_generation")
+            self.timer.start("preprocessing")
+            generation_start = time.perf_counter()
+        
         # VoRA expects a batch dictionary
         # The processor already returns the correct format!
         batch = model_inputs
@@ -238,6 +260,9 @@ class VoRAModelRunner:
         if 'gt' not in batch:
             # Empty ground truth for inference (not training)
             batch['gt'] = [''] * (len(batch['prompt']) if isinstance(batch['prompt'], list) else 1)
+        
+        if self.enable_profiling:
+            self.timer.stop("preprocessing")
         
         # Debug: print batch keys and values
         logger.info(f"Batch keys: {batch.keys()}")
@@ -284,19 +309,40 @@ class VoRAModelRunner:
                     logger.info("Replacing attention modules with VoRAAttention")
                     self.model.llm = replace_attention_with_vora(self.model.llm)
                     
+                    if self.enable_profiling:
+                        self.timer.start("model_generation")
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                    
                     # Call VoRA's generate method with custom attention
                     outputs = self.model.generate(
                         batch,
                         **generation_config
                     )
                     
+                    if self.enable_profiling:
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        self.timer.stop("model_generation")
+                    
                 else:
                     logger.warning("VoRA generation utilities not found, falling back to standard generation")
+                    
+                    if self.enable_profiling:
+                        self.timer.start("model_generation")
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                    
                     # Standard generation for text-only or fallback
                     outputs = self.model.llm.generate(
                         **batch,
                         **generation_config
                     )
+                    
+                    if self.enable_profiling:
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        self.timer.stop("model_generation")
             except Exception as e:
                 logger.error(f"VoRA generation failed: {e}")
                 logger.error(f"Error type: {type(e)}")
@@ -306,16 +352,50 @@ class VoRAModelRunner:
                 raise e
         else:
             # Standard generation for text-only or fallback
+            if self.enable_profiling:
+                self.timer.start("model_generation")
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            
             outputs = self.model.llm.generate(
                 **batch,
                 **generation_config
             )
+            
+            if self.enable_profiling:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                self.timer.stop("model_generation")
         
         # Decode outputs
+        if self.enable_profiling:
+            self.timer.start("decoding")
+            
         generated_texts = self.processor.tokenizer.batch_decode(
             outputs[:, model_inputs['input_ids'].shape[1]:],  # Skip input tokens
             skip_special_tokens=True
         )
+        
+        if self.enable_profiling:
+            self.timer.stop("decoding")
+            self.timer.stop("total_generation")
+            
+            # Calculate metrics
+            total_time = time.perf_counter() - generation_start
+            num_generated_tokens = outputs.shape[1] - model_inputs['input_ids'].shape[1]
+            tokens_per_second = num_generated_tokens / total_time if total_time > 0 else 0
+            
+            # Store metrics
+            self.metrics['total_time'].append(total_time)
+            self.metrics['tokens_generated'].append(num_generated_tokens)
+            self.metrics['throughput'].append(tokens_per_second)
+            
+            # Log performance info
+            print(f"\n[Performance metrics for this run]")
+            print(f"  Total time: {total_time:.3f}s")
+            print(f"  Generated tokens: {num_generated_tokens}")
+            print(f"  Throughput: {tokens_per_second:.1f} tokens/s")
+            print(f"  Time per token: {total_time/num_generated_tokens*1000:.1f} ms/token")
         
         return generated_texts
     
@@ -341,12 +421,45 @@ class VoRAModelRunner:
             images=images,
             **generation_kwargs
         )
+    
+    def get_performance_summary(self):
+        """Get performance summary statistics."""
+        if not self.metrics['total_time']:
+            return "No performance data collected. Enable profiling with enable_profiling=True"
+        
+        import numpy as np
+        
+        summary = {
+            'avg_total_time': np.mean(self.metrics['total_time']),
+            'std_total_time': np.std(self.metrics['total_time']),
+            'avg_tokens_generated': np.mean(self.metrics['tokens_generated']),
+            'avg_throughput': np.mean(self.metrics['throughput']),
+            'min_throughput': np.min(self.metrics['throughput']),
+            'max_throughput': np.max(self.metrics['throughput']),
+        }
+        
+        # Calculate time per token
+        avg_time_per_token = summary['avg_total_time'] / summary['avg_tokens_generated'] * 1000
+        
+        print("=== Performance Summary ===")
+        print(f"Average generation time: {summary['avg_total_time']:.3f}s (±{summary['std_total_time']:.3f}s)")
+        print(f"Average tokens generated: {summary['avg_tokens_generated']:.1f}")
+        print(f"Average throughput: {summary['avg_throughput']:.1f} tokens/s")
+        print(f"Throughput range: {summary['min_throughput']:.1f} - {summary['max_throughput']:.1f} tokens/s")
+        print(f"Average time per token: {avg_time_per_token:.1f} ms")
+        
+        # Detailed timing breakdown
+        print("\nDetailed timing breakdown:")
+        self.timer.summary()
+        
+        return summary
 
 
 def create_vora_runner(
     model_path: str,
     device: str = "cuda",
     dtype: str = "float16",
+    enable_profiling: bool = False,
     **kwargs
 ) -> VoRAModelRunner:
     """Factory function to create VoRA model runner.
@@ -372,5 +485,6 @@ def create_vora_runner(
         model_path=model_path,
         device=device,
         dtype=torch_dtype,
+        enable_profiling=enable_profiling,
         **kwargs
     )

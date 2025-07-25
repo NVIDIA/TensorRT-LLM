@@ -54,11 +54,13 @@ class VoRALLM:
             raise ValueError(f"Model type {config.model_type} is not VoRA")
         
         # Create PyTorch runner
+        self.enable_profiling = kwargs.pop('enable_profiling', False)
         self.runner = VoRAModelRunner(
             model_path=model,
             device="cuda",
             dtype=self._get_torch_dtype(dtype),
             trust_remote_code=trust_remote_code,
+            enable_profiling=self.enable_profiling,
             **kwargs
         )
         
@@ -174,6 +176,10 @@ class VoRALLM:
         )
         
         return results[0]["generated_text"]
+    
+    def get_performance_summary(self):
+        """Get performance summary from the runner."""
+        return self.runner.get_performance_summary()
 
 
 def register_vora_in_llm_api():
