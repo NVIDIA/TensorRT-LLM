@@ -57,8 +57,8 @@ void initBindings(nb::module_& m)
     using GenLlmReq = tb::GenericLlmRequest<runtime::ITensor::SharedPtr>;
 
     // Create and register exceptions in module scope
-    nb::exception<tb::PeftTaskNotCachedException>(m, "PeftTaskNotCachedException");
-    nb::exception<tr::LoraCacheFullException>(m, "LoraCacheFullException");
+    static nb::object peft_exc = nb::exception<tb::PeftTaskNotCachedException>(m, "PeftTaskNotCachedException");
+    static nb::object lora_exc = nb::exception<tr::LoraCacheFullException>(m, "LoraCacheFullException");
 
     // Register with no captures
     nb::register_exception_translator(
@@ -71,11 +71,11 @@ void initBindings(nb::module_& m)
             }
             catch (const tb::PeftTaskNotCachedException& e)
             {
-                PyErr_SetString(nb::type<tb::PeftTaskNotCachedException>().ptr(), e.what());
+                PyErr_SetString(peft_exc.ptr(), e.what());
             }
             catch (const tr::LoraCacheFullException& e)
             {
-                PyErr_SetString(nb::type<tr::LoraCacheFullException>().ptr(), e.what());
+                PyErr_SetString(lora_exc.ptr(), e.what());
             }
         });
 
