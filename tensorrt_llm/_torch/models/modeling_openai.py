@@ -25,8 +25,8 @@ from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
 from ..utils import Fp4QuantizedTensor
-from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             duplicate_kv_weight, filter_weights,
+from .modeling_speculative import SpecDecOneEngineForCausalLM
+from .modeling_utils import (DecoderModel, duplicate_kv_weight, filter_weights,
                              register_auto_model)
 
 
@@ -524,8 +524,8 @@ class Transformer(DecoderModel):
 
 
 @register_auto_model("OpenAIMoeForCausalLM")
-class OpenAIMoeForCausalLM(DecoderModelForCausalLM[Transformer,
-                                                   OpenAIMoeConfig]):
+class OpenAIMoeForCausalLM(SpecDecOneEngineForCausalLM[Transformer,
+                                                       OpenAIMoeConfig]):
 
     params_map = {
         # TRTLLM module name : OpenAIMoe module name
@@ -540,9 +540,7 @@ class OpenAIMoeForCausalLM(DecoderModelForCausalLM[Transformer,
     ):
         super().__init__(
             Transformer(model_config),
-            config=model_config,
-            hidden_size=model_config.pretrained_config.hidden_size,
-            vocab_size=model_config.pretrained_config.vocab_size,
+            model_config=model_config,
         )
 
     def __post_init__(self):
@@ -564,31 +562,6 @@ class OpenAIMoeForCausalLM(DecoderModelForCausalLM[Transformer,
             if callable(getattr(module, "create_weights", None)):
                 module.create_weights()
 
-    def forward(
-        self,
-        attn_metadata: AttentionMetadata,
-        input_ids: torch.LongTensor = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        return_context_logits: bool = False,
-        spec_metadata: Optional[SpecMetadata] = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        output = self.model(
-            input_ids=input_ids,
-            attn_metadata=attn_metadata,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            spec_metadata=spec_metadata,
-        )
-
-        return self.logits_processor.forward(
-            output,
-            self.lm_head,
-            attn_metadata,
-            return_context_logits,
-        )
-
     def load_weights(self, weights: Dict):
         head_dim = self.config.head_dim
         num_q_head = self.config.num_attention_heads
@@ -599,7 +572,7 @@ class OpenAIMoeForCausalLM(DecoderModelForCausalLM[Transformer,
 
         for name, module in tqdm(list(self.named_modules()),
                                  desc="Loading weights"):
-            if len(module._parameters) <= 0:
+            if len(module._parameters) <= 0 or name.startswith("draft_model"):
                 continue
             names = name.split(".")
             module_weights = {}
