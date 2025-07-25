@@ -25,7 +25,6 @@ from .library import (
     fuse_rmsnorm,
     insert_cached_attention,
     match_attention_layout,
-    match_causal_attn_mask,
     match_eager_attention,
     match_grouped_attention,
     match_moe_pattern,
@@ -86,9 +85,6 @@ class InferenceOptimizer:
 
         # Match grouped attention pattern
         match_grouped_attention(egm)
-
-        # Match and optimize causal attention masks
-        match_causal_attn_mask(egm)
 
         # Match attention layout expected by our backend
         match_attention_layout(egm, AttentionRegistry.get(self.ad_config.attn_backend))
