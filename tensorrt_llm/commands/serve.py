@@ -25,6 +25,7 @@ from tensorrt_llm.llmapi.disagg_utils import (CtxGenServerConfig,
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_port
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+from tensorrt_llm.llmapi.utils import get_backend_repr
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
 
@@ -292,6 +293,11 @@ def serve(
     MODEL: model name | HF checkpoint path | TensorRT engine path
     """
     logger.set_level(log_level)
+
+    backend_repr = get_backend_repr(backend)
+    logger.warning(
+        f"Starting serve with {backend_repr} backend, use `--backend` to switch to the other backend."
+    )
 
     llm_args, _ = get_llm_args(
         model=model,
