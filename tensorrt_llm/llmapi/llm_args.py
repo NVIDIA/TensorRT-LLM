@@ -93,7 +93,7 @@ class MoeConfig(BaseModel):
     """
     Configuration for MoE.
     """
-    backend: Literal["CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM",
+    backend: Literal["CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
                      "VANILLA"] = Field(default='CUTLASS',
                                         description="MoE backend to use.")
 

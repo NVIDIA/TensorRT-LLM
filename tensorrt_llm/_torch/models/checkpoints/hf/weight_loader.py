@@ -124,5 +124,3 @@ class HfWeightLoader(BaseWeightLoader):
                             len(local_file_names))
         with multiprocessing.Pool(processes=max_processes) as pool:
             pool.map(self._prefetch_one_file, local_file_names)
-        # Ensure that all ranks have finished prefetching before loading weights
-        mpi_barrier()
