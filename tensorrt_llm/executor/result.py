@@ -91,7 +91,7 @@ class CompletionOutput:
         text (str): The generated output text. Defaults to "".
         token_ids (List[int], optional): The token ids of the generated output text. Defaults to [].
         cumulative_logprob (float, optional): The cumulative log probability of the generated output text. Defaults to None.
-        logprobs (TokenLogprobs, optional): The log probabilities of the top probability words at each position if the logprobs are requested. Defaults to None.
+        logprobs (TokenLogprobs | List[float], optional): The log probabilities of the top probability words at each position if the logprobs are requested. Defaults to None.
         prompt_logprobs (TokenLogprobs, optional): The log probabilities per prompt token. Defaults to None.
         finish_reason (Literal['stop', 'length', 'timeout', 'cancelled'], optional): The reason why the sequence is finished. Defaults to None.
         stop_reason (int, str, optional): The stop string or token id that caused the completion to stop, None if the completion finished for some other reason. Defaults to None.
@@ -102,7 +102,7 @@ class CompletionOutput:
     Attributes:
         length (int): The number of generated tokens.
         token_ids_diff (List[int]): Newly generated token ids.
-        logprobs_diff (List[float]): Logprobs of newly generated tokens.
+        logprobs_diff (TokenLogprobs | List[float]): Logprobs of newly generated tokens.
         text_diff (str): Newly generated tokens.
     """
     index: int
@@ -111,8 +111,7 @@ class CompletionOutput:
     cumulative_logprob: Optional[float] = None
     logprobs: Optional[TokenLogprobs
                        | List[float]] = field(default_factory=list)
-    prompt_logprobs: Optional[TokenLogprobs
-                              | List[float]] = field(default_factory=list)
+    prompt_logprobs: Optional[TokenLogprobs] = field(default_factory=list)
     finish_reason: Optional[Literal['stop', 'length', 'timeout',
                                     'cancelled']] = None
     stop_reason: Optional[Union[int, str]] = None
@@ -143,7 +142,7 @@ class CompletionOutput:
         return self.token_ids[self._last_token_ids_len:]
 
     @property
-    def logprobs_diff(self) -> List[float]:
+    def logprobs_diff(self) -> TokenLogprobs | List[float]:
         return self.logprobs[self._last_logprobs_len:]
 
 
