@@ -314,6 +314,10 @@ class PyTorchModelEngine(ModelEngine):
         self._init_model_capacity()
 
         self._torch_compile_backend = None
+        self._torch_compile_enabled = pytorch_backend_config.torch_compile_enabled
+        self._torch_compile_piecewise_cuda_graph = (
+            pytorch_backend_config.torch_compile_piecewise_cuda_graph
+            and not self.enable_attention_dp)
 
         try:
             if pytorch_backend_config.torch_compile_enabled:
@@ -323,8 +327,8 @@ class PyTorchModelEngine(ModelEngine):
                 self._torch_compile_backend = Backend(
                     pytorch_backend_config.torch_compile_inductor_enabled,
                     enable_userbuffers=use_ub,
-                    enable_piecewise_cuda_graph=pytorch_backend_config.
-                    torch_compile_piecewise_cuda_graph,
+                    enable_piecewise_cuda_graph=self.
+                    _torch_compile_piecewise_cuda_graph,
                     cuda_graph_batch_sizes=pytorch_backend_config.
                     cuda_graph_batch_sizes,
                     max_num_streams=pytorch_backend_config.
@@ -348,8 +352,6 @@ class PyTorchModelEngine(ModelEngine):
             import traceback
             traceback.print_exception(Exception, e, e.__traceback__)
             raise e
-        self._torch_compile_enabled = pytorch_backend_config.torch_compile_enabled
-        self._torch_compile_piecewise_cuda_graph = pytorch_backend_config.torch_compile_piecewise_cuda_graph
 
         self.attn_backend = get_attention_backend(attn_backend)
 
