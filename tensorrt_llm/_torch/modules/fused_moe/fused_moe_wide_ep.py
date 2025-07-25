@@ -441,13 +441,13 @@ class WideEPMoE(MoE):
         # Prepare additional information for profiling in case padding is applied in all-to-all
         if use_all_to_all:
             if all_rank_num_tokens is not None:
-                total_valid_tokens = sum(all_rank_num_tokens)
+                tuner_num_tokens = sum(all_rank_num_tokens)
             else:
-                total_valid_tokens = x.shape[0] * self.mapping.tp_size
-            original_top_k = token_selected_slots.shape[1]
+                tuner_num_tokens = x.shape[0] * self.mapping.tp_size
+            tuner_top_k = token_selected_slots.shape[1]
         else:
-            total_valid_tokens = None
-            original_top_k = None
+            tuner_num_tokens = None
+            tuner_top_k = None
         if use_all_to_all:
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
                 if self.enable_dummy_allreduce:
@@ -680,8 +680,8 @@ class WideEPMoE(MoE):
             use_w4a8_group_scaling=use_w4a8_group_scaling,
             min_latency_mode=False,
             tune_max_num_tokens=self.tune_max_num_tokens,
-            total_valid_tokens=total_valid_tokens,
-            original_top_k=original_top_k,
+            tuner_num_tokens=tuner_num_tokens,
+            tuner_top_k=tuner_top_k,
         )
 
         if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(

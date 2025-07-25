@@ -88,7 +88,7 @@ class MoERunner(TunableRunner):
     ):
         x, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights, fc2_expert_biases = inputs
         self.fused_moe_runner.run_gemm_profile(
-            x,
+            x.contiguous(),
             fc1_expert_weights,
             fc1_expert_biases,
             fc2_expert_weights,
@@ -141,30 +141,20 @@ def fused_moe(
     use_mxfp8_act_scaling: bool = False,
     min_latency_mode: bool = False,
     tune_max_num_tokens: int = 8192,
-    total_valid_tokens: Optional[int] = None,
-    original_top_k: Optional[int] = None,
+    tuner_num_tokens: Optional[int] = None,
+    tuner_top_k: Optional[int] = None,
 ) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
     MoERunner.refine_tuning_config(tune_max_num_tokens)
 
     if enable_alltoall:
-        assert total_valid_tokens is not None
-        assert original_top_k is not None
-        if input.shape[0] >= total_valid_tokens:
-            tuner_input = input[:total_valid_tokens].contiguous()
-        else:
-            tuner_input = torch.cat([
-                input,
-                torch.zeros(total_valid_tokens - input.shape[0],
-                            *input.shape[1:],
-                            dtype=input.dtype,
-                            device=input.device)
-            ])
-        tuner_top_k = original_top_k
+        assert tuner_num_tokens is not None
+        assert tuner_top_k is not None
+        tuner_input = input[:tuner_num_tokens]
     else:
-        assert total_valid_tokens is None
-        assert original_top_k is None
+        assert tuner_num_tokens is None
+        assert tuner_top_k is None
         tuner_input = input
         tuner_top_k = token_selected_experts.size(1)
 
