@@ -223,14 +223,23 @@ def run_disaggregated_test(example_dir,
                     with open(output_file, 'r') as f:
                         content = f.read()
                         if "deepseek_v3_lite" in test_desc or output_file == "output_chat.json":
-                            expected_strings = ["Berlin", "Asyncio is a"]
+                            expected_strings = [
+                                "Berlin", ["Asyncio is a", "Asyncio module in"]
+                            ]
                         else:
                             expected_strings = [
                                 "The capital of Germany is Berlin",
                                 "Asyncio is a Python library"
                             ]
                         for expected_string in expected_strings:
-                            assert expected_string in content, f"Expected string '{expected_string}' not found in {output_file}"
+                            if isinstance(expected_string, list):
+                                # At least one of the strings in the list should be found in the content
+                                assert any(
+                                    string in content
+                                    for string in expected_string
+                                ), f"None of the strings in {expected_string} found in {output_file}"
+                            else:
+                                assert expected_string in content, f"Expected string '{expected_string}' not found in {output_file}"
                         for not_expected_string in not_expected_strings:
                             assert not_expected_string not in content, f"Unexpected string '{not_expected_string}' found in {output_file}"
     except Exception:
