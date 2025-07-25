@@ -1168,7 +1168,9 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         beta = module.swiglu_beta or 0.0
         act = FusedActivation(
             FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn,
-                    ("alpha", "beta", "limit")), (alpha, beta, None), 2)
+                    ("alpha", "beta", "limit")),
+            (alpha, beta, module.swiglu_limit), 2)
+
         act_out = matmul_ogs(hidden_states,
                              gemm1_weights,
                              module.w3_w1_bias if module.bias else None,
@@ -1247,6 +1249,7 @@ class TritonFusedMoE(MoE):
         layer_idx: Optional[int] = None,
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
+        swiglu_limit: Optional[torch.Tensor] = None,
         override_quant_method=None,
     ):
         # Override the quantization method if needed for test purpose
@@ -1299,7 +1302,7 @@ class TritonFusedMoE(MoE):
 
         self.swiglu_alpha = _maybe_squeeze_act_param(swiglu_alpha)
         self.swiglu_beta = _maybe_squeeze_act_param(swiglu_beta)
-
+        self.swiglu_limit = _maybe_squeeze_act_param(swiglu_limit)
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
             self.create_weights()

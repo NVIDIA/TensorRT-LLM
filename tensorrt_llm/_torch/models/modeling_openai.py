@@ -183,7 +183,9 @@ class MLPBlock(torch.nn.Module):
         self.swiglu_beta = torch.tensor(
             [1.0] * (self.num_experts // config.mapping.moe_ep_size),
             dtype=torch.float32).cuda()
-
+        self.swiglu_limit = torch.tensor(
+            [7.0] * (self.num_experts // config.mapping.moe_ep_size),
+            dtype=torch.float32).cuda()
         self.experts = create_moe(
             routing_method=self.routing_method,
             num_experts=pretrained_config.num_experts,
@@ -197,6 +199,7 @@ class MLPBlock(torch.nn.Module):
             bias=True,
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
+            swiglu_limit=self.swiglu_limit,
         )
 
         # Perfect router caching - precompute common logits if enabled
