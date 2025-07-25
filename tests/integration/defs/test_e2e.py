@@ -1938,8 +1938,12 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
     ("llava-v1.6-mistral-7b", "llava-v1.6-mistral-7b-hf"),
     ("qwen2-vl-7b-instruct", "Qwen2-VL-7B-Instruct"),
     ("qwen2.5-vl-7b-instruct", "Qwen2.5-VL-7B-Instruct"),
-    ("mistral-small-3.1-24b-instruct", "Mistral-Small-3.1-24B-Instruct-2503"),
-    ("gemma-3-27b-it", "gemma/gemma-3-27b-it"),
+    pytest.param("mistral-small-3.1-24b-instruct",
+                 "Mistral-Small-3.1-24B-Instruct-2503",
+                 marks=pytest.mark.skip_less_device_memory(80000)),
+    pytest.param("gemma-3-27b-it",
+                 "gemma/gemma-3-27b-it",
+                 marks=pytest.mark.skip_less_device_memory(80000)),
 ])
 def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                                    modality, use_cuda_graph):
