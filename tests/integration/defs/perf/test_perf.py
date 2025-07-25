@@ -92,6 +92,7 @@ MODEL_PATH_DICT = {
     "mistral_7b_v0.1": "mistral-7b-v0.1",
     "ministral_8b": "Ministral-8B-Instruct-2410",
     "ministral_8b_fp8": "Ministral-8B-Instruct-2410-FP8",
+    "gemma_3_1b_it": "gemma/gemma-3-1b-it",
     "deepseek_r1_fp8": "DeepSeek-R1/DeepSeek-R1",
     "deepseek_r1_nvfp4": "DeepSeek-R1/DeepSeek-R1-FP4",
     "deepseek_v3_lite_fp8": "DeepSeek-V3-Lite/fp8",
@@ -153,6 +154,7 @@ HF_MODEL_PATH = {
     "ministral_8b_hf": "mistralai/Ministral-8B-Instruct-2410",
     "flan_t5_base_hf": "google/flan-t5-small",
     "phi_4_mini_instruct_hf": "microsoft/Phi-4-mini-instruct",
+    "gemma_3_1b_it_hf": "google/gemma-3-1b-it",
 }
 LORA_MODEL_PATH = {
     "llama_v2_13b":
@@ -163,6 +165,8 @@ LORA_MODEL_PATH = {
     "lora/llama-3-chinese-8b-instruct-v2-lora/",
     "ministral_8b":
     "lora/ministral/Ministral-8B-Instruct-2410-Loras-Dummy",  # Dummy LoRA for Ministral
+    "gemma_3_1b_it":
+    "lora/gemma/gemma-3-1b-it-dummy-lora",  # Dummy LoRA for Gemma-3-1B-Instruct
     "phi_4_multimodal_instruct_image":
     "multimodals/Phi-4-multimodal-instruct/vision-lora",
     "phi_4_multimodal_instruct_audio":
