@@ -2,25 +2,27 @@
 
 By NVIDIA TensorRT-LLM Team
 
-- [Disaggregated Serving in TensorRT-LLM](#Disaggregated-Serving-in-TensorRT-LLM)
-  - [Motivation](#Motivation)
-  - [Disaggregated Serving in TensorRT-LLM](#Disaggregated-Serving-in-TensorRT-LLM)
+- [Disaggregated Serving in TensorRT-LLM](#disaggregated-serving-in-tensorrt-llm)
+  - [Motivation](#motivation)
+  - [Disaggregated Serving in TensorRT-LLM](#disaggregated-serving-in-tensorrt-llm-1)
     - [trtllm-serve](#trtllm-serve)
-    - [Dynamo](#Dynamo)
-    - [Triton Inference Server](#Triton-Inference-Server)
-  - [KV Cache Exchange](#KV-Cache-Exchange)
-    - [Multi-backend Support](#Multi-backend-Support)
-    - [Overlap Optimization](#Overlap-Optimization)
-    - [Cache Layout Transformation](#Cache-Layout-Transformation)
-  - [Performance Studies](#Performance-Studies)
-    - [Measurement Methodology](#Measurement-Methodology)
-    - [DeepSeek R1](#DeepSeek-R1)
-      - [ISL 4400 - OSL 1200 (Machine Translation Dataset)](#ISL-4400---OSL-1200-Machine-Translation-Dataset)
-      - [ISL 8192 - OSL 256 (Synthetic Dataset)](#ISL-8192---OSL-256-Synthetic-Dataset)
-      - [ISL 4096 - OSL 1024 (Machine Translation Dataset)](#ISL-4096---OSL-1024-Machine-Translation-Dataset)
-    - [Reproducing Steps](#Reproducing-Steps)
-  - [Future Work](#Future-Work)
-  - [Acknowledgement](#Acknowledgement)
+    - [Dynamo](#dynamo)
+    - [Triton Inference Server](#triton-inference-server)
+  - [KV Cache Exchange](#kv-cache-exchange)
+    - [Multi-backend Support](#multi-backend-support)
+    - [Overlap Optimization](#overlap-optimization)
+    - [Cache Layout Transformation](#cache-layout-transformation)
+  - [Performance Studies](#performance-studies)
+    - [Measurement Methodology](#measurement-methodology)
+    - [DeepSeek R1](#deepseek-r1)
+      - [ISL 4400 - OSL 1200 (Machine Translation Dataset)](#isl-4400---osl-1200-machine-translation-dataset)
+      - [ISL 8192 - OSL 256 (Synthetic Dataset)](#isl-8192---osl-256-synthetic-dataset)
+      - [ISL 4096 - OSL 1024 (Machine Translation Dataset)](#isl-4096---osl-1024-machine-translation-dataset)
+    - [Qwen 3](#qwen-3)
+      - [ISL 8192 - OSL 1024 (Machine Translation Dataset)](#isl-8192---osl-1024-machine-translation-dataset)
+    - [Reproducing Steps](#reproducing-steps)
+  - [Future Work](#future-work)
+  - [Acknowledgement](#acknowledgement)
 
 In the past tech blogs, we have introduced optimization specifically for [low-latency](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md) and [throughput](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md) oriented optimizations. For production deployment, users also care about per GPU throughput satisfying certain latency constraints. In this tech blog, we will introduce the design concept and usage of the TensorRT-LLM disaggregated serving which directly targets throughput@latency performance scenarios, together with performance study results.
 
@@ -260,9 +262,22 @@ In Figure 13 and 14, the E2E Pareto curves for aggregated serving and disaggrega
 
 For Pareto curves with MTP = 1, 2, 3, it can be observed that disaggregated results show a **1.7x** improvement over aggregated results at 50 tokens/sec/user (20 ms latency). Enabling MTP provides a larger speedup at higher concurrencies.
 
+### Qwen 3
+
+#### ISL 8192 - OSL 1024 (Machine Translation Dataset)
+
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture15.png" width="640" height="auto" alt="Qwen 3 Pareto curves">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 15. Qwen 3 Pareto curves.</em></sub></p>
+
+We also conducted performance evaluations of Qwen 3 on GB200 GPUs. The data indicate that the speedups achieved by disaggregation over aggregation range from 1.7x to 6.11x.
+
 ### Reproducing Steps
 
-We provide a set of scripts to reproduce the performance data presented in this paper. Please refer to the usage instructions described in [this document](https://github.com/NVIDIA/TensorRT-LLM/tree/main/docs/source/scripts/disaggregated).
+We provide a set of scripts to reproduce the performance data presented in this paper. Please refer to the usage instructions described in [this document](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/disaggregated/slurm).
 
 ## Future Work
 

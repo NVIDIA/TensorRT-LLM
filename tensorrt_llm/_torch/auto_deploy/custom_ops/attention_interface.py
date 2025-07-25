@@ -107,7 +107,7 @@ class SequenceInfo:
         if self.page_size < 1:
             self.page_size = self.max_seq_len
 
-        # NOTE (lucaslie): WAR to address issue when using FlashInfer attention with
+        # NOTE (lucaslie): WAR to address issue when using flashinfer attention with
         # (max_batch_size, max_seq_len) input in trtllm runtime.
         # see https://github.com/NVIDIA/TensorRT-LLM/issues/4504
         max_seq_len_adjusted = self.max_seq_len + 1
@@ -117,14 +117,20 @@ class SequenceInfo:
         # if the provided max_num_tokens is less than the max_batch_size * max_seq_len,
         # we use the provided max_num_tokens to calculate the number of pages
         total_tokens = min(self.max_num_tokens, self.max_batch_size * max_seq_len_adjusted)
-        self._num_pages = (total_tokens) // self.page_size + (total_tokens % self.page_size > 0)
+        # Num pages can not be less than max_batch_size.
+        self._num_pages = max(
+            self.max_batch_size,
+            (total_tokens) // self.page_size + (total_tokens % self.page_size > 0),
+        )
         self.input_ids = torch.ones(self.max_batch_size, 1, dtype=torch.int)
         self.position_ids = torch.zeros(self.max_batch_size, 1, dtype=torch.long)
         self.seq_len = torch.empty(self.max_batch_size, dtype=torch.int)
         self.input_pos = torch.empty_like(self.seq_len)
         self.cache_loc = torch.empty(self.num_pages, dtype=torch.int)
         self.pages_per_seq = torch.empty_like(self.seq_len)
-
+        assert self.num_pages >= self.max_batch_size, (
+            "num_pages must be greater than max_batch_size"
+        )
         # dynamic shape descriptors for tensor args
         self._dynamic_shapes: Optional[Tuple[Dict[str, Dim]]] = None
 
@@ -378,10 +384,11 @@ class SequenceInfo:
     def _update_position_ids(self) -> None:
         # set new position_ids as new tensor from input_pos and seq_len via torch.arange
         position_ids_list = [
-            torch.arange(in_pos, in_pos + seq_len, dtype=torch.long)
+            num
             for in_pos, seq_len in zip(self.input_positions, self.sequence_lengths)
+            for num in range(in_pos, in_pos + seq_len)
         ]
-        self.position_ids = torch.cat(position_ids_list, dim=0).to(self.device)
+        self.position_ids = torch.tensor(position_ids_list, dtype=torch.long).to(self.device)
 
         # use [b,1] shape to indicate generate-only batch, otherwise use [1,total_len]
         if self.is_generate:
@@ -398,13 +405,15 @@ class SequenceInfo:
         seq_lens = [len(ids) for ids in input_ids]
         self.seq_len.zero_()
         self.seq_len[: len(seq_lens)].copy_(torch.tensor(seq_lens), non_blocking=True)
-
+        # We'll preserve the dtype of the input_ids tensor if it is a tensor, otherwise we'll use int
+        dtype = input_ids.dtype if isinstance(input_ids, torch.Tensor) else torch.int
         # set new input_ids as new tensor from flattened input_ids
-        ids_tnsr_list = [
-            lst.detach() if isinstance(lst, torch.Tensor) else torch.tensor(lst, dtype=torch.int)
+        ids_list = [
+            val
             for lst in input_ids
+            for val in (lst.detach().tolist() if isinstance(lst, torch.Tensor) else lst)
         ]
-        self.input_ids = torch.cat(ids_tnsr_list, dim=0).to(self.device)
+        self.input_ids = torch.tensor(ids_list, dtype=dtype).to(self.device)
 
         # set derivative properties
         self._sequence_lengths = seq_lens

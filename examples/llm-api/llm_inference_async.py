@@ -1,8 +1,9 @@
-### Generate Text Asynchronously
+### :section Basics
+### :title Generate text asynchronously
+### :order 1
 import asyncio
 
-from tensorrt_llm import SamplingParams
-from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm import LLM, SamplingParams
 
 
 def main():
@@ -12,7 +13,6 @@ def main():
     # Sample prompts.
     prompts = [
         "Hello, my name is",
-        "The president of the United States is",
         "The capital of France is",
         "The future of AI is",
     ]
@@ -35,7 +35,6 @@ def main():
 
     # Got output like follows:
     # Prompt: 'Hello, my name is', Generated text: '\n\nJane Smith. I am a student pursuing my degree in Computer Science at [university]. I enjoy learning new things, especially technology and programming'
-    # Prompt: 'The president of the United States is', Generated text: 'likely to nominate a new Supreme Court justice to fill the seat vacated by the death of Antonin Scalia. The Senate should vote to confirm the'
     # Prompt: 'The capital of France is', Generated text: 'Paris.'
     # Prompt: 'The future of AI is', Generated text: 'an exciting time for us. We are constantly researching, developing, and improving our platform to create the most advanced and efficient model available. We are'
 

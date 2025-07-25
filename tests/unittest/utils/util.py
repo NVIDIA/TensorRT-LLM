@@ -1,7 +1,13 @@
+import multiprocessing
 import os
+import sys
+import time
 import unittest
+from contextlib import contextmanager
 from difflib import SequenceMatcher
+from multiprocessing.connection import Connection
 from pathlib import Path
+from typing import Any, Callable, Generator, Mapping, Tuple
 
 import pynvml
 import pytest
@@ -368,3 +374,141 @@ def similar(a, b, threshold=0.8):
 def get_project_root(test_file: str) -> Path:
     return next(p for p in Path(test_file).resolve().parents
                 if (p / 'tests').is_dir() and (p / "tensorrt_llm").is_dir())
+
+
+@contextmanager
+def default_dtype(dtype: torch.dtype):
+    cur_default = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    yield
+    torch.set_default_dtype(cur_default)
+
+
+def woq_assert_near_eq(ref, act, wTypeId):
+    # match the scale in cpp/tensorrt_llm/kernels/cutlass_kernels/cutlass_preprocessors.cpp
+    if wTypeId == 1:
+        bits_in_type = 8
+    else:
+        bits_in_type = 4
+    quant_range_scale = 1.0 / float(1 << (bits_in_type - 1))
+
+    max_val = torch.max(abs(ref)).item()
+    atol = (max_val * quant_range_scale) * 1.5  # allow for rounding
+    torch.testing.assert_close(ref, act, atol=atol, rtol=1e-7)
+
+
+def woq_groupwise_gt_matmul(mat1, ref_torch_weights, bias=None):
+    ref = torch.matmul(mat1, ref_torch_weights)
+    if bias is not None:
+        ref += bias
+    return ref
+
+
+def flatten_list_generator(
+        nested_list: list[Any]) -> Generator[Any, None, None]:
+    if not isinstance(nested_list, list):
+        yield nested_list
+    else:
+        for item in nested_list:
+            yield from flatten_list_generator(item)
+
+
+def flatten_list(nested_list: list[Any]) -> list[Any]:
+    return list(flatten_list_generator(nested_list))
+
+
+def duplicate_list_to_length(list: list[Any], target_length: int) -> list[Any]:
+    if target_length < len(list):
+        return list[:target_length]
+    duplicated_list = list * (target_length // len(list))
+    remain = target_length % len(list)
+    if remain != 0:
+        duplicated_list += list[:remain]
+    return duplicated_list
+
+
+def _target_wrapper(target: Callable, stdout_pipe: Connection,
+                    stderr_pipe: Connection, *args, **kwargs) -> None:
+
+    class PipeWriter:
+
+        def __init__(self, conn: Connection):
+            self.conn = conn
+
+        def write(self, s: str):
+            self.conn.send_bytes(s.encode("UTF8"))
+
+        def flush(self):
+            pass
+
+    sys.stdout = PipeWriter(stdout_pipe)
+    sys.stderr = PipeWriter(stderr_pipe)
+    target(*args, **kwargs)
+
+
+def run_function_in_sub_process(target: Callable,
+                                args: tuple,
+                                kwargs: Mapping[str, Any],
+                                stop_waiting_criteria: Callable,
+                                poll_interval_seconds: int = 5,
+                                timeout_seconds: int = 240) -> Tuple[str, str]:
+    multiprocessing.set_start_method("spawn", force=True)
+    parent_stdout_pipe, child_stdout_pipe = multiprocessing.Pipe()
+    parent_stderr_pipe, child_stderr_pipe = multiprocessing.Pipe()
+    child_process = multiprocessing.Process(
+        target=_target_wrapper,
+        args=[target, child_stdout_pipe, child_stderr_pipe] + list(args),
+        kwargs=kwargs)
+    child_process.start()
+    child_stdout_pipe.close()
+    child_stderr_pipe.close()
+
+    def _read_from_pipe(pipe: Connection):
+        out = ""
+        while pipe.poll(timeout=0.1):
+            try:
+                out += pipe.recv_bytes().decode("UTF8")
+            except Exception:
+                break
+        return out
+
+    child_stdout = ""
+    child_stderr = ""
+    try:
+        total_waiting_seconds = 0
+        while child_process.is_alive(
+        ) and total_waiting_seconds < timeout_seconds:
+            child_stdout += _read_from_pipe(parent_stdout_pipe)
+            child_stderr += _read_from_pipe(parent_stderr_pipe)
+            if stop_waiting_criteria(child_stdout, child_stderr):
+                break
+            time.sleep(poll_interval_seconds)
+            total_waiting_seconds += poll_interval_seconds
+    finally:
+        parent_stdout_pipe.close()
+        parent_stderr_pipe.close()
+        if child_process.is_alive():
+            child_process.terminate()
+
+    assert total_waiting_seconds < timeout_seconds, "Reached timeout while waiting for target"
+    return child_stdout, child_stderr
+
+
+class EnvVarsContextManager:
+
+    def __init__(self, new_env_vars: dict[str, str]):
+        self._env_vars = new_env_vars
+        self._original_value = None
+
+    def __enter__(self):
+        self._original_vars = {
+            var_name: os.environ[var_name]
+            for var_name in self._env_vars.keys() if var_name in os.environ
+        }
+        os.environ.update(self._env_vars)
+
+    def __exit__(self, type, value, traceback):
+        os.environ.update(self._original_vars)
+        for var_name in self._env_vars.keys():
+            if var_name not in self._original_vars:
+                os.environ.pop(var_name)

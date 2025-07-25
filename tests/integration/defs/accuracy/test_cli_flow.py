@@ -367,6 +367,13 @@ class TestPhi4MiniInstruct(CliFlowAccuracyTestHarness):
     def test_auto_dtype(self):
         self.run(tasks=[MMLU(self.MODEL_NAME)], dtype='auto')
 
+    @pytest.mark.skip_less_device(2)
+    def test_tp2(self):
+        # Created a dummy accuracy to track tp_size=2 for phi4-mini model.
+        # TODO: update once https://nvbugs/5393849 is fixed.
+        MODEL_NAME = "microsoft/Phi-4-mini-instruct-tp2"
+        self.run(tasks=[MMLU(MODEL_NAME)], tp_size=2)
+
 
 # Long sequence length test:
 # Model FP16 7B + 32K tokens in KV cache = 14 * 1024 MB + 32K * 0.5 MB = 30720 MB + scratch memory
@@ -765,8 +772,7 @@ class TestLlama3_1_8B(CliFlowAccuracyTestHarness):
             tp_size=4,
             extra_build_args=extra_build_args)
 
-    @skip_pre_ada
-    @skip_post_blackwell
+    @skip_pre_hopper
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize(
         "gemm_allreduce", [False, pytest.param(True, marks=skip_no_nvls)],

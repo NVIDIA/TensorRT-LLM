@@ -1,18 +1,38 @@
 (linux)=
 
-# Installing on Linux
+# Installing on Linux via `pip`
 
 1. Install TensorRT-LLM (tested on Ubuntu 24.04).
 
-    ```bash
-    (Optional) pip3 install torch==2.7.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+   ### Install prerequisites
 
-    sudo apt-get -y install libopenmpi-dev && pip3 install --upgrade pip setuptools && pip3 install tensorrt_llm
-    ```
+   Before the pre-built Python wheel can be installed via `pip`, a few
+   prerequisites must be put into place:
 
-    PyTorch CUDA 12.8 package is required for supporting NVIDIA Blackwell GPUs. On prior GPUs, this extra installation is not required.
+   ```bash
+   # Optional step: Only required for Blackwell and Grace Hopper
+   pip3 install torch==2.7.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
-    If using the [PyTorch NGC Container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) image, the prerequisite steps for installing NVIDIA Blackwell-enabled PyTorch package and `libopenmpi-dev` are not required.
+   sudo apt-get -y install libopenmpi-dev
+   ```
+
+   PyTorch CUDA 12.8 package is required for supporting NVIDIA Blackwell and Grace Hopper GPUs. On prior GPUs, this extra installation is not required.
+
+   ```{tip}
+   Instead of manually installing the preqrequisites as described
+   above, it is also possible to use the pre-built [TensorRT-LLM Develop container
+   image hosted on NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/devel)
+   (see [here](containers) for information on container tags).
+   ```
+
+   ### Install pre-built TensorRT-LLM wheel
+
+   Once all prerequisites are in place, TensorRT-LLM can be installed as follows:
+
+   ```bash
+   pip3 install --upgrade pip setuptools && pip3 install tensorrt_llm
+   ```
+   **This project will download and install additional third-party open source software projects. Review the license terms of these open source projects before use.**
 
 2. Sanity check the installation by running the following in Python (tested on Python 3.12):
 
@@ -48,17 +68,3 @@ There are some known limitations when you pip install pre-built TensorRT-LLM whe
     Unable to load extension modelopt_cuda_ext and falling back to CPU version.
     ```
     The installation of CUDA toolkit can be found in [CUDA Toolkit Documentation](https://docs.nvidia.com/cuda/).
-
-3. Install inside the PyTorch NGC Container
-
-   The PyTorch NGC Container may lock Python package versions via the `/etc/pip/constraint.txt` file. When installing the pre-built TensorRT-LLM wheel inside the [PyTorch NGC Container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch), you need to clear this file first.
-
-   ```bash
-   [ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt
-   ```
-
-   PyTorch NGC Container typically includes a pre-installed `tensorrt` Python package. If there is a version mismatch between this pre-installed package and the version required by the TensorRT-LLM wheel, you will need to uninstall the existing `tensorrt` package before installing TensorRT-LLM.
-
-   ```bash
-   pip uninstall -y tensorrt
-   ```

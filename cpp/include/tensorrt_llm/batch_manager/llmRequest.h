@@ -826,6 +826,7 @@ public:
         mState = mEncoderTokens.has_value() || mEncoderInputFeatures ? LlmRequestState::kENCODER_INIT
                                                                      : LlmRequestState::kCONTEXT_INIT;
         mContextCurrentPosition = 0;
+        mPrepopulatedPromptLen = 0;
         mContextChunkSize = mPromptLen;
         mSeqSlot.reset();
     }
@@ -1235,11 +1236,11 @@ public:
         return mPerfMetrics;
     }
 
-    void setFirstScheduledTime(executor::RequestPerfMetrics::TimePoint const& time)
+    void setFirstScheduledTime()
     {
         if (mPerfMetrics.timingMetrics.firstScheduledTime == executor::RequestPerfMetrics::TimePoint{})
         {
-            mPerfMetrics.timingMetrics.firstScheduledTime = time;
+            mPerfMetrics.timingMetrics.firstScheduledTime = std::chrono::steady_clock::now();
         }
     }
 
@@ -1506,14 +1507,6 @@ public:
         }
     }
 
-    /// To determine whether the context is unchunked. When a context is chunked into only a part, it
-    /// is still different from the unchunked state, which indicates the initial status.
-    [[nodiscard]] bool isFullContextRequest() const noexcept
-    {
-        return (isContextInitState() || isDisaggGenerationInitState() || isDisaggGenerationTransmissionComplete())
-            && !mContextChunkSize;
-    }
-
     [[nodiscard]] bool isContextOnlyRequest() const noexcept
     {
         return mLlmRequestType == LlmRequestType::LLMREQUEST_TYPE_CONTEXT_ONLY;
@@ -1572,7 +1565,9 @@ public:
     /// Returns whether the position is at the beginning of the context.
     [[nodiscard]] bool isFirstContextChunk() const noexcept
     {
-        return mContextCurrentPosition == 0;
+        // The number of cached token is encountered in mContextCurrentPosition,
+        // so the start position of the context is mPrepopulatedPromptLen.
+        return mContextCurrentPosition == mPrepopulatedPromptLen;
     }
 
     /// Move the cursor forward one chunk. When not chunked, move forward to the end of the context.

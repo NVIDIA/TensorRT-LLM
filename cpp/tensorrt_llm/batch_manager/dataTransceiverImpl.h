@@ -18,7 +18,10 @@
 #pragma once
 
 #include "cacheFormatter.h"
+#include "cacheTransBuffer.h"
 #include "dataTransceiver.h"
+#include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 
 namespace tensorrt_llm::batch_manager
 {
@@ -41,8 +44,6 @@ class DataSenderImpl : public DataSender, public TransceiverTag
 {
 public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
-    using RequestMapInfo
-        = std::vector<std::pair<executor::kv_cache::Connection const*, executor::DataTransceiverState>>;
 
     DataSenderImpl(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
         SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter);
@@ -61,7 +62,7 @@ public:
 
 private:
     executor::kv_cache::ConnectionManager* mManager;
-    std::map<LlmRequest::RequestIdType, RequestMapInfo> mRequestToComms;
+    std::map<LlmRequest::RequestIdType, TransferSession> mRequestToSession;
     executor::DataTransceiverState mSelfState;
     std::unique_ptr<BaseCacheFormatter> mFormatter;
     std::mutex mMtxForMap;
@@ -76,9 +77,9 @@ public:
     DataReceiverImpl(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
         SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter);
 
-    void sendRequestInfo(LlmRequest const& llmRequest) override;
+    TransferSession sendRequestInfo(LlmRequest const& llmRequest) override;
 
-    void receiveSync(LlmRequest const& llmRequest) override;
+    void receiveSync(TransferSession& session) override;
 
 private:
     struct ReceiveCacheResource

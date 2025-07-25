@@ -28,6 +28,7 @@ from transformers.utils import (
 )
 
 from ..custom_ops.attention_interface import CacheConfig
+from ..utils._config import deep_merge_dicts
 from ..utils.logger import ad_logger
 from .factory import ModelFactory, ModelFactoryRegistry
 
@@ -62,21 +63,27 @@ def hf_load_state_dict_with_device(device: DeviceLikeType):
 
 @ModelFactoryRegistry.register("AutoModelForCausalLM")
 class AutoModelForCausalLMFactory(ModelFactory):
-    def __init__(
-        self,
-        model_kwargs: Optional[Dict[str, Any]] = None,
-        tokenizer_kwargs: Optional[Dict[str, Any]] = None,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
+    _tokenizer_defaults = {
+        "legacy": False,
+        "padding_side": "left",
+        "truncation_side": "left",
+        "trust_remote_code": True,
+        "use_fast": True,
+    }
 
-        self.model_kwargs = model_kwargs or {}
-        self.tokenizer_kwargs = tokenizer_kwargs or {}
-        self.tokenizer_kwargs.setdefault("trust_remote_code", True)
-        self._quant_config = None
+    _model_defaults = {
+        "use_cache": False,
+        "max_position_embeddings": 1024,
+    }
 
-        # NEVER use cache
-        self.model_kwargs["use_cache"] = False
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self._quant_config: Optional[Dict] = None
+
+        # Ingest defaults for tokenizer and model kwargs
+        self.tokenizer_kwargs = deep_merge_dicts(self._tokenizer_defaults, self.tokenizer_kwargs)
+        self.model_kwargs = deep_merge_dicts(self._model_defaults, self.model_kwargs)
 
         # special handling for torch_dtype in model_kwargs since HF does not correctly update
         # torch_dtype string to an actual torch.dtype object (only with default)
@@ -86,11 +93,6 @@ class AutoModelForCausalLMFactory(ModelFactory):
                 dtype = getattr(torch, self.model_kwargs["torch_dtype"])
             assert isinstance(dtype, torch.dtype), f"Invalid dtype: {dtype}"
             self.model_kwargs["torch_dtype"] = dtype
-
-        # prefetch the model+checkpoint
-        self.prefetch_checkpoint()
-        # load the quantization config
-        self._load_quantization_config()
 
     @property
     def autoconfig_from_pretrained(self):
@@ -115,7 +117,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
     def _recursive_update_config(self, config: PretrainedConfig, update_dict: Dict[str, Any]):
         """
-        Recursively update a PretrainedConfig object with values from update_dict.
+        Deep-merge a PretrainedConfig object with values from update_dict.
 
         Args:
             config: PretrainedConfig object to update
@@ -142,7 +144,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
         return config
 
-    def build_model(self, device: DeviceLikeType) -> nn.Module:
+    def _build_model(self, device: DeviceLikeType) -> nn.Module:
         """Build the model on the desired device."""
         # We only support fp16 to fp4 conversion.
         if self._quant_config and self._quant_config.get("quant_algo", None) == "NVFP4":
@@ -293,24 +295,29 @@ class AutoModelForCausalLMFactory(ModelFactory):
         # at this point it should be a directory (either the original one or the download dir)
         assert os.path.isdir(fetched_dir), f"Checkpoint path {fetched_dir} is not a directory."
 
+        self._load_quantization_config()
+
         return fetched_dir
 
     def _load_checkpoint(self, model: nn.Module, device: DeviceLikeType):
         """Load the checkpoint into the model."""
-        # check if we skip loading weights
-        if self.skip_loading_weights:
-            return
-
-        # prefetch if needed
-        self.prefetch_checkpoint()
-
         # identify the most relevant checkpoint file
         ckpt_file = self._get_checkpoint_file(self.model)
         # reuse the load checkpoint utility from accelerate
         with hf_load_state_dict_with_device(device):
-            load_checkpoint_in_model(model, checkpoint=ckpt_file)
+            # Set `full_state_dict=False` to skip Accelerate's FSDP weight sync logic.
+            # Internally, load_checkpoint_in_model → set_model_state_dict → _load_model_state_dict,
+            # which collects local model params, syncs weights from checkpoint, and applies them via
+            # model.load_state_dict.
+            # This sync step can interfere with load_hooks by mixing raw checkpoint weights and
+            # model-transformed weights,leading to unexpected key mismatches or format issues.
+            load_checkpoint_in_model(model, checkpoint=ckpt_file, full_state_dict=False)
 
     def _load_quantization_config(self):
+        """Load the quantization config from the model directory if not done already."""
+        if self._quant_config is not None:
+            return
+
         assert self.model
         hf_quant_config_file = os.path.join(self.model, "hf_quant_config.json")
         if os.path.exists(hf_quant_config_file):
@@ -328,21 +335,14 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
 @ModelFactoryRegistry.register("AutoModelForImageTextToText")
 class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        # additional heuristic to propagate "important keys"
-        # TODO (lucaslie): WAR until we have better support on dashboard to control model_kwargs
-        keys_to_propagate = [
-            "num_hidden_layers",
-            "max_position_embeddings",
-            "use_cache",
-            "torch_dtype",
-        ]
-        self.model_kwargs["text_config"] = self.model_kwargs.get("text_config", {})
-        for key in keys_to_propagate:
-            if key in self.model_kwargs:
-                self.model_kwargs["text_config"][key] = self.model_kwargs[key]
+    _model_defaults = {
+        "use_cache": False,
+        "max_position_embeddings": 1024,
+        "text_config": {
+            "max_position_embeddings": 1024,
+            "use_cache": False,
+        },
+    }
 
     @property
     def automodel_from_config(self):

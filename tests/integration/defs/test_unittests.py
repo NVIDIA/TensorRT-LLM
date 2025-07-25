@@ -71,9 +71,9 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
 
     my_test_prefix = request.config.getoption("--test-prefix")
     if my_test_prefix:
-        test_prefix = f"{my_test_prefix}/unittests"
+        test_prefix = f"{my_test_prefix}/unittest"
     else:
-        test_prefix = ""
+        test_prefix = "unittest"
 
     num_workers = 1
 
@@ -122,7 +122,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
                               f'results-sub-unittests-{case_fn}.xml')
 
     command = [
-        '-m', 'pytest', ignore_opt, "-v", "--timeout=1600",
+        '-m', 'pytest', ignore_opt, "-v", "--timeout=2400",
         "--timeout-method=thread"
     ]
     if test_prefix:

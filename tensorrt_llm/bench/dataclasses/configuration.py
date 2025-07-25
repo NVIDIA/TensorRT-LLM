@@ -14,7 +14,6 @@ from tensorrt_llm.llmapi import (BatchingType, CapacitySchedulerPolicy,
                                  ContextChunkingPolicy, DynamicBatchConfig,
                                  ExtendedRuntimePerfKnobConfig, KvCacheConfig,
                                  SchedulerConfig)
-from tensorrt_llm.llmapi.llm_args import TorchCompileConfig, _AutoDeployLlmArgs
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_options
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
@@ -59,8 +58,6 @@ class RuntimeConfig(BaseModel):
             self.world_config.cluster_size,
             "trust_remote_code":
             True,
-            "kv_cache_config":
-            self.settings_config.get_kvcache_config(),
             "enable_chunked_prefill":
             self.settings_config.chunking,
             "extended_runtime_perf_knob_config":
@@ -82,6 +79,10 @@ class RuntimeConfig(BaseModel):
 
         if self.backend in backend_config_map:
             llm_args.update(backend_config_map[self.backend]())
+
+        kv_cache_config = self.settings_config.get_kvcache_config().__dict__
+        backend_cache_config = llm_args.pop("kv_cache_config", {})
+        llm_args["kv_cache_config"] = backend_cache_config | kv_cache_config
 
         return update_llm_args_with_extra_options(llm_args,
                                                   self.extra_llm_api_options)
@@ -110,11 +111,10 @@ class PerformanceOptions:
     def get_pytorch_perf_config(self) -> PyTorchConfig:
         return self.pytorch_config
 
-    def get_autodeploy_perf_config(self) -> _AutoDeployLlmArgs:
-        ad_config = _AutoDeployLlmArgs(**self.pytorch_config)
-        ad_config.attn_backend = "FlashInfer"
-        ad_config.torch_compile_config = TorchCompileConfig()
-        ad_config.skip_loading_weights = True
+    def get_autodeploy_perf_config(self) -> Dict:
+        AutoDeployPerfConfig = dict
+        ad_config = AutoDeployPerfConfig()
+        ad_config["attn_backend"] = "flashinfer"
         return ad_config
 
 

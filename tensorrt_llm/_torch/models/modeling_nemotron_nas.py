@@ -4,7 +4,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
@@ -48,10 +48,18 @@ def _create_linear_from_configs(model_config: ModelConfig[PretrainedConfig],
 
 
 class NemotronNASAttention(Attention):
+    NON_NEOX_TYPES = ("mistral_yarn", "rope_llama4")
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig],
                  layer_idx: int):
         config = model_config.pretrained_config
+        is_neox = getattr(model_config.pretrained_config,
+                          "position_embedding_type",
+                          None) not in self.NON_NEOX_TYPES
+        rope = RopeParams.from_config(config)
+        if rope.scale_type == RotaryScalingType.yarn:
+            rope.mscale_all_dim = 0.0
+
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
@@ -59,8 +67,9 @@ class NemotronNASAttention(Attention):
             max_position_embeddings=config.max_position_embeddings,
             bias=False,
             pos_embd_params=PositionalEmbeddingParams(
-                type=PositionEmbeddingType.rope_gpt_neox,
-                rope=RopeParams.from_config(config),
+                type=PositionEmbeddingType.rope_gpt_neox
+                if is_neox else PositionEmbeddingType.rope_gptj,
+                rope=rope,
             ),
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
@@ -183,11 +192,13 @@ class NemotronNASModel(DecoderModel):
                 model_config,
                 'lora_config') and model_config.lora_config is not None and len(
                     model_config.lora_config.lora_dir) == 1:
-            lora_loader = HfLoraLoader(model_config.lora_config.lora_dir)
-            if lora_loader.vocab_size != 0 and lora_loader.embed_tokens is not None:
-                vocab_size = lora_loader.vocab_size
-                weight = lora_loader.embed_tokens
-                self.has_custom_embed_tokens = True
+            # Only check for custom vocab in HF LoRA, not NeMo
+            if model_config.lora_config.lora_ckpt_source == "hf":
+                lora_loader = HfLoraLoader(model_config.lora_config.lora_dir)
+                if lora_loader.vocab_size != 0 and lora_loader.embed_tokens is not None:
+                    vocab_size = lora_loader.vocab_size
+                    weight = lora_loader.embed_tokens
+                    self.has_custom_embed_tokens = True
 
         self.embed_tokens = Embedding(
             vocab_size,

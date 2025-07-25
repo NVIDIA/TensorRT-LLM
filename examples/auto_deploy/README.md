@@ -6,13 +6,7 @@
 
 <div align="left">
 
-AutoDeploy is designed to simplify and accelerate the deployment of PyTorch models, including off-the-shelf models like those from Hugging Face, to TensorRT-LLM. It automates graph transformations to integrate inference optimizations such as tensor parallelism, KV-caching and quantization. AutoDeploy supports optimized in-framework deployment, minimizing the amount of manual modification needed.
-
-______________________________________________________________________
-
-## Latest News 🔥
-
-- \[2025/02/14\] Initial experimental release of `auto_deploy` backend for TensorRT-LLM
+AutoDeploy is an experimental feature in beta stage designed to simplify and accelerate the deployment of PyTorch models, including off-the-shelf models like those from Hugging Face, to TensorRT-LLM. It automates graph transformations to integrate inference optimizations such as tensor parallelism, KV-caching and quantization. AutoDeploy supports optimized in-framework deployment, minimizing the amount of manual modification needed.
 
 ______________________________________________________________________
 
@@ -52,7 +46,7 @@ The general entrypoint to run the auto-deploy demo is the `build_and_run_ad.py` 
 
 ```bash
 cd examples/auto_deploy
-python build_and_run_ad.py --config '{"model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0"}'
+python build_and_run_ad.py --model "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 ```
 
 ______________________________________________________________________
@@ -74,7 +68,7 @@ Additionally, we have officially verified support for the following models:
 
 | Model Series | HF Model Card | Model Factory | Precision | World Size | Runtime | Compile Backend ||| Attention Backend |||
 |--------------|----------------------|----------------|-----------|------------|---------|-----------------|--------------------|--------------------|--------------------|----------|----------|
-|              |               |            |           |            |         | torch-simple    | torch-compile    | torch-opt          | TritonWithFlattenedInputs | FlashInfer | MultiHeadLatentAttention |
+|              |               |            |           |            |         | torch-simple    | torch-compile    | torch-opt          | triton | flashinfer | MultiHeadLatentAttention |
 | LLaMA        | meta-llama/Llama-2-7b-chat-hf<br>meta-llama/Meta-Llama-3.1-8B-Instruct<br>meta-llama/Llama-3.1-70B-Instruct<br>codellama/CodeLlama-13b-Instruct-hf | AutoModelForCausalLM | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | ✅ | n/a |
 | LLaMA-4      | meta-llama/Llama-4-Scout-17B-16E-Instruct<br>meta-llama/Llama-4-Maverick-17B-128E-Instruct | AutoModelForImageTextToText | BF16 | 1,2,4,8 | demollm, trtllm | ✅ | ✅ | ❌ | ✅ | ✅ | n/a |
 | Nvidia Minitron | nvidia/Llama-3_1-Nemotron-51B-Instruct<br>nvidia/Llama-3.1-Minitron-4B-Width-Base<br>nvidia/Llama-3.1-Minitron-4B-Depth-Base | AutoModelForCausalLM | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | ✅ | n/a |
@@ -114,8 +108,8 @@ Optimize attention operations using different attention kernel implementations:
 
 | `"attn_backend"` | Description |
 |----------------------|-------------|
-| `TritonWithFlattenedInputs` | Custom fused multi-head attention (MHA) with KV Cache kernels for efficient attention processing. |
-| `FlashInfer`         | Uses off-the-shelf optimized attention kernels with KV Cache from the [`flashinfer`](https://github.com/flashinfer-ai/flashinfer.git) library. |
+| `triton` | Custom fused multi-head attention (MHA) with KV Cache kernels for efficient attention processing. |
+| `flashinfer`         | Uses off-the-shelf optimized attention kernels with KV Cache from the [`flashinfer`](https://github.com/flashinfer-ai/flashinfer.git) library. |
 
 ### Precision Support
 
@@ -128,59 +122,57 @@ ______________________________________________________________________
 
 ## Advanced Usage
 
-### Example Build Script ([`build_and_run_ad.py`](./build_and_run_ad.py))
+### Example Run Script ([`build_and_run_ad.py`](./build_and_run_ad.py))
 
-#### Base Command
+To build and run AutoDeploy example, use the [`build_and_run_ad.py`](./build_and_run_ad.py) script:
 
-To build and run AutoDeploy example, use the following command with the [`build_and_run_ad.py`](./build_and_run_ad.py) script:
+```bash
+cd examples/auto_deploy
+python build_and_run_ad.py --model "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+```
 
-In the below example:
+You can arbitrarily configure your experiment. Use the `-h/--help` flag to see available options:
+
+```bash
+python build_and_run_ad.py --help
+```
+
+Below is a non-exhaustive list of common config options:
 
 | Configuration Key | Description |
 |-------------------|-------------|
-| `"model"` | The HF model card or path to a HF checkpoint folder |
-| `"model_factory"` | Choose model factory implementation (`"hf"` or `"llama4"`) |
-| `"skip_loading_weights"` | Only load the architecture, not the weights |
-| `"customize_tokenizer"` | Use tokenizer from model factory (true) or from LLM API (false) |
-| `"model_kwargs"` | Extra kwargs for the model config class to customize the model config |
-| `"tokenizer_kwargs"` | Extra kwargs for the tokenizer class to customize the tokenizer |
-| `"world_size"` | The number of GPUs for Tensor Parallel |
-| `"runtime"` | Specifies which type of Engine to use during runtime |
-| `"compile_backend"` | Specifies how to compile the graph at the end |
-| `"attn_backend"` | Specifies kernel implementation for attention |
-| `"mla_backend"` | Specifies implementation for multi-head latent attention |
-| `"max_seq_len"` | Maximum sequence length for inference/cache |
-| `"max_batch_size"` | Maximum dimension for statically allocated KV cache |
-| `"attn_page_size"` | Page size for attention |
-| `"benchmark"` | Indicates whether to run the built-in benchmark for token generation |
+| `--model` | The HF model card or path to a HF checkpoint folder |
+| `--args.model-factory` | Choose model factory implementation (`"AutoModelForCausalLM"`, ...) |
+| `--args.skip-loading-weights` | Only load the architecture, not the weights |
+| `--args.model-kwargs` | Extra kwargs that are being passed to the model initializer in the model factory |
+| `--args.tokenizer-kwargs` | Extra kwargs that are being passed to the tokenizer initializer in the model factory |
+| `--args.world-size` | The number of GPUs used for auto-sharding the model |
+| `--args.runtime` | Specifies which type of Engine to use during runtime (`"demollm"` or `"trtllm"`) |
+| `--args.compile-backend` | Specifies how to compile the graph at the end |
+| `--args.attn-backend` | Specifies kernel implementation for attention |
+| `--args.mla-backend` | Specifies implementation for multi-head latent attention |
+| `--args.max-seq-len` | Maximum sequence length for inference/cache |
+| `--args.max-batch-size` | Maximum dimension for statically allocated KV cache |
+| `--args.attn-page-size` | Page size for attention |
+| `--prompt.batch-size` | Number of queries to generate |
+| `--benchmark.enabled` | Whether to run the built-in benchmark (true/false) |
 
-For default values and additional configuration options, refer to the [simple_config.py](./simple_config.py) file.
+For default values and additional configuration options, refer to the [`ExperimentConfig`](./build_and_run_ad.py) class in [build_and_run_ad.py](./build_and_run_ad.py) file.
+
+Here is a more complete example of using the script:
 
 ```bash
 cd examples/auto_deploy
 python build_and_run_ad.py \
---config '{"model": {HF_modelcard_or_path_to_local_folder}, "world_size": {num_GPUs}, "runtime": {"demollm"|"trtllm"}, "compile_backend": {"torch-simple"|"torch-opt"}, "attn_backend": {"TritonWithFlattenedInputs"|"FlashInfer"}, "benchmark": {true|false} }'
+--model "TinyLlama/TinyLlama-1.1B-Chat-v1.0" \
+--args.world-size 2 \
+--args.runtime "demollm" \
+--args.compile-backend "torch-compile" \
+--args.attn-backend "flashinfer" \
+--benchmark.enabled True
 ```
 
-#### Experiment Configuration
-
-The experiment configuration `dataclass` is defined in
-[simple_config.py](./simple_config.py). Check it out for detailed documentation on each
-available configuration.
-
-Arguments can be overwritten during runtime by specifying the `--config` argument on the command
-line and providing a valid config dictionary in `json` format. For example, to run any experiment
-with benchmarking enabled, use:
-
-```bash
-cd examples/auto_deploy
-python build_and_run_ad.py --config '{"benchmark": true}'
-```
-
-The `model_kwargs` and `tokenizer_kwargs` dictionaries can be supplied on the command line via
-`--model-kwargs '{}'` and `--tokenizer-kwargs '{}'`.
-
-#### Logging Level
+### Logging Level
 
 Use the following env variable to specify the logging level of our built-in logger ordered by
 decreasing verbosity;
@@ -222,7 +214,7 @@ Refer to [NVIDIA TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Mo
 
 ```bash
 cd examples/auto_deploy
-python build_and_run_ad.py --config '{"world_size": 1, "model": "{<MODELOPT_CKPT_PATH>}"}'
+python build_and_run_ad.py --model "<MODELOPT_CKPT_PATH>" --args.world-size 1
 ```
 
 ### Incorporating `auto_deploy` into your own workflow
@@ -231,22 +223,17 @@ AutoDeploy can be seamlessly integrated into your existing workflows using TRT-L
 
 Here is an example of how you can build an LLM object with AutoDeploy integration:
 
-<details>
-<summary>Click to expand the example</summary>
-
 ```
-from tensorrt_llm import LLM, TorchCompileConfig
+from tensorrt_llm._torch.auto_deploy import LLM
 
 
 # Construct the LLM high-level interface object with autodeploy as backend
 llm = LLM(
     model=<HF_MODEL_CARD_OR_DIR>,
-    backend="_autodeploy",
-    tensor_parallel_size=<NUM_WORLD_RANK>,
-    use_cuda_graph=True, # set True if using "torch-opt" as compile backend
-    torch_compile_config=TorchCompileConfig(), # set this if using "torch-opt" as compile backend
-    model_kwargs={"use_cache": False}, # AutoDeploy uses its own cache implementation
-    attn_backend="TritonWithFlattenedInputs", # choose between "TritonWithFlattenedInputs" and "FlashInfer"
+    world_size=<DESIRED_WORLD_SIZE>,
+    compile_backend="torch-compile",
+    model_kwargs={"num_hidden_layers": 2}, # test with smaller model configuration
+    attn_backend="flashinfer", # choose between "triton" and "flashinfer"
     attn_page_size=64, # page size for attention (tokens_per_block, should be == max_seq_len for triton)
     skip_loading_weights=False,
     model_factory="AutoModelForCausalLM", # choose appropriate model factory
@@ -259,28 +246,207 @@ llm = LLM(
 
 ```
 
+Please consult the [AutoDeploy `LLM` API](../../tensorrt_llm/_torch/auto_deploy/llm.py) and the
+[`AutoDeployConfig` class](../../tensorrt_llm/_torch/auto_deploy/llm_args.py)
+for more detail on how AutoDeploy is configured via the `**kwargs` of the `LLM` API.
+
+### Expert Configuration of LLM API
+
+For expert TensorRT-LLM users, we also expose the full set of [`LlmArgs`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py)
+*at your own risk* (the argument list diverges from TRT-LLM's argument list):
+
+<details>
+<summary>Click to expand for more details on using LlmArgs directly</summary>
+
+- All config fields that are used by the AutoDeploy core pipeline (i.e. the `InferenceOptimizer`) are
+  _exclusively_ exposed in the [`AutoDeployConfig` class](../../tensorrt_llm/_torch/auto_deploy/llm_args.py).
+  Please make sure to refer to those first.
+- For expert users we expose the full set of [`LlmArgs`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py)
+  that can be used to configure the [AutoDeploy `LLM` API](../../tensorrt_llm/_torch/auto_deploy/llm.py) including runtime options.
+- Note that some fields in the full [`LlmArgs`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py)
+  object are overlapping, duplicated, and/or _ignored_ in AutoDeploy, particularly arguments
+  pertaining to configuring the model itself since AutoDeploy's model ingestion+optimize pipeline
+  significantly differs from the default manual workflow in TensorRT-LLM.
+- However, with the proper care the full [`LlmArgs`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py)
+  objects can be used to configure advanced runtime options in TensorRT-LLM.
+- Note that any valid field can be simply provided as keyword argument ("`**kwargs`") to the
+  [AutoDeploy `LLM` API](../../tensorrt_llm/_torch/auto_deploy/llm.py).
+
 </details>
 
-For more examples on TRT-LLM LLM API, visit [`this page`](https://nvidia.github.io/TensorRT-LLM/examples/llm_api_examples.html).
+### Expert Configuration of `build_and_run_ad.py`
 
-______________________________________________________________________
+For expert users, `build_and_run_ad.py` provides advanced configuration capabilities through a flexible argument parser powered by PyDantic Settings and OmegaConf. You can use dot notation for CLI arguments, provide multiple YAML configuration files, and leverage sophisticated configuration precedence rules to create complex deployment configurations.
+
+<details>
+<summary>Click to expand for detailed configuration examples</summary>
+
+#### CLI Arguments with Dot Notation
+
+The script supports flexible CLI argument parsing using dot notation to modify nested configurations dynamically. You can target any field in both the [`ExperimentConfig`](./build_and_run_ad.py) and nested [`AutoDeployConfig`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py)/[`LlmArgs`](../../tensorrt_llm/_torch/auto_deploy/llm_args.) objects:
+
+```bash
+# Configure model parameters
+# NOTE: config values like num_hidden_layers are automatically resolved into the appropriate nested
+# dict value ``{"args": {"model_kwargs": {"num_hidden_layers": 10}}}`` although not explicitly
+# specified as CLI arg
+python build_and_run_ad.py \
+  --model "meta-llama/Meta-Llama-3.1-8B-Instruct" \
+  --args.model-kwargs.num-hidden-layers=10 \
+  --args.model-kwargs.hidden-size=2048 \
+  --args.tokenizer-kwargs.padding-side=left
+
+# Configure runtime and backend settings
+python build_and_run_ad.py \
+  --model "TinyLlama/TinyLlama-1.1B-Chat-v1.0" \
+  --args.world-size=2 \
+  --args.compile-backend=torch-opt \
+  --args.attn-backend=flashinfer
+
+# Configure prompting and benchmarking
+python build_and_run_ad.py \
+  --model "microsoft/phi-4" \
+  --prompt.batch-size=4 \
+  --prompt.sp-kwargs.max-tokens=200 \
+  --prompt.sp-kwargs.temperature=0.7 \
+  --benchmark.enabled=true \
+  --benchmark.bs=8 \
+  --benchmark.isl=1024
+```
+
+#### YAML Configuration Files
+
+Both [`ExperimentConfig`](./build_and_run_ad.py) and [`AutoDeployConfig`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py)/[`LlmArgs`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py) inherit from [`DynamicYamlMixInForSettings`](../../tensorrt_llm/_torch/auto_deploy/utils/_config.py), enabling you to provide multiple YAML configuration files that are automatically deep-merged at runtime.
+
+Create a YAML configuration file (e.g., `my_config.yaml`):
+
+```yaml
+# my_config.yaml
+args:
+  model_kwargs:
+    num_hidden_layers: 12
+    hidden_size: 1024
+  world_size: 4
+  compile_backend: torch-compile
+  attn_backend: triton
+  max_seq_len: 2048
+  max_batch_size: 16
+  transforms:
+    sharding:
+      strategy: auto
+    quantization:
+      enabled: false
+
+prompt:
+  batch_size: 8
+  sp_kwargs:
+    max_tokens: 150
+    temperature: 0.8
+    top_k: 50
+
+benchmark:
+  enabled: true
+  num: 20
+  bs: 4
+  isl: 1024
+  osl: 256
+```
+
+Create an additional override file (e.g., `production.yaml`):
+
+```yaml
+# production.yaml
+args:
+  world_size: 8
+  compile_backend: torch-opt
+  max_batch_size: 32
+
+benchmark:
+  enabled: false
+```
+
+Then use these configurations:
+
+```bash
+# Using single YAML config
+python build_and_run_ad.py \
+  --model "meta-llama/Meta-Llama-3.1-8B-Instruct" \
+  --yaml-configs my_config.yaml
+
+# Using multiple YAML configs (deep merged in order, later files have higher priority)
+python build_and_run_ad.py \
+  --model "meta-llama/Meta-Llama-3.1-8B-Instruct" \
+  --yaml-configs my_config.yaml production.yaml
+
+# Targeting nested AutoDeployConfig with separate YAML
+python build_and_run_ad.py \
+  --model "meta-llama/Meta-Llama-3.1-8B-Instruct" \
+  --yaml-configs my_config.yaml \
+  --args.yaml-configs autodeploy_overrides.yaml
+```
+
+#### Configuration Precedence and Deep Merging
+
+The configuration system follows a strict precedence order where higher priority sources override lower priority ones:
+
+1. **CLI Arguments** (highest priority) - Direct command line arguments
+1. **YAML Configs** - Files specified via `--yaml-configs` and `--args.yaml-configs`
+1. **Default Settings** (lowest priority) - Built-in defaults from the config classes
+
+**Deep Merging**: Unlike simple overwriting, deep merging intelligently combines nested dictionaries recursively. For example:
+
+```yaml
+# Base config
+args:
+  model_kwargs:
+    num_hidden_layers: 10
+    hidden_size: 1024
+  max_seq_len: 2048
+```
+
+```yaml
+# Override config
+args:
+  model_kwargs:
+    hidden_size: 2048  # This will override
+    # num_hidden_layers: 10 remains unchanged
+  world_size: 4  # This gets added
+```
+
+**Nested Config Behavior**: When using nested configurations, outer YAML configs become init settings for inner objects, giving them higher precedence:
+
+```bash
+# The outer yaml-configs affects the entire ExperimentConfig
+# The inner args.yaml-configs affects only the AutoDeployConfig
+python build_and_run_ad.py \
+  --model "meta-llama/Meta-Llama-3.1-8B-Instruct" \
+  --yaml-configs experiment_config.yaml \
+  --args.yaml-configs autodeploy_config.yaml \
+  --args.world-size=8  # CLI override beats both YAML configs
+```
+
+#### Built-in Default Configuration
+
+Both [`AutoDeployConfig`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py) and [`LlmArgs`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py) classes automatically load a built-in [`default.yaml`](../../tensorrt_llm/_torch/auto_deploy/config/default.yaml) configuration file that provides sensible defaults for the AutoDeploy inference optimizer pipeline. This file is specified in the [`_get_config_dict()`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py) function and defines default transform configurations for graph optimization stages.
+
+The built-in defaults are automatically merged with your configurations at the lowest priority level, ensuring that your custom settings always override the defaults. You can inspect the current default configuration to understand the baseline transform pipeline:
+
+```bash
+# View the default configuration
+cat tensorrt_llm/_torch/auto_deploy/config/default.yaml
+
+# Override specific transform settings
+python build_and_run_ad.py \
+  --model "TinyLlama/TinyLlama-1.1B-Chat-v1.0" \
+  --args.transforms.export-to-gm.strict=true
+```
+
+</details>
 
 ## Roadmap
 
-1. **Model Coverage:**
-
-   - Expand support for additional LLM variants and features:
-     - LoRA
-     - Speculative Decoding
-     - Model specialization for disaggregated serving
-
-1. **Performance Optimization:**
-
-   - Enhance inference speed and efficiency with:
-     - MoE fusion and all-reduce fusion techniques
-     - Reuse of TRT-LLM PyTorch operators for greater efficiency
-
-______________________________________________________________________
+Check out our [Github Project Board](https://github.com/orgs/NVIDIA/projects/83) to learn more about
+the current progress in AutoDeploy and where you can help.
 
 ## Disclaimer
 

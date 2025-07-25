@@ -5,13 +5,14 @@ import groovy.transform.Field
 
 // Docker image registry
 IMAGE_NAME = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging"
-NGC_IMAGE_NAME = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/ngc"
+NGC_IMAGE_NAME = "${IMAGE_NAME}/ngc"
 
 // LLM repository configuration
 withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
     LLM_REPO = env.gitlabSourceRepoHttpUrl ? env.gitlabSourceRepoHttpUrl : "${DEFAULT_LLM_REPO}"
 }
 
+ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 
 LLM_ROOT = "llm"
@@ -25,6 +26,8 @@ LLM_SHORT_COMMIT = env.gitlabCommit ? env.gitlabCommit.substring(0, 7) : "undefi
 
 LLM_DEFAULT_TAG = env.defaultTag ?: "${LLM_SHORT_COMMIT}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}"
 
+RUN_SANITY_CHECK = params.runSanityCheck ?: false
+
 BUILD_JOBS = "32"
 BUILD_JOBS_RELEASE_X86_64 = "32"
 BUILD_JOBS_RELEASE_SBSA = "32"
@@ -37,10 +40,13 @@ def GITHUB_PR_API_URL = "github_pr_api_url"
 def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
 @Field
 def ACTION_INFO = "action_info"
+@Field
+def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): null,
+    (IMAGE_KEY_TO_TAG): [:],
 ]
 
 @Field
@@ -90,8 +96,8 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
     {
     case "agent":
         containerConfig = """
-                  - name: alpine
-                    image: urm.nvidia.com/docker/alpine:latest
+                  - name: python3
+                    image: urm.nvidia.com/docker/python:3.12-slim
                     command: ['cat']
                     tty: true
                     resources:
@@ -203,15 +209,11 @@ def buildImage(config, imageKeyToTag)
     def dependentImageWithTag = "${IMAGE_NAME}/${dependent.dockerfileStage}:${dependentTag}"
     def customImageWithTag = "${IMAGE_NAME}/${dockerfileStage}:${customTag}"
 
-    if (target == "ngc-release") {
-        if (params.triggerType == "post-merge") {
-            echo "Use NGC artifacts for post merge build"
-            dependentImageWithTag = "${NGC_IMAGE_NAME}:${dependentTag}"
-            imageWithTag = "${NGC_IMAGE_NAME}:${tag}"
-            customImageWithTag = "${NGC_IMAGE_NAME}:${customTag}"
-        }
-        imageKeyToTag["NGC Devel Image ${config.arch}"] = dependentImageWithTag
-        imageKeyToTag["NGC Release Image ${config.arch}"] = imageWithTag
+    if (target == "ngc-release" && params.triggerType == "post-merge") {
+        echo "Use NGC artifacts for post merge build"
+        dependentImageWithTag = "${NGC_IMAGE_NAME}:${dependentTag}"
+        imageWithTag = "${NGC_IMAGE_NAME}:${tag}"
+        customImageWithTag = "${NGC_IMAGE_NAME}:${customTag}"
     }
 
     args += " GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote"
@@ -266,6 +268,9 @@ def buildImage(config, imageKeyToTag)
                     """
                 }
                 args += " DEVEL_IMAGE=${dependentImageWithTag}"
+                if (target == "ngc-release") {
+                    imageKeyToTag["NGC Devel Image ${config.arch}"] = dependentImageWithTag
+                }
             }
         }
 
@@ -289,6 +294,9 @@ def buildImage(config, imageKeyToTag)
                 STAGE=${dockerfileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
                 """
+            }
+            if (target == "ngc-release") {
+                imageKeyToTag["NGC Release Image ${config.arch}"] = imageWithTag
             }
         }
 
@@ -429,6 +437,17 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
 }
 
 
+def getCommonParameters()
+{
+    return [
+        'gitlabSourceRepoHttpUrl': LLM_REPO,
+        'gitlabCommit': env.gitlabCommit,
+        'artifactPath': ARTIFACT_PATH,
+        'uploadPath': UPLOAD_PATH,
+    ]
+}
+
+
 pipeline {
     agent {
         kubernetes createKubernetesPodConfig("agent")
@@ -491,6 +510,139 @@ pipeline {
                     writeFile file: "imageKeyToTag.json", text: imageKeyToTagJson
                     archiveArtifacts artifacts: 'imageKeyToTag.json', fingerprint: true
                     trtllm_utils.uploadArtifacts("imageKeyToTag.json", "${UPLOAD_PATH}/")
+                }
+            }
+        }
+        stage("Wait for Build Jobs Complete") {
+            when {
+                expression {
+                    RUN_SANITY_CHECK
+                }
+            }
+            steps {
+                script {
+                    container("python3") {
+                        // Install wget
+                        trtllm_utils.llmExecStepWithRetry(this, script: "apt-get update && apt-get -y install wget")
+
+                        // Poll for build artifacts
+                        def artifactBaseUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/"
+                        def requiredFiles = [
+                            "TensorRT-LLM-GH200.tar.gz",
+                            "TensorRT-LLM.tar.gz"
+                        ]
+                        def maxWaitMinutes = 60
+                        def pollIntervalSeconds = 60
+
+                        echo "Waiting for build artifacts..."
+                        echo "Required files: ${requiredFiles}"
+
+                        def startTime = System.currentTimeMillis()
+                        def maxWaitMs = maxWaitMinutes * 60 * 1000
+
+                        while ((System.currentTimeMillis() - startTime) < maxWaitMs) {
+                            def missingFiles = []
+
+                            for (file in requiredFiles) {
+                                def fileUrl = "${artifactBaseUrl}${file}"
+                                def exitCode = sh(
+                                    script: "wget --spider --quiet --timeout=30 --tries=1 '${fileUrl}'",
+                                    returnStatus: true
+                                )
+
+                                if (exitCode != 0) {
+                                    missingFiles.add(file)
+                                }
+                            }
+
+                            if (missingFiles.isEmpty()) {
+                                echo "All build artifacts are ready!"
+                                return
+                            }
+
+                            def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
+                            echo "Waiting... (${elapsedMinutes.intValue()} minutes elapsed)"
+                            echo "Missing files: ${missingFiles}"
+                            sleep(pollIntervalSeconds)
+                        }
+
+                        def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
+                        error "Timeout waiting for build artifacts (${elapsedMinutes.intValue()} minutes)"
+                    }
+                }
+            }
+        }
+        stage("Sanity Check for NGC Images") {
+            when {
+                expression {
+                    RUN_SANITY_CHECK
+                }
+            }
+            steps {
+                script {
+                    globalVars[IMAGE_KEY_TO_TAG] = imageKeyToTag
+                    String globalVarsJson = writeJSON returnText: true, json: globalVars
+                    def parameters = getCommonParameters()
+                    parameters += [
+                        'enableFailFast': false,
+                        'globalVars': globalVarsJson,
+                    ]
+
+                    echo "Trigger BuildDockerImageSanityTest job, params: ${parameters}"
+
+                    def status = ""
+                    def jobName = "/LLM/helpers/BuildDockerImageSanityTest"
+                    def handle = build(
+                        job: jobName,
+                        parameters: trtllm_utils.toBuildParameters(parameters),
+                        propagate: false,
+                    )
+                    echo "Triggered job: ${handle.absoluteUrl}"
+                    status = handle.result
+
+                    if (status != "SUCCESS") {
+                        error "Downstream job did not succeed"
+                    }
+                }
+            }
+        }
+        stage("Register NGC Images for Security Checks") {
+            when {
+                expression {
+                    return params.nspect_id && params.action == "push"
+                }
+            }
+            steps {
+                script {
+                    container("python3") {
+                        trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade pip")
+                        trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade requests")
+                        def nspect_commit = "58ee430c8c3bd36bee2073405a547d3f8bc1932f"
+                        withCredentials([string(credentialsId: "TRTLLM_NSPECT_REPO", variable: "NSPECT_REPO")]) {
+                            trtllm_utils.checkoutSource("${NSPECT_REPO}", nspect_commit, "nspect")
+                        }
+                        def nspect_env = params.nspect_env ? params.nspect_env : "prod"
+                        def program_version_name = params.program_version_name ? params.program_version_name : "PostMerge"
+                        def cmd = """./nspect/nspect.py \
+                            --env ${nspect_env} \
+                            --nspect_id ${params.nspect_id} \
+                            --program_version_name '${program_version_name}' \
+                            """
+                        if (params.register_images) {
+                            cmd += "--register "
+                        }
+                        if (params.osrb_ticket) {
+                            cmd += "--osrb_ticket ${params.osrb_ticket} "
+                        }
+                        if (params.wait_success_seconds) {
+                            cmd += "--check_launch_api "
+                            cmd += "--wait_success ${params.wait_success_seconds} "
+                        }
+                        cmd += imageKeyToTag.values().join(" ")
+                        withCredentials([usernamePassword(credentialsId: "NSPECT_CLIENT-${nspect_env}", usernameVariable: 'NSPECT_CLIENT_ID', passwordVariable: 'NSPECT_CLIENT_SECRET')]) {
+                            sh cmd
+                        }
+                    }
                 }
             }
         }

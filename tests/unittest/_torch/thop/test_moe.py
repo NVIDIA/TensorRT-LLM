@@ -15,6 +15,7 @@
 
 import os
 import sys
+from typing import Tuple
 
 import pytest
 import torch
@@ -25,6 +26,7 @@ from utils.util import getSMVersion
 
 from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.modules.fused_moe import RoutingMethodType
+from tensorrt_llm._torch.utils import next_positive_power_of_2
 from tensorrt_llm.quantization.utils.fp4_utils import (
     reorder_rows_for_gated_act_gemm, shuffle_matrix_a, shuffle_matrix_sf_a)
 
@@ -570,100 +572,133 @@ def quant_dequant_per_tensor_fp8(a):
     reason="The kernel only supports Blackwell. Current SM is %d." %
     getSMVersion(),
 )
-@pytest.mark.parametrize("num_tokens", [16, 64, 1024, 4096])
-@pytest.mark.parametrize("expert_info", [(32, 8, 4, 8), (32, 1, 1, 5),
-                                         (72, 1, 1, 6), (256, 8, 4, 8)])
-@pytest.mark.parametrize("hidden_size", [512])
-@pytest.mark.parametrize("intermediate_size", [512])
-@pytest.mark.parametrize("use_autotune", [True, False],
-                         ids=["autotune", "no_autotune"])
-def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size,
-                 use_autotune):
-    torch.random.manual_seed(0)
+class TestMoeFP8:
+    """
+    Test the FP8 MoE. As autotune also covers the actual MoE, we can run the test
+    with autotune by default. We add a separate test for no autotune to ensure that
+    the default tactic selection works. This reduces unnecessary test runs for CI
+    """
 
-    #
-    # Data Generation
-    #
-    num_experts, n_groups, top_k_groups, top_k = expert_info
-    padding = 8
-    routed_scaling = 2.5
-    routing_method_type = RoutingMethodType.DeepSeekV3
-    tile_tokens_dim = 8 if num_tokens < 1024 else 32
+    @pytest.mark.parametrize("num_tokens", [16, 64, 1024, 4096])
+    @pytest.mark.parametrize("expert_info", [(32, 8, 4, 8), (32, 1, 1, 5),
+                                             (72, 1, 1, 6), (256, 8, 4, 8)])
+    @pytest.mark.parametrize("hidden_size", [512])
+    @pytest.mark.parametrize("intermediate_size", [512])
+    def test_autotune(self, num_tokens: int, expert_info: Tuple[int, int, int,
+                                                                int],
+                      hidden_size: int, intermediate_size: int):
 
-    assert top_k <= num_experts
-    assert top_k <= 8
-    assert top_k_groups <= 4
-    assert num_experts > n_groups
-    assert num_experts % n_groups == 0
-    assert num_experts % 4 == 0
-    assert top_k < (top_k_groups * num_experts / n_groups)
+        self.run_moe_fp8_test(num_tokens,
+                              expert_info,
+                              hidden_size,
+                              intermediate_size,
+                              use_autotune=True)
 
-    expert_logits = torch.randn((num_tokens, num_experts),
-                                device='cuda').to(torch.float)
-    routing_bias = torch.randn(num_experts, device='cuda', dtype=torch.bfloat16)
+    @pytest.mark.parametrize("num_tokens", [16])
+    @pytest.mark.parametrize("expert_info", [(32, 8, 4, 8)])
+    @pytest.mark.parametrize("hidden_size", [512])
+    @pytest.mark.parametrize("intermediate_size", [512])
+    def test_no_autotune(self, num_tokens: int, expert_info: Tuple[int, int,
+                                                                   int, int],
+                         hidden_size: int, intermediate_size: int):
 
-    hidden_states = torch.randn((num_tokens, hidden_size),
-                                device='cuda').to(torch.float8_e4m3fn)
-    hidden_states_scale = 2 * torch.rand(
-        (hidden_size // 128, num_tokens), device='cuda').to(torch.float)
+        self.run_moe_fp8_test(num_tokens,
+                              expert_info,
+                              hidden_size,
+                              intermediate_size,
+                              use_autotune=False)
 
-    gemm1_weights = torch.randn(
-        (num_experts, 2 * intermediate_size, hidden_size),
-        device='cuda').to(torch.float8_e4m3fn)
-    gemm1_scales = 2 * torch.rand(
-        (num_experts, 2 * intermediate_size // 128, hidden_size // 128),
-        device='cuda').to(torch.float)
-    gemm2_weights = torch.randn((num_experts, hidden_size, intermediate_size),
-                                device='cuda').to(torch.float8_e4m3fn)
-    gemm2_scales = 2 * torch.rand(
-        (num_experts, hidden_size // 128, intermediate_size // 128),
-        device='cuda').to(torch.float)
+    def run_moe_fp8_test(self, num_tokens: int, expert_info: Tuple[int, int,
+                                                                   int, int],
+                         hidden_size: int, intermediate_size: int,
+                         use_autotune: bool):
+        torch.random.manual_seed(0)
 
-    permute_info, scores = routing_reference_no_aux(expert_logits, routing_bias,
-                                                    top_k, n_groups,
-                                                    top_k_groups,
-                                                    routed_scaling, padding)
+        #
+        # Data Generation
+        #
+        num_experts, n_groups, top_k_groups, top_k = expert_info
+        padding = 8
+        routed_scaling = 2.5
+        routing_method_type = RoutingMethodType.DeepSeekV3
 
-    args = moe_args(num_tokens, num_experts, hidden_size, intermediate_size,
-                    top_k, padding, hidden_states, hidden_states_scale, None,
-                    scores, gemm1_weights, gemm1_scales, None, gemm2_weights,
-                    gemm2_scales, None, permute_info, False)
+        assert top_k <= num_experts
+        assert top_k <= 8
+        assert top_k_groups <= 4
+        assert num_experts > n_groups
+        assert num_experts % n_groups == 0
+        assert num_experts % 4 == 0
+        assert top_k < (top_k_groups * num_experts / n_groups)
 
-    with autotune(use_autotune):
-        output = torch.ops.trtllm.fp8_block_scale_moe_runner(
-            expert_logits, routing_bias, hidden_states, hidden_states_scale,
-            gemm1_weights, gemm1_scales, gemm2_weights, gemm2_scales,
-            num_experts, top_k, n_groups, top_k_groups, intermediate_size, 0,
-            num_experts, routed_scaling, tile_tokens_dim, routing_method_type)
+        expert_logits = torch.randn((num_tokens, num_experts),
+                                    device='cuda').to(torch.float)
+        routing_bias = torch.randn(num_experts,
+                                   device='cuda',
+                                   dtype=torch.bfloat16)
 
-    output_dequant_actual = output.to(torch.float)
-    #
-    # Run the reference implementations
-    #
-    output_dequant_reference, _ = run_moe_reference_dsfp8(args)
+        hidden_states = torch.randn((num_tokens, hidden_size),
+                                    device='cuda').to(torch.float8_e4m3fn)
+        hidden_states_scale = 2 * torch.rand(
+            (hidden_size // 128, num_tokens), device='cuda').to(torch.float)
 
-    #
-    # Check the results
-    #
-    def check_accuracy(a, b, atol, rtol, percent):
-        if torch.any(torch.isnan(a)):
-            raise Exception("NaN in a")
-        if torch.any(torch.isnan(b)):
-            raise Exception("NaN in b")
-        assert a.shape == b.shape
-        left = torch.abs(a - b)
-        right = atol + rtol * torch.abs(b)
-        count = torch.sum(left > right)
-        mismatch_percent = count / a.numel()
-        if mismatch_percent > 1 - percent:
-            raise Exception("Mismatch percentage is %f for rtol %f" %
-                            (mismatch_percent, rtol))
+        gemm1_weights = torch.randn(
+            (num_experts, 2 * intermediate_size, hidden_size),
+            device='cuda').to(torch.float8_e4m3fn)
+        gemm1_scales = 2 * torch.rand(
+            (num_experts, 2 * intermediate_size // 128, hidden_size // 128),
+            device='cuda').to(torch.float)
+        gemm2_weights = torch.randn(
+            (num_experts, hidden_size, intermediate_size),
+            device='cuda').to(torch.float8_e4m3fn)
+        gemm2_scales = 2 * torch.rand(
+            (num_experts, hidden_size // 128, intermediate_size // 128),
+            device='cuda').to(torch.float)
 
-    check_accuracy(output_dequant_reference,
-                   output_dequant_actual,
-                   atol=0.1,
-                   rtol=0.85,
-                   percent=0.925)
+        permute_info, scores = routing_reference_no_aux(expert_logits,
+                                                        routing_bias, top_k,
+                                                        n_groups, top_k_groups,
+                                                        routed_scaling, padding)
+
+        args = moe_args(num_tokens, num_experts, hidden_size, intermediate_size,
+                        top_k, padding, hidden_states, hidden_states_scale,
+                        None, scores, gemm1_weights, gemm1_scales, None,
+                        gemm2_weights, gemm2_scales, None, permute_info, False)
+
+        with autotune(use_autotune):
+            output = torch.ops.trtllm.fp8_block_scale_moe_runner(
+                expert_logits, routing_bias, hidden_states, hidden_states_scale,
+                gemm1_weights, gemm1_scales, gemm2_weights, gemm2_scales,
+                num_experts, top_k, n_groups, top_k_groups, intermediate_size,
+                0, num_experts, routed_scaling, routing_method_type)
+
+        output_dequant_actual = output.to(torch.float)
+        #
+        # Run the reference implementations
+        #
+        output_dequant_reference, _ = run_moe_reference_dsfp8(args)
+
+        #
+        # Check the results
+        #
+        def check_accuracy(a, b, atol, rtol, percent):
+            if torch.any(torch.isnan(a)):
+                raise Exception("NaN in a")
+            if torch.any(torch.isnan(b)):
+                raise Exception("NaN in b")
+            assert a.shape == b.shape
+            left = torch.abs(a - b)
+            right = atol + rtol * torch.abs(b)
+            count = torch.sum(left > right)
+            mismatch_percent = count / a.numel()
+            if mismatch_percent > 1 - percent:
+                raise Exception("Mismatch percentage is %f for rtol %f" %
+                                (mismatch_percent, rtol))
+
+        check_accuracy(output_dequant_reference,
+                       output_dequant_actual,
+                       atol=0.1,
+                       rtol=0.85,
+                       percent=0.925)
 
 
 @pytest.mark.skipif(
@@ -671,299 +706,358 @@ def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size,
     reason="The kernel only supports Blackwell. Current SM is %d." %
     getSMVersion(),
 )
-@pytest.mark.parametrize("num_tokens", [1, 1024, 4096])
-@pytest.mark.parametrize("hidden_size", [1024])
-@pytest.mark.parametrize("intermediate_size", [1024, 768, 384, 192])
-@pytest.mark.parametrize(
-    "routing_info",
-    [
-        pytest.param(
-            {
-                "num_experts": 256,
-                "top_k": 8,
-                "padding": 8,
-                "n_groups": 8,
-                "top_k_groups": 4,
-                "routed_scaling": 2.5,
-                "has_routing_bias": True,
-                "routing_method_type": RoutingMethodType.DeepSeekV3
-            },
-            id="RoutingDSv3"),
-        pytest.param(
-            {
-                "num_experts": 72,
-                "top_k": 6,
-                "padding": 8,
-                "n_groups": 1,
-                "top_k_groups": 1,
-                "routed_scaling": 2.5,
-                "has_routing_bias": True,
-                "routing_method_type": RoutingMethodType.DeepSeekV3
-            },
-            id="RoutingDSlite"),
-        pytest.param(
-            {
-                "num_experts": 128,
-                "top_k": 8,
-                "padding": 8,
-                "n_groups": None,
-                "top_k_groups": None,
-                "routed_scaling": None,
-                "has_routing_bias": False,
-                "routing_method_type": RoutingMethodType.Renormalize
-            },
-            id="RoutingRenormalize"),
-        pytest.param(
-            {
-                "num_experts": 128,
-                "top_k": 8,
-                "padding": 8,
-                "n_groups": None,
-                "top_k_groups": None,
-                "routed_scaling": None,
-                "has_routing_bias": False,
-                "routing_method_type": RoutingMethodType.RenormalizeNaive
-            },
-            id="RoutingRenormalizeNaive"),
-    ],
-)
-def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
-    torch.random.manual_seed(0)
+class TestMoeFp4:
+    """
+    Test the NVFP4 MoE. As autotune also covers the actual MoE, we can run the test
+    with autotune by default. We add a separate test for no autotune to ensure that
+    the default tactic selection works. This reduces unnecessary test runs for CI
+    """
 
-    #
-    # Data Generation
-    #
+    @pytest.mark.parametrize("num_tokens", [1, 1024, 4096])
+    @pytest.mark.parametrize("hidden_size", [1024])
+    @pytest.mark.parametrize("intermediate_size", [1024, 768, 384, 192])
+    @pytest.mark.parametrize(
+        "routing_info",
+        [
+            pytest.param(
+                {
+                    "num_experts": 256,
+                    "top_k": 8,
+                    "padding": 8,
+                    "n_groups": 8,
+                    "top_k_groups": 4,
+                    "routed_scaling": 2.5,
+                    "has_routing_bias": True,
+                    "routing_method_type": RoutingMethodType.DeepSeekV3
+                },
+                id="RoutingDSv3"),
+            pytest.param(
+                {
+                    "num_experts": 72,
+                    "top_k": 6,
+                    "padding": 8,
+                    "n_groups": 1,
+                    "top_k_groups": 1,
+                    "routed_scaling": 2.5,
+                    "has_routing_bias": True,
+                    "routing_method_type": RoutingMethodType.DeepSeekV3
+                },
+                id="RoutingDSlite"),
+            pytest.param(
+                {
+                    "num_experts": 128,
+                    "top_k": 8,
+                    "padding": 8,
+                    "n_groups": None,
+                    "top_k_groups": None,
+                    "routed_scaling": None,
+                    "has_routing_bias": False,
+                    "routing_method_type": RoutingMethodType.Renormalize
+                },
+                id="RoutingRenormalize"),
+            pytest.param(
+                {
+                    "num_experts": 128,
+                    "top_k": 8,
+                    "padding": 8,
+                    "n_groups": None,
+                    "top_k_groups": None,
+                    "routed_scaling": None,
+                    "has_routing_bias": False,
+                    "routing_method_type": RoutingMethodType.RenormalizeNaive
+                },
+                id="RoutingRenormalizeNaive"),
+        ],
+    )
+    def test_autotune(self, num_tokens, hidden_size, intermediate_size,
+                      routing_info):
 
-    top_k = routing_info["top_k"]
-    # FIXME: set to TileN size
-    padding = routing_info["padding"]
-    n_groups = routing_info["n_groups"]
-    top_k_groups = routing_info["top_k_groups"]
-    routed_scaling = routing_info["routed_scaling"]
-    num_experts = routing_info["num_experts"]
-    routing_method_type = routing_info["routing_method_type"]
-    tile_tokens_dim = 8
+        self.run_moe_fp4_test(num_tokens,
+                              hidden_size,
+                              intermediate_size,
+                              routing_info,
+                              use_autotune=True)
 
-    assert top_k <= num_experts
-    assert top_k <= 8
-    if (top_k_groups is not None) and (n_groups is not None):
-        assert top_k_groups <= 4
-        assert num_experts > n_groups
-        assert num_experts % n_groups == 0
-        assert num_experts % 4 == 0
-        assert top_k < (top_k_groups * num_experts / n_groups)
+    @pytest.mark.parametrize("num_tokens", [1])
+    @pytest.mark.parametrize("hidden_size", [1024])
+    @pytest.mark.parametrize("intermediate_size", [1024])
+    @pytest.mark.parametrize(
+        "routing_info",
+        [
+            pytest.param(
+                {
+                    "num_experts": 256,
+                    "top_k": 8,
+                    "padding": 8,
+                    "n_groups": 8,
+                    "top_k_groups": 4,
+                    "routed_scaling": 2.5,
+                    "has_routing_bias": True,
+                    "routing_method_type": RoutingMethodType.DeepSeekV3
+                },
+                id="RoutingDSv3"),
+        ],
+    )
+    def test_no_autotune(self, num_tokens, hidden_size, intermediate_size,
+                         routing_info):
 
-    if routing_method_type == RoutingMethodType.DeepSeekV3:
-        expert_logits = torch.randn((num_tokens, num_experts),
-                                    device='cuda').to(torch.float)
-    elif routing_method_type == RoutingMethodType.RenormalizeNaive or routing_method_type == RoutingMethodType.Renormalize:
-        expert_logits = torch.randn((num_tokens, num_experts),
-                                    device='cuda').to(torch.bfloat16)
+        self.run_moe_fp4_test(num_tokens,
+                              hidden_size,
+                              intermediate_size,
+                              routing_info,
+                              use_autotune=False)
 
-    if routing_info["has_routing_bias"]:
-        routing_bias = torch.randn(num_experts,
-                                   device="cuda",
-                                   dtype=torch.bfloat16)
-    else:
-        routing_bias = None
+    def run_moe_fp4_test(self, num_tokens: int, hidden_size: int,
+                         intermediate_size: int, routing_info: dict,
+                         use_autotune: bool) -> None:
 
-    hidden_states = 2 * torch.randn(
-        (num_tokens, hidden_size), device='cuda', dtype=torch.bfloat16)
-    gemm1_weights = torch.randn(
-        (num_experts, 2 * intermediate_size, hidden_size),
-        device='cuda',
-        dtype=torch.bfloat16)
-    gemm2_weights = torch.randn((num_experts, hidden_size, intermediate_size),
-                                device='cuda',
-                                dtype=torch.bfloat16)
+        torch.random.manual_seed(0)
 
-    use_ue8m0 = False
-    # Quantize hidden states. Produces scales for activations in 128x4 layout for ref impl.
-    hidden_states_fp4_bytes, hidden_states_scale_fp4_bytes, hidden_states_scale_global = quant_fp4(
-        hidden_states, use_ue8m0, True)
-    # We do it twice to get the linear layout for scales for the FP4 kernels.
-    _, hidden_states_scale_linear_fp4_bytes, _ = quant_fp4(
-        hidden_states, use_ue8m0, False)
+        #
+        # Data Generation
+        #
+        num_experts = routing_info["num_experts"]
+        top_k = routing_info["top_k"]
+        n_groups = routing_info["n_groups"]
+        top_k_groups = routing_info["top_k_groups"]
+        routed_scaling = routing_info["routed_scaling"]
+        has_routing_bias = routing_info["has_routing_bias"]
+        routing_method_type = routing_info["routing_method_type"]
+        # Perfect expert distribution results in `num_tokens * top_k / num_experts` tokens per expert.
+        tile_tokens_dim = (num_tokens * top_k) // num_experts
+        # And pad the number of tokens to the next power of 2.
+        tile_tokens_dim = next_positive_power_of_2(tile_tokens_dim)
+        # At least padded to 8 tokens per CTA tile
+        tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
+        padding = tile_tokens_dim
+        if padding >= 256:
+            pytest.skip("Routing kernel requires that padding be less than 256")
 
-    hidden_states_fp4 = hidden_states_fp4_bytes.reshape(
-        num_tokens, hidden_size // 2)  # packed fp4
+        assert top_k <= num_experts
+        assert top_k <= 8
+        if (top_k_groups is not None) and (n_groups is not None):
+            assert top_k_groups <= 4
+            assert num_experts > n_groups
+            assert num_experts % n_groups == 0
+            assert num_experts % 4 == 0
+            assert top_k < (top_k_groups * num_experts / n_groups)
 
-    hidden_states_scale_linear_fp4 = hidden_states_scale_linear_fp4_bytes.view(
-        torch.float8_e4m3fn)  # fp8 scaling factors
+        if routing_method_type == RoutingMethodType.DeepSeekV3:
+            expert_logits = torch.randn((num_tokens, num_experts),
+                                        device='cuda').to(torch.float)
+        elif routing_method_type == RoutingMethodType.RenormalizeNaive or routing_method_type == RoutingMethodType.Renormalize:
+            expert_logits = torch.randn((num_tokens, num_experts),
+                                        device='cuda').to(torch.bfloat16)
 
-    # Quantize the weights for FC1. Produces scales for weights in 128x4 layout for ref impl.
-    gemm1_weights_fp4_bytes, gemm1_scales_fp4_bytes, gemm1_scales_global = quant_fp4_batches(
-        gemm1_weights, num_experts, use_ue8m0, True)
-    # We do it twice to get the linear layout for scales for the FP4 kernels.
-    _, gemm1_scales_linear_fp4_bytes, _ = quant_fp4_batches(
-        gemm1_weights, num_experts, use_ue8m0, False)
+        if has_routing_bias:
+            routing_bias = torch.randn(num_experts,
+                                       device="cuda",
+                                       dtype=torch.bfloat16)
+        else:
+            routing_bias = None
 
-    gemm1_weights_fp4 = gemm1_weights_fp4_bytes.view(
-        torch.float8_e4m3fn).reshape(num_experts, 2 * intermediate_size,
-                                     hidden_size // 2)  # packed fp4
-    gemm1_scales_linear_fp4 = gemm1_scales_linear_fp4_bytes.view(
-        torch.float8_e4m3fn).reshape(num_experts, 2 * intermediate_size,
-                                     hidden_size // 16)  # fp8 scaling factors
+        hidden_states = 2 * torch.randn(
+            (num_tokens, hidden_size), device='cuda', dtype=torch.bfloat16)
+        gemm1_weights = torch.randn(
+            (num_experts, 2 * intermediate_size, hidden_size),
+            device='cuda',
+            dtype=torch.bfloat16)
+        gemm2_weights = torch.randn(
+            (num_experts, hidden_size, intermediate_size),
+            device='cuda',
+            dtype=torch.bfloat16)
 
-    # Quantize the weights for FC2. Produces scales for weights in 128x4 layout for ref impl.
-    gemm2_weights_fp4_bytes, gemm2_scales_fp4_bytes, gemm2_scales_global = quant_fp4_batches(
-        gemm2_weights, num_experts, use_ue8m0, True)
-    # We do it twice to get the linear layout for scales for the FP4 kernels.
-    _, gemm2_scales_linear_fp4_bytes, _ = quant_fp4_batches(
-        gemm2_weights, num_experts, use_ue8m0, False)
+        use_ue8m0 = False
+        # Quantize hidden states. Produces scales for activations in 128x4 layout for ref impl.
+        hidden_states_fp4_bytes, hidden_states_scale_fp4_bytes, hidden_states_scale_global = quant_fp4(
+            hidden_states, use_ue8m0, True)
+        # We do it twice to get the linear layout for scales for the FP4 kernels.
+        _, hidden_states_scale_linear_fp4_bytes, _ = quant_fp4(
+            hidden_states, use_ue8m0, False)
 
-    gemm2_weights_fp4 = gemm2_weights_fp4_bytes.view(
-        torch.float8_e4m3fn).reshape(num_experts, hidden_size,
-                                     intermediate_size // 2)  # packed fp4
-    gemm2_scales_linear_fp4 = gemm2_scales_linear_fp4_bytes.view(
-        torch.float8_e4m3fn).reshape(num_experts, hidden_size,
-                                     intermediate_size //
-                                     16)  # fp8 scaling factors
-    if routing_method_type == RoutingMethodType.DeepSeekV3:
-        permute_info, scores = routing_reference_no_aux(expert_logits,
-                                                        routing_bias, top_k,
-                                                        n_groups, top_k_groups,
-                                                        routed_scaling, padding)
-    elif routing_method_type == RoutingMethodType.Renormalize:
-        permute_info, scores = routing_reference_renormalize(
-            expert_logits, top_k, num_experts, padding)
-    elif routing_method_type == RoutingMethodType.RenormalizeNaive:
-        permute_info, scores = routing_reference_renormalize_naive(
-            expert_logits, top_k, num_experts, padding)
+        hidden_states_fp4 = hidden_states_fp4_bytes.reshape(
+            num_tokens, hidden_size // 2)  # packed fp4
 
-    args = moe_args(num_tokens, num_experts, hidden_size, intermediate_size,
-                    top_k, padding, hidden_states_fp4_bytes,
-                    hidden_states_scale_fp4_bytes, hidden_states_scale_global,
-                    scores, gemm1_weights_fp4_bytes, gemm1_scales_fp4_bytes,
-                    gemm1_scales_global, gemm2_weights_fp4_bytes,
-                    gemm2_scales_fp4_bytes, gemm2_scales_global, permute_info,
-                    False)
-    #
-    # Run the reference implementations
-    #
-    # It is important to run the reference implementation before the TRT-LLM kernel
-    # because the MoE shuffles the weights in-place.
-    output_dequant_reference, args_dequant = run_moe_reference_fp4(args)
+        hidden_states_scale_linear_fp4 = hidden_states_scale_linear_fp4_bytes.view(
+            torch.float8_e4m3fn)  # fp8 scaling factors
 
-    # FIXME: this depends on the kernel internals
-    epilogue_tile_m = 128
+        # Quantize the weights for FC1. Produces scales for weights in 128x4 layout for ref impl.
+        gemm1_weights_fp4_bytes, gemm1_scales_fp4_bytes, gemm1_scales_global = quant_fp4_batches(
+            gemm1_weights, num_experts, use_ue8m0, True)
+        # We do it twice to get the linear layout for scales for the FP4 kernels.
+        _, gemm1_scales_linear_fp4_bytes, _ = quant_fp4_batches(
+            gemm1_weights, num_experts, use_ue8m0, False)
 
-    # Reorder rows of W1 and scales for fused gated activation
-    gemm1_weights_fp4_interleaved = []
-    gemm1_scales_fp4_interleaved = []
-    for i in range(num_experts):
-        gemm1_weights_fp4_interleaved.append(
-            reorder_rows_for_gated_act_gemm(gemm1_weights_fp4[i].clone()))
-        gemm1_scales_fp4_interleaved.append(
-            reorder_rows_for_gated_act_gemm(gemm1_scales_linear_fp4[i].clone()))
+        gemm1_weights_fp4 = gemm1_weights_fp4_bytes.view(
+            torch.float8_e4m3fn).reshape(num_experts, 2 * intermediate_size,
+                                         hidden_size // 2)  # packed fp4
+        gemm1_scales_linear_fp4 = gemm1_scales_linear_fp4_bytes.view(
+            torch.float8_e4m3fn).reshape(num_experts, 2 * intermediate_size,
+                                         hidden_size //
+                                         16)  # fp8 scaling factors
 
-    # Stack weights and scales for all experts
-    gemm1_weights_fp4_interleaved = torch.stack(
-        gemm1_weights_fp4_interleaved).reshape(num_experts,
-                                               2 * intermediate_size,
-                                               hidden_size // 2)
-    gemm1_scales_fp4_interleaved = torch.stack(
-        gemm1_scales_fp4_interleaved).reshape(num_experts,
-                                              2 * intermediate_size,
-                                              hidden_size // 16)
+        # Quantize the weights for FC2. Produces scales for weights in 128x4 layout for ref impl.
+        gemm2_weights_fp4_bytes, gemm2_scales_fp4_bytes, gemm2_scales_global = quant_fp4_batches(
+            gemm2_weights, num_experts, use_ue8m0, True)
+        # We do it twice to get the linear layout for scales for the FP4 kernels.
+        _, gemm2_scales_linear_fp4_bytes, _ = quant_fp4_batches(
+            gemm2_weights, num_experts, use_ue8m0, False)
 
-    # Shuffle weights and scaling factors for transposed mma output
-    gemm1_weights_fp4_shuffled = []
-    gemm1_scales_fp4_shuffled = []
-    gemm2_weights_fp4_shuffled = []
-    gemm2_scales_fp4_shuffled = []
-    for i in range(num_experts):
-        gemm1_weights_fp4_shuffled.append(
-            shuffle_matrix_a(gemm1_weights_fp4_interleaved[i].view(torch.uint8),
-                             epilogue_tile_m))
-        gemm1_scales_fp4_shuffled.append(
-            shuffle_matrix_sf_a(
-                gemm1_scales_fp4_interleaved[i].view(torch.uint8),
-                epilogue_tile_m))
+        gemm2_weights_fp4 = gemm2_weights_fp4_bytes.view(
+            torch.float8_e4m3fn).reshape(num_experts, hidden_size,
+                                         intermediate_size // 2)  # packed fp4
+        gemm2_scales_linear_fp4 = gemm2_scales_linear_fp4_bytes.view(
+            torch.float8_e4m3fn).reshape(num_experts, hidden_size,
+                                         intermediate_size //
+                                         16)  # fp8 scaling factors
+        if routing_method_type == RoutingMethodType.DeepSeekV3:
+            permute_info, scores = routing_reference_no_aux(
+                expert_logits, routing_bias, top_k, n_groups, top_k_groups,
+                routed_scaling, padding)
+        elif routing_method_type == RoutingMethodType.Renormalize:
+            permute_info, scores = routing_reference_renormalize(
+                expert_logits, top_k, num_experts, padding)
+        elif routing_method_type == RoutingMethodType.RenormalizeNaive:
+            permute_info, scores = routing_reference_renormalize_naive(
+                expert_logits, top_k, num_experts, padding)
 
-        gemm2_weights_fp4_shuffled.append(
-            shuffle_matrix_a(gemm2_weights_fp4[i].view(torch.uint8),
-                             epilogue_tile_m))
-        gemm2_scales_fp4_shuffled.append(
-            shuffle_matrix_sf_a(gemm2_scales_linear_fp4[i].view(torch.uint8),
-                                epilogue_tile_m))
+        args = moe_args(num_tokens, num_experts, hidden_size, intermediate_size,
+                        top_k, padding, hidden_states_fp4_bytes,
+                        hidden_states_scale_fp4_bytes,
+                        hidden_states_scale_global, scores,
+                        gemm1_weights_fp4_bytes, gemm1_scales_fp4_bytes,
+                        gemm1_scales_global, gemm2_weights_fp4_bytes,
+                        gemm2_scales_fp4_bytes, gemm2_scales_global,
+                        permute_info, False)
+        #
+        # Run the reference implementations
+        #
+        # It is important to run the reference implementation before the TRT-LLM kernel
+        # because the MoE shuffles the weights in-place.
+        output_dequant_reference, args_dequant = run_moe_reference_fp4(args)
 
-    # Stack weights for all experts
-    gemm1_weights_fp4_shuffled = torch.stack(gemm1_weights_fp4_shuffled)
-    gemm1_scales_fp4_shuffled = torch.stack(gemm1_scales_fp4_shuffled).view(
-        torch.float8_e4m3fn).reshape(num_experts, 2 * intermediate_size,
-                                     hidden_size // 16)
+        # FIXME: this depends on the kernel internals
+        epilogue_tile_m = 128
 
-    gemm2_weights_fp4_shuffled = torch.stack(gemm2_weights_fp4_shuffled)
-    gemm2_scales_fp4_shuffled = torch.stack(gemm2_scales_fp4_shuffled).view(
-        torch.float8_e4m3fn).reshape(num_experts, hidden_size,
-                                     intermediate_size // 16)
+        # Reorder rows of W1 and scales for fused gated activation
+        gemm1_weights_fp4_interleaved = []
+        gemm1_scales_fp4_interleaved = []
+        for i in range(num_experts):
+            gemm1_weights_fp4_interleaved.append(
+                reorder_rows_for_gated_act_gemm(gemm1_weights_fp4[i].clone()))
+            gemm1_scales_fp4_interleaved.append(
+                reorder_rows_for_gated_act_gemm(
+                    gemm1_scales_linear_fp4[i].clone()))
 
-    #
-    # Run the TRT-LLM kernel
-    #
+        # Stack weights and scales for all experts
+        gemm1_weights_fp4_interleaved = torch.stack(
+            gemm1_weights_fp4_interleaved).reshape(num_experts,
+                                                   2 * intermediate_size,
+                                                   hidden_size // 2)
+        gemm1_scales_fp4_interleaved = torch.stack(
+            gemm1_scales_fp4_interleaved).reshape(num_experts,
+                                                  2 * intermediate_size,
+                                                  hidden_size // 16)
 
-    # c_global_sf: fc2_input_scale
-    scale_c_fc1 = args_dequant.c_global_sf * (
-        1.0 / args.gemm1_scales_global) * (1.0 /
-                                           args.hidden_states_scale_global)
+        # Shuffle weights and scaling factors for transposed mma output
+        gemm1_weights_fp4_shuffled = []
+        gemm1_scales_fp4_shuffled = []
+        gemm2_weights_fp4_shuffled = []
+        gemm2_scales_fp4_shuffled = []
+        for i in range(num_experts):
+            gemm1_weights_fp4_shuffled.append(
+                shuffle_matrix_a(
+                    gemm1_weights_fp4_interleaved[i].view(torch.uint8),
+                    epilogue_tile_m))
+            gemm1_scales_fp4_shuffled.append(
+                shuffle_matrix_sf_a(
+                    gemm1_scales_fp4_interleaved[i].view(torch.uint8),
+                    epilogue_tile_m))
 
-    # self.fc31_alpha
-    scale_gate_fc1 = (1.0 / args.gemm1_scales_global) * (
-        1.0 / args.hidden_states_scale_global)
+            gemm2_weights_fp4_shuffled.append(
+                shuffle_matrix_a(gemm2_weights_fp4[i].view(torch.uint8),
+                                 epilogue_tile_m))
+            gemm2_scales_fp4_shuffled.append(
+                shuffle_matrix_sf_a(
+                    gemm2_scales_linear_fp4[i].view(torch.uint8),
+                    epilogue_tile_m))
 
-    # self.fc2_alpha
-    scale_c_fc2 = (1.0 / args_dequant.c_global_sf) * (1.0 /
-                                                      args.gemm2_scales_global)
+        # Stack weights for all experts
+        gemm1_weights_fp4_shuffled = torch.stack(gemm1_weights_fp4_shuffled)
+        gemm1_scales_fp4_shuffled = torch.stack(gemm1_scales_fp4_shuffled).view(
+            torch.float8_e4m3fn).reshape(num_experts, 2 * intermediate_size,
+                                         hidden_size // 16)
 
-    output = torch.ops.trtllm.fp4_block_scale_moe_runner(
-        expert_logits,
-        routing_bias,
-        hidden_states_fp4,
-        hidden_states_scale_linear_fp4,
-        gemm1_weights_fp4_shuffled,
-        gemm1_scales_fp4_shuffled,
-        gemm2_weights_fp4_shuffled,
-        gemm2_scales_fp4_shuffled,
-        scale_c_fc1,
-        scale_gate_fc1,
-        scale_c_fc2,
-        num_experts,
-        top_k,
-        n_groups,
-        top_k_groups,
-        intermediate_size,
-        0,
-        num_experts,
-        routed_scaling,
-        tile_tokens_dim,
-        routing_method_type,
-        do_finalize=True)
+        gemm2_weights_fp4_shuffled = torch.stack(gemm2_weights_fp4_shuffled)
+        gemm2_scales_fp4_shuffled = torch.stack(gemm2_scales_fp4_shuffled).view(
+            torch.float8_e4m3fn).reshape(num_experts, hidden_size,
+                                         intermediate_size // 16)
 
-    output_dequant_actual = output[0].to(torch.float)
+        #
+        # Run the TRT-LLM kernel
+        #
 
-    #
-    # Check the results
-    #
-    def check_accuracy(a, b, atol, rtol, percent):
-        if torch.any(torch.isnan(a)):
-            raise Exception("NaN in a")
-        if torch.any(torch.isnan(b)):
-            raise Exception("NaN in b")
-        assert a.shape == b.shape
-        left = torch.abs(a - b)
-        right = atol + rtol * torch.abs(b)
-        count = torch.sum(left > right)
-        mismatch_percent = count / a.numel()
-        if mismatch_percent > 1 - percent:
-            raise Exception("Mismatch percentage is %f for rtol %f" %
-                            (mismatch_percent, rtol))
+        # c_global_sf: fc2_input_scale
+        scale_c_fc1 = args_dequant.c_global_sf * (
+            1.0 / args.gemm1_scales_global) * (1.0 /
+                                               args.hidden_states_scale_global)
 
-    check_accuracy(output_dequant_reference,
-                   output_dequant_actual,
-                   atol=0.1,
-                   rtol=0.85,
-                   percent=0.925)
+        # self.fc31_alpha
+        scale_gate_fc1 = (1.0 / args.gemm1_scales_global) * (
+            1.0 / args.hidden_states_scale_global)
+
+        # self.fc2_alpha
+        scale_c_fc2 = (1.0 / args_dequant.c_global_sf) * (
+            1.0 / args.gemm2_scales_global)
+
+        with autotune(use_autotune):
+            output = torch.ops.trtllm.fp4_block_scale_moe_runner(
+                expert_logits,
+                routing_bias,
+                hidden_states_fp4,
+                hidden_states_scale_linear_fp4,
+                gemm1_weights_fp4_shuffled,
+                gemm1_scales_fp4_shuffled,
+                gemm2_weights_fp4_shuffled,
+                gemm2_scales_fp4_shuffled,
+                scale_c_fc1,
+                scale_gate_fc1,
+                scale_c_fc2,
+                num_experts,
+                top_k,
+                n_groups,
+                top_k_groups,
+                intermediate_size,
+                0,
+                num_experts,
+                routed_scaling,
+                routing_method_type,
+                do_finalize=True)
+
+        output_dequant_actual = output[0].to(torch.float)
+
+        #
+        # Check the results
+        #
+        def check_accuracy(a, b, atol, rtol, percent):
+            if torch.any(torch.isnan(a)):
+                raise Exception("NaN in a")
+            if torch.any(torch.isnan(b)):
+                raise Exception("NaN in b")
+            assert a.shape == b.shape
+            left = torch.abs(a - b)
+            right = atol + rtol * torch.abs(b)
+            count = torch.sum(left > right)
+            mismatch_percent = count / a.numel()
+            if mismatch_percent > 1 - percent:
+                raise Exception("Mismatch percentage is %f for rtol %f" %
+                                (mismatch_percent, rtol))
+
+        check_accuracy(output_dequant_reference,
+                       output_dequant_actual,
+                       atol=0.1,
+                       rtol=0.85,
+                       percent=0.925)
 
 
 @pytest.mark.skipif(
@@ -983,8 +1077,6 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
     # Data Generation
     #
     num_experts, n_groups, top_k_groups, top_k, use_routing_scales_on_input = expert_info
-    # FIXME: set to TileN size
-    padding = 8
     routed_scaling = 2.5
     routing_method_type = RoutingMethodType.Llama4
     tile_tokens_dim = 8
@@ -1019,10 +1111,10 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
 
     permute_info, scores = routing_reference_no_aux(
         expert_logits, routing_bias, top_k, n_groups, top_k_groups,
-        routed_scaling, padding, use_routing_scales_on_input)
+        routed_scaling, tile_tokens_dim, use_routing_scales_on_input)
 
     args = moe_args(num_tokens, num_experts, hidden_size, intermediate_size,
-                    top_k, padding, hidden_states_quant, None,
+                    top_k, tile_tokens_dim, hidden_states_quant, None,
                     hidden_states_global_scale, scores, gemm1_weights_quant,
                     None, gemm1_global_scales, gemm2_weights_quant, None,
                     gemm2_global_scales, permute_info,

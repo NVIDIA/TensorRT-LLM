@@ -31,6 +31,7 @@
     ],
     "skip": {
         "<filename>": "<description>",
+        "tensorrt_llm/deep_ep/strip_nvshmem_helper.py": "py",
         "tensorrt_llm/kernels/selectiveScan/selectiveScan.h": "external",
         "tensorrt_llm/kernels/cutlass_kernels/python/generate_kernels.py": "py",
         "tensorrt_llm/kernels/cutlass_kernels/fp8_rowwise_gemm/fp8_rowwise_gemm_kernel_template_sm90.h": "dual license",

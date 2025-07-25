@@ -13,6 +13,7 @@ trt_llm_release_perf_l2_test:
   tests:
   - perf/test_perf.py::test_perf[deepseek_r1_fp8-bench-pytorch-float8-maxbs:1-input_output_len:1000,2000-reqs:10-con:1-ep:4-tp:8-gpus:8] #min latency test
   - perf/test_perf.py::test_perf[deepseek_r1_fp8-bench-pytorch-float8-maxbs:128-maxnt:1127-input_output_len:1000,2000-reqs:5120-con:1024-ep:8-tp:8-gpus:8] #max throughput test
+  - perf/test_perf.py::test_perf[llama_v3.1_nemotron_nano_8b_fp8-bench-pytorch-float8-maxbs:512-maxnt:20000-input_output_len:20000,2000-reqs:500-con:250]
 
 # FP8 specific tests
 - condition:

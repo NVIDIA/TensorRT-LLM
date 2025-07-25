@@ -364,12 +364,11 @@ def test_run_stress_test(config, stress_time_timeout, backend,
     """
     # Create a new ModelConfig with the backend parameter
     # Convert 'trt' to None as expected by the ModelConfig
-    backend_param = None if backend == "trt" else backend
 
     new_config = ModelConfig(model_dir=config.model_dir,
                              tp_size=config.tp_size,
                              memory_requirement=config.memory_requirement,
-                             backend=backend_param)
+                             backend=backend)
 
     # Extract stress_time and stress_timeout from the tuple
     stress_time, stress_timeout = stress_time_timeout
@@ -518,14 +517,11 @@ def stress_test(config,
 
         if config.backend == "pytorch":
             extra_llm_options.update({
-                "use_cuda_graph":
-                True,
-                "cuda_graph_padding_enabled":
-                True,
-                "cuda_graph_batch_sizes":
-                [1, 2, 4, 8, 16, 32, 64, 128, 256, 384],
-                "print_iter_log":
-                True,
+                "cuda_graph_config": {
+                    "enable_padding": True,
+                    "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128, 256, 384],
+                },
+                "print_iter_log": True,
             })
 
     with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml',
@@ -545,6 +541,8 @@ def stress_test(config,
         str(config.tp_size),
         "--pp_size",
         str(test_server_config.pp_size),
+        "--backend",
+        config.backend,
     ]
 
     # Only add ep_size parameter if it's not None
@@ -562,12 +560,6 @@ def stress_test(config,
         "--extra_llm_api_options",
         extra_llm_options_path,
     ])
-
-    # Add backend option only if specified
-    # backend = None means trt backend
-    # backend = pytorch means pytorch backend
-    if config.backend:
-        server_cmd.extend(["--backend", config.backend])
 
     # Log the command we're about to run
     print_info(f"Running command: {' '.join(server_cmd)}")

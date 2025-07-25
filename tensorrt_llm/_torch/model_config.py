@@ -7,7 +7,9 @@ import torch
 import transformers
 
 from tensorrt_llm import logger
+from tensorrt_llm._torch.pyexecutor.config_utils import is_nemotron_hybrid
 from tensorrt_llm._utils import torch_dtype_to_binding
+from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -68,7 +70,7 @@ class ModelConfig(Generic[TConfig]):
     # to support mixed quantization.
     skip_create_weights_in_init: bool = False
 
-    spec_config: Optional["SpecConfig"] = None
+    spec_config: Optional["DecodingBaseConfig"] = None
     lora_config: Optional["LoraConfig"] = None
 
     is_generation: bool = True
@@ -86,6 +88,8 @@ class ModelConfig(Generic[TConfig]):
 
     # Allow models to select op according to whether CUDA Graphs are used.
     use_cuda_graph: bool = False
+
+    force_dynamic_quantization: bool = False
 
     extra_attrs: Dict = field(default_factory=dict, repr=False, init=False)
 
@@ -198,6 +202,9 @@ class ModelConfig(Generic[TConfig]):
             json_quant_configs = quant_config_dict['quantization']
 
             quant_config.quant_algo = json_quant_configs.get('quant_algo', None)
+            # fp8_pb_wo from modelopt is the same as FP8_BLOCK_SCALES
+            if quant_config.quant_algo == "fp8_pb_wo":
+                quant_config.quant_algo = 'FP8_BLOCK_SCALES'
             quant_config.kv_cache_quant_algo = json_quant_configs.get(
                 'kv_cache_quant_algo', None)
             quant_config.group_size = json_quant_configs.get('group_size', None)
@@ -270,11 +277,19 @@ class ModelConfig(Generic[TConfig]):
         model_config._frozen = True
         return model_config
 
-    def get_bindings_model_config(self) -> "ModelConfigCpp":
+    def get_bindings_model_config(self,
+                                  tokens_per_block: Optional[int] = None
+                                  ) -> "ModelConfigCpp":
         """
         This method is used to construct the bindings config for the model.
         Currently it adheres to gptJsonConfig.cpp::createModelConfig, which assumes
         that an engine has been created.
+
+        Args:
+            tokens_per_block: The number of tokens per block. Please note that in PyTorch flow tokens_per_block is not available in the model config, instead it is defined in the executor config.
+
+        Returns:
+            The bindings model config.
         """
         # TODO smor- this isn't robust, and currently tested for LlamaConfig only
         # TODO smor- currently assuming no rnn layers, no MOE
@@ -282,17 +297,73 @@ class ModelConfig(Generic[TConfig]):
 
         num_heads = self.pretrained_config.num_attention_heads // (
             self.mapping.tp_size * self.mapping.cp_size)
+
+        # Handle both uniform and per-layer KV heads
+        num_kv_heads_per_layer = getattr(self.pretrained_config,
+                                         'num_kv_heads_per_layer', None)
+        if num_kv_heads_per_layer is not None:
+            # For models with per-layer KV heads, like nemotron-nas
+            kv_heads_per_layer_raw = num_kv_heads_per_layer
+            use_per_layer_kv_heads = True
+        else:
+            # Check if num_key_value_heads is a list (per-layer) or scalar (uniform)
+            num_kv_heads_raw = getattr(self.pretrained_config,
+                                       'num_key_value_heads', None)
+
+            if num_kv_heads_raw is not None and isinstance(
+                    num_kv_heads_raw, list):
+                # num_key_value_heads is a list - treat as per-layer KV heads
+                kv_heads_per_layer_raw = num_kv_heads_raw
+                use_per_layer_kv_heads = True
+            else:
+                # num_key_value_heads is scalar or None - treat as uniform KV heads
+                if num_kv_heads_raw is None:
+                    # For uniform models, check: num_key_value_heads (standard) -> num_query_groups (NeMo) -> num_attention_heads
+                    num_kv_heads_raw = getattr(
+                        self.pretrained_config, 'num_query_groups',
+                        self.pretrained_config.num_attention_heads)
+
+                num_kv_heads = num_kv_heads_raw // (self.mapping.tp_size *
+                                                    self.mapping.cp_size)
+                use_per_layer_kv_heads = False
+
+        if use_per_layer_kv_heads:
+            # TRT-LLM LoRA requires uniform KV heads across layers
+            if self.lora_config is not None and len(
+                    set(kv_heads_per_layer_raw)) > 1:
+                raise ValueError(
+                    f"TRT-LLM LoRA requires uniform KV heads across layers, "
+                    f"got: {kv_heads_per_layer_raw}")
+            # Apply TP/CP scaling to each layer
+            num_kv_heads_per_layer = [
+                kv_heads // (self.mapping.tp_size * self.mapping.cp_size)
+                for kv_heads in kv_heads_per_layer_raw
+            ]
+
         hidden_size = self.pretrained_config.hidden_size // self.mapping.tp_size
 
         model_config_cpp = ModelConfigCpp(
             vocab_size=self.pretrained_config.vocab_size,
             num_layers=self.pretrained_config.num_hidden_layers,
-            num_attention_layers=self.pretrained_config.num_hidden_layers,
+            num_attention_layers=self.get_num_attention_layers(),
             num_rnn_layers=0,
             num_heads=num_heads,
             hidden_size=hidden_size,
             data_type=torch_dtype_to_binding(
                 self.pretrained_config.torch_dtype))
+
+        # For kv cache size calculation: set tokens_per_block
+        if tokens_per_block is None:
+            logger.warning(
+                f"tokens_per_block is not set, using default value {model_config_cpp.tokens_per_block}"
+            )
+        else:
+            model_config_cpp.tokens_per_block = tokens_per_block
+
+        if use_per_layer_kv_heads:
+            model_config_cpp.num_kv_heads_per_layer = num_kv_heads_per_layer
+        else:
+            model_config_cpp.set_num_kv_heads(num_kv_heads)
 
         mlp_hidden_size = None
         if self.pretrained_config.intermediate_size is not None:
@@ -315,13 +386,25 @@ class ModelConfig(Generic[TConfig]):
                 f"Failed to infer mlp hidden size for model: {self.pretrained_config.model_type}"
             )
 
-        if "head_size" in self.pretrained_config:
-            head_size = self.pretrained_config.head_size
+        # For kv cache size calculation: set size_per_head
+        head_dim_names = ["head_size", "head_dim"]
+        for head_dim_name in head_dim_names:
+            if head_dim_name in self.pretrained_config:
+                head_size = getattr(self.pretrained_config, head_dim_name)
+                break
         else:
+            logger.warning(
+                f"head_size/head_dim is not set, using default value {hidden_size // num_heads}"
+            )
             head_size = hidden_size // num_heads
 
         model_config_cpp.mlp_hidden_size = mlp_hidden_size
         model_config_cpp.size_per_head = head_size
+
+        # NOTE: this method is not robust, for Gemma3ForCausalLM only
+        layer_types = self.get_layer_types()
+        if layer_types is not None:
+            model_config_cpp.layer_types = layer_types
 
         return model_config_cpp
 
@@ -330,8 +413,10 @@ class ModelConfig(Generic[TConfig]):
         # Nemotron-NAS has variable ffn_mult for each layer, we need to find the maximum
         # so that we don't set a too small mlp_hidden_size. This solution leads to a memory
         # consumption that is higher than required.
-        biggest_ffn_mult = max(
-            [x.ffn.ffn_mult for x in self.pretrained_config.block_configs])
+        biggest_ffn_mult = max([
+            (x.ffn.ffn_mult if x.ffn.ffn_mult is not None else 0)
+            for x in self.pretrained_config.block_configs
+        ])
 
         from tensorrt_llm._torch.models.modeling_nemotron_nas import \
             _ffn_mult_to_intermediate_size
@@ -339,3 +424,24 @@ class ModelConfig(Generic[TConfig]):
             biggest_ffn_mult, self.pretrained_config.hidden_size)
 
         return mlp_hidden_size
+
+    def get_layer_types(self) -> Optional[List[LayerTypeCpp]]:
+        """
+        This method is a hack to support the effort to switch to KvCacheManagerCpp.
+        Currently, it is only tested for Gemma3ForCausalLM. For other models, it will return None.
+        """
+        if self.pretrained_config.architectures[0] in ["Gemma3ForCausalLM"]:
+            logger.debug(
+                f"Setting layer types for {self.pretrained_config.architectures}"
+            )
+            return [
+                LayerTypeCpp.ATTENTION,
+            ] * self.pretrained_config.num_hidden_layers
+        else:
+            return None
+
+    def get_num_attention_layers(self):
+        if is_nemotron_hybrid(self.pretrained_config):
+            return self.pretrained_config.hybrid_override_pattern.count("*")
+        else:
+            return self.pretrained_config.num_hidden_layers

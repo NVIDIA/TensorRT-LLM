@@ -25,6 +25,8 @@ TensorRT-LLM optimizes the performance of a range of well-known models on NVIDIA
 | `Qwen2ForRewardModel` | Qwen2-based | `Qwen/Qwen2.5-Math-RM-72B` | L |
 | `Qwen2VLForConditionalGeneration` | Qwen2-VL | `Qwen/Qwen2-VL-7B-Instruct` | L + V |
 | `Qwen2_5_VLForConditionalGeneration` | Qwen2.5-VL | `Qwen/Qwen2.5-VL-7B-Instruct` | L + V |
+| `Qwen3ForCausalLM` | Qwen3 | `Qwen/Qwen3-8B` | L |
+| `Qwen3MoeForCausalLM` | Qwen3MoE | `Qwen/Qwen3-30B-A3B` | L |
 
 Note:
 - L: Language only
@@ -72,7 +74,7 @@ Note:
 - [mT5](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/enc_dec)
 - [OPT](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/contrib/opt)
 - [Phi-1.5/Phi-2/Phi-3](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/phi)
-- [Qwen/Qwen1.5/Qwen2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/qwen)
+- [Qwen/Qwen1.5/Qwen2/Qwen3](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/qwen)
 - [Qwen-VL](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/qwenvl)
 - [RecurrentGemma](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/recurrentgemma)
 - [Replit Code](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/contrib/mpt) [^replitcode]
@@ -123,6 +125,7 @@ In addition, older architectures can have limitations for newer software release
   - TensorRT-LLM requires Linux x86_64 or Linux aarch64.
 * - GPU Model Architectures
   -
+    - [NVIDIA GB200 NVL72](https://www.nvidia.com/en-us/data-center/gb200-nvl72/)
     - [NVIDIA Blackwell Architecture](https://www.nvidia.com/en-us/data-center/technologies/blackwell-architecture/)
     - [NVIDIA Grace Hopper Superchip](https://www.nvidia.com/en-us/data-center/grace-hopper-superchip/)
     - [NVIDIA Hopper Architecture](https://www.nvidia.com/en-us/data-center/technologies/hopper-architecture/)

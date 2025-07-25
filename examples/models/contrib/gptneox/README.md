@@ -27,7 +27,7 @@ The TensorRT-LLM GPT-NeoX implementation can be found in [`tensorrt_llm/models/g
 In addition, there are two shared files in the parent folder [`examples`](../../../) for inference and evaluation:
 
 * [`../../../run.py`](../../../run.py) to run the inference on an input text;
-* [`../../../summarize.py`](../../../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
+* [`../../../summarize.py`](../../../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset.
 
 ## Support Matrix
   * FP16
@@ -118,7 +118,7 @@ trtllm-build --checkpoint_dir ./gptneox/20B/trt_ckpt/int8_wo/2-gpu/ \
 ### 4. Summarization using the GPT-NeoX model
 
 The following section describes how to run a TensorRT-LLM GPT-NeoX model to summarize the articles from the
-[cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset. For each summary, the script can compute the
+[cnn_dailymail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset. For each summary, the script can compute the
 [ROUGE](https://en.wikipedia.org/wiki/ROUGE_(metric)) scores and use the `ROUGE-1` score to validate the implementation.
 The script can also perform the same summarization using the HF GPT-NeoX model.
 

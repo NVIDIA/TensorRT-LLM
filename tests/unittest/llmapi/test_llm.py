@@ -3,6 +3,7 @@ import datetime
 import gc
 import json
 import os
+import sys
 
 # Required for test_generate_with_seed to pass.
 # See the discussion in https://github.com/NVIDIA/TensorRT-LLM/pull/4264#issuecomment-2943269891
@@ -23,7 +24,6 @@ import datasets
 import pytest
 import torch
 import transformers
-from utils.util import skip_single_gpu
 
 from tensorrt_llm import LLM as LLM_torch
 from tensorrt_llm._tensorrt_engine import LLM
@@ -47,8 +47,11 @@ from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
                                           LogitsProcessor, SamplingParams)
 
 # isort: off
+sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
+from gc_utils import assert_resource_freed
+from llmapi.lora_test_utils import check_llama_7b_multi_unique_lora_adapters_from_request
 from utils.llm_data import llm_models_root
-from utils.util import force_ampere, similar, skip_gpu_memory_less_than_40gb, skip_pre_hopper
+from utils.util import force_ampere, similar, skip_gpu_memory_less_than_40gb, skip_pre_hopper, skip_single_gpu
 # isort: on
 
 # The unittests are based on the tiny-llama, which is fast to build and run.
@@ -120,17 +123,13 @@ def llm_test_harness(model_dir: str,
     if tokenizer is None:
         tokenizer = model_dir
 
-    if backend == "pytorch":
-        llm = LLM_torch(model_dir, tokenizer=tokenizer, **llm_kwargs)
-    else:
-        llm = LLM(model_dir, tokenizer=tokenizer, **llm_kwargs)
-    outputs = llm.generate(inputs, sampling_params=sampling_params)
-    print(outputs)
-    check_output(outputs, references, similar_threshold=similar_threshold)
+    llm_cls = LLM_torch if backend == "pytorch" else LLM
 
-    assert gc.is_tracked(llm)
-    assert len(
-        gc.get_referrers(llm)) == 0, f"the references: {gc.get_referrers(llm)}"
+    with assert_resource_freed(llm_cls, model_dir, tokenizer,
+                               **llm_kwargs) as llm:
+        outputs = llm.generate(inputs, sampling_params=sampling_params)
+        print(outputs)
+        check_output(outputs, references, similar_threshold=similar_threshold)
 
 
 def llm_check_output(llm: LLM,
@@ -237,7 +236,6 @@ def test_llm_loading_from_hf():
                      kv_cache_config=global_kvcache_config)
 
 
-@pytest.mark.skip(reason="https://nvbugs/5266240")
 @force_ampere
 @pytest.mark.part0
 def test_llm_loading_from_ckpt():
@@ -258,8 +256,7 @@ def test_llm_loading_from_ckpt():
 
 @pytest.mark.parametrize('model_format', [
     'hf',
-    pytest.param('ckpt',
-                 marks=pytest.mark.skip(reason="https://nvbugs/5266240"))
+    'ckpt',
 ])
 @pytest.mark.part0
 def test_llm_with_dummy_weights(model_format):
@@ -270,7 +267,9 @@ def test_llm_with_dummy_weights(model_format):
         hf_config = transformers.AutoConfig.from_pretrained(llama_model_path)
         hf_config.save_pretrained(dummy_dir.name)
     else:
-        config = AutoConfig.from_hugging_face(llama_model_path, dtype='float16')
+        config = AutoConfig.from_hugging_face(llama_model_path,
+                                              dtype='float16',
+                                              trust_remote_code=True)
         config.to_json_file(os.path.join(dummy_dir.name, 'config.json'))
     tokenizer = transformers.AutoTokenizer.from_pretrained(llama_model_path)
     tokenizer.save_pretrained(dummy_dir.name)
@@ -365,21 +364,31 @@ def test_llm_with_kv_cache_retention_config():
         print(output)
 
 
+@pytest.mark.parametrize('backend', ["HF", "TRTLLM"])
 @pytest.mark.parametrize(
-    'tokenizer_dir, threshold',
+    'tokenizer_dir, clean_up_tokenization_spaces, threshold',
     [
-        (get_model_path('gpt2'), 0.95),  # BPE
-        (get_model_path('bert/bert-base-uncased'), 0.95),  # WordPiece
-        (get_model_path('t5-small'), 0.95),  # SentencePiece
-        (get_model_path('starcoder2-3b'), 0.95),
-        (get_model_path('falcon-7b-instruct'), 0.95),
-        (get_model_path('llama-models-v2/llama-v2-7b-hf'), 0.95),
-        (get_model_path('codellama/CodeLlama-7b-Instruct-hf'), 0.95),
-        (llama_model_path, 0.95),
-        (get_model_path(mixtral_model_name), 0.95)
+        (get_model_path('gpt2'), False, 0.95),  # BPE
+        (get_model_path('bert/bert-base-uncased'), True, 0.95),  # WordPiece
+        (get_model_path('t5-small'), True, 0.95),  # SentencePiece
+        (get_model_path('starcoder2-3b'), False, 0.95),
+        (get_model_path('falcon-7b-instruct'), False, 0.95),
+        (get_model_path('llama-models-v2/llama-v2-7b-hf'), False, 0.95),
+        (get_model_path('codellama/CodeLlama-7b-Instruct-hf'), False, 0.95),
+        (llama_model_path, False, 0.95),
+        (get_model_path(mixtral_model_name), False, 0.95),
+        (get_model_path('llama-3.1-model/Meta-Llama-3.1-8B'), False, 0.95),
+        (get_model_path('DeepSeek-R1/DeepSeek-R1'), False, 0.95)
     ])
 @pytest.mark.part0
-def test_tokenizer_decode_incrementally(tokenizer_dir: str, threshold: float):
+def test_tokenizer_decode_incrementally(tokenizer_dir: str,
+                                        clean_up_tokenization_spaces: bool,
+                                        threshold: float, backend: str, mocker):
+    import tensorrt_llm.llmapi.tokenizer
+    mocker.patch.object(tensorrt_llm.llmapi.tokenizer,
+                        "TLLM_INCREMENTAL_DETOKENIZATION_BACKEND", backend)
+    assert tensorrt_llm.llmapi.tokenizer.TLLM_INCREMENTAL_DETOKENIZATION_BACKEND == backend
+
     random.seed(42)
 
     num_samples = 100
@@ -411,8 +420,7 @@ def test_tokenizer_decode_incrementally(tokenizer_dir: str, threshold: float):
             decoded_text, states = tokenizer.decode_incrementally(
                 [token_ids[i]], decoded_text, states)
 
-        if tokenizer_dir.endswith(
-                'bert-base-uncased') and tokenizer.clean_up_tokenization_spaces:
+        if clean_up_tokenization_spaces and tokenizer.clean_up_tokenization_spaces:
             decoded_text = tokenizer.clean_up_tokenization(decoded_text)
         reference = tokenizer.decode(token_ids)
         if decoded_text == reference:
@@ -535,6 +543,40 @@ def _test_llm_generate_async(model_name=default_model_name,
     test_non_streaming_usage_wait()
 
 
+@pytest.mark.parametrize("chunked", [True, False])
+@pytest.mark.part0
+def test_llm_generate_async_with_stream_interval(chunked):
+    model_path = get_model_path('llama-models-v2/llama-v2-7b-hf')
+    max_num_tokens = 256
+    with LLM_torch(model_path,
+                   max_num_tokens=max_num_tokens,
+                   stream_interval=4,
+                   enable_chunked_prefill=chunked) as llm:
+        sampling_params = SamplingParams(max_tokens=13,
+                                         ignore_eos=True,
+                                         detokenize=False)
+        step = 0
+        last_step_len = 0
+        prompt = "The capital of France is "
+        if chunked:
+            prompt = prompt * max_num_tokens
+        for output in llm.generate_async(prompt,
+                                         sampling_params=sampling_params,
+                                         streaming=True):
+            current_step_len = len(output.outputs[0].token_ids)
+            # The output lens of each step need to be [1, 3, 4, 4, 1]
+            if step == 0:
+                assert current_step_len == 1
+            elif step == 1:
+                assert current_step_len - last_step_len == 3
+            elif step == 2 or step == 3:
+                assert current_step_len - last_step_len == 4
+            else:
+                assert current_step_len - last_step_len == 1
+            step += 1
+            last_step_len = current_step_len
+
+
 @pytest.fixture(scope="module")
 def llm_for_sampling_params():
     build_config = BuildConfig(max_beam_width=3)
@@ -625,8 +667,8 @@ def test_generate_with_seed(llm_for_sampling_params: LLM):
         SamplingParams(temperature=100, top_k=100, max_tokens=100)
         for _ in range(10)
     ]
-    # Fix the seed for the first 5 prompts
-    for i in range(5):
+    # Fix the seed for the second 5 prompts
+    for i in range(5, 10):
         sampling_params[i].seed = 515
 
     llm = llm_for_sampling_params
@@ -826,6 +868,7 @@ def test_generate_with_bad_words():
                                                     bad=["F E", "I J"]))
 
 
+@pytest.mark.skip(reason="https://nvbugs/5370718")
 @force_ampere
 @pytest.mark.part0
 def test_generate_with_sampling_params_misc():
@@ -1084,7 +1127,7 @@ def test_llm_api_medusa():
 
     speculative_config = MedusaDecodingConfig(num_medusa_heads=4,
             max_draft_len=63,
-            speculative_model=get_model_path("medusa-vicuna-7b-v1.3"),
+            speculative_model_dir=get_model_path("medusa-vicuna-7b-v1.3"),
             medusa_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
                                             [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], \
                                             [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], \
@@ -1123,7 +1166,7 @@ def test_llm_api_medusa_tp2():
 
     speculative_config = MedusaDecodingConfig(num_medusa_heads=4,
             max_draft_len=63,
-              speculative_model=get_model_path("medusa-vicuna-7b-v1.3"),
+              speculative_model_dir=get_model_path("medusa-vicuna-7b-v1.3"),
                             medusa_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
                                             [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], \
                                             [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], \
@@ -1161,7 +1204,7 @@ def test_llm_api_eagle(**llm_kwargs):
 
     speculative_config = EagleDecodingConfig(
         max_draft_len=63,
-        speculative_model=get_model_path("EAGLE-Vicuna-7B-v1.3"),
+        speculative_model_dir=get_model_path("EAGLE-Vicuna-7B-v1.3"),
         num_eagle_layers=4,
         max_non_leaves_per_layer=10,
                             eagle_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
@@ -1208,7 +1251,7 @@ def test_llm_api_eagle2(**llm_kwargs):
 
     speculative_config = EagleDecodingConfig(
         max_draft_len=63,
-        speculative_model=get_model_path("EAGLE-Vicuna-7B-v1.3"),
+        speculative_model_dir=get_model_path("EAGLE-Vicuna-7B-v1.3"),
         num_eagle_layers=4,
         max_non_leaves_per_layer=10,
         use_dynamic_tree=True,
@@ -1287,7 +1330,7 @@ def test_executor_lookahead_decoding_config():
     assert sampling_params.lookahead_config.max_verification_set_size == 8
 
 
-def llama_v2_13b_lora_test_harness(**llm_kwargs):
+def llama_v2_13b_lora_from_dir_test_harness(**llm_kwargs):
     # Shahar- perhaps disable build config
     hf_model_dir = get_model_path("llama-models-v2/llama-v2-13b-hf")
     hf_lora_dir = get_model_path("llama-models-v2/chinese-llama-2-lora-13b")
@@ -1319,67 +1362,46 @@ def llama_v2_13b_lora_test_harness(**llm_kwargs):
         assert similar(output.outputs[0].text, ref)
 
 
-def llama_7b_multi_lora_test_harness(**llm_kwargs):
-    hf_model_dir = get_model_path("llama-models/llama-7b-hf")
-    hf_lora_dir1 = get_model_path("llama-models/luotuo-lora-7b-0.1")
-    hf_lora_dir2 = get_model_path("llama-models/Japanese-Alpaca-LoRA-7b-v0")
-
+@pytest.mark.parametrize(
+    "lora_adapter_count_per_call, max_loras, max_cpu_loras, repeat_calls, repeats_per_call",
+    [
+        # Test eviction and re-loading a previously evicted adapter from the LoRA GPU cache, within a single
+        # llm.generate call, that's repeated twice.
+        ([
+            2,
+        ], 1, 2, 2, 3),
+        # Test eviction and loading of new adapters in the evicted space, over several llm.generate calls, with LoRA GPU
+        # cache size < LoRA CPU cache size
+        ([2, 2, 2], 1, 3, 1, 1),
+    ])
+@skip_gpu_memory_less_than_40gb
+def test_llama_7b_multi_lora_evict_load_new_adapters(
+        lora_adapter_count_per_call: list[int], max_loras: int,
+        max_cpu_loras: int, repeat_calls: int, repeats_per_call: int):
     # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
     # (1) specify lora_target_modules, or
     # (2) provide a lora_dir to infer the lora_target_modules.
     build_config = BuildConfig(lora_config=LoraConfig(
-        lora_target_modules=['attn_q', 'attn_k', 'attn_v']))
-    llm = LLM(hf_model_dir,
-              enable_lora=True,
-              max_lora_rank=8,
-              build_config=build_config,
-              fast_build=True,
-              **llm_kwargs)
-
-    prompts = [
-        "美国的首都在哪里? \n答案:",
-        "美国的首都在哪里? \n答案:",
-        "美国的首都在哪里? \n答案:",
-        "アメリカ合衆国の首都はどこですか? \n答え:",
-        "アメリカ合衆国の首都はどこですか? \n答え:",
-        "アメリカ合衆国の首都はどこですか? \n答え:",
-    ]
-    references = [
-        "沃尔玛\n\n## 新闻\n\n* ",
-        "美国的首都是华盛顿。\n\n美国的",
-        "纽约\n\n### カンファレンスの",
-        "Washington, D.C.\nWashington, D.C. is the capital of the United",
-        "华盛顿。\n\n英国の首都是什",
-        "ワシントン\nQ1. アメリカ合衆国",
-    ]
-    key_words = [
-        "沃尔玛",
-        "华盛顿",
-        "纽约",
-        "Washington",
-        "华盛顿",
-        "ワシントン",
-    ]
-    lora_req1 = LoRARequest("luotuo", 1, hf_lora_dir1)
-    lora_req2 = LoRARequest("Japanese", 2, hf_lora_dir2)
-    sampling_params = SamplingParams(max_tokens=20)
-    outputs = llm.generate(
-        prompts,
-        sampling_params,
-        lora_request=[None, lora_req1, lora_req2, None, lora_req1, lora_req2])
-    for output, ref, key_word in zip(outputs, references, key_words):
-        assert similar(output.outputs[0].text,
-                       ref) or key_word in output.outputs[0].txt
+        lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
+        max_lora_rank=8,
+        max_loras=max_loras,
+        max_cpu_loras=max_cpu_loras))
+    check_llama_7b_multi_unique_lora_adapters_from_request(
+        lora_adapter_count_per_call,
+        repeat_calls,
+        repeats_per_call,
+        LLM,
+        enable_lora=True,
+        build_config=build_config,
+        fast_build=True,
+        max_lora_rank=8,
+        max_loras=max_loras,
+        max_cpu_loras=max_cpu_loras)
 
 
 @skip_gpu_memory_less_than_40gb
 def test_llama_v2_13b_lora():
-    llama_v2_13b_lora_test_harness()
-
-
-@skip_gpu_memory_less_than_40gb
-def test_llama_7b_multi_lora():
-    llama_7b_multi_lora_test_harness(max_loras=1, max_cpu_loras=8)
+    llama_v2_13b_lora_from_dir_test_harness()
 
 
 def llama_v2_7b_prompt_adapter_test_harness(**llm_kwargs):
@@ -1400,12 +1422,19 @@ def llama_v2_7b_prompt_adapter_test_harness(**llm_kwargs):
         "Tweet text: I have no problems Label: ",
     ]
     references = [
-        "painter at the École des Beaux-Arts in Paris. He was a member of the",
-        "chef and has worked in the restaurant industry for 15 years.Ћ\nBorn in north",
-        "1999.\nTweet text: I have complaints! Label: 19",
-        "no complaint",
-        "100%\nI have no problems Label: 100%\nI have no",
-        "no complaint",
+        [
+            "painter at the École des Beaux-Arts in Paris. He was a member of the"
+        ],
+        [
+            "chef and has worked in the restaurant industry for 15 years.Ћ\nBorn in north"
+        ],
+        ["1999.\nTweet text: I have complaints! Label: 19"],
+        ["no complaint"],
+        [
+            "100%\nI have no problems Label: 100%\nI have no",
+            "1999\nLabel: 1999 (1999)\nT"
+        ],
+        ["no complaint"],
     ]
     pa_req = PromptAdapterRequest('tweet', 1, hf_prompt_adapter_dir)
     sampling_params = SamplingParams(max_tokens=20)
@@ -1414,7 +1443,9 @@ def llama_v2_7b_prompt_adapter_test_harness(**llm_kwargs):
         sampling_params,
         prompt_adapter_request=[None, pa_req, None, pa_req, None, pa_req])
     for output, ref in zip(outputs, references):
-        assert similar(output.outputs[0].text, ref)
+        # Currently, the 5th request may have non-deterministic outputs.
+        # Let the test pass if the generation output matches any of the candidate references.
+        assert any(similar(output.outputs[0].text, r) for r in ref)
 
 
 @skip_gpu_memory_less_than_40gb
@@ -2078,6 +2109,20 @@ def test_llm_capture_request_error():
     _test_llm_capture_request_error(tp_size=1)
 
 
+def test_llm_shutdown_executor():
+    llm = LLM(
+        model=llama_model_path,
+        kv_cache_config=global_kvcache_config,
+        fast_build=True,
+    )
+
+    llm.generate("A")
+    llm.shutdown()
+
+    with pytest.raises(RuntimeError):
+        llm.generate("A")
+
+
 def test_llm_api_jupyter_scenario():
 
     with LLM(
@@ -2128,16 +2173,18 @@ def test_llm_with_postprocess_parallel():
 def run_llm_with_postprocess_parallel_and_result_handler(
         streaming, backend, tp_size: int = 1):
     # avoid import error when running in CI
-    from tensorrt_llm.executor.postproc_worker import (PostprocArgs,
-                                                       PostprocParams)
+    from tensorrt_llm.executor.postproc_worker import PostprocParams
+    from tensorrt_llm.serve.postprocess_handlers import (
+        ChatPostprocArgs, chat_stream_post_processor)
 
-    from .run_llm_with_postproc import perform_faked_oai_postprocess
+    from .run_llm_with_postproc import get_concatenated_content
 
     sampling_params = SamplingParams(max_tokens=6)
-    post_proc_args = PostprocArgs(tokenizer=llama_model_path)
-    post_proc_params = PostprocParams(
-        post_processor=perform_faked_oai_postprocess,
-        postproc_args=post_proc_args)
+    post_proc_args = ChatPostprocArgs(tokenizer=llama_model_path,
+                                      role="assistant",
+                                      model=llama_model_path)
+    post_proc_params = PostprocParams(post_processor=chat_stream_post_processor,
+                                      postproc_args=post_proc_args)
     kwargs = {}
     if backend not in ["pytorch", "autodeploy"]:
         kwargs["fast_build"] = True
@@ -2152,17 +2199,16 @@ def run_llm_with_postprocess_parallel_and_result_handler(
                     num_postprocess_workers=2,
                     postprocess_tokenizer_dir=llama_model_path,
                     **kwargs)
-    golden_result = "DEFGHI"
-    for i, output in enumerate(
-            llm.generate_async(prompts[0],
-                               sampling_params=sampling_params,
-                               _postproc_params=post_proc_params,
-                               streaming=streaming)):
-        if i < len(golden_result) - 1:
-            assert golden_result[i] in output.outputs[0]._postprocess_result[-1]
-        else:
-            assert golden_result[i] in output.outputs[0]._postprocess_result[
-                -2]  # EOS
+    golden_result = "D E F G H I"
+    outputs = []
+    for output in llm.generate_async(prompts[0],
+                                     sampling_params=sampling_params,
+                                     _postproc_params=post_proc_params,
+                                     streaming=streaming):
+        outputs.append(output.outputs[0]._postprocess_result)
+    actual_result = get_concatenated_content(outputs)
+    assert actual_result == golden_result, \
+        f"Expected: {golden_result}, Actual: {actual_result}"
 
 
 @pytest.mark.parametrize("streaming", [True, False])

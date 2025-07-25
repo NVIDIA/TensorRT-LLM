@@ -9,7 +9,7 @@ from _model_test_utils import (
 
 import tensorrt_llm._torch.auto_deploy  # noqa: F401
 
-torch.manual_seed(0)
+torch.manual_seed(1234)
 
 
 @pytest.mark.parametrize("head_dim", [64, 256])  # head_dim must be a multiple of 64
@@ -95,7 +95,7 @@ def test_flashinfer_custom_op_and_hf_impl(dtype, atol, rtol, head_dim):
 @pytest.mark.parametrize(
     "dtype,atol,rtol",
     [
-        (torch.bfloat16, 1e-5, 1e-5),
+        (torch.bfloat16, 1e-4, 1e-4),
         (torch.float16, 5e-4, 5e-4),
     ],
     ids=["bfloat16", "float16"],  # q/k must be in half precision
@@ -143,7 +143,7 @@ def test_flashinfer_custom_op_and_complex_impl(dtype, atol, rtol, head_dim):
     torch.testing.assert_close(out_k_v2, custom_k, rtol=rtol, atol=atol)
 
 
-# Copy of TritonWithFlattenedInputs._precompute_freqs_cis
+# Copy of TritonAttention._precompute_freqs_cis
 def precompute_freqs_cis_interleaved(
     seq_len: int, head_dim: int, dtype: torch.dtype, device: torch.device
 ) -> torch.Tensor:

@@ -96,7 +96,7 @@ class TRTLLMEvalBase(TemplateLM):
                 tp = torch.cuda.device_count()
 
             pytorch_config_params = {
-                "use_cuda_graph": use_cuda_graph,
+                'cuda_graph_config': {} if use_cuda_graph else None,
                 "print_iter_log": False,
             }
             if hasattr(PyTorchConfig, "moe_backend"):

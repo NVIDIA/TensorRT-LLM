@@ -39,7 +39,7 @@ git clone https://huggingface.co/naver-hyperclovax/$MODEL_NAME hf_models/$MODEL_
 ```
 
 ### HyperCLOVAX-SEED-Vision
-Download the HuggingFace checkpoints of the HyperCLOVAX-SEED-Vision model. We support the HyperCLOVAX-SEED-Vision model in [PyTorch flow](../../../pytorch).
+Download the HuggingFace checkpoints of the HyperCLOVAX-SEED-Vision model. We support the HyperCLOVAX-SEED-Vision model in [PyTorch flow](../../../llm-api).
 
 ```bash
 export MODEL_NAME=HyperCLOVAX-SEED-Vision-Instruct-3B
@@ -49,12 +49,12 @@ git clone https://huggingface.co/naver-hyperclovax/$MODEL_NAME hf_models/$MODEL_
 ## PyTorch flow
 
 ### LLM
-To quickly run HyperCLOVAX-SEED-Text, you can use [examples/pytorch/quickstart_advanced.py](../../../pytorch/quickstart_advanced.py):
+To quickly run HyperCLOVAX-SEED-Text, you can use [examples/llm-api/quickstart_advanced.py](../../../llm-api/quickstart_advanced.py):
 
 ```bash
 pip install -r requirements.txt
 
-python ../../../pytorch/quickstart_advanced.py --model_dir hf_models/$MODEL_NAME
+python ../../../llm-api/quickstart_advanced.py --model_dir hf_models/$MODEL_NAME
 ```
 
 The output will be like:
@@ -66,12 +66,12 @@ The output will be like:
 ```
 
 ### Multimodal
-To quickly run HyperCLOVAX-SEED-Vision, you can use [examples/pytorch/quickstart_multimodal.py](../../../pytorch/quickstart_multimodal.py):
+To quickly run HyperCLOVAX-SEED-Vision, you can use [examples/llm-api/quickstart_multimodal.py](../../../llm-api/quickstart_multimodal.py):
 
 ```bash
 pip install -r requirements.txt
 
-python ../../../pytorch/quickstart_multimodal.py --model_dir hf_models/$MODEL_NAME
+python ../../../llm-api/quickstart_multimodal.py --model_dir hf_models/$MODEL_NAME
 ```
 
 The output will be like:
@@ -81,7 +81,7 @@ The output will be like:
 [2] Prompt: 'Describe the traffic condition on the road in the image.', Generated text: '이미지 속 도로의 교통 상태는 비교적 원활해 보입니다. 여러 차선이 있고, 차선마다 차량들이 일정한 간격을 유지하며 주행하고 있습니다. 도로의 왼쪽 차선에는 여러 대의 차량이 있고, 오른쪽 차선에도 몇 대의 차량이 보입니다. 도로의 중앙에는 파란'
 ```
 
-For more information, you can refer to [examples/pytorch](../../../pytorch).
+For more information, you can refer to [examples/llm-api](../../../llm-api).
 
 ## TRT flow
 The next section describes how to convert the weights from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT-LLM format. We will use llama's [convert_checkpoint.py](../../core/llama/convert_checkpoint.py) for the HyperCLOVAX model and then build the model with `trtllm-build`.

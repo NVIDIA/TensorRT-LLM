@@ -1,7 +1,6 @@
 import math
 import os
 import threading
-from itertools import accumulate
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -89,8 +88,8 @@ def get_allreduce_mnnvl_workspace(
 
         # This is a buffer to maintain the state of this allreduce Op
         # Should have the same lifetime with self._buffer
-        # [Buffer_ptr, Clear_ptr, Buffer_size, atomic access counter]
-        buffer_flags = torch.tensor([0, 2, max_num_elements, 0],
+        # [Buffer_ptr, Clear_ptr, Buffer_size, num_tokens_to_clear,atomic access counter]
+        buffer_flags = torch.tensor([0, 2, max_num_elements, 0, 0],
                                     dtype=torch.uint32,
                                     device=torch.device("cuda",
                                                         mapping.local_rank))
@@ -126,13 +125,14 @@ def filter_valid_input(
     return input_list, valid_list
 
 
-def restore_full_output(output_list: List[torch.Tensor],
+def restore_full_output(valid_outputs: List[torch.Tensor],
                         valid_list: List[bool]) -> List[torch.Tensor]:
-    index_list = list(accumulate(map(int, valid_list)))
-    output_list = list(
-        map(lambda valid, index: output_list[index - 1]
-            if valid else None, valid_list, index_list))
-    return output_list
+    idx = 0
+    full_outputs = []
+    for v in valid_list:
+        full_outputs.append(valid_outputs[idx] if v else None)
+        idx += int(v)
+    return full_outputs
 
 
 def allgather(
@@ -178,12 +178,6 @@ def allgather(
                 val.shape[dim] == sizes[mapping.tp_rank] for val in input
                 if val is not None
             ])
-        # 'sizes' is not needed if all inputs in the same TP group have the same shape
-        for split_size in sizes[1:]:
-            if split_size != sizes[0]:
-                break
-        else:
-            sizes = None
 
     # Inputs are reshaped in this way to pass necessary shape information to the allgather op
     if isinstance(input, torch.Tensor):
@@ -247,12 +241,6 @@ def reducescatter(
                 val.shape[dim] == sum_split_size for val in input
                 if val is not None
             ])
-        # 'sizes' is not needed if all outputs in the same TP group have the same shape
-        for split_size in sizes[1:]:
-            if split_size != sizes[0]:
-                break
-        else:
-            sizes = None
 
     def convert_input(x, x_info):
         # Inputs are reshaped in this way to pass necessary shape information to the reducescatter op
@@ -317,7 +305,7 @@ class MNNVLAllReduce(nn.Module):
 
     @staticmethod
     def get_supported_dtypes():
-        return (torch.bfloat16, torch.float32)
+        return (torch.float16, torch.bfloat16, torch.float32)
 
     def forward(
         self,
@@ -470,6 +458,7 @@ class AllReduce(nn.Module):
                                          == False):
             return input
 
+        allreduce_strategy = self.strategy
         if all_reduce_params is None:
             all_reduce_params = AllReduceParams()
 
@@ -481,6 +470,9 @@ class AllReduce(nn.Module):
                 return mnnvl_output
 
         # Fall back to regular AllReduce if MNNVL is not available or not applicable
+        # Make sure the strategy is AUTO since allreduceOp does not have the branch for MNNVL
+        if allreduce_strategy == AllReduceStrategy.MNNVL:
+            allreduce_strategy = AllReduceStrategy.AUTO
         output = torch.ops.trtllm.allreduce(
             input=input,
             residual=all_reduce_params.residual,
@@ -489,7 +481,7 @@ class AllReduce(nn.Module):
             bias=all_reduce_params.bias,
             workspace=self.workspace,
             group=self.mapping.tp_group,
-            strategy=self.strategy,
+            strategy=allreduce_strategy,
             op=all_reduce_params.fusion_op,
             eps=all_reduce_params.eps,
             trigger_completion_at_end=all_reduce_params.

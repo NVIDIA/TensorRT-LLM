@@ -59,7 +59,7 @@ def load_buffers_and_params(
         if clone:
             v_new = v.detach().clone()
             if isinstance(v, torch.nn.Parameter):
-                v_new = nn.Parameter(v_new)
+                v_new = nn.Parameter(v_new, requires_grad=False)
         else:
             v_new = state_dict[k]
         setattr(submod, name, v_new)
@@ -192,7 +192,7 @@ def _canonicalize_single_gm(
 
 def canonicalize_graph(
     gm: GraphModule, shape_prop: bool = False, args_static: Optional[Tuple[Any, ...]] = None
-) -> GraphModule:
+) -> None:
     """Canonicalize the graph of the given GraphModule.
 
     Args:
@@ -216,8 +216,6 @@ def canonicalize_graph(
         )
 
     ad_logger.debug(f"After canonicalizing: {gm}")
-
-    return gm
 
 
 def add_graph_input(

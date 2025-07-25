@@ -15,17 +15,17 @@ def model_name():
     return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 
-@pytest.fixture(scope="module", params=[None, 'pytorch'])
+@pytest.fixture(scope="module", params=["trt", "pytorch"])
 def backend(request):
     return request.param
 
 
-@pytest.fixture(scope="module", params=['8'])
+@pytest.fixture(scope="module", params=["8"])
 def max_batch_size(request):
     return request.param
 
 
-@pytest.fixture(scope="module", params=['80000'])
+@pytest.fixture(scope="module", params=["80000"])
 def max_seq_len(request):
     return request.param
 
@@ -34,19 +34,13 @@ def max_seq_len(request):
 def server(model_name: str, backend: str, max_batch_size: str,
            max_seq_len: str):
     model_path = get_model_path(model_name)
-    args = []
-    if backend is not None:
-        args.append("--backend")
-        args.append(backend)
+    args = ["--backend", f"{backend}"]
     if backend != "pytorch":
-        args.append("--max_beam_width")
-        args.append("4")
+        args.extend(["--max_beam_width", "4"])
     if max_batch_size is not None:
-        args.append("--max_batch_size")
-        args.append(max_batch_size)
+        args.extend(["--max_batch_size", max_batch_size])
     if max_seq_len is not None:
-        args.append("--max_seq_len")
-        args.append(max_seq_len)
+        args.extend(["--max_seq_len", max_seq_len])
     with RemoteOpenAIServer(model_path, args) as remote_server:
         yield remote_server
 
@@ -86,8 +80,6 @@ async def test_request_cancellation(server: RemoteOpenAIServer,
                                     model_name: str):
     # clunky test: send an ungodly amount of load in with short timeouts
     # then ensure that it still responds quickly afterwards
-    pytest.skip("https://nvbugs/5310314")
-
     chat_input = [{"role": "user", "content": "Write a long story"}]
     client = server.get_async_client(timeout=0.5, max_retries=3)
     tasks = []

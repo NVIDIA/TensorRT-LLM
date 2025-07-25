@@ -27,13 +27,14 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
-#include "tensorrt_llm/executor/cache_transmission/cacheConcatenate.h"
+#include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <cstddef>
 #include <cstdint>
 #include <future>
+#include <numeric>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
@@ -43,8 +44,10 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
     size_t requestBlockNum = llmRequest.getRequestedBlockHashes().size();
     constexpr SizeType32 beam{0};
     auto blockRange = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId, beam);
-    if (common::getEnvDisableSelectiveCacheTransfer())
+    auto poolNum = cacheManager->getBlockManager().getNumPools();
+    if (poolNum > 1 || common::getEnvDisableSelectiveCacheTransfer())
     {
+        // disable selective cache transfer for poolNum > 1
         return blockRange;
     }
     if (requestBlockNum < blockRange.size() && requestBlockNum > 0)
@@ -59,7 +62,9 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
 
 BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest)
 {
-    if (common::getEnvDisableSelectiveCacheTransfer())
+
+    auto poolNum = cacheManager->getBlockManager().getNumPools();
+    if (poolNum > 1 || common::getEnvDisableSelectiveCacheTransfer())
     {
         constexpr SizeType32 beam{0};
         return BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId, beam);
@@ -72,7 +77,7 @@ bool CacheFormatter::needSendCache(
 {
     // int selfTpRank = selfIdx % selfConfig.getParallelConfig().mTensorParallelism;
     auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
-    if (targetInfo.mDuplicateHeadFactor <= 1)
+    if (targetInfo.mDupHeadFactor <= 1)
     {
         return true;
     }
@@ -86,44 +91,71 @@ bool CacheFormatter::needSendCache(
         selfTpRankInDpGroup = selfTpRank % selfTPNumInDPGroup;
     }
 
-    return selfTpRankInDpGroup % targetInfo.mDuplicateHeadFactor == 0;
+    return selfTpRankInDpGroup % targetInfo.mDupHeadFactor == 0;
 }
 
-std::vector<executor::kv_cache::Connection const*> CacheFormatter::pickRecvConnections(
-    std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
-    SizeType32 selfIdx, CacheState const& destConfig) const
+void checkAlternateWindow(BaseKVCacheManager* cacheManager, BaseCacheFormatter::CacheState const& selfConfig,
+    BaseCacheFormatter::CacheState const& destConfig)
+{
+    auto numPools = cacheManager->getBlockManager().getNumPools();
+    auto layerNum = cacheManager->getBlockManager().getNumLayers();
+
+    std::vector<SizeType32> poolIdxs(numPools);
+    TLLM_CHECK(layerNum >= numPools);
+    for (int i = 0; i < numPools; i++)
+    {
+        poolIdxs[i] = cacheManager->getBlockManager().getLayerPoolIdx(i);
+        TLLM_LOG_DEBUG("poolIdxs[%d] = %d layerNum:%d", i, poolIdxs[i], layerNum);
+    }
+
+    std::unordered_set<SizeType32> uniquePoolIdxs(poolIdxs.begin(), poolIdxs.end());
+    TLLM_CHECK_WITH_INFO(uniquePoolIdxs.size() == poolIdxs.size(), "poolIdxs must contain unique elements");
+    for (int i = numPools; i < layerNum; i++)
+    {
+        TLLM_CHECK_WITH_INFO(poolIdxs[i % numPools] == cacheManager->getBlockManager().getLayerPoolIdx(i),
+            "only support Alternate Window");
+    }
+}
+
+std::vector<size_t> CacheFormatter::pickRecvConnections(
+    size_t numConnections, CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig) const
 {
     auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
-    if (targetInfo.mPeerDuplicateHeadFactor <= 1)
+    if (targetInfo.mPeerDupHeadFactor <= 1)
     {
-        return connections;
+        std::vector<size_t> ret(numConnections);
+        std::iota(ret.begin(), ret.end(), 0);
+        return ret;
     }
-    TLLM_CHECK(connections.size() == targetInfo.mIRanks.size());
+    TLLM_CHECK(numConnections == targetInfo.mIRanks.size());
 
-    std::vector<executor::kv_cache::Connection const*> ret;
+    std::vector<size_t> ret;
     for (int i = 0; i < targetInfo.mDomainTPSize; i++)
     {
-        if (i % targetInfo.mPeerDuplicateHeadFactor == 0)
+        if (i % targetInfo.mPeerDupHeadFactor == 0)
         {
             for (int j = 0; j < targetInfo.mDomainPPSize; j++)
             {
-                ret.push_back(connections.at((i * targetInfo.mDomainPPSize) + j));
+                ret.push_back((i * targetInfo.mDomainPPSize) + j);
             }
         }
     }
     return ret;
 }
 
-void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
-    std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
-    SizeType32 selfIdx, CacheState const& destConfig, runtime::BufferManager const& bufferManager)
+void CacheFormatter::format(TransferSession& session)
 {
-    NVTX3_SCOPED_RANGE(formatOutput);
+    NVTX3_SCOPED_RANGE(CacheFormatter_format);
+    auto const& llmRequest = session.getLlmRequest();
     TLLM_LOG_DEBUG(
         mpi::MpiComm::world().getRank(), "Start sending KV cache for request ID: %ld.", llmRequest.mRequestId);
 
     TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently, only beam width 1 is supported.");
-    TLLM_CHECK(!connections.empty());
+    auto const& connections = session.getConnections();
+    auto const& selfConfig = session.getSelfState().getCacheState().value();
+    auto const& destConfig = session.getOtherState().getCacheState().value();
+    auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
+    auto& bufferManager = session.getBufferManager();
     if (!needSendCache(selfConfig, destConfig, selfIdx))
     {
         return;
@@ -159,10 +191,10 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
                     TLLM_LOG_DEBUG("Block %p of pool %d shape = %s", it->data(), poolIdx,
                         runtime::ITensor::toString(it->getShape()).c_str());
                 }
-                for (auto const& connection : connections)
+                for (size_t i = 0; i < connections.size(); i++)
                 {
                     TLLM_LOG_DEBUG("Send layer %d(%d-%d)", layerIdx, poolIdx, layerIdxInPool);
-                    TransferHelper::sendBuffer(*connection, *layer, llmRequest.mRequestId);
+                    session.send(i, layer->data(), layer->getSizeInBytes());
                 }
             }
         }
@@ -170,14 +202,38 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
     else
     {
         int blockNum = 0;
-        std::vector<runtime::ITensor::SharedPtr> inputKvCacheBlocks;
+
+        size_t allCacheBlockSize = 0;
+
+        std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> inputKvCacheBlocks;
         for (auto poolIdx = 0; poolIdx < numPools; poolIdx++)
         {
             blockRange.updatePoolIdx(poolIdx);
+            SizeType32 window = mCacheManager->getBlockManager().getPoolWindowSize(poolIdx);
+            TLLM_CHECK_WITH_INFO(inputKvCacheBlocks.find(window) == inputKvCacheBlocks.end(),
+                "window size already exists, which is not supported");
+            inputKvCacheBlocks.emplace(window, std::vector<runtime::ITensor::SharedPtr>());
+            auto maxBlockThisWindow = window / selfConfig.getModelConfig().mTokensPerBlock;
+            SizeType32 blockNumThisWindow = 0;
             for (auto it = blockRange.begin(); it != blockRange.end(); ++it)
             {
                 blockNum++;
-                inputKvCacheBlocks.push_back(it);
+                inputKvCacheBlocks.at(window).push_back(it);
+                allCacheBlockSize += it->getSize();
+                blockNumThisWindow++;
+                if (blockNumThisWindow >= maxBlockThisWindow)
+                {
+                    break;
+                }
+            }
+        }
+
+        if (inputKvCacheBlocks.size() > 1)
+        {
+            if (selfConfig.getParallelConfig().mPipelineParallelism
+                != destConfig.getParallelConfig().mPipelineParallelism)
+            {
+                checkAlternateWindow(mCacheManager, selfConfig, destConfig);
             }
         }
         TLLM_CHECK(!inputKvCacheBlocks.empty());
@@ -196,11 +252,14 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
             TLLM_CHECK(connections.size() == 1);
 
             TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
-            for (auto const& connection : connections)
+            for (size_t i = 0; i < connections.size(); i++)
             {
-                for (auto const& block : inputKvCacheBlocks)
+                for (auto const& [window, blocks] : inputKvCacheBlocks)
                 {
-                    TransferHelper::sendBuffer(*connection, *block, llmRequest.mRequestId);
+                    for (auto const& block : blocks)
+                    {
+                        session.send(i, block->data(), block->getSizeInBytes());
+                    }
                 }
             }
             TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID: %ld.",
@@ -209,16 +268,13 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
             return;
         }
 
-        auto cacheBlockSize = inputKvCacheBlocks.front()->getSize();
-
         auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend();
-        int peerDuplicateHeadFactor = targetInfo.mPeerDuplicateHeadFactor;
+        int peerDuplicateHeadFactor = targetInfo.mPeerDupHeadFactor;
         auto targetNum = connections.size();
-        TLLM_CHECK((cacheBlockSize * blockNum) % targetNum == 0);
-        auto const targetBufferSize = (cacheBlockSize * blockNum) / targetNum * peerDuplicateHeadFactor;
+        auto const targetBufferSize = allCacheBlockSize / targetNum * peerDuplicateHeadFactor;
         auto bufferTargetNum = targetNum / peerDuplicateHeadFactor;
         TLLM_LOG_DEBUG(" formatOutput bufferTargetNum: %d, targetNum: %d, peerDuplicateHeadFactor: %d dupliacete:%d ",
-            bufferTargetNum, targetNum, peerDuplicateHeadFactor, targetInfo.mDuplicateHeadFactor);
+            bufferTargetNum, targetNum, peerDuplicateHeadFactor, targetInfo.mDupHeadFactor);
 
         auto result = mCacheTransBufferManager->getOrAllocateSendBuffers(
             cacheBufferId, bufferTargetNum, targetBufferSize, bufferManager);
@@ -240,7 +296,7 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
         auto preAllocSendBuffer = mCacheTransBufferManager->getSendBuffer(cacheBufferId);
         if (preAllocSendBuffer != nullptr)
         {
-            TLLM_CHECK(preAllocSendBuffer->getDataType() == inputKvCacheBlocks.front()->getDataType());
+            TLLM_CHECK(preAllocSendBuffer->getDataType() == inputKvCacheBlocks.begin()->second.front()->getDataType());
         }
         auto sendBufferFun = [&](int deviceId, size_t processIdx)
         {
@@ -257,9 +313,8 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
             if (bufferIdx < bufferCoverTargetNum)
             {
 
-                size = (*outputSplitCaches[bufferIdx]).getSizeInBytes();
-                TransferHelper::sendBuffer(
-                    *connections[processIdx], *outputSplitCaches[bufferIdx], llmRequest.mRequestId);
+                size = outputSplitCaches[bufferIdx]->getSizeInBytes();
+                session.send(processIdx, outputSplitCaches[bufferIdx]->data(), size);
             }
             else if (bufferCoverTargetNum > 0)
             {
@@ -267,9 +322,8 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
                 auto sendBufferIdx = bufferIdx % bufferCoverTargetNum;
                 bufferManager.copy(*outputSplitCaches[processIdx], *outputSplitCaches.at(sendBufferIdx));
                 bufferManager.getStream().synchronize();
-                size = (*outputSplitCaches.at(sendBufferIdx)).getSizeInBytes();
-                TransferHelper::sendBuffer(
-                    *connections[processIdx], *outputSplitCaches.at(sendBufferIdx), llmRequest.mRequestId);
+                size = outputSplitCaches.at(sendBufferIdx)->getSizeInBytes();
+                session.send(processIdx, outputSplitCaches.at(sendBufferIdx)->data(), size);
             }
             else
             {
@@ -290,7 +344,7 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
                     auto copyTargetSlice = runtime::ITensor::slice(preAllocSendBuffer, 0, sendSize);
                     bufferManager.copy(*copySlice, *copyTargetSlice);
                     bufferManager.getStream().synchronize();
-                    TransferHelper::sendBuffer(*connections[processIdx], *copyTargetSlice, llmRequest.mRequestId);
+                    session.send(processIdx, copyTargetSlice->data(), sendSize);
                     remainSendSize -= sendSize;
                 }
             }
@@ -350,39 +404,61 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
         mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID:%ld ", llmRequest.mRequestId);
 }
 
-void CacheFormatter::formatInput(LlmRequest const& llmRequest,
-    std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
-    SizeType32 selfIdx, CacheState const& destConfig, runtime::BufferManager const& bufferManager)
+void CacheFormatter::unformat(TransferSession& session)
 {
-    NVTX3_SCOPED_RANGE(formatInput);
+    NVTX3_SCOPED_RANGE(CacheFormatter_unformat);
+    auto const& llmRequest = session.getLlmRequest();
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "Start receiving KV cache for request ID: %ld, context request ID: %ld.", llmRequest.mRequestId,
         llmRequest.getContextPhaseParams().value().getReqId());
-    TLLM_CHECK(!connections.empty());
+    auto const& connections = session.getConnections();
+    auto const& selfConfig = session.getSelfState().getCacheState().value();
+    auto const& destConfig = session.getOtherState().getCacheState().value();
+    auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
+    auto& bufferManager = session.getBufferManager();
     auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest);
 
-    auto pickUpConnections = pickRecvConnections(connections, selfConfig, selfIdx, destConfig);
+    auto pickUpConnections = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig);
 
     TLLM_LOG_DEBUG("pickUpConnections size: %d connections size: %d", pickUpConnections.size(), connections.size());
     std::vector<runtime::ITensor::SharedPtr> recvBufferTmps;
-    std::vector<runtime::ITensor::SharedPtr> outputBuffers;
+    std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> outputBuffersPerWindow;
     auto const numPools = mCacheManager->getBlockManager().getNumPools();
     // TODO(oargov): are we sure the other side has the same number of pools? this might not hold for pp_size>1...
     size_t blockNum = 0;
+    size_t cacheBlockSizeSum = 0;
     for (auto poolIdx = 0; poolIdx < numPools; poolIdx++)
     {
         blockRange.updatePoolIdx(poolIdx);
+        SizeType32 window = mCacheManager->getBlockManager().getPoolWindowSize(poolIdx);
+        TLLM_CHECK_WITH_INFO(outputBuffersPerWindow.find(window) == outputBuffersPerWindow.end(),
+            "window size already exists, which is not supported");
+        outputBuffersPerWindow.emplace(window, std::vector<runtime::ITensor::SharedPtr>());
+        auto maxBlockThisWindow = window / selfConfig.getModelConfig().mTokensPerBlock;
+        SizeType32 blockNumThisWindow = 0;
         for (auto it = blockRange.begin(); it != blockRange.end(); ++it)
         {
             blockNum++;
-            outputBuffers.push_back(it);
+            blockNumThisWindow++;
+            outputBuffersPerWindow.at(window).push_back(it);
+            cacheBlockSizeSum += it->getSize();
+            if (blockNumThisWindow >= maxBlockThisWindow)
+            {
+                break;
+            }
         }
     }
-    TLLM_CHECK(!outputBuffers.empty());
+    TLLM_CHECK(!outputBuffersPerWindow.empty());
+    if (outputBuffersPerWindow.size() > 1)
+    {
+        if (selfConfig.getParallelConfig().mPipelineParallelism != destConfig.getParallelConfig().mPipelineParallelism)
+        {
+            checkAlternateWindow(mCacheManager, selfConfig, destConfig);
+        }
+    }
     {
         NVTX3_SCOPED_RANGE(formatInputRecvBuffer);
 
-        auto reqId = llmRequest.getContextPhaseParams().value().getReqId();
         auto dataType = mCacheManager->getPrimaryPool(0)->getDataType();
         bool layerWise = common::getEnvDisaggLayerwise() && numPools == 1;
         if (layerWise)
@@ -423,23 +499,24 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
                         TLLM_LOG_DEBUG("Buffer %d of pool %d shape = %s", idx, poolIdx,
                             runtime::ITensor::toString(recvBufferTmps[idx]->getShape()).c_str());
                     }
-                    for (auto const& connection : pickUpConnections)
+                    for (size_t i = 0; i < pickUpConnections.size(); i++)
                     {
                         TLLM_LOG_DEBUG("Receive layer %d(%d-%d)", layerIdx, poolIdx, layerIdxInPool);
                         // Buffer dim: [numLayersInPool * layerVolume]
                         auto layer
                             = runtime::ITensor::slice(recvBufferTmps[idx], layerIdxInPool * layerVolume, layerVolume);
                         llmRequest.updateKvCacheSize((*layer).getSizeInBytes());
-                        TransferHelper::recvBuffer(*connection, *layer, reqId);
+                        session.recv(pickUpConnections[i], layer->data(), layer->getSizeInBytes());
                         idx++;
                     }
                 }
             }
             {
                 NVTX3_SCOPED_RANGE(formatInputConcatenate);
-                executor::kv_cache::concatenateKVCacheDispatch(recvBufferTmps.data(), recvBufferTmps.size(),
-                    getCounterparts(selfConfig, selfIdx, destConfig), destConfig, outputBuffers.data(),
-                    outputBuffers.size(), selfIdx, selfConfig, bufferManager);
+                executor::kv_cache::concatKVCacheDispatch(recvBufferTmps.data(), recvBufferTmps.size(),
+                    getCounterparts(selfConfig, selfIdx, destConfig), destConfig,
+                    outputBuffersPerWindow.begin()->second.data(), outputBuffersPerWindow.begin()->second.size(),
+                    selfIdx, selfConfig, bufferManager);
                 bufferManager.getStream().synchronize();
             }
         }
@@ -456,12 +533,15 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
                 TLLM_CHECK(pickUpConnections.size() == 1);
 
                 TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
-                for (auto const& connection : pickUpConnections)
+                for (size_t i = 0; i < pickUpConnections.size(); i++)
                 {
-                    for (auto const& block : outputBuffers)
+                    for (auto const& [window, blocks] : outputBuffersPerWindow)
                     {
-                        llmRequest.updateKvCacheSize((*block).getSizeInBytes());
-                        TransferHelper::recvBuffer(*connection, *block, reqId);
+                        for (auto const& block : blocks)
+                        {
+                            llmRequest.updateKvCacheSize((*block).getSizeInBytes());
+                            session.recv(pickUpConnections[i], block->data(), block->getSizeInBytes());
+                        }
                     }
                 }
                 TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
@@ -480,12 +560,10 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
             runtime::ITensor::SharedPtr recvBufferTemp;
             std::vector<runtime::ITensor::SharedPtr> recvSplitCaches;
 
-            auto cacheBlockSize = outputBuffers.front()->getSize();
-
-            auto dataType = outputBuffers.front()->getDataType();
+            auto dataType = outputBuffersPerWindow.begin()->second.front()->getDataType();
             auto targetNum = pickUpConnections.size();
-            TLLM_CHECK((cacheBlockSize * blockNum) % targetNum == 0);
-            auto targetBufferSize = (cacheBlockSize * blockNum) / targetNum;
+            TLLM_CHECK(cacheBlockSizeSum % targetNum == 0);
+            auto targetBufferSize = cacheBlockSizeSum / targetNum;
 
             size_t remainNoCoverTargetNum = 0;
             size_t bufferCoverTargetNum = 0;
@@ -494,7 +572,6 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
                 NVTX3_SCOPED_RANGE(formatInputAllocBuffer);
 
                 TLLM_CHECK(blockNum > 0);
-                TLLM_CHECK(outputBuffers.size() == blockNum);
                 if (legacyPath)
                 {
 
@@ -514,7 +591,7 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
                 else
                 {
                     auto* agentConnnecion
-                        = dynamic_cast<executor::kv_cache::AgentConnection const*>(pickUpConnections[0]);
+                        = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[pickUpConnections[0]]);
                     if (agentConnnecion != nullptr)
                     {
                         cacheBufferId = agentConnnecion->getCacheBufferId();
@@ -567,8 +644,8 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
                         size_t blockIdx = idx % (blockNum);
                         size_t recvBufferIdx = blockIdx * pickUpConnections.size() + commIdx;
                         llmRequest.updateKvCacheSize((*recvSplitCaches[recvBufferIdx]).getSizeInBytes());
-                        TransferHelper::recvBuffer(
-                            *pickUpConnections[processIdx], *recvSplitCaches.at(recvBufferIdx), reqId);
+                        auto& buffer = recvSplitCaches.at(recvBufferIdx);
+                        session.recv(pickUpConnections[processIdx], buffer->data(), buffer->getSizeInBytes());
                         idx++;
                     }
                 }
@@ -577,15 +654,16 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
                     if (processIdx >= remainNoCoverTargetNum)
                     {
                         llmRequest.updateKvCacheSize((*recvSplitCaches.at(processIdx)).getSizeInBytes());
-                        TransferHelper::recvBuffer(*pickUpConnections[processIdx], *recvSplitCaches[processIdx], reqId);
+                        auto& buffer = recvSplitCaches[processIdx];
+                        session.recv(pickUpConnections[processIdx], buffer->data(), buffer->getSizeInBytes());
                     }
                     else if (bufferCoverTargetNum > 0)
                     {
                         auto recvBufferIdx = processIdx % bufferCoverTargetNum
                             + remainNoCoverTargetNum; // caches.at(recvBufferIdx) is allocated by cudaMalloc
                         llmRequest.updateKvCacheSize((*recvSplitCaches.at(recvBufferIdx)).getSizeInBytes());
-                        TransferHelper::recvBuffer(
-                            *pickUpConnections[processIdx], *recvSplitCaches.at(recvBufferIdx), reqId);
+                        auto& buffer = recvSplitCaches.at(recvBufferIdx);
+                        session.recv(pickUpConnections[processIdx], buffer->data(), buffer->getSizeInBytes());
                         bufferManager.copy(*recvSplitCaches.at(recvBufferIdx), *recvSplitCaches[processIdx]);
                         bufferManager.getStream().synchronize();
                     }
@@ -602,7 +680,7 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
                             auto copySlice = runtime::ITensor::slice(
                                 recvSplitCaches[processIdx], targetBufferSize - remainRecvSize, recvSize);
                             llmRequest.updateKvCacheSize((*recvSlice).getSizeInBytes());
-                            TransferHelper::recvBuffer(*pickUpConnections[processIdx], *recvSlice, reqId);
+                            session.recv(pickUpConnections[processIdx], recvSlice->data(), recvSlice->getSizeInBytes());
                             bufferManager.copy(*recvSlice, *copySlice);
                             bufferManager.getStream().synchronize();
                             remainRecvSize -= recvSize;
@@ -662,14 +740,16 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
 
                 if (legacyPath)
                 {
-                    executor::kv_cache::concatenateKVCacheDispatch(recvSplitCaches.data(), recvSplitCaches.size(),
-                        getCounterparts(selfConfig, selfIdx, destConfig), destConfig, outputBuffers.data(),
-                        outputBuffers.size(), selfIdx, selfConfig, bufferManager);
+                    TLLM_CHECK(outputBuffersPerWindow.size() == 1);
+                    executor::kv_cache::concatKVCacheDispatch(recvSplitCaches.data(), recvSplitCaches.size(),
+                        getCounterparts(selfConfig, selfIdx, destConfig), destConfig,
+                        outputBuffersPerWindow.begin()->second.data(), outputBuffersPerWindow.begin()->second.size(),
+                        selfIdx, selfConfig, bufferManager);
                 }
                 else
                 {
-                    executor::kv_cache::concatenateKvCacheV2Dispatch(
-                        recvSplitCaches, outputBuffers, destConfig, selfConfig, selfIdx, bufferManager);
+                    executor::kv_cache::concatKvCacheV2Dispatch(
+                        recvSplitCaches, outputBuffersPerWindow, destConfig, selfConfig, selfIdx, bufferManager);
                 }
                 bufferManager.getStream().synchronize();
                 if (cacheBufferId.has_value())

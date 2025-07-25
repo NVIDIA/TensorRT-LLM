@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from itertools import chain
 from typing import List, Optional, Set, Tuple
 
+import tqdm
 from zmq import PUSH
 from zmq.asyncio import Context
 
@@ -43,6 +44,14 @@ class LlmManager:
         self.request_seen = asyncio.Event()
         self.modality = modality
 
+    def _task_done_callback(self, task: asyncio.Task) -> None:
+        self._tasks.discard(task)
+        if task.exception() is not None and not self._stop.is_set():
+            logger.error(
+                f"Stopping benchmarking due to following exception raised during inference: {task.exception()}"
+            )
+            self.stop()
+
     async def process_request(self, request: InferenceRequest,
                               sampling_params: SamplingParams,
                               post_proc_params: PostprocParams):
@@ -50,44 +59,48 @@ class LlmManager:
         self.request_seen.set()
         sampling_params.max_tokens = request.output_tokens
 
-        async with semaphore_guard(self._concurrency_semaphore):
-            request_start_timestamp = time.perf_counter_ns()
-            time_on_first_token = None
-            # Schedule the request in the LLM API (asynchronously)
-            logger.debug(f"request.lora_request: {request.lora_request}")
-            output: RequestOutput = self.llm.generate_async(
-                request.input_ids if self.modality is None else request.prompt,
-                sampling_params=sampling_params,
-                _postproc_params=post_proc_params,
-                streaming=self.streaming,
-                lora_request=request.lora_request)
-            if self.streaming:
-                async for stream_output in output:
-                    if time_on_first_token is None:
-                        time_on_first_token = time.perf_counter_ns()
-                response = stream_output
-            else:
-                # Wait for the response to return to us.
-                response: RequestOutput = await output.aresult()
+        try:
+            async with semaphore_guard(self._concurrency_semaphore):
+                request_start_timestamp = time.perf_counter_ns()
+                time_on_first_token = None
+                # Schedule the request in the LLM API (asynchronously)
+                logger.debug(f"request.lora_request: {request.lora_request}")
+                output: RequestOutput = self.llm.generate_async(
+                    request.input_ids
+                    if self.modality is None else request.prompt,
+                    sampling_params=sampling_params,
+                    _postproc_params=post_proc_params,
+                    streaming=self.streaming,
+                    lora_request=request.lora_request)
+                if self.streaming:
+                    async for stream_output in output:
+                        if time_on_first_token is None:
+                            time_on_first_token = time.perf_counter_ns()
+                            response = stream_output
+                else:
+                    # Wait for the response to return to us.
+                    response: RequestOutput = await output.aresult()
 
-        response_end_timestamp = time.perf_counter_ns()
+            response_end_timestamp = time.perf_counter_ns()
 
-        # Mark that the response returned. Construct a record to send to statistics.
-        tokens = list(chain(*[beam.token_ids for beam in response.outputs]))
-        request_perf_item = PerfItemTuple(
-            start_timestamp=request_start_timestamp,
-            end_timestamp=response_end_timestamp,
-            request_id=response.request_id,
-            num_input_tokens=len(output.prompt_token_ids),
-            response_is_final=response.finished,
-            error=False,
-            tokens=tokens,
-            decoding_iteration=response.decoding_iter,
-            time_on_first_token=time_on_first_token,
-        )
+            # Mark that the response returned. Construct a record to send to statistics.
+            tokens = list(chain(*[beam.token_ids for beam in response.outputs]))
+            request_perf_item = PerfItemTuple(
+                start_timestamp=request_start_timestamp,
+                end_timestamp=response_end_timestamp,
+                request_id=response.id,
+                num_input_tokens=len(output.prompt_token_ids),
+                response_is_final=response.finished,
+                error=False,
+                tokens=tokens,
+                decoding_iteration=response.decoding_iter,
+                time_on_first_token=time_on_first_token,
+            )
 
-        # Register the new request perf items in the outbound queue for statistics keeping
-        await self._outbox.put(request_perf_item)
+            # Register the new request perf items in the outbound queue for statistics keeping
+            await self._outbox.put(request_perf_item)
+        except asyncio.CancelledError:
+            pass
 
     async def worker(self) -> None:
         while not self._stop.is_set():
@@ -99,7 +112,7 @@ class LlmManager:
                                          sampling_params=sampling_params,
                                          post_proc_params=post_proc_params))
                 self._tasks.add(task)
-                task.add_done_callback(self._tasks.discard)
+                task.add_done_callback(self._task_done_callback)
             except asyncio.CancelledError:
                 logger.info("Worker task cancelled.")
 
@@ -238,15 +251,21 @@ async def async_benchmark(
                              post_proc_params, submit_finished))
 
         logger.info("Starting benchmark...")
+        pbar = tqdm.tqdm(total=len(requests), desc="Benchmarking")
+        finished_requests = 0
+
         while not submit_finished.is_set() or backend.busy or not outbox.empty(
         ):
             try:
                 item: PerfItemTuple = await asyncio.wait_for(outbox.get(),
                                                              timeout=1.0)
                 statistics.register_request_perf_item(item)
+                pbar.update(1)
+                finished_requests += 1
             except asyncio.TimeoutError:
                 logger.debug("No items in queue. Continuing.")
 
+        assert finished_requests == len(requests), "Benchmark failed"
         logger.info("Benchmark complete.")
 
         return statistics

@@ -1,7 +1,7 @@
 """Multimodal utilities for handling images and other media types in TensorRT-LLM."""
 
-from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple, Union
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import PIL
@@ -80,6 +80,205 @@ class MultimodalInput:
             torch.tensor(self.multimodal_hashes, dtype=torch.int32),
             torch.tensor(self.multimodal_positions, dtype=torch.int32),
             torch.tensor(self.multimodal_lengths, dtype=torch.int32))
+
+
+@dataclass
+class MultimodalRuntimeData:
+    """Runtime data for tracking multimodal token caching and reuse per request sequence.
+
+    This class tracks which multimodal tokens are cached vs. need to be processed
+    for each request sequence during KV cache reuse scenarios.
+
+    Attributes:
+        num_cached_tokens: Total number of cached tokens for this sequence
+        mm_token_lengths: Length of each multimodal token chunk
+        mm_token_positions: Starting positions of each multimodal token chunk
+        prompt_tokens: Current iteration of prompt tokens for this sequence (optional). Need it for chunk prefill if enabled (#TODO)
+        num_cached_mm_tokens: Number of multimodal tokens that are cached in this iteration (computed)
+        total_mm_tokens: Total number of multimodal tokens in this sequence (computed)
+    """
+    num_cached_tokens: int
+    mm_token_lengths: List[int]
+    mm_token_positions: List[int]
+
+    # TODO: support chunk prefill for multimodal
+    # When chunk prefill is enabled, we need to pass the prompt tokens for current chunk and mask to find the included mm tokens
+    prompt_tokens: Optional[List[int]] = None
+
+    num_cached_mm_tokens: Optional[int] = None
+    total_mm_tokens: Optional[int] = None
+
+    def __post_init__(self):
+        # Validate input data
+        if len(self.mm_token_positions) != len(self.mm_token_lengths):
+            raise ValueError(
+                f"mm_token_positions ({len(self.mm_token_positions)}) and mm_token_lengths ({len(self.mm_token_lengths)}) must have the same length"
+            )
+
+        if self.num_cached_tokens < 0:
+            raise ValueError(
+                f"num_cached_tokens must be non-negative, got {self.num_cached_tokens}"
+            )
+
+        if any(length <= 0 for length in self.mm_token_lengths):
+            raise ValueError(
+                f"All mm_token_lengths must be positive, got {self.mm_token_lengths}"
+            )
+
+        if any(pos < 0 for pos in self.mm_token_positions):
+            raise ValueError(
+                f"All mm_token_positions must be non-negative, got {self.mm_token_positions}"
+            )
+
+        if self.num_cached_mm_tokens is None:
+            # Compute cached multimodal tokens based on positions and cached tokens
+            self.num_cached_mm_tokens = 0
+            for pos, length in zip(self.mm_token_positions,
+                                   self.mm_token_lengths):
+                if pos + length <= self.num_cached_tokens:
+                    self.num_cached_mm_tokens += length
+                elif pos < self.num_cached_tokens:
+                    # Partial overlap - only count the cached portion
+                    self.num_cached_mm_tokens += self.num_cached_tokens - pos
+
+        if self.num_cached_mm_tokens > self.num_cached_tokens:
+            raise ValueError(
+                f"num_cached_mm_tokens ({self.num_cached_mm_tokens}) must be less than or equal to "
+                f"num_cached_tokens ({self.num_cached_tokens})")
+        self.total_mm_tokens = sum(self.mm_token_lengths)
+
+
+@dataclass
+class MultimodalParams:
+    """Unified container for multimodal parameters.
+
+    This class encapsulates all multimodal-related data that flows through the system,
+    providing a clean interface for handling multimodal inputs across different models.
+
+    Attributes:
+        multimodal_input: Multimodal input data with hashing information.
+        multimodal_data: Processed multimodal data containing embeddings, configurations,
+                        and modality-specific data organized by type.
+
+    Structure of multimodal_data:
+        {
+            "mrope_config": {
+                "mrope_rotary_cos_sin": torch.Tensor,    # Rotary embeddings (Qwen2/2.5-VL)
+                "mrope_position_deltas": torch.Tensor,   # Position deltas (Qwen2/2.5-VL)
+            },
+            "multimodal_embedding": torch.Tensor,        # Pre-computed vision embeddings
+            "image": {
+                "pixel_values": torch.Tensor,
+                "image_height": torch.Tensor | List[int],
+                "image_width": torch.Tensor | List[int],
+            },
+            "video": {
+                "pixel_values": torch.Tensor,
+                "video_height": torch.Tensor | List[int],
+                "video_width": torch.Tensor | List[int],
+            },
+            # ... other modalities
+        }
+    """
+
+    multimodal_input: Optional[MultimodalInput] = None
+    multimodal_data: Optional[Dict[str, Any]] = field(default_factory=dict)
+    multimodal_runtime: Optional[MultimodalRuntimeData] = None
+
+    def __post_init__(self):
+        """Ensure default values are properly set."""
+        if self.multimodal_data is None:
+            self.multimodal_data = {}
+
+    def to_device(self,
+                  element: str,
+                  device: str,
+                  pin_memory: bool = False) -> None:
+        """Move specified multimodal data element to target device.
+
+        Args:
+            element: Element to move ("multimodal_data" or "multimodal_input")
+            device: Target device (e.g., "cuda", "cpu")
+            pin_memory: Whether to pin memory for faster transfers
+        """
+
+        def _to_device(
+            input_tensor: Union[torch.Tensor, List, dict, None],
+            pin_memory: bool = False,
+        ) -> Union[torch.Tensor, List, dict, None]:
+            if input_tensor is None:
+                return None
+            elif isinstance(input_tensor, list):
+                return [_to_device(item, pin_memory) for item in input_tensor]
+            elif isinstance(input_tensor, dict):
+                return {
+                    key: _to_device(value, pin_memory)
+                    for key, value in input_tensor.items()
+                }
+            elif isinstance(input_tensor, torch.Tensor):
+                if pin_memory and input_tensor.device.type == 'cpu':
+                    return input_tensor.pin_memory().to(device,
+                                                        non_blocking=True)
+                else:
+                    return input_tensor.to(device, non_blocking=True)
+            else:
+                return input_tensor
+
+        if element == "multimodal_data":
+            self.multimodal_data = _to_device(self.multimodal_data, pin_memory)
+        elif element == "multimodal_input":
+            self.multimodal_input = _to_device(self.multimodal_input,
+                                               pin_memory)
+        else:
+            print(
+                f"MultimodalParams: Unsupported element '{element}' to move to device. "
+                f"Supported elements: 'multimodal_data', 'multimodal_input'")
+
+    def strip_for_context(self) -> None:
+        """Strip multimodal data for context processing.
+
+        Removes only mrope_position_deltas while keeping all other multimodal data
+        (embeddings, images, etc.) needed for context phase processing.
+        """
+        if not (self.multimodal_data
+                and 'mrope_config' in self.multimodal_data):
+            return
+
+        mrope_config = self.multimodal_data['mrope_config']
+        if 'mrope_position_deltas' in mrope_config:
+            del mrope_config['mrope_position_deltas']
+
+            # Clean up empty mrope_config
+            if not mrope_config:
+                del self.multimodal_data['mrope_config']
+
+    def strip_for_generation(self) -> None:
+        """Strip multimodal data for generation processing.
+
+        Keeps only mrope_position_deltas and removes all other multimodal data
+        (embeddings, images, etc.) as they're not needed during generation.
+        """
+        if not self.multimodal_data:
+            return
+
+        # Extract mrope_position_deltas before clearing
+        mrope_position_deltas = None
+        if 'mrope_config' in self.multimodal_data:
+            mrope_config = self.multimodal_data['mrope_config']
+            if isinstance(mrope_config,
+                          dict) and 'mrope_position_deltas' in mrope_config:
+                mrope_position_deltas = mrope_config['mrope_position_deltas']
+
+        # Clear all data and restore only position deltas if they exist
+        self.multimodal_data = {}
+        if mrope_position_deltas is not None:
+            self.multimodal_data['mrope_config'] = {
+                'mrope_position_deltas': mrope_position_deltas
+            }
+
+    def has_content(self) -> bool:
+        """Check if this object contains any multimodal data."""
+        return bool(self.multimodal_input or self.multimodal_data)
 
 
 # adopt from vllm : https://github.com/vllm-project/vllm/blob/main/vllm/vllm/multimodal/hash.py

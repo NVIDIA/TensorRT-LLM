@@ -17,7 +17,6 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/common.h"
-#include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/runtime/eagleBuffers.h"
@@ -233,13 +232,9 @@ public:
 
     GenerationLogitsCache generationLogitsCache;
 
-    //! Helper for KV cache rewind
+    //! Mapping from batch idx to slot id
     TensorPtr seqSlots;
     TensorPtr seqSlotsDevice;
-    TensorPtr sortedSeqSlots;
-    //! TODO: move into decoderBuffers.DraftBuffers
-    TensorPtr seqSlotRemappingHost;   // [numSequences]
-    TensorPtr seqSlotRemappingDevice; // [numSequences]
 
     //! Explicitly device-copy src offsets to reduce warp stalls in copy batch kernel invocation
     //! [mMaxNumRequests], on gpu

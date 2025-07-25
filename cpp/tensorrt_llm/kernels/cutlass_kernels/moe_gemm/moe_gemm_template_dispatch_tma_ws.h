@@ -56,8 +56,8 @@
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 
 #include "../include/moe_gemm_kernels.h"
-#include "launchers/moe_gemm_tma_ws_launcher.h"
-#include "moe_tma_warp_specialized_traits.h"
+#include "./launchers/moe_gemm_tma_ws_launcher.h"
+#include "./moe_tma_warp_specialized_traits.h"
 
 #include <cuda.h>
 #include <cuda_fp16.h>
@@ -115,13 +115,30 @@ void dispatchMoeGemmSelectBiasTmaWarpSpecialized(TmaWarpSpecializedGroupedGemmIn
 #endif
     else
     {
-        auto func = &kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T, WeightType,
-            OutputType, EpilogueTag, FUSION, TileShape, ClusterShape, false>;
-        func(hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size);
+        auto getFunc = [&]()
+        {
+            if constexpr (std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp4_e2m1>)
+            {
+                TLLM_CHECK_WITH_INFO(hopper_input.fpX_block_scaling_type
+                        == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX,
+                    "MXFPX is the only supported scaling type for WFP4AFP8");
+                return &kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
+                    WeightType, OutputType, EpilogueTag, FUSION, TileShape, ClusterShape, true, false>;
+            }
+            else
+            {
+                TLLM_CHECK_WITH_INFO(hopper_input.fpX_block_scaling_type
+                        != TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX,
+                    "MXFPX is not supported for the selected weight combination");
+                return &kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
+                    WeightType, OutputType, EpilogueTag, FUSION, TileShape, ClusterShape, false, false>;
+            }
+        };
+        getFunc()(hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size);
     }
 }
 
-template <typename ClusterTileShape, typename ClusterShape, typename DataType>
+template <typename ClusterTileShape, typename ClusterShape, typename DataType, typename WeightType>
 constexpr bool are_tile_shapes_supported_sm100()
 {
     using namespace cute;
@@ -134,6 +151,20 @@ constexpr bool are_tile_shapes_supported_sm100()
     {
         return false;
     }
+
+#ifdef ENABLE_FP4
+    if constexpr (std::is_same_v<DataType, __nv_fp4_e2m1> || std::is_same_v<WeightType, __nv_fp4_e2m1>)
+    {
+        // if (TileN % 64 != 0 || TileN < 128)
+        // {
+        //     return false;
+        // }
+        if ((TileN != 64 && TileN != 128 && TileN != 256) || TileM != 128)
+        {
+            return false;
+        }
+    }
+#endif
 
     if constexpr (std::is_same_v<DataType, __nv_fp8_e4m3>)
     {
@@ -153,20 +184,6 @@ constexpr bool are_tile_shapes_supported_sm100()
     {
         return false;
     }
-
-#ifdef ENABLE_FP4
-    if constexpr (std::is_same_v<DataType, __nv_fp4_e2m1>)
-    {
-        // if (TileN % 64 != 0 || TileN < 128)
-        // {
-        //     return false;
-        // }
-        if ((TileN != 64 && TileN != 128) || TileM != 128)
-        {
-            return false;
-        }
-    }
-#endif
 
     return true;
 }
@@ -202,14 +219,14 @@ constexpr bool are_tile_shapes_supported_sm120()
     We make the above restrictions are to improve compilation speed in TRT-LLM by pruning kernels
     that may not be very useful in practice.
  */
-template <typename Arch, typename CTAShape, typename ClusterShape, typename DataType>
+template <typename Arch, typename CTAShape, typename ClusterShape, typename DataType, typename WeightType>
 constexpr bool are_tile_shapes_supported()
 {
     if constexpr (Arch::kMinComputeCapability >= 100 && Arch::kMinComputeCapability < 120)
     {
-        return are_tile_shapes_supported_sm100<CTAShape, ClusterShape, DataType>();
+        return are_tile_shapes_supported_sm100<CTAShape, ClusterShape, DataType, WeightType>();
     }
-    else if constexpr (Arch::kMinComputeCapability == 120)
+    else if constexpr (Arch::kMinComputeCapability == 120 || Arch::kMinComputeCapability == 121)
     {
         return are_tile_shapes_supported_sm120<CTAShape, ClusterShape, DataType>();
     }
@@ -255,7 +272,7 @@ void dispatchMoeGemmSelectClusterShapeTmaWarpSpecialized(TmaWarpSpecializedGroup
     case cutlass_extensions::ClusterShape::ClusterShape_##M##x##N##x##K:                                               \
     {                                                                                                                  \
         using ClusterShape = Shape<_##M, _##N, _##K>;                                                                  \
-        if constexpr (are_tile_shapes_supported<Arch, TileShape, ClusterShape, T>())                                   \
+        if constexpr (are_tile_shapes_supported<Arch, TileShape, ClusterShape, T, WeightType>())                       \
         {                                                                                                              \
             dispatchMoeGemmSelectBiasTmaWarpSpecialized<Arch, T, WeightType, OutputType, EpilogueTag, FUSION,          \
                 TileShape, ClusterShape>(                                                                              \
@@ -361,7 +378,7 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(TmaWarpSpecializedGroupedG
             TLLM_THROW("Unsupported SM100 configuration requested");
         }
     }
-    else if (gemm_config.sm_version == 120)
+    else if (gemm_config.sm_version == 120 || gemm_config.sm_version == 121)
     {
         TLLM_LOG_TRACE("At %s, SM120 config=%d", __PRETTY_FUNCTION__, (int) gemm_config.tile_config_sm120);
         if constexpr (kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType, EpilogueTag, FUSION>())
@@ -380,14 +397,15 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(TmaWarpSpecializedGroupedG
 }
 
 template <typename T, typename WeightType, typename OutputType, EpilogueFusion FUSION>
-size_t calcMaxWorkspaceSizeTmaWarpSpecialized(
-    int num_experts, cutlass_extensions::CutlassGemmConfig gemm_config, int multi_processor_count)
+size_t calcMaxWorkspaceSizeTmaWarpSpecialized(int num_experts, cutlass_extensions::CutlassGemmConfig gemm_config,
+    int multi_processor_count, TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType fpX_block_scaling_type)
 {
     size_t count = 0;
+    TmaWarpSpecializedGroupedGemmInput input{};
+    input.fpX_block_scaling_type = fpX_block_scaling_type;
     // Most of the values are ignored for WS size calculation. We reuse the function to reduce the template bloat
     dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T, WeightType, OutputType, cutlass_extensions::EpilogueOpDefault,
-        FUSION>(TmaWarpSpecializedGroupedGemmInput{}, num_experts, gemm_config, multi_processor_count, cudaStream_t{0},
-        nullptr, &count);
+        FUSION>(input, num_experts, gemm_config, multi_processor_count, cudaStream_t{0}, nullptr, &count);
     return count;
 }
 

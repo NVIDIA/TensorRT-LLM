@@ -57,7 +57,6 @@ class GenerationExecutorProxy(GenerationExecutor):
         )
 
         self.workers_started = False
-        self.doing_pre_shutdown = False
         self.worker_cls = worker_cls
 
         mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
@@ -333,10 +332,10 @@ class GenerationExecutorProxy(GenerationExecutor):
             return
         print_colored_debug('Proxy.pre_shutdown...\n', "yellow")
 
-        if self.doing_pre_shutdown:
+        if self.doing_shutdown:
             return
         else:
-            self.doing_pre_shutdown = True
+            self.doing_shutdown = True
 
         self._abort_all_requests()
 
@@ -348,7 +347,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         if not self.workers_started:
             return
 
-        if not self.doing_pre_shutdown:
+        if not self.doing_shutdown:
             self.pre_shutdown()
 
         print_colored_debug('Proxy.shutdown...\n', "yellow")

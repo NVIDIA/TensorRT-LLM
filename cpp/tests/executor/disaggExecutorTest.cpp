@@ -291,8 +291,8 @@ void runDisaggTest(tensorrt_llm::testing::disaggexecutor::DisaggExecutorLeader& 
             ++iter;
         }
         EXPECT_LT(iter, maxWaitMs);
-        testData.verifyOutput(tokens, givenInputLengths, nbGivenInputs, streaming, outConfig.excludeInputFromOutput,
-            flakyTestInfo, isSpeculativeDecoding, returnAllGeneratedTokens, beamWidth, numReturnSequences, false);
+        testData.verifyOutput(tokens, givenInputLengths, streaming, outConfig.excludeInputFromOutput, flakyTestInfo,
+            isSpeculativeDecoding, beamWidth, numReturnSequences, false);
     }
     comm.barrier();
     if (executor.isGenerationRank())
@@ -449,8 +449,8 @@ void runDisaggTest(DisaggExecutorOrchestrator& executor, tensorrt_llm::runtime::
             ++iter;
         }
         EXPECT_LT(iter, maxWaitMs);
-        testData.verifyOutput(tokens, givenInputLengths, nbGivenInputs, streaming, outConfig.excludeInputFromOutput,
-            flakyTestInfo, isSpeculativeDecoding, returnAllGeneratedTokens, beamWidth, numReturnSequences, false);
+        testData.verifyOutput(tokens, givenInputLengths, streaming, outConfig.excludeInputFromOutput, flakyTestInfo,
+            isSpeculativeDecoding, beamWidth, numReturnSequences, false);
     }
     comm.barrier();
 }
@@ -662,6 +662,8 @@ TEST_P(DisaggParamsTest, DisaggTokenComparison)
     KvCacheConfig kvCacheConfig{true, std::nullopt, std::nullopt, std::nullopt, freeGpuMemoryFraction};
     executorConfig.setKvCacheConfig(kvCacheConfig);
     executorConfig.setRequestStatsMaxIterations(1000);
+    executorConfig.setCacheTransceiverConfig(
+        texec::CacheTransceiverConfig(texec::CacheTransceiverConfig::BackendType::DEFAULT));
     auto manager = tr::BufferManager(std::make_shared<tr::CudaStream>());
     auto const& givenInput = tr::utils::loadNpy(manager, inputPath.string(), tr::MemoryType::kCPU);
     auto [givenInputLengths, nbGivenInputs, maxInputLength] = getGivenInputLengths(*givenInput, modelIds.padId);
@@ -894,6 +896,8 @@ TEST_P(DisaggOrchestratorParamsTest, DisaggTokenComparison)
             spawnProcess ? std::nullopt : std::optional<std::vector<SizeType32>>(participantIdsEachInstance.at(in)),
             orchestratorConfig};
         executorConfig.setParallelConfig(parallelConfig);
+        executorConfig.setCacheTransceiverConfig(
+            texec::CacheTransceiverConfig(texec::CacheTransceiverConfig::BackendType::DEFAULT));
         if (in < contextNum)
         {
             ctxExecutorConfigs.push_back(executorConfig);
@@ -994,6 +998,8 @@ TEST_P(ConditionalDisaggParamsTest, DisaggTokenComparison)
     KvCacheConfig kvCacheConfig{true, std::nullopt, std::nullopt, std::nullopt, freeGpuMemoryFraction};
     executorConfig.setKvCacheConfig(kvCacheConfig);
     executorConfig.setRequestStatsMaxIterations(1000);
+    executorConfig.setCacheTransceiverConfig(
+        texec::CacheTransceiverConfig(CacheTransceiverConfig::BackendType::DEFAULT));
     auto manager = tr::BufferManager(std::make_shared<tr::CudaStream>());
     auto const& givenInput = tr::utils::loadNpy(manager, inputPath.string(), tr::MemoryType::kCPU);
     auto [givenInputLengths, nbGivenInputs, maxInputLength] = getGivenInputLengths(*givenInput, modelIds.padId);
@@ -1110,8 +1116,8 @@ TEST_P(ConditionalDisaggParamsTest, DisaggTokenComparison)
             ++iter;
         }
         EXPECT_LT(iter, mMaxWaitMs);
-        testData.verifyOutput(tokens, givenInputLengths, nbGivenInputs, streaming, outConfig.excludeInputFromOutput,
-            flakyTestInfo, isSpeculativeDecoding, false, beamWidth, numReturnSequences, false);
+        testData.verifyOutput(tokens, givenInputLengths, streaming, outConfig.excludeInputFromOutput, flakyTestInfo,
+            isSpeculativeDecoding, beamWidth, numReturnSequences, false);
     }
     world_comm.barrier();
 #else

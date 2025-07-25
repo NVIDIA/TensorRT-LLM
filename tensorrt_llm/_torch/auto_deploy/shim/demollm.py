@@ -1,25 +1,17 @@
 """A demo LLM api to for debugging and testing purposes of e2e workflows."""
 
 import gc
-import types
-from pathlib import Path
 from queue import Empty
-from typing import Any, Callable, List, Literal, Optional, Tuple, Union
+from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 import torch.multiprocessing as mp
-from transformers import PreTrainedTokenizerBase
 
-from ...._tensorrt_engine import LLM
 from ....executor import GenerationExecutor
 from ....executor.request import GenerationRequest
 from ....executor.result import CompletionOutput, GenerationResult
-from ....inputs.registry import create_input_processor
-from ....llmapi.llm import RequestOutput
-from ....llmapi.llm_args import _AutoDeployLlmArgs
-from ....llmapi.tokenizer import TokenizerBase
 from ....sampling_params import SamplingParams
-from ..custom_ops.attention_interface import SequenceInfo
+from ...pyexecutor.sampler import greedy_search_sampling_batch, top_k_sampling_batch
 from ..distributed import common as dist_ad
 from ..utils.logger import ad_logger
 from .ad_executor import ADEngine
@@ -37,13 +29,8 @@ class DemoEngine(ADEngine):
     """
 
     @torch.inference_mode()
-    def __init__(
-        self,
-        get_inference_model,
-        seq_info,
-        device,
-    ) -> None:
-        super().__init__(get_inference_model, seq_info, device)
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
         self.queue = mp.Queue()
 
     @torch.inference_mode()
@@ -215,11 +202,12 @@ class DemoEngine(ADEngine):
     def _sample(
         cls, logits: torch.Tensor, sampling_params: SamplingParams
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        from tensorrt_llm._torch.pyexecutor.sampler import top_k_sampling_batch
-
         logits_shape = logits.shape
-        logits = logits.view(-1, logits_shape[-1])  # top_k_sampling_batch expects 2D logits
-        idx_next, probs = top_k_sampling_batch(logits, sampling_params.top_k)
+        logits = logits.view(-1, logits_shape[-1])  # sampling_batch expects 2D logits
+        if isinstance(sampling_params.top_k, int):
+            idx_next, probs = top_k_sampling_batch(logits, sampling_params.top_k)
+        else:
+            idx_next, probs = greedy_search_sampling_batch(logits)
         idx_next = idx_next.view(logits_shape[:-1])
         return idx_next, probs
 
@@ -227,10 +215,6 @@ class DemoEngine(ADEngine):
         self, logits_last: torch.Tensor, sampling_params: SamplingParams
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Returns a sampled token per input sequence and associating probability."""
-        if sampling_params.top_k == 1:  # greedy decoding
-            # idx_next is the index of the max logit for each sequence
-            idx_next = logits_last.argmax(dim=-1, keepdim=False)
-            return idx_next, logits_last.squeeze(-1)
         # run sampling
         return self._sample(logits_last, sampling_params)
 
@@ -332,91 +316,3 @@ class DemoGenerationExecutor(GenerationExecutor):
 
     def abort_request(self, client_id: int) -> None:
         ad_logger.warning(f"Abort request is not supported in the demo executor: {client_id=}")
-
-
-class DemoLLM(LLM):
-    """A simple LLM class to demo the LLM interface while debugging the e2e workflow.
-
-    This is a very simple implementation of an LLM class that can be hacked and used for debugging.
-    """
-
-    def __init__(
-        self,
-        model: str,
-        tokenizer: Optional[Union[str, Path, TokenizerBase, PreTrainedTokenizerBase]] = None,
-        tokenizer_mode: Literal["auto", "slow"] = "auto",
-        skip_tokenizer_init: bool = False,
-        trust_remote_code: bool = False,
-        tensor_parallel_size: int = 1,
-        dtype: str = "auto",
-        revision: Optional[str] = None,
-        tokenizer_revision: Optional[str] = None,
-        **kwargs,
-    ):
-        try:
-            self.args: _AutoDeployLlmArgs = _AutoDeployLlmArgs.from_kwargs(
-                model=model,
-                tokenizer=tokenizer,
-                tokenizer_mode=tokenizer_mode,
-                skip_tokenizer_init=skip_tokenizer_init,
-                trust_remote_code=trust_remote_code,
-                tensor_parallel_size=tensor_parallel_size,
-                dtype=dtype,
-                revision=revision,
-                tokenizer_revision=tokenizer_revision,
-                backend=kwargs.pop("backend", "_autodeploy"),
-                **kwargs,
-            )
-
-        except Exception as e:
-            ad_logger.error(f"Failed to parse the arguments for the LLM constructor: {e}")
-            raise e
-        self.mpi_session = None
-        self.runtime_context = None
-        self._tokenizer = self._try_load_tokenizer()
-        self.input_processor = create_input_processor(None, self.tokenizer)
-
-        # construct sequence info object
-        seq_info = SequenceInfo(
-            max_seq_len=self.args.max_seq_len,
-            max_batch_size=self.args.max_batch_size,
-            page_size=self.args.attn_page_size,
-        )
-
-        # construct demo executor + engine
-        self._executor = DemoGenerationExecutor(
-            world_size=tensor_parallel_size,
-            tokenizer=self.tokenizer,
-            model=model,
-            ad_config=self.args.get_pytorch_backend_config(),
-            seq_info=seq_info,
-            device="cuda",
-        )
-
-    def __del__(self):
-        """Ensure proper cleanup of distributed resources."""
-        if hasattr(self, "_executor") and self._executor is not None:
-            self._executor.shutdown()
-        # Call cleanup to ensure process group is properly destroyed
-        dist_ad.cleanup()
-
-    @staticmethod
-    def _handle_response(request_output: RequestOutput, response: List[CompletionOutput]):
-        request_output._done = True
-        gen_request = request_output._generation_request
-        for i, out in enumerate(response):
-            out.text = request_output.tokenizer.decode(
-                out.token_ids,
-                skip_special_tokens=gen_request.sampling_params.skip_special_tokens,
-                spaces_between_special_tokens=gen_request.sampling_params.spaces_between_special_tokens,
-            )
-            request_output._context_logits = out._postprocess_result["context_logits"]
-            request_output._outputs[i] = out
-
-    def generate_async(self, *args, **kwargs) -> RequestOutput:
-        request_output = super().generate_async(*args, **kwargs)
-
-        # patch the handle_output method for our use case
-        request_output._handle_response = types.MethodType(self._handle_response, request_output)
-
-        return request_output

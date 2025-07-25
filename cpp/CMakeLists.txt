@@ -28,10 +28,9 @@ project(tensorrt_llm LANGUAGES CXX)
 
 # Build options
 option(BUILD_PYT "Build in PyTorch TorchScript class mode" ON)
-option(BUILD_PYBIND "Build Python bindings for C++ runtime and batch manager"
-       ON)
 option(BUILD_TESTS "Build Google tests" ON)
 option(BUILD_BENCHMARKS "Build benchmarks" ON)
+option(BUILD_DEEP_EP "Build the Deep EP module" ON)
 option(BUILD_MICRO_BENCHMARKS "Build C++ micro benchmarks" OFF)
 option(NVTX_DISABLE "Disable all NVTX features" ON)
 option(WARNING_IS_ERROR "Treat all warnings as errors" OFF)
@@ -39,10 +38,13 @@ option(FAST_BUILD "Skip compiling some kernels to accelerate compiling" OFF)
 option(FAST_MATH "Compiling in fast math mode" OFF)
 option(INDEX_RANGE_CHECK "Compiling with index range checks" OFF)
 option(COMPRESS_FATBIN "Compress everything in fatbin" ON)
+option(TIMING_NVCC "Enable nvcc build timing report" OFF)
 option(ENABLE_MULTI_DEVICE
        "Enable building with multi device support (requires NCCL, MPI,...)" ON)
 option(ENABLE_UCX "Enable building with UCX (Uniform Communication X) support"
        ON)
+option(NVRTC_DYNAMIC_LINKING "Link against the dynamic NVRTC libraries" OFF)
+option(ENABLE_NVSHMEM "Enable building with NVSHMEM support" OFF)
 option(USING_OSS_CUTLASS_LOW_LATENCY_GEMM
        "Using open sourced Cutlass low latency gemm kernel" ON)
 option(USING_OSS_CUTLASS_FP4_GEMM "Using open sourced Cutlass fp4 gemm kernel"
@@ -51,6 +53,8 @@ option(USING_OSS_CUTLASS_MOE_GEMM "Using open sourced Cutlass moe gemm kernel"
        ON)
 option(USING_OSS_CUTLASS_ALLREDUCE_GEMM
        "Using open sourced Cutlass AR gemm kernel" ON)
+
+message(STATUS "ENABLE_NVSHMEM is ${ENABLE_NVSHMEM}")
 
 if(NVTX_DISABLE)
   add_compile_definitions("NVTX_DISABLE")
@@ -62,6 +66,11 @@ endif()
 # Add TensorRT-LLM Gen export interface and CUDA support
 add_compile_definitions("TLLM_GEN_EXPORT_INTERFACE")
 add_compile_definitions("TLLM_ENABLE_CUDA")
+
+set(BINDING_TYPE
+    "pybind"
+    CACHE STRING
+          "Binding type of Python bindings for C++ runtime and batch manager")
 
 set(INTERNAL_CUTLASS_KERNELS_PATH
     ""
@@ -134,9 +143,14 @@ configure_file(
   ${CMAKE_CURRENT_SOURCE_DIR}/include/tensorrt_llm/executor/version.h)
 
 setup_cuda_compiler()
-setup_cuda_architectures()
 
 enable_language(C CXX CUDA)
+
+# Configure CUDA Architectures after enabling CUDA.
+
+# Old CMake rejects family conditional architectures during enable_language, But
+# after that CMake handles it just fine.
+setup_cuda_architectures()
 
 find_package(CUDAToolkit 11.2 REQUIRED COMPONENTS cudart_static cuda_driver
                                                   cublas cublasLt curand nvml)
@@ -147,9 +161,16 @@ set(CURAND_LIB CUDA::curand)
 set(CUDA_DRV_LIB CUDA::cuda_driver)
 set(CUDA_NVML_LIB CUDA::nvml)
 set(CUDA_RT_LIB CUDA::cudart_static)
-set(NVRTC_LIB CUDA::nvrtc_static)
-set(NVRTC_BUILTINS_LIB CUDA::nvrtc_builtins_static)
+set(NVPTX_LIB CUDA::nvptxcompiler_static)
 set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
+
+if(NVRTC_DYNAMIC_LINKING)
+  set(NVRTC_LIB CUDA::nvrtc)
+  set(NVRTC_BUILTINS_LIB CUDA::nvrtc_builtins)
+else()
+  set(NVRTC_LIB CUDA::nvrtc_static)
+  set(NVRTC_BUILTINS_LIB CUDA::nvrtc_builtins_static)
+endif()
 
 resolve_dirs(CUDAToolkit_INCLUDE_DIRS "${CUDAToolkit_INCLUDE_DIRS}")
 
@@ -157,6 +178,7 @@ message(STATUS "CUDA library status:")
 message(STATUS "    version: ${CUDAToolkit_VERSION}")
 message(STATUS "    libraries: ${CUDAToolkit_LIBRARY_DIR}")
 message(STATUS "    include path: ${CUDAToolkit_INCLUDE_DIRS}")
+message(STATUS "CUDA_NVML_LIB: ${CUDA_NVML_LIB}")
 
 # Prevent CMake from creating a response file for CUDA compiler, so clangd can
 # pick up on the includes
@@ -177,7 +199,14 @@ set(TRT_LIB TensorRT::NvInfer)
 get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
 
 set(3RDPARTY_DIR ${TRT_LLM_ROOT_DIR}/3rdparty)
-add_subdirectory(${3RDPARTY_DIR}/pybind11 ${CMAKE_CURRENT_BINARY_DIR}/pybind11)
+if(BINDING_TYPE STREQUAL "pybind" OR BUILD_DEEP_EP)
+  add_subdirectory(${3RDPARTY_DIR}/pybind11
+                   ${CMAKE_CURRENT_BINARY_DIR}/pybind11)
+endif()
+if(BINDING_TYPE STREQUAL "nanobind")
+  add_subdirectory(${3RDPARTY_DIR}/nanobind
+                   ${CMAKE_CURRENT_BINARY_DIR}/nanobind)
+endif()
 
 # include as system to suppress warnings
 include_directories(
@@ -188,8 +217,13 @@ include_directories(
   ${3RDPARTY_DIR}/cutlass/include
   ${3RDPARTY_DIR}/cutlass/tools/util/include
   ${3RDPARTY_DIR}/NVTX/include
-  ${3RDPARTY_DIR}/json/include
-  ${3RDPARTY_DIR}/pybind11/include)
+  ${3RDPARTY_DIR}/json/include)
+if(BINDING_TYPE STREQUAL "pybind" OR BUILD_DEEP_EP)
+  include_directories(${3RDPARTY_DIR}/pybind11/include)
+endif()
+if(BINDING_TYPE STREQUAL "nanobind")
+  include_directories(${3RDPARTY_DIR}/nanobind/include)
+endif()
 
 if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "11")
   add_definitions("-DENABLE_BF16")
@@ -248,9 +282,21 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DBUILD_SYSTEM=cmake_oss ")
 # note: cmake expr generation $<BOOL:${ENABLE_MULTI_DEVICE}> is a build time
 # evaluation so hard to debug at cmake time
 if(ENABLE_MULTI_DEVICE)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DENABLE_MULTI_DEVICE=1")
+  # Add target definitions for both C++ and CUDA
+  add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:ENABLE_MULTI_DEVICE=1>
+                          $<$<COMPILE_LANGUAGE:CUDA>:ENABLE_MULTI_DEVICE=1>)
 else()
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DENABLE_MULTI_DEVICE=0")
+  # Add target definitions for both C++ and CUDA
+  add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:ENABLE_MULTI_DEVICE=0>
+                          $<$<COMPILE_LANGUAGE:CUDA>:ENABLE_MULTI_DEVICE=0>)
+endif()
+
+if(ENABLE_NVSHMEM)
+  add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:ENABLE_NVSHMEM=1>
+                          $<$<COMPILE_LANGUAGE:CUDA>:ENABLE_NVSHMEM=1>)
+else()
+  add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:ENABLE_NVSHMEM=0>
+                          $<$<COMPILE_LANGUAGE:CUDA>:ENABLE_NVSHMEM=0>)
 endif()
 
 # Fix linking issue with TRT 10, the detailed description about `--mcmodel` can
@@ -315,6 +361,10 @@ endif()
 if(COMPRESS_FATBIN)
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --fatbin-options -compress-all")
 endif()
+if(NVCC_TIMING)
+  set(CMAKE_CUDA_FLAGS
+      "${CMAKE_CUDA_FLAGS} --time ${CMAKE_CURRENT_BINARY_DIR}/nvcc-timing.csv")
+endif()
 message("CMAKE_CUDA_FLAGS: ${CMAKE_CUDA_FLAGS}")
 
 set(COMMON_HEADER_DIRS ${PROJECT_SOURCE_DIR} ${CUDAToolkit_INCLUDE_DIR})
@@ -337,15 +387,6 @@ if(NOT WIN32 AND NOT DEFINED USE_CXX11_ABI)
 endif()
 
 if(BUILD_PYT)
-  # Build TORCH_CUDA_ARCH_LIST
-  set(TORCH_CUDA_ARCH_LIST "")
-  foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
-    string(REGEX REPLACE "^([1-9][0-9]*)([0-9]a?)-real$" "\\1.\\2" TORCH_ARCH
-                         ${CUDA_ARCH})
-    list(APPEND TORCH_CUDA_ARCH_LIST ${TORCH_ARCH})
-  endforeach()
-
-  message(STATUS "TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST}")
   # ignore values passed from the environment
   if(DEFINED ENV{TORCH_CUDA_ARCH_LIST})
     message(
@@ -354,6 +395,20 @@ if(BUILD_PYT)
     )
   endif()
   unset(ENV{TORCH_CUDA_ARCH_LIST})
+  # Torch maintains custom logic to add CUDA architecture flags into
+  # CMAKE_CUDA_FLAGS based on TORCH_CUDA_ARCH_LIST variable, instead of using
+  # the native support introduced in newer CMake versions. And it always tries
+  # to add some flags, even given empty TORCH_CUDA_ARCH_LIST.
+
+  # We prefer CMake's native support to be able to easily customize the CUDA
+  # architectures to be compiled for, for each kernel individually. So we set
+  # TORCH_CUDA_ARCH_LIST to a placeholder value and remove the generated flags
+  # then to effectively prevent Torch from adding CUDA architecture flags.
+  message(
+    STATUS
+      "Set TORCH_CUDA_ARCH_LIST to placeholder value \"8.0\" to make Torch happy. "
+      "This is NOT the list of architectures that will be compiled for.")
+  set(TORCH_CUDA_ARCH_LIST "8.0")
 
   find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
   message(STATUS "Found Python executable at ${Python3_EXECUTABLE}")
@@ -377,13 +432,28 @@ if(BUILD_PYT)
 print(os.path.dirname(torch.__file__),end='');"
     RESULT_VARIABLE _PYTHON_SUCCESS
     OUTPUT_VARIABLE TORCH_DIR)
-  if(NOT _PYTHON_SUCCESS MATCHES 0)
+  if(NOT _PYTHON_SUCCESS EQUAL 0)
     message(FATAL_ERROR "Torch config Error.")
   endif()
   list(APPEND CMAKE_PREFIX_PATH ${TORCH_DIR})
   set(USE_SYSTEM_NVTX ON)
   set(nvtx3_dir ${3RDPARTY_DIR}/NVTX/include)
+  set(CMAKE_CUDA_ARCHITECTURES_BACKUP ${CMAKE_CUDA_ARCHITECTURES})
   find_package(Torch REQUIRED)
+  set(CMAKE_CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES_BACKUP})
+  message(
+    STATUS
+      "Removing Torch generated placeholder CUDA architecture flags: -gencode arch=compute_80,code=sm_80."
+  )
+  string(REPLACE "-gencode arch=compute_80,code=sm_80 " "" CMAKE_CUDA_FLAGS_NEW
+                 "${CMAKE_CUDA_FLAGS}")
+  if("${CMAKE_CUDA_FLAGS_NEW}" STREQUAL "${CMAKE_CUDA_FLAGS}")
+    message(
+      FATAL_ERROR
+        "Torch didn't generate expected placeholder CUDA architecture flags.")
+  endif()
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS_NEW}")
+
   add_compile_definitions(TORCH_CUDA=1)
 
   if(DEFINED TORCH_CXX_FLAGS)

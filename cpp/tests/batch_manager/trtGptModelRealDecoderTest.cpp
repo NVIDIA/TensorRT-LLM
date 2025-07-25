@@ -708,14 +708,16 @@ struct BeamConfig
 } // namespace
 
 using ParamType = std::tuple<ModelParams, ModelSpec, TrtGptModelType, TrtGptModelIfbTestType, BeamConfig, // id: 0-4
-    std::optional<int32_t>, // 5. maxTokensInPagedKvCache
-    std::optional<float>,   // 6. freeGpuMemoryFraction
-    bool,                   // 7. enableTrtOverlap
-    bool,                   // 8. enableChunkedContext
-    bool,                   // 9. enableStreamingMode
-    bool,                   // 10. enableCudaGraphMode
-    std::optional<size_t>,  // 11. hostCacheSize
-    bool                    // 12. useRandomEndId
+    std::optional<int32_t>,   // 5. maxTokensInPagedKvCache
+    std::optional<float>,     // 6. freeGpuMemoryFraction
+    bool,                     // 7. enableTrtOverlap
+    bool,                     // 8. enableChunkedContext
+    bool,                     // 9. enableStreamingMode
+    bool,                     // 10. enableCudaGraphMode
+    std::optional<size_t>,    // 11. hostCacheSize
+    bool,                     // 12. useRandomEndId
+    std::vector<SizeType32>,  // 13. batchSizes
+    std::optional<SizeType32> // 14. maxNumTokens
     >;
 
 std::string generateTestName(testing::TestParamInfo<ParamType> const& info)
@@ -866,7 +868,7 @@ TEST_P(ParamTest, Test)
 
     auto const useRandomEndId = std::get<12>(GetParam());
 
-    std::vector<int32_t> batchSizes = modelSpec.mBatchSizes;
+    auto const batchSizes = std::get<13>(GetParam());
 
     std::ostringstream gpuSizePath;
     gpuSizePath << "tp" << modelSpec.mTPSize << "-pp" << modelSpec.mPPSize << "-cp" << modelSpec.mCPSize;
@@ -935,6 +937,11 @@ TEST_P(ParamTest, Test)
 
     executorConfig.setEnableTrtOverlap(std::get<7>(GetParam()));
     executorConfig.setEnableChunkedContext(std::get<8>(GetParam()));
+    auto const maxNumTokens = std::get<14>(GetParam());
+    if (maxNumTokens.has_value())
+    {
+        executorConfig.setMaxNumTokens(maxNumTokens.value());
+    }
     executorConfig.setNormalizeLogProbs(false);
     executorConfig.setMaxBeamWidth(beamConfig.maxBeamWidth);
     executorConfig.setGatherGenerationLogits(modelSpec.mCollectGenerationLogits);
@@ -1042,21 +1049,23 @@ INSTANTIATE_TEST_SUITE_P(GptTests, ParamTest,
                 .useGptAttentionPlugin()
                 .setKVCacheType(KVCacheType::kDISABLED)
                 .usePackedInput()),
-        testing::Values(TrtGptModelType::InflightBatching, TrtGptModelType::InflightFusedBatching),
+        testing::Values(TrtGptModelType::InflightFusedBatching),
         testing::Values(
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(
             // TODO: enable more tests when mixed beam width is supported
-            BeamConfig{1, {1}}, BeamConfig{2, {2}} // , BeamConfig{2, {1, 2}}
+            BeamConfig{1, {1}}, BeamConfig{2, {2}}         // , BeamConfig{2, {1, 2}}
             ),
-        testing::Values(std::nullopt, 1280),       // maxTokensInPagedKvCache
-        testing::Values(std::nullopt, 0.4),        // freeGpuMemoryFraction
-        testing::Values(false, true),              // enableTrtOverlap
-        testing::Values(false),                    // enableChunkedContext
-        testing::Values(false),                    // enableStreamingMode
-        testing::Values(false),                    // enableCudaGraphMode
-        testing::Values(std::nullopt),             // hostCacheSize
-        testing::Values(false)                     // useRandomEndId
+        testing::Values(std::nullopt, 1280),               // maxTokensInPagedKvCache
+        testing::Values(std::nullopt, 0.4),                // freeGpuMemoryFraction
+        testing::Values(true),                             // enableTrtOverlap
+        testing::Values(false),                            // enableChunkedContext
+        testing::Values(false),                            // enableStreamingMode
+        testing::Values(false),                            // enableCudaGraphMode
+        testing::Values(std::nullopt),                     // hostCacheSize
+        testing::Values(false),                            // useRandomEndId
+        testing::Values(std::vector<SizeType32>{1, 2, 8}), // batchSizes
+        testing::Values(std::nullopt)                      // maxNumTokens
         ),
     generateTestName);
 
@@ -1068,21 +1077,23 @@ INSTANTIATE_TEST_SUITE_P(GptRandomEndIdTests, ParamTest,
                 .useGptAttentionPlugin()
                 .setKVCacheType(KVCacheType::kPAGED)
                 .usePackedInput()),
-        testing::Values(TrtGptModelType::InflightBatching, TrtGptModelType::InflightFusedBatching),
+        testing::Values(TrtGptModelType::InflightFusedBatching),
         testing::Values(
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(
             // TODO: enable more tests when mixed beam width is supported
-            BeamConfig{1, {1}}, BeamConfig{2, {2}} // , BeamConfig{2, {1, 2}}
+            BeamConfig{1, {1}}, BeamConfig{2, {2}}         // , BeamConfig{2, {1, 2}}
             ),
-        testing::Values(std::nullopt, 1280),       // maxTokensInPagedKvCache
-        testing::Values(std::nullopt, 0.4),        // freeGpuMemoryFraction
-        testing::Values(false, true),              // enableTrtOverlap
-        testing::Values(false),                    // enableChunkedContext
-        testing::Values(false),                    // enableStreamingMode
-        testing::Values(false),                    // enableCudaGraphMode
-        testing::Values(std::nullopt),             // hostCacheSize
-        testing::Values(true)                      // useRandomEndId
+        testing::Values(std::nullopt, 1280),               // maxTokensInPagedKvCache
+        testing::Values(std::nullopt, 0.4),                // freeGpuMemoryFraction
+        testing::Values(true),                             // enableTrtOverlap
+        testing::Values(false),                            // enableChunkedContext
+        testing::Values(false),                            // enableStreamingMode
+        testing::Values(false),                            // enableCudaGraphMode
+        testing::Values(std::nullopt),                     // hostCacheSize
+        testing::Values(true),                             // useRandomEndId
+        testing::Values(std::vector<SizeType32>{1, 2, 8}), // batchSizes
+        testing::Values(std::nullopt)                      // maxNumTokens
         ),
     generateTestName);
 
@@ -1095,18 +1106,20 @@ INSTANTIATE_TEST_SUITE_P(GptKVOffloadingTest, ParamTest,
                 .setKVCacheType(KVCacheType::kPAGED)
                 .usePackedInput()
                 .setKVCacheReuse(true)),
-        testing::Values(TrtGptModelType::InflightBatching, TrtGptModelType::InflightFusedBatching),
+        testing::Values(TrtGptModelType::InflightFusedBatching),
         testing::Values(
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(BeamConfig{1, {1}}),
-        testing::Values(256),               // maxTokensInPagedKvCache
-        testing::Values(std::nullopt, 0.4), // freeGpuMemoryFraction
-        testing::Values(false, true),       // enableTrtOverlap
-        testing::Values(false),             // enableChunkedContext
-        testing::Values(false),             // enableStreamingMode
-        testing::Values(false),             // enableCudaGraphMode
-        testing::Values(100000000),         // hostCacheSize
-        testing::Values(false, true)        // useRandomEndId
+        testing::Values(256),                              // maxTokensInPagedKvCache
+        testing::Values(std::nullopt, 0.4),                // freeGpuMemoryFraction
+        testing::Values(true),                             // enableTrtOverlap
+        testing::Values(false),                            // enableChunkedContext
+        testing::Values(false),                            // enableStreamingMode
+        testing::Values(false),                            // enableCudaGraphMode
+        testing::Values(100000000),                        // hostCacheSize
+        testing::Values(false, true),                      // useRandomEndId
+        testing::Values(std::vector<SizeType32>{1, 2, 8}), // batchSizes
+        testing::Values(std::nullopt)                      // maxNumTokens
         ),
     generateTestName);
 
@@ -1129,16 +1142,18 @@ INSTANTIATE_TEST_SUITE_P(GptCudaGraphTests, ParamTest,
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(
             // TODO: enable more tests when mixed beam width is supported
-            BeamConfig{1, {1}}, BeamConfig{2, {2}} // , BeamConfig{2, {1, 2}}
+            BeamConfig{1, {1}}, BeamConfig{2, {2}}         // , BeamConfig{2, {1, 2}}
             ),
-        testing::Values(std::nullopt),             // maxTokensInPagedKvCache
-        testing::Values(0.4),                      // freeGpuMemoryFraction
-        testing::Values(false),                    // enableTrtOverlap
-        testing::Values(false, true),              // enableChunkedContext
-        testing::Values(false),                    // enableStreamingMode
-        testing::Values(true),                     // enableCudaGraphMode
-        testing::Values(std::nullopt),             // hostCacheSize
-        testing::Values(false)                     // useRandomEndId
+        testing::Values(std::nullopt),                     // maxTokensInPagedKvCache
+        testing::Values(0.4),                              // freeGpuMemoryFraction
+        testing::Values(false),                            // enableTrtOverlap
+        testing::Values(true),                             // enableChunkedContext
+        testing::Values(false),                            // enableStreamingMode
+        testing::Values(true),                             // enableCudaGraphMode
+        testing::Values(std::nullopt),                     // hostCacheSize
+        testing::Values(false),                            // useRandomEndId
+        testing::Values(std::vector<SizeType32>{1, 2, 8}), // batchSizes
+        testing::Values(std::nullopt)                      // maxNumTokens
         ),
     generateTestName);
 
@@ -1149,23 +1164,24 @@ INSTANTIATE_TEST_SUITE_P(GptSwitchBwTests, ParamTest,
             ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}
                 .useGptAttentionPlugin()
                 .setKVCacheType(KVCacheType::kPAGED)
-                .usePackedInput()
-                .setBatchSizes({4})),
+                .usePackedInput()),
         testing::Values(TrtGptModelType::InflightFusedBatching),
         testing::Values(
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(
             // TODO: enable more tests when mixed beam width is supported
-            BeamConfig{2, {1}}         // , BeamConfig{2, {1, 2}}
+            BeamConfig{2, {1}}                       // , BeamConfig{2, {1, 2}}
             ),
-        testing::Values(std::nullopt), // maxTokensInPagedKvCache
-        testing::Values(0.4),          // freeGpuMemoryFraction
-        testing::Values(false),        // enableTrtOverlap
-        testing::Values(true),         // enableChunkedContext
-        testing::Values(false),        // enableStreamingMode
-        testing::Values(false),        // enableCudaGraphMode
-        testing::Values(std::nullopt), // hostCacheSize
-        testing::Values(false)         // useRandomEndId
+        testing::Values(std::nullopt),               // maxTokensInPagedKvCache
+        testing::Values(0.4),                        // freeGpuMemoryFraction
+        testing::Values(false),                      // enableTrtOverlap
+        testing::Values(true),                       // enableChunkedContext
+        testing::Values(false),                      // enableStreamingMode
+        testing::Values(false),                      // enableCudaGraphMode
+        testing::Values(std::nullopt),               // hostCacheSize
+        testing::Values(false),                      // useRandomEndId
+        testing::Values(std::vector<SizeType32>{4}), // batchSizes
+        testing::Values(std::nullopt)                // maxNumTokens
         ),
     generateTestName);
 
@@ -1176,20 +1192,21 @@ INSTANTIATE_TEST_SUITE_P(GptNProfilesTests, ParamTest,
                             .usePackedInput()
                             .setKVCacheType(KVCacheType::kPAGED)
                             .useMultipleProfiles()),
-        testing::Values(TrtGptModelType::InflightBatching, TrtGptModelType::InflightFusedBatching),
-        testing::Values(TrtGptModelIfbTestType::BULK),
+        testing::Values(TrtGptModelType::InflightFusedBatching), testing::Values(TrtGptModelIfbTestType::BULK),
         testing::Values(
             // TODO: enable more tests when mixed beam width is supported
-            BeamConfig{1, {1}}, BeamConfig{2, {2}} // , BeamConfig{2, {1, 2}}
+            BeamConfig{1, {1}}, BeamConfig{2, {2}}         // , BeamConfig{2, {1, 2}}
             ),
-        testing::Values(std::nullopt, 1280),       // maxTokensInPagedKvCache
-        testing::Values(std::nullopt, 0.4),        // freeGpuMemoryFraction
-        testing::Values(false, true),              // enableTrtOverlap
-        testing::Values(false, true),              // enableChunkedContext
-        testing::Values(false),                    // enableStreamingMode
-        testing::Values(false),                    // enableCudaGraphMode
-        testing::Values(std::nullopt),             // hostCacheSize
-        testing::Values(true)                      // useRandomEndId
+        testing::Values(std::nullopt, 1280),               // maxTokensInPagedKvCache
+        testing::Values(std::nullopt, 0.4),                // freeGpuMemoryFraction
+        testing::Values(true),                             // enableTrtOverlap
+        testing::Values(true),                             // enableChunkedContext
+        testing::Values(false),                            // enableStreamingMode
+        testing::Values(false),                            // enableCudaGraphMode
+        testing::Values(std::nullopt),                     // hostCacheSize
+        testing::Values(true),                             // useRandomEndId
+        testing::Values(std::vector<SizeType32>{1, 2, 8}), // batchSizes
+        testing::Values(std::nullopt)                      // maxNumTokens
         ),
     generateTestName);
 
@@ -1214,22 +1231,24 @@ INSTANTIATE_TEST_SUITE_P(GptSqTests, ParamTest,
                 .usePackedInput()
                 .setKVCacheType(KVCacheType::kDISABLED)
                 .setQuantMethod(QuantMethod::kSMOOTH_QUANT)),
-        testing::Values(TrtGptModelType::InflightBatching),
+        testing::Values(TrtGptModelType::InflightFusedBatching),
         testing::Values(
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(
             // TODO: enable more tests when mixed beam width is supported
             // FIXME: disabled flaky beam search tests (https://nvbugspro.nvidia.com/bug/4646234)
-            BeamConfig{1, {1}}         //, BeamConfig{2, {2}}
+            BeamConfig{1, {1}}                             //, BeamConfig{2, {2}}
             ),
-        testing::Values(std::nullopt), // maxTokensInPagedKvCache
-        testing::Values(0.4),          // freeGpuMemoryFraction
-        testing::Values(false),        // enableTrtOverlap
-        testing::Values(false),        // enableChunkedContext
-        testing::Values(false),        // enableStreamingMode
-        testing::Values(false),        // enableCudaGraphMode
-        testing::Values(std::nullopt), // hostCacheSize
-        testing::Values(false)         // useRandomEndId
+        testing::Values(std::nullopt),                     // maxTokensInPagedKvCache
+        testing::Values(0.4),                              // freeGpuMemoryFraction
+        testing::Values(false),                            // enableTrtOverlap
+        testing::Values(false),                            // enableChunkedContext
+        testing::Values(false),                            // enableStreamingMode
+        testing::Values(false),                            // enableCudaGraphMode
+        testing::Values(std::nullopt),                     // hostCacheSize
+        testing::Values(false),                            // useRandomEndId
+        testing::Values(std::vector<SizeType32>{1, 2, 8}), // batchSizes
+        testing::Values(std::nullopt)                      // maxNumTokens
         ),
     generateTestName);
 
@@ -1243,17 +1262,19 @@ INSTANTIATE_TEST_SUITE_P(DISABLED_GptChunkedContextTests, ParamTest,
                 .usePackedInput()
                 .setKVCacheType(KVCacheType::kPAGED)
                 .setMaxInputLength(128)),
-        testing::Values(TrtGptModelType::InflightBatching, TrtGptModelType::InflightFusedBatching),
-        testing::Values(TrtGptModelIfbTestType::BULK), // TrtGptModelIfbTestType
-        testing::Values(BeamConfig{1, {1}}),           // beam config
-        testing::Values(257),                          // maxTokensInPagedKvCache
-        testing::Values(0.4),                          // freeGpuMemoryFraction
-        testing::Values(false),                        // enableTrtOverlap
-        testing::Values(true),                         // enableChunkedContext
-        testing::Values(false),                        // enableStreamingMode
-        testing::Values(false),                        // enableCudaGraphMode
-        testing::Values(std::nullopt),                 // hostCacheSize
-        testing::Values(false)                         // useRandomEndId
+        testing::Values(TrtGptModelType::InflightFusedBatching),
+        testing::Values(TrtGptModelIfbTestType::BULK),     // TrtGptModelIfbTestType
+        testing::Values(BeamConfig{1, {1}}),               // beam config
+        testing::Values(257),                              // maxTokensInPagedKvCache
+        testing::Values(0.4),                              // freeGpuMemoryFraction
+        testing::Values(false),                            // enableTrtOverlap
+        testing::Values(true),                             // enableChunkedContext
+        testing::Values(false),                            // enableStreamingMode
+        testing::Values(false),                            // enableCudaGraphMode
+        testing::Values(std::nullopt),                     // hostCacheSize
+        testing::Values(false),                            // useRandomEndId
+        testing::Values(std::vector<SizeType32>{1, 2, 8}), // batchSizes
+        testing::Values(std::nullopt)                      // maxNumTokens
         ),
     generateTestName);
 
@@ -1272,18 +1293,20 @@ INSTANTIATE_TEST_SUITE_P(GptChunkedLongContextTests, ParamTest,
                 .setKVCacheType(KVCacheType::kPAGED)
                 .useDraftTokensExternalDecoding()
                 .setDraftTokens(5)),
-        testing::Values(TrtGptModelType::InflightBatching, TrtGptModelType::InflightFusedBatching),
+        testing::Values(TrtGptModelType::InflightFusedBatching),
         testing::Values(TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT,
-            TrtGptModelIfbTestType::RANDOM), // TrtGptModelIfbTestType
-        testing::Values(BeamConfig{1, {1}}), // beam config
-        testing::Values(std::nullopt, 1024), // maxTokensInPagedKvCache
-        testing::Values(0.4),                // freeGpuMemoryFraction
-        testing::Values(true),               // enableTrtOverlap
-        testing::Values(true),               // enableChunkedContext
-        testing::Values(false),              // enableStreamingMode
-        testing::Values(false),              // enableCudaGraphMode
-        testing::Values(std::nullopt),       // hostCacheSize
-        testing::Values(false)               // useRandomEndId
+            TrtGptModelIfbTestType::RANDOM),               // TrtGptModelIfbTestType
+        testing::Values(BeamConfig{1, {1}}),               // beam config
+        testing::Values(std::nullopt),                     // maxTokensInPagedKvCache
+        testing::Values(0.4),                              // freeGpuMemoryFraction
+        testing::Values(true),                             // enableTrtOverlap
+        testing::Values(true),                             // enableChunkedContext
+        testing::Values(false),                            // enableStreamingMode
+        testing::Values(false),                            // enableCudaGraphMode
+        testing::Values(std::nullopt),                     // hostCacheSize
+        testing::Values(false),                            // useRandomEndId
+        testing::Values(std::vector<SizeType32>{1, 2, 8}), // batchSizes
+        testing::Values(64)                                // maxNumTokens
         ),
     generateTestName);
 
@@ -1310,18 +1333,20 @@ INSTANTIATE_TEST_SUITE_P(GptDraftTests, ParamTest,
                 .replaceLogits()
                 .collectGenerationLogitsFile()
                 .collectContextLogitsFile()),
-        testing::Values(TrtGptModelType::InflightBatching, TrtGptModelType::InflightFusedBatching),
+        testing::Values(TrtGptModelType::InflightFusedBatching),
         testing::Values(
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
-        testing::Values(BeamConfig{1, {1}}), // beamConfig
-        testing::Values(std::nullopt),       // maxTokensInPagedKvCache
-        testing::Values(0.4),                // freeGpuMemoryFraction
-        testing::Values(false),              // enableTrtOverlap
-        testing::Values(true),               // enableChunkedContext
-        testing::Values(false),              // enableStreamingMode
-        testing::Values(false),              // enableCudaGraphMode
-        testing::Values(std::nullopt),       // hostCacheSize
-        testing::Values(false, true)         // useRandomEndId
+        testing::Values(BeamConfig{1, {1}}),               // beamConfig
+        testing::Values(std::nullopt),                     // maxTokensInPagedKvCache
+        testing::Values(0.4),                              // freeGpuMemoryFraction
+        testing::Values(false),                            // enableTrtOverlap
+        testing::Values(true),                             // enableChunkedContext
+        testing::Values(false),                            // enableStreamingMode
+        testing::Values(false),                            // enableCudaGraphMode
+        testing::Values(std::nullopt),                     // hostCacheSize
+        testing::Values(false, true),                      // useRandomEndId
+        testing::Values(std::vector<SizeType32>{1, 2, 8}), // batchSizes
+        testing::Values(std::nullopt)                      // maxNumTokens
         ),
     generateTestName);
 
@@ -1340,14 +1365,16 @@ INSTANTIATE_TEST_SUITE_P(GptLogitsTests, ParamTest,
         testing::Values(TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT,
             TrtGptModelIfbTestType::RANDOM),                                                        // testType
         testing::Values(BeamConfig{1, {1}}),                                                        // beamConfig
-        testing::Values(std::nullopt), // maxTokensInPagedKvCache
-        testing::Values(0.4),          // freeGpuMemoryFraction
-        testing::Values(false),        // enableTrtOverlap
-        testing::Values(true),         // enableChunkedContext
-        testing::Values(false, true),  // enableStreamingMode
-        testing::Values(false),        // enableCudaGraphMode
-        testing::Values(std::nullopt), // hostCacheSize
-        testing::Values(true)          // useRandomEndId
+        testing::Values(std::nullopt),                     // maxTokensInPagedKvCache
+        testing::Values(0.4),                              // freeGpuMemoryFraction
+        testing::Values(false),                            // enableTrtOverlap
+        testing::Values(true),                             // enableChunkedContext
+        testing::Values(false, true),                      // enableStreamingMode
+        testing::Values(false),                            // enableCudaGraphMode
+        testing::Values(std::nullopt),                     // hostCacheSize
+        testing::Values(true),                             // useRandomEndId
+        testing::Values(std::vector<SizeType32>{1, 2, 8}), // batchSizes
+        testing::Values(std::nullopt)                      // maxNumTokens
         ),
     generateTestName);
 
@@ -1373,7 +1400,9 @@ INSTANTIATE_TEST_SUITE_P(GptLogProbsTests, ParamTest,
         testing::Values(false),                                  // enableStreamingMode
         testing::Values(false),                                  // enableCudaGraphMode
         testing::Values(std::nullopt),                           // hostCacheSize
-        testing::Values(false)                                   // useRandomEndId
+        testing::Values(false),                                  // useRandomEndId
+        testing::Values(std::vector<SizeType32>{1, 2, 8}),       // batchSizes
+        testing::Values(std::nullopt)                            // maxNumTokens
         ),
     generateTestName);
 
@@ -1391,22 +1420,24 @@ INSTANTIATE_TEST_SUITE_P(GptjTests, ParamTest,
                 .usePackedInput()
 
                 ),
-        testing::Values(TrtGptModelType::InflightBatching, TrtGptModelType::InflightFusedBatching),
+        testing::Values(TrtGptModelType::InflightFusedBatching),
         // WAR: disable wavefront and random tests on because of switched beams
         testing::Values(TrtGptModelIfbTestType::BULK
             /* , TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM */),
         testing::Values(
             // TODO: enable more tests when mixed beam width is supported
-            BeamConfig{1, {1}}, BeamConfig{2, {2}} // , BeamConfig{2, {1, 2}}
+            BeamConfig{1, {1}}, BeamConfig{2, {2}}         // , BeamConfig{2, {1, 2}}
             ),
-        testing::Values(std::nullopt),             // maxTokensInPagedKvCache
-        testing::Values(0.4),                      // freeGpuMemoryFraction
-        testing::Values(false),                    // enableTrtOverlap
-        testing::Values(false),                    // enableChunkedContext
-        testing::Values(false),                    // enableStreamingMode
-        testing::Values(false),                    // enableCudaGraphMode
-        testing::Values(std::nullopt),             // hostCacheSize
-        testing::Values(false)                     // useRandomEndId
+        testing::Values(std::nullopt),                     // maxTokensInPagedKvCache
+        testing::Values(0.4),                              // freeGpuMemoryFraction
+        testing::Values(false),                            // enableTrtOverlap
+        testing::Values(false),                            // enableChunkedContext
+        testing::Values(false),                            // enableStreamingMode
+        testing::Values(false),                            // enableCudaGraphMode
+        testing::Values(std::nullopt),                     // hostCacheSize
+        testing::Values(false),                            // useRandomEndId
+        testing::Values(std::vector<SizeType32>{1, 2, 8}), // batchSizes
+        testing::Values(std::nullopt)                      // maxNumTokens
         ),
     generateTestName);
 
@@ -1428,14 +1459,16 @@ INSTANTIATE_TEST_SUITE_P(MambaTests, ParamTest,
         testing::Values(
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(BeamConfig{1, {1}}),
-        testing::Values(std::nullopt), // maxTokensInPagedKvCache
-        testing::Values(0.4),          // freeGpuMemoryFraction
-        testing::Values(false),        // enableTrtOverlap
-        testing::Values(false),        // enableChunkedContext
-        testing::Values(false),        // enableStreamingMode
-        testing::Values(false),        // enableCudaGraphMode
-        testing::Values(std::nullopt), // hostCacheSize
-        testing::Values(false)         // useRandomEndId
+        testing::Values(std::nullopt),                     // maxTokensInPagedKvCache
+        testing::Values(0.4),                              // freeGpuMemoryFraction
+        testing::Values(false),                            // enableTrtOverlap
+        testing::Values(false),                            // enableChunkedContext
+        testing::Values(false),                            // enableStreamingMode
+        testing::Values(false),                            // enableCudaGraphMode
+        testing::Values(std::nullopt),                     // hostCacheSize
+        testing::Values(false),                            // useRandomEndId
+        testing::Values(std::vector<SizeType32>{1, 2, 8}), // batchSizes
+        testing::Values(std::nullopt)                      // maxNumTokens
         ),
     generateTestName);
 
@@ -1451,14 +1484,16 @@ INSTANTIATE_TEST_SUITE_P(RecurrentGemmaTests, ParamTest,
         testing::Values(
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(BeamConfig{1, {1}}),
-        testing::Values(std::nullopt), // maxTokensInPagedKvCache
-        testing::Values(0.4),          // freeGpuMemoryFraction
-        testing::Values(false),        // enableTrtOverlap
-        testing::Values(false),        // enableChunkedContext
-        testing::Values(false),        // enableStreamingMode
-        testing::Values(false),        // enableCudaGraphMode
-        testing::Values(std::nullopt), // hostCacheSize
-        testing::Values(false)         // useRandomEndId
+        testing::Values(std::nullopt),                     // maxTokensInPagedKvCache
+        testing::Values(0.4),                              // freeGpuMemoryFraction
+        testing::Values(false),                            // enableTrtOverlap
+        testing::Values(false),                            // enableChunkedContext
+        testing::Values(false),                            // enableStreamingMode
+        testing::Values(false),                            // enableCudaGraphMode
+        testing::Values(std::nullopt),                     // hostCacheSize
+        testing::Values(false),                            // useRandomEndId
+        testing::Values(std::vector<SizeType32>{1, 2, 8}), // batchSizes
+        testing::Values(std::nullopt)                      // maxNumTokens
         ),
     generateTestName);
 
@@ -1488,21 +1523,23 @@ INSTANTIATE_TEST_SUITE_P(LlamaTests, ParamTest,
                 .useTensorParallelism(2)
 
                 ),
-        testing::Values(TrtGptModelType::InflightBatching, TrtGptModelType::InflightFusedBatching),
+        testing::Values(TrtGptModelType::InflightFusedBatching),
         testing::Values(
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(
             // TODO: enable more tests when mixed beam width is supported
-            BeamConfig{1, {1}}, BeamConfig{2, {2}} // , BeamConfig{2, {1, 2}}
+            BeamConfig{1, {1}}, BeamConfig{2, {2}}         // , BeamConfig{2, {1, 2}}
             ),
-        testing::Values(std::nullopt),             // maxTokensInPagedKvCache
-        testing::Values(0.4),                      // freeGpuMemoryFraction
-        testing::Values(false),                    // enableTrtOverlap
-        testing::Values(false),                    // enableChunkedContext
-        testing::Values(false),                    // enableStreamingMode
-        testing::Values(false),                    // enableCudaGraphMode
-        testing::Values(std::nullopt),             // hostCacheSize
-        testing::Values(false)                     // useRandomEndId
+        testing::Values(std::nullopt),                     // maxTokensInPagedKvCache
+        testing::Values(0.4),                              // freeGpuMemoryFraction
+        testing::Values(false),                            // enableTrtOverlap
+        testing::Values(false),                            // enableChunkedContext
+        testing::Values(false),                            // enableStreamingMode
+        testing::Values(false),                            // enableCudaGraphMode
+        testing::Values(std::nullopt),                     // hostCacheSize
+        testing::Values(false),                            // useRandomEndId
+        testing::Values(std::vector<SizeType32>{1, 2, 8}), // batchSizes
+        testing::Values(std::nullopt)                      // maxNumTokens
         ),
     generateTestName);
 
@@ -1518,14 +1555,16 @@ INSTANTIATE_TEST_SUITE_P(ChatGlmTests, ParamTest,
         testing::Values(
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(BeamConfig{1, {1}}),
-        testing::Values(std::nullopt), // maxTokensInPagedKvCache
-        testing::Values(0.4),          // freeGpuMemoryFraction
-        testing::Values(false),        // enableTrtOverlap
-        testing::Values(false, true),  // enableChunkedContext
-        testing::Values(false),        // enableStreamingMode
-        testing::Values(false),        // enableCudaGraphMode
-        testing::Values(std::nullopt), // hostCacheSize
-        testing::Values(false)         // useRandomEndId
+        testing::Values(std::nullopt),                     // maxTokensInPagedKvCache
+        testing::Values(0.4),                              // freeGpuMemoryFraction
+        testing::Values(false),                            // enableTrtOverlap
+        testing::Values(false, true),                      // enableChunkedContext
+        testing::Values(false),                            // enableStreamingMode
+        testing::Values(false),                            // enableCudaGraphMode
+        testing::Values(std::nullopt),                     // hostCacheSize
+        testing::Values(false),                            // useRandomEndId
+        testing::Values(std::vector<SizeType32>{1, 2, 8}), // batchSizes
+        testing::Values(std::nullopt)                      // maxNumTokens
         ),
     generateTestName);
 
@@ -1542,14 +1581,16 @@ INSTANTIATE_TEST_SUITE_P(ChatGlm0Tests, ParamTest,
         testing::Values(
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(BeamConfig{1, {1}}),
-        testing::Values(std::nullopt), // maxTokensInPagedKvCache
-        testing::Values(0.4),          // freeGpuMemoryFraction
-        testing::Values(false),        // enableTrtOverlap
-        testing::Values(false),        // enableChunkedContext
-        testing::Values(false),        // enableStreamingMode
-        testing::Values(false),        // enableCudaGraphMode
-        testing::Values(std::nullopt), // hostCacheSize
-        testing::Values(false)         // useRandomEndId
+        testing::Values(std::nullopt),                     // maxTokensInPagedKvCache
+        testing::Values(0.4),                              // freeGpuMemoryFraction
+        testing::Values(false),                            // enableTrtOverlap
+        testing::Values(false),                            // enableChunkedContext
+        testing::Values(false),                            // enableStreamingMode
+        testing::Values(false),                            // enableCudaGraphMode
+        testing::Values(std::nullopt),                     // hostCacheSize
+        testing::Values(false),                            // useRandomEndId
+        testing::Values(std::vector<SizeType32>{1, 2, 8}), // batchSizes
+        testing::Values(std::nullopt)                      // maxNumTokens
         ),
     generateTestName);
 
@@ -1563,18 +1604,21 @@ INSTANTIATE_TEST_SUITE_P(MedusaTests, ParamTest,
                 .useGptAttentionPlugin()
                 .usePackedInput()
                 .setKVCacheType(KVCacheType::kPAGED)
-                .useMedusa()
-                .setBatchSizes({8})),
-        testing::Values(TrtGptModelType::InflightFusedBatching), testing::Values(TrtGptModelIfbTestType::BULK),
+                .useMedusa()),
+        testing::Values(TrtGptModelType::InflightFusedBatching),
+        testing::Values(
+            TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(BeamConfig{1, {1}}),
-        testing::Values(std::nullopt), // maxTokensInPagedKvCache
-        testing::Values(0.4),          // freeGpuMemoryFraction
-        testing::Values(false),        // enableTrtOverlap
-        testing::Values(false, true),  // enableChunkedContext
-        testing::Values(false),        // enableStreamingMode
-        testing::Values(true, false),  // enableCudaGraphMode
-        testing::Values(std::nullopt), // hostCacheSize
-        testing::Values(false)         // useRandomEndId
+        testing::Values(std::nullopt),               // maxTokensInPagedKvCache
+        testing::Values(0.4),                        // freeGpuMemoryFraction
+        testing::Values(false),                      // enableTrtOverlap
+        testing::Values(true),                       // enableChunkedContext
+        testing::Values(false),                      // enableStreamingMode
+        testing::Values(true, false),                // enableCudaGraphMode
+        testing::Values(std::nullopt),               // hostCacheSize
+        testing::Values(false),                      // useRandomEndId
+        testing::Values(std::vector<SizeType32>{8}), // batchSizes
+        testing::Values(std::nullopt)                // maxNumTokens
         ),
     generateTestName);
 
@@ -1586,19 +1630,21 @@ INSTANTIATE_TEST_SUITE_P(EagleTests, ParamTest,
                 .useGptAttentionPlugin()
                 .usePackedInput()
                 .setKVCacheType(KVCacheType::kPAGED)
-                .useEagle()
-                .setBatchSizes({8})),
+                .useEagle()),
         testing::Values(TrtGptModelType::InflightFusedBatching),
-        testing::Values(TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT),
+        testing::Values(
+            TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(BeamConfig{1, {1}}),
-        testing::Values(std::nullopt), // maxTokensInPagedKvCache
-        testing::Values(0.4),          // freeGpuMemoryFraction
-        testing::Values(false),        // enableTrtOverlap
-        testing::Values(false, true),  // enableChunkedContext
-        testing::Values(false),        // enableStreamingMode
-        testing::Values(true, false),  // enableCudaGraphMode
-        testing::Values(std::nullopt), // hostCacheSize
-        testing::Values(false)         // useRandomEndId
+        testing::Values(std::nullopt),               // maxTokensInPagedKvCache
+        testing::Values(0.4),                        // freeGpuMemoryFraction
+        testing::Values(false),                      // enableTrtOverlap
+        testing::Values(true),                       // enableChunkedContext
+        testing::Values(false),                      // enableStreamingMode
+        testing::Values(true, false),                // enableCudaGraphMode
+        testing::Values(std::nullopt),               // hostCacheSize
+        testing::Values(false),                      // useRandomEndId
+        testing::Values(std::vector<SizeType32>{8}), // batchSizes
+        testing::Values(std::nullopt)                // maxNumTokens
         ),
     generateTestName);
 
@@ -1610,20 +1656,21 @@ INSTANTIATE_TEST_SUITE_P(LlamaLookaheadDecodingTests, ParamTest,
                 .useGptAttentionPlugin()
                 .usePackedInput()
                 .setKVCacheType(KVCacheType::kPAGED)
-                .useLookaheadDecoding()
-                .setBatchSizes({1, 16})),
+                .useLookaheadDecoding()),
         testing::Values(TrtGptModelType::InflightFusedBatching),
         testing::Values(
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
-        testing::Values(BeamConfig{1, {1}}), // beamConfig
-        testing::Values(std::nullopt),       // maxTokensInPagedKvCache
-        testing::Values(0.4),                // freeGpuMemoryFraction
-        testing::Values(false),              // enableTrtOverlap
-        testing::Values(false),              // enableChunkedContext
-        testing::Values(false),              // enableStreamingMode
-        testing::Values(false),              // enableCudaGraphMode
-        testing::Values(std::nullopt),       // hostCacheSize
-        testing::Values(true)                // useRandomEndId
+        testing::Values(BeamConfig{1, {1}}),             // beamConfig
+        testing::Values(std::nullopt),                   // maxTokensInPagedKvCache
+        testing::Values(0.4),                            // freeGpuMemoryFraction
+        testing::Values(false),                          // enableTrtOverlap
+        testing::Values(false),                          // enableChunkedContext
+        testing::Values(false),                          // enableStreamingMode
+        testing::Values(false),                          // enableCudaGraphMode
+        testing::Values(std::nullopt),                   // hostCacheSize
+        testing::Values(true),                           // useRandomEndId
+        testing::Values(std::vector<SizeType32>{1, 16}), // batchSizes
+        testing::Values(std::nullopt)                    // maxNumTokens
         ),
 
     generateTestName);
@@ -1637,18 +1684,21 @@ INSTANTIATE_TEST_SUITE_P(ExplicitDraftTokensDecodingTests, ParamTest,
                 .usePackedInput()
                 .setKVCacheType(KVCacheType::kPAGED)
                 .useExplicitDraftTokensDecoding()
-                .setMaxOutputLength(128)
-                .setBatchSizes({8})),
-        testing::Values(TrtGptModelType::InflightFusedBatching), testing::Values(TrtGptModelIfbTestType::BULK),
-        testing::Values(BeamConfig{1, {1}}), // beamConfig
-        testing::Values(std::nullopt),       // maxTokensInPagedKvCache
-        testing::Values(0.4),                // freeGpuMemoryFraction
-        testing::Values(false),              // enableTrtOverlap
-        testing::Values(false, true),        // enableChunkedContext
-        testing::Values(false),              // enableStreamingMode
-        testing::Values(false),              // enableCudaGraphMode
-        testing::Values(std::nullopt),       // hostCacheSize
-        testing::Values(false)               // useRandomEndId
+                .setMaxOutputLength(128)),
+        testing::Values(TrtGptModelType::InflightFusedBatching),
+        testing::Values(
+            TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
+        testing::Values(BeamConfig{1, {1}}),         // beamConfig
+        testing::Values(std::nullopt),               // maxTokensInPagedKvCache
+        testing::Values(0.4),                        // freeGpuMemoryFraction
+        testing::Values(false),                      // enableTrtOverlap
+        testing::Values(true),                       // enableChunkedContext
+        testing::Values(false),                      // enableStreamingMode
+        testing::Values(false),                      // enableCudaGraphMode
+        testing::Values(std::nullopt),               // hostCacheSize
+        testing::Values(false),                      // useRandomEndId
+        testing::Values(std::vector<SizeType32>{8}), // batchSizes
+        testing::Values(std::nullopt)                // maxNumTokens
         ),
 
     generateTestName);
@@ -1665,21 +1715,23 @@ INSTANTIATE_TEST_SUITE_P(GptjFP8Tests, ParamTest,
                 .usePackedInput()
 
                 ),
-        testing::Values(TrtGptModelType::InflightBatching, TrtGptModelType::InflightFusedBatching),
+        testing::Values(TrtGptModelType::InflightFusedBatching),
         testing::Values(
             TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(
             // TODO: enable more tests when supported
-            BeamConfig{1, {1}}         // , BeamConfig{2, {2}}, BeamConfig{2, {1, 2}}
+            BeamConfig{1, {1}}                             // , BeamConfig{2, {2}}, BeamConfig{2, {1, 2}}
             ),
-        testing::Values(std::nullopt), // maxTokensInPagedKvCache
-        testing::Values(0.4),          // freeGpuMemoryFraction
-        testing::Values(false),        // enableTrtOverlap
-        testing::Values(true),         // enableChunkedContext
-        testing::Values(false),        // enableStreamingMode
-        testing::Values(false),        // enableCudaGraphMode
-        testing::Values(std::nullopt), // hostCacheSize
-        testing::Values(false)         // useRandomEndId
+        testing::Values(std::nullopt),                     // maxTokensInPagedKvCache
+        testing::Values(0.4),                              // freeGpuMemoryFraction
+        testing::Values(false),                            // enableTrtOverlap
+        testing::Values(true),                             // enableChunkedContext
+        testing::Values(false),                            // enableStreamingMode
+        testing::Values(false),                            // enableCudaGraphMode
+        testing::Values(std::nullopt),                     // hostCacheSize
+        testing::Values(false),                            // useRandomEndId
+        testing::Values(std::vector<SizeType32>{1, 2, 8}), // batchSizes
+        testing::Values(std::nullopt)                      // maxNumTokens
         ),
     generateTestName);
 

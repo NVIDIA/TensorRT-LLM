@@ -18,6 +18,7 @@ extend_skip_glob = [
     "tensorrt_llm/_dlpack_utils.py",
     "tensorrt_llm/_ipc_utils.py",
     "tensorrt_llm/_mnnvl_utils.py",
+    "tensorrt_llm/_torch/models/modeling_pixtral.py",
     "tensorrt_llm/disaggregated_params.py",
     "tensorrt_llm/engine.py",
     "tensorrt_llm/graph_rewriting.py",
@@ -30,6 +31,8 @@ extend_skip_glob = [
     "tensorrt_llm/python_plugin.py",
     "tensorrt_llm/sampling_params.py",
     "tensorrt_llm/top_model_mixin.py",
+    "tests/unittest/_torch/modeling/test_modeling_mistral.py",
+    "tests/unittest/_torch/modeling/test_modeling_pixtral.py",
 ]
 
 [tool.yapf]
@@ -45,6 +48,7 @@ ignore_patterns = [
     "tensorrt_llm/_dlpack_utils.py",
     "tensorrt_llm/_ipc_utils.py",
     "tensorrt_llm/_mnnvl_utils.py",
+    "tensorrt_llm/_torch/models/modeling_pixtral.py",
     "tensorrt_llm/disaggregated_params.py",
     "tensorrt_llm/engine.py",
     "tensorrt_llm/graph_rewriting.py",
@@ -57,6 +61,8 @@ ignore_patterns = [
     "tensorrt_llm/python_plugin.py",
     "tensorrt_llm/sampling_params.py",
     "tensorrt_llm/top_model_mixin.py",
+    "tests/unittest/_torch/modeling/test_modeling_mistral.py",
+    "tests/unittest/_torch/modeling/test_modeling_pixtral.py",
 ]
 
 [tool.codespell]
@@ -76,6 +82,7 @@ exclude = [
     "tensorrt_llm/_dlpack_utils.py",
     "tensorrt_llm/_ipc_utils.py",
     "tensorrt_llm/_mnnvl_utils.py",
+    "tensorrt_llm/_torch/models/modeling_pixtral.py",
     "tensorrt_llm/disaggregated_params.py",
     "tensorrt_llm/engine.py",
     "tensorrt_llm/graph_rewriting.py",
@@ -88,6 +95,8 @@ exclude = [
     "tensorrt_llm/python_plugin.py",
     "tensorrt_llm/sampling_params.py",
     "tensorrt_llm/top_model_mixin.py",
+    "tests/unittest/_torch/modeling/test_modeling_mistral.py",
+    "tests/unittest/_torch/modeling/test_modeling_pixtral.py",
 ]
 
 
@@ -116,6 +125,7 @@ include = [
     "tensorrt_llm/_dlpack_utils.py",
     "tensorrt_llm/_ipc_utils.py",
     "tensorrt_llm/_mnnvl_utils.py",
+    "tensorrt_llm/_torch/models/modeling_pixtral.py",
     "tensorrt_llm/disaggregated_params.py",
     "tensorrt_llm/engine.py",
     "tensorrt_llm/graph_rewriting.py",
@@ -128,9 +138,11 @@ include = [
     "tensorrt_llm/python_plugin.py",
     "tensorrt_llm/sampling_params.py",
     "tensorrt_llm/top_model_mixin.py",
+    "tests/unittest/_torch/modeling/test_modeling_mistral.py",
+    "tests/unittest/_torch/modeling/test_modeling_pixtral.py",
 ]
 exclude = [
-    "3rdparty/**",
+    "**3rdparty/**",
 ]
 
 

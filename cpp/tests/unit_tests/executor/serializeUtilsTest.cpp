@@ -473,10 +473,13 @@ TEST(SerializeUtilsTest, VectorResponses)
 
 TEST(SerializeUtilsTest, KvCacheConfig)
 {
-    texec::KvCacheConfig kvCacheConfig(true, 10, std::vector(1, 100), 2, 0.1, 10000, false, 0.5, 50, 1024);
+    texec::KvCacheConfig kvCacheConfig(
+        true, 10, std::vector(1, 100), 2, 0.1, 10000, false, 0.5, 50, 1024, false, false, true);
     auto kvCacheConfig2 = serializeDeserialize(kvCacheConfig);
 
     EXPECT_EQ(kvCacheConfig.getEnableBlockReuse(), kvCacheConfig2.getEnableBlockReuse());
+    EXPECT_EQ(kvCacheConfig.getEnablePartialReuse(), kvCacheConfig2.getEnablePartialReuse());
+    EXPECT_EQ(kvCacheConfig.getCopyOnPartialReuse(), kvCacheConfig2.getCopyOnPartialReuse());
     EXPECT_EQ(kvCacheConfig.getMaxTokens(), kvCacheConfig2.getMaxTokens());
     EXPECT_EQ(kvCacheConfig.getMaxAttentionWindowVec(), kvCacheConfig2.getMaxAttentionWindowVec());
     EXPECT_EQ(kvCacheConfig.getSinkTokenLength(), kvCacheConfig2.getSinkTokenLength());
@@ -486,6 +489,7 @@ TEST(SerializeUtilsTest, KvCacheConfig)
     EXPECT_EQ(kvCacheConfig.getCrossKvCacheFraction(), kvCacheConfig2.getCrossKvCacheFraction());
     EXPECT_EQ(kvCacheConfig.getSecondaryOffloadMinPriority(), kvCacheConfig2.getSecondaryOffloadMinPriority());
     EXPECT_EQ(kvCacheConfig.getEventBufferMaxSize(), kvCacheConfig2.getEventBufferMaxSize());
+    EXPECT_EQ(kvCacheConfig.getUseUvm(), kvCacheConfig2.getUseUvm());
 }
 
 TEST(SerializeUtilsTest, SchedulerConfig)
@@ -781,8 +785,8 @@ TEST(SerializeUtilsTest, ExecutorConfig)
         texec::SpeculativeDecodingConfig(true),
         texec::GuidedDecodingConfig(
             texec::GuidedDecodingConfig::GuidedDecodingBackend::kXGRAMMAR, std::initializer_list<std::string>{"eos"}),
-        std::vector{tensorrt_llm::executor::AdditionalModelOutput{"output_name"}}, texec::CacheTransceiverConfig(1024),
-        true, true, true);
+        std::vector{tensorrt_llm::executor::AdditionalModelOutput{"output_name"}},
+        texec::CacheTransceiverConfig(std::nullopt, 1024), true, true, true);
     auto executorConfig2 = serializeDeserialize(executorConfig);
 
     EXPECT_EQ(executorConfig.getMaxBeamWidth(), executorConfig2.getMaxBeamWidth());
@@ -858,7 +862,9 @@ TEST(SerializeUtilsTest, MethodReturnType)
 
 TEST(SerializeUtilsTest, CacheTransceiverConfig)
 {
-    texec::CacheTransceiverConfig cacheTransceiverConfig(1024);
+    texec::CacheTransceiverConfig cacheTransceiverConfig(
+        tensorrt_llm::executor::CacheTransceiverConfig::BackendType::UCX, 1024);
     auto cacheTransceiverConfig2 = serializeDeserialize(cacheTransceiverConfig);
-    EXPECT_EQ(cacheTransceiverConfig.getMaxNumTokens(), cacheTransceiverConfig2.getMaxNumTokens());
+    EXPECT_EQ(cacheTransceiverConfig.getBackendType(), cacheTransceiverConfig2.getBackendType());
+    EXPECT_EQ(cacheTransceiverConfig.getMaxTokensInBuffer(), cacheTransceiverConfig2.getMaxTokensInBuffer());
 }

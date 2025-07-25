@@ -24,6 +24,12 @@
 namespace tensorrt_llm::batch_manager
 {
 
+static int32_t tagFromRequestId(LlmRequest::RequestIdType requestId)
+{
+    constexpr int32_t kDATA_TAG{43};
+    return ((requestId & 0xFFF) << 8) | (kDATA_TAG & 0xFF);
+}
+
 DataSenderImpl::DataSenderImpl(executor::kv_cache::ConnectionManager* manager,
     executor::kv_cache::CacheState selfCacheState, SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter)
     : mManager{manager}
@@ -75,33 +81,25 @@ DataSenderImpl::DataSenderImpl(executor::kv_cache::ConnectionManager* manager,
             peerRelativeRanks.begin(), peerRelativeRanks.end(), info.getTransState().getCommState()->getSelfIdx()));
     {
         std::unique_lock<std::mutex> lk(mMtxForMap);
-        auto it = mRequestToComms.find(requestId);
-        if (it == mRequestToComms.end())
+        auto it = mRequestToSession.find(requestId);
+        if (it == mRequestToSession.end())
         {
-            int recvExpectCount = peerRelativeRanks.size();
-            {
-                it = mRequestToComms.emplace(requestId, RequestMapInfo{}).first;
-                it->second.resize(recvExpectCount);
-            }
+            auto session = TransferSession(std::vector<Connection const*>(peerRelativeRanks.size(), nullptr),
+                DataContext{tagFromRequestId(requestId)}, mSelfState, info.getTransState(), mBufferManager);
+            it = mRequestToSession.emplace(requestId, std::move(session)).first;
         }
-        it->second[peerIdx] = {connection, info.getTransState()};
+        it->second.setConnection(peerIdx, connection);
     }
     return info;
 }
 
 void DataSenderImpl::sendSync(LlmRequest const& llmRequest)
 {
-    std::vector<executor::kv_cache::Connection const*> connections;
-    auto it = mRequestToComms.find(llmRequest.mRequestId);
-    TLLM_CHECK(it != mRequestToComms.end());
-    auto const& reqToComm = it->second;
-    for (auto&& [connection, dataTransceiverState] : reqToComm)
-    {
-        connections.emplace_back(connection);
-    }
-    auto&& dataTransceiverState = reqToComm.at(0).second;
-    mFormatter->formatOutput(llmRequest, std::move(connections), mSelfState.getCacheState().value(),
-        mSelfState.getCommState().value().getSelfIdx(), dataTransceiverState.getCacheState().value(), mBufferManager);
+    auto it = mRequestToSession.find(llmRequest.mRequestId);
+    TLLM_CHECK(it != mRequestToSession.end());
+    auto& session = it->second;
+    session.setLlmRequest(llmRequest);
+    mFormatter->format(session);
 }
 
 [[nodiscard]] executor::kv_cache::CommState const& DataSenderImpl::getCommState() const
@@ -116,17 +114,17 @@ void DataSenderImpl::setCommState(executor::kv_cache::CommState commState)
 
 [[nodiscard]] size_t DataSenderImpl::getCounterpartsCount(LlmRequest::RequestIdType requestId) const
 {
-    auto it = mRequestToComms.find(requestId);
-    TLLM_CHECK(it != mRequestToComms.end());
-    return it->second.size();
+    auto it = mRequestToSession.find(requestId);
+    TLLM_CHECK(it != mRequestToSession.end());
+    return it->second.getConnections().size();
 }
 
 void DataSenderImpl::release(LlmRequest::RequestIdType requestId)
 {
-    auto it = mRequestToComms.find(requestId);
-    TLLM_CHECK(it != mRequestToComms.end());
+    auto it = mRequestToSession.find(requestId);
+    TLLM_CHECK(it != mRequestToSession.end());
     std::unique_lock<std::mutex> lk(mMtxForMap);
-    mRequestToComms.erase(it);
+    mRequestToSession.erase(it);
 }
 
 DataReceiverImpl::DataReceiverImpl(executor::kv_cache::ConnectionManager* manager,
@@ -140,7 +138,7 @@ DataReceiverImpl::DataReceiverImpl(executor::kv_cache::ConnectionManager* manage
     TLLM_CHECK(mFormatter);
 }
 
-void DataReceiverImpl::sendRequestInfo(LlmRequest const& llmRequest)
+TransferSession DataReceiverImpl::sendRequestInfo(LlmRequest const& llmRequest)
 {
     uint64_t requestId = llmRequest.getContextPhaseParams().value().getReqId();
     auto const& contextState = llmRequest.getDataTransceiverState();
@@ -151,7 +149,9 @@ void DataReceiverImpl::sendRequestInfo(LlmRequest const& llmRequest)
 
     RequestInfo requestInfo(requestId, mSelfState);
 
-    if (!common::getEnvDisableSelectiveCacheTransfer())
+    auto disableSelectiveCacheTransfer = common::getEnvDisableSelectiveCacheTransfer()
+        || (mFormatter->getCacheManager()->getBlockManager().getNumPools() > 1);
+    if (!disableSelectiveCacheTransfer)
     {
         auto* cacheManager = mFormatter->getCacheManager();
         auto blockRange
@@ -177,17 +177,17 @@ void DataReceiverImpl::sendRequestInfo(LlmRequest const& llmRequest)
         auto const* connection = connections.at(index);
         counterPartConnections.emplace_back(connection);
     }
-    auto pickUpConnections = mFormatter->pickRecvConnections(counterPartConnections, mSelfState.getCacheState().value(),
+    auto pickUpIdx = mFormatter->pickRecvConnections(counterParts.size(), mSelfState.getCacheState().value(),
         mSelfState.getCommState().value().getSelfIdx(), destCacheState);
-    for (auto connection : counterPartConnections)
+    for (size_t i = 0; i < counterPartConnections.size(); i++)
     {
+        auto const* connection = counterPartConnections[i];
         // if Manager is agentConnectionManager, then send request info to agent
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
         if (agentConnectionManager != nullptr)
         {
             // TODO: index -> validConnectionIdx conversion
-            auto valideConnectionIdx
-                = std::find(pickUpConnections.begin(), pickUpConnections.end(), connection) - pickUpConnections.begin();
+            auto valideConnectionIdx = std::find(pickUpIdx.begin(), pickUpIdx.end(), i) - pickUpIdx.begin();
             auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connection);
             TLLM_CHECK(agentConnection != nullptr);
             TLLM_CHECK(cacheBufferId.has_value());
@@ -199,23 +199,14 @@ void DataReceiverImpl::sendRequestInfo(LlmRequest const& llmRequest)
             sendRequestInfo(connection, requestInfo);
         }
     }
+    auto const& resource = getReceiveCacheResource(llmRequest);
+    return TransferSession(std::move(counterPartConnections), DataContext{tagFromRequestId(requestId)}, mSelfState,
+        contextState, resource->mBufferManager, &llmRequest);
 }
 
-void DataReceiverImpl::receiveSync(LlmRequest const& llmRequest)
+void DataReceiverImpl::receiveSync(TransferSession& session)
 {
-    auto const& contextState = llmRequest.getDataTransceiverState();
-    auto const& commState = contextState.getCommState().value();
-    auto const& destCacheState = contextState.getCacheState().value();
-    std::vector<tensorrt_llm::executor::kv_cache::Connection const*> connections;
-    for (auto index : mFormatter->getCounterparts(
-             mSelfState.getCacheState().value(), mSelfState.getCommState().value().getSelfIdx(), destCacheState))
-    {
-        auto const* connection = mManager->getConnections(commState).at(index);
-        connections.emplace_back(connection);
-    }
-    auto const& resource = getReceiveCacheResource(llmRequest);
-    mFormatter->formatInput(llmRequest, std::move(connections), mSelfState.getCacheState().value(),
-        mSelfState.getCommState().value().getSelfIdx(), destCacheState, resource->mBufferManager);
+    mFormatter->unformat(session);
 }
 
 void DataReceiverImpl::sendRequestInfo(executor::kv_cache::Connection const* connection, RequestInfo const& info)

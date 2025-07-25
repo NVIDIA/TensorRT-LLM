@@ -18,7 +18,7 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/common.h"
-#include "tensorrt_llm/batch_manager/kvCacheConfig.h"
+#include "tensorrt_llm/batch_manager/kvCacheType.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
@@ -74,7 +74,6 @@ class DecoderStepAsyncSend;
 class DecoderSlotAsyncSend;
 class DecoderInputBuffers;
 class DecoderOutputBuffers;
-class DecoderBuffers;
 class SlotDecoderBuffers;
 class LlmRequest;
 class RuntimeBuffers;
@@ -114,7 +113,7 @@ class TrtGptModelInflightBatching : public TrtGptModel
     using OffsetTableDimensions = kv_cache_manager::OffsetTableDimensions;
     using KVCacheManager = kv_cache_manager::KVCacheManager;
     using KvCacheType = kv_cache_manager::CacheType;
-    using KvCacheConfig = kv_cache_manager::KvCacheConfig;
+    using KvCacheConfig = executor::KvCacheConfig;
     using RnnStateManager = rnn_state_manager::RnnStateManager;
     using LlmRequestPtr = std::shared_ptr<batch_manager::LlmRequest>;
 
@@ -248,6 +247,10 @@ private:
     //! @brief Store full kv cache blocks contributed by req.
     //! These blocks become reusable from next step.
     void storeContextBlocks(std::shared_ptr<LlmRequest> const& req);
+
+    //! @brief Store newest kv cache block for reuse.
+    //! The block become reusable from next step.
+    void storeNewBlock(std::shared_ptr<LlmRequest> const& req);
 
     //! @brief Set LayerProfiler to collect performance per layer.
     void setLayerProfiler() override;
@@ -541,8 +544,6 @@ private:
     std::vector<DecoderInputBuffers> mDecoderInputBuffers;
     // Decoder output buffers for each micro batch.
     std::vector<DecoderOutputBuffers> mDecoderOutputBuffers;
-    // Global buffer to interface with decoder. Slots in this buffer are selected by mSeqSlotManager.
-    std::unique_ptr<DecoderBuffers> mDecoderBuffers;
     // Buffers for each slot in the decoder
     std::vector<std::unique_ptr<SlotDecoderBuffers>> mSlotDecoderBuffers;
     // PEFT table for each micro batch

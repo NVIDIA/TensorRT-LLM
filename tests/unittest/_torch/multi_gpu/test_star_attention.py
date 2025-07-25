@@ -13,6 +13,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 MAX_SEQ_LEN = 4096 + 1024
 
 
+@pytest.mark.post_merge
 @pytest.mark.parametrize("backend", ["pytorch"])
 @pytest.mark.parametrize("model_name",
                          ["llama-models-v3/Llama-3-8B-Instruct-Gradient-1048k"],
@@ -25,6 +26,7 @@ MAX_SEQ_LEN = 4096 + 1024
                          ids=["anchor1024", "anchor4096"])
 def test_model(backend, model_name, quant, sp_size, sa_block_size,
                sa_anchor_size):
+    pytest.skip("https://nvbugs/5391679")
     quant_configs = {
         "bf16":
         QuantConfig(),

@@ -180,6 +180,7 @@ class TestMistral_Nemo_12B_Base(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mistral-Nemo-Base-2407"
     MODEL_PATH = f"{llm_models_root()}/Mistral-Nemo-Base-2407"
 
+    @skip_pre_ada
     def test_fp8(self):
         quant_config = QuantConfig(quant_algo=QuantAlgo.FP8,
                                    kv_cache_quant_algo=QuantAlgo.FP8)
@@ -392,7 +393,7 @@ class TestEagleVicuna_7B_v1_3(LlmapiAccuracyTestHarness):
 
     speculative_config = EagleDecodingConfig(
         max_draft_len=63,
-        speculative_model=f"{llm_models_root()}/EAGLE-Vicuna-7B-v1.3",
+        speculative_model_dir=f"{llm_models_root()}/EAGLE-Vicuna-7B-v1.3",
         num_eagle_layers=4,
         max_non_leaves_per_layer=10,
                             eagle_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
@@ -418,7 +419,7 @@ class TestEagle2Vicuna_7B_v1_3(LlmapiAccuracyTestHarness):
 
     speculative_config = EagleDecodingConfig(
         max_draft_len=63,
-        speculative_model=f"{llm_models_root()}/EAGLE-Vicuna-7B-v1.3",
+        speculative_model_dir=f"{llm_models_root()}/EAGLE-Vicuna-7B-v1.3",
         num_eagle_layers=4,
         max_non_leaves_per_layer=10,
         use_dynamic_tree=True,

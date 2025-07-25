@@ -754,11 +754,11 @@ class TestFunctional(unittest.TestCase):
                 dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
                 tgt_len=(in_len if step == 0 else 1))
             if attention_type == 'gpt2_attention':
-                torch_output, torch_present = attention(
-                    input,
-                    layer_past=layer_past,
-                    use_cache=True,
-                    attention_mask=attention_mask)
+                torch_output = attention(input,
+                                         past_key_value=layer_past,
+                                         use_cache=True,
+                                         attention_mask=attention_mask)[0]
+                torch_present = layer_past
             elif attention_type == 'llama_attention':
                 position_embeddings = rotary_emb(input, position_ids)
                 attention_mask = attention_mask + AttentionMaskConverter._make_causal_mask(
@@ -1003,8 +1003,8 @@ class TestFunctional(unittest.TestCase):
                     torch_in = input_tensor[:, offset:offset_next, :].reshape(
                         (local_beam_width, input_length, hidden_size))
 
-                # llama uses DynamicCache
-                if attention_type == 'llama_attention':
+                # llama/gpt2 uses DynamicCache
+                if attention_type in ['llama_attention', 'gpt2_attention']:
                     past_key_values = DynamicCache.from_legacy_cache(
                         torch_cache_list[req_idx])
                 else:
@@ -1014,8 +1014,8 @@ class TestFunctional(unittest.TestCase):
                     step, torch_in, ctx_attention_mask_list[req_idx], req_idx,
                     past_key_values)
 
-                # llama uses DynamicCache
-                if attention_type == 'llama_attention':
+                # llama/gpt2 uses DynamicCache
+                if attention_type in ['llama_attention', 'gpt2_attention']:
                     torch_cache_list[req_idx] = past_key_values.to_legacy_cache(
                     )
                     past_key_values = torch_cache_list[req_idx][0]

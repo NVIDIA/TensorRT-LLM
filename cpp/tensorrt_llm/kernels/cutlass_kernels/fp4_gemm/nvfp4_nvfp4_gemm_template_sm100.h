@@ -29,6 +29,7 @@
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/gemm/gemm.h"
 
+#include "tensorrt_llm/kernels/archCondition.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 
 #include "tensorrt_llm/common/envUtils.h"
@@ -37,15 +38,13 @@
 #pragma GCC diagnostic pop
 #endif // #ifndef _WIN32
 
-using namespace cute;
-using namespace tensorrt_llm::kernels::cutlass_kernels;
-
 namespace tensorrt_llm
 {
 namespace kernels
 {
 namespace cutlass_kernels
 {
+using namespace cute;
 
 #ifdef ENABLE_BF16
 using SafeBF16 = __nv_bfloat16;
@@ -95,7 +94,23 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
 {
     static_assert(always_false<T>, "Kernel should be explicitly instantiated.");
     return 0;
-};
+}
+
+#ifdef PLACEHOLDER_KERNELS
+
+#define INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER(T, CTA_M_, CTA_N_, CTA_K_, CGA_M_, CGA_N_, CGA_K_, XSM_)                  \
+    template <>                                                                                                        \
+    size_t genericFp4GemmKernelLauncher<T, cute::Int<CTA_M_>, cute::Int<CTA_N_>, cute::Int<CTA_K_>, cute::Int<CGA_M_>, \
+        cute::Int<CGA_N_>, cute::Int<CGA_K_>, XSM_>(void* D, void const* A, void const* B, void const* input_sf,       \
+        void const* weight_sf, float const* global_sf, int m, int n, int k, int batch_count,                           \
+        tkc::CutlassGemmConfig gemmConfig, char* workspace, const size_t workspaceBytes, cudaStream_t stream,          \
+        int* occupancy)                                                                                                \
+    {                                                                                                                  \
+        throw std::runtime_error(                                                                                      \
+            "[TensorRT-LLM Error][FP4 gemm Runner] TensorRT-LLM is not compiled with support for this Architecture."); \
+    }
+
+#else
 
 #define INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER(T, CTA_M_, CTA_N_, CTA_K_, CGA_M_, CGA_N_, CGA_K_, XSM_)                  \
     struct DeviceGemmFp4GemmSm100_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##_##CGA_M_##_##CGA_N_##_##CGA_K_##XSM_          \
@@ -117,7 +132,7 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
         /* // Input C */                                                                                               \
         using ElementC = void;                                                                                         \
         using LayoutC = cutlass::layout::RowMajor;                                                                     \
-        static constexpr int AlignmentC = 4;                                                                           \
+        static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<OutElementType>::value;                           \
                                                                                                                        \
         using SFType = cutlass::float_ue4m3_t;                                                                         \
         using ElementCompute = float;                                                                                  \
@@ -141,8 +156,29 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
                 sizeof(typename CollectiveEpilogue::SharedStorage))>,                                                  \
             MainloopSchedule>::CollectiveOp;                                                                           \
                                                                                                                        \
-        using GemmKernel = cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>, CollectiveMainloop,   \
-            CollectiveEpilogue, cutlass::gemm::PersistentScheduler>;                                                   \
+        template <typename Base>                                                                                       \
+        struct Sm10xOnly : Base                                                                                        \
+        {                                                                                                              \
+            using typename Base::Params;                                                                               \
+            CUTLASS_DEVICE                                                                                             \
+            void operator()(Params const& params, char* smem_buf)                                                      \
+            {                                                                                                          \
+                if constexpr (tensorrt_llm::kernels::arch::is_major_v<10>)                                             \
+                {                                                                                                      \
+                    this->Base::operator()(params, smem_buf);                                                          \
+                }                                                                                                      \
+                else                                                                                                   \
+                {                                                                                                      \
+                    if (cute::thread0())                                                                               \
+                    {                                                                                                  \
+                        printf("%s : This kernel shall only run on SM10x devices.\n", __PRETTY_FUNCTION__);            \
+                        __trap();                                                                                      \
+                    }                                                                                                  \
+                }                                                                                                      \
+            }                                                                                                          \
+        };                                                                                                             \
+        using GemmKernel = Sm10xOnly<cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>,             \
+            CollectiveMainloop, CollectiveEpilogue, cutlass::gemm::PersistentScheduler>>;                              \
                                                                                                                        \
         using Gemm = typename cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;                                 \
     };                                                                                                                 \
@@ -268,6 +304,8 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
         }                                                                                                              \
         return gemm.get_workspace_size(args);                                                                          \
     }
+
+#endif
 
 } // namespace cutlass_kernels
 } // namespace kernels

@@ -4,8 +4,7 @@ import torch
 
 from ...distributed import allgather, reducescatter
 from ...model_config import ModelConfig
-from ...utils import (EventType, Fp4QuantizedTensor, disable_fp4_allgather,
-                      reswizzle_sf)
+from ...utils import EventType, Fp4QuantizedTensor, ceil_div, swizzle_sf
 from .interface import MoE
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            FP8QDQFusedMoEMethod, MoEWeightLoadingMode,
@@ -125,6 +124,7 @@ class CutlassFusedMoE(MoE):
 
         if self.apply_router_weight_on_input:
             assert self.routing_method.top_k == 1, "Current walkaround only supports top-1 routing"
+
         if self.quant_config and self.quant_config.quant_mode.has_any_quant(
                 exclude_kv_cache=True):
             if not (self.quant_config.quant_mode.has_nvfp4()
@@ -214,12 +214,12 @@ class CutlassFusedMoE(MoE):
         assert token_selected_experts.dtype == torch.int32
 
         if self.apply_router_weight_on_input:
-            assert self.routing_method.top_k == 1, "Current workaround only supports top-1 routing"
             assert x.dtype != torch.float8_e4m3fn, "Current workaround for apply_router_weight_on_input does not support fp8 input"
             x = x * token_final_scales.to(x.dtype)
             # TODO: remove this once we have correct fusedmoe kernel ready
             token_final_scales = None
 
+        run_post_quant_allgather = self.use_dp and self.parallel_size > 1
         # quantize inputs
         use_deepseek_fp8_block_scale = False
         use_w4a8_group_scaling = False
@@ -234,42 +234,56 @@ class CutlassFusedMoE(MoE):
             elif self.has_w4afp8:
                 use_w4a8_group_scaling = True
                 weight_dtype = torch.quint4x2
-            elif self.has_nvfp4 and not disable_fp4_allgather():
-                if isinstance(x, Fp4QuantizedTensor):
-                    x_row = x.shape[0]
-                    # note: we use uint8 to store 2 fp4 values
-                    x_col = x.shape[1] * 2
-                    x, x_sf = x.fp4_tensor, x.scaling_factor
+            elif self.has_nvfp4:
+                if run_post_quant_allgather:
+                    if isinstance(x, Fp4QuantizedTensor):
+                        assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before communication"
+                        x_row = x.shape[0]
+                        # note: we use uint8 to store 2 fp4 values
+                        x_col = x.shape[1] * 2
+                        x, x_sf = x.fp4_tensor, x.scaling_factor
+                    else:
+                        x_row = x.shape[0]
+                        x_col = x.shape[1]
+                        x, x_sf = torch.ops.trtllm.fp4_quantize(
+                            x, self.fc31_input_scale, self.scaling_vector_size,
+                            False, False)
                 else:
-                    x_row = x.shape[0]
-                    x_col = x.shape[1]
-                    x, x_sf = torch.ops.trtllm.fp4_quantize(
-                        x, self.fc31_input_scale, self.scaling_vector_size,
-                        False)
+                    if not isinstance(x, Fp4QuantizedTensor):
+                        x, x_sf = torch.ops.trtllm.fp4_quantize(
+                            x, self.fc31_input_scale, self.scaling_vector_size,
+                            False, True)
             else:
                 raise ValueError(
                     f"unsupported quantization mode: {self.quant_config.quant_mode}"
                 )
 
         # gather inputs for attention dp
-        if self.use_dp and self.parallel_size > 1 and not disable_fp4_allgather(
-        ):
+        if run_post_quant_allgather:
+            if x_sf is not None:
+                x_sf = x_sf.view(x_row, ceil_div(x_col,
+                                                 self.scaling_vector_size))
+                assert len(
+                    x_sf.shape
+                ) == 2, "The hidden states scaling factor should be 2D tensor before allgather"
             x, x_sf, token_selected_experts, token_final_scales = allgather(
                 [x, x_sf, token_selected_experts, token_final_scales],
                 self.mapping,
                 dim=0,
                 sizes=None if use_dp_padding else all_rank_num_tokens)
+            x_row = x.shape[0]
             # Fp4 gemm has extra scaling factor
             if x_sf is not None:
-                x_sf = reswizzle_sf(x_sf, x_row, x_col,
-                                    self.scaling_vector_size)
+                x_sf = swizzle_sf(x_sf, x_row, x_col, self.scaling_vector_size)
 
         final_hidden_states = torch.ops.trtllm.fused_moe(
             x,
             token_selected_experts,
             token_final_scales,
             self.w3_w1_weight.view(weight_dtype),
+            None,  # fc1_expert_biases
             self.w2_weight.view(weight_dtype),
+            None,  # fc2_expert_biases
             output_dtype,
             quant_scales=self.quant_scales,
             input_sf=x_sf,
@@ -307,6 +321,7 @@ class CutlassFusedMoE(MoE):
         do_finalize: bool = True,  # used by other MoE backends
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
+        all_rank_max_num_tokens: Optional[int] = None,
         use_dp_padding: Optional[bool] = None,
     ) -> torch.Tensor:
         assert do_finalize, "CutlassFusedMoE does not support do_finalize=False"
@@ -322,7 +337,7 @@ class CutlassFusedMoE(MoE):
                       1) // self.moe_max_num_tokens
 
         if use_dp_padding:
-            all_rank_num_tokens_padded = [max(all_rank_num_tokens)
+            all_rank_num_tokens_padded = [all_rank_max_num_tokens
                                           ] * len(all_rank_num_tokens)
         else:
             all_rank_num_tokens_padded = all_rank_num_tokens

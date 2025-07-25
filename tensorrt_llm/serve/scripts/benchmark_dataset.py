@@ -29,7 +29,7 @@ import pandas as pd
 from datasets import load_dataset
 from transformers import PreTrainedTokenizerBase
 
-from .benchmark_utils import download_and_cache_file
+from tensorrt_llm.serve.scripts.benchmark_utils import download_and_cache_file
 
 logger = logging.getLogger(__name__)
 
@@ -317,6 +317,67 @@ class RandomDataset(BenchmarkDataset):
                         expected_output_len=int(output_lens[i]),
                     ))
         return requests
+
+
+# -----------------------------------------------------------------------------
+# Custom Dataset Implementation
+# -----------------------------------------------------------------------------
+
+
+class CustomDataset(BenchmarkDataset):
+    """
+    TensorRT-LLM customized dataset implementation.
+    It assumes the dataset to be consist of several lines of json, each line is a minimal OpenAI API format request.
+    Example format of each sample on each line:
+    {
+        "input": {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": ""
+                },
+                {
+                    "role": "user",
+                    "content": ""
+                }
+            ],
+            "max_tokens": 2048,
+        }
+    }
+    """
+
+    def __init__(self, dataset_path: str, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.dataset_path = dataset_path
+        self.data = []
+        self.load_data()
+
+    def load_data(self) -> None:
+        if self.dataset_path is None:
+            raise ValueError("--dataset-path is not provided")
+        with open(self.dataset_path, encoding="utf-8") as f:
+            for line in f:
+                self.data.append(json.loads(line))
+        random.seed(self.random_seed)
+        random.shuffle(self.data)
+
+    def sample(self, tokenizer: PreTrainedTokenizerBase,
+               num_requests: int) -> list[SampleRequest]:
+        samples: list = []
+        for entry in self.data:
+            if len(samples) >= num_requests:
+                break
+            prompt = entry["input"]["messages"][1]["content"]
+            prompt_ids = tokenizer(prompt).input_ids
+            prompt_len = len(prompt_ids)
+            max_tokens = entry["input"]["max_tokens"]
+            samples.append(
+                SampleRequest(
+                    prompt=prompt,
+                    prompt_len=prompt_len,
+                    expected_output_len=max_tokens,
+                ))
+        return samples
 
 
 # -----------------------------------------------------------------------------

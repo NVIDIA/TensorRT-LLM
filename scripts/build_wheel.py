@@ -144,7 +144,7 @@ def setup_venv(project_dir: Path, requirements_file: Path, no_venv: bool):
         # Ensure PyPI PyTorch is not installed in the venv
         purelib_dir = Path(scheme["purelib"])
         pytorch_package_dir = purelib_dir / "torch"
-        if venv_prefix != sys.base_prefix and pytorch_package_dir.exists():
+        if str(venv_prefix) != sys.base_prefix and pytorch_package_dir.exists():
             warnings.warn(
                 f"Using the NVIDIA PyTorch container with PyPI distributed PyTorch may lead to compatibility issues.\n"
                 f"If you encounter any problems, please delete the environment at `{venv_prefix}` so that "
@@ -298,13 +298,14 @@ def main(*,
          install: bool = False,
          skip_building_wheel: bool = False,
          linking_install_binary: bool = False,
-         python_bindings: bool = True,
+         binding_type: str = "pybind",
          benchmarks: bool = False,
          micro_benchmarks: bool = False,
          nvtx: bool = False,
          skip_stubs: bool = False,
          generate_fmha: bool = False,
-         no_venv: bool = False):
+         no_venv: bool = False,
+         nvrtc_dynamic_linking: bool = False):
 
     if clean:
         clean_wheel = True
@@ -349,9 +350,8 @@ def main(*,
         if "70-real" in cuda_architectures:
             raise RuntimeError("Volta architecture is deprecated support.")
 
-    cmake_cuda_architectures = (
-        f'"-DCMAKE_CUDA_ARCHITECTURES={cuda_architectures}"'
-        if cuda_architectures is not None else "")
+    cuda_architectures = cuda_architectures or 'all'
+    cmake_cuda_architectures = f'"-DCMAKE_CUDA_ARCHITECTURES={cuda_architectures}"'
 
     cmake_def_args = []
     cmake_generator = ""
@@ -396,6 +396,39 @@ def main(*,
         clear_folder(build_dir)  # Keep the folder in case it is mounted.
     build_dir.mkdir(parents=True, exist_ok=True)
 
+    def get_binding_type_from_cache():
+        cmake_cache_file = build_dir / "CMakeCache.txt"
+        if not cmake_cache_file.exists():
+            return None
+
+        with open(cmake_cache_file, 'r') as f:
+            for line in f:
+                if line.startswith("BINDING_TYPE:STRING="):
+                    cashed_binding_type = line.split("=", 1)[1].strip()
+                    if cashed_binding_type in ['pybind', 'nanobind']:
+                        return cashed_binding_type
+            return None
+
+    cached_binding_type = get_binding_type_from_cache()
+
+    if not first_build and cached_binding_type != binding_type:
+        # Clean up of previous binding build artifacts
+        nanobind_dir = build_dir / "tensorrt_llm" / "nanobind"
+        if nanobind_dir.exists():
+            rmtree(nanobind_dir)
+        nanobind_stub_file = project_dir / "tensorrt_llm" / "bindings.pyi"
+        if nanobind_stub_file.exists():
+            nanobind_stub_file.unlink()
+
+        pybind_dir = build_dir / "tensorrt_llm" / "pybind"
+        if pybind_dir.exists():
+            rmtree(pybind_dir)
+        pybind_stub_dir = project_dir / "tensorrt_llm" / "bindings"
+        if pybind_stub_dir.exists():
+            rmtree(pybind_stub_dir)
+
+        configure_cmake = True
+
     if use_ccache:
         cmake_def_args.append(
             f"-DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache"
@@ -404,15 +437,18 @@ def main(*,
     if fast_build:
         cmake_def_args.append(f"-DFAST_BUILD=ON")
 
+    if nvrtc_dynamic_linking:
+        cmake_def_args.append(f"-DNVRTC_DYNAMIC_LINKING=ON")
+
     targets = ["tensorrt_llm", "nvinfer_plugin_tensorrt_llm"]
 
     if cpp_only:
         build_pyt = "OFF"
-        build_pybind = "OFF"
+        build_deep_ep = "OFF"
     else:
-        targets.extend(["bindings", "th_common"])
+        targets.extend(["th_common", "bindings", "deep_ep"])
         build_pyt = "ON"
-        build_pybind = "ON"
+        build_deep_ep = "ON"
 
     if benchmarks:
         targets.append("benchmarks")
@@ -451,7 +487,7 @@ def main(*,
                 )
             cmake_def_args = " ".join(cmake_def_args)
             cmake_configure_command = (
-                f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBUILD_PYBIND="{build_pybind}"'
+                f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBINDING_TYPE="{binding_type}" -DBUILD_DEEP_EP="{build_deep_ep}"'
                 f' -DNVTX_DISABLE="{disable_nvtx}" -DBUILD_MICRO_BENCHMARKS={build_micro_benchmarks}'
                 f' -DBUILD_WHEEL_TARGETS="{";".join(targets)}"'
                 f' -DPython_EXECUTABLE={venv_python} -DPython3_EXECUTABLE={venv_python}'
@@ -591,6 +627,13 @@ def main(*,
             "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/libdecoder_attention_1.so",
             lib_dir / "libdecoder_attention_1.so")
 
+    deep_ep_dir = pkg_dir / "deep_ep"
+    if deep_ep_dir.is_symlink():
+        deep_ep_dir.unlink()
+    elif deep_ep_dir.is_dir():
+        clear_folder(deep_ep_dir)
+        deep_ep_dir.rmdir()
+
     bin_dir = pkg_dir / "bin"
     if bin_dir.exists():
         clear_folder(bin_dir)
@@ -602,60 +645,115 @@ def main(*,
 
     if not cpp_only:
 
-        def get_pybind_lib():
-            pybind_build_dir = (build_dir / "tensorrt_llm" / "pybind")
+        def get_binding_lib(subdirectory, name):
+            binding_build_dir = (build_dir / "tensorrt_llm" / subdirectory)
             if on_windows:
-                pybind_lib = list(pybind_build_dir.glob("bindings.*.pyd"))
+                binding_lib = list(binding_build_dir.glob(f"{name}.*.pyd"))
             else:
-                pybind_lib = list(pybind_build_dir.glob("bindings.*.so"))
+                binding_lib = list(binding_build_dir.glob(f"{name}.*.so"))
 
             assert len(
-                pybind_lib
-            ) == 1, f"Exactly one pybind library should be present: {pybind_lib}"
-            return pybind_lib[0]
+                binding_lib
+            ) == 1, f"Exactly one binding library should be present: {binding_lib}"
+            return binding_lib[0]
 
-        install_file(get_pybind_lib(), pkg_dir)
+        install_file(get_binding_lib(binding_type, "bindings"), pkg_dir)
+
+        with (build_dir / "tensorrt_llm" / "deep_ep" /
+              "cuda_architectures.txt").open() as f:
+            deep_ep_cuda_architectures = f.read().strip().strip(";")
+        if deep_ep_cuda_architectures:
+            install_file(get_binding_lib("deep_ep", "deep_ep_cpp_tllm"),
+                         pkg_dir)
+            install_tree(build_dir / "tensorrt_llm" / "deep_ep" / "python" /
+                         "deep_ep",
+                         deep_ep_dir,
+                         dirs_exist_ok=True)
+            (lib_dir / "nvshmem").mkdir(exist_ok=True)
+            install_file(
+                build_dir / "tensorrt_llm/deep_ep/nvshmem-build/License.txt",
+                lib_dir / "nvshmem")
+            install_file(
+                build_dir /
+                "tensorrt_llm/deep_ep/nvshmem-build/src/lib/nvshmem_bootstrap_uid.so.3",
+                lib_dir / "nvshmem")
+            install_file(
+                build_dir /
+                "tensorrt_llm/deep_ep/nvshmem-build/src/lib/nvshmem_transport_ibgda.so.103",
+                lib_dir / "nvshmem")
         if not skip_stubs:
             with working_directory(project_dir):
-                build_run(f"\"{venv_python}\" -m pip install pybind11-stubgen")
+                if binding_type == "nanobind":
+                    build_run(f"\"{venv_python}\" -m pip install nanobind")
+                else:
+                    build_run(
+                        f"\"{venv_python}\" -m pip install pybind11-stubgen")
             with working_directory(pkg_dir):
                 if on_windows:
-                    stubgen = "stubgen.py"
-                    stubgen_contents = """
-                    # Loading torch, trt before bindings is required to avoid import errors on windows.
-                    # isort: off
-                    import torch
-                    import tensorrt as trt
-                    # isort: on
-                    import os
-                    import platform
+                    if binding_type == "nanobind":
+                        print("Windows not yet supported for nanobind stubs")
+                        exit(1)
+                    else:
+                        stubgen = "stubgen.py"
+                        stubgen_contents = """
+                        # Loading torch, trt before bindings is required to avoid import errors on windows.
+                        # isort: off
+                        import torch
+                        import tensorrt as trt
+                        # isort: on
+                        import os
+                        import platform
 
-                    from pybind11_stubgen import main
+                        from pybind11_stubgen import main
 
-                    if __name__ == "__main__":
-                        # Load dlls from `libs` directory before launching bindings.
-                        if platform.system() == "Windows":
-                            os.add_dll_directory(r\"{lib_dir}\")
-                        main()
-                    """.format(lib_dir=lib_dir)
-                    (pkg_dir / stubgen).write_text(dedent(stubgen_contents))
-                    build_run(f"\"{venv_python}\" {stubgen} -o . bindings")
-                    (pkg_dir / stubgen).unlink()
+                        if __name__ == "__main__":
+                            # Load dlls from `libs` directory before launching bindings.
+                            if platform.system() == "Windows":
+                                os.add_dll_directory(r\"{lib_dir}\")
+                            main()
+                        """.format(lib_dir=lib_dir)
+                        (pkg_dir / stubgen).write_text(dedent(stubgen_contents))
+                        build_run(f"\"{venv_python}\" {stubgen} -o . bindings")
+                        (pkg_dir / stubgen).unlink()
                 else:
                     env_ld = os.environ.copy()
 
                     new_library_path = "/usr/local/cuda/compat:/usr/local/cuda/compat/lib:/usr/local/cuda/compat/lib.real"
                     if 'LD_LIBRARY_PATH' in env_ld:
                         new_library_path += f":{env_ld['LD_LIBRARY_PATH']}"
+
+                    result = build_run("find /usr -name *libnvidia-ml.so*",
+                                       capture_output=True,
+                                       text=True)
+                    assert result.returncode == 0, f"Failed to run find *libnvidia-ml.so*: {result.stderr}"
+
+                    # Build containers only contain stub version of libnvidia-ml.so and not the real version.
+                    # If real version not in system, we need to create symbolic link to stub version to prevent import errors.
+                    if "libnvidia-ml.so.1" not in result.stdout:
+                        if "libnvidia-ml.so" in result.stdout:
+                            line = result.stdout.splitlines()[0]
+                            path = os.path.dirname(line)
+                            new_library_path += f":{path}"
+                            build_run(f"ln -s {line} {path}/libnvidia-ml.so.1")
+                        else:
+                            print(
+                                f"Failed to find libnvidia-ml.so: {result.stderr}",
+                                file=sys.stderr)
+                            exit(1)
+
                     env_ld["LD_LIBRARY_PATH"] = new_library_path
-                    try:
+                    if binding_type == "nanobind":
+                        build_run(
+                            f"\"{venv_python}\" -m nanobind.stubgen -m bindings -O .",
+                            env=env_ld)
+                    else:
                         build_run(
                             f"\"{venv_python}\" -m pybind11_stubgen -o . bindings --exit-code",
                             env=env_ld)
-                    except CalledProcessError as ex:
-                        print(f"Failed to build pybind11 stubgen: {ex}",
-                              file=sys.stderr)
-                        exit(1)
+                        if deep_ep_cuda_architectures:
+                            build_run(
+                                f"\"{venv_python}\" -m pybind11_stubgen -o . deep_ep_cpp_tllm --exit-code",
+                                env=env_ld)
 
     if not skip_building_wheel:
         if dist_dir is None:
@@ -761,11 +859,10 @@ def add_arguments(parser: ArgumentParser):
         "--linking_install_binary",
         action="store_true",
         help="Install the built binary by symbolic linking instead of copying.")
-    parser.add_argument(
-        "--python_bindings",
-        "-p",
-        action="store_true",
-        help="(deprecated) Build the python bindings for the C++ runtime.")
+    parser.add_argument("--binding_type",
+                        choices=["pybind", "nanobind"],
+                        default="pybind",
+                        help="Which binding type to build: pybind, nanobind")
     parser.add_argument("--benchmarks",
                         action="store_true",
                         help="Build the benchmarks for the C++ runtime.")
@@ -786,6 +883,11 @@ def add_arguments(parser: ArgumentParser):
         action="store_true",
         help=
         "Use the current Python interpreter without creating a virtual environment."
+    )
+    parser.add_argument(
+        "--nvrtc_dynamic_linking",
+        action="store_true",
+        help="Link against the dynamic NVRTC libraries and not the static ones."
     )
 
 

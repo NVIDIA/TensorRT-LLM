@@ -8,7 +8,7 @@ from utils.llm_data import llm_models_root
 from utils.util import getSMVersion
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig
+from tensorrt_llm.llmapi import KvCacheConfig, MoeConfig, MTPDecodingConfig
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 
 
@@ -68,11 +68,9 @@ def test_deepseek_trtllmgen(model_name):
 
     pytorch_config = dict(
         disable_overlap_scheduler=True,
-        use_cuda_graph=False,
-        kv_cache_dtype="auto",
         attn_backend="TRTLLM",
         load_format="dummy",
-        moe_backend="TRTLLM",
+        moe_config=MoeConfig(backend="TRTLLM"),
     )
 
     model_dir = str(llm_models_root() / Path(f"DeepSeek-R1/{model_name}"))
@@ -90,7 +88,8 @@ def test_deepseek_trtllmgen(model_name):
               moe_tensor_parallel_size=-1,
               enable_attention_dp=False,
               speculative_config=spec_config,
-              kv_cache_config=KvCacheConfig(enable_block_reuse=False,
+              kv_cache_config=KvCacheConfig(dtype="auto",
+                                            enable_block_reuse=False,
                                             free_gpu_memory_fraction=0.4))
 
     sampling_params = SamplingParams(max_tokens=20)

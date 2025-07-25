@@ -15,7 +15,7 @@ l0_dgx_h100:
       auto_trigger: others
   tests:
   # ------------- PyTorch tests ---------------
-  - unittest/_torch/multi_gpu TIMEOUT (90)
+  - unittest/_torch/multi_gpu -m "not post_merge" TIMEOUT (90)
   - unittest/_torch/auto_deploy/unit/multigpu
   - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu4 or gpu2"
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[tp4-attn_backend=TRTLLM-torch_compile=False]
@@ -32,6 +32,10 @@ l0_dgx_h100:
   - disaggregated/test_disaggregated.py::test_disaggregated_multi_gpu_with_mpirun_trt_backend[TinyLlama-1.1B-Chat-v1.0]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[False]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[True]
+  - accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_auto_dtype[False]
+  - accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_auto_dtype[True]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ngram
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_eagle3[False]
   - test_e2e.py::test_ptp_quickstart_advanced_bs1
 - condition:
     ranges:
@@ -55,7 +59,7 @@ l0_dgx_h100:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp4-mtp_nextn=0-fp8kv=False-attention_dp=True-cuda_graph=False-overlap_scheduler=False-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp4-mtp_nextn=0-fp8kv=False-attention_dp=False-cuda_graph=True-overlap_scheduler=False-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp4-mtp_nextn=0-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp4-mtp_nextn=2-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp4-mtp_nextn=2-fp8kv=True-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp4-mtp_nextn=2-fp8kv=False-attention_dp=True-cuda_graph=False-overlap_scheduler=False-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp4-mtp_nextn=2-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=True-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[ep4-mtp_nextn=0-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False]
@@ -74,10 +78,18 @@ l0_dgx_h100:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp2pp2-mtp_nextn=2-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=True-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[pp4-mtp_nextn=0-fp8kv=False-attention_dp=False-cuda_graph=True-overlap_scheduler=False-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[pp4-mtp_nextn=0-fp8kv=False-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp4-mtp_nextn=0-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=True-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp4-mtp_nextn=0-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp4-mtp_nextn=0-fp8kv=False-attention_dp=True-cuda_graph=False-overlap_scheduler=False-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp4-mtp_nextn=0-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[pp4-mtp_nextn=0-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp2pp2-mtp_nextn=0-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp2pp2-mtp_nextn=0-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp4-mtp_nextn=2-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_cuda_graph_padding_4gpus[attention_dp=True-mtp_nextn=0]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_cuda_graph_padding_4gpus[attention_dp=True-mtp_nextn=2]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus_static_eplb
-  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8[DeepSeek-V3-Lite-fp8]
+  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_mpi[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_ucx[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_nixl[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp[DeepSeek-V3-Lite-fp8]
@@ -107,6 +119,7 @@ l0_dgx_h100:
   tests:
   # ------------- CPP tests ---------------
   - cpp/test_multi_gpu.py::test_mpi_utils[90]
+  - cpp/test_multi_gpu.py::test_fused_gemm_allreduce[4proc-90]
   - cpp/test_multi_gpu.py::test_cache_transceiver[2proc-mpi_kvcache-90]
   - cpp/test_multi_gpu.py::test_cache_transceiver[2proc-ucx_kvcache-90]
   - cpp/test_multi_gpu.py::test_cache_transceiver[8proc-mpi_kvcache-90]
@@ -119,20 +132,41 @@ l0_dgx_h100:
   - cpp/test_multi_gpu.py::test_trt_gpt_real_decoder[llama-90]
   - cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[gpt-2proc-mpi_kvcache-90]
   - cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[gpt-2proc-ucx_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[gpt-2proc-nixl_kvcache-90]
   - cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[llama-2proc-mpi_kvcache-90]
   - cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[llama-4proc-mpi_kvcache-90]
   - cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[llama-8proc-mpi_kvcache-90]
   - cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[llama-2proc-ucx_kvcache-90]
   - cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[llama-4proc-ucx_kvcache-90]
   - cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[llama-8proc-ucx_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[llama-2proc-nixl_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[llama-4proc-nixl_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[llama-8proc-nixl_kvcache-90]
   - cpp/test_multi_gpu.py::TestDisagg::test_asymmetric_executor[llama-4proc-mpi_kvcache-90]
   - cpp/test_multi_gpu.py::TestDisagg::test_asymmetric_executor[llama-6proc-mpi_kvcache-90]
   - cpp/test_multi_gpu.py::TestDisagg::test_asymmetric_executor[llama-8proc-mpi_kvcache-90]
   - cpp/test_multi_gpu.py::TestDisagg::test_asymmetric_executor[llama-4proc-ucx_kvcache-90]
   - cpp/test_multi_gpu.py::TestDisagg::test_asymmetric_executor[llama-6proc-ucx_kvcache-90]
   - cpp/test_multi_gpu.py::TestDisagg::test_asymmetric_executor[llama-8proc-ucx_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_asymmetric_executor[llama-4proc-nixl_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_asymmetric_executor[llama-6proc-nixl_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_asymmetric_executor[llama-8proc-nixl_kvcache-90]
   - cpp/test_multi_gpu.py::TestDisagg::test_orchestrator_params[llama-mpi_kvcache-90]
   - cpp/test_multi_gpu.py::TestDisagg::test_orchestrator_params[llama-ucx_kvcache-90]
   - cpp/test_multi_gpu.py::TestDisagg::test_spawn_orchestrator[llama-ucx_kvcache-90]
   - cpp/test_multi_gpu.py::TestDisagg::test_orchestrator_params[llama-nixl_kvcache-90] TIMEOUT (90)
   - cpp/test_multi_gpu.py::TestDisagg::test_spawn_orchestrator[llama-nixl_kvcache-90]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*h100*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+      backend: triton
+  tests:
+  - triton_server/test_triton_llm.py::test_llmapi_backend[4-0-disableDecoupleMode-tensorrt_llm]

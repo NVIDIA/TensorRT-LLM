@@ -1,23 +1,15 @@
 import copy
 from abc import ABC
 from enum import Enum
-from typing import Any, List, Mapping
+from typing import Any, List, Mapping, Tuple
 
 import torch
 from torch.nn import functional as F
 
+from tensorrt_llm.executor.result import GenerationResult
 from tensorrt_llm.logger import logger
 from tensorrt_llm.scaffolding.math_utils import get_digit_majority_vote_result
-from tensorrt_llm.scaffolding.task import (GenerationTask, ScaffoldingOutput,
-                                           Task)
-
-
-class ScaffoldingOutput:
-
-    def __init__(self):
-        self.output_str = None
-        # reserved for customized controller
-        self.customized_output = None
+from tensorrt_llm.scaffolding.task import GenerationTask, Task
 
 
 class Controller(ABC):
@@ -28,7 +20,7 @@ class Controller(ABC):
     def clone(self):
         return copy.deepcopy(self)
 
-    def generate(self, prompt: str, **kwargs) -> ScaffoldingOutput:
+    def generate(self, prompt: str, **kwargs) -> GenerationResult:
         task = GenerationTask.create_from_prompt(prompt)
 
         yield from self.process([task], **kwargs)
@@ -57,7 +49,7 @@ class NativeGenerationController(Controller):
     class WorkerTag(Enum):
         GENERATION = "generation"
 
-    def __init__(self, sampling_params: dict = None):
+    def __init__(self, sampling_params: dict = None, streaming: bool = False):
         super().__init__()
         if sampling_params is None:
             sampling_params = {}
@@ -67,6 +59,7 @@ class NativeGenerationController(Controller):
                     f"{key} is not a supported field for GenerationTask")
                 sampling_params.pop(key)
         self.sampling_params = sampling_params
+        self.streaming = streaming
 
     def process(self, tasks: List[Task], **kwargs):
         for task in tasks:
@@ -74,6 +67,7 @@ class NativeGenerationController(Controller):
             for key, value in self.sampling_params.items():
                 if getattr(task, key) is None:
                     setattr(task, key, value)
+            task.streaming = self.streaming
 
         yield tasks
 
@@ -237,13 +231,14 @@ class MajorityVoteController(Controller):
                               generation_kwargs_list)
 
         candidates = [tasks[0].output_str for tasks in tasks_list]
-        result = self.majority_vote(candidates, **majority_vote_kwargs)
+        majority_index, majority_answer = self.majority_vote(
+            candidates, **majority_vote_kwargs)
 
-        assert isinstance(result, str), "majority_vote failed"
+        assert isinstance(majority_answer, str), "majority_vote failed"
         # The task returned by majority vote does not have output_tokens and logits.
-        tasks[0].output_str = result
+        tasks[0].result = tasks_list[majority_index][0].result
 
-    def majority_vote(self, candidates: List[str], **kwargs) -> str:
+    def majority_vote(self, candidates: List[str], **kwargs) -> Tuple[int, str]:
         return get_digit_majority_vote_result(candidates)
 
 
@@ -298,7 +293,7 @@ class BestOfNController(Controller):
 
         best_task, best_idx = self.select_best(generation_tasks, reward_values,
                                                **select_best_kwargs)
-        task.output_str = best_task.output_str
+        task.result = best_task.result
 
     def select_best(self, tasks: List[Task], reward_values, **kwargs) -> Task:
         max_index = torch.argmax(torch.tensor(reward_values)).item()

@@ -16,10 +16,11 @@
 
 #pragma once
 
-#include "tensorrt_llm/batch_manager/kvCacheConfig.h"
 #include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
+#include "tensorrt_llm/batch_manager/kvCacheType.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h" // TODO forward declare
 #include "tensorrt_llm/common/optionalRef.h"
+#include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/kernels/kvCacheIndex.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -30,6 +31,7 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 #include <NvInferRuntime.h>
 
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <list>
@@ -66,6 +68,9 @@ using UniqueToken = tensorrt_llm::runtime::UniqueToken;
 using VecUniqueTokens = tensorrt_llm::runtime::VecUniqueTokens;
 using LoraTaskIdType = tensorrt_llm::runtime::LoraTaskIdType;
 using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
+
+// Type alias for multimodal hash key (hash array + start offset)
+using MmKey = std::pair<std::array<uint8_t, 32>, SizeType32>;
 
 template <typename T>
 using OptionalRef = tensorrt_llm::common::OptionalRef<T>;
@@ -106,6 +111,10 @@ struct BlockKey
     std::optional<LoraTaskIdType> loraTaskId = std::nullopt;
     VecUniqueTokens uniqueTokens;
 
+    // Extra keys for multimodal data (similar to VLLM's approach)
+    // Each extra key is a pair of (mm_hash, start_offset_in_block)
+    std::vector<MmKey> extraKeys;
+
     BlockKey() = default;
 
     explicit BlockKey(VecTokens const& tokens, std::optional<LoraTaskIdType> loraTaskId = std::nullopt)
@@ -118,23 +127,25 @@ struct BlockKey
         }
     }
 
-    BlockKey(bool usesExtraIds, std::optional<LoraTaskIdType> loraTaskId, VecUniqueTokens uniqueTokens)
-        : usesExtraIds(usesExtraIds)
+    explicit BlockKey(bool usesExtraIds, std::optional<LoraTaskIdType> loraTaskId, VecUniqueTokens uniqueTokens,
+        std::vector<MmKey> extraKeys = {})
+        : usesExtraIds{usesExtraIds}
         , loraTaskId{loraTaskId}
         , uniqueTokens{std::move(uniqueTokens)}
+        , extraKeys{std::move(extraKeys)}
     {
     }
 
     bool operator==(BlockKey const& other) const noexcept
     {
-        return (
-            usesExtraIds == other.usesExtraIds && loraTaskId == other.loraTaskId && uniqueTokens == other.uniqueTokens);
+        return (usesExtraIds == other.usesExtraIds && loraTaskId == other.loraTaskId
+            && uniqueTokens == other.uniqueTokens && extraKeys == other.extraKeys);
     }
 
     int partialMatch(BlockKey const& other) const noexcept
     {
         SizeType32 numMatched{0};
-        if (loraTaskId == other.loraTaskId)
+        if (loraTaskId == other.loraTaskId && extraKeys == other.extraKeys)
         {
             auto [matchEnd, otherMatchEnd] = std::mismatch(
                 uniqueTokens.begin(), uniqueTokens.end(), other.uniqueTokens.begin(), other.uniqueTokens.end());
@@ -179,6 +190,8 @@ struct KvCacheStats
     SizeType32 missedBlocks;
     // Measuring the KV Cache reuse rate. cacheHitRate = reusedBlocks / (reusedBlocks + missedBlocks).
     float cacheHitRate;
+    // Number of free blocks for every configured attention-window size.
+    std::map<SizeType32, SizeType32> numFreeBlocksPerWindowSize;
 };
 
 // Basic building block of a paged KV cache - a single
@@ -552,6 +565,8 @@ public:
 
     void storeBlocksForReuse(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
 
+    void storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
+
     //! \brief Release blocks of the sequence.
     void releaseBlocks(GenerationRequest& sequence);
 
@@ -851,6 +866,9 @@ public:
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enableHashKey = false,
         bool enablePartialReuse = true, bool copyOnPartialReuse = true);
 
+    BlockManager(BlockManager const&) = delete;
+    BlockManager& operator=(BlockManager const&) = delete;
+
     //! \brief Calculate the proportional share each window size receives of the total memory pool
     //! \details Example:       (uniqueWindowSizeToLayers={1024: [1], 4096: [0, 4, 5], 8192: [2, 3]})
     //!          Would Return:  {1024: 0.0345, 4096: 0.4138, 8192: 0.5517} [sums to 1.0].
@@ -1091,6 +1109,9 @@ public:
     //! \brief Store context blocks
     void storeContextBlocks(GenerationRequest& sequence, LlmRequest const& llmRequest);
 
+    //! \brief Store newest block for reuse
+    void storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
+
     [[nodiscard]] static bool isUseOneMoreBlock(
         SizeType32 windowSize, std::optional<SizeType32> maxSequenceLength, SizeType32 maxBeamWidth)
     {
@@ -1261,6 +1282,10 @@ public:
     //! \details These blocks become reusable from next step.
     virtual void storeContextBlocks(LlmRequest const& llmRequest) = 0;
 
+    //! \brief Store newest block for reuse.
+    //! \details This block become reusable from next step.
+    virtual void storeNewBlock(LlmRequest const& llmRequest) = 0;
+
     //! \brief Get the block ids of a request [per beam] **for a given window size block manager**
     [[nodiscard]] virtual std::vector<std::vector<SizeType32>> const& getCacheBlockIds(
         LlmRequest::RequestIdType requestId, SizeType32 windowSize) const
@@ -1309,7 +1334,7 @@ public:
     /// @param config KV cache configuration parameters
     /// @return Tuple containing the {.freePrimaryMemBytes, .freeSecondaryMemBytes}
     [[nodiscard]] static std::tuple<uint64_t, uint64_t> calculateFreeMemBytes(
-        runtime::BufferManager const& bufferManager, KvCacheConfig const& config);
+        runtime::BufferManager const& bufferManager, executor::KvCacheConfig const& config);
 
     /// @brief Calculate the maximum number of KV cache blocks that can be allocated based on available GPU memory.
     /// @details This function computes how many blocks each WindowBlockManager should receive based on the weighted
@@ -1327,8 +1352,8 @@ public:
     /// @param extraCostMemory Additional memory cost to account for CacheTransBufferManager::preAllocBufferSize
     /// @param kvFactor Factor for KV cache size calculation (typically 2 for key+value)
     /// @return Map from window size to tuple of (primary blocks, secondary blocks)
-    [[nodiscard]] static BlocksPerWindow calculateMaxNumBlocks(KvCacheConfig const& config, bool isCrossAttention,
-        nvinfer1::DataType dtype, tensorrt_llm::runtime::ModelConfig const& modelConfig,
+    [[nodiscard]] static BlocksPerWindow calculateMaxNumBlocks(executor::KvCacheConfig const& config,
+        bool isCrossAttention, nvinfer1::DataType dtype, tensorrt_llm::runtime::ModelConfig const& modelConfig,
         tensorrt_llm::runtime::WorldConfig const& worldConfig,
         std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers, uint64_t allottedPrimaryMemBytes,
         uint64_t allottedSecondaryMemBytes, size_t extraCostMemory, SizeType32 kvFactor);
@@ -1444,6 +1469,11 @@ public:
         return mBlockManager.getNumMissedBlocks();
     }
 
+    [[nodiscard]] std::map<SizeType32, SizeType32> getNumFreeBlocksPerWindowSize() const
+    {
+        return mBlockManager.getNumFreeBlocksPerWindowSize();
+    }
+
     [[nodiscard]] KvCacheStats getKvCacheStats() const override
     {
         KvCacheStats kvCacheStats;
@@ -1458,6 +1488,7 @@ public:
         kvCacheStats.cacheHitRate = kvCacheStats.reusedBlocks == 0 ? 0
                                                                    : static_cast<float>(kvCacheStats.reusedBlocks)
                 / static_cast<float>(kvCacheStats.reusedBlocks + kvCacheStats.missedBlocks);
+        kvCacheStats.numFreeBlocksPerWindowSize = getNumFreeBlocksPerWindowSize();
         return kvCacheStats;
     }
 
@@ -1566,6 +1597,9 @@ public:
     //! \brief Store full context blocks contributed by llmRequest.
     //! \details These blocks become reusable from next step.
     void storeContextBlocks(LlmRequest const& llmRequest) override;
+
+    //! \brief Store newest blocks for reuse
+    void storeNewBlock(LlmRequest const& llmRequest) override;
 
     [[nodiscard]] static SizeType32 getSinkBubbleLength(SizeType32 sinkTokenLen, SizeType32 tokensPerBlock);
 

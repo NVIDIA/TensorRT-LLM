@@ -125,7 +125,8 @@ def prepare_inputs(input_ids_data, input_lengths_data, request_output_len_data,
                    return_generation_logits_data, decoder_input_ids_data,
                    prompt_table_extra_id_data, exclude_input_in_output,
                    num_return_sequences_data, return_perf_metrics_data,
-                   lookahead_config_data):
+                   lookahead_config_data, return_num_input_tokens_data,
+                   return_num_output_tokens_data):
     inputs = [
         prepare_tensor("input_ids", input_ids_data),
         prepare_tensor("input_lengths", input_lengths_data),
@@ -138,6 +139,16 @@ def prepare_inputs(input_ids_data, input_lengths_data, request_output_len_data,
         prepare_tensor("runtime_top_k", top_k_data),
         prepare_tensor("runtime_top_p", top_p_data),
     ]
+    if return_num_input_tokens_data is not None:
+        inputs += [
+            prepare_tensor("return_num_input_tokens",
+                           return_num_input_tokens_data),
+        ]
+    if return_num_output_tokens_data is not None:
+        inputs += [
+            prepare_tensor("return_num_output_tokens",
+                           return_num_output_tokens_data),
+        ]
     if num_return_sequences_data is not None:
         inputs += [
             prepare_tensor("num_return_sequences", num_return_sequences_data)
@@ -600,6 +611,20 @@ if __name__ == "__main__":
         'Lookahead parameters in format [window_size,ngram_size,verification_set_size]. Example: [7,7,7]',
         default=None,
         required=False)
+    parser.add_argument(
+        "--return-num-input-tokens",
+        action="store_true",
+        required=False,
+        default=False,
+        help="Return the number of input tokens",
+    )
+    parser.add_argument(
+        "--return-num-output-tokens",
+        action="store_true",
+        required=False,
+        default=False,
+        help="Return the number of output tokens",
+    )
 
     FLAGS = parser.parse_args()
 
@@ -770,6 +795,16 @@ if __name__ == "__main__":
     if FLAGS.lookahead_config is not None:
         lookahead_config_data = np.array(FLAGS.lookahead_config, dtype=np.int32)
 
+    return_num_input_tokens_data = None
+    if FLAGS.return_num_input_tokens:
+        return_num_input_tokens_data = np.array(
+            [[FLAGS.return_num_input_tokens]], dtype=bool)
+
+    return_num_output_tokens_data = None
+    if FLAGS.return_num_output_tokens:
+        return_num_output_tokens_data = np.array(
+            [[FLAGS.return_num_output_tokens]], dtype=bool)
+
     inputs = prepare_inputs(
         input_ids_data, input_lengths_data, request_output_len_data,
         beam_width_data, temperature_data, repetition_penalty_data,
@@ -781,7 +816,8 @@ if __name__ == "__main__":
         return_generation_logits_data, decoder_input_ids_data,
         prompt_table_extra_id_data, exclude_input_in_output,
         num_return_sequences_data, return_perf_metrics_data,
-        lookahead_config_data)
+        lookahead_config_data, return_num_input_tokens_data,
+        return_num_output_tokens_data)
 
     if FLAGS.requested_outputs:
         # Must have at least output_ids in requested outputs
@@ -802,28 +838,37 @@ if __name__ == "__main__":
         with open(FLAGS.output_tokens_csv) as csv_file:
             csv_reader = csv.reader(csv_file, delimiter=",")
             for row in csv_reader:
-                expected_output_ids = [int(val) for val in row]
+                expected_output_ids = [[int(val) for val in row]]
                 break
     else:
-        expected_output_ids = ([] if FLAGS.exclude_input_in_output else
-                               input_ids[0]) + [
-                                   21221,
-                                   290,
-                                   373,
-                                   257,
-                                   2888,
-                                   286,
-                                   262,
-                                   4141,
-                                   2351,
-                                   10006,
-                                   13,
-                                   679,
-                                   373,
-                                   7018,
-                                   284,
-                                   262,
-                               ]
+        # expected_output_ids holds a list of lists, each list is a version of "expected" output ids
+        # The expected output could vary on different GPUs
+        expected_output_ids = []
+        expected_output_ids.append(
+            ([] if FLAGS.exclude_input_in_output else input_ids[0]) + [
+                21221,
+                290,
+                373,
+                257,
+                2888,
+                286,
+                262,
+                4141,
+                2351,
+                10006,
+                13,
+                679,
+                373,
+                7018,
+                284,
+                262,
+            ])
+        # Adding a second expected output ids for testing on A100 GPUs
+        expected_output_ids.append(
+            ([] if FLAGS.exclude_input_in_output else input_ids[0]) + [
+                21221, 290, 257, 4255, 379, 262, 1957, 7072, 11, 4689, 347,
+                2852, 2564, 494, 13, 679
+            ])
 
     if FLAGS.num_return_sequences is None:
         num_generations = FLAGS.beam_width
@@ -846,6 +891,8 @@ if __name__ == "__main__":
     context_logits = None
     generation_logits = [None] * num_generations
     returned_perf_metrics = {}
+    input_token_count = [None] * num_generations
+    output_token_count = [None] * num_generations
 
     def set_output(outputs: list, data, seq_idx=None):
         if FLAGS.beam_width > 1:
@@ -933,6 +980,12 @@ if __name__ == "__main__":
                                     generation_logits,
                                     result.as_numpy('generation_logits')[0],
                                     seq_idx)
+                            if FLAGS.return_num_input_tokens:
+                                input_token_count[seq_idx] = result.as_numpy(
+                                    'num_input_tokens')
+                            if FLAGS.return_num_output_tokens:
+                                output_token_count[seq_idx] = result.as_numpy(
+                                    'num_output_tokens')
                             if FLAGS.return_perf_metrics:
                                 returned_perf_metrics[
                                     'kv_cache_alloc_new_blocks'] = result.as_numpy(
@@ -1043,6 +1096,12 @@ if __name__ == "__main__":
                             set_output(generation_logits,
                                        result.as_numpy('generation_logits')[0],
                                        seq_idx)
+                        if FLAGS.return_num_input_tokens:
+                            input_token_count[seq_idx] = result.as_numpy(
+                                'num_input_tokens')
+                        if FLAGS.return_num_output_tokens:
+                            output_token_count[seq_idx] = result.as_numpy(
+                                'num_output_tokens')
                         if FLAGS.return_perf_metrics:
                             returned_perf_metrics[
                                 'kv_cache_alloc_new_blocks'] = result.as_numpy(
@@ -1120,8 +1179,10 @@ if __name__ == "__main__":
                 output_text = tokenizer.decode(output_ids_wo_prompt)
                 print(f'Input: {FLAGS.text}')
                 print(f'Output beam {seq_idx}: {output_text}')
-                print(f'Output beam {seq_idx}: {output_text}')
-
+            if FLAGS.return_num_input_tokens:
+                print(f'Input token count: {input_token_count[seq_idx]}')
+            if FLAGS.return_num_output_tokens:
+                print(f'Output token count: {output_token_count[seq_idx]}')
             # If cancelled, the number of output tokens should be less than request output length.
             if FLAGS.stop_after_ms > 0 and len(
                     output_ids_wo_prompt) >= FLAGS.request_output_len:
@@ -1134,16 +1195,19 @@ if __name__ == "__main__":
             if FLAGS.check_output and seq_idx == 0:
                 passed = False
                 if FLAGS.correctness_threshold == 1.0:
-                    passed = (output_ids_w_prompt == expected_output_ids)
+                    passed = (output_ids_w_prompt in expected_output_ids)
                 else:
                     # Compare the output tokens one by one
-                    num_same_output_id = 0
-                    expected_len = len(expected_output_ids)
-                    for i in range(min(len(output_ids_w_prompt), expected_len)):
-                        if output_ids_w_prompt[i] == expected_output_ids[i]:
-                            num_same_output_id += 1
+                    num_same_output_id = [0] * len(expected_output_ids)
+                    for i, expect_output in enumerate(expected_output_ids):
+                        for output, expected in zip(output_ids_w_prompt,
+                                                    expect_output):
+                            if output == expected:
+                                num_same_output_id[i] += 1
+
                     # Calculate the match rate
-                    match_rate = num_same_output_id / expected_len
+                    match_rate = max(num_same_output_id) / len(
+                        output_ids_w_prompt)
                     print(f"Output token matching rate: {match_rate}")
                     passed = (match_rate > FLAGS.correctness_threshold)
                     print("expected_output_ids = ", expected_output_ids)
@@ -1156,10 +1220,10 @@ if __name__ == "__main__":
             if FLAGS.check_output and non_deterministic_sampling and seq_idx > 0:
                 # Skip the correctness check under non-deterministic sampling.
                 # Generated sequences should not be identical.
-                passed = output_ids_w_prompt[seq_idx] != expected_output_ids
+                passed = output_ids_w_prompt[seq_idx] not in expected_output_ids
                 if not passed:
                     print(f"Output tokens of sequence {seq_idx} is identical "
-                          f"to the first sequence.")
+                          f"to the expected sequence.")
 
         if FLAGS.return_log_probs:
             print('cum_log_probs:', expand_and_vstack(cum_log_probs))
@@ -1173,6 +1237,11 @@ if __name__ == "__main__":
             generation_logits = expand_and_vstack(generation_logits)
             print(f"generation_logits.shape: {generation_logits.shape}")
             print(f"generation_logits: {generation_logits}")
+
+        if FLAGS.return_num_input_tokens:
+            print(f'Input token count: {input_token_count[0]}')
+        if FLAGS.return_num_output_tokens:
+            print(f'Output token count: {output_token_count[0]}')
 
         if FLAGS.return_perf_metrics:
             for key, value in returned_perf_metrics.items():

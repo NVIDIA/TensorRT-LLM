@@ -6,12 +6,14 @@ import torch
 from parameterized import parameterized
 from transformers import MixtralConfig
 from transformers import MixtralForCausalLM as HFMixtralForCausalLM
-from utils.util import getSMVersion
+from utils.util import default_dtype, getSMVersion
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.checkpoints.hf.mixtral_weight_mapper import \
+    MixtralHfWeightMapper
 from tensorrt_llm._torch.models.modeling_mixtral import MixtralForCausalLM
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
     DecodingCUDAGraphRunner
@@ -82,9 +84,10 @@ class TestMixtral(unittest.TestCase):
         dtype = mixtral_config.torch_dtype
         device = torch.device("cuda")
 
-        model_config = ModelConfig(pretrained_config=mixtral_config,
-                                   quant_config=quant_config)
-        mixtral = MixtralForCausalLM(model_config).to(device)
+        with torch.device(device), default_dtype(dtype):
+            model_config = ModelConfig(pretrained_config=mixtral_config,
+                                       quant_config=quant_config)
+            mixtral = MixtralForCausalLM(model_config)
 
         input_ids = torch.tensor([100, 200, 300, 100, 200, 100, 400, 500],
                                  dtype=torch.int32,
@@ -199,13 +202,15 @@ class TestMixtral(unittest.TestCase):
         dtype = mixtral_config.torch_dtype
         device = torch.device("cuda")
 
-        hf_mixtral = HFMixtralForCausalLM(mixtral_config).to(dtype).to(
-            device).eval()
+        with torch.device(device), default_dtype(dtype):
+            hf_mixtral = HFMixtralForCausalLM(mixtral_config).eval()
 
-        model_config = ModelConfig(pretrained_config=mixtral_config,
-                                   attn_backend=backend)
-        mixtral = MixtralForCausalLM(model_config).to(device)
-        mixtral.load_weights(hf_mixtral.state_dict())
+            model_config = ModelConfig(pretrained_config=mixtral_config,
+                                       attn_backend=backend)
+            mixtral = MixtralForCausalLM(model_config)
+            weight_mapper = MixtralHfWeightMapper()
+            weight_mapper.init_model_and_config(mixtral, mixtral_config)
+            mixtral.load_weights(hf_mixtral.state_dict(), weight_mapper)
 
         num_blocks = 1
         tokens_per_block = 128

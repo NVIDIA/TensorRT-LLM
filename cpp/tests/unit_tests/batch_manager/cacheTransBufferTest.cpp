@@ -18,6 +18,7 @@
 #include "tensorrt_llm/batch_manager/cacheTransBuffer.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include <gtest/gtest.h>
@@ -29,12 +30,11 @@ class CacheTransBufferTest : public ::testing::Test
 {
 protected:
     void SetUpCacheTransBuffer(int numLayers, int numHeads, int sizePerHead, int tokensPerBlock, CacheType cacheType,
-        std::optional<size_t> maxNumTokens)
+        std::optional<size_t> maxNumTokens, SizeType32 maxBlocksPerSeq)
     {
         setenv("TRTLLM_USE_UCX_KVCACHE", "1", 1);
         // Initialize KVCacheManager with required parameters
         auto hiddenSize = numHeads * sizePerHead;
-        auto constexpr maxBlocksPerSeq = 10;
         auto constexpr maxBeamWidth = 4;
         auto constexpr sinkTokenLength = 0;
         auto constexpr maxNumSequences = 8;
@@ -101,20 +101,27 @@ TEST_F(CacheTransBufferTest, TestPreAllocBufferSize)
     {
 
         // Child process
-        std::optional<size_t> maxNumTokens = 1024;
-        SetUpCacheTransBuffer(4, 2, 64, 8, CacheType::kSELFKONLY, maxNumTokens);
+        SizeType32 maxBlocksPerSeq = 10;
+        SizeType32 tokensPerBlock = 8;
+        std::optional<size_t> maxNumTokens = maxBlocksPerSeq * tokensPerBlock;
+        SetUpCacheTransBuffer(4, 2, 64, tokensPerBlock, CacheType::kSELFKONLY, maxNumTokens, maxBlocksPerSeq);
         size_t recvbufferCount = tensorrt_llm::common::getEnvRequestKVCacheConcurrent()
             ? tensorrt_llm::common::getEnvKVCacheRecvBufferCount()
             : 1;
         size_t sendBufferCount = tensorrt_llm::common::getEnvParallelCacheSend()
             ? tensorrt_llm::common::getEnvKVCacheSendMaxConcurrenceNum()
             : 1;
-        size_t bufferSizeBytes = CacheTransBufferManager::preAllocBufferSize(maxNumTokens)
-            * kvCacheSizePerToken(4, 2, 64, CacheType::kSELFKONLY);
+        size_t cacheSizeBytesPerToken = kvCacheSizePerToken(4, 2, 64, CacheType::kSELFKONLY);
+        std::map<SizeType32, SizeType32> cacheSizeBytesPerTokenPerWindow{
+            {maxBlocksPerSeq * tokensPerBlock, cacheSizeBytesPerToken}};
+        tensorrt_llm::executor::CacheTransceiverConfig cacheTransceiverConfig{
+            tensorrt_llm::executor::CacheTransceiverConfig::BackendType::UCX, maxNumTokens};
+        size_t bufferSizeBytes
+            = CacheTransBufferManager::preAllocBufferSize(cacheSizeBytesPerTokenPerWindow, cacheTransceiverConfig);
         auto bufferId = mTransBufferManager->assignBufferIndexForSend();
         EXPECT_TRUE(bufferId.has_value());
         EXPECT_EQ(bufferId.value(), 0);
-        EXPECT_GT(bufferSizeBytes,
+        EXPECT_EQ(bufferSizeBytes,
             mTransBufferManager->getSendBuffer(bufferId)->getSizeInBytes() * (recvbufferCount + sendBufferCount));
         mTransBufferManager->freeBufferIndexForSend(bufferId);
         exit(testing::Test::HasFailure() ? 1 : 0);
@@ -138,20 +145,27 @@ TEST_F(CacheTransBufferTest, TestPreAllocBufferSize2)
     {
         // Child process
 
-        std::optional<size_t> maxNumTokens = 1024;
-        SetUpCacheTransBuffer(4, 2, 64, 8, CacheType::kSELF, maxNumTokens);
+        SizeType32 maxBlocksPerSeq = 10;
+        SizeType32 tokensPerBlock = 8;
+        std::optional<size_t> maxNumTokens = maxBlocksPerSeq * tokensPerBlock;
+        SetUpCacheTransBuffer(4, 2, 64, tokensPerBlock, CacheType::kSELF, maxNumTokens, maxBlocksPerSeq);
         size_t recvbufferCount = tensorrt_llm::common::getEnvRequestKVCacheConcurrent()
             ? tensorrt_llm::common::getEnvKVCacheRecvBufferCount()
             : 1;
         size_t sendBufferCount = tensorrt_llm::common::getEnvParallelCacheSend()
             ? tensorrt_llm::common::getEnvKVCacheSendMaxConcurrenceNum()
             : 1;
-        size_t bufferSizeBytes = CacheTransBufferManager::preAllocBufferSize(maxNumTokens)
-            * kvCacheSizePerToken(4, 2, 64, CacheType::kSELFKONLY);
+        size_t cacheSizeBytesPerToken = kvCacheSizePerToken(4, 2, 64, CacheType::kSELF);
+        tensorrt_llm::executor::CacheTransceiverConfig cacheTransceiverConfig{
+            tensorrt_llm::executor::CacheTransceiverConfig::BackendType::UCX, maxNumTokens};
+        std::map<SizeType32, SizeType32> cacheSizeBytesPerTokenPerWindow{
+            {maxBlocksPerSeq * tokensPerBlock, cacheSizeBytesPerToken}};
+        size_t bufferSizeBytes
+            = CacheTransBufferManager::preAllocBufferSize(cacheSizeBytesPerTokenPerWindow, cacheTransceiverConfig);
         auto bufferId = mTransBufferManager->assignBufferIndexForSend();
         EXPECT_TRUE(bufferId.has_value());
         EXPECT_EQ(bufferId.value(), 0);
-        EXPECT_GT(bufferSizeBytes,
+        EXPECT_EQ(bufferSizeBytes,
             mTransBufferManager->getSendBuffer(bufferId)->getSizeInBytes() * (recvbufferCount + sendBufferCount));
         mTransBufferManager->freeBufferIndexForSend(bufferId);
         exit(testing::Test::HasFailure() ? 1 : 0);
@@ -174,8 +188,10 @@ TEST_F(CacheTransBufferTest, TestBufferIndexAssignment0)
     {
         // Child process
 
-        std::optional<size_t> maxNumTokens = 1024;
-        SetUpCacheTransBuffer(4, 2, 64, 8, CacheType::kSELF, maxNumTokens);
+        SizeType32 maxBlocksPerSeq = 10;
+        SizeType32 tokensPerBlock = 8;
+        std::optional<size_t> maxNumTokens = maxBlocksPerSeq * tokensPerBlock;
+        SetUpCacheTransBuffer(4, 2, 64, tokensPerBlock, CacheType::kSELF, maxNumTokens, maxBlocksPerSeq);
 
         auto bufferId = mTransBufferManager->assignBufferIndexForSend();
         EXPECT_TRUE(bufferId.has_value());
@@ -240,10 +256,12 @@ TEST_F(CacheTransBufferTest, TestBufferIndexAssignment1)
     ASSERT_NE(pid, -1) << "Fork failed";
     if (pid == 0)
     {
-        std::optional<size_t> maxNumTokens = 1024;
+        SizeType32 maxBlocksPerSeq = 10;
+        SizeType32 tokensPerBlock = 8;
+        std::optional<size_t> maxNumTokens = maxBlocksPerSeq * tokensPerBlock;
         setenv("TRTLLM_REQUEST_KV_CACHE_CONCURRENT", "1", 1);
         setenv("TRTLLM_PARALLEL_CACHE_SEND", "1", 1);
-        SetUpCacheTransBuffer(4, 2, 64, 8, CacheType::kSELF, maxNumTokens);
+        SetUpCacheTransBuffer(4, 2, 64, tokensPerBlock, CacheType::kSELF, maxNumTokens, maxBlocksPerSeq);
         auto bufferId = mTransBufferManager->assignBufferIndexForSend();
         EXPECT_TRUE(bufferId.has_value());
         EXPECT_EQ(bufferId.value(), 0);
@@ -313,8 +331,10 @@ TEST_F(CacheTransBufferTest, TestForNullOptAndNoneTransSize)
     if (pid == 0)
     {
         std::optional<size_t> maxNumTokens = std::nullopt;
+        SizeType32 maxBlocksPerSeq = 10;
+        SizeType32 tokensPerBlock = 8;
         setenv("TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE", "0B", 1);
-        SetUpCacheTransBuffer(4, 2, 64, 8, CacheType::kSELF, maxNumTokens);
+        SetUpCacheTransBuffer(4, 2, 64, tokensPerBlock, CacheType::kSELF, maxNumTokens, maxBlocksPerSeq);
         auto bufferId = mTransBufferManager->assignBufferIndexForSend();
         EXPECT_FALSE(bufferId.has_value());
         mTransBufferManager->freeBufferIndexForSend(bufferId);
@@ -354,7 +374,9 @@ TEST_F(CacheTransBufferTest, TestForNullOptAndDefaultTransSize)
     if (pid == 0)
     {
         std::optional<size_t> maxNumTokens = std::nullopt;
-        SetUpCacheTransBuffer(4, 2, 64, 8, CacheType::kSELF, maxNumTokens);
+        SizeType32 maxBlocksPerSeq = 10;
+        SizeType32 tokensPerBlock = 8;
+        SetUpCacheTransBuffer(4, 2, 64, tokensPerBlock, CacheType::kSELF, maxNumTokens, maxBlocksPerSeq);
         auto defaultTransSize = tensorrt_llm::common::getEnvMemSizeForKVCacheTransferBuffer();
         TLLM_LOG_INFO("defaultTransSize: %d", defaultTransSize);
         EXPECT_GT(defaultTransSize, 0);

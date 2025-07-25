@@ -63,7 +63,10 @@ void copySequenceLengths(RequestVector const& contextRequests, DecoderInputBuffe
     SizeType32 batchIdx{0};
     for (auto const& llmReq : contextRequests)
     {
-        auto const currentSequenceLen = llmReq->mPromptLen + llmReq->getMaxNumGeneratedTokens();
+        auto const disaggFirstGenTokenSize
+            = llmReq->getContextPhaseParams() ? llmReq->getContextPhaseParams().value().getFirstGenTokens().size() : 0;
+        auto const currentSequenceLen
+            = llmReq->mPromptLen + llmReq->getMaxNumGeneratedTokens() + disaggFirstGenTokenSize;
         // Get position of the current sequence in the decoder
         auto const seqSlot = llmReq->mSeqSlot.value();
         batchSlotsRange[batchIdx] = seqSlot;
@@ -136,8 +139,11 @@ CreateNewDecoderRequests::operator()(runtime::ModelConfig const& modelConfig, ru
     std::copy_if(contextRequests.begin(), contextRequests.end(), std::back_inserter(finishedContextRequests),
         [](auto const& llmReq) { return llmReq->isLastContextChunk(); });
 
-    copySequenceLengths(finishedContextRequests, inputBuffers, *decoderState.getSequenceLengths(), beamWidth,
-        bufferManager, runtimeStream);
+    if (!finishedContextRequests.empty())
+    {
+        copySequenceLengths(finishedContextRequests, inputBuffers, *decoderState.getSequenceLengths(), beamWidth,
+            bufferManager, runtimeStream);
+    }
 
     auto [lookaheadPrompt, lookaheadAlgoConfigs] = createDecoderRequests(finishedContextRequests,
         inputBuffers.inputsIds, decodingConfig, decoderState, bufferManager, logitsType, modelConfig, worldConfig,

@@ -5,12 +5,13 @@ import tempfile
 from collections import defaultdict
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Coroutine, Dict, List, Optional, TypedDict, Union
+from typing import Any, Coroutine, Dict, List, Optional, Tuple, TypedDict, Union
 from urllib.parse import urlparse
 
 import aiohttp
 import numpy as np
 import requests
+import soundfile
 import torch
 from PIL import Image
 from torchvision.transforms import ToTensor
@@ -44,7 +45,7 @@ def load_base64_image(parsed_url: str) -> Image.Image:
 
 def load_image(image: str,
                format: str = "pt",
-               device: str = "cuda") -> Union[Image.Image, torch.Tensor]:
+               device: str = "cpu") -> Union[Image.Image, torch.Tensor]:
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
     parsed_url = urlparse(image)
@@ -66,7 +67,7 @@ def load_image(image: str,
 async def async_load_image(
         image: str,
         format: str = "pt",
-        device: str = "cuda") -> Union[Image.Image, torch.Tensor]:
+        device: str = "cpu") -> Union[Image.Image, torch.Tensor]:
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
     parsed_url = urlparse(image)
@@ -91,7 +92,7 @@ def load_video(
         video: str,
         num_frames: int = 10,
         format: str = "pt",
-        device: str = "cuda") -> Union[List[Image.Image], List[torch.Tensor]]:
+        device: str = "cpu") -> Union[List[Image.Image], List[torch.Tensor]]:
 
     # Keep this import local to avoid importing cv2 if not needed
     import cv2
@@ -140,7 +141,7 @@ async def async_load_video(
         video: str,
         num_frames: int = 10,
         format: str = "pt",
-        device: str = "cuda") -> Union[List[Image.Image], List[torch.Tensor]]:
+        device: str = "cpu") -> Union[List[Image.Image], List[torch.Tensor]]:
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
     parsed_url = urlparse(video)
@@ -157,6 +158,35 @@ async def async_load_video(
         video_path = video
 
     return load_video(video_path, num_frames, format, device)
+
+
+def load_audio(
+    audio: str,
+    format: str = "pt",
+    device: str = "cuda",
+) -> Tuple[np.ndarray, int]:
+    parsed_url = urlparse(audio)
+    if parsed_url.scheme in ["http", "https"]:
+        audio = requests.get(audio, stream=True, timeout=10)
+        audio = BytesIO(audio.content)
+
+    audio = soundfile.read(audio)
+    return audio
+
+
+async def async_load_audio(
+    audio: str,
+    format: str = "pt",
+    device: str = "cuda",
+) -> Tuple[np.ndarray, int]:
+    parsed_url = urlparse(audio)
+    if parsed_url.scheme in ["http", "https"]:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(audio) as response:
+                audio = BytesIO(await response.content.read())
+
+    audio = soundfile.read(audio)
+    return audio
 
 
 # Copied from https://github.com/vllm-project/vllm/blob/main/examples/online_serving/openai_chat_completion_client_for_multimodal.py#L38
@@ -184,19 +214,26 @@ SUPPORTED_GEMMA_MODEL_GROUP = ["gemma3"]
 SUPPORTED_LLAMA_MODEL_GROUP = ["mllama", "llama4"]
 SUPPORTED_LLAVA_IMAGE_MODEL_GROUP = ["llava_llama", "llava_next"]
 SUPPORTED_LLAVA_VIDEO_MODEL_GROUP = ["llava_llama"]
+SUPPORTED_MISTRAL_IMAGE_MODEL_GROUP = ["mistral3"]
 SUPPORTED_HYPERCLOVAX_MODEL_GROUP = ["hyperclovax_vlm"]
+SUPPORTED_PHI_MODEL_GROUP = ["phi4mm"]
 
 ALL_SUPPORTED_IMAGE_MODELS = SUPPORTED_QWEN_MODEL_GROUP \
     + SUPPORTED_LLAMA_MODEL_GROUP \
     + SUPPORTED_LLAVA_IMAGE_MODEL_GROUP \
     + SUPPORTED_HYPERCLOVAX_MODEL_GROUP \
-    + SUPPORTED_GEMMA_MODEL_GROUP
+    + SUPPORTED_GEMMA_MODEL_GROUP \
+    + SUPPORTED_MISTRAL_IMAGE_MODEL_GROUP \
+    + SUPPORTED_PHI_MODEL_GROUP
 
 ALL_SUPPORTED_VIDEO_MODELS = SUPPORTED_QWEN_MODEL_GROUP \
     + SUPPORTED_LLAVA_VIDEO_MODEL_GROUP
 
+ALL_SUPPORTED_AUDIO_MODELS = SUPPORTED_PHI_MODEL_GROUP
+
 ALL_SUPPORTED_MULTIMODAL_MODELS = list(set(ALL_SUPPORTED_IMAGE_MODELS) \
-    | set(ALL_SUPPORTED_VIDEO_MODELS))
+    | set(ALL_SUPPORTED_VIDEO_MODELS) \
+    | set(ALL_SUPPORTED_AUDIO_MODELS))
 
 HF_CHAT_TEMPLATE_EXCEPTIONS = ["llava_llama"]
 PLACEHOLDER_EXCEPTIONS = ["llava_next"]
@@ -217,6 +254,11 @@ PLACEHOLDER_PLACEMENT_MAP = {
     "mllama": MultimodalPlaceholderPlacement.BEFORE_TEXT,
     "hyperclovax_vlm": MultimodalPlaceholderPlacement.AFTER_TEXT,
     "gemma3": MultimodalPlaceholderPlacement.BEFORE_TEXT,
+    # NOTE: for mistral3 multimodal models, it does not strictly have to be after the text.
+    # Ref: https://github.com/mistralai/mistral-common/blob/039465db2bdc0486df36365c9bdb428188482a18/
+    #      src/mistral_common/tokens/tokenizers/base.py#L326
+    "mistral3": MultimodalPlaceholderPlacement.AFTER_TEXT,
+    "phi4mm": MultimodalPlaceholderPlacement.BEFORE_TEXT,
 }
 assert len(PLACEHOLDER_PLACEMENT_MAP) == len(ALL_SUPPORTED_MULTIMODAL_MODELS)
 
@@ -229,7 +271,7 @@ def retrieve_multimodal_placeholder(model_type: str, modality: str,
         Args:
             model_type: The type of the multimodal model.
             modality: The modality of the data.
-            current_count: The number of multimodal data already added. Currently not used.
+            current_count: The number of multimodal data already added.
 
     """
 
@@ -247,6 +289,12 @@ def retrieve_multimodal_placeholder(model_type: str, modality: str,
                     '<|im_start|>user (vector)\n<|dummy3|><|im_end|>\n' + \
                     '<|im_start|>image/aux\n다음 중 ocr은 사진에서 검출된 글자이고, lens_keyword는 사진에서 추출된 keyword와 bbox 위치입니다.' + \
                     'bbox는 0~1 사이로 정규화된 [x1, y1, x2, y2]의 형태입니다. 참고하여 답변하세요. {"ocr": "", "lens_keywords": "", "lens_local_keywords": ""}'
+        elif model_type in SUPPORTED_MISTRAL_IMAGE_MODEL_GROUP:
+            # Ref: https://github.com/mistralai/mistral-common/blob/26a6bb3a07ee0b78a3808f2797f23e1d28514b93/
+            # src/mistral_common/tokens/tokenizers/base.py#L60
+            return "[IMG]"
+        elif model_type in SUPPORTED_PHI_MODEL_GROUP:
+            return f"<|image_{current_count}|>"
         raise TypeError(
             f"For image modality, only {ALL_SUPPORTED_IMAGE_MODELS} are supported but got {model_type}"
         )
@@ -258,6 +306,9 @@ def retrieve_multimodal_placeholder(model_type: str, modality: str,
         raise TypeError(
             f"For video modality, only {ALL_SUPPORTED_VIDEO_MODELS} are supported but got {model_type}"
         )
+    elif modality == "audio":
+        if model_type in SUPPORTED_PHI_MODEL_GROUP:
+            return f"<|audio_{current_count}|>"
     raise TypeError(f"Unknown modality: {modality}")
 
 
@@ -333,7 +384,10 @@ def add_multimodal_placeholders(model_type: str, text_prompt: str,
         case MultimodalPlaceholderPlacement.AFTER_TEXT:
             parts.append(text_prompt)
             parts.extend(placeholders)
-    return "\n".join(parts)
+    if model_type == "phi4mm":
+        return "".join(parts)
+    else:
+        return "\n".join(parts)
 
 
 def resolve_hf_chat_template(
@@ -426,7 +480,7 @@ def default_multimodal_input_loader(
         media: Union[List[str], List[List[str]]],
         image_data_format: str = "pt",
         num_frames: int = 8,
-        device: str = "cuda") -> List[dict[str, Union[str, torch.Tensor]]]:
+        device: str = "cpu") -> List[dict[str, Union[str, torch.Tensor]]]:
 
     def convert_to_conversation_message(prompt: str, media: Union[str,
                                                                   List[str]],
@@ -448,6 +502,34 @@ def default_multimodal_input_loader(
                                                format=image_data_format,
                                                device=device)) for i in media
             ]
+        elif modality == "audio":
+            mm_data = [
+                MultimodalData(modality=modality,
+                               data=load_audio(i, device=device)) for i in media
+            ]
+        elif modality == "image_audio":
+            # Use different load_xxx functions to match the modality.
+            mm_data = []
+            for m in media:
+                data = None
+                _modal = None
+                if _modal is None:
+                    try:
+                        data = load_image(m,
+                                          format=image_data_format,
+                                          device=device)
+                        _modal = "image"
+                    except Exception:
+                        pass
+                if _modal is None:
+                    try:
+                        data = load_audio(m, device=device)
+                        _modal = "audio"
+                    except Exception:
+                        pass
+                if _modal is None:
+                    raise ValueError(f"Unknown matching modality: {modality}")
+                mm_data.append(MultimodalData(modality=_modal, data=data))
         else:
             raise ValueError(f"Unknown modality: {modality}")
         return ConversationMessage(role="user", content=prompt, media=mm_data)
