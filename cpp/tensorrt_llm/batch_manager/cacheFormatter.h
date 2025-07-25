@@ -78,9 +78,9 @@ public:
     virtual ~BaseCacheFormatter() = default;
 
     // TODO: better way for context/generation tagging
-    void markAsContext(bool isContext)
+    void markAsSender(bool isSender)
     {
-        kvCacheMeasureHelper.markAsContext(isContext);
+        kvCacheMeasureHelper.markAsSender(isSender);
     }
 
 protected:

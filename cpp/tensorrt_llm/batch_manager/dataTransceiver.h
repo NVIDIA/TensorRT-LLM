@@ -281,9 +281,9 @@ public:
     {
     }
 
-    void markAsContext(bool isContext)
+    void markAsSender(bool isSender)
     {
-        mIsContext = isContext;
+        mIsSender = isSender;
     }
 
     void appendKVCacheTransfer(LlmRequest::RequestIdType requestId, double delay, double duration, size_t size)
@@ -302,9 +302,10 @@ public:
     {
         if (!mRequestKVCacheTranfserMeasure.empty() && !mOutputPath.empty())
         {
+            TLLM_CHECK(mIsSender.has_value());
             auto rank = mpi::MpiComm::world().getRank();
             std::string outFilePath
-                = mOutputPath + "rank_" + std::to_string(rank) + "_" + (mIsContext ? "ctx" : "gen") + ".csv";
+                = mOutputPath + "rank_" + std::to_string(rank) + "_" + (mIsSender.value() ? "send" : "recv") + ".csv";
             std::ofstream outFile(outFilePath);
 
             TLLM_CHECK_WITH_INFO(outFile.is_open(), "Cannot write to file " + outFilePath);
@@ -337,7 +338,7 @@ private:
     std::map<LlmRequest::RequestIdType, std::vector<Measure>> mRequestKVCacheTranfserMeasure;
     std::string mOutputPath;
     std::mutex mMutex;
-    bool mIsContext;
+    std::optional<bool> mIsSender;
 };
 
 } // namespace tensorrt_llm::batch_manager
