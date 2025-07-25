@@ -814,7 +814,19 @@ void CacheFormatter::unformat(TransferSession& session)
     if (selfConfig.getModelConfig().mNbKvHeadsPerLayer.size() != destConfig.getModelConfig().mNbKvHeadsPerLayer.size())
     {
         TLLM_LOG_WARNING("CacheFormatter::inquireSupport: only support same number of layers");
-        return false;
+        TLLM_LOG_WARNING("self: %d dest %d", selfConfig.getModelConfig().mNbKvHeadsPerLayer.size(),
+            destConfig.getModelConfig().mNbKvHeadsPerLayer.size());
+
+        auto selfTotalLayers = selfConfig.getModelConfig().mNbKvHeadsPerLayer.size()
+            * selfConfig.getParallelConfig().mPipelineParallelism;
+        auto destTotalLayers = destConfig.getModelConfig().mNbKvHeadsPerLayer.size()
+            * destConfig.getParallelConfig().mPipelineParallelism;
+        if (selfTotalLayers != destTotalLayers)
+        {
+            TLLM_LOG_WARNING("CacheFormatter::inquireSupport: incompatible total layer counts: self=%d, dest=%d",
+                static_cast<int>(selfTotalLayers), static_cast<int>(destTotalLayers));
+            return false;
+        }
     }
     int selfNumLayers = selfConfig.getModelConfig().mNbKvHeadsPerLayer.size();
     int selfPPSize = selfConfig.getParallelConfig().mPipelineParallelism;
