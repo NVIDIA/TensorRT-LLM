@@ -14,6 +14,9 @@ meta-llama/Llama-3.3-70B-Instruct:
     accuracy: 83.30
 meta-llama/Llama-4-Maverick-17B-128E-Instruct:
   - accuracy: 92.20
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 83.30
 meta-llama/Llama-4-Scout-17B-16E-Instruct:
   - accuracy: 89.70
 deepseek-ai/DeepSeek-V3-Lite:
