@@ -2091,6 +2091,11 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                             def ubuntu_version = key.contains("UB2404") ? "ubuntu2404" : "ubuntu2204"
                             def platform = values[2] == X86_64_TRIPLE ? "x86_64" : "sbsa"
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://developer.download.nvidia.com/compute/cuda/repos/${ubuntu_version}/${platform}/cuda-keyring_1.1-1_all.deb")
+                            
+                            // WAR: Remove CUDA sources and keys to avoid conflicts
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "rm -f /etc/apt/sources.list.d/cuda-ubuntu2404-x86_64.list")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-key del 7fa2af80 || true")
+
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "dpkg -i cuda-keyring_1.1-1_all.deb")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install cuda-toolkit-12-9")
