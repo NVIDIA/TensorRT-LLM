@@ -105,15 +105,13 @@ def EXTRA_STAGE_LIST = "extra_stage"
 @Field
 def MULTI_GPU_FILE_CHANGED = "multi_gpu_file_changed"
 @Field
-def ONLY_PYTORCH_FILE_CHANGED = "only_pytorch_file_changed"
+def ONLY_ONE_GROUP_CHANGED = "only_one_group_changed"
 @Field
 def AUTO_TRIGGER_TAG_LIST = "auto_trigger_tag_list"
 @Field
 def DEBUG_MODE = "debug"
 @Field
 def DETAILED_LOG = "detailed_log"
-@Field
-def ONLY_DOCS_FILE_CHANGED = "only_docs_file_changed"
 
 def testFilter = [
     (REUSE_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get(REUSE_STAGE_LIST, null)?.tokenize(',')),
@@ -127,11 +125,10 @@ def testFilter = [
     (DISABLE_MULTI_GPU_TEST): gitlabParamsFromBot.get((DISABLE_MULTI_GPU_TEST), false),
     (EXTRA_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get((EXTRA_STAGE_LIST), null)?.tokenize(',')),
     (MULTI_GPU_FILE_CHANGED): false,
-    (ONLY_PYTORCH_FILE_CHANGED): false,
+    (ONLY_ONE_GROUP_CHANGED): "",
     (DEBUG_MODE): gitlabParamsFromBot.get(DEBUG_MODE, false),
     (AUTO_TRIGGER_TAG_LIST): [],
     (DETAILED_LOG): gitlabParamsFromBot.get(DETAILED_LOG, false),
-    (ONLY_DOCS_FILE_CHANGED): false,
 ]
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
@@ -324,9 +321,8 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
         echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
         echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
         testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
-        testFilter[(ONLY_PYTORCH_FILE_CHANGED)] = getOnlyPytorchFileChanged(pipeline, testFilter, globalVars)
+        testFilter[(ONLY_ONE_GROUP_CHANGED)] = getOnlyOneGroupChanged(pipeline, testFilter, globalVars)
         testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
-        testFilter[(ONLY_DOCS_FILE_CHANGED)] = getOnlyDocsFileChanged(pipeline, testFilter, globalVars)
         getContainerURIs().each { k, v ->
             globalVars[k] = v
         }
@@ -644,86 +640,62 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
     return relatedFileChanged
 }
 
-def getOnlyPytorchFileChanged(pipeline, testFilter, globalVars) {
+def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
     def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
     if (env.alternativeTRT || isOfficialPostMergeJob) {
-        pipeline.echo("Force set ONLY_PYTORCH_FILE_CHANGED false.")
-        return false
+        pipeline.echo("Force set ONLY_ONE_GROUP_CHANGED \"\".")
+        return ""
     }
-    def pytorchOnlyList = [
-        "tensorrt_llm/_torch/",
-        "tensorrt_llm/scaffolding/",
-        "tests/unittest/_torch/",
-        "tests/unittest/scaffolding/",
-        "tests/unittest/llmapi/test_llm_pytorch.py",
-        "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
-        "tests/integration/defs/accuracy/test_llm_api_pytorch.py",
-        "tests/integration/defs/disaggregated/",
-        "examples/auto_deploy",
-        "examples/disaggregated",
-        "examples/pytorch/",
-        "examples/scaffolding/",
-        "docs/"
-    ]
-
-    def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
-
-    if (!changedFileList || changedFileList.isEmpty()) {
-        return false
-    }
-
-    def result = true
-    for (file in changedFileList) {
-        def isPytorchFile = false
-        for (prefix in pytorchOnlyList) {
-            if (file.startsWith(prefix)) {
-                isPytorchFile = true
-                break
-            }
-        }
-        if (!isPytorchFile) {
-            pipeline.echo("Found non-PyTorch file: ${file}")
-            result = false
-            break
-        }
-    }
-
-    pipeline.echo("Only PyTorch files changed: ${result}")
-    return result
-}
-
-def getOnlyDocsFileChanged(pipeline, testFilter, globalVars) {
-    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
-    if (env.alternativeTRT || isOfficialPostMergeJob) {
-        pipeline.echo("Force set ONLY_DOCS_FILE_CHANGED false.")
-        return false
-    }
-
-    // TODO: Add more docs path to the list, e.g. *.md files in other directories
-    def docsFileList = [
-        "docs/",
+    def groupFileMap = [
+        "Docs": [ // TODO: Add more docs path to the list, e.g. *.md files in other directories
+            "docs/",
+        ],
+        "PyTorch": [
+            "tensorrt_llm/_torch/",
+            "tensorrt_llm/scaffolding/",
+            "tests/unittest/_torch/",
+            "tests/unittest/scaffolding/",
+            "tests/unittest/llmapi/test_llm_pytorch.py",
+            "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
+            "tests/integration/defs/accuracy/test_llm_api_pytorch.py",
+            "tests/integration/defs/disaggregated/",
+            "examples/auto_deploy",
+            "examples/disaggregated",
+            "examples/pytorch/",
+            "examples/scaffolding/",
+            "docs/",
+        ],
+        "Triton": [
+            "tests/integration/defs/triton_server/",
+            "triton_backend/",
+        ],
     ]
 
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
     if (!changedFileList || changedFileList.isEmpty()) {
-        return false
+        return ""
     }
 
-    for (file in changedFileList) {
-        def isDocsFile = false
-        for (prefix in docsFileList) {
-            if (file.startsWith(prefix)) {
-                isDocsFile = true
-                break
+    for (group in groupFileMap.keySet()) {
+        def groupPrefixes = groupFileMap[group]
+        def allFilesInGroup = changedFileList.every { file ->
+            groupPrefixes.any { prefix -> file.startsWith(prefix) }
+        }
+
+        if (allFilesInGroup) {
+            pipeline.echo("Only ${group} files changed.")
+            return group
+        } else {
+            def nonGroupFile = changedFileList.find { file ->
+                !groupPrefixes.any { prefix -> file.startsWith(prefix) }
+            }
+            if (nonGroupFile != null) {
+                pipeline.echo("Found non-${group} file: ${nonGroupFile}")
             }
         }
-        if (!isDocsFile) {
-            pipeline.echo("Found non-docs file: ${file}")
-            return false
-        }
     }
-    pipeline.echo("Only docs files changed.")
-    return true
+
+    return ""
 }
 
 def collectTestResults(pipeline, testFilter)
@@ -1040,7 +1012,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     testStageName = "[Test-SBSA] Remote Run"
                 }
 
-                if (testFilter[(ONLY_DOCS_FILE_CHANGED)]) {
+                if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
                     echo "SBSA build job is skipped due to Jenkins configuration or conditional pipeline run"
                     return
                 }
