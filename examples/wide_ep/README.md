@@ -17,8 +17,6 @@ Wide-EP solves these challenges through:
 - **Dynamic expert placement and replication** strategies
 - **Layer-wise weight redistribution** to minimize inference disruption
 
-## Hardware requirements
-
 ## Quick Start
 
 ### 1. Configurations
