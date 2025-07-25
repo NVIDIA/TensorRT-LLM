@@ -516,7 +516,9 @@ Clearly in Figure 25, we can see that EPLB brings a clear performance improvemen
 
 ## Reproducing steps
 Currently to run through the reproducing steps described in this section, please, use this [feature branch](https://github.com/NVIDIA/TensorRT-LLM/tree/feat/large-ep/tensorrt_llm). It will get merged to the main branch soon.
+
 ### The effect of EP Load Balancer
+
 Please, refer to the [EP Load Balancer example](https://github.com/NVIDIA/TensorRT-LLM/tree/feat/large-ep/examples/ep_load_balancer) for how to reproduce the results for the offline EP Load Balancer.
 
 ##### Step 1: Run inference and collect statistics
