@@ -413,6 +413,23 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(8)
+    @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
+    def test_chunked_prefill(self, attn_backend):
+        pytorch_config = dict(attn_backend=attn_backend,
+                              disable_overlap_scheduler=True)
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=8,
+                 pipeline_parallel_size=1,
+                 moe_expert_parallel_size=1,
+                 max_seq_len=8192,
+                 enable_chunked_prefill=True,
+                 max_num_tokens=256,
+                 **pytorch_config) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
 
 class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
