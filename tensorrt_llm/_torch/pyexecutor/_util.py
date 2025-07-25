@@ -365,7 +365,7 @@ class KvCacheCreator:
             kv_cache_max_memory = min(kv_cache_max_memory,
                                       kv_cache_max_memory_from_max_tokens)
             logger.info(
-                f"max_tokens is provided, max_memory is set to {kv_cache_max_memory / (GB):.2f} GiB"
+                f"max_tokens={self._max_kv_tokens_in} is provided, max_memory is set to {kv_cache_max_memory / (GB):.2f} GiB"
             )
         if is_vswa:
             # For VSWA KvCacheManager now it can only use max_gpu_total_bytes
@@ -383,7 +383,7 @@ class KvCacheCreator:
                 kv_cache_max_memory,
                 executor_config.kv_cache_config.max_gpu_total_bytes)
             logger.info(
-                f"max_gpu_total_bytes is provided, max_memory is set to {kv_cache_max_memory / (GB):.2f} GiB"
+                f"max_gpu_total_bytes={executor_config.kv_cache_config.max_gpu_total_bytes / (GB):.2f} GiB is provided, max_memory is set to {kv_cache_max_memory / (GB):.2f} GiB"
             )
 
         logger.info(
