@@ -1026,7 +1026,7 @@ class HuggingFaceDataset(BenchmarkDataset):
             split=self.dataset_split,
             streaming=True,
         )
-        # Long data collections do not shuffle
+        # Long data collections dataset do not shuffle
         if "Long-Data-Collections" not in self.dataset_path:
             self.data = self.data.shuffle(seed=self.random_seed)
 
@@ -1217,9 +1217,10 @@ class LongDataCollectionsDataset(HuggingFaceDataset):
     Long Data Collections Dataset.
     https://huggingface.co/datasets/togethercomputer/Long-Data-Collections
 
-    InstructCoder is the dataset designed for general code editing.  It consists
-    of 114,239 instruction-input-output triplets, and covers multiple distinct
-    code editing scenario.
+    Long Data Collections Dataset is a compilation of long context datasets,
+    specifically designed for tasks requiring extensive comprehension and
+    inference from large text inputs.
+
     """
 
     DEFAULT_OUTPUT_LEN = 128
@@ -1239,8 +1240,8 @@ class LongDataCollectionsDataset(HuggingFaceDataset):
         for item in self.data:
             if len(sampled_requests) >= num_requests:
                 break
-            # Some items only have 'text'
-            # FIXME: 'text' may also acceptable
+            # Some items only have 'text', it may also acceptable.
+            # But now we only use the samples that have 'prompt' item.
             if 'prompt' not in item.keys():
                 continue
 
