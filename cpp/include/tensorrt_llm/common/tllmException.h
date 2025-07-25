@@ -18,14 +18,29 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 
 #define NEW_TLLM_EXCEPTION(...)                                                                                        \
     tensorrt_llm::common::TllmException(__FILE__, __LINE__, tensorrt_llm::common::fmtstr(__VA_ARGS__).c_str())
 
+#define NEW_TLLM_REQUEST_SPECIFIC_EXCEPTION_WITH_ERROR_CODE(requestID, errorCode, ...)                                 \
+    tensorrt_llm::common::RequestSpecificException(                                                                    \
+        __FILE__, __LINE__, tensorrt_llm::common::fmtstr(__VA_ARGS__).c_str(), requestID, errorCode)
+
 namespace tensorrt_llm::common
 {
+
+/// @brief Enumeration of different error codes for request-specific exceptions
+enum class RequestErrorCode : uint32_t
+{
+    // General errors (0-999)
+    UNKNOWN_ERROR = 0,
+
+    // Network and communication errors (1000-1999)
+    NETWORK_ERROR = 1000,
+};
 
 class TllmException : public std::runtime_error
 {
@@ -43,6 +58,23 @@ public:
 private:
     std::array<void*, MAX_FRAMES> mCallstack{};
     int mNbFrames;
+};
+
+class RequestSpecificException : public std::runtime_error
+{
+public:
+    explicit RequestSpecificException(
+        char const* file, std::size_t line, char const* msg, uint64_t requestID, RequestErrorCode errorCode);
+
+    ~RequestSpecificException() noexcept override;
+
+    [[nodiscard]] uint64_t getRequestId() const noexcept;
+
+    [[nodiscard]] RequestErrorCode getErrorCode() const noexcept;
+
+private:
+    uint64_t mRequestID;
+    RequestErrorCode mErrorCode;
 };
 
 } // namespace tensorrt_llm::common
