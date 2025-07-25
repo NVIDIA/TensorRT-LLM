@@ -37,7 +37,6 @@
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/contextProgress.h"
-#include "tensorrt_llm/batch_manager/dataTransceiverImpl.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/mlaCacheFormatter.h"
@@ -194,10 +193,9 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     auto makeFormatter = [cacheManager, isMLA, this]()
     { return createCacheFormatter(cacheManager, mCacheTransBufferManager.get(), isMLA); };
 
-    mCacheSender = std::make_unique<DataResponder>(
-        std::make_unique<CacheSenderImpl>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter()));
-    mDataRequester = std::make_unique<DataRequester>(
-        std::make_unique<CacheReceiverImpl>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter()));
+    mCacheSender = std::make_unique<CacheSender>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter());
+    mCacheReceiver
+        = std::make_unique<CacheReceiver>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter());
 
     initializeCommState();
 }
@@ -249,7 +247,7 @@ void CacheTransceiver::respondAndSendAsync(LlmRequest* llmRequest)
         return;
     }
     setContextState(llmRequest);
-    auto future = mCacheSender->respondAndSendAsync(*llmRequest);
+    auto future = mCacheSender->sendAsync(*llmRequest);
     mSenderFutures.emplace_back(llmRequest, std::move(future));
 }
 
@@ -265,7 +263,7 @@ void CacheTransceiver::respondAndSendLayerWise(
 
         llmRequest->setState(LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS);
         setContextState(llmRequest.get());
-        auto future = mCacheSender->respondAndSendAsync(*llmRequest);
+        auto future = mCacheSender->sendAsync(*llmRequest);
         mSenderFutures.emplace_back(llmRequest.get(), std::move(future));
     }
 }
@@ -274,7 +272,7 @@ void CacheTransceiver::requestAndReceiveSync(LlmRequest* llmRequest)
 {
     TLLM_CHECK(llmRequest && llmRequest->isGenerationOnlyRequest());
     {
-        auto future = mDataRequester->requestAndReceiveAsync(*llmRequest);
+        auto future = mCacheReceiver->receiveAsync(*llmRequest);
         future.get();
     }
     llmRequest->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
@@ -292,7 +290,7 @@ void CacheTransceiver::requestAndReceiveAsync(LlmRequest* llmRequest)
         return;
     }
 
-    auto future = mDataRequester->requestAndReceiveAsync(*llmRequest);
+    auto future = mCacheReceiver->receiveAsync(*llmRequest);
     mRequesterFutures.emplace_back(llmRequest, std::move(future));
     llmRequest->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
 }
