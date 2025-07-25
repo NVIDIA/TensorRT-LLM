@@ -31,6 +31,7 @@
 #include "tensorrt_llm/pybind/batch_manager/kvCacheConnector.h"
 #include "tensorrt_llm/pybind/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/pybind/batch_manager/llmRequest.h"
+#include "tensorrt_llm/pybind/common/tllmExceptions.h"
 #include "tensorrt_llm/pybind/executor/bindings.h"
 #include "tensorrt_llm/pybind/runtime/bindings.h"
 #include "tensorrt_llm/pybind/testing/modelSpecBinding.h"
@@ -119,10 +120,11 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     auto mInternalTesting = mInternal.def_submodule("testing", "Testing internal bindings");
     auto mInternalBatchManager = mInternal.def_submodule("batch_manager", "Batch manager internal bindings");
     auto mInternalThop = mInternal.def_submodule("thop", "Torch op internal bindings");
+    auto mExceptions = m.def_submodule("exceptions", "Exceptions internal bindings");
 
     tensorrt_llm::pybind::executor::initBindings(mExecutor);
     tensorrt_llm::pybind::runtime::initBindingsEarly(mInternalRuntime);
-    tensorrt_llm::pybind::thop::initBindings(mInternalThop);
+    tensorrt_llm::pybind::common::initExceptionsBindings(mExceptions);
 
     auto buildInfo = m.def_submodule("BuildInfo");
     buildInfo.attr("ENABLE_MULTI_DEVICE") = py::int_(ENABLE_MULTI_DEVICE);

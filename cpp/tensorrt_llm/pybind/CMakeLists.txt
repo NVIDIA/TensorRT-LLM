@@ -16,6 +16,8 @@ set(SRCS
     executor/request.cpp
     runtime/bindings.cpp
     runtime/hostfunc.cpp
+    common/tllmExceptions.cpp
+    testing/modelSpecBinding.cpp
     runtime/moeBindings.cpp
     testing/modelSpecBinding.cpp
     userbuffers/bindings.cpp
