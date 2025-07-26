@@ -10,15 +10,32 @@ from torch.fx import GraphModule
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import SequenceInfo
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactory
 from tensorrt_llm._torch.auto_deploy.transformations.library.sharding import ShardingTransformInfo
 
 
-class FakeFactory:
-    def __init__(self, model: nn.Module):
-        self.model = model
+class FakeFactory(ModelFactory):
+    """Dummy factory to pass cache_config for testing."""
 
-    def build_model(self, device: str) -> nn.Module:
-        return self.model.to(device=device)
+    def __init__(self, model=None, cache_config=None, quant_config=None):
+        self._model = model
+        self.cache_config = cache_config
+        self.quant_config = quant_config
+
+    def build_model(self, device: str):
+        return self._model.to(device=device) if self._model else None
+
+    def _build_model(self, device: str):
+        return
+
+    def _load_checkpoint(self, model, device):
+        return
+
+    def get_cache_config(self):
+        return self.cache_config
+
+    def get_quant_config(self):
+        return self.quant_config
 
 
 class SequenceEmbeddingInfo(SequenceInfo):
