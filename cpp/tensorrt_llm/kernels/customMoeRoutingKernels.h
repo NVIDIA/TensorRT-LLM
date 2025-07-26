@@ -24,6 +24,6 @@
 namespace tensorrt_llm::kernels
 {
 template <typename InputT, typename OutputT, typename IdxT, bool DoSoftmaxBeforeTopK>
-void invokeRenormMoeRouting(InputT* routerLogits, OutputT* topkValues, IdxT* topkIndices, int64_t const numTokens,
+void invokeCustomMoeRouting(InputT* routerLogits, OutputT* topkValues, IdxT* topkIndices, int64_t const numTokens,
     int64_t const numExperts, int64_t const topK, cudaStream_t const stream);
 } // namespace tensorrt_llm::kernels
